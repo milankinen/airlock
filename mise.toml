@@ -1,9 +1,63 @@
 [tools]
 
-[tasks.build]
-description = "Build and codesign the binary"
+[tasks."build:kernel"]
+description = "Build the kernel using Docker"
+sources = ["sandbox/kernel/config-arm64", "sandbox/kernel/build.sh"]
+outputs = ["sandbox/out/Image"]
 run = """
-cargo build "$@"
+echo "Building kernel..."
+mkdir -p sandbox/out
+docker run --rm \
+  -v "$PWD/sandbox/kernel/config-arm64:/config:ro" \
+  -v "$PWD/sandbox/kernel/build.sh:/build.sh:ro" \
+  -v "$PWD/sandbox/out:/out" \
+  alpine:3.23 sh /build.sh
+echo "Kernel: sandbox/out/Image ($(du -h sandbox/out/Image | cut -f1))"
+"""
+
+[tasks."build:rootfs"]
+description = "Build the rootfs initramfs using Docker"
+sources = ["sandbox/rootfs/init", "sandbox/rootfs/build.sh"]
+outputs = ["sandbox/out/initramfs.gz"]
+run = """
+echo "Building rootfs..."
+mkdir -p sandbox/out
+docker run --rm \
+  -v "$PWD/sandbox/rootfs/init:/init-script:ro" \
+  -v "$PWD/sandbox/rootfs/build.sh:/build.sh:ro" \
+  -v "$PWD/sandbox/out:/out" \
+  alpine:3.23 sh /build.sh
+echo "Rootfs: sandbox/out/initramfs.gz ($(du -h sandbox/out/initramfs.gz | cut -f1))"
+"""
+
+[tasks."build:supervisor"]
+description = "Build the supervisor for Linux (musl) using Docker"
+sources = ["supervisor/src/**/*.rs", "supervisor/Cargo.toml"]
+outputs = ["sandbox/out/supervisor"]
+run = """
+echo "Building supervisor..."
+mkdir -p sandbox/out
+docker run --rm \
+  -v "$PWD:/workspace:ro" \
+  -v "$PWD/sandbox/out:/out" \
+  -v ezpez-cargo-cache:/cargo-cache \
+  rust:alpine sh -c '
+    apk add --no-cache musl-dev >/dev/null 2>&1
+    export CARGO_HOME=/cargo-cache
+    cd /workspace
+    cargo build --release -p ezpez-supervisor --target-dir /tmp/target
+    cp /tmp/target/release/ezpez-supervisor /out/supervisor
+  '
+echo "Supervisor: sandbox/out/supervisor ($(du -h sandbox/out/supervisor | cut -f1))"
+"""
+
+[tasks.build]
+description = "Build and codesign the CLI binary"
+depends = ["build:kernel", "build:rootfs"]
+sources = ["cli/src/**/*.rs", "cli/Cargo.toml", "Cargo.toml", "Cargo.lock", "sandbox/out/Image", "sandbox/out/initramfs.gz"]
+outputs = ["target/debug/ez"]
+run = """
+cargo build -p ezpez-cli "$@"
 codesign --entitlements entitlements.plist --force -s - target/debug/ez 2>/dev/null || true
 """
 

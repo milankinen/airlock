@@ -1,0 +1,44 @@
+[package]
+name = "ezpez-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ez"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+crossterm = "0.28"
+thiserror = { workspace = true }
+tempfile = "3"
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSFileHandle", "NSString", "NSURL", "NSArray", "NSError"] }
+objc2-virtualization = { version = "0.3", features = [
+    "VZVirtualMachine",
+    "VZVirtualMachineConfiguration",
+    "VZLinuxBootLoader",
+    "VZBootLoader",
+    "VZVirtioConsoleDeviceSerialPortConfiguration",
+    "VZVirtioConsoleDeviceConfiguration",
+    "VZConsoleDeviceConfiguration",
+    "VZFileHandleSerialPortAttachment",
+    "VZSerialPortAttachment",
+    "VZSerialPortConfiguration",
+    "VZVirtioEntropyDeviceConfiguration",
+    "VZEntropyDeviceConfiguration",
+    "VZVirtioTraditionalMemoryBalloonDeviceConfiguration",
+    "VZMemoryBalloonDeviceConfiguration",
+    "VZGenericPlatformConfiguration",
+    "VZPlatformConfiguration",
+    "block2",
+    "dispatch2",
+] }
+block2 = "0.6"
+dispatch2 = "0.3"

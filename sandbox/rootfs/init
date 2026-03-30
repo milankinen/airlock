@@ -1,0 +1,22 @@
+#!/bin/sh
+mount -t proc none /proc
+mount -t sysfs none /sys
+mount -t devtmpfs none /dev
+mkdir -p /dev/pts
+mount -t devpts none /dev/pts
+
+hostname ezpez
+ip link set lo up 2>/dev/null
+
+echo "ezpez sandbox ready"
+
+# Start a login shell in a new session with /dev/console as
+# stdin/stdout/stderr. The hvc0 virtio console doesn't support
+# being a controlling terminal (no job control), but echo and
+# line editing work.
+setsid sh -c 'exec sh -l </dev/console >/dev/console 2>/dev/console' 2>/dev/null
+
+# Shell exited — shut down
+kill -TERM -1 2>/dev/null
+sleep 0.2
+/sbin/poweroff -f 2>/dev/null

@@ -1,51 +1,11 @@
-[package]
-name = "ezpez"
+[workspace]
+members = ["cli", "supervisor"]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[[bin]]
-name = "ez"
-path = "src/main.rs"
-
-[dependencies]
-clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["full"] }
-crossterm = "0.28"
+[workspace.dependencies]
 thiserror = "2"
-directories = "6"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reqwest = { version = "0.12", features = ["stream"] }
-sha2 = "0.10"
-hex = "0.4"
-futures-util = "0.3"
-libc = "0.2"
-tar = "0.4"
-flate2 = "1"
-cpio = "0.4"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSFileHandle", "NSString", "NSURL", "NSArray", "NSError"] }
-objc2-virtualization = { version = "0.3", features = [
-    "VZVirtualMachine",
-    "VZVirtualMachineConfiguration",
-    "VZLinuxBootLoader",
-    "VZBootLoader",
-    "VZVirtioConsoleDeviceSerialPortConfiguration",
-    "VZVirtioConsoleDeviceConfiguration",
-    "VZConsoleDeviceConfiguration",
-    "VZFileHandleSerialPortAttachment",
-    "VZSerialPortAttachment",
-    "VZSerialPortConfiguration",
-    "VZVirtioEntropyDeviceConfiguration",
-    "VZEntropyDeviceConfiguration",
-    "VZVirtioTraditionalMemoryBalloonDeviceConfiguration",
-    "VZMemoryBalloonDeviceConfiguration",
-    "VZGenericPlatformConfiguration",
-    "VZPlatformConfiguration",
-    "block2",
-    "dispatch2",
-] }
-block2 = "0.6"
-dispatch2 = "0.3"

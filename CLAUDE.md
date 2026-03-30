@@ -22,3 +22,8 @@ mise tasks --all   # List available tasks
 IMPORTANT: Write temporary files **ALWAYS** to this project's `.tmp`
 directory instead of `/tmp`. Delete temporary files immediately
 after their use unless told otherwise.
+
+## Commits
+
+ALWAYS use `/git-commit` skill when doing git commits and ALWAYS
+follow skill instructions and steps!

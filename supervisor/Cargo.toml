@@ -1,0 +1,8 @@
+[package]
+name = "ezpez-supervisor"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }

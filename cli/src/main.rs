@@ -21,16 +21,16 @@ async fn main() -> error::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    // Resolve kernel + initramfs paths (download on first run)
+    // Extract embedded kernel + initramfs (or use CLI overrides)
     let asset_paths = match (&cli.kernel, &cli.initramfs) {
         (Some(k), Some(i)) => assets::AssetPaths {
             kernel: k.clone(),
             initramfs: i.clone(),
+            _tmp: tempfile::tempdir()?,
         },
-        _ => assets::ensure_assets().await?,
+        _ => assets::extract_assets()?,
     };
 
-    // Create and boot VM
     let vm_config = vm::config::VmConfig {
         cpus: cli.cpus,
         memory_bytes: cli.memory * 1024 * 1024,
@@ -53,17 +53,12 @@ async fn main() -> error::Result<()> {
 
         let (write_fd, read_fd) = backend.console_fds();
 
-        // Run relay until either side closes or the VM stops
         tokio::select! {
             r = terminal::run_relay(write_fd, read_fd) => { r?; }
             _ = backend.wait_for_stop() => {}
         }
 
-        // Restore terminal before exiting
         drop(backend);
-
-        // tokio's stdin reader uses a blocking thread that can't be
-        // cancelled, so exit explicitly to avoid hanging.
         std::process::exit(0);
     }
 
