@@ -1,1 +1,14 @@
 [tools]
+
+[tasks.build]
+description = "Build and codesign the binary"
+run = """
+cargo build "$@"
+codesign --entitlements entitlements.plist --force -s - target/debug/ez 2>/dev/null || true
+"""
+
+[tasks.ez]
+description = "Build, sign, and run"
+raw = true
+depends = ["build"]
+run = "target/debug/ez"
