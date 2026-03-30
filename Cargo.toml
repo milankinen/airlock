@@ -1,5 +1,5 @@
 [workspace]
-members = ["cli", "supervisor"]
+members = ["cli", "sandbox/supervisor", "protocol"]
 resolver = "3"
 
 [workspace.package]
@@ -9,3 +9,9 @@ edition = "2024"
 [workspace.dependencies]
 thiserror = "2"
 tracing = "0.1"
+capnp = "0.25.3"
+capnp-rpc = "0.25.0"
+capnpc = "0.25.2"
+capnp-futures = "0.25.2"
+tokio = "1"
+ezpez-protocol = { path = "protocol" }

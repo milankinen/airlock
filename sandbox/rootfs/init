@@ -8,15 +8,17 @@ mount -t devpts none /dev/pts
 hostname ezpez
 ip link set lo up 2>/dev/null
 
+# Start supervisor (host↔guest communication via vsock)
+/usr/bin/supervisor &
+SUPERVISOR_PID=$!
+
 echo "ezpez sandbox ready"
 
-# Start a login shell in a new session with /dev/console as
-# stdin/stdout/stderr. The hvc0 virtio console doesn't support
-# being a controlling terminal (no job control), but echo and
-# line editing work.
+# Interactive shell (debug, will be removed when supervisor handles I/O)
 setsid sh -c 'exec sh -l </dev/console >/dev/console 2>/dev/console' 2>/dev/null
 
 # Shell exited — shut down
+kill $SUPERVISOR_PID 2>/dev/null
 kill -TERM -1 2>/dev/null
 sleep 0.2
 /sbin/poweroff -f 2>/dev/null

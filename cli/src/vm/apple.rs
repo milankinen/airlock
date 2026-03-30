@@ -160,6 +160,12 @@ impl AppleVmBackend {
         let balloons = NSArray::from_retained_slice(&[balloon_config]);
         vm_config.setMemoryBalloonDevices(&balloons);
 
+        // Vsock device (for host↔guest communication)
+        let vsock = VZVirtioSocketDeviceConfiguration::new();
+        let vsock_config: Retained<VZSocketDeviceConfiguration> = vsock.into_super();
+        let vsock_devices = NSArray::from_retained_slice(&[vsock_config]);
+        vm_config.setSocketDevices(&vsock_devices);
+
         Ok(vm_config)
         } // unsafe
     }
@@ -269,5 +275,63 @@ impl VmBackend for AppleVmBackend {
             self.host_to_guest_write.as_raw_fd(),
             self.guest_to_host_read.as_raw_fd(),
         )
+    }
+
+    async fn vsock_connect(&self, port: u32) -> Result<OwnedFd> {
+        let (tx, rx) =
+            tokio::sync::oneshot::channel::<std::result::Result<i32, String>>();
+        let tx = Mutex::new(Some(tx));
+        let vm_addr = self.vm_ptr;
+
+        self.vm_queue.exec_async(move || {
+            unsafe {
+                let vm = &*(vm_addr as *const VZVirtualMachine);
+                let devices = vm.socketDevices();
+                let device = match devices.firstObject_unchecked() {
+                    Some(d) => d,
+                    None => {
+                        if let Some(tx) = tx.lock().unwrap().take() {
+                            let _ = tx.send(Err("no vsock device".into()));
+                        }
+                        return;
+                    }
+                };
+                // Downcast VZSocketDevice → VZVirtioSocketDevice
+                // Safety: we configured exactly one VZVirtioSocketDeviceConfiguration
+                let device_ptr = device as *const VZSocketDevice as *const VZVirtioSocketDevice;
+                let device = &*device_ptr;
+
+                let handler = RcBlock::new(
+                    move |conn_ptr: *mut VZVirtioSocketConnection, err_ptr: *mut NSError| {
+                        let result = if err_ptr.is_null() && !conn_ptr.is_null() {
+                            let conn = &*conn_ptr;
+                            // Dup the fd so it outlives the connection object
+                            let fd = libc::dup(conn.fileDescriptor());
+                            if fd < 0 {
+                                Err("failed to dup vsock fd".into())
+                            } else {
+                                Ok(fd)
+                            }
+                        } else if !err_ptr.is_null() {
+                            let err = &*err_ptr;
+                            Err(format!("{}", err.localizedDescription()))
+                        } else {
+                            Err("vsock connect returned null".into())
+                        };
+                        if let Some(tx) = tx.lock().unwrap().take() {
+                            let _ = tx.send(result);
+                        }
+                    },
+                );
+                device.connectToPort_completionHandler(port, &handler);
+            }
+        });
+
+        let fd = rx
+            .await
+            .map_err(|_| Error::VmRuntime("vsock connect channel closed".into()))?
+            .map_err(|e| Error::VmRuntime(format!("vsock connect failed: {e}")))?;
+
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 }

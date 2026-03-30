@@ -3,7 +3,7 @@ pub mod apple;
 pub mod config;
 
 use crate::error::Result;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{OwnedFd, RawFd};
 
 #[allow(dead_code)]
 pub trait VmBackend {
@@ -19,4 +19,7 @@ pub trait VmBackend {
     /// Get the file descriptors for console I/O.
     /// Returns (write_to_guest_fd, read_from_guest_fd).
     fn console_fds(&self) -> (RawFd, RawFd);
+
+    /// Connect to a vsock port in the guest. Returns a connected fd.
+    fn vsock_connect(&self, port: u32) -> impl std::future::Future<Output = Result<OwnedFd>>;
 }
