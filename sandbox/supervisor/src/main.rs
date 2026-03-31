@@ -1,11 +1,14 @@
 mod vsock;
 
 use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
-use ezpez_protocol::supervisor_capnp::{output_stream, supervisor};
+use ezpez_protocol::supervisor_capnp::*;
 use futures::AsyncReadExt;
+use std::cell::RefCell;
 use std::os::unix::io::FromRawFd;
 use std::rc::Rc;
 use tokio::io::{AsyncReadExt as TokioAsyncReadExt, AsyncWriteExt};
+
+// -- Supervisor --
 
 struct SupervisorImpl;
 
@@ -19,95 +22,167 @@ impl supervisor::Server for SupervisorImpl {
         Ok(())
     }
 
-    async fn open_shell(
+    async fn exec(
         self: Rc<Self>,
-        params: supervisor::OpenShellParams,
-        mut results: supervisor::OpenShellResults,
+        params: supervisor::ExecParams,
+        mut results: supervisor::ExecResults,
     ) -> Result<(), capnp::Error> {
         let params = params.get()?;
-        let rows = params.get_rows();
-        let cols = params.get_cols();
-        let stdout: output_stream::Client = params.get_stdout()?;
+        let stdin: byte_stream::Client = params.get_stdin()?;
+        let pty_config = params.get_pty()?;
 
-        let (pty, pts) = pty_process::open()
-            .map_err(|e| capnp::Error::failed(format!("pty open failed: {e}")))?;
-        pty.resize(pty_process::Size::new(rows, cols))
-            .map_err(|e| capnp::Error::failed(format!("pty resize failed: {e}")))?;
+        // Open PTY if requested
+        let use_pty = match pty_config.which() {
+            Ok(pty_config::Size(size)) => {
+                let size = size?;
+                Some((size.get_rows(), size.get_cols()))
+            }
+            _ => None,
+        };
 
-        let mut child = pty_process::Command::new("/bin/sh")
-            .arg0("-sh")
-            .env("TERM", "linux")
-            .spawn(pts)
-            .map_err(|e| capnp::Error::failed(format!("shell spawn failed: {e}")))?;
+        let (pty, child) = if let Some((rows, cols)) = use_pty {
+            let (pty, pts) = pty_process::open()
+                .map_err(|e| capnp::Error::failed(format!("pty open failed: {e}")))?;
+            pty.resize(pty_process::Size::new(rows, cols))
+                .map_err(|e| capnp::Error::failed(format!("pty resize failed: {e}")))?;
+            let child = pty_process::Command::new("/bin/sh")
+                .arg0("-sh")
+                .env("TERM", "linux")
+                .spawn(pts)
+                .map_err(|e| capnp::Error::failed(format!("spawn failed: {e}")))?;
+            eprintln!("supervisor: shell spawned with pty ({rows}x{cols})");
+            (Some(pty), child)
+        } else {
+            // No PTY — TODO: spawn with pipes for separate stdout/stderr
+            return Err(capnp::Error::failed("non-pty exec not yet implemented".into()));
+        };
 
-        eprintln!("supervisor: shell spawned");
+        let pty = pty.unwrap();
+        let (pty_reader, pty_writer) = pty.into_split();
+        let pty_writer = Rc::new(RefCell::new(Some(pty_writer)));
 
-        let (mut pty_reader, pty_writer) = pty.into_split();
-        let pty_writer = Rc::new(std::cell::RefCell::new(pty_writer));
-
-        // Task: read PTY output → push to client, then await child exit
+        // Spawn task: pull from client's stdin ByteStream → write to PTY
+        let pty_writer_clone = pty_writer.clone();
         tokio::task::spawn_local(async move {
-            // Relay PTY output
-            let mut buf = [0u8; 4096];
             loop {
-                match pty_reader.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let mut req = stdout.write_request();
-                        req.get().set_data(&buf[..n]);
-                        if req.send().await.is_err() {
+                let response = match stdin.read_request().send().promise.await {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let frame = match response.get().and_then(|r| r.get_frame()) {
+                    Ok(f) => f,
+                    Err(_) => break,
+                };
+                match frame.which() {
+                    Ok(data_frame::Eof(())) => break,
+                    Ok(data_frame::Data(Ok(bytes))) => {
+                        if let Some(w) = pty_writer_clone.borrow_mut().as_mut() {
+                            if w.write_all(bytes).await.is_err() {
+                                break;
+                            }
+                        } else {
                             break;
                         }
                     }
+                    _ => break,
                 }
             }
-
-            // Wait for child to exit and get exit code
-            let exit_code = match child.wait().await {
-                Ok(status) => status.code().unwrap_or(1),
-                Err(_) => 1,
-            };
-
-            // Signal done with exit code
-            let mut req = stdout.done_request();
-            req.get().set_exit_code(exit_code);
-            let _ = req.send().promise.await;
         });
 
-        // Return stdin capability
-        let stdin_impl = ShellStdinImpl { pty_writer };
-        results.get().set_stdin(capnp_rpc::new_client(stdin_impl));
+        // Return Process capability
+        let proc_impl = ProcessImpl {
+            pty_reader: RefCell::new(Some(pty_reader)),
+            pty_writer,
+            child: RefCell::new(Some(child)),
+        };
+        results.get().set_proc(capnp_rpc::new_client(proc_impl));
 
         Ok(())
     }
 }
 
-struct ShellStdinImpl {
-    pty_writer: Rc<std::cell::RefCell<pty_process::OwnedWritePty>>,
+// -- Process --
+
+struct ProcessImpl {
+    pty_reader: RefCell<Option<pty_process::OwnedReadPty>>,
+    pty_writer: Rc<RefCell<Option<pty_process::OwnedWritePty>>>,
+    child: RefCell<Option<tokio::process::Child>>,
 }
 
-impl output_stream::Server for ShellStdinImpl {
-    async fn write(
+impl process::Server for ProcessImpl {
+    async fn poll(
         self: Rc<Self>,
-        params: output_stream::WriteParams,
+        _params: process::PollParams,
+        mut results: process::PollResults,
     ) -> Result<(), capnp::Error> {
-        let data = params.get()?.get_data()?;
-        let mut writer = self.pty_writer.borrow_mut();
-        writer
-            .write_all(data)
-            .await
-            .map_err(|e| capnp::Error::failed(format!("pty write failed: {e}")))?;
+        if let Some(reader) = self.pty_reader.borrow_mut().as_mut() {
+            let mut buf = [0u8; 4096];
+            match reader.read(&mut buf).await {
+                Ok(0) => {}
+                Ok(n) => {
+                    let next = results.get().init_next();
+                    next.init_stdout().set_data(&buf[..n]);
+                    return Ok(());
+                }
+                Err(_) => {}
+            }
+        }
+
+        // PTY closed — get exit code
+        self.pty_reader.borrow_mut().take();
+        let exit_code = if let Some(mut child) = self.child.borrow_mut().take() {
+            match child.wait().await {
+                Ok(status) => status.code().unwrap_or(1),
+                Err(_) => 1,
+            }
+        } else {
+            0
+        };
+
+        results.get().init_next().set_exit(exit_code);
         Ok(())
     }
 
-    async fn done(
+    async fn signal(
         self: Rc<Self>,
-        _params: output_stream::DoneParams,
-        _results: output_stream::DoneResults,
+        params: process::SignalParams,
+        _results: process::SignalResults,
     ) -> Result<(), capnp::Error> {
+        let signum = params.get()?.get_signum();
+        if let Some(child) = self.child.borrow().as_ref() {
+            if let Some(pid) = child.id() {
+                unsafe { libc::kill(pid as i32, signum as i32) };
+            }
+        }
+        Ok(())
+    }
+
+    async fn kill(
+        self: Rc<Self>,
+        _params: process::KillParams,
+        _results: process::KillResults,
+    ) -> Result<(), capnp::Error> {
+        if let Some(mut child) = self.child.borrow_mut().take() {
+            let _ = child.kill().await;
+        }
+        Ok(())
+    }
+
+    async fn resize(
+        self: Rc<Self>,
+        params: process::ResizeParams,
+        _results: process::ResizeResults,
+    ) -> Result<(), capnp::Error> {
+        let size = params.get()?.get_size()?;
+        // Resize via the writer half (both halves share the underlying PTY)
+        if let Some(writer) = self.pty_writer.borrow().as_ref() {
+            let _ = writer.resize(pty_process::Size::new(size.get_rows(), size.get_cols()));
+        }
         Ok(())
     }
 }
+
+// -- main --
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

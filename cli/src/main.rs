@@ -6,6 +6,7 @@ mod vm;
 
 use clap::Parser;
 use cli::Cli;
+use ezpez_protocol::supervisor_capnp::*;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> error::Result<()> {
@@ -58,7 +59,7 @@ async fn async_main(cli: Cli) -> error::Result<()> {
         let mut backend = vm::apple::AppleVmBackend::new(vm_config)?;
         backend.start().await?;
 
-        // Connect to supervisor via vsock (retry until ready)
+        // Connect to supervisor via vsock
         let vsock_fd = {
             let mut attempts = 0;
             loop {
@@ -96,68 +97,110 @@ async fn async_main(cli: Cli) -> error::Result<()> {
             );
 
             let mut rpc = capnp_rpc::RpcSystem::new(Box::new(network), None);
-            let client: ezpez_protocol::supervisor_capnp::supervisor::Client =
+            let client: supervisor::Client =
                 rpc.bootstrap(capnp_rpc::rpc_twoparty_capnp::Side::Server);
 
             tokio::task::spawn_local(rpc);
             client
         };
 
-        // Get terminal size
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        // Exec shell — pass stdin stream + PTY config
+        let stdin_client: byte_stream::Client = capnp_rpc::new_client(StdinStream);
+        let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
 
-        // Channel to receive exit code from shell
-        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
+        // Always allocate PTY for shell (needed for echo/job control).
+        // Terminal size from host, or default 80x24 if not a TTY.
+        let (cols, rows) = if is_tty {
+            crossterm::terminal::size().unwrap_or((80, 24))
+        } else {
+            (80, 24)
+        };
 
-        // Open shell via RPC — supervisor creates PTY
-        let shell_output_client: ezpez_protocol::supervisor_capnp::output_stream::Client =
-            capnp_rpc::new_client(ShellOutputImpl { exit_tx: std::cell::RefCell::new(Some(exit_tx)) });
-
-        let mut req = supervisor_client.open_shell_request();
-        req.get().set_rows(rows);
-        req.get().set_cols(cols);
-        req.get().set_stdout(shell_output_client);
+        let mut req = supervisor_client.exec_request();
+        req.get().set_stdin(stdin_client);
+        let mut size = req.get().init_pty().init_size();
+        size.set_rows(rows);
+        size.set_cols(cols);
 
         let response = req
             .send()
             .promise
             .await
-            .map_err(|e| error::Error::VmRuntime(format!("openShell failed: {e}")))?;
-        let shell_input = response
+            .map_err(|e| error::Error::VmRuntime(format!("exec failed: {e}")))?;
+        let proc = response
             .get()
             .map_err(|e| error::Error::VmRuntime(format!("{e}")))?
-            .get_stdin()
+            .get_proc()
             .map_err(|e| error::Error::VmRuntime(format!("{e}")))?;
 
         eprintln!("supervisor connected");
 
-        // Enter raw mode and relay stdin to shell via RPC
-        let _guard = terminal::TerminalGuard::enter();
-
-        let stdin_relay = async {
-            let mut stdin = tokio::io::stdin();
-            let mut buf = [0u8; 1024];
-            loop {
-                use tokio::io::AsyncReadExt;
-                let n = stdin.read(&mut buf).await?;
-                if n == 0 {
-                    break;
-                }
-                let mut req = shell_input.write_request();
-                req.get().set_data(&buf[..n]);
-                if req.send().await.is_err() {
-                    break; // Shell exited
-                }
-            }
-            Ok::<(), error::Error>(())
+        // Enter raw mode if on a TTY
+        let _guard = if is_tty {
+            Some(terminal::TerminalGuard::enter())
+        } else {
+            None
         };
 
-        let exit_code;
-        tokio::select! {
-            _ = stdin_relay => { exit_code = 0; }
-            code = exit_rx => { exit_code = code.unwrap_or(1); }
-            _ = backend.wait_for_stop() => { exit_code = 1; }
+        // Watch for terminal resize (SIGWINCH)
+        let proc_for_resize = proc.clone();
+        if is_tty {
+            tokio::task::spawn_local(async move {
+                let mut sigwinch = match tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::window_change(),
+                ) {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                while sigwinch.recv().await.is_some() {
+                    if let Ok((cols, rows)) = crossterm::terminal::size() {
+                        let mut req = proc_for_resize.resize_request();
+                        let mut size = req.get().init_size();
+                        size.set_rows(rows);
+                        size.set_cols(cols);
+                        let _ = req.send().promise.await;
+                    }
+                }
+            });
         }
+
+        // Poll loop: read process output until exit
+        let exit_code = loop {
+            let response = proc
+                .poll_request()
+                .send()
+                .promise
+                .await
+                .map_err(|e| error::Error::VmRuntime(format!("poll failed: {e}")))?;
+            let next = response
+                .get()
+                .map_err(|e| error::Error::VmRuntime(format!("{e}")))?
+                .get_next()
+                .map_err(|e| error::Error::VmRuntime(format!("{e}")))?;
+
+            match next.which() {
+                Ok(process_output::Exit(code)) => break code,
+                Ok(process_output::Stdout(frame)) => {
+                    let frame = frame.map_err(|e| error::Error::VmRuntime(format!("{e}")))?;
+                    if let Ok(data_frame::Data(Ok(data))) = frame.which() {
+                        use std::io::Write;
+                        let _ = std::io::stdout().write_all(data);
+                        let _ = std::io::stdout().flush();
+                    }
+                }
+                Ok(process_output::Stderr(frame)) => {
+                    let frame = frame.map_err(|e| error::Error::VmRuntime(format!("{e}")))?;
+                    if let Ok(data_frame::Data(Ok(data))) = frame.which() {
+                        use std::io::Write;
+                        let _ = std::io::stderr().write_all(data);
+                        let _ = std::io::stderr().flush();
+                    }
+                }
+                Err(_) => {
+                    break 1;
+                }
+            }
+        };
 
         drop(_guard);
         drop(backend);
@@ -173,31 +216,31 @@ async fn async_main(cli: Cli) -> error::Result<()> {
     }
 }
 
-/// Receives shell output from supervisor via RPC callback
-struct ShellOutputImpl {
-    exit_tx: std::cell::RefCell<Option<tokio::sync::oneshot::Sender<i32>>>,
-}
+/// Stdin ByteStream — supervisor calls read() to pull input from us
+struct StdinStream;
 
-impl ezpez_protocol::supervisor_capnp::output_stream::Server for ShellOutputImpl {
-    async fn write(
+impl byte_stream::Server for StdinStream {
+    async fn read(
         self: std::rc::Rc<Self>,
-        params: ezpez_protocol::supervisor_capnp::output_stream::WriteParams,
+        _params: byte_stream::ReadParams,
+        mut results: byte_stream::ReadResults,
     ) -> Result<(), capnp::Error> {
-        let data = params.get()?.get_data()?;
-        use std::io::Write;
-        let _ = std::io::stdout().write_all(data);
-        let _ = std::io::stdout().flush();
-        Ok(())
-    }
-
-    async fn done(
-        self: std::rc::Rc<Self>,
-        params: ezpez_protocol::supervisor_capnp::output_stream::DoneParams,
-        _results: ezpez_protocol::supervisor_capnp::output_stream::DoneResults,
-    ) -> Result<(), capnp::Error> {
-        let exit_code = params.get()?.get_exit_code();
-        if let Some(tx) = self.exit_tx.borrow_mut().take() {
-            let _ = tx.send(exit_code);
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 1024];
+        let mut stdin = tokio::io::stdin();
+        match stdin.read(&mut buf).await {
+            Ok(0) => {
+                results.get().init_frame().set_eof(());
+            }
+            Ok(n) => {
+                results.get().init_frame().set_data(&buf[..n]);
+            }
+            Err(e) => {
+                results
+                    .get()
+                    .init_frame()
+                    .set_err(&format!("{e}"));
+            }
         }
         Ok(())
     }
