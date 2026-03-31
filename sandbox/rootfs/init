@@ -4,12 +4,20 @@ mount -t sysfs none /sys
 mount -t devtmpfs none /dev
 mkdir -p /dev/pts
 mount -t devpts none /dev/pts
+mount -t tmpfs none /tmp
+mount -t tmpfs none /run
+
+# cgroups (required by crun)
+mkdir -p /sys/fs/cgroup
+mount -t cgroup2 none /sys/fs/cgroup
+
+# VirtioFS share (OCI bundle from host)
+mkdir -p /mnt/bundle
+mount -t virtiofs bundle /mnt/bundle || true
 
 hostname ezpez
 ip link set lo up 2>/dev/null
 
-# Supervisor handles shell via PTY over vsock RPC.
-# When it exits (host disconnected), power off.
 /usr/bin/supervisor
 
 kill -TERM -1 2>/dev/null

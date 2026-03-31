@@ -45,8 +45,8 @@ impl supervisor::Server for SupervisorImpl {
                 .map_err(|e| capnp::Error::failed(format!("pty open failed: {e}")))?;
             pty.resize(pty_process::Size::new(rows, cols))
                 .map_err(|e| capnp::Error::failed(format!("pty resize failed: {e}")))?;
-            let child = pty_process::Command::new("/bin/sh")
-                .arg0("-sh")
+            let child = pty_process::Command::new("crun")
+                .args(["run", "--no-pivot", "--bundle", "/mnt/bundle", "ezpez0"])
                 .env("TERM", "linux")
                 .spawn(pts)
                 .map_err(|e| capnp::Error::failed(format!("spawn failed: {e}")))?;

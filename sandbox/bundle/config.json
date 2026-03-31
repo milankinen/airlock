@@ -1,0 +1,37 @@
+{
+  "ociVersion": "1.0.0",
+  "process": {
+    "terminal": true,
+    "user": { "uid": 0, "gid": 0 },
+    "args": ["/bin/sh", "-l"],
+    "env": [
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "TERM=linux",
+      "HOME=/root"
+    ],
+    "cwd": "/"
+  },
+  "root": {
+    "path": "rootfs",
+    "readonly": false
+  },
+  "hostname": "ezpez",
+  "mounts": [
+    { "destination": "/proc", "type": "proc", "source": "proc" },
+    { "destination": "/dev", "type": "tmpfs", "source": "tmpfs",
+      "options": ["nosuid", "strictatime", "mode=755", "size=65536k"] },
+    { "destination": "/dev/pts", "type": "devpts", "source": "devpts",
+      "options": ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620"] },
+    { "destination": "/dev/shm", "type": "tmpfs", "source": "shm",
+      "options": ["nosuid", "noexec", "nodev", "mode=1777", "size=65536k"] },
+    { "destination": "/sys", "type": "sysfs", "source": "sysfs",
+      "options": ["nosuid", "noexec", "nodev", "ro"] }
+  ],
+  "linux": {
+    "namespaces": [
+      { "type": "pid" },
+      { "type": "uts" },
+      { "type": "mount" }
+    ]
+  }
+}

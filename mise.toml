@@ -15,22 +15,25 @@ docker run --rm \
 echo "Kernel: sandbox/out/Image ($(du -h sandbox/out/Image | cut -f1))"
 """
 
+[tasks."build:supervisor-image"]
+description = "Build the supervisor builder Docker image"
+sources = ["sandbox/supervisor/Dockerfile"]
+outputs = [".supervisor-image-built"]
+run = """
+docker build -t ezpez-supervisor-builder sandbox/supervisor/
+touch .supervisor-image-built
+"""
+
 [tasks."build:supervisor"]
 description = "Build the supervisor for Linux (musl) using Docker"
-sources = [
-    "sandbox/supervisor/Dockerfile",
-    "sandbox/supervisor/src/**/*.rs",
-    "sandbox/supervisor/Cargo.toml",
-    "protocol/src/**/*.rs",
-    "protocol/schema/**/*.capnp"
-]
+depends = ["build:supervisor-image"]
+sources = ["sandbox/supervisor/src/**/*.rs", "sandbox/supervisor/Cargo.toml", "protocol/src/**/*.rs", "protocol/schema/**/*.capnp"]
 outputs = ["sandbox/out/supervisor"]
 run = """
 echo "Building supervisor..."
-docker build -t ezpez-supervisor-builder sandbox/supervisor/
 mkdir -p sandbox/out
 docker run --rm \
-  -v "$PWD:/workspace" \
+  -v "$PWD:/workspace:ro" \
   -v "$PWD/sandbox/out:/out" \
   -v ezpez-cargo-cache:/cargo-cache \
   ezpez-supervisor-builder sh -c '
@@ -59,9 +62,18 @@ docker run --rm \
 echo "Rootfs: sandbox/out/initramfs.gz ($(du -h sandbox/out/initramfs.gz | cut -f1))"
 """
 
+[tasks."build:bundle"]
+description = "Prepare the OCI container bundle"
+sources = ["sandbox/bundle/build.sh", "sandbox/bundle/config.json"]
+outputs = [".tmp/bundle/config.json"]
+run = """
+echo "Preparing bundle..."
+sh sandbox/bundle/build.sh .tmp/bundle
+"""
+
 [tasks.build]
 description = "Build and codesign the CLI binary"
-depends = ["build:kernel", "build:rootfs"]
+depends = ["build:kernel", "build:rootfs", "build:bundle"]
 sources = ["cli/src/**/*.rs", "cli/Cargo.toml", "Cargo.toml", "Cargo.lock", "sandbox/out/Image", "sandbox/out/initramfs.gz"]
 outputs = ["target/debug/ez"]
 run = """

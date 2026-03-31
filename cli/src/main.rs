@@ -49,6 +49,7 @@ async fn async_main(cli: Cli) -> error::Result<()> {
         } else {
             "console=hvc0 rdinit=/init quiet loglevel=3".to_string()
         },
+        bundle_path: Some(".tmp/bundle".into()),
     };
 
     #[cfg(target_os = "macos")]

@@ -6,4 +6,5 @@ pub struct VmConfig {
     pub kernel: PathBuf,
     pub initramfs: PathBuf,
     pub kernel_cmdline: String,
+    pub bundle_path: Option<PathBuf>,
 }

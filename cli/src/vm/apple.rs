@@ -166,6 +166,33 @@ impl AppleVmBackend {
         let vsock_devices = NSArray::from_retained_slice(&[vsock_config]);
         vm_config.setSocketDevices(&vsock_devices);
 
+        // VirtioFS share (OCI bundle from host)
+        if let Some(ref bundle_path) = config.bundle_path {
+            let bundle_abs = std::fs::canonicalize(bundle_path)
+                .unwrap_or_else(|_| bundle_path.clone());
+            let bundle_url = NSURL::fileURLWithPath(
+                &NSString::from_str(&bundle_abs.to_string_lossy()),
+            );
+            let shared_dir = VZSharedDirectory::initWithURL_readOnly(
+                VZSharedDirectory::alloc(),
+                &bundle_url,
+                false,
+            );
+            let share = VZSingleDirectoryShare::initWithDirectory(
+                VZSingleDirectoryShare::alloc(),
+                &shared_dir,
+            );
+            let fs_config = VZVirtioFileSystemDeviceConfiguration::initWithTag(
+                VZVirtioFileSystemDeviceConfiguration::alloc(),
+                &NSString::from_str("bundle"),
+            );
+            fs_config.setShare(Some(&share.into_super()));
+            let fs_device: Retained<VZDirectorySharingDeviceConfiguration> =
+                fs_config.into_super();
+            let fs_devices = NSArray::from_retained_slice(&[fs_device]);
+            vm_config.setDirectorySharingDevices(&fs_devices);
+        }
+
         Ok(vm_config)
         } // unsafe
     }
