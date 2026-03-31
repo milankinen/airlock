@@ -8,17 +8,10 @@ mount -t devpts none /dev/pts
 hostname ezpez
 ip link set lo up 2>/dev/null
 
-# Start supervisor (host↔guest communication via vsock)
-/usr/bin/supervisor &
-SUPERVISOR_PID=$!
+# Supervisor handles shell via PTY over vsock RPC.
+# When it exits (host disconnected), power off.
+/usr/bin/supervisor
 
-echo "ezpez sandbox ready"
-
-# Interactive shell (debug, will be removed when supervisor handles I/O)
-setsid sh -c 'exec sh -l </dev/console >/dev/console 2>/dev/console' 2>/dev/null
-
-# Shell exited — shut down
-kill $SUPERVISOR_PID 2>/dev/null
 kill -TERM -1 2>/dev/null
 sleep 0.2
 /sbin/poweroff -f 2>/dev/null

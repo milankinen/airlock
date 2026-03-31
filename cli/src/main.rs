@@ -67,9 +67,9 @@ async fn async_main(cli: Cli) -> error::Result<()> {
                     Err(e) => {
                         attempts += 1;
                         if attempts >= 30 {
-                            return Err(error::Error::VmRuntime(
-                                format!("supervisor not reachable after {attempts} attempts: {e}"),
-                            ));
+                            return Err(error::Error::VmRuntime(format!(
+                                "supervisor not reachable after {attempts} attempts: {e}"
+                            )));
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
@@ -77,7 +77,7 @@ async fn async_main(cli: Cli) -> error::Result<()> {
             }
         };
 
-        // Establish RPC connection to supervisor
+        // Establish RPC connection
         let supervisor_client = {
             use futures::AsyncReadExt;
             use std::os::unix::io::{FromRawFd, IntoRawFd};
@@ -103,26 +103,65 @@ async fn async_main(cli: Cli) -> error::Result<()> {
             client
         };
 
-        // Ping/pong test
-        {
-            let request = supervisor_client.ping_request();
-            let response = request.send().promise.await
-                .map_err(|e| error::Error::VmRuntime(format!("ping failed: {e}")))?;
-            let id = response.get()
-                .map_err(|e| error::Error::VmRuntime(format!("{e}")))?
-                .get_id();
-            eprintln!("supervisor connected (pong id={id})");
-        }
+        // Get terminal size
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
-        let (write_fd, read_fd) = backend.console_fds();
+        // Channel to receive exit code from shell
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
 
+        // Open shell via RPC — supervisor creates PTY
+        let shell_output_client: ezpez_protocol::supervisor_capnp::output_stream::Client =
+            capnp_rpc::new_client(ShellOutputImpl { exit_tx: std::cell::RefCell::new(Some(exit_tx)) });
+
+        let mut req = supervisor_client.open_shell_request();
+        req.get().set_rows(rows);
+        req.get().set_cols(cols);
+        req.get().set_stdout(shell_output_client);
+
+        let response = req
+            .send()
+            .promise
+            .await
+            .map_err(|e| error::Error::VmRuntime(format!("openShell failed: {e}")))?;
+        let shell_input = response
+            .get()
+            .map_err(|e| error::Error::VmRuntime(format!("{e}")))?
+            .get_stdin()
+            .map_err(|e| error::Error::VmRuntime(format!("{e}")))?;
+
+        eprintln!("supervisor connected");
+
+        // Enter raw mode and relay stdin to shell via RPC
+        let _guard = terminal::TerminalGuard::enter();
+
+        let stdin_relay = async {
+            let mut stdin = tokio::io::stdin();
+            let mut buf = [0u8; 1024];
+            loop {
+                use tokio::io::AsyncReadExt;
+                let n = stdin.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                let mut req = shell_input.write_request();
+                req.get().set_data(&buf[..n]);
+                if req.send().await.is_err() {
+                    break; // Shell exited
+                }
+            }
+            Ok::<(), error::Error>(())
+        };
+
+        let exit_code;
         tokio::select! {
-            r = terminal::run_relay(write_fd, read_fd) => { r?; }
-            _ = backend.wait_for_stop() => {}
+            _ = stdin_relay => { exit_code = 0; }
+            code = exit_rx => { exit_code = code.unwrap_or(1); }
+            _ = backend.wait_for_stop() => { exit_code = 1; }
         }
 
+        drop(_guard);
         drop(backend);
-        std::process::exit(0);
+        std::process::exit(exit_code);
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -131,5 +170,35 @@ async fn async_main(cli: Cli) -> error::Result<()> {
         Err(error::Error::VmRuntime(
             "only macOS is supported currently".into(),
         ))
+    }
+}
+
+/// Receives shell output from supervisor via RPC callback
+struct ShellOutputImpl {
+    exit_tx: std::cell::RefCell<Option<tokio::sync::oneshot::Sender<i32>>>,
+}
+
+impl ezpez_protocol::supervisor_capnp::output_stream::Server for ShellOutputImpl {
+    async fn write(
+        self: std::rc::Rc<Self>,
+        params: ezpez_protocol::supervisor_capnp::output_stream::WriteParams,
+    ) -> Result<(), capnp::Error> {
+        let data = params.get()?.get_data()?;
+        use std::io::Write;
+        let _ = std::io::stdout().write_all(data);
+        let _ = std::io::stdout().flush();
+        Ok(())
+    }
+
+    async fn done(
+        self: std::rc::Rc<Self>,
+        params: ezpez_protocol::supervisor_capnp::output_stream::DoneParams,
+        _results: ezpez_protocol::supervisor_capnp::output_stream::DoneResults,
+    ) -> Result<(), capnp::Error> {
+        let exit_code = params.get()?.get_exit_code();
+        if let Some(tx) = self.exit_tx.borrow_mut().take() {
+            let _ = tx.send(exit_code);
+        }
+        Ok(())
     }
 }
