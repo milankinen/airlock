@@ -1,6 +1,7 @@
-use crate::error::{Error, Result};
-use crate::vm::config::VmConfig;
-use crate::vm::VmBackend;
+use crate::error::CliError;
+use super::config::VmConfig;
+
+type Result<T> = std::result::Result<T, CliError>;
 
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
@@ -8,7 +9,7 @@ use objc2::rc::Retained;
 use objc2::AnyThread;
 use objc2_foundation::{NSArray, NSError, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::*;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Mutex;
 use tracing::{debug, info};
 
@@ -20,7 +21,7 @@ struct PipeEnds {
 fn create_pipe() -> Result<PipeEnds> {
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return Err(Error::Io(std::io::Error::last_os_error()));
+        return Err(CliError::Unexpected(std::io::Error::last_os_error().into()));
     }
     Ok(PipeEnds {
         read: unsafe { OwnedFd::from_raw_fd(fds[0]) },
@@ -28,6 +29,7 @@ fn create_pipe() -> Result<PipeEnds> {
     })
 }
 
+#[allow(dead_code)]
 pub struct AppleVmBackend {
     /// Raw pointer to the VM object. Only accessed on the dispatch queue.
     /// Stored as usize to avoid Send issues with raw pointers.
@@ -54,7 +56,7 @@ impl AppleVmBackend {
 
         unsafe {
             vm_config.validateWithError().map_err(|e| {
-                Error::VmConfig(format!("VM configuration validation failed: {e}"))
+                CliError::expected(format!("VM configuration validation failed: {e}"))
             })?;
         }
         debug!("VM configuration validated");
@@ -211,8 +213,8 @@ impl Drop for AppleVmBackend {
     }
 }
 
-impl VmBackend for AppleVmBackend {
-    async fn start(&mut self) -> Result<()> {
+impl AppleVmBackend {
+    pub async fn start(&mut self) -> Result<()> {
         info!("starting VM...");
 
         let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<(), String>>();
@@ -239,14 +241,15 @@ impl VmBackend for AppleVmBackend {
         });
 
         rx.await
-            .map_err(|_| Error::VmRuntime("VM start channel closed".into()))?
-            .map_err(|e| Error::VmRuntime(format!("VM start failed: {e}")))?;
+            .map_err(|_| CliError::expected("VM start channel closed"))?
+            .map_err(|e| CliError::expected(format!("VM start failed: {e}")))?;
 
         info!("VM started");
         Ok(())
     }
 
-    async fn stop(&mut self) -> Result<()> {
+    #[allow(dead_code)]
+    pub async fn stop(&mut self) -> Result<()> {
         let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<(), String>>();
         let tx = Mutex::new(Some(tx));
         let vm_addr = self.vm_ptr;
@@ -270,14 +273,14 @@ impl VmBackend for AppleVmBackend {
         });
 
         rx.await
-            .map_err(|_| Error::VmRuntime("VM stop channel closed".into()))?
-            .map_err(|e| Error::VmRuntime(format!("VM stop failed: {e}")))?;
+            .map_err(|_| CliError::expected("VM stop channel closed"))?
+            .map_err(|e| CliError::expected(format!("VM stop failed: {e}")))?;
 
         info!("VM stopped");
         Ok(())
     }
 
-    async fn wait_for_stop(&self) {
+    pub async fn wait_for_stop_impl(&self) {
         let vm_addr = self.vm_ptr;
         let queue = self.vm_queue.clone();
         loop {
@@ -297,14 +300,7 @@ impl VmBackend for AppleVmBackend {
         }
     }
 
-    fn console_fds(&self) -> (RawFd, RawFd) {
-        (
-            self.host_to_guest_write.as_raw_fd(),
-            self.guest_to_host_read.as_raw_fd(),
-        )
-    }
-
-    async fn vsock_connect(&self, port: u32) -> Result<OwnedFd> {
+    pub async fn vsock_connect(&self, port: u32) -> Result<OwnedFd> {
         let (tx, rx) =
             tokio::sync::oneshot::channel::<std::result::Result<i32, String>>();
         let tx = Mutex::new(Some(tx));
@@ -356,8 +352,8 @@ impl VmBackend for AppleVmBackend {
 
         let fd = rx
             .await
-            .map_err(|_| Error::VmRuntime("vsock connect channel closed".into()))?
-            .map_err(|e| Error::VmRuntime(format!("vsock connect failed: {e}")))?;
+            .map_err(|_| CliError::expected("vsock connect channel closed"))?
+            .map_err(|e| CliError::expected(format!("vsock connect failed: {e}")))?;
 
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }

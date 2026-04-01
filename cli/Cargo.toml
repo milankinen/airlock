@@ -8,6 +8,7 @@ name = "ez"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 crossterm = "0.28"

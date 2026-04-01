@@ -4,8 +4,10 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+bytes = "1"
 capnp = { workspace = true }
 capnp-rpc = { workspace = true }
+tokio = { workspace = true, features = ["io-util"] }
 
 [build-dependencies]
 capnpc = { workspace = true }

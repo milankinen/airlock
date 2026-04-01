@@ -4,11 +4,12 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+anyhow = { workspace = true }
 capnp = { workspace = true }
 capnp-rpc = { workspace = true }
 ezpez-protocol = { workspace = true }
-libc = "0.2"
-tokio = { workspace = true, features = ["rt", "net", "io-util", "macros", "process"] }
-pty-process = { version = "0.5", features = ["async"] }
-tokio-util = { version = "0.7", features = ["compat"] }
 futures = "0.3"
+libc = "0.2"
+pty-process = { version = "0.5", features = ["async"] }
+tokio = { workspace = true, features = ["rt", "net", "io-util", "macros", "process"] }
+tokio-util = { version = "0.7", features = ["compat"] }

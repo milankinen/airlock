@@ -1,4 +1,5 @@
 use std::mem;
+use std::os::unix::io::{FromRawFd, OwnedFd};
 
 const AF_VSOCK: i32 = 40;
 const VMADDR_CID_ANY: u32 = 0xFFFFFFFF;
@@ -13,12 +14,13 @@ struct SockaddrVm {
     svm_zero: [u8; 3],
 }
 
-pub fn listen(port: u32) -> std::io::Result<i32> {
+pub fn listen(port: u32) -> std::io::Result<OwnedFd> {
     unsafe {
         let fd = libc::socket(AF_VSOCK, libc::SOCK_STREAM, 0);
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
+        let fd = OwnedFd::from_raw_fd(fd);
 
         let addr = SockaddrVm {
             svm_family: AF_VSOCK as u16,
@@ -29,13 +31,16 @@ pub fn listen(port: u32) -> std::io::Result<i32> {
             svm_zero: [0; 3],
         };
 
-        if libc::bind(fd, &addr as *const _ as *const libc::sockaddr, mem::size_of::<SockaddrVm>() as u32) < 0 {
-            libc::close(fd);
+        if libc::bind(
+            std::os::unix::io::AsRawFd::as_raw_fd(&fd),
+            &addr as *const _ as *const libc::sockaddr,
+            mem::size_of::<SockaddrVm>() as u32,
+        ) < 0
+        {
             return Err(std::io::Error::last_os_error());
         }
 
-        if libc::listen(fd, 1) < 0 {
-            libc::close(fd);
+        if libc::listen(std::os::unix::io::AsRawFd::as_raw_fd(&fd), 1) < 0 {
             return Err(std::io::Error::last_os_error());
         }
 
@@ -43,12 +48,16 @@ pub fn listen(port: u32) -> std::io::Result<i32> {
     }
 }
 
-pub fn accept(listen_fd: i32) -> std::io::Result<i32> {
+pub fn accept(listen_fd: &OwnedFd) -> std::io::Result<OwnedFd> {
     unsafe {
-        let fd = libc::accept(listen_fd, std::ptr::null_mut(), std::ptr::null_mut());
+        let fd = libc::accept(
+            std::os::unix::io::AsRawFd::as_raw_fd(listen_fd),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(fd)
+        Ok(OwnedFd::from_raw_fd(fd))
     }
 }

@@ -1,13 +1,26 @@
 #[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("VM configuration error: {0}")]
-    VmConfig(String),
-
-    #[error("VM runtime error: {0}")]
-    VmRuntime(String),
+pub enum CliError {
+    #[error("{0}")]
+    Expected(String),
 
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Unexpected(#[from] anyhow::Error),
 }
 
-pub type Result<T> = std::result::Result<T, Error>;
+impl CliError {
+    pub fn expected(msg: impl Into<String>) -> Self {
+        Self::Expected(msg.into())
+    }
+}
+
+impl From<std::io::Error> for CliError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Unexpected(e.into())
+    }
+}
+
+impl From<capnp::Error> for CliError {
+    fn from(e: capnp::Error) -> Self {
+        Self::Unexpected(e.into())
+    }
+}

@@ -243,6 +243,7 @@ dependencies = [
 name = "ezpez-cli"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "block2",
  "capnp",
  "capnp-rpc",
@@ -267,15 +268,18 @@ dependencies = [
 name = "ezpez-protocol"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "capnp",
  "capnp-rpc",
  "capnpc",
+ "tokio",
 ]
 
 [[package]]
 name = "ezpez-supervisor"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "capnp",
  "capnp-rpc",
  "ezpez-protocol",
