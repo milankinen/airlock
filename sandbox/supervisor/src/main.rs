@@ -1,3 +1,4 @@
+mod net;
 mod rpc;
 mod vsock;
 

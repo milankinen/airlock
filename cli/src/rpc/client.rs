@@ -1,8 +1,11 @@
 use crate::error::CliError;
+use crate::rpc::network::NetworkProxyImpl;
+use crate::rpc::logging::LogSinkImpl;
 use crate::rpc::process::Process;
 use ezpez_protocol::supervisor_capnp::*;
-use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
 use ezpez_protocol::streams::OutputStream;
+use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
+use std::path::Path;
 
 pub struct Client {
     supervisor: supervisor::Client,
@@ -34,17 +37,31 @@ impl Client {
         Ok(Self { supervisor: client })
     }
 
-    pub async fn exec(
+    pub async fn start(
         &self,
         stdin: impl Into<OutputStream>,
         rows: u16,
         cols: u16,
+        ca_cert_path: &Path,
+        ca_key_path: &Path,
     ) -> Result<Process, CliError> {
-        let mut req = self.supervisor.exec_request();
+        let network_proxy: network_proxy::Client =
+            capnp_rpc::new_client(NetworkProxyImpl);
+        let log_sink: log_sink::Client =
+            capnp_rpc::new_client(LogSinkImpl);
+
+        let ca_cert = std::fs::read(ca_cert_path)?;
+        let ca_key = std::fs::read(ca_key_path)?;
+
+        let mut req = self.supervisor.start_request();
         req.get().set_stdin(stdin.into().into());
         let mut size = req.get().init_pty().init_size();
         size.set_rows(rows);
         size.set_cols(cols);
+        req.get().set_network(network_proxy);
+        req.get().set_ca_cert(&ca_cert);
+        req.get().set_ca_key(&ca_key);
+        req.get().set_logs(log_sink);
 
         let response = req.send().promise.await?;
         let proc = response.get()?.get_proc()?;

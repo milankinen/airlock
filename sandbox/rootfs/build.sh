@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-apk add --no-cache busybox-extras iproute2 cpio crun >/dev/null 2>&1
+apk add --no-cache busybox-extras iproute2 cpio crun iptables >/dev/null 2>&1
 
 mkdir -p /proc /sys /dev /dev/pts /tmp /run /usr/bin
 cp /init-script /init && chmod 755 /init

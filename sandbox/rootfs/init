@@ -11,8 +11,7 @@ mount -t tmpfs none /run
 mkdir -p /sys/fs/cgroup
 mount -t cgroup2 none /sys/fs/cgroup
 
-# Mount VirtioFS shares. Tags are passed via kernel cmdline
-# as ezpez.shares=bundle,project,mount_0,...
+# Mount VirtioFS shares
 mkdir -p /mnt
 shares=$(cat /proc/cmdline | tr ' ' '\n' | grep '^ezpez.shares=' | cut -d= -f2)
 IFS=','
@@ -24,6 +23,23 @@ unset IFS
 
 hostname ezpez
 ip link set lo up 2>/dev/null
+
+# Network proxy: transparent TCP redirect to supervisor's proxy on port 15001.
+# Enable routing through loopback and disable reverse-path filtering
+# (rp_filter drops packets that arrive on an interface other than the
+# one the kernel would route them through — breaks REDIRECT on lo)
+echo 1 > /proc/sys/net/ipv4/conf/lo/route_localnet 2>/dev/null
+echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null
+echo 0 > /proc/sys/net/ipv4/conf/lo/rp_filter 2>/dev/null
+echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null
+# Add a routable address to lo so outbound packets get a proper source IP
+ip addr add 10.0.0.1/8 dev lo 2>/dev/null
+ip route add default via 10.0.0.1 dev lo 2>/dev/null
+# Skip proxy's own port to avoid redirect loop
+iptables -t nat -A OUTPUT -p tcp --dport 15001 -j RETURN 2>/dev/null
+# Redirect ALL outbound TCP to proxy (including localhost — enables
+# future host port forwarding through the proxy)
+iptables -t nat -A OUTPUT -p tcp -j REDIRECT --to-port 15001 2>/dev/null
 
 /usr/bin/supervisor
 

@@ -1,8 +1,14 @@
 @0x947ecba86848333b;
 
 interface Supervisor {
-  ping @0 () -> (id :UInt32);
-  exec @1 (stdin :ByteStream, pty :PtyConfig) -> (proc :Process);
+  start @0 (
+    stdin :ByteStream,
+    pty :PtyConfig,
+    network :NetworkProxy,
+    caCert :Data,
+    caKey :Data,
+    logs :LogSink
+  ) -> (proc :Process);
 }
 
 struct PtyConfig {
@@ -42,4 +48,18 @@ struct ProcessOutput {
     stdout @1 :DataFrame;
     stderr @2 :DataFrame;
   }
+}
+
+interface NetworkProxy {
+  connect @0 (host :Text, port :UInt16, tls :Bool, client :TcpSink)
+    -> (server :TcpSink);
+}
+
+interface TcpSink {
+  send @0 (data :Data) -> stream;
+  close @1 () -> ();
+}
+
+interface LogSink {
+  log @0 (level :UInt8, message :Text) -> stream;
 }

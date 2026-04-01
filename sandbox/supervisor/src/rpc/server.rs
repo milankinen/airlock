@@ -4,28 +4,28 @@ use futures::AsyncReadExt;
 use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
 use std::rc::Rc;
 
-
 struct SupervisorImpl;
 
 impl supervisor::Server for SupervisorImpl {
-    async fn ping(
+    async fn start(
         self: Rc<Self>,
-        _params: supervisor::PingParams,
-        mut results: supervisor::PingResults,
-    ) -> Result<(), capnp::Error> {
-        results.get().set_id(0);
-        Ok(())
-    }
-
-    async fn exec(
-        self: Rc<Self>,
-        params: supervisor::ExecParams,
-        mut results: supervisor::ExecResults,
+        params: supervisor::StartParams,
+        mut results: supervisor::StartResults,
     ) -> Result<(), capnp::Error> {
         let params = params.get()?;
         let stdin = params.get_stdin()?;
         let pty_config = params.get_pty()?;
+        let network = params.get_network()?;
+        let ca_cert = params.get_ca_cert()?;
+        let ca_key = params.get_ca_key()?;
+        let log_sink = params.get_logs()?;
 
+        // Start transparent proxy (CA material stays in memory)
+        let ca_cert_pem = String::from_utf8_lossy(ca_cert).to_string();
+        let ca_key_pem = String::from_utf8_lossy(ca_key).to_string();
+        crate::net::start_proxy(network, ca_cert_pem, ca_key_pem, log_sink);
+
+        // Spawn process
         let use_pty = match pty_config.which() {
             Ok(pty_config::Size(size)) => {
                 let size = size?;

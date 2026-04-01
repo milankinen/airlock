@@ -7,6 +7,8 @@ pub struct Project {
     pub hash: String,
     pub cwd: PathBuf,
     pub config: Config,
+    pub ca_cert: PathBuf,
+    pub ca_key: PathBuf,
 }
 
 pub fn ensure(config: Config) -> anyhow::Result<Project> {
@@ -20,5 +22,34 @@ pub fn ensure(config: Config) -> anyhow::Result<Project> {
     let dir = crate::oci::cache::project_dir(&hash)?;
     std::fs::create_dir_all(&dir)?;
 
-    Ok(Project { dir, hash, cwd, config })
+    let ca_dir = dir.join("ca");
+    let ca_cert = ca_dir.join("ca.crt");
+    let ca_key = ca_dir.join("ca.key");
+
+    if !ca_cert.exists() || !ca_key.exists() {
+        std::fs::create_dir_all(&ca_dir)?;
+        generate_ca(&ca_cert, &ca_key)?;
+    }
+
+    Ok(Project { dir, hash, cwd, config, ca_cert, ca_key })
+}
+
+fn generate_ca(cert_path: &PathBuf, key_path: &PathBuf) -> anyhow::Result<()> {
+    use rcgen::{CertificateParams, KeyPair, IsCa, BasicConstraints};
+
+    let mut params = CertificateParams::new(vec![])?;
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    params.distinguished_name.push(
+        rcgen::DnType::CommonName,
+        "ezpez CA",
+    );
+
+    let key_pair = KeyPair::generate()?;
+    let cert = params.self_signed(&key_pair)?;
+
+    std::fs::write(cert_path, cert.pem())?;
+    std::fs::write(key_path, key_pair.serialize_pem())?;
+
+    eprintln!("  generated project CA certificate");
+    Ok(())
 }

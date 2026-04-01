@@ -28,10 +28,14 @@ pub async fn start(
     let shares: Vec<config::VmShare> = prepared
         .shares
         .iter()
-        .map(|s| config::VmShare {
-            tag: s.tag.clone(),
-            host_path: s.host_path.clone(),
-            read_only: s.read_only,
+        .map(|s| {
+            eprintln!("  share: {} → {} ({})", s.tag, s.host_path.display(),
+                if s.read_only { "ro" } else { "rw" });
+            config::VmShare {
+                tag: s.tag.clone(),
+                host_path: s.host_path.clone(),
+                read_only: s.read_only,
+            }
         })
         .collect();
 

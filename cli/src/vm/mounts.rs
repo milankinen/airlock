@@ -61,7 +61,21 @@ pub fn prepare(config: &Config, project: &Project) -> anyhow::Result<PreparedMou
         read_only: false,
     });
 
-    // 2. Config mounts
+    // 2. CA cert for container trust store (key is passed via RPC, never on disk in VM)
+    {
+        std::fs::create_dir_all(&files_ro_dir)?;
+        let link = files_ro_dir.join("ezpez-ca.crt");
+        let _ = std::fs::hard_link(&project.ca_cert, &link)
+            .or_else(|_| std::fs::copy(&project.ca_cert, &link).map(|_| ()));
+        has_files_ro = true;
+        binds.push(ContainerBind {
+            source: "/mnt/files_ro/ezpez-ca.crt".into(),
+            destination: "/usr/local/share/ca-certificates/ezpez-ca.crt".into(),
+            read_only: true,
+        });
+    }
+
+    // 3. Config mounts
     for (i, mount) in config.mounts.iter().enumerate() {
         let source = PathBuf::from(&mount.source);
         let source = std::fs::canonicalize(&source).unwrap_or(source);

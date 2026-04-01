@@ -60,7 +60,15 @@ async fn run(config: config::Config) -> Result<i32, CliError> {
     eprintln!("supervisor connected");
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let shell = client.exec(tokio::io::stdin(), rows, cols).await?;
+    let shell = client
+        .start(
+            tokio::io::stdin(),
+            rows,
+            cols,
+            &project.ca_cert,
+            &project.ca_key,
+        )
+        .await?;
     let shell_ref = &shell;
 
     let _guard = terminal::TerminalGuard::enter();
