@@ -62,18 +62,9 @@ docker run --rm \
 echo "Rootfs: sandbox/out/initramfs.gz ($(du -h sandbox/out/initramfs.gz | cut -f1))"
 """
 
-[tasks."build:bundle"]
-description = "Prepare the OCI container bundle"
-sources = ["sandbox/bundle/build.sh", "sandbox/bundle/config.json"]
-outputs = [".tmp/bundle/config.json"]
-run = """
-echo "Preparing bundle..."
-sh sandbox/bundle/build.sh .tmp/bundle
-"""
-
 [tasks.build]
 description = "Build and codesign the CLI binary"
-depends = ["build:kernel", "build:rootfs", "build:bundle"]
+depends = ["build:kernel", "build:rootfs"]
 sources = ["cli/src/**/*.rs", "cli/Cargo.toml", "Cargo.toml", "Cargo.lock", "sandbox/out/Image", "sandbox/out/initramfs.gz"]
 outputs = ["target/debug/ez"]
 run = """

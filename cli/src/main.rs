@@ -2,6 +2,8 @@ mod assets;
 mod cli;
 mod config;
 mod error;
+mod oci;
+mod project;
 mod rpc;
 mod terminal;
 mod vm;
@@ -30,7 +32,6 @@ async fn main() {
         ..Config::default()
     };
 
-    // run_until drives both the main future AND all spawn_local tasks
     let local = LocalSet::new();
     let exit_code = local.run_until(async {
         match run(config).await {
@@ -50,8 +51,19 @@ async fn main() {
 }
 
 async fn run(config: Config) -> Result<i32, CliError> {
+    let project_hash = project::project_hash()?;
+    let resolved = oci::resolve(&config.image).await?;
+    let image_dir = oci::ensure_image(&resolved).await?;
+    let bundle_path = oci::ensure_project(
+        &image_dir,
+        &resolved.image_config,
+        &resolved.digest,
+        &project_hash,
+    )?;
+
+    // Boot VM with the prepared bundle
     eprintln!("Booting VM...");
-    let (_vm, vsock_fd) = vm::create(&config).await?;
+    let (_vm, vsock_fd) = vm::create(&config, &bundle_path).await?;
 
     let client = rpc::Client::connect(vsock_fd)?;
     eprintln!("supervisor connected");

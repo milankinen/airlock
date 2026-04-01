@@ -2,12 +2,14 @@
 mod apple;
 mod config;
 
+use crate::assets::Assets;
 use crate::config::Config;
 use crate::error::CliError;
 use std::os::unix::io::OwnedFd;
+use std::path::Path;
 
-pub async fn create(config: &Config) -> Result<(Box<dyn VmHandle>, OwnedFd), CliError> {
-    let assets = crate::assets::extract_assets()?;
+pub async fn create(config: &Config, bundle_path: &Path) -> Result<(Box<dyn VmHandle>, OwnedFd), CliError> {
+    let assets = Assets::init()?;
 
     let vm_config = config::VmConfig {
         cpus: config.cpus,
@@ -19,7 +21,7 @@ pub async fn create(config: &Config) -> Result<(Box<dyn VmHandle>, OwnedFd), Cli
         } else {
             "console=hvc0 rdinit=/init quiet loglevel=3".to_string()
         },
-        bundle_path: Some(config.bundle_path.clone()),
+        bundle_path: Some(bundle_path.to_path_buf()),
     };
 
     #[cfg(target_os = "macos")]
