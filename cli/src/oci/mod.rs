@@ -1,54 +1,105 @@
 pub mod cache;
 mod config;
+mod docker;
 mod layer;
 mod registry;
 
 use std::path::{Path, PathBuf};
 
-pub use registry::ResolvedImage;
-
-pub async fn resolve(image_ref: &str) -> anyhow::Result<ResolvedImage> {
-    eprintln!("Resolving image {image_ref}...");
-    registry::resolve(image_ref).await
+pub struct ResolvedImage {
+    pub digest: String,
+    pub image_config: oci_client::config::ConfigFile,
+    source: ImageSource,
 }
 
-/// Ensure image layers are downloaded and extracted to cache.
-pub async fn ensure_image(resolved: &ResolvedImage) -> anyhow::Result<PathBuf> {
+enum ImageSource {
+    Docker { image_ref: String },
+    Registry(registry::RegistryImage),
+}
+
+/// Resolve an image: try local Docker first, then registry.
+pub async fn resolve(image_ref: &str) -> anyhow::Result<ResolvedImage> {
+    eprintln!("Resolving image {image_ref}...");
+
+    // 1. Try local Docker daemon
+    if let Some(image_id) = docker::image_exists(image_ref) {
+        eprintln!("  found locally via docker: {}", &image_id[..19.min(image_id.len())]);
+        return Ok(ResolvedImage {
+            digest: image_id,
+            image_config: Default::default(), // will be read during export
+            source: ImageSource::Docker {
+                image_ref: image_ref.to_string(),
+            },
+        });
+    }
+
+    // 2. Try OCI registry
+    let reg = registry::resolve(image_ref).await?;
+    Ok(ResolvedImage {
+        digest: reg.digest.clone(),
+        image_config: reg.image_config.clone(),
+        source: ImageSource::Registry(reg),
+    })
+}
+
+/// Ensure image is downloaded/exported and extracted to cache.
+pub async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBuf> {
     let dir = cache::image_dir(&resolved.digest)?;
     let rootfs = dir.join("rootfs");
 
     if rootfs.exists() {
+        // Load cached config if we came from Docker path (config was deferred)
+        if matches!(resolved.source, ImageSource::Docker { .. }) {
+            let config_path = dir.join("image_config.json");
+            if config_path.exists() {
+                let data = std::fs::read(&config_path)?;
+                resolved.image_config = serde_json::from_slice(&data)?;
+            }
+        }
         eprintln!("  image cached");
         return Ok(dir);
     }
 
-    eprintln!("Downloading image layers...");
     std::fs::create_dir_all(&dir)?;
 
-    let layers = &resolved.manifest.layers;
-    let mut layer_paths = Vec::new();
-    for (i, layer_desc) in layers.iter().enumerate() {
-        let short_digest = &layer_desc.digest[7..19];
-        eprintln!(
-            "  layer {}/{}: {} ({})",
-            i + 1,
-            layers.len(),
-            short_digest,
-            format_size(layer_desc.size)
-        );
-        let layer_path = dir.join(format!("layer_{i}.tar.gz"));
-        if !layer_path.exists() {
-            registry::pull_layer(&resolved.reference, layer_desc, &layer_path).await?;
+    match &resolved.source {
+        ImageSource::Docker { image_ref } => {
+            eprintln!("  exporting from docker...");
+            let config = docker::save_and_extract(
+                image_ref,
+                &rootfs,
+                &dir.join("image_config.json"),
+            )?;
+            resolved.image_config = config;
         }
-        layer_paths.push(layer_path);
+        ImageSource::Registry(reg) => {
+            eprintln!("Downloading image layers...");
+            let layers = &reg.manifest.layers;
+            let mut layer_paths = Vec::new();
+            for (i, layer_desc) in layers.iter().enumerate() {
+                let short_digest = &layer_desc.digest[7..19];
+                eprintln!(
+                    "  layer {}/{}: {} ({})",
+                    i + 1,
+                    layers.len(),
+                    short_digest,
+                    format_size(layer_desc.size)
+                );
+                let layer_path = dir.join(format!("layer_{i}.tar.gz"));
+                if !layer_path.exists() {
+                    registry::pull_layer(&reg.reference, layer_desc, &layer_path).await?;
+                }
+                layer_paths.push(layer_path);
+            }
+
+            eprintln!("  extracting layers...");
+            let layer_refs: Vec<&Path> = layer_paths.iter().map(|p| p.as_path()).collect();
+            layer::extract_layers(&layer_refs, &rootfs)?;
+
+            let config_json = serde_json::to_string_pretty(&resolved.image_config)?;
+            std::fs::write(dir.join("image_config.json"), config_json)?;
+        }
     }
-
-    eprintln!("  extracting layers...");
-    let layer_refs: Vec<&Path> = layer_paths.iter().map(|p| p.as_path()).collect();
-    layer::extract_layers(&layer_refs, &rootfs)?;
-
-    let config_json = serde_json::to_string_pretty(&resolved.image_config)?;
-    std::fs::write(dir.join("image_config.json"), config_json)?;
 
     eprintln!("  image ready");
     Ok(dir)

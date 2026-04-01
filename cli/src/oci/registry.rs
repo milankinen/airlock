@@ -5,7 +5,7 @@ use oci_client::secrets::RegistryAuth;
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
 
-pub struct ResolvedImage {
+pub struct RegistryImage {
     pub reference: Reference,
     pub digest: String,
     pub manifest: OciImageManifest,
@@ -31,7 +31,7 @@ fn linux_arm64_resolver(manifests: &[oci_client::manifest::ImageIndexEntry]) -> 
     })
 }
 
-pub async fn resolve(image_ref: &str) -> anyhow::Result<ResolvedImage> {
+pub async fn resolve(image_ref: &str) -> anyhow::Result<RegistryImage> {
     let reference: Reference = image_ref.parse()?;
     let client = make_client();
     let auth = RegistryAuth::Anonymous;
@@ -44,7 +44,7 @@ pub async fn resolve(image_ref: &str) -> anyhow::Result<ResolvedImage> {
 
     eprintln!("  resolved {}@{}", reference, &digest[..19]);
 
-    Ok(ResolvedImage {
+    Ok(RegistryImage {
         reference,
         digest,
         manifest,

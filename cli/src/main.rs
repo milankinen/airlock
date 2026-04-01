@@ -52,8 +52,8 @@ async fn main() {
 
 async fn run(config: Config) -> Result<i32, CliError> {
     let project_hash = project::project_hash()?;
-    let resolved = oci::resolve(&config.image).await?;
-    let image_dir = oci::ensure_image(&resolved).await?;
+    let mut resolved = oci::resolve(&config.image).await?;
+    let image_dir = oci::ensure_image(&mut resolved).await?;
     let bundle_path = oci::ensure_project(
         &image_dir,
         &resolved.image_config,
