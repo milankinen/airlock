@@ -1,20 +1,31 @@
 #[cfg(target_os = "macos")]
 mod apple;
 mod config;
+pub mod mounts;
 
 use crate::assets::Assets;
-use crate::config::Config;
 use crate::error::CliError;
-use crate::mounts::PreparedMounts;
+use crate::oci::Bundle;
+use crate::project::Project;
 use std::os::unix::io::OwnedFd;
 
-pub async fn create(
-    config: &Config,
-    mounts: &PreparedMounts,
+
+pub async fn start(
+    project: &Project,
+    bundle: Bundle,
 ) -> Result<(Box<dyn VmHandle>, OwnedFd), CliError> {
     let assets = Assets::init()?;
 
-    let shares: Vec<config::VmShare> = mounts
+    // Prepare mounts from project config
+    let mut prepared = mounts::prepare(&project.config, project)?;
+
+    // Write container config.json with bind mounts
+    bundle.write_config(prepared.binds())?;
+
+    // Add bundle as a VirtioFS share
+    prepared.add_share("bundle".into(), bundle.path.clone(), false);
+
+    let shares: Vec<config::VmShare> = prepared
         .shares
         .iter()
         .map(|s| config::VmShare {
@@ -25,14 +36,17 @@ pub async fn create(
         .collect();
 
     let vm_config = config::VmConfig {
-        cpus: config.cpus,
-        memory_bytes: config.memory_mb * 1024 * 1024,
+        cpus: project.config.cpus,
+        memory_bytes: project.config.memory_mb * 1024 * 1024,
         kernel: assets.kernel,
         initramfs: assets.initramfs,
         kernel_cmdline: {
             let tags: Vec<&str> = shares.iter().map(|s| s.tag.as_str()).collect();
-            let mut cmd = format!("console=hvc0 rdinit=/init ezpez.shares={}", tags.join(","));
-            if !config.verbose {
+            let mut cmd = format!(
+                "console=hvc0 rdinit=/init ezpez.shares={}",
+                tags.join(",")
+            );
+            if !project.config.verbose {
                 cmd.push_str(" quiet loglevel=3");
             }
             cmd

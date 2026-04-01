@@ -1,14 +1,33 @@
 pub mod cache;
-mod config;
+pub(crate) mod config;
 mod docker;
 mod layer;
 mod registry;
 
+use crate::project::Project;
+use crate::vm::mounts::ContainerBind;
 use std::path::{Path, PathBuf};
 
-pub struct ResolvedImage {
-    pub digest: String,
-    pub image_config: oci_client::config::ConfigFile,
+pub struct Bundle {
+    pub path: PathBuf,
+    image_config: oci_client::config::ConfigFile,
+    project_cwd: PathBuf,
+}
+
+impl Bundle {
+    pub fn write_config(&self, binds: &[ContainerBind]) -> anyhow::Result<()> {
+        config::generate_config(
+            &self.image_config,
+            &self.project_cwd,
+            binds,
+            &self.path.join("config.json"),
+        )
+    }
+}
+
+struct ResolvedImage {
+    digest: String,
+    image_config: oci_client::config::ConfigFile,
     source: ImageSource,
 }
 
@@ -17,23 +36,31 @@ enum ImageSource {
     Registry(registry::RegistryImage),
 }
 
-/// Resolve an image: try local Docker first, then registry.
-pub async fn resolve(image_ref: &str) -> anyhow::Result<ResolvedImage> {
+/// Resolve, download, and prepare the OCI bundle for the project.
+pub async fn prepare(project: &Project) -> anyhow::Result<Bundle> {
+    let mut resolved = resolve(&project.config.image).await?;
+    let image_dir = ensure_image(&mut resolved).await?;
+    let bundle_path = ensure_rootfs(&image_dir, &resolved.digest, &project.hash)?;
+
+    Ok(Bundle {
+        path: bundle_path,
+        image_config: resolved.image_config,
+        project_cwd: project.cwd.clone(),
+    })
+}
+
+async fn resolve(image_ref: &str) -> anyhow::Result<ResolvedImage> {
     eprintln!("Resolving image {image_ref}...");
 
-    // 1. Try local Docker daemon
     if let Some(image_id) = docker::image_exists(image_ref) {
         eprintln!("  found locally via docker: {}", &image_id[..19.min(image_id.len())]);
         return Ok(ResolvedImage {
             digest: image_id,
-            image_config: Default::default(), // will be read during export
-            source: ImageSource::Docker {
-                image_ref: image_ref.to_string(),
-            },
+            image_config: Default::default(),
+            source: ImageSource::Docker { image_ref: image_ref.to_string() },
         });
     }
 
-    // 2. Try OCI registry
     let reg = registry::resolve(image_ref).await?;
     Ok(ResolvedImage {
         digest: reg.digest.clone(),
@@ -42,13 +69,11 @@ pub async fn resolve(image_ref: &str) -> anyhow::Result<ResolvedImage> {
     })
 }
 
-/// Ensure image is downloaded/exported and extracted to cache.
-pub async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBuf> {
+async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBuf> {
     let dir = cache::image_dir(&resolved.digest)?;
     let rootfs = dir.join("rootfs");
 
     if rootfs.exists() {
-        // Load cached config if we came from Docker path (config was deferred)
         if matches!(resolved.source, ImageSource::Docker { .. }) {
             let config_path = dir.join("image_config.json");
             if config_path.exists() {
@@ -65,12 +90,9 @@ pub async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBu
     match &resolved.source {
         ImageSource::Docker { image_ref } => {
             eprintln!("  exporting from docker...");
-            let config = docker::save_and_extract(
-                image_ref,
-                &rootfs,
-                &dir.join("image_config.json"),
+            resolved.image_config = docker::save_and_extract(
+                image_ref, &rootfs, &dir.join("image_config.json"),
             )?;
-            resolved.image_config = config;
         }
         ImageSource::Registry(reg) => {
             eprintln!("Downloading image layers...");
@@ -78,13 +100,7 @@ pub async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBu
             let mut layer_paths = Vec::new();
             for (i, layer_desc) in layers.iter().enumerate() {
                 let short_digest = &layer_desc.digest[7..19];
-                eprintln!(
-                    "  layer {}/{}: {} ({})",
-                    i + 1,
-                    layers.len(),
-                    short_digest,
-                    format_size(layer_desc.size)
-                );
+                eprintln!("  layer {}/{}: {} ({})", i + 1, layers.len(), short_digest, format_size(layer_desc.size));
                 let layer_path = dir.join(format!("layer_{i}.tar.gz"));
                 if !layer_path.exists() {
                     registry::pull_layer(&reg.reference, layer_desc, &layer_path).await?;
@@ -105,15 +121,8 @@ pub async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBu
     Ok(dir)
 }
 
-/// Ensure the project bundle exists (CoW copy of image rootfs).
-/// Regenerates config.json every run to pick up mount changes.
-pub fn ensure_project(
-    image_dir: &Path,
-    image_config: &oci_client::config::ConfigFile,
-    image_digest: &str,
-    project_hash: &str,
-    binds: &[crate::mounts::ContainerBind],
-) -> anyhow::Result<PathBuf> {
+/// Ensure the project bundle rootfs exists (CoW copy of image).
+fn ensure_rootfs(image_dir: &Path, image_digest: &str, project_hash: &str) -> anyhow::Result<PathBuf> {
     let project = cache::project_dir(project_hash)?;
     let bundle = project.join("bundle");
     let digest_file = project.join("image_digest");
@@ -130,17 +139,10 @@ pub fn ensure_project(
     if !bundle.join("rootfs").exists() {
         eprintln!("  creating project bundle...");
         std::fs::create_dir_all(&bundle)?;
-
-        let src_rootfs = image_dir.join("rootfs");
-        let dst_rootfs = bundle.join("rootfs");
-        cache::cow_copy(&src_rootfs, &dst_rootfs)?;
-
+        cache::cow_copy(&image_dir.join("rootfs"), &bundle.join("rootfs"))?;
         std::fs::create_dir_all(&project)?;
         std::fs::write(&digest_file, image_digest)?;
     }
-
-    // Regenerate config.json every run (mounts may change)
-    config::generate_config(image_config, binds, &bundle.join("config.json"))?;
 
     Ok(bundle)
 }

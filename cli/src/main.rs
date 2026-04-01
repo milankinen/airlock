@@ -2,7 +2,6 @@ mod assets;
 mod cli;
 mod config;
 mod error;
-mod mounts;
 mod oci;
 mod project;
 mod rpc;
@@ -13,7 +12,6 @@ use std::io::Write;
 use crate::error::CliError;
 use crate::rpc::process::ProcessEvent;
 use clap::Parser;
-use config::Config;
 use tokio::task::LocalSet;
 use tracing_subscriber::EnvFilter;
 
@@ -26,11 +24,11 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
-    let config = Config {
+    let config = config::Config {
         cpus: cli.cpus,
         memory_mb: cli.memory,
         verbose: cli.verbose,
-        ..Config::default()
+        ..config::Config::default()
     };
 
     let local = LocalSet::new();
@@ -51,32 +49,12 @@ async fn main() {
     std::process::exit(exit_code);
 }
 
-async fn run(config: Config) -> Result<i32, CliError> {
-    let project_hash = project::project_hash()?;
-    let mut resolved = oci::resolve(&config.image).await?;
-    let image_dir = oci::ensure_image(&mut resolved).await?;
-
-    // Prepare mounts (project dir + config mounts + file hard-links)
-    let project_dir = oci::cache::project_dir(&project_hash)?;
-    let mut prepared = mounts::prepare(&config, &project_dir)?;
-
-    let bundle_path = oci::ensure_project(
-        &image_dir,
-        &resolved.image_config,
-        &resolved.digest,
-        &project_hash,
-        &prepared.binds,
-    )?;
-
-    // Add bundle as a VirtioFS share (must be first so init can find it)
-    prepared.shares.insert(0, mounts::VirtioShare {
-        tag: "bundle".into(),
-        host_path: bundle_path,
-        read_only: false,
-    });
+async fn run(config: config::Config) -> Result<i32, CliError> {
+    let project = project::ensure(config)?;
+    let bundle = oci::prepare(&project).await?;
 
     eprintln!("Booting VM...");
-    let (_vm, vsock_fd) = vm::create(&config, &prepared).await?;
+    let (_vm, vsock_fd) = vm::start(&project, bundle).await?;
 
     let client = rpc::Client::connect(vsock_fd)?;
     eprintln!("supervisor connected");

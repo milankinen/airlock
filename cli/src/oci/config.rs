@@ -1,10 +1,11 @@
-use crate::mounts::ContainerBind;
+use crate::vm::mounts::ContainerBind;
 use oci_client::config::ConfigFile;
 use std::path::Path;
 
 /// Generate an OCI runtime spec config.json from the image config and bind mounts.
 pub fn generate_config(
     image_config: &ConfigFile,
+    project_cwd: &Path,
     binds: &[ContainerBind],
     dest: &Path,
 ) -> anyhow::Result<()> {
@@ -34,17 +35,7 @@ pub fn generate_config(
         }
     }
 
-    // Use the project directory (same path as host CWD) as the container's
-    // working directory, so the user starts in their project.
-    let cwd = std::env::current_dir()
-        .ok()
-        .and_then(|p| std::fs::canonicalize(&p).ok())
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| {
-            cfg.and_then(|c| c.working_dir.as_deref())
-                .unwrap_or("/")
-                .to_string()
-        });
+    let cwd = project_cwd.to_string_lossy().to_string();
 
     let user = cfg.and_then(|c| c.user.as_deref()).unwrap_or("0:0");
     let (uid, gid) = parse_user(user);
