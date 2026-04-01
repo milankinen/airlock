@@ -5,23 +5,39 @@ mod config;
 use crate::assets::Assets;
 use crate::config::Config;
 use crate::error::CliError;
+use crate::mounts::PreparedMounts;
 use std::os::unix::io::OwnedFd;
-use std::path::Path;
 
-pub async fn create(config: &Config, bundle_path: &Path) -> Result<(Box<dyn VmHandle>, OwnedFd), CliError> {
+pub async fn create(
+    config: &Config,
+    mounts: &PreparedMounts,
+) -> Result<(Box<dyn VmHandle>, OwnedFd), CliError> {
     let assets = Assets::init()?;
+
+    let shares: Vec<config::VmShare> = mounts
+        .shares
+        .iter()
+        .map(|s| config::VmShare {
+            tag: s.tag.clone(),
+            host_path: s.host_path.clone(),
+            read_only: s.read_only,
+        })
+        .collect();
 
     let vm_config = config::VmConfig {
         cpus: config.cpus,
         memory_bytes: config.memory_mb * 1024 * 1024,
         kernel: assets.kernel,
         initramfs: assets.initramfs,
-        kernel_cmdline: if config.verbose {
-            "console=hvc0 rdinit=/init".to_string()
-        } else {
-            "console=hvc0 rdinit=/init quiet loglevel=3".to_string()
+        kernel_cmdline: {
+            let tags: Vec<&str> = shares.iter().map(|s| s.tag.as_str()).collect();
+            let mut cmd = format!("console=hvc0 rdinit=/init ezpez.shares={}", tags.join(","));
+            if !config.verbose {
+                cmd.push_str(" quiet loglevel=3");
+            }
+            cmd
         },
-        bundle_path: Some(bundle_path.to_path_buf()),
+        shares,
     };
 
     #[cfg(target_os = "macos")]

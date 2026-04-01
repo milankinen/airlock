@@ -2,6 +2,7 @@ mod assets;
 mod cli;
 mod config;
 mod error;
+mod mounts;
 mod oci;
 mod project;
 mod rpc;
@@ -54,16 +55,28 @@ async fn run(config: Config) -> Result<i32, CliError> {
     let project_hash = project::project_hash()?;
     let mut resolved = oci::resolve(&config.image).await?;
     let image_dir = oci::ensure_image(&mut resolved).await?;
+
+    // Prepare mounts (project dir + config mounts + file hard-links)
+    let project_dir = oci::cache::project_dir(&project_hash)?;
+    let mut prepared = mounts::prepare(&config, &project_dir)?;
+
     let bundle_path = oci::ensure_project(
         &image_dir,
         &resolved.image_config,
         &resolved.digest,
         &project_hash,
+        &prepared.binds,
     )?;
 
-    // Boot VM with the prepared bundle
+    // Add bundle as a VirtioFS share (must be first so init can find it)
+    prepared.shares.insert(0, mounts::VirtioShare {
+        tag: "bundle".into(),
+        host_path: bundle_path,
+        read_only: false,
+    });
+
     eprintln!("Booting VM...");
-    let (_vm, vsock_fd) = vm::create(&config, &bundle_path).await?;
+    let (_vm, vsock_fd) = vm::create(&config, &prepared).await?;
 
     let client = rpc::Client::connect(vsock_fd)?;
     eprintln!("supervisor connected");

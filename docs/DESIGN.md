@@ -109,11 +109,13 @@ Platform is fixed to `linux/arm64` (matching the VM architecture).
       image_config.json
       layer_*.tar.gz         # raw layer blobs
   projects/
-    <hash>/                  # one per working directory
+    <hash>/                  # one per working directory (sha256 of cwd)
       bundle/
-        config.json          # OCI runtime spec
+        config.json          # OCI runtime spec (regenerated each run)
         rootfs/              # APFS copy-on-write clone of image rootfs
       image_digest           # tracks which image this project uses
+      files_rw/              # hard-linked rw file mounts (reset each run)
+      files_ro/              # hard-linked ro file mounts (reset each run)
 ```
 
 - **Image cache** is keyed by manifest digest. Shared across all
@@ -142,7 +144,57 @@ isolated namespaces for the container process.
   available but not yet used.
 - **config.json** is derived from the OCI image config: process
   args (CMD + ENTRYPOINT), environment variables, working directory,
-  and user are read from the image manifest.
+  and user are read from the image manifest. The container's working
+  directory is set to the host project path.
+
+## Directory and file mounting
+
+The project directory and additional configured paths are mounted
+into the container via VirtioFS.
+
+### How mounts work
+
+Each mount becomes a VirtioFS share (one virtio device per share,
+each with a unique tag). The guest init script discovers tags from
+the kernel command line and mounts them at `/mnt/<tag>`. The
+container's config.json has bind mount entries that map from
+`/mnt/<tag>` to the desired container path.
+
+### Project directory
+
+The current working directory is always mounted into the container
+at the **same absolute path as on the host**. This means paths in
+build tools, error messages, and scripts work identically on host
+and in the sandbox. The container shell starts in this directory.
+
+### Configured mounts
+
+Additional mounts can be specified in the configuration. Both
+directories and individual files are supported:
+
+- **Directory mounts**: a VirtioFS share pointing directly at the
+  host directory. Can be read-only or read-write.
+- **File mounts**: the file is hard-linked into a staging directory
+  (`~/.ezpez/projects/<hash>/files_{rw,ro}/`), which is then shared
+  via VirtioFS. Hard links provide bidirectional sync — changes in
+  the container appear on the host and vice versa. If hard-linking
+  fails (cross-filesystem), the file is copied with a warning that
+  sync is one-way. Separate staging directories for read-write and
+  read-only files since VirtioFS enforces read-only at the share
+  level.
+
+### Mount order
+
+Later mounts shadow earlier ones:
+
+1. Project directory (always first)
+2. Configured mounts in definition order
+
+### Security
+
+Only explicitly configured paths are shared into the VM. File mounts
+use hard-links into a staging directory rather than sharing the
+parent directory, so the VM never sees adjacent files.
 
 ## Build pipeline
 
@@ -164,8 +216,6 @@ incremental builds (2ms no-op when nothing changed).
 - **`ez.toml` configuration** — sandbox settings in version control
 - **Network filtering** — HTTP(S) proxy in VM, policy enforcement
   and secrets injection on the host side
-- **File/directory mounting** — selective host directory sharing via
-  additional VirtioFS mounts
 - **Environment variable injection** — pass host env vars or secrets
   into the container
 - **Memory reclaim** — use the virtio balloon device to return

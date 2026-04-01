@@ -106,11 +106,13 @@ pub async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBu
 }
 
 /// Ensure the project bundle exists (CoW copy of image rootfs).
+/// Regenerates config.json every run to pick up mount changes.
 pub fn ensure_project(
     image_dir: &Path,
     image_config: &oci_client::config::ConfigFile,
     image_digest: &str,
     project_hash: &str,
+    binds: &[crate::mounts::ContainerBind],
 ) -> anyhow::Result<PathBuf> {
     let project = cache::project_dir(project_hash)?;
     let bundle = project.join("bundle");
@@ -118,15 +120,14 @@ pub fn ensure_project(
 
     if bundle.exists() {
         if let Ok(stored) = std::fs::read_to_string(&digest_file) {
-            if stored.trim() == image_digest {
-                return Ok(bundle);
+            if stored.trim() != image_digest {
+                eprintln!("  image changed, recreating project bundle...");
+                std::fs::remove_dir_all(&bundle)?;
             }
-            eprintln!("  image changed, recreating project bundle...");
-            std::fs::remove_dir_all(&bundle)?;
         }
     }
 
-    if !bundle.exists() {
+    if !bundle.join("rootfs").exists() {
         eprintln!("  creating project bundle...");
         std::fs::create_dir_all(&bundle)?;
 
@@ -134,11 +135,12 @@ pub fn ensure_project(
         let dst_rootfs = bundle.join("rootfs");
         cache::cow_copy(&src_rootfs, &dst_rootfs)?;
 
-        config::generate_config(image_config, &bundle.join("config.json"))?;
-
         std::fs::create_dir_all(&project)?;
         std::fs::write(&digest_file, image_digest)?;
     }
+
+    // Regenerate config.json every run (mounts may change)
+    config::generate_config(image_config, binds, &bundle.join("config.json"))?;
 
     Ok(bundle)
 }

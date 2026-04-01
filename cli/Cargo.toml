@@ -31,7 +31,7 @@ futures = "0.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSFileHandle", "NSString", "NSURL", "NSArray", "NSError"] }
+objc2-foundation = { version = "0.3", features = ["NSFileHandle", "NSString", "NSURL", "NSArray", "NSError", "NSDictionary"] }
 objc2-virtualization = { version = "0.3", features = [
     "VZVirtualMachine",
     "VZVirtualMachineConfiguration",
@@ -59,6 +59,7 @@ objc2-virtualization = { version = "0.3", features = [
     "VZDirectoryShare",
     "VZSharedDirectory",
     "VZSingleDirectoryShare",
+    "VZMultipleDirectoryShare",
     "block2",
     "dispatch2",
 ] }

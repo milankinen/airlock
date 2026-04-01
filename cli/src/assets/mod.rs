@@ -11,12 +11,19 @@ pub struct Assets {
 }
 
 impl Assets {
-    pub fn init() -> Result<Self, CliError> {
+    pub fn init() -> Result<Assets, CliError> {
         let dir = cache_dir()?.join("kernel");
         let kernel = dir.join("Image");
         let initramfs = dir.join("initramfs.gz");
 
-        if !kernel.exists() || !initramfs.exists() {
+        // Re-extract if sizes don't match (detects binary updates)
+        let needs_update = !kernel.exists()
+            || !initramfs.exists()
+            || std::fs::metadata(&kernel).map(|m| m.len()).unwrap_or(0) != KERNEL.len() as u64
+            || std::fs::metadata(&initramfs).map(|m| m.len()).unwrap_or(0)
+                != INITRAMFS.len() as u64;
+
+        if needs_update {
             std::fs::create_dir_all(&dir)?;
             std::fs::write(&kernel, KERNEL)?;
             std::fs::write(&initramfs, INITRAMFS)?;

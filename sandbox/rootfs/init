@@ -11,9 +11,16 @@ mount -t tmpfs none /run
 mkdir -p /sys/fs/cgroup
 mount -t cgroup2 none /sys/fs/cgroup
 
-# VirtioFS share (OCI bundle from host)
-mkdir -p /mnt/bundle
-mount -t virtiofs bundle /mnt/bundle || true
+# Mount VirtioFS shares. Tags are passed via kernel cmdline
+# as ezpez.shares=bundle,project,mount_0,...
+mkdir -p /mnt
+shares=$(cat /proc/cmdline | tr ' ' '\n' | grep '^ezpez.shares=' | cut -d= -f2)
+IFS=','
+for tag in $shares; do
+    mkdir -p "/mnt/$tag"
+    mount -t virtiofs "$tag" "/mnt/$tag" 2>/dev/null || true
+done
+unset IFS
 
 hostname ezpez
 ip link set lo up 2>/dev/null

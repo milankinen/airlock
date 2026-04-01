@@ -168,30 +168,34 @@ impl AppleVmBackend {
         let vsock_devices = NSArray::from_retained_slice(&[vsock_config]);
         vm_config.setSocketDevices(&vsock_devices);
 
-        // VirtioFS share (OCI bundle from host)
-        if let Some(ref bundle_path) = config.bundle_path {
-            let bundle_abs = std::fs::canonicalize(bundle_path)
-                .unwrap_or_else(|_| bundle_path.clone());
-            let bundle_url = NSURL::fileURLWithPath(
-                &NSString::from_str(&bundle_abs.to_string_lossy()),
-            );
-            let shared_dir = VZSharedDirectory::initWithURL_readOnly(
-                VZSharedDirectory::alloc(),
-                &bundle_url,
-                false,
-            );
-            let share = VZSingleDirectoryShare::initWithDirectory(
-                VZSingleDirectoryShare::alloc(),
-                &shared_dir,
-            );
-            let fs_config = VZVirtioFileSystemDeviceConfiguration::initWithTag(
-                VZVirtioFileSystemDeviceConfiguration::alloc(),
-                &NSString::from_str("bundle"),
-            );
-            fs_config.setShare(Some(&share.into_super()));
-            let fs_device: Retained<VZDirectorySharingDeviceConfiguration> =
-                fs_config.into_super();
-            let fs_devices = NSArray::from_retained_slice(&[fs_device]);
+        // VirtioFS shares (bundle + mounts)
+        if !config.shares.is_empty() {
+            let mut fs_devices_vec = Vec::new();
+            for share in &config.shares {
+                let abs_path = std::fs::canonicalize(&share.host_path)
+                    .unwrap_or_else(|_| share.host_path.clone());
+                let url = NSURL::fileURLWithPath(
+                    &NSString::from_str(&abs_path.to_string_lossy()),
+                );
+                let shared_dir = VZSharedDirectory::initWithURL_readOnly(
+                    VZSharedDirectory::alloc(),
+                    &url,
+                    share.read_only,
+                );
+                let dir_share = VZSingleDirectoryShare::initWithDirectory(
+                    VZSingleDirectoryShare::alloc(),
+                    &shared_dir,
+                );
+                let fs_config = VZVirtioFileSystemDeviceConfiguration::initWithTag(
+                    VZVirtioFileSystemDeviceConfiguration::alloc(),
+                    &NSString::from_str(&share.tag),
+                );
+                fs_config.setShare(Some(&dir_share.into_super()));
+                let fs_device: Retained<VZDirectorySharingDeviceConfiguration> =
+                    fs_config.into_super();
+                fs_devices_vec.push(fs_device);
+            }
+            let fs_devices = NSArray::from_retained_slice(&fs_devices_vec);
             vm_config.setDirectorySharingDevices(&fs_devices);
         }
 

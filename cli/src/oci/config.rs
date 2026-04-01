@@ -1,12 +1,15 @@
+use crate::mounts::ContainerBind;
 use oci_client::config::ConfigFile;
 use std::path::Path;
 
-/// Generate an OCI runtime spec config.json from the image config.
-/// Derives process args, env, workdir, and user from the image.
-pub fn generate_config(image_config: &ConfigFile, dest: &Path) -> anyhow::Result<()> {
+/// Generate an OCI runtime spec config.json from the image config and bind mounts.
+pub fn generate_config(
+    image_config: &ConfigFile,
+    binds: &[ContainerBind],
+    dest: &Path,
+) -> anyhow::Result<()> {
     let cfg = image_config.config.as_ref();
 
-    // Process args: ENTRYPOINT + CMD, fallback to /bin/sh
     let mut args: Vec<String> = Vec::new();
     if let Some(ep) = cfg.and_then(|c| c.entrypoint.as_ref()) {
         args.extend(ep.iter().cloned());
@@ -18,7 +21,6 @@ pub fn generate_config(image_config: &ConfigFile, dest: &Path) -> anyhow::Result
         args.push("/bin/sh".to_string());
     }
 
-    // Environment
     let mut env: Vec<String> = vec![
         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
         "TERM=linux".to_string(),
@@ -26,19 +28,53 @@ pub fn generate_config(image_config: &ConfigFile, dest: &Path) -> anyhow::Result
     ];
     if let Some(image_env) = cfg.and_then(|c| c.env.as_ref()) {
         for e in image_env {
-            // Override defaults if image sets the same var
             let key = e.split('=').next().unwrap_or("");
             env.retain(|existing| !existing.starts_with(&format!("{key}=")));
             env.push(e.clone());
         }
     }
 
-    let cwd = cfg
-        .and_then(|c| c.working_dir.as_deref())
-        .unwrap_or("/");
+    // Use the project directory (same path as host CWD) as the container's
+    // working directory, so the user starts in their project.
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|p| std::fs::canonicalize(&p).ok())
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| {
+            cfg.and_then(|c| c.working_dir.as_deref())
+                .unwrap_or("/")
+                .to_string()
+        });
 
     let user = cfg.and_then(|c| c.user.as_deref()).unwrap_or("0:0");
     let (uid, gid) = parse_user(user);
+
+    // Build mounts: system mounts first, then bind mounts
+    let mut mounts = vec![
+        serde_json::json!({ "destination": "/proc", "type": "proc", "source": "proc" }),
+        serde_json::json!({ "destination": "/dev", "type": "tmpfs", "source": "tmpfs",
+          "options": ["nosuid", "strictatime", "mode=755", "size=65536k"] }),
+        serde_json::json!({ "destination": "/dev/pts", "type": "devpts", "source": "devpts",
+          "options": ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620"] }),
+        serde_json::json!({ "destination": "/dev/shm", "type": "tmpfs", "source": "shm",
+          "options": ["nosuid", "noexec", "nodev", "mode=1777", "size=65536k"] }),
+        serde_json::json!({ "destination": "/sys", "type": "sysfs", "source": "sysfs",
+          "options": ["nosuid", "noexec", "nodev", "ro"] }),
+    ];
+
+    // Bind mounts from VirtioFS shares into container
+    for bind in binds {
+        let mut options = vec!["bind".to_string()];
+        if bind.read_only {
+            options.push("ro".to_string());
+        }
+        mounts.push(serde_json::json!({
+            "destination": bind.destination,
+            "type": "bind",
+            "source": bind.source,
+            "options": options
+        }));
+    }
 
     let config = serde_json::json!({
         "ociVersion": "1.0.0",
@@ -54,17 +90,7 @@ pub fn generate_config(image_config: &ConfigFile, dest: &Path) -> anyhow::Result
             "readonly": false
         },
         "hostname": "ezpez",
-        "mounts": [
-            { "destination": "/proc", "type": "proc", "source": "proc" },
-            { "destination": "/dev", "type": "tmpfs", "source": "tmpfs",
-              "options": ["nosuid", "strictatime", "mode=755", "size=65536k"] },
-            { "destination": "/dev/pts", "type": "devpts", "source": "devpts",
-              "options": ["nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620"] },
-            { "destination": "/dev/shm", "type": "tmpfs", "source": "shm",
-              "options": ["nosuid", "noexec", "nodev", "mode=1777", "size=65536k"] },
-            { "destination": "/sys", "type": "sysfs", "source": "sysfs",
-              "options": ["nosuid", "noexec", "nodev", "ro"] }
-        ],
+        "mounts": mounts,
         "linux": {
             "namespaces": [
                 { "type": "pid" },
