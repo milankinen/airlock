@@ -5,7 +5,7 @@ use std::rc::Rc;
 use bytes::Bytes;
 use pty_process::OwnedWritePty;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::error;
+use tracing::{error, trace};
 use crate::rpc::HostProcess;
 
 pub struct SpawnedProcess {
@@ -31,6 +31,8 @@ impl SpawnedProcess {
     /// Attach to the host: wire up stdin/stdout relay, send the Process
     /// capability to the CLI, and wait for the child to exit.
     pub async fn attach(mut self, host: HostProcess) -> i32 {
+        use std::os::unix::io::AsRawFd;
+        let pty_fd = self.pty.as_raw_fd();
         let (mut pty_reader, pty_writer) = self.pty.into_split();
 
         // Resize PTY if host provided initial terminal size
@@ -63,11 +65,23 @@ impl SpawnedProcess {
                 },
                 s = signals_rx.recv() => match s {
                     Some(Signal::Num(signum)) => {
-                        if let Some(pid) = self.child.id() {
+                        trace!("signal ({signum}), pid: {:?}", self.child.id());
+                        // Map signals to PTY control characters when possible —
+                        // these go through the terminal discipline and work
+                        // across PID namespaces (same path as Ctrl+C).
+                        let ctrl = match signum {
+                            2 => Some(0x03u8), // SIGINT  → ^C
+                            3 => Some(0x1cu8), // SIGQUIT → ^\
+                            _ => None,
+                        };
+                        if let Some(ch) = ctrl {
+                            unsafe { libc::write(pty_fd, &ch as *const u8 as *const _, 1) };
+                        } else if let Some(pid) = self.child.id() {
                             unsafe { libc::kill(pid as i32, signum) };
                         }
                     },
                     Some(Signal::Kill) => {
+                        trace!("kill, pid: {:?}", self.child.id());
                         log_error(self.child.start_kill());
                         break;
                     },
@@ -155,7 +169,7 @@ impl process::Server for ProcessImpl {
         _results: process::SignalResults,
     ) -> Result<(), capnp::Error> {
         let signum = params.get()?.get_signum();
-        let _ = self.signals.borrow_mut().send(Signal::Num(signum as i32)).await;
+        let _ = self.signals.borrow_mut().send(Signal::Num(signum)).await;
         Ok(())
     }
 

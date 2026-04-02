@@ -1,9 +1,11 @@
+mod logging;
 mod net;
 mod rpc;
 mod vsock;
 mod process;
 
 use tokio::task::LocalSet;
+use tracing::{info};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -18,10 +20,14 @@ async fn run() -> anyhow::Result<()> {
 
     let conn = rpc::connect(conn_fd).await?;
 
-    net::start_proxy(conn.network, conn.ca, conn.log_sink);
+    logging::init(conn.log_sink);
 
+    net::start_proxy(conn.network, conn.ca);
+
+    info!("start main process");
     let proc = process::spawn("crun", &["run", "--no-pivot", "--bundle", "/mnt/bundle", "ezpez0"])?;
-    proc.attach(conn.proc).await;
+    let exit_code = proc.attach(conn.proc).await;
+    info!("main process done, exit_code = {exit_code}");
 
     // Keep supervisor alive until the CLI kills the VM
     std::future::pending::<()>().await;

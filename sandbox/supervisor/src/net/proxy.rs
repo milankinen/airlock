@@ -1,9 +1,10 @@
 use super::tls::{self, TlsInterceptor};
-use ezpez_protocol::supervisor_capnp::{log_sink, network_proxy, tcp_sink};
+use ezpez_protocol::supervisor_capnp::{network_proxy, tcp_sink};
 use std::cell::RefCell;
 use std::rc::Rc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tracing::{debug, info, warn};
 use crate::rpc::HostCA;
 
 const PROXY_PORT: u16 = 15001;
@@ -11,14 +12,13 @@ const PROXY_PORT: u16 = 15001;
 pub fn start_proxy(
     network: network_proxy::Client,
     ca: HostCA,
-    log_sink: log_sink::Client,
 ) {
+    info!("start network proxy");
     tokio::task::spawn_local(async move {
-        let logger = Logger(log_sink);
         let interceptor = match TlsInterceptor::new(&ca.cert, &ca.key) {
             Ok(i) => Rc::new(i),
             Err(e) => {
-                logger.warn(&format!("TLS interceptor init failed: {e}")).await;
+                warn!("TLS interceptor init failed: {e}");
                 return;
             }
         };
@@ -26,29 +26,26 @@ pub fn start_proxy(
         let listener = match TcpListener::bind(("127.0.0.1", PROXY_PORT)).await {
             Ok(l) => l,
             Err(e) => {
-                logger.warn(&format!("proxy listen failed: {e}")).await;
+                warn!("proxy listen failed: {e}");
                 return;
             }
         };
 
-        logger.info(&format!("proxy listening on port {PROXY_PORT}")).await;
-
+        info!("network proxy listening on port {PROXY_PORT}");
         loop {
             let (stream, _) = match listener.accept().await {
                 Ok(s) => s,
                 Err(e) => {
-                    logger.warn(&format!("proxy accept: {e}")).await;
+                    warn!("proxy accept: {e}");
                     continue;
                 }
             };
 
             let network = network.clone();
             let interceptor = interceptor.clone();
-            let logger = logger.clone();
-
             tokio::task::spawn_local(async move {
-                if let Err(e) = handle_connection(stream, &network, &interceptor, &logger).await {
-                    logger.debug(&format!("proxy conn: {e}")).await;
+                if let Err(e) = handle_connection(stream, &network, &interceptor).await {
+                    debug!("proxy conn: {e}");
                 }
             });
         }
@@ -59,7 +56,6 @@ async fn handle_connection(
     stream: tokio::net::TcpStream,
     network: &network_proxy::Client,
     interceptor: &TlsInterceptor,
-    logger: &Logger,
 ) -> anyhow::Result<()> {
     let (orig_host, orig_port) = get_original_dst(&stream)?;
 
@@ -79,9 +75,7 @@ async fn handle_connection(
     let server_sink: tcp_sink::Client =
         capnp_rpc::new_client(ChannelSink(RefCell::new(Some(server_tx))));
 
-    logger
-        .debug(&format!("connect {hostname}:{orig_port} tls={is_tls}"))
-        .await;
+    debug!("connect {hostname}:{orig_port} tls={is_tls}");
 
     let mut req = network.connect_request();
     req.get().set_host(&hostname);
@@ -173,29 +167,6 @@ impl tcp_sink::Server for ChannelSink {
     ) -> Result<(), capnp::Error> {
         self.0.borrow_mut().take();
         Ok(())
-    }
-}
-
-// -- Logger: pushes log messages to host via RPC --
-
-#[derive(Clone)]
-struct Logger(log_sink::Client);
-
-impl Logger {
-    async fn debug(&self, msg: &str) {
-        self.log(0, msg).await;
-    }
-    async fn info(&self, msg: &str) {
-        self.log(1, msg).await;
-    }
-    async fn warn(&self, msg: &str) {
-        self.log(2, msg).await;
-    }
-    async fn log(&self, level: u8, msg: &str) {
-        let mut req = self.0.log_request();
-        req.get().set_level(level);
-        req.get().set_message(msg);
-        let _ = req.send().await;
     }
 }
 

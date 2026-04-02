@@ -1,6 +1,8 @@
 mod resizes;
+mod signals;
 
 pub use resizes::resizes;
+pub use signals::signals;
 
 pub struct TerminalGuard {
     raw_mode_enabled: bool,

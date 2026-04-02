@@ -13,10 +13,10 @@ impl log_sink::Server for LogSinkImpl {
         let message = params.get_message()?.to_str()?;
 
         match level {
-            0 => eprintln!("  [vm] {message}"),
-            1 => eprintln!("  [vm] {message}"),
-            2 => eprintln!("  [vm] WARN: {message}"),
-            _ => eprintln!("  [vm] ERROR: {message}"),
+            0 => tracing::debug!(target: "vm", "{message}"),
+            1 => tracing::info!(target: "vm", "{message}"),
+            2 => tracing::warn!(target: "vm", "{message}"),
+            _ => tracing::error!(target: "vm", "{message}"),
         }
         Ok(())
     }

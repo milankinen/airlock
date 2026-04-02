@@ -6,6 +6,7 @@ pub enum ProcessEvent {
     Exit(i32),
 }
 
+#[derive(Clone)]
 pub struct Process {
     proc: process::Client,
 }
@@ -13,6 +14,13 @@ pub struct Process {
 impl Process {
     pub fn new(proc: process::Client) -> Self {
         Self { proc }
+    }
+
+    pub async fn signal(&self, signum: i32) -> anyhow::Result<()> {
+        let mut req = self.proc.signal_request();
+        req.get().set_signum(signum);
+        req.send().promise.await?;
+        Ok(())
     }
 
     pub async fn poll(&self) -> anyhow::Result<ProcessEvent> {

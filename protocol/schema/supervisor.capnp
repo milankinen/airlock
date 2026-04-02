@@ -29,7 +29,7 @@ interface Stdin {
 
 interface Process {
   poll @0 () -> (next :ProcessOutput);
-  signal @1 (signum :UInt8) -> ();
+  signal @1 (signum :Int32) -> ();
   kill @2 () -> ();
 }
 

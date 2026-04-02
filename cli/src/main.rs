@@ -70,6 +70,19 @@ async fn run(config: config::Config) -> Result<i32, CliError> {
         .start(stdin_cap, rows, cols, &project.ca_cert, &project.ca_key)
         .await?;
 
+    // Forward host signals to the VM process
+    let signal_proc = proc.clone();
+    let mut signals = terminal::signals()?;
+    tokio::task::spawn_local(async move {
+        use futures::StreamExt;
+        while let Some(signum) = signals.next().await {
+            tracing::debug!("forwarding signal {signum} to VM");
+            if let Err(e) = signal_proc.signal(signum).await {
+                tracing::debug!("signal forward failed: {e}");
+            }
+        }
+    });
+
     loop {
         match proc.poll().await {
             Ok(ProcessEvent::Exit(code)) => return Ok(code),
