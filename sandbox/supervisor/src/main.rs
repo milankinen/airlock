@@ -1,23 +1,30 @@
 mod net;
 mod rpc;
 mod vsock;
+mod process;
 
 use tokio::task::LocalSet;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    eprintln!("supervisor: starting on vsock port {}", ezpez_protocol::SUPERVISOR_PORT);
+    let local = LocalSet::new();
+    local.run_until(run()).await
+}
 
+async fn run() -> anyhow::Result<()> {
     let listen_fd = vsock::listen(ezpez_protocol::SUPERVISOR_PORT)?;
-    eprintln!("supervisor: listening");
-
     let conn_fd = vsock::accept(&listen_fd)?;
     drop(listen_fd);
-    eprintln!("supervisor: host connected");
 
-    let local = LocalSet::new();
-    local.run_until(rpc::serve(conn_fd)).await?;
+    let conn = rpc::connect(conn_fd).await?;
 
-    eprintln!("supervisor: disconnected, exiting");
+    net::start_proxy(conn.network, conn.ca, conn.log_sink);
+
+    let proc = process::spawn("crun", &["run", "--no-pivot", "--bundle", "/mnt/bundle", "ezpez0"])?;
+    proc.attach(conn.proc).await;
+
+    // Keep supervisor alive until the CLI kills the VM
+    std::future::pending::<()>().await;
+
     Ok(())
 }

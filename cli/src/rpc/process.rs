@@ -39,13 +39,4 @@ impl Process {
             Err(_) => Ok(ProcessEvent::Exit(1)),
         }
     }
-
-    pub async fn resize(&self, rows: u16, cols: u16) -> anyhow::Result<()> {
-        let mut req = self.proc.resize_request();
-        let mut size = req.get().init_size();
-        size.set_rows(rows);
-        size.set_cols(cols);
-        req.send().promise.await?;
-        Ok(())
-    }
 }

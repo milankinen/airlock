@@ -30,17 +30,18 @@ depends = ["build:supervisor-image"]
 sources = ["sandbox/supervisor/src/**/*.rs", "sandbox/supervisor/Cargo.toml", "protocol/src/**/*.rs", "protocol/schema/**/*.capnp"]
 outputs = ["sandbox/out/supervisor"]
 run = """
-echo "Building supervisor..."
+echo "Building supervisor..."n
 mkdir -p sandbox/out
 docker run --rm \
   -v "$PWD:/workspace:ro" \
   -v "$PWD/sandbox/out:/out" \
   -v ezpez-cargo-cache:/cargo-cache \
+  -v ezpez-target-cache:/target \
   ezpez-supervisor-builder sh -c '
     export CARGO_HOME=/cargo-cache
     cd /workspace
-    cargo build --release -p ezpez-supervisor --target aarch64-unknown-linux-musl --target-dir /tmp/target
-    cp /tmp/target/aarch64-unknown-linux-musl/release/ezpez-supervisor /out/supervisor
+    cargo build --release -p ezpez-supervisor --target aarch64-unknown-linux-musl --target-dir /target
+    cp /target/aarch64-unknown-linux-musl/release/ezpez-supervisor /out/supervisor
   '
 echo "Supervisor: sandbox/out/supervisor ($(du -h sandbox/out/supervisor | cut -f1))"
 """

@@ -3,15 +3,14 @@ use crate::rpc::network::NetworkProxyImpl;
 use crate::rpc::logging::LogSinkImpl;
 use crate::rpc::process::Process;
 use ezpez_protocol::supervisor_capnp::*;
-use ezpez_protocol::streams::OutputStream;
 use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
 use std::path::Path;
 
-pub struct Client {
+pub struct Supervisor {
     supervisor: supervisor::Client,
 }
 
-impl Client {
+impl Supervisor {
     pub fn connect(vsock_fd: OwnedFd) -> Result<Self, CliError> {
         use futures::AsyncReadExt;
 
@@ -39,7 +38,7 @@ impl Client {
 
     pub async fn start(
         &self,
-        stdin: impl Into<OutputStream>,
+        stdin: stdin::Client,
         rows: u16,
         cols: u16,
         ca_cert_path: &Path,
@@ -54,7 +53,7 @@ impl Client {
         let ca_key = std::fs::read(ca_key_path)?;
 
         let mut req = self.supervisor.start_request();
-        req.get().set_stdin(stdin.into().into());
+        req.get().set_stdin(stdin);
         let mut size = req.get().init_pty().init_size();
         size.set_rows(rows);
         size.set_cols(cols);

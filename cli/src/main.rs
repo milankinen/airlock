@@ -56,49 +56,32 @@ async fn run(config: config::Config) -> Result<i32, CliError> {
     eprintln!("Booting VM...");
     let (_vm, vsock_fd) = vm::start(&project, bundle).await?;
 
-    let client = rpc::Client::connect(vsock_fd)?;
+    let supervisor = rpc::Supervisor::connect(vsock_fd)?;
     eprintln!("supervisor connected");
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let shell = client
-        .start(
-            tokio::io::stdin(),
-            rows,
-            cols,
-            &project.ca_cert,
-            &project.ca_key,
-        )
-        .await?;
-    let shell_ref = &shell;
 
     let _guard = terminal::TerminalGuard::enter();
-    let mut resizes = terminal::resizes()?;
+    let resizes = terminal::resizes()?;
+    let stdin_cap =
+        capnp_rpc::new_client(rpc::stdin::StdinImpl::new(resizes));
 
-    let resize_loop = async move {
-        while resizes.recv().await.is_some() {
-            if let Ok((cols, rows)) = crossterm::terminal::size() {
-                let _ = shell_ref.resize(rows, cols).await;
-            }
-        }
-    };
-    let std_loop = async {
-        loop {
-            match shell_ref.poll().await? {
-                ProcessEvent::Exit(code) => return Ok::<i32, anyhow::Error>(code),
-                ProcessEvent::Stdout(data) => {
-                    let _ = std::io::stdout().write_all(&data);
-                    let _ = std::io::stdout().flush();
-                }
-                ProcessEvent::Stderr(data) => {
-                    let _ = std::io::stderr().write_all(&data);
-                    let _ = std::io::stderr().flush();
-                }
-            }
-        }
-    };
+    let proc = supervisor
+        .start(stdin_cap, rows, cols, &project.ca_cert, &project.ca_key)
+        .await?;
 
-    Ok(tokio::select! {
-        code = std_loop => code,
-        _ = resize_loop => Ok(-1)
-    }?)
+    loop {
+        match proc.poll().await {
+            Ok(ProcessEvent::Exit(code)) => return Ok(code),
+            Ok(ProcessEvent::Stdout(data)) => {
+                let _ = std::io::stdout().write_all(&data);
+                let _ = std::io::stdout().flush();
+            }
+            Ok(ProcessEvent::Stderr(data)) => {
+                let _ = std::io::stderr().write_all(&data);
+                let _ = std::io::stderr().flush();
+            }
+            Err(_) => return Ok(1),
+        }
+    }
 }

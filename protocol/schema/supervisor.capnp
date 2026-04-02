@@ -2,7 +2,7 @@
 
 interface Supervisor {
   start @0 (
-    stdin :ByteStream,
+    stdin :Stdin,
     pty :PtyConfig,
     network :NetworkProxy,
     caCert :Data,
@@ -23,23 +23,21 @@ struct TermSize {
   cols @1 :UInt16;
 }
 
-interface ByteStream {
-  read @0 () -> (frame :DataFrame);
-}
-
-struct DataFrame {
-  union {
-    eof @0 :Void;
-    data @1 :Data;
-    err @2 :Text;
-  }
+interface Stdin {
+  read @0 () -> (input :ProcessInput);
 }
 
 interface Process {
   poll @0 () -> (next :ProcessOutput);
   signal @1 (signum :UInt8) -> ();
   kill @2 () -> ();
-  resize @3 (size :TermSize) -> ();
+}
+
+struct ProcessInput {
+  union {
+    stdin @0 :DataFrame;
+    resize @1 :TermSize;
+  }
 }
 
 struct ProcessOutput {
@@ -47,6 +45,13 @@ struct ProcessOutput {
     exit @0 :Int32;
     stdout @1 :DataFrame;
     stderr @2 :DataFrame;
+  }
+}
+
+struct DataFrame {
+  union {
+    eof @0 :Void;
+    data @1 :Data;
   }
 }
 

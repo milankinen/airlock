@@ -1,6 +1,7 @@
-mod client;
+mod supervisor;
 mod logging;
 pub mod network;
 pub mod process;
+pub mod stdin;
 
-pub use client::Client;
+pub use supervisor::Supervisor;

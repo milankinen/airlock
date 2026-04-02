@@ -38,6 +38,7 @@ impl PreparedMounts {
 /// Mount order (latter shadows former):
 ///   1. Project directory (CWD → same absolute path in container)
 ///   2. Config mounts in definition order
+#[allow(unused_assignments)]
 pub fn prepare(config: &Config, project: &Project) -> anyhow::Result<PreparedMounts> {
     let mut shares = Vec::new();
     let mut binds = Vec::new();

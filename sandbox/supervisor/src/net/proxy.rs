@@ -4,18 +4,18 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use crate::rpc::HostCA;
 
 const PROXY_PORT: u16 = 15001;
 
 pub fn start_proxy(
     network: network_proxy::Client,
-    ca_cert_pem: String,
-    ca_key_pem: String,
+    ca: HostCA,
     log_sink: log_sink::Client,
 ) {
     tokio::task::spawn_local(async move {
         let logger = Logger(log_sink);
-        let interceptor = match TlsInterceptor::new(&ca_cert_pem, &ca_key_pem) {
+        let interceptor = match TlsInterceptor::new(&ca.cert, &ca.key) {
             Ok(i) => Rc::new(i),
             Err(e) => {
                 logger.warn(&format!("TLS interceptor init failed: {e}")).await;

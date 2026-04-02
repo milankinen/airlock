@@ -5,17 +5,16 @@ edition.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+bytes = "1"
 capnp = { workspace = true }
 capnp-rpc = { workspace = true }
 ezpez-protocol = { workspace = true }
 futures = "0.3"
-httparse = "1"
 libc = "0.2"
 quick_cache = "0.6"
 tracing = { workspace = true }
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 rustls = "0.23"
-rustls-pemfile = "2"
 tokio-rustls = "0.26"
 pty-process = { version = "0.5", features = ["async"] }
 tokio = { workspace = true, features = ["rt", "net", "io-util", "macros", "process", "time"] }
