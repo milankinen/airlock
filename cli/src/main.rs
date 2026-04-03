@@ -2,6 +2,7 @@ mod assets;
 mod cli;
 mod config;
 mod error;
+mod network;
 mod oci;
 mod project;
 mod rpc;
@@ -10,13 +11,13 @@ mod vm;
 
 use std::io::Write;
 use crate::error::CliError;
-use crate::rpc::process::ProcessEvent;
 use clap::Parser;
 use tokio::task::LocalSet;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cli = cli::Cli::parse();
 
     tracing_subscriber::fmt()
@@ -53,31 +54,20 @@ async fn main() {
 }
 
 async fn run(config: config::Config) -> Result<i32, CliError> {
-    let host_ports = config.network.host_ports.clone();
     let project = project::ensure(config)?;
-    let bundle = oci::prepare(&project).await?;
+    let vm = vm::prepare(&project)?;
+    let bundle = oci::prepare(&project, &vm).await?;
+    let network = network::setup(&project)?;
+    let terminal = terminal::setup(&project)?;
 
     eprintln!("Booting VM...");
-    let (_vm, vsock_fd) = vm::start(&project, bundle).await?;
-
+    let (vm_handle, vsock_fd) = vm.start(&project, bundle).await?;
     let supervisor = rpc::Supervisor::connect(vsock_fd)?;
     eprintln!("supervisor connected");
 
-    let terminal = project.config.terminal;
-    let pty_size = if terminal {
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        Some((rows, cols))
-    } else {
-        None
-    };
-
-    let _guard = if terminal { Some(terminal::TerminalGuard::enter()) } else { None };
-    let resizes = if terminal { Some(terminal::resizes()?) } else { None };
-    let stdin_cap =
-        capnp_rpc::new_client(rpc::stdin::StdinImpl::new(resizes));
-
+    let stdin = terminal.stdin()?;
     let proc = supervisor
-        .start(stdin_cap, pty_size, &project.ca_cert, &project.ca_key, host_ports)
+        .start(&project, stdin, network)
         .await?;
 
     // Forward host signals to the VM process
@@ -93,18 +83,23 @@ async fn run(config: config::Config) -> Result<i32, CliError> {
         }
     });
 
-    loop {
+    // Handle VM shell output and exit code delegation
+    let exit_code = loop {
         match proc.poll().await {
-            Ok(ProcessEvent::Exit(code)) => return Ok(code),
-            Ok(ProcessEvent::Stdout(data)) => {
+            Ok(rpc::ProcessEvent::Exit(code)) => break code,
+            Ok(rpc::ProcessEvent::Stdout(data)) => {
                 let _ = std::io::stdout().write_all(&data);
                 let _ = std::io::stdout().flush();
             }
-            Ok(ProcessEvent::Stderr(data)) => {
+            Ok(rpc::ProcessEvent::Stderr(data)) => {
                 let _ = std::io::stderr().write_all(&data);
                 let _ = std::io::stderr().flush();
             }
-            Err(_) => return Ok(1),
+            Err(_) => break 1,
         }
-    }
+    };
+
+    // Destroy VM and return the exit code from vm shell
+    drop(vm_handle);
+    Ok(exit_code)
 }

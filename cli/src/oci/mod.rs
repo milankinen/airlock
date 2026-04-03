@@ -7,47 +7,24 @@ mod registry;
 use crate::project::Project;
 use crate::vm::mounts::ContainerBind;
 use std::path::{Path, PathBuf};
+use crate::vm::Vm;
 
 pub struct Bundle {
     pub path: PathBuf,
-    image_config: oci_client::config::ConfigFile,
-    project_cwd: PathBuf,
-}
-
-impl Bundle {
-    pub fn write_config(&self, binds: &[ContainerBind], user_args: &[String], terminal: bool) -> anyhow::Result<()> {
-        config::generate_config(
-            &self.image_config,
-            &self.project_cwd,
-            binds,
-            user_args,
-            terminal,
-            &self.path.join("config.json"),
-        )
-    }
-}
-
-struct ResolvedImage {
-    digest: String,
-    image_config: oci_client::config::ConfigFile,
-    source: ImageSource,
-}
-
-enum ImageSource {
-    Docker { image_ref: String },
-    Registry(registry::RegistryImage),
 }
 
 /// Resolve, download, and prepare the OCI bundle for the project.
-pub async fn prepare(project: &Project) -> anyhow::Result<Bundle> {
+pub async fn prepare(project: &Project, vm: &Vm) -> anyhow::Result<Bundle> {
     let mut resolved = resolve(&project.config.image).await?;
     let image_dir = ensure_image(&mut resolved).await?;
     let bundle_path = ensure_rootfs(&image_dir, &resolved.digest, &project.hash)?;
 
+    // Apply project overrides to the base bundle
+    write_config(&bundle_path, &project.cwd, &resolved.image_config, vm.binds(), &project.config.args, project.config.terminal)?;
+    install_ca_cert(&image_dir, &bundle_path, &project.ca_cert)?;
+
     Ok(Bundle {
-        path: bundle_path,
-        image_config: resolved.image_config,
-        project_cwd: project.cwd.clone(),
+        path: bundle_path
     })
 }
 
@@ -69,6 +46,17 @@ async fn resolve(image_ref: &str) -> anyhow::Result<ResolvedImage> {
         image_config: reg.image_config.clone(),
         source: ImageSource::Registry(reg),
     })
+}
+
+struct ResolvedImage {
+    digest: String,
+    image_config: oci_client::config::ConfigFile,
+    source: ImageSource,
+}
+
+enum ImageSource {
+    Docker { image_ref: String },
+    Registry(registry::RegistryImage),
 }
 
 async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBuf> {
@@ -147,6 +135,37 @@ fn ensure_rootfs(image_dir: &Path, image_digest: &str, project_hash: &str) -> an
     }
 
     Ok(bundle)
+}
+
+fn write_config(bundle_path: &Path, cwd: &Path, image_config: &oci_client::config::ConfigFile, binds: &[ContainerBind], user_args: &[String], terminal: bool) -> anyhow::Result<()> {
+    config::generate_config(
+        &image_config,
+        &cwd,
+        binds,
+        user_args,
+        terminal,
+        &bundle_path.join("config.json"),
+    )
+}
+
+/// Rewrite the container's trust store with the image's original certs
+/// plus the project CA cert for TLS MITM.
+fn install_ca_cert(image_dir: &Path, bundle_path: &Path, ca_cert_path: &Path) -> anyhow::Result<()> {
+    let ca_store = "rootfs/etc/ssl/certs/ca-certificates.crt";
+    let dest = bundle_path.join(ca_store);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Read from the pristine image, not the bundle (avoids duplicating on repeated runs)
+    let existing = std::fs::read(image_dir.join(ca_store)).unwrap_or_default();
+    let ca_cert = std::fs::read(ca_cert_path)?;
+    let mut out = existing;
+    if !out.ends_with(b"\n") && !out.is_empty() {
+        out.push(b'\n');
+    }
+    out.extend_from_slice(&ca_cert);
+    std::fs::write(&dest, &out)?;
+    Ok(())
 }
 
 fn format_size(bytes: i64) -> String {

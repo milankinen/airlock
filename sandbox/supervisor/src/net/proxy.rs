@@ -1,6 +1,8 @@
+use super::dns::DnsState;
 use super::tls::{self, TlsInterceptor};
 use ezpez_protocol::supervisor_capnp::{network_proxy, tcp_sink};
 use std::cell::RefCell;
+use std::net::Ipv4Addr;
 use std::rc::Rc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -12,6 +14,7 @@ const PROXY_PORT: u16 = 15001;
 pub fn start_proxy(
     network: network_proxy::Client,
     ca: HostCA,
+    dns: Rc<DnsState>,
 ) {
     info!("start network proxy");
     tokio::task::spawn_local(async move {
@@ -43,8 +46,9 @@ pub fn start_proxy(
 
             let network = network.clone();
             let interceptor = interceptor.clone();
+            let dns = dns.clone();
             tokio::task::spawn_local(async move {
-                if let Err(e) = handle_connection(stream, &network, &interceptor).await {
+                if let Err(e) = handle_connection(stream, &network, &interceptor, &dns).await {
                     debug!("proxy conn: {e}");
                 }
             });
@@ -56,6 +60,7 @@ async fn handle_connection(
     stream: tokio::net::TcpStream,
     network: &network_proxy::Client,
     interceptor: &TlsInterceptor,
+    dns: &DnsState,
 ) -> anyhow::Result<()> {
     let (orig_host, orig_port) = get_original_dst(&stream)?;
 
@@ -64,7 +69,10 @@ async fn handle_connection(
     let n = stream.peek(&mut peek_buf).await?;
     let is_tls = tls::is_tls(&peek_buf[..n]);
 
-    let hostname = if is_tls {
+    // Resolve hostname: virtual IP reverse lookup → SNI → raw IP
+    let hostname = if let Some(name) = orig_host.parse::<Ipv4Addr>().ok().and_then(|ip| dns.reverse(&ip)) {
+        name
+    } else if is_tls {
         tls::extract_sni(&peek_buf[..n]).unwrap_or(orig_host.clone())
     } else {
         orig_host.clone()

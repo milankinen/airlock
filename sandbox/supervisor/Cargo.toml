@@ -11,11 +11,13 @@ capnp-rpc = { workspace = true }
 ezpez-protocol = { workspace = true }
 futures = "0.3"
 libc = "0.2"
+scc = "2"
+simple-dns = "0.9"
 quick_cache = "0.6"
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["registry"] }
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
-rustls = "0.23"
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
 tokio-rustls = "0.26"
 pty-process = { version = "0.5", features = ["async"] }
 tokio = { workspace = true, features = ["rt", "net", "io-util", "macros", "process", "time"] }

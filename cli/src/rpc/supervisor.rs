@@ -1,10 +1,11 @@
 use crate::error::CliError;
-use crate::rpc::network::NetworkProxyImpl;
+use crate::network::Network;
+use crate::project::Project;
 use crate::rpc::logging::LogSinkImpl;
 use crate::rpc::process::Process;
+use crate::rpc::stdin::Stdin;
 use ezpez_protocol::supervisor_capnp::*;
 use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
-use std::path::Path;
 
 pub struct Supervisor {
     supervisor: supervisor::Client,
@@ -38,22 +39,19 @@ impl Supervisor {
 
     pub async fn start(
         &self,
-        stdin: stdin::Client,
-        pty_size: Option<(u16, u16)>,
-        ca_cert_path: &Path,
-        ca_key_path: &Path,
-        host_ports: Vec<u16>,
+        project: &Project,
+        stdin: Stdin,
+        network: Network,
     ) -> Result<Process, CliError> {
-        let network_proxy: network_proxy::Client =
-            capnp_rpc::new_client(NetworkProxyImpl::new(host_ports));
         let log_sink: log_sink::Client =
             capnp_rpc::new_client(LogSinkImpl);
 
-        let ca_cert = std::fs::read(ca_cert_path)?;
-        let ca_key = std::fs::read(ca_key_path)?;
+        let ca_cert = std::fs::read(&project.ca_cert)?;
+        let ca_key = std::fs::read(&project.ca_key)?;
 
         let mut req = self.supervisor.start_request();
-        req.get().set_stdin(stdin);
+        let pty_size = stdin.pty_size();
+        req.get().set_stdin(capnp_rpc::new_client(stdin));
         if let Some((rows, cols)) = pty_size {
             let mut size = req.get().init_pty().init_size();
             size.set_rows(rows);
@@ -61,7 +59,7 @@ impl Supervisor {
         } else {
             req.get().init_pty().set_none(());
         }
-        req.get().set_network(network_proxy);
+        req.get().set_network(capnp_rpc::new_client(network));
         req.get().set_ca_cert(&ca_cert);
         req.get().set_ca_key(&ca_key);
         req.get().set_logs(log_sink);

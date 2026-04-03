@@ -4,21 +4,27 @@ use std::rc::Rc;
 use tokio::io::AsyncReadExt;
 use tokio::signal::unix::Signal;
 
-pub struct StdinImpl {
+pub struct Stdin {
     reader: RefCell<tokio::io::Stdin>,
     resizes: RefCell<Option<Signal>>,
+    pty_size: Option<(u16, u16)>
 }
 
-impl StdinImpl {
-    pub fn new(resizes: Option<Signal>) -> Self {
+impl Stdin {
+    pub fn new(reader: tokio::io::Stdin, pty_size: Option<(u16, u16)>, resizes: Option<Signal>) -> Self {
         Self {
-            reader: RefCell::new(tokio::io::stdin()),
+            reader: RefCell::new(reader),
             resizes: RefCell::new(resizes),
+            pty_size,
         }
+    }
+    
+    pub fn pty_size(&self) -> Option<(u16, u16)> {
+        self.pty_size
     }
 }
 
-impl stdin::Server for StdinImpl {
+impl stdin::Server for Stdin {
     async fn read(
         self: Rc<Self>,
         _params: stdin::ReadParams,

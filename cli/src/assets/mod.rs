@@ -1,4 +1,3 @@
-use crate::error::CliError;
 use crate::oci::cache::cache_dir;
 use std::path::PathBuf;
 
@@ -12,7 +11,7 @@ pub struct Assets {
 }
 
 impl Assets {
-    pub fn init() -> Result<Assets, CliError> {
+    pub fn init() -> anyhow::Result<Assets> {
         let dir = cache_dir()?.join("kernel");
         let kernel = dir.join("Image");
         let initramfs = dir.join("initramfs.gz");

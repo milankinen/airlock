@@ -1,5 +1,9 @@
 #!/bin/sh
 mount -t proc none /proc
+
+# Set system clock from host time passed via kernel cmdline
+epoch=$(cat /proc/cmdline | tr ' ' '\n' | grep '^ezpez.epoch=' | cut -d= -f2)
+[ -n "$epoch" ] && date -s "@$epoch" >/dev/null 2>&1
 mount -t sysfs none /sys
 mount -t devtmpfs none /dev
 mkdir -p /dev/pts
@@ -51,6 +55,10 @@ iptables -t nat -A OUTPUT -p tcp -d 127.0.0.1 -j RETURN 2>/dev/null
 iptables -t nat -A OUTPUT -p tcp --dport 15001 -j RETURN 2>/dev/null
 # Redirect all other outbound TCP to proxy
 iptables -t nat -A OUTPUT -p tcp -j REDIRECT --to-port 15001 2>/dev/null
+
+# DNS: point container resolver at supervisor's virtual DNS
+mkdir -p /mnt/bundle/rootfs/etc
+echo "nameserver 10.0.0.1" > /mnt/bundle/rootfs/etc/resolv.conf
 
 /usr/bin/supervisor
 

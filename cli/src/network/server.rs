@@ -1,24 +1,15 @@
-use ezpez_protocol::supervisor_capnp::{network_proxy, tcp_sink};
 use std::cell::RefCell;
-use std::rc::Rc;
+use capnp::capability::Rc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-
-pub struct NetworkProxyImpl {
-    host_ports: Vec<u16>,
-}
-
-impl NetworkProxyImpl {
-    pub fn new(host_ports: Vec<u16>) -> Self {
-        Self { host_ports }
-    }
-}
+use ezpez_protocol::supervisor_capnp::{network_proxy, tcp_sink};
+use super::Network;
 
 fn is_localhost(host: &str) -> bool {
     host == "127.0.0.1" || host == "localhost" || host == "::1"
 }
 
-impl network_proxy::Server for NetworkProxyImpl {
+impl network_proxy::Server for Network {
     async fn connect(
         self: Rc<Self>,
         params: network_proxy::ConnectParams,
@@ -43,10 +34,9 @@ impl network_proxy::Server for NetworkProxyImpl {
         })?;
 
         if tls {
-            let connector = make_tls_connector()?;
             let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
                 .map_err(|e| capnp::Error::failed(format!("invalid hostname: {e}")))?;
-            let tls_stream = connector.connect(server_name, stream).await
+            let tls_stream = self.tls.connect(server_name, stream).await
                 .map_err(|e| capnp::Error::failed(format!("TLS to {host} failed: {e}")))?;
 
             let (read, write) = tokio::io::split(tls_stream);
@@ -73,7 +63,6 @@ where
 {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
 
-    // server → supervisor: push reads to client_sink
     tokio::task::spawn_local(async move {
         let mut buf = [0u8; 8192];
         loop {
@@ -91,7 +80,6 @@ where
         let _ = client_sink.close_request().send().promise.await;
     });
 
-    // supervisor → server: pull from channel, write to stream
     tokio::task::spawn_local(async move {
         while let Some(data) = rx.recv().await {
             if write.write_all(&data).await.is_err() {
@@ -127,15 +115,4 @@ impl tcp_sink::Server for ChannelSink {
         self.0.borrow_mut().take();
         Ok(())
     }
-}
-
-fn make_tls_connector() -> Result<tokio_rustls::TlsConnector, capnp::Error> {
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    Ok(tokio_rustls::TlsConnector::from(std::sync::Arc::new(config)))
 }

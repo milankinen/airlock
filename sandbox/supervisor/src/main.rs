@@ -4,8 +4,9 @@ mod rpc;
 mod vsock;
 mod process;
 
+use std::rc::Rc;
 use tokio::task::LocalSet;
-use tracing::{info};
+use tracing::info;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -14,6 +15,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run() -> anyhow::Result<()> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let listen_fd = vsock::listen(ezpez_protocol::SUPERVISOR_PORT)?;
     let conn_fd = vsock::accept(&listen_fd)?;
     drop(listen_fd);
@@ -22,7 +24,9 @@ async fn run() -> anyhow::Result<()> {
 
     logging::init(conn.log_sink);
 
-    net::start_proxy(conn.network, conn.ca);
+    let dns = Rc::new(net::dns::DnsState::new());
+    net::dns::start(dns.clone());
+    net::start_proxy(conn.network, conn.ca, dns);
 
     info!("start main process");
     let use_pty = conn.proc.pty_size.is_some();

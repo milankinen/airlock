@@ -1,4 +1,3 @@
-use crate::config::Config;
 use crate::project::Project;
 use std::path::PathBuf;
 use tracing::warn;
@@ -39,7 +38,7 @@ impl PreparedMounts {
 ///   1. Project directory (CWD → same absolute path in container)
 ///   2. Config mounts in definition order
 #[allow(unused_assignments)]
-pub fn prepare(config: &Config, project: &Project) -> anyhow::Result<PreparedMounts> {
+pub fn prepare(project: &Project) -> anyhow::Result<PreparedMounts> {
     let mut shares = Vec::new();
     let mut binds = Vec::new();
 
@@ -77,7 +76,7 @@ pub fn prepare(config: &Config, project: &Project) -> anyhow::Result<PreparedMou
     }
 
     // 3. Config mounts
-    for (i, mount) in config.mounts.iter().enumerate() {
+    for (i, mount) in project.config.mounts.iter().enumerate() {
         let source = PathBuf::from(&mount.source);
         let source = std::fs::canonicalize(&source).unwrap_or(source);
 
