@@ -15,22 +15,20 @@ docker run --rm \
 echo "Kernel: sandbox/out/Image ($(du -h sandbox/out/Image | cut -f1))"
 """
 
-[tasks."build:supervisor-image"]
-description = "Build the supervisor builder Docker image"
-sources = ["sandbox/supervisor/Dockerfile"]
-outputs = [".supervisor-image-built"]
-run = """
-docker build -t ezpez-supervisor-builder sandbox/supervisor/
-touch .supervisor-image-built
-"""
-
 [tasks."build:supervisor"]
 description = "Build the supervisor for Linux (musl) using Docker"
-depends = ["build:supervisor-image"]
-sources = ["sandbox/supervisor/src/**/*.rs", "sandbox/supervisor/Cargo.toml", "protocol/src/**/*.rs", "protocol/schema/**/*.capnp"]
+sources = [
+    "sandbox/supervisor/src/**/*.rs",
+    "sandbox/supervisor/Cargo.toml",
+    "protocol/src/**/*.rs",
+    "protocol/schema/**/*.capnp",
+    "sandbox/supervisor/Dockerfile"
+]
 outputs = ["sandbox/out/supervisor"]
 run = """
-echo "Building supervisor..."n
+echo "Preparing supervisor builder..."
+docker build --progress=quiet -t ezpez-supervisor-builder sandbox/supervisor
+echo "Building supervisor..."
 mkdir -p sandbox/out
 docker run --rm \
   -v "$PWD:/workspace:ro" \
