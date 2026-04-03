@@ -26,7 +26,7 @@ impl Supervisor {
             reader,
             writer,
             capnp_rpc::rpc_twoparty_capnp::Side::Client,
-            Default::default(),
+            capnp::message::ReaderOptions::default(),
         );
 
         let mut rpc = capnp_rpc::RpcSystem::new(Box::new(network), None);

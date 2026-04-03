@@ -10,6 +10,7 @@ use tokio::task::LocalSet;
 use tracing::info;
 
 #[tokio::main(flavor = "current_thread")]
+#[allow(clippy::large_futures)]
 async fn main() -> anyhow::Result<()> {
     let local = LocalSet::new();
     local.run_until(run()).await

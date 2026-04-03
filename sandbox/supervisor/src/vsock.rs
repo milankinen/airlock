@@ -5,6 +5,7 @@ const AF_VSOCK: i32 = 40;
 const VMADDR_CID_ANY: u32 = 0xFFFFFFFF;
 
 #[repr(C)]
+#[allow(clippy::struct_field_names)]
 struct SockaddrVm {
     svm_family: u16,
     svm_reserved1: u16,
@@ -33,7 +34,7 @@ pub fn listen(port: u32) -> std::io::Result<OwnedFd> {
 
         if libc::bind(
             std::os::unix::io::AsRawFd::as_raw_fd(&fd),
-            &addr as *const _ as *const libc::sockaddr,
+            (&raw const addr).cast::<libc::sockaddr>(),
             mem::size_of::<SockaddrVm>() as u32,
         ) < 0
         {

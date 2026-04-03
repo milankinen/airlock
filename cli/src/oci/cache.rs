@@ -9,7 +9,7 @@ pub fn cache_dir() -> anyhow::Result<PathBuf> {
 }
 
 pub fn image_dir(digest: &str) -> anyhow::Result<PathBuf> {
-    let name = digest.split(':').last().unwrap_or(digest);
+    let name = digest.split(':').next_back().unwrap_or(digest);
     let dir = cache_dir()?.join("images").join(name);
     Ok(dir)
 }

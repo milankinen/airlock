@@ -61,7 +61,7 @@ pub async fn pull_layer(
 
     // Store auth so pull_blob can use it
     let registry = reference.resolve_registry();
-    client.store_auth_if_needed(&registry, &auth).await;
+    client.store_auth_if_needed(registry, &auth).await;
 
     let mut file = tokio::fs::File::create(dest).await?;
     client.pull_blob(reference, layer, &mut file).await?;

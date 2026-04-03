@@ -1,14 +1,14 @@
 use crate::rpc;
 
-pub fn setup() -> anyhow::Result<Terminal> {
+pub fn setup() -> Terminal {
     let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
     if !is_tty {
-        return Ok(Terminal { guard: None });
+        return Terminal { guard: None };
     }
     let raw_mode_enabled = crossterm::terminal::enable_raw_mode().is_ok();
-    Ok(Terminal {
+    Terminal {
         guard: Some(TerminalGuard { raw_mode_enabled }),
-    })
+    }
 }
 
 pub struct Terminal {

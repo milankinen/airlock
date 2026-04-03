@@ -27,6 +27,7 @@ pub struct Config {
     pub mounts: Vec<Mount>,
 }
 
+#[allow(clippy::module_inception)]
 pub mod config {
     use std::cmp::{max, min};
 
@@ -36,9 +37,7 @@ pub mod config {
     use crate::config::de;
 
     pub fn default_cpus() -> u32 {
-        std::thread::available_parallelism()
-            .map(|n| n.get() as u32)
-            .unwrap_or(2)
+        std::thread::available_parallelism().map_or(2, |n| n.get() as u32)
     }
 
     pub fn default_memory_mb() -> u64 {

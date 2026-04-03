@@ -34,7 +34,7 @@ pub async fn connect(conn_fd: OwnedFd) -> anyhow::Result<HostConnection> {
         reader,
         writer,
         rpc_twoparty_capnp::Side::Server,
-        Default::default(),
+        capnp::message::ReaderOptions::default(),
     );
 
     let (conn_tx, conn_rx) = tokio::sync::oneshot::channel::<HostConnection>();
@@ -78,8 +78,8 @@ impl supervisor::Server for SupervisorImpl {
             },
             network: params.get_network()?,
             ca: HostCA {
-                cert: String::from_utf8_lossy(&params.get_ca_cert()?.to_vec()).to_string(),
-                key: String::from_utf8_lossy(&params.get_ca_key()?.to_vec()).to_string(),
+                cert: String::from_utf8_lossy(params.get_ca_cert()?).to_string(),
+                key: String::from_utf8_lossy(params.get_ca_key()?).to_string(),
             },
             log_sink: params.get_logs()?,
             verbose: params.get_verbose(),

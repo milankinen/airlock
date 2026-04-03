@@ -1,10 +1,12 @@
 [tools]
 
 [tasks.format]
+quiet = true
 description = "Format all code"
 run = "cargo +nightly fmt --all"
 
 [tasks.lint]
+quiet = true
 description = "Lint all code"
 run = """
 cargo +nightly fmt --all -- --check

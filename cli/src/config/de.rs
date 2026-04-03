@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::fmt::Debug;
+use std::fmt::{Debug, Write};
 use std::marker::PhantomData;
 
 use serde::Serialize;
@@ -13,7 +13,7 @@ thread_local! {
 }
 
 fn indent() -> String {
-    let depth = NEST_DEPTH.with(|d| d.get());
+    let depth = NEST_DEPTH.with(std::cell::Cell::get);
     "  ".repeat(depth)
 }
 
@@ -66,14 +66,14 @@ where
 pub fn format_error(title: impl Into<String>, errors: smart_config::ParseErrors) -> String {
     let ind = indent();
     let mut msg = title.into();
-    for e in errors.into_iter() {
+    for e in errors {
         let path = e.path();
         let detail = if matches!(e.category(), smart_config::ParseErrorCategory::MissingField) {
             "missing".to_string()
         } else {
             e.inner().to_string()
         };
-        msg += &format!("\n{ind}* `{path}` {detail}");
+        let _ = write!(msg, "\n{ind}* `{path}` {detail}");
     }
     msg
 }

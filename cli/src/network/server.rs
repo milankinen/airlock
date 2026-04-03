@@ -50,7 +50,7 @@ impl network_proxy::Server for Network {
             }
             Err(e) => {
                 debug!("tcp_connect error: {e}");
-                results.get().init_result().set_denied(&e.to_string());
+                results.get().init_result().set_denied(e.to_string());
                 return Ok(());
             }
         };

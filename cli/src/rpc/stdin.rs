@@ -30,6 +30,8 @@ impl Stdin {
 }
 
 impl stdin::Server for Stdin {
+    // Single-threaded runtime; RefCell is appropriate here.
+    #[allow(clippy::await_holding_refcell_ref)]
     async fn read(
         self: Rc<Self>,
         _params: stdin::ReadParams,
@@ -51,12 +53,11 @@ impl stdin::Server for Stdin {
         tokio::select! {
             result = reader.read(&mut buf) => {
                 match result {
-                    Ok(0) => results.get().init_input().init_stdin().set_eof(()),
+                    Ok(0) | Err(_) => results.get().init_input().init_stdin().set_eof(()),
                     Ok(n) => results.get().init_input().init_stdin().set_data(&buf[..n]),
-                    Err(_) => results.get().init_input().init_stdin().set_eof(()),
                 }
             }
-            _ = resize_fut => {
+            () = resize_fut => {
                 let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
                 let mut size = results.get().init_input().init_resize();
                 size.set_rows(rows);

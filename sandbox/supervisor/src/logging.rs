@@ -21,7 +21,7 @@ async fn forward(log_sink: log_sink::Client, mut rx: mpsc::UnboundedReceiver<(u8
         let mut req = log_sink.log_request();
         req.get().set_level(level);
         req.get().set_message(&msg);
-        let _ = req.send();
+        drop(req.send());
     }
 }
 
@@ -56,8 +56,7 @@ impl<S: tracing::Subscriber> Layer<S> for RpcLayer {
             tracing::Level::ERROR => 3,
             tracing::Level::WARN => 2,
             tracing::Level::INFO => 1,
-            tracing::Level::DEBUG => 0,
-            tracing::Level::TRACE => 0,
+            tracing::Level::DEBUG | tracing::Level::TRACE => 0,
         };
 
         let mut visitor = MsgVisitor(String::new());

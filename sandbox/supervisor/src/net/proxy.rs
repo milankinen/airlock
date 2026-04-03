@@ -71,7 +71,7 @@ async fn handle_connection(
     let hostname = if let Some(name) = orig_host
         .parse::<Ipv4Addr>()
         .ok()
-        .and_then(|ip| dns.reverse(&ip))
+        .and_then(|ip| dns.reverse(ip))
     {
         name
     } else if is_tls {
@@ -138,7 +138,7 @@ async fn relay(
         let mut buf = [0u8; 8192];
         loop {
             match local_read.read(&mut buf).await {
-                Ok(0) => break,
+                Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let mut req = remote_sink.send_request();
                     req.get().set_data(&buf[..n]);
@@ -146,7 +146,6 @@ async fn relay(
                         break;
                     }
                 }
-                Err(_) => break,
             }
         }
         let _ = remote_sink.close_request().send().promise.await;
@@ -171,9 +170,10 @@ struct ChannelSink(RefCell<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>);
 impl tcp_sink::Server for ChannelSink {
     async fn send(self: Rc<Self>, params: tcp_sink::SendParams) -> Result<(), capnp::Error> {
         let data = params.get()?.get_data()?;
-        if let Some(tx) = self.0.borrow().as_ref() {
+        let tx = self.0.borrow().clone();
+        if let Some(tx) = tx.as_ref() {
             // Bounded send — blocks if channel full (backpressure)
-            tx.send(data.to_vec())
+            tx.send(data.to_owned())
                 .await
                 .map_err(|_| capnp::Error::failed("channel closed".into()))?;
         }
@@ -194,6 +194,7 @@ impl tcp_sink::Server for ChannelSink {
 
 const SO_ORIGINAL_DST: libc::c_int = 80;
 
+#[allow(clippy::ptr_as_ptr, clippy::borrow_as_ptr, clippy::ref_as_ptr)]
 fn get_original_dst(stream: &tokio::net::TcpStream) -> anyhow::Result<(String, u16)> {
     use std::os::unix::io::AsRawFd;
 

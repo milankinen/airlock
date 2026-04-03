@@ -48,11 +48,11 @@ pub struct AppleVmBackend {
 unsafe impl Send for AppleVmBackend {}
 
 impl AppleVmBackend {
-    pub fn new(config: VmConfig) -> Result<Self> {
+    pub fn new(config: &VmConfig) -> Result<Self> {
         let host_to_guest = create_pipe()?;
         let guest_to_host = create_pipe()?;
 
-        let vm_config = unsafe { Self::create_vm_config(&config, &host_to_guest, &guest_to_host)? };
+        let vm_config = unsafe { Self::create_vm_config(config, &host_to_guest, &guest_to_host) };
 
         unsafe {
             vm_config.validateWithError().map_err(|e| {
@@ -71,7 +71,7 @@ impl AppleVmBackend {
             )
         };
 
-        let vm_ptr = &*vm as *const VZVirtualMachine as usize;
+        let vm_ptr = (&raw const *vm) as usize;
 
         // Drop the guest-side pipe ends on the host. The VM has its own
         // dup'd copies via NSFileHandle. When the VM shuts down and closes
@@ -92,7 +92,7 @@ impl AppleVmBackend {
         config: &VmConfig,
         host_to_guest: &PipeEnds,
         guest_to_host: &PipeEnds,
-    ) -> Result<Retained<VZVirtualMachineConfiguration>> {
+    ) -> Retained<VZVirtualMachineConfiguration> {
         unsafe {
             // Boot loader
             let kernel_path = config.kernel.to_string_lossy();
@@ -197,7 +197,7 @@ impl AppleVmBackend {
                 vm_config.setDirectorySharingDevices(&fs_devices);
             }
 
-            Ok(vm_config)
+            vm_config
         } // unsafe
     }
 }
@@ -289,11 +289,11 @@ impl AppleVmBackend {
                 let state = unsafe { (*(vm_addr as *const VZVirtualMachine)).state() };
                 let _ = tx.send(state);
             });
-            if let Ok(state) = rx.await {
-                if state == VZVirtualMachineState::Stopped || state == VZVirtualMachineState::Error
-                {
-                    return;
-                }
+            if let Ok(state) = rx.await
+                && (state == VZVirtualMachineState::Stopped
+                    || state == VZVirtualMachineState::Error)
+            {
+                return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
@@ -308,18 +308,16 @@ impl AppleVmBackend {
             unsafe {
                 let vm = &*(vm_addr as *const VZVirtualMachine);
                 let devices = vm.socketDevices();
-                let device = match devices.firstObject_unchecked() {
-                    Some(d) => d,
-                    None => {
-                        if let Some(tx) = tx.lock().unwrap().take() {
-                            let _ = tx.send(Err("no vsock device".into()));
-                        }
-                        return;
+                let Some(device) = devices.firstObject_unchecked() else {
+                    if let Some(tx) = tx.lock().unwrap().take() {
+                        let _ = tx.send(Err("no vsock device".into()));
                     }
+                    return;
                 };
                 // Downcast VZSocketDevice → VZVirtioSocketDevice
                 // Safety: we configured exactly one VZVirtioSocketDeviceConfiguration
-                let device_ptr = device as *const VZSocketDevice as *const VZVirtioSocketDevice;
+                let device_ptr =
+                    std::ptr::from_ref::<VZSocketDevice>(device).cast::<VZVirtioSocketDevice>();
                 let device = &*device_ptr;
 
                 let handler = RcBlock::new(

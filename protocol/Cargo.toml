@@ -3,6 +3,9 @@ name = "ezpez-protocol"
 version.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 capnp = { workspace = true }
 capnp-rpc = { workspace = true }

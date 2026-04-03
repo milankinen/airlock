@@ -104,8 +104,7 @@ pub fn prepare(project: &Project) -> anyhow::Result<PreparedMounts> {
                 "f{i}_{}",
                 source
                     .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| format!("file_{i}"))
+                    .map_or_else(|| format!("file_{i}"), |n| n.to_string_lossy().to_string())
             );
             let link_path = fdir.join(&file_name);
 

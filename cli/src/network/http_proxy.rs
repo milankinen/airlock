@@ -43,13 +43,12 @@ pub async fn detect(rx: &mut mpsc::Receiver<Vec<u8>>) -> Result<Vec<u8>, Vec<u8>
             if is_http_request_line(&buf[..pos]) {
                 debug!("detected HTTP request line");
                 return Ok(buf);
-            } else {
-                trace!(
-                    "first line is not HTTP: {:?}",
-                    String::from_utf8_lossy(&buf[..pos.min(80)])
-                );
-                return Err(buf);
             }
+            trace!(
+                "first line is not HTTP: {:?}",
+                String::from_utf8_lossy(&buf[..pos.min(80)])
+            );
+            return Err(buf);
         }
 
         if buf.len() > MAX_DETECT_SIZE {
@@ -67,6 +66,7 @@ pub enum ServerProtocol {
 }
 
 /// Run hyper HTTP proxy with auto h1/h2 detection. Bodies stream through.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve<R, W>(
     prefix: Vec<u8>,
     rx: mpsc::Receiver<Vec<u8>>,
@@ -190,8 +190,7 @@ async fn handle_request(
     let path = req
         .uri()
         .path_and_query()
-        .map(|pq| pq.to_string())
-        .unwrap_or_else(|| "/".to_string());
+        .map_or_else(|| "/".to_string(), std::string::ToString::to_string);
     let headers: Vec<(String, String)> = req
         .headers()
         .iter()
@@ -393,7 +392,7 @@ impl AsyncWrite for RpcTransport {
         // With h2 concurrent streams this could silently drop data.
         let mut req = self.client_sink.send_request();
         req.get().set_data(buf);
-        let _ = req.send();
+        drop(req.send());
         Poll::Ready(Ok(buf.len()))
     }
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {

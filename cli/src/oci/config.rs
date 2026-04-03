@@ -15,10 +15,7 @@ pub fn generate_config(
 ) -> anyhow::Result<()> {
     let cfg = image_config.config.as_ref();
 
-    let args: Vec<String> = if !user_args.is_empty() {
-        // User args override the entire command
-        user_args.to_vec()
-    } else {
+    let args: Vec<String> = if user_args.is_empty() {
         let mut a = Vec::new();
         if let Some(ep) = cfg.and_then(|c| c.entrypoint.as_ref()) {
             a.extend(ep.iter().cloned());
@@ -30,6 +27,9 @@ pub fn generate_config(
             a.push("/bin/sh".to_string());
         }
         a
+    } else {
+        // User args override the entire command
+        user_args.to_vec()
     };
 
     let mut env: Vec<String> = vec![

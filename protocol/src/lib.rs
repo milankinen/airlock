@@ -1,4 +1,4 @@
-#[allow(clippy::all)]
+#[allow(clippy::all, clippy::pedantic)]
 pub mod supervisor_capnp {
     include!(concat!(env!("OUT_DIR"), "/schema/supervisor_capnp.rs"));
 }

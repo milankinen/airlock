@@ -3,6 +3,9 @@ name = "ezpez-cli"
 version.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "ez"
 path = "src/main.rs"

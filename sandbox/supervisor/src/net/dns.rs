@@ -41,8 +41,8 @@ impl DnsState {
         ip
     }
 
-    pub fn reverse(&self, ip: &Ipv4Addr) -> Option<String> {
-        self.ip_to_host.get(ip).map(|e| e.get().clone())
+    pub fn reverse(&self, ip: Ipv4Addr) -> Option<String> {
+        self.ip_to_host.get(&ip).map(|e| e.get().clone())
     }
 }
 

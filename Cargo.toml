@@ -16,3 +16,22 @@ capnpc = "0.25.2"
 capnp-futures = "0.25.2"
 tokio = "1"
 ezpez-protocol = { path = "protocol" }
+
+[workspace.lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+# Allow these pedantic lints that add noise without value in this codebase:
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+doc_markdown = "allow"
+inline_always = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"
+too_many_lines = "allow"
+unreadable_literal = "allow"
+wildcard_imports = "allow"
+similar_names = "allow"

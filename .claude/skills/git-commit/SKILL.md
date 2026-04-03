@@ -3,6 +3,12 @@ name: git-commit
 description: Use always when committing changes to git.
 ---
 
+# Before commit
+
+IMPORTANT: `mise lint` command MUST SUCCEED before commiting ANYTHING
+to version control. Fix the formatting and linting errors before continuing.
+This is non-negotiable. DO NOT SKIP THIS STEP!
+
 # Git commit messages
 
 Format:

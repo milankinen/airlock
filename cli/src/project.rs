@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
@@ -43,7 +43,7 @@ pub fn ensure(config: Config) -> anyhow::Result<Project> {
     })
 }
 
-fn generate_ca(cert_path: &PathBuf, key_path: &PathBuf) -> anyhow::Result<()> {
+fn generate_ca(cert_path: &Path, key_path: &Path) -> anyhow::Result<()> {
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 
     let mut params = CertificateParams::new(vec![])?;

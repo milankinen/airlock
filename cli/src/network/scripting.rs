@@ -164,8 +164,8 @@ fn compile_rule(rule: &config::NetworkRule) -> anyhow::Result<CompiledRule> {
 
 fn sandbox(lua: &Lua) -> mlua::Result<()> {
     let globals = lua.globals();
-    for name in &["os", "io", "debug", "loadfile", "dofile", "load", "require"] {
-        globals.set(*name, Value::Nil)?;
+    for name in ["os", "io", "debug", "loadfile", "dofile", "load", "require"] {
+        globals.set(name, Value::Nil)?;
     }
 
     let _ = lua.set_hook(

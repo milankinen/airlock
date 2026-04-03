@@ -6,6 +6,8 @@ mod registry;
 
 use std::path::{Path, PathBuf};
 
+use oci_client::config::ConfigFile;
+
 use crate::cli::Cli;
 use crate::project::Project;
 use crate::terminal::Terminal;
@@ -51,7 +53,7 @@ async fn resolve(image_ref: &str) -> anyhow::Result<ResolvedImage> {
         );
         return Ok(ResolvedImage {
             digest: image_id,
-            image_config: Default::default(),
+            image_config: ConfigFile::default(),
             source: ImageSource::Docker {
                 image_ref: image_ref.to_string(),
             },
@@ -62,7 +64,7 @@ async fn resolve(image_ref: &str) -> anyhow::Result<ResolvedImage> {
     Ok(ResolvedImage {
         digest: reg.digest.clone(),
         image_config: reg.image_config.clone(),
-        source: ImageSource::Registry(reg),
+        source: ImageSource::Registry(Box::new(reg)),
     })
 }
 
@@ -74,7 +76,7 @@ struct ResolvedImage {
 
 enum ImageSource {
     Docker { image_ref: String },
-    Registry(registry::RegistryImage),
+    Registry(Box<registry::RegistryImage>),
 }
 
 async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBuf> {
@@ -122,7 +124,10 @@ async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBuf> {
             }
 
             eprintln!("  extracting layers...");
-            let layer_refs: Vec<&Path> = layer_paths.iter().map(|p| p.as_path()).collect();
+            let layer_refs: Vec<&Path> = layer_paths
+                .iter()
+                .map(std::path::PathBuf::as_path)
+                .collect();
             layer::extract_layers(&layer_refs, &rootfs)?;
 
             let config_json = serde_json::to_string_pretty(&resolved.image_config)?;
@@ -144,13 +149,12 @@ fn ensure_rootfs(
     let bundle = project.join("bundle");
     let digest_file = project.join("image_digest");
 
-    if bundle.exists() {
-        if let Ok(stored) = std::fs::read_to_string(&digest_file) {
-            if stored.trim() != image_digest {
-                eprintln!("  image changed, recreating project bundle...");
-                std::fs::remove_dir_all(&bundle)?;
-            }
-        }
+    if bundle.exists()
+        && let Ok(stored) = std::fs::read_to_string(&digest_file)
+        && stored.trim() != image_digest
+    {
+        eprintln!("  image changed, recreating project bundle...");
+        std::fs::remove_dir_all(&bundle)?;
     }
 
     if !bundle.join("rootfs").exists() {
@@ -173,8 +177,8 @@ fn write_config(
     terminal: bool,
 ) -> anyhow::Result<()> {
     config::generate_config(
-        &image_config,
-        &cwd,
+        image_config,
+        cwd,
         binds,
         user_args,
         terminal,

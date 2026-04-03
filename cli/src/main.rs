@@ -68,7 +68,7 @@ async fn main() {
 async fn run(cli: cli::Cli, config: config::Config) -> Result<i32, CliError> {
     let project = project::ensure(config)?;
     let vm = vm::prepare(&project)?;
-    let terminal = terminal::setup()?;
+    let terminal = terminal::setup();
     let bundle = oci::prepare(&cli, &project, &terminal, &vm).await?;
     let network = network::setup(&project)?;
 

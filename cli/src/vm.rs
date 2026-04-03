@@ -3,6 +3,7 @@ mod apple;
 mod config;
 pub mod mounts;
 
+use std::fmt::Write;
 use std::os::unix::io::OwnedFd;
 
 use crate::assets::Assets;
@@ -77,9 +78,9 @@ impl Vm {
                         .network
                         .host_ports
                         .iter()
-                        .map(|p| p.to_string())
+                        .map(std::string::ToString::to_string)
                         .collect();
-                    cmd.push_str(&format!(" ezpez.host_ports={}", ports.join(",")));
+                    let _ = write!(cmd, " ezpez.host_ports={}", ports.join(","));
                 }
                 if !verbose {
                     cmd.push_str(" quiet loglevel=3");
@@ -91,7 +92,7 @@ impl Vm {
 
         #[cfg(target_os = "macos")]
         {
-            let mut backend = apple::AppleVmBackend::new(vm_config)?;
+            let mut backend = apple::AppleVmBackend::new(&vm_config)?;
             backend.start().await?;
 
             let vsock_fd = {
