@@ -1,5 +1,6 @@
-use flate2::read::GzDecoder;
 use std::path::Path;
+
+use flate2::read::GzDecoder;
 
 /// Extract OCI image layers in order into a merged rootfs directory.
 /// Handles whiteout files (.wh.*) for layer deletions.

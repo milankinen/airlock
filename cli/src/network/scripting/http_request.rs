@@ -1,6 +1,7 @@
 use mlua::{FromLua, Lua, UserData, UserDataFields, UserDataMethods, Value};
-use super::connect_request::host_matches;
+
 use super::HttpRequestInfo;
+use super::connect_request::host_matches;
 
 impl FromLua for HttpRequestInfo {
     fn from_lua(value: Value, _lua: &Lua) -> mlua::Result<Self> {

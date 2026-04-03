@@ -1,7 +1,8 @@
+use std::sync::Arc;
+
 use quick_cache::sync::Cache;
 use rcgen::{CertificateParams, KeyPair};
 use rustls::ServerConfig;
-use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::TlsAcceptor;
 
@@ -76,16 +77,24 @@ pub fn extract_sni(buf: &[u8]) -> Option<String> {
 
     let mut pos = hs + 38;
 
-    if pos >= buf.len() { return None; }
+    if pos >= buf.len() {
+        return None;
+    }
     pos += 1 + buf[pos] as usize;
 
-    if pos + 2 > buf.len() { return None; }
+    if pos + 2 > buf.len() {
+        return None;
+    }
     pos += 2 + u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
 
-    if pos >= buf.len() { return None; }
+    if pos >= buf.len() {
+        return None;
+    }
     pos += 1 + buf[pos] as usize;
 
-    if pos + 2 > buf.len() { return None; }
+    if pos + 2 > buf.len() {
+        return None;
+    }
     let ext_end = pos + 2 + u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
     pos += 2;
 

@@ -1,11 +1,13 @@
 mod http_proxy;
-mod server;
 pub mod scripting;
+mod server;
 
-use crate::project::Project;
-use scripting::ScriptEngine;
 use std::rc::Rc;
 use std::sync::Arc;
+
+use scripting::ScriptEngine;
+
+use crate::project::Project;
 
 pub fn setup(project: &Project) -> anyhow::Result<Network> {
     let mut root_store = rustls::RootCertStore::empty();
@@ -18,9 +20,7 @@ pub fn setup(project: &Project) -> anyhow::Result<Network> {
         .with_no_client_auth();
     tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
-    let script_engine = Rc::new(ScriptEngine::init(
-        &project.config.network,
-    )?);
+    let script_engine = Rc::new(ScriptEngine::init(&project.config.network)?);
 
     Ok(Network {
         tls: tokio_rustls::TlsConnector::from(Arc::new(tls_config)),

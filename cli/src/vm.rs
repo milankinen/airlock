@@ -3,25 +3,23 @@ mod apple;
 mod config;
 pub mod mounts;
 
+use std::os::unix::io::OwnedFd;
+
 use crate::assets::Assets;
 use crate::error::CliError;
 use crate::oci::Bundle;
 use crate::project::Project;
-use std::os::unix::io::OwnedFd;
 use crate::vm::mounts::{ContainerBind, PreparedMounts};
 
 pub fn prepare(project: &Project) -> anyhow::Result<Vm> {
     let assets = Assets::init()?;
     let mounts = mounts::prepare(project)?;
-    Ok(Vm {
-        assets,
-        mounts
-    })
+    Ok(Vm { assets, mounts })
 }
 
 pub struct Vm {
     assets: Assets,
-    mounts: PreparedMounts
+    mounts: PreparedMounts,
 }
 
 impl Vm {
@@ -44,8 +42,12 @@ impl Vm {
             .shares
             .iter()
             .map(|s| {
-                eprintln!("  share: {} → {} ({})", s.tag, s.host_path.display(),
-                          if s.read_only { "ro" } else { "rw" });
+                eprintln!(
+                    "  share: {} → {} ({})",
+                    s.tag,
+                    s.host_path.display(),
+                    if s.read_only { "ro" } else { "rw" }
+                );
                 config::VmShare {
                     tag: s.tag.clone(),
                     host_path: s.host_path.clone(),
@@ -70,7 +72,13 @@ impl Vm {
                     tags.join(",")
                 );
                 if !project.config.network.host_ports.is_empty() {
-                    let ports: Vec<String> = project.config.network.host_ports.iter().map(|p| p.to_string()).collect();
+                    let ports: Vec<String> = project
+                        .config
+                        .network
+                        .host_ports
+                        .iter()
+                        .map(|p| p.to_string())
+                        .collect();
                     cmd.push_str(&format!(" ezpez.host_ports={}", ports.join(",")));
                 }
                 if !verbose {
@@ -114,7 +122,6 @@ impl Vm {
         }
     }
 }
-
 
 #[allow(dead_code)]
 pub trait VmHandle {

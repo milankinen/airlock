@@ -1,8 +1,8 @@
-mod supervisor;
 mod logging;
 mod process;
 mod stdin;
+mod supervisor;
 
-pub use supervisor::Supervisor;
 pub use process::*;
 pub use stdin::Stdin;
+pub use supervisor::Supervisor;

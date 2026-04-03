@@ -1,21 +1,19 @@
-use super::dns::DnsState;
-use super::tls::{self, TlsInterceptor};
-use ezpez_protocol::supervisor_capnp::{connect_result, network_proxy, tcp_sink};
 use std::cell::RefCell;
 use std::net::Ipv4Addr;
 use std::rc::Rc;
+
+use ezpez_protocol::supervisor_capnp::{connect_result, network_proxy, tcp_sink};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
+
+use super::dns::DnsState;
+use super::tls::{self, TlsInterceptor};
 use crate::rpc::HostCA;
 
 const PROXY_PORT: u16 = 15001;
 
-pub fn start_proxy(
-    network: network_proxy::Client,
-    ca: HostCA,
-    dns: Rc<DnsState>,
-) {
+pub fn start_proxy(network: network_proxy::Client, ca: HostCA, dns: Rc<DnsState>) {
     info!("start network proxy");
     tokio::task::spawn_local(async move {
         let interceptor = match TlsInterceptor::new(&ca.cert, &ca.key) {
@@ -70,7 +68,11 @@ async fn handle_connection(
     let is_tls = tls::is_tls(&peek_buf[..n]);
 
     // Resolve hostname: virtual IP reverse lookup → SNI → raw IP
-    let hostname = if let Some(name) = orig_host.parse::<Ipv4Addr>().ok().and_then(|ip| dns.reverse(&ip)) {
+    let hostname = if let Some(name) = orig_host
+        .parse::<Ipv4Addr>()
+        .ok()
+        .and_then(|ip| dns.reverse(&ip))
+    {
         name
     } else if is_tls {
         tls::extract_sni(&peek_buf[..n]).unwrap_or(orig_host.clone())
@@ -104,7 +106,7 @@ async fn handle_connection(
         _ => {
             stream.shutdown().await?;
             anyhow::bail!("invalid connect result")
-        },
+        }
     };
 
     if is_tls {
@@ -167,10 +169,7 @@ async fn relay(
 struct ChannelSink(RefCell<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>);
 
 impl tcp_sink::Server for ChannelSink {
-    async fn send(
-        self: Rc<Self>,
-        params: tcp_sink::SendParams,
-    ) -> Result<(), capnp::Error> {
+    async fn send(self: Rc<Self>, params: tcp_sink::SendParams) -> Result<(), capnp::Error> {
         let data = params.get()?.get_data()?;
         if let Some(tx) = self.0.borrow().as_ref() {
             // Bounded send — blocks if channel full (backpressure)

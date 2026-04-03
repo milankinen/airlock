@@ -1,10 +1,9 @@
-mod load_config;
 mod de;
-
-use smart_config::{DescribeConfig, DeserializeConfig};
+mod load_config;
 
 use config::*;
 pub use load_config::load;
+use smart_config::{DescribeConfig, DeserializeConfig};
 
 /// Configuration loaded from hierarchical TOML files and validated
 /// by smart-config. Runtime-only fields (args, terminal) are set
@@ -30,8 +29,10 @@ pub struct Config {
 
 pub mod config {
     use std::cmp::{max, min};
-    use smart_config::{DescribeConfig, DeserializeConfig, Serde};
+
     use smart_config::de::WellKnown;
+    use smart_config::{DescribeConfig, DeserializeConfig, Serde};
+
     use crate::config::de;
 
     pub fn default_cpus() -> u32 {
@@ -44,10 +45,12 @@ pub mod config {
         use sysinfo::System;
         let sys_mem = System::new_with_specifics(
             sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()),
-        ).total_memory() / 1024 / 1024;
+        )
+        .total_memory()
+            / 1024
+            / 1024;
         min(max(512, sys_mem / 2), sys_mem)
     }
-
 
     /// Network configuration
     #[derive(Debug, DescribeConfig, DeserializeConfig)]
@@ -68,7 +71,7 @@ pub mod config {
     #[serde(rename_all = "snake_case")]
     pub enum NetworkMode {
         Allow,
-        Deny
+        Deny,
     }
 
     /// Network filtering rule with inline Lua script
@@ -90,7 +93,7 @@ pub mod config {
     #[serde(rename_all = "snake_case")]
     pub enum NetworkRuleType {
         TcpConnect,
-        HttpRequest
+        HttpRequest,
     }
 
     impl WellKnown for NetworkRule {

@@ -4,41 +4,57 @@ mod docker;
 mod layer;
 mod registry;
 
-use crate::project::Project;
-use crate::vm::mounts::ContainerBind;
 use std::path::{Path, PathBuf};
+
 use crate::cli::Cli;
+use crate::project::Project;
 use crate::terminal::Terminal;
 use crate::vm::Vm;
+use crate::vm::mounts::ContainerBind;
 
 pub struct Bundle {
     pub path: PathBuf,
 }
 
 /// Resolve, download, and prepare the OCI bundle for the project.
-pub async fn prepare(cli: &Cli, project: &Project, terminal: &Terminal, vm: &Vm) -> anyhow::Result<Bundle> {
+pub async fn prepare(
+    cli: &Cli,
+    project: &Project,
+    terminal: &Terminal,
+    vm: &Vm,
+) -> anyhow::Result<Bundle> {
     let mut resolved = resolve(&project.config.image).await?;
     let image_dir = ensure_image(&mut resolved).await?;
     let bundle_path = ensure_rootfs(&image_dir, &resolved.digest, &project.hash)?;
 
     // Apply project overrides to the base bundle
-    write_config(&bundle_path, &project.cwd, &resolved.image_config, vm.binds(), &cli.args, terminal.is_tty())?;
+    write_config(
+        &bundle_path,
+        &project.cwd,
+        &resolved.image_config,
+        vm.binds(),
+        &cli.args,
+        terminal.is_tty(),
+    )?;
     install_ca_cert(&image_dir, &bundle_path, &project.ca_cert)?;
 
-    Ok(Bundle {
-        path: bundle_path
-    })
+    Ok(Bundle { path: bundle_path })
 }
 
 async fn resolve(image_ref: &str) -> anyhow::Result<ResolvedImage> {
     eprintln!("Resolving image {image_ref}...");
 
     if let Some(image_id) = docker::image_exists(image_ref) {
-        eprintln!("  found locally via docker: {}", &image_id[..19.min(image_id.len())]);
+        eprintln!(
+            "  found locally via docker: {}",
+            &image_id[..19.min(image_id.len())]
+        );
         return Ok(ResolvedImage {
             digest: image_id,
             image_config: Default::default(),
-            source: ImageSource::Docker { image_ref: image_ref.to_string() },
+            source: ImageSource::Docker {
+                image_ref: image_ref.to_string(),
+            },
         });
     }
 
@@ -82,9 +98,8 @@ async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBuf> {
     match &resolved.source {
         ImageSource::Docker { image_ref } => {
             eprintln!("  exporting from docker...");
-            resolved.image_config = docker::save_and_extract(
-                image_ref, &rootfs, &dir.join("image_config.json"),
-            )?;
+            resolved.image_config =
+                docker::save_and_extract(image_ref, &rootfs, &dir.join("image_config.json"))?;
         }
         ImageSource::Registry(reg) => {
             eprintln!("Downloading image layers...");
@@ -92,7 +107,13 @@ async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBuf> {
             let mut layer_paths = Vec::new();
             for (i, layer_desc) in layers.iter().enumerate() {
                 let short_digest = &layer_desc.digest[7..19];
-                eprintln!("  layer {}/{}: {} ({})", i + 1, layers.len(), short_digest, format_size(layer_desc.size));
+                eprintln!(
+                    "  layer {}/{}: {} ({})",
+                    i + 1,
+                    layers.len(),
+                    short_digest,
+                    format_size(layer_desc.size)
+                );
                 let layer_path = dir.join(format!("layer_{i}.tar.gz"));
                 if !layer_path.exists() {
                     registry::pull_layer(&reg.reference, layer_desc, &layer_path).await?;
@@ -114,7 +135,11 @@ async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBuf> {
 }
 
 /// Ensure the project bundle rootfs exists (CoW copy of image).
-fn ensure_rootfs(image_dir: &Path, image_digest: &str, project_hash: &str) -> anyhow::Result<PathBuf> {
+fn ensure_rootfs(
+    image_dir: &Path,
+    image_digest: &str,
+    project_hash: &str,
+) -> anyhow::Result<PathBuf> {
     let project = cache::project_dir(project_hash)?;
     let bundle = project.join("bundle");
     let digest_file = project.join("image_digest");
@@ -139,7 +164,14 @@ fn ensure_rootfs(image_dir: &Path, image_digest: &str, project_hash: &str) -> an
     Ok(bundle)
 }
 
-fn write_config(bundle_path: &Path, cwd: &Path, image_config: &oci_client::config::ConfigFile, binds: &[ContainerBind], user_args: &[String], terminal: bool) -> anyhow::Result<()> {
+fn write_config(
+    bundle_path: &Path,
+    cwd: &Path,
+    image_config: &oci_client::config::ConfigFile,
+    binds: &[ContainerBind],
+    user_args: &[String],
+    terminal: bool,
+) -> anyhow::Result<()> {
     config::generate_config(
         &image_config,
         &cwd,
@@ -152,7 +184,11 @@ fn write_config(bundle_path: &Path, cwd: &Path, image_config: &oci_client::confi
 
 /// Rewrite the container's trust store with the image's original certs
 /// plus the project CA cert for TLS MITM.
-fn install_ca_cert(image_dir: &Path, bundle_path: &Path, ca_cert_path: &Path) -> anyhow::Result<()> {
+fn install_ca_cert(
+    image_dir: &Path,
+    bundle_path: &Path,
+    ca_cert_path: &Path,
+) -> anyhow::Result<()> {
     let ca_store = "rootfs/etc/ssl/certs/ca-certificates.crt";
     let dest = bundle_path.join(ca_store);
     if let Some(parent) = dest.parent() {

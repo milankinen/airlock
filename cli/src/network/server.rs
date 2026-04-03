@@ -1,12 +1,13 @@
 use std::cell::RefCell;
 use std::rc::Rc;
+
+use ezpez_protocol::supervisor_capnp::{network_proxy, tcp_sink};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use ezpez_protocol::supervisor_capnp::{network_proxy, tcp_sink};
 use tracing::{debug, error, trace};
-use super::Network;
-use super::http_proxy;
-use super::scripting::{TcpConnect, ScriptError};
+
+use super::scripting::{ScriptError, TcpConnect};
+use super::{Network, http_proxy};
 
 fn is_localhost(host: &str) -> bool {
     host == "127.0.0.1" || host == "localhost" || host == "::1"
@@ -26,41 +27,55 @@ impl network_proxy::Server for Network {
 
         if is_localhost(host) && !self.host_ports.contains(&port) {
             debug!("blocked localhost:{port} (not in host_ports)");
-            return Err(capnp::Error::failed(
-                format!("host port {port} is not exposed"),
-            ));
+            return Err(capnp::Error::failed(format!(
+                "host port {port} is not exposed"
+            )));
         }
 
         // Run tcp_connect filter scripts
-        let connect = TcpConnect { host: host.to_string(), port, tls };
+        let connect = TcpConnect {
+            host: host.to_string(),
+            port,
+            tls,
+        };
         let connect = match self.script_engine.intercept_tcp_connect(connect) {
             Ok(conn) => conn,
             Err(ScriptError::Denied) => {
                 debug!("tcp_connect denied: {host}:{port}");
-                results.get().init_result().set_denied("denied by network rules");
+                results
+                    .get()
+                    .init_result()
+                    .set_denied("denied by network rules");
                 return Ok(());
-            },
+            }
             Err(e) => {
                 debug!("tcp_connect error: {e}");
                 results.get().init_result().set_denied(&e.to_string());
                 return Ok(());
-            },
+            }
         };
 
         let (host, port) = (connect.host.as_str(), connect.port);
         let addr = format!("{host}:{port}");
         trace!("connecting to {addr} tls={tls}");
-        let stream = TcpStream::connect(&addr).await.map_err(|e| {
-            capnp::Error::failed(format!("connect to {addr} failed: {e}"))
-        })?;
+        let stream = TcpStream::connect(&addr)
+            .await
+            .map_err(|e| capnp::Error::failed(format!("connect to {addr} failed: {e}")))?;
 
         let has_http_rules = self.script_engine.has_http_rules();
-        let http_engine = if has_http_rules { Some(self.script_engine.clone()) } else { None };
-        
+        let http_engine = if has_http_rules {
+            Some(self.script_engine.clone())
+        } else {
+            None
+        };
+
         let sink = if tls {
             let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
                 .map_err(|e| capnp::Error::failed(format!("invalid hostname: {e}")))?;
-            let tls_stream = self.tls.connect(server_name, stream).await
+            let tls_stream = self
+                .tls
+                .connect(server_name, stream)
+                .await
                 .map_err(|e| capnp::Error::failed(format!("TLS to {host} failed: {e}")))?;
             let alpn = tls_stream.get_ref().1.alpn_protocol();
             let server_proto = if alpn == Some(b"h2") {
@@ -75,7 +90,14 @@ impl network_proxy::Server for Network {
         } else {
             let (read, write) = stream.into_split();
             // Non-TLS always uses h1 (h2c / plaintext h2 is not supported)
-            spawn_relay(read, write, client_sink, http_engine, connect, http_proxy::ServerProtocol::Http1)
+            spawn_relay(
+                read,
+                write,
+                client_sink,
+                http_engine,
+                connect,
+                http_proxy::ServerProtocol::Http1,
+            )
         };
 
         results.get().init_result().set_server(sink);
@@ -112,16 +134,29 @@ where
                 match http_proxy::detect(&mut rx).await {
                     Ok(prefix) => {
                         http_proxy::serve(
-                            prefix, rx, client_sink, server_read, server_write,
-                            server_protocol, &engine, &connect,
-                        ).await.map_err(|e| format!("http proxy: {e}"))?;
+                            prefix,
+                            rx,
+                            client_sink,
+                            server_read,
+                            server_write,
+                            server_protocol,
+                            &engine,
+                            &connect,
+                        )
+                        .await
+                        .map_err(|e| format!("http proxy: {e}"))?;
                         debug!("http relay closed");
                         return Ok(());
                     }
                     Err(buffered) => {
-                        debug!("not HTTP ({} bytes buffered), falling back to raw relay", buffered.len());
+                        debug!(
+                            "not HTTP ({} bytes buffered), falling back to raw relay",
+                            buffered.len()
+                        );
                         if !buffered.is_empty() {
-                            server_write.write_all(&buffered).await
+                            server_write
+                                .write_all(&buffered)
+                                .await
                                 .map_err(|e| format!("write failed: {e}"))?;
                         }
                     }
@@ -162,7 +197,8 @@ where
             }
             debug!("container→server: channel closed");
             Ok(())
-        }.await;
+        }
+        .await;
 
         if let Err(e) = result {
             debug!("relay error: {e}");
@@ -183,15 +219,15 @@ pub struct ChannelSink {
 
 impl ChannelSink {
     fn new(tx: tokio::sync::mpsc::Sender<Vec<u8>>, error: RelayError) -> Self {
-        Self { tx: RefCell::new(Some(tx)), error }
+        Self {
+            tx: RefCell::new(Some(tx)),
+            error,
+        }
     }
 }
 
 impl tcp_sink::Server for ChannelSink {
-    async fn send(
-        self: Rc<Self>,
-        params: tcp_sink::SendParams,
-    ) -> Result<(), capnp::Error> {
+    async fn send(self: Rc<Self>, params: tcp_sink::SendParams) -> Result<(), capnp::Error> {
         // Check if relay task has failed
         if let Some(err) = self.error.borrow().as_ref() {
             return Err(capnp::Error::failed(err.clone()));
@@ -200,13 +236,11 @@ impl tcp_sink::Server for ChannelSink {
         let tx = self.tx.borrow().clone();
         match tx.as_ref() {
             Some(tx) => {
-                tx.send(data.to_vec())
-                    .await
-                    .map_err(|_| {
-                        let err = self.error.borrow();
-                        let msg = err.as_deref().unwrap_or("relay closed");
-                        capnp::Error::failed(msg.to_string())
-                    })?;
+                tx.send(data.to_vec()).await.map_err(|_| {
+                    let err = self.error.borrow();
+                    let msg = err.as_deref().unwrap_or("relay closed");
+                    capnp::Error::failed(msg.to_string())
+                })?;
             }
             None => {
                 return Err(capnp::Error::failed("channel closed".to_string()));

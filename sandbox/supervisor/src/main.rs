@@ -1,10 +1,11 @@
 mod logging;
 mod net;
+mod process;
 mod rpc;
 mod vsock;
-mod process;
 
 use std::rc::Rc;
+
 use tokio::task::LocalSet;
 use tracing::info;
 
@@ -30,7 +31,11 @@ async fn run() -> anyhow::Result<()> {
 
     info!("start main process");
     let use_pty = conn.proc.pty_size.is_some();
-    let proc = process::spawn("crun", &["run", "--no-pivot", "--bundle", "/mnt/bundle", "ezpez0"], use_pty)?;
+    let proc = process::spawn(
+        "crun",
+        &["run", "--no-pivot", "--bundle", "/mnt/bundle", "ezpez0"],
+        use_pty,
+    )?;
     let exit_code = proc.attach(conn.proc).await;
     info!("main process done, exit_code = {exit_code}");
 

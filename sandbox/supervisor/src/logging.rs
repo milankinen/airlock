@@ -1,9 +1,10 @@
-use ezpez_protocol::supervisor_capnp::log_sink;
 use std::fmt::Write;
+
+use ezpez_protocol::supervisor_capnp::log_sink;
 use tokio::sync::mpsc;
+use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::Layer;
 
 pub fn init(log_sink: log_sink::Client, verbose: bool) {
     let (tx, rx) = mpsc::unbounded_channel::<(u8, String)>();
@@ -33,7 +34,11 @@ struct RpcLayer {
 }
 
 impl<S: tracing::Subscriber> Layer<S> for RpcLayer {
-    fn enabled(&self, metadata: &tracing::Metadata<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) -> bool {
+    fn enabled(
+        &self,
+        metadata: &tracing::Metadata<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
         let level = *metadata.level();
         if self.verbose && metadata.target().starts_with(OWN_TARGET) {
             level <= tracing::Level::DEBUG
@@ -42,7 +47,11 @@ impl<S: tracing::Subscriber> Layer<S> for RpcLayer {
         }
     }
 
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
         let level = match *event.metadata().level() {
             tracing::Level::ERROR => 3,
             tracing::Level::WARN => 2,

@@ -7,7 +7,6 @@ pub enum CliError {
     Unexpected(#[from] anyhow::Error),
 }
 
-
 impl CliError {
     pub fn expected(msg: impl Into<String>) -> Self {
         Self::Expected(msg.into())

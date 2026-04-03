@@ -1,8 +1,9 @@
+use std::path::Path;
+
 use oci_client::client::{ClientConfig, ClientProtocol};
 use oci_client::manifest::OciImageManifest;
-use oci_client::{Client, Reference};
 use oci_client::secrets::RegistryAuth;
-use std::path::Path;
+use oci_client::{Client, Reference};
 use tokio::io::AsyncWriteExt;
 
 pub struct RegistryImage {
@@ -36,9 +37,7 @@ pub async fn resolve(image_ref: &str) -> anyhow::Result<RegistryImage> {
     let client = make_client();
     let auth = RegistryAuth::Anonymous;
 
-    let (manifest, digest, config_str) = client
-        .pull_manifest_and_config(&reference, &auth)
-        .await?;
+    let (manifest, digest, config_str) = client.pull_manifest_and_config(&reference, &auth).await?;
 
     let image_config: oci_client::config::ConfigFile = serde_json::from_str(&config_str)?;
 
@@ -62,9 +61,7 @@ pub async fn pull_layer(
 
     // Store auth so pull_blob can use it
     let registry = reference.resolve_registry();
-    client
-        .store_auth_if_needed(&registry, &auth)
-        .await;
+    client.store_auth_if_needed(&registry, &auth).await;
 
     let mut file = tokio::fs::File::create(dest).await?;
     client.pull_blob(reference, layer, &mut file).await?;

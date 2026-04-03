@@ -1,7 +1,8 @@
+use std::pin::Pin;
+
 use async_stream::stream;
 use futures::Stream;
-use std::pin::Pin;
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
 
 // Linux signal numbers — the target is always the Linux VM,
 // regardless of the host platform.

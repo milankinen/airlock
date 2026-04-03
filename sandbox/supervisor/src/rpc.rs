@@ -1,8 +1,9 @@
-use capnp_rpc::{rpc_twoparty_capnp, twoparty, RpcSystem};
-use ezpez_protocol::supervisor_capnp::*;
-use futures::AsyncReadExt;
 use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
 use std::rc::Rc;
+
+use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
+use ezpez_protocol::supervisor_capnp::*;
+use futures::AsyncReadExt;
 
 pub struct HostConnection {
     pub proc: HostProcess,
@@ -78,7 +79,7 @@ impl supervisor::Server for SupervisorImpl {
             network: params.get_network()?,
             ca: HostCA {
                 cert: String::from_utf8_lossy(&params.get_ca_cert()?.to_vec()).to_string(),
-                key: String::from_utf8_lossy(&params.get_ca_key()?.to_vec()).to_string()
+                key: String::from_utf8_lossy(&params.get_ca_key()?.to_vec()).to_string(),
             },
             log_sink: params.get_logs()?,
             verbose: params.get_verbose(),

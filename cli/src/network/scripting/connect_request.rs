@@ -1,5 +1,6 @@
-use crate::network::scripting::TcpConnect;
 use mlua::{FromLua, Lua, UserData, UserDataFields, UserDataMethods, Value};
+
+use crate::network::scripting::TcpConnect;
 
 #[derive(Debug, Clone)]
 pub(super) struct ConnectRequest {

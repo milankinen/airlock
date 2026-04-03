@@ -1,24 +1,29 @@
-use ezpez_protocol::supervisor_capnp::*;
 use std::cell::RefCell;
 use std::rc::Rc;
+
+use ezpez_protocol::supervisor_capnp::*;
 use tokio::io::AsyncReadExt;
 use tokio::signal::unix::Signal;
 
 pub struct Stdin {
     reader: RefCell<tokio::io::Stdin>,
     resizes: RefCell<Option<Signal>>,
-    pty_size: Option<(u16, u16)>
+    pty_size: Option<(u16, u16)>,
 }
 
 impl Stdin {
-    pub fn new(reader: tokio::io::Stdin, pty_size: Option<(u16, u16)>, resizes: Option<Signal>) -> Self {
+    pub fn new(
+        reader: tokio::io::Stdin,
+        pty_size: Option<(u16, u16)>,
+        resizes: Option<Signal>,
+    ) -> Self {
         Self {
             reader: RefCell::new(reader),
             resizes: RefCell::new(resizes),
             pty_size,
         }
     }
-    
+
     pub fn pty_size(&self) -> Option<(u16, u16)> {
         self.pty_size
     }
@@ -36,7 +41,9 @@ impl stdin::Server for Stdin {
 
         let resize_fut = async {
             match resizes.as_mut() {
-                Some(s) => { s.recv().await; },
+                Some(s) => {
+                    s.recv().await;
+                }
                 None => std::future::pending().await,
             }
         };

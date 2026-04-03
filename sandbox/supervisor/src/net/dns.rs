@@ -1,9 +1,10 @@
-use scc::HashMap;
-use simple_dns::{rdata, Packet, PacketFlag, Question, ResourceRecord, CLASS, QTYPE, TYPE};
 use std::cell::Cell;
 use std::io::Cursor;
 use std::net::Ipv4Addr;
 use std::rc::Rc;
+
+use scc::HashMap;
+use simple_dns::{CLASS, Packet, PacketFlag, QTYPE, Question, ResourceRecord, TYPE, rdata};
 use tokio::net::UdpSocket;
 use tracing::{debug, warn};
 

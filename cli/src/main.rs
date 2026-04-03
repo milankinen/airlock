@@ -10,10 +10,12 @@ mod terminal;
 mod vm;
 
 use std::io::Write;
-use crate::error::CliError;
+
 use clap::Parser;
 use tokio::task::LocalSet;
 use tracing_subscriber::EnvFilter;
+
+use crate::error::CliError;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -26,7 +28,11 @@ async fn main() {
         .open("ez.log")
         .expect("failed to open ez.log");
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(if cli.verbose { "warn,ez=debug" } else { "warn" }))
+        .with_env_filter(EnvFilter::new(if cli.verbose {
+            "warn,ez=debug"
+        } else {
+            "warn"
+        }))
         .with_writer(std::sync::Mutex::new(log_file))
         .with_ansi(false)
         .init();
@@ -40,19 +46,21 @@ async fn main() {
         }
     };
     let local = LocalSet::new();
-    let exit_code = local.run_until(async {
-        match run(cli, config).await {
-            Ok(code) => code,
-            Err(CliError::Expected(msg)) => {
-                eprintln!("error: {msg}");
-                1
+    let exit_code = local
+        .run_until(async {
+            match run(cli, config).await {
+                Ok(code) => code,
+                Err(CliError::Expected(msg)) => {
+                    eprintln!("error: {msg}");
+                    1
+                }
+                Err(CliError::Unexpected(e)) => {
+                    eprintln!("{e:#}");
+                    2
+                }
             }
-            Err(CliError::Unexpected(e)) => {
-                eprintln!("{e:#}");
-                2
-            }
-        }
-    }).await;
+        })
+        .await;
 
     std::process::exit(exit_code);
 }

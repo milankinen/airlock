@@ -1,16 +1,17 @@
-use crate::error::CliError;
 use super::config::VmConfig;
+use crate::error::CliError;
 
 type Result<T> = std::result::Result<T, CliError>;
 
-use block2::RcBlock;
-use dispatch2::DispatchQueue;
-use objc2::rc::Retained;
-use objc2::AnyThread;
-use objc2_foundation::{NSArray, NSError, NSFileHandle, NSString, NSURL};
-use objc2_virtualization::*;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Mutex;
+
+use block2::RcBlock;
+use dispatch2::DispatchQueue;
+use objc2::AnyThread;
+use objc2::rc::Retained;
+use objc2_foundation::{NSArray, NSError, NSFileHandle, NSString, NSURL};
+use objc2_virtualization::*;
 use tracing::{debug, info};
 
 struct PipeEnds {
@@ -51,8 +52,7 @@ impl AppleVmBackend {
         let host_to_guest = create_pipe()?;
         let guest_to_host = create_pipe()?;
 
-        let vm_config =
-            unsafe { Self::create_vm_config(&config, &host_to_guest, &guest_to_host)? };
+        let vm_config = unsafe { Self::create_vm_config(&config, &host_to_guest, &guest_to_host)? };
 
         unsafe {
             vm_config.validateWithError().map_err(|e| {
@@ -61,8 +61,7 @@ impl AppleVmBackend {
         }
         debug!("VM configuration validated");
 
-        let vm_queue =
-            DispatchQueue::new("com.ezpez.vm", dispatch2::DispatchQueueAttr::SERIAL);
+        let vm_queue = DispatchQueue::new("com.ezpez.vm", dispatch2::DispatchQueueAttr::SERIAL);
 
         let vm = unsafe {
             VZVirtualMachine::initWithConfiguration_queue(
@@ -95,111 +94,110 @@ impl AppleVmBackend {
         guest_to_host: &PipeEnds,
     ) -> Result<Retained<VZVirtualMachineConfiguration>> {
         unsafe {
-        // Boot loader
-        let kernel_path = config.kernel.to_string_lossy();
-        let kernel_url = NSURL::fileURLWithPath(&NSString::from_str(&kernel_path));
-        let boot_loader =
-            VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &kernel_url);
+            // Boot loader
+            let kernel_path = config.kernel.to_string_lossy();
+            let kernel_url = NSURL::fileURLWithPath(&NSString::from_str(&kernel_path));
+            let boot_loader =
+                VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &kernel_url);
 
-        boot_loader.setCommandLine(&NSString::from_str(&config.kernel_cmdline));
+            boot_loader.setCommandLine(&NSString::from_str(&config.kernel_cmdline));
 
-        let initramfs_path = config.initramfs.to_string_lossy();
-        let initramfs_url = NSURL::fileURLWithPath(&NSString::from_str(&initramfs_path));
-        boot_loader.setInitialRamdiskURL(Some(&initramfs_url));
+            let initramfs_path = config.initramfs.to_string_lossy();
+            let initramfs_url = NSURL::fileURLWithPath(&NSString::from_str(&initramfs_path));
+            boot_loader.setInitialRamdiskURL(Some(&initramfs_url));
 
-        debug!(cmdline = %config.kernel_cmdline, "boot loader configured");
+            debug!(cmdline = %config.kernel_cmdline, "boot loader configured");
 
-        // VM configuration
-        let vm_config = VZVirtualMachineConfiguration::new();
-        vm_config.setBootLoader(Some(&boot_loader.into_super()));
-        vm_config.setCPUCount(config.cpus as usize);
-        vm_config.setMemorySize(config.memory_bytes);
+            // VM configuration
+            let vm_config = VZVirtualMachineConfiguration::new();
+            vm_config.setBootLoader(Some(&boot_loader.into_super()));
+            vm_config.setCPUCount(config.cpus as usize);
+            vm_config.setMemorySize(config.memory_bytes);
 
-        // Platform
-        let platform = VZGenericPlatformConfiguration::new();
-        vm_config.setPlatform(&platform.into_super());
+            // Platform
+            let platform = VZGenericPlatformConfiguration::new();
+            vm_config.setPlatform(&platform.into_super());
 
-        // Serial port (console) via pipes.
-        // Dup the fds for NSFileHandle with closeOnDealloc:true so the VM
-        // owns its copies. When the VM shuts down, these close, giving the
-        // host relay EOF.
-        let guest_read_fd = libc::dup(host_to_guest.read.as_raw_fd());
-        let guest_write_fd = libc::dup(guest_to_host.write.as_raw_fd());
-        let read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
-            NSFileHandle::alloc(),
-            guest_read_fd,
-            true,
-        );
-        let write_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
-            NSFileHandle::alloc(),
-            guest_write_fd,
-            true,
-        );
-
-        let attachment =
-            VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
-                VZFileHandleSerialPortAttachment::alloc(),
-                Some(&read_handle),
-                Some(&write_handle),
+            // Serial port (console) via pipes.
+            // Dup the fds for NSFileHandle with closeOnDealloc:true so the VM
+            // owns its copies. When the VM shuts down, these close, giving the
+            // host relay EOF.
+            let guest_read_fd = libc::dup(host_to_guest.read.as_raw_fd());
+            let guest_write_fd = libc::dup(guest_to_host.write.as_raw_fd());
+            let read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+                NSFileHandle::alloc(),
+                guest_read_fd,
+                true,
+            );
+            let write_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+                NSFileHandle::alloc(),
+                guest_write_fd,
+                true,
             );
 
-        let serial_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
-        serial_port.setAttachment(Some(&attachment.into_super()));
-
-        let serial_port_config: Retained<VZSerialPortConfiguration> = serial_port.into_super();
-        let serial_ports = NSArray::from_retained_slice(&[serial_port_config]);
-        vm_config.setSerialPorts(&serial_ports);
-
-        // Entropy device
-        let entropy = VZVirtioEntropyDeviceConfiguration::new();
-        let entropy_config: Retained<VZEntropyDeviceConfiguration> = entropy.into_super();
-        let entropy_devices = NSArray::from_retained_slice(&[entropy_config]);
-        vm_config.setEntropyDevices(&entropy_devices);
-
-        // Memory balloon device
-        let balloon = VZVirtioTraditionalMemoryBalloonDeviceConfiguration::new();
-        let balloon_config: Retained<VZMemoryBalloonDeviceConfiguration> = balloon.into_super();
-        let balloons = NSArray::from_retained_slice(&[balloon_config]);
-        vm_config.setMemoryBalloonDevices(&balloons);
-
-        // Vsock device (for host↔guest communication)
-        let vsock = VZVirtioSocketDeviceConfiguration::new();
-        let vsock_config: Retained<VZSocketDeviceConfiguration> = vsock.into_super();
-        let vsock_devices = NSArray::from_retained_slice(&[vsock_config]);
-        vm_config.setSocketDevices(&vsock_devices);
-
-        // VirtioFS shares (bundle + mounts)
-        if !config.shares.is_empty() {
-            let mut fs_devices_vec = Vec::new();
-            for share in &config.shares {
-                let abs_path = std::fs::canonicalize(&share.host_path)
-                    .unwrap_or_else(|_| share.host_path.clone());
-                let url = NSURL::fileURLWithPath(
-                    &NSString::from_str(&abs_path.to_string_lossy()),
+            let attachment =
+                VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                    VZFileHandleSerialPortAttachment::alloc(),
+                    Some(&read_handle),
+                    Some(&write_handle),
                 );
-                let shared_dir = VZSharedDirectory::initWithURL_readOnly(
-                    VZSharedDirectory::alloc(),
-                    &url,
-                    share.read_only,
-                );
-                let dir_share = VZSingleDirectoryShare::initWithDirectory(
-                    VZSingleDirectoryShare::alloc(),
-                    &shared_dir,
-                );
-                let fs_config = VZVirtioFileSystemDeviceConfiguration::initWithTag(
-                    VZVirtioFileSystemDeviceConfiguration::alloc(),
-                    &NSString::from_str(&share.tag),
-                );
-                fs_config.setShare(Some(&dir_share.into_super()));
-                let fs_device: Retained<VZDirectorySharingDeviceConfiguration> =
-                    fs_config.into_super();
-                fs_devices_vec.push(fs_device);
+
+            let serial_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
+            serial_port.setAttachment(Some(&attachment.into_super()));
+
+            let serial_port_config: Retained<VZSerialPortConfiguration> = serial_port.into_super();
+            let serial_ports = NSArray::from_retained_slice(&[serial_port_config]);
+            vm_config.setSerialPorts(&serial_ports);
+
+            // Entropy device
+            let entropy = VZVirtioEntropyDeviceConfiguration::new();
+            let entropy_config: Retained<VZEntropyDeviceConfiguration> = entropy.into_super();
+            let entropy_devices = NSArray::from_retained_slice(&[entropy_config]);
+            vm_config.setEntropyDevices(&entropy_devices);
+
+            // Memory balloon device
+            let balloon = VZVirtioTraditionalMemoryBalloonDeviceConfiguration::new();
+            let balloon_config: Retained<VZMemoryBalloonDeviceConfiguration> = balloon.into_super();
+            let balloons = NSArray::from_retained_slice(&[balloon_config]);
+            vm_config.setMemoryBalloonDevices(&balloons);
+
+            // Vsock device (for host↔guest communication)
+            let vsock = VZVirtioSocketDeviceConfiguration::new();
+            let vsock_config: Retained<VZSocketDeviceConfiguration> = vsock.into_super();
+            let vsock_devices = NSArray::from_retained_slice(&[vsock_config]);
+            vm_config.setSocketDevices(&vsock_devices);
+
+            // VirtioFS shares (bundle + mounts)
+            if !config.shares.is_empty() {
+                let mut fs_devices_vec = Vec::new();
+                for share in &config.shares {
+                    let abs_path = std::fs::canonicalize(&share.host_path)
+                        .unwrap_or_else(|_| share.host_path.clone());
+                    let url =
+                        NSURL::fileURLWithPath(&NSString::from_str(&abs_path.to_string_lossy()));
+                    let shared_dir = VZSharedDirectory::initWithURL_readOnly(
+                        VZSharedDirectory::alloc(),
+                        &url,
+                        share.read_only,
+                    );
+                    let dir_share = VZSingleDirectoryShare::initWithDirectory(
+                        VZSingleDirectoryShare::alloc(),
+                        &shared_dir,
+                    );
+                    let fs_config = VZVirtioFileSystemDeviceConfiguration::initWithTag(
+                        VZVirtioFileSystemDeviceConfiguration::alloc(),
+                        &NSString::from_str(&share.tag),
+                    );
+                    fs_config.setShare(Some(&dir_share.into_super()));
+                    let fs_device: Retained<VZDirectorySharingDeviceConfiguration> =
+                        fs_config.into_super();
+                    fs_devices_vec.push(fs_device);
+                }
+                let fs_devices = NSArray::from_retained_slice(&fs_devices_vec);
+                vm_config.setDirectorySharingDevices(&fs_devices);
             }
-            let fs_devices = NSArray::from_retained_slice(&fs_devices_vec);
-            vm_config.setDirectorySharingDevices(&fs_devices);
-        }
 
-        Ok(vm_config)
+            Ok(vm_config)
         } // unsafe
     }
 }
@@ -225,23 +223,21 @@ impl AppleVmBackend {
         let tx = Mutex::new(Some(tx));
         let vm_addr = self.vm_ptr;
 
-        self.vm_queue.exec_async(move || {
-            unsafe {
-                let vm = &*(vm_addr as *const VZVirtualMachine);
+        self.vm_queue.exec_async(move || unsafe {
+            let vm = &*(vm_addr as *const VZVirtualMachine);
 
-                let handler = RcBlock::new(move |err_ptr: *mut NSError| {
-                    let result = if err_ptr.is_null() {
-                        Ok(())
-                    } else {
-                        let err = &*err_ptr;
-                        Err(format!("{}", err.localizedDescription()))
-                    };
-                    if let Some(tx) = tx.lock().unwrap().take() {
-                        let _ = tx.send(result);
-                    }
-                });
-                vm.startWithCompletionHandler(&handler);
-            }
+            let handler = RcBlock::new(move |err_ptr: *mut NSError| {
+                let result = if err_ptr.is_null() {
+                    Ok(())
+                } else {
+                    let err = &*err_ptr;
+                    Err(format!("{}", err.localizedDescription()))
+                };
+                if let Some(tx) = tx.lock().unwrap().take() {
+                    let _ = tx.send(result);
+                }
+            });
+            vm.startWithCompletionHandler(&handler);
         });
 
         rx.await
@@ -294,8 +290,7 @@ impl AppleVmBackend {
                 let _ = tx.send(state);
             });
             if let Ok(state) = rx.await {
-                if state == VZVirtualMachineState::Stopped
-                    || state == VZVirtualMachineState::Error
+                if state == VZVirtualMachineState::Stopped || state == VZVirtualMachineState::Error
                 {
                     return;
                 }
@@ -305,8 +300,7 @@ impl AppleVmBackend {
     }
 
     pub async fn vsock_connect(&self, port: u32) -> Result<OwnedFd> {
-        let (tx, rx) =
-            tokio::sync::oneshot::channel::<std::result::Result<i32, String>>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<i32, String>>();
         let tx = Mutex::new(Some(tx));
         let vm_addr = self.vm_ptr;
 

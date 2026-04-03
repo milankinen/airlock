@@ -1,6 +1,8 @@
-use crate::vm::mounts::ContainerBind;
-use oci_client::config::ConfigFile;
 use std::path::Path;
+
+use oci_client::config::ConfigFile;
+
+use crate::vm::mounts::ContainerBind;
 
 /// Generate an OCI runtime spec config.json from the image config and bind mounts.
 pub fn generate_config(

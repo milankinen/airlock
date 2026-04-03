@@ -1,6 +1,8 @@
-use crate::config::Config;
-use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+
+use sha2::{Digest, Sha256};
+
+use crate::config::Config;
 
 pub struct Project {
     pub dir: PathBuf,
@@ -31,18 +33,24 @@ pub fn ensure(config: Config) -> anyhow::Result<Project> {
         generate_ca(&ca_cert, &ca_key)?;
     }
 
-    Ok(Project { dir, hash, cwd, config, ca_cert, ca_key })
+    Ok(Project {
+        dir,
+        hash,
+        cwd,
+        config,
+        ca_cert,
+        ca_key,
+    })
 }
 
 fn generate_ca(cert_path: &PathBuf, key_path: &PathBuf) -> anyhow::Result<()> {
-    use rcgen::{CertificateParams, KeyPair, IsCa, BasicConstraints};
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 
     let mut params = CertificateParams::new(vec![])?;
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
-    params.distinguished_name.push(
-        rcgen::DnType::CommonName,
-        "ezpez CA",
-    );
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "ezpez CA");
 
     let key_pair = KeyPair::generate()?;
     let cert = params.self_signed(&key_pair)?;

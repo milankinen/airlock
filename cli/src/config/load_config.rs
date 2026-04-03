@@ -1,5 +1,7 @@
 use std::path::Path;
+
 use smart_config::DescribeConfig;
+
 use crate::config::Config;
 use crate::config::de::format_error;
 use crate::error::CliError;
@@ -39,9 +41,10 @@ pub fn load(project_root: &Path) -> Result<Config, CliError> {
     let parser = repo.single::<Config>()?;
     match parser.parse() {
         Ok(config) => Ok(config),
-        Err(errors) => {
-            Err(CliError::expected(format_error("invalid configuration", errors)))
-        }
+        Err(errors) => Err(CliError::expected(format_error(
+            "invalid configuration",
+            errors,
+        ))),
     }
 }
 

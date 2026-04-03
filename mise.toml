@@ -1,5 +1,16 @@
 [tools]
 
+[tasks.format]
+description = "Format all code"
+run = "cargo +nightly fmt --all"
+
+[tasks.lint]
+description = "Lint all code"
+run = """
+cargo +nightly fmt --all -- --check
+cargo clippy --workspace -- -D warnings
+"""
+
 [tasks."build:kernel"]
 description = "Build the kernel using Docker"
 sources = ["sandbox/kernel/config-arm64", "sandbox/kernel/build.sh"]

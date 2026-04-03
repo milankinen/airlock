@@ -3,8 +3,9 @@ mod http_request;
 
 use mlua::{Function, Lua, Value};
 use tracing::{debug, trace};
-use crate::config::config;
+
 use self::connect_request::ConnectRequest;
+use crate::config::config;
 
 pub struct ScriptEngine {
     tcp_rules: Vec<CompiledRule>,
@@ -36,7 +37,7 @@ pub enum ScriptError {
     #[error("script error: {0}")]
     Lua(#[from] mlua::Error),
     #[error(transparent)]
-    Internal(#[from] anyhow::Error)
+    Internal(#[from] anyhow::Error),
 }
 
 impl ScriptEngine {
@@ -55,10 +56,19 @@ impl ScriptEngine {
 
         debug!(
             "script engine: {} tcp rules, {} http rules, default={}",
-            tcp_rules.len(), http_rules.len(),
-            if default_mode == config::NetworkMode::Allow { "allow" } else { "deny" }
+            tcp_rules.len(),
+            http_rules.len(),
+            if default_mode == config::NetworkMode::Allow {
+                "allow"
+            } else {
+                "deny"
+            }
         );
-        Ok(Self { tcp_rules, http_rules, default_mode })
+        Ok(Self {
+            tcp_rules,
+            http_rules,
+            default_mode,
+        })
     }
 
     pub fn default_allows(&self) -> bool {
@@ -77,7 +87,8 @@ impl ScriptEngine {
         };
         for rule in &self.tcp_rules {
             rule.lua.globals().set("req", req)?;
-            rule.func.call::<()>(())
+            rule.func
+                .call::<()>(())
                 .map_err(|e| anyhow::anyhow!("rule '{}': {e}", rule.name))?;
             req = rule.lua.globals().get("req")?;
             if req.denied {
@@ -94,7 +105,8 @@ impl ScriptEngine {
         for rule in &self.http_rules {
             trace!("running http rule '{}'", rule.name);
             rule.lua.globals().set("req", info.clone())?;
-            rule.func.call::<()>(())
+            rule.func
+                .call::<()>(())
                 .map_err(|e| anyhow::anyhow!("rule '{}': {e}", rule.name))?;
             *info = rule.lua.globals().get("req")?;
             if info.denied {
@@ -137,11 +149,17 @@ fn compile_rule(rule: &config::NetworkRule) -> anyhow::Result<CompiledRule> {
     })?;
     lua.globals().set("log", log_fn)?;
 
-    let func = lua.load(&rule.script).set_name(&rule.name).into_function().map_err(|e| {
-        anyhow::anyhow!("failed to compile rule '{}': {e}", rule.name)
-    })?;
+    let func = lua
+        .load(&rule.script)
+        .set_name(&rule.name)
+        .into_function()
+        .map_err(|e| anyhow::anyhow!("failed to compile rule '{}': {e}", rule.name))?;
 
-    Ok(CompiledRule { name: rule.name.clone(), lua, func })
+    Ok(CompiledRule {
+        name: rule.name.clone(),
+        lua,
+        func,
+    })
 }
 
 fn sandbox(lua: &Lua) -> mlua::Result<()> {
@@ -152,9 +170,7 @@ fn sandbox(lua: &Lua) -> mlua::Result<()> {
 
     let _ = lua.set_hook(
         mlua::HookTriggers::new().every_nth_instruction(1_000_000),
-        |_lua, _debug| {
-            Err(mlua::Error::runtime("script exceeded instruction limit"))
-        },
+        |_lua, _debug| Err(mlua::Error::runtime("script exceeded instruction limit")),
     );
 
     Ok(())

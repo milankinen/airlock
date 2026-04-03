@@ -5,20 +5,22 @@
 //! For each request, Lua scripts run and the (possibly modified) request
 //! is forwarded via hyper client. Bodies are streamed, not buffered.
 
-use super::scripting::{HttpRequestInfo, ScriptEngine, TcpConnect};
-use ezpez_protocol::supervisor_capnp::tcp_sink;
-use hyper::body::{Bytes, Incoming};
-use hyper::service::service_fn;
-use hyper::{Request, Response};
-use http_body_util::{Either, Full};
 use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
+
+use ezpez_protocol::supervisor_capnp::tcp_sink;
+use http_body_util::{Either, Full};
+use hyper::body::{Bytes, Incoming};
+use hyper::service::service_fn;
+use hyper::{Request, Response};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use tracing::{debug, trace};
+
+use super::scripting::{HttpRequestInfo, ScriptEngine, TcpConnect};
 
 const MAX_DETECT_SIZE: usize = 4096;
 
@@ -42,7 +44,10 @@ pub async fn detect(rx: &mut mpsc::Receiver<Vec<u8>>) -> Result<Vec<u8>, Vec<u8>
                 debug!("detected HTTP request line");
                 return Ok(buf);
             } else {
-                trace!("first line is not HTTP: {:?}", String::from_utf8_lossy(&buf[..pos.min(80)]));
+                trace!(
+                    "first line is not HTTP: {:?}",
+                    String::from_utf8_lossy(&buf[..pos.min(80)])
+                );
                 return Err(buf);
             }
         }
@@ -53,7 +58,6 @@ pub async fn detect(rx: &mut mpsc::Receiver<Vec<u8>>) -> Result<Vec<u8>, Vec<u8>
         }
     }
 }
-
 
 /// Whether the upstream server speaks h1 or h2.
 #[derive(Debug, Clone, Copy)]
@@ -80,7 +84,10 @@ where
     let container_io = RpcTransport::new(prefix, rx, client_sink.clone());
     let container_conn = hyper_util::rt::TokioIo::new(container_io);
 
-    let server_io = hyper_util::rt::TokioIo::new(CombinedStream { read: server_read, write: server_write });
+    let server_io = hyper_util::rt::TokioIo::new(CombinedStream {
+        read: server_read,
+        write: server_write,
+    });
     debug!("http proxy: server protocol = {server_protocol:?}");
     let sender: Rc<dyn RequestSender> = match server_protocol {
         ServerProtocol::Http1 => {
@@ -90,7 +97,8 @@ where
             Rc::new(H1Sender(RefCell::new(sender)))
         }
         ServerProtocol::Http2 => {
-            let (sender, conn) = hyper::client::conn::http2::handshake(LocalExec, server_io).await?;
+            let (sender, conn) =
+                hyper::client::conn::http2::handshake(LocalExec, server_io).await?;
             tokio::task::spawn_local(conn);
             debug!("h2 client handshake complete");
             Rc::new(H2Sender(sender))
@@ -128,12 +136,18 @@ where
 
 /// Abstraction over h1/h2 client senders.
 trait RequestSender {
-    fn send(&self, req: Request<Incoming>) -> Pin<Box<dyn Future<Output = Result<Response<Incoming>, hyper::Error>>>>;
+    fn send(
+        &self,
+        req: Request<Incoming>,
+    ) -> Pin<Box<dyn Future<Output = Result<Response<Incoming>, hyper::Error>>>>;
 }
 
 struct H1Sender(RefCell<hyper::client::conn::http1::SendRequest<Incoming>>);
 impl RequestSender for H1Sender {
-    fn send(&self, req: Request<Incoming>) -> Pin<Box<dyn Future<Output = Result<Response<Incoming>, hyper::Error>>>> {
+    fn send(
+        &self,
+        req: Request<Incoming>,
+    ) -> Pin<Box<dyn Future<Output = Result<Response<Incoming>, hyper::Error>>>> {
         Box::pin(self.0.borrow_mut().send_request(req))
     }
 }
@@ -141,7 +155,10 @@ impl RequestSender for H1Sender {
 /// h2 SendRequest is Clone and safe for concurrent use — clone per request.
 struct H2Sender(hyper::client::conn::http2::SendRequest<Incoming>);
 impl RequestSender for H2Sender {
-    fn send(&self, req: Request<Incoming>) -> Pin<Box<dyn Future<Output = Result<Response<Incoming>, hyper::Error>>>> {
+    fn send(
+        &self,
+        req: Request<Incoming>,
+    ) -> Pin<Box<dyn Future<Output = Result<Response<Incoming>, hyper::Error>>>> {
         let mut sender = self.0.clone();
         Box::pin(async move { sender.send_request(req).await })
     }
@@ -150,7 +167,12 @@ impl RequestSender for H2Sender {
 type ResponseBody = Either<Incoming, Full<Bytes>>;
 
 fn safe_header_value<'a>(name: &str, value: &'a str) -> &'a str {
-    const SENSITIVE: &[&str] = &["authorization", "cookie", "set-cookie", "proxy-authorization"];
+    const SENSITIVE: &[&str] = &[
+        "authorization",
+        "cookie",
+        "set-cookie",
+        "proxy-authorization",
+    ];
     if SENSITIVE.iter().any(|&s| s.eq_ignore_ascii_case(name)) {
         "[redacted]"
     } else {
@@ -165,10 +187,14 @@ async fn handle_request(
     sender: Rc<dyn RequestSender>,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let method = req.method().clone();
-    let path = req.uri().path_and_query()
+    let path = req
+        .uri()
+        .path_and_query()
         .map(|pq| pq.to_string())
         .unwrap_or_else(|| "/".to_string());
-    let headers: Vec<(String, String)> = req.headers().iter()
+    let headers: Vec<(String, String)> = req
+        .headers()
+        .iter()
         .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
 
@@ -190,7 +216,9 @@ async fn handle_request(
         debug!("http denied: {method} {} ({e})", http_req.path);
         return Ok(Response::builder()
             .status(403)
-            .body(Either::Right(Full::new(Bytes::from("Denied by network rules\n"))))
+            .body(Either::Right(Full::new(Bytes::from(
+                "Denied by network rules\n",
+            ))))
             .unwrap());
     }
     debug!("http allowed: {method} {}", http_req.path);
@@ -209,9 +237,7 @@ async fn handle_request(
                 .unwrap());
         }
     };
-    let mut builder = Request::builder()
-        .method(parts.method.clone())
-        .uri(&uri);
+    let mut builder = Request::builder().method(parts.method.clone()).uri(&uri);
     for (name, value) in &http_req.headers {
         builder = builder.header(name.as_str(), value.as_str());
     }
@@ -226,8 +252,13 @@ async fn handle_request(
         }
     };
 
-    debug!("forwarding: {} {} (out uri={}) ({} headers)",
-        parts.method, http_req.path, out_req.uri(), http_req.headers.len());
+    debug!(
+        "forwarding: {} {} (out uri={}) ({} headers)",
+        parts.method,
+        http_req.path,
+        out_req.uri(),
+        http_req.headers.len()
+    );
     for (k, v) in &http_req.headers {
         trace!("  >> {k}: {}", safe_header_value(k, v));
     }
@@ -241,9 +272,17 @@ async fn handle_request(
         }
     };
 
-    debug!("response: {} ({} headers)", resp.status(), resp.headers().len());
+    debug!(
+        "response: {} ({} headers)",
+        resp.status(),
+        resp.headers().len()
+    );
     for (k, v) in resp.headers() {
-        trace!("  < {}: {}", k, safe_header_value(k.as_str(), v.to_str().unwrap_or("?")));
+        trace!(
+            "  < {}: {}",
+            k,
+            safe_header_value(k.as_str(), v.to_str().unwrap_or("?"))
+        );
     }
     let (parts, body) = resp.into_parts();
     Ok(Response::from_parts(parts, Either::Left(body)))
@@ -251,16 +290,27 @@ async fn handle_request(
 
 // -- I/O bridges --
 
-struct CombinedStream<R, W> { read: R, write: W }
+struct CombinedStream<R, W> {
+    read: R,
+    write: W,
+}
 
 impl<R: AsyncRead + Unpin, W: Unpin> AsyncRead for CombinedStream<R, W> {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.get_mut().read).poll_read(cx, buf)
     }
 }
 
 impl<R: Unpin, W: AsyncWrite + Unpin> AsyncWrite for CombinedStream<R, W> {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
         Pin::new(&mut self.get_mut().write).poll_write(cx, buf)
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -282,12 +332,23 @@ struct RpcTransport {
 
 impl RpcTransport {
     fn new(prefix: Vec<u8>, rx: mpsc::Receiver<Vec<u8>>, client_sink: tcp_sink::Client) -> Self {
-        Self { prefix, prefix_pos: 0, rx, client_sink, read_buf: Vec::new(), read_pos: 0 }
+        Self {
+            prefix,
+            prefix_pos: 0,
+            rx,
+            client_sink,
+            read_buf: Vec::new(),
+            read_pos: 0,
+        }
     }
 }
 
 impl AsyncRead for RpcTransport {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
         if self.prefix_pos < self.prefix.len() {
             let remaining = &self.prefix[self.prefix_pos..];
             let n = remaining.len().min(buf.remaining());
@@ -323,7 +384,11 @@ impl AsyncRead for RpcTransport {
 }
 
 impl AsyncWrite for RpcTransport {
-    fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
         // TODO: fire-and-forget — no backpressure or error propagation from RPC send.
         // With h2 concurrent streams this could silently drop data.
         let mut req = self.client_sink.send_request();
@@ -342,14 +407,13 @@ impl AsyncWrite for RpcTransport {
 /// Check if a line matches an HTTP request line or h2 connection preface.
 fn is_http_request_line(line: &[u8]) -> bool {
     use std::sync::LazyLock;
+
     use regex::bytes::Regex;
 
-    static H2_PREFACE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"^PRI \* HTTP/2\.0$").unwrap()
-    });
-    static H1_REQUEST: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"^[A-Z]+ \S+ HTTP/\S+$").unwrap()
-    });
+    static H2_PREFACE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^PRI \* HTTP/2\.0$").unwrap());
+    static H1_REQUEST: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^[A-Z]+ \S+ HTTP/\S+$").unwrap());
 
     H2_PREFACE.is_match(line) || H1_REQUEST.is_match(line)
 }

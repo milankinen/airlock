@@ -1,6 +1,8 @@
-use crate::project::Project;
 use std::path::PathBuf;
+
 use tracing::warn;
+
+use crate::project::Project;
 
 /// A bind mount inside the container.
 pub struct ContainerBind {
@@ -28,7 +30,11 @@ impl PreparedMounts {
 
 impl PreparedMounts {
     pub(super) fn add_share(&mut self, tag: String, host_path: PathBuf, read_only: bool) {
-        self.shares.push(Share { tag, host_path, read_only });
+        self.shares.push(Share {
+            tag,
+            host_path,
+            read_only,
+        });
     }
 }
 
@@ -44,8 +50,12 @@ pub fn prepare(project: &Project) -> anyhow::Result<PreparedMounts> {
 
     let files_rw_dir = project.dir.join("files_rw");
     let files_ro_dir = project.dir.join("files_ro");
-    if files_rw_dir.exists() { std::fs::remove_dir_all(&files_rw_dir)?; }
-    if files_ro_dir.exists() { std::fs::remove_dir_all(&files_ro_dir)?; }
+    if files_rw_dir.exists() {
+        std::fs::remove_dir_all(&files_rw_dir)?;
+    }
+    if files_ro_dir.exists() {
+        std::fs::remove_dir_all(&files_ro_dir)?;
+    }
     let mut has_files_rw = false;
     let mut has_files_ro = false;
 
@@ -90,13 +100,20 @@ pub fn prepare(project: &Project) -> anyhow::Result<PreparedMounts> {
             };
             std::fs::create_dir_all(fdir)?;
 
-            let file_name = format!("f{i}_{}", source.file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| format!("file_{i}")));
+            let file_name = format!(
+                "f{i}_{}",
+                source
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| format!("file_{i}"))
+            );
             let link_path = fdir.join(&file_name);
 
             if let Err(e) = std::fs::hard_link(&source, &link_path) {
-                warn!("cannot hard-link {}: {e} (file will not be synced)", source.display());
+                warn!(
+                    "cannot hard-link {}: {e} (file will not be synced)",
+                    source.display()
+                );
                 if let Err(e2) = std::fs::copy(&source, &link_path) {
                     warn!("cannot copy {}: {e2}, skipping mount", source.display());
                     continue;
@@ -110,7 +127,11 @@ pub fn prepare(project: &Project) -> anyhow::Result<PreparedMounts> {
             });
         } else if source.is_dir() {
             let tag = format!("mount_{i}");
-            shares.push(Share { tag: tag.clone(), host_path: source, read_only: mount.read_only });
+            shares.push(Share {
+                tag: tag.clone(),
+                host_path: source,
+                read_only: mount.read_only,
+            });
             binds.push(ContainerBind {
                 source: format!("/mnt/{tag}"),
                 destination: mount.target.clone(),
@@ -122,10 +143,18 @@ pub fn prepare(project: &Project) -> anyhow::Result<PreparedMounts> {
     }
 
     if has_files_rw {
-        shares.push(Share { tag: "files_rw".into(), host_path: files_rw_dir, read_only: false });
+        shares.push(Share {
+            tag: "files_rw".into(),
+            host_path: files_rw_dir,
+            read_only: false,
+        });
     }
     if has_files_ro {
-        shares.push(Share { tag: "files_ro".into(), host_path: files_ro_dir, read_only: true });
+        shares.push(Share {
+            tag: "files_ro".into(),
+            host_path: files_ro_dir,
+            read_only: true,
+        });
     }
 
     Ok(PreparedMounts { shares, binds })

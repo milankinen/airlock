@@ -1,11 +1,13 @@
+use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
+
+use ezpez_protocol::supervisor_capnp::*;
+
 use crate::error::CliError;
 use crate::network::Network;
 use crate::project::Project;
 use crate::rpc::logging::LogSinkImpl;
 use crate::rpc::process::Process;
 use crate::rpc::stdin::Stdin;
-use ezpez_protocol::supervisor_capnp::*;
-use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
 
 pub struct Supervisor {
     supervisor: supervisor::Client,
@@ -18,8 +20,7 @@ impl Supervisor {
         let std_stream = unsafe { std::net::TcpStream::from_raw_fd(vsock_fd.into_raw_fd()) };
         std_stream.set_nonblocking(true)?;
         let stream = tokio::net::TcpStream::from_std(std_stream)?;
-        let (reader, writer) =
-            tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
+        let (reader, writer) = tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
 
         let network = capnp_rpc::twoparty::VatNetwork::new(
             reader,
@@ -29,8 +30,7 @@ impl Supervisor {
         );
 
         let mut rpc = capnp_rpc::RpcSystem::new(Box::new(network), None);
-        let client: supervisor::Client =
-            rpc.bootstrap(capnp_rpc::rpc_twoparty_capnp::Side::Server);
+        let client: supervisor::Client = rpc.bootstrap(capnp_rpc::rpc_twoparty_capnp::Side::Server);
 
         tokio::task::spawn_local(rpc);
 
@@ -44,8 +44,7 @@ impl Supervisor {
         network: Network,
         verbose: bool,
     ) -> Result<Process, CliError> {
-        let log_sink: log_sink::Client =
-            capnp_rpc::new_client(LogSinkImpl);
+        let log_sink: log_sink::Client = capnp_rpc::new_client(LogSinkImpl);
 
         let ca_cert = std::fs::read(&project.ca_cert)?;
         let ca_key = std::fs::read(&project.ca_key)?;

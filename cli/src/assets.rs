@@ -1,5 +1,6 @@
-use crate::oci::cache::cache_dir;
 use std::path::PathBuf;
+
+use crate::oci::cache::cache_dir;
 
 const KERNEL: &[u8] = include_bytes!("../../sandbox/out/Image");
 const INITRAMFS: &[u8] = include_bytes!("../../sandbox/out/initramfs.gz");

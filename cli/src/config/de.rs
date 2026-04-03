@@ -1,15 +1,16 @@
+use std::cell::Cell;
+use std::fmt::Debug;
+use std::marker::PhantomData;
+
 use serde::Serialize;
 use serde_json::Value;
 use smart_config::de::{DeserializeContext, DeserializeParam};
 use smart_config::metadata::{BasicTypes, ParamMetadata};
 use smart_config::{DescribeConfig, DeserializeConfig, ErrorWithOrigin};
-use std::cell::Cell;
-use std::fmt::Debug;
-use std::marker::PhantomData;
 
 thread_local! {
-        static NEST_DEPTH: Cell<usize> = const { Cell::new(0) };
-    }
+    static NEST_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
 
 fn indent() -> String {
     let depth = NEST_DEPTH.with(|d| d.get());
@@ -28,14 +29,22 @@ where
 {
     const EXPECTING: BasicTypes = BasicTypes::OBJECT;
 
-    fn deserialize_param(&self, ctx: DeserializeContext<'_>, param: &'static ParamMetadata) -> Result<T, ErrorWithOrigin> {
-        let Value::Object(value) = smart_config::de::Serde::<{ BasicTypes::OBJECT.raw() }>.deserialize_param(ctx, param)? else {
+    fn deserialize_param(
+        &self,
+        ctx: DeserializeContext<'_>,
+        param: &'static ParamMetadata,
+    ) -> Result<T, ErrorWithOrigin> {
+        let Value::Object(value) = smart_config::de::Serde::<{ BasicTypes::OBJECT.raw() }>
+            .deserialize_param(ctx, param)?
+        else {
             panic!("not a json object");
         };
         let schema = smart_config::ConfigSchema::new(&T::DESCRIPTION, "");
         let source = smart_config::Json::new("nested config", value);
         let repo = smart_config::ConfigRepository::new(&schema).with(source);
-        let parser = repo.single::<T>().map_err(|e| ErrorWithOrigin::custom(e.to_string()))?;
+        let parser = repo
+            .single::<T>()
+            .map_err(|e| ErrorWithOrigin::custom(e.to_string()))?;
 
         NEST_DEPTH.with(|d| d.set(d.get() + 1));
         let result = match parser.parse() {
