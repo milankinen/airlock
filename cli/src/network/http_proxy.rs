@@ -112,7 +112,7 @@ where
         let engine = engine.clone();
         let connect = connect.clone();
         let sender = sender.clone();
-        async move { handle_request(req, &engine, &connect, sender).await }
+        async move { handle_request(req, &engine, &connect, sender, server_protocol).await }
     });
 
     hyper_util::server::conn::auto::Builder::new(LocalExec)
@@ -185,6 +185,7 @@ async fn handle_request(
     engine: &ScriptEngine,
     connect: &TcpConnect,
     sender: Rc<dyn RequestSender>,
+    server_protocol: ServerProtocol,
 ) -> Result<Response<ResponseBody>, hyper::Error> {
     let method = req.method().clone();
     let path = req
@@ -223,10 +224,19 @@ async fn handle_request(
     debug!("http allowed: {method} {}", http_req.path);
 
     let (parts, body) = req.into_parts();
-    let scheme = if connect.tls { "https" } else { "http" };
-    let authority = &http_req.connect.host;
-    let path = &http_req.path;
-    let uri: hyper::Uri = match format!("{scheme}://{authority}{path}").parse() {
+    // h2 needs absolute URI for :authority/:scheme pseudo-headers.
+    // h1 uses relative path + Host header.
+    let uri_str = match server_protocol {
+        ServerProtocol::Http2 => {
+            let scheme = if connect.tls { "https" } else { "http" };
+            format!(
+                "{scheme}://{}:{}{}",
+                http_req.connect.host, http_req.connect.port, http_req.path
+            )
+        }
+        ServerProtocol::Http1 => http_req.path.clone(),
+    };
+    let uri: hyper::Uri = match uri_str.parse() {
         Ok(u) => u,
         Err(e) => {
             debug!("bad outgoing URI: {e}");
