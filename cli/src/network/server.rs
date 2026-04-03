@@ -4,6 +4,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use ezpez_protocol::supervisor_capnp::{network_proxy, tcp_sink};
 use super::Network;
+use super::scripting::{TcpConnect, ScriptError};
 
 fn is_localhost(host: &str) -> bool {
     host == "127.0.0.1" || host == "localhost" || host == "::1"
@@ -27,8 +28,27 @@ impl network_proxy::Server for Network {
             ));
         }
 
-        let addr = format!("{host}:{port}");
+        // Run network filter scripts
+        let connect = TcpConnect {
+            host: host.to_string(),
+            port,
+            tls
+        };
+        let connect = match self.script_engine.intercept_tcp_connect(connect)
+        {
+            Ok(conn) => conn,
+            Err(ScriptError::Denied) => {
+                results.get().init_result().set_denied("denied by network rules");
+                return Ok(());
+            },
+            Err(e) => {
+                results.get().init_result().set_denied(&e.to_string());
+                return Ok(());
+            },
+        };
 
+        let (host, port) = (connect.host.as_str(), connect.port);
+        let addr = format!("{host}:{port}");
         let stream = TcpStream::connect(&addr).await.map_err(|e| {
             capnp::Error::failed(format!("connect to {addr} failed: {e}"))
         })?;
@@ -41,11 +61,11 @@ impl network_proxy::Server for Network {
 
             let (read, write) = tokio::io::split(tls_stream);
             let server_sink = spawn_relay(read, write, client_sink);
-            results.get().set_server(server_sink);
+            results.get().init_result().set_server(server_sink);
         } else {
             let (read, write) = stream.into_split();
             let server_sink = spawn_relay(read, write, client_sink);
-            results.get().set_server(server_sink);
+            results.get().init_result().set_server(server_sink);
         }
 
         Ok(())

@@ -30,7 +30,7 @@ pub struct Config {
 
 pub mod config {
     use std::cmp::{max, min};
-    use smart_config::{DescribeConfig, DeserializeConfig};
+    use smart_config::{DescribeConfig, DeserializeConfig, Serde};
     use smart_config::de::WellKnown;
     use crate::config::de;
 
@@ -55,6 +55,47 @@ pub mod config {
         /// Host ports exposed to the VM
         #[config(default)]
         pub host_ports: Vec<u16>,
+        /// Default network policy: "allow" or "deny"
+        #[config(with = Serde![str])]
+        #[config(default_t = NetworkMode::Deny)]
+        pub default_mode: NetworkMode,
+        /// Network filtering rules (Lua scripts)
+        #[config(default)]
+        pub rules: Vec<NetworkRule>,
+    }
+
+    #[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum NetworkMode {
+        Allow,
+        Deny
+    }
+
+    /// Network filtering rule with inline Lua script
+    #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
+    pub struct NetworkRule {
+        /// Rule name (for error messages)
+        pub name: String,
+        /// Rule type: "tcp_connect" or "http_request"
+        #[config(with = Serde![str])]
+        pub r#type: NetworkRuleType,
+        /// Required env vars: name → description
+        #[config(default)]
+        pub env: std::collections::HashMap<String, String>,
+        /// Inline Lua script
+        pub script: String,
+    }
+
+    #[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum NetworkRuleType {
+        TcpConnect,
+        HttpRequest
+    }
+
+    impl WellKnown for NetworkRule {
+        type Deserializer = de::Nested<NetworkRule>;
+        const DE: Self::Deserializer = de::nested();
     }
 
     /// Mount point configuration — uses serde (not smart-config derive)

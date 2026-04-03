@@ -57,7 +57,14 @@ struct DataFrame {
 
 interface NetworkProxy {
   connect @0 (host :Text, port :UInt16, tls :Bool, client :TcpSink)
-    -> (server :TcpSink);
+    -> (result :ConnectResult);
+}
+
+struct ConnectResult {
+  union {
+    server @0 :TcpSink;
+    denied @1 :Text;
+  }
 }
 
 interface TcpSink {

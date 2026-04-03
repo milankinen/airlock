@@ -1,6 +1,6 @@
 use super::dns::DnsState;
 use super::tls::{self, TlsInterceptor};
-use ezpez_protocol::supervisor_capnp::{network_proxy, tcp_sink};
+use ezpez_protocol::supervisor_capnp::{connect_result, network_proxy, tcp_sink};
 use std::cell::RefCell;
 use std::net::Ipv4Addr;
 use std::rc::Rc;
@@ -57,7 +57,7 @@ pub fn start_proxy(
 }
 
 async fn handle_connection(
-    stream: tokio::net::TcpStream,
+    mut stream: tokio::net::TcpStream,
     network: &network_proxy::Client,
     interceptor: &TlsInterceptor,
     dns: &DnsState,
@@ -92,7 +92,20 @@ async fn handle_connection(
     req.get().set_client(server_sink);
 
     let response = req.send().promise.await?;
-    let client_sink = response.get()?.get_server()?;
+    let result = response.get()?.get_result()?;
+    let client_sink = match result.which() {
+        Ok(connect_result::Server(Ok(sink))) => sink,
+        Ok(connect_result::Denied(Ok(reason))) => {
+            let reason = reason.to_str().unwrap_or("unknown");
+            debug!("connection denied: {reason}");
+            stream.shutdown().await?;
+            anyhow::bail!("denied: {reason}");
+        }
+        _ => {
+            stream.shutdown().await?;
+            anyhow::bail!("invalid connect result")
+        },
+    };
 
     if is_tls {
         // TLS interception with timeout on handshake
