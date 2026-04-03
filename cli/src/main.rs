@@ -24,10 +24,13 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
+    let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
     let config = config::Config {
         cpus: cli.cpus,
         memory_mb: cli.memory,
         verbose: cli.verbose,
+        args: cli.args,
+        terminal: is_tty,
         ..config::Config::default()
     };
 
@@ -50,6 +53,7 @@ async fn main() {
 }
 
 async fn run(config: config::Config) -> Result<i32, CliError> {
+    let host_ports = config.network.host_ports.clone();
     let project = project::ensure(config)?;
     let bundle = oci::prepare(&project).await?;
 
@@ -59,15 +63,21 @@ async fn run(config: config::Config) -> Result<i32, CliError> {
     let supervisor = rpc::Supervisor::connect(vsock_fd)?;
     eprintln!("supervisor connected");
 
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let terminal = project.config.terminal;
+    let pty_size = if terminal {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        Some((rows, cols))
+    } else {
+        None
+    };
 
-    let _guard = terminal::TerminalGuard::enter();
-    let resizes = terminal::resizes()?;
+    let _guard = if terminal { Some(terminal::TerminalGuard::enter()) } else { None };
+    let resizes = if terminal { Some(terminal::resizes()?) } else { None };
     let stdin_cap =
         capnp_rpc::new_client(rpc::stdin::StdinImpl::new(resizes));
 
     let proc = supervisor
-        .start(stdin_cap, rows, cols, &project.ca_cert, &project.ca_key)
+        .start(stdin_cap, pty_size, &project.ca_cert, &project.ca_key, host_ports)
         .await?;
 
     // Forward host signals to the VM process

@@ -6,11 +6,11 @@ use tokio::signal::unix::Signal;
 
 pub struct StdinImpl {
     reader: RefCell<tokio::io::Stdin>,
-    resizes: RefCell<Signal>,
+    resizes: RefCell<Option<Signal>>,
 }
 
 impl StdinImpl {
-    pub fn new(resizes: Signal) -> Self {
+    pub fn new(resizes: Option<Signal>) -> Self {
         Self {
             reader: RefCell::new(tokio::io::stdin()),
             resizes: RefCell::new(resizes),
@@ -28,6 +28,13 @@ impl stdin::Server for StdinImpl {
         let mut resizes = self.resizes.borrow_mut();
         let mut buf = [0u8; 4096];
 
+        let resize_fut = async {
+            match resizes.as_mut() {
+                Some(s) => { s.recv().await; },
+                None => std::future::pending().await,
+            }
+        };
+
         tokio::select! {
             result = reader.read(&mut buf) => {
                 match result {
@@ -36,7 +43,7 @@ impl stdin::Server for StdinImpl {
                     Err(_) => results.get().init_input().init_stdin().set_eof(()),
                 }
             }
-            _ = resizes.recv() => {
+            _ = resize_fut => {
                 let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
                 let mut size = results.get().init_input().init_resize();
                 size.set_rows(rows);

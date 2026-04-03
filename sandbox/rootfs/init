@@ -35,10 +35,21 @@ echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null
 # Add a routable address to lo so outbound packets get a proper source IP
 ip addr add 10.0.0.1/8 dev lo 2>/dev/null
 ip route add default via 10.0.0.1 dev lo 2>/dev/null
+
+# Host port forwarding: redirect specific localhost ports to proxy so they
+# reach the host. All other localhost traffic passes through directly so
+# local services in the VM work normally.
+host_ports=$(cat /proc/cmdline | tr ' ' '\n' | grep '^ezpez.host_ports=' | cut -d= -f2)
+IFS=','
+for port in $host_ports; do
+    iptables -t nat -A OUTPUT -p tcp -d 127.0.0.1 --dport "$port" -j REDIRECT --to-port 15001 2>/dev/null
+done
+unset IFS
+# Skip remaining localhost traffic (local services)
+iptables -t nat -A OUTPUT -p tcp -d 127.0.0.1 -j RETURN 2>/dev/null
 # Skip proxy's own port to avoid redirect loop
 iptables -t nat -A OUTPUT -p tcp --dport 15001 -j RETURN 2>/dev/null
-# Redirect ALL outbound TCP to proxy (including localhost — enables
-# future host port forwarding through the proxy)
+# Redirect all other outbound TCP to proxy
 iptables -t nat -A OUTPUT -p tcp -j REDIRECT --to-port 15001 2>/dev/null
 
 /usr/bin/supervisor

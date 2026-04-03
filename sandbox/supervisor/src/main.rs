@@ -25,7 +25,8 @@ async fn run() -> anyhow::Result<()> {
     net::start_proxy(conn.network, conn.ca);
 
     info!("start main process");
-    let proc = process::spawn("crun", &["run", "--no-pivot", "--bundle", "/mnt/bundle", "ezpez0"])?;
+    let use_pty = conn.proc.pty_size.is_some();
+    let proc = process::spawn("crun", &["run", "--no-pivot", "--bundle", "/mnt/bundle", "ezpez0"], use_pty)?;
     let exit_code = proc.attach(conn.proc).await;
     info!("main process done, exit_code = {exit_code}");
 

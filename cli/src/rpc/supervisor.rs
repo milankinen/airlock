@@ -39,13 +39,13 @@ impl Supervisor {
     pub async fn start(
         &self,
         stdin: stdin::Client,
-        rows: u16,
-        cols: u16,
+        pty_size: Option<(u16, u16)>,
         ca_cert_path: &Path,
         ca_key_path: &Path,
+        host_ports: Vec<u16>,
     ) -> Result<Process, CliError> {
         let network_proxy: network_proxy::Client =
-            capnp_rpc::new_client(NetworkProxyImpl);
+            capnp_rpc::new_client(NetworkProxyImpl::new(host_ports));
         let log_sink: log_sink::Client =
             capnp_rpc::new_client(LogSinkImpl);
 
@@ -54,9 +54,13 @@ impl Supervisor {
 
         let mut req = self.supervisor.start_request();
         req.get().set_stdin(stdin);
-        let mut size = req.get().init_pty().init_size();
-        size.set_rows(rows);
-        size.set_cols(cols);
+        if let Some((rows, cols)) = pty_size {
+            let mut size = req.get().init_pty().init_size();
+            size.set_rows(rows);
+            size.set_cols(cols);
+        } else {
+            req.get().init_pty().set_none(());
+        }
         req.get().set_network(network_proxy);
         req.get().set_ca_cert(&ca_cert);
         req.get().set_ca_key(&ca_key);

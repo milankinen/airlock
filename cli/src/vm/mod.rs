@@ -20,7 +20,7 @@ pub async fn start(
     let mut prepared = mounts::prepare(&project.config, project)?;
 
     // Write container config.json with bind mounts
-    bundle.write_config(prepared.binds())?;
+    bundle.write_config(prepared.binds(), &project.config.args, project.config.terminal)?;
 
     // Add bundle as a VirtioFS share
     prepared.add_share("bundle".into(), bundle.path.clone(), false);
@@ -50,6 +50,10 @@ pub async fn start(
                 "console=hvc0 rdinit=/init ezpez.shares={}",
                 tags.join(",")
             );
+            if !project.config.network.host_ports.is_empty() {
+                let ports: Vec<String> = project.config.network.host_ports.iter().map(|p| p.to_string()).collect();
+                cmd.push_str(&format!(" ezpez.host_ports={}", ports.join(",")));
+            }
             if !project.config.verbose {
                 cmd.push_str(" quiet loglevel=3");
             }

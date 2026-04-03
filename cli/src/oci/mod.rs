@@ -15,11 +15,13 @@ pub struct Bundle {
 }
 
 impl Bundle {
-    pub fn write_config(&self, binds: &[ContainerBind]) -> anyhow::Result<()> {
+    pub fn write_config(&self, binds: &[ContainerBind], user_args: &[String], terminal: bool) -> anyhow::Result<()> {
         config::generate_config(
             &self.image_config,
             &self.project_cwd,
             binds,
+            user_args,
+            terminal,
             &self.path.join("config.json"),
         )
     }

@@ -7,20 +7,28 @@ pub fn generate_config(
     image_config: &ConfigFile,
     project_cwd: &Path,
     binds: &[ContainerBind],
+    user_args: &[String],
+    terminal: bool,
     dest: &Path,
 ) -> anyhow::Result<()> {
     let cfg = image_config.config.as_ref();
 
-    let mut args: Vec<String> = Vec::new();
-    if let Some(ep) = cfg.and_then(|c| c.entrypoint.as_ref()) {
-        args.extend(ep.iter().cloned());
-    }
-    if let Some(cmd) = cfg.and_then(|c| c.cmd.as_ref()) {
-        args.extend(cmd.iter().cloned());
-    }
-    if args.is_empty() {
-        args.push("/bin/sh".to_string());
-    }
+    let args: Vec<String> = if !user_args.is_empty() {
+        // User args override the entire command
+        user_args.to_vec()
+    } else {
+        let mut a = Vec::new();
+        if let Some(ep) = cfg.and_then(|c| c.entrypoint.as_ref()) {
+            a.extend(ep.iter().cloned());
+        }
+        if let Some(cmd) = cfg.and_then(|c| c.cmd.as_ref()) {
+            a.extend(cmd.iter().cloned());
+        }
+        if a.is_empty() {
+            a.push("/bin/sh".to_string());
+        }
+        a
+    };
 
     let mut env: Vec<String> = vec![
         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
@@ -70,7 +78,7 @@ pub fn generate_config(
     let config = serde_json::json!({
         "ociVersion": "1.0.0",
         "process": {
-            "terminal": true,
+            "terminal": terminal,
             "user": { "uid": uid, "gid": gid },
             "args": args,
             "env": env,

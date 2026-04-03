@@ -4,7 +4,19 @@ use std::rc::Rc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-pub struct NetworkProxyImpl;
+pub struct NetworkProxyImpl {
+    host_ports: Vec<u16>,
+}
+
+impl NetworkProxyImpl {
+    pub fn new(host_ports: Vec<u16>) -> Self {
+        Self { host_ports }
+    }
+}
+
+fn is_localhost(host: &str) -> bool {
+    host == "127.0.0.1" || host == "localhost" || host == "::1"
+}
 
 impl network_proxy::Server for NetworkProxyImpl {
     async fn connect(
@@ -17,6 +29,12 @@ impl network_proxy::Server for NetworkProxyImpl {
         let port = params.get_port();
         let tls = params.get_tls();
         let client_sink = params.get_client()?;
+
+        if is_localhost(host) && !self.host_ports.contains(&port) {
+            return Err(capnp::Error::failed(
+                format!("host port {port} is not exposed"),
+            ));
+        }
 
         let addr = format!("{host}:{port}");
 

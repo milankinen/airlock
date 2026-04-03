@@ -17,6 +17,31 @@ mise run <task>    # Run task
 mise tasks --all   # List available tasks
 ```
 
+## Testing the VM
+
+Non-interactive commands can be tested directly from the CLI:
+
+```bash
+# Pipe mode (stdin is not a TTY → no PTY, pipe I/O)
+echo "hello" | target/debug/ez -- cat
+echo "data" | target/debug/ez -- grep pattern
+
+# Command mode (stdin is TTY → PTY allocated)
+target/debug/ez -- ls /usr
+target/debug/ez -- sh -c 'echo hi; exit 42'
+
+# Interactive shell (no args)
+target/debug/ez
+```
+
+Exit codes propagate. `mise run ez` always builds latest
+(including supervisor cross-compile) before running:
+
+```bash
+mise run ez               # interactive shell
+mise run ez -- ls /usr    # command with args
+```
+
 ## Temporary files
 
 IMPORTANT: Write temporary files **ALWAYS** to this project's `.tmp`
