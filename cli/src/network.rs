@@ -13,9 +13,10 @@ pub fn setup(project: &Project) -> anyhow::Result<Network> {
         let _ = root_store.add(cert);
     }
 
-    let tls_config = rustls::ClientConfig::builder()
+    let mut tls_config = rustls::ClientConfig::builder()
         .with_root_certificates(root_store)
         .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     let script_engine = Rc::new(ScriptEngine::init(
         &project.config.network,

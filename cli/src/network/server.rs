@@ -62,12 +62,20 @@ impl network_proxy::Server for Network {
                 .map_err(|e| capnp::Error::failed(format!("invalid hostname: {e}")))?;
             let tls_stream = self.tls.connect(server_name, stream).await
                 .map_err(|e| capnp::Error::failed(format!("TLS to {host} failed: {e}")))?;
-            trace!("TLS established to {addr}");
+            let alpn = tls_stream.get_ref().1.alpn_protocol();
+            let server_proto = if alpn == Some(b"h2") {
+                trace!("TLS established to {addr} (h2)");
+                http_proxy::ServerProtocol::Http2
+            } else {
+                trace!("TLS established to {addr} (h1)");
+                http_proxy::ServerProtocol::Http1
+            };
             let (read, write) = tokio::io::split(tls_stream);
-            spawn_relay(read, write, client_sink, http_engine, connect)
+            spawn_relay(read, write, client_sink, http_engine, connect, server_proto)
         } else {
             let (read, write) = stream.into_split();
-            spawn_relay(read, write, client_sink, http_engine, connect)
+            // Non-TLS always uses h1 (h2c / plaintext h2 is not supported)
+            spawn_relay(read, write, client_sink, http_engine, connect, http_proxy::ServerProtocol::Http1)
         };
 
         results.get().init_result().set_server(sink);
@@ -87,6 +95,7 @@ fn spawn_relay<R, W>(
     client_sink: tcp_sink::Client,
     http_engine: Option<Rc<super::scripting::ScriptEngine>>,
     connect: TcpConnect,
+    server_protocol: http_proxy::ServerProtocol,
 ) -> tcp_sink::Client
 where
     R: tokio::io::AsyncRead + Unpin + 'static,
@@ -103,8 +112,8 @@ where
                 match http_proxy::detect(&mut rx).await {
                     Ok(prefix) => {
                         http_proxy::serve(
-                            prefix, &mut rx, client_sink, server_read, server_write,
-                            &engine, &connect,
+                            prefix, rx, client_sink, server_read, server_write,
+                            server_protocol, &engine, &connect,
                         ).await.map_err(|e| format!("http proxy: {e}"))?;
                         debug!("http relay closed");
                         return Ok(());
@@ -188,14 +197,20 @@ impl tcp_sink::Server for ChannelSink {
             return Err(capnp::Error::failed(err.clone()));
         }
         let data = params.get()?.get_data()?;
-        if let Some(tx) = self.tx.borrow().as_ref() {
-            tx.send(data.to_vec())
-                .await
-                .map_err(|_| {
-                    let err = self.error.borrow();
-                    let msg = err.as_deref().unwrap_or("relay closed");
-                    capnp::Error::failed(msg.to_string())
-                })?;
+        let tx = self.tx.borrow().clone();
+        match tx.as_ref() {
+            Some(tx) => {
+                tx.send(data.to_vec())
+                    .await
+                    .map_err(|_| {
+                        let err = self.error.borrow();
+                        let msg = err.as_deref().unwrap_or("relay closed");
+                        capnp::Error::failed(msg.to_string())
+                    })?;
+            }
+            None => {
+                return Err(capnp::Error::failed("channel closed".to_string()));
+            }
         }
         Ok(())
     }

@@ -49,11 +49,11 @@ impl TlsInterceptor {
         let key_der = rustls::pki_types::PrivateKeyDer::try_from(leaf_key.serialize_der())
             .map_err(|e| anyhow::anyhow!("key conversion: {e}"))?;
 
-        let config = Arc::new(
-            ServerConfig::builder()
-                .with_no_client_auth()
-                .with_single_cert(vec![cert_der], key_der)?,
-        );
+        let mut config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)?;
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let config = Arc::new(config);
 
         self.cache.insert(hostname.to_string(), config.clone());
         Ok(config)
