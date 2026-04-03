@@ -1,8 +1,10 @@
+mod http_proxy;
 mod server;
 pub mod scripting;
 
 use crate::project::Project;
 use scripting::ScriptEngine;
+use std::rc::Rc;
 use std::sync::Arc;
 
 pub fn setup(project: &Project) -> anyhow::Result<Network> {
@@ -15,9 +17,9 @@ pub fn setup(project: &Project) -> anyhow::Result<Network> {
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
-    let script_engine = ScriptEngine::init(
+    let script_engine = Rc::new(ScriptEngine::init(
         &project.config.network,
-    )?;
+    )?);
 
     Ok(Network {
         tls: tokio_rustls::TlsConnector::from(Arc::new(tls_config)),
@@ -29,5 +31,5 @@ pub fn setup(project: &Project) -> anyhow::Result<Network> {
 pub struct Network {
     tls: tokio_rustls::TlsConnector,
     host_ports: Vec<u16>,
-    script_engine: ScriptEngine,
+    pub(crate) script_engine: std::rc::Rc<ScriptEngine>,
 }

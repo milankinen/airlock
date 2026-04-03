@@ -7,7 +7,8 @@ interface Supervisor {
     network :NetworkProxy,
     caCert :Data,
     caKey :Data,
-    logs :LogSink
+    logs :LogSink,
+    verbose :Bool
   ) -> (proc :Process);
 }
 

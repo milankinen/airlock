@@ -3,7 +3,9 @@ use std::rc::Rc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use ezpez_protocol::supervisor_capnp::{network_proxy, tcp_sink};
+use tracing::{debug, error, trace};
 use super::Network;
+use super::http_proxy;
 use super::scripting::{TcpConnect, ScriptError};
 
 fn is_localhost(host: &str) -> bool {
@@ -23,25 +25,23 @@ impl network_proxy::Server for Network {
         let client_sink = params.get_client()?;
 
         if is_localhost(host) && !self.host_ports.contains(&port) {
+            debug!("blocked localhost:{port} (not in host_ports)");
             return Err(capnp::Error::failed(
                 format!("host port {port} is not exposed"),
             ));
         }
 
-        // Run network filter scripts
-        let connect = TcpConnect {
-            host: host.to_string(),
-            port,
-            tls
-        };
-        let connect = match self.script_engine.intercept_tcp_connect(connect)
-        {
+        // Run tcp_connect filter scripts
+        let connect = TcpConnect { host: host.to_string(), port, tls };
+        let connect = match self.script_engine.intercept_tcp_connect(connect) {
             Ok(conn) => conn,
             Err(ScriptError::Denied) => {
+                debug!("tcp_connect denied: {host}:{port}");
                 results.get().init_result().set_denied("denied by network rules");
                 return Ok(());
             },
             Err(e) => {
+                debug!("tcp_connect error: {e}");
                 results.get().init_result().set_denied(&e.to_string());
                 return Ok(());
             },
@@ -49,80 +49,153 @@ impl network_proxy::Server for Network {
 
         let (host, port) = (connect.host.as_str(), connect.port);
         let addr = format!("{host}:{port}");
+        trace!("connecting to {addr} tls={tls}");
         let stream = TcpStream::connect(&addr).await.map_err(|e| {
             capnp::Error::failed(format!("connect to {addr} failed: {e}"))
         })?;
 
-        if tls {
+        let has_http_rules = self.script_engine.has_http_rules();
+        let http_engine = if has_http_rules { Some(self.script_engine.clone()) } else { None };
+        
+        let sink = if tls {
             let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
                 .map_err(|e| capnp::Error::failed(format!("invalid hostname: {e}")))?;
             let tls_stream = self.tls.connect(server_name, stream).await
                 .map_err(|e| capnp::Error::failed(format!("TLS to {host} failed: {e}")))?;
-
+            trace!("TLS established to {addr}");
             let (read, write) = tokio::io::split(tls_stream);
-            let server_sink = spawn_relay(read, write, client_sink);
-            results.get().init_result().set_server(server_sink);
+            spawn_relay(read, write, client_sink, http_engine, connect)
         } else {
             let (read, write) = stream.into_split();
-            let server_sink = spawn_relay(read, write, client_sink);
-            results.get().init_result().set_server(server_sink);
-        }
+            spawn_relay(read, write, client_sink, http_engine, connect)
+        };
 
+        results.get().init_result().set_server(sink);
+
+        debug!("relay started: {addr} tls={tls} http_intercept={has_http_rules}");
         Ok(())
     }
 }
 
+/// Spawn a relay between the container (via RPC channel) and the real server.
+///
+/// If `http_engine` is Some, tries to detect HTTP and intercept via hyper.
+/// Falls back to raw byte relay if not HTTP or no http rules.
 fn spawn_relay<R, W>(
-    mut read: R,
-    mut write: W,
+    mut server_read: R,
+    mut server_write: W,
     client_sink: tcp_sink::Client,
+    http_engine: Option<Rc<super::scripting::ScriptEngine>>,
+    connect: TcpConnect,
 ) -> tcp_sink::Client
 where
     R: tokio::io::AsyncRead + Unpin + 'static,
     W: tokio::io::AsyncWrite + Unpin + 'static,
 {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    let error: RelayError = Rc::new(RefCell::new(None));
+    let task_error = error.clone();
 
     tokio::task::spawn_local(async move {
-        let mut buf = [0u8; 8192];
-        loop {
-            match read.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let mut req = client_sink.send_request();
-                    req.get().set_data(&buf[..n]);
-                    if req.send().await.is_err() {
-                        break;
+        let result: Result<(), String> = async {
+            // Try HTTP interception if configured
+            if let Some(engine) = http_engine {
+                match http_proxy::detect(&mut rx).await {
+                    Ok(prefix) => {
+                        http_proxy::serve(
+                            prefix, &mut rx, client_sink, server_read, server_write,
+                            &engine, &connect,
+                        ).await.map_err(|e| format!("http proxy: {e}"))?;
+                        debug!("http relay closed");
+                        return Ok(());
+                    }
+                    Err(buffered) => {
+                        debug!("not HTTP ({} bytes buffered), falling back to raw relay", buffered.len());
+                        if !buffered.is_empty() {
+                            server_write.write_all(&buffered).await
+                                .map_err(|e| format!("write failed: {e}"))?;
+                        }
                     }
                 }
             }
-        }
-        let _ = client_sink.close_request().send().promise.await;
-    });
 
-    tokio::task::spawn_local(async move {
-        while let Some(data) = rx.recv().await {
-            if write.write_all(&data).await.is_err() {
-                break;
+            // Raw bidirectional relay
+            let client_sink_clone = client_sink.clone();
+            tokio::task::spawn_local(async move {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match server_read.read(&mut buf).await {
+                        Ok(0) => {
+                            debug!("server→container: server closed");
+                            break;
+                        }
+                        Err(e) => {
+                            debug!("server→container: read error: {e}");
+                            break;
+                        }
+                        Ok(n) => {
+                            let mut req = client_sink_clone.send_request();
+                            req.get().set_data(&buf[..n]);
+                            if req.send().await.is_err() {
+                                error!("server→container: rpc send failed");
+                                break;
+                            }
+                        }
+                    }
+                }
+                let _ = client_sink_clone.close_request().send().promise.await;
+            });
+
+            while let Some(data) = rx.recv().await {
+                if server_write.write_all(&data).await.is_err() {
+                    return Err("upstream write failed".into());
+                }
             }
+            debug!("container→server: channel closed");
+            Ok(())
+        }.await;
+
+        if let Err(e) = result {
+            debug!("relay error: {e}");
+            *task_error.borrow_mut() = Some(e);
         }
     });
 
-    capnp_rpc::new_client(ChannelSink(RefCell::new(Some(tx))))
+    capnp_rpc::new_client(ChannelSink::new(tx, error))
 }
 
-struct ChannelSink(RefCell<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>);
+/// Shared error state between relay task and ChannelSink.
+type RelayError = Rc<RefCell<Option<String>>>;
+
+pub struct ChannelSink {
+    tx: RefCell<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>,
+    error: RelayError,
+}
+
+impl ChannelSink {
+    fn new(tx: tokio::sync::mpsc::Sender<Vec<u8>>, error: RelayError) -> Self {
+        Self { tx: RefCell::new(Some(tx)), error }
+    }
+}
 
 impl tcp_sink::Server for ChannelSink {
     async fn send(
         self: Rc<Self>,
         params: tcp_sink::SendParams,
     ) -> Result<(), capnp::Error> {
+        // Check if relay task has failed
+        if let Some(err) = self.error.borrow().as_ref() {
+            return Err(capnp::Error::failed(err.clone()));
+        }
         let data = params.get()?.get_data()?;
-        if let Some(tx) = self.0.borrow().as_ref() {
+        if let Some(tx) = self.tx.borrow().as_ref() {
             tx.send(data.to_vec())
                 .await
-                .map_err(|_| capnp::Error::failed("channel closed".into()))?;
+                .map_err(|_| {
+                    let err = self.error.borrow();
+                    let msg = err.as_deref().unwrap_or("relay closed");
+                    capnp::Error::failed(msg.to_string())
+                })?;
         }
         Ok(())
     }
@@ -132,7 +205,7 @@ impl tcp_sink::Server for ChannelSink {
         _params: tcp_sink::CloseParams,
         _results: tcp_sink::CloseResults,
     ) -> Result<(), capnp::Error> {
-        self.0.borrow_mut().take();
+        self.tx.borrow_mut().take();
         Ok(())
     }
 }

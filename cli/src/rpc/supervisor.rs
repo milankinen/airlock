@@ -42,6 +42,7 @@ impl Supervisor {
         project: &Project,
         stdin: Stdin,
         network: Network,
+        verbose: bool,
     ) -> Result<Process, CliError> {
         let log_sink: log_sink::Client =
             capnp_rpc::new_client(LogSinkImpl);
@@ -63,6 +64,7 @@ impl Supervisor {
         req.get().set_ca_cert(&ca_cert);
         req.get().set_ca_key(&ca_key);
         req.get().set_logs(log_sink);
+        req.get().set_verbose(verbose);
 
         let response = req.send().promise.await?;
         let proc = response.get()?.get_proc()?;

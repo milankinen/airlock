@@ -5,11 +5,11 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer;
 
-pub fn init(log_sink: log_sink::Client) {
+pub fn init(log_sink: log_sink::Client, verbose: bool) {
     let (tx, rx) = mpsc::unbounded_channel::<(u8, String)>();
 
     tracing_subscriber::registry()
-        .with(RpcLayer(tx))
+        .with(RpcLayer { tx, verbose })
         .init();
 
     tokio::task::spawn_local(forward(log_sink, rx));
@@ -24,9 +24,24 @@ async fn forward(log_sink: log_sink::Client, mut rx: mpsc::UnboundedReceiver<(u8
     }
 }
 
-struct RpcLayer(mpsc::UnboundedSender<(u8, String)>);
+/// Crate target prefix — matches module paths like `ezpez_supervisor::net::proxy`.
+const OWN_TARGET: &str = "ezpez_supervisor";
+
+struct RpcLayer {
+    tx: mpsc::UnboundedSender<(u8, String)>,
+    verbose: bool,
+}
 
 impl<S: tracing::Subscriber> Layer<S> for RpcLayer {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) -> bool {
+        let level = *metadata.level();
+        if self.verbose && metadata.target().starts_with(OWN_TARGET) {
+            level <= tracing::Level::DEBUG
+        } else {
+            level <= tracing::Level::WARN
+        }
+    }
+
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
         let level = match *event.metadata().level() {
             tracing::Level::ERROR => 3,
@@ -38,7 +53,7 @@ impl<S: tracing::Subscriber> Layer<S> for RpcLayer {
 
         let mut visitor = MsgVisitor(String::new());
         event.record(&mut visitor);
-        let _ = self.0.send((level, visitor.0));
+        let _ = self.tx.send((level, visitor.0));
     }
 }
 

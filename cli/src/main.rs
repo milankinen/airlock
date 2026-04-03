@@ -20,9 +20,15 @@ async fn main() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cli = cli::Cli::parse();
 
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("ez.log")
+        .expect("failed to open ez.log");
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(if cli.verbose { "debug" } else { "warn" }))
-        .with_writer(std::io::stderr)
+        .with_env_filter(EnvFilter::new(if cli.verbose { "warn,ez=debug" } else { "warn" }))
+        .with_writer(std::sync::Mutex::new(log_file))
+        .with_ansi(false)
         .init();
 
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -65,7 +71,7 @@ async fn run(cli: cli::Cli, config: config::Config) -> Result<i32, CliError> {
 
     let stdin = terminal.stdin()?;
     let proc = supervisor
-        .start(&project, stdin, network)
+        .start(&project, stdin, network, cli.verbose)
         .await?;
 
     // Forward host signals to the VM process
@@ -76,7 +82,7 @@ async fn run(cli: cli::Cli, config: config::Config) -> Result<i32, CliError> {
         while let Some(signum) = signals.next().await {
             tracing::debug!("forwarding signal {signum} to VM");
             if let Err(e) = signal_proc.signal(signum).await {
-                tracing::debug!("signal forward failed: {e}");
+                tracing::error!("signal forward failed: {e}");
             }
         }
     });
