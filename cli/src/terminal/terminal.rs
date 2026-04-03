@@ -1,18 +1,13 @@
-use crate::project::Project;
 use crate::rpc;
 
-pub fn setup(project: &Project) -> anyhow::Result<Terminal> {
-    if !project.config.terminal {
+pub fn setup() -> anyhow::Result<Terminal> {
+    let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    if !is_tty {
         return Ok(Terminal { guard: None })
     }
-    let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    let raw_mode_enabled = if is_tty {
-        crossterm::terminal::enable_raw_mode().is_ok()
-    } else {
-        false
-    };
+    let raw_mode_enabled = crossterm::terminal::enable_raw_mode().is_ok();
     Ok(Terminal {
-        guard: Some( TerminalGuard { raw_mode_enabled })
+        guard: Some(TerminalGuard { raw_mode_enabled })
     })
 
 }
@@ -22,16 +17,19 @@ pub struct Terminal {
 }
 
 impl Terminal {
+    pub fn is_tty(&self) -> bool {
+        self.guard.is_some()
+    }
+
     pub fn stdin(&self) -> anyhow::Result<rpc::Stdin> {
-        let (pty_size, resizes) = match &self.guard {
-            Some(_) => {
-                let pty_size = crossterm::terminal::size().unwrap_or((80, 24));
-                let resizes = tokio::signal::unix::signal(
-                    tokio::signal::unix::SignalKind::window_change()
-                )?;
-                (Some(pty_size), Some(resizes))
-            },
-            None => (None, None)
+        let (pty_size, resizes) = if self.is_tty() {
+            let pty_size = crossterm::terminal::size().unwrap_or((80, 24));
+            let resizes = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::window_change()
+            )?;
+            (Some(pty_size), Some(resizes))
+        } else {
+            (None, None)
         };
         Ok(rpc::Stdin::new(tokio::io::stdin(), pty_size, resizes))
     }

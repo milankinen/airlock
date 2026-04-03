@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use capnp::capability::Rc;
+use std::rc::Rc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use ezpez_protocol::supervisor_capnp::{network_proxy, tcp_sink};

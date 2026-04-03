@@ -1,8 +1,8 @@
 use crate::oci::cache::cache_dir;
 use std::path::PathBuf;
 
-const KERNEL: &[u8] = include_bytes!("../../../sandbox/out/Image");
-const INITRAMFS: &[u8] = include_bytes!("../../../sandbox/out/initramfs.gz");
+const KERNEL: &[u8] = include_bytes!("../../sandbox/out/Image");
+const INITRAMFS: &[u8] = include_bytes!("../../sandbox/out/initramfs.gz");
 const CHECKSUM: &str = env!("EZPEZ_ASSETS_CHECKSUM");
 
 pub struct Assets {

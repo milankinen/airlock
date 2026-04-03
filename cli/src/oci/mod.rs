@@ -7,6 +7,8 @@ mod registry;
 use crate::project::Project;
 use crate::vm::mounts::ContainerBind;
 use std::path::{Path, PathBuf};
+use crate::cli::Cli;
+use crate::terminal::Terminal;
 use crate::vm::Vm;
 
 pub struct Bundle {
@@ -14,13 +16,13 @@ pub struct Bundle {
 }
 
 /// Resolve, download, and prepare the OCI bundle for the project.
-pub async fn prepare(project: &Project, vm: &Vm) -> anyhow::Result<Bundle> {
+pub async fn prepare(cli: &Cli, project: &Project, terminal: &Terminal, vm: &Vm) -> anyhow::Result<Bundle> {
     let mut resolved = resolve(&project.config.image).await?;
     let image_dir = ensure_image(&mut resolved).await?;
     let bundle_path = ensure_rootfs(&image_dir, &resolved.digest, &project.hash)?;
 
     // Apply project overrides to the base bundle
-    write_config(&bundle_path, &project.cwd, &resolved.image_config, vm.binds(), &project.config.args, project.config.terminal)?;
+    write_config(&bundle_path, &project.cwd, &resolved.image_config, vm.binds(), &cli.args, terminal.is_tty())?;
     install_ca_cert(&image_dir, &bundle_path, &project.ca_cert)?;
 
     Ok(Bundle {

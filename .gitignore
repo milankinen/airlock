@@ -6,3 +6,4 @@
 *.iml
 *.log
 *.local.json
+*.local.toml

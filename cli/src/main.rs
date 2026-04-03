@@ -25,19 +25,17 @@ async fn main() {
         .with_writer(std::io::stderr)
         .init();
 
-    let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    let config = config::Config {
-        cpus: cli.cpus,
-        memory_mb: cli.memory,
-        verbose: cli.verbose,
-        args: cli.args,
-        terminal: is_tty,
-        ..config::Config::default()
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let config = match config::load(&cwd) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("config error: {e:#}");
+            std::process::exit(2);
+        }
     };
-
     let local = LocalSet::new();
     let exit_code = local.run_until(async {
-        match run(config).await {
+        match run(cli, config).await {
             Ok(code) => code,
             Err(CliError::Expected(msg)) => {
                 eprintln!("error: {msg}");
@@ -53,15 +51,15 @@ async fn main() {
     std::process::exit(exit_code);
 }
 
-async fn run(config: config::Config) -> Result<i32, CliError> {
+async fn run(cli: cli::Cli, config: config::Config) -> Result<i32, CliError> {
     let project = project::ensure(config)?;
     let vm = vm::prepare(&project)?;
-    let bundle = oci::prepare(&project, &vm).await?;
+    let terminal = terminal::setup()?;
+    let bundle = oci::prepare(&cli, &project, &terminal, &vm).await?;
     let network = network::setup(&project)?;
-    let terminal = terminal::setup(&project)?;
 
     eprintln!("Booting VM...");
-    let (vm_handle, vsock_fd) = vm.start(&project, bundle).await?;
+    let (vm_handle, vsock_fd) = vm.start(&project, bundle, cli.verbose).await?;
     let supervisor = rpc::Supervisor::connect(vsock_fd)?;
     eprintln!("supervisor connected");
 

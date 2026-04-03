@@ -32,7 +32,8 @@ impl Vm {
     pub async fn start(
         self,
         project: &Project,
-        bundle: Bundle
+        bundle: Bundle,
+        verbose: bool,
     ) -> Result<(Box<dyn VmHandle>, OwnedFd), CliError> {
         let Self { assets, mut mounts } = self;
 
@@ -72,7 +73,7 @@ impl Vm {
                     let ports: Vec<String> = project.config.network.host_ports.iter().map(|p| p.to_string()).collect();
                     cmd.push_str(&format!(" ezpez.host_ports={}", ports.join(",")));
                 }
-                if !project.config.verbose {
+                if !verbose {
                     cmd.push_str(" quiet loglevel=3");
                 }
                 cmd
