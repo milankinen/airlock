@@ -1,5 +1,18 @@
 # Development Log
 
+## 2026-04-05: Grant all capabilities, fix CA certs
+
+Three fixes to make containers work properly:
+
+1. **All Linux capabilities**: crun drops capabilities by default. Tools
+   like `apt-get` need `CAP_SETUID`/`CAP_SETGID` to drop privileges.
+   Since the VM is the security boundary, grant all capabilities in the
+   OCI spec — no reason to restrict inside the VM.
+
+2. **CA cert paths**: The MITM CA cert was only installed at the Debian
+   path (`/etc/ssl/certs/ca-certificates.crt`). Alpine's LibreSSL reads
+   `/etc/ssl/cert.pem`. Now writes to all common distro paths.
+
 ## 2026-04-05: Add cache volume via VirtIO block device
 
 VirtioFS mounts have significant overhead for metadata-heavy operations
@@ -92,6 +105,7 @@ between container and real server, no MITM, no HTTP parsing.
 ### Mount resolution refactoring
 
 Separated mount resolution from execution:
+
 - `oci::prepare` resolves everything: tilde expansion on source
   (host `~`) and target (container `~` via rootfs `/etc/passwd`),
   mount type detection (`Dir`/`File`), OCI config.json generation.
@@ -136,6 +150,7 @@ to avoid confusion with the module name. All console utilities now
 accessed as `cli::log!`, `cli::check()`, `cli::dim()`, etc.
 
 Added:
+
 - `cli::error!` macro for red error output
 - `cli::check()` green checkmark, `cli::bullet()` for detail lines
 - `cli::dim()` grey text for secondary values (digests, sizes, etc.)
@@ -240,6 +255,7 @@ buffer up to 4KB or first `\r\n`, then validate with regex
 ### RefCell soundness fix
 
 Audited all RefCell usage in the network module:
+
 - **ChannelSink::tx** — was holding `Ref` across `.await` in `send()`,
   which could panic if `close()` was dispatched concurrently by
   capnp-rpc. Fixed by cloning the sender before awaiting.
@@ -261,6 +277,7 @@ AsyncWrite), while hyper client forwards to the real server (via
 stream through without buffering.
 
 Per-request flow:
+
 1. hyper server parses `Request<Incoming>` from container
 2. Extract method/path/headers, run http_request Lua scripts
 3. Scripts can modify headers (e.g., inject auth tokens) and path
@@ -351,6 +368,7 @@ remain as runtime overrides.
 ### Config file loading
 
 Files loaded in order (later merges over former):
+
 1. `~/.ezpez/config.toml` — global defaults
 2. `~/.ez.toml` — user-level shorthand
 3. `<project-root>/ez.toml` — project config (committed)
@@ -447,13 +465,14 @@ no args are provided, falls back to image entrypoint+cmd or `/bin/sh`.
 ### Pipe mode (no PTY)
 
 When stdin is not a TTY (piped input), the VM runs without PTY:
+
 - OCI config sets `"terminal": false`
 - Supervisor spawns process with piped stdin/stdout/stderr instead of
   PTY, giving proper separation of stdout and stderr
 - CLI skips raw terminal mode and resize handling
 - StdinImpl handles optional resize signal (None in pipe mode)
 
-This enables: `echo data | ez -- grep pattern`, 
+This enables: `echo data | ez -- grep pattern`,
 `ez -- sh -c 'echo hi; exit 42'` (exit codes propagate).
 
 ## 2026-04-03: Expose host ports to the VM
@@ -508,6 +527,7 @@ PID namespaces, exactly like Ctrl+C. For other signals, it falls
 back to `kill(-pid, sig)` on crun's process group.
 
 The PTY control character approach was chosen because:
+
 - crun runs the container in a PID namespace
 - The shell has job control disabled ("can't access tty")
 - `tcgetpgrp()` returns crun's PGID, not the shell's
@@ -550,6 +570,7 @@ writes and resize calls — no sharing needed.
 ### Design
 
 **Schema changes:**
+
 - Removed `ByteStream` interface entirely
 - Added `Stdin { read() -> ProcessInput }` interface
 - Removed `resize` from `Process` (now poll/signal/kill only)
@@ -557,6 +578,7 @@ writes and resize calls — no sharing needed.
 - `Supervisor.start()` takes `Stdin` instead of `ByteStream`
 
 **CLI side:**
+
 - New `StdinImpl` (stdin::Server) multiplexes tokio stdin reads and
   SIGWINCH resize signals via `tokio::select!` in a single `read()`
 - Removed separate resize loop from main — resize events flow through
@@ -565,15 +587,17 @@ writes and resize calls — no sharing needed.
   protocol crate (no longer needed without ByteStream)
 
 **Supervisor side:**
+
 - `ProcessImpl` now communicates with `attach()` via channels:
-  - `frames` channel: PTY output + exit code → ProcessImpl.poll()
-  - `signals` channel: ProcessImpl.signal()/kill() → attach() loop
+    - `frames` channel: PTY output + exit code → ProcessImpl.poll()
+    - `signals` channel: ProcessImpl.signal()/kill() → attach() loop
 - `attach()` owns the main select loop (PTY reads + signal dispatch)
 - `relay_stdin()` extracted as standalone async fn
 - PTY read errors (EIO on child exit) break the loop correctly
 - Supervisor hangs after sending exit frame; CLI kills VM to stop it
 
 **Build:**
+
 - Added Docker volume for supervisor target dir to cache incremental
   builds across `mise run build:supervisor` invocations
 
@@ -932,6 +956,7 @@ All tasks have `sources`/`outputs` for incremental rebuilds (2ms no-op).
 ### Cargo workspace
 
 Project restructured into a workspace:
+
 - `cli/` — the `ez` binary (macOS host, Apple Virtualization)
 - `supervisor/` — agent that will run inside the VM (built for Linux
   via Docker with `rust:alpine`)
@@ -995,6 +1020,7 @@ fails with `VZErrorInternal` (code 1) when it encounters a PE header.
 The error message is completely unhelpful — "Internal Virtualization
 error. The virtual machine failed to start." — with no indication that
 the kernel format is the issue. Discovered this by:
+
 1. Testing with Docker's LinuxKit kernel (works — starts with ARM64
    NOP, no PE header)
 2. Comparing binary headers between working and failing kernels
@@ -1005,6 +1031,7 @@ the kernel format is the issue. Discovered this by:
 kernel (5MB, built specifically for Apple Virtualization, no EFI stub).
 
 **Alternatives considered**:
+
 - Kata Containers kernel (`vmlinux` ELF format) — works but 400MB+ download
 - Building custom kernel — too complex for MVP
 - `VZEFIBootLoader` — would handle EFI kernels but requires disk images,
@@ -1023,6 +1050,7 @@ via `mise run build`.
 
 `VZVirtualMachine` is `!Send` (ObjC objects contain raw pointers) and
 must be used from its serial dispatch queue. Solution:
+
 - Store the VM pointer as `usize` to cross thread boundaries
 - `unsafe impl Send` on the backend struct
 - All VM method calls dispatched to the queue via `exec_async`

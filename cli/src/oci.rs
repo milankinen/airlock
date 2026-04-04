@@ -348,26 +348,38 @@ async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Rewrite the container's trust store with the image's original certs
-/// plus the project CA cert for TLS MITM.
+/// Install the project CA cert into the container's trust store(s).
+/// Different distros use different paths — write to all common locations.
 fn install_ca_cert(
     image_dir: &Path,
     bundle_path: &Path,
     ca_cert_path: &Path,
 ) -> anyhow::Result<()> {
-    let ca_store = "rootfs/etc/ssl/certs/ca-certificates.crt";
-    let dest = bundle_path.join(ca_store);
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let existing = std::fs::read(image_dir.join(ca_store)).unwrap_or_default();
     let ca_cert = std::fs::read(ca_cert_path)?;
-    let mut out = existing;
-    if !out.ends_with(b"\n") && !out.is_empty() {
-        out.push(b'\n');
+
+    // All common CA trust store paths across distros
+    let ca_stores = [
+        "rootfs/etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu
+        "rootfs/etc/ssl/cert.pem",                  // Alpine/LibreSSL
+        "rootfs/etc/pki/tls/certs/ca-bundle.crt",   // RHEL/CentOS
+        "rootfs/etc/ssl/ca-bundle.pem",             // openSUSE
+    ];
+
+    for ca_store in ca_stores {
+        let dest = bundle_path.join(ca_store);
+        // Read pristine certs from image (may not exist for all paths)
+        let existing = std::fs::read(image_dir.join(ca_store)).unwrap_or_default();
+        let mut out = existing;
+        if !out.ends_with(b"\n") && !out.is_empty() {
+            out.push(b'\n');
+        }
+        out.extend_from_slice(&ca_cert);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&dest, &out)?;
     }
-    out.extend_from_slice(&ca_cert);
-    std::fs::write(&dest, &out)?;
+
     Ok(())
 }
 
