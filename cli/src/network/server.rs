@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, error, trace};
 
-use super::scripting::{ScriptError, TcpConnect, host_matches};
+use super::scripting::host_matches;
 use super::{Network, http_proxy};
 
 fn is_localhost(host: &str) -> bool {
@@ -32,30 +32,15 @@ impl network_proxy::Server for Network {
             )));
         }
 
-        // Run tcp_connect filter scripts
-        let connect = TcpConnect {
-            host: host.to_string(),
-            port,
-            tls,
-        };
-        let connect = match self.script_engine.intercept_tcp_connect(connect) {
-            Ok(conn) => conn,
-            Err(ScriptError::Denied) => {
-                debug!("tcp_connect denied: {host}:{port}");
-                results
-                    .get()
-                    .init_result()
-                    .set_denied("denied by network rules");
-                return Ok(());
-            }
-            Err(e) => {
-                debug!("tcp_connect error: {e}");
-                results.get().init_result().set_denied(e.to_string());
-                return Ok(());
-            }
-        };
-
-        let (host, port) = (connect.host.as_str(), connect.port);
+        // Check if host is allowed
+        if !self.script_engine.is_host_allowed(host) {
+            debug!("tcp_connect denied: {host}:{port} (not in allowed_hosts)");
+            results
+                .get()
+                .init_result()
+                .set_denied("host not in allowed_hosts");
+            return Ok(());
+        }
         let addr = format!("{host}:{port}");
         trace!("connecting to {addr} tls={tls}");
         let stream = TcpStream::connect(&addr)
@@ -67,6 +52,12 @@ impl network_proxy::Server for Network {
             Some(self.script_engine.clone())
         } else {
             None
+        };
+
+        let connect = super::scripting::TcpConnect {
+            host: host.to_string(),
+            port,
+            tls,
         };
 
         let sink = if tls {
@@ -116,7 +107,7 @@ fn spawn_relay<R, W>(
     mut server_write: W,
     client_sink: tcp_sink::Client,
     http_engine: Option<Rc<super::scripting::ScriptEngine>>,
-    connect: TcpConnect,
+    connect: super::scripting::TcpConnect,
     server_protocol: http_proxy::ServerProtocol,
 ) -> tcp_sink::Client
 where

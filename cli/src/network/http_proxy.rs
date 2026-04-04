@@ -208,7 +208,7 @@ async fn handle_request(
         method: method.to_string(),
         path,
         headers,
-        allowed: engine.default_allows(),
+        allowed: true,
         denied: false,
     };
 

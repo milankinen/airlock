@@ -32,7 +32,7 @@ pub mod config {
     use std::cmp::{max, min};
 
     use smart_config::de::WellKnown;
-    use smart_config::{DescribeConfig, DeserializeConfig, Serde};
+    use smart_config::{DescribeConfig, DeserializeConfig};
 
     use crate::config::de;
 
@@ -57,24 +57,17 @@ pub mod config {
         /// Host ports exposed to the VM
         #[config(default)]
         pub host_ports: Vec<u16>,
-        /// Default network policy: "allow" or "deny"
-        #[config(with = Serde![str])]
-        #[config(default_t = NetworkMode::Deny)]
-        pub default_mode: NetworkMode,
-        /// Network filtering rules (Lua scripts)
+        /// Allowed host patterns. Connections to hosts not matching any
+        /// pattern are denied. Supports glob patterns like "*.example.com".
         #[config(default)]
-        pub rules: Vec<NetworkRule>,
-        /// Hosts whose TLS traffic should NOT be intercepted (cert pinning support).
+        pub allowed_hosts: Vec<String>,
+        /// Hosts whose TLS should NOT be intercepted (cert pinning).
         /// Supports glob patterns like "*.example.com".
         #[config(default)]
-        pub allowed_hosts_tls: Vec<String>,
-    }
-
-    #[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum NetworkMode {
-        Allow,
-        Deny,
+        pub tls_passthrough: Vec<String>,
+        /// HTTP request filtering rules (Lua scripts)
+        #[config(default)]
+        pub rules: Vec<NetworkRule>,
     }
 
     /// Network filtering rule with inline Lua script
@@ -82,21 +75,11 @@ pub mod config {
     pub struct NetworkRule {
         /// Rule name (for error messages)
         pub name: String,
-        /// Rule type: "tcp_connect" or "http_request"
-        #[config(with = Serde![str])]
-        pub r#type: NetworkRuleType,
         /// Required env vars: name → description
         #[config(default)]
         pub env: std::collections::HashMap<String, String>,
         /// Inline Lua script
         pub script: String,
-    }
-
-    #[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-    #[serde(rename_all = "snake_case")]
-    pub enum NetworkRuleType {
-        TcpConnect,
-        HttpRequest,
     }
 
     impl WellKnown for NetworkRule {

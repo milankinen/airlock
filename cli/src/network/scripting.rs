@@ -5,13 +5,11 @@ pub use connect_request::host_matches;
 use mlua::{Function, Lua, Value};
 use tracing::{debug, trace};
 
-use self::connect_request::ConnectRequest;
 use crate::config::config;
 
 pub struct ScriptEngine {
-    tcp_rules: Vec<CompiledRule>,
     http_rules: Vec<CompiledRule>,
-    default_mode: config::NetworkMode,
+    allowed_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,63 +41,30 @@ pub enum ScriptError {
 
 impl ScriptEngine {
     pub fn init(config: &config::Network) -> anyhow::Result<Self> {
-        let default_mode = config.default_mode;
-        let mut tcp_rules = Vec::new();
         let mut http_rules = Vec::new();
 
         for rule in &config.rules {
-            let compiled = compile_rule(rule)?;
-            match rule.r#type {
-                config::NetworkRuleType::TcpConnect => tcp_rules.push(compiled),
-                config::NetworkRuleType::HttpRequest => http_rules.push(compiled),
-            }
+            http_rules.push(compile_rule(rule)?);
         }
 
         debug!(
-            "script engine: {} tcp rules, {} http rules, default={}",
-            tcp_rules.len(),
+            "script engine: {} http rules, {} allowed hosts",
             http_rules.len(),
-            if default_mode == config::NetworkMode::Allow {
-                "allow"
-            } else {
-                "deny"
-            }
+            config.allowed_hosts.len(),
         );
         Ok(Self {
-            tcp_rules,
             http_rules,
-            default_mode,
+            allowed_hosts: config.allowed_hosts.clone(),
         })
-    }
-
-    pub fn default_allows(&self) -> bool {
-        self.default_mode == config::NetworkMode::Allow
     }
 
     pub fn has_http_rules(&self) -> bool {
         !self.http_rules.is_empty()
     }
 
-    pub fn intercept_tcp_connect(&self, connect: TcpConnect) -> Result<TcpConnect, ScriptError> {
-        let mut req = ConnectRequest {
-            connect,
-            allowed: self.default_allows(),
-            denied: false,
-        };
-        for rule in &self.tcp_rules {
-            rule.lua.globals().set("req", req)?;
-            rule.func
-                .call::<()>(())
-                .map_err(|e| anyhow::anyhow!("rule '{}': {e}", rule.name))?;
-            req = rule.lua.globals().get("req")?;
-            if req.denied {
-                return Err(ScriptError::Denied);
-            }
-        }
-        if !req.allowed {
-            return Err(ScriptError::Denied);
-        }
-        Ok(req.connect)
+    /// Check if a host is allowed by the allowed_hosts patterns.
+    pub fn is_host_allowed(&self, host: &str) -> bool {
+        self.allowed_hosts.iter().any(|p| host_matches(host, p))
     }
 
     pub fn intercept_http_request(&self, info: &mut HttpRequestInfo) -> Result<(), ScriptError> {
@@ -115,9 +80,7 @@ impl ScriptEngine {
                 return Err(ScriptError::Denied);
             }
         }
-        if !info.allowed {
-            return Err(ScriptError::Denied);
-        }
+        // Allowed unless explicitly denied by a script
         Ok(())
     }
 }

@@ -95,7 +95,7 @@ impl Supervisor {
         }
 
         // TLS passthrough hosts (cert pinning — skip MITM)
-        let tls_passthrough = &project.config.network.allowed_hosts_tls;
+        let tls_passthrough = &project.config.network.tls_passthrough;
         let mut pt_builder = req.get().init_tls_passthrough(tls_passthrough.len() as u32);
         for (i, host) in tls_passthrough.iter().enumerate() {
             pt_builder.set(i as u32, host);
