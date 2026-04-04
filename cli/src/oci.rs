@@ -36,7 +36,6 @@ pub enum MountType {
 }
 
 impl ResolvedMount {
-    /// Mount key to VM /mnt
     pub fn key(&self) -> &str {
         match &self.mount_type {
             MountType::Dir { key } => key.as_str(),
@@ -58,10 +57,68 @@ pub async fn prepare(
     project: &Project,
     terminal: &Terminal,
 ) -> anyhow::Result<Bundle> {
-    let mut image = resolve_image(&project.config.image).await?;
-    let image_dir = ensure_image(&mut image).await?;
-    let bundle_path = ensure_rootfs(&image_dir, &image.digest, project)?;
+    let digest_file = project.cache_dir.join("image_digest");
+    let bundle = project.cache_dir.join("bundle");
+    let stored_digest = std::fs::read_to_string(&digest_file).ok();
 
+    // Resolve image reference to a digest (no download yet)
+    cli::log!(
+        "Preparing project environment using image {}...",
+        cli::dim(&project.config.image)
+    );
+    let mut image = resolve_image(&project.config.image).await?;
+
+    // Check if image changed before downloading
+    let mut digest_changed = stored_digest
+        .as_deref()
+        .is_none_or(|s| s.trim() != image.digest);
+
+    if let Some(old_digest) = stored_digest
+        && digest_changed
+    {
+        match prompt_image_changed()? {
+            ImageChangeAction::KeepOld => {
+                digest_changed = false;
+            }
+            ImageChangeAction::Recreate => {
+                let spinner = cli::spinner("erasing old environment...");
+                let _ = std::fs::remove_dir_all(&bundle);
+                let _ = std::fs::remove_file(&digest_file);
+                spinner.finish_and_clear();
+                cli::log!("  {} old environment erased", cli::check());
+                // GC: check if old image is still used by any project
+                gc_unused_image(old_digest.trim())?;
+            }
+            ImageChangeAction::Cancel => anyhow::bail!("cancelled by user"),
+        }
+    }
+
+    // Download/ensure image
+    let image_dir = ensure_image(&mut image).await?;
+
+    // Ensure bundle rootfs
+    if !bundle.exists() {
+        let spinner = cli::spinner("creating project environment...");
+        std::fs::create_dir_all(&bundle)?;
+        crate::cache::cow_copy(&image_dir.join("rootfs"), &bundle.join("rootfs"))?;
+        spinner.finish_and_clear();
+    }
+    if digest_changed {
+        std::fs::write(&digest_file, &image.digest)?;
+    }
+
+    install_ca_cert(&image_dir, &bundle, &project.ca_cert)?;
+    cli::log!("  {} environment ready", cli::check());
+
+    build_bundle(args, project, terminal, &bundle)
+}
+
+fn build_bundle(
+    args: &CliArgs,
+    project: &Project,
+    terminal: &Terminal,
+    bundle_path: &Path,
+) -> anyhow::Result<Bundle> {
     let mut mounts = vec![];
     mounts.push(ResolvedMount {
         display: None,
@@ -72,10 +129,19 @@ pub async fn prepare(
         target: project.cwd.to_string_lossy().into(),
         read_only: false,
     });
-    mounts.push(install_ca_cert(&image_dir, &bundle_path, &project.ca_cert)?);
 
-    // Resolve mount paths: expand ~ on source (host home) and target (container home)
-    let container_uid = config::get_uid(&image.config);
+    // Read image config from the image cache
+    let digest_file = project.cache_dir.join("image_digest");
+    let digest = std::fs::read_to_string(&digest_file).unwrap_or_default();
+    let image_dir = crate::cache::image_dir(digest.trim())?;
+    let config_path = image_dir.join("image_config.json");
+    let image_config: OciConfig = if let Ok(data) = std::fs::read(&config_path) {
+        serde_json::from_slice(&data).unwrap_or_default()
+    } else {
+        OciConfig::default()
+    };
+
+    let container_uid = config::get_uid(&image_config);
     let container_home = lookup_home_dir(&bundle_path.join("rootfs"), container_uid)?;
     let host_home = dirs::home_dir().unwrap_or_default();
     mounts.extend(resolve_mounts(
@@ -84,9 +150,8 @@ pub async fn prepare(
         &container_home,
     )?);
 
-    // Write OCI config.json now that all binds are assembled
     config::generate_config(
-        &image.config,
+        &image_config,
         &project.cwd,
         &mounts,
         &args.args,
@@ -95,17 +160,44 @@ pub async fn prepare(
     )?;
 
     Ok(Bundle {
-        path: bundle_path,
+        path: bundle_path.to_path_buf(),
         mounts,
     })
 }
 
-async fn resolve_image(image_ref: &str) -> anyhow::Result<ResolvedImage> {
-    cli::log!(
-        "Preparing project environment using image {}...",
-        cli::dim(image_ref)
-    );
+enum ImageChangeAction {
+    Recreate,
+    KeepOld,
+    Cancel,
+}
 
+fn prompt_image_changed() -> anyhow::Result<ImageChangeAction> {
+    if !cli::is_interactive() {
+        anyhow::bail!("project image has changed");
+    }
+    let term = dialoguer::console::Term::stderr();
+    let choice = dialoguer::Select::new()
+        .with_prompt("Image has changed. What would you like to do?")
+        .items([
+            "Re-create environment",
+            "Continue using old environment",
+            "Cancel",
+        ])
+        .default(0)
+        .clear(true)
+        .interact_on_opt(&term)?
+        .unwrap_or(2);
+    let _ = term.clear_last_lines(1);
+
+    Ok(match choice {
+        0 => ImageChangeAction::Recreate,
+        1 => ImageChangeAction::KeepOld,
+        _ => ImageChangeAction::Cancel,
+    })
+}
+
+/// Full image resolution (with config).
+async fn resolve_image(image_ref: &str) -> anyhow::Result<ResolvedImage> {
     if let Some(image_id) = docker::image_exists(image_ref) {
         cli::log!(
             "  {} resolved via docker {}",
@@ -228,85 +320,13 @@ async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Ensure the project bundle rootfs exists (CoW copy of image).
-///
-/// The digest file is the consistency marker — it's written last after
-/// a successful rootfs copy. If it's missing or stale, the bundle is
-/// considered incomplete and gets recreated.
-fn ensure_rootfs(
-    image_dir: &Path,
-    image_digest: &str,
-    project: &Project,
-) -> anyhow::Result<PathBuf> {
-    let bundle = project.cache_dir.join("bundle");
-    let digest_file = project.cache_dir.join("image_digest");
-    let rootfs = bundle.join("rootfs");
-
-    // Check digest: missing = incomplete, mismatched = image changed
-    let stored_digest = std::fs::read_to_string(&digest_file).ok();
-    let digest_matches = stored_digest
-        .as_deref()
-        .is_some_and(|s| s.trim() == image_digest);
-
-    if stored_digest.is_some() && !digest_matches {
-        // Image changed — prompt in interactive mode
-        if !cli::is_interactive() {
-            anyhow::bail!("project image has changed");
-        }
-        let term = dialoguer::console::Term::stderr();
-        let choice = dialoguer::Select::new()
-            .with_prompt("Image has changed. What would you like to do?")
-            .items([
-                "Re-create environment",
-                "Continue using old environment",
-                "Cancel",
-            ])
-            .default(0)
-            .clear(true)
-            .interact_on_opt(&term)?
-            .unwrap_or(2);
-        let _ = term.clear_last_lines(1);
-
-        match choice {
-            0 => {
-                let spinner = cli::spinner("erasing old environment...");
-                let _ = std::fs::remove_dir_all(&bundle);
-                let _ = std::fs::remove_file(&digest_file);
-                spinner.finish_and_clear();
-                cli::log!("  {} old environment erased", cli::check());
-            }
-            1 => {
-                cli::log!("  {} environment ready", cli::check());
-                return Ok(bundle);
-            }
-            _ => anyhow::bail!("cancelled by user"),
-        }
-    }
-
-    if !digest_matches {
-        // Incomplete or missing bundle — clean up any partial state and recreate
-        let _ = std::fs::remove_dir_all(&rootfs);
-        let _ = std::fs::remove_file(&digest_file);
-
-        let spinner = cli::spinner("creating project environment...");
-        std::fs::create_dir_all(&bundle)?;
-        crate::cache::cow_copy(&image_dir.join("rootfs"), &rootfs)?;
-        // Write digest last — marks the bundle as complete
-        std::fs::write(&digest_file, image_digest)?;
-        spinner.finish_and_clear();
-    }
-
-    cli::log!("  {} environment ready", cli::check());
-    Ok(bundle)
-}
-
 /// Rewrite the container's trust store with the image's original certs
 /// plus the project CA cert for TLS MITM.
 fn install_ca_cert(
     image_dir: &Path,
     bundle_path: &Path,
     ca_cert_path: &Path,
-) -> anyhow::Result<ResolvedMount> {
+) -> anyhow::Result<()> {
     let ca_store = "rootfs/etc/ssl/certs/ca-certificates.crt";
     let dest = bundle_path.join(ca_store);
     if let Some(parent) = dest.parent() {
@@ -320,19 +340,36 @@ fn install_ca_cert(
     }
     out.extend_from_slice(&ca_cert);
     std::fs::write(&dest, &out)?;
-    Ok(ResolvedMount {
-        display: None,
-        mount_type: MountType::File {
-            filename: ca_cert_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into(),
-        },
-        source: ca_cert_path.to_path_buf(),
-        target: "/etc/ssl/certs/ca-certificates.crt".to_string(),
-        read_only: true,
-    })
+    Ok(())
+}
+
+/// Check if an image digest is used by any project. If not, delete it.
+fn gc_unused_image(digest: &str) -> anyhow::Result<()> {
+    let projects_dir = crate::cache::cache_dir()?.join("projects");
+    if !projects_dir.exists() {
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(&projects_dir)?.flatten() {
+        let digest_file = entry.path().join("image_digest");
+        if let Ok(stored) = std::fs::read_to_string(&digest_file)
+            && stored.trim() == digest
+        {
+            // Still in use by another project
+            return Ok(());
+        }
+    }
+
+    // No project references this image — delete it
+    let image_dir = crate::cache::image_dir(digest)?;
+    if image_dir.exists() {
+        let sp = cli::spinner("cleaning unused image...");
+        let _ = std::fs::remove_dir_all(&image_dir);
+        sp.finish_and_clear();
+        cli::log!("  {} cleaned unused image", cli::check());
+    }
+
+    Ok(())
 }
 
 fn format_size(bytes: i64) -> String {
@@ -343,23 +380,6 @@ fn format_size(bytes: i64) -> String {
     } else {
         format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
     }
-}
-
-/// Look up a user's home directory from the container rootfs /etc/passwd.
-fn lookup_home_dir(rootfs: &Path, uid: u32) -> anyhow::Result<String> {
-    let passwd_path = rootfs.join("etc/passwd");
-    let content = std::fs::read_to_string(&passwd_path)
-        .map_err(|e| anyhow::anyhow!("cannot read container /etc/passwd: {e}"))?;
-
-    for line in content.lines() {
-        let fields: Vec<&str> = line.split(':').collect();
-        // passwd format: name:password:uid:gid:gecos:home:shell
-        if fields.len() >= 6 && fields[2].parse::<u32>().ok() == Some(uid) {
-            return Ok(fields[5].to_string());
-        }
-    }
-
-    anyhow::bail!("no home directory found for uid {uid} in container /etc/passwd")
 }
 
 /// Expand `~` prefix in a path string.
@@ -373,8 +393,22 @@ fn expand_tilde(path: &str, home: &Path) -> PathBuf {
     }
 }
 
-/// Resolve mount paths: expand ~ on source (host home) and target (container home).
-/// Determines mount type (dir with unique tag, or file) based on source path.
+/// Look up a user's home directory from the container rootfs /etc/passwd.
+fn lookup_home_dir(rootfs: &Path, uid: u32) -> anyhow::Result<String> {
+    let passwd_path = rootfs.join("etc/passwd");
+    let content = std::fs::read_to_string(&passwd_path)
+        .map_err(|e| anyhow::anyhow!("cannot read container /etc/passwd: {e}"))?;
+
+    for line in content.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() >= 6 && fields[2].parse::<u32>().ok() == Some(uid) {
+            return Ok(fields[5].to_string());
+        }
+    }
+
+    anyhow::bail!("no home directory found for uid {uid} in container /etc/passwd")
+}
+
 fn resolve_mounts(
     mounts: &[crate::config::config::Mount],
     host_home: &Path,
@@ -389,24 +423,24 @@ fn resolve_mounts(
             let source = std::fs::canonicalize(&source).unwrap_or(source);
             let target = expand_tilde(&m.target, &container_home);
 
+            let file_name = source
+                .file_name()
+                .map_or_else(|| format!("file_{i}"), |n| n.to_string_lossy().to_string());
+
             let mount_type = if source.is_dir() {
                 MountType::Dir {
                     key: format!("mount_{i}"),
                 }
             } else {
                 MountType::File {
-                    filename: source
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into(),
+                    filename: file_name,
                 }
             };
 
             Ok(ResolvedMount {
                 display: Some((m.source.clone(), m.target.clone())),
-                mount_type,
                 source,
+                mount_type,
                 target: target.to_string_lossy().to_string(),
                 read_only: m.read_only,
             })
