@@ -39,7 +39,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
-      - run: mise run build:kernel
+      - uses: actions/cache@v4
+        id: kernel-cache
+        with:
+          path: sandbox/out/Image
+          key: kernel-aarch64-${{ hashFiles('sandbox/kernel/config-arm64', 'sandbox/kernel/build.sh') }}
+      - if: steps.kernel-cache.outputs.cache-hit != 'true'
+        run: mise run build:kernel
       - uses: actions/upload-artifact@v4
         with:
           name: kernel
@@ -51,6 +57,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
+      - uses: Swatinem/rust-cache@v2
       - name: Build supervisor
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq capnproto libcapnp-dev musl-tools
@@ -82,7 +89,7 @@ jobs:
         with:
           name: rootfs
           path: sandbox/out
-      - run: cargo build --release -p ezpez-cli --features dev
+      - run: cargo build --release -p ezpez-cli
       - run: codesign --entitlements entitlements.plist --force -s - target/release/ez
       - uses: actions/upload-artifact@v4
         with:
