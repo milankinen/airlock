@@ -1,14 +1,12 @@
 use std::path::Path;
 
-use oci_client::config::ConfigFile;
-
-use crate::vm::mounts::ContainerBind;
+use super::{OciConfig, ResolvedMount};
 
 /// Generate an OCI runtime spec config.json from the image config and bind mounts.
 pub fn generate_config(
-    image_config: &ConfigFile,
+    image_config: &OciConfig,
     project_cwd: &Path,
-    binds: &[ContainerBind],
+    mounts: &[ResolvedMount],
     user_args: &[String],
     terminal: bool,
     dest: &Path,
@@ -51,7 +49,7 @@ pub fn generate_config(
     let (uid, gid) = parse_user(user);
 
     // Build mounts: system mounts first, then bind mounts
-    let mut mounts = vec![
+    let mut mounts_json = vec![
         serde_json::json!({ "destination": "/proc", "type": "proc", "source": "proc" }),
         serde_json::json!({ "destination": "/dev", "type": "tmpfs", "source": "tmpfs",
           "options": ["nosuid", "strictatime", "mode=755", "size=65536k"] }),
@@ -64,15 +62,15 @@ pub fn generate_config(
     ];
 
     // Bind mounts from VirtioFS shares into container
-    for bind in binds {
+    for mount in mounts {
         let mut options = vec!["bind".to_string()];
-        if bind.read_only {
+        if mount.read_only {
             options.push("ro".to_string());
         }
-        mounts.push(serde_json::json!({
-            "destination": bind.destination,
+        mounts_json.push(serde_json::json!({
+            "destination": mount.target,
             "type": "bind",
-            "source": bind.source,
+            "source": mount.vm_path(),
             "options": options
         }));
     }
@@ -91,7 +89,7 @@ pub fn generate_config(
             "readonly": false
         },
         "hostname": "ezpez",
-        "mounts": mounts,
+        "mounts": mounts_json,
         "linux": {
             "namespaces": [
                 { "type": "pid" },
@@ -111,4 +109,11 @@ fn parse_user(user: &str) -> (u32, u32) {
     let uid = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
     let gid = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
     (uid, gid)
+}
+
+/// Get the container uid from the image config.
+pub fn get_uid(image_config: &OciConfig) -> u32 {
+    let cfg = image_config.config.as_ref();
+    let user = cfg.and_then(|c| c.user.as_deref()).unwrap_or("0:0");
+    parse_user(user).0
 }

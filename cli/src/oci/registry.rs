@@ -9,11 +9,13 @@ use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
+use super::OciConfig;
+
 pub struct RegistryImage {
     pub reference: Reference,
     pub digest: String,
     pub manifest: OciImageManifest,
-    pub image_config: oci_client::config::ConfigFile,
+    pub image_config: OciConfig,
 }
 
 fn make_client() -> Client {
@@ -42,7 +44,7 @@ pub async fn resolve(image_ref: &str) -> anyhow::Result<RegistryImage> {
 
     let (manifest, digest, config_str) = client.pull_manifest_and_config(&reference, &auth).await?;
 
-    let image_config: oci_client::config::ConfigFile = serde_json::from_str(&config_str)?;
+    let image_config: OciConfig = serde_json::from_str(&config_str)?;
 
     Ok(RegistryImage {
         reference,

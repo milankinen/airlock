@@ -3,6 +3,27 @@ use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
 use ezpez_protocol::supervisor_capnp::*;
 
 use crate::cli::CliArgs;
+
+/// Build the command + args for the supervisor to execute.
+/// With the `dev` feature and `EZ_DEV_NO_CRUN=true`, runs a shell instead of crun.
+fn build_command() -> (String, Vec<String>) {
+    #[cfg(feature = "dev")]
+    if std::env::var("EZ_DEV_NO_CRUN").is_ok_and(|v| v == "true" || v == "1") {
+        tracing::debug!("dev mode: skipping crun, starting shell");
+        return ("/bin/sh".to_string(), vec![]);
+    }
+
+    (
+        "crun".to_string(),
+        vec![
+            "run".to_string(),
+            "--no-pivot".to_string(),
+            "--bundle".to_string(),
+            "/mnt/bundle".to_string(),
+            "ezpez0".to_string(),
+        ],
+    )
+}
 use crate::network::Network;
 use crate::project::Project;
 use crate::rpc::logging::LogSinkImpl;
@@ -64,6 +85,14 @@ impl Supervisor {
         req.get().set_ca_key(&ca_key);
         req.get().set_logs(log_sink);
         req.get().set_log_filter(args.log_filter());
+
+        // Build the command for the supervisor to execute
+        let (cmd, cmd_args) = build_command();
+        req.get().set_cmd(&cmd);
+        let mut args_builder = req.get().init_args(cmd_args.len() as u32);
+        for (i, arg) in cmd_args.iter().enumerate() {
+            args_builder.set(i as u32, arg);
+        }
 
         let response = req.send().promise.await?;
         let proc = response.get()?.get_proc()?;

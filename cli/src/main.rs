@@ -15,26 +15,13 @@ use std::io::Write;
 use tokio::task::LocalSet;
 use tracing_subscriber::EnvFilter;
 
+use crate::cli::CliArgs;
+use crate::project::Project;
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let args = cli::initialize();
-
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .open(&args.log_file);
-    match log_file {
-        Ok(file) => tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::new(args.log_filter()))
-            .with_writer(std::sync::Mutex::new(file))
-            .with_ansi(false)
-            .init(),
-        Err(_) => tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::new("off"))
-            .init(),
-    }
-
     let cwd = std::env::current_dir().unwrap_or_default();
     let config = match config::load(&cwd) {
         Ok(c) => c,
@@ -47,7 +34,7 @@ async fn main() {
     let exit_code = local
         .run_until(async {
             run(args, config).await.unwrap_or_else(|e| {
-                cli::error!("error: {e:#}");
+                cli::error!("error: {e:?}");
                 1
             })
         })
@@ -56,11 +43,12 @@ async fn main() {
     std::process::exit(exit_code);
 }
 
-async fn run(args: cli::CliArgs, config: config::Config) -> anyhow::Result<i32> {
+async fn run(args: CliArgs, config: config::Config) -> anyhow::Result<i32> {
     let project = project::lock(config)?;
-    let vm = vm::prepare(&project)?;
+    setup_logging(&args, &project);
+
     let mut terminal = terminal::setup();
-    let bundle = oci::prepare(&args, &project, &terminal, &vm).await?;
+    let bundle = oci::prepare(&args, &project, &terminal).await?;
     let network = network::setup(&project)?;
 
     // Check if user interrupted during setup (e.g. Ctrl+C during download)
@@ -72,7 +60,7 @@ async fn run(args: cli::CliArgs, config: config::Config) -> anyhow::Result<i32> 
     terminal.enter_raw_mode();
 
     cli::log!("Booting VM...");
-    let (vm_handle, vsock_fd) = vm.start(&args, &project, bundle).await?;
+    let (vm_handle, vsock_fd) = vm::start(&args, &project, bundle).await?;
     let supervisor = rpc::Supervisor::connect(vsock_fd)?;
 
     let stdin = terminal.stdin()?;
@@ -110,4 +98,19 @@ async fn run(args: cli::CliArgs, config: config::Config) -> anyhow::Result<i32> 
     // Destroy VM and return the exit code from vm shell
     drop(vm_handle);
     Ok(exit_code)
+}
+
+fn setup_logging(args: &CliArgs, project: &Project) {
+    if let Ok(log_file) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(project.cache_dir.join("ez.log"))
+    {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new(args.log_filter()))
+            .with_writer(std::sync::Mutex::new(log_file))
+            .with_ansi(false)
+            .init();
+    }
 }

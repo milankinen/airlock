@@ -5,44 +5,102 @@ mod registry;
 
 use std::path::{Path, PathBuf};
 
-use oci_client::config::ConfigFile;
+use oci_client::config::ConfigFile as OciConfig;
 
 use crate::cli;
 use crate::cli::CliArgs;
 use crate::project::Project;
 use crate::terminal::Terminal;
-use crate::vm::Vm;
-use crate::vm::mounts::ContainerBind;
 
 pub struct Bundle {
     pub path: PathBuf,
+    /// Mounts with `~` expanded: source to host home, target to container home.
+    pub mounts: Vec<ResolvedMount>,
+}
+
+pub struct ResolvedMount {
+    /// Source + target (with `~`) for display (only for config mounts)
+    pub display: Option<(String, String)>,
+    /// Mount type: file / directory
+    pub mount_type: MountType,
+    /// Expanded absolute source path on host.
+    pub source: PathBuf,
+    /// Expanded absolute target path in container.
+    pub target: String,
+    pub read_only: bool,
+}
+
+pub enum MountType {
+    Dir { key: String },
+    File { filename: String },
+}
+
+impl ResolvedMount {
+    /// Mount key to VM /mnt
+    pub fn key(&self) -> &str {
+        match &self.mount_type {
+            MountType::Dir { key } => key.as_str(),
+            MountType::File { filename: _ } if self.read_only => "files_ro",
+            MountType::File { filename: _ } => "files_rw",
+        }
+    }
+    pub fn vm_path(&self) -> String {
+        match &self.mount_type {
+            MountType::Dir { key } => format!("/mnt/{key}"),
+            MountType::File { filename } => format!("/mnt/{}/{filename}", self.key()),
+        }
+    }
 }
 
 /// Resolve, download, and prepare the OCI bundle for the project.
 pub async fn prepare(
-    cli: &CliArgs,
+    args: &CliArgs,
     project: &Project,
     terminal: &Terminal,
-    vm: &Vm,
 ) -> anyhow::Result<Bundle> {
-    let mut resolved = resolve(&project.config.image).await?;
-    let image_dir = ensure_image(&mut resolved).await?;
-    let bundle_path = ensure_rootfs(&image_dir, &resolved.digest, project)?;
+    let mut image = resolve_image(&project.config.image).await?;
+    let image_dir = ensure_image(&mut image).await?;
+    let bundle_path = ensure_rootfs(&image_dir, &image.digest, project)?;
 
-    write_config(
-        &bundle_path,
+    let mut mounts = vec![];
+    mounts.push(ResolvedMount {
+        display: None,
+        mount_type: MountType::Dir {
+            key: "project".to_string(),
+        },
+        source: project.cwd.clone(),
+        target: project.cwd.to_string_lossy().into(),
+        read_only: false,
+    });
+    mounts.push(install_ca_cert(&image_dir, &bundle_path, &project.ca_cert)?);
+
+    // Resolve mount paths: expand ~ on source (host home) and target (container home)
+    let container_uid = config::get_uid(&image.config);
+    let container_home = lookup_home_dir(&bundle_path.join("rootfs"), container_uid)?;
+    let host_home = dirs::home_dir().unwrap_or_default();
+    mounts.extend(resolve_mounts(
+        &project.config.mounts,
+        &host_home,
+        &container_home,
+    )?);
+
+    // Write OCI config.json now that all binds are assembled
+    config::generate_config(
+        &image.config,
         &project.cwd,
-        &resolved.image_config,
-        vm.binds(),
-        &cli.args,
+        &mounts,
+        &args.args,
         terminal.is_tty(),
+        &bundle_path.join("config.json"),
     )?;
-    install_ca_cert(&image_dir, &bundle_path, &project.ca_cert)?;
 
-    Ok(Bundle { path: bundle_path })
+    Ok(Bundle {
+        path: bundle_path,
+        mounts,
+    })
 }
 
-async fn resolve(image_ref: &str) -> anyhow::Result<ResolvedImage> {
+async fn resolve_image(image_ref: &str) -> anyhow::Result<ResolvedImage> {
     cli::log!(
         "Preparing project environment using image {}...",
         cli::dim(image_ref)
@@ -56,7 +114,7 @@ async fn resolve(image_ref: &str) -> anyhow::Result<ResolvedImage> {
         );
         return Ok(ResolvedImage {
             digest: image_id,
-            image_config: ConfigFile::default(),
+            config: OciConfig::default(),
             source: ImageSource::Docker {
                 image_ref: image_ref.to_string(),
             },
@@ -71,14 +129,14 @@ async fn resolve(image_ref: &str) -> anyhow::Result<ResolvedImage> {
     );
     Ok(ResolvedImage {
         digest: reg.digest.clone(),
-        image_config: reg.image_config.clone(),
+        config: reg.image_config.clone(),
         source: ImageSource::Registry(Box::new(reg)),
     })
 }
 
 struct ResolvedImage {
     digest: String,
-    image_config: oci_client::config::ConfigFile,
+    config: OciConfig,
     source: ImageSource,
 }
 
@@ -96,7 +154,7 @@ async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBuf> {
             let config_path = dir.join("image_config.json");
             if config_path.exists() {
                 let data = std::fs::read(&config_path)?;
-                resolved.image_config = serde_json::from_slice(&data)?;
+                resolved.config = serde_json::from_slice(&data)?;
             }
         }
         return Ok(dir);
@@ -116,7 +174,7 @@ async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBuf> {
     match &resolved.source {
         ImageSource::Docker { image_ref } => {
             let sp = cli::spinner("exporting from docker...");
-            resolved.image_config =
+            resolved.config =
                 docker::save_and_extract(image_ref, &rootfs, &dir.join("image_config.json"))?;
             sp.finish_and_clear();
             cli::log!("  {} exported from docker", cli::check());
@@ -162,7 +220,7 @@ async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBuf> {
             sp.finish_and_clear();
             cli::log!("  {} extracted layers", cli::check());
 
-            let config_json = serde_json::to_string_pretty(&resolved.image_config)?;
+            let config_json = serde_json::to_string_pretty(&resolved.config)?;
             std::fs::write(dir.join("image_config.json"), config_json)?;
         }
     }
@@ -180,8 +238,8 @@ fn ensure_rootfs(
     image_digest: &str,
     project: &Project,
 ) -> anyhow::Result<PathBuf> {
-    let bundle = project.dir.join("bundle");
-    let digest_file = project.dir.join("image_digest");
+    let bundle = project.cache_dir.join("bundle");
+    let digest_file = project.cache_dir.join("image_digest");
     let rootfs = bundle.join("rootfs");
 
     // Check digest: missing = incomplete, mismatched = image changed
@@ -242,31 +300,13 @@ fn ensure_rootfs(
     Ok(bundle)
 }
 
-fn write_config(
-    bundle_path: &Path,
-    cwd: &Path,
-    image_config: &oci_client::config::ConfigFile,
-    binds: &[ContainerBind],
-    user_args: &[String],
-    terminal: bool,
-) -> anyhow::Result<()> {
-    config::generate_config(
-        image_config,
-        cwd,
-        binds,
-        user_args,
-        terminal,
-        &bundle_path.join("config.json"),
-    )
-}
-
 /// Rewrite the container's trust store with the image's original certs
 /// plus the project CA cert for TLS MITM.
 fn install_ca_cert(
     image_dir: &Path,
     bundle_path: &Path,
     ca_cert_path: &Path,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ResolvedMount> {
     let ca_store = "rootfs/etc/ssl/certs/ca-certificates.crt";
     let dest = bundle_path.join(ca_store);
     if let Some(parent) = dest.parent() {
@@ -280,7 +320,19 @@ fn install_ca_cert(
     }
     out.extend_from_slice(&ca_cert);
     std::fs::write(&dest, &out)?;
-    Ok(())
+    Ok(ResolvedMount {
+        display: None,
+        mount_type: MountType::File {
+            filename: ca_cert_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into(),
+        },
+        source: ca_cert_path.to_path_buf(),
+        target: "/etc/ssl/certs/ca-certificates.crt".to_string(),
+        read_only: true,
+    })
 }
 
 fn format_size(bytes: i64) -> String {
@@ -291,4 +343,73 @@ fn format_size(bytes: i64) -> String {
     } else {
         format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
     }
+}
+
+/// Look up a user's home directory from the container rootfs /etc/passwd.
+fn lookup_home_dir(rootfs: &Path, uid: u32) -> anyhow::Result<String> {
+    let passwd_path = rootfs.join("etc/passwd");
+    let content = std::fs::read_to_string(&passwd_path)
+        .map_err(|e| anyhow::anyhow!("cannot read container /etc/passwd: {e}"))?;
+
+    for line in content.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        // passwd format: name:password:uid:gid:gecos:home:shell
+        if fields.len() >= 6 && fields[2].parse::<u32>().ok() == Some(uid) {
+            return Ok(fields[5].to_string());
+        }
+    }
+
+    anyhow::bail!("no home directory found for uid {uid} in container /etc/passwd")
+}
+
+/// Expand `~` prefix in a path string.
+fn expand_tilde(path: &str, home: &Path) -> PathBuf {
+    if path == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        PathBuf::from(path)
+    }
+}
+
+/// Resolve mount paths: expand ~ on source (host home) and target (container home).
+/// Determines mount type (dir with unique tag, or file) based on source path.
+fn resolve_mounts(
+    mounts: &[crate::config::config::Mount],
+    host_home: &Path,
+    container_home: &str,
+) -> anyhow::Result<Vec<ResolvedMount>> {
+    let container_home = PathBuf::from(container_home);
+    mounts
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let source = expand_tilde(&m.source, host_home);
+            let source = std::fs::canonicalize(&source).unwrap_or(source);
+            let target = expand_tilde(&m.target, &container_home);
+
+            let mount_type = if source.is_dir() {
+                MountType::Dir {
+                    key: format!("mount_{i}"),
+                }
+            } else {
+                MountType::File {
+                    filename: source
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into(),
+                }
+            };
+
+            Ok(ResolvedMount {
+                display: Some((m.source.clone(), m.target.clone())),
+                mount_type,
+                source,
+                target: target.to_string_lossy().to_string(),
+                read_only: m.read_only,
+            })
+        })
+        .collect()
 }

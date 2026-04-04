@@ -22,10 +22,6 @@ pub struct CliArgs {
     pub quiet: bool,
 
     /// Debug log file path
-    #[arg(long, env = "EZ_LOG_FILE", default_value = "~/.ezpez/ez.log")]
-    pub log_file: String,
-
-    /// Debug log file path
     #[arg(long, env = "EZ_LOG_LEVEL", default_value = "warn")]
     pub log_level: LogLevel,
 

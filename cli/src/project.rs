@@ -6,7 +6,7 @@ use crate::cli;
 use crate::config::Config;
 
 pub struct Project {
-    pub dir: PathBuf,
+    pub cache_dir: PathBuf,
     pub cwd: PathBuf,
     pub config: Config,
     pub ca_cert: PathBuf,
@@ -54,7 +54,7 @@ pub fn lock(config: Config) -> anyhow::Result<Project> {
     }
 
     Ok(Project {
-        dir,
+        cache_dir: dir,
         cwd,
         config,
         ca_cert,

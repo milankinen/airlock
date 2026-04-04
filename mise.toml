@@ -76,18 +76,25 @@ docker run --rm \
 echo "Rootfs: sandbox/out/initramfs.gz ($(du -h sandbox/out/initramfs.gz | cut -f1))"
 """
 
-[tasks.build]
+[tasks."build:dev"]
 description = "Build and codesign the CLI binary"
 depends = ["build:kernel", "build:rootfs"]
 sources = ["cli/src/**/*.rs", "cli/Cargo.toml", "Cargo.toml", "Cargo.lock", "sandbox/out/Image", "sandbox/out/initramfs.gz"]
 outputs = ["target/debug/ez"]
 run = """
-cargo build -p ezpez-cli "$@"
+cargo build -p ezpez-cli --features dev "$@"
 codesign --entitlements entitlements.plist --force -s - target/debug/ez 2>/dev/null || true
+"""
+
+[tasks."build:dev-image"]
+description = "Build development time sandbox image for `mise ez`"
+run = """
+docker build -t ez:dev -f dev.dockerfile .
 """
 
 [tasks.ez]
 description = "Build, sign, and run"
 raw = true
-depends = ["build"]
+depends = ["build:dev", "build:dev-image"]
+env.RUST_BACKTRACE = "1"
 run = "target/debug/ez"

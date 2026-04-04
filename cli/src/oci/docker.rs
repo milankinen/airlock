@@ -2,6 +2,8 @@ use std::io::Read;
 use std::path::Path;
 use std::process::Command;
 
+use super::OciConfig;
+
 /// Docker save manifest.json entry (Docker-specific, not OCI standard)
 #[derive(serde::Deserialize)]
 struct DockerManifestEntry {
@@ -47,7 +49,7 @@ pub fn save_and_extract(
     image_ref: &str,
     rootfs: &Path,
     image_config_dest: &Path,
-) -> anyhow::Result<oci_client::config::ConfigFile> {
+) -> anyhow::Result<OciConfig> {
     std::fs::create_dir_all(rootfs)?;
 
     let child = Command::new("docker")
@@ -92,7 +94,7 @@ pub fn save_and_extract(
     }
     let config_bytes = config_data
         .ok_or_else(|| anyhow::anyhow!("config blob not found in docker save output"))?;
-    let image_config: oci_client::config::ConfigFile = serde_json::from_slice(&config_bytes)?;
+    let image_config: OciConfig = serde_json::from_slice(&config_bytes)?;
 
     // Save config for caching
     std::fs::write(image_config_dest, &config_bytes)?;

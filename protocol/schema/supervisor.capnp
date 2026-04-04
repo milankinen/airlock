@@ -8,7 +8,9 @@ interface Supervisor {
     caCert :Data,
     caKey :Data,
     logs :LogSink,
-    logFilter :Text
+    logFilter :Text,
+    cmd :Text,
+    args :List(Text)
   ) -> (proc :Process);
 }
 
