@@ -2,7 +2,7 @@
 set -eu
 
 REPO="milankinen/ezpez"
-INSTALL_DIR="${EZPEZ_INSTALL_DIR:-/usr/local/bin}"
+INSTALL_DIR="${EZPEZ_INSTALL_DIR:-$HOME/.local/bin}"
 
 info() { printf '  %s\n' "$@"; }
 err()  { printf 'error: %s\n' "$@" >&2; exit 1; }
@@ -56,13 +56,9 @@ ACTUAL=$(shasum -a 256 "$TMPDIR/$ARCHIVE" | cut -d' ' -f1)
 
 # ── Install ─────────────────────────────────────────────
 info "extracting to $INSTALL_DIR"
+mkdir -p "$INSTALL_DIR"
 tar -xzf "$TMPDIR/$ARCHIVE" -C "$TMPDIR"
-
-if [ -w "$INSTALL_DIR" ]; then
-  mv "$TMPDIR/ez" "$INSTALL_DIR/ez"
-else
-  sudo mv "$TMPDIR/ez" "$INSTALL_DIR/ez"
-fi
+mv "$TMPDIR/ez" "$INSTALL_DIR/ez"
 chmod +x "$INSTALL_DIR/ez"
 
 printf 'done! ez installed to %s/ez\n' "$INSTALL_DIR"
