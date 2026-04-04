@@ -13,8 +13,14 @@ use crate::rpc::HostCA;
 
 const PROXY_PORT: u16 = 15001;
 
-pub fn start_proxy(network: network_proxy::Client, ca: HostCA, dns: Rc<DnsState>) {
+pub fn start_proxy(
+    network: network_proxy::Client,
+    ca: HostCA,
+    dns: Rc<DnsState>,
+    tls_passthrough: Vec<String>,
+) {
     info!("start network proxy");
+    let tls_passthrough = Rc::new(tls_passthrough);
     tokio::task::spawn_local(async move {
         let interceptor = match TlsInterceptor::new(&ca.cert, &ca.key) {
             Ok(i) => Rc::new(i),
@@ -45,8 +51,11 @@ pub fn start_proxy(network: network_proxy::Client, ca: HostCA, dns: Rc<DnsState>
             let network = network.clone();
             let interceptor = interceptor.clone();
             let dns = dns.clone();
+            let tls_passthrough = tls_passthrough.clone();
             tokio::task::spawn_local(async move {
-                if let Err(e) = handle_connection(stream, &network, &interceptor, &dns).await {
+                if let Err(e) =
+                    handle_connection(stream, &network, &interceptor, &dns, &tls_passthrough).await
+                {
                     debug!("proxy conn: {e}");
                 }
             });
@@ -59,6 +68,7 @@ async fn handle_connection(
     network: &network_proxy::Client,
     interceptor: &TlsInterceptor,
     dns: &DnsState,
+    tls_passthrough: &[String],
 ) -> anyhow::Result<()> {
     let (orig_host, orig_port) = get_original_dst(&stream)?;
 
@@ -85,12 +95,19 @@ async fn handle_connection(
     let server_sink: tcp_sink::Client =
         capnp_rpc::new_client(ChannelSink(RefCell::new(Some(server_tx))));
 
-    debug!("connect {hostname}:{orig_port} tls={is_tls}");
+    let passthrough = is_tls && host_matches_any(&hostname, tls_passthrough);
+    if passthrough {
+        debug!("connect {hostname}:{orig_port} tls=passthrough");
+    } else {
+        debug!("connect {hostname}:{orig_port} tls={is_tls}");
+    }
 
     let mut req = network.connect_request();
     req.get().set_host(&hostname);
     req.get().set_port(orig_port);
-    req.get().set_tls(is_tls);
+    // Tell CLI this is NOT TLS from its perspective if passthrough
+    // (CLI won't wrap with TLS — the container↔server TLS is end-to-end)
+    req.get().set_tls(is_tls && !passthrough);
     req.get().set_client(server_sink);
 
     let response = req.send().promise.await?;
@@ -109,7 +126,7 @@ async fn handle_connection(
         }
     };
 
-    if is_tls {
+    if is_tls && !passthrough {
         // TLS interception with timeout on handshake
         let tls_stream = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -121,6 +138,7 @@ async fn handle_connection(
         let (mut read, mut write) = tokio::io::split(tls_stream);
         relay(&mut read, &mut write, client_sink, &mut server_rx).await;
     } else {
+        // Plain TCP or TLS passthrough (raw bytes forwarded end-to-end)
         let (mut read, mut write) = stream.into_split();
         relay(&mut read, &mut write, client_sink, &mut server_rx).await;
     }
@@ -222,4 +240,16 @@ fn get_original_dst(stream: &tokio::net::TcpStream) -> anyhow::Result<(String, u
     let ip = std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
     let port = u16::from_be(addr.sin_port);
     Ok((ip.to_string(), port))
+}
+
+/// Check if a hostname matches any pattern in the list.
+/// Supports exact match and `*.domain.com` wildcard.
+fn host_matches_any(host: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|pattern| {
+        if let Some(suffix) = pattern.strip_prefix("*.") {
+            host.ends_with(suffix) && host.len() > suffix.len() || host == suffix
+        } else {
+            host == pattern
+        }
+    })
 }

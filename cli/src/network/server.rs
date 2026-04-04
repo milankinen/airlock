@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, error, trace};
 
-use super::scripting::{ScriptError, TcpConnect};
+use super::scripting::{ScriptError, TcpConnect, host_matches};
 use super::{Network, http_proxy};
 
 fn is_localhost(host: &str) -> bool {
@@ -62,8 +62,8 @@ impl network_proxy::Server for Network {
             .await
             .map_err(|e| capnp::Error::failed(format!("connect to {addr} failed: {e}")))?;
 
-        let has_http_rules = self.script_engine.has_http_rules();
-        let http_engine = if has_http_rules {
+        let is_passthrough = self.tls_passthrough.iter().any(|p| host_matches(host, p));
+        let http_engine = if self.script_engine.has_http_rules() && !is_passthrough {
             Some(self.script_engine.clone())
         } else {
             None
@@ -102,7 +102,7 @@ impl network_proxy::Server for Network {
 
         results.get().init_result().set_server(sink);
 
-        debug!("relay started: {addr} tls={tls} http_intercept={has_http_rules}");
+        debug!("relay started: {addr} tls={tls} passthrough={is_passthrough}");
         Ok(())
     }
 }

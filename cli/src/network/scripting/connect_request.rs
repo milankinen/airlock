@@ -48,7 +48,7 @@ impl UserData for ConnectRequest {
     }
 }
 
-pub(super) fn host_matches(host: &str, pattern: &str) -> bool {
+pub fn host_matches(host: &str, pattern: &str) -> bool {
     if let Some(suffix) = pattern.strip_prefix('*') {
         // suffix is ".example.com"
         host.ends_with(suffix) || host == &suffix[1..]

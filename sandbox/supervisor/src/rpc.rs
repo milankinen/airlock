@@ -13,6 +13,7 @@ pub struct HostConnection {
     pub log_filter: String,
     pub cmd: String,
     pub args: Vec<String>,
+    pub tls_passthrough: Vec<String>,
 }
 
 pub struct HostCA {
@@ -88,6 +89,11 @@ impl supervisor::Server for SupervisorImpl {
             cmd: params.get_cmd()?.to_str()?.to_string(),
             args: params
                 .get_args()?
+                .iter()
+                .map(|a| a.map(|s| s.to_str().unwrap_or("").to_string()))
+                .collect::<Result<Vec<_>, _>>()?,
+            tls_passthrough: params
+                .get_tls_passthrough()?
                 .iter()
                 .map(|a| a.map(|s| s.to_str().unwrap_or("").to_string()))
                 .collect::<Result<Vec<_>, _>>()?,

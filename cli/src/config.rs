@@ -64,6 +64,10 @@ pub mod config {
         /// Network filtering rules (Lua scripts)
         #[config(default)]
         pub rules: Vec<NetworkRule>,
+        /// Hosts whose TLS traffic should NOT be intercepted (cert pinning support).
+        /// Supports glob patterns like "*.example.com".
+        #[config(default)]
+        pub allowed_hosts_tls: Vec<String>,
     }
 
     #[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]

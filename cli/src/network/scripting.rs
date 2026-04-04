@@ -1,6 +1,7 @@
 mod connect_request;
 mod http_request;
 
+pub use connect_request::host_matches;
 use mlua::{Function, Lua, Value};
 use tracing::{debug, trace};
 

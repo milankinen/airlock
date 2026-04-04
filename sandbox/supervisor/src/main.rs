@@ -27,7 +27,7 @@ async fn run() -> anyhow::Result<()> {
 
     let dns = Rc::new(net::dns::DnsState::new());
     net::dns::start(dns.clone());
-    net::start_proxy(conn.network, conn.ca, dns);
+    net::start_proxy(conn.network, conn.ca, dns, conn.tls_passthrough);
 
     info!("start: {} {}", conn.cmd, conn.args.join(" "));
     let use_pty = conn.proc.pty_size.is_some();

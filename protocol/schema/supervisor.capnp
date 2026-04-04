@@ -10,7 +10,8 @@ interface Supervisor {
     logs :LogSink,
     logFilter :Text,
     cmd :Text,
-    args :List(Text)
+    args :List(Text),
+    tlsPassthrough :List(Text)
   ) -> (proc :Process);
 }
 

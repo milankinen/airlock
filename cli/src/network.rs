@@ -25,6 +25,7 @@ pub fn setup(project: &Project) -> anyhow::Result<Network> {
     Ok(Network {
         tls: tokio_rustls::TlsConnector::from(Arc::new(tls_config)),
         host_ports: project.config.network.host_ports.clone(),
+        tls_passthrough: project.config.network.allowed_hosts_tls.clone(),
         script_engine,
     })
 }
@@ -32,5 +33,6 @@ pub fn setup(project: &Project) -> anyhow::Result<Network> {
 pub struct Network {
     tls: tokio_rustls::TlsConnector,
     host_ports: Vec<u16>,
+    tls_passthrough: Vec<String>,
     pub(crate) script_engine: std::rc::Rc<ScriptEngine>,
 }
