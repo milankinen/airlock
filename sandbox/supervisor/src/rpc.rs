@@ -14,6 +14,7 @@ pub struct HostConnection {
     pub cmd: String,
     pub args: Vec<String>,
     pub tls_passthrough: Vec<String>,
+    pub cache_dirs: Vec<String>,
 }
 
 pub struct HostCA {
@@ -94,6 +95,11 @@ impl supervisor::Server for SupervisorImpl {
                 .collect::<Result<Vec<_>, _>>()?,
             tls_passthrough: params
                 .get_tls_passthrough()?
+                .iter()
+                .map(|a| a.map(|s| s.to_str().unwrap_or("").to_string()))
+                .collect::<Result<Vec<_>, _>>()?,
+            cache_dirs: params
+                .get_cache_dirs()?
                 .iter()
                 .map(|a| a.map(|s| s.to_str().unwrap_or("").to_string()))
                 .collect::<Result<Vec<_>, _>>()?,

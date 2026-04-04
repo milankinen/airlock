@@ -1,3 +1,4 @@
+pub(crate) mod cache;
 pub(crate) mod config;
 mod docker;
 mod layer;
@@ -16,6 +17,21 @@ pub struct Bundle {
     pub path: PathBuf,
     /// Mounts with `~` expanded: source to host home, target to container home.
     pub mounts: Vec<ResolvedMount>,
+    /// Sparse raw disk image for the cache volume (VirtIO block device).
+    pub cache_image: Option<PathBuf>,
+}
+
+impl Bundle {
+    /// Collect cache subdirs that the supervisor needs to create on the cache volume.
+    pub fn cache_dirs(&self) -> Vec<&str> {
+        self.mounts
+            .iter()
+            .filter_map(|m| match &m.mount_type {
+                MountType::Cache { subdir } => Some(subdir.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 pub struct ResolvedMount {
@@ -33,6 +49,7 @@ pub struct ResolvedMount {
 pub enum MountType {
     Dir { key: String },
     File { filename: String },
+    Cache { subdir: String },
 }
 
 impl ResolvedMount {
@@ -41,12 +58,14 @@ impl ResolvedMount {
             MountType::Dir { key } => key.as_str(),
             MountType::File { filename: _ } if self.read_only => "files_ro",
             MountType::File { filename: _ } => "files_rw",
+            MountType::Cache { .. } => "cache",
         }
     }
     pub fn vm_path(&self) -> String {
         match &self.mount_type {
             MountType::Dir { key } => format!("/mnt/{key}"),
             MountType::File { filename } => format!("/mnt/{}/{filename}", self.key()),
+            MountType::Cache { subdir } => format!("/mnt/cache/{subdir}"),
         }
     }
 }
@@ -150,6 +169,14 @@ fn build_bundle(
         &container_home,
     )?);
 
+    // Cache volume (VirtIO block device with ext4)
+    let (cache_image, cache_mounts) = cache::prepare(
+        &project.cache_dir,
+        project.config.cache.as_ref(),
+        &container_home,
+    )?;
+    mounts.extend(cache_mounts);
+
     config::generate_config(
         &image_config,
         &project.cwd,
@@ -162,6 +189,7 @@ fn build_bundle(
     Ok(Bundle {
         path: bundle_path.to_path_buf(),
         mounts,
+        cache_image,
     })
 }
 

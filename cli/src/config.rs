@@ -3,6 +3,7 @@ mod load_config;
 
 use config::*;
 pub use load_config::load;
+pub use smart_config::ByteSize;
 use smart_config::{DescribeConfig, DeserializeConfig};
 
 /// Configuration loaded from hierarchical TOML files and validated
@@ -16,15 +17,18 @@ pub struct Config {
     /// Number of virtual CPUs
     #[config(default = default_cpus)]
     pub cpus: u32,
-    /// Memory size in megabytes
-    #[config(default = default_memory_mb)]
-    pub memory_mb: u64,
+    /// Memory size (e.g. "4 GB", "512 MB")
+    #[config(default = default_memory)]
+    pub memory: ByteSize,
     /// Network configuration
     #[config(nest)]
     pub network: Network,
     /// Mount points
     #[config(default)]
     pub mounts: Vec<Mount>,
+    /// Cache volume (VirtIO block device with ext4)
+    #[config(nest)]
+    pub cache: Option<Cache>,
 }
 
 #[allow(clippy::module_inception)]
@@ -40,15 +44,15 @@ pub mod config {
         std::thread::available_parallelism().map_or(2, |n| n.get() as u32)
     }
 
-    pub fn default_memory_mb() -> u64 {
+    pub fn default_memory() -> smart_config::ByteSize {
         use sysinfo::System;
-        let sys_mem = System::new_with_specifics(
+        let sys_bytes = System::new_with_specifics(
             sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()),
         )
-        .total_memory()
-            / 1024
-            / 1024;
-        min(max(512, sys_mem / 2), sys_mem)
+        .total_memory();
+        let half = sys_bytes / 2;
+        let min_bytes = 512 * 1024 * 1024;
+        smart_config::ByteSize(min(max(min_bytes, half), sys_bytes))
     }
 
     /// Network configuration
@@ -100,5 +104,15 @@ pub mod config {
     impl WellKnown for Mount {
         type Deserializer = de::Nested<Mount>;
         const DE: Self::Deserializer = de::nested();
+    }
+
+    /// Cache volume configuration — sparse raw disk with ext4
+    #[derive(Debug, DescribeConfig, DeserializeConfig)]
+    pub struct Cache {
+        /// Disk image size (e.g. "20 GB", "512 MB")
+        pub size: smart_config::ByteSize,
+        /// Container paths to bind-mount from the cache volume
+        #[config(default)]
+        pub mounts: Vec<String>,
     }
 }

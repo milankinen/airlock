@@ -84,6 +84,10 @@ objc2-virtualization = { version = "0.3", features = [
     "VZSharedDirectory",
     "VZSingleDirectoryShare",
     "VZMultipleDirectoryShare",
+    "VZVirtioBlockDeviceConfiguration",
+    "VZStorageDeviceConfiguration",
+    "VZDiskImageStorageDeviceAttachment",
+    "VZStorageDeviceAttachment",
     "block2",
     "dispatch2",
 ] }

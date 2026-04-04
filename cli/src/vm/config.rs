@@ -13,4 +13,6 @@ pub struct VmConfig {
     pub initramfs: PathBuf,
     pub kernel_cmdline: String,
     pub shares: Vec<VmShare>,
+    /// Sparse raw disk image for cache volume (VirtIO block device).
+    pub cache_disk: Option<PathBuf>,
 }

@@ -64,6 +64,7 @@ impl Supervisor {
         project: &Project,
         stdin: Stdin,
         network: Network,
+        cache_dirs: &[String],
     ) -> anyhow::Result<Process> {
         let log_sink: log_sink::Client = capnp_rpc::new_client(LogSinkImpl);
 
@@ -99,6 +100,12 @@ impl Supervisor {
         let mut pt_builder = req.get().init_tls_passthrough(tls_passthrough.len() as u32);
         for (i, host) in tls_passthrough.iter().enumerate() {
             pt_builder.set(i as u32, host);
+        }
+
+        // Cache volume subdirs to create on /mnt/cache
+        let mut cd_builder = req.get().init_cache_dirs(cache_dirs.len() as u32);
+        for (i, dir) in cache_dirs.iter().enumerate() {
+            cd_builder.set(i as u32, dir);
         }
 
         let response = req.send().promise.await?;

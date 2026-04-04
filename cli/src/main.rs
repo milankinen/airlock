@@ -60,11 +60,14 @@ async fn run(args: CliArgs, config: config::Config) -> anyhow::Result<i32> {
     terminal.enter_raw_mode();
 
     cli::log!("Booting VM...");
+    let cache_dirs: Vec<String> = bundle.cache_dirs().into_iter().map(Into::into).collect();
     let (vm_handle, vsock_fd) = vm::start(&args, &project, bundle).await?;
     let supervisor = rpc::Supervisor::connect(vsock_fd)?;
 
     let stdin = terminal.stdin()?;
-    let proc = supervisor.start(&args, &project, stdin, network).await?;
+    let proc = supervisor
+        .start(&args, &project, stdin, network, &cache_dirs)
+        .await?;
 
     // Forward host signals to the VM process
     let signal_proc = proc.clone();

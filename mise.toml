@@ -10,7 +10,7 @@ quiet = true
 description = "Lint all code"
 run = """
 cargo +nightly fmt --all -- --check
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --tests -- -D warnings
 """
 
 [tasks."build:kernel"]

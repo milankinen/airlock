@@ -55,6 +55,9 @@ pub async fn start(
                     shares.push(share);
                 }
             }
+            crate::oci::MountType::Cache { .. } => {
+                // Cache mounts use VirtIO block device, not VirtioFS
+            }
         }
     }
     // Add bundle as a VirtioFS share
@@ -72,15 +75,32 @@ pub async fn start(
     cli::log!(
         "  {} memory: {}",
         cli::bullet(),
-        cli::dim(&format!("{}MB", project.config.memory_mb))
+        cli::dim(&project.config.memory.to_string())
     );
-    for mount in bundle.mounts {
-        let Some((source, target)) = mount.display else {
+    cli::log!(
+        "  {} cache:  {}",
+        cli::bullet(),
+        cli::dim(
+            &project
+                .config
+                .cache
+                .as_ref()
+                .map_or_else(|| "none".to_string(), |c| c.size.to_string())
+        )
+    );
+    for mount in &bundle.mounts {
+        let Some((source, target)) = &mount.display else {
             continue;
         };
-        let mode = if mount.read_only { "ro" } else { "rw" };
+        let mode = if matches!(mount.mount_type, crate::oci::MountType::Cache { .. }) {
+            continue;
+        } else if mount.read_only {
+            "ro"
+        } else {
+            "rw"
+        };
         cli::log!(
-            "  {} mount: {}",
+            "  {} mount:  {}",
             cli::bullet(),
             cli::dim(&format!("{source} → {target} ({mode})"))
         );
@@ -97,7 +117,7 @@ pub async fn start(
 
     let vm_config = config::VmConfig {
         cpus: project.config.cpus,
-        memory_bytes: project.config.memory_mb * 1024 * 1024,
+        memory_bytes: project.config.memory.0,
         kernel: assets.kernel,
         initramfs: assets.initramfs,
         kernel_cmdline: {
@@ -126,6 +146,7 @@ pub async fn start(
             cmd
         },
         shares,
+        cache_disk: bundle.cache_image.clone(),
     };
 
     #[cfg(target_os = "macos")]

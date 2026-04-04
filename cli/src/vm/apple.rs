@@ -49,7 +49,7 @@ impl AppleVmBackend {
         let host_to_guest = create_pipe()?;
         let guest_to_host = create_pipe()?;
 
-        let vm_config = unsafe { Self::create_vm_config(config, &host_to_guest, &guest_to_host) };
+        let vm_config = unsafe { Self::create_vm_config(config, &host_to_guest, &guest_to_host)? };
 
         unsafe {
             vm_config
@@ -89,7 +89,7 @@ impl AppleVmBackend {
         config: &VmConfig,
         host_to_guest: &PipeEnds,
         guest_to_host: &PipeEnds,
-    ) -> Retained<VZVirtualMachineConfiguration> {
+    ) -> anyhow::Result<Retained<VZVirtualMachineConfiguration>> {
         unsafe {
             // Boot loader
             let kernel_path = config.kernel.to_string_lossy();
@@ -194,7 +194,28 @@ impl AppleVmBackend {
                 vm_config.setDirectorySharingDevices(&fs_devices);
             }
 
-            vm_config
+            // VirtIO block device for cache volume
+            if let Some(disk_path) = &config.cache_disk {
+                let abs_path =
+                    std::fs::canonicalize(disk_path).unwrap_or_else(|_| disk_path.clone());
+                let url = NSURL::fileURLWithPath(&NSString::from_str(&abs_path.to_string_lossy()));
+                let attachment = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
+                    VZDiskImageStorageDeviceAttachment::alloc(),
+                    &url,
+                    false,
+                )
+                .map_err(|e| anyhow::anyhow!("cache disk attachment: {e}"))?;
+                let block_config = VZVirtioBlockDeviceConfiguration::initWithAttachment(
+                    VZVirtioBlockDeviceConfiguration::alloc(),
+                    &attachment.into_super(),
+                );
+                let storage: Retained<VZStorageDeviceConfiguration> = block_config.into_super();
+                let storage_devices = NSArray::from_retained_slice(&[storage]);
+                vm_config.setStorageDevices(&storage_devices);
+                debug!("cache block device attached: {}", abs_path.display());
+            }
+
+            Ok(vm_config)
         } // unsafe
     }
 }

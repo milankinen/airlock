@@ -11,7 +11,8 @@ interface Supervisor {
     logFilter :Text,
     cmd :Text,
     args :List(Text),
-    tlsPassthrough :List(Text)
+    tlsPassthrough :List(Text),
+    cacheDirs :List(Text)
   ) -> (proc :Process);
 }
 

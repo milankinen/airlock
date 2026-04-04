@@ -56,6 +56,16 @@ iptables -t nat -A OUTPUT -p tcp --dport 15001 -j RETURN 2>/dev/null
 # Redirect all other outbound TCP to proxy
 iptables -t nat -A OUTPUT -p tcp -j REDIRECT --to-port 15001 2>/dev/null
 
+# Cache volume (VirtIO block device with ext4)
+if [ -b /dev/vda ]; then
+    if ! blkid /dev/vda 2>/dev/null | grep -q ext4; then
+        mkfs.ext4 -q -L ezpez-cache /dev/vda
+    fi
+    mkdir -p /mnt/cache
+    mount /dev/vda /mnt/cache
+    resize2fs /dev/vda 2>/dev/null || true
+fi
+
 # DNS: point container resolver at supervisor's virtual DNS
 mkdir -p /mnt/bundle/rootfs/etc
 echo "nameserver 10.0.0.1" > /mnt/bundle/rootfs/etc/resolv.conf

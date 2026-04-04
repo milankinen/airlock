@@ -29,6 +29,16 @@ async fn run() -> anyhow::Result<()> {
     net::dns::start(dns.clone());
     net::start_proxy(conn.network, conn.ca, dns, conn.tls_passthrough);
 
+    // Create cache volume subdirs (the ext4 volume is already mounted at /mnt/cache by init)
+    for dir in &conn.cache_dirs {
+        let path = format!("/mnt/cache/{dir}");
+        if let Err(e) = std::fs::create_dir_all(&path) {
+            tracing::warn!("failed to create cache dir {path}: {e}");
+        } else {
+            info!("cache dir: /mnt/cache/{dir}");
+        }
+    }
+
     info!("start: {} {}", conn.cmd, conn.args.join(" "));
     let use_pty = conn.proc.pty_size.is_some();
     let args_ref: Vec<&str> = conn.args.iter().map(String::as_str).collect();
