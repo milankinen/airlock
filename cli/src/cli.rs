@@ -125,7 +125,8 @@ macro_rules! _error {
     };
 }
 
-pub(crate) use {_error as error, _log as log};
+pub(crate) use _error as error;
+pub(crate) use _log as log;
 
 /// Create a progress bar for downloading (unless silent).
 pub fn progress_bar(total: u64, prefix: &str) -> ProgressBar {

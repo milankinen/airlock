@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ "v*" ]
+  pull_request:
+
+jobs:
+  # ── Stage 1 ────────────────────────────────────────────
+  lint:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Install rustfmt
+        run: |
+          rustup component add clippy
+          rustup toolchain install nightly --component rustfmt
+      - name: Install capnp
+        run: brew install capnp
+      - uses: Swatinem/rust-cache@v2
+      - run: mise run lint
+
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Install capnp
+        run: brew install capnp
+      - uses: Swatinem/rust-cache@v2
+      - run: mise run test
+
+  # ── Stage 2 ────────────────────────────────────────────
+  build-kernel-aarch64:
+    needs: [ lint, test ]
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - run: mise run build:kernel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel
+          path: sandbox/out/Image
+
+  build-rootfs-aarch64:
+    needs: [ lint, test ]
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Build supervisor
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq capnproto libcapnp-dev musl-tools
+          rustup target add aarch64-unknown-linux-musl
+          cargo build --release -p ezpez-supervisor --target aarch64-unknown-linux-musl
+          mkdir -p sandbox/out
+          cp target/aarch64-unknown-linux-musl/release/ezpez-supervisor sandbox/out/supervisor
+      - run: mise run build:rootfs --no-deps
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rootfs
+          path: sandbox/out/initramfs.gz
+
+  # ── Stage 3 ────────────────────────────────────────────
+  build-cli-macos-aarch64:
+    needs: [ build-kernel-aarch64, build-rootfs-aarch64 ]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Install capnp
+        run: brew install capnp
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel
+          path: sandbox/out
+      - uses: actions/download-artifact@v4
+        with:
+          name: rootfs
+          path: sandbox/out
+      - run: cargo build --release -p ezpez-cli --features dev
+      - run: codesign --entitlements entitlements.plist --force -s - target/release/ez
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ez
+          path: target/release/ez
+
+  # ── Stage 4 ────────────────────────────────────────────
+  release:
+    needs: [ build-cli-macos-aarch64 ]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ez
+      - name: Package release artifacts
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          ARCHIVE="ez-${VERSION}-darwin-aarch64.tar.gz"
+          chmod +x ez
+          tar -czf "$ARCHIVE" ez
+          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          ARCHIVE="ez-${VERSION}-darwin-aarch64.tar.gz"
+          gh release create "$VERSION" "$ARCHIVE" "${ARCHIVE}.sha256" \
+            --repo "$GITHUB_REPOSITORY" --generate-notes

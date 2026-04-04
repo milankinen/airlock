@@ -2,9 +2,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 
 fn main() {
-    let kernel = std::fs::read("../sandbox/out/Image").expect("sandbox/out/Image not found");
-    let initramfs =
-        std::fs::read("../sandbox/out/initramfs.gz").expect("sandbox/out/initramfs.gz not found");
+    let kernel = std::fs::read("../sandbox/out/Image").unwrap_or_default();
+    let initramfs = std::fs::read("../sandbox/out/initramfs.gz").unwrap_or_default();
 
     let mut hasher = DefaultHasher::new();
     hasher.write(&kernel);

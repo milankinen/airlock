@@ -1,5 +1,10 @@
 [tools]
 
+[tasks.test]
+quiet = true
+description = "Run all tests"
+run = "cargo test --workspace"
+
 [tasks.format]
 quiet = true
 description = "Format all code"
