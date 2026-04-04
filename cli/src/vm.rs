@@ -7,7 +7,8 @@ use std::fmt::Write;
 use std::os::unix::io::OwnedFd;
 
 use crate::assets::Assets;
-use crate::error::CliError;
+use crate::cli;
+use crate::cli::{CliArgs, LogLevel};
 use crate::oci::Bundle;
 use crate::project::Project;
 use crate::vm::mounts::{ContainerBind, PreparedMounts};
@@ -30,30 +31,43 @@ impl Vm {
 
     pub async fn start(
         self,
+        args: &CliArgs,
         project: &Project,
         bundle: Bundle,
-        verbose: bool,
-    ) -> Result<(Box<dyn VmHandle>, OwnedFd), CliError> {
+    ) -> anyhow::Result<(Box<dyn VmHandle>, OwnedFd)> {
         let Self { assets, mut mounts } = self;
 
         // Add bundle as a VirtioFS share
         mounts.add_share("bundle".into(), bundle.path.clone(), false);
 
+        cli::log!(
+            "  {} cpus:   {}",
+            cli::bullet(),
+            cli::dim(&project.config.cpus.to_string())
+        );
+        cli::log!(
+            "  {} memory: {}",
+            cli::bullet(),
+            cli::dim(&format!("{}MB", project.config.memory_mb))
+        );
+        for mount in &project.config.mounts {
+            let mode = if mount.read_only { "ro" } else { "rw" };
+            cli::log!(
+                "  {} mount:  {} → {} {}",
+                cli::bullet(),
+                mount.source,
+                mount.target,
+                cli::dim(&format!("({mode})"))
+            );
+        }
+
         let shares: Vec<config::VmShare> = mounts
             .shares
             .iter()
-            .map(|s| {
-                eprintln!(
-                    "  share: {} → {} ({})",
-                    s.tag,
-                    s.host_path.display(),
-                    if s.read_only { "ro" } else { "rw" }
-                );
-                config::VmShare {
-                    tag: s.tag.clone(),
-                    host_path: s.host_path.clone(),
-                    read_only: s.read_only,
-                }
+            .map(|s| config::VmShare {
+                tag: s.tag.clone(),
+                host_path: s.host_path.clone(),
+                read_only: s.read_only,
             })
             .collect();
 
@@ -82,7 +96,7 @@ impl Vm {
                         .collect();
                     let _ = write!(cmd, " ezpez.host_ports={}", ports.join(","));
                 }
-                if !verbose {
+                if matches!(args.log_level, LogLevel::Trace | LogLevel::Debug) {
                     cmd.push_str(" quiet loglevel=3");
                 }
                 cmd
@@ -103,7 +117,7 @@ impl Vm {
                         Err(e) => {
                             attempts += 1;
                             if attempts >= 30 {
-                                return Err(CliError::expected(format!(
+                                return Err(anyhow::anyhow!(format!(
                                     "supervisor not reachable after {attempts} attempts: {e}"
                                 )));
                             }
@@ -119,7 +133,7 @@ impl Vm {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = vm_config;
-            Err(CliError::expected("only macOS is supported currently"))
+            Err(anyhow::anyhow!("only macOS is supported currently"))
         }
     }
 }

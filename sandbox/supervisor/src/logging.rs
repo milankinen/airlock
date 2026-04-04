@@ -2,15 +2,15 @@ use std::fmt::Write;
 
 use ezpez_protocol::supervisor_capnp::log_sink;
 use tokio::sync::mpsc;
-use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer};
 
-pub fn init(log_sink: log_sink::Client, verbose: bool) {
+pub fn init(log_sink: log_sink::Client, log_filter: &str) {
     let (tx, rx) = mpsc::unbounded_channel::<(u8, String)>();
-
+    let filter = EnvFilter::new(log_filter);
     tracing_subscriber::registry()
-        .with(RpcLayer { tx, verbose })
+        .with(RpcLayer { tx }.with_filter(filter))
         .init();
 
     tokio::task::spawn_local(forward(log_sink, rx));
@@ -25,28 +25,11 @@ async fn forward(log_sink: log_sink::Client, mut rx: mpsc::UnboundedReceiver<(u8
     }
 }
 
-/// Crate target prefix — matches module paths like `ezpez_supervisor::net::proxy`.
-const OWN_TARGET: &str = "ezpez_supervisor";
-
 struct RpcLayer {
     tx: mpsc::UnboundedSender<(u8, String)>,
-    verbose: bool,
 }
 
 impl<S: tracing::Subscriber> Layer<S> for RpcLayer {
-    fn enabled(
-        &self,
-        metadata: &tracing::Metadata<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) -> bool {
-        let level = *metadata.level();
-        if self.verbose && metadata.target().starts_with(OWN_TARGET) {
-            level <= tracing::Level::DEBUG
-        } else {
-            level <= tracing::Level::WARN
-        }
-    }
-
     fn on_event(
         &self,
         event: &tracing::Event<'_>,

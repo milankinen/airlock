@@ -50,7 +50,9 @@ docker run --rm \
   -v ezpez-target-cache:/target \
   ezpez-supervisor-builder sh -c '
     export CARGO_HOME=/cargo-cache
+    export RUSTUP_HOME=/cargo-cache
     cd /workspace
+    rustup target add aarch64-unknown-linux-musl
     cargo build --release -p ezpez-supervisor --target aarch64-unknown-linux-musl --target-dir /target
     cp /target/aarch64-unknown-linux-musl/release/ezpez-supervisor /out/supervisor
   '

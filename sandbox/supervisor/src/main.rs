@@ -23,8 +23,7 @@ async fn run() -> anyhow::Result<()> {
     drop(listen_fd);
 
     let conn = rpc::connect(conn_fd).await?;
-
-    logging::init(conn.log_sink, conn.verbose);
+    logging::init(conn.log_sink, &conn.log_filter);
 
     let dns = Rc::new(net::dns::DnsState::new());
     net::dns::start(dns.clone());

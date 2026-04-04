@@ -4,7 +4,6 @@ use smart_config::DescribeConfig;
 
 use crate::config::Config;
 use crate::config::de::format_error;
-use crate::error::CliError;
 
 /// Load configuration from hierarchical TOML files.
 ///
@@ -13,7 +12,7 @@ use crate::error::CliError;
 /// 2. `~/.ez.toml`
 /// 3. `<project_root>/ez.toml`
 /// 4. `<project_root>/ez.local.toml`
-pub fn load(project_root: &Path) -> Result<Config, CliError> {
+pub fn load(project_root: &Path) -> anyhow::Result<Config> {
     let home = dirs::home_dir().unwrap_or_default();
     let paths = [
         home.join(".ezpez/config.toml"),
@@ -25,14 +24,14 @@ pub fn load(project_root: &Path) -> Result<Config, CliError> {
     let mut merged = serde_json::Value::Object(serde_json::Map::new());
     for path in &paths {
         if let Ok(content) = std::fs::read_to_string(path) {
-            let value: serde_json::Value = toml::from_str(&content)
-                .map_err(|e| CliError::expected(format!("{}: {e}", path.display())))?;
+            let value: serde_json::Value =
+                toml::from_str(&content).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
             merged = merge_json(merged, value);
         }
     }
 
     let serde_json::Value::Object(map) = merged else {
-        return Err(CliError::expected("config must be a TOML table"));
+        anyhow::bail!("config must be a TOML table");
     };
 
     let schema = smart_config::ConfigSchema::new(&Config::DESCRIPTION, "");
@@ -41,7 +40,7 @@ pub fn load(project_root: &Path) -> Result<Config, CliError> {
     let parser = repo.single::<Config>()?;
     match parser.parse() {
         Ok(config) => Ok(config),
-        Err(errors) => Err(CliError::expected(format_error(
+        Err(errors) => Err(anyhow::anyhow!(format_error(
             "invalid configuration",
             errors,
         ))),

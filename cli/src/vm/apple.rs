@@ -1,8 +1,3 @@
-use super::config::VmConfig;
-use crate::error::CliError;
-
-type Result<T> = std::result::Result<T, CliError>;
-
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Mutex;
 
@@ -14,15 +9,17 @@ use objc2_foundation::{NSArray, NSError, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::*;
 use tracing::{debug, info};
 
+use super::config::VmConfig;
+
 struct PipeEnds {
     read: OwnedFd,
     write: OwnedFd,
 }
 
-fn create_pipe() -> Result<PipeEnds> {
+fn create_pipe() -> anyhow::Result<PipeEnds> {
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return Err(CliError::Unexpected(std::io::Error::last_os_error().into()));
+        return Err(anyhow::anyhow!(std::io::Error::last_os_error()));
     }
     Ok(PipeEnds {
         read: unsafe { OwnedFd::from_raw_fd(fds[0]) },
@@ -48,16 +45,16 @@ pub struct AppleVmBackend {
 unsafe impl Send for AppleVmBackend {}
 
 impl AppleVmBackend {
-    pub fn new(config: &VmConfig) -> Result<Self> {
+    pub fn new(config: &VmConfig) -> anyhow::Result<Self> {
         let host_to_guest = create_pipe()?;
         let guest_to_host = create_pipe()?;
 
         let vm_config = unsafe { Self::create_vm_config(config, &host_to_guest, &guest_to_host) };
 
         unsafe {
-            vm_config.validateWithError().map_err(|e| {
-                CliError::expected(format!("VM configuration validation failed: {e}"))
-            })?;
+            vm_config
+                .validateWithError()
+                .map_err(|e| anyhow::anyhow!(format!("VM configuration validation failed: {e}")))?;
         }
         debug!("VM configuration validated");
 
@@ -216,7 +213,7 @@ impl Drop for AppleVmBackend {
 }
 
 impl AppleVmBackend {
-    pub async fn start(&mut self) -> Result<()> {
+    pub async fn start(&mut self) -> anyhow::Result<()> {
         info!("starting VM...");
 
         let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<(), String>>();
@@ -241,15 +238,15 @@ impl AppleVmBackend {
         });
 
         rx.await
-            .map_err(|_| CliError::expected("VM start channel closed"))?
-            .map_err(|e| CliError::expected(format!("VM start failed: {e}")))?;
+            .map_err(|_| anyhow::anyhow!("VM start channel closed"))?
+            .map_err(|e| anyhow::anyhow!(format!("VM start failed: {e}")))?;
 
         info!("VM started");
         Ok(())
     }
 
     #[allow(dead_code)]
-    pub async fn stop(&mut self) -> Result<()> {
+    pub async fn stop(&mut self) -> anyhow::Result<()> {
         let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<(), String>>();
         let tx = Mutex::new(Some(tx));
         let vm_addr = self.vm_ptr;
@@ -273,8 +270,8 @@ impl AppleVmBackend {
         });
 
         rx.await
-            .map_err(|_| CliError::expected("VM stop channel closed"))?
-            .map_err(|e| CliError::expected(format!("VM stop failed: {e}")))?;
+            .map_err(|_| anyhow::anyhow!("VM stop channel closed"))?
+            .map_err(|e| anyhow::anyhow!(format!("VM stop failed: {e}")))?;
 
         info!("VM stopped");
         Ok(())
@@ -299,7 +296,7 @@ impl AppleVmBackend {
         }
     }
 
-    pub async fn vsock_connect(&self, port: u32) -> Result<OwnedFd> {
+    pub async fn vsock_connect(&self, port: u32) -> anyhow::Result<OwnedFd> {
         let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<i32, String>>();
         let tx = Mutex::new(Some(tx));
         let vm_addr = self.vm_ptr;
@@ -348,8 +345,8 @@ impl AppleVmBackend {
 
         let fd = rx
             .await
-            .map_err(|_| CliError::expected("vsock connect channel closed"))?
-            .map_err(|e| CliError::expected(format!("vsock connect failed: {e}")))?;
+            .map_err(|_| anyhow::anyhow!("vsock connect channel closed"))?
+            .map_err(|e| anyhow::anyhow!(format!("vsock connect failed: {e}")))?;
 
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }

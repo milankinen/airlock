@@ -8,7 +8,7 @@ interface Supervisor {
     caCert :Data,
     caKey :Data,
     logs :LogSink,
-    verbose :Bool
+    logFilter :Text
   ) -> (proc :Process);
 }
 

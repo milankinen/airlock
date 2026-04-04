@@ -1,7 +1,8 @@
 mod assets;
+mod cache;
 mod cli;
 mod config;
-mod error;
+
 mod network;
 mod oci;
 mod project;
@@ -11,76 +12,71 @@ mod vm;
 
 use std::io::Write;
 
-use clap::Parser;
 use tokio::task::LocalSet;
 use tracing_subscriber::EnvFilter;
-
-use crate::error::CliError;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let cli = cli::Cli::parse();
+    let args = cli::initialize();
 
     let log_file = std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
-        .open("ez.log")
-        .expect("failed to open ez.log");
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(if cli.verbose {
-            "warn,ez=debug"
-        } else {
-            "warn"
-        }))
-        .with_writer(std::sync::Mutex::new(log_file))
-        .with_ansi(false)
-        .init();
+        .truncate(true)
+        .open(&args.log_file);
+    match log_file {
+        Ok(file) => tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new(args.log_filter()))
+            .with_writer(std::sync::Mutex::new(file))
+            .with_ansi(false)
+            .init(),
+        Err(_) => tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new("off"))
+            .init(),
+    }
 
     let cwd = std::env::current_dir().unwrap_or_default();
     let config = match config::load(&cwd) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("config error: {e:#}");
+            cli::error!("config error: {e:#}");
             std::process::exit(2);
         }
     };
     let local = LocalSet::new();
     let exit_code = local
         .run_until(async {
-            match run(cli, config).await {
-                Ok(code) => code,
-                Err(CliError::Expected(msg)) => {
-                    eprintln!("error: {msg}");
-                    1
-                }
-                Err(CliError::Unexpected(e)) => {
-                    eprintln!("{e:#}");
-                    2
-                }
-            }
+            run(args, config).await.unwrap_or_else(|e| {
+                cli::error!("error: {e:#}");
+                1
+            })
         })
         .await;
 
     std::process::exit(exit_code);
 }
 
-async fn run(cli: cli::Cli, config: config::Config) -> Result<i32, CliError> {
-    let project = project::ensure(config)?;
+async fn run(args: cli::CliArgs, config: config::Config) -> anyhow::Result<i32> {
+    let project = project::lock(config)?;
     let vm = vm::prepare(&project)?;
-    let terminal = terminal::setup();
-    let bundle = oci::prepare(&cli, &project, &terminal, &vm).await?;
+    let mut terminal = terminal::setup();
+    let bundle = oci::prepare(&args, &project, &terminal, &vm).await?;
     let network = network::setup(&project)?;
 
-    eprintln!("Booting VM...");
-    let (vm_handle, vsock_fd) = vm.start(&project, bundle, cli.verbose).await?;
+    // Check if user interrupted during setup (e.g. Ctrl+C during download)
+    if cli::is_interrupted() {
+        return Ok(130); // 128 + SIGINT
+    }
+
+    // Enter raw mode only after downloads complete so Ctrl+C works during setup
+    terminal.enter_raw_mode();
+
+    cli::log!("Booting VM...");
+    let (vm_handle, vsock_fd) = vm.start(&args, &project, bundle).await?;
     let supervisor = rpc::Supervisor::connect(vsock_fd)?;
-    eprintln!("supervisor connected");
 
     let stdin = terminal.stdin()?;
-    let proc = supervisor
-        .start(&project, stdin, network, cli.verbose)
-        .await?;
+    let proc = supervisor.start(&args, &project, stdin, network).await?;
 
     // Forward host signals to the VM process
     let signal_proc = proc.clone();

@@ -10,7 +10,7 @@ pub struct HostConnection {
     pub network: network_proxy::Client,
     pub ca: HostCA,
     pub log_sink: log_sink::Client,
-    pub verbose: bool,
+    pub log_filter: String,
 }
 
 pub struct HostCA {
@@ -82,7 +82,7 @@ impl supervisor::Server for SupervisorImpl {
                 key: String::from_utf8_lossy(params.get_ca_key()?).to_string(),
             },
             log_sink: params.get_logs()?,
-            verbose: params.get_verbose(),
+            log_filter: params.get_log_filter()?.to_str()?.to_string(),
         };
 
         if let Some(tx) = self.0.borrow_mut().take() {

@@ -18,7 +18,7 @@ scc = "2"
 simple-dns = "0.9"
 quick_cache = "0.6"
 tracing = { workspace = true }
-tracing-subscriber = { version = "0.3", features = ["registry"] }
+tracing-subscriber = { version = "0.3", features = ["registry", "env-filter"] }
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 tokio-rustls = "0.26"

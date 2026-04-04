@@ -2,7 +2,7 @@ use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
 
 use ezpez_protocol::supervisor_capnp::*;
 
-use crate::error::CliError;
+use crate::cli::CliArgs;
 use crate::network::Network;
 use crate::project::Project;
 use crate::rpc::logging::LogSinkImpl;
@@ -14,7 +14,7 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    pub fn connect(vsock_fd: OwnedFd) -> Result<Self, CliError> {
+    pub fn connect(vsock_fd: OwnedFd) -> anyhow::Result<Self> {
         use futures::AsyncReadExt;
 
         let std_stream = unsafe { std::net::TcpStream::from_raw_fd(vsock_fd.into_raw_fd()) };
@@ -39,11 +39,11 @@ impl Supervisor {
 
     pub async fn start(
         &self,
+        args: &CliArgs,
         project: &Project,
         stdin: Stdin,
         network: Network,
-        verbose: bool,
-    ) -> Result<Process, CliError> {
+    ) -> anyhow::Result<Process> {
         let log_sink: log_sink::Client = capnp_rpc::new_client(LogSinkImpl);
 
         let ca_cert = std::fs::read(&project.ca_cert)?;
@@ -63,7 +63,7 @@ impl Supervisor {
         req.get().set_ca_cert(&ca_cert);
         req.get().set_ca_key(&ca_key);
         req.get().set_logs(log_sink);
-        req.get().set_verbose(verbose);
+        req.get().set_log_filter(args.log_filter());
 
         let response = req.send().promise.await?;
         let proc = response.get()?.get_proc()?;

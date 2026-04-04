@@ -1,4 +1,3 @@
-pub mod cache;
 pub(crate) mod config;
 mod docker;
 mod layer;
@@ -8,7 +7,8 @@ use std::path::{Path, PathBuf};
 
 use oci_client::config::ConfigFile;
 
-use crate::cli::Cli;
+use crate::cli;
+use crate::cli::CliArgs;
 use crate::project::Project;
 use crate::terminal::Terminal;
 use crate::vm::Vm;
@@ -20,16 +20,15 @@ pub struct Bundle {
 
 /// Resolve, download, and prepare the OCI bundle for the project.
 pub async fn prepare(
-    cli: &Cli,
+    cli: &CliArgs,
     project: &Project,
     terminal: &Terminal,
     vm: &Vm,
 ) -> anyhow::Result<Bundle> {
     let mut resolved = resolve(&project.config.image).await?;
     let image_dir = ensure_image(&mut resolved).await?;
-    let bundle_path = ensure_rootfs(&image_dir, &resolved.digest, &project.hash)?;
+    let bundle_path = ensure_rootfs(&image_dir, &resolved.digest, project)?;
 
-    // Apply project overrides to the base bundle
     write_config(
         &bundle_path,
         &project.cwd,
@@ -44,12 +43,16 @@ pub async fn prepare(
 }
 
 async fn resolve(image_ref: &str) -> anyhow::Result<ResolvedImage> {
-    eprintln!("Resolving image {image_ref}...");
+    cli::log!(
+        "Preparing project environment using image {}...",
+        cli::dim(image_ref)
+    );
 
     if let Some(image_id) = docker::image_exists(image_ref) {
-        eprintln!(
-            "  found locally via docker: {}",
-            &image_id[..19.min(image_id.len())]
+        cli::log!(
+            "  {} resolved via docker {}",
+            cli::check(),
+            cli::dim(&image_id[..19.min(image_id.len())])
         );
         return Ok(ResolvedImage {
             digest: image_id,
@@ -61,6 +64,11 @@ async fn resolve(image_ref: &str) -> anyhow::Result<ResolvedImage> {
     }
 
     let reg = registry::resolve(image_ref).await?;
+    cli::log!(
+        "  {} resolved {}",
+        cli::check(),
+        cli::dim(&format!("{}@{}", reg.reference, &reg.digest[..19]))
+    );
     Ok(ResolvedImage {
         digest: reg.digest.clone(),
         image_config: reg.image_config.clone(),
@@ -80,7 +88,7 @@ enum ImageSource {
 }
 
 async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBuf> {
-    let dir = cache::image_dir(&resolved.digest)?;
+    let dir = crate::cache::image_dir(&resolved.digest)?;
     let rootfs = dir.join("rootfs");
 
     if rootfs.exists() {
@@ -91,80 +99,146 @@ async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBuf> {
                 resolved.image_config = serde_json::from_slice(&data)?;
             }
         }
-        eprintln!("  image cached");
         return Ok(dir);
     }
 
     std::fs::create_dir_all(&dir)?;
 
+    // Clean up any .tmp files from interrupted downloads
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if entry.path().extension().is_some_and(|ext| ext == "tmp") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
     match &resolved.source {
         ImageSource::Docker { image_ref } => {
-            eprintln!("  exporting from docker...");
+            let sp = cli::spinner("exporting from docker...");
             resolved.image_config =
                 docker::save_and_extract(image_ref, &rootfs, &dir.join("image_config.json"))?;
+            sp.finish_and_clear();
+            cli::log!("  {} exported from docker", cli::check());
         }
         ImageSource::Registry(reg) => {
-            eprintln!("Downloading image layers...");
             let layers = &reg.manifest.layers;
+            let total_bytes: u64 = layers.iter().map(|l| l.size as u64).sum();
+            let pb = cli::progress_bar(total_bytes, "downloading");
+
             let mut layer_paths = Vec::new();
             for (i, layer_desc) in layers.iter().enumerate() {
-                let short_digest = &layer_desc.digest[7..19];
-                eprintln!(
-                    "  layer {}/{}: {} ({})",
-                    i + 1,
-                    layers.len(),
-                    short_digest,
-                    format_size(layer_desc.size)
-                );
                 let layer_path = dir.join(format!("layer_{i}.tar.gz"));
-                if !layer_path.exists() {
-                    registry::pull_layer(&reg.reference, layer_desc, &layer_path).await?;
+                if registry::is_layer_valid(layer_desc, &layer_path) {
+                    pb.inc(layer_desc.size as u64);
+                } else {
+                    let _ = std::fs::remove_file(&layer_path);
+                    tokio::select! {
+                        result = registry::pull_layer(&reg.reference, layer_desc, &layer_path, Some(&pb)) => {
+                            result?;
+                        }
+                        () = cli::interrupted() => {
+                            pb.finish_and_clear();
+                            anyhow::bail!("interrupted");
+                        }
+                    }
                 }
                 layer_paths.push(layer_path);
             }
+            pb.finish_and_clear();
+            cli::log!(
+                "  {} downloaded {}",
+                cli::check(),
+                cli::dim(&format!(
+                    "{} layers, {}",
+                    layers.len(),
+                    format_size(total_bytes as i64)
+                ))
+            );
 
-            eprintln!("  extracting layers...");
-            let layer_refs: Vec<&Path> = layer_paths
-                .iter()
-                .map(std::path::PathBuf::as_path)
-                .collect();
+            let sp = cli::spinner("extracting layers...");
+            let layer_refs: Vec<&Path> = layer_paths.iter().map(PathBuf::as_path).collect();
             layer::extract_layers(&layer_refs, &rootfs)?;
+            sp.finish_and_clear();
+            cli::log!("  {} extracted layers", cli::check());
 
             let config_json = serde_json::to_string_pretty(&resolved.image_config)?;
             std::fs::write(dir.join("image_config.json"), config_json)?;
         }
     }
 
-    eprintln!("  image ready");
     Ok(dir)
 }
 
 /// Ensure the project bundle rootfs exists (CoW copy of image).
+///
+/// The digest file is the consistency marker — it's written last after
+/// a successful rootfs copy. If it's missing or stale, the bundle is
+/// considered incomplete and gets recreated.
 fn ensure_rootfs(
     image_dir: &Path,
     image_digest: &str,
-    project_hash: &str,
+    project: &Project,
 ) -> anyhow::Result<PathBuf> {
-    let project = cache::project_dir(project_hash)?;
-    let bundle = project.join("bundle");
-    let digest_file = project.join("image_digest");
+    let bundle = project.dir.join("bundle");
+    let digest_file = project.dir.join("image_digest");
+    let rootfs = bundle.join("rootfs");
 
-    if bundle.exists()
-        && let Ok(stored) = std::fs::read_to_string(&digest_file)
-        && stored.trim() != image_digest
-    {
-        eprintln!("  image changed, recreating project bundle...");
-        std::fs::remove_dir_all(&bundle)?;
+    // Check digest: missing = incomplete, mismatched = image changed
+    let stored_digest = std::fs::read_to_string(&digest_file).ok();
+    let digest_matches = stored_digest
+        .as_deref()
+        .is_some_and(|s| s.trim() == image_digest);
+
+    if stored_digest.is_some() && !digest_matches {
+        // Image changed — prompt in interactive mode
+        if !cli::is_interactive() {
+            anyhow::bail!("project image has changed");
+        }
+        let term = dialoguer::console::Term::stderr();
+        let choice = dialoguer::Select::new()
+            .with_prompt("Image has changed. What would you like to do?")
+            .items([
+                "Re-create environment",
+                "Continue using old environment",
+                "Cancel",
+            ])
+            .default(0)
+            .clear(true)
+            .interact_on_opt(&term)?
+            .unwrap_or(2);
+        let _ = term.clear_last_lines(1);
+
+        match choice {
+            0 => {
+                let spinner = cli::spinner("erasing old environment...");
+                let _ = std::fs::remove_dir_all(&bundle);
+                let _ = std::fs::remove_file(&digest_file);
+                spinner.finish_and_clear();
+                cli::log!("  {} old environment erased", cli::check());
+            }
+            1 => {
+                cli::log!("  {} environment ready", cli::check());
+                return Ok(bundle);
+            }
+            _ => anyhow::bail!("cancelled by user"),
+        }
     }
 
-    if !bundle.join("rootfs").exists() {
-        eprintln!("  creating project bundle...");
+    if !digest_matches {
+        // Incomplete or missing bundle — clean up any partial state and recreate
+        let _ = std::fs::remove_dir_all(&rootfs);
+        let _ = std::fs::remove_file(&digest_file);
+
+        let spinner = cli::spinner("creating project environment...");
         std::fs::create_dir_all(&bundle)?;
-        cache::cow_copy(&image_dir.join("rootfs"), &bundle.join("rootfs"))?;
-        std::fs::create_dir_all(&project)?;
+        crate::cache::cow_copy(&image_dir.join("rootfs"), &rootfs)?;
+        // Write digest last — marks the bundle as complete
         std::fs::write(&digest_file, image_digest)?;
+        spinner.finish_and_clear();
     }
 
+    cli::log!("  {} environment ready", cli::check());
     Ok(bundle)
 }
 
@@ -198,7 +272,6 @@ fn install_ca_cert(
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Read from the pristine image, not the bundle (avoids duplicating on repeated runs)
     let existing = std::fs::read(image_dir.join(ca_store)).unwrap_or_default();
     let ca_cert = std::fs::read(ca_cert_path)?;
     let mut out = existing;

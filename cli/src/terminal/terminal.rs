@@ -2,26 +2,33 @@ use crate::rpc;
 
 pub fn setup() -> Terminal {
     let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    if !is_tty {
-        return Terminal { guard: None };
-    }
-    let raw_mode_enabled = crossterm::terminal::enable_raw_mode().is_ok();
     Terminal {
-        guard: Some(TerminalGuard { raw_mode_enabled }),
+        is_tty,
+        guard: None,
     }
 }
 
 pub struct Terminal {
+    is_tty: bool,
     guard: Option<TerminalGuard>,
 }
 
 impl Terminal {
     pub fn is_tty(&self) -> bool {
-        self.guard.is_some()
+        self.is_tty
+    }
+
+    /// Enter raw terminal mode. Call this only when ready for VM interaction
+    /// (after downloads complete) so Ctrl+C works during setup.
+    pub fn enter_raw_mode(&mut self) {
+        if self.is_tty && self.guard.is_none() {
+            let raw_mode_enabled = crossterm::terminal::enable_raw_mode().is_ok();
+            self.guard = Some(TerminalGuard { raw_mode_enabled });
+        }
     }
 
     pub fn stdin(&self) -> anyhow::Result<rpc::Stdin> {
-        let (pty_size, resizes) = if self.is_tty() {
+        let (pty_size, resizes) = if self.is_tty {
             let pty_size = crossterm::terminal::size().unwrap_or((80, 24));
             let resizes =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
