@@ -12,42 +12,43 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
-async-stream = "0.3"
-clap = { version = "4", features = ["derive", "env"] }
-tokio = { version = "1", features = ["full"] }
-crossterm = "0.28"
-flate2 = "1"
-hex = "0.4"
-oci-client = "0.16"
-rcgen = "0.13"
-rustls = { version = "0.23", features = ["aws-lc-rs"] }
-tokio-rustls = "0.26"
-rustls-native-certs = "0.8"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-tar = "0.4"
-thiserror = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-libc = "0.2"
+async-stream = { workspace = true }
+bytes = { workspace = true }
 capnp = { workspace = true }
 capnp-rpc = { workspace = true }
+clap = { workspace = true }
+console = { workspace = true }
+crossterm = { workspace = true }
+dialoguer = { workspace = true }
+dirs = { workspace = true }
 ezpez-protocol = { workspace = true }
-tokio-util = { version = "0.7", features = ["compat"] }
-futures = "0.3"
-smart-config = "0.4.0-pre.2"
-toml = "1.1.2"
-dirs = "6.0.0"
-mlua = { version = "0.11", features = ["luajit", "vendored", "anyhow"] }
-hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
-hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "server-auto"] }
-http-body-util = "0.1"
-sysinfo = { version = "0.38.4", features = ["system"] }
-regex = "1.12.3"
-console = "0.16.3"
-indicatif = "0.18.4"
-dialoguer = "0.12.0"
+flate2 = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+indicatif = { workspace = true }
+libc = { workspace = true }
+mlua = { workspace = true }
+oci-client = { workspace = true }
+rcgen = { workspace = true }
+regex = { workspace = true }
+rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+smart-config = { workspace = true }
+sysinfo = { workspace = true }
+tar = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-rustls = { workspace = true }
+tokio-util = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

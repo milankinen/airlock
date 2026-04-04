@@ -1,27 +1,24 @@
 use std::sync::Arc;
 
 use quick_cache::sync::Cache;
-use rcgen::{CertificateParams, KeyPair};
+use rcgen::{CertificateParams, Issuer, KeyPair};
 use rustls::ServerConfig;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::TlsAcceptor;
 
 /// TLS interceptor with per-hostname cert caching.
 pub struct TlsInterceptor {
-    ca_cert: rcgen::Certificate,
-    ca_key: KeyPair,
+    issuer: Issuer<'static, KeyPair>,
     cache: Cache<String, Arc<ServerConfig>>,
 }
 
 impl TlsInterceptor {
     pub fn new(ca_cert_pem: &str, ca_key_pem: &str) -> anyhow::Result<Self> {
         let ca_key = KeyPair::from_pem(ca_key_pem)?;
-        let ca_params = CertificateParams::from_ca_cert_pem(ca_cert_pem)?;
-        let ca_cert = ca_params.self_signed(&ca_key)?;
+        let issuer = Issuer::from_ca_cert_pem(ca_cert_pem, ca_key)?;
 
         Ok(Self {
-            ca_cert,
-            ca_key,
+            issuer,
             cache: Cache::new(256),
         })
     }
@@ -44,7 +41,7 @@ impl TlsInterceptor {
         let leaf_key = KeyPair::generate()?;
         let mut params = CertificateParams::new(vec![hostname.to_string()])?;
         params.not_before = rcgen::date_time_ymd(1970, 1, 1);
-        let leaf_cert = params.signed_by(&leaf_key, &self.ca_cert, &self.ca_key)?;
+        let leaf_cert = params.signed_by(&leaf_key, &self.issuer)?;
 
         let cert_der = rustls::pki_types::CertificateDer::from(leaf_cert.der().to_vec());
         let key_der = rustls::pki_types::PrivateKeyDer::try_from(leaf_key.serialize_der())
