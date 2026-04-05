@@ -21,15 +21,20 @@ pub struct RegistryImage {
 fn make_client() -> Client {
     Client::new(ClientConfig {
         protocol: ClientProtocol::Https,
-        platform_resolver: Some(Box::new(linux_arm64_resolver)),
+        platform_resolver: Some(Box::new(linux_platform_resolver)),
         ..Default::default()
     })
 }
 
-fn linux_arm64_resolver(manifests: &[oci_client::manifest::ImageIndexEntry]) -> Option<String> {
+fn linux_platform_resolver(manifests: &[oci_client::manifest::ImageIndexEntry]) -> Option<String> {
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    };
     manifests.iter().find_map(|m| {
         let p = m.platform.as_ref()?;
-        if format!("{}", p.os) == "linux" && format!("{}", p.architecture) == "arm64" {
+        if format!("{}", p.os) == "linux" && format!("{}", p.architecture) == arch {
             Some(m.digest.clone())
         } else {
             None

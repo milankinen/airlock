@@ -38,9 +38,19 @@ impl Supervisor {
     pub fn connect(vsock_fd: OwnedFd) -> anyhow::Result<Self> {
         use futures::AsyncReadExt;
 
-        let std_stream = unsafe { std::net::TcpStream::from_raw_fd(vsock_fd.into_raw_fd()) };
-        std_stream.set_nonblocking(true)?;
-        let stream = tokio::net::TcpStream::from_std(std_stream)?;
+        #[cfg(target_os = "macos")]
+        let stream = {
+            let std_stream = unsafe { std::net::TcpStream::from_raw_fd(vsock_fd.into_raw_fd()) };
+            std_stream.set_nonblocking(true)?;
+            tokio::net::TcpStream::from_std(std_stream)?
+        };
+        #[cfg(target_os = "linux")]
+        let stream = {
+            let std_stream =
+                unsafe { std::os::unix::net::UnixStream::from_raw_fd(vsock_fd.into_raw_fd()) };
+            std_stream.set_nonblocking(true)?;
+            tokio::net::UnixStream::from_std(std_stream)?
+        };
         let (reader, writer) = tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
 
         let network = capnp_rpc::twoparty::VatNetwork::new(

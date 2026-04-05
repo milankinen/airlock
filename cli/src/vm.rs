@@ -1,6 +1,8 @@
 #[cfg(target_os = "macos")]
 mod apple;
 mod config;
+#[cfg(target_os = "linux")]
+mod krun;
 
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -16,7 +18,6 @@ use crate::oci::Bundle;
 use crate::project::Project;
 use crate::vm::config::VmShare;
 
-#[allow(clippy::unused_async)]
 pub async fn start(
     args: &CliArgs,
     project: &Project,
@@ -128,7 +129,7 @@ pub async fn start(
                 .unwrap_or_default()
                 .as_secs();
             let mut cmd = format!(
-                "console=hvc0 rdinit=/init ezpez.epoch={epoch} ezpez.shares={}",
+                "console=hvc0 console=ttyS0 rdinit=/init ezpez.epoch={epoch} ezpez.shares={}",
                 tags.join(",")
             );
             if !project.config.network.host_ports.is_empty() {
@@ -148,6 +149,10 @@ pub async fn start(
         },
         shares,
         cache_disk: bundle.cache_image.clone(),
+        runtime_dir: project.cache_dir.clone(),
+        #[cfg(target_os = "linux")]
+        initramfs_root: assets.initramfs_root,
+        host_ports: project.config.network.host_ports.clone(),
     };
 
     #[cfg(target_os = "macos")]
@@ -176,10 +181,66 @@ pub async fn start(
         Ok((Box::new(backend), vsock_fd))
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        let backend = krun::KrunVmBackend::start(&vm_config, &assets.libkrun, &assets.libkrunfw)?;
+
+        // Wait for the VM to boot and supervisor to start listening.
+        // With libkrun, the first successful connect may reach the guest
+        // before the supervisor binds its vsock port, causing an RST.
+        // We retry the full connect to handle this race.
+        let vsock_fd = {
+            let mut attempts = 0;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                match backend.vsock_connect() {
+                    Ok(fd) => {
+                        // Verify the connection is alive by peeking
+                        use std::os::unix::io::AsRawFd;
+                        let mut buf = [0u8; 1];
+                        let ret = unsafe {
+                            libc::recv(
+                                fd.as_raw_fd(),
+                                buf.as_mut_ptr().cast(),
+                                1,
+                                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                            )
+                        };
+                        if ret == 0
+                            || (ret < 0
+                                && std::io::Error::last_os_error().raw_os_error()
+                                    == Some(libc::ECONNRESET))
+                        {
+                            // Connection was RST — supervisor not ready yet
+                            attempts += 1;
+                            if attempts >= 60 {
+                                return Err(anyhow::anyhow!(
+                                    "supervisor not reachable after {attempts} attempts"
+                                ));
+                            }
+                            continue;
+                        }
+                        break fd;
+                    }
+                    Err(e) => {
+                        attempts += 1;
+                        if attempts >= 60 {
+                            return Err(anyhow::anyhow!(format!(
+                                "supervisor not reachable after {attempts} attempts: {e}"
+                            )));
+                        }
+                    }
+                }
+            }
+        };
+
+        Ok((Box::new(backend), vsock_fd))
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = vm_config;
-        Err(anyhow::anyhow!("only macOS is supported currently"))
+        Err(anyhow::anyhow!("unsupported platform"))
     }
 }
 
@@ -227,5 +288,12 @@ pub trait VmHandle {
 impl VmHandle for apple::AppleVmBackend {
     fn wait_for_stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>> {
         Box::pin(apple::AppleVmBackend::wait_for_stop_impl(self))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl VmHandle for krun::KrunVmBackend {
+    fn wait_for_stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>> {
+        Box::pin(krun::KrunVmBackend::wait_for_stop_impl(self))
     }
 }

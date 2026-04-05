@@ -46,8 +46,12 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         let entry = entry?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
-        if src_path.is_dir() {
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
+        } else if ft.is_symlink() {
+            let target = std::fs::read_link(&src_path)?;
+            std::os::unix::fs::symlink(&target, &dst_path)?;
         } else {
             std::fs::copy(&src_path, &dst_path)?;
         }

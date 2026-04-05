@@ -5,6 +5,10 @@
 #MISE outputs=["target/debug/ez"]
 set -euo pipefail
 
+if [[ "$(uname -s)" == "Linux" ]]; then
+  mise run build:libkrun
+fi
+
 cargo build -p ezpez-cli --features dev "$@"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then

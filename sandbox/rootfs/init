@@ -1,23 +1,30 @@
 #!/bin/sh
-mount -t proc none /proc
+mount -t proc none /proc 2>/dev/null
 
-# Set system clock from host time passed via kernel cmdline
-epoch=$(cat /proc/cmdline | tr ' ' '\n' | grep '^ezpez.epoch=' | cut -d= -f2)
+# Read config from env vars (libkrun) or kernel cmdline (Apple Virtualization)
+ezpez_cfg() {
+    val=$(printenv "EZPEZ_$(echo "$1" | tr '[:lower:]' '[:upper:]')" 2>/dev/null)
+    [ -n "$val" ] && echo "$val" && return
+    cat /proc/cmdline 2>/dev/null | tr ' ' '\n' | grep "^ezpez.$1=" | cut -d= -f2
+}
+
+# Set system clock from host time
+epoch=$(ezpez_cfg epoch)
 [ -n "$epoch" ] && date -s "@$epoch" >/dev/null 2>&1
-mount -t sysfs none /sys
-mount -t devtmpfs none /dev
+mount -t sysfs none /sys 2>/dev/null
+mount -t devtmpfs none /dev 2>/dev/null
 mkdir -p /dev/pts
-mount -t devpts none /dev/pts
-mount -t tmpfs none /tmp
-mount -t tmpfs none /run
+mount -t devpts none /dev/pts 2>/dev/null
+mount -t tmpfs none /tmp 2>/dev/null
+mount -t tmpfs none /run 2>/dev/null
 
 # cgroups (required by crun)
 mkdir -p /sys/fs/cgroup
-mount -t cgroup2 none /sys/fs/cgroup
+mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null
 
 # Mount VirtioFS shares
 mkdir -p /mnt
-shares=$(cat /proc/cmdline | tr ' ' '\n' | grep '^ezpez.shares=' | cut -d= -f2)
+shares=$(ezpez_cfg shares)
 IFS=','
 for tag in $shares; do
     mkdir -p "/mnt/$tag"
@@ -43,7 +50,7 @@ ip route add default via 10.0.0.1 dev lo 2>/dev/null
 # Host port forwarding: redirect specific localhost ports to proxy so they
 # reach the host. All other localhost traffic passes through directly so
 # local services in the VM work normally.
-host_ports=$(cat /proc/cmdline | tr ' ' '\n' | grep '^ezpez.host_ports=' | cut -d= -f2)
+host_ports=$(ezpez_cfg host_ports)
 IFS=','
 for port in $host_ports; do
     iptables -t nat -A OUTPUT -p tcp -d 127.0.0.1 --dport "$port" -j REDIRECT --to-port 15001 2>/dev/null
