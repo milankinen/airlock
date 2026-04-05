@@ -2,15 +2,16 @@
 #MISE description="Build the rootfs initramfs using Docker"
 #MISE depends=["build:supervisor"]
 #MISE sources=["sandbox/rootfs/init", "sandbox/rootfs/build.sh", "sandbox/out/supervisor"]
-#MISE outputs=["sandbox/out/initramfs.gz"]
+#MISE outputs=["sandbox/out/initramfs.gz", "sandbox/out/rootfs.tar.gz"]
 set -euo pipefail
 
 echo "Building rootfs..."
 mkdir -p sandbox/out
 docker run --rm \
+  -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
   -v "$PWD/sandbox/rootfs/init:/init-script:ro" \
   -v "$PWD/sandbox/rootfs/build.sh:/build.sh:ro" \
   -v "$PWD/sandbox/out/supervisor:/supervisor-bin:ro" \
   -v "$PWD/sandbox/out:/out" \
-  alpine:3.23 sh /build.sh
-echo "Rootfs: sandbox/out/initramfs.gz ($(du -h sandbox/out/initramfs.gz | cut -f1))"
+  alpine:3.23 sh -c 'sh /build.sh && chown "$HOST_UID:$HOST_GID" /out/initramfs.gz /out/rootfs.tar.gz'
+echo "Rootfs: sandbox/out/initramfs.gz ($(du -h sandbox/out/initramfs.gz | cut -f1)), sandbox/out/rootfs.tar.gz ($(du -h sandbox/out/rootfs.tar.gz | cut -f1))"

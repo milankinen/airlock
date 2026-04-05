@@ -176,8 +176,7 @@ impl KrunVmBackend {
             "set_vm_config",
         )?;
 
-        // Set root to our initramfs rootfs (extracted during rootfs build)
-        let root_path = to_cstr(&config.initramfs_root.to_string_lossy())?;
+        let root_path = to_cstr(&config.initramfs.to_string_lossy())?;
         check_krun(
             unsafe { (fns.set_root)(ctx, root_path.as_ptr()) },
             "set_root",

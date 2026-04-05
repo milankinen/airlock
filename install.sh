@@ -13,12 +13,20 @@ ARCH=$(uname -m)
 
 case "$OS" in
   Darwin) OS="darwin" ;;
-  *)      err "unsupported OS: $OS (only macOS is supported)" ;;
+  Linux)  OS="linux" ;;
+  *)      err "unsupported OS: $OS" ;;
 esac
 
 case "$ARCH" in
   arm64|aarch64) ARCH="aarch64" ;;
-  *)             err "unsupported architecture: $ARCH (only aarch64 is supported)" ;;
+  x86_64)        ARCH="x86_64" ;;
+  *)             err "unsupported architecture: $ARCH" ;;
+esac
+
+# Validate supported combinations
+case "${OS}-${ARCH}" in
+  darwin-aarch64|linux-x86_64|linux-aarch64) ;;
+  *) err "unsupported platform: ${OS}-${ARCH}" ;;
 esac
 
 # ── Version resolution ──────────────────────────────────
@@ -51,7 +59,11 @@ curl -fsSL "$BASE_URL/$ARCHIVE.sha256" -o "$TMPDIR/$ARCHIVE.sha256" \
 # ── Verify checksum ─────────────────────────────────────
 info "verifying checksum"
 EXPECTED=$(cut -d' ' -f1 < "$TMPDIR/$ARCHIVE.sha256")
-ACTUAL=$(shasum -a 256 "$TMPDIR/$ARCHIVE" | cut -d' ' -f1)
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL=$(sha256sum "$TMPDIR/$ARCHIVE" | cut -d' ' -f1)
+else
+  ACTUAL=$(shasum -a 256 "$TMPDIR/$ARCHIVE" | cut -d' ' -f1)
+fi
 [ "$EXPECTED" = "$ACTUAL" ] || err "checksum mismatch: expected $EXPECTED, got $ACTUAL"
 
 # ── Install ─────────────────────────────────────────────

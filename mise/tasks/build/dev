@@ -1,9 +1,13 @@
 #!/bin/bash
-#MISE description="Build and codesign the CLI binary"
-#MISE depends=["build:kernel", "build:rootfs"]
-#MISE sources=["cli/src/**/*.rs", "cli/Cargo.toml", "Cargo.toml", "Cargo.lock", "sandbox/out/Image", "sandbox/out/initramfs.gz"]
+#MISE description="Build the CLI binary"
+#MISE depends=["build:rootfs"]
+#MISE sources=["cli/src/**/*.rs", "cli/Cargo.toml", "Cargo.toml", "Cargo.lock", "sandbox/out/*"]
 #MISE outputs=["target/debug/ez"]
 set -euo pipefail
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  mise run build:kernel
+fi
 
 if [[ "$(uname -s)" == "Linux" ]]; then
   mise run build:libkrun

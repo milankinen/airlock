@@ -4,6 +4,7 @@ mod config;
 #[cfg(target_os = "linux")]
 mod krun;
 use std::collections::HashSet;
+#[cfg(target_os = "macos")]
 use std::fmt::Write;
 use std::os::unix::io::OwnedFd;
 use std::path::Path;
@@ -14,13 +15,15 @@ use tracing::warn;
 
 use crate::assets::Assets;
 use crate::cli;
-use crate::cli::{CliArgs, LogLevel};
+use crate::cli::CliArgs;
+#[cfg(target_os = "macos")]
+use crate::cli::LogLevel;
 use crate::oci::Bundle;
 use crate::project::Project;
 use crate::vm::config::VmShare;
 
 pub async fn start(
-    args: &CliArgs,
+    #[cfg_attr(target_os = "linux", allow(unused_variables))] args: &CliArgs,
     project: &Project,
     bundle: Bundle,
 ) -> anyhow::Result<(Box<dyn VmHandle>, OwnedFd)> {
@@ -121,8 +124,10 @@ pub async fn start(
     let vm_config = config::VmConfig {
         cpus: project.config.cpus,
         memory_bytes: project.config.memory.0,
+        #[cfg(target_os = "macos")]
         kernel: assets.kernel,
         initramfs: assets.initramfs,
+        #[cfg(target_os = "macos")]
         kernel_cmdline: {
             let tags: Vec<&str> = shares.iter().map(|s| s.tag.as_str()).collect();
             let epoch = std::time::SystemTime::now()
@@ -130,7 +135,7 @@ pub async fn start(
                 .unwrap_or_default()
                 .as_secs();
             let mut cmd = format!(
-                "console=hvc0 console=ttyS0 rdinit=/init ezpez.epoch={epoch} ezpez.shares={}",
+                "console=hvc0 rdinit=/init ezpez.epoch={epoch} ezpez.shares={}",
                 tags.join(",")
             );
             if !project.config.network.host_ports.is_empty() {
@@ -151,8 +156,6 @@ pub async fn start(
         shares,
         cache_disk: bundle.cache_image.clone(),
         runtime_dir: project.cache_dir.clone(),
-        #[cfg(target_os = "linux")]
-        initramfs_root: assets.initramfs_root,
         host_ports: project.config.network.host_ports.clone(),
     };
 

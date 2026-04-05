@@ -21,6 +21,7 @@ else
   docker build --progress=quiet -t ezpez-supervisor-builder sandbox/supervisor
   echo "Building supervisor (docker, ${TARGET})..."
   docker run --rm \
+    -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
     -v "$PWD:/workspace:ro" \
     -v "$PWD/sandbox/out:/out" \
     -v ezpez-cargo-cache:/cargo-cache \
@@ -32,6 +33,7 @@ else
       rustup target add ${TARGET}
       cargo build --release -p ezpez-supervisor --target ${TARGET} --target-dir /target
       cp /target/${TARGET}/release/ezpez-supervisor /out/supervisor
+      chown \${HOST_UID}:\${HOST_GID} /out/supervisor
     "
 fi
 

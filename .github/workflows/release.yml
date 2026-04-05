@@ -21,7 +21,7 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Download artifact from CI run
+      - name: Download artifacts from CI run
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -36,25 +36,38 @@ jobs:
               --json databaseId \
               --jq '.[0].databaseId')
           fi
-          echo "Downloading artifact from CI run $RUN_ID"
-          gh run download "$RUN_ID" \
-            --repo "$GITHUB_REPOSITORY" \
-            --name ez \
-            --dir .
+          echo "Downloading artifacts from CI run $RUN_ID"
+          for name in ez-macos-aarch64 ez-linux-x86_64 ez-linux-aarch64; do
+            gh run download "$RUN_ID" \
+              --repo "$GITHUB_REPOSITORY" \
+              --name "$name" \
+              --dir "artifacts/${name#ez-}"
+          done
       - name: Package release artifacts
         run: |
           VERSION="${{ github.event.inputs.version }}"
-          ARCHIVE="ez-${VERSION}-darwin-aarch64.tar.gz"
-          chmod +x ez
-          tar -czf "$ARCHIVE" ez
-          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+
+          for variant in darwin-aarch64:macos-aarch64 linux-x86_64:linux-x86_64 linux-aarch64:linux-aarch64; do
+            NAME="${variant%%:*}"
+            DIR="${variant##*:}"
+            ARCHIVE="ez-${VERSION}-${NAME}.tar.gz"
+            chmod +x "artifacts/${DIR}/ez"
+            tar -czf "$ARCHIVE" -C "artifacts/${DIR}" ez
+            sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+          done
+
           sed -i "s/^DEFAULT_VERSION=\"\"/DEFAULT_VERSION=\"${VERSION}\"/" install.sh
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${{ github.event.inputs.version }}"
-          ARCHIVE="ez-${VERSION}-darwin-aarch64.tar.gz"
           gh release create "$VERSION" \
-            "$ARCHIVE" "${ARCHIVE}.sha256" "install.sh" \
+            ez-${VERSION}-darwin-aarch64.tar.gz \
+            ez-${VERSION}-darwin-aarch64.tar.gz.sha256 \
+            ez-${VERSION}-linux-x86_64.tar.gz \
+            ez-${VERSION}-linux-x86_64.tar.gz.sha256 \
+            ez-${VERSION}-linux-aarch64.tar.gz \
+            ez-${VERSION}-linux-aarch64.tar.gz.sha256 \
+            install.sh \
             --repo "$GITHUB_REPOSITORY" --generate-notes

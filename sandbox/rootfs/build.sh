@@ -1,12 +1,19 @@
 #!/bin/sh
 set -e
 
-apk add --no-cache busybox-extras iproute2 cpio crun iptables e2fsprogs >/dev/null 2>&1
+apk add --no-cache busybox-extras iproute2 cpio crun iptables e2fsprogs tar >/dev/null 2>&1
 
 mkdir -p /proc /sys /dev /dev/pts /tmp /run /usr/bin
 cp /init-script /init && chmod 755 /init
 cp /supervisor-bin /usr/bin/supervisor && chmod 755 /usr/bin/supervisor
 
 cd /
+
+# Gzipped cpio archive (macOS / Apple Virtualization)
 find . \( -path './proc/*' -o -path './sys/*' -o -path './dev/*' -o -path './tmp/*' -o -path './out/*' \) -prune -o -print \
   | cpio -o -H newc --quiet | gzip > /out/initramfs.gz
+
+# Gzipped tar archive (Linux / libkrun - extracted at runtime)
+tar -czf /out/rootfs.tar.gz \
+  --exclude='./proc/*' --exclude='./sys/*' --exclude='./dev/*' --exclude='./tmp/*' --exclude='./out/*' \
+  .

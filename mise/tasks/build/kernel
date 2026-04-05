@@ -14,8 +14,9 @@ echo "Building kernel (${ARCH})..."
 mkdir -p sandbox/out
 docker run --rm \
   -e "ARCH=${ARCH}" \
+  -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
   -v "$PWD/sandbox/kernel/${CONFIG}:/config:ro" \
   -v "$PWD/sandbox/kernel/build.sh:/build.sh:ro" \
   -v "$PWD/sandbox/out:/out" \
-  alpine:3.23 sh /build.sh
+  alpine:3.23 sh -c 'sh /build.sh && chown "$HOST_UID:$HOST_GID" /out/Image'
 echo "Kernel: sandbox/out/Image ($(du -h sandbox/out/Image | cut -f1))"
