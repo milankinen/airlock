@@ -1,0 +1,21 @@
+#!/bin/bash
+#MISE description="Build the kernel using Docker"
+#MISE sources=["sandbox/kernel/config-*", "sandbox/kernel/build.sh"]
+#MISE outputs=["sandbox/out/Image"]
+set -euo pipefail
+
+HOST_ARCH=$(uname -m)
+case "$HOST_ARCH" in
+  x86_64)  ARCH=x86_64;  CONFIG=config-x86_64 ;;
+  *)       ARCH=arm64;    CONFIG=config-arm64 ;;
+esac
+
+echo "Building kernel (${ARCH})..."
+mkdir -p sandbox/out
+docker run --rm \
+  -e "ARCH=${ARCH}" \
+  -v "$PWD/sandbox/kernel/${CONFIG}:/config:ro" \
+  -v "$PWD/sandbox/kernel/build.sh:/build.sh:ro" \
+  -v "$PWD/sandbox/out:/out" \
+  alpine:3.23 sh /build.sh
+echo "Kernel: sandbox/out/Image ($(du -h sandbox/out/Image | cut -f1))"

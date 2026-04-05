@@ -1,0 +1,38 @@
+#!/bin/bash
+#MISE description="Build the supervisor for Linux (musl)"
+#MISE sources=["sandbox/supervisor/src/**/*.rs", "sandbox/supervisor/Cargo.toml", "protocol/src/**/*.rs", "protocol/schema/**/*.capnp", "sandbox/supervisor/Dockerfile"]
+#MISE outputs=["sandbox/out/supervisor"]
+set -euo pipefail
+
+HOST_ARCH=$(uname -m)
+case "$HOST_ARCH" in
+  x86_64)  TARGET=x86_64-unknown-linux-musl ;;
+  *)       TARGET=aarch64-unknown-linux-musl ;;
+esac
+
+mkdir -p sandbox/out
+
+if [[ "${SUPERVISOR_BUILD_HOST:-}" == "true" ]]; then
+  echo "Building supervisor (native, ${TARGET})..."
+  cargo build --release -p ezpez-supervisor --target "${TARGET}"
+  cp "target/${TARGET}/release/ezpez-supervisor" sandbox/out/supervisor
+else
+  echo "Preparing supervisor builder..."
+  docker build --progress=quiet -t ezpez-supervisor-builder sandbox/supervisor
+  echo "Building supervisor (docker, ${TARGET})..."
+  docker run --rm \
+    -v "$PWD:/workspace:ro" \
+    -v "$PWD/sandbox/out:/out" \
+    -v ezpez-cargo-cache:/cargo-cache \
+    -v ezpez-target-cache:/target \
+    ezpez-supervisor-builder sh -c "
+      export CARGO_HOME=/cargo-cache
+      export RUSTUP_HOME=/cargo-cache
+      cd /workspace
+      rustup target add ${TARGET}
+      cargo build --release -p ezpez-supervisor --target ${TARGET} --target-dir /target
+      cp /target/${TARGET}/release/ezpez-supervisor /out/supervisor
+    "
+fi
+
+echo "Supervisor: sandbox/out/supervisor ($(du -h sandbox/out/supervisor | cut -f1))"

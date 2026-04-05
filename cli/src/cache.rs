@@ -1,3 +1,4 @@
+#[cfg(target_os = "macos")]
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 

@@ -1,0 +1,5 @@
+#!/bin/bash
+#MISE description="Build development time sandbox image for mise ez"
+set -euo pipefail
+
+docker build -t ez:dev -f dev.dockerfile .

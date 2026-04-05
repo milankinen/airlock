@@ -57,13 +57,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
       - uses: Swatinem/rust-cache@v2
+      - name: Install build deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq capnproto libcapnp-dev musl-tools
       - name: Build supervisor
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq capnproto libcapnp-dev musl-tools
-          rustup target add aarch64-unknown-linux-musl
-          cargo build --release -p ezpez-supervisor --target aarch64-unknown-linux-musl
-          mkdir -p sandbox/out
-          cp target/aarch64-unknown-linux-musl/release/ezpez-supervisor sandbox/out/supervisor
+        run: SUPERVISOR_BUILD_HOST=true mise run build:supervisor
       - run: mise run build:rootfs --no-deps
       - uses: actions/upload-artifact@v4
         with:

@@ -1,0 +1,16 @@
+#!/bin/bash
+#MISE description="Build the rootfs initramfs using Docker"
+#MISE depends=["build:supervisor"]
+#MISE sources=["sandbox/rootfs/init", "sandbox/rootfs/build.sh", "sandbox/out/supervisor"]
+#MISE outputs=["sandbox/out/initramfs.gz"]
+set -euo pipefail
+
+echo "Building rootfs..."
+mkdir -p sandbox/out
+docker run --rm \
+  -v "$PWD/sandbox/rootfs/init:/init-script:ro" \
+  -v "$PWD/sandbox/rootfs/build.sh:/build.sh:ro" \
+  -v "$PWD/sandbox/out/supervisor:/supervisor-bin:ro" \
+  -v "$PWD/sandbox/out:/out" \
+  alpine:3.23 sh /build.sh
+echo "Rootfs: sandbox/out/initramfs.gz ($(du -h sandbox/out/initramfs.gz | cut -f1))"

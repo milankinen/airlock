@@ -6,6 +6,7 @@ pub struct VmShare {
     pub read_only: bool,
 }
 
+#[allow(dead_code)]
 pub struct VmConfig {
     pub cpus: u32,
     pub memory_bytes: u64,

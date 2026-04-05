@@ -16,6 +16,7 @@ use crate::oci::Bundle;
 use crate::project::Project;
 use crate::vm::config::VmShare;
 
+#[allow(clippy::unused_async)]
 pub async fn start(
     args: &CliArgs,
     project: &Project,

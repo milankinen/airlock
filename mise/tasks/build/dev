@@ -1,0 +1,12 @@
+#!/bin/bash
+#MISE description="Build and codesign the CLI binary"
+#MISE depends=["build:kernel", "build:rootfs"]
+#MISE sources=["cli/src/**/*.rs", "cli/Cargo.toml", "Cargo.toml", "Cargo.lock", "sandbox/out/Image", "sandbox/out/initramfs.gz"]
+#MISE outputs=["target/debug/ez"]
+set -euo pipefail
+
+cargo build -p ezpez-cli --features dev "$@"
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  codesign --entitlements entitlements.plist --force -s - target/debug/ez 2>/dev/null || true
+fi

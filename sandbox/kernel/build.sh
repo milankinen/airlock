@@ -10,4 +10,8 @@ cd "linux-${KVER}"
 cp /config .config
 make olddefconfig
 make -j"$(nproc)"
-cp arch/arm64/boot/Image /out/
+
+case "${ARCH}" in
+  x86_64) cp arch/x86/boot/bzImage /out/Image ;;
+  *)      cp arch/arm64/boot/Image /out/Image ;;
+esac
