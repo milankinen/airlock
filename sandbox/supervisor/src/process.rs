@@ -200,12 +200,22 @@ async fn relay_stdin_pty(
         let response = stdin.read_request().send().promise.await?;
         let input = response.get()?.get_input()?;
         match input.which()? {
-            process_input::Stdin(frame) => match frame?.which() {
-                Ok(data_frame::Data(Ok(data))) => writer.write_all(data).await?,
-                _ => return Ok(()),
-            },
+            process_input::Stdin(frame) => {
+                if let Ok(data_frame::Data(Ok(data))) = frame?.which() {
+                    tracing::trace!(
+                        "guest stdin pty: {} bytes: {:?}",
+                        data.len(),
+                        String::from_utf8_lossy(data)
+                    );
+                    writer.write_all(data).await?;
+                } else {
+                    tracing::trace!("guest stdin pty: EOF");
+                    return Ok(());
+                }
+            }
             process_input::Resize(size) => {
                 let s = size?;
+                tracing::trace!("guest stdin pty: resize {}x{}", s.get_cols(), s.get_rows());
                 writer.resize(pty_process::Size::new(s.get_rows(), s.get_cols()))?;
             }
         }

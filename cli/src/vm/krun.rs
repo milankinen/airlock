@@ -81,6 +81,7 @@ struct KrunFns {
         filepath: *const libc::c_char,
         listen: bool,
     ) -> i32,
+    disable_implicit_console: unsafe extern "C" fn(ctx_id: u32) -> i32,
     start_enter: unsafe extern "C" fn(ctx_id: u32) -> i32,
 }
 
@@ -113,6 +114,7 @@ impl KrunFns {
                 set_exec: load_sym(handle, "krun_set_exec")?,
                 add_virtiofs: load_sym(handle, "krun_add_virtiofs")?,
                 add_vsock_port2: load_sym(handle, "krun_add_vsock_port2")?,
+                disable_implicit_console: load_sym(handle, "krun_disable_implicit_console")?,
                 start_enter: load_sym(handle, "krun_start_enter")?,
             })
         }
@@ -161,6 +163,12 @@ impl KrunVmBackend {
             anyhow::bail!("krun create_ctx failed (error code: {ctx})");
         }
         let ctx = ctx as u32;
+
+        // Disable implicit console so libkrun doesn't steal our stdin/stdout
+        check_krun(
+            unsafe { (fns.disable_implicit_console)(ctx) },
+            "disable_implicit_console",
+        )?;
 
         let ram_mib = (config.memory_bytes / (1024 * 1024)) as u32;
         check_krun(

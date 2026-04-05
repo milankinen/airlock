@@ -89,14 +89,23 @@ async fn run(args: CliArgs, config: config::Config) -> anyhow::Result<i32> {
         match proc.poll().await {
             Ok(rpc::ProcessEvent::Exit(code)) => break code,
             Ok(rpc::ProcessEvent::Stdout(data)) => {
+                tracing::trace!(
+                    "host stdout: {} bytes: {:?}",
+                    data.len(),
+                    String::from_utf8_lossy(&data)
+                );
                 let _ = std::io::stdout().write_all(&data);
                 let _ = std::io::stdout().flush();
             }
             Ok(rpc::ProcessEvent::Stderr(data)) => {
+                tracing::trace!("host stderr: {} bytes", data.len());
                 let _ = std::io::stderr().write_all(&data);
                 let _ = std::io::stderr().flush();
             }
-            Err(_) => break 1,
+            Err(e) => {
+                tracing::trace!("host poll error: {e}");
+                break 1;
+            }
         }
     };
 

@@ -53,12 +53,19 @@ impl stdin::Server for Stdin {
         tokio::select! {
             result = reader.read(&mut buf) => {
                 match result {
-                    Ok(0) | Err(_) => results.get().init_input().init_stdin().set_eof(()),
-                    Ok(n) => results.get().init_input().init_stdin().set_data(&buf[..n]),
+                    Ok(0) | Err(_) => {
+                        tracing::trace!("host stdin: EOF");
+                        results.get().init_input().init_stdin().set_eof(());
+                    }
+                    Ok(n) => {
+                        tracing::trace!("host stdin: {} bytes: {:?}", n, String::from_utf8_lossy(&buf[..n]));
+                        results.get().init_input().init_stdin().set_data(&buf[..n]);
+                    }
                 }
             }
             () = resize_fut => {
                 let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                tracing::trace!("host stdin: resize {}x{}", cols, rows);
                 let mut size = results.get().init_input().init_resize();
                 size.set_rows(rows);
                 size.set_cols(cols);
