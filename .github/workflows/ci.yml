@@ -7,21 +7,33 @@ on:
 
 jobs:
   # ── Stage 1 ────────────────────────────────────────────
-  lint:
+  lint-macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
-      - name: Install rustfmt
+      - name: Install deps
         run: |
           rustup component add clippy
           rustup toolchain install nightly --component rustfmt
-      - name: Install capnp
-        run: brew install capnp
+          brew install capnp
       - uses: Swatinem/rust-cache@v2
       - run: mise run lint
 
-  test:
+  lint-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq capnproto libcapnp-dev libclang-dev
+          rustup component add clippy
+          rustup toolchain install nightly --component rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: mise run lint
+
+  test-macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,9 +43,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: mise run test
 
+  test-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Install deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq capnproto libcapnp-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: mise run test
+
   # ── Stage 2: build artifacts ───────────────────────────
   build-kernel-aarch64:
-    needs: [ lint, test ]
+    needs: [ lint-macos, lint-linux, test-macos, test-linux ]
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
@@ -51,7 +73,7 @@ jobs:
           path: sandbox/out/Image
 
   build-rootfs-aarch64:
-    needs: [ lint, test ]
+    needs: [ lint-macos, lint-linux, test-macos, test-linux ]
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
@@ -72,7 +94,7 @@ jobs:
             sandbox/out/rootfs.tar.gz
 
   build-rootfs-x86_64:
-    needs: [ lint, test ]
+    needs: [ lint-macos, lint-linux, test-macos, test-linux ]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -91,7 +113,7 @@ jobs:
           path: sandbox/out/rootfs.tar.gz
 
   build-libkrun-x86_64:
-    needs: [ lint, test ]
+    needs: [ lint-macos, lint-linux, test-macos, test-linux ]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -105,7 +127,7 @@ jobs:
             sandbox/out/libkrunfw.so
 
   build-libkrun-aarch64:
-    needs: [ lint, test ]
+    needs: [ lint-macos, lint-linux, test-macos, test-linux ]
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
