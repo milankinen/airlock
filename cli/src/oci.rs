@@ -182,12 +182,19 @@ fn build_bundle(
     )?;
     mounts.extend(cache_mounts);
 
+    let pty_size = if terminal.is_tty() {
+        // crossterm::terminal::size() returns (cols, rows)
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        Some((rows, cols))
+    } else {
+        None
+    };
     config::generate_config(
         &image_config,
         &project.cwd,
         &mounts,
         &args.args,
-        terminal.is_tty(),
+        pty_size,
         &bundle_path.join("config.json"),
     )?;
 

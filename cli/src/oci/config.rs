@@ -8,7 +8,7 @@ pub fn generate_config(
     project_cwd: &Path,
     mounts: &[ResolvedMount],
     user_args: &[String],
-    terminal: bool,
+    terminal: Option<(u16, u16)>,
     dest: &Path,
 ) -> anyhow::Result<()> {
     let cfg = image_config.config.as_ref();
@@ -120,21 +120,29 @@ pub fn generate_config(
         "CAP_WAKE_ALARM"
     ]);
 
+    let mut process = serde_json::json!({
+        "terminal": terminal.is_some(),
+        "user": { "uid": uid, "gid": gid },
+        "args": args,
+        "env": env,
+        "cwd": cwd,
+        "capabilities": {
+            "bounding": all_caps,
+            "effective": all_caps,
+            "permitted": all_caps,
+            "ambient": all_caps,
+        }
+    });
+    if let Some((rows, cols)) = terminal {
+        process["consoleSize"] = serde_json::json!({
+            "height": rows,
+            "width": cols
+        });
+    }
+
     let config = serde_json::json!({
         "ociVersion": "1.0.0",
-        "process": {
-            "terminal": terminal,
-            "user": { "uid": uid, "gid": gid },
-            "args": args,
-            "env": env,
-            "cwd": cwd,
-            "capabilities": {
-                "bounding": all_caps,
-                "effective": all_caps,
-                "permitted": all_caps,
-                "ambient": all_caps,
-            }
-        },
+        "process": process,
         "root": {
             "path": "rootfs",
             "readonly": false

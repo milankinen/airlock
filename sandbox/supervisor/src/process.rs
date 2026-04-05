@@ -14,9 +14,18 @@ pub struct SpawnedProcess {
     pty: Option<pty_process::Pty>,
 }
 
-pub fn spawn(cmd: &str, args: &[&str], use_pty: bool) -> Result<SpawnedProcess, anyhow::Error> {
-    if use_pty {
+pub fn spawn(
+    cmd: &str,
+    args: &[&str],
+    pty_size: Option<(u16, u16)>,
+) -> Result<SpawnedProcess, anyhow::Error> {
+    if let Some((rows, cols)) = pty_size {
         let (pty, pts) = pty_process::open()?;
+        // Set size before spawning so the process sees the correct size immediately
+        tracing::debug!("pty initial size: {rows}x{cols}");
+        if let Err(e) = pty.resize(pty_process::Size::new(rows, cols)) {
+            tracing::warn!("initial pty resize failed: {e}");
+        }
         let child = pty_process::Command::new(cmd)
             .args(args)
             .env("TERM", "linux")
@@ -54,11 +63,7 @@ async fn attach_pty(
     let pty_fd = pty.as_raw_fd();
     let (mut pty_reader, pty_writer) = pty.into_split();
 
-    if let Some((rows, cols)) = host.pty_size
-        && let Err(e) = pty_writer.resize(pty_process::Size::new(rows, cols))
-    {
-        error!("pty resize failure: {e:#}");
-    }
+    // Initial size is set before spawn. This handles size changes during attach.
 
     let stdin = host.stdin;
     tokio::task::spawn_local(async move {
@@ -215,7 +220,7 @@ async fn relay_stdin_pty(
             }
             process_input::Resize(size) => {
                 let s = size?;
-                tracing::trace!("guest stdin pty: resize {}x{}", s.get_cols(), s.get_rows());
+                tracing::debug!("pty resize: {}x{}", s.get_rows(), s.get_cols());
                 writer.resize(pty_process::Size::new(s.get_rows(), s.get_cols()))?;
             }
         }

@@ -65,7 +65,7 @@ impl stdin::Server for Stdin {
             }
             () = resize_fut => {
                 let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-                tracing::trace!("host stdin: resize {}x{}", cols, rows);
+                tracing::debug!("host terminal resized: {rows}x{cols}");
                 let mut size = results.get().init_input().init_resize();
                 size.set_rows(rows);
                 size.set_cols(cols);

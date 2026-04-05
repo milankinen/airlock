@@ -29,7 +29,10 @@ impl Terminal {
 
     pub fn stdin(&self) -> anyhow::Result<rpc::Stdin> {
         let (pty_size, resizes) = if self.is_tty {
-            let pty_size = crossterm::terminal::size().unwrap_or((80, 24));
+            // crossterm::terminal::size() returns (cols, rows)
+            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+            tracing::debug!("host terminal size: {rows}x{cols}");
+            let pty_size = (rows, cols);
             let resizes =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())?;
             (Some(pty_size), Some(resizes))

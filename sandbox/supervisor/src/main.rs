@@ -39,9 +39,8 @@ async fn run() -> anyhow::Result<()> {
     }
 
     info!("start: {} {}", conn.cmd, conn.args.join(" "));
-    let use_pty = conn.proc.pty_size.is_some();
     let args_ref: Vec<&str> = conn.args.iter().map(String::as_str).collect();
-    let proc = process::spawn(&conn.cmd, &args_ref, use_pty)?;
+    let proc = process::spawn(&conn.cmd, &args_ref, conn.proc.pty_size)?;
     let exit_code = proc.attach(conn.proc).await;
     info!("main process done, exit_code = {exit_code}");
 
