@@ -62,7 +62,7 @@ smart-config = "0.4.0-pre.2"
 toml = "1"
 
 # Scripting
-mlua = { version = "0.11", features = ["luajit", "vendored", "anyhow"] }
+mlua = { version = "0.11", features = ["luajit", "vendored", "anyhow", "async", "serialize"] }
 
 # System
 sysinfo = { version = "0.38", features = ["system"] }

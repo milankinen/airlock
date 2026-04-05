@@ -1,14 +1,13 @@
 mod http;
 mod io;
-pub mod scripting;
+mod matchers;
+mod middleware;
 mod server;
 mod tcp;
 mod tls;
 
 use std::rc::Rc;
 use std::sync::Arc;
-
-use scripting::ScriptEngine;
 
 use crate::project::Project;
 
@@ -22,7 +21,7 @@ pub fn setup(project: &Project) -> anyhow::Result<Network> {
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
-    let script_engine = Rc::new(ScriptEngine::init(&project.config.network)?);
+    let mw = middleware::Middleware::init(&project.config.network)?;
 
     let ca_cert = std::fs::read_to_string(&project.ca_cert)?;
     let ca_key = std::fs::read_to_string(&project.ca_key)?;
@@ -33,7 +32,7 @@ pub fn setup(project: &Project) -> anyhow::Result<Network> {
         interceptor: Rc::new(interceptor),
         host_ports: project.config.network.host_ports.clone(),
         tls_passthrough: project.config.network.tls_passthrough.clone(),
-        script_engine,
+        middleware: Rc::new(mw),
     })
 }
 
@@ -42,5 +41,5 @@ pub struct Network {
     interceptor: Rc<tls::TlsInterceptor>,
     host_ports: Vec<u16>,
     tls_passthrough: Vec<String>,
-    pub(crate) script_engine: Rc<ScriptEngine>,
+    middleware: Rc<middleware::Middleware>,
 }

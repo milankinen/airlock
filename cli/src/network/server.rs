@@ -7,8 +7,7 @@ use ezpez_protocol::supervisor_capnp::{network_proxy, tcp_sink};
 use tokio::sync::mpsc;
 use tracing::debug;
 
-use super::scripting::host_matches;
-use super::{Network, http, io, tcp, tls};
+use super::{Network, http, io, matchers, tcp, tls};
 
 fn is_localhost(host: &str) -> bool {
     host == "127.0.0.1" || host == "localhost" || host == "::1"
@@ -32,7 +31,7 @@ impl network_proxy::Server for Network {
             )));
         }
 
-        if !self.script_engine.is_host_allowed(&host) {
+        if !self.middleware.is_host_allowed(&host) {
             debug!("denied: {host}:{port} (not in allowed_hosts)");
             results
                 .get()
@@ -50,7 +49,7 @@ impl network_proxy::Server for Network {
             self.tls_client.clone(),
             self.interceptor.clone(),
             self.tls_passthrough.clone(),
-            self.script_engine.clone(),
+            self.middleware.clone(),
         );
         results.get().init_result().set_server(sink);
         Ok(())
@@ -65,7 +64,7 @@ fn spawn_connection(
     tls_client: Arc<rustls::ClientConfig>,
     interceptor: Rc<tls::TlsInterceptor>,
     tls_passthrough: Vec<String>,
-    script_engine: Rc<super::scripting::ScriptEngine>,
+    middleware: Rc<super::middleware::Middleware>,
 ) -> tcp_sink::Client {
     let (tx, rx) = mpsc::channel::<Bytes>(1);
     let error: io::RelayError = Rc::new(RefCell::new(None));
@@ -80,7 +79,7 @@ fn spawn_connection(
             &tls_client,
             &interceptor,
             &tls_passthrough,
-            &script_engine,
+            &middleware,
         ))
         .await;
 
@@ -102,13 +101,17 @@ async fn handle_connection(
     tls_client: &Arc<rustls::ClientConfig>,
     interceptor: &tls::TlsInterceptor,
     tls_passthrough: &[String],
-    script_engine: &Rc<super::scripting::ScriptEngine>,
+    middleware: &super::middleware::Middleware,
 ) -> anyhow::Result<()> {
     let (is_tls, first) = tls::detect(&mut rx).await;
     let addr = format!("{host}:{port}");
 
     // TLS passthrough: raw relay, container↔server TLS end-to-end
-    if is_tls && tls_passthrough.iter().any(|p| host_matches(host, p)) {
+    if is_tls
+        && tls_passthrough
+            .iter()
+            .any(|p| matchers::host_matches(host, p))
+    {
         debug!("passthrough: {addr}");
         let (container, server) = tcp::establish(&addr, first, rx, client_sink).await?;
         Box::pin(tcp::relay(container, server)).await;
@@ -122,26 +125,20 @@ async fn handle_connection(
         tcp::establish(&addr, first, rx, client_sink).await?
     };
 
-    let connect = super::scripting::TcpConnect {
-        host: host.to_string(),
-        port,
-        tls: is_tls,
-    };
-
-    // Detect HTTP if rules are configured
-    let (container, is_http) = if script_engine.has_http_rules() {
-        detect_http(container).await
-    } else {
+    // Detect HTTP if middleware is configured
+    let http_layers = middleware.http();
+    let (container, is_http) = if http_layers.is_empty() {
         (container, false)
+    } else {
+        detect_http(container).await
     };
 
     if is_http {
-        Box::pin(http::relay(container, server, script_engine, connect)).await?;
-        Ok(())
+        Box::pin(http::relay(container, server, http_layers)).await?;
     } else {
         Box::pin(tcp::relay(container, server)).await;
-        Ok(())
     }
+    Ok(())
 }
 
 /// Peek at the container stream to detect HTTP.

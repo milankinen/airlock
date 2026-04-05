@@ -71,12 +71,12 @@ pub mod config {
         pub tls_passthrough: Vec<String>,
         /// HTTP request filtering rules (Lua scripts)
         #[config(default)]
-        pub rules: Vec<NetworkRule>,
+        pub middleware: Vec<NetworkMiddleware>,
     }
 
     /// Network filtering rule with inline Lua script
     #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
-    pub struct NetworkRule {
+    pub struct NetworkMiddleware {
         /// Rule name (for error messages)
         pub name: String,
         /// Required env vars: name → description
@@ -86,8 +86,8 @@ pub mod config {
         pub script: String,
     }
 
-    impl WellKnown for NetworkRule {
-        type Deserializer = de::Nested<NetworkRule>;
+    impl WellKnown for NetworkMiddleware {
+        type Deserializer = de::Nested<NetworkMiddleware>;
         const DE: Self::Deserializer = de::nested();
     }
 
