@@ -4,6 +4,8 @@ mod matchers;
 mod middleware;
 mod server;
 mod tcp;
+#[cfg(test)]
+mod tests;
 mod tls;
 
 use std::rc::Rc;

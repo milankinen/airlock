@@ -27,7 +27,10 @@ struct Inner {
     func: Function,
 }
 
-pub fn compile(rule: &config::NetworkMiddleware) -> anyhow::Result<CompiledMiddleware> {
+pub fn compile(
+    rule: &config::NetworkMiddleware,
+    log: middleware::LogFn,
+) -> anyhow::Result<CompiledMiddleware> {
     let lua = Lua::new();
     middleware::sandbox(&lua)?;
 
@@ -43,8 +46,8 @@ pub fn compile(rule: &config::NetworkMiddleware) -> anyhow::Result<CompiledMiddl
     }
     lua.globals().set("env", env_table)?;
 
-    let log_fn = lua.create_function(|_, msg: String| {
-        tracing::debug!(target: "script", "{msg}");
+    let log_fn = lua.create_function(move |_, msg: String| {
+        log(&msg);
         Ok(())
     })?;
     lua.globals().set("log", log_fn)?;
