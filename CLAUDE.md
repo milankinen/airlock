@@ -17,6 +17,12 @@ mise run <task>    # Run task
 mise tasks --all   # List available tasks
 ```
 
+## Formatting
+
+Always format code you produce. Use `mise format`
+
+* Do NOT use `cargo fmt` directly because it uses wrong `rustfmt` version).
+
 ## Testing the VM
 
 Non-interactive commands can be tested directly from the CLI:
