@@ -8,7 +8,6 @@ workspace = true
 
 [dependencies]
 capnp = { workspace = true }
-capnp-rpc = { workspace = true }
 
 [build-dependencies]
 capnpc = { workspace = true }

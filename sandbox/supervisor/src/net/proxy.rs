@@ -2,34 +2,19 @@ use std::cell::RefCell;
 use std::net::Ipv4Addr;
 use std::rc::Rc;
 
+use bytes::Bytes;
 use ezpez_protocol::supervisor_capnp::{connect_result, network_proxy, tcp_sink};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
 
 use super::dns::DnsState;
-use super::tls::{self, TlsInterceptor};
-use crate::rpc::HostCA;
 
 const PROXY_PORT: u16 = 15001;
 
-pub fn start_proxy(
-    network: network_proxy::Client,
-    ca: HostCA,
-    dns: Rc<DnsState>,
-    tls_passthrough: Vec<String>,
-) {
+pub fn start_proxy(network: network_proxy::Client, dns: Rc<DnsState>) {
     info!("start network proxy");
-    let tls_passthrough = Rc::new(tls_passthrough);
     tokio::task::spawn_local(async move {
-        let interceptor = match TlsInterceptor::new(&ca.cert, &ca.key) {
-            Ok(i) => Rc::new(i),
-            Err(e) => {
-                warn!("TLS interceptor init failed: {e}");
-                return;
-            }
-        };
-
         let listener = match TcpListener::bind(("127.0.0.1", PROXY_PORT)).await {
             Ok(l) => l,
             Err(e) => {
@@ -49,13 +34,9 @@ pub fn start_proxy(
             };
 
             let network = network.clone();
-            let interceptor = interceptor.clone();
             let dns = dns.clone();
-            let tls_passthrough = tls_passthrough.clone();
             tokio::task::spawn_local(async move {
-                if let Err(e) =
-                    handle_connection(stream, &network, &interceptor, &dns, &tls_passthrough).await
-                {
+                if let Err(e) = handle_connection(stream, &network, &dns).await {
                     debug!("proxy conn: {e}");
                 }
             });
@@ -64,50 +45,29 @@ pub fn start_proxy(
 }
 
 async fn handle_connection(
-    mut stream: tokio::net::TcpStream,
+    stream: tokio::net::TcpStream,
     network: &network_proxy::Client,
-    interceptor: &TlsInterceptor,
     dns: &DnsState,
-    tls_passthrough: &[String],
 ) -> anyhow::Result<()> {
     let (orig_host, orig_port) = get_original_dst(&stream)?;
 
-    // Peek to detect TLS
-    let mut peek_buf = vec![0u8; 4096];
-    let n = stream.peek(&mut peek_buf).await?;
-    let is_tls = tls::is_tls(&peek_buf[..n]);
-
-    // Resolve hostname: virtual IP reverse lookup → SNI → raw IP
-    let hostname = if let Some(name) = orig_host
+    // Resolve hostname via virtual DNS reverse lookup, fall back to raw IP
+    let hostname = orig_host
         .parse::<Ipv4Addr>()
         .ok()
         .and_then(|ip| dns.reverse(ip))
-    {
-        name
-    } else if is_tls {
-        tls::extract_sni(&peek_buf[..n]).unwrap_or(orig_host.clone())
-    } else {
-        orig_host.clone()
-    };
+        .unwrap_or(orig_host);
 
-    // Channel for server→container data (bounded for backpressure)
-    let (server_tx, mut server_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+    debug!("connect {hostname}:{orig_port}");
+
+    // Channel for server→container data
+    let (server_tx, mut server_rx) = tokio::sync::mpsc::channel::<Bytes>(1);
     let server_sink: tcp_sink::Client =
         capnp_rpc::new_client(ChannelSink(RefCell::new(Some(server_tx))));
-
-    let passthrough = is_tls && host_matches_any(&hostname, tls_passthrough);
-    if passthrough {
-        debug!("connect {hostname}:{orig_port} tls=passthrough");
-    } else {
-        debug!("connect {hostname}:{orig_port} tls={is_tls}");
-    }
 
     let mut req = network.connect_request();
     req.get().set_host(&hostname);
     req.get().set_port(orig_port);
-    // Tell CLI this is NOT TLS from its perspective if passthrough
-    // (CLI won't wrap with TLS — the container↔server TLS is end-to-end)
-    req.get().set_tls(is_tls && !passthrough);
     req.get().set_client(server_sink);
 
     let response = req.send().promise.await?;
@@ -117,32 +77,14 @@ async fn handle_connection(
         Ok(connect_result::Denied(Ok(reason))) => {
             let reason = reason.to_str().unwrap_or("unknown");
             debug!("connection denied: {reason}");
-            stream.shutdown().await?;
             anyhow::bail!("denied: {reason}");
         }
-        _ => {
-            stream.shutdown().await?;
-            anyhow::bail!("invalid connect result")
-        }
+        _ => anyhow::bail!("invalid connect result"),
     };
 
-    if is_tls && !passthrough {
-        // TLS interception with timeout on handshake
-        let tls_stream = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            interceptor.accept(stream, &hostname),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("TLS handshake timeout"))??;
-
-        let (mut read, mut write) = tokio::io::split(tls_stream);
-        relay(&mut read, &mut write, client_sink, &mut server_rx).await;
-    } else {
-        // Plain TCP or TLS passthrough (raw bytes forwarded end-to-end)
-        let (mut read, mut write) = stream.into_split();
-        relay(&mut read, &mut write, client_sink, &mut server_rx).await;
-    }
-
+    // Raw TCP relay — just forward bytes both directions
+    let (mut read, mut write) = stream.into_split();
+    relay(&mut read, &mut write, client_sink, &mut server_rx).await;
     Ok(())
 }
 
@@ -150,7 +92,7 @@ async fn relay(
     local_read: &mut (impl AsyncReadExt + Unpin),
     local_write: &mut (impl AsyncWriteExt + Unpin),
     remote_sink: tcp_sink::Client,
-    remote_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    remote_rx: &mut tokio::sync::mpsc::Receiver<Bytes>,
 ) {
     let to_remote = async {
         let mut buf = [0u8; 8192];
@@ -183,15 +125,14 @@ async fn relay(
 
 // -- ChannelSink: bridges RPC push into an mpsc channel --
 
-struct ChannelSink(RefCell<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>);
+struct ChannelSink(RefCell<Option<tokio::sync::mpsc::Sender<Bytes>>>);
 
 impl tcp_sink::Server for ChannelSink {
     async fn send(self: Rc<Self>, params: tcp_sink::SendParams) -> Result<(), capnp::Error> {
         let data = params.get()?.get_data()?;
         let tx = self.0.borrow().clone();
         if let Some(tx) = tx.as_ref() {
-            // Bounded send — blocks if channel full (backpressure)
-            tx.send(data.to_owned())
+            tx.send(Bytes::copy_from_slice(data))
                 .await
                 .map_err(|_| capnp::Error::failed("channel closed".into()))?;
         }
@@ -240,16 +181,4 @@ fn get_original_dst(stream: &tokio::net::TcpStream) -> anyhow::Result<(String, u
     let ip = std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
     let port = u16::from_be(addr.sin_port);
     Ok((ip.to_string(), port))
-}
-
-/// Check if a hostname matches any pattern in the list.
-/// Supports exact match and `*.domain.com` wildcard.
-fn host_matches_any(host: &str, patterns: &[String]) -> bool {
-    patterns.iter().any(|pattern| {
-        if let Some(suffix) = pattern.strip_prefix("*.") {
-            host.ends_with(suffix) && host.len() > suffix.len() || host == suffix
-        } else {
-            host == pattern
-        }
-    })
 }

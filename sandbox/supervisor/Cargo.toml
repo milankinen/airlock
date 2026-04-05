@@ -15,13 +15,9 @@ ezpez-protocol = { workspace = true }
 futures = { workspace = true }
 libc = { workspace = true }
 pty-process = { workspace = true }
-quick_cache = { workspace = true }
-rcgen = { workspace = true, features = ["pem", "x509-parser"] }
-rustls = { workspace = true }
 scc = { workspace = true }
 simple-dns = { workspace = true }
 tokio = { workspace = true, features = ["rt", "net", "io-util", "macros", "process", "time"] }
-tokio-rustls = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["registry", "env-filter"] }

@@ -1,0 +1,190 @@
+use std::sync::Arc;
+
+use bytes::Bytes;
+use ezpez_protocol::supervisor_capnp::tcp_sink;
+use quick_cache::sync::Cache;
+use rcgen::{CertificateParams, Issuer, KeyPair};
+use rustls::ServerConfig;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tokio_rustls::TlsAcceptor;
+use tracing::{debug, trace};
+
+use super::io;
+
+/// Establish TLS MITM: accept TLS from container, connect to real server with matching ALPN.
+pub async fn establish(
+    host: &str,
+    port: u16,
+    first: Bytes,
+    rx: mpsc::Receiver<Bytes>,
+    client_sink: tcp_sink::Client,
+    interceptor: &TlsInterceptor,
+    tls_client: &Arc<rustls::ClientConfig>,
+) -> anyhow::Result<(io::Transport, io::Transport)> {
+    let addr = format!("{host}:{port}");
+    let sni_host = extract_sni(&first).unwrap_or_else(|| host.to_string());
+
+    let rpc_io = io::RpcTransport::new(first, rx, client_sink);
+    let (tls_stream, alpn) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        interceptor.accept(rpc_io, &sni_host),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("TLS handshake timeout"))??;
+
+    let is_h2 = alpn.as_deref() == Some(b"h2");
+    debug!(
+        "tls accepted: {addr} alpn={:?}",
+        alpn.as_deref().map(String::from_utf8_lossy)
+    );
+
+    // Connect to real server, matching the container's ALPN
+    let server_stream = TcpStream::connect(&addr).await?;
+    let mut config = (**tls_client).clone();
+    config.alpn_protocols = match &alpn {
+        Some(proto) => vec![proto.to_vec()],
+        None => vec![b"http/1.1".to_vec()],
+    };
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|e| anyhow::anyhow!("invalid hostname: {e}"))?;
+    let server_tls = connector.connect(server_name, server_stream).await?;
+    let server_h2 = server_tls.get_ref().1.alpn_protocol() == Some(b"h2");
+    trace!("tls to server: {addr} h2={server_h2}");
+
+    let (cr, cw) = tokio::io::split(tls_stream);
+    let (sr, sw) = tokio::io::split(server_tls);
+    Ok((
+        io::Transport {
+            read: Box::new(cr),
+            write: Box::new(cw),
+            h2: is_h2,
+        },
+        io::Transport {
+            read: Box::new(sr),
+            write: Box::new(sw),
+            h2: server_h2,
+        },
+    ))
+}
+
+/// TLS interceptor with per-hostname cert caching.
+pub struct TlsInterceptor {
+    issuer: Issuer<'static, KeyPair>,
+    cache: Cache<String, Arc<ServerConfig>>,
+}
+
+impl TlsInterceptor {
+    pub fn new(ca_cert_pem: &str, ca_key_pem: &str) -> anyhow::Result<Self> {
+        let ca_key = KeyPair::from_pem(ca_key_pem)?;
+        let issuer = Issuer::from_ca_cert_pem(ca_cert_pem, ca_key)?;
+
+        Ok(Self {
+            issuer,
+            cache: Cache::new(256),
+        })
+    }
+
+    /// Perform TLS server-side handshake, returning the negotiated ALPN protocol.
+    pub async fn accept<S: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        stream: S,
+        hostname: &str,
+    ) -> anyhow::Result<(tokio_rustls::server::TlsStream<S>, Option<Bytes>)> {
+        let config = self.get_or_create_config(hostname)?;
+        let acceptor = TlsAcceptor::from(config);
+        let tls_stream = acceptor.accept(stream).await?;
+        let alpn = tls_stream
+            .get_ref()
+            .1
+            .alpn_protocol()
+            .map(Bytes::copy_from_slice);
+        Ok((tls_stream, alpn))
+    }
+
+    fn get_or_create_config(&self, hostname: &str) -> anyhow::Result<Arc<ServerConfig>> {
+        if let Some(config) = self.cache.get(hostname) {
+            return Ok(config);
+        }
+
+        let leaf_key = KeyPair::generate()?;
+        let mut params = CertificateParams::new(vec![hostname.to_string()])?;
+        params.not_before = rcgen::date_time_ymd(1970, 1, 1);
+        let leaf_cert = params.signed_by(&leaf_key, &self.issuer)?;
+
+        let cert_der = rustls::pki_types::CertificateDer::from(leaf_cert.der().to_vec());
+        let key_der = rustls::pki_types::PrivateKeyDer::try_from(leaf_key.serialize_der())
+            .map_err(|e| anyhow::anyhow!("key conversion: {e}"))?;
+
+        let mut config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)?;
+        // Offer both h2 and h1.1 — we'll match the container's choice when
+        // connecting to the real server.
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let config = Arc::new(config);
+
+        self.cache.insert(hostname.to_string(), config.clone());
+        Ok(config)
+    }
+}
+
+/// Read from the channel until we can determine if the stream is TLS.
+///
+/// Returns `(true, buf)` if TLS handshake detected, `(false, buf)` otherwise.
+/// The buffer always contains the consumed bytes for re-feeding as prefix.
+pub async fn detect(rx: &mut mpsc::Receiver<Bytes>) -> (bool, Bytes) {
+    use tls_parser::{TlsRecordType, parse_tls_record_header};
+
+    let mut buf = bytes::BytesMut::new();
+
+    // Read until we have at least 5 bytes (TLS record header)
+    while buf.len() < 5 {
+        let Some(data) = rx.recv().await else {
+            return (false, buf.freeze());
+        };
+        buf.extend_from_slice(&data);
+    }
+
+    // Parse record header — check if it's a handshake record
+    let hdr = match parse_tls_record_header(&buf) {
+        Ok((_, hdr)) if hdr.record_type == TlsRecordType::Handshake => hdr,
+        _ => return (false, buf.freeze()),
+    };
+
+    // Read until we have the full record (header + payload)
+    let record_len = 5 + hdr.len as usize;
+    while buf.len() < record_len {
+        let Some(data) = rx.recv().await else {
+            return (false, buf.freeze());
+        };
+        buf.extend_from_slice(&data);
+    }
+
+    (true, buf.freeze())
+}
+
+/// Extract SNI hostname from a buffered TLS ClientHello.
+pub fn extract_sni(buf: &[u8]) -> Option<String> {
+    use tls_parser::{
+        TlsExtension, TlsMessage, TlsMessageHandshake, parse_tls_extensions, parse_tls_plaintext,
+    };
+    let (_, plaintext) = parse_tls_plaintext(buf).ok()?;
+    for msg in &plaintext.msg {
+        if let TlsMessage::Handshake(TlsMessageHandshake::ClientHello(ch)) = msg {
+            let (_, extensions) = parse_tls_extensions(ch.ext?).ok()?;
+            for ext in extensions {
+                if let TlsExtension::SNI(sni_list) = ext {
+                    for (sni_type, name) in sni_list {
+                        if sni_type.0 == 0 {
+                            return std::str::from_utf8(name).ok().map(String::from);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}

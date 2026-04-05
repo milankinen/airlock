@@ -73,6 +73,9 @@ scc = "2"
 simple-dns = "0.9"
 quick_cache = "0.6"
 
+# TLS parsing
+tls-parser = "0.12"
+
 # Internal
 ezpez-protocol = { path = "protocol" }
 

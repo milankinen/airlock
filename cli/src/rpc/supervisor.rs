@@ -68,9 +68,6 @@ impl Supervisor {
     ) -> anyhow::Result<Process> {
         let log_sink: log_sink::Client = capnp_rpc::new_client(LogSinkImpl);
 
-        let ca_cert = std::fs::read(&project.ca_cert)?;
-        let ca_key = std::fs::read(&project.ca_key)?;
-
         let mut req = self.supervisor.start_request();
         let pty_size = stdin.pty_size();
         req.get().set_stdin(capnp_rpc::new_client(stdin));
@@ -82,8 +79,6 @@ impl Supervisor {
             req.get().init_pty().set_none(());
         }
         req.get().set_network(capnp_rpc::new_client(network));
-        req.get().set_ca_cert(&ca_cert);
-        req.get().set_ca_key(&ca_key);
         req.get().set_logs(log_sink);
         req.get().set_log_filter(args.log_filter());
 

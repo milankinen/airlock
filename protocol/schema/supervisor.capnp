@@ -5,8 +5,6 @@ interface Supervisor {
     stdin :Stdin,
     pty :PtyConfig,
     network :NetworkProxy,
-    caCert :Data,
-    caKey :Data,
     logs :LogSink,
     logFilter :Text,
     cmd :Text,
@@ -61,7 +59,7 @@ struct DataFrame {
 }
 
 interface NetworkProxy {
-  connect @0 (host :Text, port :UInt16, tls :Bool, client :TcpSink)
+  connect @0 (host :Text, port :UInt16, client :TcpSink)
     -> (result :ConnectResult);
 }
 

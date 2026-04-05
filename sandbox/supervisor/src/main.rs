@@ -17,7 +17,6 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run() -> anyhow::Result<()> {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let listen_fd = vsock::listen(ezpez_protocol::SUPERVISOR_PORT)?;
     let conn_fd = vsock::accept(&listen_fd)?;
     drop(listen_fd);
@@ -27,7 +26,7 @@ async fn run() -> anyhow::Result<()> {
 
     let dns = Rc::new(net::dns::DnsState::new());
     net::dns::start(dns.clone());
-    net::start_proxy(conn.network, conn.ca, dns, conn.tls_passthrough);
+    net::start_proxy(conn.network, dns);
 
     // Create cache volume subdirs (the ext4 volume is already mounted at /mnt/cache by init)
     for dir in &conn.cache_dirs {

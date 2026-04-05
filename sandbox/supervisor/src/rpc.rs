@@ -8,18 +8,11 @@ use futures::AsyncReadExt;
 pub struct HostConnection {
     pub proc: HostProcess,
     pub network: network_proxy::Client,
-    pub ca: HostCA,
     pub log_sink: log_sink::Client,
     pub log_filter: String,
     pub cmd: String,
     pub args: Vec<String>,
-    pub tls_passthrough: Vec<String>,
     pub cache_dirs: Vec<String>,
-}
-
-pub struct HostCA {
-    pub cert: String,
-    pub key: String,
 }
 
 pub struct HostProcess {
@@ -81,20 +74,11 @@ impl supervisor::Server for SupervisorImpl {
                 attachment: attach_tx,
             },
             network: params.get_network()?,
-            ca: HostCA {
-                cert: String::from_utf8_lossy(params.get_ca_cert()?).to_string(),
-                key: String::from_utf8_lossy(params.get_ca_key()?).to_string(),
-            },
             log_sink: params.get_logs()?,
             log_filter: params.get_log_filter()?.to_str()?.to_string(),
             cmd: params.get_cmd()?.to_str()?.to_string(),
             args: params
                 .get_args()?
-                .iter()
-                .map(|a| a.map(|s| s.to_str().unwrap_or("").to_string()))
-                .collect::<Result<Vec<_>, _>>()?,
-            tls_passthrough: params
-                .get_tls_passthrough()?
                 .iter()
                 .map(|a| a.map(|s| s.to_str().unwrap_or("").to_string()))
                 .collect::<Result<Vec<_>, _>>()?,

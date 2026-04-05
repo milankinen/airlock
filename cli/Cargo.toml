@@ -35,7 +35,8 @@ indicatif = { workspace = true }
 libc = { workspace = true }
 mlua = { workspace = true }
 oci-client = { workspace = true }
-rcgen = { workspace = true }
+quick_cache = { workspace = true }
+rcgen = { workspace = true, features = ["pem", "x509-parser"] }
 regex = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
@@ -46,6 +47,7 @@ smart-config = { workspace = true }
 sysinfo = { workspace = true }
 tar = { workspace = true }
 thiserror = { workspace = true }
+tls-parser = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-rustls = { workspace = true }
 tokio-util = { workspace = true }
