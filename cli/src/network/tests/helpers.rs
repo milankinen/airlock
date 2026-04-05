@@ -17,9 +17,25 @@ use tokio::task::LocalSet;
 
 use crate::config::config;
 use crate::network::Network;
-use crate::network::middleware::Middleware;
-pub use crate::network::middleware::RequestLog;
+use crate::network::middleware::{LogFn, Middleware};
 use crate::network::tls::TlsInterceptor;
+
+/// Collects log messages from Lua `log()` calls for test assertions.
+#[derive(Clone)]
+pub struct RequestLog(Rc<std::cell::RefCell<Vec<String>>>);
+
+impl RequestLog {
+    pub fn new() -> (Self, LogFn) {
+        let log = Self(Rc::new(std::cell::RefCell::new(Vec::new())));
+        let inner = log.0.clone();
+        let log_fn: LogFn = Rc::new(move |msg: &str| inner.borrow_mut().push(msg.to_string()));
+        (log, log_fn)
+    }
+
+    pub fn messages(&self) -> Vec<String> {
+        self.0.borrow().clone()
+    }
+}
 
 // ── Test HTTP server ────────────────────────────────────
 

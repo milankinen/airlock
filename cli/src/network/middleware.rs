@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use mlua::{Lua, Value};
@@ -13,23 +12,6 @@ pub type LogFn = Rc<dyn Fn(&str)>;
 /// Creates the default log sink that writes to tracing.
 pub fn tracing_log() -> LogFn {
     Rc::new(|msg| tracing::debug!(target: "ez::script", "{msg}"))
-}
-
-/// Collects log messages for testing.
-#[derive(Clone)]
-pub struct RequestLog(Rc<RefCell<Vec<String>>>);
-
-impl RequestLog {
-    pub fn new() -> (Self, LogFn) {
-        let log = Self(Rc::new(RefCell::new(Vec::new())));
-        let inner = log.0.clone();
-        let log_fn: LogFn = Rc::new(move |msg: &str| inner.borrow_mut().push(msg.to_string()));
-        (log, log_fn)
-    }
-
-    pub fn messages(&self) -> Vec<String> {
-        self.0.borrow().clone()
-    }
 }
 
 pub struct Middleware {
