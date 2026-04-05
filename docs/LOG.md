@@ -78,6 +78,21 @@ libkrunfw.so from GitHub releases, embed both in the binary via
 - `mise run build:dev` — on Linux, runs build:libkrun before cargo build
 - Both .so files embedded in the ez binary (~23MB total)
 
+## 2026-04-05: Add mount `missing` action and resolve relative paths
+
+Mount source paths are now resolved against the project's cwd before
+checking existence, fixing `./target`-style relative paths. Added a
+configurable `missing` field to mount config controlling behavior when
+the source doesn't exist:
+
+- `fail` (default) — error out
+- `warn` — skip with a warning message
+- `ignore` — skip silently
+- `create` — create the directory and mount it
+
+18 tests covering: absolute/relative/tilde paths, all missing actions,
+nested create, mixed mounts, file vs dir detection, read_only flag.
+
 ## 2026-04-05: Add comprehensive network tests
 
 33 end-to-end tests covering TCP relay, HTTP proxy, TLS MITM, TLS

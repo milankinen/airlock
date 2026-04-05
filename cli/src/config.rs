@@ -99,6 +99,28 @@ pub mod config {
         pub target: String,
         #[config(default_t = false)]
         pub read_only: bool,
+        /// What to do when the source path doesn't exist.
+        #[config(default_t = MissingAction::Fail)]
+        pub missing: MissingAction,
+    }
+
+    #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum MissingAction {
+        /// Error out if the source doesn't exist (default).
+        Fail,
+        /// Skip the mount with a warning.
+        Warn,
+        /// Skip the mount silently.
+        Ignore,
+        /// Create the directory and mount it.
+        Create,
+    }
+
+    impl WellKnown for MissingAction {
+        type Deserializer =
+            smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
+        const DE: Self::Deserializer = smart_config::de::Serde;
     }
 
     impl WellKnown for Mount {

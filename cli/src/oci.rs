@@ -3,6 +3,8 @@ pub(crate) mod config;
 mod docker;
 mod layer;
 mod registry;
+#[cfg(test)]
+mod tests;
 
 use std::path::{Path, PathBuf};
 
@@ -34,6 +36,7 @@ impl Bundle {
     }
 }
 
+#[derive(Debug)]
 pub struct ResolvedMount {
     /// Source + target (with `~`) for display (only for config mounts)
     pub display: Option<(String, String)>,
@@ -46,6 +49,7 @@ pub struct ResolvedMount {
     pub read_only: bool,
 }
 
+#[derive(Debug)]
 pub enum MountType {
     Dir { key: String },
     File { filename: String },
@@ -167,6 +171,7 @@ fn build_bundle(
         &project.config.mounts,
         &host_home,
         &container_home,
+        &project.cwd,
     )?);
 
     // Cache volume (VirtIO block device with ext4)
@@ -449,41 +454,72 @@ fn lookup_home_dir(rootfs: &Path, uid: u32) -> anyhow::Result<String> {
     anyhow::bail!("no home directory found for uid {uid} in container /etc/passwd")
 }
 
-fn resolve_mounts(
+pub(crate) fn resolve_mounts(
     mounts: &[crate::config::config::Mount],
     host_home: &Path,
     container_home: &str,
+    cwd: &Path,
 ) -> anyhow::Result<Vec<ResolvedMount>> {
+    use crate::config::config::MissingAction;
+
     let container_home = PathBuf::from(container_home);
-    mounts
-        .iter()
-        .enumerate()
-        .map(|(i, m)| {
-            let source = expand_tilde(&m.source, host_home);
-            let source = std::fs::canonicalize(&source).unwrap_or(source);
-            let target = expand_tilde(&m.target, &container_home);
+    let mut result = Vec::new();
 
-            let file_name = source
-                .file_name()
-                .map_or_else(|| format!("file_{i}"), |n| n.to_string_lossy().to_string());
+    for (i, m) in mounts.iter().enumerate() {
+        let source = expand_tilde(&m.source, host_home);
+        // Resolve relative paths against cwd
+        let source = if source.is_relative() {
+            cwd.join(&source)
+        } else {
+            source
+        };
 
-            let mount_type = if source.is_dir() {
-                MountType::Dir {
-                    key: format!("mount_{i}"),
+        // Handle missing source
+        if !source.exists() {
+            match m.missing {
+                MissingAction::Fail => {
+                    anyhow::bail!("mount source does not exist: {}", source.display());
                 }
-            } else {
-                MountType::File {
-                    filename: file_name,
+                MissingAction::Warn => {
+                    crate::cli::log!(
+                        "  {} mount skipped (not found): {}",
+                        crate::cli::bullet(),
+                        crate::cli::dim(&source.display().to_string())
+                    );
+                    continue;
                 }
-            };
+                MissingAction::Ignore => continue,
+                MissingAction::Create => {
+                    std::fs::create_dir_all(&source)?;
+                }
+            }
+        }
 
-            Ok(ResolvedMount {
-                display: Some((m.source.clone(), m.target.clone())),
-                source,
-                mount_type,
-                target: target.to_string_lossy().to_string(),
-                read_only: m.read_only,
-            })
-        })
-        .collect()
+        let source = std::fs::canonicalize(&source).unwrap_or(source);
+        let target = expand_tilde(&m.target, &container_home);
+
+        let file_name = source
+            .file_name()
+            .map_or_else(|| format!("file_{i}"), |n| n.to_string_lossy().to_string());
+
+        let mount_type = if source.is_dir() {
+            MountType::Dir {
+                key: format!("mount_{i}"),
+            }
+        } else {
+            MountType::File {
+                filename: file_name,
+            }
+        };
+
+        result.push(ResolvedMount {
+            display: Some((m.source.clone(), m.target.clone())),
+            source,
+            mount_type,
+            target: target.to_string_lossy().to_string(),
+            read_only: m.read_only,
+        });
+    }
+
+    Ok(result)
 }
