@@ -1,4 +1,5 @@
 use std::ffi::CString;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -7,6 +8,41 @@ use std::thread::JoinHandle;
 use tracing::debug;
 
 use super::config::VmConfig;
+
+pub fn check_kvm_access() {
+    let path = Path::new("/dev/kvm");
+    if !path.exists() {
+        crate::cli::error!("KVM not available (/dev/kvm not found)");
+        crate::cli::error!("ensure KVM is enabled in your kernel/BIOS");
+        std::process::exit(1);
+    }
+    if let Ok(metadata) = path.metadata() {
+        let mode = metadata.mode();
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        let dev_uid = metadata.uid();
+        let dev_gid = metadata.gid();
+
+        let owner_ok = uid == dev_uid && (mode & 0o600 == 0o600);
+        let group_ok = gid == dev_gid && (mode & 0o060 == 0o060);
+        let other_ok = mode & 0o006 == 0o006;
+
+        // Also check supplementary groups
+        let supp_ok = if group_ok {
+            false
+        } else {
+            let mut groups = vec![0u32; 64];
+            let n = unsafe { libc::getgroups(groups.len() as i32, groups.as_mut_ptr()) };
+            n > 0 && groups[..n as usize].contains(&dev_gid)
+        };
+
+        if !owner_ok && !group_ok && !supp_ok && !other_ok {
+            crate::cli::error!("no permission to access /dev/kvm");
+            crate::cli::error!("run: sudo usermod -aG kvm $USER  (then re-login)");
+            std::process::exit(1);
+        }
+    }
+}
 
 const KRUN_LOG_ERROR: u32 = 1;
 const KRUN_LOG_DEBUG: u32 = 4;

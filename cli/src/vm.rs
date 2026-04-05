@@ -3,12 +3,13 @@ mod apple;
 mod config;
 #[cfg(target_os = "linux")]
 mod krun;
-
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::os::unix::io::OwnedFd;
 use std::path::Path;
 
+#[cfg(target_os = "linux")]
+pub use krun::check_kvm_access;
 use tracing::warn;
 
 use crate::assets::Assets;

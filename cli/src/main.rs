@@ -21,6 +21,8 @@ use crate::project::Project;
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    #[cfg(target_os = "linux")]
+    vm::check_kvm_access();
     let args = cli::initialize();
     let cwd = std::env::current_dir().unwrap_or_default();
     let config = match config::load(&cwd) {
