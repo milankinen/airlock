@@ -154,7 +154,9 @@ impl KrunVmBackend {
     ) -> anyhow::Result<Self> {
         let fns = KrunFns::load(libkrun_path, libkrunfw_path)?;
 
-        let log_level = if tracing::enabled!(tracing::Level::DEBUG) {
+        // Keep libkrun at ERROR — its debug output is extremely verbose.
+        // Our own supervisor logs go through the RPC LogSink separately.
+        let log_level = if tracing::enabled!(tracing::Level::TRACE) {
             KRUN_LOG_DEBUG
         } else {
             KRUN_LOG_ERROR

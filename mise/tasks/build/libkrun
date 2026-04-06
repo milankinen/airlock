@@ -1,6 +1,6 @@
 #!/bin/bash
 #MISE description="Build libkrun and download libkrunfw"
-#MISE sources=["sandbox/libkrun/build.sh"]
+#MISE sources=["sandbox/libkrun/build.sh", "sandbox/libkrun/netfilter.cfg"]
 #MISE outputs=["sandbox/out/libkrun.so", "sandbox/out/libkrunfw.so"]
 set -euo pipefail
 

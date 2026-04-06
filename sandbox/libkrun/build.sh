@@ -2,19 +2,34 @@
 set -euo pipefail
 
 mkdir -p sandbox/out
-rm -f sandbox/out/libkrun*
+rm -f sandbox/out/libkrun* sandbox/out/libkrunfw*
 
-# Download libkrunfw from GitHub releases
 KRUNFW_VERSION="v5.3.0"
-HOST_ARCH=$(uname -m)
-echo "Downloading libkrunfw ${KRUNFW_VERSION} (${HOST_ARCH})..."
-KRUNFW_FULL_VERSION="${KRUNFW_VERSION#v}"
-curl -fSL "https://github.com/containers/libkrunfw/releases/download/${KRUNFW_VERSION}/libkrunfw-${HOST_ARCH}.tgz" \
-  | tar -xzf - --strip-components=1 -C sandbox/out "lib64/libkrunfw.so.${KRUNFW_FULL_VERSION}"
-mv "sandbox/out/libkrunfw.so.${KRUNFW_FULL_VERSION}" sandbox/out/libkrunfw.so
+
+# Build libkrunfw with netfilter support
+echo "Building libkrunfw (with netfilter)..."
+docker run --rm \
+  -v "$PWD/sandbox/libkrun/netfilter.cfg:/netfilter.cfg:ro" \
+  -v "$PWD/sandbox/out:/out" \
+  -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
+  rust:1-slim-trixie sh -c "
+    set -e
+    apt-get update -qq && apt-get install -y -qq \
+      git make gcc curl xz-utils python3 python3-pyelftools flex bison bc \
+      libelf-dev libssl-dev >/dev/null 2>&1
+    cd /tmp
+    git clone --depth=1 --branch ${KRUNFW_VERSION} https://github.com/containers/libkrunfw.git
+    cd libkrunfw
+    # Enable netfilter in kernel config
+    sed -i '/# CONFIG_NETFILTER is not set/d' config-libkrunfw_\$(uname -m)
+    cat /netfilter.cfg >> config-libkrunfw_\$(uname -m)
+    make -j\$(nproc)
+    cp libkrunfw.so.* /out/libkrunfw.so
+    chown \"\$HOST_UID:\$HOST_GID\" /out/libkrunfw.so
+  "
 echo "libkrunfw: sandbox/out/libkrunfw.so ($(du -h sandbox/out/libkrunfw.so | cut -f1))"
 
-# Build libkrun
+# Build libkrun with block device support
 echo "Building libkrun..."
 docker run --rm \
   -v "$PWD/sandbox/out:/out" \

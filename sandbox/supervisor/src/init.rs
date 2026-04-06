@@ -219,15 +219,15 @@ fn write_sysctl(path: &str, value: &str) {
 }
 
 fn run_quiet(args: &[&str]) {
+    let cmd_str = args.join(" ");
     match Command::new(args[0]).args(&args[1..]).output() {
         Ok(output) if !output.status.success() => {
-            debug!(
-                "{} failed: {}",
-                args[0],
+            warn!(
+                "{cmd_str}: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        Err(e) => debug!("{} exec failed: {e}", args[0]),
-        _ => {}
+        Err(e) => warn!("{cmd_str}: exec failed: {e}"),
+        Ok(_) => debug!("{cmd_str}: ok"),
     }
 }
