@@ -19,7 +19,7 @@ fn build_command() -> (String, Vec<String>) {
             "run".to_string(),
             "--no-pivot".to_string(),
             "--bundle".to_string(),
-            "/mnt/bundle".to_string(),
+            "/mnt/overlay".to_string(),
             "ezpez0".to_string(),
         ],
     )
@@ -68,17 +68,13 @@ impl Supervisor {
         Ok(Self { supervisor: client })
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn start(
         &self,
         args: &CliArgs,
         project: &Project,
         stdin: Stdin,
         network: Network,
-        cache_dirs: &[String],
-        shares: &[String],
         epoch: u64,
-        has_cache_disk: bool,
     ) -> anyhow::Result<Process> {
         let log_sink: log_sink::Client = capnp_rpc::new_client(LogSinkImpl);
 
@@ -112,17 +108,7 @@ impl Supervisor {
             pt_builder.set(i as u32, host.as_str());
         }
 
-        // Cache volume subdirs to create on /mnt/cache
-        let mut cd_builder = req.get().init_cache_dirs(cache_dirs.len() as u32);
-        for (i, dir) in cache_dirs.iter().enumerate() {
-            cd_builder.set(i as u32, dir);
-        }
-
-        // Init config: shares, epoch, host ports, cache disk
-        let mut shares_builder = req.get().init_shares(shares.len() as u32);
-        for (i, tag) in shares.iter().enumerate() {
-            shares_builder.set(i as u32, tag);
-        }
+        // Init config: epoch, host ports
         req.get().set_epoch(epoch);
         let host_ports =
             crate::network::rules::localhost_ports_from_config(&project.config.network);
@@ -130,11 +116,17 @@ impl Supervisor {
         for (i, port) in host_ports.iter().enumerate() {
             hp_builder.set(i as u32, *port);
         }
-        req.get().set_has_cache_disk(has_cache_disk);
 
         let response = req.send().promise.await?;
         let proc = response.get()?.get_proc()?;
 
         Ok(Process::new(proc))
+    }
+
+    pub async fn shutdown(&self) {
+        let req = self.supervisor.shutdown_request();
+        if let Err(e) = req.send().promise.await {
+            tracing::debug!("shutdown RPC: {e}");
+        }
     }
 }

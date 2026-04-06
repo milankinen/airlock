@@ -3,7 +3,6 @@ mod apple;
 mod config;
 #[cfg(target_os = "linux")]
 mod krun;
-use std::collections::HashSet;
 #[cfg(target_os = "macos")]
 use std::fmt::Write;
 use std::os::unix::io::OwnedFd;
@@ -26,18 +25,37 @@ pub async fn start(
     #[cfg_attr(target_os = "linux", allow(unused_variables))] args: &CliArgs,
     project: &Project,
     bundle: Bundle,
-) -> anyhow::Result<(Box<dyn VmHandle>, OwnedFd, Vec<String>)> {
+) -> anyhow::Result<(Box<dyn VmHandle>, OwnedFd)> {
     let assets = Assets::init()?;
     let mut shares = vec![];
-    let mut file_share_tags = HashSet::new();
 
-    let files_dir = project.cache_dir.join("files");
-    // Purge existing file mounts
-    if files_dir.exists() {
-        std::fs::remove_dir_all(&files_dir)?;
+    let overlay_dir = project.cache_dir.join("overlay");
+    // Create overlay subdirs (rootfs is the overlayfs mount point)
+    for subdir in ["rootfs", "files_rw", "files_ro"] {
+        std::fs::create_dir_all(overlay_dir.join(subdir))?;
+    }
+    // Purge file mount dirs on each start (rebuilt from config)
+    for subdir in ["files_rw", "files_ro"] {
+        let dir = overlay_dir.join(subdir);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+            std::fs::create_dir_all(&dir)?;
+        }
     }
 
-    // Add user config mounts from resolved bundle
+    // Well-known shares
+    shares.push(VmShare {
+        tag: "base".to_string(),
+        host_path: bundle.image_rootfs.clone(),
+        read_only: true,
+    });
+    shares.push(VmShare {
+        tag: "overlay".to_string(),
+        host_path: overlay_dir.clone(),
+        read_only: false,
+    });
+
+    // User dir mounts and file mounts
     for mount in &bundle.mounts {
         tracing::debug!(
             "mount: {} → {} → {} (read-only: {})",
@@ -55,23 +73,10 @@ pub async fn start(
                 });
             }
             crate::oci::MountType::File { .. } => {
-                let share = link_file(mount.key(), &mount.source, &mount.target, &files_dir)?;
-                if !file_share_tags.contains(&share.tag) {
-                    file_share_tags.insert(share.tag.clone());
-                    shares.push(share);
-                }
-            }
-            crate::oci::MountType::Cache { .. } => {
-                // Cache mounts use VirtIO block device, not VirtioFS
+                link_file(&mount.source, &mount.target, &overlay_dir, mount.read_only)?;
             }
         }
     }
-    // Add bundle as a VirtioFS share
-    shares.push(VmShare {
-        tag: "bundle".to_string(),
-        host_path: bundle.path.clone(),
-        read_only: false,
-    });
 
     cli::log!(
         "  {} cpus:   {}",
@@ -98,13 +103,7 @@ pub async fn start(
         let Some((source, target)) = &mount.display else {
             continue;
         };
-        let mode = if matches!(mount.mount_type, crate::oci::MountType::Cache { .. }) {
-            continue;
-        } else if mount.read_only {
-            "ro"
-        } else {
-            "rw"
-        };
+        let mode = if mount.read_only { "ro" } else { "rw" };
         cli::log!(
             "  {} mount:  {}",
             cli::bullet(),
@@ -120,8 +119,6 @@ pub async fn start(
             share.read_only
         );
     }
-
-    let share_tags: Vec<String> = shares.iter().map(|s| s.tag.clone()).collect();
 
     let vm_config = config::VmConfig {
         cpus: project.config.cpus,
@@ -152,7 +149,7 @@ pub async fn start(
             cmd
         },
         shares,
-        cache_disk: bundle.cache_image.clone(),
+        cache_disk: Some(bundle.disk_image.clone()),
         runtime_dir: project.cache_dir.clone(),
     };
 
@@ -179,7 +176,7 @@ pub async fn start(
             }
         };
 
-        Ok((Box::new(backend), vsock_fd, share_tags.clone()))
+        Ok((Box::new(backend), vsock_fd))
     }
 
     #[cfg(target_os = "linux")]
@@ -235,7 +232,7 @@ pub async fn start(
             }
         };
 
-        Ok((Box::new(backend), vsock_fd, share_tags.clone()))
+        Ok((Box::new(backend), vsock_fd))
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -245,26 +242,26 @@ pub async fn start(
     }
 }
 
-/// Link a file mount into the shared files directory, replicating the
+/// Link a file mount into the overlay directory, replicating the
 /// target's directory structure so the entire tree can be overlaid onto
 /// the container rootfs.
 ///
-/// For target `/root/.claude.json`, creates `files_rw/root/.claude.json`.
+/// For target `/root/.claude.json` with read_only=false, creates
+/// `overlay/files_rw/root/.claude.json`.
 pub fn link_file(
-    ftag: &str,
     source: &Path,
     target: &str,
-    files_dir: &Path,
-) -> anyhow::Result<VmShare> {
-    let fdir = files_dir.join(ftag);
-    // Replicate target directory structure: /root/.claude.json → files_rw/root/
+    overlay_dir: &Path,
+    read_only: bool,
+) -> anyhow::Result<()> {
+    let subdir = if read_only { "files_ro" } else { "files_rw" };
     let target_path = Path::new(target);
     let parent = target_path
         .parent()
         .unwrap_or(Path::new(""))
         .strip_prefix("/")
         .unwrap_or(Path::new(""));
-    let link_dir = fdir.join(parent);
+    let link_dir = overlay_dir.join(subdir).join(parent);
     std::fs::create_dir_all(&link_dir)?;
 
     let file_name = target_path
@@ -286,11 +283,7 @@ pub fn link_file(
         source.display(),
         link_path.display()
     );
-    Ok(VmShare {
-        tag: ftag.into(),
-        host_path: fdir,
-        read_only: false, // overlay upperdir must be writable
-    })
+    Ok(())
 }
 
 #[allow(dead_code)]

@@ -3,81 +3,78 @@ use std::path::{Path, PathBuf};
 
 use crate::cli;
 use crate::config::config::Cache;
-use crate::oci::{MountType, ResolvedMount};
 
-/// Prepare the cache disk image and return the image path + cache mounts.
+/// Default disk size (10 GB) — used for overlay upper + cache dirs.
+const DEFAULT_DISK_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Ensure the project disk image exists (for overlay upper + cache).
+/// Always creates one — the disk backs both the rootfs overlay upper
+/// layer and any configured cache mounts.
 ///
-/// Returns `(None, [])` if cache is not configured.
+/// Returns (disk_image_path, cache_target_paths).
 pub fn prepare(
     cache_dir: &Path,
     config: Option<&Cache>,
     container_home: &str,
-) -> anyhow::Result<(Option<PathBuf>, Vec<ResolvedMount>)> {
-    let image_path = cache_dir.join("cache.img");
-    let Some(config) = config.filter(|c| !c.mounts.is_empty()) else {
-        if image_path.exists() {
-            fs::remove_file(&image_path)?;
-            cli::log!("  {} cache volume removed", cli::check());
-        }
-        return Ok((None, vec![]));
-    };
+    cwd: &Path,
+) -> anyhow::Result<(PathBuf, Vec<String>)> {
+    let image_path = cache_dir.join("disk.img");
 
-    // Align to 512-byte blocks (required by VZDiskImageStorageDeviceAttachment)
-    let size = config.size;
-    let bytes = (size.0 + 511) & !511;
+    let configured_bytes = config.map(|c| (c.size.0 + 511) & !511).filter(|&b| b > 0);
+    let bytes = configured_bytes.unwrap_or((DEFAULT_DISK_BYTES + 511) & !511);
 
     if image_path.exists() {
         let current_size = fs::metadata(&image_path)?.len();
         if current_size > bytes {
-            // Shrink: delete and recreate (ext4 will be reformatted)
             fs::remove_file(&image_path)?;
             create_sparse(&image_path, bytes)?;
             cli::log!(
-                "  {} cache volume recreated {}",
+                "  {} disk recreated {}",
                 cli::check(),
-                cli::dim(&size.to_string())
+                cli::dim(&format_size(bytes))
             );
         } else if current_size < bytes {
-            // Grow: extend the sparse file (resize2fs in init will expand fs)
             grow_sparse(&image_path, bytes)?;
             cli::log!(
-                "  {} cache volume grown to {}",
+                "  {} disk grown to {}",
                 cli::check(),
-                cli::dim(&size.to_string())
+                cli::dim(&format_size(bytes))
             );
         }
     } else {
         create_sparse(&image_path, bytes)?;
         cli::log!(
-            "  {} cache volume created {}",
+            "  {} disk created {}",
             cli::check(),
-            cli::dim(&size.to_string())
+            cli::dim(&format_size(bytes))
         );
     }
 
     let container_home = PathBuf::from(container_home);
-    let mounts: Vec<ResolvedMount> = config
-        .mounts
+    let empty = vec![];
+    let cache_targets: Vec<String> = config
+        .map_or(&empty, |c| &c.mounts)
         .iter()
         .map(|path| {
             let target = super::expand_tilde(path, &container_home);
-            let target_str = target.to_string_lossy().into_owned();
-            // Use the absolute target path (without leading /) as subdir
-            let subdir = target_str
-                .strip_prefix('/')
-                .unwrap_or(&target_str)
-                .to_string();
-            ResolvedMount {
-                display: Some((path.clone(), path.clone())),
-                mount_type: MountType::Cache { subdir },
-                source: image_path.clone(),
-                target: target_str,
-                read_only: false,
-            }
+            let target = if target.is_relative() {
+                cwd.join(target)
+            } else {
+                target
+            };
+            target.to_string_lossy().into_owned()
         })
         .collect();
 
-    Ok((Some(image_path), mounts))
+    Ok((image_path, cache_targets))
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{} GB", bytes / (1024 * 1024 * 1024))
+    } else {
+        format!("{} MB", bytes / (1024 * 1024))
+    }
 }
 
 fn create_sparse(path: &Path, size: u64) -> anyhow::Result<()> {

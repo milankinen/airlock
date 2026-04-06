@@ -4,6 +4,13 @@
 #MISE outputs=["sandbox/out/Image"]
 set -euo pipefail
 
+# Kernel is only needed on macOS (Apple Virtualization)
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "Skipping kernel build (not macOS)"
+  touch sandbox/out/Image
+  exit 0
+fi
+
 HOST_ARCH=$(uname -m)
 case "$HOST_ARCH" in
   x86_64)  ARCH=x86_64;  CONFIG=config-x86_64 ;;
@@ -19,4 +26,5 @@ docker run --rm \
   -v "$PWD/sandbox/kernel/build.sh:/build.sh:ro" \
   -v "$PWD/sandbox/out:/out" \
   alpine:3.23 sh -c 'sh /build.sh && chown "$HOST_UID:$HOST_GID" /out/Image'
-echo "Kernel: sandbox/out/Image ($(du -h sandbox/out/Image | cut -f1))"
+SIZE=$(du -h sandbox/out/Image | cut -f1)
+echo "Kernel: sandbox/out/Image (${SIZE})"

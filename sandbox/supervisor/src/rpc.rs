@@ -85,19 +85,8 @@ impl supervisor::Server for SupervisorImpl {
                 .map(|a| a.map(|s| s.to_str().unwrap_or("").to_string()))
                 .collect::<Result<Vec<_>, _>>()?,
             init_config: InitConfig {
-                shares: params
-                    .get_shares()?
-                    .iter()
-                    .map(|a| a.map(|s| s.to_str().unwrap_or("").to_string()))
-                    .collect::<Result<Vec<_>, _>>()?,
                 epoch: params.get_epoch(),
                 host_ports: params.get_host_ports()?.iter().collect(),
-                has_cache_disk: params.get_has_cache_disk(),
-                cache_dirs: params
-                    .get_cache_dirs()?
-                    .iter()
-                    .map(|a| a.map(|s| s.to_str().unwrap_or("").to_string()))
-                    .collect::<Result<Vec<_>, _>>()?,
             },
         };
 
@@ -110,6 +99,17 @@ impl supervisor::Server for SupervisorImpl {
             .map_err(|_| capnp::Error::failed("process not established".into()))?;
 
         results.get().set_proc(proc);
+        Ok(())
+    }
+
+    async fn shutdown(
+        self: Rc<Self>,
+        _params: supervisor::ShutdownParams,
+        _results: supervisor::ShutdownResults,
+    ) -> Result<(), capnp::Error> {
+        tracing::info!("shutdown: syncing filesystems");
+        unsafe { libc::sync() };
+        tracing::info!("shutdown: sync complete");
         Ok(())
     }
 }

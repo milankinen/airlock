@@ -2,7 +2,7 @@ use std::path::Path;
 
 use super::{OciConfig, ResolvedMount};
 
-/// Generate an OCI runtime spec config.json from the image config and bind mounts.
+/// Generate an OCI runtime spec config.json from the image config.
 pub fn generate_config(
     image_config: &OciConfig,
     project_cwd: &Path,
@@ -48,7 +48,8 @@ pub fn generate_config(
     let user = cfg.and_then(|c| c.user.as_deref()).unwrap_or("0:0");
     let (uid, gid) = parse_user(user);
 
-    // Build mounts: system mounts first, then bind mounts
+    // System mounts + file overlay mounts.
+    // Dir/cache mounts are handled by the supervisor via mounts.json.
     let mut mounts_json = vec![
         serde_json::json!({ "destination": "/proc", "type": "proc", "source": "proc" }),
         serde_json::json!({ "destination": "/dev", "type": "tmpfs", "source": "tmpfs",
@@ -61,21 +62,31 @@ pub fn generate_config(
           "options": ["nosuid", "noexec", "nodev", "ro"] }),
     ];
 
-    // Bind mounts from VirtioFS shares into container.
-    // File mounts are excluded — they are overlaid onto the rootfs by init.
-    for mount in mounts {
-        if matches!(mount.mount_type, super::MountType::File { .. }) {
-            continue;
-        }
-        let mut options = vec!["bind".to_string()];
-        if mount.read_only {
-            options.push("ro".to_string());
-        }
+    // File mounts from VirtioFS. VirtioFS doesn't support file-level
+    // bind mounts (Permission denied), but directory bind mounts work.
+    // We bind the files_rw/files_ro dirs into the container at /.ez/,
+    // then the supervisor creates symlinks from target paths into /.ez/.
+    let has_rw_files = mounts
+        .iter()
+        .any(|m| matches!(m.mount_type, super::MountType::File { .. }) && !m.read_only);
+    let has_ro_files = mounts
+        .iter()
+        .any(|m| matches!(m.mount_type, super::MountType::File { .. }) && m.read_only);
+
+    if has_rw_files {
         mounts_json.push(serde_json::json!({
-            "destination": mount.target,
+            "destination": "/.ez/files_rw",
             "type": "bind",
-            "source": mount.vm_path(),
-            "options": options
+            "source": "/mnt/overlay/files_rw",
+            "options": ["bind"],
+        }));
+    }
+    if has_ro_files {
+        mounts_json.push(serde_json::json!({
+            "destination": "/.ez/files_ro",
+            "type": "bind",
+            "source": "/mnt/overlay/files_ro",
+            "options": ["bind", "ro"],
         }));
     }
 

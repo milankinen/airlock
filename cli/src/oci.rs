@@ -16,24 +16,12 @@ use crate::project::Project;
 use crate::terminal::Terminal;
 
 pub struct Bundle {
-    pub path: PathBuf,
     /// Mounts with `~` expanded: source to host home, target to container home.
     pub mounts: Vec<ResolvedMount>,
-    /// Sparse raw disk image for the cache volume (VirtIO block device).
-    pub cache_image: Option<PathBuf>,
-}
-
-impl Bundle {
-    /// Collect cache subdirs that the supervisor needs to create on the cache volume.
-    pub fn cache_dirs(&self) -> Vec<&str> {
-        self.mounts
-            .iter()
-            .filter_map(|m| match &m.mount_type {
-                MountType::Cache { subdir } => Some(subdir.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
+    /// Sparse disk image for overlay upper + cache (always present).
+    pub disk_image: PathBuf,
+    /// Path to the shared read-only image rootfs in the image cache.
+    pub image_rootfs: PathBuf,
 }
 
 #[derive(Debug)]
@@ -53,7 +41,6 @@ pub struct ResolvedMount {
 pub enum MountType {
     Dir { key: String },
     File { filename: String },
-    Cache { subdir: String },
 }
 
 impl ResolvedMount {
@@ -62,14 +49,12 @@ impl ResolvedMount {
             MountType::Dir { key } => key.as_str(),
             MountType::File { filename: _ } if self.read_only => "files_ro",
             MountType::File { filename: _ } => "files_rw",
-            MountType::Cache { .. } => "cache",
         }
     }
     pub fn vm_path(&self) -> String {
         match &self.mount_type {
             MountType::Dir { key } => format!("/mnt/{key}"),
-            MountType::File { filename } => format!("/mnt/{}/{filename}", self.key()),
-            MountType::Cache { subdir } => format!("/mnt/cache/{subdir}"),
+            MountType::File { filename } => format!("overlay/{}/{filename}", self.key()),
         }
     }
 }
@@ -81,7 +66,6 @@ pub async fn prepare(
     terminal: &Terminal,
 ) -> anyhow::Result<Bundle> {
     let digest_file = project.cache_dir.join("image_digest");
-    let bundle = project.cache_dir.join("bundle");
     let stored_digest = std::fs::read_to_string(&digest_file).ok();
 
     // Resolve image reference to a digest (no download yet)
@@ -105,7 +89,7 @@ pub async fn prepare(
             }
             ImageChangeAction::Recreate => {
                 let spinner = cli::spinner("erasing old environment...");
-                let _ = std::fs::remove_dir_all(&bundle);
+                let _ = std::fs::remove_dir_all(project.cache_dir.join("overlay"));
                 let _ = std::fs::remove_file(&digest_file);
                 spinner.finish_and_clear();
                 cli::log!("  {} old environment erased", cli::check());
@@ -119,28 +103,32 @@ pub async fn prepare(
     // Download/ensure image
     let image_dir = ensure_image(&mut image).await?;
 
-    // Ensure bundle rootfs
-    if !bundle.exists() {
-        let spinner = cli::spinner("creating project environment...");
-        std::fs::create_dir_all(&bundle)?;
-        crate::cache::cow_copy(&image_dir.join("rootfs"), &bundle.join("rootfs"))?;
-        spinner.finish_and_clear();
-    }
     if digest_changed {
         std::fs::write(&digest_file, &image.digest)?;
     }
 
-    install_ca_cert(&image_dir, &bundle, &project.ca_cert)?;
+    let overlay_dir = project.cache_dir.join("overlay");
+    std::fs::create_dir_all(&overlay_dir)?;
+    install_ca_cert(&image_dir, &overlay_dir, &project.ca_cert)?;
     cli::log!("  {} environment ready", cli::check());
 
-    build_bundle(args, project, terminal, &bundle)
+    build_bundle(
+        args,
+        project,
+        terminal,
+        &overlay_dir,
+        &image_dir,
+        &image.digest,
+    )
 }
 
 fn build_bundle(
     args: &CliArgs,
     project: &Project,
     terminal: &Terminal,
-    bundle_path: &Path,
+    overlay_dir: &Path,
+    image_dir: &Path,
+    image_id: &str,
 ) -> anyhow::Result<Bundle> {
     let mut mounts = vec![];
     mounts.push(ResolvedMount {
@@ -154,9 +142,6 @@ fn build_bundle(
     });
 
     // Read image config from the image cache
-    let digest_file = project.cache_dir.join("image_digest");
-    let digest = std::fs::read_to_string(&digest_file).unwrap_or_default();
-    let image_dir = crate::cache::image_dir(digest.trim())?;
     let config_path = image_dir.join("image_config.json");
     let image_config: OciConfig = if let Ok(data) = std::fs::read(&config_path) {
         serde_json::from_slice(&data).unwrap_or_default()
@@ -165,7 +150,8 @@ fn build_bundle(
     };
 
     let container_uid = config::get_uid(&image_config);
-    let container_home = lookup_home_dir(&bundle_path.join("rootfs"), container_uid)?;
+    let image_rootfs = image_dir.join("rootfs");
+    let container_home = lookup_home_dir(&image_rootfs, container_uid)?;
     let host_home = dirs::home_dir().unwrap_or_default();
     mounts.extend(resolve_mounts(
         &project.config.mounts,
@@ -174,13 +160,13 @@ fn build_bundle(
         &project.cwd,
     )?);
 
-    // Cache volume (VirtIO block device with ext4)
-    let (cache_image, cache_mounts) = cache::prepare(
+    // Disk image (ext4) for overlay upper + cache mounts
+    let (disk_image, cache_targets) = cache::prepare(
         &project.cache_dir,
         project.config.cache.as_ref(),
         &container_home,
+        &project.cwd,
     )?;
-    mounts.extend(cache_mounts);
 
     let pty_size = if terminal.is_tty() {
         // crossterm::terminal::size() returns (cols, rows)
@@ -195,13 +181,46 @@ fn build_bundle(
         &mounts,
         &args.args,
         pty_size,
-        &bundle_path.join("config.json"),
+        &overlay_dir.join("config.json"),
+    )?;
+
+    // Write mounts.json for the supervisor to read
+    let dirs_json: Vec<serde_json::Value> = mounts
+        .iter()
+        .filter(|m| matches!(m.mount_type, MountType::Dir { .. }))
+        .map(|m| {
+            serde_json::json!({
+                "tag": m.key(),
+                "target": m.target,
+                "read_only": m.read_only,
+            })
+        })
+        .collect();
+    let files_json: Vec<serde_json::Value> = mounts
+        .iter()
+        .filter(|m| matches!(m.mount_type, MountType::File { .. }))
+        .map(|m| {
+            serde_json::json!({
+                "target": m.target,
+                "read_only": m.read_only,
+            })
+        })
+        .collect();
+    let mounts_json = serde_json::json!({
+        "image_id": image_id,
+        "dirs": dirs_json,
+        "files": files_json,
+        "cache": cache_targets,
+    });
+    std::fs::write(
+        overlay_dir.join("mounts.json"),
+        serde_json::to_string_pretty(&mounts_json)?,
     )?;
 
     Ok(Bundle {
-        path: bundle_path.to_path_buf(),
         mounts,
-        cache_image,
+        disk_image,
+        image_rootfs,
     })
 }
 
@@ -360,27 +379,28 @@ async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Install the project CA cert into the container's trust store(s).
+/// Install the project CA cert into overlay/files_rw so the container
+/// sees the combined (image + project) CA trust stores via overlayfs.
 /// Different distros use different paths — write to all common locations.
 fn install_ca_cert(
     image_dir: &Path,
-    bundle_path: &Path,
+    overlay_dir: &Path,
     ca_cert_path: &Path,
 ) -> anyhow::Result<()> {
     let ca_cert = std::fs::read(ca_cert_path)?;
 
-    // All common CA trust store paths across distros
+    // Paths relative to rootfs for CA trust stores across distros
     let ca_stores = [
-        "rootfs/etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu
-        "rootfs/etc/ssl/cert.pem",                  // Alpine/LibreSSL
-        "rootfs/etc/pki/tls/certs/ca-bundle.crt",   // RHEL/CentOS
-        "rootfs/etc/ssl/ca-bundle.pem",             // openSUSE
+        "etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu
+        "etc/ssl/cert.pem",                  // Alpine/LibreSSL
+        "etc/pki/tls/certs/ca-bundle.crt",   // RHEL/CentOS
+        "etc/ssl/ca-bundle.pem",             // openSUSE
     ];
 
     for ca_store in ca_stores {
-        let dest = bundle_path.join(ca_store);
+        let dest = overlay_dir.join("files_rw").join(ca_store);
         // Read pristine certs from image (may not exist for all paths)
-        let existing = std::fs::read(image_dir.join(ca_store)).unwrap_or_default();
+        let existing = std::fs::read(image_dir.join("rootfs").join(ca_store)).unwrap_or_default();
         let mut out = existing;
         if !out.ends_with(b"\n") && !out.is_empty() {
             out.push(b'\n');

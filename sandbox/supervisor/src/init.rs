@@ -1,10 +1,7 @@
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct InitConfig {
-    pub shares: Vec<String>,
     pub epoch: u64,
     pub host_ports: Vec<u16>,
-    pub has_cache_disk: bool,
-    pub cache_dirs: Vec<String>,
 }
 
 #[cfg(target_os = "linux")]

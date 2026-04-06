@@ -62,27 +62,16 @@ async fn run(args: CliArgs, config: config::Config) -> anyhow::Result<i32> {
     terminal.enter_raw_mode();
 
     cli::log!("Booting VM...");
-    let cache_dirs: Vec<String> = bundle.cache_dirs().into_iter().map(Into::into).collect();
-    let has_cache_disk = bundle.cache_image.is_some();
     let epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let (vm_handle, vsock_fd, share_tags) = vm::start(&args, &project, bundle).await?;
+    let (vm_handle, vsock_fd) = vm::start(&args, &project, bundle).await?;
     let supervisor = rpc::Supervisor::connect(vsock_fd)?;
 
     let stdin = terminal.stdin()?;
     let proc = supervisor
-        .start(
-            &args,
-            &project,
-            stdin,
-            network,
-            &cache_dirs,
-            &share_tags,
-            epoch,
-            has_cache_disk,
-        )
+        .start(&args, &project, stdin, network, epoch)
         .await?;
 
     // Forward host signals to the VM process
@@ -122,6 +111,9 @@ async fn run(args: CliArgs, config: config::Config) -> anyhow::Result<i32> {
             }
         }
     };
+
+    // Sync filesystems before killing VM
+    supervisor.shutdown().await;
 
     // Destroy VM and return the exit code from vm shell
     drop(vm_handle);

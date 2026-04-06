@@ -4,4 +4,12 @@
 #MISE outputs=["sandbox/out/libkrun.so", "sandbox/out/libkrunfw.so"]
 set -euo pipefail
 
+# libkrun is only needed on Linux
+if [[ "$(uname -s)" != "Linux" ]]; then
+  echo "Skipping libkrun build (not Linux)"
+  touch sandbox/out/libkrun.so
+  touch sandbox/out/libkrunfw.so
+  exit 0
+fi
+
 ./sandbox/libkrun/build.sh

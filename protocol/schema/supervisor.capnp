@@ -10,12 +10,11 @@ interface Supervisor {
     cmd :Text,
     args :List(Text),
     tlsPassthrough :List(Text),
-    cacheDirs :List(Text),
-    shares :List(Text),
     epoch :UInt64,
-    hostPorts :List(UInt16),
-    hasCacheDisk :Bool
+    hostPorts :List(UInt16)
   ) -> (proc :Process);
+
+  shutdown @1 () -> ();
 }
 
 struct PtyConfig {

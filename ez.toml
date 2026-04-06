@@ -1,4 +1,4 @@
-presets = ["claude-code"]
+presets = ["debian", "claude-code"]
 image = "ez:dev"
 
 [network]

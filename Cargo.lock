@@ -880,6 +880,8 @@ dependencies = [
  "libc",
  "pty-process",
  "scc",
+ "serde",
+ "serde_json",
  "simple-dns",
  "tokio",
  "tokio-util",

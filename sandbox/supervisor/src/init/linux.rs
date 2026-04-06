@@ -1,18 +1,263 @@
+use std::path::Path;
 use std::process::Command;
 
 use tracing::{debug, error, info, warn};
 
 use super::InitConfig;
 
+/// Mount config read from /mnt/overlay/mounts.json (written by host).
+#[derive(serde::Deserialize)]
+struct MountsConfig {
+    #[serde(default)]
+    image_id: String,
+    #[serde(default)]
+    dirs: Vec<DirMount>,
+    #[serde(default)]
+    files: Vec<FileMount>,
+    #[serde(default)]
+    cache: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct DirMount {
+    tag: String,
+    target: String,
+    read_only: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct FileMount {
+    target: String,
+    read_only: bool,
+}
+
 pub fn setup(config: &InitConfig) {
     set_clock(config.epoch);
-    mount_virtiofs(&config.shares);
-    setup_networking(&config.host_ports);
-    if config.has_cache_disk {
-        setup_cache_disk(&config.cache_dirs);
+
+    // 1. Mount well-known VirtioFS shares
+    for tag in ["base", "overlay"] {
+        mount_virtiofs(tag);
     }
-    overlay_file_mounts();
+
+    // 2. Read mount config
+    let mounts = read_mounts_config();
+
+    // 3. Mount user-defined VirtioFS shares
+    for dir in &mounts.dirs {
+        mount_virtiofs(&dir.tag);
+    }
+
+    // 4. Networking
+    setup_networking(&config.host_ports);
+
+    // 5. Project disk (ext4 — overlayfs upper + cache)
+    setup_disk(&mounts.cache);
+
+    // 6. Assemble container rootfs
+    assemble_rootfs(&mounts);
+
+    // 7. DNS
     setup_dns();
+}
+
+fn read_mounts_config() -> MountsConfig {
+    let path = "/mnt/overlay/mounts.json";
+    match std::fs::read_to_string(path) {
+        Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
+            error!("failed to parse {path}: {e}");
+            MountsConfig::default()
+        }),
+        Err(e) => {
+            error!("failed to read {path}: {e}");
+            MountsConfig::default()
+        }
+    }
+}
+
+impl Default for MountsConfig {
+    fn default() -> Self {
+        Self {
+            image_id: String::new(),
+            dirs: vec![],
+            files: vec![],
+            cache: vec![],
+        }
+    }
+}
+
+/// Assemble the container rootfs from overlayfs layers, file symlinks,
+/// directory bind mounts, and cache bind mounts.
+fn assemble_rootfs(mounts: &MountsConfig) {
+    let has_disk = Path::new("/mnt/disk").is_dir();
+
+    // Upper/work must be on a local filesystem (not VirtioFS/FUSE).
+    // Use disk if available (persists), otherwise tmpfs (ephemeral).
+    let (upper, work) = if has_disk {
+        reset_overlay_if_needed(&mounts.image_id);
+        std::fs::create_dir_all("/mnt/disk/overlay/rootfs")
+            .unwrap_or_else(|e| error!("overlay rootfs dir: {e}"));
+        std::fs::create_dir_all("/mnt/disk/overlay/work")
+            .unwrap_or_else(|e| error!("overlay work dir: {e}"));
+        ("/mnt/disk/overlay/rootfs", "/mnt/disk/overlay/work")
+    } else {
+        std::fs::create_dir_all("/tmp/overlay_rootfs")
+            .unwrap_or_else(|e| error!("overlay rootfs dir: {e}"));
+        std::fs::create_dir_all("/tmp/overlay_work")
+            .unwrap_or_else(|e| error!("overlay work dir: {e}"));
+        ("/tmp/overlay_rootfs", "/tmp/overlay_work")
+    };
+
+    // overlayfs: base image (lowerdir) + project state (upperdir)
+    let opts = format!("lowerdir=/mnt/base,upperdir={upper},workdir={work}");
+    let opts_cstr = std::ffi::CString::new(opts.as_str()).unwrap();
+    let overlay_type = std::ffi::CString::new("overlay").unwrap();
+    let target = std::ffi::CString::new("/mnt/overlay/rootfs").unwrap();
+    let ret = unsafe {
+        libc::mount(
+            overlay_type.as_ptr(),
+            target.as_ptr(),
+            overlay_type.as_ptr(),
+            0,
+            opts_cstr.as_ptr().cast(),
+        )
+    };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        error!("failed to mount overlayfs: {err}");
+        return;
+    }
+    info!("assembled rootfs via overlayfs");
+
+    // Mount points for file mount directories (used by OCI config)
+    let _ = std::fs::create_dir_all("/mnt/overlay/rootfs/.ez/files_rw");
+    let _ = std::fs::create_dir_all("/mnt/overlay/rootfs/.ez/files_ro");
+
+    // File mounts: symlinks into /.ez/files_rw or /.ez/files_ro.
+    // VirtioFS doesn't support file-level bind mounts (data reads fail
+    // with EACCES), but directory bind mounts work. The OCI config binds
+    // the files_rw/files_ro dirs to /.ez/, and symlinks point there.
+    for file in &mounts.files {
+        let subdir = if file.read_only {
+            "files_ro"
+        } else {
+            "files_rw"
+        };
+        let rel = file.target.strip_prefix('/').unwrap_or(&file.target);
+        let link = Path::new("/mnt/overlay/rootfs").join(rel);
+        let symlink_target = format!("/.ez/{subdir}/{rel}");
+        if let Some(parent) = link.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::remove_file(&link);
+        if let Err(e) = std::os::unix::fs::symlink(&symlink_target, &link) {
+            error!(
+                "failed to symlink {} → {symlink_target}: {e}",
+                link.display()
+            );
+        } else {
+            debug!("file symlink: {rel} → {symlink_target}");
+        }
+    }
+
+    // Directory bind mounts
+    for dir in &mounts.dirs {
+        let src = format!("/mnt/{}", dir.tag);
+        let rel = dir.target.strip_prefix('/').unwrap_or(&dir.target);
+        let dst = Path::new("/mnt/overlay/rootfs").join(rel);
+        let dst = dst.to_string_lossy();
+        if let Err(e) = std::fs::create_dir_all(dst.as_ref()) {
+            error!("failed to create mount point {dst}: {e}");
+        }
+        bind_mount(&src, &dst, dir.read_only);
+        debug!("dir mount: {src} → {dst}");
+    }
+
+    // Cache bind mounts (last — override dir mounts)
+    if has_disk {
+        for target in &mounts.cache {
+            let rel = target.strip_prefix('/').unwrap_or(target);
+            let src = Path::new("/mnt/disk/cache").join(rel);
+            let dst = Path::new("/mnt/overlay/rootfs").join(rel);
+            let (src, dst) = (src.to_string_lossy(), dst.to_string_lossy());
+            if let Err(e) = std::fs::create_dir_all(src.as_ref()) {
+                error!("failed to create cache dir {src}: {e}");
+            }
+            if let Err(e) = std::fs::create_dir_all(dst.as_ref()) {
+                error!("failed to create cache mount point {dst}: {e}");
+            }
+            bind_mount(&src, &dst, false);
+            debug!("cache mount: {src} → {dst}");
+        }
+    }
+}
+
+/// Reset the overlay upper layer if the base image changed.
+fn reset_overlay_if_needed(image_id: &str) {
+    let id_file = "/mnt/disk/overlay/.image_id";
+    let current = std::fs::read_to_string(id_file).unwrap_or_default();
+    if !current.is_empty() && current.trim() == image_id {
+        debug!("overlay image ID matches, keeping existing state");
+        return;
+    }
+    info!("image changed, resetting overlay");
+    if let Err(e) = std::fs::remove_dir_all("/mnt/disk/overlay") {
+        debug!("overlay cleanup: {e}");
+    }
+    if let Err(e) = std::fs::create_dir_all("/mnt/disk/overlay") {
+        error!("failed to create overlay dir: {e}");
+    }
+    if let Err(e) = std::fs::write(id_file, image_id) {
+        error!("failed to write image ID: {e}");
+    }
+}
+
+fn mount_virtiofs(tag: &str) {
+    let mount_point = format!("/mnt/{tag}");
+    if let Err(e) = std::fs::create_dir_all(&mount_point) {
+        error!("failed to create {mount_point}: {e}");
+        return;
+    }
+    let tag_cstr = std::ffi::CString::new(tag).unwrap();
+    let mount_cstr = std::ffi::CString::new(mount_point.as_str()).unwrap();
+    let fstype = std::ffi::CString::new("virtiofs").unwrap();
+    let ret = unsafe {
+        libc::mount(
+            tag_cstr.as_ptr(),
+            mount_cstr.as_ptr(),
+            fstype.as_ptr(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        error!("failed to mount virtiofs {tag}: {err}");
+    } else {
+        debug!("mounted virtiofs: {tag} → {mount_point}");
+    }
+}
+
+fn bind_mount(src: &str, dst: &str, read_only: bool) {
+    let src_cstr = std::ffi::CString::new(src).unwrap();
+    let dst_cstr = std::ffi::CString::new(dst).unwrap();
+    let flags = if read_only {
+        libc::MS_BIND | libc::MS_RDONLY
+    } else {
+        libc::MS_BIND
+    };
+    let ret = unsafe {
+        libc::mount(
+            src_cstr.as_ptr(),
+            dst_cstr.as_ptr(),
+            std::ptr::null(),
+            flags,
+            std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        error!("failed to bind-mount {src} → {dst}: {err}");
+    }
 }
 
 fn set_clock(epoch: u64) {
@@ -30,53 +275,22 @@ fn set_clock(epoch: u64) {
     }
 }
 
-fn mount_virtiofs(shares: &[String]) {
-    for tag in shares {
-        let mount_point = format!("/mnt/{tag}");
-        if let Err(e) = std::fs::create_dir_all(&mount_point) {
-            warn!("failed to create {mount_point}: {e}");
-            continue;
-        }
-        let tag_cstr = std::ffi::CString::new(tag.as_str()).unwrap();
-        let mount_cstr = std::ffi::CString::new(mount_point.as_str()).unwrap();
-        let fstype = std::ffi::CString::new("virtiofs").unwrap();
-        let ret = unsafe {
-            libc::mount(
-                tag_cstr.as_ptr(),
-                mount_cstr.as_ptr(),
-                fstype.as_ptr(),
-                0,
-                std::ptr::null(),
-            )
-        };
-        if ret != 0 {
-            warn!("failed to mount virtiofs {tag} at {mount_point}");
-        } else {
-            debug!("mounted virtiofs: {tag} → {mount_point}");
-        }
-    }
-}
-
 fn setup_networking(host_ports: &[u16]) {
-    // Enable loopback
-    run_quiet(&["ip", "link", "set", "lo", "up"]);
+    run_quiet(&["/sbin/ip", "link", "set", "lo", "up"]);
 
-    // Enable routing through loopback for transparent proxy
     write_sysctl("/proc/sys/net/ipv4/conf/lo/route_localnet", "1");
     write_sysctl("/proc/sys/net/ipv4/conf/all/rp_filter", "0");
     write_sysctl("/proc/sys/net/ipv4/conf/lo/rp_filter", "0");
     write_sysctl("/proc/sys/net/ipv4/ip_forward", "1");
 
-    // Add routable address to lo
-    run_quiet(&["ip", "addr", "add", "10.0.0.1/8", "dev", "lo"]);
+    run_quiet(&["/sbin/ip", "addr", "add", "10.0.0.1/8", "dev", "lo"]);
     run_quiet(&[
-        "ip", "route", "add", "default", "via", "10.0.0.1", "dev", "lo",
+        "/sbin/ip", "route", "add", "default", "via", "10.0.0.1", "dev", "lo",
     ]);
 
-    // Host port forwarding
     for port in host_ports {
         run_quiet(&[
-            "iptables",
+            "/usr/sbin/iptables",
             "-t",
             "nat",
             "-A",
@@ -93,9 +307,8 @@ fn setup_networking(host_ports: &[u16]) {
             "15001",
         ]);
     }
-    // Skip remaining localhost traffic
     run_quiet(&[
-        "iptables",
+        "/usr/sbin/iptables",
         "-t",
         "nat",
         "-A",
@@ -107,13 +320,21 @@ fn setup_networking(host_ports: &[u16]) {
         "-j",
         "RETURN",
     ]);
-    // Skip proxy's own port
     run_quiet(&[
-        "iptables", "-t", "nat", "-A", "OUTPUT", "-p", "tcp", "--dport", "15001", "-j", "RETURN",
+        "/usr/sbin/iptables",
+        "-t",
+        "nat",
+        "-A",
+        "OUTPUT",
+        "-p",
+        "tcp",
+        "--dport",
+        "15001",
+        "-j",
+        "RETURN",
     ]);
-    // Redirect all other outbound TCP to proxy
     run_quiet(&[
-        "iptables",
+        "/usr/sbin/iptables",
         "-t",
         "nat",
         "-A",
@@ -129,26 +350,33 @@ fn setup_networking(host_ports: &[u16]) {
     info!("networking configured");
 }
 
-fn setup_cache_disk(cache_dirs: &[String]) {
+/// Mount the project disk at /mnt/disk (overlay upper + cache).
+fn setup_disk(cache_dirs: &[String]) {
     let dev = "/dev/vda";
-    if !std::path::Path::new(dev).exists() {
-        warn!("cache disk {dev} not found, skipping");
+    if !Path::new(dev).exists() {
+        error!("disk {dev} not found");
         return;
     }
 
-    // Check if already formatted
-    let needs_format = Command::new("blkid")
-        .arg(dev)
-        .output()
-        .map(|o| !String::from_utf8_lossy(&o.stdout).contains("ext4"))
-        .unwrap_or(true);
+    let blkid = Command::new("/sbin/blkid").arg(dev).output();
+    let needs_format = match &blkid {
+        Ok(o) => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            debug!("blkid {dev}: {out}");
+            !out.contains("ext4")
+        }
+        Err(e) => {
+            error!("blkid exec failed: {e}");
+            true
+        }
+    };
 
     if needs_format {
-        info!("formatting cache disk {dev}");
-        let status = Command::new("mkfs.ext4")
-            .args(["-q", "-L", "ezpez-cache", dev])
-            .status();
-        match status {
+        info!("formatting disk {dev}");
+        match Command::new("/sbin/mkfs.ext4")
+            .args(["-q", "-L", "ezpez-disk", dev])
+            .status()
+        {
             Ok(s) if s.success() => debug!("formatted {dev}"),
             Ok(s) => {
                 error!("mkfs.ext4 failed: {s}");
@@ -161,13 +389,9 @@ fn setup_cache_disk(cache_dirs: &[String]) {
         }
     }
 
-    if let Err(e) = std::fs::create_dir_all("/mnt/cache") {
-        error!("failed to create /mnt/cache: {e}");
-        return;
-    }
-
+    let _ = std::fs::create_dir_all("/mnt/disk");
     let dev_cstr = std::ffi::CString::new(dev).unwrap();
-    let mount_cstr = std::ffi::CString::new("/mnt/cache").unwrap();
+    let mount_cstr = std::ffi::CString::new("/mnt/disk").unwrap();
     let fstype = std::ffi::CString::new("ext4").unwrap();
     let ret = unsafe {
         libc::mount(
@@ -179,112 +403,28 @@ fn setup_cache_disk(cache_dirs: &[String]) {
         )
     };
     if ret != 0 {
-        error!("failed to mount {dev} at /mnt/cache");
+        let err = std::io::Error::last_os_error();
+        error!("failed to mount {dev}: {err}");
         return;
     }
-    info!("mounted cache disk at /mnt/cache");
+    info!("mounted disk at /mnt/disk");
+    let _ = Command::new("/usr/sbin/resize2fs").arg(dev).output();
 
-    // Resize to fill the disk (no-op if already full size)
-    let _ = Command::new("resize2fs").arg(dev).output();
-
-    // Create cache subdirectories
+    // Create cache directories
     for dir in cache_dirs {
-        let path = format!("/mnt/cache/{dir}");
-        if let Err(e) = std::fs::create_dir_all(&path) {
-            warn!("failed to create cache dir {path}: {e}");
-        }
-    }
-}
-
-/// Overlay file mounts onto the container rootfs.
-///
-/// 1. overlayfs makes files visible at their target paths. A tmpfs
-///    upperdir absorbs stray rootfs writes so they don't leak to host.
-/// 2. Individual bind mounts from VirtioFS on top of the overlay ensure
-///    writes to mounted files sync back to the host.
-fn overlay_file_mounts() {
-    let has_rw = std::path::Path::new("/mnt/files_rw").is_dir();
-    let has_ro = std::path::Path::new("/mnt/files_ro").is_dir();
-    if !has_rw && !has_ro {
-        return;
-    }
-
-    let _ = std::fs::create_dir_all("/tmp/overlay_upper");
-    let _ = std::fs::create_dir_all("/tmp/overlay_work");
-
-    // Build lowerdir chain: files_rw:files_ro:rootfs
-    let mut lower = String::from("/mnt/bundle/rootfs");
-    if has_ro {
-        lower = format!("/mnt/files_ro:{lower}");
-    }
-    if has_rw {
-        lower = format!("/mnt/files_rw:{lower}");
-    }
-
-    let opts = format!("lowerdir={lower},upperdir=/tmp/overlay_upper,workdir=/tmp/overlay_work");
-    let opts_cstr = std::ffi::CString::new(opts.as_str()).unwrap();
-    let overlay = std::ffi::CString::new("overlay").unwrap();
-    let target = std::ffi::CString::new("/mnt/bundle/rootfs").unwrap();
-    let ret = unsafe {
-        libc::mount(
-            overlay.as_ptr(),
-            target.as_ptr(),
-            overlay.as_ptr(),
-            0,
-            opts_cstr.as_ptr().cast(),
-        )
-    };
-    if ret != 0 {
-        error!("failed to mount overlay on rootfs");
-        return;
-    }
-    info!("overlaid file mounts onto rootfs");
-
-    // Bind-mount each rw file from VirtioFS so writes go back to host
-    if has_rw {
-        bind_mount_files(std::path::Path::new("/mnt/files_rw"), "/mnt/bundle/rootfs");
-    }
-}
-
-fn bind_mount_files(src_root: &std::path::Path, dst_root: &str) {
-    let Ok(entries) = std::fs::read_dir(src_root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            bind_mount_files(&path, dst_root);
-        } else if path.is_file() {
-            let rel = path.strip_prefix("/mnt/files_rw").unwrap();
-            let dst = format!("{dst_root}/{}", rel.display());
-            let src_cstr = std::ffi::CString::new(path.to_string_lossy().as_ref()).unwrap();
-            let dst_cstr = std::ffi::CString::new(dst.as_str()).unwrap();
-            let ret = unsafe {
-                libc::mount(
-                    src_cstr.as_ptr(),
-                    dst_cstr.as_ptr(),
-                    std::ptr::null(),
-                    libc::MS_BIND,
-                    std::ptr::null(),
-                )
-            };
-            if ret != 0 {
-                warn!("failed to bind-mount {}", rel.display());
-            } else {
-                debug!("bind-mounted file: {}", rel.display());
-            }
-        }
+        let rel = dir.strip_prefix('/').unwrap_or(dir);
+        let _ = std::fs::create_dir_all(format!("/mnt/disk/cache/{rel}"));
     }
 }
 
 fn setup_dns() {
-    let resolv_dir = "/mnt/bundle/rootfs/etc";
-    if let Err(e) = std::fs::create_dir_all(resolv_dir) {
-        warn!("failed to create {resolv_dir}: {e}");
+    let dir = "/mnt/overlay/rootfs/etc";
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        error!("failed to create {dir}: {e}");
         return;
     }
-    if let Err(e) = std::fs::write(format!("{resolv_dir}/resolv.conf"), "nameserver 10.0.0.1\n") {
-        warn!("failed to write resolv.conf: {e}");
+    if let Err(e) = std::fs::write(format!("{dir}/resolv.conf"), "nameserver 10.0.0.1\n") {
+        error!("failed to write resolv.conf: {e}");
     }
 }
 
@@ -298,12 +438,12 @@ fn run_quiet(args: &[&str]) {
     let cmd_str = args.join(" ");
     match Command::new(args[0]).args(&args[1..]).output() {
         Ok(output) if !output.status.success() => {
-            warn!(
+            error!(
                 "{cmd_str}: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        Err(e) => warn!("{cmd_str}: exec failed: {e}"),
+        Err(e) => error!("{cmd_str}: exec failed: {e}"),
         Ok(_) => debug!("{cmd_str}: ok"),
     }
 }
