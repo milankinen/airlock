@@ -57,7 +57,7 @@ impl SpawnedProcess {
 async fn attach_pty(
     mut child: tokio::process::Child,
     pty: pty_process::Pty,
-    host: HostProcess,
+    mut host: HostProcess,
 ) -> i32 {
     use std::os::unix::io::AsRawFd;
     let pty_fd = pty.as_raw_fd();
@@ -74,10 +74,12 @@ async fn attach_pty(
 
     let (signals_tx, mut signals_rx) = tokio::sync::mpsc::channel(1);
     let (frames_tx, frames_rx) = tokio::sync::mpsc::channel::<Frame>(1);
-    let _ = host.attachment.send(capnp_rpc::new_client(ProcessImpl {
-        frames: RefCell::new(frames_rx),
-        signals: RefCell::new(signals_tx),
-    }));
+    if let Some(tx) = host.result.take() {
+        let _ = tx.send(Ok(capnp_rpc::new_client(ProcessImpl {
+            frames: RefCell::new(frames_rx),
+            signals: RefCell::new(signals_tx),
+        })));
+    }
 
     let mut buf = [0u8; 4096];
     loop {
@@ -114,7 +116,7 @@ async fn attach_pty(
     exit_code
 }
 
-async fn attach_pipe(mut child: tokio::process::Child, host: HostProcess) -> i32 {
+async fn attach_pipe(mut child: tokio::process::Child, mut host: HostProcess) -> i32 {
     let child_stdin = child.stdin.take();
     let mut child_stdout = child.stdout.take();
     let mut child_stderr = child.stderr.take();
@@ -130,10 +132,12 @@ async fn attach_pipe(mut child: tokio::process::Child, host: HostProcess) -> i32
 
     let (signals_tx, mut signals_rx) = tokio::sync::mpsc::channel(1);
     let (frames_tx, frames_rx) = tokio::sync::mpsc::channel::<Frame>(1);
-    let _ = host.attachment.send(capnp_rpc::new_client(ProcessImpl {
-        frames: RefCell::new(frames_rx),
-        signals: RefCell::new(signals_tx),
-    }));
+    if let Some(tx) = host.result.take() {
+        let _ = tx.send(Ok(capnp_rpc::new_client(ProcessImpl {
+            frames: RefCell::new(frames_rx),
+            signals: RefCell::new(signals_tx),
+        })));
+    }
 
     let mut stdout_buf = [0u8; 4096];
     let mut stderr_buf = [0u8; 4096];

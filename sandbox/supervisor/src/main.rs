@@ -8,13 +8,16 @@ mod vsock;
 use std::rc::Rc;
 
 use tokio::task::LocalSet;
-use tracing::info;
+use tracing::{error, info};
 
 #[tokio::main(flavor = "current_thread")]
 #[allow(clippy::large_futures)]
 async fn main() -> anyhow::Result<()> {
     let local = LocalSet::new();
-    local.run_until(run()).await
+    local.run_until(run()).await?;
+    // Keep supervisor alive until the CLI kills the VM
+    std::future::pending::<()>().await;
+    Ok(())
 }
 
 async fn run() -> anyhow::Result<()> {
@@ -22,11 +25,16 @@ async fn run() -> anyhow::Result<()> {
     let conn_fd = vsock::accept(&listen_fd)?;
     drop(listen_fd);
 
-    let conn = rpc::connect(conn_fd).await?;
-    logging::init(conn.log_sink, &conn.log_filter);
+    let (log_sink, log_filter, mut conn) = rpc::connect(conn_fd).await?;
+    logging::init(log_sink, &log_filter);
 
-    // Perform VM init setup (mounts, networking, cache disk, DNS)
-    init::setup(&conn.init_config);
+    if let Err(e) = init::setup(&conn.init_config) {
+        error!("startup failed: {e:#}");
+        if let Some(tx) = conn.proc.result.take() {
+            let _ = tx.send(Err(format!("{e:#}")));
+        }
+        return Ok(());
+    }
 
     let dns = Rc::new(net::dns::DnsState::new());
     net::dns::start(dns.clone());
@@ -34,12 +42,19 @@ async fn run() -> anyhow::Result<()> {
 
     info!("start: {} {}", conn.cmd, conn.args.join(" "));
     let args_ref: Vec<&str> = conn.args.iter().map(String::as_str).collect();
-    let proc = process::spawn(&conn.cmd, &args_ref, conn.proc.pty_size)?;
-    let exit_code = proc.attach(conn.proc).await;
-    info!("main process done, exit_code = {exit_code}");
-
-    // Keep supervisor alive until the CLI kills the VM
-    std::future::pending::<()>().await;
-
+    match process::spawn(&conn.cmd, &args_ref, conn.proc.pty_size) {
+        Ok(proc) => {
+            tokio::task::spawn_local(async move {
+                let exit_code = proc.attach(conn.proc).await;
+                info!("main process done, exit_code = {exit_code}");
+            });
+        }
+        Err(e) => {
+            error!("process spawn failed: {e:#}");
+            if let Some(tx) = conn.proc.result.take() {
+                let _ = tx.send(Err(format!("{e:#}")));
+            }
+        }
+    }
     Ok(())
 }

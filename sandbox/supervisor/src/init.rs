@@ -8,11 +8,11 @@ pub struct InitConfig {
 mod linux;
 
 #[cfg(target_os = "linux")]
-pub fn setup(config: &InitConfig) {
-    linux::setup(config);
+pub fn setup(config: &InitConfig) -> anyhow::Result<()> {
+    linux::setup(config)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn setup(_config: &InitConfig) {
+pub fn setup(_config: &InitConfig) -> anyhow::Result<()> {
     unimplemented!("supervisor only runs inside the Linux VM");
 }

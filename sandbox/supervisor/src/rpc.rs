@@ -10,8 +10,6 @@ use crate::init::InitConfig;
 pub struct HostConnection {
     pub proc: HostProcess,
     pub network: network_proxy::Client,
-    pub log_sink: log_sink::Client,
-    pub log_filter: String,
     pub cmd: String,
     pub args: Vec<String>,
     pub init_config: InitConfig,
@@ -20,10 +18,14 @@ pub struct HostConnection {
 pub struct HostProcess {
     pub stdin: stdin::Client,
     pub pty_size: Option<(u16, u16)>,
-    pub attachment: tokio::sync::oneshot::Sender<process::Client>,
+    /// Send Ok(process) on success, or Err(message) on init failure.
+    /// Taken by the startup code — None after process is spawned.
+    pub result: Option<tokio::sync::oneshot::Sender<Result<process::Client, String>>>,
 }
 
-pub async fn connect(conn_fd: OwnedFd) -> anyhow::Result<HostConnection> {
+pub async fn connect(
+    conn_fd: OwnedFd,
+) -> anyhow::Result<(log_sink::Client, String, HostConnection)> {
     let std_stream = unsafe { std::net::TcpStream::from_raw_fd(conn_fd.into_raw_fd()) };
     std_stream.set_nonblocking(true)?;
     let stream = tokio::net::TcpStream::from_std(std_stream)?;
@@ -36,7 +38,7 @@ pub async fn connect(conn_fd: OwnedFd) -> anyhow::Result<HostConnection> {
         capnp::message::ReaderOptions::default(),
     );
 
-    let (conn_tx, conn_rx) = tokio::sync::oneshot::channel::<HostConnection>();
+    let (conn_tx, conn_rx) = tokio::sync::oneshot::channel::<ConnPayload>();
 
     let client: supervisor::Client =
         capnp_rpc::new_client(SupervisorImpl(std::cell::RefCell::new(Some(conn_tx))));
@@ -49,7 +51,9 @@ pub async fn connect(conn_fd: OwnedFd) -> anyhow::Result<HostConnection> {
         .map_err(|_| anyhow::anyhow!("host disconnected before start()"))
 }
 
-struct SupervisorImpl(std::cell::RefCell<Option<tokio::sync::oneshot::Sender<HostConnection>>>);
+type ConnPayload = (log_sink::Client, String, HostConnection);
+
+struct SupervisorImpl(std::cell::RefCell<Option<tokio::sync::oneshot::Sender<ConnPayload>>>);
 
 impl supervisor::Server for SupervisorImpl {
     async fn start(
@@ -67,17 +71,17 @@ impl supervisor::Server for SupervisorImpl {
             _ => None,
         };
 
-        let (attach_tx, attach_rx) = tokio::sync::oneshot::channel();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
 
+        let log_sink = params.get_logs()?;
+        let log_filter = params.get_log_filter()?.to_str()?.to_string();
         let conn = HostConnection {
             proc: HostProcess {
                 stdin: params.get_stdin()?,
                 pty_size,
-                attachment: attach_tx,
+                result: Some(result_tx),
             },
             network: params.get_network()?,
-            log_sink: params.get_logs()?,
-            log_filter: params.get_log_filter()?.to_str()?.to_string(),
             cmd: params.get_cmd()?.to_str()?.to_string(),
             args: params
                 .get_args()?
@@ -91,15 +95,17 @@ impl supervisor::Server for SupervisorImpl {
         };
 
         if let Some(tx) = self.0.borrow_mut().take() {
-            let _ = tx.send(conn);
+            let _ = tx.send((log_sink, log_filter, conn));
         }
 
-        let proc = attach_rx
-            .await
-            .map_err(|_| capnp::Error::failed("process not established".into()))?;
-
-        results.get().set_proc(proc);
-        Ok(())
+        match result_rx.await {
+            Ok(Ok(proc)) => {
+                results.get().set_proc(proc);
+                Ok(())
+            }
+            Ok(Err(msg)) => Err(capnp::Error::failed(msg)),
+            Err(_) => Err(capnp::Error::failed("supervisor setup dropped".into())),
+        }
     }
 
     async fn shutdown(

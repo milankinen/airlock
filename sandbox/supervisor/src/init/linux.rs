@@ -31,20 +31,20 @@ struct FileMount {
     read_only: bool,
 }
 
-pub fn setup(config: &InitConfig) {
+pub fn setup(config: &InitConfig) -> anyhow::Result<()> {
     set_clock(config.epoch);
 
     // 1. Mount well-known VirtioFS shares
     for tag in ["base", "overlay"] {
-        mount_virtiofs(tag);
+        mount_virtiofs(tag)?;
     }
 
     // 2. Read mount config
-    let mounts = read_mounts_config();
+    let mounts = read_mounts_config()?;
 
     // 3. Mount user-defined VirtioFS shares
     for dir in &mounts.dirs {
-        mount_virtiofs(&dir.tag);
+        mount_virtiofs(&dir.tag)?;
     }
 
     // 4. Networking
@@ -54,40 +54,24 @@ pub fn setup(config: &InitConfig) {
     setup_disk(&mounts.cache);
 
     // 6. Assemble container rootfs
-    assemble_rootfs(&mounts);
+    assemble_rootfs(&mounts)?;
 
     // 7. DNS
     setup_dns();
+
+    Ok(())
 }
 
-fn read_mounts_config() -> MountsConfig {
+fn read_mounts_config() -> anyhow::Result<MountsConfig> {
     let path = "/mnt/overlay/mounts.json";
-    match std::fs::read_to_string(path) {
-        Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
-            error!("failed to parse {path}: {e}");
-            MountsConfig::default()
-        }),
-        Err(e) => {
-            error!("failed to read {path}: {e}");
-            MountsConfig::default()
-        }
-    }
-}
-
-impl Default for MountsConfig {
-    fn default() -> Self {
-        Self {
-            image_id: String::new(),
-            dirs: vec![],
-            files: vec![],
-            cache: vec![],
-        }
-    }
+    let data =
+        std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("failed to read {path}: {e}"))?;
+    serde_json::from_str(&data).map_err(|e| anyhow::anyhow!("failed to parse {path}: {e}"))
 }
 
 /// Assemble the container rootfs from overlayfs layers, file symlinks,
 /// directory bind mounts, and cache bind mounts.
-fn assemble_rootfs(mounts: &MountsConfig) {
+fn assemble_rootfs(mounts: &MountsConfig) -> anyhow::Result<()> {
     let has_disk = Path::new("/mnt/disk").is_dir();
 
     // Upper/work must be on a local filesystem (not VirtioFS/FUSE).
@@ -123,8 +107,7 @@ fn assemble_rootfs(mounts: &MountsConfig) {
     };
     if ret != 0 {
         let err = std::io::Error::last_os_error();
-        error!("failed to mount overlayfs: {err}");
-        return;
+        anyhow::bail!("failed to mount overlayfs: {err}");
     }
     info!("assembled rootfs via overlayfs");
 
@@ -149,14 +132,13 @@ fn assemble_rootfs(mounts: &MountsConfig) {
             let _ = std::fs::create_dir_all(parent);
         }
         let _ = std::fs::remove_file(&link);
-        if let Err(e) = std::os::unix::fs::symlink(&symlink_target, &link) {
-            error!(
+        std::os::unix::fs::symlink(&symlink_target, &link).map_err(|e| {
+            anyhow::anyhow!(
                 "failed to symlink {} → {symlink_target}: {e}",
                 link.display()
-            );
-        } else {
-            debug!("file symlink: {rel} → {symlink_target}");
-        }
+            )
+        })?;
+        debug!("file symlink: {rel} → {symlink_target}");
     }
 
     // Directory bind mounts
@@ -165,10 +147,8 @@ fn assemble_rootfs(mounts: &MountsConfig) {
         let rel = dir.target.strip_prefix('/').unwrap_or(&dir.target);
         let dst = Path::new("/mnt/overlay/rootfs").join(rel);
         let dst = dst.to_string_lossy();
-        if let Err(e) = std::fs::create_dir_all(dst.as_ref()) {
-            error!("failed to create mount point {dst}: {e}");
-        }
-        bind_mount(&src, &dst, dir.read_only);
+        std::fs::create_dir_all(dst.as_ref())?;
+        bind_mount(&src, &dst, dir.read_only)?;
         debug!("dir mount: {src} → {dst}");
     }
 
@@ -179,16 +159,14 @@ fn assemble_rootfs(mounts: &MountsConfig) {
             let src = Path::new("/mnt/disk/cache").join(rel);
             let dst = Path::new("/mnt/overlay/rootfs").join(rel);
             let (src, dst) = (src.to_string_lossy(), dst.to_string_lossy());
-            if let Err(e) = std::fs::create_dir_all(src.as_ref()) {
-                error!("failed to create cache dir {src}: {e}");
-            }
-            if let Err(e) = std::fs::create_dir_all(dst.as_ref()) {
-                error!("failed to create cache mount point {dst}: {e}");
-            }
-            bind_mount(&src, &dst, false);
+            std::fs::create_dir_all(src.as_ref())?;
+            std::fs::create_dir_all(dst.as_ref())?;
+            bind_mount(&src, &dst, false)?;
             debug!("cache mount: {src} → {dst}");
         }
     }
+
+    Ok(())
 }
 
 /// Reset the overlay upper layer if the base image changed.
@@ -211,12 +189,9 @@ fn reset_overlay_if_needed(image_id: &str) {
     }
 }
 
-fn mount_virtiofs(tag: &str) {
+fn mount_virtiofs(tag: &str) -> anyhow::Result<()> {
     let mount_point = format!("/mnt/{tag}");
-    if let Err(e) = std::fs::create_dir_all(&mount_point) {
-        error!("failed to create {mount_point}: {e}");
-        return;
-    }
+    std::fs::create_dir_all(&mount_point)?;
     let tag_cstr = std::ffi::CString::new(tag).unwrap();
     let mount_cstr = std::ffi::CString::new(mount_point.as_str()).unwrap();
     let fstype = std::ffi::CString::new("virtiofs").unwrap();
@@ -231,13 +206,13 @@ fn mount_virtiofs(tag: &str) {
     };
     if ret != 0 {
         let err = std::io::Error::last_os_error();
-        error!("failed to mount virtiofs {tag}: {err}");
-    } else {
-        debug!("mounted virtiofs: {tag} → {mount_point}");
+        anyhow::bail!("failed to mount virtiofs {tag}: {err}");
     }
+    debug!("mounted virtiofs: {tag} → {mount_point}");
+    Ok(())
 }
 
-fn bind_mount(src: &str, dst: &str, read_only: bool) {
+fn bind_mount(src: &str, dst: &str, read_only: bool) -> anyhow::Result<()> {
     let src_cstr = std::ffi::CString::new(src).unwrap();
     let dst_cstr = std::ffi::CString::new(dst).unwrap();
     let flags = if read_only {
@@ -256,8 +231,9 @@ fn bind_mount(src: &str, dst: &str, read_only: bool) {
     };
     if ret != 0 {
         let err = std::io::Error::last_os_error();
-        error!("failed to bind-mount {src} → {dst}: {err}");
+        anyhow::bail!("failed to bind-mount {src} → {dst}: {err}");
     }
+    Ok(())
 }
 
 fn set_clock(epoch: u64) {
