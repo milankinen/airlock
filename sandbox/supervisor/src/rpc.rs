@@ -5,6 +5,8 @@ use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use ezpez_protocol::supervisor_capnp::*;
 use futures::AsyncReadExt;
 
+use crate::init::InitConfig;
+
 pub struct HostConnection {
     pub proc: HostProcess,
     pub network: network_proxy::Client,
@@ -12,7 +14,7 @@ pub struct HostConnection {
     pub log_filter: String,
     pub cmd: String,
     pub args: Vec<String>,
-    pub cache_dirs: Vec<String>,
+    pub init_config: InitConfig,
 }
 
 pub struct HostProcess {
@@ -82,11 +84,21 @@ impl supervisor::Server for SupervisorImpl {
                 .iter()
                 .map(|a| a.map(|s| s.to_str().unwrap_or("").to_string()))
                 .collect::<Result<Vec<_>, _>>()?,
-            cache_dirs: params
-                .get_cache_dirs()?
-                .iter()
-                .map(|a| a.map(|s| s.to_str().unwrap_or("").to_string()))
-                .collect::<Result<Vec<_>, _>>()?,
+            init_config: InitConfig {
+                shares: params
+                    .get_shares()?
+                    .iter()
+                    .map(|a| a.map(|s| s.to_str().unwrap_or("").to_string()))
+                    .collect::<Result<Vec<_>, _>>()?,
+                epoch: params.get_epoch(),
+                host_ports: params.get_host_ports()?.iter().collect(),
+                has_cache_disk: params.get_has_cache_disk(),
+                cache_dirs: params
+                    .get_cache_dirs()?
+                    .iter()
+                    .map(|a| a.map(|s| s.to_str().unwrap_or("").to_string()))
+                    .collect::<Result<Vec<_>, _>>()?,
+            },
         };
 
         if let Some(tx) = self.0.borrow_mut().take() {

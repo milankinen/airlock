@@ -21,12 +21,12 @@ docker run --rm \
   -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
   rust:1-slim-trixie sh -c '
     set -e
-    apt-get update -qq && apt-get install -y -qq git >/dev/null 2>&1
+    apt-get update -qq && apt-get install -y -qq git make libclang-dev libcap-ng-dev >/dev/null 2>&1
     cd /tmp
-    git clone --depth=1 https://github.com/containers/libkrun.git
+    git clone --depth=1 --branch v1.17.4 https://github.com/containers/libkrun.git
     cd libkrun
-    cargo build --release -p libkrun
-    cp target/release/libkrun.so /out/libkrun.so
+    make BLK=1
+    cp target/release/libkrun.so.* /out/libkrun.so
     chown "$HOST_UID:$HOST_GID" /out/libkrun.so
   '
 echo "libkrun: sandbox/out/libkrun.so ($(du -h sandbox/out/libkrun.so | cut -f1))"

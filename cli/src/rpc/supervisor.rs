@@ -68,6 +68,7 @@ impl Supervisor {
         Ok(Self { supervisor: client })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn start(
         &self,
         args: &CliArgs,
@@ -75,6 +76,9 @@ impl Supervisor {
         stdin: Stdin,
         network: Network,
         cache_dirs: &[String],
+        shares: &[String],
+        epoch: u64,
+        has_cache_disk: bool,
     ) -> anyhow::Result<Process> {
         let log_sink: log_sink::Client = capnp_rpc::new_client(LogSinkImpl);
 
@@ -112,6 +116,19 @@ impl Supervisor {
         for (i, dir) in cache_dirs.iter().enumerate() {
             cd_builder.set(i as u32, dir);
         }
+
+        // Init config: shares, epoch, host ports, cache disk
+        let mut shares_builder = req.get().init_shares(shares.len() as u32);
+        for (i, tag) in shares.iter().enumerate() {
+            shares_builder.set(i as u32, tag);
+        }
+        req.get().set_epoch(epoch);
+        let host_ports = &project.config.network.host_ports;
+        let mut hp_builder = req.get().init_host_ports(host_ports.len() as u32);
+        for (i, port) in host_ports.iter().enumerate() {
+            hp_builder.set(i as u32, *port);
+        }
+        req.get().set_has_cache_disk(has_cache_disk);
 
         let response = req.send().promise.await?;
         let proc = response.get()?.get_proc()?;

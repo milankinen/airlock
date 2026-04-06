@@ -1,3 +1,4 @@
+mod init;
 mod logging;
 mod net;
 mod process;
@@ -24,19 +25,12 @@ async fn run() -> anyhow::Result<()> {
     let conn = rpc::connect(conn_fd).await?;
     logging::init(conn.log_sink, &conn.log_filter);
 
+    // Perform VM init setup (mounts, networking, cache disk, DNS)
+    init::setup(&conn.init_config);
+
     let dns = Rc::new(net::dns::DnsState::new());
     net::dns::start(dns.clone());
     net::start_proxy(conn.network, dns);
-
-    // Create cache volume subdirs (the ext4 volume is already mounted at /mnt/cache by init)
-    for dir in &conn.cache_dirs {
-        let path = format!("/mnt/cache/{dir}");
-        if let Err(e) = std::fs::create_dir_all(&path) {
-            tracing::warn!("failed to create cache dir {path}: {e}");
-        } else {
-            info!("cache dir: /mnt/cache/{dir}");
-        }
-    }
 
     info!("start: {} {}", conn.cmd, conn.args.join(" "));
     let args_ref: Vec<&str> = conn.args.iter().map(String::as_str).collect();

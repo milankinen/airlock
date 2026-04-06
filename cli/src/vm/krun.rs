@@ -81,6 +81,12 @@ struct KrunFns {
         filepath: *const libc::c_char,
         listen: bool,
     ) -> i32,
+    add_disk: unsafe extern "C" fn(
+        ctx_id: u32,
+        block_id: *const libc::c_char,
+        disk_path: *const libc::c_char,
+        read_only: bool,
+    ) -> i32,
     disable_implicit_console: unsafe extern "C" fn(ctx_id: u32) -> i32,
     start_enter: unsafe extern "C" fn(ctx_id: u32) -> i32,
 }
@@ -114,6 +120,7 @@ impl KrunFns {
                 set_exec: load_sym(handle, "krun_set_exec")?,
                 add_virtiofs: load_sym(handle, "krun_add_virtiofs")?,
                 add_vsock_port2: load_sym(handle, "krun_add_vsock_port2")?,
+                add_disk: load_sym(handle, "krun_add_disk")?,
                 disable_implicit_console: load_sym(handle, "krun_disable_implicit_console")?,
                 start_enter: load_sym(handle, "krun_start_enter")?,
             })
@@ -183,14 +190,9 @@ impl KrunVmBackend {
         )?;
 
         let exec_path = to_cstr("/init")?;
-        let env_strings = build_env(config);
-        let env_cstrs: Vec<CString> = env_strings
-            .iter()
-            .map(|s| to_cstr(s))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let mut env_ptrs: Vec<*const libc::c_char> = env_cstrs.iter().map(|c| c.as_ptr()).collect();
-        env_ptrs.push(std::ptr::null());
-
+        let path_env =
+            to_cstr("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")?;
+        let env_ptrs = [path_env.as_ptr(), std::ptr::null()];
         check_krun(
             unsafe { (fns.set_exec)(ctx, exec_path.as_ptr(), std::ptr::null(), env_ptrs.as_ptr()) },
             "set_exec",
@@ -210,8 +212,14 @@ impl KrunVmBackend {
             );
         }
 
-        if config.cache_disk.is_some() {
-            tracing::warn!("cache disk not supported on Linux yet (libkrun blk feature pending)");
+        if let Some(cache_disk) = &config.cache_disk {
+            let block_id = to_cstr("vda")?;
+            let disk_path = to_cstr(&cache_disk.to_string_lossy())?;
+            check_krun(
+                unsafe { (fns.add_disk)(ctx, block_id.as_ptr(), disk_path.as_ptr(), false) },
+                "add_disk",
+            )?;
+            debug!("block device: {}", cache_disk.display());
         }
 
         let sock_path = to_cstr(&vsock_socket_path.to_string_lossy())?;
@@ -271,22 +279,4 @@ impl Drop for KrunVmBackend {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.vsock_socket_path);
     }
-}
-
-fn build_env(config: &VmConfig) -> Vec<String> {
-    let tags: Vec<&str> = config.shares.iter().map(|s| s.tag.as_str()).collect();
-    let epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let mut env = vec![
-        format!("EZPEZ_SHARES={}", tags.join(",")),
-        format!("EZPEZ_EPOCH={epoch}"),
-        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
-    ];
-    if !config.host_ports.is_empty() {
-        let ports: Vec<String> = config.host_ports.iter().map(ToString::to_string).collect();
-        env.push(format!("EZPEZ_HOST_PORTS={}", ports.join(",")));
-    }
-    env
 }

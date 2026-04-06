@@ -26,7 +26,7 @@ pub async fn start(
     #[cfg_attr(target_os = "linux", allow(unused_variables))] args: &CliArgs,
     project: &Project,
     bundle: Bundle,
-) -> anyhow::Result<(Box<dyn VmHandle>, OwnedFd)> {
+) -> anyhow::Result<(Box<dyn VmHandle>, OwnedFd, Vec<String>)> {
     let assets = Assets::init()?;
     let mut shares = vec![];
     let mut file_share_tags = HashSet::new();
@@ -121,6 +121,8 @@ pub async fn start(
         );
     }
 
+    let share_tags: Vec<String> = shares.iter().map(|s| s.tag.clone()).collect();
+
     let vm_config = config::VmConfig {
         cpus: project.config.cpus,
         memory_bytes: project.config.memory.0,
@@ -156,7 +158,6 @@ pub async fn start(
         shares,
         cache_disk: bundle.cache_image.clone(),
         runtime_dir: project.cache_dir.clone(),
-        host_ports: project.config.network.host_ports.clone(),
     };
 
     #[cfg(target_os = "macos")]
@@ -182,7 +183,7 @@ pub async fn start(
             }
         };
 
-        Ok((Box::new(backend), vsock_fd))
+        Ok((Box::new(backend), vsock_fd, share_tags.clone()))
     }
 
     #[cfg(target_os = "linux")]
@@ -238,7 +239,7 @@ pub async fn start(
             }
         };
 
-        Ok((Box::new(backend), vsock_fd))
+        Ok((Box::new(backend), vsock_fd, share_tags.clone()))
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]

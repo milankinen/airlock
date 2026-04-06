@@ -20,6 +20,4 @@ pub struct VmConfig {
     pub cache_disk: Option<PathBuf>,
     /// Directory for runtime files (e.g., vsock UNIX sockets).
     pub runtime_dir: PathBuf,
-    /// Host ports to forward.
-    pub host_ports: Vec<u16>,
 }
