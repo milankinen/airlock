@@ -1,5 +1,85 @@
 # Development Log
 
+
+## 2026-04-06: Overlay file mounts onto container rootfs
+
+Individual file bind mounts via crun had permission issues — files were
+visible (`ls` showed correct ownership/mode) but reads failed with
+"Permission denied" inside the container despite running as root with all
+capabilities. Directory mounts via VirtioFS worked fine.
+
+### Root cause
+
+crun's bind mount of individual files from a VirtioFS share into the
+container didn't work reliably. Reading the file from the VM root
+(`/mnt/files_rw/.claude.json`) succeeded, but the same file bind-mounted
+into the container (`/root/.claude.json`) was unreadable.
+
+### Fix: overlayfs + per-file bind mounts
+
+Instead of per-file bind mounts in the OCI config, file mounts now use a
+two-layer approach in the VM init script:
+
+1. `link_file` replicates the target directory structure inside the
+   `files_rw`/`files_ro` wrapper: target `/root/.claude.json` becomes
+   `files_rw/root/.claude.json`.
+2. Init sets up overlayfs on the container rootfs:
+   `lowerdir=files_rw:files_ro:rootfs, upperdir=tmpfs, workdir=tmpfs`.
+   This makes all mounted files visible at their target paths. The tmpfs
+   upperdir absorbs stray rootfs writes so they don't leak to the host.
+3. Each file in `files_rw` is then individually bind-mounted from VirtioFS
+   on top of the overlay, so writes sync back to the host.
+
+File mounts are now excluded from the OCI config (only directory and cache
+mounts remain as bind mounts).
+
+## 2026-04-06: Add config presets feature
+
+Presets allow reusable configuration templates that pre-populate config
+values. A user config with `presets = ["claude-code"]` applies the named
+preset as a base layer before the user's own settings.
+
+### Loading algorithm
+
+1. Create empty base config
+2. Merge all user config files (hierarchical TOML)
+3. Extract `presets` array from merged config
+4. For each preset, recursively resolve its own presets, merge onto base
+5. Merge user config on top (user always wins)
+
+### Design choices
+
+- **Presets are compiled-in TOML files** under `cli/src/config/presets/`,
+  embedded via `include_dir!`. No runtime file loading — keeps deployment
+  simple, presets are versioned with the binary.
+- **`presets` is a meta-field** stripped before smart-config parsing, not
+  part of the `Config` struct.
+- **Cycle detection** via call chain tracking; **diamond dependencies**
+  handled by "already applied" set (each preset applied at most once).
+- **Null-safe merging**: `merge_json` skips null overlays so serialized
+  `Option::None` values don't clobber existing config.
+- **Config structs now derive `Serialize`** so presets can be modeled as
+  Rust objects and converted to Values. `ByteSize` uses a custom
+  `serialize_with` helper (upstream doesn't impl Serialize).
+- **Preset resolver is injectable** (`&dyn Fn`) — tests use fixture
+  presets from `tests/fixtures/`, production uses `presets::get`.
+
+### Bundled presets
+
+- `claude-code`: Anthropic API + claude.ai hosts, mounts `~/.claude` and
+  `~/.claude.json` (global state file needed for onboarding/terms).
+- `copilot-cli`: GitHub API + githubusercontent hosts, mounts `~/.config/gh`.
+- `codex`: OpenAI API hosts, mounts `~/.codex`.
+
+### Test coverage
+
+- Merge: recursive objects, array concatenation, null skip, primitive
+  override.
+- Presets: single, multiple, nested, circular detection, diamond
+  deduplication, unknown error, key stripping, full parse.
+- `all_bundled_presets_are_valid`: iterates every non-test preset,
+  resolves and parses — catches invalid TOML or schema mismatches.
+
 ## 2026-04-06: Fix VM networking by disabling TSI socket hijacking
 
 Networking (DNS, TCP proxy) was broken on Linux because libkrun's

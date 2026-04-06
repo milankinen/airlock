@@ -1,0 +1,13 @@
+[network]
+allowed_hosts = [
+    "api.openai.com",
+    "auth.openai.com",
+]
+tls_passthrough = [
+    "api.openai.com",
+    "auth.openai.com",
+]
+
+[[mounts]]
+source = "~/.codex"
+target = "~/.codex"

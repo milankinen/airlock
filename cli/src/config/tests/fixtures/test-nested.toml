@@ -1,0 +1,2 @@
+presets = ["test-base"]
+cpus = 4

@@ -1,0 +1,4 @@
+cpus = 2
+
+[network]
+allowed_hosts = ["example.com"]

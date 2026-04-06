@@ -1,0 +1,18 @@
+[network]
+allowed_hosts = [
+    "github.com",
+    "api.github.com",
+    "*.githubusercontent.com",
+    "*.github.dev",
+    "default.exp-tas.com",
+]
+tls_passthrough = [
+    "github.com",
+    "api.github.com",
+    "*.githubusercontent.com",
+    "*.github.dev",
+]
+
+[[mounts]]
+source = "~/.config/gh"
+target = "~/.config/gh"

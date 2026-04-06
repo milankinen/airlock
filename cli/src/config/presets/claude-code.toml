@@ -1,0 +1,21 @@
+[network]
+allowed_hosts = [
+    "api.anthropic.com",
+    "claude.ai",
+    "downloads.claude.ai",
+    "platform.claude.com",
+]
+tls_passthrough = [
+    "api.anthropic.com",
+    "claude.ai",
+    "downloads.claude.ai",
+    "platform.claude.com",
+]
+
+[[mounts]]
+source = "~/.claude"
+target = "~/.claude"
+
+[[mounts]]
+source = "~/.claude.json"
+target = "~/.claude.json"

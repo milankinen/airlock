@@ -1,0 +1,2 @@
+presets = ["test-diamond-base"]
+cpus = 4

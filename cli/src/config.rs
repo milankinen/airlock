@@ -1,5 +1,8 @@
 mod de;
-mod load_config;
+pub(crate) mod load_config;
+pub(crate) mod presets;
+#[cfg(test)]
+mod tests;
 
 use config::*;
 pub use load_config::load;
@@ -9,7 +12,7 @@ use smart_config::{DescribeConfig, DeserializeConfig};
 /// Configuration loaded from hierarchical TOML files and validated
 /// by smart-config. Runtime-only fields (args, terminal) are set
 /// separately after loading.
-#[derive(Debug, DescribeConfig, DeserializeConfig)]
+#[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
 pub struct Config {
     /// OCI image to use
     #[config(default_t = "alpine:latest".into())]
@@ -18,6 +21,7 @@ pub struct Config {
     #[config(default = default_cpus)]
     pub cpus: u32,
     /// Memory size (e.g. "4 GB", "512 MB")
+    #[serde(serialize_with = "config::ser_byte_size")]
     #[config(default = default_memory)]
     pub memory: ByteSize,
     /// Network configuration
@@ -55,8 +59,16 @@ pub mod config {
         smart_config::ByteSize(min(max(min_bytes, half), sys_bytes))
     }
 
+    #[allow(clippy::trivially_copy_pass_by_ref)] // serde serialize_with requires &T
+    pub fn ser_byte_size<S: serde::Serializer>(
+        size: &smart_config::ByteSize,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&size.to_string())
+    }
+
     /// Network configuration
-    #[derive(Debug, DescribeConfig, DeserializeConfig)]
+    #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
     pub struct Network {
         /// Host ports exposed to the VM
         #[config(default)]
@@ -129,9 +141,10 @@ pub mod config {
     }
 
     /// Cache volume configuration — sparse raw disk with ext4
-    #[derive(Debug, DescribeConfig, DeserializeConfig)]
+    #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
     pub struct Cache {
         /// Disk image size (e.g. "20 GB", "512 MB")
+        #[serde(serialize_with = "ser_byte_size")]
         pub size: smart_config::ByteSize,
         /// Container paths to bind-mount from the cache volume
         #[config(default)]

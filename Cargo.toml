@@ -59,6 +59,7 @@ tar = "0.4"
 sha2 = "0.10"
 
 # Config
+include_dir = "0.7.4"
 smart-config = "0.4.0-pre.2"
 toml = "1"
 
