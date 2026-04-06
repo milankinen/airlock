@@ -105,10 +105,11 @@ impl Supervisor {
         }
 
         // TLS passthrough hosts (cert pinning — skip MITM)
-        let tls_passthrough = &project.config.network.tls_passthrough;
+        let tls_passthrough =
+            crate::network::rules::tls_passthrough_from_config(&project.config.network);
         let mut pt_builder = req.get().init_tls_passthrough(tls_passthrough.len() as u32);
         for (i, host) in tls_passthrough.iter().enumerate() {
-            pt_builder.set(i as u32, host);
+            pt_builder.set(i as u32, host.as_str());
         }
 
         // Cache volume subdirs to create on /mnt/cache
@@ -123,7 +124,8 @@ impl Supervisor {
             shares_builder.set(i as u32, tag);
         }
         req.get().set_epoch(epoch);
-        let host_ports = &project.config.network.host_ports;
+        let host_ports =
+            crate::network::rules::localhost_ports_from_config(&project.config.network);
         let mut hp_builder = req.get().init_host_ports(host_ports.len() as u32);
         for (i, port) in host_ports.iter().enumerate() {
             hp_builder.set(i as u32, *port);

@@ -2,7 +2,9 @@ mod http;
 mod io;
 mod matchers;
 mod middleware;
+pub(crate) mod rules;
 mod server;
+pub(crate) mod target;
 mod tcp;
 #[cfg(test)]
 mod tests;
@@ -23,25 +25,25 @@ pub fn setup(project: &Project) -> anyhow::Result<Network> {
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
-    let mw = middleware::Middleware::init(&project.config.network)?;
+    let net = &project.config.network;
+    let log = middleware::tracing_log();
+    let targets = rules::resolve(net, &log)?;
 
     let ca_cert = std::fs::read_to_string(&project.ca_cert)?;
     let ca_key = std::fs::read_to_string(&project.ca_key)?;
     let interceptor = tls::TlsInterceptor::new(&ca_cert, &ca_key)?;
 
+    tracing::debug!("network: {} targets resolved", targets.len());
+
     Ok(Network {
         tls_client: Arc::new(tls_client),
         interceptor: Rc::new(interceptor),
-        host_ports: project.config.network.host_ports.clone(),
-        tls_passthrough: project.config.network.tls_passthrough.clone(),
-        middleware: Rc::new(mw),
+        targets,
     })
 }
 
 pub struct Network {
     tls_client: Arc<rustls::ClientConfig>,
     interceptor: Rc<tls::TlsInterceptor>,
-    host_ports: Vec<u16>,
-    tls_passthrough: Vec<String>,
-    middleware: Rc<middleware::Middleware>,
+    targets: Vec<target::NetworkTarget>,
 }

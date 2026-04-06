@@ -21,9 +21,9 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::{debug, trace};
 
 use crate::network::http::executor::LocalExecutor;
-use crate::network::http::middleware::CompiledMiddleware;
 use crate::network::http::senders::{H1Sender, H2Sender, RequestSender};
 use crate::network::io;
+use crate::network::target::NetworkTarget;
 
 const MAX_DETECT_SIZE: usize = 4096;
 
@@ -74,7 +74,7 @@ type ResponseBody = Either<Incoming, Full<Bytes>>;
 pub async fn relay(
     container: io::Transport,
     server: io::Transport,
-    layers: &[CompiledMiddleware],
+    target: NetworkTarget,
 ) -> anyhow::Result<()> {
     let client_io = hyper_util::rt::TokioIo::new(tokio::io::join(container.read, container.write));
     let server_io = hyper_util::rt::TokioIo::new(tokio::io::join(server.read, server.write));
@@ -94,12 +94,12 @@ pub async fn relay(
         Rc::new(H1Sender(RefCell::new(sender)))
     };
 
-    let layers: Vec<_> = layers.to_vec();
+    let middleware = target.middleware;
     let service = service_fn(move |req: Request<Incoming>| {
         let sender = sender.clone();
-        let layers = layers.clone();
+        let middleware = middleware.clone();
         async move {
-            let result = middleware::run(req, &layers, move |req| {
+            let result = middleware::run(req, &middleware, move |req| {
                 let sender = sender.clone();
                 async move { sender.send(req).await.map_err(|e| anyhow::anyhow!("{e}")) }
             })

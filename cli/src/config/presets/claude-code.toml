@@ -1,11 +1,6 @@
-[network]
-allowed_hosts = [
-    "api.anthropic.com",
-    "claude.ai",
-    "downloads.claude.ai",
-    "platform.claude.com",
-]
-tls_passthrough = [
+[[network.rules]]
+name = "claude-code"
+allow = [
     "api.anthropic.com",
     "claude.ai",
     "downloads.claude.ai",

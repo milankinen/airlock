@@ -1,16 +1,11 @@
-[network]
-allowed_hosts = [
+[[network.rules]]
+name = "copilot-cli"
+allow = [
     "github.com",
     "api.github.com",
     "*.githubusercontent.com",
     "*.github.dev",
     "default.exp-tas.com",
-]
-tls_passthrough = [
-    "github.com",
-    "api.github.com",
-    "*.githubusercontent.com",
-    "*.github.dev",
 ]
 
 [[mounts]]

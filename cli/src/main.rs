@@ -3,7 +3,7 @@ mod cache;
 mod cli;
 mod config;
 
-mod network;
+pub(crate) mod network;
 mod oci;
 mod project;
 mod rpc;

@@ -9,7 +9,6 @@ use hyper::body::Incoming;
 use mlua::{Function, Lua, UserData, UserDataFields, UserDataMethods};
 use tracing::trace;
 
-use crate::config::config;
 use crate::network::{matchers, middleware};
 
 type RequestBody = Either<Incoming, Full<Bytes>>;
@@ -28,23 +27,12 @@ struct Inner {
 }
 
 pub fn compile(
-    rule: &config::NetworkMiddleware,
+    name: &str,
+    script: &str,
     log: middleware::LogFn,
 ) -> anyhow::Result<CompiledMiddleware> {
     let lua = Lua::new();
     middleware::sandbox(&lua)?;
-
-    let env_table = lua.create_table()?;
-    for (var_name, description) in &rule.env {
-        let val = std::env::var(var_name).map_err(|_| {
-            anyhow::anyhow!(
-                "rule '{}': missing required env var `{var_name}` ({description})",
-                rule.name
-            )
-        })?;
-        env_table.set(var_name.as_str(), val)?;
-    }
-    lua.globals().set("env", env_table)?;
 
     let log_fn = lua.create_function(move |_, msg: String| {
         log(&msg);
@@ -55,15 +43,15 @@ pub fn compile(
     // Wrap the script in a function(req) so `req` is a local parameter,
     // not a global. This prevents races when concurrent requests share
     // the same Lua instance.
-    let wrapped = format!("return function(req)\n{}\nend", rule.script);
+    let wrapped = format!("return function(req)\n{script}\nend");
     let func: Function = lua
         .load(&wrapped)
-        .set_name(&rule.name)
+        .set_name(name)
         .eval()
-        .map_err(|e| anyhow::anyhow!("failed to compile rule '{}': {e}", rule.name))?;
+        .map_err(|e| anyhow::anyhow!("failed to compile middleware '{name}': {e}"))?;
 
     Ok(CompiledMiddleware(Rc::new(Inner {
-        name: rule.name.clone(),
+        name: name.to_string(),
         lua,
         func,
     })))
@@ -85,14 +73,14 @@ fn is_denied(e: &mlua::Error) -> bool {
 /// Run all HTTP middleware layers around the send function.
 pub async fn run<F, Fut>(
     req: hyper::Request<Incoming>,
-    layers: &[CompiledMiddleware],
+    middleware: &[CompiledMiddleware],
     send: F,
 ) -> anyhow::Result<hyper::Response<Either<Incoming, Full<Bytes>>>>
 where
     F: FnOnce(hyper::Request<RequestBody>) -> Fut + 'static,
     Fut: Future<Output = anyhow::Result<hyper::Response<Incoming>>> + 'static,
 {
-    if layers.is_empty() {
+    if middleware.is_empty() {
         return send(req.map(Either::Left))
             .await
             .map(|r| r.map(Either::Left));
@@ -110,7 +98,7 @@ where
     });
 
     // Wrap with each middleware layer (innermost first)
-    for m in layers.iter().rev() {
+    for m in middleware.iter().rev() {
         let inner = next;
         let m = m.0.clone();
 

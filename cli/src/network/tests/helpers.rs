@@ -15,10 +15,10 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 
-use crate::config::config;
-use crate::network::Network;
-use crate::network::middleware::{LogFn, Middleware};
+use crate::config::config::{self, NetworkMiddleware, NetworkRule};
+use crate::network::middleware::LogFn;
 use crate::network::tls::TlsInterceptor;
+use crate::network::{Network, rules};
 
 /// Collects log messages from Lua `log()` calls for test assertions.
 #[derive(Clone)]
@@ -136,22 +136,55 @@ where
 }
 
 fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
-    let config = config::Network {
-        host_ports: (0..=65535).collect(),
-        allowed_hosts: cfg.allowed_hosts,
-        tls_passthrough: cfg.tls_passthrough,
-        middleware: cfg
+    // Build rules from the test config. Middleware is attached to the
+    // allow rule so it applies to matched targets.
+    let mut rules = vec![];
+
+    // Build middleware map from scripts.
+    // If no scripts and no explicit passthrough, add a no-op middleware
+    // so TLS interception is enabled (matches old test behavior).
+    let middleware = if !cfg.middleware_scripts.is_empty() {
+        let scripts: Vec<NetworkMiddleware> = cfg
             .middleware_scripts
-            .into_iter()
-            .map(|(name, script)| config::NetworkMiddleware {
-                name: name.to_string(),
-                env: HashMap::new(),
+            .iter()
+            .map(|(_, script)| NetworkMiddleware {
                 script: script.to_string(),
             })
-            .collect(),
+            .collect();
+        HashMap::from([("*".to_string(), scripts)])
+    } else if cfg.tls_passthrough.is_empty() {
+        // No-op middleware forces MITM (old test default behavior)
+        HashMap::from([(
+            "*".to_string(),
+            vec![NetworkMiddleware {
+                script: String::new(),
+            }],
+        )])
+    } else {
+        HashMap::new()
     };
+
+    // Main allow rule (with middleware if any)
+    if !cfg.allowed_hosts.is_empty() {
+        rules.push(NetworkRule {
+            name: "test-allow".to_string(),
+            allow: cfg.allowed_hosts.clone(),
+            middleware,
+        });
+    }
+
+    // Explicit TLS passthrough: add as allowed targets without middleware
+    if !cfg.tls_passthrough.is_empty() {
+        rules.push(NetworkRule {
+            name: "test-passthrough".to_string(),
+            allow: cfg.tls_passthrough,
+            middleware: HashMap::new(),
+        });
+    }
+
+    let config = config::Network { rules };
     let (request_log, log_fn) = RequestLog::new();
-    let mw = Middleware::init_with_log(&config, &log_fn).unwrap();
+    let targets = rules::resolve(&config, &log_fn).unwrap();
 
     // MITM CA
     let mitm_ca_key = rcgen::KeyPair::generate().unwrap();
@@ -180,9 +213,7 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
         Network {
             tls_client: Arc::new(tls_client),
             interceptor: Rc::new(interceptor),
-            host_ports: config.host_ports,
-            tls_passthrough: config.tls_passthrough,
-            middleware: Rc::new(mw),
+            targets,
         },
     )
 }

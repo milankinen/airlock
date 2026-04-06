@@ -70,30 +70,46 @@ pub mod config {
     /// Network configuration
     #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
     pub struct Network {
-        /// Host ports exposed to the VM
+        /// Named network rules. Each rule allows a set of targets and
+        /// optionally attaches per-target HTTP middleware. A connection is
+        /// allowed if ANY rule allows it.
         #[config(default)]
-        pub host_ports: Vec<u16>,
-        /// Allowed host patterns. Connections to hosts not matching any
-        /// pattern are denied. Supports glob patterns like "*.example.com".
-        #[config(default)]
-        pub allowed_hosts: Vec<String>,
-        /// Hosts whose TLS should NOT be intercepted (cert pinning).
-        /// Supports glob patterns like "*.example.com".
-        #[config(default)]
-        pub tls_passthrough: Vec<String>,
-        /// HTTP request filtering rules (Lua scripts)
-        #[config(default)]
-        pub middleware: Vec<NetworkMiddleware>,
+        pub rules: Vec<NetworkRule>,
     }
 
-    /// Network filtering rule with inline Lua script
+    /// A named network rule with allowed targets and optional middleware.
+    ///
+    /// Target syntax: `host[:port]` — omitted port means all ports.
+    /// Both host and port support `*` wildcards.
+    ///
+    /// Targets matching `localhost` drive VM-side iptables port
+    /// forwarding (replacing the old `host_ports` field).
+    ///
+    /// Targets without middleware get TLS passthrough (no MITM).
+    /// Targets with middleware get TLS interception so middleware can
+    /// inspect HTTP traffic.
+    #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
+    pub struct NetworkRule {
+        /// Rule name (for logging / error messages)
+        pub name: String,
+        /// Allowed target patterns: `host[:port]`
+        #[config(default)]
+        pub allow: Vec<String>,
+        /// Per-host HTTP middleware (Lua scripts). Key is host pattern,
+        /// value is list of scripts. If a host has middleware, TLS is
+        /// intercepted.
+        #[config(default)]
+        pub middleware: std::collections::HashMap<String, Vec<NetworkMiddleware>>,
+    }
+
+    impl WellKnown for NetworkRule {
+        type Deserializer = de::Nested<NetworkRule>;
+        const DE: Self::Deserializer = de::nested();
+    }
+
+    /// HTTP middleware script applied to matching targets.
     #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
     pub struct NetworkMiddleware {
-        /// Rule name (for error messages)
-        pub name: String,
-        /// Required env vars: name → description
-        #[config(default)]
-        pub env: std::collections::HashMap<String, String>,
         /// Inline Lua script
         pub script: String,
     }

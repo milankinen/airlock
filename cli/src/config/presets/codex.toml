@@ -1,9 +1,6 @@
-[network]
-allowed_hosts = [
-    "api.openai.com",
-    "auth.openai.com",
-]
-tls_passthrough = [
+[[network.rules]]
+name = "codex"
+allow = [
     "api.openai.com",
     "auth.openai.com",
 ]

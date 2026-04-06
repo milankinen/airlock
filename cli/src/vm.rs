@@ -140,14 +140,10 @@ pub async fn start(
                 "console=hvc0 rdinit=/init ezpez.epoch={epoch} ezpez.shares={}",
                 tags.join(",")
             );
-            if !project.config.network.host_ports.is_empty() {
-                let ports: Vec<String> = project
-                    .config
-                    .network
-                    .host_ports
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect();
+            let host_ports =
+                crate::network::rules::localhost_ports_from_config(&project.config.network);
+            if !host_ports.is_empty() {
+                let ports: Vec<String> = host_ports.iter().map(ToString::to_string).collect();
                 let _ = write!(cmd, " ezpez.host_ports={}", ports.join(","));
             }
             if !matches!(args.log_level, LogLevel::Trace | LogLevel::Debug) {

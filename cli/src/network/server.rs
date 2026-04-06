@@ -7,11 +7,8 @@ use ezpez_protocol::supervisor_capnp::{network_proxy, tcp_sink};
 use tokio::sync::mpsc;
 use tracing::debug;
 
-use super::{Network, http, io, matchers, tcp, tls};
-
-fn is_localhost(host: &str) -> bool {
-    host == "127.0.0.1" || host == "localhost" || host == "::1"
-}
+use super::target::NetworkTarget;
+use super::{Network, http, io, tcp, tls};
 
 impl network_proxy::Server for Network {
     async fn connect(
@@ -24,52 +21,44 @@ impl network_proxy::Server for Network {
         let port = params.get_port();
         let client_sink = params.get_client()?;
 
-        if is_localhost(&host) && !self.host_ports.contains(&port) {
-            debug!("blocked localhost:{port} (not in host_ports)");
-            return Err(capnp::Error::failed(format!(
-                "host port {port} is not exposed"
-            )));
-        }
-
-        if !self.middleware.is_host_allowed(&host) {
-            debug!("denied: {host}:{port} (not in allowed_hosts)");
+        let Some(target) = super::target::find_match(&self.targets, &host, port) else {
+            debug!("denied: {host}:{port} (no matching rule)");
             results
                 .get()
                 .init_result()
-                .set_denied("host not in allowed_hosts");
+                .set_denied("no matching network rule");
             return Ok(());
-        }
+        };
 
         debug!("connect {host}:{port}");
 
         let sink = spawn_connection(
-            host,
+            &host,
             port,
             client_sink,
             self.tls_client.clone(),
             self.interceptor.clone(),
-            self.tls_passthrough.clone(),
-            self.middleware.clone(),
+            target,
         );
         results.get().init_result().set_server(sink);
         Ok(())
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn spawn_connection(
-    host: String,
+    host: &str,
     port: u16,
     client_sink: tcp_sink::Client,
     tls_client: Arc<rustls::ClientConfig>,
     interceptor: Rc<tls::TlsInterceptor>,
-    tls_passthrough: Vec<String>,
-    middleware: Rc<super::middleware::Middleware>,
+    target: &NetworkTarget,
 ) -> tcp_sink::Client {
     let (tx, rx) = mpsc::channel::<Bytes>(1);
     let error: io::RelayError = Rc::new(RefCell::new(None));
     let task_error = error.clone();
 
+    let host = host.to_string();
+    let target = target.clone();
     tokio::task::spawn_local(async move {
         let result = Box::pin(handle_connection(
             &host,
@@ -78,8 +67,7 @@ fn spawn_connection(
             client_sink,
             &tls_client,
             &interceptor,
-            &tls_passthrough,
-            &middleware,
+            target,
         ))
         .await;
 
@@ -100,18 +88,13 @@ async fn handle_connection(
     client_sink: tcp_sink::Client,
     tls_client: &Arc<rustls::ClientConfig>,
     interceptor: &tls::TlsInterceptor,
-    tls_passthrough: &[String],
-    middleware: &super::middleware::Middleware,
+    target: NetworkTarget,
 ) -> anyhow::Result<()> {
     let (is_tls, first) = tls::detect(&mut rx).await;
     let addr = format!("{host}:{port}");
 
-    // TLS passthrough: raw relay, container↔server TLS end-to-end
-    if is_tls
-        && tls_passthrough
-            .iter()
-            .any(|p| matchers::host_matches(host, p))
-    {
+    // Passthrough: raw relay, container↔server TLS end-to-end
+    if target.is_passthrough() {
         debug!("passthrough: {addr}");
         let (container, server) = tcp::establish(&addr, first, rx, client_sink).await?;
         Box::pin(tcp::relay(container, server)).await;
@@ -126,15 +109,9 @@ async fn handle_connection(
     };
 
     // Detect HTTP if middleware is configured
-    let http_layers = middleware.http();
-    let (container, is_http) = if http_layers.is_empty() {
-        (container, false)
-    } else {
-        detect_http(container).await
-    };
-
+    let (container, is_http) = detect_http(container).await;
     if is_http {
-        Box::pin(http::relay(container, server, http_layers)).await?;
+        Box::pin(http::relay(container, server, target)).await?;
     } else {
         Box::pin(tcp::relay(container, server)).await;
     }
