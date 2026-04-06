@@ -1,0 +1,9 @@
+presets = ["claude-code"]
+image = "ez:dev"
+
+[network]
+# allowed_hosts = []
+
+[cache]
+size = "20 GB"
+mounts = ["target"]
