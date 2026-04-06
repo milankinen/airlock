@@ -61,6 +61,7 @@ async fn serve(state: Rc<DnsState>) -> anyhow::Result<()> {
     let mut buf = [0u8; 512];
     loop {
         let (len, addr) = socket.recv_from(&mut buf).await?;
+        debug!("dns query from {addr}: {len} bytes");
         if let Some(response) = handle_query(&buf[..len], &state) {
             let _ = socket.send_to(&response, addr).await;
         }

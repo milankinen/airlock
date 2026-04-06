@@ -87,7 +87,9 @@ struct KrunFns {
         disk_path: *const libc::c_char,
         read_only: bool,
     ) -> i32,
+    add_vsock: unsafe extern "C" fn(ctx_id: u32, tsi_features: u32) -> i32,
     disable_implicit_console: unsafe extern "C" fn(ctx_id: u32) -> i32,
+    disable_implicit_vsock: unsafe extern "C" fn(ctx_id: u32) -> i32,
     start_enter: unsafe extern "C" fn(ctx_id: u32) -> i32,
 }
 
@@ -121,7 +123,9 @@ impl KrunFns {
                 add_virtiofs: load_sym(handle, "krun_add_virtiofs")?,
                 add_vsock_port2: load_sym(handle, "krun_add_vsock_port2")?,
                 add_disk: load_sym(handle, "krun_add_disk")?,
+                add_vsock: load_sym(handle, "krun_add_vsock")?,
                 disable_implicit_console: load_sym(handle, "krun_disable_implicit_console")?,
+                disable_implicit_vsock: load_sym(handle, "krun_disable_implicit_vsock")?,
                 start_enter: load_sym(handle, "krun_start_enter")?,
             })
         }
@@ -178,6 +182,13 @@ impl KrunVmBackend {
             unsafe { (fns.disable_implicit_console)(ctx) },
             "disable_implicit_console",
         )?;
+        // Disable implicit vsock (which enables TSI_HIJACK_INET, intercepting
+        // all AF_INET sockets) and add explicit vsock with TSI disabled (flags=0).
+        check_krun(
+            unsafe { (fns.disable_implicit_vsock)(ctx) },
+            "disable_implicit_vsock",
+        )?;
+        check_krun(unsafe { (fns.add_vsock)(ctx, 0) }, "add_vsock")?;
 
         let ram_mib = (config.memory_bytes / (1024 * 1024)) as u32;
         check_krun(
