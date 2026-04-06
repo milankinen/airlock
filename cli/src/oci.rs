@@ -299,8 +299,9 @@ enum ImageSource {
 async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBuf> {
     let dir = crate::cache::image_dir(&resolved.digest)?;
     let rootfs = dir.join("rootfs");
+    let complete_marker = dir.join(".complete");
 
-    if rootfs.exists() {
+    if rootfs.exists() && complete_marker.exists() {
         if matches!(resolved.source, ImageSource::Docker { .. }) {
             let config_path = dir.join("image_config.json");
             if config_path.exists() {
@@ -309,6 +310,13 @@ async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBuf> {
             }
         }
         return Ok(dir);
+    }
+
+    // Incomplete or corrupt image — clean up and re-extract
+    if rootfs.exists() {
+        tracing::debug!("image extraction incomplete, cleaning up");
+        let _ = std::fs::remove_dir_all(&rootfs);
+        let _ = std::fs::remove_file(&complete_marker);
     }
 
     std::fs::create_dir_all(&dir)?;
@@ -327,6 +335,7 @@ async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBuf> {
             let sp = cli::spinner("exporting from docker...");
             resolved.config =
                 docker::save_and_extract(image_ref, &rootfs, &dir.join("image_config.json"))?;
+            std::fs::write(&complete_marker, "")?;
             sp.finish_and_clear();
             cli::log!("  {} exported from docker", cli::check());
         }
@@ -373,6 +382,7 @@ async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBuf> {
 
             let config_json = serde_json::to_string_pretty(&resolved.config)?;
             std::fs::write(dir.join("image_config.json"), config_json)?;
+            std::fs::write(&complete_marker, "")?;
         }
     }
 
