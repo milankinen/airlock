@@ -1,0 +1,12 @@
+# Debian/Ubuntu apt package manager
+
+[[network.rules]]
+name = "debian-packages"
+allow = [
+    "http:deb.debian.org",
+    "http:security.debian.org",
+    "http:archive.ubuntu.com",
+    "http:security.ubuntu.com",
+    "http:ppa.launchpad.net",
+    "http:keyserver.ubuntu.com",
+]

@@ -1,0 +1,10 @@
+# openSUSE/SLES zypper package manager
+
+[[network.rules]]
+name = "suse-packages"
+allow = [
+    "http:download.opensuse.org",
+    "http:mirrorcache.opensuse.org",
+    "http:scc.suse.com",
+    "http:updates.suse.com",
+]

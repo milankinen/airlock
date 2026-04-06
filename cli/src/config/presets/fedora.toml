@@ -1,0 +1,13 @@
+# Fedora/RHEL/CentOS dnf/yum package manager
+
+[[network.rules]]
+name = "fedora-packages"
+allow = [
+    "http:mirrors.fedoraproject.org",
+    "http:download.fedoraproject.org",
+    "http:dl.fedoraproject.org",
+    "http:mirror.centos.org",
+    "http:vault.centos.org",
+    "http:cdn-ubi.redhat.com",
+    "http:rhui.REGION.aws.ce.redhat.com",
+]

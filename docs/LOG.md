@@ -1,5 +1,58 @@
 # Development Log
 
+## 2026-04-06: Rework VM mount architecture with shared rootfs and overlay
+
+Major rework of how the container filesystem is assembled. Previously the
+image rootfs was CoW-copied per project and mounts were split between OCI
+config and supervisor. Now the image rootfs is shared read-only via VirtioFS,
+and all mounting happens in the supervisor.
+
+### Architecture
+
+VirtioFS shares: `base` (shared image rootfs, read-only), `overlay`
+(project-specific files_rw/files_ro), `bundle` (OCI config + mounts.json),
+`project` + `mount_N` (user dir mounts). Plus a VirtIO block device (ext4)
+for the overlay upper layer and cache dirs.
+
+The supervisor reads `mounts.json` from the bundle and assembles the rootfs:
+1. overlayfs: lowerdir=files_rw:files_ro:base, upperdir=disk/overlay/upper
+2. bind-mount rw files from VirtioFS
+3. bind-mount dir mounts
+4. bind-mount cache dirs (last, overrides project dir)
+
+### Key decisions
+
+- **Overlay upper on ext4 disk, not VirtioFS**: overlayfs requires a local
+  filesystem for upper/work — VirtioFS is FUSE-based and rejected by the
+  kernel.
+- **Always-present disk** (default 10GB sparse): serves as both overlay upper
+  and cache. Replaces the optional cache-only disk.
+- **Image ID tracking**: stored on disk at `overlay/.image_id`. Supervisor
+  resets the overlay dir when the image changes. Cache dirs survive.
+- **Shutdown RPC**: host calls `supervisor.shutdown()` after process exits,
+  supervisor calls `sync()` to flush ext4 writes before VM is killed.
+- **mounts.json**: replaces RPC fields for shares/cacheDirs/hasCacheDisk.
+  Supervisor reads it from the VirtioFS bundle share.
+
+### Other fixes in this batch
+
+- ext4 support added to kernel configs (CONFIG_EXT4_FS=y)
+- e2fsprogs-extra added to rootfs (provides resize2fs)
+- System binaries use absolute paths (/sbin/mkfs.ext4, /usr/sbin/iptables)
+- mise build tasks: kernel/libkrun as dependencies of build:dev with OS gates
+
+## 2026-04-06: Add http: target prefix and distro presets
+
+Extended target pattern syntax to `[http:]host[:port]`. The `http:` prefix
+enforces HTTP-only traffic — non-HTTP connections are rejected after TLS
+interception. Targets with `http:` also force TLS interception (no passthrough)
+since the proxy needs to verify the protocol.
+
+Rewrote copilot-cli preset based on the official GitHub allowlist reference
+with path-restricting middleware for github.com, api.github.com, and
+copilot-telemetry.githubusercontent.com. Added distro package manager presets
+(alpine, debian, fedora, suse, arch) with http: enforcement.
+
 ## 2026-04-06: Replace flat network config with composable rules
 
 The flat network config (`allowed_hosts`, `tls_passthrough`, `host_ports`,

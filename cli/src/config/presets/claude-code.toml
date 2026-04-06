@@ -1,16 +1,18 @@
 [[network.rules]]
 name = "claude-code"
 allow = [
-    "api.anthropic.com",
-    "claude.ai",
-    "downloads.claude.ai",
-    "platform.claude.com",
+    "claude.ai:443",
+    "downloads.claude.ai:443",
+    "platform.claude.com:443",
+    "api.anthropic.com:443",
 ]
 
 [[mounts]]
+missing = "warn"
 source = "~/.claude"
 target = "~/.claude"
 
 [[mounts]]
+missing = "warn"
 source = "~/.claude.json"
 target = "~/.claude.json"

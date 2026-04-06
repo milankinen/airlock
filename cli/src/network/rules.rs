@@ -10,7 +10,7 @@ pub fn resolve(network: &Network, log: &LogFn) -> anyhow::Result<Vec<NetworkTarg
 
     for rule in &network.rules {
         for allow in &rule.allow {
-            let (host, port) = parse_target(allow);
+            let (http_only, host, port) = parse_target(allow);
             let port = port.and_then(|p| p.parse::<u16>().ok());
 
             // Collect middleware scripts that match this host
@@ -31,6 +31,7 @@ pub fn resolve(network: &Network, log: &LogFn) -> anyhow::Result<Vec<NetworkTarg
             targets.push(NetworkTarget {
                 host: host.to_string(),
                 port,
+                http_only,
                 middleware,
             });
         }
@@ -44,7 +45,7 @@ pub fn localhost_ports_from_config(network: &Network) -> Vec<u16> {
     let mut ports = Vec::new();
     for rule in &network.rules {
         for target in &rule.allow {
-            let (host, port) = parse_target(target);
+            let (_, host, port) = parse_target(target);
             if is_localhost(host)
                 && let Some(port_str) = port
                 && let Ok(p) = port_str.parse::<u16>()
@@ -58,7 +59,7 @@ pub fn localhost_ports_from_config(network: &Network) -> Vec<u16> {
 }
 
 /// Derive TLS passthrough hosts directly from config (no compilation needed).
-/// A host gets passthrough if it has no middleware in any rule.
+/// A host gets passthrough if it has no middleware in any rule and no `http:` prefix.
 pub fn tls_passthrough_from_config(network: &Network) -> Vec<String> {
     let mut passthrough = Vec::new();
     let mut has_middleware = std::collections::HashSet::new();
@@ -69,8 +70,9 @@ pub fn tls_passthrough_from_config(network: &Network) -> Vec<String> {
     }
     for rule in &network.rules {
         for target in &rule.allow {
-            let (host, _) = parse_target(target);
-            if !is_localhost(host)
+            let (http_only, host, _) = parse_target(target);
+            if !http_only
+                && !is_localhost(host)
                 && !has_middleware.contains(host)
                 && !passthrough.contains(&host.to_string())
             {
@@ -85,10 +87,14 @@ fn is_localhost(host: &str) -> bool {
     host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
-/// Parse a target pattern into (host, port_str). Missing port → None.
-fn parse_target(target: &str) -> (&str, Option<&str>) {
-    match target.rsplit_once(':') {
-        Some((host, port)) => (host, Some(port)),
-        None => (target, None),
+/// Parse a target pattern `[http:]host[:port]` into (http_only, host, port_str).
+fn parse_target(target: &str) -> (bool, &str, Option<&str>) {
+    let (http_only, rest) = match target.strip_prefix("http:") {
+        Some(rest) => (true, rest),
+        None => (false, target),
+    };
+    match rest.rsplit_once(':') {
+        Some((host, port)) => (http_only, host, Some(port)),
+        None => (http_only, rest, None),
     }
 }

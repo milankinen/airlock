@@ -1,0 +1,9 @@
+# Arch Linux pacman package manager
+
+[[network.rules]]
+name = "arch-packages"
+allow = [
+    "http:*.archlinux.org",
+    "http:archlinux.org",
+    "http:aur.archlinux.org",
+]

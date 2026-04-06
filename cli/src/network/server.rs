@@ -108,10 +108,12 @@ async fn handle_connection(
         tcp::establish(&addr, first, rx, client_sink).await?
     };
 
-    // Detect HTTP if middleware is configured
+    // Detect HTTP
     let (container, is_http) = detect_http(container).await;
     if is_http {
         Box::pin(http::relay(container, server, target)).await?;
+    } else if target.http_only {
+        anyhow::bail!("non-HTTP traffic rejected for {addr} (http-only target)");
     } else {
         Box::pin(tcp::relay(container, server)).await;
     }

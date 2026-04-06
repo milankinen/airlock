@@ -1,12 +1,56 @@
+# GitHub Copilot CLI preset
+# Based on: https://docs.github.com/en/copilot/reference/copilot-allowlist-reference
+
 [[network.rules]]
 name = "copilot-cli"
 allow = [
-    "github.com",
-    "api.github.com",
-    "*.githubusercontent.com",
-    "*.github.dev",
+    # GitHub core (path-restricted via middleware below)
+    "http:github.com",
+    "http:api.github.com",
+
+    # Copilot proxy (no path restriction)
+    "copilot-proxy.githubusercontent.com",
+    "origin-tracker.githubusercontent.com",
+
+    # Telemetry (path-restricted via middleware below)
+    "http:copilot-telemetry.githubusercontent.com",
+    "http:collector.github.com",
+
+    # Copilot API endpoints
+    "*.githubcopilot.com",
+    "*.individual.githubcopilot.com",
+    "*.business.githubcopilot.com",
+    "*.enterprise.githubcopilot.com",
+
+    # Experimentation
     "default.exp-tas.com",
 ]
+
+# Path restrictions per the allowlist reference.
+# Hosts with middleware get TLS interception to inspect HTTP paths.
+
+[[network.rules.middleware."github.com"]]
+script = """
+local p = req.path
+if not (p:find("^/login") or p:find("^/enterprises/")) then
+  req:deny()
+end
+"""
+
+[[network.rules.middleware."api.github.com"]]
+script = """
+local p = req.path
+if not (p == "/user" or p:find("^/copilot_internal/")) then
+  req:deny()
+end
+"""
+
+[[network.rules.middleware."copilot-telemetry.githubusercontent.com"]]
+script = """
+if req.path ~= "/telemetry" then
+  req:deny()
+end
+"""
 
 [[mounts]]
 source = "~/.config/gh"
