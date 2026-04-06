@@ -31,7 +31,8 @@ pub fn check_kvm_access() {
         let supp_ok = if group_ok {
             false
         } else {
-            let mut groups = vec![0u32; 64];
+            let ngroups = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+            let mut groups = vec![0u32; ngroups.max(1) as usize];
             let n = unsafe { libc::getgroups(groups.len() as i32, groups.as_mut_ptr()) };
             n > 0 && groups[..n as usize].contains(&dev_gid)
         };

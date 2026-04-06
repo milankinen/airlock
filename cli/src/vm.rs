@@ -184,16 +184,14 @@ pub async fn start(
         let backend = krun::KrunVmBackend::start(&vm_config, &assets.libkrun, &assets.libkrunfw)?;
 
         // Wait for the VM to boot and supervisor to start listening.
-        // With libkrun, the first successful connect may reach the guest
-        // before the supervisor binds its vsock port, causing an RST.
-        // We retry the full connect to handle this race.
+        // libkrun's vsock may accept connections before the supervisor
+        // binds its port, causing an RST. We detect this with a peek
+        // and retry the full connect.
         let vsock_fd = {
-            let mut attempts = 0;
+            let mut attempts = 0u32;
             loop {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 match backend.vsock_connect() {
                     Ok(fd) => {
-                        // Verify the connection is alive by peeking
                         use std::os::unix::io::AsRawFd;
                         let mut buf = [0u8; 1];
                         let ret = unsafe {
@@ -209,13 +207,14 @@ pub async fn start(
                                 && std::io::Error::last_os_error().raw_os_error()
                                     == Some(libc::ECONNRESET))
                         {
-                            // Connection was RST — supervisor not ready yet
+                            tracing::trace!("vsock connected but RST (attempt {attempts})");
                             attempts += 1;
                             if attempts >= 60 {
                                 return Err(anyhow::anyhow!(
-                                    "supervisor not reachable after {attempts} attempts"
+                                    "supervisor not reachable after {attempts} attempts (RST)"
                                 ));
                             }
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                             continue;
                         }
                         break fd;
@@ -223,10 +222,11 @@ pub async fn start(
                     Err(e) => {
                         attempts += 1;
                         if attempts >= 60 {
-                            return Err(anyhow::anyhow!(format!(
+                            return Err(anyhow::anyhow!(
                                 "supervisor not reachable after {attempts} attempts: {e}"
-                            )));
+                            ));
                         }
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     }
                 }
             }

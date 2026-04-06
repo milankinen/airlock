@@ -5,6 +5,7 @@ mkdir -p sandbox/out
 rm -f sandbox/out/libkrun* sandbox/out/libkrunfw*
 
 KRUNFW_VERSION="v5.3.0"
+KRUN_VERSION="v1.17.4"
 
 # Build libkrunfw with netfilter support
 echo "Building libkrunfw (with netfilter)..."
@@ -34,11 +35,12 @@ echo "Building libkrun..."
 docker run --rm \
   -v "$PWD/sandbox/out:/out" \
   -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
+  -e "KRUN_VERSION=${KRUN_VERSION}" \
   rust:1-slim-trixie sh -c '
     set -e
     apt-get update -qq && apt-get install -y -qq git make libclang-dev libcap-ng-dev >/dev/null 2>&1
     cd /tmp
-    git clone --depth=1 --branch v1.17.4 https://github.com/containers/libkrun.git
+    git clone --depth=1 --branch "$KRUN_VERSION" https://github.com/containers/libkrun.git
     cd libkrun
     make BLK=1
     cp target/release/libkrun.so.* /out/libkrun.so
