@@ -7,6 +7,7 @@ set -euo pipefail
 # libkrun is only needed on Linux
 if [[ "$(uname -s)" != "Linux" ]]; then
   echo "Skipping libkrun build (not Linux)"
+  mkdir -p sandbox/out
   touch sandbox/out/libkrun.so
   touch sandbox/out/libkrunfw.so
   exit 0
