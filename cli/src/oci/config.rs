@@ -61,8 +61,12 @@ pub fn generate_config(
           "options": ["nosuid", "noexec", "nodev", "ro"] }),
     ];
 
-    // Bind mounts from VirtioFS shares into container
+    // Bind mounts from VirtioFS shares into container.
+    // File mounts are excluded — they are overlaid onto the rootfs by init.
     for mount in mounts {
+        if matches!(mount.mount_type, super::MountType::File { .. }) {
+            continue;
+        }
         let mut options = vec!["bind".to_string()];
         if mount.read_only {
             options.push("ro".to_string());

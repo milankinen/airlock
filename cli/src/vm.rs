@@ -55,7 +55,7 @@ pub async fn start(
                 });
             }
             crate::oci::MountType::File { .. } => {
-                let share = link_file(mount.key(), &mount.source, mount.read_only, &files_dir)?;
+                let share = link_file(mount.key(), &mount.source, &mount.target, &files_dir)?;
                 if !file_share_tags.contains(&share.tag) {
                     file_share_tags.insert(share.tag.clone());
                     shares.push(share);
@@ -249,19 +249,32 @@ pub async fn start(
     }
 }
 
+/// Link a file mount into the shared files directory, replicating the
+/// target's directory structure so the entire tree can be overlaid onto
+/// the container rootfs.
+///
+/// For target `/root/.claude.json`, creates `files_rw/root/.claude.json`.
 pub fn link_file(
     ftag: &str,
     source: &Path,
-    read_only: bool,
+    target: &str,
     files_dir: &Path,
 ) -> anyhow::Result<VmShare> {
     let fdir = files_dir.join(ftag);
-    std::fs::create_dir_all(&fdir)?;
+    // Replicate target directory structure: /root/.claude.json → files_rw/root/
+    let target_path = Path::new(target);
+    let parent = target_path
+        .parent()
+        .unwrap_or(Path::new(""))
+        .strip_prefix("/")
+        .unwrap_or(Path::new(""));
+    let link_dir = fdir.join(parent);
+    std::fs::create_dir_all(&link_dir)?;
 
-    let file_name = source
+    let file_name = target_path
         .file_name()
         .map_or_else(|| "file".to_string(), |n| n.to_string_lossy().to_string());
-    let link_path = fdir.join(&file_name);
+    let link_path = link_dir.join(&file_name);
 
     if let Err(e) = std::fs::hard_link(source, &link_path) {
         warn!(
@@ -280,7 +293,7 @@ pub fn link_file(
     Ok(VmShare {
         tag: ftag.into(),
         host_path: fdir,
-        read_only,
+        read_only: false, // overlay upperdir must be writable
     })
 }
 
