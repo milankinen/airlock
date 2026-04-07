@@ -226,6 +226,7 @@ pub async fn start(
         cloud_hypervisor: assets.cloud_hypervisor,
         #[cfg(target_os = "linux")]
         virtiofsd: assets.virtiofsd,
+        #[cfg(target_os = "linux")]
         nested_virtualization: project.config.nested_virtualization,
     };
 
