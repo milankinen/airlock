@@ -28,7 +28,7 @@ pub async fn establish(
 
     let rpc_io = io::RpcTransport::new(first, rx, client_sink);
     let (tls_stream, alpn) = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        crate::constants::TLS_HANDSHAKE_TIMEOUT,
         interceptor.accept(rpc_io, &sni_host),
     )
     .await

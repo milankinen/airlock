@@ -81,6 +81,26 @@ pub mod config {
         /// allowed if ANY rule allows it.
         #[config(default)]
         pub rules: BTreeMap<String, NetworkRule>,
+        /// Unix socket forwarding from host to guest.
+        #[config(default)]
+        pub sockets: BTreeMap<String, SocketForward>,
+    }
+
+    /// Forward a host Unix socket into the guest container.
+    #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
+    pub struct SocketForward {
+        /// Enable/disable this socket forward
+        #[config(default_t = true)]
+        pub enabled: bool,
+        /// Host socket path (e.g., "/var/run/docker.sock")
+        pub host: String,
+        /// Guest socket path (e.g., "/var/run/docker.sock")
+        pub guest: String,
+    }
+
+    impl WellKnown for SocketForward {
+        type Deserializer = de::Nested<SocketForward>;
+        const DE: Self::Deserializer = de::nested();
     }
 
     /// A named network rule with allowed targets and optional middleware.

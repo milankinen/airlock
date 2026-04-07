@@ -8,12 +8,18 @@ use futures::AsyncReadExt;
 use crate::init::InitConfig;
 use crate::process::{SpawnedProcess, spawn};
 
+pub struct SocketForwardConfig {
+    pub host: String,
+    pub guest: String,
+}
+
 pub struct HostConnection {
     pub proc: HostProcess,
     pub network: network_proxy::Client,
     pub cmd: String,
     pub args: Vec<String>,
     pub init_config: InitConfig,
+    pub sockets: Vec<SocketForwardConfig>,
 }
 
 pub struct HostProcess {
@@ -23,7 +29,7 @@ pub struct HostProcess {
     /// Taken by the startup code — None after process is spawned.
     pub result: Option<tokio::sync::oneshot::Sender<Result<process::Client, String>>>,
 }
-// init_config, cmd, args, log_sink, log_filter, pty_size, network
+// init_config, cmd, args, log_sink, log_filter, pty_size, network, sockets
 pub async fn start<
     Init: AsyncFn(
         InitConfig,
@@ -33,6 +39,7 @@ pub async fn start<
         String,
         Option<(u16, u16)>,
         network_proxy::Client,
+        Vec<SocketForwardConfig>,
     ) -> anyhow::Result<SpawnedProcess>,
 >(
     conn_fd: OwnedFd,
@@ -66,6 +73,7 @@ pub async fn start<
         log_filter,
         host.proc.pty_size,
         host.network,
+        host.sockets,
     )
     .await
     {
@@ -119,6 +127,16 @@ impl supervisor::Server for SupervisorImpl {
                 epoch: params.get_epoch(),
                 host_ports: params.get_host_ports()?.iter().collect(),
             },
+            sockets: params
+                .get_sockets()?
+                .iter()
+                .map(|s| {
+                    Ok(SocketForwardConfig {
+                        host: s.get_host()?.to_str()?.to_string(),
+                        guest: s.get_guest()?.to_str()?.to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>, capnp::Error>>()?,
         };
 
         if let Some(tx) = self.0.borrow_mut().take() {

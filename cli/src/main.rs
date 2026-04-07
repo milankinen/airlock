@@ -2,6 +2,7 @@ mod assets;
 mod cache;
 pub(crate) mod cli;
 mod config;
+mod constants;
 
 pub(crate) mod network;
 mod oci;

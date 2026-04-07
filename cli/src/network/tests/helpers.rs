@@ -190,7 +190,10 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
         );
     }
 
-    let config = config::Network { rules };
+    let config = config::Network {
+        rules,
+        sockets: BTreeMap::default(),
+    };
     let (request_log, log_fn) = RequestLog::new();
     let targets = rules::resolve(&config, &log_fn).unwrap();
 
@@ -271,8 +274,9 @@ impl TestConnection {
         let client_sink: tcp_sink::Client = capnp_rpc::new_client(CollectorSink(tx));
 
         let mut req = proxy.connect_request();
-        req.get().set_host(host);
-        req.get().set_port(port);
+        let mut tcp = req.get().init_target().init_tcp();
+        tcp.set_host(host);
+        tcp.set_port(port);
         req.get().set_client(client_sink);
 
         let response = req.send().promise.await.unwrap();

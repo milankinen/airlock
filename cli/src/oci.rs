@@ -178,6 +178,14 @@ fn build_bundle(
     } else {
         None
     };
+    let socket_fwds: Vec<(String, String)> = project
+        .config
+        .network
+        .sockets
+        .values()
+        .filter(|s| s.enabled)
+        .map(|s| (s.host.clone(), s.guest.clone()))
+        .collect();
     config::generate_config(
         &image_config,
         &project.cwd,
@@ -185,6 +193,7 @@ fn build_bundle(
         &args.args,
         pty_size,
         project.config.nested_virtualization,
+        &socket_fwds,
         &overlay_dir.join("config.json"),
     )?;
 

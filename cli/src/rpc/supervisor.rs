@@ -117,6 +117,20 @@ impl Supervisor {
             hp_builder.set(i as u32, *port);
         }
 
+        // Socket forwards
+        let socket_fwds: Vec<_> = project
+            .config
+            .network
+            .sockets
+            .values()
+            .filter(|s| s.enabled)
+            .collect();
+        let mut sf_builder = req.get().init_sockets(socket_fwds.len() as u32);
+        for (i, sf) in socket_fwds.iter().enumerate() {
+            sf_builder.reborrow().get(i as u32).set_host(&sf.host);
+            sf_builder.reborrow().get(i as u32).set_guest(&sf.guest);
+        }
+
         let response = req.send().promise.await?;
         let proc = response.get()?.get_proc()?;
 

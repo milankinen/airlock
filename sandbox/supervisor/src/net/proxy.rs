@@ -66,8 +66,9 @@ async fn handle_connection(
         capnp_rpc::new_client(ChannelSink(RefCell::new(Some(server_tx))));
 
     let mut req = network.connect_request();
-    req.get().set_host(&hostname);
-    req.get().set_port(orig_port);
+    let mut tcp = req.get().init_target().init_tcp();
+    tcp.set_host(&hostname);
+    tcp.set_port(orig_port);
     req.get().set_client(server_sink);
 
     let response = req.send().promise.await?;
@@ -108,7 +109,6 @@ async fn relay(
                 }
             }
         }
-        let _ = remote_sink.close_request().send().promise.await;
     };
 
     let to_local = async {
@@ -117,25 +117,31 @@ async fn relay(
                 break;
             }
         }
-        let _ = local_write.shutdown().await;
     };
 
-    tokio::join!(to_remote, to_local);
+    // When either direction closes, clean up both sides
+    tokio::select! {
+        () = to_remote => {}
+        () = to_local => {}
+    }
+    let _ = remote_sink.close_request().send().promise.await;
+    let _ = local_write.shutdown().await;
 }
 
 // -- ChannelSink: bridges RPC push into an mpsc channel --
 
-struct ChannelSink(RefCell<Option<tokio::sync::mpsc::Sender<Bytes>>>);
+pub(crate) struct ChannelSink(pub RefCell<Option<tokio::sync::mpsc::Sender<Bytes>>>);
 
 impl tcp_sink::Server for ChannelSink {
     async fn send(self: Rc<Self>, params: tcp_sink::SendParams) -> Result<(), capnp::Error> {
         let data = params.get()?.get_data()?;
         let tx = self.0.borrow().clone();
-        if let Some(tx) = tx.as_ref() {
-            tx.send(Bytes::copy_from_slice(data))
-                .await
-                .map_err(|_| capnp::Error::failed("channel closed".into()))?;
-        }
+        let Some(tx) = tx.as_ref() else {
+            return Err(capnp::Error::failed("channel closed".into()));
+        };
+        tx.send(Bytes::copy_from_slice(data))
+            .await
+            .map_err(|_| capnp::Error::failed("channel closed".into()))?;
         Ok(())
     }
 

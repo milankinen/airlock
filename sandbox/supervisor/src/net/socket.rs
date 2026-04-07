@@ -1,0 +1,120 @@
+use std::cell::RefCell;
+use std::path::Path;
+
+use bytes::Bytes;
+use ezpez_protocol::supervisor_capnp::{connect_result, network_proxy, tcp_sink};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixListener;
+use tracing::{debug, error, info};
+
+use super::proxy::ChannelSink;
+use crate::rpc::SocketForwardConfig;
+
+pub fn start(network: &network_proxy::Client, sockets: Vec<SocketForwardConfig>) {
+    for sock in sockets {
+        let network = network.clone();
+        tokio::task::spawn_local(async move {
+            if let Err(e) = listen(&sock.host, &sock.guest, network).await {
+                error!("socket forward {} → {}: {e}", sock.host, sock.guest);
+            }
+        });
+    }
+}
+
+async fn listen(
+    host_path: &str,
+    guest_path: &str,
+    network: network_proxy::Client,
+) -> anyhow::Result<()> {
+    // Create the socket on the disk mount so crun can bind-mount it
+    let sock_name = guest_path.rsplit('/').next().unwrap_or(guest_path);
+    let sock_dir = Path::new("/mnt/disk/sockets");
+    std::fs::create_dir_all(sock_dir)?;
+    let full_path = sock_dir.join(sock_name);
+
+    // Remove stale socket from previous run
+    let _ = std::fs::remove_file(&full_path);
+
+    let listener = UnixListener::bind(&full_path)?;
+    std::fs::set_permissions(
+        &full_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o777),
+    )?;
+    info!("socket forward: {guest_path} → {host_path}");
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let network = network.clone();
+        let host_path = host_path.to_string();
+        tokio::task::spawn_local(async move {
+            if let Err(e) = relay(stream, &host_path, &network).await {
+                debug!("socket relay {host_path}: {e}");
+            }
+        });
+    }
+}
+
+async fn relay(
+    stream: tokio::net::UnixStream,
+    host_path: &str,
+    network: &network_proxy::Client,
+) -> anyhow::Result<()> {
+    let (mut local_read, mut local_write) = stream.into_split();
+
+    // Set up RPC channel for server→local data
+    let (server_tx, mut server_rx) = tokio::sync::mpsc::channel::<Bytes>(1);
+    let server_sink: tcp_sink::Client =
+        capnp_rpc::new_client(ChannelSink(RefCell::new(Some(server_tx))));
+
+    // Call host NetworkProxy.connect with socket target
+    let mut req = network.connect_request();
+    req.get().init_target().set_socket(host_path);
+    req.get().set_client(server_sink);
+
+    let response = req.send().promise.await?;
+    let result = response.get()?.get_result()?;
+    let client_sink = match result.which() {
+        Ok(connect_result::Server(Ok(sink))) => sink,
+        Ok(connect_result::Denied(Ok(reason))) => {
+            let reason = reason.to_str().unwrap_or("unknown");
+            anyhow::bail!("socket denied: {reason}");
+        }
+        _ => anyhow::bail!("invalid connect result"),
+    };
+
+    // Bidirectional relay: local ↔ RPC.
+    // When either direction closes, clean up both sides.
+    let local_to_rpc = async {
+        let mut buf = [0u8; 8192];
+        loop {
+            match local_read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let mut req = client_sink.send_request();
+                    req.get().set_data(&buf[..n]);
+                    if req.send().await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    };
+
+    let rpc_to_local = async {
+        while let Some(data) = server_rx.recv().await {
+            if local_write.write_all(&data).await.is_err() {
+                break;
+            }
+        }
+    };
+
+    tokio::select! {
+        () = local_to_rpc => {}
+        () = rpc_to_local => {}
+    }
+
+    // Clean up both sides regardless of which direction closed
+    let _ = client_sink.close_request().send().promise.await;
+    let _ = local_write.shutdown().await;
+    Ok(())
+}

@@ -3,7 +3,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use ezpez_protocol::supervisor_capnp::{network_proxy, tcp_sink};
+use ezpez_protocol::supervisor_capnp::{connect_target, network_proxy, tcp_sink};
 use tokio::sync::mpsc;
 use tracing::debug;
 
@@ -17,35 +17,47 @@ impl network_proxy::Server for Network {
         mut results: network_proxy::ConnectResults,
     ) -> Result<(), capnp::Error> {
         let params = params.get()?;
-        let host = params.get_host()?.to_str()?.to_string();
-        let port = params.get_port();
+        let target = params.get_target()?;
         let client_sink = params.get_client()?;
 
-        let Some(target) = super::target::find_match(&self.targets, &host, port) else {
-            debug!("denied: {host}:{port} (no matching rule)");
-            results
-                .get()
-                .init_result()
-                .set_denied("no matching network rule");
-            return Ok(());
-        };
+        match target.which()? {
+            connect_target::Tcp(tcp) => {
+                let tcp = tcp?;
+                let host = tcp.get_host()?.to_str()?.to_string();
+                let port = tcp.get_port();
 
-        debug!("connect {host}:{port}");
+                let Some(net_target) = super::target::find_match(&self.targets, &host, port) else {
+                    debug!("denied: {host}:{port} (no matching rule)");
+                    results
+                        .get()
+                        .init_result()
+                        .set_denied("no matching network rule");
+                    return Ok(());
+                };
 
-        let sink = spawn_connection(
-            &host,
-            port,
-            client_sink,
-            self.tls_client.clone(),
-            self.interceptor.clone(),
-            target,
-        );
-        results.get().init_result().set_server(sink);
+                debug!("connect {host}:{port}");
+                let sink = spawn_tcp_connection(
+                    &host,
+                    port,
+                    client_sink,
+                    self.tls_client.clone(),
+                    self.interceptor.clone(),
+                    net_target,
+                );
+                results.get().init_result().set_server(sink);
+            }
+            connect_target::Socket(path) => {
+                let path = path?.to_str()?.to_string();
+                debug!("connect socket: {path}");
+                let sink = spawn_socket_connection(&path, client_sink);
+                results.get().init_result().set_server(sink);
+            }
+        }
         Ok(())
     }
 }
 
-fn spawn_connection(
+fn spawn_tcp_connection(
     host: &str,
     port: u16,
     client_sink: tcp_sink::Client,
@@ -73,6 +85,48 @@ fn spawn_connection(
 
         if let Err(e) = result {
             debug!("connection {host}:{port} error: {e}");
+            *task_error.borrow_mut() = Some(format!("{e}"));
+        }
+    });
+
+    capnp_rpc::new_client(io::ChannelSink::new(tx, error))
+}
+
+fn spawn_socket_connection(path: &str, client_sink: tcp_sink::Client) -> tcp_sink::Client {
+    let (tx, rx) = mpsc::channel::<Bytes>(1);
+    let error: io::RelayError = Rc::new(RefCell::new(None));
+    let task_error = error.clone();
+
+    let path = path.to_string();
+    tokio::task::spawn_local(async move {
+        let result: anyhow::Result<()> = async {
+            let rpc_io = io::RpcTransport::new(Bytes::new(), rx, client_sink);
+            let (cr, cw) = tokio::io::split(rpc_io);
+            let container = io::Transport {
+                read: Box::new(cr),
+                write: Box::new(cw),
+                h2: false,
+            };
+
+            let socket = tokio::time::timeout(
+                crate::constants::SOCKET_CONNECT_TIMEOUT,
+                tokio::net::UnixStream::connect(&path),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("socket connect timed out: {path}"))??;
+            let (sr, sw) = socket.into_split();
+            let server = io::Transport {
+                read: Box::new(sr),
+                write: Box::new(sw),
+                h2: false,
+            };
+
+            Box::pin(tcp::relay(container, server)).await;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            debug!("socket connection {path} error: {e}");
             *task_error.borrow_mut() = Some(format!("{e}"));
         }
     });

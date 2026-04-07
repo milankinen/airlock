@@ -11,10 +11,16 @@ interface Supervisor {
     args :List(Text),
     tlsPassthrough :List(Text),
     epoch :UInt64,
-    hostPorts :List(UInt16)
+    hostPorts :List(UInt16),
+    sockets :List(SocketForward)
   ) -> (proc :Process);
 
   shutdown @1 () -> ();
+}
+
+struct SocketForward {
+  host @0 :Text;
+  guest @1 :Text;
 }
 
 struct PtyConfig {
@@ -62,8 +68,20 @@ struct DataFrame {
 }
 
 interface NetworkProxy {
-  connect @0 (host :Text, port :UInt16, client :TcpSink)
+  connect @0 (target :ConnectTarget, client :TcpSink)
     -> (result :ConnectResult);
+}
+
+struct ConnectTarget {
+  union {
+    tcp @0 :TcpTarget;
+    socket @1 :Text;
+  }
+}
+
+struct TcpTarget {
+  host @0 :Text;
+  port @1 :UInt16;
 }
 
 struct ConnectResult {

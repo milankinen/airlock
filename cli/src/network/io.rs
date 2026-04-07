@@ -119,6 +119,7 @@ impl AsyncWrite for RpcTransport {
         Poll::Ready(Ok(()))
     }
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        drop(self.client_sink.close_request().send());
         Poll::Ready(Ok(()))
     }
 }

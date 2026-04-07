@@ -16,7 +16,12 @@ pub async fn establish(
 ) -> anyhow::Result<(io::Transport, io::Transport)> {
     debug!("plain tcp: {addr}");
     let rpc_io = io::RpcTransport::new(first, rx, client_sink);
-    let server = TcpStream::connect(addr).await?;
+    let server = tokio::time::timeout(
+        crate::constants::TCP_CONNECT_TIMEOUT,
+        TcpStream::connect(addr),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("connection timed out: {addr}"))??;
     let (sr, sw) = server.into_split();
     let (cr, cw) = tokio::io::split(rpc_io);
     Ok((
@@ -34,6 +39,7 @@ pub async fn establish(
 }
 
 /// Bidirectional relay between two transports.
+/// When either direction closes, both sides are fully shut down.
 pub async fn relay(mut container: io::Transport, mut server: io::Transport) {
     let c2s = async {
         let mut buf = [0u8; 8192];
@@ -47,7 +53,6 @@ pub async fn relay(mut container: io::Transport, mut server: io::Transport) {
                 }
             }
         }
-        let _ = server.write.shutdown().await;
     };
 
     let s2c = async {
@@ -62,8 +67,13 @@ pub async fn relay(mut container: io::Transport, mut server: io::Transport) {
                 }
             }
         }
-        let _ = container.write.shutdown().await;
     };
 
-    tokio::join!(c2s, s2c);
+    // When either direction finishes, shut down everything
+    tokio::select! {
+        () = c2s => {}
+        () = s2c => {}
+    }
+    let _ = server.write.shutdown().await;
+    let _ = container.write.shutdown().await;
 }

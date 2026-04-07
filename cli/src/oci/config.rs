@@ -3,6 +3,7 @@ use std::path::Path;
 use super::{OciConfig, ResolvedMount};
 
 /// Generate an OCI runtime spec config.json from the image config.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_config(
     image_config: &OciConfig,
     project_cwd: &Path,
@@ -10,6 +11,7 @@ pub fn generate_config(
     user_args: &[String],
     terminal: Option<(u16, u16)>,
     nested_virtualization: bool,
+    socket_forwards: &[(String, String)],
     dest: &Path,
 ) -> anyhow::Result<()> {
     let cfg = image_config.config.as_ref();
@@ -88,6 +90,17 @@ pub fn generate_config(
             "type": "bind",
             "source": "/mnt/overlay/files_ro",
             "options": ["bind", "ro"],
+        }));
+    }
+
+    // Socket forward bind mounts (supervisor creates sockets at /mnt/disk/sockets/)
+    for (_, guest_path) in socket_forwards {
+        let sock_name = guest_path.rsplit('/').next().unwrap_or(guest_path);
+        mounts_json.push(serde_json::json!({
+            "destination": guest_path,
+            "type": "bind",
+            "source": format!("/mnt/disk/sockets/{sock_name}"),
+            "options": ["bind"],
         }));
     }
 

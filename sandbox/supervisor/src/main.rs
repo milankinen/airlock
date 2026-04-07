@@ -25,7 +25,7 @@ async fn run() -> anyhow::Result<()> {
 
     let exit_code = rpc::start(
         conn_fd,
-        async |init_config, cmd, args, log_sink, log_filter, pty_size, network| {
+        async |init_config, cmd, args, log_sink, log_filter, pty_size, network, sockets| {
             logging::init(log_sink, &log_filter);
 
             info!("setup vm");
@@ -33,7 +33,8 @@ async fn run() -> anyhow::Result<()> {
 
             let dns = Rc::new(net::dns::DnsState::new());
             net::dns::start(dns.clone());
-            net::start_proxy(network, dns);
+            net::start_proxy(network.clone(), dns);
+            net::socket::start(&network, sockets);
 
             info!("start: {} {}", cmd, args.join(" "));
             let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
