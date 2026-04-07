@@ -1,14 +1,9 @@
 #!/bin/bash
 #MISE description="Build the CLI binary"
-#MISE depends=["build:rootfs", "build:kernel"]
+#MISE depends=["build:rootfs", "build:kernel", "fetch:cloud-hypervisor", "fetch:virtiofsd"]
 #MISE sources=["cli/src/**/*.rs", "cli/Cargo.toml", "Cargo.toml", "Cargo.lock", "sandbox/out/*"]
 #MISE outputs=["target/debug/ez"]
 set -euo pipefail
-
-if [[ "$(uname -s)" == "Linux" ]]; then
-  mise run build:cloud-hypervisor
-  mise run build:virtiofsd
-fi
 
 cargo build -p ezpez-cli --features dev "$@"
 

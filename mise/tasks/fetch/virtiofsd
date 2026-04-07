@@ -1,7 +1,15 @@
 #!/bin/bash
 #MISE description="Build virtiofsd binary"
+#MISE sources=["mise/tasks/fetch/virtiofsd"]
 #MISE outputs=["sandbox/out/virtiofsd"]
 set -euo pipefail
+
+if [[ "$(uname -s)" != "Linux" ]]; then
+  echo "Skipping virtiofsd (not Linux)"
+  mkdir -p sandbox/out
+  touch sandbox/out/virtiofsd
+  exit 0
+fi
 
 VIRTIOFSD_VERSION="v1.13.3"
 
