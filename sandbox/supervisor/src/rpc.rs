@@ -163,4 +163,50 @@ impl supervisor::Server for SupervisorImpl {
         tracing::info!("shutdown: sync complete");
         Ok(())
     }
+
+    async fn exec(
+        self: Rc<Self>,
+        params: supervisor::ExecParams,
+        mut results: supervisor::ExecResults,
+    ) -> Result<(), capnp::Error> {
+        let params = params.get()?;
+
+        let cmd = params.get_cmd()?.to_str()?.to_string();
+        let args: Vec<String> = params
+            .get_args()?
+            .iter()
+            .map(|a| a.map(|s| s.to_str().unwrap_or("").to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let pty_size = match params.get_pty()?.which() {
+            Ok(pty_config::Size(size)) => {
+                let size = size?;
+                Some((size.get_rows(), size.get_cols()))
+            }
+            _ => None,
+        };
+
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let host = HostProcess {
+            stdin: params.get_stdin()?,
+            pty_size,
+            result: Some(result_tx),
+        };
+
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let proc = spawn(&cmd, &refs, pty_size).map_err(|e| capnp::Error::failed(e.to_string()))?;
+
+        tokio::task::spawn_local(async move {
+            proc.attach(host).await;
+        });
+
+        match result_rx.await {
+            Ok(Ok(proc_client)) => {
+                results.get().set_proc(proc_client);
+                Ok(())
+            }
+            Ok(Err(msg)) => Err(capnp::Error::failed(msg)),
+            Err(_) => Err(capnp::Error::failed("exec setup dropped".into())),
+        }
+    }
 }

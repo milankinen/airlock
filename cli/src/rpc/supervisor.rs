@@ -24,12 +24,47 @@ fn build_command() -> (String, Vec<String>) {
         ],
     )
 }
+
+/// Build the `crun exec` invocation for attaching to the running container.
+/// In dev mode (`EZ_DEV_NO_CRUN=true`) runs the command directly instead.
+pub fn build_exec_command(
+    user_cmd: &str,
+    user_args: &[String],
+    cwd: &str,
+    env: &[String],
+    pty: bool,
+) -> (String, Vec<String>) {
+    #[cfg(feature = "dev")]
+    if std::env::var("EZ_DEV_NO_CRUN").is_ok_and(|v| v == "true" || v == "1") {
+        tracing::debug!("dev mode: skipping crun exec, running directly");
+        return (user_cmd.to_string(), user_args.to_vec());
+    }
+
+    let mut args = vec!["exec".to_string()];
+    if pty {
+        args.push("--tty".to_string());
+    }
+    if !cwd.is_empty() && cwd != "/" {
+        args.push("--cwd".to_string());
+        args.push(cwd.to_string());
+    }
+    for e in env {
+        args.push("--env".to_string());
+        args.push(e.clone());
+    }
+    args.push("ezpez0".to_string());
+    args.push(user_cmd.to_string());
+    args.extend_from_slice(user_args);
+
+    ("crun".to_string(), args)
+}
 use crate::network::Network;
 use crate::project::Project;
 use crate::rpc::logging::LogSinkImpl;
 use crate::rpc::process::Process;
 use crate::rpc::stdin::Stdin;
 
+#[derive(Clone)]
 pub struct Supervisor {
     supervisor: supervisor::Client,
 }
@@ -135,6 +170,33 @@ impl Supervisor {
         let proc = response.get()?.get_proc()?;
 
         Ok(Process::new(proc))
+    }
+
+    /// Attach a new process to the running container.
+    /// `cmd` and `args` are the fully-constructed invocation (e.g. `crun exec …`).
+    pub async fn exec(
+        &self,
+        stdin: stdin::Client,
+        pty_size: Option<(u16, u16)>,
+        cmd: &str,
+        args: &[String],
+    ) -> anyhow::Result<Process> {
+        let mut req = self.supervisor.exec_request();
+        req.get().set_stdin(stdin);
+        if let Some((rows, cols)) = pty_size {
+            let mut size = req.get().init_pty().init_size();
+            size.set_rows(rows);
+            size.set_cols(cols);
+        } else {
+            req.get().init_pty().set_none(());
+        }
+        req.get().set_cmd(cmd);
+        let mut args_b = req.get().init_args(args.len() as u32);
+        for (i, a) in args.iter().enumerate() {
+            args_b.set(i as u32, a.as_str());
+        }
+        let response = req.send().promise.await?;
+        Ok(Process::new(response.get()?.get_proc()?))
     }
 
     pub async fn shutdown(&self) {

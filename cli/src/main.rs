@@ -1,6 +1,7 @@
 mod assets;
 mod cache;
 pub(crate) mod cli;
+mod cli_server;
 mod config;
 mod constants;
 
@@ -31,6 +32,18 @@ async fn main() {
 
     let exit_code = match parsed.command {
         Command::Go { log_level } => cli::cmd_go::run(log_level, extra_args).await,
+        Command::Exec {
+            cmd,
+            args,
+            cwd,
+            env,
+        } => {
+            if !extra_args.is_empty() {
+                cli::error!("'--' args are not supported with 'exec'");
+                std::process::exit(2);
+            }
+            cli::cmd_exec::run(cmd, args, cwd, env).await
+        }
         Command::Project { command } => {
             if !extra_args.is_empty() {
                 cli::error!("'--' args are only supported with 'go' command");

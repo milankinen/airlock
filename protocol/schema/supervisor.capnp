@@ -16,6 +16,26 @@ interface Supervisor {
   ) -> (proc :Process);
 
   shutdown @1 () -> ();
+
+  exec @2 (
+    stdin :Stdin,
+    pty   :PtyConfig,
+    cmd   :Text,
+    args  :List(Text)
+  ) -> (proc :Process);
+}
+
+# CLI server interface — exposed over the unix socket by `ez go`.
+# `ez exec` connects here to attach new processes to the running container.
+interface CliService @0xb5ce8d3c8a4a7d2f {
+  exec @0 (
+    stdin :Stdin,
+    pty   :PtyConfig,
+    cmd   :Text,
+    args  :List(Text),
+    cwd   :Text,
+    env   :List(Text)
+  ) -> (proc :Process);
 }
 
 struct SocketForward {

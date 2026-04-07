@@ -4,6 +4,7 @@
 //! `cli::progress_bar()` / `cli::spinner()` for progress,
 //! and `cli::interrupted()` for Ctrl+C cancellation.
 
+pub mod cmd_exec;
 pub mod cmd_go;
 pub mod cmd_project_info;
 pub mod cmd_project_list;
@@ -62,6 +63,21 @@ pub enum Command {
         /// Log level
         #[arg(long, env = "EZ_LOG_LEVEL", default_value = "warn")]
         log_level: LogLevel,
+    },
+    /// Execute a command inside the running VM container
+    #[command(alias = "x")]
+    Exec {
+        /// Command to run
+        cmd: String,
+        /// Arguments for the command
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+        /// Working directory inside the container
+        #[arg(short = 'w', long)]
+        cwd: Option<String>,
+        /// Environment variables (KEY=VALUE)
+        #[arg(short = 'e', long = "env")]
+        env: Vec<String>,
     },
     /// Manage projects
     Project {

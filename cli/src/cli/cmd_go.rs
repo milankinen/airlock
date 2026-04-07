@@ -5,7 +5,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::cli::{self, CliArgs, LogLevel};
 use crate::project::{self, Project};
-use crate::{config, network, oci, rpc, terminal, vm};
+use crate::{cli_server, config, network, oci, rpc, terminal, vm};
 
 pub async fn run(log_level: LogLevel, extra_args: Vec<String>) -> i32 {
     #[cfg(target_os = "linux")]
@@ -72,6 +72,10 @@ async fn run_inner(args: CliArgs, config: config::Config) -> anyhow::Result<i32>
     let proc = supervisor
         .start(&args, &project, stdin, network, epoch)
         .await?;
+
+    // Start CLI server so `ez exec` can attach processes to this VM
+    let sock_path = project.cache_dir.join(ezpez_protocol::CLI_SOCK_FILENAME);
+    tokio::task::spawn_local(cli_server::serve(sock_path, supervisor.clone()));
 
     // Forward host signals to the VM process
     let signal_proc = proc.clone();

@@ -49,6 +49,26 @@ mise run ez               # interactive shell
 mise run ez -- ls /usr    # command with args
 ```
 
+## Exec (sidecar) CLI
+
+With a VM running (`ez go`), attach additional processes in a separate terminal:
+
+```bash
+# Run a command inside the running container (alias: ez x)
+target/debug/ez exec ls /usr
+target/debug/ez exec sh -c 'echo hi'
+target/debug/ez x bash
+
+# With options
+target/debug/ez exec -w /app bash          # set working directory
+target/debug/ez exec -e KEY=val env        # set env vars
+```
+
+`ez exec` connects to `<project-cache>/cli.sock` (Cap'n Proto RPC) that
+`ez go` exposes while the VM is running. TTY mode is auto-detected; raw
+mode is enabled for interactive commands. The `CliService` interface is
+defined in `protocol/schema/supervisor.capnp`.
+
 ## Project management CLI
 
 ```bash

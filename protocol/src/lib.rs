@@ -4,3 +4,4 @@ pub mod supervisor_capnp {
 }
 
 pub const SUPERVISOR_PORT: u32 = 1024;
+pub const CLI_SOCK_FILENAME: &str = "cli.sock";
