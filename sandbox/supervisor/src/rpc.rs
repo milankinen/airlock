@@ -6,6 +6,7 @@ use ezpez_protocol::supervisor_capnp::*;
 use futures::AsyncReadExt;
 
 use crate::init::InitConfig;
+use crate::process::SpawnedProcess;
 
 pub struct HostConnection {
     pub proc: HostProcess,
@@ -22,10 +23,21 @@ pub struct HostProcess {
     /// Taken by the startup code — None after process is spawned.
     pub result: Option<tokio::sync::oneshot::Sender<Result<process::Client, String>>>,
 }
-
-pub async fn connect(
+// init_config, cmd, args, log_sink, log_filter, pty_size, network
+pub async fn start<
+    Init: AsyncFn(
+        InitConfig,
+        String,
+        Vec<String>,
+        log_sink::Client,
+        String,
+        Option<(u16, u16)>,
+        network_proxy::Client,
+    ) -> anyhow::Result<SpawnedProcess>,
+>(
     conn_fd: OwnedFd,
-) -> anyhow::Result<(log_sink::Client, String, HostConnection)> {
+    init: Init,
+) -> anyhow::Result<i32> {
     let std_stream = unsafe { std::net::TcpStream::from_raw_fd(conn_fd.into_raw_fd()) };
     std_stream.set_nonblocking(true)?;
     let stream = tokio::net::TcpStream::from_std(std_stream)?;
@@ -45,10 +57,18 @@ pub async fn connect(
     let rpc = RpcSystem::new(Box::new(network), Some(client.client));
 
     tokio::task::spawn_local(rpc);
-
-    conn_rx
-        .await
-        .map_err(|_| anyhow::anyhow!("host disconnected before start()"))
+    let (log_sink, log_filter, host) = conn_rx.await.expect("host connection failed");
+    let proc = init(
+        host.init_config,
+        host.cmd,
+        host.args,
+        log_sink,
+        log_filter,
+        host.proc.pty_size,
+        host.network,
+    )
+    .await?;
+    Ok(proc.attach(host.proc).await)
 }
 
 type ConnPayload = (log_sink::Client, String, HostConnection);
