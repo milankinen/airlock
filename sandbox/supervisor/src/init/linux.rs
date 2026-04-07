@@ -91,8 +91,18 @@ fn assemble_rootfs(mounts: &MountsConfig) -> anyhow::Result<()> {
         ("/tmp/overlay_rootfs", "/tmp/overlay_work")
     };
 
-    // overlayfs: base image (lowerdir) + project state (upperdir)
-    let opts = format!("lowerdir=/mnt/base,upperdir={upper},workdir={work}");
+    // overlayfs: ca layer + base image (lowerdirs) + project state (upperdir)
+    // /mnt/overlay/ca contains files that override the base image (e.g. CA certs).
+    let ca_dir = Path::new("/mnt/overlay/ca");
+    let ca_exists = ca_dir.is_dir();
+    debug!("overlayfs ca layer: exists={ca_exists}");
+    let lower = if ca_exists {
+        "/mnt/overlay/ca:/mnt/base".to_string()
+    } else {
+        "/mnt/base".to_string()
+    };
+    let opts = format!("lowerdir={lower},upperdir={upper},workdir={work}");
+    info!("overlayfs opts: {opts}");
     let opts_cstr = std::ffi::CString::new(opts.as_str()).unwrap();
     let overlay_type = std::ffi::CString::new("overlay").unwrap();
     let target = std::ffi::CString::new("/mnt/overlay/rootfs").unwrap();

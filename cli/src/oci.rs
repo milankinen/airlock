@@ -411,9 +411,9 @@ async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Install the project CA cert into overlay/files_rw so the container
-/// sees the combined (image + project) CA trust stores via overlayfs.
-/// Different distros use different paths — write to all common locations.
+/// Install the project CA cert into overlay/ca/ as an extra overlayfs lowerdir.
+/// The supervisor mounts overlay/ca as the highest-priority lowerdir, so these
+/// files override the base image without needing symlinks or upperdir writes.
 fn install_ca_cert(
     image_dir: &Path,
     overlay_dir: &Path,
@@ -430,8 +430,8 @@ fn install_ca_cert(
     ];
 
     for ca_store in ca_stores {
-        let dest = overlay_dir.join("files_rw").join(ca_store);
-        // Read pristine certs from image (may not exist for all paths)
+        let dest = overlay_dir.join("ca").join(ca_store);
+        // Read pristine certs from image (may not exist for all distro paths)
         let existing = std::fs::read(image_dir.join("rootfs").join(ca_store)).unwrap_or_default();
         let mut out = existing;
         if !out.ends_with(b"\n") && !out.is_empty() {
