@@ -144,6 +144,41 @@ pub fn red(s: &str) -> String {
     console::style(s).red().to_string()
 }
 
+/// Build the version string shown by `-V`.
+///
+/// In release builds the release action appends `<version><len:u32le>` to
+/// the binary; we detect that here and show it alongside the git hash.
+/// Falls back to the Cargo package version in dev builds.
+pub fn version_string() -> String {
+    let git_hash = env!("GIT_HASH");
+    match release_version() {
+        Some(v) => format!("{v} ({git_hash})"),
+        None => format!("{} ({git_hash})", env!("CARGO_PKG_VERSION")),
+    }
+}
+
+/// Read the release version appended to the binary by the release action.
+/// Format: `<utf8 version string><length as u32 little-endian>`.
+fn release_version() -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(std::env::current_exe().ok()?).ok()?;
+    let file_len = f.seek(SeekFrom::End(0)).ok()?;
+    if file_len < 4 {
+        return None;
+    }
+    f.seek(SeekFrom::End(-4)).ok()?;
+    let mut len_bytes = [0u8; 4];
+    f.read_exact(&mut len_bytes).ok()?;
+    let len = u32::from_le_bytes(len_bytes) as usize;
+    if len == 0 || len >= 20 || (file_len as usize) < len + 4 {
+        return None;
+    }
+    f.seek(SeekFrom::End(-(len as i64 + 4))).ok()?;
+    let mut ver_bytes = vec![0u8; len];
+    f.read_exact(&mut ver_bytes).ok()?;
+    Some(String::from_utf8_lossy(&ver_bytes).into_owned())
+}
+
 /// Initialize the console; call at the very beginning of the program.
 pub fn initialize(global: &GlobalArgs) {
     let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());

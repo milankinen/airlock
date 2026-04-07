@@ -52,6 +52,12 @@ jobs:
             DIR="${variant##*:}"
             ARCHIVE="ez-${VERSION}-${NAME}.tar.gz"
             chmod +x "artifacts/${DIR}/ez"
+            python3 -c "
+import sys
+v = sys.argv[1].encode('utf-8')
+sys.stdout.buffer.write(v)
+sys.stdout.buffer.write(len(v).to_bytes(4, 'little'))
+" "$VERSION" >> "artifacts/${DIR}/ez"
             tar -czf "$ARCHIVE" -C "artifacts/${DIR}" ez
             sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
           done

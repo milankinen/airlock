@@ -22,6 +22,7 @@ async fn main() {
     let (ez_args, extra_args) = split_at_separator(&raw_args);
 
     let matches = Cli::command()
+        .version(cli::version_string().leak() as &str)
         .after_help(cli::platform_status())
         .get_matches_from(&ez_args);
     let parsed = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
