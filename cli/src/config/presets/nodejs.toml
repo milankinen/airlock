@@ -1,0 +1,17 @@
+# Node.js development preset
+
+[network.rules.nodejs-packages]
+allow = [
+    "http:registry.npmjs.org",
+    "http:registry.yarnpkg.com",
+    "http:registry.npmmirror.com",
+]
+
+[disk.cache.npm-cache]
+path = "~/.npm"
+
+[disk.cache.yarn-cache]
+path = "~/.yarn"
+
+[disk.cache.node-modules]
+path = "node_modules"

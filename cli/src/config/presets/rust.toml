@@ -1,0 +1,19 @@
+# Rust development preset
+
+[network.rules.rust-packages]
+allow = [
+    "http:crates.io",
+    "http:index.crates.io",
+    "http:static.crates.io",
+    "http:static.rust-lang.org",
+    "http:doc.rust-lang.org",
+]
+
+[disk.cache.cargo-registry]
+path = "~/.cargo/registry"
+
+[disk.cache.cargo-git]
+path = "~/.cargo/git"
+
+[disk.cache.rust-target]
+path = "target"

@@ -1,0 +1,13 @@
+# Python development preset
+
+[network.rules.python-packages]
+allow = [
+    "http:pypi.org",
+    "http:files.pythonhosted.org",
+]
+
+[disk.cache.pip-cache]
+path = "~/.cache/pip"
+
+[disk.cache.python-venv]
+path = ".venv"
