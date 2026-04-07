@@ -1,7 +1,6 @@
 # Debian/Ubuntu apt package manager
 
-[[network.rules]]
-name = "debian-packages"
+[network.rules.debian-packages]
 allow = [
     "http:deb.debian.org",
     "http:security.debian.org",

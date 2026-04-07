@@ -1,11 +1,10 @@
-[[network.rules]]
-name = "codex"
+[network.rules.codex]
 allow = [
     "api.openai.com:443",
     "auth.openai.com:443",
 ]
 
-[[mounts]]
+[mounts.codex-dir]
 missing = "warn"
 source = "~/.codex"
 target = "~/.codex"

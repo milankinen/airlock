@@ -4,24 +4,30 @@ use super::target::NetworkTarget;
 use crate::config::config::Network;
 
 /// Resolve config rules into a flat list of network targets with
-/// compiled middleware attached.
+/// compiled middleware attached. Disabled rules/middleware are skipped.
 pub fn resolve(network: &Network, log: &LogFn) -> anyhow::Result<Vec<NetworkTarget>> {
     let mut targets = Vec::new();
 
-    for rule in &network.rules {
+    for (key, rule) in &network.rules {
+        if !rule.enabled {
+            continue;
+        }
         for allow in &rule.allow {
             let (http_only, host, port) = parse_target(allow);
             let port = port.and_then(|p| p.parse::<u16>().ok());
 
-            // Collect middleware scripts that match this host
+            // Collect enabled middleware scripts that match this host
             let mut middleware = Vec::new();
             for (mw_host, scripts) in &rule.middleware {
                 if mw_host == host || mw_host == "*" {
                     for (i, mw) in scripts.iter().enumerate() {
+                        if !mw.enabled {
+                            continue;
+                        }
                         let name = if scripts.len() == 1 {
-                            format!("{}:{}:{}", rule.name, host, mw_host)
+                            format!("{key}:{host}:{mw_host}")
                         } else {
-                            format!("{}:{}:{}[{i}]", rule.name, host, mw_host)
+                            format!("{key}:{host}:{mw_host}[{i}]")
                         };
                         middleware.push(http::middleware::compile(&name, &mw.script, log.clone())?);
                     }
@@ -43,7 +49,10 @@ pub fn resolve(network: &Network, log: &LogFn) -> anyhow::Result<Vec<NetworkTarg
 /// Derive localhost ports directly from config (no compilation needed).
 pub fn localhost_ports_from_config(network: &Network) -> Vec<u16> {
     let mut ports = Vec::new();
-    for rule in &network.rules {
+    for rule in network.rules.values() {
+        if !rule.enabled {
+            continue;
+        }
         for target in &rule.allow {
             let (_, host, port) = parse_target(target);
             if is_localhost(host)
@@ -63,12 +72,18 @@ pub fn localhost_ports_from_config(network: &Network) -> Vec<u16> {
 pub fn tls_passthrough_from_config(network: &Network) -> Vec<String> {
     let mut passthrough = Vec::new();
     let mut has_middleware = std::collections::HashSet::new();
-    for rule in &network.rules {
+    for rule in network.rules.values() {
+        if !rule.enabled {
+            continue;
+        }
         for host_pattern in rule.middleware.keys() {
             has_middleware.insert(host_pattern.clone());
         }
     }
-    for rule in &network.rules {
+    for rule in network.rules.values() {
+        if !rule.enabled {
+            continue;
+        }
         for target in &rule.allow {
             let (http_only, host, _) = parse_target(target);
             if !http_only

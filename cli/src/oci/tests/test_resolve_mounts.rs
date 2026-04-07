@@ -5,6 +5,7 @@ use crate::oci::{MountType, resolve_mounts};
 
 fn mount(source: &str, target: &str) -> Mount {
     Mount {
+        enabled: true,
         source: source.into(),
         target: target.into(),
         read_only: false,
@@ -14,6 +15,7 @@ fn mount(source: &str, target: &str) -> Mount {
 
 fn mount_with(source: &str, target: &str, missing: MissingAction) -> Mount {
     Mount {
+        enabled: true,
         source: source.into(),
         target: target.into(),
         read_only: false,
@@ -277,6 +279,7 @@ fn read_only_preserved() {
 
     let mounts = resolve_mounts(
         &[Mount {
+            enabled: true,
             source: src.to_string_lossy().into(),
             target: "/ro".into(),
             read_only: true,

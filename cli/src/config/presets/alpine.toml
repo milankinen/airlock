@@ -1,7 +1,6 @@
 # Alpine Linux apk package manager
 
-[[network.rules]]
-name = "alpine-packages"
+[network.rules.alpine-packages]
 allow = [
     "http:dl-cdn.alpinelinux.org",
     "http:*.alpinelinux.org",

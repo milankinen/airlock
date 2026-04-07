@@ -86,13 +86,7 @@ pub async fn start(
     cli::log!(
         "  {} cache:  {}",
         cli::bullet(),
-        cli::dim(
-            &project
-                .config
-                .cache
-                .as_ref()
-                .map_or_else(|| "none".to_string(), |c| c.size.to_string())
-        )
+        cli::dim(&project.config.disk.size.to_string())
     );
     for mount in &bundle.mounts {
         let Some((source, target)) = &mount.display else {

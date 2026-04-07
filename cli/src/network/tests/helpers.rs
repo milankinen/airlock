@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -138,7 +138,7 @@ where
 fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
     // Build rules from the test config. Middleware is attached to the
     // allow rule so it applies to matched targets.
-    let mut rules = vec![];
+    let mut rules = BTreeMap::new();
 
     // Build middleware map from scripts.
     // If no scripts and no explicit passthrough, add a no-op middleware
@@ -148,38 +148,46 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
             .middleware_scripts
             .iter()
             .map(|(_, script)| NetworkMiddleware {
+                enabled: true,
                 script: script.to_string(),
             })
             .collect();
-        HashMap::from([("*".to_string(), scripts)])
+        BTreeMap::from([("*".to_string(), scripts)])
     } else if cfg.tls_passthrough.is_empty() {
         // No-op middleware forces MITM (old test default behavior)
-        HashMap::from([(
+        BTreeMap::from([(
             "*".to_string(),
             vec![NetworkMiddleware {
+                enabled: true,
                 script: String::new(),
             }],
         )])
     } else {
-        HashMap::new()
+        BTreeMap::new()
     };
 
     // Main allow rule (with middleware if any)
     if !cfg.allowed_hosts.is_empty() {
-        rules.push(NetworkRule {
-            name: "test-allow".to_string(),
-            allow: cfg.allowed_hosts.clone(),
-            middleware,
-        });
+        rules.insert(
+            "test-allow".to_string(),
+            NetworkRule {
+                enabled: true,
+                allow: cfg.allowed_hosts.clone(),
+                middleware,
+            },
+        );
     }
 
     // Explicit TLS passthrough: add as allowed targets without middleware
     if !cfg.tls_passthrough.is_empty() {
-        rules.push(NetworkRule {
-            name: "test-passthrough".to_string(),
-            allow: cfg.tls_passthrough,
-            middleware: HashMap::new(),
-        });
+        rules.insert(
+            "test-passthrough".to_string(),
+            NetworkRule {
+                enabled: true,
+                allow: cfg.tls_passthrough,
+                middleware: BTreeMap::new(),
+            },
+        );
     }
 
     let config = config::Network { rules };

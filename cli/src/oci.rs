@@ -153,8 +153,15 @@ fn build_bundle(
     let image_rootfs = image_dir.join("rootfs");
     let container_home = lookup_home_dir(&image_rootfs, container_uid)?;
     let host_home = dirs::home_dir().unwrap_or_default();
+    let enabled_mounts: Vec<_> = project
+        .config
+        .mounts
+        .values()
+        .filter(|m| m.enabled)
+        .cloned()
+        .collect::<Vec<_>>();
     mounts.extend(resolve_mounts(
-        &project.config.mounts,
+        &enabled_mounts,
         &host_home,
         &container_home,
         &project.cwd,
@@ -163,7 +170,7 @@ fn build_bundle(
     // Disk image (ext4) for overlay upper + cache mounts
     let (disk_image, cache_targets) = cache::prepare(
         &project.cache_dir,
-        project.config.cache.as_ref(),
+        &project.config.disk,
         &container_home,
         &project.cwd,
     )?;

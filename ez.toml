@@ -1,9 +1,8 @@
 presets = ["debian", "claude-code"]
 image = "ez:dev"
 
-[network]
-# allowed_hosts = []
-
-[cache]
+[disk]
 size = "20 GB"
-mounts = ["target"]
+
+[disk.cache.target]
+path = "target"

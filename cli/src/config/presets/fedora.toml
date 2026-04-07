@@ -1,7 +1,6 @@
 # Fedora/RHEL/CentOS dnf/yum package manager
 
-[[network.rules]]
-name = "fedora-packages"
+[network.rules.fedora-packages]
 allow = [
     "http:mirrors.fedoraproject.org",
     "http:download.fedoraproject.org",

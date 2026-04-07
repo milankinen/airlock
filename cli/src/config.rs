@@ -4,6 +4,8 @@ pub(crate) mod presets;
 #[cfg(test)]
 mod tests;
 
+use std::collections::BTreeMap;
+
 use config::*;
 pub use load_config::load;
 pub use smart_config::ByteSize;
@@ -29,15 +31,16 @@ pub struct Config {
     pub network: Network,
     /// Mount points
     #[config(default)]
-    pub mounts: Vec<Mount>,
+    pub mounts: BTreeMap<String, Mount>,
     /// Cache volume (VirtIO block device with ext4)
     #[config(nest)]
-    pub cache: Option<Cache>,
+    pub disk: Disk,
 }
 
 #[allow(clippy::module_inception)]
 pub mod config {
     use std::cmp::{max, min};
+    use std::collections::BTreeMap;
 
     use smart_config::de::WellKnown;
     use smart_config::{DescribeConfig, DeserializeConfig};
@@ -74,7 +77,7 @@ pub mod config {
         /// optionally attaches per-target HTTP middleware. A connection is
         /// allowed if ANY rule allows it.
         #[config(default)]
-        pub rules: Vec<NetworkRule>,
+        pub rules: BTreeMap<String, NetworkRule>,
     }
 
     /// A named network rule with allowed targets and optional middleware.
@@ -90,8 +93,9 @@ pub mod config {
     /// inspect HTTP traffic.
     #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
     pub struct NetworkRule {
-        /// Rule name (for logging / error messages)
-        pub name: String,
+        /// Enable/disable rule
+        #[config(default_t = true)]
+        pub enabled: bool,
         /// Allowed target patterns: `host[:port]`
         #[config(default)]
         pub allow: Vec<String>,
@@ -99,7 +103,7 @@ pub mod config {
         /// value is list of scripts. If a host has middleware, TLS is
         /// intercepted.
         #[config(default)]
-        pub middleware: std::collections::HashMap<String, Vec<NetworkMiddleware>>,
+        pub middleware: BTreeMap<String, Vec<NetworkMiddleware>>,
     }
 
     impl WellKnown for NetworkRule {
@@ -110,6 +114,9 @@ pub mod config {
     /// HTTP middleware script applied to matching targets.
     #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
     pub struct NetworkMiddleware {
+        /// Enable/disable middleware
+        #[config(default_t = true)]
+        pub enabled: bool,
         /// Inline Lua script
         pub script: String,
     }
@@ -119,11 +126,15 @@ pub mod config {
         const DE: Self::Deserializer = de::nested();
     }
 
-    /// Mount point configuration — uses serde (not smart-config derive)
-    /// because it appears inside Vec<Mount>.
-    #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
+    /// Mount point configuration.
+    #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
     pub struct Mount {
+        /// Enable/disable mount
+        #[config(default_t = true)]
+        pub enabled: bool,
+        /// Source path in the host
         pub source: String,
+        /// Target path in the VM container
         pub target: String,
         #[config(default_t = false)]
         pub read_only: bool,
@@ -145,6 +156,27 @@ pub mod config {
         Create,
     }
 
+    /// VM disk image configuration — sparse raw disk with ext4
+    #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
+    pub struct Disk {
+        /// Disk image size (e.g. "20 GB", "512 MB"). Default 10 GB.
+        #[serde(serialize_with = "ser_byte_size")]
+        #[config(default_t = smart_config::ByteSize(10 * 1024 * 1024 * 1024))]
+        pub size: smart_config::ByteSize,
+        /// Container paths to bind-mount from the cache volume
+        #[config(default)]
+        pub cache: BTreeMap<String, CacheMount>,
+    }
+
+    #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
+    pub struct CacheMount {
+        /// Enable/disable mount
+        #[config(default_t = true)]
+        pub enabled: bool,
+        /// Path in the VM container
+        pub path: String,
+    }
+
     impl WellKnown for MissingAction {
         type Deserializer =
             smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
@@ -156,14 +188,8 @@ pub mod config {
         const DE: Self::Deserializer = de::nested();
     }
 
-    /// Cache volume configuration — sparse raw disk with ext4
-    #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
-    pub struct Cache {
-        /// Disk image size (e.g. "20 GB", "512 MB")
-        #[serde(serialize_with = "ser_byte_size")]
-        pub size: smart_config::ByteSize,
-        /// Container paths to bind-mount from the cache volume
-        #[config(default)]
-        pub mounts: Vec<String>,
+    impl WellKnown for CacheMount {
+        type Deserializer = de::Nested<CacheMount>;
+        const DE: Self::Deserializer = de::nested();
     }
 }

@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::cli;
-use crate::config::config::Cache;
+use crate::config::config::Disk;
 
 /// Default disk size (10 GB) — used for overlay upper + cache dirs.
 const DEFAULT_DISK_BYTES: u64 = 10 * 1024 * 1024 * 1024;
@@ -14,14 +14,18 @@ const DEFAULT_DISK_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 /// Returns (disk_image_path, cache_target_paths).
 pub fn prepare(
     cache_dir: &Path,
-    config: Option<&Cache>,
+    config: &Disk,
     container_home: &str,
     cwd: &Path,
 ) -> anyhow::Result<(PathBuf, Vec<String>)> {
     let image_path = cache_dir.join("disk.img");
 
-    let configured_bytes = config.map(|c| (c.size.0 + 511) & !511).filter(|&b| b > 0);
-    let bytes = configured_bytes.unwrap_or((DEFAULT_DISK_BYTES + 511) & !511);
+    let bytes = (config.size.0 + 511) & !511;
+    let bytes = if bytes > 0 {
+        bytes
+    } else {
+        (DEFAULT_DISK_BYTES + 511) & !511
+    };
 
     if image_path.exists() {
         let current_size = fs::metadata(&image_path)?.len();
@@ -51,12 +55,12 @@ pub fn prepare(
     }
 
     let container_home = PathBuf::from(container_home);
-    let empty = vec![];
     let cache_targets: Vec<String> = config
-        .map_or(&empty, |c| &c.mounts)
-        .iter()
-        .map(|path| {
-            let target = super::expand_tilde(path, &container_home);
+        .cache
+        .values()
+        .filter(|m| m.enabled)
+        .map(|m| {
+            let target = super::expand_tilde(&m.path, &container_home);
             let target = if target.is_relative() {
                 cwd.join(target)
             } else {

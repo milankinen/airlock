@@ -1,5 +1,4 @@
-[[network.rules]]
-name = "claude-code"
+[network.rules.claude-code]
 allow = [
     "claude.ai:443",
     "downloads.claude.ai:443",
@@ -7,12 +6,12 @@ allow = [
     "api.anthropic.com:443",
 ]
 
-[[mounts]]
+[mounts.claude-dir]
 missing = "warn"
 source = "~/.claude"
 target = "~/.claude"
 
-[[mounts]]
+[mounts.claude-json]
 missing = "warn"
 source = "~/.claude.json"
 target = "~/.claude.json"
