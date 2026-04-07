@@ -12,6 +12,7 @@ use futures::AsyncReadExt;
 
 use crate::rpc::{Process, ProcessEvent, Supervisor, build_exec_command};
 
+/// RAII guard that removes the Unix socket file when dropped.
 struct SockGuard(PathBuf);
 
 impl Drop for SockGuard {
@@ -20,6 +21,8 @@ impl Drop for SockGuard {
     }
 }
 
+/// Accept `ez exec` connections on a Unix socket and bridge each into the
+/// running VM supervisor via Cap'n Proto RPC.
 pub async fn serve(sock_path: PathBuf, supervisor: Supervisor) {
     let _ = tokio::fs::remove_file(&sock_path).await;
     let listener = match tokio::net::UnixListener::bind(&sock_path) {
@@ -45,6 +48,7 @@ pub async fn serve(sock_path: PathBuf, supervisor: Supervisor) {
     }
 }
 
+/// Set up a Cap'n Proto RPC system for a single `ez exec` client connection.
 fn handle_connection(stream: tokio::net::UnixStream, supervisor: Supervisor) {
     let (reader, writer) = tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
     let network = capnp_rpc::twoparty::VatNetwork::new(
@@ -58,8 +62,7 @@ fn handle_connection(stream: tokio::net::UnixStream, supervisor: Supervisor) {
     tokio::task::spawn_local(rpc);
 }
 
-// --- CliServiceImpl ---
-
+/// Implements the `CliService` Cap'n Proto interface exposed to `ez exec` clients.
 struct CliServiceImpl {
     supervisor: Supervisor,
 }
@@ -113,8 +116,8 @@ impl cli_service::Server for CliServiceImpl {
     }
 }
 
-// --- StdinBridge: relays supervisor stdin.read() calls to the exec client ---
-
+/// Bridges `Stdin.read()` calls from the vsock supervisor to the `ez exec`
+/// client's unix-socket stdin capability.
 struct StdinBridge {
     inner: stdin::Client,
 }
@@ -150,8 +153,8 @@ impl stdin::Server for StdinBridge {
     }
 }
 
-// --- ProcessBridge: relays exec client poll/signal calls to the vsock process ---
-
+/// Bridges `Process.poll()`/`signal()` calls from the `ez exec` client to
+/// the vsock-side process running inside the VM.
 struct ProcessBridge {
     inner: Process,
 }

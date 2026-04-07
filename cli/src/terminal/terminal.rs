@@ -1,5 +1,6 @@
 use crate::rpc;
 
+/// Detect whether stdin is a TTY and create a [`Terminal`] handle.
 pub fn setup() -> Terminal {
     let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
     Terminal {
@@ -8,12 +9,14 @@ pub fn setup() -> Terminal {
     }
 }
 
+/// Manages raw mode entry/exit and provides stdin/resize event sources.
 pub struct Terminal {
     is_tty: bool,
     guard: Option<TerminalGuard>,
 }
 
 impl Terminal {
+    /// Returns true if stdin is a terminal.
     pub fn is_tty(&self) -> bool {
         self.is_tty
     }
@@ -27,6 +30,7 @@ impl Terminal {
         }
     }
 
+    /// Create an RPC stdin server, optionally with resize events if TTY.
     pub fn stdin(&self) -> anyhow::Result<rpc::Stdin> {
         let (pty_size, resizes) = if self.is_tty {
             // crossterm::terminal::size() returns (cols, rows)
@@ -43,6 +47,7 @@ impl Terminal {
     }
 }
 
+/// RAII guard that restores the terminal to cooked mode on drop.
 struct TerminalGuard {
     raw_mode_enabled: bool,
 }

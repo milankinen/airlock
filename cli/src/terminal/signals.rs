@@ -1,3 +1,8 @@
+//! Merges multiple Unix signals into a single async stream.
+//!
+//! The signal numbers emitted are Linux signal numbers (not host numbers),
+//! because they are forwarded to the Linux VM process.
+
 use std::pin::Pin;
 
 use async_stream::stream;
@@ -13,6 +18,8 @@ const SIGTERM: i32 = 15;
 const SIGUSR1: i32 = 10;
 const SIGUSR2: i32 = 12;
 
+/// Create a stream that yields Linux signal numbers when the host receives
+/// SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, or SIGUSR2.
 pub fn signals() -> anyhow::Result<Pin<Box<dyn Stream<Item = i32>>>> {
     let mut sighup = signal(SignalKind::hangup())?;
     let mut sigint = signal(SignalKind::interrupt())?;

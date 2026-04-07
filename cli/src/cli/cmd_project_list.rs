@@ -1,5 +1,8 @@
+//! `ez project list` — list all known projects.
+
 use crate::{cli, project};
 
+/// Display row for a single project.
 struct Row {
     id: String,
     cwd: String,
@@ -8,6 +11,7 @@ struct Row {
     ago: Option<String>,
 }
 
+/// Print all projects with abbreviated IDs, paths, images, and status.
 pub fn run() -> i32 {
     let projects_dir = match crate::cache::cache_dir() {
         Ok(d) => d.join("projects"),

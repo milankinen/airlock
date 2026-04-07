@@ -1,3 +1,9 @@
+//! I/O primitives for bridging RPC byte streams with tokio async I/O.
+//!
+//! The network proxy needs to treat both real TCP sockets and Cap'n Proto
+//! RPC channels as `AsyncRead + AsyncWrite`. This module provides the
+//! adapters that make that possible.
+
 use std::cell::RefCell;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -8,8 +14,9 @@ use ezpez_protocol::supervisor_capnp::tcp_sink;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 
-/// Boxed read/write halves for type-erased streams.
+/// Boxed read half for type-erased async streams.
 pub type BoxRead = Box<dyn AsyncRead + Unpin>;
+/// Boxed write half for type-erased async streams.
 pub type BoxWrite = Box<dyn AsyncWrite + Unpin>;
 
 /// A connection endpoint with boxed read/write streams and h2 flag.
@@ -56,6 +63,8 @@ pub struct RpcTransport {
 }
 
 impl RpcTransport {
+    /// Create a transport with an optional prefix (pre-read bytes), an mpsc
+    /// receiver for incoming data, and an RPC sink for outgoing data.
     pub fn new(
         prefix: impl Into<Bytes>,
         rx: mpsc::Receiver<Bytes>,
@@ -134,6 +143,7 @@ pub struct ChannelSink {
 }
 
 impl ChannelSink {
+    /// Create a new sink with the given channel and shared error state.
     pub fn new(tx: mpsc::Sender<Bytes>, error: RelayError) -> Self {
         Self {
             tx: RefCell::new(Some(tx)),

@@ -1,3 +1,8 @@
+//! VM lifecycle: configure, boot, and connect to the in-VM supervisor.
+//!
+//! On macOS, uses the Apple Virtualization.framework. On Linux, uses
+//! cloud-hypervisor + virtiofsd.
+
 #[cfg(target_os = "macos")]
 mod apple;
 #[cfg(target_os = "linux")]
@@ -76,6 +81,8 @@ use crate::oci::Bundle;
 use crate::project::Project;
 use crate::vm::config::VmShare;
 
+/// Boot the VM with the given config and bundle. Returns a handle (for
+/// cleanup on drop) and the vsock fd connected to the in-VM supervisor.
 pub async fn start(
     args: &CliArgs,
     project: &Project,
@@ -332,6 +339,7 @@ pub fn link_file(
     Ok(())
 }
 
+/// Trait for VM backends. Dropping the handle kills the VM.
 #[allow(dead_code)]
 pub trait VmHandle {
     fn wait_for_stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>>;

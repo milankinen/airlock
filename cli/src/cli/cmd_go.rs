@@ -1,3 +1,8 @@
+//! `ez go` — boot the VM and run the container.
+//!
+//! Orchestrates the full lifecycle: load config → pull OCI image → set up
+//! network rules → boot VM → start supervisor RPC → relay I/O → clean up.
+
 use std::io::Write;
 
 use tokio::task::LocalSet;
@@ -7,6 +12,7 @@ use crate::cli::{self, CliArgs, LogLevel};
 use crate::project::{self, Project};
 use crate::{cli_server, config, network, oci, rpc, terminal, vm};
 
+/// Entry point for `ez go [--log-level <level>] [-- extra-args...]`.
 pub async fn run(log_level: LogLevel, extra_args: Vec<String>) -> i32 {
     #[cfg(target_os = "linux")]
     vm::require_kvm();

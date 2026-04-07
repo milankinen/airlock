@@ -1,11 +1,15 @@
+//! Platform-independent VM configuration structs.
+
 use std::path::PathBuf;
 
+/// A VirtioFS shared directory between host and guest.
 pub struct VmShare {
     pub tag: String,
     pub host_path: PathBuf,
     pub read_only: bool,
 }
 
+/// Full VM configuration, consumed by the platform-specific backend.
 #[allow(dead_code)]
 pub struct VmConfig {
     pub cpus: u32,

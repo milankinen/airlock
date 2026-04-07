@@ -1,3 +1,6 @@
+//! `NetworkProxy` RPC server implementation — the main entry point for all
+//! outbound connections from the guest VM.
+
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -66,6 +69,8 @@ impl network_proxy::Server for Network {
     }
 }
 
+/// Spawn a background task for a TCP connection: detect TLS, optionally
+/// intercept, apply middleware, and relay bytes bidirectionally.
 fn spawn_tcp_connection(
     host: &str,
     port: u16,
@@ -101,6 +106,8 @@ fn spawn_tcp_connection(
     capnp_rpc::new_client(io::ChannelSink::new(tx, error))
 }
 
+/// Spawn a background task for a Unix socket connection: connect to the
+/// host-side socket and relay bytes bidirectionally.
 fn spawn_socket_connection(path: &str, client_sink: tcp_sink::Client) -> tcp_sink::Client {
     let (tx, rx) = mpsc::channel::<Bytes>(1);
     let error: io::RelayError = Rc::new(RefCell::new(None));
@@ -143,6 +150,8 @@ fn spawn_socket_connection(path: &str, client_sink: tcp_sink::Client) -> tcp_sin
     capnp_rpc::new_client(io::ChannelSink::new(tx, error))
 }
 
+/// Main connection handler: detect TLS, decide on passthrough vs. intercept,
+/// detect HTTP, and route to the appropriate relay.
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     host: &str,

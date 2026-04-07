@@ -1,3 +1,9 @@
+//! Apple Virtualization.framework backend (macOS).
+//!
+//! Uses `VZVirtualMachine` on a serial dispatch queue. All VM method calls
+//! are dispatched to this queue, with oneshot channels bridging back to the
+//! async world.
+
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Mutex;
 
@@ -16,6 +22,7 @@ struct PipeEnds {
     write: OwnedFd,
 }
 
+/// Create a Unix pipe and return both ends as owned file descriptors.
 fn create_pipe() -> anyhow::Result<PipeEnds> {
     let mut fds = [0i32; 2];
     if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -27,6 +34,7 @@ fn create_pipe() -> anyhow::Result<PipeEnds> {
     })
 }
 
+/// macOS VM backend using the Apple Virtualization.framework.
 #[allow(dead_code)]
 pub struct AppleVmBackend {
     /// Raw pointer to the VM object. Only accessed on the dispatch queue.
@@ -45,6 +53,7 @@ pub struct AppleVmBackend {
 unsafe impl Send for AppleVmBackend {}
 
 impl AppleVmBackend {
+    /// Create a new VM (not yet started) with the given configuration.
     pub fn new(config: &VmConfig) -> anyhow::Result<Self> {
         let host_to_guest = create_pipe()?;
         let guest_to_host = create_pipe()?;
@@ -234,6 +243,7 @@ impl Drop for AppleVmBackend {
 }
 
 impl AppleVmBackend {
+    /// Boot the VM asynchronously via the dispatch queue.
     pub async fn start(&mut self) -> anyhow::Result<()> {
         info!("starting VM...");
 
@@ -317,6 +327,7 @@ impl AppleVmBackend {
         }
     }
 
+    /// Connect to a vsock port inside the VM, returning an owned fd.
     pub async fn vsock_connect(&self, port: u32) -> anyhow::Result<OwnedFd> {
         let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<i32, String>>();
         let tx = Mutex::new(Some(tx));

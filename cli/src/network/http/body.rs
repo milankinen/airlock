@@ -1,3 +1,9 @@
+//! Lua `Body` userdata for HTTP middleware scripts.
+//!
+//! Provides `text()`, `json()`, and `len()` accessors on HTTP bodies.
+//! Also implements `FromLua` so scripts can pass strings, tables, or
+//! Body objects wherever a body is expected.
+
 use bytes::Bytes;
 use mlua::{FromLua, Lua, LuaSerdeExt, UserData, UserDataMethods, Value};
 
@@ -6,6 +12,7 @@ use mlua::{FromLua, Lua, LuaSerdeExt, UserData, UserDataMethods, Value};
 pub struct Body(pub Bytes);
 
 impl Body {
+    /// Create an empty body.
     pub fn empty() -> Self {
         Self(Bytes::new())
     }

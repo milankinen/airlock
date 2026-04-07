@@ -1,3 +1,9 @@
+//! Built-in configuration presets embedded from `src/config/presets/*.toml`.
+//!
+//! Presets provide reusable base configurations (e.g. for specific runtimes
+//! or security profiles). Users reference them via `presets = ["name"]` in
+//! their `ez.toml`.
+
 use include_dir::{Dir, include_dir};
 
 static PRESETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/config/presets");

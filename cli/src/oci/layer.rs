@@ -1,3 +1,5 @@
+//! OCI image layer extraction with whiteout file handling.
+
 use std::path::Path;
 
 use flate2::read::GzDecoder;

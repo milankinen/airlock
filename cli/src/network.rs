@@ -1,3 +1,11 @@
+//! Network proxy layer — the host-side counterpart of the guest's transparent
+//! TCP proxy.
+//!
+//! When the guest process opens a TCP connection, the supervisor forwards it
+//! via RPC to this module. The host decides whether to allow the connection
+//! (based on config rules), whether to intercept TLS (for HTTP middleware),
+//! and how to relay traffic to the real server.
+
 mod http;
 mod io;
 mod matchers;
@@ -17,6 +25,9 @@ use std::sync::Arc;
 
 use crate::project::Project;
 
+/// Build the [`Network`] from the project config: load native CA roots,
+/// compile middleware scripts, resolve network targets, and prepare the
+/// TLS interceptor with the project's CA.
 pub fn setup(project: &Project, bundle: &crate::oci::Bundle) -> anyhow::Result<Network> {
     let mut root_store = rustls::RootCertStore::empty();
     for cert in rustls_native_certs::load_native_certs().expect("native certs") {
@@ -60,6 +71,7 @@ pub fn setup(project: &Project, bundle: &crate::oci::Bundle) -> anyhow::Result<N
     })
 }
 
+/// Expand `~` to the given home directory in a path string.
 fn expand_tilde(path: &str, home: &Path) -> PathBuf {
     if path == "~" {
         home.to_path_buf()
@@ -70,9 +82,12 @@ fn expand_tilde(path: &str, home: &Path) -> PathBuf {
     }
 }
 
+/// Host-side network proxy state, implementing the `NetworkProxy` RPC
+/// interface that the guest supervisor calls for every outbound connection.
 pub struct Network {
     tls_client: Arc<rustls::ClientConfig>,
     interceptor: Rc<tls::TlsInterceptor>,
     targets: Vec<target::NetworkTarget>,
+    /// Guest socket path → host socket path mapping for Unix socket forwarding.
     pub(super) socket_map: HashMap<String, PathBuf>,
 }

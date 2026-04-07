@@ -1,3 +1,5 @@
+//! Lua sandbox for HTTP middleware scripts.
+
 use mlua::{Lua, Value};
 
 /// Log sink for middleware scripts. Production uses tracing, tests can collect.
@@ -8,6 +10,8 @@ pub fn tracing_log() -> LogFn {
     std::rc::Rc::new(|msg| tracing::debug!(target: "ez::script", "{msg}"))
 }
 
+/// Strip dangerous globals and set an instruction-count limit so user
+/// scripts can't escape the sandbox or run forever.
 pub(super) fn sandbox(lua: &Lua) -> mlua::Result<()> {
     let globals = lua.globals();
     for name in ["os", "io", "debug", "loadfile", "dofile", "load", "require"] {

@@ -1,3 +1,11 @@
+//! Lua-based HTTP middleware: compile scripts, then run them in a chain
+//! around each proxied HTTP request.
+//!
+//! Each script receives a `req` userdata with fields like `method`, `path`,
+//! `headers` and methods like `body()`, `setBody()`, `send()`, `deny()`.
+//! Scripts can inspect and modify the request before forwarding, or
+//! inspect/modify the response after.
+
 use std::cell::RefCell;
 use std::future::Future;
 use std::pin::Pin;
@@ -17,6 +25,7 @@ type MiddlewareNext = Box<dyn FnOnce(hyper::http::request::Parts, RequestBody) -
 type NextFuture =
     Pin<Box<dyn Future<Output = mlua::Result<hyper::Response<Either<Incoming, Full<Bytes>>>>>>>;
 
+/// A compiled Lua middleware script, ready to be invoked per-request.
 #[derive(Clone)]
 pub struct CompiledMiddleware(Rc<Inner>);
 
@@ -26,6 +35,8 @@ struct Inner {
     func: Function,
 }
 
+/// Compile a Lua middleware script. The script is wrapped in a closure so
+/// `req` is a local parameter rather than a global, preventing races.
 pub fn compile(
     name: &str,
     script: &str,

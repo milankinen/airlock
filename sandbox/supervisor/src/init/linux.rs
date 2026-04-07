@@ -1,3 +1,10 @@
+//! Linux-specific guest VM initialization.
+//!
+//! This module runs once at supervisor startup to turn the raw VM into a
+//! usable container environment: set the clock, mount VirtioFS shares, format
+//! and mount the project disk, assemble the overlayfs rootfs, and configure
+//! iptables-based networking.
+
 use std::path::Path;
 use std::process::Command;
 
@@ -5,19 +12,24 @@ use tracing::{debug, error, info, warn};
 
 use super::InitConfig;
 
-/// Mount config read from /mnt/overlay/mounts.json (written by host).
+/// Describes how to assemble the container rootfs. Written by the host CLI
+/// as `/mnt/overlay/mounts.json` on the overlay VirtioFS share.
 #[derive(serde::Deserialize)]
 struct MountsConfig {
+    /// OCI image digest — used to detect image changes and reset the overlay
+    /// upper layer so stale whiteout files from a previous image don't leak.
     #[serde(default)]
     image_id: String,
     #[serde(default)]
     dirs: Vec<DirMount>,
     #[serde(default)]
     files: Vec<FileMount>,
+    /// Guest paths that should be backed by persistent disk storage.
     #[serde(default)]
     cache: Vec<String>,
 }
 
+/// A directory bind-mounted into the container rootfs via VirtioFS.
 #[derive(serde::Deserialize)]
 struct DirMount {
     tag: String,
@@ -25,12 +37,19 @@ struct DirMount {
     read_only: bool,
 }
 
+/// A single-file mount implemented as a symlink into a VirtioFS-backed
+/// directory, because VirtioFS doesn't support file-level bind mounts.
 #[derive(serde::Deserialize)]
 struct FileMount {
     target: String,
     read_only: bool,
 }
 
+/// Run all guest initialization steps in order.
+///
+/// The ordering matters: VirtioFS shares must be mounted before we can read
+/// the mount config, networking must be up before the proxy starts, and the
+/// project disk must be ready before the overlayfs rootfs is assembled.
 pub fn setup(config: &InitConfig) -> anyhow::Result<()> {
     set_clock(config.epoch);
 
@@ -199,6 +218,7 @@ fn reset_overlay_if_needed(image_id: &str) {
     }
 }
 
+/// Mount a VirtioFS share by its tag name at `/mnt/<tag>`.
 fn mount_virtiofs(tag: &str) -> anyhow::Result<()> {
     let mount_point = format!("/mnt/{tag}");
     std::fs::create_dir_all(&mount_point)?;
@@ -222,6 +242,7 @@ fn mount_virtiofs(tag: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Create a bind mount using the `mount(2)` syscall directly.
 fn bind_mount(src: &str, dst: &str, read_only: bool) -> anyhow::Result<()> {
     let src_cstr = std::ffi::CString::new(src).unwrap();
     let dst_cstr = std::ffi::CString::new(dst).unwrap();
@@ -246,6 +267,8 @@ fn bind_mount(src: &str, dst: &str, read_only: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Set the guest system clock from the host-provided epoch. VMs boot with an
+/// undefined clock, so without this TLS certificate validation would fail.
 fn set_clock(epoch: u64) {
     if epoch == 0 {
         return;
@@ -261,6 +284,12 @@ fn set_clock(epoch: u64) {
     }
 }
 
+/// Configure loopback networking and iptables rules.
+///
+/// All outbound TCP is redirected to port 15001 (the transparent proxy) via
+/// iptables NAT, except for localhost traffic on `host_ports` which gets its
+/// own explicit redirect rules so it can be intercepted before the generic
+/// localhost RETURN rule.
 fn setup_networking(host_ports: &[u16]) {
     run_quiet(&["/sbin/ip", "link", "set", "lo", "up"]);
 
@@ -397,6 +426,7 @@ fn setup_disk(cache_dirs: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Point the container's `/etc/resolv.conf` at the in-VM DNS server.
 fn setup_dns() -> anyhow::Result<()> {
     let dir = "/mnt/overlay/rootfs/etc";
     std::fs::create_dir_all(dir)?;
@@ -404,12 +434,14 @@ fn setup_dns() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Write a sysctl value, ignoring errors (best-effort).
 fn write_sysctl(path: &str, value: &str) {
     if let Err(e) = std::fs::write(path, value) {
         debug!("sysctl {path}={value} failed: {e}");
     }
 }
 
+/// Run a command, logging stderr on failure but otherwise silent.
 fn run_quiet(args: &[&str]) {
     let cmd_str = args.join(" ");
     match Command::new(args[0]).args(&args[1..]).output() {

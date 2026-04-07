@@ -1,3 +1,6 @@
+//! Docker-daemon image export: check if an image exists locally and extract
+//! it via `docker image save` without pulling from a registry.
+
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;

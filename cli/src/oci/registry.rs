@@ -1,3 +1,6 @@
+//! OCI registry client: resolve image manifests, pull layers, and verify
+//! downloads.
+
 use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -11,6 +14,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use super::OciConfig;
 
+/// A fully resolved registry image with manifest and config.
 pub struct RegistryImage {
     pub reference: Reference,
     pub digest: String,
@@ -18,6 +22,7 @@ pub struct RegistryImage {
     pub image_config: OciConfig,
 }
 
+/// Create an OCI registry client configured for HTTPS and Linux platform resolution.
 fn make_client() -> Client {
     Client::new(ClientConfig {
         protocol: ClientProtocol::Https,
@@ -26,6 +31,7 @@ fn make_client() -> Client {
     })
 }
 
+/// Select the `linux/<host-arch>` manifest from a multi-platform image index.
 fn linux_platform_resolver(manifests: &[oci_client::manifest::ImageIndexEntry]) -> Option<String> {
     let arch = match std::env::consts::ARCH {
         "x86_64" => "amd64",
@@ -42,6 +48,7 @@ fn linux_platform_resolver(manifests: &[oci_client::manifest::ImageIndexEntry]) 
     })
 }
 
+/// Resolve an image reference to a manifest, digest, and config.
 pub async fn resolve(image_ref: &str) -> anyhow::Result<RegistryImage> {
     let reference: Reference = image_ref.parse()?;
     let client = make_client();
@@ -59,6 +66,8 @@ pub async fn resolve(image_ref: &str) -> anyhow::Result<RegistryImage> {
     })
 }
 
+/// Download a single layer blob to disk with optional progress reporting.
+/// Uses a temp file + atomic rename to avoid partial downloads.
 pub async fn pull_layer(
     reference: &Reference,
     layer: &oci_client::manifest::OciDescriptor,

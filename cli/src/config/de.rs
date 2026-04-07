@@ -1,3 +1,10 @@
+//! Custom `smart-config` deserializer for nested config structs.
+//!
+//! `smart-config` doesn't natively support `BTreeMap<String, T>` where `T` is
+//! itself a config struct. This module provides a [`Nested`] deserializer that
+//! re-parses each map value through `smart-config`'s validation pipeline so
+//! defaults and error reporting work correctly for nested structures.
+
 use std::cell::Cell;
 use std::fmt::{Debug, Write};
 use std::marker::PhantomData;
@@ -8,6 +15,7 @@ use smart_config::de::{DeserializeContext, DeserializeParam};
 use smart_config::metadata::{BasicTypes, ParamMetadata};
 use smart_config::{DescribeConfig, DeserializeConfig, ErrorWithOrigin};
 
+// Tracks nesting depth for indented error formatting.
 thread_local! {
     static NEST_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
@@ -17,6 +25,8 @@ fn indent() -> String {
     "  ".repeat(depth)
 }
 
+/// Deserializer that parses a JSON object value as a full `smart-config`
+/// config struct, supporting defaults and validation at any nesting level.
 #[derive(Debug)]
 pub struct Nested<T>(PhantomData<T>);
 pub const fn nested<T>() -> Nested<T> {
@@ -63,6 +73,7 @@ where
     }
 }
 
+/// Format `smart-config` parse errors into a human-readable string.
 pub fn format_error(title: impl Into<String>, errors: smart_config::ParseErrors) -> String {
     let ind = indent();
     let mut msg = title.into();

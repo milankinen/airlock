@@ -1,3 +1,5 @@
+//! Sparse disk image management for the project's persistent overlay and cache.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -81,12 +83,14 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Create a new sparse file (allocates no disk blocks until written).
 fn create_sparse(path: &Path, size: u64) -> anyhow::Result<()> {
     let file = fs::File::create(path)?;
     file.set_len(size)?;
     Ok(())
 }
 
+/// Grow an existing sparse file to a larger size.
 fn grow_sparse(path: &Path, size: u64) -> anyhow::Result<()> {
     let file = fs::OpenOptions::new().write(true).open(path)?;
     file.set_len(size)?;

@@ -1,3 +1,9 @@
+//! OCI image resolution, download, extraction, and bundle preparation.
+//!
+//! Handles both Docker-daemon images and remote registry pulls, caches
+//! layers and rootfs locally, and generates the OCI runtime config.json
+//! and mounts.json that the supervisor uses to assemble the container.
+
 pub(crate) mod cache;
 pub(crate) mod config;
 mod docker;
@@ -15,6 +21,7 @@ use crate::cli::CliArgs;
 use crate::project::Project;
 use crate::terminal::Terminal;
 
+/// Everything needed to boot the VM: mount list, disk image, rootfs path.
 pub struct Bundle {
     /// Mounts with `~` expanded: source to host home, target to container home.
     pub mounts: Vec<ResolvedMount>,
@@ -26,6 +33,7 @@ pub struct Bundle {
     pub container_home: String,
 }
 
+/// A mount with host/guest paths fully expanded and validated.
 #[derive(Debug)]
 pub struct ResolvedMount {
     /// Source + target (with `~`) for display (only for config mounts)
@@ -39,6 +47,7 @@ pub struct ResolvedMount {
     pub read_only: bool,
 }
 
+/// Whether a mount is a directory (VirtioFS share) or a single file (symlink).
 #[derive(Debug)]
 pub enum MountType {
     Dir { key: String },
@@ -46,6 +55,7 @@ pub enum MountType {
 }
 
 impl ResolvedMount {
+    /// VirtioFS share tag or file overlay key used in the supervisor.
     pub fn key(&self) -> &str {
         match &self.mount_type {
             MountType::Dir { key } => key.as_str(),
@@ -53,6 +63,7 @@ impl ResolvedMount {
             MountType::File { filename: _ } => "files_rw",
         }
     }
+    /// Path inside the VM where this mount is located (before pivot_root).
     pub fn vm_path(&self) -> String {
         match &self.mount_type {
             MountType::Dir { key } => format!("/mnt/{key}"),
@@ -120,6 +131,8 @@ pub async fn prepare(
     )
 }
 
+/// Build the OCI bundle: resolve mounts, create disk, generate config.json
+/// and mounts.json for the supervisor.
 fn build_bundle(
     args: &CliArgs,
     project: &Project,
@@ -307,6 +320,7 @@ async fn resolve_image(image_ref: &str) -> anyhow::Result<ResolvedImage> {
     })
 }
 
+/// An image resolved to a concrete digest, ready to be downloaded.
 struct ResolvedImage {
     digest: String,
     config: OciConfig,
@@ -318,6 +332,8 @@ enum ImageSource {
     Registry(Box<registry::RegistryImage>),
 }
 
+/// Ensure the image is fully downloaded and extracted in the cache.
+/// Re-downloads if the extraction was incomplete.
 async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBuf> {
     let dir = crate::cache::image_dir(&resolved.digest)?;
     let rootfs = dir.join("rootfs");
@@ -513,6 +529,8 @@ fn lookup_home_dir(rootfs: &Path, uid: u32) -> anyhow::Result<String> {
     anyhow::bail!("no home directory found for uid {uid} in container /etc/passwd")
 }
 
+/// Expand `~` in mount paths, handle missing sources, and classify as
+/// dir or file mounts.
 pub(crate) fn resolve_mounts(
     mounts: &[crate::config::config::Mount],
     host_home: &Path,

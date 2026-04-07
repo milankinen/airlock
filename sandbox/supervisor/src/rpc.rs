@@ -1,3 +1,10 @@
+//! Cap'n Proto RPC server for the supervisor.
+//!
+//! Implements the `Supervisor` interface: the host CLI calls `start()` once to
+//! bootstrap the VM and launch the main process, and may later call `exec()`
+//! to attach sidecar processes. The `shutdown()` call syncs filesystems before
+//! the VM is destroyed.
+
 use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
 use std::rc::Rc;
 
@@ -8,11 +15,13 @@ use futures::AsyncReadExt;
 use crate::init::InitConfig;
 use crate::process::{SpawnedProcess, spawn};
 
+/// Unix socket forwarding pair: host-side path and guest-side path.
 pub struct SocketForwardConfig {
     pub host: String,
     pub guest: String,
 }
 
+/// Everything the host sends in the initial `Supervisor.start()` call.
 pub struct HostConnection {
     pub proc: HostProcess,
     pub network: network_proxy::Client,
@@ -22,14 +31,16 @@ pub struct HostConnection {
     pub sockets: Vec<SocketForwardConfig>,
 }
 
+/// Host-side handles for a single process's I/O.
 pub struct HostProcess {
     pub stdin: stdin::Client,
     pub pty_size: Option<(u16, u16)>,
-    /// Send Ok(process) on success, or Err(message) on init failure.
-    /// Taken by the startup code — None after process is spawned.
+    /// Oneshot to deliver the `Process` capability back to the host once the
+    /// child is spawned. Taken by the startup code — `None` after consumption.
     pub result: Option<tokio::sync::oneshot::Sender<Result<process::Client, String>>>,
 }
-// init_config, cmd, args, log_sink, log_filter, pty_size, network, sockets
+/// Accept the RPC connection, run the init callback, and block until the
+/// main process exits. Returns the process exit code.
 pub async fn start<
     Init: AsyncFn(
         InitConfig,
@@ -88,6 +99,10 @@ pub async fn start<
 
 type ConnPayload = (log_sink::Client, String, HostConnection);
 
+/// Server-side implementation of the `Supervisor` Cap'n Proto interface.
+///
+/// The oneshot is consumed by `start()` and set to `None` — subsequent calls
+/// are rejected because the VM only supports a single init sequence.
 struct SupervisorImpl(std::cell::RefCell<Option<tokio::sync::oneshot::Sender<ConnPayload>>>);
 
 impl supervisor::Server for SupervisorImpl {

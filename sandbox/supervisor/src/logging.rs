@@ -1,3 +1,10 @@
+//! Forwards `tracing` log events from the guest to the host CLI over RPC.
+//!
+//! The guest has no direct access to stderr or a log file. Instead, a custom
+//! `tracing` layer serialises every event into a `(level, message)` pair and
+//! sends it through the Cap'n Proto `LogSink` interface so the host can
+//! display or filter it.
+
 use std::fmt::Write;
 
 use ezpez_protocol::supervisor_capnp::log_sink;
@@ -6,6 +13,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
+/// Install the global tracing subscriber that forwards events to the host.
 pub fn init(log_sink: log_sink::Client, log_filter: &str) {
     let (tx, rx) = mpsc::unbounded_channel::<(u8, String)>();
     let filter = EnvFilter::new(log_filter);
@@ -16,6 +24,7 @@ pub fn init(log_sink: log_sink::Client, log_filter: &str) {
     tokio::task::spawn_local(forward(log_sink, rx));
 }
 
+/// Drain the channel and send each event to the host via RPC streaming.
 async fn forward(log_sink: log_sink::Client, mut rx: mpsc::UnboundedReceiver<(u8, String)>) {
     while let Some((level, msg)) = rx.recv().await {
         let mut req = log_sink.log_request();
@@ -25,6 +34,7 @@ async fn forward(log_sink: log_sink::Client, mut rx: mpsc::UnboundedReceiver<(u8
     }
 }
 
+/// Tracing layer that enqueues log events to send over RPC.
 struct RpcLayer {
     tx: mpsc::UnboundedSender<(u8, String)>,
 }
@@ -48,6 +58,7 @@ impl<S: tracing::Subscriber> Layer<S> for RpcLayer {
     }
 }
 
+/// Collects tracing event fields into a single log message string.
 struct MsgVisitor(String);
 
 impl tracing::field::Visit for MsgVisitor {

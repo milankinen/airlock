@@ -1,21 +1,27 @@
+//! Host-side wrapper around a guest `Process` RPC capability.
+
 use ezpez_protocol::supervisor_capnp::*;
 
+/// A decoded output event from a guest process.
 pub enum ProcessEvent {
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
     Exit(i32),
 }
 
+/// Typed wrapper around the Cap'n Proto `Process` client capability.
 #[derive(Clone)]
 pub struct Process {
     proc: process::Client,
 }
 
 impl Process {
+    /// Wrap a raw Cap'n Proto process client.
     pub fn new(proc: process::Client) -> Self {
         Self { proc }
     }
 
+    /// Send a Unix signal to the guest process.
     pub async fn signal(&self, signum: i32) -> anyhow::Result<()> {
         let mut req = self.proc.signal_request();
         req.get().set_signum(signum);
@@ -23,6 +29,7 @@ impl Process {
         Ok(())
     }
 
+    /// Poll for the next output event (stdout chunk, stderr chunk, or exit).
     pub async fn poll(&self) -> anyhow::Result<ProcessEvent> {
         let response = self.proc.poll_request().send().promise.await?;
         let next = response.get()?.get_next()?;

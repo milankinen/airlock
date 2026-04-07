@@ -1,3 +1,8 @@
+//! Hierarchical TOML configuration with preset support.
+//!
+//! Configuration is loaded from up to four files (global, home, project,
+//! local), merged with deep-merge semantics, and validated by `smart-config`.
+
 mod de;
 pub(crate) mod load_config;
 pub(crate) mod presets;
@@ -50,10 +55,12 @@ pub mod config {
 
     use crate::config::de;
 
+    /// Default to all available host CPUs.
     pub fn default_cpus() -> u32 {
         std::thread::available_parallelism().map_or(2, |n| n.get() as u32)
     }
 
+    /// Default to half of total system RAM, clamped to [512 MB, total].
     pub fn default_memory() -> smart_config::ByteSize {
         use sysinfo::System;
         let sys_bytes = System::new_with_specifics(

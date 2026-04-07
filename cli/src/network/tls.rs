@@ -1,3 +1,9 @@
+//! TLS interception (MITM) for HTTP middleware.
+//!
+//! When a target has middleware attached, the proxy terminates the container's
+//! TLS, inspects/modifies HTTP traffic, then re-encrypts to the real server.
+//! Per-hostname leaf certificates are generated on demand and cached.
+
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -77,6 +83,7 @@ pub struct TlsInterceptor {
 }
 
 impl TlsInterceptor {
+    /// Create an interceptor from the project CA certificate and private key.
     pub fn new(ca_cert_pem: &str, ca_key_pem: &str) -> anyhow::Result<Self> {
         let ca_key = KeyPair::from_pem(ca_key_pem)?;
         let issuer = Issuer::from_ca_cert_pem(ca_cert_pem, ca_key)?;
@@ -104,6 +111,8 @@ impl TlsInterceptor {
         Ok((tls_stream, alpn))
     }
 
+    /// Get or generate a TLS server config with a leaf cert for `hostname`,
+    /// signed by the project CA.
     fn get_or_create_config(&self, hostname: &str) -> anyhow::Result<Arc<ServerConfig>> {
         if let Some(config) = self.cache.get(hostname) {
             return Ok(config);

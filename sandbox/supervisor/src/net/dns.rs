@@ -1,3 +1,10 @@
+//! Virtual DNS server that assigns deterministic fake IPs to hostnames.
+//!
+//! The guest has no real DNS resolver. When a process inside the container
+//! resolves a hostname, this server assigns it a unique IP from the `10.2.0.0/16`
+//! range. The transparent proxy later reverse-maps that IP back to the original
+//! hostname before forwarding the connection to the host.
+
 use std::cell::Cell;
 use std::io::Cursor;
 use std::net::Ipv4Addr;
@@ -11,6 +18,7 @@ use tracing::{debug, warn};
 const LISTEN_ADDR: &str = "10.0.0.1:53";
 const IP_BASE: u32 = 0x0A020001; // 10.2.0.1
 
+/// Bidirectional hostname ↔ IP mapping, assigning IPs sequentially.
 pub struct DnsState {
     host_to_ip: HashMap<String, Ipv4Addr>,
     ip_to_host: HashMap<Ipv4Addr, String>,
@@ -18,6 +26,7 @@ pub struct DnsState {
 }
 
 impl DnsState {
+    /// Create a new empty DNS state starting IP allocation from `10.2.0.1`.
     pub fn new() -> Self {
         Self {
             host_to_ip: HashMap::new(),
@@ -26,6 +35,7 @@ impl DnsState {
         }
     }
 
+    /// Return the IP for `hostname`, allocating a new one if first seen.
     pub fn allocate(&self, hostname: &str) -> Ipv4Addr {
         if hostname == "localhost" {
             return Ipv4Addr::LOCALHOST;
@@ -41,11 +51,13 @@ impl DnsState {
         ip
     }
 
+    /// Reverse-lookup: map a virtual IP back to its hostname.
     pub fn reverse(&self, ip: Ipv4Addr) -> Option<String> {
         self.ip_to_host.get(&ip).map(|e| e.get().clone())
     }
 }
 
+/// Spawn the DNS UDP server as a local task.
 pub fn start(state: Rc<DnsState>) {
     tokio::task::spawn_local(async move {
         if let Err(e) = serve(state).await {

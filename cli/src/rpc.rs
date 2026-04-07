@@ -1,3 +1,5 @@
+//! Host-side Cap'n Proto RPC types for communicating with the in-VM supervisor.
+
 mod logging;
 mod process;
 mod stdin;

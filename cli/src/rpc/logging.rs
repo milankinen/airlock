@@ -1,7 +1,12 @@
+//! Receives log events from the in-VM supervisor and re-emits them through
+//! the host's `tracing` subscriber under the `ez::ezd` target.
+
 use std::rc::Rc;
 
 use ezpez_protocol::supervisor_capnp::log_sink;
 
+/// Cap'n Proto `LogSink` server that bridges guest log events into the host
+/// tracing system.
 pub struct LogSinkImpl;
 
 impl log_sink::Server for LogSinkImpl {

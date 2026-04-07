@@ -1,3 +1,10 @@
+//! Transparent TCP proxy running inside the guest VM.
+//!
+//! All outbound TCP from the guest is iptables-redirected to port 15001. This
+//! proxy accepts those connections, recovers the original destination via
+//! `SO_ORIGINAL_DST`, reverse-maps the virtual IP to a hostname through the
+//! DNS state, and forwards the connection to the host CLI via RPC.
+
 use std::cell::RefCell;
 use std::net::Ipv4Addr;
 use std::rc::Rc;
@@ -12,6 +19,7 @@ use super::dns::DnsState;
 
 const PROXY_PORT: u16 = 15001;
 
+/// Spawn the transparent TCP proxy as a local task.
 pub fn start_proxy(network: network_proxy::Client, dns: Rc<DnsState>) {
     info!("start network proxy");
     tokio::task::spawn_local(async move {
@@ -89,6 +97,7 @@ async fn handle_connection(
     Ok(())
 }
 
+/// Bidirectional byte relay between a local TCP stream and a remote RPC sink.
 async fn relay(
     local_read: &mut (impl AsyncReadExt + Unpin),
     local_write: &mut (impl AsyncWriteExt + Unpin),
@@ -128,8 +137,9 @@ async fn relay(
     let _ = local_write.shutdown().await;
 }
 
-// -- ChannelSink: bridges RPC push into an mpsc channel --
-
+/// Bridges RPC `TcpSink.send()` push calls into a tokio mpsc channel.
+///
+/// Shared between the TCP proxy and socket forwarding modules.
 pub(crate) struct ChannelSink(pub RefCell<Option<tokio::sync::mpsc::Sender<Bytes>>>);
 
 impl tcp_sink::Server for ChannelSink {
@@ -155,10 +165,10 @@ impl tcp_sink::Server for ChannelSink {
     }
 }
 
-// -- SO_ORIGINAL_DST --
-
 const SO_ORIGINAL_DST: libc::c_int = 80;
 
+/// Recover the original destination address from an iptables-redirected socket
+/// via the `SO_ORIGINAL_DST` socket option.
 #[allow(clippy::ptr_as_ptr, clippy::borrow_as_ptr, clippy::ref_as_ptr)]
 fn get_original_dst(stream: &tokio::net::TcpStream) -> anyhow::Result<(String, u16)> {
     use std::os::unix::io::AsRawFd;

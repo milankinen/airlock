@@ -1,5 +1,12 @@
+//! Embedded VM assets (kernel, initramfs, hypervisor binaries).
+//!
+//! These files are compiled into the `ez` binary via `include_bytes!`. On
+//! first run (or after a build changes the checksum), they are extracted to
+//! `~/.ezpez/kernel/` so the hypervisor can memory-map them.
+
 use std::path::PathBuf;
 
+/// Paths to the extracted VM boot assets.
 pub struct Assets {
     pub kernel: PathBuf,
     pub initramfs: PathBuf,
@@ -10,6 +17,7 @@ pub struct Assets {
 }
 
 impl Assets {
+    /// Extract embedded assets to the cache directory if the checksum changed.
     #[cfg(not(test))]
     pub fn init() -> anyhow::Result<Assets> {
         const CHECKSUM: &str = env!("EZPEZ_ASSETS_CHECKSUM");

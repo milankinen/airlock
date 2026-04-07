@@ -19,6 +19,7 @@ use tokio::sync::watch;
 
 // -- CLI argument parsing --
 
+/// Top-level CLI definition. Clap derives argument parsing from this struct.
 #[derive(Parser)]
 #[command(
     name = "ez",
@@ -107,8 +108,8 @@ pub enum ProjectCommand {
     },
 }
 
-/// Runtime args passed to the go command implementation.
-/// NOT a clap struct — constructed from parsed args.
+/// Runtime arguments for the `go` command. Constructed from parsed CLI args
+/// plus any extra arguments that appeared after `--`.
 pub struct CliArgs {
     pub log_level: LogLevel,
     pub args: Vec<String>,
@@ -123,6 +124,7 @@ impl CliArgs {
     }
 }
 
+/// Supervisor log verbosity level, mapped to `tracing` filter strings.
 #[derive(ValueEnum, Debug, Clone, Copy)]
 pub enum LogLevel {
     Trace,
@@ -215,6 +217,7 @@ pub fn initialize(global: &GlobalArgs) {
     });
 }
 
+/// Returns true if `--quiet` was passed.
 pub fn is_silent() -> bool {
     SILENT.load(Ordering::Relaxed)
 }
@@ -282,6 +285,7 @@ pub fn spinner(msg: &str) -> ProgressBar {
 }
 
 impl CliArgs {
+    /// Map the user-facing log level to a `tracing` filter directive.
     pub fn log_filter(&self) -> &str {
         match self.log_level {
             LogLevel::Trace => "info,ez=trace,ezpez_supervisor=trace",

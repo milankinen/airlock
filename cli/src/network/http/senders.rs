@@ -1,3 +1,6 @@
+//! Trait abstraction over hyper's HTTP/1.1 and HTTP/2 client senders so
+//! the middleware layer doesn't need to know which protocol is in use.
+
 use std::cell::RefCell;
 use std::pin::Pin;
 
@@ -6,7 +9,7 @@ use hyper::{Request, Response};
 
 use crate::network::http::ResponseBody;
 
-/// Abstraction over h1/h2 client senders.
+/// Send an HTTP request over either h1 or h2.
 pub trait RequestSender {
     fn send(
         &self,
@@ -14,6 +17,7 @@ pub trait RequestSender {
     ) -> Pin<Box<dyn Future<Output = Result<Response<Incoming>, hyper::Error>>>>;
 }
 
+/// HTTP/1.1 sender wrapper. Uses `RefCell` because h1 `SendRequest` requires `&mut`.
 pub struct H1Sender(pub RefCell<hyper::client::conn::http1::SendRequest<ResponseBody>>);
 impl RequestSender for H1Sender {
     fn send(
@@ -24,6 +28,7 @@ impl RequestSender for H1Sender {
     }
 }
 
+/// HTTP/2 sender wrapper. h2 `SendRequest` is clone-friendly, no `RefCell` needed.
 pub struct H2Sender(pub hyper::client::conn::http2::SendRequest<ResponseBody>);
 impl RequestSender for H2Sender {
     fn send(

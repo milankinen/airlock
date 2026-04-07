@@ -1,3 +1,6 @@
+//! Host-side stdin RPC server that reads from the real terminal and delivers
+//! data (or resize events) to the guest supervisor on demand.
+
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -5,6 +8,9 @@ use ezpez_protocol::supervisor_capnp::*;
 use tokio::io::AsyncReadExt;
 use tokio::signal::unix::Signal;
 
+/// Implements the Cap'n Proto `Stdin` interface by reading from the host
+/// terminal. When the terminal is a TTY, it also watches for `SIGWINCH`
+/// to deliver resize events.
 pub struct Stdin {
     reader: RefCell<tokio::io::Stdin>,
     resizes: RefCell<Option<Signal>>,
@@ -12,6 +18,7 @@ pub struct Stdin {
 }
 
 impl Stdin {
+    /// Create a new stdin server.
     pub fn new(
         reader: tokio::io::Stdin,
         pty_size: Option<(u16, u16)>,
@@ -24,6 +31,7 @@ impl Stdin {
         }
     }
 
+    /// Initial terminal size, if running in interactive (PTY) mode.
     pub fn pty_size(&self) -> Option<(u16, u16)> {
         self.pty_size
     }

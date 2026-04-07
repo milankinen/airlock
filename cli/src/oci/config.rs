@@ -1,3 +1,9 @@
+//! OCI runtime spec (`config.json`) generation.
+//!
+//! Builds the crun runtime configuration from the image config, user mounts,
+//! and project settings. The VM is the security boundary, so all Linux
+//! capabilities are granted inside the container.
+
 use std::path::Path;
 
 use super::{OciConfig, ResolvedMount};
@@ -208,6 +214,7 @@ pub fn generate_config(
     Ok(())
 }
 
+/// Parse a `USER` string (`uid[:gid]`) into numeric uid/gid.
 fn parse_user(user: &str) -> (u32, u32) {
     let parts: Vec<&str> = user.split(':').collect();
     let uid = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);

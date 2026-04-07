@@ -1,3 +1,8 @@
+//! Host-side RPC client for the in-VM supervisor.
+//!
+//! [`Supervisor`] connects over virtio-vsock and exposes typed methods for
+//! starting and exec'ing processes, plus a shutdown call for filesystem sync.
+
 use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
 
 use ezpez_protocol::supervisor_capnp::*;
@@ -64,12 +69,14 @@ use crate::rpc::logging::LogSinkImpl;
 use crate::rpc::process::Process;
 use crate::rpc::stdin::Stdin;
 
+/// Host-side handle to the in-VM supervisor, wrapping the Cap'n Proto client.
 #[derive(Clone)]
 pub struct Supervisor {
     supervisor: supervisor::Client,
 }
 
 impl Supervisor {
+    /// Establish an RPC connection to the supervisor over the given vsock fd.
     pub fn connect(vsock_fd: OwnedFd) -> anyhow::Result<Self> {
         use futures::AsyncReadExt;
 
@@ -103,6 +110,9 @@ impl Supervisor {
         Ok(Self { supervisor: client })
     }
 
+    /// Send the initial `Supervisor.start()` RPC to bootstrap the VM and
+    /// launch the main container process. Returns a [`Process`] handle for
+    /// polling output and forwarding signals.
     pub async fn start(
         &self,
         args: &CliArgs,
@@ -199,6 +209,7 @@ impl Supervisor {
         Ok(Process::new(response.get()?.get_proc()?))
     }
 
+    /// Request the supervisor to sync filesystems before the VM is destroyed.
     pub async fn shutdown(&self) {
         let req = self.supervisor.shutdown_request();
         if let Err(e) = req.send().promise.await {

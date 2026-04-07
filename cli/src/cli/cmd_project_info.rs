@@ -1,5 +1,8 @@
+//! `ez project info` — display project details.
+
 use crate::{cli, project};
 
+/// Print project metadata (ID, path, status, image, config) to stdout.
 pub fn run(path: Option<&str>) -> i32 {
     let project = match project::load(path) {
         Ok(p) => p,

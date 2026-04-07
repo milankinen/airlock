@@ -1,3 +1,10 @@
+//! Unix socket forwarding from guest to host.
+//!
+//! For each configured socket pair, a Unix listener is created inside the VM.
+//! When a guest process connects, the connection is relayed to the host via
+//! the `NetworkProxy` RPC interface, which connects to the corresponding
+//! host-side Unix socket (e.g. a Docker socket or SSH agent).
+
 use std::cell::RefCell;
 use std::path::Path;
 
@@ -10,6 +17,7 @@ use tracing::{debug, error, info};
 use super::proxy::ChannelSink;
 use crate::rpc::SocketForwardConfig;
 
+/// Spawn a listener for each configured socket forward.
 pub fn start(network: &network_proxy::Client, sockets: Vec<SocketForwardConfig>) {
     for sock in sockets {
         let network = network.clone();

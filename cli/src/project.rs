@@ -1,3 +1,9 @@
+//! Project identity, locking, and metadata.
+//!
+//! Each host directory that runs `ez go` gets a deterministic project hash
+//! derived from its absolute path. The per-project cache directory stores
+//! the CA keypair, lock file, overlay state, and run metadata.
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -6,25 +12,30 @@ use sha2::{Digest, Sha256};
 
 use crate::config::Config;
 
+/// A resolved project: its working directory, cache paths, config, and CA.
 pub struct Project {
     pub cache_dir: PathBuf,
     pub cwd: PathBuf,
     pub config: Config,
     pub ca_cert: PathBuf,
     pub ca_key: PathBuf,
+    /// True if the CA keypair was generated during this session (first run).
     pub ca_newly_generated: bool,
     lock_path: Option<PathBuf>,
 }
 
 impl Project {
+    /// The project's hash ID (directory name under `~/.ezpez/projects/`).
     pub fn id(&self) -> String {
         project_id(&self.cache_dir)
     }
 
+    /// Check if this project has an active `ez go` process via its PID lock.
     pub fn is_running(&self) -> bool {
         is_running(&self.cache_dir)
     }
 
+    /// Human-readable time since the last `ez go` run (e.g. "2 hours ago").
     pub fn last_run_ago(&self) -> Option<String> {
         last_run_ago(&self.cache_dir)
     }
@@ -231,6 +242,8 @@ fn save_meta(project_dir: &Path, image: &str) {
     let _ = std::fs::write(project_dir.join("last_run"), epoch.to_string());
 }
 
+/// Atomic PID lock acquisition via write-then-verify. Retries up to 10
+/// times to handle concurrent launch races.
 fn acquire_lock(lock_path: &Path) -> anyhow::Result<()> {
     let my_pid = std::process::id().to_string();
     let mut attempts = 0;
@@ -263,6 +276,7 @@ fn acquire_lock(lock_path: &Path) -> anyhow::Result<()> {
     Err(anyhow::anyhow!("failed to obtain project lock"))
 }
 
+/// Generate a self-signed CA certificate used for MITM TLS interception.
 fn generate_ca(cert_path: &Path, key_path: &Path) -> anyhow::Result<()> {
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 

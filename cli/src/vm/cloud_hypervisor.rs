@@ -1,3 +1,9 @@
+//! Cloud Hypervisor + virtiofsd backend (Linux).
+//!
+//! Spawns a virtiofsd instance per VirtioFS share, then launches
+//! cloud-hypervisor with vsock support. Vsock connections use a
+//! `CONNECT <port>` handshake over the unix socket.
+
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::io::OwnedFd;
 use std::os::unix::net::UnixStream;
@@ -8,6 +14,7 @@ use tracing::debug;
 
 use super::config::VmConfig;
 
+/// Linux VM backend using cloud-hypervisor and virtiofsd.
 pub struct CloudHypervisorBackend {
     ch_child: Option<Child>,
     virtiofsd_children: Vec<Child>,
@@ -16,6 +23,7 @@ pub struct CloudHypervisorBackend {
 }
 
 impl CloudHypervisorBackend {
+    /// Launch virtiofsd instances and cloud-hypervisor, then wait for sockets.
     pub fn start(config: &VmConfig) -> anyhow::Result<Self> {
         let runtime_dir = &config.runtime_dir;
         let vsock_socket_path = runtime_dir.join("vsock.sock");
@@ -129,6 +137,8 @@ impl CloudHypervisorBackend {
         })
     }
 
+    /// Connect to the in-VM supervisor via the cloud-hypervisor vsock socket.
+    /// Performs the `CONNECT <port>` handshake that cloud-hypervisor expects.
     pub fn vsock_connect(&self) -> anyhow::Result<OwnedFd> {
         let port = ezpez_protocol::SUPERVISOR_PORT;
         let mut stream = UnixStream::connect(&self.vsock_socket_path).map_err(|e| {

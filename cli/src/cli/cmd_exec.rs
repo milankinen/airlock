@@ -1,3 +1,9 @@
+//! `ez exec` — attach a process to a running VM container.
+//!
+//! Connects to the `cli.sock` Unix socket exposed by a running `ez go` session
+//! and sends a `CliService.exec()` RPC to spawn a new process inside the
+//! container. I/O is bridged between the host terminal and the guest process.
+
 use std::io::Write;
 
 use ezpez_protocol::supervisor_capnp::*;
@@ -6,6 +12,7 @@ use tokio::task::LocalSet;
 
 use crate::{cli, project, rpc, terminal};
 
+/// Entry point for `ez exec <cmd> [args...]`.
 pub async fn run(cmd: String, args: Vec<String>, cwd: Option<String>, env: Vec<String>) -> i32 {
     let local = LocalSet::new();
     local

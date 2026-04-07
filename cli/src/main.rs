@@ -1,3 +1,5 @@
+//! `ez` — host-side CLI for the ezpez VM sandbox.
+
 mod assets;
 mod cache;
 pub(crate) mod cli;

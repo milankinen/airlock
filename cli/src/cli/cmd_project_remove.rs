@@ -1,7 +1,10 @@
+//! `ez project remove` — delete a project's cached data.
+
 use std::io::Write;
 
 use crate::{cli, project};
 
+/// Remove the project cache directory after confirmation (unless `--yes`).
 pub fn run(path: Option<&str>, yes: bool) -> i32 {
     let project = match project::load(path) {
         Ok(p) => p,

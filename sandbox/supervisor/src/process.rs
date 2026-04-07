@@ -1,3 +1,9 @@
+//! Child process management inside the guest VM.
+//!
+//! Handles both PTY-based (interactive) and pipe-based (non-interactive)
+//! processes. Each spawned process is later attached to a [`HostProcess`]
+//! which bridges its I/O back to the host CLI via RPC.
+
 use std::cell::RefCell;
 use std::fmt::Display;
 use std::rc::Rc;
@@ -9,11 +15,17 @@ use tracing::{error, trace};
 
 use crate::rpc::HostProcess;
 
+/// A child process that has been spawned but not yet wired to host I/O.
 pub struct SpawnedProcess {
     child: tokio::process::Child,
     pty: Option<pty_process::Pty>,
 }
 
+/// Spawn a child process, optionally allocating a PTY.
+///
+/// When `pty_size` is `Some`, a PTY is opened and sized before spawning so
+/// the child sees correct terminal dimensions from the start. Otherwise the
+/// child gets plain stdin/stdout/stderr pipes.
 pub fn spawn(
     cmd: &str,
     args: &[&str],
@@ -46,6 +58,8 @@ pub fn spawn(
 }
 
 impl SpawnedProcess {
+    /// Wire this process's I/O to the host and block until it exits.
+    /// Returns the process exit code.
     pub async fn attach(self, host: HostProcess) -> i32 {
         match self.pty {
             Some(pty) => attach_pty(self.child, pty, host).await,
@@ -54,6 +68,11 @@ impl SpawnedProcess {
     }
 }
 
+/// Relay I/O between a PTY-backed child and the host RPC connection.
+///
+/// Signals are translated: SIGINT/SIGQUIT are written as control characters
+/// to the PTY (as a real terminal would), while other signals are forwarded
+/// via `kill(2)`.
 async fn attach_pty(
     mut child: tokio::process::Child,
     pty: pty_process::Pty,
@@ -116,6 +135,8 @@ async fn attach_pty(
     exit_code
 }
 
+/// Relay I/O between a pipe-backed child and the host RPC connection.
+/// Stdout and stderr are forwarded as separate frame types.
 async fn attach_pipe(mut child: tokio::process::Child, mut host: HostProcess) -> i32 {
     let child_stdin = child.stdin.take();
     let mut child_stdout = child.stdout.take();
@@ -201,6 +222,7 @@ fn log_error<Ok, Err: Display>(res: Result<Ok, Err>) {
     }
 }
 
+/// Read host stdin frames and write them to the PTY, handling resize events.
 async fn relay_stdin_pty(
     stdin: stdin::Client,
     mut writer: pty_process::OwnedWritePty,
@@ -231,6 +253,7 @@ async fn relay_stdin_pty(
     }
 }
 
+/// Read host stdin frames and write them to the child's pipe stdin.
 async fn relay_stdin_pipe(
     stdin: stdin::Client,
     writer: &mut tokio::process::ChildStdin,
@@ -248,17 +271,22 @@ async fn relay_stdin_pipe(
     }
 }
 
+/// Server-side implementation of the Cap'n Proto `Process` interface.
+///
+/// The host polls for output frames and can send signals or kill the process.
 struct ProcessImpl {
     frames: RefCell<tokio::sync::mpsc::Receiver<Frame>>,
     signals: RefCell<tokio::sync::mpsc::Sender<Signal>>,
 }
 
+/// An output frame from a child process, sent to the host via polling.
 enum Frame {
     Stdout(Bytes),
     Stderr(Bytes),
     Exit(i32),
 }
 
+/// A signal request from the host to the child process.
 enum Signal {
     Num(i32),
     Kill,
