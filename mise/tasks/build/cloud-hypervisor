@@ -1,0 +1,26 @@
+#!/bin/bash
+#MISE description="Fetch cloud-hypervisor static binary"
+#MISE outputs=["sandbox/out/cloud-hypervisor"]
+set -euo pipefail
+
+CH_VERSION="v51.1"
+
+HOST_ARCH=$(uname -m)
+case "$HOST_ARCH" in
+  x86_64)  SUFFIX="" ;;
+  aarch64) SUFFIX="-aarch64" ;;
+  *)       echo "Unsupported architecture: $HOST_ARCH"; exit 1 ;;
+esac
+
+mkdir -p sandbox/out
+OUTPUT="sandbox/out/cloud-hypervisor"
+
+if [[ -f "$OUTPUT" ]]; then
+  echo "cloud-hypervisor already fetched"
+else
+  URL="https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-static${SUFFIX}"
+  echo "Fetching cloud-hypervisor ${CH_VERSION} (${HOST_ARCH})..."
+  curl -fSL -o "$OUTPUT" "$URL"
+  chmod +x "$OUTPUT"
+fi
+echo "cloud-hypervisor: $OUTPUT ($(du -h "$OUTPUT" | cut -f1))"

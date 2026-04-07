@@ -13,7 +13,7 @@ cd /
 find . \( -path './proc/*' -o -path './sys/*' -o -path './dev/*' -o -path './tmp/*' -o -path './out/*' \) -prune -o -print \
   | cpio -o -H newc --quiet | gzip > /out/initramfs.gz
 
-# Gzipped tar archive (Linux / libkrun - extracted at runtime)
+# Gzipped tar archive (Linux - extracted at runtime)
 tar -czf /out/rootfs.tar.gz \
   --exclude='./proc/*' --exclude='./sys/*' --exclude='./dev/*' --exclude='./tmp/*' --exclude='./out/*' \
   .

@@ -12,6 +12,6 @@ make olddefconfig
 make -j"$(nproc)"
 
 case "${ARCH}" in
-  x86_64) cp vmlinux /out/Image ;;
+  x86_64) cp arch/x86/boot/bzImage /out/Image ;;
   *)      cp arch/arm64/boot/Image /out/Image ;;
 esac

@@ -6,7 +6,7 @@ use ezpez_protocol::supervisor_capnp::*;
 use futures::AsyncReadExt;
 
 use crate::init::InitConfig;
-use crate::process::SpawnedProcess;
+use crate::process::{SpawnedProcess, spawn};
 
 pub struct HostConnection {
     pub proc: HostProcess,
@@ -58,7 +58,7 @@ pub async fn start<
 
     tokio::task::spawn_local(rpc);
     let (log_sink, log_filter, host) = conn_rx.await.expect("host connection failed");
-    let proc = init(
+    let proc = match init(
         host.init_config,
         host.cmd,
         host.args,
@@ -67,7 +67,14 @@ pub async fn start<
         host.proc.pty_size,
         host.network,
     )
-    .await?;
+    .await
+    {
+        Ok(proc) => proc,
+        Err(e) => {
+            tracing::error!("supervisor init error: {e:#}");
+            spawn("/bin/sh", &["-c", "exit 100"], None)?
+        }
+    };
     Ok(proc.attach(host.proc).await)
 }
 

@@ -1,28 +1,23 @@
 #[cfg(target_os = "macos")]
 mod apple;
-mod config;
 #[cfg(target_os = "linux")]
-mod krun;
-#[cfg(target_os = "macos")]
+mod cloud_hypervisor;
+mod config;
 use std::fmt::Write;
 use std::os::unix::io::OwnedFd;
 use std::path::Path;
 
-#[cfg(target_os = "linux")]
-pub use krun::check_kvm_access;
 use tracing::warn;
 
 use crate::assets::Assets;
 use crate::cli;
-use crate::cli::CliArgs;
-#[cfg(target_os = "macos")]
-use crate::cli::LogLevel;
+use crate::cli::{CliArgs, LogLevel};
 use crate::oci::Bundle;
 use crate::project::Project;
 use crate::vm::config::VmShare;
 
 pub async fn start(
-    #[cfg_attr(target_os = "linux", allow(unused_variables))] args: &CliArgs,
+    args: &CliArgs,
     project: &Project,
     bundle: Bundle,
 ) -> anyhow::Result<(Box<dyn VmHandle>, OwnedFd)> {
@@ -123,10 +118,8 @@ pub async fn start(
     let vm_config = config::VmConfig {
         cpus: project.config.cpus,
         memory_bytes: project.config.memory.0,
-        #[cfg(target_os = "macos")]
         kernel: assets.kernel,
         initramfs: assets.initramfs,
-        #[cfg(target_os = "macos")]
         kernel_cmdline: {
             let tags: Vec<&str> = shares.iter().map(|s| s.tag.as_str()).collect();
             let epoch = std::time::SystemTime::now()
@@ -134,7 +127,7 @@ pub async fn start(
                 .unwrap_or_default()
                 .as_secs();
             let mut cmd = format!(
-                "console=hvc0 rdinit=/init ezpez.epoch={epoch} ezpez.shares={}",
+                "console=hvc0 console=ttyS0 rdinit=/init ezpez.epoch={epoch} ezpez.shares={}",
                 tags.join(",")
             );
             let host_ports =
@@ -151,6 +144,10 @@ pub async fn start(
         shares,
         cache_disk: Some(bundle.disk_image.clone()),
         runtime_dir: project.cache_dir.clone(),
+        #[cfg(target_os = "linux")]
+        cloud_hypervisor: assets.cloud_hypervisor,
+        #[cfg(target_os = "linux")]
+        virtiofsd: assets.virtiofsd,
     };
 
     #[cfg(target_os = "macos")]
@@ -181,44 +178,13 @@ pub async fn start(
 
     #[cfg(target_os = "linux")]
     {
-        let backend = krun::KrunVmBackend::start(&vm_config, &assets.libkrun, &assets.libkrunfw)?;
+        let backend = cloud_hypervisor::CloudHypervisorBackend::start(&vm_config)?;
 
-        // Wait for the VM to boot and supervisor to start listening.
-        // libkrun's vsock may accept connections before the supervisor
-        // binds its port, causing an RST. We detect this with a peek
-        // and retry the full connect.
         let vsock_fd = {
             let mut attempts = 0u32;
             loop {
                 match backend.vsock_connect() {
-                    Ok(fd) => {
-                        use std::os::unix::io::AsRawFd;
-                        let mut buf = [0u8; 1];
-                        let ret = unsafe {
-                            libc::recv(
-                                fd.as_raw_fd(),
-                                buf.as_mut_ptr().cast(),
-                                1,
-                                libc::MSG_PEEK | libc::MSG_DONTWAIT,
-                            )
-                        };
-                        if ret == 0
-                            || (ret < 0
-                                && std::io::Error::last_os_error().raw_os_error()
-                                    == Some(libc::ECONNRESET))
-                        {
-                            tracing::trace!("vsock connected but RST (attempt {attempts})");
-                            attempts += 1;
-                            if attempts >= 60 {
-                                return Err(anyhow::anyhow!(
-                                    "supervisor not reachable after {attempts} attempts (RST)"
-                                ));
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                            continue;
-                        }
-                        break fd;
-                    }
+                    Ok(fd) => break fd,
                     Err(e) => {
                         attempts += 1;
                         if attempts >= 60 {
@@ -299,8 +265,8 @@ impl VmHandle for apple::AppleVmBackend {
 }
 
 #[cfg(target_os = "linux")]
-impl VmHandle for krun::KrunVmBackend {
+impl VmHandle for cloud_hypervisor::CloudHypervisorBackend {
     fn wait_for_stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>> {
-        Box::pin(krun::KrunVmBackend::wait_for_stop_impl(self))
+        Box::pin(cloud_hypervisor::CloudHypervisorBackend::wait_for_stop_impl(self))
     }
 }

@@ -51,13 +51,13 @@ pub fn setup(config: &InitConfig) -> anyhow::Result<()> {
     setup_networking(&config.host_ports);
 
     // 5. Project disk (ext4 — overlayfs upper + cache)
-    setup_disk(&mounts.cache);
+    setup_disk(&mounts.cache)?;
 
     // 6. Assemble container rootfs
     assemble_rootfs(&mounts)?;
 
     // 7. DNS
-    setup_dns();
+    setup_dns()?;
 
     Ok(())
 }
@@ -327,11 +327,10 @@ fn setup_networking(host_ports: &[u16]) {
 }
 
 /// Mount the project disk at /mnt/disk (overlay upper + cache).
-fn setup_disk(cache_dirs: &[String]) {
+fn setup_disk(cache_dirs: &[String]) -> anyhow::Result<()> {
     let dev = "/dev/vda";
     if !Path::new(dev).exists() {
-        error!("disk {dev} not found");
-        return;
+        anyhow::bail!("disk {dev} not found");
     }
 
     let blkid = Command::new("/sbin/blkid").arg(dev).output();
@@ -342,30 +341,25 @@ fn setup_disk(cache_dirs: &[String]) {
             !out.contains("ext4")
         }
         Err(e) => {
-            error!("blkid exec failed: {e}");
+            warn!("blkid exec failed: {e}");
             true
         }
     };
 
     if needs_format {
         info!("formatting disk {dev}");
-        match Command::new("/sbin/mkfs.ext4")
-            .args(["-q", "-L", "ezpez-disk", dev])
-            .status()
-        {
-            Ok(s) if s.success() => debug!("formatted {dev}"),
-            Ok(s) => {
-                error!("mkfs.ext4 failed: {s}");
-                return;
-            }
-            Err(e) => {
-                error!("mkfs.ext4 exec failed: {e}");
-                return;
-            }
+        let output = Command::new("/sbin/mkfs.ext4")
+            .args(["-q", "-E", "nodiscard", "-L", "ezpez-disk", dev])
+            .output()
+            .map_err(|e| anyhow::anyhow!("mkfs.ext4 exec failed: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("mkfs.ext4 failed: {} {}", output.status, stderr.trim());
         }
+        debug!("formatted {dev}");
     }
 
-    let _ = std::fs::create_dir_all("/mnt/disk");
+    std::fs::create_dir_all("/mnt/disk")?;
     let dev_cstr = std::ffi::CString::new(dev).unwrap();
     let mount_cstr = std::ffi::CString::new("/mnt/disk").unwrap();
     let fstype = std::ffi::CString::new("ext4").unwrap();
@@ -380,8 +374,7 @@ fn setup_disk(cache_dirs: &[String]) {
     };
     if ret != 0 {
         let err = std::io::Error::last_os_error();
-        error!("failed to mount {dev}: {err}");
-        return;
+        anyhow::bail!("failed to mount {dev}: {err}");
     }
     info!("mounted disk at /mnt/disk");
     let _ = Command::new("/usr/sbin/resize2fs").arg(dev).output();
@@ -389,19 +382,16 @@ fn setup_disk(cache_dirs: &[String]) {
     // Create cache directories
     for dir in cache_dirs {
         let rel = dir.strip_prefix('/').unwrap_or(dir);
-        let _ = std::fs::create_dir_all(format!("/mnt/disk/cache/{rel}"));
+        std::fs::create_dir_all(format!("/mnt/disk/cache/{rel}"))?;
     }
+    Ok(())
 }
 
-fn setup_dns() {
+fn setup_dns() -> anyhow::Result<()> {
     let dir = "/mnt/overlay/rootfs/etc";
-    if let Err(e) = std::fs::create_dir_all(dir) {
-        error!("failed to create {dir}: {e}");
-        return;
-    }
-    if let Err(e) = std::fs::write(format!("{dir}/resolv.conf"), "nameserver 10.0.0.1\n") {
-        error!("failed to write resolv.conf: {e}");
-    }
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(format!("{dir}/resolv.conf"), "nameserver 10.0.0.1\n")?;
+    Ok(())
 }
 
 fn write_sysctl(path: &str, value: &str) {

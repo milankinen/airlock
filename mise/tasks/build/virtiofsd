@@ -1,0 +1,29 @@
+#!/bin/bash
+#MISE description="Build virtiofsd binary"
+#MISE outputs=["sandbox/out/virtiofsd"]
+set -euo pipefail
+
+VIRTIOFSD_VERSION="v1.13.3"
+
+mkdir -p sandbox/out
+OUTPUT="sandbox/out/virtiofsd"
+
+if [[ -f "$OUTPUT" ]]; then
+  echo "virtiofsd already built"
+else
+  echo "Building virtiofsd ${VIRTIOFSD_VERSION}..."
+  docker run --rm \
+    -v "$PWD/sandbox/out:/out" \
+    -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
+    rust:1-slim-trixie sh -c "
+      set -e
+      apt-get update -qq && apt-get install -y -qq git libcap-ng-dev libseccomp-dev >/dev/null 2>&1
+      cd /tmp
+      git clone --depth=1 --branch ${VIRTIOFSD_VERSION} https://gitlab.com/virtio-fs/virtiofsd.git
+      cd virtiofsd
+      cargo build --release
+      cp target/release/virtiofsd /out/virtiofsd
+      chown \"\$HOST_UID:\$HOST_GID\" /out/virtiofsd
+    "
+fi
+echo "virtiofsd: $OUTPUT ($(du -h "$OUTPUT" | cut -f1))"

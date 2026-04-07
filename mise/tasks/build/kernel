@@ -4,14 +4,6 @@
 #MISE outputs=["sandbox/out/Image"]
 set -euo pipefail
 
-# Kernel is only needed on macOS (Apple Virtualization)
-if [[ "$(uname -s)" != "Darwin" ]]; then
-  echo "Skipping kernel build (not macOS)"
-  mkdir -p sandbox/out
-  touch sandbox/out/Image
-  exit 0
-fi
-
 HOST_ARCH=$(uname -m)
 case "$HOST_ARCH" in
   x86_64)  ARCH=x86_64;  CONFIG=config-x86_64 ;;
