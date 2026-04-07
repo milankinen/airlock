@@ -34,10 +34,11 @@ echo "data" | target/debug/ez -- grep pattern
 
 # Command mode (stdin is TTY → PTY allocated)
 target/debug/ez -- ls /usr
-target/debug/ez -- sh -c 'echo hi; exit 42'
+target/debug/ez go -- sh -c 'echo hi; exit 42'
 
-# Interactive shell (no args)
+# Interactive shell (no subcommand or explicit go)
 target/debug/ez
+target/debug/ez go
 ```
 
 Exit codes propagate. `mise run ez` always builds latest
@@ -46,6 +47,22 @@ Exit codes propagate. `mise run ez` always builds latest
 ```bash
 mise run ez               # interactive shell
 mise run ez -- ls /usr    # command with args
+```
+
+## Project management CLI
+
+```bash
+# Show info for the project in the current directory
+target/debug/ez project info
+
+# List all known projects with abbreviated IDs
+target/debug/ez project list
+
+# Remove project by current directory, path, full hash, or abbreviated hash
+target/debug/ez project remove
+target/debug/ez project remove /path/to/project
+target/debug/ez project remove abc1234   # abbreviated hash
+target/debug/ez project remove --yes     # skip confirmation prompt
 ```
 
 ## Temporary files

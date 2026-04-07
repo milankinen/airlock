@@ -4,30 +4,107 @@
 //! `cli::progress_bar()` / `cli::spinner()` for progress,
 //! and `cli::interrupted()` for Ctrl+C cancellation.
 
+pub mod cmd_go;
+pub mod cmd_project_info;
+pub mod cmd_project_list;
+pub mod cmd_project_remove;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use clap::{Parser, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::signal::unix::SignalKind;
 use tokio::sync::watch;
 
 // -- CLI argument parsing --
 
-/// Lightweight VM sandbox for running untrusted code
-#[derive(Parser, Debug)]
-#[command(name = "ez", version, about)]
-pub struct CliArgs {
+#[derive(Parser)]
+#[command(
+    name = "ez",
+    version,
+    about = "Lightweight VM sandbox for running untrusted code"
+)]
+pub struct Cli {
+    #[command(flatten)]
+    pub global: GlobalArgs,
+
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[cfg(target_os = "linux")]
+pub fn platform_status() -> String {
+    use crate::vm::{KvmStatus, kvm_status};
+    let kvm_line = match kvm_status() {
+        KvmStatus::Available => format!("{} kvm access granted", check()),
+        KvmStatus::NotFound => format!("{} kvm not available", red("!")),
+        KvmStatus::NoPermission => format!("{} kvm permission denied", red("!")),
+    };
+    format!("{}:\n  {kvm_line}\n", console::style("Status").underlined())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn platform_status() -> String {
+    String::new()
+}
+
+#[derive(Args, Debug)]
+pub struct GlobalArgs {
     /// Suppress ez cli output
     #[arg(short, long, default_value_t = false)]
     pub quiet: bool,
+}
 
-    /// Debug log file path
-    #[arg(long, env = "EZ_LOG_LEVEL", default_value = "warn")]
+#[derive(Subcommand)]
+pub enum Command {
+    /// Start the VM
+    Go {
+        /// Log level
+        #[arg(long, env = "EZ_LOG_LEVEL", default_value = "warn")]
+        log_level: LogLevel,
+    },
+    /// Manage projects
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ProjectCommand {
+    /// Show project info (defaults to current directory)
+    Info {
+        /// Project path (defaults to cwd)
+        path: Option<String>,
+    },
+    /// List all projects
+    #[command(alias = "ls")]
+    List,
+    /// Remove a project (defaults to current directory)
+    #[command(alias = "rm")]
+    Remove {
+        /// Project path (defaults to cwd)
+        path: Option<String>,
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
+    },
+}
+
+/// Runtime args passed to the go command implementation.
+/// NOT a clap struct — constructed from parsed args.
+pub struct CliArgs {
     pub log_level: LogLevel,
-
-    /// Arguments passed to the entrypoint (e.g. ez -- -c 'echo hi')
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
+}
+
+impl CliArgs {
+    pub fn new(log_level: LogLevel, extra_args: Vec<String>) -> Self {
+        Self {
+            log_level,
+            args: extra_args,
+        }
+    }
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
@@ -68,10 +145,9 @@ pub fn red(s: &str) -> String {
 }
 
 /// Initialize the console; call at the very beginning of the program.
-pub fn initialize() -> CliArgs {
-    let args = CliArgs::parse();
+pub fn initialize(global: &GlobalArgs) {
     let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    SILENT.store(args.quiet, Ordering::Relaxed);
+    SILENT.store(global.quiet, Ordering::Relaxed);
     IS_TTY.store(is_tty, Ordering::Relaxed);
 
     let tx = INTERRUPTED.0.clone();
@@ -86,7 +162,6 @@ pub fn initialize() -> CliArgs {
         }
         let _ = tx.send(true);
     });
-    args
 }
 
 pub fn is_silent() -> bool {

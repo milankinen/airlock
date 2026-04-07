@@ -48,6 +48,7 @@ smart-config = { workspace = true }
 sysinfo = { workspace = true }
 tar = { workspace = true }
 thiserror = { workspace = true }
+timeago = "0.6.0"
 tls-parser = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-rustls = { workspace = true }

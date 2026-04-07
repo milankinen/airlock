@@ -69,10 +69,6 @@ pub async fn prepare(
     let stored_digest = std::fs::read_to_string(&digest_file).ok();
 
     // Resolve image reference to a digest (no download yet)
-    cli::log!(
-        "Preparing project environment using image {}...",
-        cli::dim(&project.config.image)
-    );
     let mut image = resolve_image(&project.config.image).await?;
 
     // Check if image changed before downloading
@@ -266,7 +262,7 @@ fn prompt_image_changed() -> anyhow::Result<ImageChangeAction> {
 async fn resolve_image(image_ref: &str) -> anyhow::Result<ResolvedImage> {
     if let Some(image_id) = docker::image_exists(image_ref) {
         cli::log!(
-            "  {} resolved via docker {}",
+            "  {} image resolved via docker {}",
             cli::check(),
             cli::dim(&image_id[..19.min(image_id.len())])
         );
@@ -281,7 +277,7 @@ async fn resolve_image(image_ref: &str) -> anyhow::Result<ResolvedImage> {
 
     let reg = registry::resolve(image_ref).await?;
     cli::log!(
-        "  {} resolved {}",
+        "  {} image resolved {}",
         cli::check(),
         cli::dim(&format!("{}@{}", reg.reference, &reg.digest[..19]))
     );

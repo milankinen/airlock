@@ -1,0 +1,64 @@
+use crate::{cli, project};
+
+pub fn run(path: Option<&str>) -> i32 {
+    let project = match project::load(path) {
+        Ok(p) => p,
+        Err(e) => {
+            cli::error!("{e:#}");
+            return 1;
+        }
+    };
+
+    if !project.cache_dir.exists() {
+        cli::error!(
+            "no project data for {} — run `ez go` first",
+            project.cwd.display()
+        );
+        return 1;
+    }
+
+    let status = if project.is_running() {
+        cli::red("running")
+    } else {
+        cli::dim("stopped")
+    };
+
+    println!("ID:       {}", project.id());
+    println!("Path:     {}", project.cwd.display());
+    println!("Status:   {status}");
+    println!("Image:    {}", project.config.image);
+    println!("CPUs:     {}", project.config.cpus);
+    println!("Memory:   {}", project.config.memory);
+
+    if let Some(ago) = project.last_run_ago() {
+        println!("Last run: {ago}");
+    }
+
+    println!("Disk:     {}", project.cache_dir.display());
+
+    if !project.config.disk.cache.is_empty() {
+        println!("Disk cache:");
+        for (key, mount) in &project.config.disk.cache {
+            let status = if mount.enabled { "" } else { " (disabled)" };
+            println!("  {key}: {}{status}", mount.path);
+        }
+    }
+
+    if !project.config.mounts.is_empty() {
+        println!("Mounts:");
+        for (key, mount) in &project.config.mounts {
+            let status = if mount.enabled { "" } else { " (disabled)" };
+            println!("  {key}: {} → {}{status}", mount.source, mount.target);
+        }
+    }
+
+    if !project.config.network.rules.is_empty() {
+        println!("Network rules:");
+        for (key, rule) in &project.config.network.rules {
+            let status = if rule.enabled { "" } else { " (disabled)" };
+            println!("  {key}: {} targets{status}", rule.allow.len());
+        }
+    }
+
+    0
+}

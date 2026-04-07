@@ -83,21 +83,45 @@ pub async fn start(
         cli::bullet(),
         cli::dim(&project.config.memory.to_string())
     );
-    cli::log!(
-        "  {} cache:  {}",
-        cli::bullet(),
-        cli::dim(&project.config.disk.size.to_string())
-    );
-    for mount in &bundle.mounts {
-        let Some((source, target)) = &mount.display else {
-            continue;
-        };
-        let mode = if mount.read_only { "ro" } else { "rw" };
+    let cache_paths: Vec<&str> = project
+        .config
+        .disk
+        .cache
+        .values()
+        .filter(|c| c.enabled)
+        .map(|c| c.path.as_str())
+        .collect();
+    let disk_info = if cache_paths.is_empty() {
+        project.config.disk.size.to_string()
+    } else {
+        format!(
+            "{} (caches: {})",
+            project.config.disk.size,
+            cache_paths.join(", ")
+        )
+    };
+    cli::log!("  {} disk:   {}", cli::bullet(), cli::dim(&disk_info));
+
+    let display_mounts: Vec<_> = bundle
+        .mounts
+        .iter()
+        .filter(|m| m.display.is_some())
+        .collect();
+    if !display_mounts.is_empty() {
         cli::log!(
-            "  {} mount:  {}",
+            "  {} mounts: {}",
             cli::bullet(),
-            cli::dim(&format!("{source} → {target} ({mode})"))
+            cli::dim(&display_mounts.len().to_string())
         );
+        for mount in &display_mounts {
+            let (source, target) = mount.display.as_ref().unwrap();
+            let mode = if mount.read_only { "ro" } else { "rw" };
+            cli::log!(
+                "    {} {}",
+                cli::bullet(),
+                cli::dim(&format!("{source} → {target} ({mode})"))
+            );
+        }
     }
 
     for share in &shares {
