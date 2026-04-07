@@ -77,7 +77,12 @@ impl CloudHypervisorBackend {
         cmd.arg("--kernel").arg(&config.kernel);
         cmd.arg("--initramfs").arg(&config.initramfs);
         cmd.arg("--cmdline").arg(&config.kernel_cmdline);
-        cmd.arg("--cpus").arg(format!("boot={}", config.cpus));
+        let cpus_arg = if config.nested_virtualization {
+            format!("boot={},nested=on", config.cpus)
+        } else {
+            format!("boot={}", config.cpus)
+        };
+        cmd.arg("--cpus").arg(cpus_arg);
         cmd.arg("--memory")
             .arg(format!("size={ram_mib}M,shared=on"));
         let serial_log = config.runtime_dir.join("serial.log");

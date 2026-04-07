@@ -108,13 +108,22 @@ pub(super) fn parse_config(merged: serde_json::Value) -> anyhow::Result<Config> 
     let source = smart_config::Json::new("merged config", map);
     let repo = smart_config::ConfigRepository::new(&schema).with(source);
     let parser = repo.single::<Config>()?;
-    match parser.parse() {
-        Ok(config) => Ok(config),
-        Err(errors) => Err(anyhow::anyhow!(format_error(
-            "invalid configuration",
-            errors,
-        ))),
+    let config = match parser.parse() {
+        Ok(config) => config,
+        Err(errors) => {
+            return Err(anyhow::anyhow!(format_error(
+                "invalid configuration",
+                errors,
+            )));
+        }
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    if config.nested_virtualization {
+        anyhow::bail!("nested_virtualization is only supported on Linux");
     }
+
+    Ok(config)
 }
 
 /// Merge two JSON values with custom rules:

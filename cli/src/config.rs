@@ -35,6 +35,9 @@ pub struct Config {
     /// Cache volume (VirtIO block device with ext4)
     #[config(nest)]
     pub disk: Disk,
+    /// Enable nested virtualization (Linux only)
+    #[config(default)]
+    pub nested_virtualization: bool,
 }
 
 #[allow(clippy::module_inception)]

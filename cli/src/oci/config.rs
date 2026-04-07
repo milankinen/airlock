@@ -9,6 +9,7 @@ pub fn generate_config(
     mounts: &[ResolvedMount],
     user_args: &[String],
     terminal: Option<(u16, u16)>,
+    nested_virtualization: bool,
     dest: &Path,
 ) -> anyhow::Result<()> {
     let cfg = image_config.config.as_ref();
@@ -155,6 +156,28 @@ pub fn generate_config(
         });
     }
 
+    let mut linux = serde_json::json!({
+        "namespaces": [
+            { "type": "pid" },
+            { "type": "uts" },
+            { "type": "mount" }
+        ]
+    });
+
+    if nested_virtualization {
+        linux["devices"] = serde_json::json!([
+            {
+                "path": "/dev/kvm",
+                "type": "c",
+                "major": 10,
+                "minor": 232,
+                "fileMode": 438,
+                "uid": 0,
+                "gid": 0
+            }
+        ]);
+    }
+
     let config = serde_json::json!({
         "ociVersion": "1.0.0",
         "process": process,
@@ -164,13 +187,7 @@ pub fn generate_config(
         },
         "hostname": "ezpez",
         "mounts": mounts_json,
-        "linux": {
-            "namespaces": [
-                { "type": "pid" },
-                { "type": "uts" },
-                { "type": "mount" }
-            ]
-        }
+        "linux": linux
     });
 
     let json = serde_json::to_string_pretty(&config)?;

@@ -184,6 +184,7 @@ fn build_bundle(
         &mounts,
         &args.args,
         pty_size,
+        project.config.nested_virtualization,
         &overlay_dir.join("config.json"),
     )?;
 
