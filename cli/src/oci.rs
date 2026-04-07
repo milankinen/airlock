@@ -22,6 +22,8 @@ pub struct Bundle {
     pub disk_image: PathBuf,
     /// Path to the shared read-only image rootfs in the image cache.
     pub image_rootfs: PathBuf,
+    /// Container home directory (e.g. `/root`), for guest-path `~` expansion.
+    pub container_home: String,
 }
 
 #[derive(Debug)]
@@ -178,13 +180,19 @@ fn build_bundle(
     } else {
         None
     };
+    let container_home_path = PathBuf::from(&container_home);
     let socket_fwds: Vec<(String, String)> = project
         .config
         .network
         .sockets
         .values()
         .filter(|s| s.enabled)
-        .map(|s| (s.host.clone(), s.guest.clone()))
+        .map(|s| {
+            let guest = expand_tilde(&s.guest, &container_home_path)
+                .to_string_lossy()
+                .into_owned();
+            (s.host.clone(), guest)
+        })
         .collect();
     config::generate_config(
         &image_config,
@@ -234,6 +242,7 @@ fn build_bundle(
         mounts,
         disk_image,
         image_rootfs,
+        container_home,
     })
 }
 

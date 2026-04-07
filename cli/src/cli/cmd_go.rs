@@ -49,7 +49,7 @@ async fn run_inner(args: CliArgs, config: config::Config) -> anyhow::Result<i32>
 
     let mut terminal = terminal::setup();
     let bundle = oci::prepare(&args, &project, &terminal).await?;
-    let network = network::setup(&project)?;
+    let network = network::setup(&project, &bundle)?;
 
     // Check if user interrupted during setup (e.g. Ctrl+C during download)
     if cli::is_interrupted() {

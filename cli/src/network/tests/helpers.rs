@@ -225,6 +225,7 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
             tls_client: Arc::new(tls_client),
             interceptor: Rc::new(interceptor),
             targets,
+            socket_map: std::collections::HashMap::default(),
         },
     )
 }

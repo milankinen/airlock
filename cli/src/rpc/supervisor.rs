@@ -113,6 +113,13 @@ impl Supervisor {
     ) -> anyhow::Result<Process> {
         let log_sink: log_sink::Client = capnp_rpc::new_client(LogSinkImpl);
 
+        // Collect socket forwards before network is moved into the RPC capability.
+        let socket_fwds: Vec<(String, String)> = network
+            .socket_map
+            .iter()
+            .map(|(guest, host)| (host.to_string_lossy().into_owned(), guest.clone()))
+            .collect();
+
         let mut req = self.supervisor.start_request();
         let pty_size = stdin.pty_size();
         req.get().set_stdin(capnp_rpc::new_client(stdin));
@@ -152,18 +159,11 @@ impl Supervisor {
             hp_builder.set(i as u32, *port);
         }
 
-        // Socket forwards
-        let socket_fwds: Vec<_> = project
-            .config
-            .network
-            .sockets
-            .values()
-            .filter(|s| s.enabled)
-            .collect();
+        // Socket forwards — already expanded, sourced from network.socket_map
         let mut sf_builder = req.get().init_sockets(socket_fwds.len() as u32);
-        for (i, sf) in socket_fwds.iter().enumerate() {
-            sf_builder.reborrow().get(i as u32).set_host(&sf.host);
-            sf_builder.reborrow().get(i as u32).set_guest(&sf.guest);
+        for (i, (host, guest)) in socket_fwds.iter().enumerate() {
+            sf_builder.reborrow().get(i as u32).set_host(host);
+            sf_builder.reborrow().get(i as u32).set_guest(guest);
         }
 
         let response = req.send().promise.await?;

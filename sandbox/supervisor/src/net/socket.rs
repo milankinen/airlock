@@ -45,10 +45,10 @@ async fn listen(
     loop {
         let (stream, _) = listener.accept().await?;
         let network = network.clone();
-        let host_path = host_path.to_string();
+        let guest_path = guest_path.to_string();
         tokio::task::spawn_local(async move {
-            if let Err(e) = relay(stream, &host_path, &network).await {
-                debug!("socket relay {host_path}: {e}");
+            if let Err(e) = relay(stream, &guest_path, &network).await {
+                debug!("socket relay {guest_path}: {e}");
             }
         });
     }
@@ -56,7 +56,7 @@ async fn listen(
 
 async fn relay(
     stream: tokio::net::UnixStream,
-    host_path: &str,
+    guest_path: &str,
     network: &network_proxy::Client,
 ) -> anyhow::Result<()> {
     let (mut local_read, mut local_write) = stream.into_split();
@@ -66,9 +66,10 @@ async fn relay(
     let server_sink: tcp_sink::Client =
         capnp_rpc::new_client(ChannelSink(RefCell::new(Some(server_tx))));
 
-    // Call host NetworkProxy.connect with socket target
+    // Call host NetworkProxy.connect with the guest socket path.
+    // The CLI maps guest → host path (with tilde expansion) on its side.
     let mut req = network.connect_request();
-    req.get().init_target().set_socket(host_path);
+    req.get().init_target().set_socket(guest_path);
     req.get().set_client(server_sink);
 
     let response = req.send().promise.await?;

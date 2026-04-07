@@ -46,10 +46,19 @@ impl network_proxy::Server for Network {
                 );
                 results.get().init_result().set_server(sink);
             }
-            connect_target::Socket(path) => {
-                let path = path?.to_str()?.to_string();
-                debug!("connect socket: {path}");
-                let sink = spawn_socket_connection(&path, client_sink);
+            connect_target::Socket(guest_path) => {
+                let guest_path = guest_path?.to_str()?.to_string();
+                let Some(host_path) = self.socket_map.get(&guest_path) else {
+                    debug!("denied: socket {guest_path} (no matching rule)");
+                    results
+                        .get()
+                        .init_result()
+                        .set_denied("no matching socket rule");
+                    return Ok(());
+                };
+                let host_path = host_path.to_string_lossy().into_owned();
+                debug!("connect socket: {guest_path} → {host_path}");
+                let sink = spawn_socket_connection(&host_path, client_sink);
                 results.get().init_result().set_server(sink);
             }
         }
