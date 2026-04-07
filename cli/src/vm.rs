@@ -9,6 +9,66 @@ use std::path::Path;
 
 use tracing::warn;
 
+#[cfg(target_os = "linux")]
+pub enum KvmStatus {
+    Available,
+    NotFound,
+    NoPermission,
+}
+
+#[cfg(target_os = "linux")]
+pub fn kvm_status() -> KvmStatus {
+    use std::os::unix::fs::MetadataExt;
+    let path = std::path::Path::new("/dev/kvm");
+    if !path.exists() {
+        return KvmStatus::NotFound;
+    }
+    if let Ok(metadata) = path.metadata() {
+        let mode = metadata.mode();
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        let dev_uid = metadata.uid();
+        let dev_gid = metadata.gid();
+
+        let owner_ok = uid == dev_uid && (mode & 0o600 == 0o600);
+        let group_ok = gid == dev_gid && (mode & 0o060 == 0o060);
+        let other_ok = mode & 0o006 == 0o006;
+        let supp_ok = if group_ok {
+            false
+        } else {
+            let ngroups = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+            let mut groups = vec![0u32; ngroups.max(1) as usize];
+            let n = unsafe { libc::getgroups(groups.len() as i32, groups.as_mut_ptr()) };
+            n > 0 && groups[..n as usize].contains(&dev_gid)
+        };
+
+        if owner_ok || group_ok || supp_ok || other_ok {
+            KvmStatus::Available
+        } else {
+            KvmStatus::NoPermission
+        }
+    } else {
+        KvmStatus::NoPermission
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn require_kvm() {
+    match kvm_status() {
+        KvmStatus::Available => {}
+        KvmStatus::NotFound => {
+            cli::error!("KVM not available (/dev/kvm not found)");
+            cli::error!("ensure KVM is enabled in your kernel/BIOS");
+            std::process::exit(1);
+        }
+        KvmStatus::NoPermission => {
+            cli::error!("no permission to access /dev/kvm");
+            cli::error!("run: sudo usermod -aG kvm $USER  (then re-login)");
+            std::process::exit(1);
+        }
+    }
+}
+
 use crate::assets::Assets;
 use crate::cli;
 use crate::cli::{CliArgs, LogLevel};
