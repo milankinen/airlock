@@ -1,4 +1,6 @@
 presets = ["debian", "claude-code", "rust"]
+
+[vm]
 image = "ez:dev"
 
 [env]

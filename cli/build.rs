@@ -4,12 +4,15 @@ use std::hash::Hasher;
 fn main() {
     let mut hasher = DefaultHasher::new();
 
-    let kernel = std::fs::read("../sandbox/out/Image").unwrap_or_default();
-    let initramfs = std::fs::read("../sandbox/out/initramfs.gz").unwrap_or_default();
-    hasher.write(&kernel);
-    hasher.write(&initramfs);
-    println!("cargo:rerun-if-changed=../sandbox/out/Image");
-    println!("cargo:rerun-if-changed=../sandbox/out/initramfs.gz");
+    let distroless = std::env::var("CARGO_FEATURE_DISTROLESS").is_ok();
+    if !distroless {
+        let kernel = std::fs::read("../sandbox/out/Image").unwrap_or_default();
+        let initramfs = std::fs::read("../sandbox/out/initramfs.gz").unwrap_or_default();
+        hasher.write(&kernel);
+        hasher.write(&initramfs);
+        println!("cargo:rerun-if-changed=../sandbox/out/Image");
+        println!("cargo:rerun-if-changed=../sandbox/out/initramfs.gz");
+    }
 
     #[cfg(target_os = "linux")]
     {

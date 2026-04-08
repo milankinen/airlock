@@ -89,6 +89,12 @@ pub mod config {
         /// Enable nested virtualization (Linux only)
         #[config(default)]
         pub nested_virtualization: bool,
+        /// Custom kernel image path (overrides the bundled kernel)
+        #[config(default)]
+        pub kernel: Option<String>,
+        /// Custom initramfs path (overrides the bundled initramfs)
+        #[config(default)]
+        pub initramfs: Option<String>,
     }
 
     /// Network configuration

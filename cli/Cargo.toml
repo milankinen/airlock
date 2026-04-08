@@ -8,6 +8,9 @@ workspace = true
 
 [features]
 dev = []
+# Build without bundled kernel/initramfs — requires vm.kernel and vm.initramfs
+# to be set in the project config at runtime.
+distroless = []
 
 [[bin]]
 name = "ez"

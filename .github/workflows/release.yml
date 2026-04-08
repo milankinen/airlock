@@ -37,7 +37,8 @@ jobs:
               --jq '.[0].databaseId')
           fi
           echo "Downloading artifacts from CI run $RUN_ID"
-          for name in ez-macos-aarch64 ez-linux-x86_64 ez-linux-aarch64; do
+          for name in ez-macos-aarch64 ez-linux-x86_64 ez-linux-aarch64 \
+                      ez-macos-aarch64-distroless ez-linux-x86_64-distroless ez-linux-aarch64-distroless; do
             gh run download "$RUN_ID" \
               --repo "$GITHUB_REPOSITORY" \
               --name "$name" \
@@ -47,7 +48,10 @@ jobs:
         run: |
           VERSION="${{ github.event.inputs.version }}"
 
-          for variant in darwin-aarch64:macos-aarch64 linux-x86_64:linux-x86_64 linux-aarch64:linux-aarch64; do
+          for variant in darwin-aarch64:macos-aarch64 linux-x86_64:linux-x86_64 linux-aarch64:linux-aarch64 \
+                         darwin-aarch64-distroless:macos-aarch64-distroless \
+                         linux-x86_64-distroless:linux-x86_64-distroless \
+                         linux-aarch64-distroless:linux-aarch64-distroless; do
             NAME="${variant%%:*}"
             DIR="${variant##*:}"
             ARCHIVE="ez-${VERSION}-${NAME}.tar.gz"
@@ -70,5 +74,11 @@ jobs:
             ez-${VERSION}-linux-x86_64.tar.gz.sha256 \
             ez-${VERSION}-linux-aarch64.tar.gz \
             ez-${VERSION}-linux-aarch64.tar.gz.sha256 \
+            ez-${VERSION}-darwin-aarch64-distroless.tar.gz \
+            ez-${VERSION}-darwin-aarch64-distroless.tar.gz.sha256 \
+            ez-${VERSION}-linux-x86_64-distroless.tar.gz \
+            ez-${VERSION}-linux-x86_64-distroless.tar.gz.sha256 \
+            ez-${VERSION}-linux-aarch64-distroless.tar.gz \
+            ez-${VERSION}-linux-aarch64-distroless.tar.gz.sha256 \
             install.sh \
             --repo "$GITHUB_REPOSITORY" --generate-notes

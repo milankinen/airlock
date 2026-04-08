@@ -1,7 +1,7 @@
 #!/bin/bash
 #MISE description="Build the rootfs initramfs using Docker"
 #MISE depends=["build:supervisor"]
-#MISE sources=["sandbox/rootfs/init", "sandbox/rootfs/build.sh", "sandbox/out/supervisor"]
+#MISE sources=["sandbox/rootfs/init", "sandbox/rootfs/build.sh", "sandbox/rootfs/ez/oci-run", "sandbox/rootfs/ez/oci-exec", "sandbox/out/supervisor"]
 #MISE outputs=["sandbox/out/initramfs.gz", "sandbox/out/rootfs.tar.gz"]
 set -euo pipefail
 
@@ -11,6 +11,8 @@ docker run --rm \
   -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
   -v "$PWD/sandbox/rootfs/init:/init-script:ro" \
   -v "$PWD/sandbox/rootfs/build.sh:/build.sh:ro" \
+  -v "$PWD/sandbox/rootfs/ez/oci-run:/ez-oci-run:ro" \
+  -v "$PWD/sandbox/rootfs/ez/oci-exec:/ez-oci-exec:ro" \
   -v "$PWD/sandbox/out/supervisor:/supervisor-bin:ro" \
   -v "$PWD/sandbox/out:/out" \
   alpine:3.23 sh -c 'sh /build.sh && chown "$HOST_UID:$HOST_GID" /out/initramfs.gz /out/rootfs.tar.gz'

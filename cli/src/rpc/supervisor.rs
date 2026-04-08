@@ -10,27 +10,18 @@ use ezpez_protocol::supervisor_capnp::*;
 use crate::cli::CliArgs;
 
 /// Build the command + args for the supervisor to execute.
-/// With the `dev` feature and `EZ_DEV_NO_CRUN=true`, runs a shell instead of crun.
+/// With the `dev` feature and `EZ_DEV_NO_CRUN=true`, runs a shell instead.
 fn build_command() -> (String, Vec<String>) {
     #[cfg(feature = "dev")]
     if std::env::var("EZ_DEV_NO_CRUN").is_ok_and(|v| v == "true" || v == "1") {
-        tracing::debug!("dev mode: skipping crun, starting shell");
+        tracing::debug!("dev mode: skipping oci-run, starting shell");
         return ("/bin/sh".to_string(), vec![]);
     }
 
-    (
-        "crun".to_string(),
-        vec![
-            "run".to_string(),
-            "--no-pivot".to_string(),
-            "--bundle".to_string(),
-            "/mnt/overlay".to_string(),
-            "ezpez0".to_string(),
-        ],
-    )
+    ("/ez/oci-run".to_string(), vec![])
 }
 
-/// Build the `crun exec` invocation for attaching to the running container.
+/// Build the `/ez/oci-exec` invocation for attaching to the running container.
 /// In dev mode (`EZ_DEV_NO_CRUN=true`) runs the command directly instead.
 pub fn build_exec_command(
     user_cmd: &str,
@@ -41,11 +32,11 @@ pub fn build_exec_command(
 ) -> (String, Vec<String>) {
     #[cfg(feature = "dev")]
     if std::env::var("EZ_DEV_NO_CRUN").is_ok_and(|v| v == "true" || v == "1") {
-        tracing::debug!("dev mode: skipping crun exec, running directly");
+        tracing::debug!("dev mode: skipping oci-exec, running directly");
         return (user_cmd.to_string(), user_args.to_vec());
     }
 
-    let mut args = vec!["exec".to_string()];
+    let mut args = vec![];
     if pty {
         args.push("--tty".to_string());
     }
@@ -61,7 +52,7 @@ pub fn build_exec_command(
     args.push(user_cmd.to_string());
     args.extend_from_slice(user_args);
 
-    ("crun".to_string(), args)
+    ("/ez/oci-exec".to_string(), args)
 }
 use crate::network::Network;
 use crate::project::Project;

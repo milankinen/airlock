@@ -88,7 +88,7 @@ pub async fn start(
     project: &Project,
     bundle: Bundle,
 ) -> anyhow::Result<(Box<dyn VmHandle>, OwnedFd)> {
-    let assets = Assets::init()?;
+    let assets = Assets::init(project)?;
     let mut shares = vec![];
 
     let overlay_dir = project.cache_dir.join("overlay");

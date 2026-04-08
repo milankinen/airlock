@@ -1,0 +1,2 @@
+#!/bin/sh
+exec crun run --no-pivot --bundle /mnt/overlay ezpez0

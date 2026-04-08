@@ -240,3 +240,58 @@ jobs:
         with:
           name: ez-linux-aarch64
           path: target/release/ez
+
+  # ── Stage 3b: distroless CLI binaries (no bundled kernel/initramfs) ────
+  build-cli-macos-aarch64-distroless:
+    needs: [ lint-macos, lint-linux, test-macos, test-linux ]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Install capnp
+        run: brew install capnp
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p ezpez-cli --features distroless
+      - run: codesign --entitlements entitlements.plist --force -s - target/release/ez
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ez-macos-aarch64-distroless
+          path: target/release/ez
+
+  build-cli-linux-x86_64-distroless:
+    needs: [ lint-macos, lint-linux, test-macos, test-linux, fetch-vmm-x86_64 ]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Install capnp
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq capnproto libcapnp-dev
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: vmm-x86_64
+          path: sandbox/out
+      - run: cargo build --release -p ezpez-cli --features distroless
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ez-linux-x86_64-distroless
+          path: target/release/ez
+
+  build-cli-linux-aarch64-distroless:
+    needs: [ lint-macos, lint-linux, test-macos, test-linux, fetch-vmm-aarch64 ]
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Install capnp
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq capnproto libcapnp-dev
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: vmm-aarch64
+          path: sandbox/out
+      - run: cargo build --release -p ezpez-cli --features distroless
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ez-linux-aarch64-distroless
+          path: target/release/ez
