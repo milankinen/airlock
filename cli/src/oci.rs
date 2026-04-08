@@ -101,7 +101,14 @@ pub async fn prepare(
     {
         match prompt_image_changed()? {
             ImageChangeAction::KeepOld => {
-                digest_changed = false;
+                // Only keep old if the cache is still intact; otherwise
+                // fall through and let the new image be used.
+                let old_image_dir = crate::cache::image_dir(old_digest.trim())?;
+                if old_image_dir.join("rootfs").exists() && old_image_dir.join(".complete").exists()
+                {
+                    digest_changed = false;
+                    image.digest = old_digest.trim().to_string();
+                }
             }
             ImageChangeAction::Recreate => {
                 let spinner = cli::spinner("erasing old environment...");
@@ -307,18 +314,30 @@ fn prompt_image_changed() -> anyhow::Result<ImageChangeAction> {
 /// Full image resolution (with config).
 async fn resolve_image(image_ref: &str) -> anyhow::Result<ResolvedImage> {
     if let Some(image_id) = docker::image_exists(image_ref) {
+        let host_arch = match std::env::consts::ARCH {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            other => other,
+        };
+        let docker_arch = docker::image_arch(&image_id).unwrap_or_default();
+        if docker_arch.is_empty() || docker_arch == host_arch {
+            cli::log!(
+                "  {} image resolved via docker {}",
+                cli::check(),
+                cli::dim(&image_id[..19.min(image_id.len())])
+            );
+            return Ok(ResolvedImage {
+                digest: image_id,
+                config: OciConfig::default(),
+                source: ImageSource::Docker {
+                    image_ref: image_ref.to_string(),
+                },
+            });
+        }
         cli::log!(
-            "  {} image resolved via docker {}",
-            cli::check(),
-            cli::dim(&image_id[..19.min(image_id.len())])
+            "  {} docker image is {docker_arch}, need {host_arch} — trying registry",
+            cli::bullet()
         );
-        return Ok(ResolvedImage {
-            digest: image_id,
-            config: OciConfig::default(),
-            source: ImageSource::Docker {
-                image_ref: image_ref.to_string(),
-            },
-        });
     }
 
     let reg = registry::resolve(image_ref).await?;

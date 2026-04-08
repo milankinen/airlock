@@ -44,6 +44,27 @@ pub fn image_exists(image_ref: &str) -> Option<String> {
     Some(id.lines().next().unwrap_or(&id).to_string())
 }
 
+/// Returns the architecture of a locally available Docker image (e.g. "amd64", "arm64").
+pub fn image_arch(image_id: &str) -> Option<String> {
+    let output = Command::new("docker")
+        .args([
+            "image",
+            "inspect",
+            "--format",
+            "{{.Architecture}}",
+            image_id,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let arch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if arch.is_empty() { None } else { Some(arch) }
+}
+
 /// Extract an image from the local Docker daemon into a rootfs directory,
 /// and return the parsed image config.
 ///
