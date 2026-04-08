@@ -23,7 +23,7 @@ use tracing::{debug, trace};
 use crate::network::http::executor::LocalExecutor;
 use crate::network::http::senders::{H1Sender, H2Sender, RequestSender};
 use crate::network::io;
-use crate::network::target::NetworkTarget;
+use crate::network::target::ResolvedTarget;
 
 const MAX_DETECT_SIZE: usize = 4096;
 
@@ -74,7 +74,7 @@ type ResponseBody = Either<Incoming, Full<Bytes>>;
 pub async fn relay(
     container: io::Transport,
     server: io::Transport,
-    target: NetworkTarget,
+    target: ResolvedTarget,
 ) -> anyhow::Result<()> {
     let client_io = hyper_util::rt::TokioIo::new(tokio::io::join(container.read, container.write));
     let server_io = hyper_util::rt::TokioIo::new(tokio::io::join(server.read, server.write));

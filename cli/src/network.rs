@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use crate::network::target::ResolvedTarget;
 use crate::project::Project;
 
 /// Build the [`Network`] from the project config: load native CA roots,
@@ -90,4 +91,24 @@ pub struct Network {
     targets: Vec<target::NetworkTarget>,
     /// Guest socket path → host socket path mapping for Unix socket forwarding.
     pub(super) socket_map: HashMap<String, PathBuf>,
+}
+
+impl Network {
+    pub fn resolve_target(&self, host: &str, port: u16) -> Option<ResolvedTarget> {
+        let mut matches = false;
+        let mut resolved = ResolvedTarget {
+            host: host.to_string(),
+            port,
+            http_only: false,
+            middleware: vec![],
+        };
+        for target in &self.targets {
+            if target.matches(host, port) {
+                matches = true;
+                resolved.http_only = resolved.http_only || target.http_only;
+                resolved.middleware.extend(target.middleware.clone());
+            }
+        }
+        if matches { Some(resolved) } else { None }
+    }
 }

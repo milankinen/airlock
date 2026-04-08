@@ -143,27 +143,22 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
     // Build middleware map from scripts.
     // If no scripts and no explicit passthrough, add a no-op middleware
     // so TLS interception is enabled (matches old test behavior).
-    let middleware = if !cfg.middleware_scripts.is_empty() {
-        let scripts: Vec<NetworkMiddleware> = cfg
-            .middleware_scripts
+    let middleware: Vec<NetworkMiddleware> = if !cfg.middleware_scripts.is_empty() {
+        cfg.middleware_scripts
             .iter()
             .map(|(_, script)| NetworkMiddleware {
-                enabled: true,
+                env: BTreeMap::new(),
                 script: script.to_string(),
             })
-            .collect();
-        BTreeMap::from([("*".to_string(), scripts)])
+            .collect()
     } else if cfg.tls_passthrough.is_empty() {
         // No-op middleware forces MITM (old test default behavior)
-        BTreeMap::from([(
-            "*".to_string(),
-            vec![NetworkMiddleware {
-                enabled: true,
-                script: String::new(),
-            }],
-        )])
+        vec![NetworkMiddleware {
+            env: BTreeMap::new(),
+            script: String::new(),
+        }]
     } else {
-        BTreeMap::new()
+        vec![]
     };
 
     // Main allow rule (with middleware if any)
@@ -185,7 +180,7 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
             NetworkRule {
                 enabled: true,
                 allow: cfg.tls_passthrough,
-                middleware: BTreeMap::new(),
+                middleware: vec![],
             },
         );
     }

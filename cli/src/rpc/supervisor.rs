@@ -152,14 +152,6 @@ impl Supervisor {
             args_builder.set(i as u32, arg);
         }
 
-        // TLS passthrough hosts (cert pinning — skip MITM)
-        let tls_passthrough =
-            crate::network::rules::tls_passthrough_from_config(&project.config.network);
-        let mut pt_builder = req.get().init_tls_passthrough(tls_passthrough.len() as u32);
-        for (i, host) in tls_passthrough.iter().enumerate() {
-            pt_builder.set(i as u32, host.as_str());
-        }
-
         // Init config: epoch, host ports
         req.get().set_epoch(epoch);
         let host_ports =

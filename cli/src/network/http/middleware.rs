@@ -7,6 +7,7 @@
 //! inspect/modify the response after.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -30,16 +31,19 @@ type NextFuture =
 pub struct CompiledMiddleware(Rc<Inner>);
 
 struct Inner {
-    name: String,
     lua: Lua,
     func: Function,
 }
 
 /// Compile a Lua middleware script. The script is wrapped in a closure so
 /// `req` is a local parameter rather than a global, preventing races.
+///
+/// `env_vars` maps variable names to their descriptions; values are resolved
+/// from the host environment and exposed to the script as the `env` global
+/// table (nil for any variable not set on the host).
 pub fn compile(
-    name: &str,
     script: &str,
+    env_vars: &BTreeMap<String, String>,
     log: middleware::LogFn,
 ) -> anyhow::Result<CompiledMiddleware> {
     let lua = Lua::new();
@@ -51,21 +55,28 @@ pub fn compile(
     })?;
     lua.globals().set("log", log_fn)?;
 
+    // Expose declared env vars as the `env` global table.
+    // Values are subst templates expanded from the host environment.
+    // Any template that references an undefined host variable resolves to nil.
+    let host_env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    let env_table = lua.create_table()?;
+    for (key, template) in env_vars {
+        let value = subst::substitute(template, &host_env).ok();
+        env_table.set(key.as_str(), value)?;
+    }
+    lua.globals().set("env", env_table)?;
+
     // Wrap the script in a function(req) so `req` is a local parameter,
     // not a global. This prevents races when concurrent requests share
     // the same Lua instance.
     let wrapped = format!("return function(req)\n{script}\nend");
     let func: Function = lua
         .load(&wrapped)
-        .set_name(name)
+        .set_name("middleware")
         .eval()
-        .map_err(|e| anyhow::anyhow!("failed to compile middleware '{name}': {e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to compile middleware '{script}': {e}"))?;
 
-    Ok(CompiledMiddleware(Rc::new(Inner {
-        name: name.to_string(),
-        lua,
-        func,
-    })))
+    Ok(CompiledMiddleware(Rc::new(Inner { lua, func })))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -121,7 +132,7 @@ where
                     resp: Rc::new(RefCell::new(None)),
                 };
 
-                trace!("running http middleware '{}'", m.name);
+                trace!("running http middleware '{:?}'", m.func);
                 let thread = m.lua.create_thread(m.func.clone())?;
                 // Pass state as the function argument (not a global)
                 let result = thread.into_async::<()>(state.clone())?.await;
@@ -132,10 +143,7 @@ where
                         return Err(mlua::Error::external(Denied));
                     }
                     Err(e) => {
-                        return Err(mlua::Error::runtime(format!(
-                            "middleware '{}': {e}",
-                            m.name
-                        )));
+                        return Err(mlua::Error::runtime(format!("middleware error: {e}")));
                     }
                 }
 
@@ -147,10 +155,7 @@ where
                 }
 
                 // Script didn't call send() — do it implicitly
-                trace!(
-                    "middleware '{}' did not call send(), sending implicitly",
-                    m.name
-                );
+                trace!("middleware did not call send(), sending implicitly");
                 let next = state
                     .next
                     .borrow_mut()

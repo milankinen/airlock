@@ -121,6 +121,9 @@ impl TlsInterceptor {
         let leaf_key = KeyPair::generate()?;
         let mut params = CertificateParams::new(vec![hostname.to_string()])?;
         params.not_before = rcgen::date_time_ymd(1970, 1, 1);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, format!("ezpez {hostname}"));
         let leaf_cert = params.signed_by(&leaf_key, &self.issuer)?;
 
         let cert_der = rustls::pki_types::CertificateDer::from(leaf_cert.der().to_vec());

@@ -10,7 +10,7 @@ use ezpez_protocol::supervisor_capnp::{connect_target, network_proxy, tcp_sink};
 use tokio::sync::mpsc;
 use tracing::debug;
 
-use super::target::NetworkTarget;
+use super::target::ResolvedTarget;
 use super::{Network, http, io, tcp, tls};
 
 impl network_proxy::Server for Network {
@@ -29,7 +29,7 @@ impl network_proxy::Server for Network {
                 let host = tcp.get_host()?.to_str()?.to_string();
                 let port = tcp.get_port();
 
-                let Some(net_target) = super::target::find_match(&self.targets, &host, port) else {
+                let Some(net_target) = self.resolve_target(&host, port) else {
                     debug!("denied: {host}:{port} (no matching rule)");
                     results
                         .get()
@@ -40,12 +40,10 @@ impl network_proxy::Server for Network {
 
                 debug!("connect {host}:{port}");
                 let sink = spawn_tcp_connection(
-                    &host,
-                    port,
+                    net_target,
                     client_sink,
                     self.tls_client.clone(),
                     self.interceptor.clone(),
-                    net_target,
                 );
                 results.get().init_result().set_server(sink);
             }
@@ -72,33 +70,28 @@ impl network_proxy::Server for Network {
 /// Spawn a background task for a TCP connection: detect TLS, optionally
 /// intercept, apply middleware, and relay bytes bidirectionally.
 fn spawn_tcp_connection(
-    host: &str,
-    port: u16,
+    target: ResolvedTarget,
     client_sink: tcp_sink::Client,
     tls_client: Arc<rustls::ClientConfig>,
     interceptor: Rc<tls::TlsInterceptor>,
-    target: &NetworkTarget,
 ) -> tcp_sink::Client {
     let (tx, rx) = mpsc::channel::<Bytes>(1);
     let error: io::RelayError = Rc::new(RefCell::new(None));
     let task_error = error.clone();
 
-    let host = host.to_string();
-    let target = target.clone();
     tokio::task::spawn_local(async move {
+        let addr = format!("{}:{}", target.host, target.port);
         let result = Box::pin(handle_connection(
-            &host,
-            port,
+            target,
             rx,
             client_sink,
             &tls_client,
             &interceptor,
-            target,
         ))
         .await;
 
         if let Err(e) = result {
-            debug!("connection {host}:{port} error: {e}");
+            debug!("connection {addr} error: {e}");
             *task_error.borrow_mut() = Some(format!("{e}"));
         }
     });
@@ -154,16 +147,14 @@ fn spawn_socket_connection(path: &str, client_sink: tcp_sink::Client) -> tcp_sin
 /// detect HTTP, and route to the appropriate relay.
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
-    host: &str,
-    port: u16,
+    target: ResolvedTarget,
     mut rx: mpsc::Receiver<Bytes>,
     client_sink: tcp_sink::Client,
     tls_client: &Arc<rustls::ClientConfig>,
     interceptor: &tls::TlsInterceptor,
-    target: NetworkTarget,
 ) -> anyhow::Result<()> {
     let (is_tls, first) = tls::detect(&mut rx).await;
-    let addr = format!("{host}:{port}");
+    let addr = format!("{}:{}", target.host, target.port);
 
     // Passthrough: raw relay, container↔server TLS end-to-end
     if target.is_passthrough() {
@@ -175,7 +166,16 @@ async fn handle_connection(
 
     // Establish connection pair
     let (container, server) = if is_tls {
-        tls::establish(host, port, first, rx, client_sink, interceptor, tls_client).await?
+        tls::establish(
+            &target.host,
+            target.port,
+            first,
+            rx,
+            client_sink,
+            interceptor,
+            tls_client,
+        )
+        .await?
     } else {
         tcp::establish(&addr, first, rx, client_sink).await?
     };

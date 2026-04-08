@@ -1,8 +1,27 @@
-presets = ["debian", "claude-code"]
+presets = ["debian", "claude-code", "rust"]
 image = "ez:dev"
+
+[env]
+CLAUDE_CODE_OAUTH_TOKEN = "-"
 
 [disk]
 size = "20 GB"
 
-[disk.cache.target]
-path = "target"
+[disk.cache."rustup-toolchains"]
+path = "~/.rustup/toolchains"
+
+[mounts.claude-json]
+missing = "fail"
+source = "~/.ez/claude.json"
+target = "~/.claude.json"
+
+[network.rules.all]
+allow = ["*"]
+
+[[network.rules.claude-code.middleware]]
+env.TOKEN = "${CLAUDE_CODE_OAUTH_TOKEN}"
+script = """
+if env.TOKEN then
+  req:setHeader("Authorization", "Bearer " .. env.TOKEN)
+end
+"""

@@ -103,17 +103,26 @@ allow = [
 
 #### Network middleware
 
-Rules can include Lua middleware to intercept and modify traffic:
+Rules can include Lua middleware to intercept TLS and modify HTTP traffic.
+Add one or more `[[network.rules.<name>.middleware]]` entries:
 
 ```toml
 [network.rules.my-api]
 allow = ["api.example.com:443"]
 
-[network.rules.my-api.middleware."api.example.com"]
+[[network.rules.my-api.middleware]]
+env.TOKEN = "${MY_API_KEY}"        # expanded from host environment; nil if unset
 script = '''
-if req.path ~= "/telemetry" then
-  req:deny()
+if not env.TOKEN then
+    req:deny()
 end
-req:header("Authorization", "Bearer " .. os.getenv("MY_API_KEY"))
+req:setHeader("Authorization", "Bearer " .. env.TOKEN)
 '''
 ```
+
+The `env` table is populated at startup from the host environment using
+`${VAR}` substitution. Values are available as `env.VAR` in the script;
+any variable not set on the host is nil.
+
+A per-project CA certificate is automatically installed in the container so
+intercepted TLS is transparent to the containerized process.

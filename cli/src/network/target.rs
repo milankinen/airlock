@@ -18,20 +18,21 @@ impl NetworkTarget {
     pub fn matches(&self, host: &str, port: u16) -> bool {
         matchers::host_matches(host, &self.host) && self.port.is_none_or(|p| p == port)
     }
+}
 
+#[derive(Clone)]
+pub struct ResolvedTarget {
+    pub host: String,
+    pub port: u16,
+    pub http_only: bool,
+    pub middleware: Vec<CompiledMiddleware>,
+}
+
+impl ResolvedTarget {
     /// Should TLS be passed through (no MITM) for this target?
     /// Targets without middleware get passthrough, unless http_only
     /// is set (needs interception to verify HTTP).
     pub fn is_passthrough(&self) -> bool {
         self.middleware.is_empty() && !self.http_only
     }
-}
-
-/// Find the first target matching host:port, or None if denied.
-pub fn find_match<'a>(
-    targets: &'a [NetworkTarget],
-    host: &str,
-    port: u16,
-) -> Option<&'a NetworkTarget> {
-    targets.iter().find(|t| t.matches(host, port))
 }

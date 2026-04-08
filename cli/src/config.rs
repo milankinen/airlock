@@ -133,11 +133,12 @@ pub mod config {
         /// Allowed target patterns: `host[:port]`
         #[config(default)]
         pub allow: Vec<String>,
-        /// Per-host HTTP middleware (Lua scripts). Key is host pattern,
-        /// value is list of scripts. If a host has middleware, TLS is
-        /// intercepted.
+        /// Middleware to apply for the allowed hosts. If any middleware is
+        /// set, then also TLS connections will be encrypted and intercepted.
+        /// If client is using certification pinning, it will break, otherwise
+        /// interception should be transparent to the client.
         #[config(default)]
-        pub middleware: BTreeMap<String, Vec<NetworkMiddleware>>,
+        pub middleware: Vec<NetworkMiddleware>,
     }
 
     impl WellKnown for NetworkRule {
@@ -148,9 +149,12 @@ pub mod config {
     /// HTTP middleware script applied to matching targets.
     #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
     pub struct NetworkMiddleware {
-        /// Enable/disable middleware
-        #[config(default_t = true)]
-        pub enabled: bool,
+        /// Variables exposed to the script as the `env` global table.
+        /// Values are subst templates (e.g. `"${HOST_VAR}"`) expanded from
+        /// the host environment. Any template referencing an undefined host
+        /// variable resolves to nil in the script.
+        #[config(default)]
+        pub env: BTreeMap<String, String>,
         /// Inline Lua script
         pub script: String,
     }
