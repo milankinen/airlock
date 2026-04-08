@@ -7,7 +7,4 @@ allow = [
 ]
 
 [disk.cache.pip-cache]
-path = "~/.cache/pip"
-
-[disk.cache.python-venv]
-path = ".venv"
+paths = ["~/.cache/pip"]

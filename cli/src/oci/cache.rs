@@ -13,13 +13,17 @@ const DEFAULT_DISK_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 /// Always creates one — the disk backs both the rootfs overlay upper
 /// layer and any configured cache mounts.
 ///
-/// Returns (disk_image_path, cache_target_paths).
+/// Returns `(disk_image_path, cache_entries)` where each entry is
+/// `(name, enabled, expanded_container_paths)`.
+/// Named cache entry: `(name, enabled, expanded_container_paths)`.
+pub type CacheEntry = (String, bool, Vec<String>);
+
 pub fn prepare(
     cache_dir: &Path,
     config: &Disk,
     container_home: &str,
     cwd: &Path,
-) -> anyhow::Result<(PathBuf, Vec<String>)> {
+) -> anyhow::Result<(PathBuf, Vec<CacheEntry>)> {
     let image_path = cache_dir.join("disk.img");
 
     let bytes = (config.size.0 + 511) & !511;
@@ -57,22 +61,31 @@ pub fn prepare(
     }
 
     let container_home = PathBuf::from(container_home);
-    let cache_targets: Vec<String> = config
+    // Include all entries (enabled and disabled) so the supervisor
+    // knows every declared name — it will clean up disk dirs for any
+    // name not present in this list, and skip mounting disabled ones.
+    let cache_entries: Vec<(String, bool, Vec<String>)> = config
         .cache
-        .values()
-        .filter(|m| m.enabled)
-        .map(|m| {
-            let target = super::expand_tilde(&m.path, &container_home);
-            let target = if target.is_relative() {
-                cwd.join(target)
-            } else {
-                target
-            };
-            target.to_string_lossy().into_owned()
+        .iter()
+        .map(|(name, m)| {
+            let paths = m
+                .paths
+                .iter()
+                .map(|p| {
+                    let target = super::expand_tilde(p, &container_home);
+                    let target = if target.is_relative() {
+                        cwd.join(target)
+                    } else {
+                        target
+                    };
+                    target.to_string_lossy().into_owned()
+                })
+                .collect();
+            (name.clone(), m.enabled, paths)
         })
         .collect();
 
-    Ok((image_path, cache_targets))
+    Ok((image_path, cache_entries))
 }
 
 fn format_size(bytes: u64) -> String {

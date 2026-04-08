@@ -8,10 +8,7 @@ allow = [
 ]
 
 [disk.cache.npm-cache]
-path = "~/.npm"
+paths = ["~/.npm"]
 
 [disk.cache.yarn-cache]
-path = "~/.yarn"
-
-[disk.cache.node-modules]
-path = "node_modules"
+paths = ["~/.yarn"]

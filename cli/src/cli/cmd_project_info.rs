@@ -43,7 +43,7 @@ pub fn run(path: Option<&str>) -> i32 {
         println!("Disk cache:");
         for (key, mount) in &project.config.disk.cache {
             let status = if mount.enabled { "" } else { " (disabled)" };
-            println!("  {key}: {}{status}", mount.path);
+            println!("  {key}: {}{status}", mount.paths.join(", "));
         }
     }
 

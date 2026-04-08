@@ -156,7 +156,7 @@ pub async fn start(
         .cache
         .values()
         .filter(|c| c.enabled)
-        .map(|c| c.path.as_str())
+        .flat_map(|c| c.paths.iter().map(String::as_str))
         .collect();
     let disk_info = if cache_paths.is_empty() {
         project.config.disk.size.to_string()

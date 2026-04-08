@@ -155,7 +155,7 @@ where
                 }
 
                 // Script didn't call send() — do it implicitly
-                trace!("middleware did not call send(), sending implicitly");
+                trace!("middleware did not call send(), sending implicitly!");
                 let next = state
                     .next
                     .borrow_mut()

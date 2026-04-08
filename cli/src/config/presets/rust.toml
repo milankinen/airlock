@@ -10,10 +10,7 @@ allow = [
 ]
 
 [disk.cache.cargo-registry]
-path = "~/.cargo/registry"
+paths = ["~/.cargo/registry"]
 
 [disk.cache.cargo-git]
-path = "~/.cargo/git"
-
-[disk.cache.rust-target]
-path = "target"
+paths = ["~/.cargo/git"]

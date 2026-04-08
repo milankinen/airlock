@@ -24,9 +24,17 @@ struct MountsConfig {
     dirs: Vec<DirMount>,
     #[serde(default)]
     files: Vec<FileMount>,
-    /// Guest paths that should be backed by persistent disk storage.
+    /// Named cache mounts backed by persistent disk storage.
     #[serde(default)]
-    cache: Vec<String>,
+    cache: Vec<CacheMount>,
+}
+
+/// A named persistent cache: one disk directory backing multiple container paths.
+#[derive(serde::Deserialize)]
+struct CacheMount {
+    name: String,
+    enabled: bool,
+    paths: Vec<String>,
 }
 
 /// A directory bind-mounted into the container rootfs via VirtioFS.
@@ -181,17 +189,20 @@ fn assemble_rootfs(mounts: &MountsConfig) -> anyhow::Result<()> {
         debug!("dir mount: {src} → {dst}");
     }
 
-    // Cache bind mounts (last — override dir mounts)
+    // Cache bind mounts (last — override dir mounts).
+    // Each named cache stores its paths under /mnt/disk/cache/<name>/<rel-path>.
     if has_disk {
-        for target in &mounts.cache {
-            let rel = target.strip_prefix('/').unwrap_or(target);
-            let src = Path::new("/mnt/disk/cache").join(rel);
-            let dst = Path::new("/mnt/overlay/rootfs").join(rel);
-            let (src, dst) = (src.to_string_lossy(), dst.to_string_lossy());
-            std::fs::create_dir_all(src.as_ref())?;
-            std::fs::create_dir_all(dst.as_ref())?;
-            bind_mount(&src, &dst, false)?;
-            debug!("cache mount: {src} → {dst}");
+        for cache in mounts.cache.iter().filter(|c| c.enabled) {
+            for target in &cache.paths {
+                let rel = target.strip_prefix('/').unwrap_or(target);
+                let src = Path::new("/mnt/disk/cache").join(&cache.name).join(rel);
+                let dst = Path::new("/mnt/overlay/rootfs").join(rel);
+                let (src, dst) = (src.to_string_lossy(), dst.to_string_lossy());
+                std::fs::create_dir_all(src.as_ref())?;
+                std::fs::create_dir_all(dst.as_ref())?;
+                bind_mount(&src, &dst, false)?;
+                debug!("cache mount: {} → {dst}", &cache.name);
+            }
         }
     }
 
@@ -366,7 +377,7 @@ fn setup_networking(host_ports: &[u16]) {
 }
 
 /// Mount the project disk at /mnt/disk (overlay upper + cache).
-fn setup_disk(cache_dirs: &[String]) -> anyhow::Result<()> {
+fn setup_disk(cache_mounts: &[CacheMount]) -> anyhow::Result<()> {
     let dev = "/dev/vda";
     if !Path::new(dev).exists() {
         anyhow::bail!("disk {dev} not found");
@@ -418,10 +429,27 @@ fn setup_disk(cache_dirs: &[String]) -> anyhow::Result<()> {
     info!("mounted disk at /mnt/disk");
     let _ = Command::new("/usr/sbin/resize2fs").arg(dev).output();
 
-    // Create cache directories
-    for dir in cache_dirs {
-        let rel = dir.strip_prefix('/').unwrap_or(dir);
-        std::fs::create_dir_all(format!("/mnt/disk/cache/{rel}"))?;
+    std::fs::create_dir_all("/mnt/disk/cache")?;
+
+    // Remove cache dirs for names no longer in config.
+    let known_names: std::collections::HashSet<&str> =
+        cache_mounts.iter().map(|c| c.name.as_str()).collect();
+    if let Ok(entries) = std::fs::read_dir("/mnt/disk/cache") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !known_names.contains(name.as_ref()) {
+                debug!("removing stale cache dir: {name}");
+                if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                    warn!("failed to remove stale cache {name}: {e}");
+                }
+            }
+        }
+    }
+
+    // Create named cache dirs for all declared entries.
+    for cache in cache_mounts {
+        std::fs::create_dir_all(format!("/mnt/disk/cache/{}", cache.name))?;
     }
     Ok(())
 }

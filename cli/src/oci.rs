@@ -241,11 +241,17 @@ fn build_bundle(
             })
         })
         .collect();
+    let cache_json: Vec<serde_json::Value> = cache_targets
+        .iter()
+        .map(|(name, enabled, paths)| {
+            serde_json::json!({"name": name, "enabled": enabled, "paths": paths})
+        })
+        .collect();
     let mounts_json = serde_json::json!({
         "image_id": image_id,
         "dirs": dirs_json,
         "files": files_json,
-        "cache": cache_targets,
+        "cache": cache_json,
     });
     std::fs::write(
         overlay_dir.join("mounts.json"),

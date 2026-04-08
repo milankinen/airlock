@@ -211,8 +211,8 @@ pub mod config {
         /// Enable/disable mount
         #[config(default_t = true)]
         pub enabled: bool,
-        /// Path in the VM container
-        pub path: String,
+        /// One or more container paths to back with persistent cache storage
+        pub paths: Vec<String>,
     }
 
     impl WellKnown for MissingAction {
