@@ -1,4 +1,5 @@
 [tools]
+"aqua:docker/cli" = "29.4.0"
 
 [tasks.test]
 quiet = true
@@ -18,10 +19,27 @@ cargo +nightly fmt --all -- --check
 cargo clippy --workspace --tests -- -D warnings
 """
 
-
 [tasks.ez]
 description = "Build, sign, and run"
 raw = true
 depends = ["build:dev", "build:dev-image"]
 env.RUST_BACKTRACE = "1"
 run = "target/debug/ez"
+
+[tasks.vibe]
+description = "Go wild"
+raw = true
+quiet = true
+depends = ["build:dev", "build:dev-image"]
+usage = "arg <feature>"
+run = """
+root_dir=$(pwd)
+ez=$(pwd)/target/debug/ez
+tree=.claude/worktrees/$usage_feature
+[ -d $tree ] || git worktree add .claude/worktrees/$usage_feature
+[ -f ez.local.toml ] && cp ez.local.toml $tree/
+[ -d $tree/sandbox/out ] || cp -r sandbox/out $tree/sandbox/out
+cd $tree
+exec $ez go --project-cwd=$root_dir -- bash -l -c "mise trust -a; clear; exec claude --dangerously-skip-permissions --effort=max --name=$feature"
+"""
+

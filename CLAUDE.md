@@ -25,19 +25,21 @@ Always format code you produce. Use `mise format`
 
 ## Testing the VM
 
+IMPORTANT: if `NO_KVM` environment variable is set to `1`, it means
+that there is no KVM support and running `ez go` will fail.
+
 Non-interactive commands can be tested directly from the CLI:
 
 ```bash
 # Pipe mode (stdin is not a TTY → no PTY, pipe I/O)
-echo "hello" | target/debug/ez -- cat
-echo "data" | target/debug/ez -- grep pattern
+echo "hello" | target/debug/ez go -- cat
+echo "data" | target/debug/ez go -- grep pattern
 
 # Command mode (stdin is TTY → PTY allocated)
-target/debug/ez -- ls /usr
+target/debug/ez go -- ls /usr
 target/debug/ez go -- sh -c 'echo hi; exit 42'
 
-# Interactive shell (no subcommand or explicit go)
-target/debug/ez
+# Interactive shell (no subcommand)
 target/debug/ez go
 ```
 

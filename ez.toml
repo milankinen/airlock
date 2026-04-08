@@ -2,20 +2,43 @@ presets = ["debian", "claude-code", "rust"]
 image = "ez:dev"
 
 [env]
+# Needs to be something to make Claude happy; the actual token
+# is set by the network middleware
 CLAUDE_CODE_OAUTH_TOKEN = "-"
+# We can always build natively inside vm
+SUPERVISOR_BUILD_HOST = "true"
+# We can use host's docker image
+SKIP_DEV_IMAGE_BUILD = "true"
+# Allow --dangerously-skip-permissions inside vm
+IS_SANDBOX = "1"
 
 [disk]
 size = "20 GB"
 
-[disk.cache."rustup-toolchains"]
-path = "~/.rustup/toolchains"
+[disk.cache.rustup]
+paths = ["~/.rustup"]
+
+[disk.cache.cago-target]
+paths = ["target"]
+
+[disk.cache.cargo-registry]
+enabled = false
+
+[mounts.cargo-registry]
+missing = "ignore"
+source = "~/.cargo/registry"
+target = "~/.cargo/registry"
 
 [mounts.claude-json]
 missing = "fail"
 source = "~/.ez/claude.json"
 target = "~/.claude.json"
 
-[network.rules.all]
+[network.sockets.docker]
+host = "~/.docker/run/docker.sock"
+guest = "/var/run/docker.sock"
+
+[network.rules.allow-all]
 allow = ["*"]
 
 [[network.rules.claude-code.middleware]]

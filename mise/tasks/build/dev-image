@@ -4,6 +4,13 @@
 #MISE outputs=["target/ez.dev"]
 set -euo pipefail
 
-docker build --progress=quiet -t ez:dev -f dev.dockerfile .
+if [[ "${SKIP_DEV_IMAGE_BUILD:-}" == "true" ]]; then
+  echo "Skipping dev image build"
+  mkdir -p target
+  touch target/ez.dev
+  exit 0
+fi
+
+docker build -t ez:dev -f dev.dockerfile .
 mkdir -p target
 touch target/ez.dev
