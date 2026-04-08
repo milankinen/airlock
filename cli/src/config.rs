@@ -40,6 +40,10 @@ pub struct Config {
     /// Cache volume (VirtIO block device with ext4)
     #[config(nest)]
     pub disk: Disk,
+    /// Environment variables injected into the container.
+    /// Values support `${VAR}` substitution from the host environment.
+    #[config(default)]
+    pub env: BTreeMap<String, String>,
     /// Enable nested virtualization (Linux only)
     #[config(default)]
     pub nested_virtualization: bool,

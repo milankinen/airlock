@@ -4,6 +4,7 @@
 //! and project settings. The VM is the security boundary, so all Linux
 //! capabilities are granted inside the container.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use super::{OciConfig, ResolvedMount};
@@ -18,6 +19,7 @@ pub fn generate_config(
     terminal: Option<(u16, u16)>,
     nested_virtualization: bool,
     socket_forwards: &[(String, String)],
+    extra_env: &BTreeMap<String, String>,
     dest: &Path,
 ) -> anyhow::Result<()> {
     let cfg = image_config.config.as_ref();
@@ -50,6 +52,16 @@ pub fn generate_config(
             env.retain(|existing| !existing.starts_with(&format!("{key}=")));
             env.push(e.clone());
         }
+    }
+
+    // User-configured env vars (from [env] in ez.toml).
+    // Values support ${VAR} substitution from the host environment.
+    let host_env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    for (key, template) in extra_env {
+        let value = subst::substitute(template, &host_env)
+            .map_err(|e| anyhow::anyhow!("env.{key}: {e}"))?;
+        env.retain(|existing| !existing.starts_with(&format!("{key}=")));
+        env.push(format!("{key}={value}"));
     }
 
     let cwd = project_cwd.to_string_lossy().to_string();

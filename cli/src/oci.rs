@@ -215,6 +215,7 @@ fn build_bundle(
         pty_size,
         project.config.nested_virtualization,
         &socket_fwds,
+        &project.config.env,
         &overlay_dir.join("config.json"),
     )?;
 
