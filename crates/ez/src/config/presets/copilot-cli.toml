@@ -24,26 +24,22 @@ allow = [
 # Path restrictions per the allowlist reference.
 # Hosts with middleware get TLS interception to inspect HTTP paths.
 
-[[network.rules.copilot-cli.middleware."github.com"]]
+[[network.rules.copilot-cli.middleware]]
 script = """
+local h = req.host
 local p = req.path
-if not (p:find("^/login") or p:find("^/enterprises/")) then
-  req:deny()
-end
-"""
-
-[[network.rules.copilot-cli.middleware."api.github.com"]]
-script = """
-local p = req.path
-if not (p == "/user" or p:find("^/copilot_internal/")) then
-  req:deny()
-end
-"""
-
-[[network.rules.copilot-cli.middleware."copilot-telemetry.githubusercontent.com"]]
-script = """
-if req.path ~= "/telemetry" then
-  req:deny()
+if h == "github.com" then
+  if not (p:find("^/login") or p:find("^/enterprises/")) then
+    req:deny()
+  end
+elseif h == "api.github.com" then
+  if not (p == "/user" or p:find("^/copilot_internal/")) then
+    req:deny()
+  end
+elseif h == "copilot-telemetry.githubusercontent.com" or h == "collector.github.com" then
+  if p ~= "/telemetry" then
+    req:deny()
+  end
 end
 """
 
