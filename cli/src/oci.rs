@@ -54,6 +54,13 @@ pub enum MountType {
     File { filename: String },
 }
 
+impl Bundle {
+    /// Expand `~` in a container path string using the container's home directory.
+    pub fn expand_tilde(&self, path: &str) -> PathBuf {
+        expand_tilde(path, Path::new(&self.container_home))
+    }
+}
+
 impl ResolvedMount {
     /// VirtioFS share tag or file overlay key used in the supervisor.
     pub fn key(&self) -> &str {
@@ -147,8 +154,8 @@ fn build_bundle(
         mount_type: MountType::Dir {
             key: "project".to_string(),
         },
-        source: project.cwd.clone(),
-        target: project.cwd.to_string_lossy().into(),
+        source: project.host_cwd.clone(),
+        target: project.guest_cwd.to_string_lossy().into(),
         read_only: false,
     });
 
@@ -163,7 +170,7 @@ fn build_bundle(
     let container_uid = config::get_uid(&image_config);
     let image_rootfs = image_dir.join("rootfs");
     let container_home = lookup_home_dir(&image_rootfs, container_uid)?;
-    let host_home = dirs::home_dir().unwrap_or_default();
+    let host_home = &project.host_home;
     let enabled_mounts: Vec<_> = project
         .config
         .mounts
@@ -173,9 +180,9 @@ fn build_bundle(
         .collect::<Vec<_>>();
     mounts.extend(resolve_mounts(
         &enabled_mounts,
-        &host_home,
+        host_home,
         &container_home,
-        &project.cwd,
+        &project.host_cwd,
     )?);
 
     // Disk image (ext4) for overlay upper + cache mounts
@@ -183,7 +190,7 @@ fn build_bundle(
         &project.cache_dir,
         &project.config.disk,
         &container_home,
-        &project.cwd,
+        &project.host_cwd,
     )?;
 
     let pty_size = if terminal.is_tty() {
@@ -209,7 +216,7 @@ fn build_bundle(
         .collect();
     config::generate_config(
         &image_config,
-        &project.cwd,
+        &project.guest_cwd,
         &mounts,
         &args.args,
         pty_size,
@@ -510,7 +517,7 @@ fn format_size(bytes: i64) -> String {
 }
 
 /// Expand `~` prefix in a path string.
-fn expand_tilde(path: &str, home: &Path) -> PathBuf {
+pub(crate) fn expand_tilde(path: &str, home: &Path) -> PathBuf {
     if path == "~" {
         home.to_path_buf()
     } else if let Some(rest) = path.strip_prefix("~/") {

@@ -33,7 +33,10 @@ async fn main() {
     cli::initialize(&parsed.global);
 
     let exit_code = match parsed.command {
-        Command::Go { log_level } => cli::cmd_go::run(log_level, extra_args).await,
+        Command::Go {
+            log_level,
+            project_cwd,
+        } => cli::cmd_go::run(log_level, extra_args, project_cwd).await,
         Command::Exec {
             cmd,
             args,

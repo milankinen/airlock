@@ -15,7 +15,7 @@ pub fn run(path: Option<&str>) -> i32 {
     if !project.cache_dir.exists() {
         cli::error!(
             "no project data for {} — run `ez go` first",
-            project.cwd.display()
+            project.host_cwd.display()
         );
         return 1;
     }
@@ -27,7 +27,7 @@ pub fn run(path: Option<&str>) -> i32 {
     };
 
     println!("ID:       {}", project.id());
-    println!("Path:     {}", project.cwd.display());
+    println!("Path:     {}", project.display_cwd());
     println!("Status:   {status}");
     println!("Image:    {}", project.config.image);
     println!("CPUs:     {}", project.config.cpus);

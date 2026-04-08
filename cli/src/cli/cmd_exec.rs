@@ -78,7 +78,7 @@ async fn run_inner(
     for (i, a) in args.iter().enumerate() {
         args_b.set(i as u32, a.as_str());
     }
-    let cwd = cwd.unwrap_or_else(|| project.cwd.to_string_lossy().into_owned());
+    let cwd = cwd.unwrap_or_else(|| project.guest_cwd.to_string_lossy().into_owned());
     req.get().set_cwd(&cwd);
     let mut env_b = req.get().init_env(env.len() as u32);
     for (i, e) in env.iter().enumerate() {

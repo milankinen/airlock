@@ -64,6 +64,9 @@ pub enum Command {
         /// Log level
         #[arg(long, env = "EZ_LOG_LEVEL", default_value = "warn")]
         log_level: LogLevel,
+        /// Working directory inside the container (defaults to the host cwd)
+        #[arg(long)]
+        project_cwd: Option<String>,
     },
     /// Execute a command inside the running VM container
     #[command(alias = "x")]

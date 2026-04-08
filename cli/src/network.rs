@@ -19,7 +19,7 @@ mod tests;
 mod tls;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -47,17 +47,13 @@ pub fn setup(project: &Project, bundle: &crate::oci::Bundle) -> anyhow::Result<N
     let ca_key = std::fs::read_to_string(&project.ca_key)?;
     let interceptor = tls::TlsInterceptor::new(&ca_cert, &ca_key)?;
 
-    let host_home = dirs::home_dir().unwrap_or_default();
-    let container_home_path = Path::new(bundle.container_home.as_str());
     let socket_map: HashMap<String, PathBuf> = net
         .sockets
         .values()
         .filter(|s| s.enabled)
         .map(|s| {
-            let guest = expand_tilde(&s.guest, container_home_path)
-                .to_string_lossy()
-                .into_owned();
-            let host = expand_tilde(&s.host, &host_home);
+            let guest = bundle.expand_tilde(&s.guest).to_string_lossy().into_owned();
+            let host = project.expand_host_tilde(&s.host);
             (guest, host)
         })
         .collect();
@@ -70,17 +66,6 @@ pub fn setup(project: &Project, bundle: &crate::oci::Bundle) -> anyhow::Result<N
         targets,
         socket_map,
     })
-}
-
-/// Expand `~` to the given home directory in a path string.
-fn expand_tilde(path: &str, home: &Path) -> PathBuf {
-    if path == "~" {
-        home.to_path_buf()
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        home.join(rest)
-    } else {
-        PathBuf::from(path)
-    }
 }
 
 /// Host-side network proxy state, implementing the `NetworkProxy` RPC

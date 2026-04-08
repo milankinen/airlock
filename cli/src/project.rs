@@ -15,7 +15,12 @@ use crate::config::Config;
 /// A resolved project: its working directory, cache paths, config, and CA.
 pub struct Project {
     pub cache_dir: PathBuf,
-    pub cwd: PathBuf,
+    /// Host user's home directory.
+    pub host_home: PathBuf,
+    /// Absolute working directory on the host.
+    pub host_cwd: PathBuf,
+    /// Working directory inside the container (defaults to `host_cwd`).
+    pub guest_cwd: PathBuf,
     pub config: Config,
     pub ca_cert: PathBuf,
     pub ca_key: PathBuf,
@@ -28,6 +33,17 @@ impl Project {
     /// The project's hash ID (directory name under `~/.ezpez/projects/`).
     pub fn id(&self) -> String {
         project_id(&self.cache_dir)
+    }
+
+    /// Expand `~` in `path` using the host home directory.
+    pub fn expand_host_tilde(&self, path: &str) -> PathBuf {
+        if path == "~" {
+            self.host_home.clone()
+        } else if let Some(rest) = path.strip_prefix("~/") {
+            self.host_home.join(rest)
+        } else {
+            PathBuf::from(path)
+        }
     }
 
     /// Check if this project has an active `ez go` process via its PID lock.
@@ -43,6 +59,14 @@ impl Project {
     /// Save image + last_run metadata after a successful VM start.
     pub fn save_meta(&self) {
         save_meta(&self.cache_dir, &self.config.image);
+    }
+
+    pub fn display_cwd(&self) -> String {
+        if self.host_cwd == self.guest_cwd {
+            self.host_cwd.display().to_string()
+        } else {
+            format!("{} → {}", self.host_cwd.display(), self.guest_cwd.display())
+        }
     }
 }
 
@@ -71,13 +95,18 @@ pub fn project_hash(cwd: &Path) -> String {
 /// loads its config, and returns a `Project`. No lock is acquired
 /// and no CA is generated — use this for read-only subcommands.
 pub fn load(arg: Option<&str>) -> anyhow::Result<Project> {
-    let (cwd, cache_dir) = resolve_project_dir(arg)?;
-    let config = crate::config::load(&cwd)?;
+    let home_dir =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    let (host_cwd, cache_dir) = resolve_project_dir(arg)?;
+    let config = crate::config::load(&host_cwd)?;
     let ca_cert = cache_dir.join("ca/ca.crt");
     let ca_key = cache_dir.join("ca/ca.key");
+    let guest_cwd = read_guest_cwd(&cache_dir).unwrap_or_else(|| host_cwd.clone());
     Ok(Project {
         cache_dir,
-        cwd,
+        host_home: home_dir,
+        host_cwd,
+        guest_cwd,
         config,
         ca_cert,
         ca_key,
@@ -91,11 +120,18 @@ pub fn load(arg: Option<&str>) -> anyhow::Result<Project> {
 /// Writes a PID lockfile to prevent concurrent instances from
 /// modifying the same project (bundle, mounts, etc.). The lock
 /// is released when the `Project` is dropped.
-pub fn lock(config: Config) -> anyhow::Result<Project> {
-    let cwd = std::env::current_dir()?;
-    let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+///
+/// `guest_cwd_override` sets the working directory inside the container
+/// (defaults to `host_cwd` when `None`).
+pub fn lock(config: Config, guest_cwd_override: Option<String>) -> anyhow::Result<Project> {
+    let home_dir =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    let host_cwd = std::env::current_dir()?;
+    let host_cwd = std::fs::canonicalize(&host_cwd).unwrap_or(host_cwd);
 
-    let hash = project_hash(&cwd);
+    let guest_cwd = guest_cwd_override.map_or_else(|| host_cwd.clone(), PathBuf::from);
+
+    let hash = project_hash(&host_cwd);
 
     let dir = crate::cache::project_dir(&hash)?;
     std::fs::create_dir_all(&dir)?;
@@ -104,7 +140,9 @@ pub fn lock(config: Config) -> anyhow::Result<Project> {
     acquire_lock(&lock_path)?;
 
     // Write the cwd so project list can display it
-    std::fs::write(dir.join("cwd"), cwd.to_string_lossy().as_ref())?;
+    std::fs::write(dir.join("cwd"), host_cwd.to_string_lossy().as_ref())?;
+    // Persist guest_cwd so `ez exec` can default to it
+    std::fs::write(dir.join("guest_cwd"), guest_cwd.to_string_lossy().as_ref())?;
 
     let ca_dir = dir.join("ca");
     let ca_cert = ca_dir.join("ca.crt");
@@ -118,7 +156,9 @@ pub fn lock(config: Config) -> anyhow::Result<Project> {
 
     Ok(Project {
         cache_dir: dir,
-        cwd,
+        host_home: home_dir,
+        host_cwd,
+        guest_cwd,
         config,
         ca_cert,
         ca_key,
@@ -184,6 +224,14 @@ pub fn last_run_ago(project_dir: &Path) -> Option<String> {
 }
 
 // -- Private helpers --
+
+/// Read the persisted guest_cwd for a project (written by `lock`).
+fn read_guest_cwd(project_dir: &Path) -> Option<PathBuf> {
+    std::fs::read_to_string(project_dir.join("guest_cwd"))
+        .ok()
+        .map(|s| PathBuf::from(s.trim()))
+        .filter(|p| !p.as_os_str().is_empty())
+}
 
 /// Resolve a project directory from an optional path/hash argument.
 fn resolve_project_dir(arg: Option<&str>) -> anyhow::Result<(PathBuf, PathBuf)> {

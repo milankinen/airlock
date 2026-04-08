@@ -15,7 +15,7 @@ pub fn run(path: Option<&str>, yes: bool) -> i32 {
     };
 
     if !project.cache_dir.exists() {
-        cli::error!("no project found for {}", project.cwd.display());
+        cli::error!("no project found for {}", project.host_cwd.display());
         return 1;
     }
 
@@ -25,7 +25,7 @@ pub fn run(path: Option<&str>, yes: bool) -> i32 {
     }
 
     if !yes {
-        eprint!("Remove project for {}? [y/N] ", project.cwd.display());
+        eprint!("Remove project for {}? [y/N] ", project.host_cwd.display());
         let _ = std::io::stderr().flush();
         let mut input = String::new();
         if std::io::stdin().read_line(&mut input).is_err()
@@ -41,6 +41,6 @@ pub fn run(path: Option<&str>, yes: bool) -> i32 {
         return 1;
     }
 
-    println!("Removed project for {}", project.cwd.display());
+    println!("Removed project for {}", project.host_cwd.display());
     0
 }
