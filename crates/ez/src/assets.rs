@@ -40,10 +40,13 @@ impl Assets {
 
             #[cfg(not(feature = "distroless"))]
             {
-                std::fs::write(dir.join("Image"), include_bytes!("../../sandbox/out/Image"))?;
+                std::fs::write(
+                    dir.join("Image"),
+                    include_bytes!("../../../target/vm/Image"),
+                )?;
                 std::fs::write(
                     dir.join("initramfs.gz"),
-                    include_bytes!("../../sandbox/out/initramfs.gz"),
+                    include_bytes!("../../../target/vm/initramfs.gz"),
                 )?;
             }
 
@@ -52,11 +55,11 @@ impl Assets {
                 use std::os::unix::fs::PermissionsExt;
 
                 let ch = dir.join("cloud-hypervisor");
-                std::fs::write(&ch, include_bytes!("../../sandbox/out/cloud-hypervisor"))?;
+                std::fs::write(&ch, include_bytes!("../../../target/vm/cloud-hypervisor"))?;
                 std::fs::set_permissions(&ch, std::fs::Permissions::from_mode(0o755))?;
 
                 let vfs = dir.join("virtiofsd");
-                std::fs::write(&vfs, include_bytes!("../../sandbox/out/virtiofsd"))?;
+                std::fs::write(&vfs, include_bytes!("../../../target/vm/virtiofsd"))?;
                 std::fs::set_permissions(&vfs, std::fs::Permissions::from_mode(0o755))?;
             }
 

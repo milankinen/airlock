@@ -1,7 +1,7 @@
 #!/bin/bash
 #MISE description="Build the supervisor for Linux (musl)"
-#MISE sources=["sandbox/supervisor/src/**/*.rs", "sandbox/supervisor/Cargo.toml", "protocol/src/**/*.rs", "protocol/schema/**/*.capnp", "sandbox/supervisor/Dockerfile"]
-#MISE outputs=["sandbox/out/supervisor"]
+#MISE sources=["crates/ezd/src/**/*.rs", "crates/ezd/Cargo.toml", "crates/common/src/**/*.rs", "crates/common/schema/**/*.capnp", "crates/ezd/builder.dockerfile"]
+#MISE outputs=["target/vm/ezd"]
 set -euo pipefail
 
 HOST_ARCH=$(uname -m)
@@ -10,20 +10,20 @@ case "$HOST_ARCH" in
   *)       TARGET=aarch64-unknown-linux-musl ;;
 esac
 
-mkdir -p sandbox/out
+mkdir -p target/vm
 
 if [[ "${SUPERVISOR_BUILD_HOST:-}" == "true" ]]; then
   echo "Building supervisor (native, ${TARGET})..."
   cargo build --release -p ezpez-supervisor --target "${TARGET}"
-  cp "target/${TARGET}/release/ezpez-supervisor" sandbox/out/supervisor
+  cp "target/${TARGET}/release/ezd" target/vm/ezd
 else
   echo "Preparing supervisor builder..."
-  docker build --progress=quiet -t ezpez-supervisor-builder sandbox/supervisor
+  docker build --progress=quiet -t ezpez-supervisor-builder -f crates/ezd/builder.dockerfile crates/ezd
   echo "Building supervisor (docker, ${TARGET})..."
   docker run --rm \
     -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
     -v "$PWD:/workspace:ro" \
-    -v "$PWD/sandbox/out:/out" \
+    -v "$PWD/target/vm:/out" \
     -v ezpez-cargo-cache:/cargo-cache \
     -v ezpez-target-cache:/target \
     ezpez-supervisor-builder sh -c "
@@ -32,9 +32,9 @@ else
       cd /workspace
       rustup target add ${TARGET}
       cargo build --release -p ezpez-supervisor --target ${TARGET} --target-dir /target
-      cp /target/${TARGET}/release/ezpez-supervisor /out/supervisor
-      chown \${HOST_UID}:\${HOST_GID} /out/supervisor
+      cp /target/${TARGET}/release/ezd /out/ezd
+      chown \${HOST_UID}:\${HOST_GID} /out/ezd
     "
 fi
 
-echo "Supervisor: sandbox/out/supervisor ($(du -h sandbox/out/supervisor | cut -f1))"
+echo "Supervisor: target/vm/ezd ($(du -h target/vm/ezd | cut -f1))"

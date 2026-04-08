@@ -63,14 +63,14 @@ jobs:
       - uses: actions/cache@v4
         id: kernel-cache
         with:
-          path: sandbox/out/Image
-          key: kernel-aarch64-${{ hashFiles('sandbox/kernel/config-arm64', 'sandbox/kernel/build.sh') }}
+          path: target/vm/Image
+          key: kernel-aarch64-${{ hashFiles('vm/kernel/config-arm64', 'vm/kernel/build.sh') }}
       - if: steps.kernel-cache.outputs.cache-hit != 'true'
         run: mise run build:kernel
       - uses: actions/upload-artifact@v4
         with:
           name: kernel-aarch64
-          path: sandbox/out/Image
+          path: target/vm/Image
 
   build-kernel-x86_64:
     needs: [ lint-macos, lint-linux, test-macos, test-linux ]
@@ -81,14 +81,14 @@ jobs:
       - uses: actions/cache@v4
         id: kernel-cache
         with:
-          path: sandbox/out/Image
-          key: kernel-x86_64-${{ hashFiles('sandbox/kernel/config-x86_64', 'sandbox/kernel/build.sh') }}
+          path: target/vm/Image
+          key: kernel-x86_64-${{ hashFiles('vm/kernel/config-x86_64', 'vm/kernel/build.sh') }}
       - if: steps.kernel-cache.outputs.cache-hit != 'true'
         run: mise run build:kernel
       - uses: actions/upload-artifact@v4
         with:
           name: kernel-x86_64
-          path: sandbox/out/Image
+          path: target/vm/Image
 
   build-rootfs-aarch64:
     needs: [ lint-macos, lint-linux, test-macos, test-linux ]
@@ -108,8 +108,8 @@ jobs:
         with:
           name: rootfs-aarch64
           path: |
-            sandbox/out/initramfs.gz
-            sandbox/out/rootfs.tar.gz
+            target/vm/initramfs.gz
+            target/vm/rootfs.tar.gz
 
   build-rootfs-x86_64:
     needs: [ lint-macos, lint-linux, test-macos, test-linux ]
@@ -129,8 +129,8 @@ jobs:
         with:
           name: rootfs-x86_64
           path: |
-            sandbox/out/initramfs.gz
-            sandbox/out/rootfs.tar.gz
+            target/vm/initramfs.gz
+            target/vm/rootfs.tar.gz
 
   fetch-vmm-x86_64:
     needs: [ lint-macos, lint-linux, test-macos, test-linux ]
@@ -144,8 +144,8 @@ jobs:
         with:
           name: vmm-x86_64
           path: |
-            sandbox/out/cloud-hypervisor
-            sandbox/out/virtiofsd
+            target/vm/cloud-hypervisor
+            target/vm/virtiofsd
 
   fetch-vmm-aarch64:
     needs: [ lint-macos, lint-linux, test-macos, test-linux ]
@@ -159,8 +159,8 @@ jobs:
         with:
           name: vmm-aarch64
           path: |
-            sandbox/out/cloud-hypervisor
-            sandbox/out/virtiofsd
+            target/vm/cloud-hypervisor
+            target/vm/virtiofsd
 
   # ── Stage 3: CLI binaries ──────────────────────────────
   build-cli-macos-aarch64:
@@ -175,11 +175,11 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: kernel-aarch64
-          path: sandbox/out
+          path: target/vm
       - uses: actions/download-artifact@v4
         with:
           name: rootfs-aarch64
-          path: sandbox/out
+          path: target/vm
       - run: cargo build --release -p ezpez-cli
       - run: codesign --entitlements entitlements.plist --force -s - target/release/ez
       - uses: actions/upload-artifact@v4
@@ -199,15 +199,15 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: kernel-x86_64
-          path: sandbox/out
+          path: target/vm
       - uses: actions/download-artifact@v4
         with:
           name: rootfs-x86_64
-          path: sandbox/out
+          path: target/vm
       - uses: actions/download-artifact@v4
         with:
           name: vmm-x86_64
-          path: sandbox/out
+          path: target/vm
       - run: cargo build --release -p ezpez-cli
       - uses: actions/upload-artifact@v4
         with:
@@ -226,15 +226,15 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: kernel-aarch64
-          path: sandbox/out
+          path: target/vm
       - uses: actions/download-artifact@v4
         with:
           name: rootfs-aarch64
-          path: sandbox/out
+          path: target/vm
       - uses: actions/download-artifact@v4
         with:
           name: vmm-aarch64
-          path: sandbox/out
+          path: target/vm
       - run: cargo build --release -p ezpez-cli
       - uses: actions/upload-artifact@v4
         with:
@@ -270,7 +270,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: vmm-x86_64
-          path: sandbox/out
+          path: target/vm
       - run: cargo build --release -p ezpez-cli --features distroless
       - uses: actions/upload-artifact@v4
         with:
@@ -289,7 +289,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: vmm-aarch64
-          path: sandbox/out
+          path: target/vm
       - run: cargo build --release -p ezpez-cli --features distroless
       - uses: actions/upload-artifact@v4
         with:

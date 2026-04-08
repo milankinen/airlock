@@ -1,27 +1,27 @@
 #!/bin/bash
 #MISE description="Build virtiofsd binary"
 #MISE sources=["mise/tasks/fetch/virtiofsd"]
-#MISE outputs=["sandbox/out/virtiofsd"]
+#MISE outputs=["target/vm/virtiofsd"]
 set -euo pipefail
 
 if [[ "$(uname -s)" != "Linux" ]]; then
   echo "Skipping virtiofsd (not Linux)"
-  mkdir -p sandbox/out
-  touch sandbox/out/virtiofsd
+  mkdir -p target/vm
+  touch target/vm/virtiofsd
   exit 0
 fi
 
 VIRTIOFSD_VERSION="v1.13.3"
 
-mkdir -p sandbox/out
-OUTPUT="sandbox/out/virtiofsd"
+mkdir -p target/vm
+OUTPUT="target/vm/virtiofsd"
 
 if [[ -f "$OUTPUT" ]]; then
   echo "virtiofsd already built"
 else
   echo "Building virtiofsd ${VIRTIOFSD_VERSION}..."
   docker run --rm \
-    -v "$PWD/sandbox/out:/out" \
+    -v "$PWD/target/vm:/out" \
     -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
     rust:1-slim-trixie sh -c "
       set -e

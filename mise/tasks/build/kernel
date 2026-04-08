@@ -1,7 +1,7 @@
 #!/bin/bash
 #MISE description="Build the kernel using Docker"
-#MISE sources=["sandbox/kernel/config-*", "sandbox/kernel/build.sh"]
-#MISE outputs=["sandbox/out/Image"]
+#MISE sources=["vm/kernel/config-*", "vm/kernel/build.sh"]
+#MISE outputs=["target/vm/Image"]
 set -euo pipefail
 
 HOST_ARCH=$(uname -m)
@@ -11,13 +11,13 @@ case "$HOST_ARCH" in
 esac
 
 echo "Building kernel (${ARCH})..."
-mkdir -p sandbox/out
+mkdir -p target/vm
 docker run --rm \
   -e "ARCH=${ARCH}" \
   -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
-  -v "$PWD/sandbox/kernel/${CONFIG}:/config:ro" \
-  -v "$PWD/sandbox/kernel/build.sh:/build.sh:ro" \
-  -v "$PWD/sandbox/out:/out" \
+  -v "$PWD/vm/kernel/${CONFIG}:/config:ro" \
+  -v "$PWD/vm/kernel/build.sh:/build.sh:ro" \
+  -v "$PWD/target/vm:/out" \
   alpine:3.23 sh -c 'sh /build.sh && chown "$HOST_UID:$HOST_GID" /out/Image'
-SIZE=$(du -h sandbox/out/Image | cut -f1)
-echo "Kernel: sandbox/out/Image (${SIZE})"
+SIZE=$(du -h target/vm/Image | cut -f1)
+echo "Kernel: target/vm/Image (${SIZE})"

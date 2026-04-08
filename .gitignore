@@ -1,7 +1,6 @@
 .DS_Store
 
 /target
-/sandbox/out
 /.idea
 *.iml
 *.log

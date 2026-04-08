@@ -3,6 +3,10 @@ name = "ezpez-supervisor"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "ezd"
+path = "src/main.rs"
+
 [lints]
 workspace = true
 

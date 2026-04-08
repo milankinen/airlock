@@ -69,7 +69,7 @@ target/debug/ez exec -e KEY=val env        # set env vars
 `ez exec` connects to `<project-cache>/cli.sock` (Cap'n Proto RPC) that
 `ez go` exposes while the VM is running. TTY mode is auto-detected; raw
 mode is enabled for interactive commands. The `CliService` interface is
-defined in `protocol/schema/supervisor.capnp`.
+defined in `crates/common/schema/supervisor.capnp`.
 
 ## Project management CLI
 

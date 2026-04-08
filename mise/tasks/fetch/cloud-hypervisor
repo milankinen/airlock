@@ -1,13 +1,13 @@
 #!/bin/bash
 #MISE description="Fetch cloud-hypervisor static binary"
 #MISE sources=["mise/tasks/fetch/cloud-hypervisor"]
-#MISE outputs=["sandbox/out/cloud-hypervisor"]
+#MISE outputs=["target/vm/cloud-hypervisor"]
 set -euo pipefail
 
 if [[ "$(uname -s)" != "Linux" ]]; then
   echo "Skipping cloud-hypervisor (not Linux)"
-  mkdir -p sandbox/out
-  touch sandbox/out/cloud-hypervisor
+  mkdir -p target/vm
+  touch target/vm/cloud-hypervisor
   exit 0
 fi
 
@@ -20,8 +20,8 @@ case "$HOST_ARCH" in
   *)       echo "Unsupported architecture: $HOST_ARCH"; exit 1 ;;
 esac
 
-mkdir -p sandbox/out
-OUTPUT="sandbox/out/cloud-hypervisor"
+mkdir -p target/vm
+OUTPUT="target/vm/cloud-hypervisor"
 
 if [[ -f "$OUTPUT" ]]; then
   echo "cloud-hypervisor already fetched"

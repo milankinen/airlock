@@ -6,22 +6,22 @@ fn main() {
 
     let distroless = std::env::var("CARGO_FEATURE_DISTROLESS").is_ok();
     if !distroless {
-        let kernel = std::fs::read("../sandbox/out/Image").unwrap_or_default();
-        let initramfs = std::fs::read("../sandbox/out/initramfs.gz").unwrap_or_default();
+        let kernel = std::fs::read("../../target/vm/Image").unwrap_or_default();
+        let initramfs = std::fs::read("../../target/vm/initramfs.gz").unwrap_or_default();
         hasher.write(&kernel);
         hasher.write(&initramfs);
-        println!("cargo:rerun-if-changed=../sandbox/out/Image");
-        println!("cargo:rerun-if-changed=../sandbox/out/initramfs.gz");
+        println!("cargo:rerun-if-changed=../../target/vm/Image");
+        println!("cargo:rerun-if-changed=../../target/vm/initramfs.gz");
     }
 
     #[cfg(target_os = "linux")]
     {
-        let ch = std::fs::read("../sandbox/out/cloud-hypervisor").unwrap_or_default();
-        let vfs = std::fs::read("../sandbox/out/virtiofsd").unwrap_or_default();
+        let ch = std::fs::read("../../target/vm/cloud-hypervisor").unwrap_or_default();
+        let vfs = std::fs::read("../../target/vm/virtiofsd").unwrap_or_default();
         hasher.write(&ch);
         hasher.write(&vfs);
-        println!("cargo:rerun-if-changed=../sandbox/out/cloud-hypervisor");
-        println!("cargo:rerun-if-changed=../sandbox/out/virtiofsd");
+        println!("cargo:rerun-if-changed=../../target/vm/cloud-hypervisor");
+        println!("cargo:rerun-if-changed=../../target/vm/virtiofsd");
     }
 
     let checksum = format!("{:016x}", hasher.finish());
