@@ -29,9 +29,9 @@ pub fn run(path: Option<&str>) -> i32 {
     println!("ID:       {}", project.id());
     println!("Path:     {}", project.display_cwd());
     println!("Status:   {status}");
-    println!("Image:    {}", project.config.image);
-    println!("CPUs:     {}", project.config.cpus);
-    println!("Memory:   {}", project.config.memory);
+    println!("Image:    {}", project.config.vm.image);
+    println!("CPUs:     {}", project.config.vm.cpus);
+    println!("Memory:   {}", project.config.vm.memory);
 
     if let Some(ago) = project.last_run_ago() {
         println!("Last run: {ago}");

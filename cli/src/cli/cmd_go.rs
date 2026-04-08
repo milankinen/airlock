@@ -53,7 +53,7 @@ async fn run_inner(
     cli::log!(
         "  {} config loaded, image: {}",
         cli::check(),
-        cli::dim(&project.config.image)
+        cli::dim(&project.config.vm.image)
     );
     if project.ca_newly_generated {
         cli::log!("  {} ca cert generated", cli::check());

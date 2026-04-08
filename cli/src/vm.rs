@@ -143,12 +143,12 @@ pub async fn start(
     cli::log!(
         "  {} cpus:   {}",
         cli::bullet(),
-        cli::dim(&project.config.cpus.to_string())
+        cli::dim(&project.config.vm.cpus.to_string())
     );
     cli::log!(
         "  {} memory: {}",
         cli::bullet(),
-        cli::dim(&project.config.memory.to_string())
+        cli::dim(&project.config.vm.memory.to_string())
     );
     let cache_paths: Vec<&str> = project
         .config
@@ -201,8 +201,8 @@ pub async fn start(
     }
 
     let vm_config = config::VmConfig {
-        cpus: project.config.cpus,
-        memory_bytes: project.config.memory.0,
+        cpus: project.config.vm.cpus,
+        memory_bytes: project.config.vm.memory.0,
         kernel: assets.kernel,
         initramfs: assets.initramfs,
         kernel_cmdline: {
@@ -234,7 +234,7 @@ pub async fn start(
         #[cfg(target_os = "linux")]
         virtiofsd: assets.virtiofsd,
         #[cfg(target_os = "linux")]
-        nested_virtualization: project.config.nested_virtualization,
+        nested_virtualization: project.config.vm.nested_virtualization,
     };
 
     #[cfg(target_os = "macos")]

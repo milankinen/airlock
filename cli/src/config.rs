@@ -13,7 +13,6 @@ use std::collections::BTreeMap;
 
 use config::*;
 pub use load_config::load;
-pub use smart_config::ByteSize;
 use smart_config::{DescribeConfig, DeserializeConfig};
 
 /// Configuration loaded from hierarchical TOML files and validated
@@ -21,16 +20,9 @@ use smart_config::{DescribeConfig, DeserializeConfig};
 /// separately after loading.
 #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
 pub struct Config {
-    /// OCI image to use
-    #[config(default_t = "alpine:latest".into())]
-    pub image: String,
-    /// Number of virtual CPUs
-    #[config(default = default_cpus)]
-    pub cpus: u32,
-    /// Memory size (e.g. "4 GB", "512 MB")
-    #[serde(serialize_with = "config::ser_byte_size")]
-    #[config(default = default_memory)]
-    pub memory: ByteSize,
+    /// Virtual machine configuration
+    #[config(nest)]
+    pub vm: VirtualMachine,
     /// Network configuration
     #[config(nest)]
     pub network: Network,
@@ -44,9 +36,6 @@ pub struct Config {
     /// Values support `${VAR}` substitution from the host environment.
     #[config(default)]
     pub env: BTreeMap<String, String>,
-    /// Enable nested virtualization (Linux only)
-    #[config(default)]
-    pub nested_virtualization: bool,
 }
 
 #[allow(clippy::module_inception)]
@@ -55,7 +44,7 @@ pub mod config {
     use std::collections::BTreeMap;
 
     use smart_config::de::WellKnown;
-    use smart_config::{DescribeConfig, DeserializeConfig};
+    use smart_config::{ByteSize, DescribeConfig, DeserializeConfig};
 
     use crate::config::de;
 
@@ -82,6 +71,24 @@ pub mod config {
         s: S,
     ) -> Result<S::Ok, S::Error> {
         s.serialize_str(&size.to_string())
+    }
+
+    /// Virtual machine configurations
+    #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
+    pub struct VirtualMachine {
+        /// OCI image to use
+        #[config(default_t = "alpine:latest".into())]
+        pub image: String,
+        /// Number of virtual CPUs
+        #[config(default = default_cpus)]
+        pub cpus: u32,
+        /// Memory size (e.g. "4 GB", "512 MB")
+        #[serde(serialize_with = "ser_byte_size")]
+        #[config(default = default_memory)]
+        pub memory: ByteSize,
+        /// Enable nested virtualization (Linux only)
+        #[config(default)]
+        pub nested_virtualization: bool,
     }
 
     /// Network configuration

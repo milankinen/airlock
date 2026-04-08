@@ -89,7 +89,7 @@ pub async fn prepare(
     let stored_digest = std::fs::read_to_string(&digest_file).ok();
 
     // Resolve image reference to a digest (no download yet)
-    let mut image = resolve_image(&project.config.image).await?;
+    let mut image = resolve_image(&project.config.vm.image).await?;
 
     // Check if image changed before downloading
     let mut digest_changed = stored_digest
@@ -220,7 +220,7 @@ fn build_bundle(
         &mounts,
         &args.args,
         pty_size,
-        project.config.nested_virtualization,
+        project.config.vm.nested_virtualization,
         &socket_fwds,
         &project.config.env,
         &overlay_dir.join("config.json"),
