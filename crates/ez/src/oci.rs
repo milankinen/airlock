@@ -231,6 +231,11 @@ fn build_bundle(
     } else {
         args.args.clone()
     };
+    let cmd = if args.login {
+        apply_login_shell(cmd)
+    } else {
+        cmd
+    };
 
     // Resolve environment: base defaults → image env → user env
     let mut env: Vec<String> = vec![
@@ -268,6 +273,35 @@ fn build_bundle(
         image_id: image_id.to_string(),
         caches,
     })
+}
+
+/// Wrap a command vector for execution inside a login shell.
+///
+/// Lone shell binaries (`sh`, `bash`, etc.) get `-l` appended directly.
+/// All other commands are wrapped as `sh -l -c 'exec "$0" "$@"' cmd args...`
+/// which passes arguments without quoting.
+fn apply_login_shell(cmd: Vec<String>) -> Vec<String> {
+    let is_lone_shell = cmd.len() == 1 && {
+        let name = std::path::Path::new(&cmd[0])
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        matches!(name, "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh") || name.ends_with("sh")
+    };
+    if is_lone_shell {
+        let mut result = cmd;
+        result.push("-l".to_string());
+        result
+    } else {
+        let mut result = vec![
+            "bash".to_string(),
+            "-l".to_string(),
+            "-c".to_string(),
+            r#"exec "$0" "$@""#.to_string(),
+        ];
+        result.extend(cmd);
+        result
+    }
 }
 
 /// Parse a `USER` string (`uid[:gid]`) into numeric uid/gid.

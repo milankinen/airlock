@@ -6,7 +6,7 @@ use crate::{cli, project};
 
 /// Remove the project cache directory after confirmation (unless `--yes`).
 pub fn run(path: Option<&str>, yes: bool) -> i32 {
-    let project = match project::load(path) {
+    let project = match project::load(path, None) {
         Ok(p) => p,
         Err(e) => {
             cli::error!("{e:#}");

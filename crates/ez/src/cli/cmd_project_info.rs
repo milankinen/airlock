@@ -4,7 +4,7 @@ use crate::{cli, project};
 
 /// Print project metadata (ID, path, status, image, config) to stdout.
 pub fn run(path: Option<&str>) -> i32 {
-    let project = match project::load(path) {
+    let project = match project::load(path, None) {
         Ok(p) => p,
         Err(e) => {
             cli::error!("{e:#}");

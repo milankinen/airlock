@@ -58,11 +58,16 @@ pub fn run() -> i32 {
         return 0;
     }
 
-    let hashes: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
-    let abbrev = project::min_unique_prefix_len(&hashes);
+    let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+    let abbrev = project::min_unique_prefix_len(&ids);
 
     for row in &rows {
-        let short_id = cli::dim(&row.id[..abbrev]);
+        let (hash, session) = project::parse_id(&row.id);
+        let short_hash = &hash[..abbrev.min(hash.len())];
+        let short_id = match session {
+            Some(s) => cli::dim(&format!("{short_hash}:{s}")),
+            None => cli::dim(short_hash),
+        };
         let status = if row.running {
             cli::red(" (running)")
         } else {

@@ -67,6 +67,13 @@ pub enum Command {
         /// Working directory inside the container (defaults to the host cwd)
         #[arg(long)]
         project_cwd: Option<String>,
+        /// Named session — isolates this run's state from other sessions of the
+        /// same project (listed as <id>:<session> in `ez project list`)
+        #[arg(long)]
+        session: Option<String>,
+        /// Run the container command inside a login shell (sources /etc/profile, ~/.profile)
+        #[arg(short = 'l', long)]
+        login: bool,
     },
     /// Execute a command inside the running VM container
     #[command(alias = "x")]
@@ -82,6 +89,12 @@ pub enum Command {
         /// Environment variables (KEY=VALUE)
         #[arg(short = 'e', long = "env")]
         env: Vec<String>,
+        /// Connect to the named session started with `ez go --session`
+        #[arg(long)]
+        session: Option<String>,
+        /// Run the command inside a login shell (sources /etc/profile, ~/.profile)
+        #[arg(short = 'l', long)]
+        login: bool,
     },
     /// Manage projects
     Project {
@@ -116,13 +129,15 @@ pub enum ProjectCommand {
 pub struct CliArgs {
     pub log_level: LogLevel,
     pub args: Vec<String>,
+    pub login: bool,
 }
 
 impl CliArgs {
-    pub fn new(log_level: LogLevel, extra_args: Vec<String>) -> Self {
+    pub fn new(log_level: LogLevel, extra_args: Vec<String>, login: bool) -> Self {
         Self {
             log_level,
             args: extra_args,
+            login,
         }
     }
 }

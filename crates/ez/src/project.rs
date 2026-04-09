@@ -89,15 +89,30 @@ pub fn project_hash(cwd: &Path) -> String {
     hex::encode(&hasher.finalize()[..16])
 }
 
+/// Split a raw project ID (directory name) into its hash and optional session.
+///
+/// Directory names use `<hash>.<session>` on disk; this returns the two parts.
+/// The display format uses `:` instead of `.` (see [`display_id`]).
+pub fn parse_id(id: &str) -> (&str, Option<&str>) {
+    match id.find('.') {
+        Some(pos) => (&id[..pos], Some(&id[pos + 1..])),
+        None => (id, None),
+    }
+}
+
 /// Load project data without locking.
 ///
 /// Resolves the project from an optional path/hash argument,
 /// loads its config, and returns a `Project`. No lock is acquired
 /// and no CA is generated — use this for read-only subcommands.
-pub fn load(arg: Option<&str>) -> anyhow::Result<Project> {
+///
+/// `session` selects a named session within the project (see [`lock`]).
+/// When `arg` contains a `<hash>:<session>` identifier the session is
+/// taken from there and `session` is ignored.
+pub fn load(arg: Option<&str>, session: Option<&str>) -> anyhow::Result<Project> {
     let home_dir =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
-    let (host_cwd, cache_dir) = resolve_project_dir(arg)?;
+    let (host_cwd, cache_dir) = resolve_project_dir(arg, session)?;
     let config = crate::config::load(&host_cwd)?;
     let ca_cert = cache_dir.join("ca/ca.crt");
     let ca_key = cache_dir.join("ca/ca.key");
@@ -123,7 +138,15 @@ pub fn load(arg: Option<&str>) -> anyhow::Result<Project> {
 ///
 /// `guest_cwd_override` sets the working directory inside the container
 /// (defaults to `host_cwd` when `None`).
-pub fn lock(config: Config, guest_cwd_override: Option<String>) -> anyhow::Result<Project> {
+///
+/// `session` creates an isolated backing directory for this named session
+/// (stored as `<hash>.<session>` under `~/.ezpez/projects/`). Without a
+/// session each project directory maps 1:1 with its host path.
+pub fn lock(
+    config: Config,
+    guest_cwd_override: Option<String>,
+    session: Option<&str>,
+) -> anyhow::Result<Project> {
     let home_dir =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
     let host_cwd = std::env::current_dir()?;
@@ -132,8 +155,12 @@ pub fn lock(config: Config, guest_cwd_override: Option<String>) -> anyhow::Resul
     let guest_cwd = guest_cwd_override.map_or_else(|| host_cwd.clone(), PathBuf::from);
 
     let hash = project_hash(&host_cwd);
+    let dir_name = match session {
+        Some(s) => format!("{hash}.{s}"),
+        None => hash,
+    };
 
-    let dir = crate::cache::project_dir(&hash)?;
+    let dir = crate::cache::project_dir(&dir_name)?;
     std::fs::create_dir_all(&dir)?;
 
     let lock_path = dir.join("lock");
@@ -188,14 +215,27 @@ pub fn project_id(project_dir: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Minimum prefix length such that all hashes are uniquely identified, starting at 7.
-pub fn min_unique_prefix_len(hashes: &[String]) -> usize {
-    if hashes.len() <= 1 {
+/// Minimum prefix length such that all project hashes are uniquely identified,
+/// starting at 7. Operates on the hash part of each ID (ignoring session suffix)
+/// so session variants of the same project share an abbreviation length.
+pub fn min_unique_prefix_len(ids: &[String]) -> usize {
+    // Deduplicate by hash part — sessions sharing a hash need the same abbrev.
+    let unique_hashes: Vec<&str> = {
+        let mut seen = HashSet::new();
+        ids.iter()
+            .map(|id| parse_id(id).0)
+            .filter(|h| seen.insert(*h))
+            .collect()
+    };
+    if unique_hashes.len() <= 1 {
         return 7;
     }
     for len in 7..=32_usize {
-        let prefixes: HashSet<&str> = hashes.iter().map(|h| &h[..len.min(h.len())]).collect();
-        if prefixes.len() == hashes.len() {
+        let prefixes: HashSet<&str> = unique_hashes
+            .iter()
+            .map(|h| &h[..len.min(h.len())])
+            .collect();
+        if prefixes.len() == unique_hashes.len() {
             return len;
         }
     }
@@ -233,12 +273,32 @@ fn read_guest_cwd(project_dir: &Path) -> Option<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
-/// Resolve a project directory from an optional path/hash argument.
-fn resolve_project_dir(arg: Option<&str>) -> anyhow::Result<(PathBuf, PathBuf)> {
+/// Resolve a project directory from an optional path/hash argument and session.
+///
+/// Supports these `arg` formats:
+/// - `None` — use the current directory
+/// - `"abc1234"` — hash prefix (7–32 hex chars)
+/// - `"abc1234:foo"` — hash prefix + explicit session
+/// - `"/path/to/dir"` — host path
+fn resolve_project_dir(
+    arg: Option<&str>,
+    session: Option<&str>,
+) -> anyhow::Result<(PathBuf, PathBuf)> {
     match arg {
-        None => resolve_from_path(None),
-        Some(s) if looks_like_hash(s) => resolve_from_hash_prefix(s),
-        Some(p) => resolve_from_path(Some(p)),
+        None => resolve_from_path(None, session),
+        Some(s) => {
+            // "hash:session" — session encoded in the identifier
+            if let Some((hash_part, sess_part)) = s.split_once(':')
+                && looks_like_hash(hash_part)
+            {
+                return resolve_from_hash_prefix(hash_part, Some(sess_part));
+            }
+            if looks_like_hash(s) {
+                resolve_from_hash_prefix(s, session)
+            } else {
+                resolve_from_path(Some(s), session)
+            }
+        }
     }
 }
 
@@ -246,7 +306,10 @@ fn looks_like_hash(s: &str) -> bool {
     s.len() >= 7 && s.len() <= 32 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-fn resolve_from_path(path: Option<&str>) -> anyhow::Result<(PathBuf, PathBuf)> {
+fn resolve_from_path(
+    path: Option<&str>,
+    session: Option<&str>,
+) -> anyhow::Result<(PathBuf, PathBuf)> {
     let cwd = if let Some(p) = path {
         let p = PathBuf::from(p);
         std::fs::canonicalize(&p).unwrap_or(p)
@@ -255,29 +318,42 @@ fn resolve_from_path(path: Option<&str>) -> anyhow::Result<(PathBuf, PathBuf)> {
         std::fs::canonicalize(&cwd).unwrap_or(cwd)
     };
     let hash = project_hash(&cwd);
-    let project_dir = crate::cache::project_dir(&hash)?;
+    let dir_name = match session {
+        Some(s) => format!("{hash}.{s}"),
+        None => hash,
+    };
+    let project_dir = crate::cache::project_dir(&dir_name)?;
     Ok((cwd, project_dir))
 }
 
-fn resolve_from_hash_prefix(prefix: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
+fn resolve_from_hash_prefix(
+    prefix: &str,
+    session: Option<&str>,
+) -> anyhow::Result<(PathBuf, PathBuf)> {
     let projects_dir = crate::cache::cache_dir()?.join("projects");
     let mut matches = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&projects_dir) {
         for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().starts_with(prefix) {
+            let dir_name = entry.file_name().to_string_lossy().into_owned();
+            let (hash_part, dir_session) = parse_id(&dir_name);
+            if hash_part.starts_with(prefix) && dir_session == session {
                 matches.push(entry.path());
             }
         }
     }
+    let display = match session {
+        Some(s) => format!("{prefix}:{s}"),
+        None => prefix.to_string(),
+    };
     match matches.len() {
-        0 => anyhow::bail!("no project found with id '{prefix}'"),
+        0 => anyhow::bail!("no project found with id '{display}'"),
         1 => {
             let project_dir = matches.remove(0);
             let cwd = std::fs::read_to_string(project_dir.join("cwd"))
                 .map_or_else(|_| project_dir.clone(), |s| PathBuf::from(s.trim()));
             Ok((cwd, project_dir))
         }
-        n => anyhow::bail!("ambiguous id '{prefix}' — matches {n} projects"),
+        n => anyhow::bail!("ambiguous id '{display}' — matches {n} projects"),
     }
 }
 

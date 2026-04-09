@@ -36,18 +36,22 @@ async fn main() {
         Command::Go {
             log_level,
             project_cwd,
-        } => cli::cmd_go::run(log_level, extra_args, project_cwd).await,
+            session,
+            login,
+        } => cli::cmd_go::run(log_level, extra_args, project_cwd, session, login).await,
         Command::Exec {
             cmd,
             args,
             cwd,
             env,
+            session,
+            login,
         } => {
             if !extra_args.is_empty() {
                 cli::error!("'--' args are not supported with 'exec'");
                 std::process::exit(2);
             }
-            cli::cmd_exec::run(cmd, args, cwd, env).await
+            cli::cmd_exec::run(cmd, args, cwd, env, session, login).await
         }
         Command::Project { command } => {
             if !extra_args.is_empty() {

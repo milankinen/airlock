@@ -81,7 +81,13 @@ pub async fn start<Init: AsyncFn(StartConfig) -> anyhow::Result<SpawnedProcess>>
         Ok(proc) => proc,
         Err(e) => {
             tracing::error!("supervisor init error: {e:#}");
-            spawn_root("/bin/sh", &["-c", "exit 100"], None)?
+            // Escape single quotes so the message can be embedded in a
+            // single-quoted shell string: ' → '\''
+            // Use {e} (not {e:#}) to avoid duplicating the chain when
+            // the outer error and its source have the same display string.
+            let msg = format!("{e}").replace('\'', r"'\''");
+            let script = format!("printf '%s\\n' 'error: {msg}' >&2; exit 100");
+            spawn_root("/bin/sh", &["-c", &script], None)?
         }
     };
     Ok(proc.attach(host_proc).await)

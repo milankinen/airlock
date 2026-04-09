@@ -13,7 +13,13 @@ use crate::project::{self, Project};
 use crate::{cli_server, config, network, oci, rpc, terminal, vm};
 
 /// Entry point for `ez go [--log-level <level>] [-- extra-args...]`.
-pub async fn run(log_level: LogLevel, extra_args: Vec<String>, project_cwd: Option<String>) -> i32 {
+pub async fn run(
+    log_level: LogLevel,
+    extra_args: Vec<String>,
+    project_cwd: Option<String>,
+    session: Option<String>,
+    login: bool,
+) -> i32 {
     #[cfg(target_os = "linux")]
     vm::require_kvm();
 
@@ -26,11 +32,11 @@ pub async fn run(log_level: LogLevel, extra_args: Vec<String>, project_cwd: Opti
         }
     };
 
-    let args = CliArgs::new(log_level, extra_args);
+    let args = CliArgs::new(log_level, extra_args, login);
     let local = LocalSet::new();
     local
         .run_until(async {
-            run_inner(args, config, project_cwd)
+            run_inner(args, config, project_cwd, session)
                 .await
                 .unwrap_or_else(|e| {
                     cli::error!("error: {e:?}");
@@ -44,11 +50,17 @@ async fn run_inner(
     args: CliArgs,
     config: config::Config,
     project_cwd: Option<String>,
+    session: Option<String>,
 ) -> anyhow::Result<i32> {
-    let project = project::lock(config, project_cwd)?;
+    let project = project::lock(config, project_cwd, session.as_deref())?;
     setup_logging(&args, &project);
 
-    let short_id = &project.id()[..7];
+    let id = project.id();
+    let (hash, sess) = project::parse_id(&id);
+    let short_id = match sess {
+        Some(s) => format!("{}:{s}", &hash[..7]),
+        None => hash[..7].to_string(),
+    };
     cli::log!("Preparing project {short_id}...");
     cli::log!(
         "  {} config loaded, image: {}",

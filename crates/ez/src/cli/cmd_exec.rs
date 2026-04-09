@@ -13,14 +13,23 @@ use tokio::task::LocalSet;
 use crate::{cli, project, rpc, terminal};
 
 /// Entry point for `ez exec <cmd> [args...]`.
-pub async fn run(cmd: String, args: Vec<String>, cwd: Option<String>, env: Vec<String>) -> i32 {
+pub async fn run(
+    cmd: String,
+    args: Vec<String>,
+    cwd: Option<String>,
+    env: Vec<String>,
+    session: Option<String>,
+    login: bool,
+) -> i32 {
     let local = LocalSet::new();
     local
         .run_until(async {
-            run_inner(cmd, args, cwd, env).await.unwrap_or_else(|e| {
-                cli::error!("{e:#}");
-                1
-            })
+            run_inner(cmd, args, cwd, env, session, login)
+                .await
+                .unwrap_or_else(|e| {
+                    cli::error!("{e:#}");
+                    1
+                })
         })
         .await
 }
@@ -30,8 +39,15 @@ async fn run_inner(
     args: Vec<String>,
     cwd: Option<String>,
     env: Vec<String>,
+    session: Option<String>,
+    login: bool,
 ) -> anyhow::Result<i32> {
-    let project = project::load(None)?;
+    let project = project::load(None, session.as_deref())?;
+    let (cmd, args) = if login {
+        apply_login_shell(cmd, args)
+    } else {
+        (cmd, args)
+    };
     let sock_path = project.cache_dir.join(ezpez_protocol::CLI_SOCK_FILENAME);
 
     let stream = tokio::net::UnixStream::connect(&sock_path)
@@ -130,4 +146,33 @@ async fn run_inner(
     };
 
     Ok(exit_code)
+}
+
+/// Wrap `(cmd, args)` for execution inside a login shell.
+///
+/// If `cmd` is a lone shell binary (no args), adds `-l` directly.
+/// Otherwise wraps as `sh -l -c 'exec "$0" "$@"' cmd args...` — the
+/// `$0`/`$@` trick passes args without any quoting.
+fn apply_login_shell(cmd: String, args: Vec<String>) -> (String, Vec<String>) {
+    let is_lone_shell = args.is_empty() && is_shell_name(&cmd);
+    if is_lone_shell {
+        (cmd, vec!["-l".to_string()])
+    } else {
+        let mut new_args = vec![
+            "-l".to_string(),
+            "-c".to_string(),
+            r#"exec "$0" "$@""#.to_string(),
+            cmd,
+        ];
+        new_args.extend(args);
+        ("bash".to_string(), new_args)
+    }
+}
+
+fn is_shell_name(cmd: &str) -> bool {
+    let name = std::path::Path::new(cmd)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(cmd);
+    matches!(name, "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh") || name.ends_with("sh")
 }
