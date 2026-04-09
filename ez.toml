@@ -22,6 +22,11 @@ missing = "fail"
 source = "~/.ez/claude.json"
 target = "~/.claude.json"
 
+[mounts.gitconfig]
+missing = "fail"
+source = "~/.gitconfig"
+target = "~/.gitconfig"
+
 [network.sockets.docker]
 enabled = false
 host = "~/.docker/run/docker.sock"

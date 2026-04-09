@@ -1,7 +1,6 @@
 #!/bin/bash
 #MISE description="Build development time sandbox image for mise ez"
 #MISE sources=["dev.dockerfile"]
-#MISE outputs=["target/ez.dev"]
 set -euo pipefail
 
 if [[ "${SKIP_DEV_IMAGE_BUILD:-}" == "true" ]]; then
