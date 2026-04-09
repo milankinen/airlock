@@ -126,3 +126,31 @@ any variable not set on the host is nil.
 
 A per-project CA certificate is automatically installed in the container so
 intercepted TLS is transparent to the containerized process.
+
+
+## License
+
+### Rust source code
+
+All Rust source code in this repository (`crates` directory) is dual-licensed
+under **MIT OR Apache-2.0** at your option. See [LICENSE-MIT](LICENSE-MIT) and
+[LICENSE-APACHE](LICENSE-APACHE).
+
+### Bundled Linux kernel (non-distroless builds)
+
+The default build embeds a Linux kernel and initramfs image directly into the
+`ez` binary as data blobs that are extracted at runtime and loaded by the
+hypervisor. The Linux kernel is distributed under the **GNU General Public
+License version 2** (GPLv2). Distributing a binary that contains the bundled
+kernel therefore requires GPLv2 compliance for the kernel component —
+in particular, you must make the corresponding kernel source available to
+recipients upon request. The Rust-authored code in the same binary remains
+**MIT OR Apache-2.0**; it does not constitute a combined work with the kernel
+because the two components execute in separate protection domains (host process
+vs. guest VM) and do not link to or call each other directly.
+
+Releases also include a pre-built `distroless` variant **without the embedded
+Linux kernel or initramfs**, licensed entirely under MIT OR Apache-2.0.
+When using the distroless build, you must supply your own kernel that has the
+capabilities required to work correctly with the `ez` supervisor.
+See [kernel configs](vm/kernel) for details.
