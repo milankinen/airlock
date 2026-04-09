@@ -4,11 +4,4 @@
 allow = [
     "http:registry.npmjs.org",
     "http:registry.yarnpkg.com",
-    "http:registry.npmmirror.com",
 ]
-
-[disk.cache.npm-cache]
-paths = ["~/.npm"]
-
-[disk.cache.yarn-cache]
-paths = ["~/.yarn"]

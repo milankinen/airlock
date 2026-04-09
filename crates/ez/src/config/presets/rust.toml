@@ -8,9 +8,3 @@ allow = [
     "http:static.rust-lang.org",
     "http:doc.rust-lang.org",
 ]
-
-[disk.cache.cargo-registry]
-paths = ["~/.cargo/registry"]
-
-[disk.cache.cargo-git]
-paths = ["~/.cargo/git"]

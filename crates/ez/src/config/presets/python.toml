@@ -3,8 +3,7 @@
 [network.rules.python-packages]
 allow = [
     "http:pypi.org",
+    "http:pypi.python.org",
     "http:files.pythonhosted.org",
+    "http:pythonhosted.org",
 ]
-
-[disk.cache.pip-cache]
-paths = ["~/.cache/pip"]
