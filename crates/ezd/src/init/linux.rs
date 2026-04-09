@@ -10,55 +10,15 @@ use std::process::Command;
 
 use tracing::{debug, error, info, warn};
 
-use super::InitConfig;
-
-/// Describes how to assemble the container rootfs. Written by the host CLI
-/// as `/mnt/overlay/mounts.json` on the overlay VirtioFS share.
-#[derive(serde::Deserialize)]
-struct MountsConfig {
-    /// OCI image digest — used to detect image changes and reset the overlay
-    /// upper layer so stale whiteout files from a previous image don't leak.
-    #[serde(default)]
-    image_id: String,
-    #[serde(default)]
-    dirs: Vec<DirMount>,
-    #[serde(default)]
-    files: Vec<FileMount>,
-    /// Named cache mounts backed by persistent disk storage.
-    #[serde(default)]
-    cache: Vec<CacheMount>,
-}
-
-/// A named persistent cache: one disk directory backing multiple container paths.
-#[derive(serde::Deserialize)]
-struct CacheMount {
-    name: String,
-    enabled: bool,
-    paths: Vec<String>,
-}
-
-/// A directory bind-mounted into the container rootfs via VirtioFS.
-#[derive(serde::Deserialize)]
-struct DirMount {
-    tag: String,
-    target: String,
-    read_only: bool,
-}
-
-/// A single-file mount implemented as a symlink into a VirtioFS-backed
-/// directory, because VirtioFS doesn't support file-level bind mounts.
-#[derive(serde::Deserialize)]
-struct FileMount {
-    target: String,
-    read_only: bool,
-}
+use super::{CacheConfig, InitConfig, MountConfig};
+use crate::rpc::SocketForwardConfig;
 
 /// Run all guest initialization steps in order.
 ///
-/// The ordering matters: VirtioFS shares must be mounted before we can read
-/// the mount config, networking must be up before the proxy starts, and the
-/// project disk must be ready before the overlayfs rootfs is assembled.
-pub fn setup(config: &InitConfig) -> anyhow::Result<()> {
+/// The ordering matters: VirtioFS shares must be mounted before we can
+/// assemble the overlay, networking must be up before the proxy starts, and
+/// the project disk must be ready before the overlayfs rootfs is assembled.
+pub fn setup(config: &InitConfig, mounts: &MountConfig) -> anyhow::Result<()> {
     set_clock(config.epoch);
 
     // 1. Mount well-known VirtioFS shares
@@ -66,39 +26,162 @@ pub fn setup(config: &InitConfig) -> anyhow::Result<()> {
         mount_virtiofs(tag)?;
     }
 
-    // 2. Read mount config
-    let mounts = read_mounts_config()?;
-
-    // 3. Mount user-defined VirtioFS shares
+    // 2. Mount user-defined VirtioFS shares (dir mounts from RPC)
     for dir in &mounts.dirs {
         mount_virtiofs(&dir.tag)?;
     }
 
-    // 4. Networking
+    // 3. Networking
     setup_networking(&config.host_ports);
 
-    // 5. Project disk (ext4 — overlayfs upper + cache)
-    setup_disk(&mounts.cache)?;
+    // 4. Project disk (ext4 — overlayfs upper + cache)
+    setup_disk(&mounts.caches)?;
 
-    // 6. Assemble container rootfs
-    assemble_rootfs(&mounts)?;
+    // 5. Assemble container rootfs
+    assemble_rootfs(mounts)?;
 
-    // 7. DNS
+    // 6. DNS
     setup_dns()?;
 
     Ok(())
 }
 
-fn read_mounts_config() -> anyhow::Result<MountsConfig> {
-    let path = "/mnt/overlay/mounts.json";
-    let data =
-        std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("failed to read {path}: {e}"))?;
-    serde_json::from_str(&data).map_err(|e| anyhow::anyhow!("failed to parse {path}: {e}"))
+/// Mount all filesystems that the container process needs inside its rootfs.
+///
+/// Called after `setup()` but before spawning any processes. Handles the mounts
+/// that crun previously managed via config.json: proc/sys/dev, file overlay
+/// bind mounts, socket forward bind mounts, and optionally /dev/kvm.
+pub fn setup_container_mounts(
+    mounts: &MountConfig,
+    sockets: &[SocketForwardConfig],
+    nested_virt: bool,
+) -> anyhow::Result<()> {
+    let root = "/mnt/overlay/rootfs";
+
+    // proc
+    std::fs::create_dir_all(format!("{root}/proc"))?;
+    mount_fs("proc", &format!("{root}/proc"), "proc", 0, "")?;
+
+    // sysfs — writable so container runtimes (Docker) can manage cgroups
+    std::fs::create_dir_all(format!("{root}/sys"))?;
+    mount_fs(
+        "sysfs",
+        &format!("{root}/sys"),
+        "sysfs",
+        libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV,
+        "",
+    )?;
+
+    // cgroup2 — required by Docker / containerd to create and manage cgroups
+    std::fs::create_dir_all(format!("{root}/sys/fs/cgroup"))?;
+    mount_fs(
+        "cgroup2",
+        &format!("{root}/sys/fs/cgroup"),
+        "cgroup2",
+        0,
+        "",
+    )?;
+
+    // /dev — recursive bind from VM /dev (avoids mknod; all devices already present)
+    std::fs::create_dir_all(format!("{root}/dev"))?;
+    bind_mount_rec("/dev", &format!("{root}/dev"))?;
+
+    // /dev/pts
+    std::fs::create_dir_all(format!("{root}/dev/pts"))?;
+    mount_fs(
+        "devpts",
+        &format!("{root}/dev/pts"),
+        "devpts",
+        libc::MS_NOSUID | libc::MS_NOEXEC,
+        "newinstance,ptmxmode=0666,mode=0620",
+    )?;
+
+    // /dev/shm
+    std::fs::create_dir_all(format!("{root}/dev/shm"))?;
+    mount_fs(
+        "shm",
+        &format!("{root}/dev/shm"),
+        "tmpfs",
+        libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV,
+        "mode=1777,size=65536k",
+    )?;
+
+    // /ez/.files/{rw,ro} — VirtioFS-backed file mount staging dirs.
+    // Symlinks from guest paths point here; see assemble_rootfs.
+    let has_rw = mounts.files.iter().any(|f| !f.read_only);
+    let has_ro = mounts.files.iter().any(|f| f.read_only);
+    if has_rw {
+        std::fs::create_dir_all(format!("{root}/ez/.files/rw"))?;
+        bind_mount(
+            "/mnt/overlay/files_rw",
+            &format!("{root}/ez/.files/rw"),
+            false,
+        )?;
+    }
+    if has_ro {
+        std::fs::create_dir_all(format!("{root}/ez/.files/ro"))?;
+        bind_mount(
+            "/mnt/overlay/files_ro",
+            &format!("{root}/ez/.files/ro"),
+            true,
+        )?;
+    }
+
+    // /ez/disk — ext4 project disk (or tmpfs fallback) exposed directly so
+    // container workloads that need a non-overlayfs filesystem (e.g. Docker's
+    // overlayfs snapshotter) can bind-mount a subdirectory as needed.
+    std::fs::create_dir_all(format!("{root}/ez/disk"))?;
+    if Path::new("/mnt/disk").is_dir() {
+        std::fs::create_dir_all("/mnt/disk/userdata")?;
+        bind_mount("/mnt/disk/userdata", &format!("{root}/ez/disk"), false)?;
+        debug!("/ez/disk → /mnt/disk/userdata (ext4)");
+    } else {
+        mount_fs(
+            "ez-disk",
+            &format!("{root}/ez/disk"),
+            "tmpfs",
+            libc::MS_NOSUID | libc::MS_NODEV,
+            "mode=0755",
+        )?;
+        debug!("/ez/disk → tmpfs");
+    }
+
+    // Socket forward bind mounts
+    // The socket files at /mnt/disk/sockets/<name> are created by net::socket::start.
+    // We create placeholder files here so the bind mount succeeds; net::socket::start
+    // removes and recreates the socket.
+    for sock in sockets {
+        let sock_name = sock.guest.rsplit('/').next().unwrap_or(sock.guest.as_str());
+        let src = format!("/mnt/disk/sockets/{sock_name}");
+        let dst = format!("{root}/{}", sock.guest.trim_start_matches('/'));
+
+        std::fs::create_dir_all("/mnt/disk/sockets")?;
+        // Create placeholder regular file so bind mount works
+        if !Path::new(&src).exists() {
+            let _ = std::fs::File::create(&src);
+        }
+        if let Some(parent) = Path::new(&dst).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if !Path::new(&dst).exists() {
+            let _ = std::fs::File::create(&dst);
+        }
+        bind_mount(&src, &dst, false)?;
+        debug!("socket bind: {src} → {dst}");
+    }
+
+    // /dev/kvm for nested virtualization (already in /dev bind, but explicit for clarity)
+    if nested_virt && !Path::new("/dev/kvm").exists() {
+        warn!("/dev/kvm requested but not present in VM");
+    }
+
+    info!("container mounts configured");
+    Ok(())
 }
 
 /// Assemble the container rootfs from overlayfs layers, file symlinks,
 /// directory bind mounts, and cache bind mounts.
-fn assemble_rootfs(mounts: &MountsConfig) -> anyhow::Result<()> {
+fn assemble_rootfs(mounts: &MountConfig) -> anyhow::Result<()> {
     let has_disk = Path::new("/mnt/disk").is_dir();
 
     // Upper/work must be on a local filesystem (not VirtioFS/FUSE).
@@ -119,7 +202,6 @@ fn assemble_rootfs(mounts: &MountsConfig) -> anyhow::Result<()> {
     };
 
     // overlayfs: ca layer + base image (lowerdirs) + project state (upperdir)
-    // /mnt/overlay/ca contains files that override the base image (e.g. CA certs).
     let ca_dir = Path::new("/mnt/overlay/ca");
     let ca_exists = ca_dir.is_dir();
     debug!("overlayfs ca layer: exists={ca_exists}");
@@ -148,23 +230,16 @@ fn assemble_rootfs(mounts: &MountsConfig) -> anyhow::Result<()> {
     }
     info!("assembled rootfs via overlayfs");
 
-    // Mount points for file mount directories (used by OCI config)
-    let _ = std::fs::create_dir_all("/mnt/overlay/rootfs/.ez/files_rw");
-    let _ = std::fs::create_dir_all("/mnt/overlay/rootfs/.ez/files_ro");
+    // Create staging dirs for file mount bind mounts (populated in setup_container_mounts).
+    let _ = std::fs::create_dir_all("/mnt/overlay/rootfs/ez/.files/rw");
+    let _ = std::fs::create_dir_all("/mnt/overlay/rootfs/ez/.files/ro");
 
-    // File mounts: symlinks into /.ez/files_rw or /.ez/files_ro.
-    // VirtioFS doesn't support file-level bind mounts (data reads fail
-    // with EACCES), but directory bind mounts work. The OCI config binds
-    // the files_rw/files_ro dirs to /.ez/, and symlinks point there.
+    // File mounts: symlinks into /ez/.files/{rw,ro}.
     for file in &mounts.files {
-        let subdir = if file.read_only {
-            "files_ro"
-        } else {
-            "files_rw"
-        };
+        let subdir = if file.read_only { "ro" } else { "rw" };
         let rel = file.target.strip_prefix('/').unwrap_or(&file.target);
         let link = Path::new("/mnt/overlay/rootfs").join(rel);
-        let symlink_target = format!("/.ez/{subdir}/{rel}");
+        let symlink_target = format!("/ez/.files/{subdir}/{rel}");
         if let Some(parent) = link.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -190,9 +265,8 @@ fn assemble_rootfs(mounts: &MountsConfig) -> anyhow::Result<()> {
     }
 
     // Cache bind mounts (last — override dir mounts).
-    // Each named cache stores its paths under /mnt/disk/cache/<name>/<rel-path>.
     if has_disk {
-        for cache in mounts.cache.iter().filter(|c| c.enabled) {
+        for cache in mounts.caches.iter().filter(|c| c.enabled) {
             for target in &cache.paths {
                 let rel = target.strip_prefix('/').unwrap_or(target);
                 let src = Path::new("/mnt/disk/cache").join(&cache.name).join(rel);
@@ -278,8 +352,64 @@ fn bind_mount(src: &str, dst: &str, read_only: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Set the guest system clock from the host-provided epoch. VMs boot with an
-/// undefined clock, so without this TLS certificate validation would fail.
+/// Recursive bind mount (MS_BIND | MS_REC).
+fn bind_mount_rec(src: &str, dst: &str) -> anyhow::Result<()> {
+    let src_cstr = std::ffi::CString::new(src).unwrap();
+    let dst_cstr = std::ffi::CString::new(dst).unwrap();
+    let ret = unsafe {
+        libc::mount(
+            src_cstr.as_ptr(),
+            dst_cstr.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND | libc::MS_REC,
+            std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        anyhow::bail!("failed to recursive bind-mount {src} → {dst}: {err}");
+    }
+    Ok(())
+}
+
+/// Mount a filesystem with optional data string.
+fn mount_fs(
+    source: &str,
+    target: &str,
+    fstype: &str,
+    flags: libc::c_ulong,
+    data: &str,
+) -> anyhow::Result<()> {
+    let src_cstr = std::ffi::CString::new(source).unwrap();
+    let dst_cstr = std::ffi::CString::new(target).unwrap();
+    let fs_cstr = std::ffi::CString::new(fstype).unwrap();
+    // Leak the CString to keep the pointer valid across the syscall
+    let data_ptr = if data.is_empty() {
+        std::ptr::null()
+    } else {
+        let c = std::ffi::CString::new(data).unwrap();
+        let p = c.as_ptr().cast::<libc::c_void>();
+        std::mem::forget(c);
+        p
+    };
+    let ret = unsafe {
+        libc::mount(
+            src_cstr.as_ptr(),
+            dst_cstr.as_ptr(),
+            fs_cstr.as_ptr(),
+            flags,
+            data_ptr,
+        )
+    };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        anyhow::bail!("failed to mount {fstype} at {target}: {err}");
+    }
+    debug!("mounted {fstype} at {target}");
+    Ok(())
+}
+
+/// Set the guest system clock from the host-provided epoch.
 fn set_clock(epoch: u64) {
     if epoch == 0 {
         return;
@@ -296,11 +426,6 @@ fn set_clock(epoch: u64) {
 }
 
 /// Configure loopback networking and iptables rules.
-///
-/// All outbound TCP is redirected to port 15001 (the transparent proxy) via
-/// iptables NAT, except for localhost traffic on `host_ports` which gets its
-/// own explicit redirect rules so it can be intercepted before the generic
-/// localhost RETURN rule.
 fn setup_networking(host_ports: &[u16]) {
     run_quiet(&["/sbin/ip", "link", "set", "lo", "up"]);
 
@@ -377,7 +502,7 @@ fn setup_networking(host_ports: &[u16]) {
 }
 
 /// Mount the project disk at /mnt/disk (overlay upper + cache).
-fn setup_disk(cache_mounts: &[CacheMount]) -> anyhow::Result<()> {
+fn setup_disk(cache_mounts: &[CacheConfig]) -> anyhow::Result<()> {
     let dev = "/dev/vda";
     if !Path::new(dev).exists() {
         anyhow::bail!("disk {dev} not found");
@@ -447,7 +572,6 @@ fn setup_disk(cache_mounts: &[CacheMount]) -> anyhow::Result<()> {
         }
     }
 
-    // Create named cache dirs for all declared entries.
     for cache in cache_mounts {
         std::fs::create_dir_all(format!("/mnt/disk/cache/{}", cache.name))?;
     }
@@ -462,14 +586,12 @@ fn setup_dns() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Write a sysctl value, ignoring errors (best-effort).
 fn write_sysctl(path: &str, value: &str) {
     if let Err(e) = std::fs::write(path, value) {
         debug!("sysctl {path}={value} failed: {e}");
     }
 }
 
-/// Run a command, logging stderr on failure but otherwise silent.
 fn run_quiet(args: &[&str]) {
     let cmd_str = args.join(" ");
     match Command::new(args[0]).args(&args[1..]).output() {

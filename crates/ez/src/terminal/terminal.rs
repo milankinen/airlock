@@ -17,6 +17,7 @@ pub struct Terminal {
 
 impl Terminal {
     /// Returns true if stdin is a terminal.
+    #[allow(dead_code)]
     pub fn is_tty(&self) -> bool {
         self.is_tty
     }

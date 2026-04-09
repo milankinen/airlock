@@ -12,8 +12,8 @@ use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use ezpez_protocol::supervisor_capnp::*;
 use futures::AsyncReadExt;
 
-use crate::init::InitConfig;
-use crate::process::{SpawnedProcess, spawn};
+use crate::init::{CacheConfig, DirMountConfig, FileMountConfig, InitConfig, MountConfig};
+use crate::process::{SpawnedProcess, spawn_root, spawn_user};
 
 /// Unix socket forwarding pair: host-side path and guest-side path.
 pub struct SocketForwardConfig {
@@ -21,38 +21,37 @@ pub struct SocketForwardConfig {
     pub guest: String,
 }
 
-/// Everything the host sends in the initial `Supervisor.start()` call.
-pub struct HostConnection {
-    pub proc: HostProcess,
+/// All configuration received in the `Supervisor.start()` RPC call.
+/// Passed to the `init` closure which bootstraps the container.
+pub struct StartConfig {
+    pub log_sink: log_sink::Client,
+    pub log_filter: String,
     pub network: network_proxy::Client,
+    pub sockets: Vec<SocketForwardConfig>,
     pub cmd: String,
     pub args: Vec<String>,
+    pub env: Vec<String>,
+    pub cwd: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub nested_virt: bool,
+    pub harden: bool,
     pub init_config: InitConfig,
-    pub sockets: Vec<SocketForwardConfig>,
+    pub mount_config: MountConfig,
+    pub pty_size: Option<(u16, u16)>,
 }
 
 /// Host-side handles for a single process's I/O.
 pub struct HostProcess {
     pub stdin: stdin::Client,
-    pub pty_size: Option<(u16, u16)>,
     /// Oneshot to deliver the `Process` capability back to the host once the
     /// child is spawned. Taken by the startup code — `None` after consumption.
     pub result: Option<tokio::sync::oneshot::Sender<Result<process::Client, String>>>,
 }
+
 /// Accept the RPC connection, run the init callback, and block until the
 /// main process exits. Returns the process exit code.
-pub async fn start<
-    Init: AsyncFn(
-        InitConfig,
-        String,
-        Vec<String>,
-        log_sink::Client,
-        String,
-        Option<(u16, u16)>,
-        network_proxy::Client,
-        Vec<SocketForwardConfig>,
-    ) -> anyhow::Result<SpawnedProcess>,
->(
+pub async fn start<Init: AsyncFn(StartConfig) -> anyhow::Result<SpawnedProcess>>(
     conn_fd: OwnedFd,
     init: Init,
 ) -> anyhow::Result<i32> {
@@ -70,40 +69,35 @@ pub async fn start<
 
     let (conn_tx, conn_rx) = tokio::sync::oneshot::channel::<ConnPayload>();
 
-    let client: supervisor::Client =
-        capnp_rpc::new_client(SupervisorImpl(std::cell::RefCell::new(Some(conn_tx))));
+    let client: supervisor::Client = capnp_rpc::new_client(SupervisorImpl {
+        start_tx: std::cell::RefCell::new(Some(conn_tx)),
+        exec_creds: std::cell::RefCell::new(None),
+    });
     let rpc = RpcSystem::new(Box::new(network), Some(client.client));
 
     tokio::task::spawn_local(rpc);
-    let (log_sink, log_filter, host) = conn_rx.await.expect("host connection failed");
-    let proc = match init(
-        host.init_config,
-        host.cmd,
-        host.args,
-        log_sink,
-        log_filter,
-        host.proc.pty_size,
-        host.network,
-        host.sockets,
-    )
-    .await
-    {
+    let (cfg, host_proc) = conn_rx.await.expect("host connection failed");
+    let proc = match init(cfg).await {
         Ok(proc) => proc,
         Err(e) => {
             tracing::error!("supervisor init error: {e:#}");
-            spawn("/bin/sh", &["-c", "exit 100"], None)?
+            spawn_root("/bin/sh", &["-c", "exit 100"], None)?
         }
     };
-    Ok(proc.attach(host.proc).await)
+    Ok(proc.attach(host_proc).await)
 }
 
-type ConnPayload = (log_sink::Client, String, HostConnection);
+type ConnPayload = (StartConfig, HostProcess);
 
 /// Server-side implementation of the `Supervisor` Cap'n Proto interface.
 ///
-/// The oneshot is consumed by `start()` and set to `None` — subsequent calls
-/// are rejected because the VM only supports a single init sequence.
-struct SupervisorImpl(std::cell::RefCell<Option<tokio::sync::oneshot::Sender<ConnPayload>>>);
+/// `start_tx` is consumed by the first `start()` call and set to `None` —
+/// subsequent calls are rejected because the VM only supports one init sequence.
+/// `uid_gid` is set during `start()` and read by `exec()` to reuse container credentials.
+struct SupervisorImpl {
+    start_tx: std::cell::RefCell<Option<tokio::sync::oneshot::Sender<ConnPayload>>>,
+    exec_creds: std::cell::RefCell<Option<(u32, u32, bool)>>,
+}
 
 impl supervisor::Server for SupervisorImpl {
     async fn start(
@@ -121,27 +115,56 @@ impl supervisor::Server for SupervisorImpl {
             _ => None,
         };
 
+        let uid = params.get_uid();
+        let gid = params.get_gid();
+        let harden = params.get_harden();
+
+        let dirs = params
+            .get_dirs()?
+            .iter()
+            .map(|d| {
+                Ok(DirMountConfig {
+                    tag: d.get_tag()?.to_str()?.to_string(),
+                    target: d.get_target()?.to_str()?.to_string(),
+                    read_only: d.get_read_only(),
+                })
+            })
+            .collect::<Result<Vec<_>, capnp::Error>>()?;
+
+        let files = params
+            .get_files()?
+            .iter()
+            .map(|f| {
+                Ok(FileMountConfig {
+                    target: f.get_target()?.to_str()?.to_string(),
+                    read_only: f.get_read_only(),
+                })
+            })
+            .collect::<Result<Vec<_>, capnp::Error>>()?;
+
+        let caches = params
+            .get_caches()?
+            .iter()
+            .map(|c| {
+                let paths = c
+                    .get_paths()?
+                    .iter()
+                    .map(|p| Ok(p?.to_str()?.to_string()))
+                    .collect::<Result<Vec<_>, capnp::Error>>()?;
+                Ok(CacheConfig {
+                    name: c.get_name()?.to_str()?.to_string(),
+                    enabled: c.get_enabled(),
+                    paths,
+                })
+            })
+            .collect::<Result<Vec<_>, capnp::Error>>()?;
+
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
 
-        let log_sink = params.get_logs()?;
-        let log_filter = params.get_log_filter()?.to_str()?.to_string();
-        let conn = HostConnection {
-            proc: HostProcess {
-                stdin: params.get_stdin()?,
-                pty_size,
-                result: Some(result_tx),
-            },
+        let cfg = StartConfig {
+            log_sink: params.get_logs()?,
+            log_filter: params.get_log_filter()?.to_str()?.to_string(),
             network: params.get_network()?,
-            cmd: params.get_cmd()?.to_str()?.to_string(),
-            args: params
-                .get_args()?
-                .iter()
-                .map(|a| a.map(|s| s.to_str().unwrap_or("").to_string()))
-                .collect::<Result<Vec<_>, _>>()?,
-            init_config: InitConfig {
-                epoch: params.get_epoch(),
-                host_ports: params.get_host_ports()?.iter().collect(),
-            },
             sockets: params
                 .get_sockets()?
                 .iter()
@@ -152,10 +175,45 @@ impl supervisor::Server for SupervisorImpl {
                     })
                 })
                 .collect::<Result<Vec<_>, capnp::Error>>()?,
+            cmd: params.get_cmd()?.to_str()?.to_string(),
+            args: params
+                .get_args()?
+                .iter()
+                .map(|a| a.map(|s| s.to_str().unwrap_or("").to_string()))
+                .collect::<Result<Vec<_>, _>>()?,
+            env: params
+                .get_env()?
+                .iter()
+                .map(|e| e.map(|s| s.to_str().unwrap_or("").to_string()))
+                .collect::<Result<Vec<_>, _>>()?,
+            cwd: params.get_cwd()?.to_str()?.to_string(),
+            uid,
+            gid,
+            nested_virt: params.get_nested_virt(),
+            harden,
+            init_config: InitConfig {
+                epoch: params.get_epoch(),
+                host_ports: params.get_host_ports()?.iter().collect(),
+            },
+            mount_config: MountConfig {
+                image_id: params.get_image_id()?.to_str()?.to_string(),
+                dirs,
+                files,
+                caches,
+            },
+            pty_size,
         };
 
-        if let Some(tx) = self.0.borrow_mut().take() {
-            let _ = tx.send((log_sink, log_filter, conn));
+        let host_proc = HostProcess {
+            stdin: params.get_stdin()?,
+            result: Some(result_tx),
+        };
+
+        // Store credentials so exec() can reuse them for container processes.
+        *self.exec_creds.borrow_mut() = Some((uid, gid, harden));
+
+        if let Some(tx) = self.start_tx.borrow_mut().take() {
+            let _ = tx.send((cfg, host_proc));
         }
 
         match result_rx.await {
@@ -192,6 +250,12 @@ impl supervisor::Server for SupervisorImpl {
             .iter()
             .map(|a| a.map(|s| s.to_str().unwrap_or("").to_string()))
             .collect::<Result<Vec<_>, _>>()?;
+        let cwd = params.get_cwd()?.to_str()?.to_string();
+        let env: Vec<String> = params
+            .get_env()?
+            .iter()
+            .map(|e| e.map(|s| s.to_str().unwrap_or("").to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
 
         let pty_size = match params.get_pty()?.which() {
             Ok(pty_config::Size(size)) => {
@@ -201,15 +265,18 @@ impl supervisor::Server for SupervisorImpl {
             _ => None,
         };
 
+        let (uid, gid, harden) = (*self.exec_creds.borrow()).ok_or_else(|| {
+            capnp::Error::failed("exec called before container was started".into())
+        })?;
+
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let host = HostProcess {
             stdin: params.get_stdin()?,
-            pty_size,
             result: Some(result_tx),
         };
 
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let proc = spawn(&cmd, &refs, pty_size).map_err(|e| capnp::Error::failed(e.to_string()))?;
+        let proc = spawn_user(&cmd, &args, &env, &cwd, uid, gid, harden, pty_size)
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
         tokio::task::spawn_local(async move {
             proc.attach(host).await;

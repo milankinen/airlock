@@ -2,17 +2,28 @@
 
 interface Supervisor {
   start @0 (
-    stdin :Stdin,
-    pty :PtyConfig,
-    network :NetworkProxy,
-    logs :LogSink,
-    logFilter :Text,
-    cmd :Text,
-    args :List(Text),
-    tlsPassthrough :List(Text),
-    epoch :UInt64,
-    hostPorts :List(UInt16),
-    sockets :List(SocketForward)
+    stdin      :Stdin,
+    pty        :PtyConfig,
+    network    :NetworkProxy,
+    logs       :LogSink,
+    logFilter  :Text,
+    epoch      :UInt64,
+    hostPorts  :List(UInt16),
+    sockets    :List(SocketForward),
+    # Process configuration (replaces config.json)
+    cmd        :Text,
+    args       :List(Text),
+    env        :List(Text),
+    cwd        :Text,
+    uid        :UInt32,
+    gid        :UInt32,
+    nestedVirt :Bool,
+    harden     :Bool,
+    # Mount configuration (replaces mounts.json)
+    imageId    :Text,
+    dirs       :List(DirMount),
+    files      :List(FileMount),
+    caches     :List(CacheMount),
   ) -> (proc :Process);
 
   shutdown @1 () -> ();
@@ -21,7 +32,9 @@ interface Supervisor {
     stdin :Stdin,
     pty   :PtyConfig,
     cmd   :Text,
-    args  :List(Text)
+    args  :List(Text),
+    cwd   :Text,
+    env   :List(Text),
   ) -> (proc :Process);
 }
 
@@ -41,6 +54,23 @@ interface CliService @0xb5ce8d3c8a4a7d2f {
 struct SocketForward {
   host @0 :Text;
   guest @1 :Text;
+}
+
+struct DirMount {
+  tag      @0 :Text;
+  target   @1 :Text;
+  readOnly @2 :Bool;
+}
+
+struct FileMount {
+  target   @0 :Text;
+  readOnly @1 :Bool;
+}
+
+struct CacheMount {
+  name    @0 :Text;
+  enabled @1 :Bool;
+  paths   @2 :List(Text);
 }
 
 struct PtyConfig {

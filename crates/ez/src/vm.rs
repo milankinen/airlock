@@ -86,7 +86,7 @@ use crate::vm::config::VmShare;
 pub async fn start(
     args: &CliArgs,
     project: &Project,
-    bundle: Bundle,
+    bundle: &Bundle,
 ) -> anyhow::Result<(Box<dyn VmHandle>, OwnedFd)> {
     let assets = Assets::init(project)?;
     let mut shares = vec![];

@@ -31,27 +31,33 @@ async fn run() -> anyhow::Result<()> {
     let conn_fd = vsock::accept(&listen_fd)?;
     drop(listen_fd);
 
-    let exit_code = rpc::start(
-        conn_fd,
-        async |init_config, cmd, args, log_sink, log_filter, pty_size, network, sockets| {
-            logging::init(log_sink, &log_filter);
+    let exit_code = rpc::start(conn_fd, async |cfg| {
+        logging::init(cfg.log_sink, &cfg.log_filter);
 
-            info!("setup vm");
-            init::setup(&init_config)?;
+        info!("setup vm");
+        init::setup(&cfg.init_config, &cfg.mount_config)?;
+        init::setup_container_mounts(&cfg.mount_config, &cfg.sockets, cfg.nested_virt)?;
 
-            let dns = Rc::new(net::dns::DnsState::new());
-            net::dns::start(dns.clone());
-            net::start_proxy(network.clone(), dns);
-            net::socket::start(&network, sockets);
+        let dns = Rc::new(net::dns::DnsState::new());
+        net::dns::start(dns.clone());
+        net::start_proxy(cfg.network.clone(), dns);
+        net::socket::start(&cfg.network, cfg.sockets);
 
-            info!("start: {} {}", cmd, args.join(" "));
-            let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-            let proc = process::spawn(&cmd, &args_ref, pty_size)?;
-            info!("main process started");
+        info!("start: {} {}", cfg.cmd, cfg.args.join(" "));
+        let proc = process::spawn_user(
+            &cfg.cmd,
+            &cfg.args,
+            &cfg.env,
+            &cfg.cwd,
+            cfg.uid,
+            cfg.gid,
+            cfg.harden,
+            cfg.pty_size,
+        )?;
+        info!("main process started");
 
-            Ok(proc)
-        },
-    )
+        Ok(proc)
+    })
     .await?;
 
     info!("main process done, exit_code = {exit_code}");

@@ -9,18 +9,63 @@ pub struct InitConfig {
     pub host_ports: Vec<u16>,
 }
 
+/// A directory mount: a VirtioFS tag mapped to a container path.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct DirMountConfig {
+    pub tag: String,
+    pub target: String,
+    pub read_only: bool,
+}
+
+/// A file mount: symlinked into the container rootfs via /ez/.files/{rw,ro}.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct FileMountConfig {
+    pub target: String,
+    pub read_only: bool,
+}
+
+/// A named persistent cache mount backed by the project disk.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct CacheConfig {
+    pub name: String,
+    pub enabled: bool,
+    pub paths: Vec<String>,
+}
+
+/// All mount configuration received from the host via the start RPC.
+/// Replaces the mounts.json file previously written to the overlay share.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct MountConfig {
+    pub image_id: String,
+    pub dirs: Vec<DirMountConfig>,
+    pub files: Vec<FileMountConfig>,
+    pub caches: Vec<CacheConfig>,
+}
+
 #[cfg(target_os = "linux")]
 mod linux;
 
 /// Bootstrap the guest VM environment: clock, mounts, networking, rootfs.
 #[cfg(target_os = "linux")]
-pub fn setup(config: &InitConfig) -> anyhow::Result<()> {
-    linux::setup(config)
+pub fn setup(config: &InitConfig, mounts: &MountConfig) -> anyhow::Result<()> {
+    linux::setup(config, mounts)
 }
 
-/// Stub for non-Linux hosts — the supervisor binary is cross-compiled for
-/// Linux but the rest of the workspace is built on macOS for dev tooling.
+/// Set up filesystem mounts inside the container rootfs (replaces crun).
+#[cfg(target_os = "linux")]
+pub use linux::setup_container_mounts;
+
+/// Stubs for non-Linux hosts.
 #[cfg(not(target_os = "linux"))]
-pub fn setup(_config: &InitConfig) -> anyhow::Result<()> {
+pub fn setup(_config: &InitConfig, _mounts: &MountConfig) -> anyhow::Result<()> {
+    unimplemented!("supervisor only runs inside the Linux VM");
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn setup_container_mounts(
+    _mounts: &MountConfig,
+    _sockets: &[crate::rpc::SocketForwardConfig],
+    _nested_virt: bool,
+) -> anyhow::Result<()> {
     unimplemented!("supervisor only runs inside the Linux VM");
 }

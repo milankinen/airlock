@@ -76,13 +76,13 @@ async fn run_inner(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let (vm_handle, vsock_fd) = vm::start(&args, &project, bundle).await?;
+    let (vm_handle, vsock_fd) = vm::start(&args, &project, &bundle).await?;
     project.save_meta();
     let supervisor = rpc::Supervisor::connect(vsock_fd)?;
 
     let stdin = terminal.stdin()?;
     let proc = supervisor
-        .start(&args, &project, stdin, network, epoch)
+        .start(&args, &project, &bundle, stdin, network, epoch)
         .await?;
 
     // Start CLI server so `ez exec` can attach processes to this VM

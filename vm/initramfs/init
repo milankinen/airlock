@@ -11,10 +11,10 @@ mount -t tmpfs none /tmp 2>/dev/null
 mount -t tmpfs none /run 2>/dev/null
 mkdir -p /sys/fs/cgroup
 mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null
-hostname ezpez
+hostname ezvm
 ip link set lo up 2>/dev/null
 
-/usr/bin/supervisor
+/usr/bin/ezd
 
 kill -TERM -1 2>/dev/null
 sleep 0.2

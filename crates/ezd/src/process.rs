@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::fmt::Display;
 use std::rc::Rc;
 
+use anyhow::Context as _;
 use bytes::Bytes;
 use ezpez_protocol::supervisor_capnp::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,42 +22,6 @@ pub struct SpawnedProcess {
     pty: Option<pty_process::Pty>,
 }
 
-/// Spawn a child process, optionally allocating a PTY.
-///
-/// When `pty_size` is `Some`, a PTY is opened and sized before spawning so
-/// the child sees correct terminal dimensions from the start. Otherwise the
-/// child gets plain stdin/stdout/stderr pipes.
-pub fn spawn(
-    cmd: &str,
-    args: &[&str],
-    pty_size: Option<(u16, u16)>,
-) -> Result<SpawnedProcess, anyhow::Error> {
-    if let Some((rows, cols)) = pty_size {
-        let (pty, pts) = pty_process::open()?;
-        // Set size before spawning so the process sees the correct size immediately
-        tracing::debug!("pty initial size: {rows}x{cols}");
-        if let Err(e) = pty.resize(pty_process::Size::new(rows, cols)) {
-            tracing::warn!("initial pty resize failed: {e}");
-        }
-        let child = pty_process::Command::new(cmd)
-            .args(args)
-            .env("TERM", "linux")
-            .spawn(pts)?;
-        Ok(SpawnedProcess {
-            child,
-            pty: Some(pty),
-        })
-    } else {
-        let child = tokio::process::Command::new(cmd)
-            .args(args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?;
-        Ok(SpawnedProcess { child, pty: None })
-    }
-}
-
 impl SpawnedProcess {
     /// Wire this process's I/O to the host and block until it exits.
     /// Returns the process exit code.
@@ -65,6 +30,193 @@ impl SpawnedProcess {
             Some(pty) => attach_pty(self.child, pty, host).await,
             None => attach_pipe(self.child, host).await,
         }
+    }
+}
+
+/// Spawn a host-side child process with inherited environment.
+pub fn spawn_root(
+    cmd: &str,
+    args: &[&str],
+    pty_size: Option<(u16, u16)>,
+) -> Result<SpawnedProcess, anyhow::Error> {
+    spawn(cmd, args, None, || Ok(()), pty_size)
+}
+
+/// Spawn a process inside the container rootfs via chroot + setuid/setgid.
+///
+/// Builds a pre-exec hook (chroot → chdir → setgid → setuid, optionally with
+/// namespace/privilege hardening) and delegates to [`spawn`].
+///
+/// Uses a diagnostic pipe to capture which syscall failed inside the pre_exec,
+/// since error strings cannot cross the fork/exec boundary — only the errno does.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_user(
+    cmd: &str,
+    args: &[String],
+    env: &[String],
+    cwd: &str,
+    uid: u32,
+    gid: u32,
+    harden: bool,
+    pty_size: Option<(u16, u16)>,
+) -> Result<SpawnedProcess, anyhow::Error> {
+    let cwd = cwd.to_string();
+    // harden is only used in the Linux-specific pre_exec block below
+    #[cfg(not(target_os = "linux"))]
+    let _ = harden;
+
+    let env_pairs: Vec<(String, String)> = env
+        .iter()
+        .filter_map(|e| {
+            let mut parts = e.splitn(2, '=');
+            let k = parts.next()?.to_string();
+            let v = parts.next().unwrap_or("").to_string();
+            Some((k, v))
+        })
+        .collect();
+
+    // Diagnostic pipe: the pre_exec writes a static step name on failure so
+    // the parent can add context to the error.  O_CLOEXEC closes it
+    // automatically on exec (the success path), giving the parent clean EOF.
+    // pipe2 is Linux-specific; on other platforms the diagnostic is skipped.
+    #[cfg(target_os = "linux")]
+    let [diag_r, diag_w] = {
+        let mut fds = [-1i32; 2];
+        unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        fds
+    };
+    #[cfg(not(target_os = "linux"))]
+    let [diag_r, diag_w] = [-1i32, -1i32];
+
+    let pre_exec = move || {
+        // Save errno first, then write the step tag (write(2) might change it).
+        macro_rules! fail {
+            ($tag:expr) => {{
+                let err = std::io::Error::last_os_error();
+                if diag_w >= 0 {
+                    let b: &[u8] = $tag;
+                    unsafe { libc::write(diag_w, b.as_ptr().cast(), b.len()) };
+                }
+                return Err(err);
+            }};
+        }
+
+        #[cfg(target_os = "linux")]
+        if harden {
+            // Prevent privilege escalation via setuid/setcap binaries.
+            if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+                fail!(b"prctl(PR_SET_NO_NEW_PRIVS)");
+            }
+            // Best-effort namespace isolation: private mount, IPC, and UTS
+            // namespaces. Network namespace is intentionally shared so the
+            // container has network access. Failures are ignored — the primary
+            // security (NO_NEW_PRIVS + chroot + setuid) remains in effect.
+            // Each flag is tried individually; the diagnostic pipe only fires
+            // for hard failures below (chroot, setgid, setuid).
+            unsafe { libc::unshare(libc::CLONE_NEWNS) };
+            unsafe { libc::unshare(libc::CLONE_NEWIPC) };
+            unsafe { libc::unshare(libc::CLONE_NEWUTS) };
+        }
+
+        // chroot into the assembled container rootfs
+        let rootfs = std::ffi::CString::new("/mnt/overlay/rootfs").unwrap();
+        if unsafe { libc::chroot(rootfs.as_ptr()) } != 0 {
+            fail!(b"chroot(/mnt/overlay/rootfs)");
+        }
+        // chdir to the container working directory (fall back to / if missing)
+        let cwd_cstr = std::ffi::CString::new(cwd.as_str()).unwrap();
+        if unsafe { libc::chdir(cwd_cstr.as_ptr()) } != 0 {
+            let root = std::ffi::CString::new("/").unwrap();
+            unsafe { libc::chdir(root.as_ptr()) };
+        }
+        // setgid must come before setuid (can't change gid after dropping root)
+        if unsafe { libc::setgid(gid) } != 0 {
+            fail!(b"setgid");
+        }
+        if unsafe { libc::setuid(uid) } != 0 {
+            fail!(b"setuid");
+        }
+        Ok(())
+    };
+
+    let result = spawn(cmd, args, Some(env_pairs), pre_exec, pty_size);
+
+    // Close parent's write end so read() sees EOF once the child exits.
+    if diag_w >= 0 {
+        unsafe { libc::close(diag_w) };
+    }
+
+    // On failure, read the step tag the child wrote and add it as context.
+    let result = if result.is_err() && diag_r >= 0 {
+        let mut buf = [0u8; 64];
+        let n = unsafe { libc::read(diag_r, buf.as_mut_ptr().cast(), buf.len()) };
+        if n > 0 {
+            let step = String::from_utf8_lossy(&buf[..n as usize]);
+            result.with_context(|| format!("{step}"))
+        } else {
+            result
+        }
+    } else {
+        result
+    };
+
+    if diag_r >= 0 {
+        unsafe { libc::close(diag_r) };
+    }
+
+    result
+}
+
+/// Core spawn primitive. Handles PTY/pipe dispatch, env setup, and an optional
+/// pre-exec hook. All callers go through here.
+///
+/// - `env_override`: `None` → inherit environment (PTY mode also sets TERM=linux);
+///   `Some(pairs)` → clear environment and replace with `pairs`.
+/// - `pre_exec`: runs in the child after fork, before exec. Must only use
+///   async-signal-safe operations.
+fn spawn<A, F>(
+    cmd: &str,
+    args: &[A],
+    env_override: Option<Vec<(String, String)>>,
+    pre_exec: F,
+    pty_size: Option<(u16, u16)>,
+) -> Result<SpawnedProcess, anyhow::Error>
+where
+    A: AsRef<std::ffi::OsStr>,
+    F: FnMut() -> std::io::Result<()> + Send + Sync + 'static,
+{
+    if let Some((rows, cols)) = pty_size {
+        let (pty, pts) = pty_process::open()?;
+        tracing::debug!("pty initial size: {rows}x{cols}");
+        if let Err(e) = pty.resize(pty_process::Size::new(rows, cols)) {
+            tracing::warn!("initial pty resize failed: {e}");
+        }
+        // pty_process::Command is a consuming builder — chain all calls.
+        let builder = pty_process::Command::new(cmd).args(args);
+        let builder = match env_override {
+            Some(pairs) => builder.env_clear().envs(pairs),
+            None => builder.env("TERM", "linux"),
+        };
+        // Safety: pre_exec runs post-fork in child; only async-signal-safe calls.
+        let child = unsafe { builder.pre_exec(pre_exec) }.spawn(pts)?;
+        Ok(SpawnedProcess {
+            child,
+            pty: Some(pty),
+        })
+    } else {
+        let mut command = tokio::process::Command::new(cmd);
+        command
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(pairs) = env_override {
+            command.env_clear().envs(pairs);
+        }
+        // Safety: pre_exec runs post-fork in child; only async-signal-safe calls.
+        unsafe { command.pre_exec(pre_exec) };
+        let child = command.spawn()?;
+        Ok(SpawnedProcess { child, pty: None })
     }
 }
 

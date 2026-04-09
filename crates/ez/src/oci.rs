@@ -1,11 +1,10 @@
 //! OCI image resolution, download, extraction, and bundle preparation.
 //!
 //! Handles both Docker-daemon images and remote registry pulls, caches
-//! layers and rootfs locally, and generates the OCI runtime config.json
-//! and mounts.json that the supervisor uses to assemble the container.
+//! layers and rootfs locally, and assembles the virtiofs shares and process
+//! configuration that the supervisor uses to set up the container.
 
 pub(crate) mod cache;
-pub(crate) mod config;
 mod docker;
 mod layer;
 mod registry;
@@ -21,7 +20,7 @@ use crate::cli::CliArgs;
 use crate::project::Project;
 use crate::terminal::Terminal;
 
-/// Everything needed to boot the VM: mount list, disk image, rootfs path.
+/// Everything needed to boot the VM and start the container process.
 pub struct Bundle {
     /// Mounts with `~` expanded: source to host home, target to container home.
     pub mounts: Vec<ResolvedMount>,
@@ -31,6 +30,20 @@ pub struct Bundle {
     pub image_rootfs: PathBuf,
     /// Container home directory (e.g. `/root`), for guest-path `~` expansion.
     pub container_home: String,
+    /// Container command + args (image entrypoint/cmd merged with user args).
+    pub cmd: Vec<String>,
+    /// Container environment variables as `KEY=value` strings.
+    pub env: Vec<String>,
+    /// Container working directory.
+    pub cwd: String,
+    /// Container uid (from image config).
+    pub uid: u32,
+    /// Container gid (from image config).
+    pub gid: u32,
+    /// OCI image digest, used by supervisor to detect image changes.
+    pub image_id: String,
+    /// Cache mount entries: (name, enabled, expanded container paths).
+    pub caches: Vec<cache::CacheEntry>,
 }
 
 /// A mount with host/guest paths fully expanded and validated.
@@ -145,13 +158,14 @@ pub async fn prepare(
     )
 }
 
-/// Build the OCI bundle: resolve mounts, create disk, generate config.json
-/// and mounts.json for the supervisor.
+/// Build the bundle: resolve mounts, create disk, assemble process config.
+/// All data is returned in the Bundle and sent to the supervisor via RPC —
+/// no config.json or mounts.json files are written.
 fn build_bundle(
     args: &CliArgs,
     project: &Project,
-    terminal: &Terminal,
-    overlay_dir: &Path,
+    _terminal: &Terminal,
+    _overlay_dir: &Path,
     image_dir: &Path,
     image_id: &str,
 ) -> anyhow::Result<Bundle> {
@@ -174,9 +188,10 @@ fn build_bundle(
         OciConfig::default()
     };
 
-    let container_uid = config::get_uid(&image_config);
+    let cfg = image_config.config.as_ref();
+    let (uid, gid) = parse_user(cfg.and_then(|c| c.user.as_deref()).unwrap_or("0:0"));
     let image_rootfs = image_dir.join("rootfs");
-    let container_home = lookup_home_dir(&image_rootfs, container_uid)?;
+    let container_home = lookup_home_dir(&image_rootfs, uid)?;
     let host_home = &project.host_home;
     let enabled_mounts: Vec<_> = project
         .config
@@ -193,91 +208,74 @@ fn build_bundle(
     )?);
 
     // Disk image (ext4) for overlay upper + cache mounts
-    let (disk_image, cache_targets) = cache::prepare(
+    let (disk_image, caches) = cache::prepare(
         &project.cache_dir,
         &project.config.disk,
         &container_home,
         &project.host_cwd,
     )?;
 
-    let pty_size = if terminal.is_tty() {
-        // crossterm::terminal::size() returns (cols, rows)
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        Some((rows, cols))
+    // Resolve container command: entrypoint + cmd merged with user args
+    let cmd: Vec<String> = if args.args.is_empty() {
+        let mut a = Vec::new();
+        if let Some(ep) = cfg.and_then(|c| c.entrypoint.as_ref()) {
+            a.extend(ep.iter().cloned());
+        }
+        if let Some(cmd) = cfg.and_then(|c| c.cmd.as_ref()) {
+            a.extend(cmd.iter().cloned());
+        }
+        if a.is_empty() {
+            a.push("/bin/sh".to_string());
+        }
+        a
     } else {
-        None
+        args.args.clone()
     };
-    let container_home_path = PathBuf::from(&container_home);
-    let socket_fwds: Vec<(String, String)> = project
-        .config
-        .network
-        .sockets
-        .values()
-        .filter(|s| s.enabled)
-        .map(|s| {
-            let guest = expand_tilde(&s.guest, &container_home_path)
-                .to_string_lossy()
-                .into_owned();
-            (s.host.clone(), guest)
-        })
-        .collect();
-    config::generate_config(
-        &image_config,
-        &project.guest_cwd,
-        &mounts,
-        &args.args,
-        pty_size,
-        project.config.vm.nested_virtualization,
-        &socket_fwds,
-        &project.config.env,
-        &overlay_dir.join("config.json"),
-    )?;
 
-    // Write mounts.json for the supervisor to read
-    let dirs_json: Vec<serde_json::Value> = mounts
-        .iter()
-        .filter(|m| matches!(m.mount_type, MountType::Dir { .. }))
-        .map(|m| {
-            serde_json::json!({
-                "tag": m.key(),
-                "target": m.target,
-                "read_only": m.read_only,
-            })
-        })
-        .collect();
-    let files_json: Vec<serde_json::Value> = mounts
-        .iter()
-        .filter(|m| matches!(m.mount_type, MountType::File { .. }))
-        .map(|m| {
-            serde_json::json!({
-                "target": m.target,
-                "read_only": m.read_only,
-            })
-        })
-        .collect();
-    let cache_json: Vec<serde_json::Value> = cache_targets
-        .iter()
-        .map(|(name, enabled, paths)| {
-            serde_json::json!({"name": name, "enabled": enabled, "paths": paths})
-        })
-        .collect();
-    let mounts_json = serde_json::json!({
-        "image_id": image_id,
-        "dirs": dirs_json,
-        "files": files_json,
-        "cache": cache_json,
-    });
-    std::fs::write(
-        overlay_dir.join("mounts.json"),
-        serde_json::to_string_pretty(&mounts_json)?,
-    )?;
+    // Resolve environment: base defaults → image env → user env
+    let mut env: Vec<String> = vec![
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+        "TERM=linux".to_string(),
+        format!("HOME={container_home}"),
+    ];
+    if let Some(image_env) = cfg.and_then(|c| c.env.as_ref()) {
+        for e in image_env {
+            let key = e.split('=').next().unwrap_or("");
+            env.retain(|existing| !existing.starts_with(&format!("{key}=")));
+            env.push(e.clone());
+        }
+    }
+    let host_env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    for (key, template) in &project.config.env {
+        let value = subst::substitute(template, &host_env)
+            .map_err(|e| anyhow::anyhow!("env.{key}: {e}"))?;
+        env.retain(|existing| !existing.starts_with(&format!("{key}=")));
+        env.push(format!("{key}={value}"));
+    }
+
+    let cwd = project.guest_cwd.to_string_lossy().into_owned();
 
     Ok(Bundle {
         mounts,
         disk_image,
         image_rootfs,
         container_home,
+        cmd,
+        env,
+        cwd,
+        uid,
+        gid,
+        image_id: image_id.to_string(),
+        caches,
     })
+}
+
+/// Parse a `USER` string (`uid[:gid]`) into numeric uid/gid.
+fn parse_user(user: &str) -> (u32, u32) {
+    let parts: Vec<&str> = user.split(':').collect();
+    let uid = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let gid = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    (uid, gid)
 }
 
 enum ImageChangeAction {

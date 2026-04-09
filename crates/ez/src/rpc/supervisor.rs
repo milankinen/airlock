@@ -7,54 +7,8 @@ use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
 
 use ezpez_protocol::supervisor_capnp::*;
 
-use crate::cli::CliArgs;
-
-/// Build the command + args for the supervisor to execute.
-/// With the `dev` feature and `EZ_DEV_NO_CRUN=true`, runs a shell instead.
-fn build_command() -> (String, Vec<String>) {
-    #[cfg(feature = "dev")]
-    if std::env::var("EZ_DEV_NO_CRUN").is_ok_and(|v| v == "true" || v == "1") {
-        tracing::debug!("dev mode: skipping oci-run, starting shell");
-        return ("/bin/sh".to_string(), vec![]);
-    }
-
-    ("/ez/oci-run".to_string(), vec![])
-}
-
-/// Build the `/ez/oci-exec` invocation for attaching to the running container.
-/// In dev mode (`EZ_DEV_NO_CRUN=true`) runs the command directly instead.
-pub fn build_exec_command(
-    user_cmd: &str,
-    user_args: &[String],
-    cwd: &str,
-    env: &[String],
-    pty: bool,
-) -> (String, Vec<String>) {
-    #[cfg(feature = "dev")]
-    if std::env::var("EZ_DEV_NO_CRUN").is_ok_and(|v| v == "true" || v == "1") {
-        tracing::debug!("dev mode: skipping oci-exec, running directly");
-        return (user_cmd.to_string(), user_args.to_vec());
-    }
-
-    let mut args = vec![];
-    if pty {
-        args.push("--tty".to_string());
-    }
-    if !cwd.is_empty() && cwd != "/" {
-        args.push("--cwd".to_string());
-        args.push(cwd.to_string());
-    }
-    for e in env {
-        args.push("--env".to_string());
-        args.push(e.clone());
-    }
-    args.push("ezpez0".to_string());
-    args.push(user_cmd.to_string());
-    args.extend_from_slice(user_args);
-
-    ("/ez/oci-exec".to_string(), args)
-}
 use crate::network::Network;
+use crate::oci::Bundle;
 use crate::project::Project;
 use crate::rpc::logging::LogSinkImpl;
 use crate::rpc::process::Process;
@@ -106,8 +60,9 @@ impl Supervisor {
     /// polling output and forwarding signals.
     pub async fn start(
         &self,
-        args: &CliArgs,
+        args: &crate::cli::CliArgs,
         project: &Project,
+        bundle: &Bundle,
         stdin: Stdin,
         network: Network,
         epoch: u64,
@@ -135,14 +90,6 @@ impl Supervisor {
         req.get().set_logs(log_sink);
         req.get().set_log_filter(args.log_filter());
 
-        // Build the command for the supervisor to execute
-        let (cmd, cmd_args) = build_command();
-        req.get().set_cmd(&cmd);
-        let mut args_builder = req.get().init_args(cmd_args.len() as u32);
-        for (i, arg) in cmd_args.iter().enumerate() {
-            args_builder.set(i as u32, arg);
-        }
-
         // Init config: epoch, host ports
         req.get().set_epoch(epoch);
         let host_ports =
@@ -152,11 +99,73 @@ impl Supervisor {
             hp_builder.set(i as u32, *port);
         }
 
-        // Socket forwards — already expanded, sourced from network.socket_map
+        // Socket forwards
         let mut sf_builder = req.get().init_sockets(socket_fwds.len() as u32);
         for (i, (host, guest)) in socket_fwds.iter().enumerate() {
             sf_builder.reborrow().get(i as u32).set_host(host);
             sf_builder.reborrow().get(i as u32).set_guest(guest);
+        }
+
+        // Process configuration
+        req.get()
+            .set_cmd(bundle.cmd.first().map_or("/bin/sh", String::as_str));
+        let proc_args = if bundle.cmd.len() > 1 {
+            &bundle.cmd[1..]
+        } else {
+            &[]
+        };
+        let mut args_b = req.get().init_args(proc_args.len() as u32);
+        for (i, a) in proc_args.iter().enumerate() {
+            args_b.set(i as u32, a);
+        }
+        let mut env_b = req.get().init_env(bundle.env.len() as u32);
+        for (i, e) in bundle.env.iter().enumerate() {
+            env_b.set(i as u32, e);
+        }
+        req.get().set_cwd(&bundle.cwd);
+        req.get().set_uid(bundle.uid);
+        req.get().set_gid(bundle.gid);
+        req.get()
+            .set_nested_virt(project.config.vm.nested_virtualization);
+        req.get().set_harden(project.config.vm.harden);
+
+        // Mount configuration
+        req.get().set_image_id(&bundle.image_id);
+
+        let dirs: Vec<_> = bundle
+            .mounts
+            .iter()
+            .filter(|m| matches!(m.mount_type, crate::oci::MountType::Dir { .. }))
+            .collect();
+        let mut dirs_b = req.get().init_dirs(dirs.len() as u32);
+        for (i, m) in dirs.iter().enumerate() {
+            dirs_b.reborrow().get(i as u32).set_tag(m.key());
+            dirs_b.reborrow().get(i as u32).set_target(&m.target);
+            dirs_b.reborrow().get(i as u32).set_read_only(m.read_only);
+        }
+
+        let files: Vec<_> = bundle
+            .mounts
+            .iter()
+            .filter(|m| matches!(m.mount_type, crate::oci::MountType::File { .. }))
+            .collect();
+        let mut files_b = req.get().init_files(files.len() as u32);
+        for (i, m) in files.iter().enumerate() {
+            files_b.reborrow().get(i as u32).set_target(&m.target);
+            files_b.reborrow().get(i as u32).set_read_only(m.read_only);
+        }
+
+        let mut caches_b = req.get().init_caches(bundle.caches.len() as u32);
+        for (i, (name, enabled, paths)) in bundle.caches.iter().enumerate() {
+            caches_b.reborrow().get(i as u32).set_name(name);
+            caches_b.reborrow().get(i as u32).set_enabled(*enabled);
+            let mut paths_b = caches_b
+                .reborrow()
+                .get(i as u32)
+                .init_paths(paths.len() as u32);
+            for (j, p) in paths.iter().enumerate() {
+                paths_b.set(j as u32, p);
+            }
         }
 
         let response = req.send().promise.await?;
@@ -166,13 +175,14 @@ impl Supervisor {
     }
 
     /// Attach a new process to the running container.
-    /// `cmd` and `args` are the fully-constructed invocation (e.g. `crun exec …`).
     pub async fn exec(
         &self,
         stdin: stdin::Client,
         pty_size: Option<(u16, u16)>,
         cmd: &str,
         args: &[String],
+        cwd: &str,
+        env: &[String],
     ) -> anyhow::Result<Process> {
         let mut req = self.supervisor.exec_request();
         req.get().set_stdin(stdin);
@@ -187,6 +197,11 @@ impl Supervisor {
         let mut args_b = req.get().init_args(args.len() as u32);
         for (i, a) in args.iter().enumerate() {
             args_b.set(i as u32, a.as_str());
+        }
+        req.get().set_cwd(cwd);
+        let mut env_b = req.get().init_env(env.len() as u32);
+        for (i, e) in env.iter().enumerate() {
+            env_b.set(i as u32, e.as_str());
         }
         let response = req.send().promise.await?;
         Ok(Process::new(response.get()?.get_proc()?))

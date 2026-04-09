@@ -89,6 +89,10 @@ pub mod config {
         /// Enable nested virtualization (Linux only)
         #[config(default)]
         pub nested_virtualization: bool,
+        /// Apply security hardening to spawned processes (namespace isolation,
+        /// no-new-privileges). Disable only for debugging or Docker-in-VM use.
+        #[config(default_t = true)]
+        pub harden: bool,
         /// Custom kernel image path (overrides the bundled kernel)
         #[config(default)]
         pub kernel: Option<String>,

@@ -10,7 +10,7 @@ use std::rc::Rc;
 use ezpez_protocol::supervisor_capnp::*;
 use futures::AsyncReadExt;
 
-use crate::rpc::{Process, ProcessEvent, Supervisor, build_exec_command};
+use crate::rpc::{Process, ProcessEvent, Supervisor};
 
 /// RAII guard that removes the Unix socket file when dropped.
 struct SockGuard(PathBuf);
@@ -100,11 +100,9 @@ impl cli_service::Server for CliServiceImpl {
             .map(|e| e.map(|s| s.to_str().unwrap_or("").to_string()))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let (cmd, args) = build_exec_command(&user_cmd, &user_args, &cwd, &env, pty_size.is_some());
-
         let proc = self
             .supervisor
-            .exec(vsock_stdin, pty_size, &cmd, &args)
+            .exec(vsock_stdin, pty_size, &user_cmd, &user_args, &cwd, &env)
             .await
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
 

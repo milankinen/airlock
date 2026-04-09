@@ -1,6 +1,6 @@
 #!/bin/bash
 #MISE description="Build the CLI binary"
-#MISE depends=["build:rootfs", "build:kernel", "fetch:cloud-hypervisor", "fetch:virtiofsd"]
+#MISE depends=["build:initramfs", "build:kernel", "fetch:cloud-hypervisor", "fetch:virtiofsd"]
 #MISE sources=["crates/ez/src/**/*.rs", "crates/ez/Cargo.toml", "Cargo.toml", "Cargo.lock", "target/vm/*"]
 #MISE outputs=["target/debug/ez"]
 set -euo pipefail

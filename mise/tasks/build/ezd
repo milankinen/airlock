@@ -1,5 +1,5 @@
 #!/bin/bash
-#MISE description="Build the supervisor for Linux (musl)"
+#MISE description="Build ezd supervisor for Linux (musl)"
 #MISE sources=["crates/ezd/src/**/*.rs", "crates/ezd/Cargo.toml", "crates/common/src/**/*.rs", "crates/common/schema/**/*.capnp", "crates/ezd/builder.dockerfile"]
 #MISE outputs=["target/vm/ezd"]
 set -euo pipefail
@@ -13,13 +13,13 @@ esac
 mkdir -p target/vm
 
 if [[ "${SUPERVISOR_BUILD_HOST:-}" == "true" ]]; then
-  echo "Building supervisor (native, ${TARGET})..."
+  echo "Building ezd (native, ${TARGET})..."
   cargo build --release -p ezpez-supervisor --target "${TARGET}"
   cp "target/${TARGET}/release/ezd" target/vm/ezd
 else
-  echo "Preparing supervisor builder..."
+  echo "Preparing ezd builder..."
   docker build --progress=quiet -t ezpez-supervisor-builder -f crates/ezd/builder.dockerfile crates/ezd
-  echo "Building supervisor (docker, ${TARGET})..."
+  echo "Building ezd (docker, ${TARGET})..."
   docker run --rm \
     -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
     -v "$PWD:/workspace:ro" \
@@ -37,4 +37,4 @@ else
     "
 fi
 
-echo "Supervisor: target/vm/ezd ($(du -h target/vm/ezd | cut -f1))"
+echo "ezd: target/vm/ezd ($(du -h target/vm/ezd | cut -f1))"

@@ -23,6 +23,7 @@ source = "~/.ez/claude.json"
 target = "~/.claude.json"
 
 [network.sockets.docker]
+enabled = false
 host = "~/.docker/run/docker.sock"
 guest = "/var/run/docker.sock"
 
