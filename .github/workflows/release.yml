@@ -48,7 +48,7 @@ jobs:
         run: |
           VERSION="${{ github.event.inputs.version }}"
 
-          for variant in darwin-aarch64:macos-aarch64 linux-x86_64:linux-x86_64 linux-aarch64:linux-aarch64 \
+          for variant in darwin-aarch64-all:macos-aarch64 linux-x86_64-all:linux-x86_64 linux-aarch64-all:linux-aarch64 \
                          darwin-aarch64-distroless:macos-aarch64-distroless \
                          linux-x86_64-distroless:linux-x86_64-distroless \
                          linux-aarch64-distroless:linux-aarch64-distroless; do
@@ -68,12 +68,12 @@ jobs:
         run: |
           VERSION="${{ github.event.inputs.version }}"
           gh release create "$VERSION" \
-            ez-${VERSION}-darwin-aarch64.tar.gz \
-            ez-${VERSION}-darwin-aarch64.tar.gz.sha256 \
-            ez-${VERSION}-linux-x86_64.tar.gz \
-            ez-${VERSION}-linux-x86_64.tar.gz.sha256 \
-            ez-${VERSION}-linux-aarch64.tar.gz \
-            ez-${VERSION}-linux-aarch64.tar.gz.sha256 \
+            ez-${VERSION}-darwin-aarch64-all.tar.gz \
+            ez-${VERSION}-darwin-aarch64-all.tar.gz.sha256 \
+            ez-${VERSION}-linux-x86_64-all.tar.gz \
+            ez-${VERSION}-linux-x86_64-all.tar.gz.sha256 \
+            ez-${VERSION}-linux-aarch64-all.tar.gz \
+            ez-${VERSION}-linux-aarch64-all.tar.gz.sha256 \
             ez-${VERSION}-darwin-aarch64-distroless.tar.gz \
             ez-${VERSION}-darwin-aarch64-distroless.tar.gz.sha256 \
             ez-${VERSION}-linux-x86_64-distroless.tar.gz \

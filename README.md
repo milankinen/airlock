@@ -20,6 +20,21 @@ Features:
 
 ## Quick start
 
+**Install** (macOS / Linux):
+
+```bash
+curl -fsSL https://github.com/milankinen/ezpez/releases/latest/download/install.sh | sh
+```
+
+This installs the `all` variant which bundles the VM kernel and initramfs.
+For the `distroless` variant (bring your own kernel and initramfs via `ez.toml`):
+
+```bash
+curl -fsSL https://github.com/milankinen/ezpez/releases/latest/download/install.sh | sh -s -- --distroless
+```
+
+**Run:**
+
 ```bash
 ez go                          # start interactive VM shell
 ez go -- ls /usr               # one-off command

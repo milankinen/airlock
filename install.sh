@@ -3,9 +3,18 @@ set -eu
 
 REPO="milankinen/ezpez"
 INSTALL_DIR="${EZPEZ_INSTALL_DIR:-$HOME/.local/bin}"
+VARIANT="all"
 
 info() { printf '  %s\n' "$@"; }
 err()  { printf 'error: %s\n' "$@" >&2; exit 1; }
+
+# ── Argument parsing ────────────────────────────────────
+for arg in "$@"; do
+  case "$arg" in
+    --distroless) VARIANT="distroless" ;;
+    *) err "unknown argument: $arg" ;;
+  esac
+done
 
 # ── Platform detection ──────────────────────────────────
 OS=$(uname -s)
@@ -41,10 +50,10 @@ else
     || err "failed to fetch latest version"
 fi
 
-ARCHIVE="ez-${VERSION}-${OS}-${ARCH}.tar.gz"
+ARCHIVE="ez-${VERSION}-${OS}-${ARCH}-${VARIANT}.tar.gz"
 BASE_URL="https://github.com/$REPO/releases/download/$VERSION"
 
-printf 'Installing ez %s (%s-%s)\n' "$VERSION" "$OS" "$ARCH"
+printf 'Installing ez %s (%s-%s, %s)\n' "$VERSION" "$OS" "$ARCH" "$VARIANT"
 
 # ── Download ────────────────────────────────────────────
 TMPDIR=$(mktemp -d)
