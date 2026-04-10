@@ -205,6 +205,7 @@ fn build_bundle(
         host_home,
         &container_home,
         &project.host_cwd,
+        &project.guest_cwd,
     )?);
 
     // Disk image (ext4) for overlay upper + cache mounts
@@ -601,6 +602,7 @@ pub(crate) fn resolve_mounts(
     host_home: &Path,
     container_home: &str,
     cwd: &Path,
+    guest_cwd: &Path,
 ) -> anyhow::Result<Vec<ResolvedMount>> {
     use crate::config::config::MissingAction;
 
@@ -639,6 +641,12 @@ pub(crate) fn resolve_mounts(
 
         let source = std::fs::canonicalize(&source).unwrap_or(source);
         let target = expand_tilde(&m.target, &container_home);
+        // Resolve relative target paths against guest_cwd (mirrors source → cwd behavior)
+        let target = if target.is_relative() {
+            guest_cwd.join(&target)
+        } else {
+            target
+        };
 
         let file_name = source
             .file_name()

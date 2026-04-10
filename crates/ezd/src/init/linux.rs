@@ -106,27 +106,6 @@ pub fn setup_container_mounts(
         "mode=1777,size=65536k",
     )?;
 
-    // /ez/.files/{rw,ro} — VirtioFS-backed file mount staging dirs.
-    // Symlinks from guest paths point here; see assemble_rootfs.
-    let has_rw = mounts.files.iter().any(|f| !f.read_only);
-    let has_ro = mounts.files.iter().any(|f| f.read_only);
-    if has_rw {
-        std::fs::create_dir_all(format!("{root}/ez/.files/rw"))?;
-        bind_mount(
-            "/mnt/overlay/files_rw",
-            &format!("{root}/ez/.files/rw"),
-            false,
-        )?;
-    }
-    if has_ro {
-        std::fs::create_dir_all(format!("{root}/ez/.files/ro"))?;
-        bind_mount(
-            "/mnt/overlay/files_ro",
-            &format!("{root}/ez/.files/ro"),
-            true,
-        )?;
-    }
-
     // /ez/disk — ext4 project disk (or tmpfs fallback) exposed directly so
     // container workloads that need a non-overlayfs filesystem (e.g. Docker's
     // overlayfs snapshotter) can bind-mount a subdirectory as needed.
@@ -168,6 +147,28 @@ pub fn setup_container_mounts(
         }
         bind_mount(&src, &dst, false)?;
         debug!("socket bind: {src} → {dst}");
+    }
+
+    // File bind mounts — applied after dir mounts (assemble_rootfs) so they can override
+    // files inside dir-mounted paths such as guest_cwd.
+    // Source is at /mnt/overlay/files_{rw,ro}/ mirroring the full target path.
+    for file in &mounts.files {
+        let subdir = if file.read_only {
+            "files_ro"
+        } else {
+            "files_rw"
+        };
+        let rel = file.target.strip_prefix('/').unwrap_or(&file.target);
+        let src = format!("/mnt/overlay/{subdir}/{rel}");
+        let dst = format!("{root}/{rel}");
+        if let Some(parent) = std::path::Path::new(&dst).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if !std::path::Path::new(&dst).exists() {
+            let _ = std::fs::File::create(&dst);
+        }
+        bind_mount(&src, &dst, file.read_only)?;
+        debug!("file bind: {src} → {dst}");
     }
 
     // /dev/kvm for nested virtualization (already in /dev bind, but explicit for clarity)
@@ -229,29 +230,6 @@ fn assemble_rootfs(mounts: &MountConfig) -> anyhow::Result<()> {
         anyhow::bail!("failed to mount overlayfs: {err}");
     }
     info!("assembled rootfs via overlayfs");
-
-    // Create staging dirs for file mount bind mounts (populated in setup_container_mounts).
-    let _ = std::fs::create_dir_all("/mnt/overlay/rootfs/ez/.files/rw");
-    let _ = std::fs::create_dir_all("/mnt/overlay/rootfs/ez/.files/ro");
-
-    // File mounts: symlinks into /ez/.files/{rw,ro}.
-    for file in &mounts.files {
-        let subdir = if file.read_only { "ro" } else { "rw" };
-        let rel = file.target.strip_prefix('/').unwrap_or(&file.target);
-        let link = Path::new("/mnt/overlay/rootfs").join(rel);
-        let symlink_target = format!("/ez/.files/{subdir}/{rel}");
-        if let Some(parent) = link.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink(&symlink_target, &link).map_err(|e| {
-            anyhow::anyhow!(
-                "failed to symlink {} → {symlink_target}: {e}",
-                link.display()
-            )
-        })?;
-        debug!("file symlink: {rel} → {symlink_target}");
-    }
 
     // Directory bind mounts
     for dir in &mounts.dirs {

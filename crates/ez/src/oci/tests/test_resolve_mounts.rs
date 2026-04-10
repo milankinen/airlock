@@ -34,6 +34,7 @@ fn absolute_existing_dir() {
         Path::new("/home/test"),
         "/root",
         &tmp,
+        Path::new("/workdir"),
     )
     .unwrap();
 
@@ -53,6 +54,7 @@ fn relative_path_resolved_against_cwd() {
         Path::new("/home/test"),
         "/root",
         &tmp, // cwd
+        Path::new("/workdir"),
     )
     .unwrap();
 
@@ -72,6 +74,7 @@ fn dot_slash_relative_path() {
         Path::new("/home/test"),
         "/root",
         &tmp,
+        Path::new("/workdir"),
     )
     .unwrap();
 
@@ -88,6 +91,7 @@ fn missing_fail_is_default() {
         Path::new("/home/test"),
         "/root",
         &tmp,
+        Path::new("/workdir"),
     );
 
     assert!(result.is_err());
@@ -107,6 +111,7 @@ fn missing_ignore_skips_silently() {
         Path::new("/home/test"),
         "/root",
         &tmp,
+        Path::new("/workdir"),
     )
     .unwrap();
 
@@ -122,6 +127,7 @@ fn missing_warn_skips() {
         Path::new("/home/test"),
         "/root",
         &tmp,
+        Path::new("/workdir"),
     )
     .unwrap();
 
@@ -143,6 +149,7 @@ fn missing_create_makes_directory() {
         Path::new("/home/test"),
         "/root",
         &tmp,
+        Path::new("/workdir"),
     )
     .unwrap();
 
@@ -166,6 +173,7 @@ fn missing_create_nested() {
         Path::new("/home/test"),
         "/root",
         &tmp,
+        Path::new("/workdir"),
     )
     .unwrap();
 
@@ -186,6 +194,7 @@ fn missing_create_relative() {
         Path::new("/home/test"),
         "/root",
         &tmp,
+        Path::new("/workdir"),
     )
     .unwrap();
 
@@ -204,7 +213,14 @@ fn tilde_expansion_source() {
     let src = home.join(".config");
     std::fs::create_dir_all(&src).unwrap();
 
-    let mounts = resolve_mounts(&[mount("~/.config", "/config")], &home, "/root", &tmp).unwrap();
+    let mounts = resolve_mounts(
+        &[mount("~/.config", "/config")],
+        &home,
+        "/root",
+        &tmp,
+        Path::new("/workdir"),
+    )
+    .unwrap();
 
     assert_eq!(mounts.len(), 1);
     assert_eq!(mounts[0].source, std::fs::canonicalize(&src).unwrap());
@@ -221,11 +237,31 @@ fn tilde_expansion_target() {
         Path::new("/home/test"),
         "/home/container",
         &tmp,
+        Path::new("/workdir"),
     )
     .unwrap();
 
     assert_eq!(mounts.len(), 1);
     assert_eq!(mounts[0].target, "/home/container/data");
+}
+
+#[test]
+fn relative_target_resolved_against_guest_cwd() {
+    let tmp = tempdir();
+    let src = tmp.join("myfile.txt");
+    std::fs::write(&src, "content").unwrap();
+
+    let mounts = resolve_mounts(
+        &[mount(&src.to_string_lossy(), "myfile.txt")],
+        Path::new("/home/test"),
+        "/root",
+        &tmp,
+        Path::new("/workdir"),
+    )
+    .unwrap();
+
+    assert_eq!(mounts.len(), 1);
+    assert_eq!(mounts[0].target, "/workdir/myfile.txt");
 }
 
 #[test]
@@ -239,6 +275,7 @@ fn file_mount() {
         Path::new("/home/test"),
         "/root",
         &tmp,
+        Path::new("/workdir"),
     )
     .unwrap();
 
@@ -263,6 +300,7 @@ fn multiple_mounts_mixed() {
         Path::new("/home/test"),
         "/root",
         &tmp,
+        Path::new("/workdir"),
     )
     .unwrap();
 
@@ -288,6 +326,7 @@ fn read_only_preserved() {
         Path::new("/home/test"),
         "/root",
         &tmp,
+        Path::new("/workdir"),
     )
     .unwrap();
 
@@ -300,7 +339,13 @@ fn tilde_missing_fail() {
     let home = tmp.join("fakehome");
     std::fs::create_dir(&home).unwrap();
     // ~/.nonexistent doesn't exist → fail
-    let result = resolve_mounts(&[mount("~/.nonexistent", "/target")], &home, "/root", &tmp);
+    let result = resolve_mounts(
+        &[mount("~/.nonexistent", "/target")],
+        &home,
+        "/root",
+        &tmp,
+        Path::new("/workdir"),
+    );
     assert!(result.is_err());
 }
 
@@ -319,6 +364,7 @@ fn tilde_missing_create() {
         &home,
         "/root",
         &tmp,
+        Path::new("/workdir"),
     )
     .unwrap();
 
@@ -339,6 +385,7 @@ fn tilde_missing_ignore() {
         &home,
         "/root",
         &tmp,
+        Path::new("/workdir"),
     )
     .unwrap();
 
@@ -352,7 +399,14 @@ fn bare_tilde_source() {
     let home = tmp.join("fakehome");
     std::fs::create_dir(&home).unwrap();
 
-    let mounts = resolve_mounts(&[mount("~", "~")], &home, "/root", &tmp).unwrap();
+    let mounts = resolve_mounts(
+        &[mount("~", "~")],
+        &home,
+        "/root",
+        &tmp,
+        Path::new("/workdir"),
+    )
+    .unwrap();
 
     assert_eq!(mounts.len(), 1);
     assert_eq!(mounts[0].source, std::fs::canonicalize(&home).unwrap());
