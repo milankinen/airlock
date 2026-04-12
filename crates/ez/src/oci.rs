@@ -79,8 +79,8 @@ impl ResolvedMount {
     pub fn key(&self) -> &str {
         match &self.mount_type {
             MountType::Dir { key } => key.as_str(),
-            MountType::File { filename: _ } if self.read_only => "files_ro",
-            MountType::File { filename: _ } => "files_rw",
+            MountType::File { filename: _ } if self.read_only => "files/ro",
+            MountType::File { filename: _ } => "files/rw",
         }
     }
     /// Path inside the VM where this mount is located (before pivot_root).

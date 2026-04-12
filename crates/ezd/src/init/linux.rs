@@ -161,7 +161,7 @@ fn setup_container_mounts(
         info!("socket: {src} → {dst}");
     }
 
-    // File mounts — expose files_rw and files_ro as directories inside the container,
+    // File mounts — expose files/rw and files/ro as directories inside the container,
     // then create symlinks at the target paths pointing into those directories.
     //
     // VirtioFS DIRECTORY bind mounts work correctly. VirtioFS FILE bind mounts fail with
@@ -171,12 +171,12 @@ fn setup_container_mounts(
     std::fs::create_dir_all(format!("{root}/ez/.files/rw"))?;
     std::fs::create_dir_all(format!("{root}/ez/.files/ro"))?;
     bind_mount(
-        "/mnt/overlay/files_rw",
+        "/mnt/overlay/files/rw",
         &format!("{root}/ez/.files/rw"),
         false,
     )?;
     bind_mount(
-        "/mnt/overlay/files_ro",
+        "/mnt/overlay/files/ro",
         &format!("{root}/ez/.files/ro"),
         true,
     )?;

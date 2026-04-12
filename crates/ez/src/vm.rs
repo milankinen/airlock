@@ -93,11 +93,11 @@ pub async fn start(
 
     let overlay_dir = project.cache_dir.join("overlay");
     // Create overlay subdirs (rootfs is the overlayfs mount point)
-    for subdir in ["rootfs", "files_rw", "files_ro"] {
+    for subdir in ["rootfs", "files/rw", "files/ro"] {
         std::fs::create_dir_all(overlay_dir.join(subdir))?;
     }
     // Purge file mount dirs on each start (rebuilt from config)
-    for subdir in ["files_rw", "files_ro"] {
+    for subdir in ["files/rw", "files/ro"] {
         let dir = overlay_dir.join(subdir);
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
@@ -234,7 +234,7 @@ pub async fn start(
         #[cfg(target_os = "linux")]
         virtiofsd: assets.virtiofsd,
         #[cfg(target_os = "linux")]
-        nested_virtualization: project.config.vm.nested_virtualization,
+        kvm: project.config.vm.kvm,
     };
 
     #[cfg(target_os = "macos")]
@@ -300,14 +300,14 @@ pub async fn start(
 /// the container rootfs.
 ///
 /// For target `/root/.claude.json` with read_only=false, creates
-/// `overlay/files_rw/root/.claude.json`.
+/// `overlay/files/rw/root/.claude.json`.
 pub fn link_file(
     source: &Path,
     target: &str,
     overlay_dir: &Path,
     read_only: bool,
 ) -> anyhow::Result<()> {
-    let subdir = if read_only { "files_ro" } else { "files_rw" };
+    let subdir = if read_only { "files/ro" } else { "files/rw" };
     let target_path = Path::new(target);
     let parent = target_path
         .parent()

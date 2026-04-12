@@ -125,8 +125,7 @@ impl Supervisor {
         req.get().set_cwd(&bundle.cwd);
         req.get().set_uid(bundle.uid);
         req.get().set_gid(bundle.gid);
-        req.get()
-            .set_nested_virt(project.config.vm.nested_virtualization);
+        req.get().set_nested_virt(project.config.vm.kvm);
         req.get().set_harden(project.config.vm.harden);
 
         // Mount configuration

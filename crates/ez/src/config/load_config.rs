@@ -119,8 +119,8 @@ pub(super) fn parse_config(merged: serde_json::Value) -> anyhow::Result<Config> 
     };
 
     #[cfg(not(target_os = "linux"))]
-    if config.vm.nested_virtualization {
-        anyhow::bail!("nested_virtualization is only supported on Linux");
+    if config.vm.kvm {
+        anyhow::bail!("kvm is only supported on Linux");
     }
 
     Ok(config)

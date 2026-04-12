@@ -85,7 +85,7 @@ impl CloudHypervisorBackend {
         cmd.arg("--kernel").arg(&config.kernel);
         cmd.arg("--initramfs").arg(&config.initramfs);
         cmd.arg("--cmdline").arg(&config.kernel_cmdline);
-        let cpus_arg = if config.nested_virtualization {
+        let cpus_arg = if config.kvm {
             format!("boot={},nested=on", config.cpus)
         } else {
             format!("boot={}", config.cpus)
