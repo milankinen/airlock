@@ -41,9 +41,10 @@ trigger this memory reclaim. See next commit for more details about the
 co-operation implementation.
 ```
 
-IMPORTANT: save the detailed work log to the beginning of `docs/LOG.md`
-file to document the design/implementation rationale BEFORE the commit
-and add the changes to the commit. DO NOT SKIP THIS STEP!
+IMPORTANT: save a detailed work log entry to `docs/log/` as an individual
+file named `<yyyy-mm-dd>-<title>.md` to document the design/implementation
+rationale BEFORE the commit and add the file to the commit. DO NOT SKIP
+THIS STEP!
 
 IMPORTANT: NEVER commit changes unless explicitly asked and ALWAYS
 confirm the commit message from the user before commit. DO NOT SKIP 
