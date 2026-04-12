@@ -19,12 +19,12 @@ cargo +nightly fmt --all -- --check
 cargo clippy --workspace --tests -- -D warnings
 """
 
-[tasks.ez]
+[tasks.dev]
 description = "Build, sign, and run"
 raw = true
 depends = ["build:dev", "build:dev-image"]
 env.RUST_BACKTRACE = "1"
-run = "exec target/debug/ez"
+run = "exec target/debug/airlock"
 
 [tasks.claude]
 description = "Build, sign, and run"
@@ -34,5 +34,5 @@ depends = ["build:dev", "build:dev-image"]
 run = """
 export GIT_AUTHOR_NAME="$(git config --get user.name)"
 export GIT_AUTHOR_EMAIL="$(git config --get user.email)"
-exec target/debug/ez go --login -- claude --dangerously-skip-permissions --effort=high
+exec target/debug/airlock go --login -- claude --dangerously-skip-permissions --effort=high
 """

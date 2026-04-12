@@ -1,15 +1,15 @@
 #!/bin/bash
-#MISE description="Build development time sandbox image for mise ez"
+#MISE description="Build development time sandbox image for mise dev"
 #MISE sources=["dev.dockerfile"]
 set -euo pipefail
 
 if [[ "${SKIP_DEV_IMAGE_BUILD:-}" == "true" ]]; then
   echo "Skipping dev image build"
   mkdir -p target
-  touch target/ez.dev
+  touch target/airlock.dev
   exit 0
 fi
 
-docker build -t ez:dev -f dev.dockerfile .
+docker build -t airlock:dev -f dev.dockerfile .
 mkdir -p target
-touch target/ez.dev
+touch target/airlock.dev

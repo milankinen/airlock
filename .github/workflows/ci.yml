@@ -101,8 +101,8 @@ jobs:
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq capnproto libcapnp-dev musl-tools
           rustup target add aarch64-unknown-linux-musl
-      - name: Build ezd
-        run: SUPERVISOR_BUILD_HOST=true mise run build:ezd
+      - name: Build airlockd
+        run: SUPERVISOR_BUILD_HOST=true mise run build:airlockd
       - run: mise run build:initramfs --no-deps
       - uses: actions/upload-artifact@v4
         with:
@@ -120,8 +120,8 @@ jobs:
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq capnproto libcapnp-dev musl-tools
           rustup target add x86_64-unknown-linux-musl
-      - name: Build ezd
-        run: SUPERVISOR_BUILD_HOST=true mise run build:ezd
+      - name: Build airlockd
+        run: SUPERVISOR_BUILD_HOST=true mise run build:airlockd
       - run: mise run build:initramfs --no-deps
       - uses: actions/upload-artifact@v4
         with:
@@ -176,12 +176,12 @@ jobs:
         with:
           name: initramfs-aarch64
           path: target/vm
-      - run: cargo build --release -p ezpez-cli
-      - run: codesign --entitlements entitlements.plist --force -s - target/release/ez
+      - run: cargo build --release -p airlock-cli
+      - run: codesign --entitlements entitlements.plist --force -s - target/release/airlock
       - uses: actions/upload-artifact@v4
         with:
-          name: ez-macos-aarch64
-          path: target/release/ez
+          name: airlock-macos-aarch64
+          path: target/release/airlock
 
   build-cli-linux-x86_64:
     needs: [ build-kernel-x86_64, build-initramfs-x86_64, fetch-vmm-x86_64 ]
@@ -204,11 +204,11 @@ jobs:
         with:
           name: vmm-x86_64
           path: target/vm
-      - run: cargo build --release -p ezpez-cli
+      - run: cargo build --release -p airlock-cli
       - uses: actions/upload-artifact@v4
         with:
-          name: ez-linux-x86_64
-          path: target/release/ez
+          name: airlock-linux-x86_64
+          path: target/release/airlock
 
   build-cli-linux-aarch64:
     needs: [ build-kernel-aarch64, build-initramfs-aarch64, fetch-vmm-aarch64 ]
@@ -231,11 +231,11 @@ jobs:
         with:
           name: vmm-aarch64
           path: target/vm
-      - run: cargo build --release -p ezpez-cli
+      - run: cargo build --release -p airlock-cli
       - uses: actions/upload-artifact@v4
         with:
-          name: ez-linux-aarch64
-          path: target/release/ez
+          name: airlock-linux-aarch64
+          path: target/release/airlock
 
   # ── Stage 3b: distroless CLI binaries (no bundled kernel/initramfs) ────
   build-cli-macos-aarch64-distroless:
@@ -247,12 +247,12 @@ jobs:
       - name: Install capnp
         run: brew install capnp
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release -p ezpez-cli --features distroless
-      - run: codesign --entitlements entitlements.plist --force -s - target/release/ez
+      - run: cargo build --release -p airlock-cli --features distroless
+      - run: codesign --entitlements entitlements.plist --force -s - target/release/airlock
       - uses: actions/upload-artifact@v4
         with:
-          name: ez-macos-aarch64-distroless
-          path: target/release/ez
+          name: airlock-macos-aarch64-distroless
+          path: target/release/airlock
 
   build-cli-linux-x86_64-distroless:
     needs: [ lint-macos, lint-linux, test-macos, test-linux, fetch-vmm-x86_64 ]
@@ -267,11 +267,11 @@ jobs:
         with:
           name: vmm-x86_64
           path: target/vm
-      - run: cargo build --release -p ezpez-cli --features distroless
+      - run: cargo build --release -p airlock-cli --features distroless
       - uses: actions/upload-artifact@v4
         with:
-          name: ez-linux-x86_64-distroless
-          path: target/release/ez
+          name: airlock-linux-x86_64-distroless
+          path: target/release/airlock
 
   build-cli-linux-aarch64-distroless:
     needs: [ lint-macos, lint-linux, test-macos, test-linux, fetch-vmm-aarch64 ]
@@ -286,8 +286,8 @@ jobs:
         with:
           name: vmm-aarch64
           path: target/vm
-      - run: cargo build --release -p ezpez-cli --features distroless
+      - run: cargo build --release -p airlock-cli --features distroless
       - uses: actions/upload-artifact@v4
         with:
-          name: ez-linux-aarch64-distroless
-          path: target/release/ez
+          name: airlock-linux-aarch64-distroless
+          path: target/release/airlock

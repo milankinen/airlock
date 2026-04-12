@@ -31,6 +31,94 @@ dependencies = [
 ]
 
 [[package]]
+name = "airlock-cli"
+version = "0.1.0"
+dependencies = [
+ "airlock-protocol",
+ "anyhow",
+ "async-stream",
+ "axum",
+ "block2",
+ "bytes",
+ "capnp",
+ "capnp-rpc",
+ "clap",
+ "console",
+ "crossterm",
+ "dialoguer",
+ "dirs",
+ "dispatch2",
+ "flate2",
+ "futures",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "include_dir",
+ "indicatif",
+ "libc",
+ "mlua",
+ "objc2",
+ "objc2-foundation",
+ "objc2-virtualization",
+ "oci-client",
+ "quick_cache",
+ "rcgen",
+ "regex",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pemfile",
+ "security-framework",
+ "serde",
+ "serde_json",
+ "sha2",
+ "smart-config",
+ "subst",
+ "sysinfo",
+ "tar",
+ "thiserror 2.0.18",
+ "timeago",
+ "tls-parser",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "toml",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "airlock-protocol"
+version = "0.1.0"
+dependencies = [
+ "capnp",
+ "capnpc",
+]
+
+[[package]]
+name = "airlock-supervisor"
+version = "0.1.0"
+dependencies = [
+ "airlock-protocol",
+ "anyhow",
+ "bytes",
+ "capnp",
+ "capnp-rpc",
+ "futures",
+ "libc",
+ "pty-process",
+ "scc",
+ "serde",
+ "serde_json",
+ "simple-dns",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -802,94 +890,6 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "ezpez-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "axum",
- "block2",
- "bytes",
- "capnp",
- "capnp-rpc",
- "clap",
- "console",
- "crossterm",
- "dialoguer",
- "dirs",
- "dispatch2",
- "ezpez-protocol",
- "flate2",
- "futures",
- "hex",
- "http-body-util",
- "hyper",
- "hyper-util",
- "include_dir",
- "indicatif",
- "libc",
- "mlua",
- "objc2",
- "objc2-foundation",
- "objc2-virtualization",
- "oci-client",
- "quick_cache",
- "rcgen",
- "regex",
- "rustls",
- "rustls-native-certs",
- "rustls-pemfile",
- "security-framework",
- "serde",
- "serde_json",
- "sha2",
- "smart-config",
- "subst",
- "sysinfo",
- "tar",
- "thiserror 2.0.18",
- "timeago",
- "tls-parser",
- "tokio",
- "tokio-rustls",
- "tokio-util",
- "toml",
- "tower",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "ezpez-protocol"
-version = "0.1.0"
-dependencies = [
- "capnp",
- "capnpc",
-]
-
-[[package]]
-name = "ezpez-supervisor"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "capnp",
- "capnp-rpc",
- "ezpez-protocol",
- "futures",
- "libc",
- "pty-process",
- "scc",
- "serde",
- "serde_json",
- "simple-dns",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

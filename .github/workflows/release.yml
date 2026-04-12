@@ -37,12 +37,12 @@ jobs:
               --jq '.[0].databaseId')
           fi
           echo "Downloading artifacts from CI run $RUN_ID"
-          for name in ez-macos-aarch64 ez-linux-x86_64 ez-linux-aarch64 \
-                      ez-macos-aarch64-distroless ez-linux-x86_64-distroless ez-linux-aarch64-distroless; do
+          for name in airlock-macos-aarch64 airlock-linux-x86_64 airlock-linux-aarch64 \
+                      airlock-macos-aarch64-distroless airlock-linux-x86_64-distroless airlock-linux-aarch64-distroless; do
             gh run download "$RUN_ID" \
               --repo "$GITHUB_REPOSITORY" \
               --name "$name" \
-              --dir "artifacts/${name#ez-}"
+              --dir "artifacts/${name#airlock-}"
           done
       - name: Package release artifacts
         run: |
@@ -54,10 +54,10 @@ jobs:
                          linux-aarch64-distroless:linux-aarch64-distroless; do
             NAME="${variant%%:*}"
             DIR="${variant##*:}"
-            ARCHIVE="ez-${VERSION}-${NAME}.tar.gz"
-            chmod +x "artifacts/${DIR}/ez"
-            python3 -c "import sys; v=sys.argv[1].encode('utf-8'); sys.stdout.buffer.write(v + len(v).to_bytes(4, 'little'))" "$VERSION" >> "artifacts/${DIR}/ez"
-            tar -czf "$ARCHIVE" -C "artifacts/${DIR}" ez
+            ARCHIVE="airlock-${VERSION}-${NAME}.tar.gz"
+            chmod +x "artifacts/${DIR}/airlock"
+            python3 -c "import sys; v=sys.argv[1].encode('utf-8'); sys.stdout.buffer.write(v + len(v).to_bytes(4, 'little'))" "$VERSION" >> "artifacts/${DIR}/airlock"
+            tar -czf "$ARCHIVE" -C "artifacts/${DIR}" airlock
             sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
           done
 
@@ -68,17 +68,17 @@ jobs:
         run: |
           VERSION="${{ github.event.inputs.version }}"
           gh release create "$VERSION" \
-            ez-${VERSION}-darwin-aarch64-all.tar.gz \
-            ez-${VERSION}-darwin-aarch64-all.tar.gz.sha256 \
-            ez-${VERSION}-linux-x86_64-all.tar.gz \
-            ez-${VERSION}-linux-x86_64-all.tar.gz.sha256 \
-            ez-${VERSION}-linux-aarch64-all.tar.gz \
-            ez-${VERSION}-linux-aarch64-all.tar.gz.sha256 \
-            ez-${VERSION}-darwin-aarch64-distroless.tar.gz \
-            ez-${VERSION}-darwin-aarch64-distroless.tar.gz.sha256 \
-            ez-${VERSION}-linux-x86_64-distroless.tar.gz \
-            ez-${VERSION}-linux-x86_64-distroless.tar.gz.sha256 \
-            ez-${VERSION}-linux-aarch64-distroless.tar.gz \
-            ez-${VERSION}-linux-aarch64-distroless.tar.gz.sha256 \
+            airlock-${VERSION}-darwin-aarch64-all.tar.gz \
+            airlock-${VERSION}-darwin-aarch64-all.tar.gz.sha256 \
+            airlock-${VERSION}-linux-x86_64-all.tar.gz \
+            airlock-${VERSION}-linux-x86_64-all.tar.gz.sha256 \
+            airlock-${VERSION}-linux-aarch64-all.tar.gz \
+            airlock-${VERSION}-linux-aarch64-all.tar.gz.sha256 \
+            airlock-${VERSION}-darwin-aarch64-distroless.tar.gz \
+            airlock-${VERSION}-darwin-aarch64-distroless.tar.gz.sha256 \
+            airlock-${VERSION}-linux-x86_64-distroless.tar.gz \
+            airlock-${VERSION}-linux-x86_64-distroless.tar.gz.sha256 \
+            airlock-${VERSION}-linux-aarch64-distroless.tar.gz \
+            airlock-${VERSION}-linux-aarch64-distroless.tar.gz.sha256 \
             install.sh \
             --repo "$GITHUB_REPOSITORY" --generate-notes

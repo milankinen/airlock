@@ -26,48 +26,48 @@ Always format code you produce. Use `mise format`
 ## Testing the VM
 
 IMPORTANT: if `NO_KVM` environment variable is set to `1`, it means
-that there is no KVM support and running `ez go` will fail.
+that there is no KVM support and running `airlock go` will fail.
 
 Non-interactive commands can be tested directly from the CLI:
 
 ```bash
 # Pipe mode (stdin is not a TTY → no PTY, pipe I/O)
-echo "hello" | target/debug/ez go -- cat
-echo "data" | target/debug/ez go -- grep pattern
+echo "hello" | target/debug/airlock go -- cat
+echo "data" | target/debug/airlock go -- grep pattern
 
 # Command mode (stdin is TTY → PTY allocated)
-target/debug/ez go -- ls /usr
-target/debug/ez go -- sh -c 'echo hi; exit 42'
+target/debug/airlock go -- ls /usr
+target/debug/airlock go -- sh -c 'echo hi; exit 42'
 
 # Interactive shell (no subcommand)
-target/debug/ez go
+target/debug/airlock go
 ```
 
-Exit codes propagate. `mise run ez` always builds latest
+Exit codes propagate. `mise run airlock` always builds latest
 (including supervisor cross-compile) before running:
 
 ```bash
-mise run ez               # interactive shell
-mise run ez -- ls /usr    # command with args
+mise run airlock               # interactive shell
+mise run airlock -- ls /usr    # command with args
 ```
 
 ## Exec (sidecar) CLI
 
-With a VM running (`ez go`), attach additional processes in a separate terminal:
+With a VM running (`airlock go`), attach additional processes in a separate terminal:
 
 ```bash
-# Run a command inside the running container (alias: ez x)
-target/debug/ez exec ls /usr
-target/debug/ez exec sh -c 'echo hi'
-target/debug/ez x bash
+# Run a command inside the running container (alias: airlock x)
+target/debug/airlock exec ls /usr
+target/debug/airlock exec sh -c 'echo hi'
+target/debug/airlock x bash
 
 # With options
-target/debug/ez exec -w /app bash          # set working directory
-target/debug/ez exec -e KEY=val env        # set env vars
+target/debug/airlock exec -w /app bash          # set working directory
+target/debug/airlock exec -e KEY=val env        # set env vars
 ```
 
-`ez exec` connects to `<project-cache>/cli.sock` (Cap'n Proto RPC) that
-`ez go` exposes while the VM is running. TTY mode is auto-detected; raw
+`airlock exec` connects to `<project-cache>/cli.sock` (Cap'n Proto RPC) that
+`airlock go` exposes while the VM is running. TTY mode is auto-detected; raw
 mode is enabled for interactive commands. The `CliService` interface is
 defined in `crates/common/schema/supervisor.capnp`.
 
@@ -75,16 +75,16 @@ defined in `crates/common/schema/supervisor.capnp`.
 
 ```bash
 # Show info for the project in the current directory
-target/debug/ez project info
+target/debug/airlock project info
 
 # List all known projects with abbreviated IDs
-target/debug/ez project list
+target/debug/airlock project list
 
 # Remove project by current directory, path, full hash, or abbreviated hash
-target/debug/ez project remove
-target/debug/ez project remove /path/to/project
-target/debug/ez project remove abc1234   # abbreviated hash
-target/debug/ez project remove --yes     # skip confirmation prompt
+target/debug/airlock project remove
+target/debug/airlock project remove /path/to/project
+target/debug/airlock project remove abc1234   # abbreviated hash
+target/debug/airlock project remove --yes     # skip confirmation prompt
 ```
 
 ## Temporary files

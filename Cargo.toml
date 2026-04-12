@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ez", "crates/common", "crates/ezd"]
+members = ["crates/airlock", "crates/common", "crates/airlockd"]
 resolver = "3"
 
 [workspace.package]
@@ -85,7 +85,7 @@ axum = "0.8"
 tower = "0.5"
 
 # Internal
-ezpez-protocol = { path = "crates/common" }
+airlock-protocol = { path = "crates/common" }
 
 [workspace.lints.clippy]
 pedantic = { level = "deny", priority = -1 }

@@ -13,6 +13,6 @@ pub mod supervisor_capnp {
 /// Virtio-vsock port the supervisor listens on inside the VM.
 pub const SUPERVISOR_PORT: u32 = 1024;
 
-/// Filename of the Unix domain socket that `ez go` creates on the host so
-/// that `ez exec` can attach sidecar processes to the running container.
+/// Filename of the Unix domain socket that `airlock go` creates on the host so
+/// that `airlock exec` can attach sidecar processes to the running container.
 pub const CLI_SOCK_FILENAME: &str = "cli.sock";

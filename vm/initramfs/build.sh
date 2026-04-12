@@ -8,7 +8,7 @@ apk add --no-cache busybox-extras iproute2 iptables e2fsprogs e2fsprogs-extra >/
 # Set up the container filesystem
 mkdir -p /proc /sys /dev /dev/pts /tmp /run /usr/bin
 cp /init-script /init && chmod 755 /init
-cp /supervisor-bin /usr/bin/ezd && chmod 755 /usr/bin/ezd
+cp /supervisor-bin /usr/bin/airlockd && chmod 755 /usr/bin/airlockd
 
 # Snapshot the rootfs into /staging before installing build tools.
 # Exclude volatile/host-only dirs so they don't end up in the archives.

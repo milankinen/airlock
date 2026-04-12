@@ -1,0 +1,43 @@
+presets = ["debian", "claude-code", "rust"]
+
+[vm]
+image = "airlock:dev"
+
+[env]
+# Needs to be something to make Claude happy; the actual token
+# is set by the network middleware
+CLAUDE_CODE_OAUTH_TOKEN = "-"
+# We can always build natively inside vm
+SUPERVISOR_BUILD_HOST = "true"
+# We can use host's docker image
+SKIP_DEV_IMAGE_BUILD = "true"
+# Allow --dangerously-skip-permissions inside vm
+IS_SANDBOX = "1"
+# Git configs
+GIT_AUTHOR_NAME = "${GIT_AUTHOR_NAME:-}"
+GIT_AUTHOR_EMAIL = "${GIT_AUTHOR_EMAIL:-}"
+CARGO_TARGET_DIR = "/tmp/cargo"
+
+[disk]
+size = "20 GB"
+
+[mounts.claude-json]
+missing = "fail"
+source = "~/.ez/claude.json"
+target = "~/.claude.json"
+
+[network.sockets.docker]
+enabled = false
+host = "~/.docker/run/docker.sock"
+guest = "/var/run/docker.sock"
+
+[network.rules.allow-all]
+allow = ["*"]
+
+[[network.rules.claude-code.middleware]]
+env.TOKEN = "${CLAUDE_CODE_OAUTH_TOKEN}"
+script = """
+if env.TOKEN then
+  req:setHeader("Authorization", "Bearer " .. env.TOKEN)
+end
+"""

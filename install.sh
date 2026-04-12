@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-REPO="milankinen/ezpez"
-INSTALL_DIR="${EZPEZ_INSTALL_DIR:-$HOME/.local/bin}"
+REPO="milankinen/airlock"
+INSTALL_DIR="${AIRLOCK_INSTALL_DIR:-$HOME/.local/bin}"
 VARIANT="all"
 
 info() { printf '  %s\n' "$@"; }
@@ -42,18 +42,18 @@ esac
 # Pinned at release time by CI; empty in the repo source.
 DEFAULT_VERSION=""
 
-if [ -n "${EZPEZ_VERSION:-$DEFAULT_VERSION}" ]; then
-  VERSION="${EZPEZ_VERSION:-$DEFAULT_VERSION}"
+if [ -n "${AIRLOCK_VERSION:-$DEFAULT_VERSION}" ]; then
+  VERSION="${AIRLOCK_VERSION:-$DEFAULT_VERSION}"
 else
   VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
     | grep '"tag_name"' | cut -d'"' -f4) \
     || err "failed to fetch latest version"
 fi
 
-ARCHIVE="ez-${VERSION}-${OS}-${ARCH}-${VARIANT}.tar.gz"
+ARCHIVE="airlock-${VERSION}-${OS}-${ARCH}-${VARIANT}.tar.gz"
 BASE_URL="https://github.com/$REPO/releases/download/$VERSION"
 
-printf 'Installing ez %s (%s-%s, %s)\n' "$VERSION" "$OS" "$ARCH" "$VARIANT"
+printf 'Installing airlock %s (%s-%s, %s)\n' "$VERSION" "$OS" "$ARCH" "$VARIANT"
 
 # ── Download ────────────────────────────────────────────
 TMPDIR=$(mktemp -d)
@@ -79,7 +79,7 @@ fi
 info "extracting to $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 tar -xzf "$TMPDIR/$ARCHIVE" -C "$TMPDIR"
-mv "$TMPDIR/ez" "$INSTALL_DIR/ez"
-chmod +x "$INSTALL_DIR/ez"
+mv "$TMPDIR/airlock" "$INSTALL_DIR/airlock"
+chmod +x "$INSTALL_DIR/airlock"
 
-printf 'done! ez installed to %s/ez\n' "$INSTALL_DIR"
+printf 'done! airlock installed to %s/airlock\n' "$INSTALL_DIR"

@@ -38,8 +38,8 @@ interface Supervisor {
   ) -> (proc :Process);
 }
 
-# CLI server interface — exposed over the unix socket by `ez go`.
-# `ez exec` connects here to attach new processes to the running container.
+# CLI server interface — exposed over the unix socket by `airlock go`.
+# `airlock exec` connects here to attach new processes to the running container.
 interface CliService @0xb5ce8d3c8a4a7d2f {
   exec @0 (
     stdin :Stdin,

@@ -1,7 +1,7 @@
 #!/bin/bash
 #MISE description="Build the initramfs using Docker"
-#MISE depends=["build:ezd"]
-#MISE sources=["vm/initramfs/init", "vm/initramfs/build.sh", "target/vm/ezd"]
+#MISE depends=["build:airlockd"]
+#MISE sources=["vm/initramfs/init", "vm/initramfs/build.sh", "target/vm/airlockd"]
 #MISE outputs=["target/vm/initramfs.gz"]
 set -euo pipefail
 
@@ -11,7 +11,7 @@ docker run --rm \
   -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
   -v "$PWD/vm/initramfs/init:/init-script:ro" \
   -v "$PWD/vm/initramfs/build.sh:/build.sh:ro" \
-  -v "$PWD/target/vm/ezd:/supervisor-bin:ro" \
+  -v "$PWD/target/vm/airlockd:/supervisor-bin:ro" \
   -v "$PWD/target/vm:/out" \
   alpine:3.23 sh -c 'sh /build.sh && chown "$HOST_UID:$HOST_GID" /out/initramfs.gz'
 echo "Initramfs: target/vm/initramfs.gz ($(du -h target/vm/initramfs.gz | cut -f1))"

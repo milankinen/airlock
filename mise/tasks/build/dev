@@ -1,12 +1,12 @@
 #!/bin/bash
 #MISE description="Build the CLI binary"
 #MISE depends=["build:initramfs", "build:kernel", "fetch:cloud-hypervisor", "fetch:virtiofsd"]
-#MISE sources=["crates/ez/src/**/*.rs", "crates/ez/Cargo.toml", "Cargo.toml", "Cargo.lock", "target/vm/*"]
-#MISE outputs=["target/debug/ez"]
+#MISE sources=["crates/airlock/src/**/*.rs", "crates/airlock/Cargo.toml", "Cargo.toml", "Cargo.lock", "target/vm/*"]
+#MISE outputs=["target/debug/airlock"]
 set -euo pipefail
 
-cargo build -p ezpez-cli --features dev "$@"
+cargo build -p airlock-cli --features dev "$@"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
-  codesign --entitlements entitlements.plist --force -s - target/debug/ez 2>/dev/null || true
+  codesign --entitlements entitlements.plist --force -s - target/debug/airlock 2>/dev/null || true
 fi
