@@ -13,6 +13,9 @@ SUPERVISOR_BUILD_HOST = "true"
 SKIP_DEV_IMAGE_BUILD = "true"
 # Allow --dangerously-skip-permissions inside vm
 IS_SANDBOX = "1"
+# Git configs
+GIT_AUTHOR_NAME = "${GIT_AUTHOR_NAME:-}"
+GIT_AUTHOR_EMAIL = "${GIT_AUTHOR_EMAIL:-}"
 
 [disk]
 size = "20 GB"
@@ -21,11 +24,6 @@ size = "20 GB"
 missing = "fail"
 source = "~/.ez/claude.json"
 target = "~/.claude.json"
-
-[mounts.gitconfig]
-missing = "fail"
-source = "~/.gitconfig"
-target = "~/.gitconfig"
 
 [network.sockets.docker]
 enabled = false
