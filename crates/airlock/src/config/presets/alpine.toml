@@ -2,6 +2,6 @@
 
 [network.rules.alpine-packages]
 allow = [
-    "http:dl-cdn.alpinelinux.org",
-    "http:*.alpinelinux.org",
+    "dl-cdn.alpinelinux.org",
+    "*.alpinelinux.org",
 ]

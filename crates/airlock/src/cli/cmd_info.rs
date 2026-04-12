@@ -59,7 +59,16 @@ pub fn run(path: Option<&str>) -> i32 {
         println!("Network rules:");
         for (key, rule) in &project.config.network.rules {
             let status = if rule.enabled { "" } else { " (disabled)" };
-            println!("  {key}: {} targets{status}", rule.allow.len());
+            let mw = if rule.middleware.is_empty() {
+                String::new()
+            } else {
+                format!(", {} middleware", rule.middleware.len())
+            };
+            println!(
+                "  {key}: allow {} deny {}{mw}{status}",
+                rule.allow.len(),
+                rule.deny.len()
+            );
         }
     }
 

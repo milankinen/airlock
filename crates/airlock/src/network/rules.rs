@@ -3,38 +3,52 @@ use super::middleware::LogFn;
 use super::target::NetworkTarget;
 use crate::config::config::Network;
 
-/// Resolve config rules into a flat list of network targets with
-/// compiled middleware attached. Disabled rules/middleware are skipped.
-pub fn resolve(network: &Network, log: &LogFn) -> anyhow::Result<Vec<NetworkTarget>> {
-    let mut targets = Vec::new();
+/// Resolve config rules into allow and deny target lists with compiled
+/// middleware attached. Disabled rules are skipped.
+///
+/// Returns `(allow_targets, deny_targets)`.
+pub fn resolve(
+    network: &Network,
+    log: &LogFn,
+) -> anyhow::Result<(Vec<NetworkTarget>, Vec<NetworkTarget>)> {
+    let mut allow_targets = Vec::new();
+    let mut deny_targets = Vec::new();
 
     for rule in network.rules.values() {
         if !rule.enabled {
             continue;
         }
-        for allow in &rule.allow {
-            let (http_only, host, port) = parse_target(allow);
-            let port = port.and_then(|p| p.parse::<u16>().ok());
 
-            // Collect enabled middleware scripts that match this host
-            let mut middleware = Vec::new();
-            for mw in &rule.middleware {
-                middleware.push(http::middleware::compile(&mw.script, &mw.env, log.clone())?);
-            }
+        let compiled_middleware: Vec<_> = rule
+            .middleware
+            .iter()
+            .map(|mw| http::middleware::compile(&mw.script, &mw.env, log.clone()))
+            .collect::<anyhow::Result<_>>()?;
 
-            targets.push(NetworkTarget {
+        for target_str in &rule.allow {
+            let (host, port) = parse_target(target_str);
+            allow_targets.push(NetworkTarget {
                 host: host.to_string(),
-                port,
-                http_only,
-                middleware,
+                port: port.and_then(|p| p.parse::<u16>().ok()),
+                middleware: compiled_middleware.clone(),
+            });
+        }
+
+        for target_str in &rule.deny {
+            let (host, port) = parse_target(target_str);
+            deny_targets.push(NetworkTarget {
+                host: host.to_string(),
+                port: port.and_then(|p| p.parse::<u16>().ok()),
+                middleware: vec![],
             });
         }
     }
 
-    Ok(targets)
+    Ok((allow_targets, deny_targets))
 }
 
 /// Derive localhost ports directly from config (no compilation needed).
+/// Only `allow` targets contribute to port forwarding.
 pub fn localhost_ports_from_config(network: &Network) -> Vec<u16> {
     let mut ports = Vec::new();
     for rule in network.rules.values() {
@@ -42,7 +56,7 @@ pub fn localhost_ports_from_config(network: &Network) -> Vec<u16> {
             continue;
         }
         for target in &rule.allow {
-            let (_, host, port) = parse_target(target);
+            let (host, port) = parse_target(target);
             if is_localhost(host)
                 && let Some(port_str) = port
                 && let Ok(p) = port_str.parse::<u16>()
@@ -59,14 +73,10 @@ fn is_localhost(host: &str) -> bool {
     host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
-/// Parse a target pattern `[http:]host[:port]` into (http_only, host, port_str).
-fn parse_target(target: &str) -> (bool, &str, Option<&str>) {
-    let (http_only, rest) = match target.strip_prefix("http:") {
-        Some(rest) => (true, rest),
-        None => (false, target),
-    };
-    match rest.rsplit_once(':') {
-        Some((host, port)) => (http_only, host, Some(port)),
-        None => (http_only, rest, None),
+/// Parse a target pattern `host[:port]` into (host, port_str).
+fn parse_target(target: &str) -> (&str, Option<&str>) {
+    match target.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (target, None),
     }
 }

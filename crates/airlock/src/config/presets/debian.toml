@@ -2,10 +2,10 @@
 
 [network.rules.debian-packages]
 allow = [
-    "http:deb.debian.org",
-    "http:security.debian.org",
-    "http:archive.ubuntu.com",
-    "http:security.ubuntu.com",
-    "http:ppa.launchpad.net",
-    "http:keyserver.ubuntu.com",
+    "deb.debian.org",
+    "security.debian.org",
+    "archive.ubuntu.com",
+    "security.ubuntu.com",
+    "ppa.launchpad.net",
+    "keyserver.ubuntu.com",
 ]

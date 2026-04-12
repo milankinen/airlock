@@ -168,6 +168,7 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
             NetworkRule {
                 enabled: true,
                 allow: cfg.allowed_hosts.clone(),
+                deny: vec![],
                 middleware,
             },
         );
@@ -180,6 +181,7 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
             NetworkRule {
                 enabled: true,
                 allow: cfg.tls_passthrough,
+                deny: vec![],
                 middleware: vec![],
             },
         );
@@ -190,7 +192,7 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
         sockets: BTreeMap::default(),
     };
     let (request_log, log_fn) = RequestLog::new();
-    let targets = rules::resolve(&config, &log_fn).unwrap();
+    let (allow_targets, deny_targets) = rules::resolve(&config, &log_fn).unwrap();
 
     // MITM CA
     let mitm_ca_key = rcgen::KeyPair::generate().unwrap();
@@ -219,7 +221,8 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
         Network {
             tls_client: Arc::new(tls_client),
             interceptor: Rc::new(interceptor),
-            targets,
+            allow_targets,
+            deny_targets,
             socket_map: std::collections::HashMap::default(),
         },
     )

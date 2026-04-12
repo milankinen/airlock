@@ -2,7 +2,7 @@
 
 [network.rules.arch-packages]
 allow = [
-    "http:*.archlinux.org",
-    "http:archlinux.org",
-    "http:aur.archlinux.org",
+    "*.archlinux.org",
+    "archlinux.org",
+    "aur.archlinux.org",
 ]

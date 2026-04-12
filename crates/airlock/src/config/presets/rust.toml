@@ -2,9 +2,9 @@
 
 [network.rules.rust-packages]
 allow = [
-    "http:crates.io",
-    "http:index.crates.io",
-    "http:static.crates.io",
-    "http:static.rust-lang.org",
-    "http:doc.rust-lang.org",
+    "crates.io",
+    "index.crates.io",
+    "static.crates.io",
+    "static.rust-lang.org",
+    "doc.rust-lang.org",
 ]

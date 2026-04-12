@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::network::target::ResolvedTarget;
+use crate::network::target::{NetworkTarget, ResolvedTarget};
 use crate::project::Project;
 
 /// Build the [`Network`] from the project config: load native CA roots,
@@ -41,7 +41,7 @@ pub fn setup(project: &Project, bundle: &crate::oci::Bundle) -> anyhow::Result<N
 
     let net = &project.config.network;
     let log = middleware::tracing_log();
-    let targets = rules::resolve(net, &log)?;
+    let (allow_targets, deny_targets) = rules::resolve(net, &log)?;
 
     let ca_cert = std::fs::read_to_string(&project.ca_cert)?;
     let ca_key = std::fs::read_to_string(&project.ca_key)?;
@@ -58,12 +58,17 @@ pub fn setup(project: &Project, bundle: &crate::oci::Bundle) -> anyhow::Result<N
         })
         .collect();
 
-    tracing::debug!("network: {} targets resolved", targets.len());
+    tracing::debug!(
+        "network: {} allow targets, {} deny targets",
+        allow_targets.len(),
+        deny_targets.len()
+    );
 
     Ok(Network {
         tls_client: Arc::new(tls_client),
         interceptor: Rc::new(interceptor),
-        targets,
+        allow_targets,
+        deny_targets,
         socket_map,
     })
 }
@@ -73,27 +78,49 @@ pub fn setup(project: &Project, bundle: &crate::oci::Bundle) -> anyhow::Result<N
 pub struct Network {
     tls_client: Arc<rustls::ClientConfig>,
     interceptor: Rc<tls::TlsInterceptor>,
-    targets: Vec<target::NetworkTarget>,
+    /// Allow-rule targets with optional middleware.
+    allow_targets: Vec<NetworkTarget>,
+    /// Deny-rule targets (no middleware; deny wins unconditionally).
+    deny_targets: Vec<NetworkTarget>,
     /// Guest socket path → host socket path mapping for Unix socket forwarding.
     pub(super) socket_map: HashMap<String, PathBuf>,
 }
 
 impl Network {
-    pub fn resolve_target(&self, host: &str, port: u16) -> Option<ResolvedTarget> {
-        let mut matches = false;
-        let mut resolved = ResolvedTarget {
-            host: host.to_string(),
-            port,
-            http_only: false,
-            middleware: vec![],
-        };
-        for target in &self.targets {
+    /// Resolve a host:port to a `ResolvedTarget`.
+    ///
+    /// Logic:
+    /// 1. If any deny target matches → `allowed = false` immediately.
+    /// 2. If no allow target matches → `allowed = false`.
+    /// 3. Otherwise → `allowed = true`; middleware collected from all matching allow rules.
+    pub fn resolve_target(&self, host: &str, port: u16) -> ResolvedTarget {
+        // Deny wins: checked first, no middleware involved.
+        for target in &self.deny_targets {
             if target.matches(host, port) {
-                matches = true;
-                resolved.http_only = resolved.http_only || target.http_only;
-                resolved.middleware.extend(target.middleware.clone());
+                return ResolvedTarget {
+                    host: host.to_string(),
+                    port,
+                    middleware: vec![],
+                    allowed: false,
+                };
             }
         }
-        if matches { Some(resolved) } else { None }
+
+        // Collect middleware from all matching allow rules.
+        let mut middleware = vec![];
+        let mut any_allow = false;
+        for target in &self.allow_targets {
+            if target.matches(host, port) {
+                any_allow = true;
+                middleware.extend(target.middleware.iter().cloned());
+            }
+        }
+
+        ResolvedTarget {
+            host: host.to_string(),
+            port,
+            middleware,
+            allowed: any_allow,
+        }
     }
 }

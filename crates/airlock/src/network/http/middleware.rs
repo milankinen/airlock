@@ -93,6 +93,13 @@ fn is_denied(e: &mlua::Error) -> bool {
 }
 
 /// Run all HTTP middleware layers around the send function.
+///
+/// Default behaviour is to forward the request. Scripts can call
+/// `req:deny()` to block with 403. If a script neither calls
+/// `req:send()`/`req:allow()` nor `req:deny()`, the request is forwarded
+/// implicitly (allow-by-default).
+///
+/// Empty middleware list forwards directly.
 pub async fn run<F, Fut>(
     req: hyper::Request<Incoming>,
     middleware: &[CompiledMiddleware],
@@ -119,7 +126,7 @@ where
         })
     });
 
-    // Wrap with each middleware layer (innermost first)
+    // Wrap with each middleware layer (innermost first).
     for m in middleware.iter().rev() {
         let inner = next;
         let m = m.0.clone();
@@ -147,15 +154,15 @@ where
                     }
                 }
 
-                // If script called send(), response is stored in the linked RespState
+                // If script called send()/allow(), response is stored in RespState
                 if let Some(resp_ref) = state.resp.borrow_mut().take()
                     && let Some(resp) = resp_ref.borrow_mut().take()
                 {
                     return Ok(resp);
                 }
 
-                // Script didn't call send() — do it implicitly
-                trace!("middleware did not call send(), sending implicitly!");
+                // Script didn't call send()/deny() — forward implicitly
+                trace!("middleware did not call send(), forwarding implicitly");
                 let next = state
                     .next
                     .borrow_mut()

@@ -2,6 +2,6 @@
 
 [network.rules.nodejs-packages]
 allow = [
-    "http:registry.npmjs.org",
-    "http:registry.yarnpkg.com",
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
 ]

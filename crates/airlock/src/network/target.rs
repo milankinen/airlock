@@ -1,15 +1,13 @@
 use super::http::middleware::CompiledMiddleware;
 use super::matchers;
 
-/// A resolved network target — parsed from config rules at startup.
-/// Each target represents one allowed `[http:]host[:port]` pattern
-/// with optional compiled HTTP middleware scripts.
+/// A resolved network target — parsed from a rule's `allow` list at startup.
+/// Each target represents one `host[:port]` pattern with optional compiled
+/// HTTP middleware scripts.
 #[derive(Clone)]
 pub struct NetworkTarget {
     pub host: String,
     pub port: Option<u16>,
-    /// If true, only HTTP traffic is allowed; non-HTTP is rejected.
-    pub http_only: bool,
     pub middleware: Vec<CompiledMiddleware>,
 }
 
@@ -24,15 +22,17 @@ impl NetworkTarget {
 pub struct ResolvedTarget {
     pub host: String,
     pub port: u16,
-    pub http_only: bool,
+    /// Middleware scripts from all matching allow rules.
     pub middleware: Vec<CompiledMiddleware>,
+    /// Whether this connection is permitted.
+    /// False if any deny pattern matched or no allow pattern matched.
+    pub allowed: bool,
 }
 
 impl ResolvedTarget {
     /// Should TLS be passed through (no MITM) for this target?
-    /// Targets without middleware get passthrough, unless http_only
-    /// is set (needs interception to verify HTTP).
+    /// Only allowed targets without middleware get raw passthrough.
     pub fn is_passthrough(&self) -> bool {
-        self.middleware.is_empty() && !self.http_only
+        self.allowed && self.middleware.is_empty()
     }
 }

@@ -2,8 +2,8 @@
 
 [network.rules.suse-packages]
 allow = [
-    "http:download.opensuse.org",
-    "http:mirrorcache.opensuse.org",
-    "http:scc.suse.com",
-    "http:updates.suse.com",
+    "download.opensuse.org",
+    "mirrorcache.opensuse.org",
+    "scc.suse.com",
+    "updates.suse.com",
 ]

@@ -2,10 +2,10 @@
 
 [network.rules.claude-code]
 allow = [
-    "http:claude.ai:443",
-    "http:downloads.claude.ai:443",
-    "http:platform.claude.com:443",
-    "http:api.anthropic.com:443",
+    "claude.ai:443",
+    "downloads.claude.ai:443",
+    "platform.claude.com:443",
+    "api.anthropic.com:443",
 ]
 
 [mounts.claude-dir]

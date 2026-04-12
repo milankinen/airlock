@@ -2,8 +2,8 @@
 
 [network.rules.python-packages]
 allow = [
-    "http:pypi.org",
-    "http:pypi.python.org",
-    "http:files.pythonhosted.org",
-    "http:pythonhosted.org",
+    "pypi.org",
+    "pypi.python.org",
+    "files.pythonhosted.org",
+    "pythonhosted.org",
 ]

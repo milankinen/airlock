@@ -192,9 +192,7 @@ pub mod config {
     /// Network configuration
     #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
     pub struct Network {
-        /// Named network rules. Each rule allows a set of targets and
-        /// optionally attaches per-target HTTP middleware. A connection is
-        /// allowed if ANY rule allows it.
+        /// Named network rules.
         #[config(default)]
         pub rules: BTreeMap<String, NetworkRule>,
         /// Unix socket forwarding from host to guest.
@@ -219,28 +217,32 @@ pub mod config {
         const DE: Self::Deserializer = de::nested();
     }
 
-    /// A named network rule with allowed targets and optional middleware.
+    /// A named network rule.
     ///
     /// Target syntax: `host[:port]` — omitted port means all ports.
     /// Both host and port support `*` wildcards.
     ///
-    /// Targets matching `localhost` drive VM-side iptables port
-    /// forwarding (replacing the old `host_ports` field).
+    /// A connection is allowed when it matches at least one `allow` pattern
+    /// and no `deny` pattern. `deny` is checked first and wins immediately.
+    /// If no `allow` pattern matches, the connection is denied.
     ///
-    /// Targets without middleware get TLS passthrough (no MITM).
-    /// Targets with middleware get TLS interception so middleware can
-    /// inspect HTTP traffic.
+    /// `allow` targets matching `localhost` drive VM-side iptables port forwarding.
+    ///
+    /// Rules without middleware get TLS passthrough (no MITM).
+    /// Rules with middleware get TLS interception for HTTP.
     #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
     pub struct NetworkRule {
         /// Enable/disable rule
         #[config(default_t = true)]
         pub enabled: bool,
-        /// Allowed target patterns: `host[:port]`
+        /// Hosts/ports to allow. Middleware (if any) can still deny via `req:deny()`.
+        #[config(default)]
         pub allow: Vec<String>,
-        /// Middleware to apply for the allowed hosts. If any middleware is
-        /// set, then also TLS connections will be encrypted and intercepted.
-        /// If client is using certification pinning, it will break, otherwise
-        /// interception should be transparent to the client.
+        /// Hosts/ports to deny unconditionally (no middleware, deny wins over allow).
+        #[config(default)]
+        pub deny: Vec<String>,
+        /// Optional HTTP middleware scripts. Only applied to `allow` targets.
+        /// Default behaviour is to forward; call `req:deny()` to block.
         #[config(default)]
         pub middleware: Vec<NetworkMiddleware>,
     }

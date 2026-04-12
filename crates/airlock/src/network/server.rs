@@ -29,14 +29,15 @@ impl network_proxy::Server for Network {
                 let host = tcp.get_host()?.to_str()?.to_string();
                 let port = tcp.get_port();
 
-                let Some(net_target) = self.resolve_target(&host, port) else {
-                    debug!("denied: {host}:{port} (no matching rule)");
+                let net_target = self.resolve_target(&host, port);
+                if !net_target.allowed {
+                    debug!("denied: {host}:{port}");
                     results
                         .get()
                         .init_result()
-                        .set_denied("no matching network rule");
+                        .set_denied("denied by network rules");
                     return Ok(());
-                };
+                }
 
                 debug!("connect {host}:{port}");
                 let sink = spawn_tcp_connection(
@@ -180,12 +181,10 @@ async fn handle_connection(
         tcp::establish(&addr, first, rx, client_sink).await?
     };
 
-    // Detect HTTP
+    // Detect HTTP and route
     let (container, is_http) = detect_http(container).await;
     if is_http {
         Box::pin(http::relay(container, server, target)).await?;
-    } else if target.http_only {
-        anyhow::bail!("non-HTTP traffic rejected for {addr} (http-only target)");
     } else {
         Box::pin(tcp::relay(container, server)).await;
     }

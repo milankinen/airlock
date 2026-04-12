@@ -2,8 +2,8 @@
 
 [network.rules.codex]
 allow = [
-    "http:api.openai.com:443",
-    "http:auth.openai.com:443",
+    "api.openai.com:443",
+    "auth.openai.com:443",
 ]
 
 [mounts.codex-dir]
