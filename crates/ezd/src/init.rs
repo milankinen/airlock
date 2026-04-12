@@ -45,24 +45,22 @@ pub struct MountConfig {
 #[cfg(target_os = "linux")]
 mod linux;
 
-/// Bootstrap the guest VM environment: clock, mounts, networking, rootfs.
+/// Bootstrap the guest VM environment: clock, mounts, networking, rootfs,
+/// and all container-internal mounts (proc/sys/dev, file bind mounts).
 #[cfg(target_os = "linux")]
-pub fn setup(config: &InitConfig, mounts: &MountConfig) -> anyhow::Result<()> {
-    linux::setup(config, mounts)
+pub fn setup(
+    config: &InitConfig,
+    mounts: &MountConfig,
+    sockets: &[crate::rpc::SocketForwardConfig],
+    nested_virt: bool,
+) -> anyhow::Result<()> {
+    linux::setup(config, mounts, sockets, nested_virt)
 }
 
-/// Set up filesystem mounts inside the container rootfs (replaces crun).
-#[cfg(target_os = "linux")]
-pub use linux::setup_container_mounts;
-
-/// Stubs for non-Linux hosts.
+/// Stub for non-Linux hosts.
 #[cfg(not(target_os = "linux"))]
-pub fn setup(_config: &InitConfig, _mounts: &MountConfig) -> anyhow::Result<()> {
-    unimplemented!("supervisor only runs inside the Linux VM");
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn setup_container_mounts(
+pub fn setup(
+    _config: &InitConfig,
     _mounts: &MountConfig,
     _sockets: &[crate::rpc::SocketForwardConfig],
     _nested_virt: bool,

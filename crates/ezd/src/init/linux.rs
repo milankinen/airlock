@@ -13,12 +13,19 @@ use tracing::{debug, error, info, warn};
 use super::{CacheConfig, InitConfig, MountConfig};
 use crate::rpc::SocketForwardConfig;
 
-/// Run all guest initialization steps in order.
+/// Run all guest initialization steps in order, including container mounts.
 ///
 /// The ordering matters: VirtioFS shares must be mounted before we can
 /// assemble the overlay, networking must be up before the proxy starts, and
 /// the project disk must be ready before the overlayfs rootfs is assembled.
-pub fn setup(config: &InitConfig, mounts: &MountConfig) -> anyhow::Result<()> {
+/// Container mounts (proc/sys/dev, file bind mounts) run last so they take
+/// precedence over earlier dir bind mounts.
+pub fn setup(
+    config: &InitConfig,
+    mounts: &MountConfig,
+    sockets: &[SocketForwardConfig],
+    nested_virt: bool,
+) -> anyhow::Result<()> {
     set_clock(config.epoch);
 
     // 1. Mount well-known VirtioFS shares
@@ -37,21 +44,26 @@ pub fn setup(config: &InitConfig, mounts: &MountConfig) -> anyhow::Result<()> {
     // 4. Project disk (ext4 — overlayfs upper + cache)
     setup_disk(&mounts.caches)?;
 
-    // 5. Assemble container rootfs
+    // 5. Assemble container rootfs (overlayfs layers + dir/cache bind mounts)
     assemble_rootfs(mounts)?;
 
     // 6. DNS
     setup_dns()?;
+
+    // 7. Container mounts: proc/sys/dev, socket forwards, file bind mounts.
+    //    Runs after assemble_rootfs so file bind mounts can override paths
+    //    inside dir-bind-mounted directories (e.g. guest_cwd).
+    setup_container_mounts(mounts, sockets, nested_virt)?;
 
     Ok(())
 }
 
 /// Mount all filesystems that the container process needs inside its rootfs.
 ///
-/// Called after `setup()` but before spawning any processes. Handles the mounts
-/// that crun previously managed via config.json: proc/sys/dev, file overlay
-/// bind mounts, socket forward bind mounts, and optionally /dev/kvm.
-pub fn setup_container_mounts(
+/// Called at the end of `setup()`. Handles the mounts that crun previously
+/// managed via config.json: proc/sys/dev, file overlay bind mounts, socket
+/// forward bind mounts, and optionally /dev/kvm.
+fn setup_container_mounts(
     mounts: &MountConfig,
     sockets: &[SocketForwardConfig],
     nested_virt: bool,
@@ -113,7 +125,7 @@ pub fn setup_container_mounts(
     if Path::new("/mnt/disk").is_dir() {
         std::fs::create_dir_all("/mnt/disk/userdata")?;
         bind_mount("/mnt/disk/userdata", &format!("{root}/ez/disk"), false)?;
-        debug!("/ez/disk → /mnt/disk/userdata (ext4)");
+        info!("/ez/disk → /mnt/disk/userdata (ext4)");
     } else {
         mount_fs(
             "ez-disk",
@@ -122,7 +134,7 @@ pub fn setup_container_mounts(
             libc::MS_NOSUID | libc::MS_NODEV,
             "mode=0755",
         )?;
-        debug!("/ez/disk → tmpfs");
+        info!("/ez/disk → tmpfs");
     }
 
     // Socket forward bind mounts
@@ -146,29 +158,42 @@ pub fn setup_container_mounts(
             let _ = std::fs::File::create(&dst);
         }
         bind_mount(&src, &dst, false)?;
-        debug!("socket bind: {src} → {dst}");
+        info!("socket: {src} → {dst}");
     }
 
-    // File bind mounts — applied after dir mounts (assemble_rootfs) so they can override
-    // files inside dir-mounted paths such as guest_cwd.
-    // Source is at /mnt/overlay/files_{rw,ro}/ mirroring the full target path.
+    // File mounts — expose files_rw and files_ro as directories inside the container,
+    // then create symlinks at the target paths pointing into those directories.
+    //
+    // VirtioFS DIRECTORY bind mounts work correctly. VirtioFS FILE bind mounts fail with
+    // EACCES on open() despite correct permissions. Symlinks through a VirtioFS directory
+    // avoid the per-file bind mount entirely while keeping writes live (symlink → VirtioFS
+    // → host file).
+    std::fs::create_dir_all(format!("{root}/ez/.files/rw"))?;
+    std::fs::create_dir_all(format!("{root}/ez/.files/ro"))?;
+    bind_mount(
+        "/mnt/overlay/files_rw",
+        &format!("{root}/ez/.files/rw"),
+        false,
+    )?;
+    bind_mount(
+        "/mnt/overlay/files_ro",
+        &format!("{root}/ez/.files/ro"),
+        true,
+    )?;
     for file in &mounts.files {
-        let subdir = if file.read_only {
-            "files_ro"
-        } else {
-            "files_rw"
-        };
+        let subdir = if file.read_only { "ro" } else { "rw" };
         let rel = file.target.strip_prefix('/').unwrap_or(&file.target);
-        let src = format!("/mnt/overlay/{subdir}/{rel}");
+        let link_target = format!("/ez/.files/{subdir}/{rel}");
         let dst = format!("{root}/{rel}");
-        if let Some(parent) = std::path::Path::new(&dst).parent() {
+        if let Some(parent) = Path::new(&dst).parent() {
             std::fs::create_dir_all(parent)?;
         }
-        if !std::path::Path::new(&dst).exists() {
-            let _ = std::fs::File::create(&dst);
-        }
-        bind_mount(&src, &dst, file.read_only)?;
-        debug!("file bind: {src} → {dst}");
+        // Remove any stale entry (file, anchor, or old symlink with different target).
+        let _ = std::fs::remove_file(&dst);
+        std::os::unix::fs::symlink(&link_target, &dst).map_err(|e| {
+            anyhow::anyhow!("failed to create file mount symlink {dst} → {link_target}: {e}")
+        })?;
+        info!("file: {dst} → {link_target}");
     }
 
     // /dev/kvm for nested virtualization (already in /dev bind, but explicit for clarity)
@@ -239,7 +264,7 @@ fn assemble_rootfs(mounts: &MountConfig) -> anyhow::Result<()> {
         let dst = dst.to_string_lossy();
         std::fs::create_dir_all(dst.as_ref())?;
         bind_mount(&src, &dst, dir.read_only)?;
-        debug!("dir mount: {src} → {dst}");
+        info!("dir: {src} → {dst}");
     }
 
     // Cache bind mounts (last — override dir mounts).
@@ -253,7 +278,7 @@ fn assemble_rootfs(mounts: &MountConfig) -> anyhow::Result<()> {
                 std::fs::create_dir_all(src.as_ref())?;
                 std::fs::create_dir_all(dst.as_ref())?;
                 bind_mount(&src, &dst, false)?;
-                debug!("cache mount: {} → {dst}", &cache.name);
+                info!("cache: {} → {dst}", &cache.name);
             }
         }
     }

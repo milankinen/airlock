@@ -35,8 +35,12 @@ async fn run() -> anyhow::Result<()> {
         logging::init(cfg.log_sink, &cfg.log_filter);
 
         info!("setup vm");
-        init::setup(&cfg.init_config, &cfg.mount_config)?;
-        init::setup_container_mounts(&cfg.mount_config, &cfg.sockets, cfg.nested_virt)?;
+        init::setup(
+            &cfg.init_config,
+            &cfg.mount_config,
+            &cfg.sockets,
+            cfg.nested_virt,
+        )?;
 
         let dns = Rc::new(net::dns::DnsState::new());
         net::dns::start(dns.clone());

@@ -62,7 +62,7 @@ pub enum Command {
     /// Start the VM
     Go {
         /// Log level
-        #[arg(long, env = "EZ_LOG_LEVEL", default_value = "warn")]
+        #[arg(long, env = "EZ_LOG_LEVEL", default_value = "info")]
         log_level: LogLevel,
         /// Working directory inside the container (defaults to the host cwd)
         #[arg(long)]
@@ -308,7 +308,7 @@ impl CliArgs {
         match self.log_level {
             LogLevel::Trace => "info,ez=trace,ezpez_supervisor=trace",
             LogLevel::Debug => "warn,ez=debug,ezpez_supervisor=trace",
-            LogLevel::Info => "warn,ez=info,ezpez_supervisor=trace",
+            LogLevel::Info => "warn,ez=info,ezpez_supervisor=info",
             LogLevel::Warn => "warn",
             LogLevel::Error => "error",
         }

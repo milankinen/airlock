@@ -54,7 +54,7 @@ pub mod config {
     }
 
     /// Default to half of total system RAM, clamped to [512 MB, total].
-    pub fn default_memory() -> smart_config::ByteSize {
+    pub fn default_memory() -> ByteSize {
         use sysinfo::System;
         let sys_bytes = System::new_with_specifics(
             sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()),
@@ -62,14 +62,11 @@ pub mod config {
         .total_memory();
         let half = sys_bytes / 2;
         let min_bytes = 512 * 1024 * 1024;
-        smart_config::ByteSize(min(max(min_bytes, half), sys_bytes))
+        ByteSize(min(max(min_bytes, half), sys_bytes))
     }
 
     #[allow(clippy::trivially_copy_pass_by_ref)] // serde serialize_with requires &T
-    pub fn ser_byte_size<S: serde::Serializer>(
-        size: &smart_config::ByteSize,
-        s: S,
-    ) -> Result<S::Ok, S::Error> {
+    pub fn ser_byte_size<S: serde::Serializer>(size: &ByteSize, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&size.to_string())
     }
 
@@ -148,7 +145,6 @@ pub mod config {
         #[config(default_t = true)]
         pub enabled: bool,
         /// Allowed target patterns: `host[:port]`
-        #[config(default)]
         pub allow: Vec<String>,
         /// Middleware to apply for the allowed hosts. If any middleware is
         /// set, then also TLS connections will be encrypted and intercepted.
@@ -216,8 +212,8 @@ pub mod config {
     pub struct Disk {
         /// Disk image size (e.g. "20 GB", "512 MB"). Default 10 GB.
         #[serde(serialize_with = "ser_byte_size")]
-        #[config(default_t = smart_config::ByteSize(10 * 1024 * 1024 * 1024))]
-        pub size: smart_config::ByteSize,
+        #[config(default_t = ByteSize(10 * 1024 * 1024 * 1024))]
+        pub size: ByteSize,
         /// Container paths to bind-mount from the cache volume
         #[config(default)]
         pub cache: BTreeMap<String, CacheMount>,
