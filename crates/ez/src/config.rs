@@ -70,12 +70,103 @@ pub mod config {
         s.serialize_str(&size.to_string())
     }
 
+    /// How the OCI image is resolved.
+    #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum Resolution {
+        /// Try Docker daemon first, fall back to the registry (default).
+        #[default]
+        Auto,
+        /// Only use the local Docker daemon.
+        Docker,
+        /// Only pull from the OCI registry.
+        Registry,
+    }
+
+    impl WellKnown for Resolution {
+        type Deserializer =
+            smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
+        const DE: Self::Deserializer = smart_config::de::Serde;
+    }
+
+    /// OCI image reference — either a plain image name string or a full config object.
+    ///
+    /// String form:  `image = "alpine:latest"`
+    /// Object form:  `[vm.image]\nname = "localhost:5005/alpine:3"\ninsecure = true`
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub struct ImageRef {
+        /// Image name (e.g. `alpine:latest`, `localhost:5005/alpine:3`).
+        pub name: String,
+        /// Resolution strategy: `auto` (default), `docker`, or `registry`.
+        #[serde(default)]
+        pub resolution: Resolution,
+        /// Allow plain HTTP to the registry (for local or dev registries).
+        #[serde(default)]
+        pub insecure: bool,
+    }
+
+    impl ImageRef {
+        pub fn auto(name: impl Into<String>) -> Self {
+            Self {
+                name: name.into(),
+                resolution: Resolution::Auto,
+                insecure: false,
+            }
+        }
+    }
+
+    impl std::fmt::Display for ImageRef {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.name)
+        }
+    }
+
+    impl<'de> serde::Deserialize<'de> for ImageRef {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            #[derive(serde::Deserialize)]
+            #[serde(untagged)]
+            enum Helper {
+                Simple(String),
+                Full {
+                    name: String,
+                    #[serde(default)]
+                    resolution: Resolution,
+                    #[serde(default)]
+                    insecure: bool,
+                },
+            }
+            match Helper::deserialize(d)? {
+                Helper::Simple(name) => Ok(ImageRef::auto(name)),
+                Helper::Full {
+                    name,
+                    resolution,
+                    insecure,
+                } => Ok(ImageRef {
+                    name,
+                    resolution,
+                    insecure,
+                }),
+            }
+        }
+    }
+
+    impl WellKnown for ImageRef {
+        type Deserializer = smart_config::de::Serde<
+            {
+                smart_config::metadata::BasicTypes::STRING
+                    .or(smart_config::metadata::BasicTypes::OBJECT)
+                    .raw()
+            },
+        >;
+        const DE: Self::Deserializer = smart_config::de::Serde;
+    }
+
     /// Virtual machine configurations
     #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
     pub struct VirtualMachine {
         /// OCI image to use
-        #[config(default_t = "alpine:latest".into())]
-        pub image: String,
+        #[config(default_t = ImageRef::auto("alpine:latest"))]
+        pub image: ImageRef,
         /// Number of virtual CPUs
         #[config(default = default_cpus)]
         pub cpus: u32,

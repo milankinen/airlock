@@ -58,7 +58,7 @@ impl Project {
 
     /// Save image + last_run metadata after a successful VM start.
     pub fn save_meta(&self) {
-        save_meta(&self.cache_dir, &self.config.vm.image);
+        save_meta(&self.cache_dir, &self.config.vm.image.name);
     }
 
     pub fn display_cwd(&self) -> String {

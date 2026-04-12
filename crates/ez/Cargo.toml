@@ -68,6 +68,7 @@ rustls-pemfile = { workspace = true }
 tower = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSFileHandle", "NSString", "NSURL", "NSArray", "NSError", "NSDictionary"] }
 objc2-virtualization = { version = "0.3", features = [

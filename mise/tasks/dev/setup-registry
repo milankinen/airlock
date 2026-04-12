@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+#MISE description="Start a local registry with htpasswd auth and push a test image"
+set -euo pipefail
+
+exec dev/registry/setup.sh "$@"

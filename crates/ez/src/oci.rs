@@ -5,6 +5,7 @@
 //! configuration that the supervisor uses to set up the container.
 
 pub(crate) mod cache;
+mod credentials;
 mod docker;
 mod layer;
 mod registry;
@@ -14,6 +15,7 @@ mod tests;
 use std::path::{Path, PathBuf};
 
 use oci_client::config::ConfigFile as OciConfig;
+use oci_client::secrets::RegistryAuth;
 
 use crate::cli;
 use crate::cli::CliArgs;
@@ -101,8 +103,40 @@ pub async fn prepare(
     let digest_file = project.cache_dir.join("image_digest");
     let stored_digest = std::fs::read_to_string(&digest_file).ok();
 
-    // Resolve image reference to a digest (no download yet)
-    let mut image = resolve_image(&project.config.vm.image).await?;
+    // Set up registry auth: use stored credentials, fall back to anonymous.
+    let image_cfg = &project.config.vm.image;
+    let image_name = &image_cfg.name;
+    let registry_host: String = image_name
+        .parse::<oci_client::Reference>()
+        .map_or_else(|_| image_name.clone(), |r| r.resolve_registry().to_string());
+    let mut auth =
+        credentials::load(&registry_host).map_or(RegistryAuth::Anonymous, |c| c.to_auth());
+
+    // Resolve image reference to a digest. On auth failure, prompt for
+    // credentials and retry in a loop until success or user interrupts.
+    let mut image = loop {
+        match resolve_image(image_name, image_cfg.resolution, image_cfg.insecure, &auth).await {
+            Ok(img) => break img,
+            Err(e) if registry::is_auth_error(&e) => {
+                let creds = credentials::prompt(&registry_host)?;
+                auth = creds.to_auth();
+                match resolve_image(image_name, image_cfg.resolution, image_cfg.insecure, &auth)
+                    .await
+                {
+                    Ok(img) => {
+                        credentials::save(&registry_host, &creds)?;
+                        break img;
+                    }
+                    Err(e) if registry::is_auth_error(&e) => {
+                        cli::error!("authentication failed, try again");
+                        // loop back to prompt again
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    };
 
     // Check if image changed before downloading
     let mut digest_changed = stored_digest
@@ -136,8 +170,8 @@ pub async fn prepare(
         }
     }
 
-    // Download/ensure image
-    let image_dir = ensure_image(&mut image).await?;
+    // Download/ensure image (auth already resolved above).
+    let image_dir = ensure_image(&mut image, &auth, image_cfg.insecure).await?;
 
     if digest_changed {
         std::fs::write(&digest_file, &image.digest)?;
@@ -345,35 +379,47 @@ fn prompt_image_changed() -> anyhow::Result<ImageChangeAction> {
 }
 
 /// Full image resolution (with config).
-async fn resolve_image(image_ref: &str) -> anyhow::Result<ResolvedImage> {
-    if let Some(image_id) = docker::image_exists(image_ref) {
-        let host_arch = match std::env::consts::ARCH {
-            "x86_64" => "amd64",
-            "aarch64" => "arm64",
-            other => other,
-        };
-        let docker_arch = docker::image_arch(&image_id).unwrap_or_default();
-        if docker_arch.is_empty() || docker_arch == host_arch {
+async fn resolve_image(
+    image_ref: &str,
+    resolution: crate::config::config::Resolution,
+    insecure: bool,
+    auth: &RegistryAuth,
+) -> anyhow::Result<ResolvedImage> {
+    use crate::config::config::Resolution;
+
+    if !matches!(resolution, Resolution::Registry) {
+        if let Some(image_id) = docker::image_exists(image_ref) {
+            let host_arch = match std::env::consts::ARCH {
+                "x86_64" => "amd64",
+                "aarch64" => "arm64",
+                other => other,
+            };
+            let docker_arch = docker::image_arch(&image_id).unwrap_or_default();
+            if docker_arch.is_empty() || docker_arch == host_arch {
+                cli::log!(
+                    "  {} image resolved via docker {}",
+                    cli::check(),
+                    cli::dim(&image_id[..19.min(image_id.len())])
+                );
+                return Ok(ResolvedImage {
+                    digest: image_id,
+                    config: OciConfig::default(),
+                    source: ImageSource::Docker {
+                        image_ref: image_ref.to_string(),
+                    },
+                });
+            }
             cli::log!(
-                "  {} image resolved via docker {}",
-                cli::check(),
-                cli::dim(&image_id[..19.min(image_id.len())])
+                "  {} docker image is {docker_arch}, need {host_arch} — trying registry",
+                cli::bullet()
             );
-            return Ok(ResolvedImage {
-                digest: image_id,
-                config: OciConfig::default(),
-                source: ImageSource::Docker {
-                    image_ref: image_ref.to_string(),
-                },
-            });
         }
-        cli::log!(
-            "  {} docker image is {docker_arch}, need {host_arch} — trying registry",
-            cli::bullet()
-        );
+        if matches!(resolution, Resolution::Docker) {
+            anyhow::bail!("image {image_ref} not found in Docker daemon");
+        }
     }
 
-    let reg = registry::resolve(image_ref).await?;
+    let reg = registry::resolve(image_ref, auth, insecure).await?;
     cli::log!(
         "  {} image resolved {}",
         cli::check(),
@@ -400,7 +446,11 @@ enum ImageSource {
 
 /// Ensure the image is fully downloaded and extracted in the cache.
 /// Re-downloads if the extraction was incomplete.
-async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBuf> {
+async fn ensure_image(
+    resolved: &mut ResolvedImage,
+    auth: &RegistryAuth,
+    insecure: bool,
+) -> anyhow::Result<PathBuf> {
     let dir = crate::cache::image_dir(&resolved.digest)?;
     let rootfs = dir.join("rootfs");
     let complete_marker = dir.join(".complete");
@@ -456,7 +506,7 @@ async fn ensure_image(resolved: &mut ResolvedImage) -> anyhow::Result<PathBuf> {
                 } else {
                     let _ = std::fs::remove_file(&layer_path);
                     tokio::select! {
-                        result = registry::pull_layer(&reg.reference, layer_desc, &layer_path, Some(&pb)) => {
+                        result = registry::pull_layer(&reg.reference, layer_desc, &layer_path, Some(&pb), auth, insecure) => {
                             result?;
                         }
                         () = cli::interrupted() => {

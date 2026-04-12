@@ -22,10 +22,16 @@ pub struct RegistryImage {
     pub image_config: OciConfig,
 }
 
-/// Create an OCI registry client configured for HTTPS and Linux platform resolution.
-fn make_client() -> Client {
+/// Create an OCI registry client. Uses plain HTTP when `insecure` is true,
+/// HTTPS otherwise.
+fn make_client(insecure: bool) -> Client {
+    let protocol = if insecure {
+        ClientProtocol::Http
+    } else {
+        ClientProtocol::Https
+    };
     Client::new(ClientConfig {
-        protocol: ClientProtocol::Https,
+        protocol,
         platform_resolver: Some(Box::new(linux_platform_resolver)),
         ..Default::default()
     })
@@ -48,13 +54,28 @@ fn linux_platform_resolver(manifests: &[oci_client::manifest::ImageIndexEntry]) 
     })
 }
 
-/// Resolve an image reference to a manifest, digest, and config.
-pub async fn resolve(image_ref: &str) -> anyhow::Result<RegistryImage> {
-    let reference: Reference = image_ref.parse()?;
-    let client = make_client();
-    let auth = RegistryAuth::Anonymous;
+/// Returns true if `e` is an OCI registry authentication failure.
+pub fn is_auth_error(e: &anyhow::Error) -> bool {
+    use oci_client::errors::OciDistributionError;
+    e.downcast_ref::<OciDistributionError>().is_some_and(|err| {
+        matches!(
+            err,
+            OciDistributionError::AuthenticationFailure(_)
+                | OciDistributionError::UnauthorizedError { .. }
+        )
+    })
+}
 
-    let (manifest, digest, config_str) = client.pull_manifest_and_config(&reference, &auth).await?;
+/// Resolve an image reference to a manifest, digest, and config.
+pub async fn resolve(
+    image_ref: &str,
+    auth: &RegistryAuth,
+    insecure: bool,
+) -> anyhow::Result<RegistryImage> {
+    let reference: Reference = image_ref.parse()?;
+    let client = make_client(insecure);
+
+    let (manifest, digest, config_str) = client.pull_manifest_and_config(&reference, auth).await?;
 
     let image_config: OciConfig = serde_json::from_str(&config_str)?;
 
@@ -73,12 +94,13 @@ pub async fn pull_layer(
     layer: &oci_client::manifest::OciDescriptor,
     dest: &Path,
     progress: Option<&ProgressBar>,
+    auth: &RegistryAuth,
+    insecure: bool,
 ) -> anyhow::Result<()> {
-    let client = make_client();
-    let auth = RegistryAuth::Anonymous;
+    let client = make_client(insecure);
 
     let registry = reference.resolve_registry();
-    client.store_auth_if_needed(registry, &auth).await;
+    client.store_auth_if_needed(registry, auth).await;
 
     // Download to a temp file, then rename on success
     let tmp = dest.with_extension("tmp");

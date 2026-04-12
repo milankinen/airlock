@@ -1,0 +1,28 @@
+services:
+  registry:
+    image: registry:2
+    ports:
+      - "5005:5000"
+    environment:
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: Registry
+      REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd
+    volumes:
+      - ./auth:/auth:ro
+      - registry-data:/var/lib/registry
+
+  registry2:
+    image: registry:2
+    ports:
+      - "5006:5000"
+    environment:
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: Registry
+      REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd2
+    volumes:
+      - ./auth:/auth:ro
+      - registry2-data:/var/lib/registry
+
+volumes:
+  registry-data:
+  registry2-data:
