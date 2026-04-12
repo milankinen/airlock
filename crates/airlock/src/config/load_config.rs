@@ -1,39 +1,42 @@
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use smart_config::DescribeConfig;
 
 use crate::config::de::format_error;
 use crate::config::{Config, presets};
 
-/// Load configuration from hierarchical TOML files.
+const EXTENSIONS: &[&str] = &["toml", "json", "yaml", "yml"];
+
+/// Load configuration from hierarchical config files.
 ///
 /// Files are loaded in order (later overrides former):
-/// 1. `~/.cache/airlock/config.toml`
-/// 2. `~/.airlock.toml`
-/// 3. `<project_root>/airlock.toml`
-/// 4. `<project_root>/airlock.local.toml`
+/// 1. `~/.cache/airlock/config.<ext>`
+/// 2. `~/.airlock.<ext>`
+/// 3. `<project_root>/airlock.<ext>`
+/// 4. `<project_root>/airlock.local.<ext>`
+///
+/// Supported formats: TOML, JSON, YAML. For each slot the first matching
+/// extension (`toml` → `json` → `yaml` → `yml`) wins.
 ///
 /// If the merged config contains a `presets` array, the named
 /// presets are applied as base layers before the user config.
 pub fn load(project_root: &Path) -> anyhow::Result<Config> {
     let home = dirs::home_dir().unwrap_or_default();
-    let paths = [
-        home.join(".cache/airlock/config.toml"),
-        home.join(".airlock.toml"),
-        project_root.join("airlock.toml"),
-        project_root.join("airlock.local.toml"),
+    let bases: [PathBuf; 4] = [
+        home.join(".cache/airlock/config"),
+        home.join(".airlock"),
+        project_root.join("airlock"),
+        project_root.join("airlock.local"),
     ];
 
     // 1. Create base config
     let base = serde_json::Value::Object(serde_json::Map::new());
 
-    // 2. Load user config
+    // 2. Load user config — for each slot, use the first extension found
     let mut user_config = serde_json::Value::Object(serde_json::Map::new());
-    for path in &paths {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            let value: serde_json::Value =
-                toml::from_str(&content).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    for base_path in &bases {
+        if let Some(value) = load_first(base_path)? {
             user_config = merge_json(user_config, value);
         }
     }
@@ -48,6 +51,34 @@ pub fn load(project_root: &Path) -> anyhow::Result<Config> {
     )?;
 
     parse_config(merged)
+}
+
+/// Try each supported extension for `base` and parse the first file found.
+fn load_first(base: &Path) -> anyhow::Result<Option<serde_json::Value>> {
+    for ext in EXTENSIONS {
+        let path = base.with_extension(ext);
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let value = parse_file(&path, &content)?;
+        return Ok(Some(value));
+    }
+    Ok(None)
+}
+
+fn parse_file(path: &Path, content: &str) -> anyhow::Result<serde_json::Value> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("toml") => {
+            toml::from_str(content).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
+        }
+        Some("json") => {
+            serde_json::from_str(content).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
+        }
+        Some("yaml" | "yml") => {
+            serde_yaml::from_str(content).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
+        }
+        _ => anyhow::bail!("unsupported config format: {}", path.display()),
+    }
 }
 
 /// Apply a config layer with preset resolution:

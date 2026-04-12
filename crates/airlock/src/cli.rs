@@ -4,11 +4,11 @@
 //! `cli::progress_bar()` / `cli::spinner()` for progress,
 //! and `cli::interrupted()` for Ctrl+C cancellation.
 
+pub mod cmd_down;
 pub mod cmd_exec;
-pub mod cmd_go;
-pub mod cmd_project_info;
-pub mod cmd_project_list;
-pub mod cmd_project_remove;
+pub mod cmd_info;
+pub mod cmd_list;
+pub mod cmd_up;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -59,21 +59,27 @@ pub struct GlobalArgs {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Start the VM
-    Go {
+    /// Start the project in an isolated VM
+    Up {
+        /// Project directory (defaults to current directory)
+        path: Option<String>,
         /// Log level
-        #[arg(long, env = "EZ_LOG_LEVEL", default_value = "info")]
+        #[arg(long, env = "AIRLOCK_LOG_LEVEL", default_value = "info")]
         log_level: LogLevel,
         /// Working directory inside the container (defaults to the host cwd)
         #[arg(long)]
         project_cwd: Option<String>,
-        /// Named session — isolates this run's state from other sessions of the
-        /// same project (listed as <id>:<session> in `airlock project list`)
-        #[arg(long)]
-        session: Option<String>,
         /// Run the container command inside a login shell (sources /etc/profile, ~/.profile)
         #[arg(short = 'l', long)]
         login: bool,
+    },
+    /// Remove the project VM
+    Down {
+        /// Project path or abbreviated ID (defaults to current directory)
+        path: Option<String>,
+        /// Skip confirmation prompt
+        #[arg(short = 'f', long)]
+        force: bool,
     },
     /// Execute a command inside the running VM container
     #[command(alias = "x")]
@@ -89,42 +95,21 @@ pub enum Command {
         /// Environment variables (KEY=VALUE)
         #[arg(short = 'e', long = "env")]
         env: Vec<String>,
-        /// Connect to the named session started with `airlock go --session`
-        #[arg(long)]
-        session: Option<String>,
         /// Run the command inside a login shell (sources /etc/profile, ~/.profile)
         #[arg(short = 'l', long)]
         login: bool,
     },
-    /// Manage projects
-    Project {
-        #[command(subcommand)]
-        command: ProjectCommand,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum ProjectCommand {
     /// Show project info (defaults to current directory)
     Info {
-        /// Project path (defaults to cwd)
+        /// Project path or abbreviated ID (defaults to cwd)
         path: Option<String>,
     },
     /// List all projects
     #[command(alias = "ls")]
     List,
-    /// Remove a project (defaults to current directory)
-    #[command(alias = "rm")]
-    Remove {
-        /// Project path (defaults to cwd)
-        path: Option<String>,
-        /// Skip confirmation prompt
-        #[arg(short, long)]
-        yes: bool,
-    },
 }
 
-/// Runtime arguments for the `go` command. Constructed from parsed CLI args
+/// Runtime arguments for the `up` command. Constructed from parsed CLI args
 /// plus any extra arguments that appeared after `--`.
 pub struct CliArgs {
     pub log_level: LogLevel,
@@ -187,8 +172,11 @@ pub fn red(s: &str) -> String {
 /// Falls back to the Cargo package version in dev builds.
 pub fn version_string() -> String {
     let git_hash = env!("GIT_HASH");
+    let distroless = cfg!(feature = "distroless");
     match release_version() {
+        Some(v) if distroless => format!("{v} [distroless] ({git_hash})"),
         Some(v) => format!("{v} ({git_hash})"),
+        None if distroless => format!("{} [distroless] ({git_hash})", env!("CARGO_PKG_VERSION")),
         None => format!("{} ({git_hash})", env!("CARGO_PKG_VERSION")),
     }
 }

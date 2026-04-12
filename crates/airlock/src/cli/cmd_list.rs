@@ -1,4 +1,4 @@
-//! `airlock project list` — list all known projects.
+//! `airlock list` — list all known projects.
 
 use crate::{cli, project};
 
@@ -31,7 +31,6 @@ pub fn run() -> i32 {
         return 0;
     };
 
-    // Collect all projects first so we can compute abbreviated IDs
     let rows: Vec<Row> = entries
         .flatten()
         .filter(|e| e.path().is_dir())
@@ -62,12 +61,7 @@ pub fn run() -> i32 {
     let abbrev = project::min_unique_prefix_len(&ids);
 
     for row in &rows {
-        let (hash, session) = project::parse_id(&row.id);
-        let short_hash = &hash[..abbrev.min(hash.len())];
-        let short_id = match session {
-            Some(s) => cli::dim(&format!("{short_hash}:{s}")),
-            None => cli::dim(short_hash),
-        };
+        let short_id = cli::dim(&row.id[..abbrev.min(row.id.len())]);
         let status = if row.running {
             cli::red(" (running)")
         } else {

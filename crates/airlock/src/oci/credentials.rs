@@ -4,6 +4,7 @@
 //! Linux/other: credentials stored in `~/.cache/airlock/registry-credentials.json`
 //! with 0600 permissions.
 
+use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Input, Password};
 use oci_client::secrets::RegistryAuth;
 use serde::{Deserialize, Serialize};
@@ -36,11 +37,12 @@ pub fn prompt(registry_host: &str) -> anyhow::Result<Credentials> {
     if !crate::cli::is_interactive() {
         anyhow::bail!("registry {registry_host} requires authentication");
     }
+    let theme = ColorfulTheme::default();
     let term = console::Term::stderr();
-    let username: String = Input::new()
+    let username: String = Input::with_theme(&theme)
         .with_prompt(format!("Username for {registry_host}"))
         .interact_on(&term)?;
-    let password = Password::new()
+    let password = Password::with_theme(&theme)
         .with_prompt(format!("Password for {registry_host}"))
         .interact_on(&term)?;
     Ok(Credentials { username, password })

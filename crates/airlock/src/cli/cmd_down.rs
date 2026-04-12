@@ -1,12 +1,13 @@
-//! `airlock project remove` — delete a project's cached data.
+//! `airlock down` — delete a project's cached state.
 
-use std::io::Write;
+use dialoguer::Select;
+use dialoguer::theme::ColorfulTheme;
 
 use crate::{cli, project};
 
-/// Remove the project cache directory after confirmation (unless `--yes`).
-pub fn run(path: Option<&str>, yes: bool) -> i32 {
-    let project = match project::load(path, None) {
+/// Remove the project cache directory after confirmation (unless `--force`).
+pub fn run(path: Option<&str>, force: bool) -> i32 {
+    let project = match project::load(path) {
         Ok(p) => p,
         Err(e) => {
             cli::error!("{e:#}");
@@ -24,13 +25,17 @@ pub fn run(path: Option<&str>, yes: bool) -> i32 {
         return 1;
     }
 
-    if !yes {
-        eprint!("Remove project for {}? [y/N] ", project.host_cwd.display());
-        let _ = std::io::stderr().flush();
-        let mut input = String::new();
-        if std::io::stdin().read_line(&mut input).is_err()
-            || !input.trim().eq_ignore_ascii_case("y")
-        {
+    if !force {
+        let selection = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt(format!(
+                "Remove project for {}?",
+                project.host_cwd.display()
+            ))
+            .items(["Yes", "No"])
+            .default(1)
+            .interact()
+            .unwrap_or(1);
+        if selection != 0 {
             println!("Aborted.");
             return 0;
         }

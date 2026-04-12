@@ -1,10 +1,10 @@
-//! `airlock project info` — display project details.
+//! `airlock info` — display project details.
 
 use crate::{cli, project};
 
 /// Print project metadata (ID, path, status, image, config) to stdout.
 pub fn run(path: Option<&str>) -> i32 {
-    let project = match project::load(path, None) {
+    let project = match project::load(path) {
         Ok(p) => p,
         Err(e) => {
             cli::error!("{e:#}");
@@ -14,7 +14,7 @@ pub fn run(path: Option<&str>) -> i32 {
 
     if !project.cache_dir.exists() {
         cli::error!(
-            "no project data for {} — run `airlock go` first",
+            "no project data for {} — run `airlock up` first",
             project.host_cwd.display()
         );
         return 1;

@@ -15,7 +15,7 @@ mod terminal;
 mod vm;
 
 use clap::{CommandFactory, FromArgMatches};
-use cli::{Cli, Command, ProjectCommand};
+use cli::{Cli, Command};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -23,48 +23,55 @@ async fn main() {
 
     // Split argv at "--" before clap sees it
     let raw_args: Vec<String> = std::env::args().collect();
-    let (ez_args, extra_args) = split_at_separator(&raw_args);
+    let (airlock_args, extra_args) = split_at_separator(&raw_args);
 
     let matches = Cli::command()
         .version(cli::version_string().leak() as &str)
         .after_help(cli::platform_status())
-        .get_matches_from(&ez_args);
+        .get_matches_from(&airlock_args);
     let parsed = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     cli::initialize(&parsed.global);
 
     let exit_code = match parsed.command {
-        Command::Go {
+        Command::Up {
+            path,
             log_level,
             project_cwd,
-            session,
             login,
-        } => cli::cmd_go::run(log_level, extra_args, project_cwd, session, login).await,
+        } => cli::cmd_up::run(path, log_level, extra_args, project_cwd, login).await,
         Command::Exec {
             cmd,
             args,
             cwd,
             env,
-            session,
             login,
         } => {
             if !extra_args.is_empty() {
                 cli::error!("'--' args are not supported with 'exec'");
                 std::process::exit(2);
             }
-            cli::cmd_exec::run(cmd, args, cwd, env, session, login).await
+            cli::cmd_exec::run(cmd, args, cwd, env, login).await
         }
-        Command::Project { command } => {
+        Command::Info { path } => {
             if !extra_args.is_empty() {
-                cli::error!("'--' args are only supported with 'go' command");
+                cli::error!("'--' args are only supported with 'up'");
                 std::process::exit(2);
             }
-            match command {
-                ProjectCommand::Info { path } => cli::cmd_project_info::run(path.as_deref()),
-                ProjectCommand::List => cli::cmd_project_list::run(),
-                ProjectCommand::Remove { path, yes } => {
-                    cli::cmd_project_remove::run(path.as_deref(), yes)
-                }
+            cli::cmd_info::run(path.as_deref())
+        }
+        Command::List => {
+            if !extra_args.is_empty() {
+                cli::error!("'--' args are only supported with 'up'");
+                std::process::exit(2);
             }
+            cli::cmd_list::run()
+        }
+        Command::Down { path, force } => {
+            if !extra_args.is_empty() {
+                cli::error!("'--' args are only supported with 'up'");
+                std::process::exit(2);
+            }
+            cli::cmd_down::run(path.as_deref(), force)
         }
     };
 

@@ -18,13 +18,12 @@ pub async fn run(
     args: Vec<String>,
     cwd: Option<String>,
     env: Vec<String>,
-    session: Option<String>,
     login: bool,
 ) -> i32 {
     let local = LocalSet::new();
     local
         .run_until(async {
-            run_inner(cmd, args, cwd, env, session, login)
+            run_inner(cmd, args, cwd, env, login)
                 .await
                 .unwrap_or_else(|e| {
                     cli::error!("{e:#}");
@@ -39,10 +38,9 @@ async fn run_inner(
     args: Vec<String>,
     cwd: Option<String>,
     env: Vec<String>,
-    session: Option<String>,
     login: bool,
 ) -> anyhow::Result<i32> {
-    let project = project::load(None, session.as_deref())?;
+    let project = project::load(None)?;
     let (cmd, args) = if login {
         apply_login_shell(cmd, args)
     } else {
