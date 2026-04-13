@@ -419,7 +419,7 @@ fn set_clock(epoch: u64, epoch_nanos: u32) {
     }
     let ts = libc::timespec {
         tv_sec: epoch as i64,
-        tv_nsec: epoch_nanos as i64,
+        tv_nsec: i64::from(epoch_nanos),
     };
     if unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &raw const ts) } != 0 {
         warn!("failed to set system clock");
