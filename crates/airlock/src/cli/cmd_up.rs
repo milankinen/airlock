@@ -135,17 +135,18 @@ async fn run_inner(
     terminal.enter_raw_mode();
 
     cli::log!("Booting VM...");
-    let epoch = std::time::SystemTime::now()
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+        .unwrap_or_default();
+    let epoch = now.as_secs();
+    let epoch_nanos = now.subsec_nanos();
     let (vm_handle, vsock_fd) = vm::start(&args, &project, &bundle).await?;
     project.save_meta();
     let supervisor = rpc::Supervisor::connect(vsock_fd)?;
 
     let stdin = terminal.stdin()?;
     let proc = supervisor
-        .start(&args, &project, &bundle, stdin, network, epoch)
+        .start(&args, &project, &bundle, stdin, network, epoch, epoch_nanos)
         .await?;
 
     // Start CLI server so `airlock exec` can attach processes to this VM

@@ -1,9 +1,11 @@
 /// Parameters passed from the host CLI that influence guest VM initialization.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct InitConfig {
-    /// Wall-clock epoch (seconds since Unix epoch) to set as the guest system
-    /// clock. VMs don't have an RTC, so the host provides the current time.
+    /// Wall-clock time to set as the guest system clock (seconds since Unix
+    /// epoch). VMs don't have an RTC, so the host provides the current time.
     pub epoch: u64,
+    /// Sub-second nanoseconds component of the wall-clock time.
+    pub epoch_nanos: u32,
     /// Host TCP ports whose traffic should be redirected through the network
     /// proxy (iptables REDIRECT) so the sandbox can intercept localhost traffic.
     pub host_ports: Vec<u16>,

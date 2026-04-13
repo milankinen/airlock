@@ -58,6 +58,7 @@ impl Supervisor {
     /// Send the initial `Supervisor.start()` RPC to bootstrap the VM and
     /// launch the main container process. Returns a [`Process`] handle for
     /// polling output and forwarding signals.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start(
         &self,
         args: &crate::cli::CliArgs,
@@ -66,6 +67,7 @@ impl Supervisor {
         stdin: Stdin,
         network: Network,
         epoch: u64,
+        epoch_nanos: u32,
     ) -> anyhow::Result<Process> {
         let log_sink: log_sink::Client = capnp_rpc::new_client(LogSinkImpl);
 
@@ -92,6 +94,7 @@ impl Supervisor {
 
         // Init config: epoch, host ports
         req.get().set_epoch(epoch);
+        req.get().set_epoch_nanos(epoch_nanos);
         let host_ports =
             crate::network::rules::localhost_ports_from_config(&project.config.network);
         let mut hp_builder = req.get().init_host_ports(host_ports.len() as u32);

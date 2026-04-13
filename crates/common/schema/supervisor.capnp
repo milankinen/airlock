@@ -8,6 +8,7 @@ interface Supervisor {
     logs       :LogSink,
     logFilter  :Text,
     epoch      :UInt64,
+    epochNanos :UInt32,
     hostPorts  :List(UInt16),
     sockets    :List(SocketForward),
     # Process configuration (replaces config.json)

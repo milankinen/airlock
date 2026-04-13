@@ -26,7 +26,7 @@ pub fn setup(
     sockets: &[SocketForwardConfig],
     nested_virt: bool,
 ) -> anyhow::Result<()> {
-    set_clock(config.epoch);
+    set_clock(config.epoch, config.epoch_nanos);
 
     // 1. Mount well-known VirtioFS shares
     for tag in ["base", "overlay"] {
@@ -413,18 +413,18 @@ fn mount_fs(
 }
 
 /// Set the guest system clock from the host-provided epoch.
-fn set_clock(epoch: u64) {
+fn set_clock(epoch: u64, epoch_nanos: u32) {
     if epoch == 0 {
         return;
     }
     let ts = libc::timespec {
         tv_sec: epoch as i64,
-        tv_nsec: 0,
+        tv_nsec: epoch_nanos as i64,
     };
     if unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &raw const ts) } != 0 {
         warn!("failed to set system clock");
     } else {
-        debug!("system clock set to epoch {epoch}");
+        debug!("system clock set to epoch {epoch}.{epoch_nanos:09}");
     }
 }
 

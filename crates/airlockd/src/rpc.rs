@@ -199,6 +199,7 @@ impl supervisor::Server for SupervisorImpl {
             harden,
             init_config: InitConfig {
                 epoch: params.get_epoch(),
+                epoch_nanos: params.get_epoch_nanos(),
                 host_ports: params.get_host_ports()?.iter().collect(),
             },
             mount_config: MountConfig {
