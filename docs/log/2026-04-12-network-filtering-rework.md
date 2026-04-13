@@ -38,9 +38,9 @@ matching.
 ```
 TCP connection (host, port)
 │
-├─ any deny pattern matches? → DENY immediately (deny wins)
-├─ no allow pattern matches? → DENY
-└─ allow matches            → collect middleware from all matching allow rules
+├─ any deny pattern matches?  → DENY immediately (deny wins)
+├─ any allow pattern matches? → collect middleware from matching allow rules
+└─ no match                   → allowed if default_mode = "allow", denied otherwise
 │
 ├─ middleware empty → passthrough (raw TCP relay, no TLS MITM)
 │
@@ -53,6 +53,12 @@ TCP connection (host, port)
 │
 └─ non-HTTP → raw TCP relay
 ```
+
+`default_mode` (config field, default `"allow"`) controls what happens when no
+rule matches: `"allow"` passes the connection through without middleware (pure
+passthrough), `"deny"` blocks it. This replaces the implicit deny-all behaviour
+of the initial simplification, restoring the original permissive default for
+projects that don't enumerate every host they need to reach.
 
 ## Code changes
 
@@ -76,7 +82,7 @@ TCP connection (host, port)
 ### `network.rs`
 - `Network` holds `allow_targets` and `deny_targets` separately.
 - `resolve_target()`: deny patterns checked first (deny wins); then allow
-  patterns collected with middleware; `allowed = any_allow`.
+  patterns collected with middleware; `allowed = any_allow || default_mode == Allow`.
 
 ### `http/middleware.rs`
 - Removed `fallback_action`/`base_action` parameter from `run()`.
@@ -86,6 +92,18 @@ TCP connection (host, port)
 ### `server.rs`
 - Deny check: `if !net_target.allowed { ... return Denied }`.
 - Removed `http_only` and `tcp_action == Deny` checks from connection handler.
+
+### `config.rs` (follow-up: re-added `default_mode`)
+- `DefaultMode` enum re-added (`Allow` default, `Deny`).
+- `Network.default_mode` field re-added; propagated through `Network::setup`.
+
+### `cmd_info.rs` (follow-up)
+- `airlock info` now shows `Network rules (default: allow|deny):`.
+
+### `oci.rs` (minor fixes)
+- `dialoguer::Select` now uses `ColorfulTheme` for consistent styling.
+- Added `etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem` to CA install paths
+  (RHEL/Fedora `update-ca-trust` output location).
 
 ### Presets (all 11 files)
 - `mode = "allow"\ntargets = [...]` → `allow = [...]`.

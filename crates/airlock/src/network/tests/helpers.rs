@@ -15,7 +15,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 
-use crate::config::config::{self, NetworkMiddleware, NetworkRule};
+use crate::config::config::{self, DefaultMode, NetworkMiddleware, NetworkRule};
 use crate::network::middleware::LogFn;
 use crate::network::tls::TlsInterceptor;
 use crate::network::{Network, rules};
@@ -187,7 +187,9 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
         );
     }
 
+    // Tests use an allowlist model: only explicitly listed hosts are permitted.
     let config = config::Network {
+        default_mode: DefaultMode::Deny,
         rules,
         sockets: BTreeMap::default(),
     };
@@ -219,6 +221,7 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
         request_log,
         mitm_ca_pem,
         Network {
+            default_mode: crate::config::config::DefaultMode::Deny,
             tls_client: Arc::new(tls_client),
             interceptor: Rc::new(interceptor),
             allow_targets,

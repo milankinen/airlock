@@ -358,7 +358,7 @@ fn prompt_image_changed() -> anyhow::Result<ImageChangeAction> {
         anyhow::bail!("project image has changed");
     }
     let term = dialoguer::console::Term::stderr();
-    let choice = dialoguer::Select::new()
+    let choice = dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
         .with_prompt("Image has changed. What would you like to do?")
         .items([
             "Re-create environment",
@@ -555,10 +555,11 @@ fn install_ca_cert(
 
     // Paths relative to rootfs for CA trust stores across distros
     let ca_stores = [
-        "etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu
+        "etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu/Alpine
         "etc/ssl/cert.pem",                  // Alpine/LibreSSL
-        "etc/pki/tls/certs/ca-bundle.crt",   // RHEL/CentOS
-        "etc/ssl/ca-bundle.pem",             // openSUSE
+        "etc/pki/tls/certs/ca-bundle.crt",   // RHEL/CentOS/Fedora
+        "etc/ssl/ca-bundle.pem",             // openSUSE/SLES
+        "etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", // RHEL/Fedora (update-ca-trust output)
     ];
 
     for ca_store in ca_stores {

@@ -189,9 +189,29 @@ pub mod config {
         pub initramfs: Option<String>,
     }
 
+    /// Default action when no allow rule matches a connection.
+    #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum DefaultMode {
+        /// Allow the connection (default).
+        #[default]
+        Allow,
+        /// Deny the connection.
+        Deny,
+    }
+
+    impl WellKnown for DefaultMode {
+        type Deserializer =
+            smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
+        const DE: Self::Deserializer = smart_config::de::Serde;
+    }
+
     /// Network configuration
     #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
     pub struct Network {
+        /// Default action when no allow rule matches: `"allow"` (default) or `"deny"`.
+        #[config(default)]
+        pub default_mode: DefaultMode,
         /// Named network rules.
         #[config(default)]
         pub rules: BTreeMap<String, NetworkRule>,

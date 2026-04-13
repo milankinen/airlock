@@ -56,7 +56,8 @@ pub fn run(path: Option<&str>) -> i32 {
     }
 
     if !project.config.network.rules.is_empty() {
-        println!("Network rules:");
+        let default_mode = format!("{:?}", project.config.network.default_mode).to_lowercase();
+        println!("Network rules (default: {default_mode}):");
         for (key, rule) in &project.config.network.rules {
             let status = if rule.enabled { "" } else { " (disabled)" };
             let mw = if rule.middleware.is_empty() {

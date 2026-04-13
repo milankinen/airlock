@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use crate::config::config::DefaultMode;
 use crate::network::target::{NetworkTarget, ResolvedTarget};
 use crate::project::Project;
 
@@ -65,6 +66,7 @@ pub fn setup(project: &Project, bundle: &crate::oci::Bundle) -> anyhow::Result<N
     );
 
     Ok(Network {
+        default_mode: net.default_mode,
         tls_client: Arc::new(tls_client),
         interceptor: Rc::new(interceptor),
         allow_targets,
@@ -76,6 +78,7 @@ pub fn setup(project: &Project, bundle: &crate::oci::Bundle) -> anyhow::Result<N
 /// Host-side network proxy state, implementing the `NetworkProxy` RPC
 /// interface that the guest supervisor calls for every outbound connection.
 pub struct Network {
+    default_mode: DefaultMode,
     tls_client: Arc<rustls::ClientConfig>,
     interceptor: Rc<tls::TlsInterceptor>,
     /// Allow-rule targets with optional middleware.
@@ -91,8 +94,8 @@ impl Network {
     ///
     /// Logic:
     /// 1. If any deny target matches → `allowed = false` immediately.
-    /// 2. If no allow target matches → `allowed = false`.
-    /// 3. Otherwise → `allowed = true`; middleware collected from all matching allow rules.
+    /// 2. If any allow target matches → `allowed = true`; middleware collected.
+    /// 3. If neither matched → `allowed` follows `default_mode`.
     pub fn resolve_target(&self, host: &str, port: u16) -> ResolvedTarget {
         // Deny wins: checked first, no middleware involved.
         for target in &self.deny_targets {
@@ -116,11 +119,13 @@ impl Network {
             }
         }
 
+        let allowed = any_allow || matches!(self.default_mode, DefaultMode::Allow);
+
         ResolvedTarget {
             host: host.to_string(),
             port,
             middleware,
-            allowed: any_allow,
+            allowed,
         }
     }
 }
