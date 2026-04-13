@@ -2,25 +2,24 @@
 
 ## Overview
 
-ezpez runs untrusted code inside a lightweight Linux VM. A single `ez` binary
-boots a VM, pulls an OCI container image, assembles an overlayfs rootfs, and
-gives the user an interactive shell (or runs a one-off command) inside the
-container. The VM provides hardware-level isolation; the container provides a
-familiar image-based environment.
+airlock runs untrusted code inside a lightweight Linux VM. A single `airlock`
+binary boots a VM, pulls an OCI container image, assembles an overlayfs
+rootfs, and gives the user an interactive shell (or runs a one-off command)
+inside the container. The VM provides hardware-level isolation; the container
+provides a familiar image-based environment.
 
 ```
 ┌─ HOST (macOS / Linux) ─────────────────────────────────────────┐
 │                                                                  │
-│  ez (CLI)                                                        │
+│  airlock (CLI)                                                   │
 │  ├─ Pull + cache OCI image (host-side)                          │
-│  ├─ Prepare container bundle (overlayfs + OCI config.json)      │
 │  ├─ Boot Linux VM (Apple Virtualization / Cloud Hypervisor+KVM) │
 │  │   ├─ Kernel + initramfs embedded in binary                   │
 │  │   ├─ VirtioFS shares rootfs layers and mounts into VM        │
 │  │   └─ vsock connects CLI ↔ supervisor (Cap'n Proto RPC)       │
 │  ├─ Start container, relay terminal I/O                         │
-│  ├─ Network proxy (HTTP/HTTPS allow-list + TLS interception)    │
-│  └─ CLI server (Unix socket) — serves ez exec connections       │
+│  ├─ Network proxy (allow/deny rules + TLS interception)         │
+│  └─ CLI server (Unix socket) — serves airlock exec connections  │
 │                                                                  │
 │  ┌──────────────────────────────────────────────────────────┐   │
 │  │ VM (Linux, ARM64)                                        │   │
@@ -29,16 +28,13 @@ familiar image-based environment.
 │  │  ├─ Mount VirtioFS shares (base image, overlay, mounts)  │   │
 │  │  ├─ Assemble overlayfs rootfs                            │   │
 │  │  ├─ Setup networking (iptables + DNS)                    │   │
-│  │  └─ Launch supervisor                                    │   │
+│  │  └─ Launch supervisor (airlockd)                         │   │
 │  │                                                          │   │
-│  │  supervisor (Rust, static musl binary)                   │   │
+│  │  airlockd (supervisor, static musl binary)               │   │
 │  │  ├─ Listen on vsock port 1024                            │   │
 │  │  ├─ Accept RPC connection from CLI                       │   │
-│  │  ├─ Spawn crun container (or attach via crun exec)       │   │
+│  │  ├─ Assemble overlayfs, chroot, exec container process   │   │
 │  │  └─ Network relay: proxy guest TCP → host NetworkProxy   │   │
-│  │                                                          │   │
-│  │  crun (OCI runtime)                                      │   │
-│  │  └─ PID, UTS, mount namespace isolation                  │   │
 │  └──────────────────────────────────────────────────────────┘   │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -60,21 +56,21 @@ com.apple.security.hypervisor
 ### Linux: Cloud Hypervisor + KVM
 
 Uses Cloud Hypervisor with KVM acceleration. The `cloud-hypervisor` and
-`virtiofsd` binaries are embedded in the `ez` binary and extracted on first
-run. Requires `/dev/kvm` access; `ez` checks and reports permission issues
-at startup.
+`virtiofsd` binaries are embedded in the `airlock` binary and extracted on
+first run. Requires `/dev/kvm` access; `airlock` checks and reports permission
+issues at startup.
 
 ### Kernel and initramfs
 
 - **Kernel**: Linux 6.18 built from source with a minimal config (no EFI
   stub — VZLinuxBootLoader and Cloud Hypervisor both require a raw ARM64
-  `Image`). Built inside Docker; embedded in the `ez` binary via
+  `Image`). Built inside Docker; embedded in the `airlock` binary via
   `include_bytes!`.
-- **Initramfs**: Alpine 3.23 with `crun`, the supervisor binary, and a
+- **Initramfs**: Alpine 3.23 with the `airlockd` supervisor binary and a
   minimal init script. Built inside Docker as a gzipped cpio archive;
   also embedded in the binary.
-- Both are extracted to `~/.ezpez/kernel/` on first run. A checksum check
-  re-extracts them if the binary is updated.
+- Both are extracted to `~/.cache/airlock/kernel/` on first run. A checksum
+  check re-extracts them if the binary is updated.
 
 ### Virtio devices
 
@@ -101,16 +97,24 @@ delegates in the host virtualization API.
 
 ```
 Supervisor
-  start(stdin, pty, network, logs, logFilter, cmd, args,
-        tlsPassthrough, epoch, hostPorts, sockets) → Process
-    # Boot-time call. Triggers VM init, then spawns crun run.
+  start(stdin, pty, network, logs, logFilter,
+        epoch, hostPorts, sockets,
+        cmd, args, env, cwd, uid, gid, nestedVirt, harden,
+        imageId, dirs, files, caches) → Process
+    # Boot-time call. Carries all process config (replaces config.json)
+    # and mount config (replaces mounts.json). Triggers VM init, then
+    # forks and execs the container process directly (no crun).
 
-  exec(stdin, pty, cmd, args) → Process
-    # Attach a new process to the running container via crun exec.
-    # Called once per ez exec invocation.
+  exec(stdin, pty, cmd, args, cwd, env) → Process
+    # Attach a new process to the running container.
+    # Called once per `airlock exec` invocation.
 
   shutdown() → ()
     # Sync filesystems before VM teardown.
+
+CliService   (Unix socket: <project-cache>/cli.sock)
+  exec(stdin, pty, cmd, args, cwd, env) → Process
+    # Exposed by `airlock go` for `airlock exec` to connect to.
 
 Process
   poll() → (exit:Int32 | stdout:Data | stderr:Data)
@@ -132,37 +136,33 @@ LogSink
 ## VM init
 
 Inside the VM, the init script mounts essential filesystems (`/proc`, `/sys`,
-`/dev`, `/cgroup2`) then launches the supervisor. The supervisor's init
-closure (called before the first RPC) does the heavy setup:
+`/dev`, `/cgroup2`) then launches the supervisor (`airlockd`). The supervisor's
+init closure (called on the first `start` RPC) does the heavy setup:
 
 1. **Mount VirtioFS shares** — `base` (read-only image rootfs) and `overlay`
-   (CA certs, OCI config, mounts.json) are mounted unconditionally. User
-   directory mounts are also mounted at this step.
+   (CA certs, file mount staging dirs) are mounted unconditionally. The full
+   mount list is received via the `start` RPC (no separate `mounts.json`).
 
-2. **Read `mounts.json`** — written by the CLI into the `overlay` share
-   before boot. Contains the full list of VirtioFS-backed directory mounts,
-   file symlink targets, and cache directories.
-
-3. **Set system clock** — host passes a Unix epoch in the start RPC so the
+2. **Set system clock** — host passes a Unix epoch in the start RPC so the
    guest clock is correct from the start.
 
-4. **Setup networking** — loopback IP `10.0.0.1/8`, default route, iptables
+3. **Setup networking** — loopback IP `10.0.0.1/8`, default route, iptables
    rules for localhost port forwarding (port N → 15001, the in-VM TCP proxy).
 
-5. **Mount the project disk** — formats the ext4 image if blank (`mkfs.ext4`),
+4. **Mount the project disk** — formats the ext4 image if blank (`mkfs.ext4`),
    then mounts it at `/mnt/disk`. Resizes the filesystem if the disk image was
    enlarged.
 
-6. **Assemble overlayfs rootfs**:
+5. **Assemble overlayfs rootfs**:
    - **lower**: CA cert layer (`/mnt/overlay/ca`) if present, then base image
      (`/mnt/base`). Leftmost = highest priority.
    - **upper + work**: on the ext4 disk (`/mnt/disk/overlay/rootfs` and
      `/mnt/disk/overlay/work`). The overlay is reset if the image ID changes.
    - After mounting: file mounts become symlinks inside the rootfs pointing
-     into `/.ez/files_rw` or `/.ez/files_ro`. Directory mounts are bind-
-     mounted. Cache directories are bind-mounted last (override dir mounts).
+     into `/airlock/.files/rw` or `/airlock/.files/ro`. Directory mounts are
+     bind-mounted. Cache directories are bind-mounted last (override dir mounts).
 
-7. **Setup DNS** — writes `nameserver 10.0.0.1` to `/etc/resolv.conf` in the
+6. **Setup DNS** — writes `nameserver 10.0.0.1` to `/etc/resolv.conf` in the
    rootfs. DNS queries go to the in-VM network proxy, which resolves them on
    the host.
 
@@ -173,45 +173,34 @@ reset when the base image changes.
 
 ## Container execution
 
-### OCI runtime: crun
+### Process spawning
 
-Containers run via **crun** (≈512 KB), a lightweight OCI runtime. It receives
-an OCI runtime bundle (`config.json` + rootfs path) and creates namespaces
-for the container process.
+The supervisor (`airlockd`) does not use an OCI runtime. After assembling the
+overlayfs rootfs, it spawns container processes directly via fork + chroot +
+exec:
 
-- **`--no-pivot`** is required for `crun run` because VirtioFS does not
-  support `pivot_root`. `chroot` is used instead, which is safe since the
-  VM is the true security boundary.
+- **chroot**: into the assembled overlayfs rootfs.
+- **uid/gid**: switched to the container user (read from `start` RPC params,
+  derived from the image's `/etc/passwd`).
 - **PTY**: allocated when stdin is a TTY; host terminal size is sent as the
   initial PTY dimensions, and resize events (SIGWINCH) are forwarded.
 - **Pipe mode**: when stdin is not a TTY, separate stdout/stderr pipes are
   used with no PTY.
 
-### `ez exec` — attach to a running container
+All process configuration (`cmd`, `args`, `env`, `cwd`, `uid`, `gid`) is
+carried in the `start` RPC call rather than written to a `config.json` file.
 
-`ez exec` attaches a new process to an already-running container without
+### `airlock exec` — attach to a running container
+
+`airlock exec` attaches a new process to an already-running container without
 rebooting the VM. Flow:
 
-1. `ez exec` connects to `<project-cache>/cli.sock` (Unix socket, Cap'n
-   Proto RPC) that `ez go` exposes while the VM is running.
-2. The CLI server receives the exec request, calls
-   `build_exec_command(cmd, args, cwd, env, pty)` to construct the full
-   `crun exec [--tty] [--cwd ...] [--env ...] ezpez0 cmd args` invocation.
-3. The command is forwarded to the in-VM supervisor via the existing RPC
-   connection.
-4. The supervisor spawns the process and returns a `Process` capability.
-5. I/O is relayed back to the `ez exec` terminal.
-
-### OCI config generation
-
-`config.json` is generated per run from the image config:
-- `CMD` and `ENTRYPOINT` from the image, overridden by CLI args if given.
-- `ENV` from the image, plus injected vars (`HOME`, `TERM=xterm-256color`).
-- `USER` and `WORKDIR` from the image. Working directory is overridden to
-  the project path.
-- Bind mounts for each VirtioFS share, the `/.ez/` file mount directories,
-  and the CA cert overlay directory.
-- PID, UTS, and mount namespaces.
+1. `airlock exec` connects to `<project-cache>/cli.sock` (Unix socket, Cap'n
+   Proto RPC) that `airlock go` exposes while the VM is running.
+2. The CLI server forwards the exec request to the in-VM supervisor via the
+   existing RPC connection (reusing the established vsock).
+3. The supervisor forks a new process inside the container's chroot namespace.
+4. I/O is relayed back to the `airlock exec` terminal.
 
 
 ## File and directory mounting
@@ -219,8 +208,8 @@ rebooting the VM. Flow:
 ### How VirtioFS shares work
 
 Each directory mount becomes a VirtioFS share (one virtio device per share).
-The guest init mounts each share under `/mnt/<tag>`. The OCI `config.json`
-then bind-mounts from `/mnt/<tag>` to the desired container path.
+The guest init mounts each share under `/mnt/<tag>`. The supervisor then
+bind-mounts from `/mnt/<tag>` to the desired container path after chroot.
 
 ### Project directory
 
@@ -237,10 +226,10 @@ read-write as configured.
 
 VirtioFS does not support file-level bind mounts reliably. Instead:
 
-1. The file is hard-linked into a staging directory (`overlay/files_rw/` or
-   `overlay/files_ro/`) which is the VirtioFS share root.
-2. Inside the rootfs, a symlink at the target path points into `/.ez/files_rw`
-   or `/.ez/files_ro`.
+1. The file is hard-linked into a staging directory (`overlay/files/rw/` or
+   `overlay/files/ro/`) which is the VirtioFS share root.
+2. Inside the rootfs, a symlink at the target path points into
+   `/airlock/.files/rw` or `/airlock/.files/ro`.
 
 Hard links provide bidirectional sync — changes in the container appear on
 the host and vice versa. If hard-linking fails (cross-filesystem), the file
@@ -269,19 +258,25 @@ proxy. Inside the VM, iptables redirects all outbound TCP to the supervisor's
 proxy listener on `127.0.0.1:15001`. The supervisor relays connections back
 to the CLI via the `NetworkProxy.connect()` RPC.
 
-### Allow-list rules
+### Allow/deny rules
 
 Rules are evaluated per connection against the resolved hostname and port.
-A connection is allowed only if at least one enabled rule matches. Rules
-accumulate additively across config files and presets. `enabled = false`
-disables a rule including one inherited from a preset.
+Each rule has an `allow` list and an optional `deny` list. Rules accumulate
+additively across config files and presets. `enabled = false` disables a rule
+including one inherited from a preset.
 
-Pattern formats:
+Decision logic:
+1. If any `deny` pattern matches → **block** immediately (deny wins).
+2. If any `allow` pattern matches → **allow**; collect middleware from all
+   matching allow rules.
+3. If neither matched → follow `default_mode` (`"allow"` by default, or
+   `"deny"` to require explicit allow rules).
+
+Pattern formats (used in both `allow` and `deny` lists):
 - `host` — exact hostname, any port
 - `host:port` — exact hostname and port
-- `http:host` — HTTP only (port 80, not intercepted)
 - `*:port` — any hostname on a specific port
-- `*` — allow all (use only for development)
+- `*` — match all (use only for development)
 
 ### TLS interception
 
@@ -291,12 +286,8 @@ rootfs via the overlayfs lowerdir mechanism so containers trust it
 automatically.
 
 TLS interception is applied **only** for hosts that have Lua middleware
-scripts attached. Hosts without middleware pass through unmodified even if
-they are in an allow rule.
-
-Hosts listed with the `http:` prefix are never intercepted. A
-`tlsPassthrough` list is also sent to the supervisor (for cert-pinned clients
-that must not be MITM'd).
+scripts attached. Hosts without middleware (or unmatched hosts under
+`default_mode = "allow"`) pass through as raw TCP — no TLS MITM.
 
 ### Lua middleware
 
@@ -334,12 +325,13 @@ directory.
 ### Identity and cache
 
 Each project is identified by the SHA256 hash of its canonical working
-directory path. State is stored in `~/.ezpez/projects/<hash>/`:
+directory path. State is stored in `~/.cache/airlock/projects/<hash>/`:
 
 ```
 <hash>/
   lock              # PID lock (one VM per project at a time)
   cwd               # Canonical working directory (for display)
+  guest_cwd         # Working directory inside container (if overridden)
   image             # Last used image name
   last_run          # Unix epoch of last run
   disk.img          # Sparse ext4 image (overlay upper + caches)
@@ -347,17 +339,15 @@ directory path. State is stored in `~/.ezpez/projects/<hash>/`:
     ca.crt          # Self-signed CA cert (PEM)
     ca.key          # CA private key (PEM)
   overlay/
-    config.json     # OCI runtime spec (regenerated each run)
-    mounts.json     # Mount list (written by CLI, read by init)
-    files_rw/       # Hard-linked rw file mounts
-    files_ro/       # Hard-linked ro file mounts
+    files/rw/       # Hard-linked rw file mounts (VirtioFS share root)
+    files/ro/       # Hard-linked ro file mounts (VirtioFS share root)
     ca/             # CA cert tree (overlayfs lowerdir)
-  cli.sock          # Unix socket for ez exec RPC
+  cli.sock          # Unix socket for airlock exec RPC
 ```
 
 ### Image cache
 
-Images are cached at `~/.ezpez/images/<manifest-digest>/`:
+Images are cached at `~/.cache/airlock/images/<manifest-digest>/`:
 
 ```
 <digest>/
@@ -374,20 +364,21 @@ upper layer is reset.
 ### Locking
 
 The lock file contains the running PID. If a lock file exists and the PID is
-alive, `ez go` refuses to start (one VM per working directory). Stale locks
-(dead PID) are silently cleared.
+alive, `airlock go` refuses to start (one VM per working directory). Stale
+locks (dead PID) are silently cleared.
 
 
 ## Configuration system
 
 ### Loading order
 
-Files are loaded in order; later files override earlier:
+Files are loaded in order; later files override earlier. TOML, JSON, and YAML
+are supported (first matching extension wins per slot):
 
-1. `~/.ezpez/config.toml`
-2. `~/.ez.toml`
-3. `<project>/ez.toml`
-4. `<project>/ez.local.toml`
+1. `~/.cache/airlock/config.toml`
+2. `~/.airlock.toml`
+3. `<project>/airlock.toml`
+4. `<project>/airlock.local.toml`
 
 ### Merging semantics
 
@@ -411,7 +402,7 @@ dependencies are detected and rejected.
 mise run build
   ├─ build:kernel      Docker: compile Linux 6.18 from source (ARM64)
   ├─ build:supervisor  Docker: cross-compile Rust binary (musl, ARM64)
-  ├─ build:rootfs      Docker: Alpine + crun + supervisor → gzipped cpio
+  ├─ build:rootfs      Docker: Alpine + airlockd supervisor → gzipped cpio
   └─ build (cargo)     Compile CLI, embed kernel + rootfs, codesign (macOS)
 ```
 
