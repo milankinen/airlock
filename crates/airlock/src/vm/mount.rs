@@ -61,6 +61,8 @@ pub fn resolve_mounts(
     cwd: &Path,
     guest_cwd: &Path,
 ) -> anyhow::Result<Vec<ResolvedMount>> {
+    use std::os::unix::fs::PermissionsExt;
+
     use crate::config::config::MissingAction;
 
     let container_home = PathBuf::from(container_home);
@@ -91,8 +93,19 @@ pub fn resolve_mounts(
                     continue;
                 }
                 MissingAction::Ignore => continue,
-                MissingAction::Create => {
+                MissingAction::CreateDir => {
                     std::fs::create_dir_all(&source)?;
+                    let mode = parse_mode(m.create_mode.as_deref(), 0o755)?;
+                    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(mode))?;
+                }
+                MissingAction::CreateFile => {
+                    if let Some(parent) = source.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let content = m.file_content.as_deref().unwrap_or("");
+                    std::fs::write(&source, content)?;
+                    let mode = parse_mode(m.create_mode.as_deref(), 0o644)?;
+                    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(mode))?;
                 }
             }
         }
@@ -130,6 +143,16 @@ pub fn resolve_mounts(
     Ok(result)
 }
 
+/// Parse an octal mode string (e.g. "755") into a `u32`, or return the default.
+fn parse_mode(s: Option<&str>, default: u32) -> anyhow::Result<u32> {
+    match s {
+        Some(s) => {
+            u32::from_str_radix(s, 8).map_err(|_| anyhow::anyhow!("invalid octal mode: {s:?}"))
+        }
+        None => Ok(default),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
@@ -144,6 +167,8 @@ mod tests {
             target: target.into(),
             read_only: false,
             missing: MissingAction::Fail,
+            create_mode: None,
+            file_content: None,
         }
     }
 
@@ -154,6 +179,8 @@ mod tests {
             target: target.into(),
             read_only: false,
             missing,
+            create_mode: None,
+            file_content: None,
         }
     }
 
@@ -283,7 +310,7 @@ mod tests {
         let mounts = resolve_mounts(
             &[(
                 "auto",
-                mount_with(&src.to_string_lossy(), "/target", MissingAction::Create),
+                mount_with(&src.to_string_lossy(), "/target", MissingAction::CreateDir),
             )],
             Path::new("/home/test"),
             "/root",
@@ -306,7 +333,7 @@ mod tests {
         let mounts = resolve_mounts(
             &[(
                 "deep",
-                mount_with(&src.to_string_lossy(), "/target", MissingAction::Create),
+                mount_with(&src.to_string_lossy(), "/target", MissingAction::CreateDir),
             )],
             Path::new("/home/test"),
             "/root",
@@ -326,7 +353,7 @@ mod tests {
         let mounts = resolve_mounts(
             &[(
                 "rel",
-                mount_with("new-relative-dir", "/target", MissingAction::Create),
+                mount_with("new-relative-dir", "/target", MissingAction::CreateDir),
             )],
             Path::new("/home/test"),
             "/root",
@@ -468,6 +495,8 @@ mod tests {
                     target: "/ro".into(),
                     read_only: true,
                     missing: MissingAction::Fail,
+                    create_mode: None,
+                    file_content: None,
                 },
             )],
             Path::new("/home/test"),
@@ -505,7 +534,7 @@ mod tests {
         let mounts = resolve_mounts(
             &[(
                 "auto",
-                mount_with("~/.auto-created", "/target", MissingAction::Create),
+                mount_with("~/.auto-created", "/target", MissingAction::CreateDir),
             )],
             &home,
             "/root",
@@ -560,6 +589,84 @@ mod tests {
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].source, std::fs::canonicalize(&home).unwrap());
         assert_eq!(mounts[0].target, "/root");
+    }
+
+    #[test]
+    fn missing_create_file() {
+        let tmp = tempdir();
+        let src = tmp.join("new-file.txt");
+        assert!(!src.exists());
+
+        let mounts = resolve_mounts(
+            &[(
+                "f",
+                mount_with(&src.to_string_lossy(), "/target", MissingAction::CreateFile),
+            )],
+            Path::new("/home/test"),
+            "/root",
+            &tmp,
+            Path::new("/workdir"),
+        )
+        .unwrap();
+
+        assert_eq!(mounts.len(), 1);
+        assert!(src.exists(), "file should have been created");
+        assert!(src.is_file());
+        assert_eq!(std::fs::read_to_string(&src).unwrap(), "");
+        assert!(matches!(mounts[0].mount_type, MountType::File { .. }));
+    }
+
+    #[test]
+    fn missing_create_file_with_content() {
+        let tmp = tempdir();
+        let src = tmp.join("init.json");
+        assert!(!src.exists());
+
+        let mounts = resolve_mounts(
+            &[(
+                "f",
+                Mount {
+                    enabled: true,
+                    source: src.to_string_lossy().into(),
+                    target: "/target".into(),
+                    read_only: false,
+                    missing: MissingAction::CreateFile,
+                    create_mode: None,
+                    file_content: Some("{}".into()),
+                },
+            )],
+            Path::new("/home/test"),
+            "/root",
+            &tmp,
+            Path::new("/workdir"),
+        )
+        .unwrap();
+
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(std::fs::read_to_string(&src).unwrap(), "{}");
+    }
+
+    #[test]
+    fn missing_create_file_nested_parent() {
+        let tmp = tempdir();
+        let src = tmp.join("a/b/c/deep.txt");
+        assert!(!src.exists());
+
+        let mounts = resolve_mounts(
+            &[(
+                "f",
+                mount_with(&src.to_string_lossy(), "/target", MissingAction::CreateFile),
+            )],
+            Path::new("/home/test"),
+            "/root",
+            &tmp,
+            Path::new("/workdir"),
+        )
+        .unwrap();
+
+        assert_eq!(mounts.len(), 1);
+        assert!(src.exists(), "file with nested parents should be created");
+        assert!(src.is_file());
     }
 
     /// Create a temporary directory that's cleaned up on drop.

@@ -305,10 +305,17 @@ pub mod config {
         /// What to do when the source path doesn't exist.
         #[config(default_t = MissingAction::Fail)]
         pub missing: MissingAction,
+        /// Unix permissions for created dirs/files (octal string, e.g. "755").
+        /// Default: "755" for directories, "644" for files.
+        #[config(default)]
+        pub create_mode: Option<String>,
+        /// Initial content written when `missing = "create-file"` creates the file.
+        #[config(default)]
+        pub file_content: Option<String>,
     }
 
     #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-    #[serde(rename_all = "lowercase")]
+    #[serde(rename_all = "kebab-case")]
     pub enum MissingAction {
         /// Error out if the source doesn't exist (default).
         Fail,
@@ -317,7 +324,9 @@ pub mod config {
         /// Skip the mount silently.
         Ignore,
         /// Create the directory and mount it.
-        Create,
+        CreateDir,
+        /// Create the file (with optional content) and mount it.
+        CreateFile,
     }
 
     /// VM disk image configuration — sparse raw disk with ext4
