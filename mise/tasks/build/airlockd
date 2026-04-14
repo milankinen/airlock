@@ -20,6 +20,7 @@ else
   echo "Preparing airlockd builder..."
   docker build --progress=quiet -t airlock-supervisor-builder -f crates/airlockd/builder.dockerfile crates/airlockd
   echo "Building airlockd (docker, ${TARGET})..."
+  [ -f target/vm/airlockd ] && rm target/vm/airlockd
   docker run --rm \
     -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
     -v "$PWD:/workspace:ro" \
@@ -35,6 +36,7 @@ else
       cp /target/${TARGET}/release/airlockd /out/airlockd
       chown \${HOST_UID}:\${HOST_GID} /out/airlockd
     "
+  [ -f target/vm/airlockd ] || exit 1
 fi
 
 echo "airlockd: target/vm/airlockd ($(du -h target/vm/airlockd | cut -f1))"

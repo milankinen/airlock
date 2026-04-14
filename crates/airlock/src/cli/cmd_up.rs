@@ -4,7 +4,6 @@
 //! network rules → boot VM → start supervisor RPC → relay I/O → clean up.
 
 use std::io::Write;
-use std::path::PathBuf;
 
 use dialoguer::Select;
 use dialoguer::theme::ColorfulTheme;
@@ -15,30 +14,28 @@ use crate::cli::{self, CliArgs, LogLevel};
 use crate::project::{self, Project};
 use crate::{cli_server, config, network, oci, rpc, terminal, vm};
 
-/// Default `airlock.toml` written when initializing a new project.
+/// Default `airlock.toml` written when initializing a new sandbox.
 const DEFAULT_CONFIG: &str = "[vm]\n# image = \"alpine:latest\"\n";
 
-/// Entry point for `airlock up [path] [--log-level <level>] [-- extra-args...]`.
+/// Entry point for `airlock up [--log-level <level>] [-- extra-args...]`.
 pub async fn run(
-    path: Option<String>,
     log_level: LogLevel,
     extra_args: Vec<String>,
     project_cwd: Option<String>,
     login: bool,
 ) -> i32 {
     if !cli::is_interactive() {
-        cli::error!("airlock up requires a TTY");
+        cli::error!("Interactive mode (TTY) is required");
         return 2;
     }
 
     #[cfg(target_os = "linux")]
     vm::require_kvm();
 
-    // Resolve project directory
-    let host_cwd = match resolve_project_dir(path) {
-        Ok(p) => p,
+    let host_cwd = match std::env::current_dir() {
+        Ok(p) => std::fs::canonicalize(&p).unwrap_or(p),
         Err(e) => {
-            cli::error!("{e:#}");
+            cli::error!("Cannot determine current directory: {e}");
             return 1;
         }
     };
@@ -56,11 +53,11 @@ pub async fn run(
             .interact()
             .unwrap_or(1);
         if selection != 0 {
-            println!("Aborted.");
+            cli::error!("Aborted.");
             return 0;
         }
         if let Err(e) = std::fs::write(host_cwd.join("airlock.toml"), DEFAULT_CONFIG) {
-            cli::error!("failed to create airlock.toml: {e}");
+            cli::error!("Failed to create airlock.toml: {e}");
             return 1;
         }
         cli::log!("Created airlock.toml in {}", host_cwd.display());
@@ -69,7 +66,7 @@ pub async fn run(
     let config = match config::load(&host_cwd) {
         Ok(c) => c,
         Err(e) => {
-            cli::error!("config error: {e:#}");
+            cli::error!("Config error: {e:#}");
             return 2;
         }
     };
@@ -81,38 +78,23 @@ pub async fn run(
             run_inner(args, config, host_cwd, project_cwd)
                 .await
                 .unwrap_or_else(|e| {
-                    cli::error!("error: {e:?}");
+                    cli::error!("Error: {e:?}");
                     1
                 })
         })
         .await
 }
 
-fn resolve_project_dir(path: Option<String>) -> anyhow::Result<PathBuf> {
-    let p = if let Some(s) = path {
-        let p = PathBuf::from(s);
-        if !p.is_dir() {
-            anyhow::bail!("not a directory: {}", p.display());
-        }
-        std::fs::canonicalize(&p).unwrap_or(p)
-    } else {
-        let cwd = std::env::current_dir()?;
-        std::fs::canonicalize(&cwd).unwrap_or(cwd)
-    };
-    Ok(p)
-}
-
 async fn run_inner(
     args: CliArgs,
     config: config::Config,
-    host_cwd: PathBuf,
+    host_cwd: std::path::PathBuf,
     project_cwd: Option<String>,
 ) -> anyhow::Result<i32> {
     let project = project::lock(host_cwd, config, project_cwd)?;
     setup_logging(&args, &project);
 
-    let short_id = project.id()[..7].to_string();
-    cli::log!("Preparing project {short_id}...");
+    cli::log!("Preparing sandbox...");
     cli::log!(
         "  {} config loaded, image: {}",
         cli::check(),
@@ -150,7 +132,9 @@ async fn run_inner(
         .await?;
 
     // Start CLI server so `airlock exec` can attach processes to this VM
-    let sock_path = project.cache_dir.join(airlock_protocol::CLI_SOCK_FILENAME);
+    let sock_path = project
+        .sandbox_dir
+        .join(airlock_protocol::CLI_SOCK_FILENAME);
     tokio::task::spawn_local(cli_server::serve(sock_path, supervisor.clone()));
 
     // Forward host signals to the VM process
@@ -204,7 +188,7 @@ fn setup_logging(args: &CliArgs, project: &Project) {
         .create(true)
         .write(true)
         .truncate(true)
-        .open(project.cache_dir.join("airlock.log"))
+        .open(project.sandbox_dir.join("run.log"))
     {
         tracing_subscriber::fmt()
             .with_env_filter(EnvFilter::new(args.log_filter()))

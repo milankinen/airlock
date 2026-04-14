@@ -19,6 +19,22 @@ use crate::cli::CliArgs;
 use crate::project::Project;
 use crate::terminal::Terminal;
 
+/// Metadata written to `image_dir/meta.json` after a successful image pull.
+/// Hard-linked to `sandbox/image` — serves as both the GC ref (nlink > 1 means
+/// in use) and the stored-digest source (replaces run.json image_digest field).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ImageMeta {
+    digest: String,
+    name: String,
+}
+
+/// Read `sandbox/image` as `ImageMeta`. Returns `None` if absent or not yet
+/// in the new format (migration from old empty `.ref` hard-link).
+fn read_sandbox_image_meta(sandbox_dir: &Path) -> Option<ImageMeta> {
+    let data = std::fs::read(sandbox_dir.join("image")).ok()?;
+    serde_json::from_slice(&data).ok()
+}
+
 /// Everything needed to configure the container process (returned by `prepare`).
 /// Mount resolution, disk setup, and command/env overrides happen in `vm::start`.
 pub struct OciImage {
@@ -36,18 +52,17 @@ pub struct OciImage {
     /// No args.args overrides (those go in vm::start).
     pub cmd: Vec<String>,
     /// Base defaults (PATH/TERM/HOME) + image env.
-    /// No project.config.env overrides (those go in vm::start).
+    /// No sandbox.config.env overrides (those go in vm::start).
     pub env: Vec<String>,
 }
 
-/// Resolve, download, and prepare the OCI image for the project.
+/// Resolve, download, and prepare the OCI image for the sandbox.
 pub async fn prepare(
     _args: &CliArgs,
     project: &Project,
     _terminal: &Terminal,
 ) -> anyhow::Result<OciImage> {
-    let digest_file = project.cache_dir.join("image_digest");
-    let stored_digest = std::fs::read_to_string(&digest_file).ok();
+    let stored_digest = read_sandbox_image_meta(&project.sandbox_dir).map(|m| m.digest);
 
     // Set up registry auth: use stored credentials, fall back to anonymous.
     let image_cfg = &project.config.vm.image;
@@ -97,7 +112,7 @@ pub async fn prepare(
                 // Only keep old if the cache is still intact; otherwise
                 // fall through and let the new image be used.
                 let old_image_dir = crate::cache::image_dir(old_digest.trim())?;
-                if old_image_dir.join("rootfs").exists() && old_image_dir.join(".complete").exists()
+                if old_image_dir.join("rootfs").exists() && old_image_dir.join("meta.json").exists()
                 {
                     digest_changed = false;
                     image.digest = old_digest.trim().to_string();
@@ -105,11 +120,14 @@ pub async fn prepare(
             }
             ImageChangeAction::Recreate => {
                 let spinner = cli::spinner("erasing old environment...");
-                let _ = std::fs::remove_dir_all(project.cache_dir.join("overlay"));
-                let _ = std::fs::remove_file(&digest_file);
+                // Remove overlay files dir and CA overlay (both rebuilt on next start)
+                let _ = std::fs::remove_dir_all(project.sandbox_dir.join("overlay"));
+                let _ = std::fs::remove_dir_all(project.sandbox_dir.join("ca"));
+                // Remove image ref hard link
+                let _ = std::fs::remove_file(project.sandbox_dir.join("image"));
                 spinner.finish_and_clear();
                 cli::log!("  {} old environment erased", cli::check());
-                // GC: check if old image is still used by any project
+                // GC: remove image cache if no other sandbox references it
                 gc_unused_image(old_digest.trim())?;
             }
             ImageChangeAction::Cancel => anyhow::bail!("cancelled by user"),
@@ -117,13 +135,20 @@ pub async fn prepare(
     }
 
     // Download/ensure image (auth already resolved above).
-    let image_dir = ensure_image(&mut image, &auth, image_cfg.insecure).await?;
+    let image_dir = ensure_image(&mut image, image_name, &auth, image_cfg.insecure).await?;
 
     if digest_changed {
-        std::fs::write(&digest_file, &image.digest)?;
+        // Hard-link meta.json into the sandbox directory.
+        // Link count > 1 on meta.json means the image is still in use (GC guard).
+        let meta_path = image_dir.join("meta.json");
+        let sandbox_image = project.sandbox_dir.join("image");
+        let _ = std::fs::remove_file(&sandbox_image);
+        if let Err(e) = std::fs::hard_link(&meta_path, &sandbox_image) {
+            tracing::debug!("image ref hard-link failed (cross-device?): {e}");
+        }
     }
 
-    let overlay_dir = project.cache_dir.join("overlay");
+    let overlay_dir = project.sandbox_dir.join("overlay");
     std::fs::create_dir_all(&overlay_dir)?;
     cli::log!("  {} environment ready", cli::check());
 
@@ -155,7 +180,7 @@ pub async fn prepare(
         a
     };
 
-    // Resolve environment: base defaults → image env (no project overrides here)
+    // Resolve environment: base defaults → image env (no sandbox overrides here)
     let mut env: Vec<String> = vec![
         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
         "TERM=linux".to_string(),
@@ -225,7 +250,7 @@ enum ImageChangeAction {
 
 fn prompt_image_changed() -> anyhow::Result<ImageChangeAction> {
     if !cli::is_interactive() {
-        anyhow::bail!("project image has changed");
+        anyhow::bail!("sandbox image has changed");
     }
     let term = dialoguer::console::Term::stderr();
     let choice = dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
@@ -318,14 +343,15 @@ enum ImageSource {
 /// Re-downloads if the extraction was incomplete.
 async fn ensure_image(
     resolved: &mut ResolvedImage,
+    image_name: &str,
     auth: &RegistryAuth,
     insecure: bool,
 ) -> anyhow::Result<PathBuf> {
     let dir = crate::cache::image_dir(&resolved.digest)?;
     let rootfs = dir.join("rootfs");
-    let complete_marker = dir.join(".complete");
+    let meta_path = dir.join("meta.json");
 
-    if rootfs.exists() && complete_marker.exists() {
+    if rootfs.exists() && meta_path.exists() {
         if matches!(resolved.source, ImageSource::Docker { .. }) {
             let config_path = dir.join("image_config.json");
             if config_path.exists() {
@@ -336,10 +362,30 @@ async fn ensure_image(
         return Ok(dir);
     }
 
+    // Migration: old cache has .complete but no meta.json — write meta.json and continue.
+    let complete_marker = dir.join(".complete");
+    if rootfs.exists() && complete_marker.exists() {
+        let meta = ImageMeta {
+            digest: resolved.digest.clone(),
+            name: image_name.to_string(),
+        };
+        std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
+        let _ = std::fs::remove_file(&complete_marker);
+        if matches!(resolved.source, ImageSource::Docker { .. }) {
+            let config_path = dir.join("image_config.json");
+            if config_path.exists() {
+                let data = std::fs::read(&config_path)?;
+                resolved.config = serde_json::from_slice(&data).unwrap_or_default();
+            }
+        }
+        return Ok(dir);
+    }
+
     // Incomplete or corrupt image — clean up and re-extract
     if rootfs.exists() {
         tracing::debug!("image extraction incomplete, cleaning up");
         let _ = std::fs::remove_dir_all(&rootfs);
+        let _ = std::fs::remove_file(&meta_path);
         let _ = std::fs::remove_file(&complete_marker);
     }
 
@@ -359,7 +405,11 @@ async fn ensure_image(
             let sp = cli::spinner("exporting from docker...");
             resolved.config =
                 docker::save_and_extract(image_ref, &rootfs, &dir.join("image_config.json"))?;
-            std::fs::write(&complete_marker, "")?;
+            let meta = ImageMeta {
+                digest: resolved.digest.clone(),
+                name: image_name.to_string(),
+            };
+            std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
             sp.finish_and_clear();
             cli::log!("  {} exported from docker", cli::check());
         }
@@ -406,39 +456,42 @@ async fn ensure_image(
 
             let config_json = serde_json::to_string_pretty(&resolved.config)?;
             std::fs::write(dir.join("image_config.json"), config_json)?;
-            std::fs::write(&complete_marker, "")?;
+            let meta = ImageMeta {
+                digest: resolved.digest.clone(),
+                name: image_name.to_string(),
+            };
+            std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
         }
     }
 
     Ok(dir)
 }
 
-/// Check if an image digest is used by any project. If not, delete it.
+/// Remove an image from the cache if no sandbox holds a hard-link ref to it.
+///
+/// Each sandbox that uses an image hard-links `image_cache/meta.json` to
+/// `sandbox/.airlock/sandbox/image`. A link count of 1 on `meta.json` means
+/// only the cache's own copy remains — safe to delete.
 fn gc_unused_image(digest: &str) -> anyhow::Result<()> {
-    let projects_dir = crate::cache::cache_dir()?.join("projects");
-    if !projects_dir.exists() {
+    let image_dir = crate::cache::image_dir(digest)?;
+    if !image_dir.exists() {
         return Ok(());
     }
 
-    for entry in std::fs::read_dir(&projects_dir)?.flatten() {
-        let digest_file = entry.path().join("image_digest");
-        if let Ok(stored) = std::fs::read_to_string(&digest_file)
-            && stored.trim() == digest
-        {
-            // Still in use by another project
+    let meta_file = image_dir.join("meta.json");
+    if meta_file.exists() {
+        use std::os::unix::fs::MetadataExt;
+        if std::fs::metadata(&meta_file).is_ok_and(|m| m.nlink() > 1) {
+            // At least one sandbox still holds a hard link — keep the image.
             return Ok(());
         }
     }
 
-    // No project references this image — delete it
-    let image_dir = crate::cache::image_dir(digest)?;
-    if image_dir.exists() {
-        let sp = cli::spinner("cleaning unused image...");
-        let _ = std::fs::remove_dir_all(&image_dir);
-        sp.finish_and_clear();
-        cli::log!("  {} cleaned unused image", cli::check());
-    }
-
+    // No sandbox references this image — delete it
+    let sp = cli::spinner("cleaning unused image...");
+    let _ = std::fs::remove_dir_all(&image_dir);
+    sp.finish_and_clear();
+    cli::log!("  {} cleaned unused image", cli::check());
     Ok(())
 }
 

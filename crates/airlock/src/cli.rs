@@ -7,7 +7,6 @@
 pub mod cmd_down;
 pub mod cmd_exec;
 pub mod cmd_info;
-pub mod cmd_list;
 pub mod cmd_up;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,29 +58,25 @@ pub struct GlobalArgs {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Start the project in an isolated VM
+    /// Start the sandbox VM for the current project directory
     Up {
-        /// Project directory (defaults to current directory)
-        path: Option<String>,
         /// Log level
         #[arg(long, env = "AIRLOCK_LOG_LEVEL", default_value = "info")]
         log_level: LogLevel,
         /// Working directory inside the container (defaults to the host cwd)
         #[arg(long)]
-        project_cwd: Option<String>,
+        sandbox_cwd: Option<String>,
         /// Run the container command inside a login shell (sources /etc/profile, ~/.profile)
         #[arg(short = 'l', long)]
         login: bool,
     },
-    /// Remove the project VM
+    /// Remove the current project data
     Down {
-        /// Project path or abbreviated ID (defaults to current directory)
-        path: Option<String>,
         /// Skip confirmation prompt
         #[arg(short = 'f', long)]
         force: bool,
     },
-    /// Execute a command inside the running VM container
+    /// Execute a command inside the running sandbox VM
     #[command(alias = "x")]
     Exec {
         /// Command to run
@@ -99,14 +94,8 @@ pub enum Command {
         #[arg(short = 'l', long)]
         login: bool,
     },
-    /// Show project info (defaults to current directory)
-    Info {
-        /// Project path or abbreviated ID (defaults to cwd)
-        path: Option<String>,
-    },
-    /// List all projects
-    #[command(alias = "ls")]
-    List,
+    /// Show the current project info
+    Info,
 }
 
 /// Runtime arguments for the `up` command. Constructed from parsed CLI args

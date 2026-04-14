@@ -40,13 +40,15 @@ async fn run_inner(
     env: Vec<String>,
     login: bool,
 ) -> anyhow::Result<i32> {
-    let project = project::load(None)?;
+    let project = project::load()?;
     let (cmd, args) = if login {
         apply_login_shell(cmd, args)
     } else {
         (cmd, args)
     };
-    let sock_path = project.cache_dir.join(airlock_protocol::CLI_SOCK_FILENAME);
+    let sock_path = project
+        .sandbox_dir
+        .join(airlock_protocol::CLI_SOCK_FILENAME);
 
     let stream = tokio::net::UnixStream::connect(&sock_path)
         .await
@@ -55,7 +57,7 @@ async fn run_inner(
                 e.kind(),
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
             ) {
-                anyhow::anyhow!("no running VM — is 'airlock go' running in this project?")
+                anyhow::anyhow!("no running VM — is 'airlock up' running in this project?")
             } else {
                 anyhow::anyhow!("failed to connect to VM: {e}")
             }

@@ -1,20 +1,20 @@
-//! `airlock info` — display project details.
+//! `airlock info` — display sandbox details.
 
 use crate::{cli, project};
 
-/// Print project metadata (ID, path, status, image, config) to stdout.
-pub fn run(path: Option<&str>) -> i32 {
-    let project = match project::load(path) {
-        Ok(p) => p,
+/// Print sandbox metadata (path, status, image, config) to stdout.
+pub fn run() -> i32 {
+    let project = match project::load() {
+        Ok(s) => s,
         Err(e) => {
-            cli::error!("{e:#}");
+            cli::error!("Project data loading failed: {e:#}");
             return 1;
         }
     };
 
-    if !project.cache_dir.exists() {
+    if !project.sandbox_dir.exists() {
         cli::error!(
-            "no project data for {} — run `airlock up` first",
+            "No project data for {} — run `airlock up` first",
             project.host_cwd.display()
         );
         return 1;
@@ -26,7 +26,6 @@ pub fn run(path: Option<&str>) -> i32 {
         cli::dim("stopped")
     };
 
-    println!("ID:       {}", project.id());
     println!("Path:     {}", project.display_cwd());
     println!("Status:   {status}");
     println!("Image:    {}", project.config.vm.image);
@@ -37,7 +36,7 @@ pub fn run(path: Option<&str>) -> i32 {
         println!("Last run: {ago}");
     }
 
-    println!("Disk:     {}", project.cache_dir.display());
+    println!("Sandbox:  {}", project.sandbox_dir.display());
 
     if !project.config.disk.cache.is_empty() {
         println!("Disk cache:");

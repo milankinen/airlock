@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use super::{CacheConfig, InitConfig, MountConfig};
 use crate::rpc::SocketForwardConfig;
@@ -49,7 +49,7 @@ pub fn setup(
     std::fs::create_dir_all("/mnt/overlay/rootfs")?;
 
     // 4. Networking
-    setup_networking(&config.host_ports);
+    setup_networking(&config.host_ports)?;
 
     // 5. Project disk (ext4 — overlayfs upper + cache)
     setup_disk(&mounts.caches)?;
@@ -159,13 +159,13 @@ fn setup_container_mounts(
         std::fs::create_dir_all("/mnt/disk/sockets")?;
         // Create placeholder regular file so bind mount works
         if !Path::new(&src).exists() {
-            let _ = std::fs::File::create(&src);
+            std::fs::File::create(&src)?;
         }
         if let Some(parent) = Path::new(&dst).parent() {
             std::fs::create_dir_all(parent)?;
         }
         if !Path::new(&dst).exists() {
-            let _ = std::fs::File::create(&dst);
+            std::fs::File::create(&dst)?;
         }
         bind_mount(&src, &dst, false)?;
         info!("socket: {src} → {dst}");
@@ -206,17 +206,13 @@ fn assemble_rootfs(mounts: &MountConfig) -> anyhow::Result<()> {
     // Upper/work must be on a local filesystem (not VirtioFS/FUSE).
     // Use disk if available (persists), otherwise tmpfs (ephemeral).
     let (upper, work) = if has_disk {
-        reset_overlay_if_needed(&mounts.image_id);
-        std::fs::create_dir_all("/mnt/disk/overlay/upper")
-            .unwrap_or_else(|e| error!("overlay upper dir: {e}"));
-        std::fs::create_dir_all("/mnt/disk/overlay/work")
-            .unwrap_or_else(|e| error!("overlay work dir: {e}"));
+        reset_overlay_if_needed(&mounts.image_id)?;
+        std::fs::create_dir_all("/mnt/disk/overlay/upper")?;
+        std::fs::create_dir_all("/mnt/disk/overlay/work")?;
         ("/mnt/disk/overlay/upper", "/mnt/disk/overlay/work")
     } else {
-        std::fs::create_dir_all("/tmp/overlay_upper")
-            .unwrap_or_else(|e| error!("overlay upper dir: {e}"));
-        std::fs::create_dir_all("/tmp/overlay_work")
-            .unwrap_or_else(|e| error!("overlay work dir: {e}"));
+        std::fs::create_dir_all("/tmp/overlay_upper")?;
+        std::fs::create_dir_all("/tmp/overlay_work")?;
         ("/tmp/overlay_upper", "/tmp/overlay_work")
     };
 
@@ -231,8 +227,7 @@ fn assemble_rootfs(mounts: &MountConfig) -> anyhow::Result<()> {
         let rel = file.target.strip_prefix('/').unwrap_or(&file.target);
         let upper_path = format!("{upper}/{rel}");
         if let Some(parent) = Path::new(&upper_path).parent() {
-            std::fs::create_dir_all(parent)
-                .unwrap_or_else(|e| error!("file mount parent dir: {e}"));
+            std::fs::create_dir_all(parent)?;
         }
         // Overwrite any existing entry at this path (file mount takes precedence).
         let _ = std::fs::remove_file(&upper_path);
@@ -244,16 +239,14 @@ fn assemble_rootfs(mounts: &MountConfig) -> anyhow::Result<()> {
 
     // Persist filelinks for debugging (survives overlay resets, shows active file mounts).
     if has_disk {
-        std::fs::create_dir_all("/mnt/disk/filelinks")
-            .unwrap_or_else(|e| error!("filelinks dir: {e}"));
+        std::fs::create_dir_all("/mnt/disk/filelinks")?;
         let current_keys: std::collections::HashSet<&str> =
             mounts.files.iter().map(|f| f.mount_key.as_str()).collect();
-        if let Ok(entries) = std::fs::read_dir("/mnt/disk/filelinks") {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                if !current_keys.contains(name.to_string_lossy().as_ref()) {
-                    let _ = std::fs::remove_file(entry.path());
-                }
+        let entries = std::fs::read_dir("/mnt/disk/filelinks")?;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if !current_keys.contains(name.to_string_lossy().as_ref()) {
+                let _ = std::fs::remove_file(entry.path());
             }
         }
         for file in &mounts.files {
@@ -261,7 +254,9 @@ fn assemble_rootfs(mounts: &MountConfig) -> anyhow::Result<()> {
             let link_target = format!("/airlock/.files/{rw_or_ro}/{}", file.mount_key);
             let filelink_path = format!("/mnt/disk/filelinks/{}", file.mount_key);
             let _ = std::fs::remove_file(&filelink_path);
-            let _ = std::os::unix::fs::symlink(&link_target, &filelink_path);
+            std::os::unix::fs::symlink(&link_target, &filelink_path).map_err(|e| {
+                anyhow::anyhow!("failed to create filelink {filelink_path} → {link_target}: {e}")
+            })?;
         }
     }
 
@@ -320,27 +315,46 @@ fn assemble_rootfs(mounts: &MountConfig) -> anyhow::Result<()> {
         }
     }
 
+    // Mask .airlock/: bind an empty read-only directory over the sandbox
+    // directory's .airlock/ so the container user cannot accidentally read or
+    // modify sandbox internals (CA keys, disk image, lock file, etc.).
+    if let Some(project_mount) = mounts.dirs.iter().find(|d| d.tag == "project") {
+        let mask_src = if has_disk {
+            std::fs::create_dir_all("/mnt/disk/mask")?;
+            "/mnt/disk/mask"
+        } else {
+            std::fs::create_dir_all("/tmp/airlock-mask")?;
+            "/tmp/airlock-mask"
+        };
+        let rel = project_mount
+            .target
+            .strip_prefix('/')
+            .unwrap_or(&project_mount.target);
+        let dst = Path::new("/mnt/overlay/rootfs").join(rel).join(".airlock");
+        std::fs::create_dir_all(&dst)?;
+        bind_mount(mask_src, &dst.to_string_lossy(), true)?;
+        info!("masked .airlock at {}", dst.display());
+    }
+
     Ok(())
 }
 
 /// Reset the overlay upper layer if the base image changed.
-fn reset_overlay_if_needed(image_id: &str) {
+fn reset_overlay_if_needed(image_id: &str) -> anyhow::Result<()> {
     let id_file = "/mnt/disk/overlay/.image_id";
+    // Missing file is normal on first run — treat as empty (needs reset).
     let current = std::fs::read_to_string(id_file).unwrap_or_default();
     if !current.is_empty() && current.trim() == image_id {
         debug!("overlay image ID matches, keeping existing state");
-        return;
+        return Ok(());
     }
     info!("image changed, resetting overlay");
     if let Err(e) = std::fs::remove_dir_all("/mnt/disk/overlay") {
         debug!("overlay cleanup: {e}");
     }
-    if let Err(e) = std::fs::create_dir_all("/mnt/disk/overlay") {
-        error!("failed to create overlay dir: {e}");
-    }
-    if let Err(e) = std::fs::write(id_file, image_id) {
-        error!("failed to write image ID: {e}");
-    }
+    std::fs::create_dir_all("/mnt/disk/overlay")?;
+    std::fs::write(id_file, image_id)?;
+    Ok(())
 }
 
 /// Mount a VirtioFS share by its tag name at `/mnt/<tag>`.
@@ -471,21 +485,21 @@ fn set_clock(epoch: u64, epoch_nanos: u32) {
 }
 
 /// Configure loopback networking and iptables rules.
-fn setup_networking(host_ports: &[u16]) {
-    run_quiet(&["/sbin/ip", "link", "set", "lo", "up"]);
+fn setup_networking(host_ports: &[u16]) -> anyhow::Result<()> {
+    run_cmd(&["/sbin/ip", "link", "set", "lo", "up"])?;
 
-    write_sysctl("/proc/sys/net/ipv4/conf/lo/route_localnet", "1");
-    write_sysctl("/proc/sys/net/ipv4/conf/all/rp_filter", "0");
-    write_sysctl("/proc/sys/net/ipv4/conf/lo/rp_filter", "0");
-    write_sysctl("/proc/sys/net/ipv4/ip_forward", "1");
+    write_sysctl("/proc/sys/net/ipv4/conf/lo/route_localnet", "1")?;
+    write_sysctl("/proc/sys/net/ipv4/conf/all/rp_filter", "0")?;
+    write_sysctl("/proc/sys/net/ipv4/conf/lo/rp_filter", "0")?;
+    write_sysctl("/proc/sys/net/ipv4/ip_forward", "1")?;
 
-    run_quiet(&["/sbin/ip", "addr", "add", "10.0.0.1/8", "dev", "lo"]);
-    run_quiet(&[
+    run_cmd(&["/sbin/ip", "addr", "add", "10.0.0.1/8", "dev", "lo"])?;
+    run_cmd(&[
         "/sbin/ip", "route", "add", "default", "via", "10.0.0.1", "dev", "lo",
-    ]);
+    ])?;
 
     for port in host_ports {
-        run_quiet(&[
+        run_cmd(&[
             "/usr/sbin/iptables",
             "-t",
             "nat",
@@ -501,9 +515,9 @@ fn setup_networking(host_ports: &[u16]) {
             "REDIRECT",
             "--to-port",
             "15001",
-        ]);
+        ])?;
     }
-    run_quiet(&[
+    run_cmd(&[
         "/usr/sbin/iptables",
         "-t",
         "nat",
@@ -515,8 +529,8 @@ fn setup_networking(host_ports: &[u16]) {
         "127.0.0.1",
         "-j",
         "RETURN",
-    ]);
-    run_quiet(&[
+    ])?;
+    run_cmd(&[
         "/usr/sbin/iptables",
         "-t",
         "nat",
@@ -528,8 +542,8 @@ fn setup_networking(host_ports: &[u16]) {
         "15001",
         "-j",
         "RETURN",
-    ]);
-    run_quiet(&[
+    ])?;
+    run_cmd(&[
         "/usr/sbin/iptables",
         "-t",
         "nat",
@@ -541,9 +555,10 @@ fn setup_networking(host_ports: &[u16]) {
         "REDIRECT",
         "--to-port",
         "15001",
-    ]);
+    ])?;
 
     info!("networking configured");
+    Ok(())
 }
 
 /// Mount the project disk at /mnt/disk (overlay upper + cache).
@@ -604,16 +619,13 @@ fn setup_disk(cache_mounts: &[CacheConfig]) -> anyhow::Result<()> {
     // Remove cache dirs for names no longer in config.
     let known_names: std::collections::HashSet<&str> =
         cache_mounts.iter().map(|c| c.name.as_str()).collect();
-    if let Ok(entries) = std::fs::read_dir("/mnt/disk/cache") {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if !known_names.contains(name.as_ref()) {
-                debug!("removing stale cache dir: {name}");
-                if let Err(e) = std::fs::remove_dir_all(entry.path()) {
-                    warn!("failed to remove stale cache {name}: {e}");
-                }
-            }
+    for entry in std::fs::read_dir("/mnt/disk/cache")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !known_names.contains(name.as_ref()) {
+            debug!("removing stale cache dir: {name}");
+            std::fs::remove_dir_all(entry.path())?;
         }
     }
 
@@ -631,22 +643,20 @@ fn setup_dns() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn write_sysctl(path: &str, value: &str) {
-    if let Err(e) = std::fs::write(path, value) {
-        debug!("sysctl {path}={value} failed: {e}");
-    }
+fn write_sysctl(path: &str, value: &str) -> anyhow::Result<()> {
+    std::fs::write(path, value).map_err(|e| anyhow::anyhow!("sysctl {path}={value} failed: {e}"))
 }
 
-fn run_quiet(args: &[&str]) {
+fn run_cmd(args: &[&str]) -> anyhow::Result<()> {
     let cmd_str = args.join(" ");
-    match Command::new(args[0]).args(&args[1..]).output() {
-        Ok(output) if !output.status.success() => {
-            error!(
-                "{cmd_str}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Err(e) => error!("{cmd_str}: exec failed: {e}"),
-        Ok(_) => debug!("{cmd_str}: ok"),
+    let output = Command::new(args[0])
+        .args(&args[1..])
+        .output()
+        .map_err(|e| anyhow::anyhow!("{cmd_str}: exec failed: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("{cmd_str}: {}", stderr.trim());
     }
+    debug!("{cmd_str}: ok");
+    Ok(())
 }

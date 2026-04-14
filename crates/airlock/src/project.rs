@@ -1,19 +1,20 @@
-//! Project identity, locking, and metadata.
+//! Sandbox identity, locking, and metadata.
 //!
-//! Each host directory that runs `airlock up` gets a deterministic project hash
-//! derived from its absolute path. The per-project cache directory stores
-//! the CA keypair, lock file, overlay state, and run metadata.
+//! Each project directory that runs `airlock up` gets a `.airlock/sandbox/`
+//! directory created next to the config file. This directory stores the CA
+//! keypair, lock file, overlay state, and run metadata.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use sha2::{Digest, Sha256};
-
 use crate::config::Config;
 
-/// A resolved project: its working directory, cache paths, config, and CA.
+/// A resolved project: its working directory, sandbox paths, config, and CA.
 pub struct Project {
+    /// `.airlock/` under the project root (holds `.gitignore` and `sandbox/`).
     pub cache_dir: PathBuf,
+    /// `.airlock/sandbox/` — CA, overlay, disk image, lock, run metadata.
+    pub sandbox_dir: PathBuf,
     /// Host user's home directory.
     pub host_home: PathBuf,
     /// Absolute working directory on the host.
@@ -21,43 +22,41 @@ pub struct Project {
     /// Working directory inside the container (defaults to `host_cwd`).
     pub guest_cwd: PathBuf,
     pub config: Config,
-    pub ca_cert: PathBuf,
-    pub ca_key: PathBuf,
+    /// CA certificate PEM (read from `ca.json` at load time).
+    pub ca_cert: String,
+    /// CA private key PEM (read from `ca.json` at load time).
+    pub ca_key: String,
     /// True if the CA keypair was generated during this session (first run).
     pub ca_newly_generated: bool,
     lock_path: Option<PathBuf>,
 }
 
 impl Project {
-    /// The project's hash ID (directory name under `~/.cache/airlock/projects/`).
-    pub fn id(&self) -> String {
-        project_id(&self.cache_dir)
-    }
-
     /// Expand `~` in `path` using the host home directory.
     pub fn expand_host_tilde(&self, path: &str) -> PathBuf {
-        if path == "~" {
-            self.host_home.clone()
-        } else if let Some(rest) = path.strip_prefix("~/") {
-            self.host_home.join(rest)
-        } else {
-            PathBuf::from(path)
-        }
+        crate::util::expand_tilde(path, &self.host_home)
     }
 
     /// Check if this project has an active `airlock up` process via its PID lock.
     pub fn is_running(&self) -> bool {
-        is_running(&self.cache_dir)
+        is_running(&self.sandbox_dir)
     }
 
     /// Human-readable time since the last `airlock up` run (e.g. "2 hours ago").
     pub fn last_run_ago(&self) -> Option<String> {
-        last_run_ago(&self.cache_dir)
+        last_run_ago(&self.sandbox_dir)
     }
 
-    /// Save image + last_run metadata after a successful VM start.
+    /// Save the last_run timestamp to `run.json` after a successful start.
     pub fn save_meta(&self) {
-        save_meta(&self.cache_dir, &self.config.vm.image.name);
+        let mut meta = read_run_meta(&self.sandbox_dir);
+        meta.last_run = Some(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        );
+        let _ = write_run_meta(&self.sandbox_dir, &meta);
     }
 
     pub fn display_cwd(&self) -> String {
@@ -68,31 +67,30 @@ impl Project {
         }
     }
 
-    /// Install the project CA cert into overlay/ca/ as an extra overlayfs lowerdir.
-    /// The supervisor mounts overlay/ca as the highest-priority lowerdir, so these
-    /// files override the base image without needing symlinks or upperdir writes.
+    /// Install the sandbox CA cert into `sandbox_dir/ca/` as an extra overlayfs
+    /// lowerdir. The supervisor mounts this as the highest-priority lowerdir so
+    /// it overrides the base image without touching the upperdir.
     pub fn install_ca_cert(&self, image_rootfs: &Path) -> anyhow::Result<()> {
-        let ca_cert = std::fs::read(&self.ca_cert)?;
-        let overlay_ca_dir = self.cache_dir.join("overlay/ca");
+        let ca_cert = self.ca_cert.as_bytes();
+        // CA overlay lives at sandbox_dir/ca/ (not overlay/ca/)
+        let overlay_ca_dir = self.sandbox_dir.join("ca");
 
-        // Paths relative to rootfs for CA trust stores across distros
         let ca_stores = [
             "etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu/Alpine
             "etc/ssl/cert.pem",                  // Alpine/LibreSSL
             "etc/pki/tls/certs/ca-bundle.crt",   // RHEL/CentOS/Fedora
             "etc/ssl/ca-bundle.pem",             // openSUSE/SLES
-            "etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", // RHEL/Fedora (update-ca-trust output)
+            "etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", // RHEL/Fedora
         ];
 
         for ca_store in ca_stores {
             let dest = overlay_ca_dir.join(ca_store);
-            // Read pristine certs from image (may not exist for all distro paths)
             let existing = std::fs::read(image_rootfs.join(ca_store)).unwrap_or_default();
             let mut out = existing;
             if !out.ends_with(b"\n") && !out.is_empty() {
                 out.push(b'\n');
             }
-            out.extend_from_slice(&ca_cert);
+            out.extend_from_slice(ca_cert);
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -105,7 +103,6 @@ impl Project {
 
 impl Drop for Project {
     fn drop(&mut self) {
-        // Release the lock — only remove if it still contains our PID
         if let Some(lock_path) = &self.lock_path
             && let Ok(contents) = std::fs::read_to_string(lock_path)
             && contents.trim() == std::process::id().to_string()
@@ -115,28 +112,30 @@ impl Drop for Project {
     }
 }
 
-/// Compute a deterministic hash for a project directory path.
-pub fn project_hash(cwd: &Path) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(cwd.to_string_lossy().as_bytes());
-    hex::encode(&hasher.finalize()[..16])
-}
-
 /// Load project data without locking.
 ///
-/// Resolves the project from an optional path/hash argument,
-/// loads its config, and returns a `Project`. No lock is acquired
-/// and no CA is generated — use this for read-only subcommands.
-pub fn load(arg: Option<&str>) -> anyhow::Result<Project> {
+/// Resolves the project from the current working directory, loads its config,
+/// and returns a `Project`. No lock is acquired and no CA is generated —
+/// use this for read-only subcommands (`info`, `down`, `exec`).
+pub fn load() -> anyhow::Result<Project> {
     let home_dir =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
-    let (host_cwd, cache_dir) = resolve_project_dir(arg)?;
+    let host_cwd = {
+        let cwd = std::env::current_dir()?;
+        std::fs::canonicalize(&cwd).unwrap_or(cwd)
+    };
     let config = crate::config::load(&host_cwd)?;
-    let ca_cert = cache_dir.join("ca/ca.crt");
-    let ca_key = cache_dir.join("ca/ca.key");
-    let guest_cwd = read_guest_cwd(&cache_dir).unwrap_or_else(|| host_cwd.clone());
+    let cache_dir = host_cwd.join(".airlock");
+    let sandbox_dir = cache_dir.join("sandbox");
+    let (ca_cert, ca_key) = read_ca(&sandbox_dir).unwrap_or_default();
+    let guest_cwd = read_run_meta(&sandbox_dir)
+        .guest_cwd
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| host_cwd.clone());
     Ok(Project {
         cache_dir,
+        sandbox_dir,
         host_home: home_dir,
         host_cwd,
         guest_cwd,
@@ -148,50 +147,45 @@ pub fn load(arg: Option<&str>) -> anyhow::Result<Project> {
     })
 }
 
-/// Lock the project directory and prepare it for use.
+/// Lock the sandbox directory and prepare it for use.
 ///
-/// Writes a PID lockfile to prevent concurrent instances from
-/// modifying the same project (bundle, mounts, etc.). The lock
-/// is released when the `Project` is dropped.
+/// Creates `.airlock/sandbox/`, acquires a PID lockfile to prevent concurrent
+/// `airlock up` runs, and generates the CA keypair if missing. The lock is
+/// released when the `Project` is dropped.
 ///
-/// `host_cwd` is the project's host directory (already canonicalized).
-/// `guest_cwd_override` sets the working directory inside the container
+/// `sandbox_cwd_override` sets the working directory inside the container
 /// (defaults to `host_cwd` when `None`).
 pub fn lock(
     host_cwd: PathBuf,
     config: Config,
-    guest_cwd_override: Option<String>,
+    sandbox_cwd_override: Option<String>,
 ) -> anyhow::Result<Project> {
     let home_dir =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
 
     let host_cwd = std::fs::canonicalize(&host_cwd).unwrap_or(host_cwd);
-    let guest_cwd = guest_cwd_override.map_or_else(|| host_cwd.clone(), PathBuf::from);
+    let guest_cwd = sandbox_cwd_override.map_or_else(|| host_cwd.clone(), PathBuf::from);
 
-    let hash = project_hash(&host_cwd);
-    let dir = crate::cache::project_dir(&hash)?;
-    std::fs::create_dir_all(&dir)?;
-
-    let lock_path = dir.join("lock");
+    let cache_dir = ensure_cache_dir(&host_cwd)?;
+    let sandbox_dir = cache_dir.join("sandbox");
+    std::fs::create_dir_all(&sandbox_dir)?;
+    let lock_path = sandbox_dir.join("lock");
     acquire_lock(&lock_path)?;
 
-    // Write the cwd so project list can display it
-    std::fs::write(dir.join("cwd"), host_cwd.to_string_lossy().as_ref())?;
-    // Persist guest_cwd so `airlock exec` can default to it
-    std::fs::write(dir.join("guest_cwd"), guest_cwd.to_string_lossy().as_ref())?;
+    // Persist guest_cwd in run.json so `airlock exec` can default to it.
+    let mut meta = read_run_meta(&sandbox_dir);
+    meta.guest_cwd = Some(guest_cwd.to_string_lossy().into_owned());
+    write_run_meta(&sandbox_dir, &meta)?;
 
-    let ca_dir = dir.join("ca");
-    let ca_cert = ca_dir.join("ca.crt");
-    let ca_key = ca_dir.join("ca.key");
-
-    let ca_newly_generated = !ca_cert.exists() || !ca_key.exists();
+    let ca_newly_generated = !sandbox_dir.join("ca.json").exists();
     if ca_newly_generated {
-        std::fs::create_dir_all(&ca_dir)?;
-        generate_ca(&ca_cert, &ca_key)?;
+        generate_ca(&sandbox_dir)?;
     }
+    let (ca_cert, ca_key) = read_ca(&sandbox_dir)?;
 
     Ok(Project {
-        cache_dir: dir,
+        cache_dir,
+        sandbox_dir,
         host_home: home_dir,
         host_cwd,
         guest_cwd,
@@ -203,11 +197,24 @@ pub fn lock(
     })
 }
 
-// -- Path-based helpers (used by project list which iterates dirs directly) --
+// -- Private helpers --
+
+/// Ensure `.airlock/` exists, write `.gitignore`, and return the cache dir path.
+fn ensure_cache_dir(host_cwd: &Path) -> anyhow::Result<PathBuf> {
+    let cache_dir = host_cwd.join(".airlock");
+    std::fs::create_dir_all(&cache_dir)?;
+
+    let gitignore = cache_dir.join(".gitignore");
+    if !gitignore.exists() {
+        std::fs::write(&gitignore, "*\n")?;
+    }
+
+    Ok(cache_dir)
+}
 
 /// Check if a project is running by examining its lock file.
-pub fn is_running(project_dir: &Path) -> bool {
-    let Ok(contents) = std::fs::read_to_string(project_dir.join("lock")) else {
+pub fn is_running(sandbox_dir: &Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(sandbox_dir.join("lock")) else {
         return false;
     };
     let Ok(pid) = contents.trim().parse::<i32>() else {
@@ -216,43 +223,9 @@ pub fn is_running(project_dir: &Path) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
-/// Extract the project hash/id from the project directory name.
-pub fn project_id(project_dir: &Path) -> String {
-    project_dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
-
-/// Minimum prefix length such that all project hashes are uniquely identified,
-/// starting at 7.
-pub fn min_unique_prefix_len(ids: &[String]) -> usize {
-    if ids.len() <= 1 {
-        return 7;
-    }
-    for len in 7..=32_usize {
-        let mut prefixes: Vec<&str> = ids.iter().map(|h| &h[..len.min(h.len())]).collect();
-        prefixes.sort_unstable();
-        prefixes.dedup();
-        if prefixes.len() == ids.len() {
-            return len;
-        }
-    }
-    32
-}
-
-/// Read the saved image name for a project dir.
-pub fn image(project_dir: &Path) -> Option<String> {
-    std::fs::read_to_string(project_dir.join("image"))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
 /// Format the last run time as "X ago".
-pub fn last_run_ago(project_dir: &Path) -> Option<String> {
-    let epoch_str = std::fs::read_to_string(project_dir.join("last_run")).ok()?;
-    let epoch: u64 = epoch_str.trim().parse().ok()?;
+pub fn last_run_ago(sandbox_dir: &Path) -> Option<String> {
+    let epoch = read_run_meta(sandbox_dir).last_run?;
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
@@ -262,86 +235,38 @@ pub fn last_run_ago(project_dir: &Path) -> Option<String> {
     Some(f.convert(elapsed))
 }
 
-// -- Private helpers --
+/// Run metadata persisted to `run.json`.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct RunMeta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_run: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guest_cwd: Option<String>,
+}
 
-/// Read the persisted guest_cwd for a project (written by `lock`).
-fn read_guest_cwd(project_dir: &Path) -> Option<PathBuf> {
-    std::fs::read_to_string(project_dir.join("guest_cwd"))
+fn read_run_meta(sandbox_dir: &Path) -> RunMeta {
+    std::fs::read_to_string(sandbox_dir.join("run.json"))
         .ok()
-        .map(|s| PathBuf::from(s.trim()))
-        .filter(|p| !p.as_os_str().is_empty())
-}
-
-/// Resolve a project directory from an optional path/hash argument.
-///
-/// Supports these `arg` formats:
-/// - `None` — use the current directory
-/// - `"abc1234"` — hash prefix (7–32 hex chars)
-/// - `"/path/to/dir"` — host path
-fn resolve_project_dir(arg: Option<&str>) -> anyhow::Result<(PathBuf, PathBuf)> {
-    match arg {
-        None => resolve_from_path(None),
-        Some(s) => {
-            if looks_like_hash(s) {
-                resolve_from_hash_prefix(s)
-            } else {
-                resolve_from_path(Some(s))
-            }
-        }
-    }
-}
-
-fn looks_like_hash(s: &str) -> bool {
-    s.len() >= 7 && s.len() <= 32 && s.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-fn resolve_from_path(path: Option<&str>) -> anyhow::Result<(PathBuf, PathBuf)> {
-    let cwd = if let Some(p) = path {
-        let p = PathBuf::from(p);
-        std::fs::canonicalize(&p).unwrap_or(p)
-    } else {
-        let cwd = std::env::current_dir()?;
-        std::fs::canonicalize(&cwd).unwrap_or(cwd)
-    };
-    let hash = project_hash(&cwd);
-    let project_dir = crate::cache::project_dir(&hash)?;
-    Ok((cwd, project_dir))
-}
-
-fn resolve_from_hash_prefix(prefix: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
-    let projects_dir = crate::cache::cache_dir()?.join("projects");
-    let mut matches = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&projects_dir) {
-        for entry in entries.flatten() {
-            let dir_name = entry.file_name().to_string_lossy().into_owned();
-            if dir_name.starts_with(prefix) {
-                matches.push(entry.path());
-            }
-        }
-    }
-    match matches.len() {
-        0 => anyhow::bail!("no project found with id '{prefix}'"),
-        1 => {
-            let project_dir = matches.remove(0);
-            let cwd = std::fs::read_to_string(project_dir.join("cwd"))
-                .map_or_else(|_| project_dir.clone(), |s| PathBuf::from(s.trim()));
-            Ok((cwd, project_dir))
-        }
-        n => anyhow::bail!("ambiguous id '{prefix}' — matches {n} projects"),
-    }
-}
-
-fn save_meta(project_dir: &Path, image: &str) {
-    let _ = std::fs::write(project_dir.join("image"), image);
-    let epoch = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
+        .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
-        .as_secs();
-    let _ = std::fs::write(project_dir.join("last_run"), epoch.to_string());
 }
 
-/// Atomic PID lock acquisition via write-then-verify. Retries up to 10
-/// times to handle concurrent launch races.
+fn write_run_meta(sandbox_dir: &Path, meta: &RunMeta) -> anyhow::Result<()> {
+    let json = serde_json::to_string_pretty(meta)?;
+    let tmp = sandbox_dir.join(".run.json.tmp");
+    std::fs::write(&tmp, &json)?;
+    std::fs::rename(&tmp, sandbox_dir.join("run.json"))?;
+    Ok(())
+}
+
+/// CA keypair data stored in `ca.json`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CaData {
+    cert: String,
+    key: String,
+}
+
+/// Atomic PID lock acquisition via write-then-verify, retrying up to 10 times.
 fn acquire_lock(lock_path: &Path) -> anyhow::Result<()> {
     let my_pid = std::process::id().to_string();
     let mut attempts = 0;
@@ -353,7 +278,7 @@ fn acquire_lock(lock_path: &Path) -> anyhow::Result<()> {
                 && unsafe { libc::kill(pid, 0) } == 0
             {
                 anyhow::bail!(
-                    "another airlock instance (pid {pid}) is using this project. \
+                    "another airlock instance (pid {pid}) is using this sandbox. \
                      If this is stale, remove {}",
                     lock_path.display()
                 );
@@ -371,11 +296,11 @@ fn acquire_lock(lock_path: &Path) -> anyhow::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         attempts += 1;
     }
-    Err(anyhow::anyhow!("failed to obtain project lock"))
+    Err(anyhow::anyhow!("failed to obtain sandbox lock"))
 }
 
-/// Generate a self-signed CA certificate used for MITM TLS interception.
-fn generate_ca(cert_path: &Path, key_path: &Path) -> anyhow::Result<()> {
+/// Generate a self-signed CA keypair and write it to `ca.json`.
+fn generate_ca(sandbox_dir: &Path) -> anyhow::Result<()> {
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 
     let mut params = CertificateParams::new(vec![])?;
@@ -387,7 +312,22 @@ fn generate_ca(cert_path: &Path, key_path: &Path) -> anyhow::Result<()> {
     let key_pair = KeyPair::generate()?;
     let cert = params.self_signed(&key_pair)?;
 
-    std::fs::write(cert_path, cert.pem())?;
-    std::fs::write(key_path, key_pair.serialize_pem())?;
+    let ca_data = CaData {
+        cert: cert.pem(),
+        key: key_pair.serialize_pem(),
+    };
+    std::fs::write(
+        sandbox_dir.join("ca.json"),
+        serde_json::to_string_pretty(&ca_data)?,
+    )?;
+
     Ok(())
+}
+
+/// Read the CA cert and key PEM strings from `ca.json`.
+fn read_ca(sandbox_dir: &Path) -> anyhow::Result<(String, String)> {
+    let json = std::fs::read_to_string(sandbox_dir.join("ca.json"))
+        .map_err(|_| anyhow::anyhow!("CA not found — run `airlock up` first"))?;
+    let ca: CaData = serde_json::from_str(&json)?;
+    Ok((ca.cert, ca.key))
 }

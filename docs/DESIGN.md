@@ -112,9 +112,9 @@ Supervisor
   shutdown() → ()
     # Sync filesystems before VM teardown.
 
-CliService   (Unix socket: <project-cache>/cli.sock)
+CliService   (Unix socket: <project>/.airlock/sandbox/cli.sock)
   exec(stdin, pty, cmd, args, cwd, env) → Process
-    # Exposed by `airlock go` for `airlock exec` to connect to.
+    # Exposed by `airlock up` for `airlock exec` to connect to.
 
 Process
   poll() → (exit:Int32 | stdout:Data | stderr:Data)
@@ -139,9 +139,10 @@ Inside the VM, the init script mounts essential filesystems (`/proc`, `/sys`,
 `/dev`, `/cgroup2`) then launches the supervisor (`airlockd`). The supervisor's
 init closure (called on the first `start` RPC) does the heavy setup:
 
-1. **Mount VirtioFS shares** — `base` (read-only image rootfs) and `overlay`
-   (CA certs, file mount staging dirs) are mounted unconditionally. The full
-   mount list is received via the `start` RPC (no separate `mounts.json`).
+1. **Mount VirtioFS shares** — `base` (read-only image rootfs), `ca` (CA cert
+   lowerdir), and `files/rw` + `files/ro` (file mount staging) are mounted as
+   needed. The full mount list is received via the `start` RPC (no separate
+   `mounts.json`).
 
 2. **Set system clock** — host passes a Unix epoch in the start RPC so the
    guest clock is correct from the start.
@@ -154,7 +155,7 @@ init closure (called on the first `start` RPC) does the heavy setup:
    enlarged.
 
 5. **Assemble overlayfs rootfs**:
-   - **lower**: CA cert layer (`/mnt/overlay/ca`) if present, then base image
+   - **lower**: CA cert layer (`/mnt/ca`) if present, then base image
      (`/mnt/base`). Leftmost = highest priority.
    - **upper + work**: on the ext4 disk (`/mnt/disk/overlay/rootfs` and
      `/mnt/disk/overlay/work`). The overlay is reset if the image ID changes.
@@ -195,8 +196,8 @@ carried in the `start` RPC call rather than written to a `config.json` file.
 `airlock exec` attaches a new process to an already-running container without
 rebooting the VM. Flow:
 
-1. `airlock exec` connects to `<project-cache>/cli.sock` (Unix socket, Cap'n
-   Proto RPC) that `airlock go` exposes while the VM is running.
+1. `airlock exec` connects to `<project>/.airlock/sandbox/cli.sock` (Unix
+   socket, Cap'n Proto RPC) that `airlock up` exposes while the VM is running.
 2. The CLI server forwards the exec request to the in-VM supervisor via the
    existing RPC connection (reusing the established vsock).
 3. The supervisor forks a new process inside the container's chroot namespace.
@@ -226,8 +227,8 @@ read-write as configured.
 
 VirtioFS does not support file-level bind mounts reliably. Instead:
 
-1. The file is hard-linked into a staging directory (`overlay/files/rw/` or
-   `overlay/files/ro/`) which is the VirtioFS share root.
+1. The file is hard-linked into a staging directory (`sandbox/overlay/files/rw/` or
+   `sandbox/overlay/files/ro/`) which is the VirtioFS share root.
 2. Inside the rootfs, a symlink at the target path points into
    `/airlock/.files/rw` or `/airlock/.files/ro`.
 
@@ -239,12 +240,12 @@ is copied with a warning that sync is one-way.
 
 The project CA certificate (used for TLS interception) is installed as an
 extra overlayfs lowerdir rather than a symlink or file mount. The cert bundle
-is written to `overlay/ca/` mirroring the distro's CA store paths (e.g.
-`overlay/ca/etc/ssl/certs/ca-certificates.crt`). The supervisor prepends
+is written to `sandbox/ca/` mirroring the distro's CA store paths (e.g.
+`sandbox/ca/etc/ssl/certs/ca-certificates.crt`). The supervisor prepends
 `/mnt/overlay/ca` as the highest-priority lowerdir:
 
 ```
-lowerdir=/mnt/overlay/ca:/mnt/base
+lowerdir=/mnt/ca:/mnt/base
 ```
 
 The cert appears as a regular file inside the container, which is required by
@@ -322,49 +323,79 @@ directory.
 
 ## Project management
 
-### Identity and cache
+### Sandbox directory
 
-Each project is identified by the SHA256 hash of its canonical working
-directory path. State is stored in `~/.cache/airlock/projects/<hash>/`:
+Each project stores its sandbox state locally in `.airlock/` next to the
+config file. A `.gitignore` containing `*` is written there automatically so
+nothing under `.airlock/` is tracked by version control.
 
 ```
-<hash>/
-  lock              # PID lock (one VM per project at a time)
-  cwd               # Canonical working directory (for display)
-  guest_cwd         # Working directory inside container (if overridden)
-  image             # Last used image name
-  last_run          # Unix epoch of last run
-  disk.img          # Sparse ext4 image (overlay upper + caches)
-  ca/
-    ca.crt          # Self-signed CA cert (PEM)
-    ca.key          # CA private key (PEM)
-  overlay/
-    files/rw/       # Hard-linked rw file mounts (VirtioFS share root)
-    files/ro/       # Hard-linked ro file mounts (VirtioFS share root)
-    ca/             # CA cert tree (overlayfs lowerdir)
-  cli.sock          # Unix socket for airlock exec RPC
+<project>/
+  airlock.toml                   # user config (tracked by VCS)
+  .airlock/
+    .gitignore                   # contains "*" — auto-created
+    sandbox/
+      ca.json                    # CA cert + key PEMs (JSON, single source of truth)
+      ca/                        # overlayfs lowerdir: CA cert injected into container
+      │                          #   trust stores (etc/ssl/certs/…, etc/pki/…)
+      overlay/
+        files/rw/{key}           # hard-linked writable file mounts (VirtioFS share root)
+        files/ro/{key}           # hard-linked read-only file mounts (VirtioFS share root)
+      disk.img                   # virtio-blk ext4 volume (rootfs overlay upper + caches)
+      run.json                   # last_run timestamp, guest_cwd override
+      run.log                    # tracing log from last `airlock up`
+      lock                       # PID lockfile (one VM per project at a time)
+      cli.sock                   # Unix socket for `airlock exec` RPC
+      image                      # hard-link to image_cache/meta.json (GC ref + digest)
 ```
+
+`airlock down` removes the entire `.airlock/` directory. The config file is
+untouched.
+
+### CA keypair
+
+On first `airlock up`, a self-signed CA keypair is generated and written to
+`sandbox/ca.json` as a JSON object with `cert` and `key` PEM fields. The PEM
+strings are read into memory at startup — no further file reads are needed at
+TLS setup time. The CA cert is injected into the container via the `sandbox/ca/`
+overlayfs lowerdir so containers trust it automatically.
 
 ### Image cache
 
 Images are cached at `~/.cache/airlock/images/<manifest-digest>/`:
 
 ```
-<digest>/
-  rootfs/            # All layers merged (read-only)
-  image_config.json  # OCI image config (CMD, ENV, user, etc.)
-  layer_*.tar.gz     # Raw layer blobs
+~/.cache/airlock/
+  kernel/
+    Image                    # Linux kernel (extracted from binary on first run)
+    initramfs.gz             # initramfs
+    cloud-hypervisor         # (Linux only) hypervisor binary
+    virtiofsd                # (Linux only) VirtioFS daemon
+    checksum                 # triggers re-extraction when binary is updated
+  images/<digest>/
+    rootfs/                  # All OCI layers merged (read-only, shared)
+    image_config.json        # OCI image config (CMD, ENV, user, etc.)
+    meta.json                # {"digest": "sha256:...", "name": "alpine:latest"}
+    layer_*.tar.gz           # Raw layer blobs
 ```
 
 The image cache is shared across all projects. Platform is fixed to
-`linux/arm64` (matching the VM architecture). A stored per-project digest
-file detects image changes across runs; if the digest changes the overlay
-upper layer is reset.
+`linux/arm64` (matching the VM architecture).
+
+`meta.json` is written as the final step of a successful image pull — its
+presence signals that the image is complete and ready to use (replaces the
+old `.complete` marker). It is hard-linked to `sandbox/image`; a link count
+greater than 1 on `meta.json` means at least one sandbox references the
+image, preventing GC.
+
+`sandbox/image` is the per-project GC ref and also the stored-digest source:
+reading it as JSON gives the digest used to detect image changes across runs.
+When the digest changes the overlay upper layer is reset.
 
 ### Locking
 
-The lock file contains the running PID. If a lock file exists and the PID is
-alive, `airlock go` refuses to start (one VM per working directory). Stale
+`sandbox/lock` contains the running PID. If the lock file exists and the PID
+is alive, `airlock up` refuses to start (one VM per project at a time). Stale
 locks (dead PID) are silently cleared.
 
 

@@ -35,11 +35,10 @@ async fn main() {
 
     let exit_code = match parsed.command {
         Command::Up {
-            path,
             log_level,
-            project_cwd,
+            sandbox_cwd,
             login,
-        } => cli::cmd_up::run(path, log_level, extra_args, project_cwd, login).await,
+        } => cli::cmd_up::run(log_level, extra_args, sandbox_cwd, login).await,
         Command::Exec {
             cmd,
             args,
@@ -53,26 +52,19 @@ async fn main() {
             }
             cli::cmd_exec::run(cmd, args, cwd, env, login).await
         }
-        Command::Info { path } => {
+        Command::Info => {
             if !extra_args.is_empty() {
                 cli::error!("'--' args are only supported with 'up'");
                 std::process::exit(2);
             }
-            cli::cmd_info::run(path.as_deref())
+            cli::cmd_info::run()
         }
-        Command::List => {
+        Command::Down { force } => {
             if !extra_args.is_empty() {
                 cli::error!("'--' args are only supported with 'up'");
                 std::process::exit(2);
             }
-            cli::cmd_list::run()
-        }
-        Command::Down { path, force } => {
-            if !extra_args.is_empty() {
-                cli::error!("'--' args are only supported with 'up'");
-                std::process::exit(2);
-            }
-            cli::cmd_down::run(path.as_deref(), force)
+            cli::cmd_down::run(force)
         }
     };
 

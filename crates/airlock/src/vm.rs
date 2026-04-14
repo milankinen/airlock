@@ -121,14 +121,15 @@ pub async fn start(
     image: &OciImage,
 ) -> anyhow::Result<(VmInstance, OwnedFd)> {
     let assets = Assets::init(project)?;
-    let overlay_dir = project.cache_dir.join("overlay");
+    // CA overlay lives at sandbox_dir/ca/; files overlay at sandbox_dir/overlay/
+    let overlay_dir = project.sandbox_dir.join("overlay");
 
     project.install_ca_cert(&image.rootfs)?;
 
     let mounts = assemble_mounts(project, image)?;
-    let shares = prepare_shares(image, &mounts, &overlay_dir)?;
+    let shares = prepare_shares(image, &mounts, &project.sandbox_dir)?;
     let (disk_image, caches) = disk::prepare(
-        &project.cache_dir,
+        &project.sandbox_dir,
         &project.config.disk,
         &image.container_home,
         &project.host_cwd,
@@ -147,7 +148,7 @@ pub async fn start(
         kernel_cmdline: build_kernel_cmdline(args, project, &shares),
         shares,
         cache_disk: Some(disk_image.clone()),
-        runtime_dir: project.cache_dir.clone(),
+        runtime_dir: project.sandbox_dir.clone(),
         #[cfg(target_os = "linux")]
         cloud_hypervisor: assets.cloud_hypervisor,
         #[cfg(target_os = "linux")]
@@ -178,7 +179,7 @@ pub async fn start(
     ))
 }
 
-/// Build the project dir mount and resolve all enabled user mounts.
+/// Build the sandbox dir mount and resolve all enabled user mounts.
 fn assemble_mounts(
     project: &Project,
     image: &OciImage,
@@ -218,17 +219,19 @@ fn assemble_mounts(
 ///
 /// File mounts are hard-linked (copy fallback on EXDEV) into
 /// `overlay/files/{rw,ro}/{key}` and exposed as two consolidated shares.
+/// CA overlay lives at `sandbox_dir/ca/`; files overlay at `sandbox_dir/overlay/files/`.
 fn prepare_shares(
     image: &OciImage,
     mounts: &[mount::ResolvedMount],
-    overlay_dir: &Path,
+    sandbox_dir: &Path,
 ) -> anyhow::Result<Vec<VmShare>> {
     let mut shares = vec![VmShare {
         tag: "base".to_string(),
         host_path: image.rootfs.clone(),
         read_only: true,
     }];
-    let ca_dir = overlay_dir.join("ca");
+    // CA overlay is at sandbox_dir/ca/ (was overlay/ca/)
+    let ca_dir = sandbox_dir.join("ca");
     if ca_dir.exists() {
         shares.push(VmShare {
             tag: "ca".to_string(),
@@ -257,8 +260,8 @@ fn prepare_shares(
 
     // Hard-link file mounts into overlay/files/{rw|ro}/{key}. Rebuild from
     // scratch each boot so stale entries are removed.
-    let files_rw_dir = overlay_dir.join("files").join("rw");
-    let files_ro_dir = overlay_dir.join("files").join("ro");
+    let files_rw_dir = sandbox_dir.join("overlay").join("files").join("rw");
+    let files_ro_dir = sandbox_dir.join("overlay").join("files").join("ro");
     let _ = std::fs::remove_dir_all(&files_rw_dir);
     let _ = std::fs::remove_dir_all(&files_ro_dir);
     let mut has_rw_files = false;

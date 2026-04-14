@@ -27,9 +27,9 @@ use crate::config::config::DefaultMode;
 use crate::network::target::{NetworkTarget, ResolvedTarget};
 use crate::project::Project;
 
-/// Build the [`Network`] from the project config: load native CA roots,
+/// Build the [`Network`] from the sandbox config: load native CA roots,
 /// compile middleware scripts, resolve network targets, and prepare the
-/// TLS interceptor with the project's CA.
+/// TLS interceptor with the sandbox's CA.
 pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network> {
     let mut root_store = rustls::RootCertStore::empty();
     for cert in rustls_native_certs::load_native_certs().expect("native certs") {
@@ -44,9 +44,7 @@ pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network>
     let log = middleware::tracing_log();
     let (allow_targets, deny_targets) = rules::resolve(net, &log)?;
 
-    let ca_cert = std::fs::read_to_string(&project.ca_cert)?;
-    let ca_key = std::fs::read_to_string(&project.ca_key)?;
-    let interceptor = tls::TlsInterceptor::new(&ca_cert, &ca_key)?;
+    let interceptor = tls::TlsInterceptor::new(&project.ca_cert, &project.ca_key)?;
 
     let socket_map: HashMap<String, PathBuf> = net
         .sockets
