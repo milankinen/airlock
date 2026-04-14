@@ -26,10 +26,12 @@ impl CloudHypervisorBackend {
     /// Launch virtiofsd instances and cloud-hypervisor, then wait for sockets.
     pub fn start(config: &VmConfig) -> anyhow::Result<Self> {
         let runtime_dir = &config.runtime_dir;
+        let vfs_dir = runtime_dir.join("vfs");
+        std::fs::create_dir_all(&vfs_dir)?;
         let vsock_socket_path = runtime_dir.join("vsock.sock");
 
         // Clean up leftover sockets
-        cleanup_sockets(runtime_dir);
+        cleanup_sockets(runtime_dir, &vfs_dir);
 
         let host_uid = unsafe { libc::getuid() };
         let host_gid = unsafe { libc::getgid() };
@@ -39,7 +41,8 @@ impl CloudHypervisorBackend {
         let mut fs_args: Vec<String> = Vec::new();
 
         for share in &config.shares {
-            let sock_path = runtime_dir.join(format!("vfs-{}.sock", share.tag));
+            let sock_name = share.tag.replace('/', "-");
+            let sock_path = vfs_dir.join(format!("{sock_name}.sock"));
             let _ = std::fs::remove_file(&sock_path);
 
             let mut cmd = Command::new(&config.virtiofsd);
@@ -187,7 +190,7 @@ impl Drop for CloudHypervisorBackend {
             let _ = child.kill();
             let _ = child.wait();
         }
-        cleanup_sockets(&self.runtime_dir);
+        cleanup_sockets(&self.runtime_dir, &self.runtime_dir.join("vfs"));
     }
 }
 
@@ -226,7 +229,7 @@ fn spawn_stderr_drain(tag: &str, child: &mut Child) {
     }
 }
 
-fn cleanup_sockets(dir: &Path) {
+fn cleanup_sockets(dir: &Path, vfs_dir: &Path) {
     let patterns = ["vsock.sock", "ch-api.sock"];
     for pat in &patterns {
         let _ = std::fs::remove_file(dir.join(pat));
@@ -237,11 +240,11 @@ fn cleanup_sockets(dir: &Path) {
         airlock_protocol::SUPERVISOR_PORT,
     ));
     // Clean virtiofsd sockets
-    if let Ok(entries) = std::fs::read_dir(dir) {
+    if let Ok(entries) = std::fs::read_dir(vfs_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with("vfs-") && name.ends_with(".sock") {
+            if name.ends_with(".sock") {
                 let _ = std::fs::remove_file(entry.path());
             }
         }

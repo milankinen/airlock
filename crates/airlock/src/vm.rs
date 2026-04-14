@@ -479,7 +479,7 @@ async fn boot_backend(
                 }
             }
         };
-        return Ok((Box::new(backend), vsock_fd));
+        Ok((Box::new(backend), vsock_fd))
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
