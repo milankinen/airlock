@@ -4,10 +4,10 @@
 //! `cli::progress_bar()` / `cli::spinner()` for progress,
 //! and `cli::interrupted()` for Ctrl+C cancellation.
 
-pub mod cmd_down;
 pub mod cmd_exec;
-pub mod cmd_info;
-pub mod cmd_up;
+pub mod cmd_rm;
+pub mod cmd_show;
+pub mod cmd_start;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -59,43 +59,14 @@ pub struct GlobalArgs {
 #[derive(Subcommand)]
 pub enum Command {
     /// Start the sandbox VM for the current project directory
-    Up {
-        /// Log level
-        #[arg(long, env = "AIRLOCK_LOG_LEVEL", default_value = "info")]
-        log_level: LogLevel,
-        /// Working directory inside the container (defaults to the host cwd)
-        #[arg(long)]
-        sandbox_cwd: Option<String>,
-        /// Run the container command inside a login shell (sources /etc/profile, ~/.profile)
-        #[arg(short = 'l', long)]
-        login: bool,
-    },
+    Start(cmd_start::StartArgs),
     /// Remove the current project data
-    Down {
-        /// Skip confirmation prompt
-        #[arg(short = 'f', long)]
-        force: bool,
-    },
+    Rm(cmd_rm::RmArgs),
     /// Execute a command inside the running sandbox VM
     #[command(alias = "x")]
-    Exec {
-        /// Command to run
-        cmd: String,
-        /// Arguments for the command
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-        /// Working directory inside the container
-        #[arg(short = 'w', long)]
-        cwd: Option<String>,
-        /// Environment variables (KEY=VALUE)
-        #[arg(short = 'e', long = "env")]
-        env: Vec<String>,
-        /// Run the command inside a login shell (sources /etc/profile, ~/.profile)
-        #[arg(short = 'l', long)]
-        login: bool,
-    },
+    Exec(cmd_exec::ExecArgs),
     /// Show the current project info
-    Info,
+    Show(cmd_show::ShowArgs),
 }
 
 /// Runtime arguments for the `up` command. Constructed from parsed CLI args
@@ -130,6 +101,7 @@ pub enum LogLevel {
 
 static SILENT: AtomicBool = AtomicBool::new(false);
 static IS_TTY: AtomicBool = AtomicBool::new(false);
+static VERBOSE: AtomicBool = AtomicBool::new(false);
 
 static INTERRUPTED: std::sync::LazyLock<(watch::Sender<bool>, watch::Receiver<bool>)> =
     std::sync::LazyLock::new(|| watch::channel(false));
@@ -217,6 +189,27 @@ pub fn is_silent() -> bool {
     SILENT.load(Ordering::Relaxed)
 }
 
+/// Returns true if `--verbose` was passed.
+pub fn is_verbose() -> bool {
+    VERBOSE.load(Ordering::Relaxed)
+}
+
+/// Enable verbose output for the current command.
+pub fn set_verbose(value: bool) {
+    VERBOSE.store(value, Ordering::Relaxed);
+}
+
+/// Format a byte count as a human-readable string (GB/MB/KB).
+pub fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{} KB", bytes / 1024)
+    }
+}
+
 /// Returns true if the user has pressed Ctrl+C / SIGTERM.
 pub fn is_interrupted() -> bool {
     *INTERRUPTED.1.borrow()
@@ -249,8 +242,17 @@ macro_rules! _error {
     };
 }
 
+macro_rules! _verbose {
+    ($($arg:tt)*) => {
+        if $crate::cli::is_verbose() && !$crate::cli::is_silent() {
+            eprint!("{}\r\n", format_args!($($arg)*));
+        }
+    };
+}
+
 pub(crate) use _error as error;
 pub(crate) use _log as log;
+pub(crate) use _verbose as verbose;
 
 /// Create a progress bar for downloading (unless silent).
 pub fn progress_bar(total: u64, prefix: &str) -> ProgressBar {

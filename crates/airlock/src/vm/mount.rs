@@ -5,8 +5,6 @@ use std::path::{Path, PathBuf};
 /// A mount with host/guest paths fully expanded and validated.
 #[derive(Debug)]
 pub struct ResolvedMount {
-    /// Source + target (with `~`) for display (only for config mounts)
-    pub display: Option<(String, String)>,
     /// Mount type: file / directory
     pub mount_type: MountType,
     /// Expanded absolute source path on host.
@@ -132,7 +130,6 @@ pub fn resolve_mounts(
         };
 
         result.push(ResolvedMount {
-            display: Some((m.source.clone(), m.target.clone())),
             source,
             mount_type,
             target: target.to_string_lossy().to_string(),

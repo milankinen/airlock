@@ -1,9 +1,15 @@
-//! `airlock info` — display sandbox details.
+//! `airlock show` — display sandbox details.
+
+use clap::Args;
 
 use crate::{cli, project};
 
+/// CLI arguments for `airlock show`.
+#[derive(Args, Debug)]
+pub struct ShowArgs {}
+
 /// Print sandbox metadata (path, status, image, config) to stdout.
-pub fn run() -> i32 {
+pub fn run(_args: &ShowArgs) -> i32 {
     let project = match project::load() {
         Ok(s) => s,
         Err(e) => {
@@ -14,7 +20,7 @@ pub fn run() -> i32 {
 
     if !project.sandbox_dir.exists() {
         cli::error!(
-            "No project data for {} — run `airlock up` first",
+            "No project data for {} — run `airlock start` first",
             project.host_cwd.display()
         );
         return 1;
@@ -38,6 +44,14 @@ pub fn run() -> i32 {
 
     println!("Sandbox:  {}", project.sandbox_dir.display());
 
+    if let Some((used, total)) = project.disk_usage() {
+        println!(
+            "Disk:     {} / {}",
+            cli::format_bytes(used),
+            cli::format_bytes(total)
+        );
+    }
+
     if !project.config.disk.cache.is_empty() {
         println!("Disk cache:");
         for (key, mount) in &project.config.disk.cache {
@@ -50,7 +64,10 @@ pub fn run() -> i32 {
         println!("Mounts:");
         for (key, mount) in &project.config.mounts {
             let status = if mount.enabled { "" } else { " (disabled)" };
-            println!("  {key}: {} → {}{status}", mount.source, mount.target);
+            println!(
+                "  {key}: {} \u{2192} {}{status}",
+                mount.source, mount.target
+            );
         }
     }
 

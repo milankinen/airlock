@@ -138,7 +138,7 @@ pub async fn start(
     let env = resolve_env(project, image)?;
     let cwd = project.guest_cwd.to_string_lossy().into_owned();
 
-    log_config(project, &mounts, &shares);
+    log_config(project, &shares);
 
     let vm_config = config::VmConfig {
         cpus: project.config.vm.cpus,
@@ -185,7 +185,6 @@ fn assemble_mounts(
     image: &OciImage,
 ) -> anyhow::Result<Vec<mount::ResolvedMount>> {
     let project_mount = mount::ResolvedMount {
-        display: None,
         mount_type: mount::MountType::Dir {
             key: "project".to_string(),
         },
@@ -370,7 +369,7 @@ fn build_kernel_cmdline(args: &CliArgs, project: &Project, shares: &[VmShare]) -
 }
 
 /// Log the resolved VM configuration to the terminal and trace output.
-fn log_config(project: &Project, mounts: &[mount::ResolvedMount], shares: &[VmShare]) {
+fn log_config(project: &Project, shares: &[VmShare]) {
     cli::log!(
         "  {} cpus:   {}",
         cli::bullet(),
@@ -381,43 +380,6 @@ fn log_config(project: &Project, mounts: &[mount::ResolvedMount], shares: &[VmSh
         cli::bullet(),
         cli::dim(&project.config.vm.memory.to_string())
     );
-    let cache_paths: Vec<&str> = project
-        .config
-        .disk
-        .cache
-        .values()
-        .filter(|c| c.enabled)
-        .flat_map(|c| c.paths.iter().map(String::as_str))
-        .collect();
-    let disk_info = if cache_paths.is_empty() {
-        project.config.disk.size.to_string()
-    } else {
-        format!(
-            "{} (caches: {})",
-            project.config.disk.size,
-            cache_paths.join(", ")
-        )
-    };
-    cli::log!("  {} disk:   {}", cli::bullet(), cli::dim(&disk_info));
-
-    let display_mounts: Vec<_> = mounts.iter().filter(|m| m.display.is_some()).collect();
-    if !display_mounts.is_empty() {
-        cli::log!(
-            "  {} mounts: {}",
-            cli::bullet(),
-            cli::dim(&display_mounts.len().to_string())
-        );
-        for m in &display_mounts {
-            let (source, target) = m.display.as_ref().unwrap();
-            let mode = if m.read_only { "ro" } else { "rw" };
-            cli::log!(
-                "    {} {}",
-                cli::bullet(),
-                cli::dim(&format!("{source} → {target} ({mode})"))
-            );
-        }
-    }
-
     for share in shares {
         tracing::debug!(
             "share: tag={}, host_path={}, ro={}",

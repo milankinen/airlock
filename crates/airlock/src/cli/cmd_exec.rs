@@ -1,45 +1,58 @@
 //! `airlock exec` — attach a process to a running VM container.
 //!
-//! Connects to the `cli.sock` Unix socket exposed by a running `airlock go` session
+//! Connects to the `cli.sock` Unix socket exposed by a running `airlock start` session
 //! and sends a `CliService.exec()` RPC to spawn a new process inside the
 //! container. I/O is bridged between the host terminal and the guest process.
 
 use std::io::Write;
 
 use airlock_protocol::supervisor_capnp::*;
+use clap::Args;
 use futures::AsyncReadExt;
 use tokio::task::LocalSet;
 
 use crate::{cli, project, rpc, terminal};
 
+/// CLI arguments for `airlock exec`.
+#[derive(Args, Debug)]
+pub struct ExecArgs {
+    /// Command to run
+    pub cmd: String,
+    /// Arguments for the command
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub args: Vec<String>,
+    /// Working directory inside the container
+    #[arg(short = 'w', long)]
+    pub cwd: Option<String>,
+    /// Environment variables (KEY=VALUE)
+    #[arg(short = 'e', long = "env")]
+    pub env: Vec<String>,
+    /// Run the command inside a login shell (sources /etc/profile, ~/.profile)
+    #[arg(short = 'l', long)]
+    pub login: bool,
+}
+
 /// Entry point for `airlock exec <cmd> [args...]`.
-pub async fn run(
-    cmd: String,
-    args: Vec<String>,
-    cwd: Option<String>,
-    env: Vec<String>,
-    login: bool,
-) -> i32 {
+pub async fn run(args: ExecArgs) -> i32 {
     let local = LocalSet::new();
     local
         .run_until(async {
-            run_inner(cmd, args, cwd, env, login)
-                .await
-                .unwrap_or_else(|e| {
-                    cli::error!("{e:#}");
-                    1
-                })
+            run_inner(args).await.unwrap_or_else(|e| {
+                cli::error!("{e:#}");
+                1
+            })
         })
         .await
 }
 
-async fn run_inner(
-    cmd: String,
-    args: Vec<String>,
-    cwd: Option<String>,
-    env: Vec<String>,
-    login: bool,
-) -> anyhow::Result<i32> {
+async fn run_inner(args: ExecArgs) -> anyhow::Result<i32> {
+    let ExecArgs {
+        cmd,
+        args,
+        cwd,
+        env,
+        login,
+    } = args;
     let project = project::load()?;
     let (cmd, args) = if login {
         apply_login_shell(cmd, args)

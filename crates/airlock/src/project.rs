@@ -59,6 +59,18 @@ impl Project {
         let _ = write_run_meta(&self.sandbox_dir, &meta);
     }
 
+    /// Actual and apparent size of the sandbox disk image.
+    ///
+    /// Returns `(used, total)` in bytes. The disk is a sparse file so `used`
+    /// is the number of allocated blocks (`blocks() * 512`) while `total` is
+    /// the virtual file size. Returns `None` if the disk image does not exist.
+    pub fn disk_usage(&self) -> Option<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let path = self.sandbox_dir.join("disk.img");
+        let meta = std::fs::metadata(path).ok()?;
+        Some((meta.blocks() * 512, meta.len()))
+    }
+
     pub fn display_cwd(&self) -> String {
         if self.host_cwd == self.guest_cwd {
             self.host_cwd.display().to_string()

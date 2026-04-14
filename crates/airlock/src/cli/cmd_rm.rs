@@ -1,12 +1,21 @@
-//! `airlock down` — delete a sandbox's cached state.
+//! `airlock rm` — delete a sandbox's cached state.
 
+use clap::Args;
 use dialoguer::Select;
 use dialoguer::theme::ColorfulTheme;
 
 use crate::{cli, project};
 
+/// CLI arguments for `airlock rm`.
+#[derive(Args, Debug)]
+pub struct RmArgs {
+    /// Skip confirmation prompt
+    #[arg(short = 'f', long)]
+    pub force: bool,
+}
+
 /// Remove the sandbox directory after confirmation (unless `--force`).
-pub fn run(force: bool) -> i32 {
+pub fn run(args: &RmArgs) -> i32 {
     let project = match project::load() {
         Ok(s) => s,
         Err(e) => {
@@ -24,7 +33,7 @@ pub fn run(force: bool) -> i32 {
         return 1;
     }
 
-    if !force {
+    if !args.force {
         let selection = Select::with_theme(&ColorfulTheme::default())
             .with_prompt("Remove project data?")
             .items(["Yes", "No"])

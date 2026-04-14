@@ -1,10 +1,11 @@
-//! `airlock up` — boot the VM and run the container.
+//! `airlock start` — boot the VM and run the container.
 //!
 //! Orchestrates the full lifecycle: load config → pull OCI image → set up
 //! network rules → boot VM → start supervisor RPC → relay I/O → clean up.
 
 use std::io::Write;
 
+use clap::Args;
 use dialoguer::Select;
 use dialoguer::theme::ColorfulTheme;
 use tokio::task::LocalSet;
@@ -17,13 +18,27 @@ use crate::{cli_server, config, network, oci, rpc, terminal, vm};
 /// Default `airlock.toml` written when initializing a new sandbox.
 const DEFAULT_CONFIG: &str = "[vm]\n# image = \"alpine:latest\"\n";
 
-/// Entry point for `airlock up [--log-level <level>] [-- extra-args...]`.
-pub async fn run(
-    log_level: LogLevel,
-    extra_args: Vec<String>,
-    project_cwd: Option<String>,
-    login: bool,
-) -> i32 {
+/// CLI arguments for `airlock start`.
+#[derive(Args, Debug)]
+pub struct StartArgs {
+    /// Log level
+    #[arg(long, env = "AIRLOCK_LOG_LEVEL", default_value = "info")]
+    pub log_level: LogLevel,
+    /// Working directory inside the container (defaults to the host cwd)
+    #[arg(long)]
+    pub sandbox_cwd: Option<String>,
+    /// Run the container command inside a login shell (sources /etc/profile, ~/.profile)
+    #[arg(short = 'l', long)]
+    pub login: bool,
+    /// Show detailed output (mounts, network rules)
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+}
+
+/// Entry point for `airlock start [--log-level <level>] [-- extra-args...]`.
+pub async fn run(args: StartArgs, extra_args: Vec<String>) -> i32 {
+    cli::set_verbose(args.verbose);
+
     if !cli::is_interactive() {
         cli::error!("Interactive mode (TTY) is required");
         return 2;
@@ -71,11 +86,12 @@ pub async fn run(
         }
     };
 
-    let args = CliArgs::new(log_level, extra_args, login);
+    let cli_args = CliArgs::new(args.log_level, extra_args, args.login);
+    let sandbox_cwd = args.sandbox_cwd;
     let local = LocalSet::new();
     local
         .run_until(async {
-            run_inner(args, config, host_cwd, project_cwd)
+            run_inner(cli_args, config, host_cwd, sandbox_cwd)
                 .await
                 .unwrap_or_else(|e| {
                     cli::error!("Error: {e:?}");
@@ -108,6 +124,42 @@ async fn run_inner(
     let image = oci::prepare(&args, &project, &terminal).await?;
     let network = network::setup(&project, &image.container_home)?;
 
+    // Show mounts and network rules grouped (verbose)
+    let enabled_mounts: Vec<_> = project
+        .config
+        .mounts
+        .iter()
+        .filter(|(_, m)| m.enabled)
+        .collect();
+    if !enabled_mounts.is_empty() {
+        cli::verbose!("  {} mounts: {}", cli::bullet(), enabled_mounts.len());
+        for (key, mount) in &enabled_mounts {
+            cli::verbose!("      {key}: {} \u{2192} {}", mount.source, mount.target);
+        }
+    }
+    let enabled_rules: Vec<_> = project
+        .config
+        .network
+        .rules
+        .iter()
+        .filter(|(_, r)| r.enabled)
+        .collect();
+    if !enabled_rules.is_empty() {
+        let default_mode = format!("{:?}", project.config.network.default_mode).to_lowercase();
+        cli::verbose!(
+            "  {} network rules: {} (default: {default_mode})",
+            cli::bullet(),
+            enabled_rules.len()
+        );
+        for (key, rule) in &enabled_rules {
+            cli::verbose!(
+                "      {key}: allow {} deny {}",
+                rule.allow.len(),
+                rule.deny.len()
+            );
+        }
+    }
+
     // Check if user interrupted during setup (e.g. Ctrl+C during download)
     if cli::is_interrupted() {
         return Ok(130); // 128 + SIGINT
@@ -124,6 +176,20 @@ async fn run_inner(
     let epoch_nanos = now.subsec_nanos();
     let (vm, vsock_fd) = vm::start(&args, &project, &image).await?;
     project.save_meta();
+
+    // Show disk utilization after disk has been prepared
+    if let Some((used, total)) = project.disk_usage() {
+        cli::log!(
+            "  {} disk:   {}",
+            cli::bullet(),
+            cli::dim(&format!(
+                "{} / {}",
+                cli::format_bytes(used),
+                cli::format_bytes(total)
+            ))
+        );
+    }
+
     let supervisor = rpc::Supervisor::connect(vsock_fd)?;
 
     let stdin = terminal.stdin()?;
