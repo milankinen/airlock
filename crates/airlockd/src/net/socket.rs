@@ -17,39 +17,59 @@ use tracing::{debug, error, info};
 use super::proxy::ChannelSink;
 use crate::rpc::SocketForwardConfig;
 
-/// Spawn a listener for each configured socket forward.
-pub fn start(network: &network_proxy::Client, sockets: Vec<SocketForwardConfig>) {
+/// Bind all socket listeners synchronously, then spawn the accept loops.
+///
+/// Binding is done before returning so all socket files exist in the
+/// container rootfs before the container process starts.
+pub fn start(
+    network: &network_proxy::Client,
+    sockets: Vec<SocketForwardConfig>,
+) -> anyhow::Result<()> {
     for sock in sockets {
+        let listener = bind(&sock.guest)?;
+        info!("socket forward: {} → {}", sock.guest, sock.host);
         let network = network.clone();
         tokio::task::spawn_local(async move {
-            if let Err(e) = listen(&sock.host, &sock.guest, network).await {
+            if let Err(e) = accept_loop(listener, &sock.host, &sock.guest, network).await {
                 error!("socket forward {} → {}: {e}", sock.host, sock.guest);
             }
         });
     }
+    Ok(())
 }
 
-async fn listen(
-    host_path: &str,
-    guest_path: &str,
-    network: network_proxy::Client,
-) -> anyhow::Result<()> {
-    // Create the socket on the disk mount so crun can bind-mount it
-    let sock_name = guest_path.rsplit('/').next().unwrap_or(guest_path);
-    let sock_dir = Path::new("/mnt/disk/sockets");
-    std::fs::create_dir_all(sock_dir)?;
-    let full_path = sock_dir.join(sock_name);
-
+/// Bind a UnixListener at the guest path inside the container rootfs.
+///
+/// Creates the socket file at the resolved path within `/mnt/overlay/rootfs`
+/// so it lands in the overlayfs upper layer and is visible inside the container.
+///
+/// Path resolution treats absolute symlink targets as relative to the container
+/// root, mirroring chroot semantics. Without this, an absolute symlink like
+/// `/var/run -> /run` would redirect the bind to the VM's `/run/`, not the
+/// container's `/run/`.
+fn bind(guest_path: &str) -> anyhow::Result<UnixListener> {
+    let root = Path::new("/mnt/overlay/rootfs");
+    let full_path = crate::util::resolve_in_root(root, guest_path);
+    if let Some(parent) = full_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     // Remove stale socket from previous run
     let _ = std::fs::remove_file(&full_path);
-
-    let listener = UnixListener::bind(&full_path)?;
+    let listener = UnixListener::bind(&full_path)
+        .map_err(|e| anyhow::anyhow!("bind {}: {e}", full_path.display()))?;
     std::fs::set_permissions(
         &full_path,
         std::os::unix::fs::PermissionsExt::from_mode(0o777),
     )?;
-    info!("socket forward: {guest_path} → {host_path}");
+    Ok(listener)
+}
 
+async fn accept_loop(
+    listener: UnixListener,
+    _host_path: &str,
+    guest_path: &str,
+    network: network_proxy::Client,
+) -> anyhow::Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let network = network.clone();

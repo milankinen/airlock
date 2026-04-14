@@ -23,7 +23,7 @@ use crate::rpc::SocketForwardConfig;
 pub fn setup(
     config: &InitConfig,
     mounts: &MountConfig,
-    sockets: &[SocketForwardConfig],
+    _sockets: &[SocketForwardConfig],
     nested_virt: bool,
 ) -> anyhow::Result<()> {
     set_clock(config.epoch, config.epoch_nanos);
@@ -60,10 +60,10 @@ pub fn setup(
     // 7. DNS
     setup_dns()?;
 
-    // 8. Container mounts: proc/sys/dev, socket forwards, file bind mounts.
+    // 8. Container mounts: proc/sys/dev, file bind mounts.
     //    Runs after assemble_rootfs so file bind mounts can override paths
     //    inside dir-bind-mounted directories (e.g. guest_cwd).
-    setup_container_mounts(mounts, sockets, nested_virt)?;
+    setup_container_mounts(mounts, nested_virt)?;
 
     Ok(())
 }
@@ -73,11 +73,7 @@ pub fn setup(
 /// Called at the end of `setup()`. Handles the mounts that crun previously
 /// managed via config.json: proc/sys/dev, file overlay bind mounts, socket
 /// forward bind mounts, and optionally /dev/kvm.
-fn setup_container_mounts(
-    mounts: &MountConfig,
-    sockets: &[SocketForwardConfig],
-    nested_virt: bool,
-) -> anyhow::Result<()> {
+fn setup_container_mounts(mounts: &MountConfig, nested_virt: bool) -> anyhow::Result<()> {
     let root = "/mnt/overlay/rootfs";
 
     // proc
@@ -145,30 +141,6 @@ fn setup_container_mounts(
             "mode=0755",
         )?;
         info!("/airlock/disk → tmpfs");
-    }
-
-    // Socket forward bind mounts
-    // The socket files at /mnt/disk/sockets/<name> are created by net::socket::start.
-    // We create placeholder files here so the bind mount succeeds; net::socket::start
-    // removes and recreates the socket.
-    for sock in sockets {
-        let sock_name = sock.guest.rsplit('/').next().unwrap_or(sock.guest.as_str());
-        let src = format!("/mnt/disk/sockets/{sock_name}");
-        let dst = format!("{root}/{}", sock.guest.trim_start_matches('/'));
-
-        std::fs::create_dir_all("/mnt/disk/sockets")?;
-        // Create placeholder regular file so bind mount works
-        if !Path::new(&src).exists() {
-            std::fs::File::create(&src)?;
-        }
-        if let Some(parent) = Path::new(&dst).parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        if !Path::new(&dst).exists() {
-            std::fs::File::create(&dst)?;
-        }
-        bind_mount(&src, &dst, false)?;
-        info!("socket: {src} → {dst}");
     }
 
     // File mounts: bind the VirtioFS files shares into the container so that the
@@ -288,15 +260,15 @@ fn assemble_rootfs(mounts: &MountConfig) -> anyhow::Result<()> {
     }
     info!("assembled rootfs via overlayfs");
 
+    let rootfs = Path::new("/mnt/overlay/rootfs");
+
     // Directory bind mounts
     for dir in &mounts.dirs {
         let src = format!("/mnt/{}", dir.tag);
-        let rel = dir.target.strip_prefix('/').unwrap_or(&dir.target);
-        let dst = Path::new("/mnt/overlay/rootfs").join(rel);
-        let dst = dst.to_string_lossy();
-        std::fs::create_dir_all(dst.as_ref())?;
-        bind_mount(&src, &dst, dir.read_only)?;
-        info!("dir: {src} → {dst}");
+        let dst = crate::util::resolve_in_root(rootfs, &dir.target);
+        std::fs::create_dir_all(&dst)?;
+        bind_mount(&src, &dst.to_string_lossy(), dir.read_only)?;
+        info!("dir: {src} → {}", dst.display());
     }
 
     // Cache bind mounts (last — override dir mounts).
@@ -305,12 +277,11 @@ fn assemble_rootfs(mounts: &MountConfig) -> anyhow::Result<()> {
             for target in &cache.paths {
                 let rel = target.strip_prefix('/').unwrap_or(target);
                 let src = Path::new("/mnt/disk/cache").join(&cache.name).join(rel);
-                let dst = Path::new("/mnt/overlay/rootfs").join(rel);
-                let (src, dst) = (src.to_string_lossy(), dst.to_string_lossy());
-                std::fs::create_dir_all(src.as_ref())?;
-                std::fs::create_dir_all(dst.as_ref())?;
-                bind_mount(&src, &dst, false)?;
-                info!("cache: {} → {dst}", &cache.name);
+                let dst = crate::util::resolve_in_root(rootfs, target);
+                std::fs::create_dir_all(&src)?;
+                std::fs::create_dir_all(&dst)?;
+                bind_mount(&src.to_string_lossy(), &dst.to_string_lossy(), false)?;
+                info!("cache: {} → {}", &cache.name, dst.display());
             }
         }
     }
@@ -326,11 +297,7 @@ fn assemble_rootfs(mounts: &MountConfig) -> anyhow::Result<()> {
             std::fs::create_dir_all("/tmp/airlock-mask")?;
             "/tmp/airlock-mask"
         };
-        let rel = project_mount
-            .target
-            .strip_prefix('/')
-            .unwrap_or(&project_mount.target);
-        let dst = Path::new("/mnt/overlay/rootfs").join(rel).join(".airlock");
+        let dst = crate::util::resolve_in_root(rootfs, &project_mount.target).join(".airlock");
         std::fs::create_dir_all(&dst)?;
         bind_mount(mask_src, &dst.to_string_lossy(), true)?;
         info!("masked .airlock at {}", dst.display());

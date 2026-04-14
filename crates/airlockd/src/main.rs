@@ -9,6 +9,7 @@ mod logging;
 mod net;
 mod process;
 mod rpc;
+mod util;
 mod vsock;
 
 use std::rc::Rc;
@@ -43,9 +44,9 @@ async fn run() -> anyhow::Result<()> {
         )?;
 
         let dns = Rc::new(net::dns::DnsState::new());
-        net::dns::start(dns.clone());
-        net::start_proxy(cfg.network.clone(), dns);
-        net::socket::start(&cfg.network, cfg.sockets);
+        net::dns::start(dns.clone()).await?;
+        net::socket::start(&cfg.network, cfg.sockets)?;
+        net::start_proxy(cfg.network.clone(), dns).await?;
 
         info!("start: {} {}", cfg.cmd, cfg.args.join(" "));
         let proc = process::spawn_user(

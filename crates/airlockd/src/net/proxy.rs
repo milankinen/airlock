@@ -20,18 +20,11 @@ use super::dns::DnsState;
 const PROXY_PORT: u16 = 15001;
 
 /// Spawn the transparent TCP proxy as a local task.
-pub fn start_proxy(network: network_proxy::Client, dns: Rc<DnsState>) {
+pub async fn start_proxy(network: network_proxy::Client, dns: Rc<DnsState>) -> anyhow::Result<()> {
     info!("start network proxy");
+    let listener = TcpListener::bind(("127.0.0.1", PROXY_PORT)).await?;
+    info!("network proxy listening on port {PROXY_PORT}");
     tokio::task::spawn_local(async move {
-        let listener = match TcpListener::bind(("127.0.0.1", PROXY_PORT)).await {
-            Ok(l) => l,
-            Err(e) => {
-                warn!("proxy listen failed: {e}");
-                return;
-            }
-        };
-
-        info!("network proxy listening on port {PROXY_PORT}");
         loop {
             let (stream, _) = match listener.accept().await {
                 Ok(s) => s,
@@ -50,6 +43,7 @@ pub fn start_proxy(network: network_proxy::Client, dns: Rc<DnsState>) {
             });
         }
     });
+    Ok(())
 }
 
 async fn handle_connection(

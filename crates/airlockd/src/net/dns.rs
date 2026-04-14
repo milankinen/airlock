@@ -13,7 +13,7 @@ use std::rc::Rc;
 use scc::HashMap;
 use simple_dns::{CLASS, Packet, PacketFlag, QTYPE, Question, ResourceRecord, TYPE, rdata};
 use tokio::net::UdpSocket;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 const LISTEN_ADDR: &str = "10.0.0.1:53";
 const IP_BASE: u32 = 0x0A020001; // 10.2.0.1
@@ -58,18 +58,18 @@ impl DnsState {
 }
 
 /// Spawn the DNS UDP server as a local task.
-pub fn start(state: Rc<DnsState>) {
+pub async fn start(state: Rc<DnsState>) -> anyhow::Result<()> {
+    let socket = UdpSocket::bind(LISTEN_ADDR).await?;
+    info!("dns listening on {LISTEN_ADDR}");
     tokio::task::spawn_local(async move {
-        if let Err(e) = serve(state).await {
+        if let Err(e) = serve(socket, state).await {
             warn!("dns server failed: {e}");
         }
     });
+    Ok(())
 }
 
-async fn serve(state: Rc<DnsState>) -> anyhow::Result<()> {
-    let socket = UdpSocket::bind(LISTEN_ADDR).await?;
-    debug!("dns listening on {LISTEN_ADDR}");
-
+async fn serve(socket: UdpSocket, state: Rc<DnsState>) -> anyhow::Result<()> {
     let mut buf = [0u8; 512];
     loop {
         let (len, addr) = socket.recv_from(&mut buf).await?;
