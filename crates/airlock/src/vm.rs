@@ -9,6 +9,7 @@ mod apple;
 mod cloud_hypervisor;
 mod config;
 pub(crate) mod disk;
+mod file_sync;
 pub mod mount;
 
 use std::fmt::Write;
@@ -82,11 +83,13 @@ use crate::oci::OciImage;
 use crate::project::Project;
 use crate::vm::config::VmShare;
 
-/// A running VM instance. Dropping this kills the VM.
+/// A running VM instance. Dropping this kills the VM and stops file sync.
 #[allow(dead_code)]
 pub struct VmInstance {
     /// Private — dropping kills the VM via the existing backend impls.
     vm_handle: Box<dyn VmHandle>,
+    /// File-sync handle — gracefully drained by `shutdown()`, aborted on drop.
+    sync_handle: Option<file_sync::SyncHandle>,
     pub image_id: String,
     pub mounts: Vec<mount::ResolvedMount>,
     pub disk_image: PathBuf,
@@ -99,6 +102,15 @@ pub struct VmInstance {
     pub cwd: String,
     pub uid: u32,
     pub gid: u32,
+}
+
+impl VmInstance {
+    /// Gracefully shut down file sync (drains pending events) then drop the VM.
+    pub async fn shutdown(mut self) {
+        if let Some(handle) = self.sync_handle.take() {
+            handle.shutdown().await;
+        }
+    }
 }
 
 /// Boot the VM with the given config and image. Returns a `VmInstance` (for
@@ -145,10 +157,12 @@ pub async fn start(
     };
 
     let (vm_handle, vsock_fd) = boot_backend(&vm_config).await?;
+    let sync_handle = file_sync::start(&mounts, &overlay_dir);
 
     Ok((
         VmInstance {
             vm_handle,
+            sync_handle,
             image_id: image.image_id.clone(),
             mounts,
             disk_image,

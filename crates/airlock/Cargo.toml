@@ -39,6 +39,7 @@ include_dir = { workspace = true }
 indicatif = { workspace = true }
 libc = { workspace = true }
 mlua = { workspace = true }
+notify = { workspace = true }
 oci-client = { workspace = true }
 quick_cache = { workspace = true }
 rcgen = { workspace = true, features = ["pem", "x509-parser"] }

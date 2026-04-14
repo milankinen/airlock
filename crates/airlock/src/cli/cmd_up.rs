@@ -194,8 +194,8 @@ async fn run_inner(
     // Sync filesystems before killing VM
     supervisor.shutdown().await;
 
-    // Destroy VM and return the exit code from vm shell
-    drop(vm);
+    // Drain file-sync events then destroy VM.
+    vm.shutdown().await;
     Ok(exit_code)
 }
 
