@@ -142,6 +142,7 @@ impl supervisor::Server for SupervisorImpl {
             .iter()
             .map(|f| {
                 Ok(FileMountConfig {
+                    mount_key: f.get_key()?.to_str()?.to_string(),
                     target: f.get_target()?.to_str()?.to_string(),
                     read_only: f.get_read_only(),
                 })

@@ -8,11 +8,12 @@ mod apple;
 #[cfg(target_os = "linux")]
 mod cloud_hypervisor;
 mod config;
+pub(crate) mod disk;
+pub mod mount;
+
 use std::fmt::Write;
 use std::os::unix::io::OwnedFd;
-use std::path::Path;
-
-use tracing::warn;
+use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
 pub enum KvmStatus {
@@ -77,69 +78,282 @@ pub fn require_kvm() {
 use crate::assets::Assets;
 use crate::cli;
 use crate::cli::{CliArgs, LogLevel};
-use crate::oci::Bundle;
+use crate::oci::OciImage;
 use crate::project::Project;
 use crate::vm::config::VmShare;
 
-/// Boot the VM with the given config and bundle. Returns a handle (for
+/// A running VM instance. Dropping this kills the VM.
+#[allow(dead_code)]
+pub struct VmInstance {
+    /// Private — dropping kills the VM via the existing backend impls.
+    vm_handle: Box<dyn VmHandle>,
+    pub image_id: String,
+    pub mounts: Vec<mount::ResolvedMount>,
+    pub disk_image: PathBuf,
+    pub caches: Vec<disk::CacheEntry>,
+    pub container_home: String,
+    /// Fully resolved command (args.args + login shell applied).
+    pub cmd: Vec<String>,
+    /// Fully resolved environment (project.config.env overrides applied).
+    pub env: Vec<String>,
+    pub cwd: String,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// Boot the VM with the given config and image. Returns a `VmInstance` (for
 /// cleanup on drop) and the vsock fd connected to the in-VM supervisor.
 pub async fn start(
     args: &CliArgs,
     project: &Project,
-    bundle: &Bundle,
-) -> anyhow::Result<(Box<dyn VmHandle>, OwnedFd)> {
+    image: &OciImage,
+) -> anyhow::Result<(VmInstance, OwnedFd)> {
     let assets = Assets::init(project)?;
-    let mut shares = vec![];
-
     let overlay_dir = project.cache_dir.join("overlay");
-    // Create overlay subdirs (rootfs is the overlayfs mount point)
-    for subdir in ["rootfs", "files/rw", "files/ro"] {
-        std::fs::create_dir_all(overlay_dir.join(subdir))?;
-    }
-    // Purge file mount dirs on each start (rebuilt from config)
-    for subdir in ["files/rw", "files/ro"] {
-        let dir = overlay_dir.join(subdir);
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir)?;
-            std::fs::create_dir_all(&dir)?;
-        }
-    }
 
-    // Well-known shares
-    shares.push(VmShare {
-        tag: "base".to_string(),
-        host_path: bundle.image_rootfs.clone(),
-        read_only: true,
-    });
-    shares.push(VmShare {
-        tag: "overlay".to_string(),
-        host_path: overlay_dir.clone(),
+    project.install_ca_cert(&image.rootfs)?;
+
+    let mounts = assemble_mounts(project, image)?;
+    let shares = prepare_shares(image, &mounts, &overlay_dir)?;
+    let (disk_image, caches) = disk::prepare(
+        &project.cache_dir,
+        &project.config.disk,
+        &image.container_home,
+        &project.host_cwd,
+    )?;
+    let cmd = resolve_cmd(args, image);
+    let env = resolve_env(project, image)?;
+    let cwd = project.guest_cwd.to_string_lossy().into_owned();
+
+    log_config(project, &mounts, &shares);
+
+    let vm_config = config::VmConfig {
+        cpus: project.config.vm.cpus,
+        memory_bytes: project.config.vm.memory.0,
+        kernel: assets.kernel,
+        initramfs: assets.initramfs,
+        kernel_cmdline: build_kernel_cmdline(args, project, &shares),
+        shares,
+        cache_disk: Some(disk_image.clone()),
+        runtime_dir: project.cache_dir.clone(),
+        #[cfg(target_os = "linux")]
+        cloud_hypervisor: assets.cloud_hypervisor,
+        #[cfg(target_os = "linux")]
+        virtiofsd: assets.virtiofsd,
+        #[cfg(target_os = "linux")]
+        kvm: project.config.vm.kvm,
+    };
+
+    let (vm_handle, vsock_fd) = boot_backend(&vm_config).await?;
+
+    Ok((
+        VmInstance {
+            vm_handle,
+            image_id: image.image_id.clone(),
+            mounts,
+            disk_image,
+            caches,
+            container_home: image.container_home.clone(),
+            cmd,
+            env,
+            cwd,
+            uid: image.uid,
+            gid: image.gid,
+        },
+        vsock_fd,
+    ))
+}
+
+/// Build the project dir mount and resolve all enabled user mounts.
+fn assemble_mounts(
+    project: &Project,
+    image: &OciImage,
+) -> anyhow::Result<Vec<mount::ResolvedMount>> {
+    let project_mount = mount::ResolvedMount {
+        display: None,
+        mount_type: mount::MountType::Dir {
+            key: "project".to_string(),
+        },
+        source: project.host_cwd.clone(),
+        target: project.guest_cwd.to_string_lossy().into(),
         read_only: false,
-    });
+    };
 
-    // User dir mounts and file mounts
-    for mount in &bundle.mounts {
+    let mut enabled_mounts: Vec<_> = project
+        .config
+        .mounts
+        .iter()
+        .filter(|(_, m)| m.enabled)
+        .map(|(k, m)| (k.as_str(), m.clone()))
+        .collect();
+    enabled_mounts.sort_by_key(|(k, _)| *k);
+    let user_mounts = mount::resolve_mounts(
+        &enabled_mounts,
+        &project.host_home,
+        &image.container_home,
+        &project.host_cwd,
+        &project.guest_cwd,
+    )?;
+
+    let mut mounts = vec![project_mount];
+    mounts.extend(user_mounts);
+    Ok(mounts)
+}
+
+/// Build the VirtioFS share list from static shares + dir mounts + file mounts.
+///
+/// File mounts are hard-linked (copy fallback on EXDEV) into
+/// `overlay/files/{rw,ro}/{key}` and exposed as two consolidated shares.
+fn prepare_shares(
+    image: &OciImage,
+    mounts: &[mount::ResolvedMount],
+    overlay_dir: &Path,
+) -> anyhow::Result<Vec<VmShare>> {
+    let mut shares = vec![VmShare {
+        tag: "base".to_string(),
+        host_path: image.rootfs.clone(),
+        read_only: true,
+    }];
+    let ca_dir = overlay_dir.join("ca");
+    if ca_dir.exists() {
+        shares.push(VmShare {
+            tag: "ca".to_string(),
+            host_path: ca_dir,
+            read_only: true,
+        });
+    }
+
+    for m in mounts
+        .iter()
+        .filter(|m| matches!(m.mount_type, mount::MountType::Dir { .. }))
+    {
         tracing::debug!(
             "mount: {} → {} → {} (read-only: {})",
-            mount.source.display(),
-            mount.vm_path(),
-            mount.target,
-            mount.read_only
+            m.source.display(),
+            m.vm_path(),
+            m.target,
+            m.read_only
         );
-        match &mount.mount_type {
-            crate::oci::MountType::Dir { .. } => {
-                shares.push(VmShare {
-                    tag: mount.key().into(),
-                    host_path: mount.source.clone(),
-                    read_only: mount.read_only,
-                });
-            }
-            crate::oci::MountType::File { .. } => {
-                link_file(&mount.source, &mount.target, &overlay_dir, mount.read_only)?;
-            }
-        }
+        shares.push(VmShare {
+            tag: m.key().into(),
+            host_path: m.source.clone(),
+            read_only: m.read_only,
+        });
     }
 
+    // Hard-link file mounts into overlay/files/{rw|ro}/{key}. Rebuild from
+    // scratch each boot so stale entries are removed.
+    let files_rw_dir = overlay_dir.join("files").join("rw");
+    let files_ro_dir = overlay_dir.join("files").join("ro");
+    let _ = std::fs::remove_dir_all(&files_rw_dir);
+    let _ = std::fs::remove_dir_all(&files_ro_dir);
+    let mut has_rw_files = false;
+    let mut has_ro_files = false;
+
+    for m in mounts
+        .iter()
+        .filter(|m| matches!(m.mount_type, mount::MountType::File { .. }))
+    {
+        tracing::debug!(
+            "file mount: {} → {} (read-only: {})",
+            m.source.display(),
+            m.target,
+            m.read_only
+        );
+        let dir = if m.read_only {
+            &files_ro_dir
+        } else {
+            &files_rw_dir
+        };
+        std::fs::create_dir_all(dir)?;
+        let link_path = dir.join(m.key());
+        if let Err(e) = std::fs::hard_link(&m.source, &link_path) {
+            if e.kind() == std::io::ErrorKind::CrossesDevices {
+                cli::log!(
+                    "file mount {}: cross-device hard link failed, falling back to copy \
+                     (writes inside the VM will NOT sync back to the host)",
+                    m.source.display()
+                );
+                std::fs::copy(&m.source, &link_path)?;
+            } else {
+                return Err(
+                    anyhow::Error::from(e).context(format!("file mount {}", m.source.display()))
+                );
+            }
+        }
+        has_ro_files = has_ro_files || m.read_only;
+        has_rw_files = has_rw_files || !m.read_only;
+    }
+
+    if has_rw_files {
+        shares.push(VmShare {
+            tag: "files/rw".to_string(),
+            host_path: files_rw_dir,
+            read_only: false,
+        });
+    }
+    if has_ro_files {
+        shares.push(VmShare {
+            tag: "files/ro".to_string(),
+            host_path: files_ro_dir,
+            read_only: true,
+        });
+    }
+
+    Ok(shares)
+}
+
+/// Resolve the final container command: args override, then login shell wrap.
+fn resolve_cmd(args: &CliArgs, image: &OciImage) -> Vec<String> {
+    let cmd = if args.args.is_empty() {
+        image.cmd.clone()
+    } else {
+        args.args.clone()
+    };
+    if args.login {
+        crate::oci::apply_login_shell(cmd)
+    } else {
+        cmd
+    }
+}
+
+/// Resolve the final container environment: image env with project overrides applied.
+fn resolve_env(project: &Project, image: &OciImage) -> anyhow::Result<Vec<String>> {
+    let mut env = image.env.clone();
+    let host_env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    for (key, template) in &project.config.env {
+        let value = subst::substitute(template, &host_env)
+            .map_err(|e| anyhow::anyhow!("env.{key}: {e}"))?;
+        env.retain(|existing| !existing.starts_with(&format!("{key}=")));
+        env.push(format!("{key}={value}"));
+    }
+    Ok(env)
+}
+
+/// Build the kernel command line string.
+fn build_kernel_cmdline(args: &CliArgs, project: &Project, shares: &[VmShare]) -> String {
+    let tags: Vec<&str> = shares.iter().map(|s| s.tag.as_str()).collect();
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut cmdline = format!(
+        "console=hvc0 console=ttyS0 rdinit=/init airlock.epoch={epoch} airlock.shares={}",
+        tags.join(",")
+    );
+    let host_ports = crate::network::rules::localhost_ports_from_config(&project.config.network);
+    if !host_ports.is_empty() {
+        let ports: Vec<String> = host_ports.iter().map(ToString::to_string).collect();
+        let _ = write!(cmdline, " airlock.host_ports={}", ports.join(","));
+    }
+    if !matches!(args.log_level, LogLevel::Trace | LogLevel::Debug) {
+        cmdline.push_str(" quiet loglevel=3");
+    }
+    cmdline
+}
+
+/// Log the resolved VM configuration to the terminal and trace output.
+fn log_config(project: &Project, mounts: &[mount::ResolvedMount], shares: &[VmShare]) {
     cli::log!(
         "  {} cpus:   {}",
         cli::bullet(),
@@ -169,20 +383,16 @@ pub async fn start(
     };
     cli::log!("  {} disk:   {}", cli::bullet(), cli::dim(&disk_info));
 
-    let display_mounts: Vec<_> = bundle
-        .mounts
-        .iter()
-        .filter(|m| m.display.is_some())
-        .collect();
+    let display_mounts: Vec<_> = mounts.iter().filter(|m| m.display.is_some()).collect();
     if !display_mounts.is_empty() {
         cli::log!(
             "  {} mounts: {}",
             cli::bullet(),
             cli::dim(&display_mounts.len().to_string())
         );
-        for mount in &display_mounts {
-            let (source, target) = mount.display.as_ref().unwrap();
-            let mode = if mount.read_only { "ro" } else { "rw" };
+        for m in &display_mounts {
+            let (source, target) = m.display.as_ref().unwrap();
+            let mode = if m.read_only { "ro" } else { "rw" };
             cli::log!(
                 "    {} {}",
                 cli::bullet(),
@@ -191,7 +401,7 @@ pub async fn start(
         }
     }
 
-    for share in &shares {
+    for share in shares {
         tracing::debug!(
             "share: tag={}, host_path={}, ro={}",
             share.tag,
@@ -199,49 +409,16 @@ pub async fn start(
             share.read_only
         );
     }
+}
 
-    let vm_config = config::VmConfig {
-        cpus: project.config.vm.cpus,
-        memory_bytes: project.config.vm.memory.0,
-        kernel: assets.kernel,
-        initramfs: assets.initramfs,
-        kernel_cmdline: {
-            let tags: Vec<&str> = shares.iter().map(|s| s.tag.as_str()).collect();
-            let epoch = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let mut cmd = format!(
-                "console=hvc0 console=ttyS0 rdinit=/init airlock.epoch={epoch} airlock.shares={}",
-                tags.join(",")
-            );
-            let host_ports =
-                crate::network::rules::localhost_ports_from_config(&project.config.network);
-            if !host_ports.is_empty() {
-                let ports: Vec<String> = host_ports.iter().map(ToString::to_string).collect();
-                let _ = write!(cmd, " airlock.host_ports={}", ports.join(","));
-            }
-            if !matches!(args.log_level, LogLevel::Trace | LogLevel::Debug) {
-                cmd.push_str(" quiet loglevel=3");
-            }
-            cmd
-        },
-        shares,
-        cache_disk: Some(bundle.disk_image.clone()),
-        runtime_dir: project.cache_dir.clone(),
-        #[cfg(target_os = "linux")]
-        cloud_hypervisor: assets.cloud_hypervisor,
-        #[cfg(target_os = "linux")]
-        virtiofsd: assets.virtiofsd,
-        #[cfg(target_os = "linux")]
-        kvm: project.config.vm.kvm,
-    };
-
+/// Start the platform-specific VM backend and wait for the supervisor vsock.
+async fn boot_backend(
+    vm_config: &config::VmConfig,
+) -> anyhow::Result<(Box<dyn VmHandle>, OwnedFd)> {
     #[cfg(target_os = "macos")]
     {
-        let mut backend = apple::AppleVmBackend::new(&vm_config)?;
+        let mut backend = apple::AppleVmBackend::new(vm_config)?;
         backend.start().await?;
-
         let vsock_fd = {
             let mut attempts = 0;
             loop {
@@ -253,23 +430,21 @@ pub async fn start(
                     Err(e) => {
                         attempts += 1;
                         if attempts >= 30 {
-                            return Err(anyhow::anyhow!(format!(
+                            return Err(anyhow::anyhow!(
                                 "supervisor not reachable after {attempts} attempts: {e}"
-                            )));
+                            ));
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                 }
             }
         };
-
         Ok((Box::new(backend), vsock_fd))
     }
 
     #[cfg(target_os = "linux")]
     {
-        let backend = cloud_hypervisor::CloudHypervisorBackend::start(&vm_config)?;
-
+        let backend = cloud_hypervisor::CloudHypervisorBackend::start(vm_config)?;
         let vsock_fd = {
             let mut attempts = 0u32;
             loop {
@@ -287,8 +462,7 @@ pub async fn start(
                 }
             }
         };
-
-        Ok((Box::new(backend), vsock_fd))
+        return Ok((Box::new(backend), vsock_fd));
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -298,53 +472,9 @@ pub async fn start(
     }
 }
 
-/// Link a file mount into the overlay directory, replicating the
-/// target's directory structure so the entire tree can be overlaid onto
-/// the container rootfs.
-///
-/// For target `/root/.claude.json` with read_only=false, creates
-/// `overlay/files/rw/root/.claude.json`.
-pub fn link_file(
-    source: &Path,
-    target: &str,
-    overlay_dir: &Path,
-    read_only: bool,
-) -> anyhow::Result<()> {
-    let subdir = if read_only { "files/ro" } else { "files/rw" };
-    let target_path = Path::new(target);
-    let parent = target_path
-        .parent()
-        .unwrap_or(Path::new(""))
-        .strip_prefix("/")
-        .unwrap_or(Path::new(""));
-    let link_dir = overlay_dir.join(subdir).join(parent);
-    std::fs::create_dir_all(&link_dir)?;
-
-    let file_name = target_path
-        .file_name()
-        .map_or_else(|| "file".to_string(), |n| n.to_string_lossy().to_string());
-    let link_path = link_dir.join(&file_name);
-
-    if let Err(e) = std::fs::hard_link(source, &link_path) {
-        warn!(
-            "cannot hard-link {}: {e} (file will not be synced)",
-            source.display()
-        );
-        if let Err(e2) = std::fs::copy(source, &link_path) {
-            anyhow::bail!("cannot copy {}: {e2}", source.display());
-        }
-    }
-    tracing::debug!(
-        "hard linked shared file: {} → {}",
-        source.display(),
-        link_path.display()
-    );
-    Ok(())
-}
-
 /// Trait for VM backends. Dropping the handle kills the VM.
 #[allow(dead_code)]
-pub trait VmHandle {
+trait VmHandle {
     fn wait_for_stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>>;
 }
 

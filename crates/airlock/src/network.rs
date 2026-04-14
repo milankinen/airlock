@@ -30,7 +30,7 @@ use crate::project::Project;
 /// Build the [`Network`] from the project config: load native CA roots,
 /// compile middleware scripts, resolve network targets, and prepare the
 /// TLS interceptor with the project's CA.
-pub fn setup(project: &Project, bundle: &crate::oci::Bundle) -> anyhow::Result<Network> {
+pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network> {
     let mut root_store = rustls::RootCertStore::empty();
     for cert in rustls_native_certs::load_native_certs().expect("native certs") {
         let _ = root_store.add(cert);
@@ -53,7 +53,9 @@ pub fn setup(project: &Project, bundle: &crate::oci::Bundle) -> anyhow::Result<N
         .values()
         .filter(|s| s.enabled)
         .map(|s| {
-            let guest = bundle.expand_tilde(&s.guest).to_string_lossy().into_owned();
+            let guest = crate::util::expand_tilde(&s.guest, std::path::Path::new(container_home))
+                .to_string_lossy()
+                .into_owned();
             let host = project.expand_host_tilde(&s.host);
             (guest, host)
         })

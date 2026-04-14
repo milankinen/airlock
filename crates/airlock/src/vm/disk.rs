@@ -72,7 +72,7 @@ pub fn prepare(
                 .paths
                 .iter()
                 .map(|p| {
-                    let target = super::expand_tilde(p, &container_home);
+                    let target = crate::util::expand_tilde(p, &container_home);
                     let target = if target.is_relative() {
                         cwd.join(target)
                     } else {

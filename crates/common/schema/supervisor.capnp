@@ -66,6 +66,7 @@ struct DirMount {
 struct FileMount {
   target   @0 :Text;
   readOnly @1 :Bool;
+  key      @2 :Text;
 }
 
 struct CacheMount {

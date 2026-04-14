@@ -29,28 +29,38 @@ pub fn setup(
     set_clock(config.epoch, config.epoch_nanos);
 
     // 1. Mount well-known VirtioFS shares
-    for tag in ["base", "overlay"] {
-        mount_virtiofs(tag)?;
-    }
+    mount_virtiofs("base")?;
+    mount_virtiofs("ca")?;
 
-    // 2. Mount user-defined VirtioFS shares (dir mounts from RPC)
+    // 2. Mount user dir shares (includes "project" and "dir_N" mounts)
     for dir in &mounts.dirs {
         mount_virtiofs(&dir.tag)?;
     }
 
-    // 3. Networking
+    // 3. Mount file-mount VirtioFS shares (present only if config has file mounts)
+    if mounts.files.iter().any(|f| !f.read_only) {
+        mount_virtiofs("files/rw")?;
+    }
+    if mounts.files.iter().any(|f| f.read_only) {
+        mount_virtiofs("files/ro")?;
+    }
+
+    // Create local directory for the overlayfs mount point (no longer a VirtioFS share).
+    std::fs::create_dir_all("/mnt/overlay/rootfs")?;
+
+    // 4. Networking
     setup_networking(&config.host_ports);
 
-    // 4. Project disk (ext4 — overlayfs upper + cache)
+    // 5. Project disk (ext4 — overlayfs upper + cache)
     setup_disk(&mounts.caches)?;
 
-    // 5. Assemble container rootfs (overlayfs layers + dir/cache bind mounts)
+    // 6. Assemble container rootfs (overlayfs layers + dir/cache bind mounts)
     assemble_rootfs(mounts)?;
 
-    // 6. DNS
+    // 7. DNS
     setup_dns()?;
 
-    // 7. Container mounts: proc/sys/dev, socket forwards, file bind mounts.
+    // 8. Container mounts: proc/sys/dev, socket forwards, file bind mounts.
     //    Runs after assemble_rootfs so file bind mounts can override paths
     //    inside dir-bind-mounted directories (e.g. guest_cwd).
     setup_container_mounts(mounts, sockets, nested_virt)?;
@@ -161,39 +171,22 @@ fn setup_container_mounts(
         info!("socket: {src} → {dst}");
     }
 
-    // File mounts — expose files/rw and files/ro as directories inside the container,
-    // then create symlinks at the target paths pointing into those directories.
-    //
-    // VirtioFS DIRECTORY bind mounts work correctly. VirtioFS FILE bind mounts fail with
-    // EACCES on open() despite correct permissions. Symlinks through a VirtioFS directory
-    // avoid the per-file bind mount entirely while keeping writes live (symlink → VirtioFS
-    // → host file).
-    std::fs::create_dir_all(format!("{root}/airlock/.files/rw"))?;
-    std::fs::create_dir_all(format!("{root}/airlock/.files/ro"))?;
-    bind_mount(
-        "/mnt/overlay/files/rw",
-        &format!("{root}/airlock/.files/rw"),
-        false,
-    )?;
-    bind_mount(
-        "/mnt/overlay/files/ro",
-        &format!("{root}/airlock/.files/ro"),
-        true,
-    )?;
-    for file in &mounts.files {
-        let subdir = if file.read_only { "ro" } else { "rw" };
-        let rel = file.target.strip_prefix('/').unwrap_or(&file.target);
-        let link_target = format!("/airlock/.files/{subdir}/{rel}");
-        let dst = format!("{root}/{rel}");
-        if let Some(parent) = Path::new(&dst).parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // Remove any stale entry (file, anchor, or old symlink with different target).
-        let _ = std::fs::remove_file(&dst);
-        std::os::unix::fs::symlink(&link_target, &dst).map_err(|e| {
-            anyhow::anyhow!("failed to create file mount symlink {dst} → {link_target}: {e}")
-        })?;
-        info!("file: {dst} → {link_target}");
+    // File mounts: bind the VirtioFS files shares into the container so that the
+    // symlinks placed in the upper layer (by assemble_rootfs) can be resolved.
+    // The symlinks point to /airlock/.files/{rw|ro}/{mount_key}, which resolves
+    // through this bind mount to /mnt/files/{rw|ro}/{mount_key} — the hard-linked
+    // source file in the project overlay directory.
+    if mounts.files.iter().any(|f| !f.read_only) {
+        let dst = format!("{root}/airlock/.files/rw");
+        std::fs::create_dir_all(&dst)?;
+        bind_mount("/mnt/files/rw", &dst, false)?;
+        info!("/airlock/.files/rw → /mnt/files/rw");
+    }
+    if mounts.files.iter().any(|f| f.read_only) {
+        let dst = format!("{root}/airlock/.files/ro");
+        std::fs::create_dir_all(&dst)?;
+        bind_mount("/mnt/files/ro", &dst, true)?;
+        info!("/airlock/.files/ro → /mnt/files/ro");
     }
 
     // /dev/kvm for nested virtualization (already in /dev bind, but explicit for clarity)
@@ -214,25 +207,69 @@ fn assemble_rootfs(mounts: &MountConfig) -> anyhow::Result<()> {
     // Use disk if available (persists), otherwise tmpfs (ephemeral).
     let (upper, work) = if has_disk {
         reset_overlay_if_needed(&mounts.image_id);
-        std::fs::create_dir_all("/mnt/disk/overlay/rootfs")
-            .unwrap_or_else(|e| error!("overlay rootfs dir: {e}"));
+        std::fs::create_dir_all("/mnt/disk/overlay/upper")
+            .unwrap_or_else(|e| error!("overlay upper dir: {e}"));
         std::fs::create_dir_all("/mnt/disk/overlay/work")
             .unwrap_or_else(|e| error!("overlay work dir: {e}"));
-        ("/mnt/disk/overlay/rootfs", "/mnt/disk/overlay/work")
+        ("/mnt/disk/overlay/upper", "/mnt/disk/overlay/work")
     } else {
-        std::fs::create_dir_all("/tmp/overlay_rootfs")
-            .unwrap_or_else(|e| error!("overlay rootfs dir: {e}"));
+        std::fs::create_dir_all("/tmp/overlay_upper")
+            .unwrap_or_else(|e| error!("overlay upper dir: {e}"));
         std::fs::create_dir_all("/tmp/overlay_work")
             .unwrap_or_else(|e| error!("overlay work dir: {e}"));
-        ("/tmp/overlay_rootfs", "/tmp/overlay_work")
+        ("/tmp/overlay_upper", "/tmp/overlay_work")
     };
 
-    // overlayfs: ca layer + base image (lowerdirs) + project state (upperdir)
-    let ca_dir = Path::new("/mnt/overlay/ca");
-    let ca_exists = ca_dir.is_dir();
+    // Write file mount symlinks into the upper layer BEFORE mounting overlayfs.
+    // Each symlink at upper/{target_rel} → /airlock/.files/{rw|ro}/{mount_key}
+    // is merged into the container rootfs by overlayfs. The container resolves
+    // the path through /airlock/.files/{rw|ro}/ which is bind-mounted from the
+    // VirtioFS share (set up in setup_container_mounts).
+    for file in &mounts.files {
+        let rw_or_ro = if file.read_only { "ro" } else { "rw" };
+        let link_target = format!("/airlock/.files/{rw_or_ro}/{}", file.mount_key);
+        let rel = file.target.strip_prefix('/').unwrap_or(&file.target);
+        let upper_path = format!("{upper}/{rel}");
+        if let Some(parent) = Path::new(&upper_path).parent() {
+            std::fs::create_dir_all(parent)
+                .unwrap_or_else(|e| error!("file mount parent dir: {e}"));
+        }
+        // Overwrite any existing entry at this path (file mount takes precedence).
+        let _ = std::fs::remove_file(&upper_path);
+        std::os::unix::fs::symlink(&link_target, &upper_path).map_err(|e| {
+            anyhow::anyhow!("failed to create file mount symlink {upper_path} → {link_target}: {e}")
+        })?;
+        debug!("file symlink: {upper_path} → {link_target}");
+    }
+
+    // Persist filelinks for debugging (survives overlay resets, shows active file mounts).
+    if has_disk {
+        std::fs::create_dir_all("/mnt/disk/filelinks")
+            .unwrap_or_else(|e| error!("filelinks dir: {e}"));
+        let current_keys: std::collections::HashSet<&str> =
+            mounts.files.iter().map(|f| f.mount_key.as_str()).collect();
+        if let Ok(entries) = std::fs::read_dir("/mnt/disk/filelinks") {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if !current_keys.contains(name.to_string_lossy().as_ref()) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        for file in &mounts.files {
+            let rw_or_ro = if file.read_only { "ro" } else { "rw" };
+            let link_target = format!("/airlock/.files/{rw_or_ro}/{}", file.mount_key);
+            let filelink_path = format!("/mnt/disk/filelinks/{}", file.mount_key);
+            let _ = std::fs::remove_file(&filelink_path);
+            let _ = std::os::unix::fs::symlink(&link_target, &filelink_path);
+        }
+    }
+
+    // overlayfs: ca (highest priority) + base image (lowerdirs) + project state (upperdir)
+    let ca_exists = Path::new("/mnt/ca").is_dir();
     debug!("overlayfs ca layer: exists={ca_exists}");
     let lower = if ca_exists {
-        "/mnt/overlay/ca:/mnt/base".to_string()
+        "/mnt/ca:/mnt/base".to_string()
     } else {
         "/mnt/base".to_string()
     };
@@ -309,9 +346,14 @@ fn reset_overlay_if_needed(image_id: &str) {
 /// Mount a VirtioFS share by its tag name at `/mnt/<tag>`.
 fn mount_virtiofs(tag: &str) -> anyhow::Result<()> {
     let mount_point = format!("/mnt/{tag}");
-    std::fs::create_dir_all(&mount_point)?;
+    mount_virtiofs_at(tag, &mount_point)
+}
+
+/// Mount a VirtioFS share by its tag name at an arbitrary path.
+fn mount_virtiofs_at(tag: &str, mount_point: &str) -> anyhow::Result<()> {
+    std::fs::create_dir_all(mount_point)?;
     let tag_cstr = std::ffi::CString::new(tag).unwrap();
-    let mount_cstr = std::ffi::CString::new(mount_point.as_str()).unwrap();
+    let mount_cstr = std::ffi::CString::new(mount_point).unwrap();
     let fstype = std::ffi::CString::new("virtiofs").unwrap();
     let ret = unsafe {
         libc::mount(
@@ -324,7 +366,7 @@ fn mount_virtiofs(tag: &str) -> anyhow::Result<()> {
     };
     if ret != 0 {
         let err = std::io::Error::last_os_error();
-        anyhow::bail!("failed to mount virtiofs {tag}: {err}");
+        anyhow::bail!("failed to mount virtiofs {tag} at {mount_point}: {err}");
     }
     debug!("mounted virtiofs: {tag} → {mount_point}");
     Ok(())

@@ -8,7 +8,6 @@ use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
 use airlock_protocol::supervisor_capnp::*;
 
 use crate::network::Network;
-use crate::oci::Bundle;
 use crate::project::Project;
 use crate::rpc::logging::LogSinkImpl;
 use crate::rpc::process::Process;
@@ -63,7 +62,7 @@ impl Supervisor {
         &self,
         args: &crate::cli::CliArgs,
         project: &Project,
-        bundle: &Bundle,
+        vm: &crate::vm::VmInstance,
         stdin: Stdin,
         network: Network,
         epoch: u64,
@@ -111,33 +110,29 @@ impl Supervisor {
 
         // Process configuration
         req.get()
-            .set_cmd(bundle.cmd.first().map_or("/bin/sh", String::as_str));
-        let proc_args = if bundle.cmd.len() > 1 {
-            &bundle.cmd[1..]
-        } else {
-            &[]
-        };
+            .set_cmd(vm.cmd.first().map_or("/bin/sh", String::as_str));
+        let proc_args = if vm.cmd.len() > 1 { &vm.cmd[1..] } else { &[] };
         let mut args_b = req.get().init_args(proc_args.len() as u32);
         for (i, a) in proc_args.iter().enumerate() {
             args_b.set(i as u32, a);
         }
-        let mut env_b = req.get().init_env(bundle.env.len() as u32);
-        for (i, e) in bundle.env.iter().enumerate() {
+        let mut env_b = req.get().init_env(vm.env.len() as u32);
+        for (i, e) in vm.env.iter().enumerate() {
             env_b.set(i as u32, e);
         }
-        req.get().set_cwd(&bundle.cwd);
-        req.get().set_uid(bundle.uid);
-        req.get().set_gid(bundle.gid);
+        req.get().set_cwd(&vm.cwd);
+        req.get().set_uid(vm.uid);
+        req.get().set_gid(vm.gid);
         req.get().set_nested_virt(project.config.vm.kvm);
         req.get().set_harden(project.config.vm.harden);
 
         // Mount configuration
-        req.get().set_image_id(&bundle.image_id);
+        req.get().set_image_id(&vm.image_id);
 
-        let dirs: Vec<_> = bundle
+        let dirs: Vec<_> = vm
             .mounts
             .iter()
-            .filter(|m| matches!(m.mount_type, crate::oci::MountType::Dir { .. }))
+            .filter(|m| matches!(m.mount_type, crate::vm::mount::MountType::Dir { .. }))
             .collect();
         let mut dirs_b = req.get().init_dirs(dirs.len() as u32);
         for (i, m) in dirs.iter().enumerate() {
@@ -146,19 +141,20 @@ impl Supervisor {
             dirs_b.reborrow().get(i as u32).set_read_only(m.read_only);
         }
 
-        let files: Vec<_> = bundle
+        let files: Vec<_> = vm
             .mounts
             .iter()
-            .filter(|m| matches!(m.mount_type, crate::oci::MountType::File { .. }))
+            .filter(|m| matches!(m.mount_type, crate::vm::mount::MountType::File { .. }))
             .collect();
         let mut files_b = req.get().init_files(files.len() as u32);
         for (i, m) in files.iter().enumerate() {
             files_b.reborrow().get(i as u32).set_target(&m.target);
             files_b.reborrow().get(i as u32).set_read_only(m.read_only);
+            files_b.reborrow().get(i as u32).set_key(m.key());
         }
 
-        let mut caches_b = req.get().init_caches(bundle.caches.len() as u32);
-        for (i, (name, enabled, paths)) in bundle.caches.iter().enumerate() {
+        let mut caches_b = req.get().init_caches(vm.caches.len() as u32);
+        for (i, (name, enabled, paths)) in vm.caches.iter().enumerate() {
             caches_b.reborrow().get(i as u32).set_name(name);
             caches_b.reborrow().get(i as u32).set_enabled(*enabled);
             let mut paths_b = caches_b

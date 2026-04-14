@@ -12,6 +12,7 @@ mod oci;
 mod project;
 mod rpc;
 mod terminal;
+mod util;
 mod vm;
 
 use clap::{CommandFactory, FromArgMatches};

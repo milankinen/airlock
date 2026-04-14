@@ -19,9 +19,14 @@ pub struct DirMountConfig {
     pub read_only: bool,
 }
 
-/// A file mount: symlinked into the container rootfs via /airlock/.files/{rw,ro}.
+/// A file mount: the file is hard-linked (with copy fallback) into the project's
+/// `overlay/files/{rw|ro}/{mount_key}` directory on the host and exposed via the
+/// `files/rw` or `files/ro` VirtioFS share. Inside the container, `target`
+/// becomes a symlink → `/airlock/.files/{rw|ro}/{mount_key}`.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct FileMountConfig {
+    /// Config key identifying the mount (used as filename in the VirtioFS share dir).
+    pub mount_key: String,
     pub target: String,
     pub read_only: bool,
 }

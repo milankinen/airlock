@@ -67,6 +67,40 @@ impl Project {
             format!("{} → {}", self.host_cwd.display(), self.guest_cwd.display())
         }
     }
+
+    /// Install the project CA cert into overlay/ca/ as an extra overlayfs lowerdir.
+    /// The supervisor mounts overlay/ca as the highest-priority lowerdir, so these
+    /// files override the base image without needing symlinks or upperdir writes.
+    pub fn install_ca_cert(&self, image_rootfs: &Path) -> anyhow::Result<()> {
+        let ca_cert = std::fs::read(&self.ca_cert)?;
+        let overlay_ca_dir = self.cache_dir.join("overlay/ca");
+
+        // Paths relative to rootfs for CA trust stores across distros
+        let ca_stores = [
+            "etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu/Alpine
+            "etc/ssl/cert.pem",                  // Alpine/LibreSSL
+            "etc/pki/tls/certs/ca-bundle.crt",   // RHEL/CentOS/Fedora
+            "etc/ssl/ca-bundle.pem",             // openSUSE/SLES
+            "etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", // RHEL/Fedora (update-ca-trust output)
+        ];
+
+        for ca_store in ca_stores {
+            let dest = overlay_ca_dir.join(ca_store);
+            // Read pristine certs from image (may not exist for all distro paths)
+            let existing = std::fs::read(image_rootfs.join(ca_store)).unwrap_or_default();
+            let mut out = existing;
+            if !out.ends_with(b"\n") && !out.is_empty() {
+                out.push(b'\n');
+            }
+            out.extend_from_slice(&ca_cert);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&dest, &out)?;
+        }
+
+        Ok(())
+    }
 }
 
 impl Drop for Project {

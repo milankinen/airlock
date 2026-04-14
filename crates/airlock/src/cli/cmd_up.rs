@@ -123,8 +123,8 @@ async fn run_inner(
     }
 
     let mut terminal = terminal::setup();
-    let bundle = oci::prepare(&args, &project, &terminal).await?;
-    let network = network::setup(&project, &bundle)?;
+    let image = oci::prepare(&args, &project, &terminal).await?;
+    let network = network::setup(&project, &image.container_home)?;
 
     // Check if user interrupted during setup (e.g. Ctrl+C during download)
     if cli::is_interrupted() {
@@ -140,13 +140,13 @@ async fn run_inner(
         .unwrap_or_default();
     let epoch = now.as_secs();
     let epoch_nanos = now.subsec_nanos();
-    let (vm_handle, vsock_fd) = vm::start(&args, &project, &bundle).await?;
+    let (vm, vsock_fd) = vm::start(&args, &project, &image).await?;
     project.save_meta();
     let supervisor = rpc::Supervisor::connect(vsock_fd)?;
 
     let stdin = terminal.stdin()?;
     let proc = supervisor
-        .start(&args, &project, &bundle, stdin, network, epoch, epoch_nanos)
+        .start(&args, &project, &vm, stdin, network, epoch, epoch_nanos)
         .await?;
 
     // Start CLI server so `airlock exec` can attach processes to this VM
@@ -195,7 +195,7 @@ async fn run_inner(
     supervisor.shutdown().await;
 
     // Destroy VM and return the exit code from vm shell
-    drop(vm_handle);
+    drop(vm);
     Ok(exit_code)
 }
 
