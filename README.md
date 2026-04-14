@@ -33,10 +33,11 @@ curl -fsSL https://github.com/milankinen/airlock/releases/latest/download/instal
 **Run:**
 
 ```bash
-airlock up                          # Start interactive VM shell
-airlock up -- ls /usr               # One-off command
+airlock start                       # Start interactive VM shell
+airlock start -- ls /usr            # One-off command
 airlock exec bash                   # Attach to running VM (alias: airlock x)
-airlock down                        # Stop and remove VM
+airlock show                        # Show sandbox status and config
+airlock rm                          # Remove sandbox state
 
 airlock help                        # See all available commands and options
 ```
@@ -44,16 +45,17 @@ airlock help                        # See all available commands and options
 ## CLI reference
 
 ```
-airlock up [path] [options] [-- cmd args...]
+airlock start [options] [-- cmd args...]
 ```
 
-Start the project VM. `path` defaults to the current directory. Extra
-arguments after `--` are passed to the container command.
+Start the project VM from the current directory. Extra arguments after `--`
+are passed to the container command.
 
 | Option               | Description                                                                       |
 |----------------------|-----------------------------------------------------------------------------------|
-| `--project-cwd PATH` | Working directory inside the container (defaults to host cwd)                     |
+| `--sandbox-cwd PATH` | Working directory inside the container (defaults to host cwd)                     |
 | `-l, --login`        | Run the container command in a login shell (sources `/etc/profile`, `~/.profile`) |
+| `-v, --verbose`      | Show mounts and network rules during startup                                      |
 | `--log-level LEVEL`  | Supervisor log verbosity: `trace`/`debug`/`info`/`warn`/`error` (default: `info`) |
 
 ---
@@ -74,19 +76,20 @@ Execute a command inside the running VM container.
 ---
 
 ```
-airlock down [path] [-f]
+airlock show
 ```
 
-Stop and remove the project VM. `-f`/`--force` skips the confirmation prompt.
+Show sandbox status, image, resource config, disk usage, mounts, and network
+rules for the current project.
 
 ---
 
 ```
-airlock info [path]
-airlock list  (alias: ls)
+airlock rm [-f]
 ```
 
-Show project info or list all known projects.
+Remove the sandbox state (`.airlock/` directory). `-f`/`--force` skips the
+confirmation prompt. Run `airlock start` again to reinitialise.
 
 ## Configuration
 
@@ -94,6 +97,10 @@ Show project info or list all known projects.
 overrides. Files are loaded in order (later wins): `~/.cache/airlock/config.toml`,
 `~/.airlock.toml`, `airlock.toml`, `airlock.local.toml`. JSON and YAML are also
 accepted alongside TOML.
+
+Sandbox state (overlay, disk image, CA cert, lock) is stored in `.airlock/`
+inside the project directory and is excluded from version control automatically.
+`airlock rm` removes this directory entirely.
 
 ```toml
 presets = ["rust"]             # built-in preset bundles
@@ -181,7 +188,8 @@ enabled = true               # enable/disable mount (default: true)
 source = "~/.ssh/config"    # path on the host
 target = "~/.ssh/config"    # path in the container
 read_only = true
-missing = "warn"             # fail | warn | ignore | create
+missing = "warn"             # fail (default) | warn | ignore | create-dir | create-file
+# file_content = "..."       # initial content when missing = "create-file"
 ```
 
 The project directory is always mounted at its exact host path.
