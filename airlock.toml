@@ -19,13 +19,3 @@ CARGO_TARGET_DIR = "/tmp/cargo"
 
 [disk]
 size = "20 GB"
-
-[mounts.claude-json]
-missing = "fail"
-source = "~/.ez/claude.json"
-target = "~/.claude.json"
-
-[network.sockets.docker]
-host = "~/.docker/run/docker.sock"
-guest = "/var/run/docker.sock"
-

@@ -1,5 +1,8 @@
 # Claude code development preset
 
+[env]
+CLAUDE_CODE_OAUTH_TOKEN = "${CLAUDE_CODE_OAUTH_TOKEN:}"
+
 [network.rules.claude-code]
 allow = [
     "claude.ai:443",
@@ -8,12 +11,13 @@ allow = [
     "api.anthropic.com:443",
 ]
 
-[mounts.claude-dir]
-missing = "warn"
-source = "~/.claude"
+[mounts.claude-settings]
+missing = "create-dir"
+source = "~/.airlock/claude/settings"
 target = "~/.claude"
 
 [mounts.claude-json]
-missing = "warn"
-source = "~/.claude.json"
+missing = "create-file"
+file_content = "{\"hasCompletedOnboarding\":true}"
+source = "~/.airlock/claude/claude.json"
 target = "~/.claude.json"
