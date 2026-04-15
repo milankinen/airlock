@@ -3,7 +3,7 @@ set -eu
 
 REPO="milankinen/airlock"
 INSTALL_DIR="${AIRLOCK_INSTALL_DIR:-$HOME/.local/bin}"
-VARIANT="all"
+VARIANT="bundled"
 
 info() { printf '  %s\n' "$@"; }
 err()  { printf 'error: %s\n' "$@" >&2; exit 1; }

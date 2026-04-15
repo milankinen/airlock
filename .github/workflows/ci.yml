@@ -53,6 +53,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: mise run test
 
+  build-manual:
+    needs: [ lint-macos, lint-linux, test-macos, test-linux ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - run: mise run docs:build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: manual
+          path: target/manual
+
   # ── Stage 2: build artifacts ───────────────────────────
   build-kernel-aarch64:
     needs: [ lint-macos, lint-linux, test-macos, test-linux ]

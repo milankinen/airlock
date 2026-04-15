@@ -1,5 +1,6 @@
 [tools]
 "aqua:docker/cli" = "29.4.0"
+"github:rust-lang/mdBook" = "0.5.2"
 
 [tasks.test]
 quiet = true
@@ -18,6 +19,16 @@ run = """
 cargo +nightly fmt --all -- --check
 cargo clippy --workspace --tests -- -D warnings
 """
+
+[tasks."docs:build"]
+quiet = true
+description = "Build documentation"
+run = "mdbook build docs/manual"
+
+[tasks."docs:serve"]
+description = "Serve documentation with live reload"
+raw = true
+run = "mdbook serve docs/manual"
 
 [tasks.dev]
 description = "Build, sign, and run"

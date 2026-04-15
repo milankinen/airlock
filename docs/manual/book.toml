@@ -1,0 +1,16 @@
+[book]
+title = "airlock user manual"
+description = "Lightweight VM sandbox for running untrusted code"
+authors = ["Matti Lankinen"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "../../target/manual"
+
+[output.html]
+no-section-label = true
+default-theme = "light"
+preferred-dark-theme = "dark"
+additional-css = ["./theme/catppuccin.css", "./theme/custom.css"]
+git-repository-url = "https://github.com/milankinen/airlock"

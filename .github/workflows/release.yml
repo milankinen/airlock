@@ -17,11 +17,14 @@ jobs:
   release:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    outputs:
+      ci_run_id: ${{ steps.ci-run.outputs.run_id }}
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Download artifacts from CI run
+      - name: Resolve CI run ID
+        id: ci-run
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -36,6 +39,12 @@ jobs:
               --json databaseId \
               --jq '.[0].databaseId')
           fi
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+      - name: Download artifacts from CI run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUN_ID="${{ steps.ci-run.outputs.run_id }}"
           echo "Downloading artifacts from CI run $RUN_ID"
           for name in airlock-macos-aarch64 airlock-linux-x86_64 airlock-linux-aarch64 \
                       airlock-macos-aarch64-distroless airlock-linux-x86_64-distroless airlock-linux-aarch64-distroless; do
@@ -48,7 +57,7 @@ jobs:
         run: |
           VERSION="${{ github.event.inputs.version }}"
 
-          for variant in darwin-aarch64-all:macos-aarch64 linux-x86_64-all:linux-x86_64 linux-aarch64-all:linux-aarch64 \
+          for variant in darwin-aarch64-bundled:macos-aarch64 linux-x86_64-bundled:linux-x86_64 linux-aarch64-bundled:linux-aarch64 \
                          darwin-aarch64-distroless:macos-aarch64-distroless \
                          linux-x86_64-distroless:linux-x86_64-distroless \
                          linux-aarch64-distroless:linux-aarch64-distroless; do
@@ -68,12 +77,12 @@ jobs:
         run: |
           VERSION="${{ github.event.inputs.version }}"
           gh release create "$VERSION" \
-            airlock-${VERSION}-darwin-aarch64-all.tar.gz \
-            airlock-${VERSION}-darwin-aarch64-all.tar.gz.sha256 \
-            airlock-${VERSION}-linux-x86_64-all.tar.gz \
-            airlock-${VERSION}-linux-x86_64-all.tar.gz.sha256 \
-            airlock-${VERSION}-linux-aarch64-all.tar.gz \
-            airlock-${VERSION}-linux-aarch64-all.tar.gz.sha256 \
+            airlock-${VERSION}-darwin-aarch64-bundled.tar.gz \
+            airlock-${VERSION}-darwin-aarch64-bundled.tar.gz.sha256 \
+            airlock-${VERSION}-linux-x86_64-bundled.tar.gz \
+            airlock-${VERSION}-linux-x86_64-bundled.tar.gz.sha256 \
+            airlock-${VERSION}-linux-aarch64-bundled.tar.gz \
+            airlock-${VERSION}-linux-aarch64-bundled.tar.gz.sha256 \
             airlock-${VERSION}-darwin-aarch64-distroless.tar.gz \
             airlock-${VERSION}-darwin-aarch64-distroless.tar.gz.sha256 \
             airlock-${VERSION}-linux-x86_64-distroless.tar.gz \
@@ -82,3 +91,28 @@ jobs:
             airlock-${VERSION}-linux-aarch64-distroless.tar.gz.sha256 \
             install.sh \
             --repo "$GITHUB_REPOSITORY" --generate-notes
+
+  publish-manual:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Download manual artifact from CI run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download "${{ needs.release.outputs.ci_run_id }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name manual \
+            --dir manual
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: manual
+      - id: deploy
+        uses: actions/deploy-pages@v4

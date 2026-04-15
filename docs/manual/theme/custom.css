@@ -1,0 +1,23 @@
+/* Logo in sidebar */
+.sidebar .sidebar-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.75rem 1rem;
+}
+
+.sidebar .sidebar-header img {
+    height: 32px;
+    width: auto;
+}
+
+.sidebar .sidebar-header h1 {
+    margin: 0;
+    font-size: 1.2rem;
+    font-weight: 600;
+}
+
+.on-this-page {
+    border-width: 3px;
+    margin-top: 8px;
+}
