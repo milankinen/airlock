@@ -153,9 +153,9 @@ async fn run_inner(
         .filter(|(_, r)| r.enabled)
         .collect();
     if !enabled_rules.is_empty() {
-        let default_mode = format!("{:?}", project.config.network.default_mode).to_lowercase();
+        let policy = format!("{:?}", project.config.network.policy).to_lowercase();
         cli::verbose!(
-            "  {} network rules: {} (default: {default_mode})",
+            "  {} network rules: {} (policy: {policy})",
             cli::bullet(),
             enabled_rules.len()
         );

@@ -15,7 +15,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 
-use crate::config::config::{self, DefaultMode, NetworkMiddleware, NetworkRule};
+use crate::config::config::{self, MiddlewareRule, NetworkRule, Policy};
 use crate::network::middleware::LogFn;
 use crate::network::tls::TlsInterceptor;
 use crate::network::{Network, rules};
@@ -136,32 +136,10 @@ where
 }
 
 fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
-    // Build rules from the test config. Middleware is attached to the
-    // allow rule so it applies to matched targets.
+    // Build rules from test config (no middleware — rules are pure allow/deny).
     let mut rules = BTreeMap::new();
 
-    // Build middleware map from scripts.
-    // If no scripts and no explicit passthrough, add a no-op middleware
-    // so TLS interception is enabled (matches old test behavior).
-    let middleware: Vec<NetworkMiddleware> = if !cfg.middleware_scripts.is_empty() {
-        cfg.middleware_scripts
-            .iter()
-            .map(|(_, script)| NetworkMiddleware {
-                env: BTreeMap::new(),
-                script: script.to_string(),
-            })
-            .collect()
-    } else if cfg.tls_passthrough.is_empty() {
-        // No-op middleware forces MITM (old test default behavior)
-        vec![NetworkMiddleware {
-            env: BTreeMap::new(),
-            script: String::new(),
-        }]
-    } else {
-        vec![]
-    };
-
-    // Main allow rule (with middleware if any)
+    // Main allow rule
     if !cfg.allowed_hosts.is_empty() {
         rules.insert(
             "test-allow".to_string(),
@@ -169,33 +147,66 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
                 enabled: true,
                 allow: cfg.allowed_hosts.clone(),
                 deny: vec![],
-                middleware,
             },
         );
     }
 
-    // Explicit TLS passthrough: add as allowed targets without middleware
-    if !cfg.tls_passthrough.is_empty() {
+    // Build middleware from test config.
+    // Middleware targets default to allowed_hosts if present.
+    // If no scripts and no explicit passthrough, add a no-op middleware
+    // so TLS interception is enabled (matches old test behavior).
+    let mut middleware_config = BTreeMap::new();
+    let middleware_targets = cfg.allowed_hosts.clone();
+    let has_passthrough = !cfg.tls_passthrough.is_empty();
+
+    // Explicit TLS passthrough: allowed targets (no middleware → passthrough)
+    if has_passthrough {
         rules.insert(
             "test-passthrough".to_string(),
             NetworkRule {
                 enabled: true,
                 allow: cfg.tls_passthrough,
                 deny: vec![],
-                middleware: vec![],
             },
         );
     }
 
-    // Tests use an allowlist model: only explicitly listed hosts are permitted.
+    if !cfg.middleware_scripts.is_empty() {
+        for (i, (_, script)) in cfg.middleware_scripts.iter().enumerate() {
+            middleware_config.insert(
+                format!("test-mw-{i}"),
+                MiddlewareRule {
+                    enabled: true,
+                    target: middleware_targets.clone(),
+                    env: BTreeMap::new(),
+                    script: script.to_string(),
+                },
+            );
+        }
+    } else if !has_passthrough {
+        // No-op middleware forces MITM (old test default behavior)
+        middleware_config.insert(
+            "test-noop".to_string(),
+            MiddlewareRule {
+                enabled: true,
+                target: middleware_targets,
+                env: BTreeMap::new(),
+                script: String::new(),
+            },
+        );
+    }
+
+    // Tests use a deny-by-default model: only explicitly listed hosts are permitted.
     let config = config::Network {
-        default_mode: DefaultMode::Deny,
+        policy: Policy::DenyByDefault,
         rules,
+        middleware: middleware_config,
         ports: BTreeMap::default(),
         sockets: BTreeMap::default(),
     };
     let (request_log, log_fn) = RequestLog::new();
-    let (allow_targets, deny_targets) = rules::resolve(&config, &log_fn).unwrap();
+    let (allow_targets, deny_targets) = rules::resolve(&config);
+    let middleware_targets = rules::resolve_middleware(&config, &log_fn).unwrap();
 
     // MITM CA
     let mitm_ca_key = rcgen::KeyPair::generate().unwrap();
@@ -222,11 +233,12 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
         request_log,
         mitm_ca_pem,
         Network {
-            default_mode: crate::config::config::DefaultMode::Deny,
+            policy: Policy::DenyByDefault,
             tls_client: Arc::new(tls_client),
             interceptor: Rc::new(interceptor),
             allow_targets,
             deny_targets,
+            middleware_targets,
             port_forwards: std::collections::HashMap::default(),
             socket_map: std::collections::HashMap::default(),
         },

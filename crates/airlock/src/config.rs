@@ -189,18 +189,23 @@ pub mod config {
         pub initramfs: Option<String>,
     }
 
-    /// Default action when no allow rule matches a connection.
+    /// Network policy — controls whether connections are allowed or denied
+    /// before rules are evaluated.
     #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
-    #[serde(rename_all = "lowercase")]
-    pub enum DefaultMode {
-        /// Allow the connection (default).
+    #[serde(rename_all = "kebab-case")]
+    pub enum Policy {
+        /// Skip rules, allow all connections (default).
         #[default]
-        Allow,
-        /// Deny the connection.
-        Deny,
+        AllowAlways,
+        /// Skip rules, deny all connections (including port forwards and sockets).
+        DenyAlways,
+        /// Allow connections unless explicitly denied by a rule.
+        AllowByDefault,
+        /// Deny connections unless explicitly allowed by a rule.
+        DenyByDefault,
     }
 
-    impl WellKnown for DefaultMode {
+    impl WellKnown for Policy {
         type Deserializer =
             smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
         const DE: Self::Deserializer = smart_config::de::Serde;
@@ -209,12 +214,16 @@ pub mod config {
     /// Network configuration
     #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
     pub struct Network {
-        /// Default action when no allow rule matches: `"allow"` (default) or `"deny"`.
+        /// Network policy: `"allow-always"` (default), `"deny-always"`,
+        /// `"allow-by-default"`, or `"deny-by-default"`.
         #[config(default)]
-        pub default_mode: DefaultMode,
-        /// Named network rules.
+        pub policy: Policy,
+        /// Named network rules (allow/deny patterns).
         #[config(default)]
         pub rules: BTreeMap<String, NetworkRule>,
+        /// Named HTTP middleware scripts.
+        #[config(default)]
+        pub middleware: BTreeMap<String, MiddlewareRule>,
         /// Port forwarding from guest to host.
         #[config(default)]
         pub ports: BTreeMap<String, PortForward>,
@@ -392,32 +401,24 @@ pub mod config {
         const DE: Self::Deserializer = smart_config::de::Serde;
     }
 
-    /// A named network rule.
+    /// A named network rule — allow/deny patterns for host:port targets.
     ///
     /// Target syntax: `host[:port]` — omitted port means all ports.
     /// Both host and port support `*` wildcards.
     ///
-    /// A connection is allowed when it matches at least one `allow` pattern
-    /// and no `deny` pattern. `deny` is checked first and wins immediately.
-    /// If no `allow` pattern matches, the connection is denied.
-    ///
-    /// Rules without middleware get TLS passthrough (no MITM).
-    /// Rules with middleware get TLS interception for HTTP.
+    /// `deny` is checked first and wins unconditionally. If no rule matches,
+    /// the connection follows the network `policy`.
     #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
     pub struct NetworkRule {
         /// Enable/disable rule
         #[config(default_t = true)]
         pub enabled: bool,
-        /// Hosts/ports to allow. Middleware (if any) can still deny via `req:deny()`.
+        /// Hosts/ports to allow.
         #[config(default)]
         pub allow: Vec<String>,
-        /// Hosts/ports to deny unconditionally (no middleware, deny wins over allow).
+        /// Hosts/ports to deny unconditionally (deny wins over allow).
         #[config(default)]
         pub deny: Vec<String>,
-        /// Optional HTTP middleware scripts. Only applied to `allow` targets.
-        /// Default behaviour is to forward; call `req:deny()` to block.
-        #[config(default)]
-        pub middleware: Vec<NetworkMiddleware>,
     }
 
     impl WellKnown for NetworkRule {
@@ -425,9 +426,19 @@ pub mod config {
         const DE: Self::Deserializer = de::nested();
     }
 
-    /// HTTP middleware script applied to matching targets.
+    /// HTTP middleware script with target patterns.
+    ///
+    /// Middleware is applied to allowed connections whose host:port matches
+    /// any entry in `target`. Triggers TLS interception for HTTPS traffic.
     #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
-    pub struct NetworkMiddleware {
+    pub struct MiddlewareRule {
+        /// Enable/disable this middleware
+        #[config(default_t = true)]
+        pub enabled: bool,
+        /// Host:port patterns where this middleware applies (same syntax as
+        /// rule allow/deny).
+        #[config(default)]
+        pub target: Vec<String>,
         /// Variables exposed to the script as the `env` global table.
         /// Values are subst templates (e.g. `"${HOST_VAR}"`) expanded from
         /// the host environment. Any template referencing an undefined host
@@ -438,8 +449,8 @@ pub mod config {
         pub script: String,
     }
 
-    impl WellKnown for NetworkMiddleware {
-        type Deserializer = de::Nested<NetworkMiddleware>;
+    impl WellKnown for MiddlewareRule {
+        type Deserializer = de::Nested<MiddlewareRule>;
         const DE: Self::Deserializer = de::nested();
     }
 

@@ -25,7 +25,7 @@ setup_file() {
 [vm]
 
 [network]
-default_mode = "deny"
+policy = "deny-by-default"
 
 [network.ports.test-server]
 host = [18081]
@@ -33,7 +33,8 @@ host = [18081]
 [network.rules.example]
 allow = ["example.org:443"]
 
-[[network.rules.example.middleware]]
+[network.middleware.deny-forbidden]
+target = ["example.org:443"]
 script = '''
 if req.path:find("^/forbidden") then
     req:deny()

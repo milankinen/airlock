@@ -24,7 +24,13 @@ allow = [
 # Path restrictions per the allowlist reference.
 # Hosts with middleware get TLS interception to inspect HTTP paths.
 
-[[network.rules.copilot-cli.middleware]]
+[network.middleware.copilot-cli-paths]
+target = [
+    "github.com",
+    "api.github.com",
+    "copilot-telemetry.githubusercontent.com",
+    "collector.github.com",
+]
 script = """
 local h = req.host
 local p = req.path

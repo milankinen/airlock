@@ -70,12 +70,13 @@ presets = ["debian", "python", "claude-code"]
 image = "ubuntu:24.04"
 
 [network]
-default_mode = "deny"
+policy = "deny-by-default"
 
 [network.rules.internal-api]
 allow = ["api.internal.company.com:443"]
 
-[[network.rules.internal-api.middleware]]
+[network.middleware.internal-api-auth]
+target = ["api.internal.company.com:443"]
 env.TOKEN = "${INTERNAL_API_TOKEN}"
 script = '''
 req:setHeader("Authorization", "Bearer " .. env.TOKEN)

@@ -25,7 +25,7 @@ setup_file() {
 [vm]
 
 [network]
-default_mode = "deny"
+policy = "deny-by-default"
 
 [network.ports.dev-server]
 host = [18080]

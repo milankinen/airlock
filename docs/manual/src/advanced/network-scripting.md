@@ -1,21 +1,22 @@
 # Network Scripting
 
-When a network rule has middleware attached, airlock performs transparent TLS
+Middleware entries under `[network.middleware]` trigger transparent TLS
 interception on matching connections. This gives your Lua scripts access to
 the full HTTP request and response, letting you do things like inject
 credentials, enforce path-level access control, or rewrite payloads.
 
 If you haven't read the [Network](../configuration/network.md) chapter yet,
-start there — it covers the rule system that middleware builds on.
+start there — it covers the rule system and policy that middleware builds on.
 
 ## How it works
 
-Each middleware entry is a short Lua script that receives a `req` object
-representing the intercepted HTTP request. The script can inspect the request,
-modify it, block it, or forward it and inspect the response.
+Each middleware entry is a named Lua script with `target` patterns that
+determine which connections it applies to. The script receives a `req` object
+representing the intercepted HTTP request.
 
 ```toml
-[[network.rules.my-api.middleware]]
+[network.middleware.add-header]
+target = ["api.example.com:443"]
 script = '''
 req:setHeader("X-Custom", "added-by-airlock")
 '''
@@ -31,7 +32,8 @@ Middleware can reference host environment variables through the `env` table.
 Define the mapping in the middleware config:
 
 ```toml
-[[network.rules.my-api.middleware]]
+[network.middleware.api-auth]
+target = ["api.example.com:443"]
 env.TOKEN = "${MY_API_KEY}"
 script = '''
 if not env.TOKEN then
@@ -51,8 +53,9 @@ VM's system trust store the first time you start a sandbox. Processes inside
 the container see valid certificates for intercepted connections — no manual
 trust configuration is needed.
 
-Rules without middleware get raw TLS passthrough (no interception), so only
-the traffic you explicitly script is decrypted on the host.
+Connections without matching middleware get raw TLS passthrough (no
+interception), so only the traffic you explicitly script is decrypted on the
+host.
 
 ## Request API
 
@@ -137,16 +140,19 @@ calling `body()` altogether.
 
 ## Chaining middleware
 
-A rule can have multiple middleware entries. They run in order, and each one
-sees the modifications made by the previous:
+Multiple middleware entries with overlapping `target` patterns all apply to
+matching connections. They run in order, and each one sees the modifications
+made by the previous:
 
 ```toml
-[[network.rules.my-api.middleware]]
+[network.middleware.add-id]
+target = ["api.example.com:443"]
 script = '''
 req:setHeader("X-Request-ID", "abc123")
 '''
 
-[[network.rules.my-api.middleware]]
+[network.middleware.log-id]
+target = ["api.example.com:443"]
 script = '''
 -- this script sees the X-Request-ID header set above
 log("request id: " .. req:header("X-Request-ID"))
@@ -165,7 +171,8 @@ Allow GitHub API requests only to specific endpoints:
 [network.rules.github]
 allow = ["api.github.com:443"]
 
-[[network.rules.github.middleware]]
+[network.middleware.github-paths]
+target = ["api.github.com:443"]
 script = '''
 local p = req.path
 if not (p == "/user" or p:find("^/repos/myorg/")) then
@@ -177,7 +184,8 @@ end
 ### Logging request bodies
 
 ```toml
-[[network.rules.my-api.middleware]]
+[network.middleware.log-posts]
+target = ["api.example.com:443"]
 script = '''
 if req.method == "POST" then
     local b = req:body()
@@ -189,7 +197,8 @@ end
 ### Modifying a response
 
 ```toml
-[[network.rules.my-api.middleware]]
+[network.middleware.sandbox-header]
+target = ["api.example.com:443"]
 script = '''
 local res = req:send()
 res:setHeader("X-Sandbox", "true")

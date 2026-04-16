@@ -1,16 +1,13 @@
 use super::http;
 use super::middleware::LogFn;
-use super::target::NetworkTarget;
+use super::target::{MiddlewareTarget, NetworkTarget};
 use crate::config::config::Network;
 
-/// Resolve config rules into allow and deny target lists with compiled
-/// middleware attached. Disabled rules are skipped.
+/// Resolve config rules into allow and deny target lists.
+/// Disabled rules are skipped.
 ///
 /// Returns `(allow_targets, deny_targets)`.
-pub fn resolve(
-    network: &Network,
-    log: &LogFn,
-) -> anyhow::Result<(Vec<NetworkTarget>, Vec<NetworkTarget>)> {
+pub fn resolve(network: &Network) -> (Vec<NetworkTarget>, Vec<NetworkTarget>) {
     let mut allow_targets = Vec::new();
     let mut deny_targets = Vec::new();
 
@@ -19,18 +16,11 @@ pub fn resolve(
             continue;
         }
 
-        let compiled_middleware: Vec<_> = rule
-            .middleware
-            .iter()
-            .map(|mw| http::middleware::compile(&mw.script, &mw.env, log.clone()))
-            .collect::<anyhow::Result<_>>()?;
-
         for target_str in &rule.allow {
             let (host, port) = parse_target(target_str);
             allow_targets.push(NetworkTarget {
                 host: host.to_string(),
                 port: port.and_then(|p| p.parse::<u16>().ok()),
-                middleware: compiled_middleware.clone(),
             });
         }
 
@@ -39,12 +29,36 @@ pub fn resolve(
             deny_targets.push(NetworkTarget {
                 host: host.to_string(),
                 port: port.and_then(|p| p.parse::<u16>().ok()),
-                middleware: vec![],
             });
         }
     }
 
-    Ok((allow_targets, deny_targets))
+    (allow_targets, deny_targets)
+}
+
+/// Compile middleware from the `network.middleware` config section.
+/// Each enabled middleware rule is compiled and paired with its target patterns.
+pub fn resolve_middleware(network: &Network, log: &LogFn) -> anyhow::Result<Vec<MiddlewareTarget>> {
+    let mut targets = Vec::new();
+
+    for mw in network.middleware.values() {
+        if !mw.enabled {
+            continue;
+        }
+
+        let compiled = http::middleware::compile(&mw.script, &mw.env, log.clone())?;
+
+        for target_str in &mw.target {
+            let (host, port) = parse_target(target_str);
+            targets.push(MiddlewareTarget {
+                host: host.to_string(),
+                port: port.and_then(|p| p.parse::<u16>().ok()),
+                middleware: compiled.clone(),
+            });
+        }
+    }
+
+    Ok(targets)
 }
 
 /// Derive port forward mappings from config.

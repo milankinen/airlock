@@ -266,12 +266,14 @@ Each rule has an `allow` list and an optional `deny` list. Rules accumulate
 additively across config files and presets. `enabled = false` disables a rule
 including one inherited from a preset.
 
-Decision logic:
+Decision logic (for `allow-by-default` and `deny-by-default` policies):
 1. If any `deny` pattern matches → **block** immediately (deny wins).
-2. If any `allow` pattern matches → **allow**; collect middleware from all
-   matching allow rules.
-3. If neither matched → follow `default_mode` (`"allow"` by default, or
-   `"deny"` to require explicit allow rules).
+2. If any `allow` pattern matches → **allow**.
+3. If neither matched → follow `policy` (`allow-by-default` allows,
+   `deny-by-default` denies).
+
+`allow-always` skips rules and allows everything. `deny-always` denies
+everything including port forwards and sockets.
 
 Pattern formats (used in both `allow` and `deny` lists):
 - `host` — exact hostname, any port
@@ -286,9 +288,9 @@ project cache on first run. The CLI installs the CA cert into the container
 rootfs via the overlayfs lowerdir mechanism so containers trust it
 automatically.
 
-TLS interception is applied **only** for hosts that have Lua middleware
-scripts attached. Hosts without middleware (or unmatched hosts under
-`default_mode = "allow"`) pass through as raw TCP — no TLS MITM.
+TLS interception is applied **only** for connections that match a
+`[network.middleware]` target pattern. Connections without matching
+middleware pass through as raw TCP — no TLS MITM.
 
 ### Lua middleware
 

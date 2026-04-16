@@ -50,6 +50,13 @@ impl network_proxy::Server for Network {
             }
             connect_target::Socket(guest_path) => {
                 let guest_path = guest_path?.to_str()?.to_string();
+
+                if self.is_deny_always() {
+                    debug!("denied: socket {guest_path} (denied by policy)");
+                    results.get().init_result().set_denied("denied by policy");
+                    return Ok(());
+                }
+
                 let Some(host_path) = self.socket_map.get(&guest_path) else {
                     debug!("denied: socket {guest_path} (no matching rule)");
                     results

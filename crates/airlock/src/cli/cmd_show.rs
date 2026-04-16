@@ -71,21 +71,28 @@ pub fn run(_args: &ShowArgs) -> i32 {
         }
     }
 
+    {
+        let policy = format!("{:?}", project.config.network.policy).to_lowercase();
+        println!("Network policy: {policy}");
+    }
+
     if !project.config.network.rules.is_empty() {
-        let default_mode = format!("{:?}", project.config.network.default_mode).to_lowercase();
-        println!("Network rules (default: {default_mode}):");
+        println!("Network rules:");
         for (key, rule) in &project.config.network.rules {
             let status = if rule.enabled { "" } else { " (disabled)" };
-            let mw = if rule.middleware.is_empty() {
-                String::new()
-            } else {
-                format!(", {} middleware", rule.middleware.len())
-            };
             println!(
-                "  {key}: allow {} deny {}{mw}{status}",
+                "  {key}: allow {} deny {}{status}",
                 rule.allow.len(),
                 rule.deny.len()
             );
+        }
+    }
+
+    if !project.config.network.middleware.is_empty() {
+        println!("Network middleware:");
+        for (key, mw) in &project.config.network.middleware {
+            let status = if mw.enabled { "" } else { " (disabled)" };
+            println!("  {key}: {} targets{status}", mw.target.len());
         }
     }
 
