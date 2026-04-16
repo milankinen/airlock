@@ -12,7 +12,6 @@ pub(crate) mod disk;
 mod file_sync;
 pub mod mount;
 
-use std::fmt::Write;
 use std::os::unix::io::OwnedFd;
 use std::path::{Path, PathBuf};
 
@@ -145,7 +144,7 @@ pub async fn start(
         memory_bytes: project.config.vm.memory.0,
         kernel: assets.kernel,
         initramfs: assets.initramfs,
-        kernel_cmdline: build_kernel_cmdline(args, project, &shares),
+        kernel_cmdline: build_kernel_cmdline(args),
         shares,
         cache_disk: Some(disk_image.clone()),
         runtime_dir: project.sandbox_dir.clone(),
@@ -347,21 +346,8 @@ fn resolve_env(project: &Project, image: &OciImage) -> anyhow::Result<Vec<String
 }
 
 /// Build the kernel command line string.
-fn build_kernel_cmdline(args: &CliArgs, project: &Project, shares: &[VmShare]) -> String {
-    let tags: Vec<&str> = shares.iter().map(|s| s.tag.as_str()).collect();
-    let epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let mut cmdline = format!(
-        "console=hvc0 console=ttyS0 rdinit=/init airlock.epoch={epoch} airlock.shares={}",
-        tags.join(",")
-    );
-    let host_ports = crate::network::rules::localhost_ports_from_config(&project.config.network);
-    if !host_ports.is_empty() {
-        let ports: Vec<String> = host_ports.iter().map(ToString::to_string).collect();
-        let _ = write!(cmdline, " airlock.host_ports={}", ports.join(","));
-    }
+fn build_kernel_cmdline(args: &CliArgs) -> String {
+    let mut cmdline = "console=hvc0 console=ttyS0 rdinit=/init".to_string();
     if !matches!(args.log_level, LogLevel::Trace | LogLevel::Debug) {
         cmdline.push_str(" quiet loglevel=3");
     }

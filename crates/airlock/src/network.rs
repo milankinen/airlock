@@ -46,6 +46,9 @@ pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network>
 
     let interceptor = tls::TlsInterceptor::new(&project.ca_cert, &project.ca_key)?;
 
+    let port_forwards: HashMap<u16, u16> =
+        rules::port_forwards_from_config(net).into_iter().collect();
+
     let socket_map: HashMap<String, PathBuf> = net
         .sockets
         .values()
@@ -71,6 +74,7 @@ pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network>
         interceptor: Rc::new(interceptor),
         allow_targets,
         deny_targets,
+        port_forwards,
         socket_map,
     })
 }
@@ -85,6 +89,9 @@ pub struct Network {
     allow_targets: Vec<NetworkTarget>,
     /// Deny-rule targets (no middleware; deny wins unconditionally).
     deny_targets: Vec<NetworkTarget>,
+    /// Port forward mappings: guest_port → host_port.
+    /// Connections to these ports from localhost bypass allow/deny rules.
+    port_forwards: HashMap<u16, u16>,
     /// Guest socket path → host socket path mapping for Unix socket forwarding.
     pub(super) socket_map: HashMap<String, PathBuf>,
 }
@@ -93,10 +100,23 @@ impl Network {
     /// Resolve a host:port to a `ResolvedTarget`.
     ///
     /// Logic:
+    /// 0. If this is a port-forwarded localhost connection → always allowed.
     /// 1. If any deny target matches → `allowed = false` immediately.
     /// 2. If any allow target matches → `allowed = true`; middleware collected.
     /// 3. If neither matched → `allowed` follows `default_mode`.
     pub fn resolve_target(&self, host: &str, port: u16) -> ResolvedTarget {
+        // Port-forwarded localhost connections are always allowed.
+        if is_localhost_ip(host)
+            && let Some(&host_port) = self.port_forwards.get(&port)
+        {
+            return ResolvedTarget {
+                host: "127.0.0.1".to_string(),
+                port: host_port,
+                middleware: vec![],
+                allowed: true,
+            };
+        }
+
         // Deny wins: checked first, no middleware involved.
         for target in &self.deny_targets {
             if target.matches(host, port) {
@@ -128,4 +148,8 @@ impl Network {
             allowed,
         }
     }
+}
+
+fn is_localhost_ip(host: &str) -> bool {
+    host == "127.0.0.1" || host == "::1"
 }

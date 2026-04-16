@@ -108,14 +108,25 @@ forwards can be disabled with `enabled = false`.
 
 ## Port forwarding
 
-When a rule allows `localhost` targets, airlock sets up iptables-based port
-forwarding inside the VM so that the guest can reach host services
-transparently:
+Host TCP ports can be forwarded into the VM so that the guest can reach host
+services transparently. Forwarded ports are configured under `[network.ports]`:
 
 ```toml
-[network.rules.local-services]
-allow = ["localhost:5432", "localhost:6379"]
+[network.ports.local-services]
+host = [5432, 6379]
 ```
 
-This makes the host's PostgreSQL and Redis available to the sandbox without
-any additional configuration.
+This makes the host's PostgreSQL and Redis available at `localhost:5432` and
+`localhost:6379` inside the sandbox. Port forwarding bypasses network rules
+entirely — forwarded ports are always allowed regardless of `default_mode`.
+
+Each entry in `host` is either a plain port number (same port on both sides)
+or a `"source:target"` string for port remapping (host port → guest port):
+
+```toml
+[network.ports.dev]
+host = [8080, "9000:3000"]  # host 9000 → guest 3000
+```
+
+Like other config entries, port forward groups can be disabled with
+`enabled = false`.

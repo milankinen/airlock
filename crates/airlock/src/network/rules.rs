@@ -47,30 +47,23 @@ pub fn resolve(
     Ok((allow_targets, deny_targets))
 }
 
-/// Derive localhost ports directly from config (no compilation needed).
-/// Only `allow` targets contribute to port forwarding.
-pub fn localhost_ports_from_config(network: &Network) -> Vec<u16> {
-    let mut ports = Vec::new();
-    for rule in network.rules.values() {
-        if !rule.enabled {
+/// Derive port forward mappings from config.
+/// For `network.ports` (host→guest): source = host port, target = guest port.
+/// Returns `(guest_port, host_port)` pairs from all enabled port forward groups.
+pub fn port_forwards_from_config(network: &Network) -> Vec<(u16, u16)> {
+    let mut forwards = Vec::new();
+    for pf in network.ports.values() {
+        if !pf.enabled {
             continue;
         }
-        for target in &rule.allow {
-            let (host, port) = parse_target(target);
-            if is_localhost(host)
-                && let Some(port_str) = port
-                && let Ok(p) = port_str.parse::<u16>()
-                && !ports.contains(&p)
-            {
-                ports.push(p);
+        for mapping in &pf.host {
+            let pair = (mapping.target, mapping.source);
+            if !forwards.contains(&pair) {
+                forwards.push(pair);
             }
         }
     }
-    ports
-}
-
-fn is_localhost(host: &str) -> bool {
-    host == "localhost" || host == "127.0.0.1" || host == "::1"
+    forwards
 }
 
 /// Parse a target pattern `host[:port]` into (host, port_str).

@@ -94,10 +94,11 @@ impl Supervisor {
         // Init config: epoch, host ports
         req.get().set_epoch(epoch);
         req.get().set_epoch_nanos(epoch_nanos);
-        let host_ports =
-            crate::network::rules::localhost_ports_from_config(&project.config.network);
-        let mut hp_builder = req.get().init_host_ports(host_ports.len() as u32);
-        for (i, port) in host_ports.iter().enumerate() {
+        let port_forwards =
+            crate::network::rules::port_forwards_from_config(&project.config.network);
+        let guest_ports: Vec<u16> = port_forwards.iter().map(|(g, _)| *g).collect();
+        let mut hp_builder = req.get().init_host_ports(guest_ports.len() as u32);
+        for (i, port) in guest_ports.iter().enumerate() {
             hp_builder.set(i as u32, *port);
         }
 

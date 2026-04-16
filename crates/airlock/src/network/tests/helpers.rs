@@ -191,6 +191,7 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
     let config = config::Network {
         default_mode: DefaultMode::Deny,
         rules,
+        ports: BTreeMap::default(),
         sockets: BTreeMap::default(),
     };
     let (request_log, log_fn) = RequestLog::new();
@@ -226,6 +227,7 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
             interceptor: Rc::new(interceptor),
             allow_targets,
             deny_targets,
+            port_forwards: std::collections::HashMap::default(),
             socket_map: std::collections::HashMap::default(),
         },
     )

@@ -215,6 +215,9 @@ pub mod config {
         /// Named network rules.
         #[config(default)]
         pub rules: BTreeMap<String, NetworkRule>,
+        /// Port forwarding from guest to host.
+        #[config(default)]
+        pub ports: BTreeMap<String, PortForward>,
         /// Unix socket forwarding from host to guest.
         #[config(default)]
         pub sockets: BTreeMap<String, SocketForward>,
@@ -237,6 +240,101 @@ pub mod config {
         const DE: Self::Deserializer = de::nested();
     }
 
+    /// Named port forward group — exposes host TCP ports to the guest.
+    #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
+    pub struct PortForward {
+        /// Enable/disable this port forward group
+        #[config(default_t = true)]
+        pub enabled: bool,
+        /// List of ports to forward. Each entry is either a plain port number
+        /// (same port on guest and host) or `"source:target"` string.
+        /// For `network.ports` (host→guest): source is the host port, target
+        /// is the guest port.
+        #[config(default)]
+        pub host: Vec<PortMapping>,
+    }
+
+    impl WellKnown for PortForward {
+        type Deserializer = de::Nested<PortForward>;
+        const DE: Self::Deserializer = de::nested();
+    }
+
+    /// A directional port mapping between two endpoints.
+    ///
+    /// Accepts either a plain integer (same port both sides: `8080`)
+    /// or a `"source:target"` string (e.g. `"9000:8081"`).
+    ///
+    /// The meaning of source/target depends on context:
+    /// - `network.ports` (host→guest): source = host port, target = guest port
+    #[derive(Debug, Clone, Copy)]
+    pub struct PortMapping {
+        pub source: u16,
+        pub target: u16,
+    }
+
+    impl PortMapping {
+        pub fn same(port: u16) -> Self {
+            Self {
+                source: port,
+                target: port,
+            }
+        }
+    }
+
+    impl serde::Serialize for PortMapping {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            if self.source == self.target {
+                s.serialize_u16(self.source)
+            } else {
+                s.serialize_str(&format!("{}:{}", self.source, self.target))
+            }
+        }
+    }
+
+    impl<'de> serde::Deserialize<'de> for PortMapping {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct Visitor;
+            impl serde::de::Visitor<'_> for Visitor {
+                type Value = PortMapping;
+
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("a port number or \"source:target\" string")
+                }
+
+                fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<PortMapping, E> {
+                    let port = u16::try_from(v).map_err(serde::de::Error::custom)?;
+                    Ok(PortMapping::same(port))
+                }
+
+                fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<PortMapping, E> {
+                    let port = u16::try_from(v).map_err(serde::de::Error::custom)?;
+                    Ok(PortMapping::same(port))
+                }
+
+                fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<PortMapping, E> {
+                    let (source, target) = v
+                        .split_once(':')
+                        .ok_or_else(|| serde::de::Error::custom("expected \"source:target\""))?;
+                    let source: u16 = source.parse().map_err(serde::de::Error::custom)?;
+                    let target: u16 = target.parse().map_err(serde::de::Error::custom)?;
+                    Ok(PortMapping { source, target })
+                }
+            }
+            d.deserialize_any(Visitor)
+        }
+    }
+
+    impl WellKnown for PortMapping {
+        type Deserializer = smart_config::de::Serde<
+            {
+                smart_config::metadata::BasicTypes::INTEGER
+                    .or(smart_config::metadata::BasicTypes::STRING)
+                    .raw()
+            },
+        >;
+        const DE: Self::Deserializer = smart_config::de::Serde;
+    }
+
     /// A named network rule.
     ///
     /// Target syntax: `host[:port]` — omitted port means all ports.
@@ -245,8 +343,6 @@ pub mod config {
     /// A connection is allowed when it matches at least one `allow` pattern
     /// and no `deny` pattern. `deny` is checked first and wins immediately.
     /// If no `allow` pattern matches, the connection is denied.
-    ///
-    /// `allow` targets matching `localhost` drive VM-side iptables port forwarding.
     ///
     /// Rules without middleware get TLS passthrough (no MITM).
     /// Rules with middleware get TLS interception for HTTP.
