@@ -1,11 +1,29 @@
 [tools]
 "aqua:docker/cli" = "29.4.0"
 "github:rust-lang/mdBook" = "0.5.2"
+"aqua:bats-core/bats-core" = "1.11.1"
 
 [tasks.test]
 quiet = true
-description = "Run all tests"
+description = "Run Rust unit tests"
 run = "cargo test --workspace"
+
+[tasks.bats]
+quiet = true
+description = "Run all bats tests"
+run = [{ task = "bats:cli" }, { task = "bats:vm" }]
+
+[tasks."bats:cli"]
+quiet = true
+description = "Run CLI bats tests"
+depends = ["build:release"]
+run = "bats tests/cli/"
+
+[tasks."bats:vm"]
+quiet = true
+description = "Run VM bats tests (requires KVM + docker)"
+depends = ["build:release"]
+run = "bats tests/vm/"
 
 [tasks.format]
 quiet = true

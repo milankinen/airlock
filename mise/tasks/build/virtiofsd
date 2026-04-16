@@ -1,6 +1,6 @@
 #!/bin/bash
 #MISE description="Build virtiofsd binary"
-#MISE sources=["mise/tasks/fetch/virtiofsd"]
+#MISE sources=["mise/tasks/build/virtiofsd"]
 #MISE outputs=["target/vm/virtiofsd"]
 set -euo pipefail
 

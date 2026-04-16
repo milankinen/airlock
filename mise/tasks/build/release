@@ -1,12 +1,12 @@
 #!/bin/bash
-#MISE description="Build the CLI binary"
+#MISE description="Build the CLI binary for testing"
 #MISE depends=["build:initramfs", "build:kernel", "fetch:cloud-hypervisor", "build:virtiofsd"]
 #MISE sources=["crates/airlock/src/**/*.rs", "crates/airlock/Cargo.toml", "Cargo.toml", "Cargo.lock", "target/vm/*"]
-#MISE outputs=["target/debug/airlock"]
+#MISE outputs=["target/release/airlock"]
 set -euo pipefail
 
-cargo build -p airlock-cli --features dev "$@"
+cargo build -p airlock-cli --release "$@"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
-  codesign --entitlements entitlements.plist --force -s - target/debug/airlock 2>/dev/null || true
+  codesign --entitlements entitlements.plist --force -s - target/release/airlock 2>/dev/null || true
 fi
