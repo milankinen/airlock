@@ -38,11 +38,6 @@ pub struct StartArgs {
 pub async fn run(args: StartArgs, extra_args: Vec<String>) -> i32 {
     cli::set_verbose(args.verbose);
 
-    if !cli::is_interactive() {
-        cli::error!("Interactive mode (TTY) is required");
-        return 2;
-    }
-
     #[cfg(target_os = "linux")]
     vm::require_kvm();
 
@@ -71,6 +66,10 @@ pub async fn run(args: StartArgs, extra_args: Vec<String>) -> i32 {
             || host_cwd.join(format!("airlock.local.{ext}")).exists()
     });
     if !has_config {
+        if !cli::is_interactive() {
+            cli::error!("No airlock.toml found in {}", host_cwd.display());
+            return 2;
+        }
         let selection = Select::with_theme(&ColorfulTheme::default())
             .with_prompt(format!("No airlock.toml found in {}", host_cwd.display()))
             .items(["Initialize with defaults", "Cancel"])
@@ -185,19 +184,6 @@ async fn run_inner(
     let epoch_nanos = now.subsec_nanos();
     let (vm, vsock_fd) = vm::start(&args, &project, &image).await?;
     project.save_meta();
-
-    // Show disk utilization after disk has been prepared
-    if let Some((used, total)) = project.disk_usage() {
-        cli::log!(
-            "  {} disk:   {}",
-            cli::bullet(),
-            cli::dim(&format!(
-                "{} / {}",
-                cli::format_bytes(used),
-                cli::format_bytes(total)
-            ))
-        );
-    }
 
     let supervisor = rpc::Supervisor::connect(vsock_fd)?;
 

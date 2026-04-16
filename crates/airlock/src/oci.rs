@@ -62,11 +62,33 @@ pub async fn prepare(
     project: &Project,
     _terminal: &Terminal,
 ) -> anyhow::Result<OciImage> {
-    let stored_digest = read_sandbox_image_meta(&project.sandbox_dir).map(|m| m.digest);
-
-    // Set up registry auth: use stored credentials, fall back to anonymous.
+    let stored_meta = read_sandbox_image_meta(&project.sandbox_dir);
     let image_cfg = &project.config.vm.image;
     let image_name = &image_cfg.name;
+
+    // Fast path: if we already have a cached image for this name, skip
+    // the network round-trip to resolve tag → digest.
+    if let Some(ref meta) = stored_meta
+        && meta.name == *image_name
+    {
+        let image_dir = crate::cache::image_dir(&meta.digest)?;
+        if image_dir.join("rootfs").exists() && image_dir.join("meta.json").exists() {
+            tracing::debug!("image cache hit for {image_name}");
+            cli::log!(
+                "  {} image cached {}",
+                cli::check(),
+                cli::dim(&meta.digest[..19.min(meta.digest.len())])
+            );
+            let overlay_dir = project.sandbox_dir.join("overlay");
+            std::fs::create_dir_all(&overlay_dir)?;
+            cli::log!("  {} environment ready", cli::check());
+            return build_oci_image(&image_dir, meta.digest.clone());
+        }
+    }
+
+    let stored_digest = stored_meta.map(|m| m.digest);
+
+    // Set up registry auth: use stored credentials, fall back to anonymous.
     let registry_host: String = image_name
         .parse::<oci_client::Reference>()
         .map_or_else(|_| image_name.clone(), |r| r.resolve_registry().to_string());
@@ -152,7 +174,11 @@ pub async fn prepare(
     std::fs::create_dir_all(&overlay_dir)?;
     cli::log!("  {} environment ready", cli::check());
 
-    // Read image config from the image cache
+    build_oci_image(&image_dir, image.digest)
+}
+
+/// Build an `OciImage` from a cached image directory.
+fn build_oci_image(image_dir: &Path, digest: String) -> anyhow::Result<OciImage> {
     let config_path = image_dir.join("image_config.json");
     let image_config: OciConfig = if let Ok(data) = std::fs::read(&config_path) {
         serde_json::from_slice(&data).unwrap_or_default()
@@ -196,7 +222,7 @@ pub async fn prepare(
 
     Ok(OciImage {
         rootfs,
-        image_id: image.digest,
+        image_id: digest,
         container_home,
         uid,
         gid,

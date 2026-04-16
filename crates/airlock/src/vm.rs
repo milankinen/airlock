@@ -380,6 +380,11 @@ fn log_config(project: &Project, shares: &[VmShare]) {
         cli::bullet(),
         cli::dim(&project.config.vm.memory.to_string())
     );
+    cli::log!(
+        "  {} disk:   {}",
+        cli::bullet(),
+        cli::dim(&project.config.disk.size.to_string())
+    );
     for share in shares {
         tracing::debug!(
             "share: tag={}, host_path={}, ro={}",
