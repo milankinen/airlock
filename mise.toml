@@ -66,5 +66,5 @@ export GIT_AUTHOR_NAME="$(git config --get user.name)"
 export GIT_AUTHOR_EMAIL="$(git config --get user.email)"
 export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
 export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
-exec target/debug/airlock start --login -- claude --dangerously-skip-permissions --effort=high
+exec target/debug/airlock start --monitor --login -- claude --dangerously-skip-permissions --effort=high
 """

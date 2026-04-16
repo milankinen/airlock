@@ -53,12 +53,14 @@ impl network_proxy::Server for Network {
 
                 if self.is_deny_always() {
                     debug!("denied: socket {guest_path} (denied by policy)");
+                    self.emit_event(&guest_path, 0, false);
                     results.get().init_result().set_denied("denied by policy");
                     return Ok(());
                 }
 
                 let Some(host_path) = self.socket_map.get(&guest_path) else {
                     debug!("denied: socket {guest_path} (no matching rule)");
+                    self.emit_event(&guest_path, 0, false);
                     results
                         .get()
                         .init_result()

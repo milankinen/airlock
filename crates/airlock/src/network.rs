@@ -23,6 +23,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
+
 use crate::config::config::Policy;
 use crate::network::http::middleware::CompiledMiddleware;
 use crate::network::target::{MiddlewareTarget, NetworkTarget, ResolvedTarget};
@@ -31,7 +33,11 @@ use crate::project::Project;
 /// Build the [`Network`] from the sandbox config: load native CA roots,
 /// compile middleware scripts, resolve network targets, and prepare the
 /// TLS interceptor with the sandbox's CA.
-pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network> {
+pub fn setup(
+    project: &Project,
+    container_home: &str,
+    event_tx: Option<mpsc::Sender<airlock_tui::NetworkEvent>>,
+) -> anyhow::Result<Network> {
     let mut root_store = rustls::RootCertStore::empty();
     for cert in rustls_native_certs::load_native_certs().expect("native certs") {
         let _ = root_store.add(cert);
@@ -81,6 +87,7 @@ pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network>
         middleware_targets,
         port_forwards,
         socket_map,
+        event_tx,
     })
 }
 
@@ -100,6 +107,8 @@ pub struct Network {
     port_forwards: HashMap<u16, u16>,
     /// Guest socket path → host socket path mapping for Unix socket forwarding.
     pub(super) socket_map: HashMap<String, PathBuf>,
+    /// Optional channel to send connection events to the TUI monitor.
+    event_tx: Option<mpsc::Sender<airlock_tui::NetworkEvent>>,
 }
 
 impl Network {
@@ -115,6 +124,7 @@ impl Network {
     pub fn resolve_target(&self, host: &str, port: u16) -> ResolvedTarget {
         // deny-always denies everything.
         if matches!(self.policy, Policy::DenyAlways) {
+            self.emit_event(host, port, false);
             return denied(host, port);
         }
 
@@ -131,6 +141,7 @@ impl Network {
 
         // allow-always skips rules, collects middleware.
         if matches!(self.policy, Policy::AllowAlways) {
+            self.emit_event(host, port, true);
             return ResolvedTarget {
                 host: host.to_string(),
                 port,
@@ -142,6 +153,7 @@ impl Network {
         // Deny rules win unconditionally.
         for target in &self.deny_targets {
             if target.matches(host, port) {
+                self.emit_event(host, port, false);
                 return denied(host, port);
             }
         }
@@ -150,6 +162,8 @@ impl Network {
         let allowed = port_forwarded
             || matches!(self.policy, Policy::AllowByDefault)
             || self.allow_targets.iter().any(|t| t.matches(host, port));
+
+        self.emit_event(host, port, allowed);
 
         let middleware = if allowed {
             self.collect_middleware(host, port)
@@ -168,6 +182,17 @@ impl Network {
     /// Whether the policy is `deny-always` (blocks everything including sockets).
     pub fn is_deny_always(&self) -> bool {
         matches!(self.policy, Policy::DenyAlways)
+    }
+
+    /// Send a network event to the TUI monitor, if connected.
+    fn emit_event(&self, host: &str, port: u16, allowed: bool) {
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.try_send(airlock_tui::NetworkEvent::Connect {
+                host: host.to_string(),
+                port,
+                allowed,
+            });
+        }
     }
 
     /// Collect compiled middleware from all matching middleware targets.

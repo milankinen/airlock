@@ -207,9 +207,10 @@ fn build_oci_image(image_dir: &Path, digest: String) -> anyhow::Result<OciImage>
     };
 
     // Resolve environment: base defaults → image env (no sandbox overrides here)
+    let host_term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
     let mut env: Vec<String> = vec![
         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
-        "TERM=linux".to_string(),
+        format!("TERM={host_term}"),
         format!("HOME={container_home}"),
     ];
     if let Some(image_env) = cfg.and_then(|c| c.env.as_ref()) {

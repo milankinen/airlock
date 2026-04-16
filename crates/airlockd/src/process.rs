@@ -195,7 +195,7 @@ where
         let builder = pty_process::Command::new(cmd).args(args);
         let builder = match env_override {
             Some(pairs) => builder.env_clear().envs(pairs),
-            None => builder.env("TERM", "linux"),
+            None => builder.env("TERM", "xterm-256color"),
         };
         // Safety: pre_exec runs post-fork in child; only async-signal-safe calls.
         let child = unsafe { builder.pre_exec(pre_exec) }.spawn(pts)?;

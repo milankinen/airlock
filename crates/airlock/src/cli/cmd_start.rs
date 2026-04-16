@@ -32,6 +32,9 @@ pub struct StartArgs {
     /// Show detailed output (mounts, network rules)
     #[arg(short = 'v', long)]
     pub verbose: bool,
+    /// Open TUI monitoring control panel (tabbed sandbox + network view)
+    #[arg(short = 'm', long)]
+    pub monitor: bool,
 }
 
 /// Entry point for `airlock start [--log-level <level>] [-- extra-args...]`.
@@ -97,10 +100,11 @@ pub async fn run(args: StartArgs, extra_args: Vec<String>) -> i32 {
 
     let cli_args = CliArgs::new(args.log_level, extra_args, args.login);
     let sandbox_cwd = args.sandbox_cwd;
+    let monitor = args.monitor;
     let local = LocalSet::new();
     local
         .run_until(async {
-            run_inner(cli_args, config, host_cwd, sandbox_cwd)
+            run_inner(cli_args, config, host_cwd, sandbox_cwd, monitor)
                 .await
                 .unwrap_or_else(|e| {
                     cli::error!("Error: {e:?}");
@@ -115,6 +119,7 @@ async fn run_inner(
     config: config::Config,
     host_cwd: std::path::PathBuf,
     project_cwd: Option<String>,
+    monitor: bool,
 ) -> anyhow::Result<i32> {
     let project = project::lock(host_cwd, config, project_cwd)?;
 
@@ -130,7 +135,15 @@ async fn run_inner(
 
     let mut terminal = terminal::setup();
     let image = oci::prepare(&args, &project, &terminal).await?;
-    let network = network::setup(&project, &image.container_home)?;
+
+    // Create network event channel for TUI monitor
+    let (event_tx, event_rx) = if monitor {
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    let network = network::setup(&project, &image.container_home, event_tx)?;
 
     // Show mounts and network rules grouped (verbose)
     let enabled_mounts: Vec<_> = project
@@ -176,6 +189,8 @@ async fn run_inner(
     // Enter raw mode only after downloads complete so Ctrl+C works during setup
     terminal.enter_raw_mode();
 
+    let policy_str = format!("{:?}", project.config.network.policy).to_lowercase();
+
     cli::log!("Booting VM...");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -187,9 +202,31 @@ async fn run_inner(
 
     let supervisor = rpc::Supervisor::connect(vsock_fd)?;
 
-    let stdin = terminal.stdin()?;
+    // In monitor mode, use channel-based stdin; otherwise use real terminal stdin.
+    // Both produce a stdin::Client for the supervisor RPC.
+    let (stdin_tx, stdin_client, pty_size) = if monitor {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let tui_stdin = airlock_tui::TuiStdin::new(rx, Some((rows, cols)));
+        let pty_size = tui_stdin.pty_size();
+        (Some(tx), capnp_rpc::new_client(tui_stdin), pty_size)
+    } else {
+        let stdin = terminal.stdin()?;
+        let pty_size = stdin.pty_size();
+        (None, capnp_rpc::new_client(stdin), pty_size)
+    };
+
     let proc = supervisor
-        .start(&args, &project, &vm, stdin, network, epoch, epoch_nanos)
+        .start(
+            &args,
+            &project,
+            &vm,
+            stdin_client,
+            pty_size,
+            network,
+            epoch,
+            epoch_nanos,
+        )
         .await?;
 
     // Start CLI server so `airlock exec` can attach processes to this VM
@@ -211,27 +248,61 @@ async fn run_inner(
         }
     });
 
-    // Handle VM shell output and exit code delegation
-    let exit_code = loop {
-        match proc.poll().await {
-            Ok(rpc::ProcessEvent::Exit(code)) => break code,
-            Ok(rpc::ProcessEvent::Stdout(data)) => {
-                tracing::trace!(
-                    "host stdout: {} bytes: {:?}",
-                    data.len(),
-                    String::from_utf8_lossy(&data)
-                );
-                let _ = std::io::stdout().write_all(&data);
-                let _ = std::io::stdout().flush();
+    let exit_code = if let (Some(stdin_tx), Some(mut event_rx)) = (stdin_tx, event_rx) {
+        // TUI monitor mode: spawn TUI on its own thread, keep process
+        // polling on the LocalSet so RPC is never blocked by rendering.
+        drop(terminal);
+        let tui = airlock_tui::spawn(stdin_tx, policy_str);
+
+        // Forward network events from the tokio channel to the TUI thread
+        let net_tx = tui.tx.clone();
+        tokio::task::spawn_local(async move {
+            while let Some(ev) = event_rx.recv().await {
+                net_tx.send_network(ev);
             }
-            Ok(rpc::ProcessEvent::Stderr(data)) => {
-                tracing::trace!("host stderr: {} bytes", data.len());
-                let _ = std::io::stderr().write_all(&data);
-                let _ = std::io::stderr().flush();
+        });
+
+        // Process poll loop — forward output to TUI, signal exit when done
+        let tui_tx = tui.tx.clone();
+        loop {
+            match proc.poll().await {
+                Ok(rpc::ProcessEvent::Stdout(data) | rpc::ProcessEvent::Stderr(data)) => {
+                    tui_tx.send_output(data);
+                }
+                Ok(rpc::ProcessEvent::Exit(code)) => {
+                    tui_tx.send_exit(code);
+                    break;
+                }
+                Err(_) => {
+                    tui_tx.send_exit(1);
+                    break;
+                }
             }
-            Err(e) => {
-                tracing::trace!("host poll error: {e}");
-                break 1;
+        }
+        tui.join()?
+    } else {
+        // Standard mode: direct stdout relay
+        loop {
+            match proc.poll().await {
+                Ok(rpc::ProcessEvent::Exit(code)) => break code,
+                Ok(rpc::ProcessEvent::Stdout(data)) => {
+                    tracing::trace!(
+                        "host stdout: {} bytes: {:?}",
+                        data.len(),
+                        String::from_utf8_lossy(&data)
+                    );
+                    let _ = std::io::stdout().write_all(&data);
+                    let _ = std::io::stdout().flush();
+                }
+                Ok(rpc::ProcessEvent::Stderr(data)) => {
+                    tracing::trace!("host stderr: {} bytes", data.len());
+                    let _ = std::io::stderr().write_all(&data);
+                    let _ = std::io::stderr().flush();
+                }
+                Err(e) => {
+                    tracing::trace!("host poll error: {e}");
+                    break 1;
+                }
             }
         }
     };

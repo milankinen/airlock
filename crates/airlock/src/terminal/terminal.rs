@@ -24,10 +24,21 @@ impl Terminal {
 
     /// Enter raw terminal mode. Call this only when ready for VM interaction
     /// (after downloads complete) so Ctrl+C works during setup.
+    ///
+    /// Enables xterm `modifyOtherKeys` level 1 so the host terminal encodes
+    /// Shift+Enter as `\e[27;2;13~` (distinct from bare Enter `\r`). Level 1
+    /// leaves keys with well-known behavior alone, so Ctrl+C stays `0x03` for
+    /// PTY line discipline. The guest app sees a distinguishable Shift+Enter
+    /// without needing to negotiate the kitty protocol through the pipe.
     pub fn enter_raw_mode(&mut self) {
         if self.is_tty && self.guard.is_none() {
             let raw_mode_enabled = crossterm::terminal::enable_raw_mode().is_ok();
-            self.guard = Some(TerminalGuard { raw_mode_enabled });
+            let modify_other_keys =
+                std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[>4;1m").is_ok();
+            self.guard = Some(TerminalGuard {
+                raw_mode_enabled,
+                modify_other_keys,
+            });
         }
     }
 
@@ -51,10 +62,14 @@ impl Terminal {
 /// RAII guard that restores the terminal to cooked mode on drop.
 struct TerminalGuard {
     raw_mode_enabled: bool,
+    modify_other_keys: bool,
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        if self.modify_other_keys {
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[>4;0m");
+        }
         if self.raw_mode_enabled {
             let _ = crossterm::terminal::disable_raw_mode();
             let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\r\n");

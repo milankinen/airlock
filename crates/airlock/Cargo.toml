@@ -29,6 +29,7 @@ crossterm = { workspace = true }
 dialoguer = { workspace = true }
 dirs = { workspace = true }
 airlock-protocol = { workspace = true }
+airlock-tui = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }

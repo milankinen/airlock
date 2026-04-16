@@ -11,7 +11,6 @@ use crate::network::Network;
 use crate::project::Project;
 use crate::rpc::logging::LogSinkImpl;
 use crate::rpc::process::Process;
-use crate::rpc::stdin::Stdin;
 
 /// Host-side handle to the in-VM supervisor, wrapping the Cap'n Proto client.
 #[derive(Clone)]
@@ -63,7 +62,8 @@ impl Supervisor {
         args: &crate::cli::CliArgs,
         project: &Project,
         vm: &crate::vm::VmInstance,
-        stdin: Stdin,
+        stdin: stdin::Client,
+        pty_size: Option<(u16, u16)>,
         network: Network,
         epoch: u64,
         epoch_nanos: u32,
@@ -78,8 +78,7 @@ impl Supervisor {
             .collect();
 
         let mut req = self.supervisor.start_request();
-        let pty_size = stdin.pty_size();
-        req.get().set_stdin(capnp_rpc::new_client(stdin));
+        req.get().set_stdin(stdin);
         if let Some((rows, cols)) = pty_size {
             let mut size = req.get().init_pty().init_size();
             size.set_rows(rows);

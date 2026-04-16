@@ -100,6 +100,33 @@ resolution = "registry"
 insecure = true
 ```
 
+## Monitor mode
+
+The `--monitor` (`-m`) flag opens a tabbed TUI control panel alongside
+the sandbox shell. It's most useful when you want to observe what the
+sandbox is doing — especially which outbound connections it's making and
+which are being blocked by policy.
+
+```bash
+airlock start --monitor
+```
+
+Tabs:
+
+- **Sandbox** — the embedded VM terminal, with 1000 lines of mouse-wheel
+  scrollback
+- **Network** — live log of outbound connection attempts, each marked
+  allowed or denied, along with the current policy
+
+Keyboard shortcuts:
+
+| Key      | Action                                                     |
+|----------|------------------------------------------------------------|
+| `F1`     | Switch to Sandbox tab                                      |
+| `F2`     | Switch to Network tab                                      |
+| `F12`    | Toggle mouse capture (release to select text with drag)    |
+| `Ctrl+Q` | Quit                                                       |
+
 ## Verbose output
 
 The `--verbose` flag (or `-v`) shows mounts and network rules during startup,
