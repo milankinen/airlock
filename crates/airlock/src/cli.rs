@@ -284,7 +284,12 @@ pub fn spinner(msg: &str) -> ProgressBar {
 impl CliArgs {
     /// Map the user-facing log level to a `tracing` filter directive.
     pub fn log_filter(&self) -> &str {
-        match self.log_level {
+        Self::log_filter_for(self.log_level)
+    }
+
+    /// Map a log level to a `tracing` filter directive (static version).
+    pub fn log_filter_for(level: LogLevel) -> &'static str {
+        match level {
             LogLevel::Trace => "info,airlock=trace,airlock_supervisor=trace",
             LogLevel::Debug => "warn,airlock=debug,airlock_supervisor=trace",
             LogLevel::Info => "warn,airlock=info,airlock_supervisor=info",

@@ -62,16 +62,15 @@ directory is automatically excluded from version control (it contains a
 `.gitignore` with `*`). Inside it, the `sandbox/` subdirectory holds all
 runtime state:
 
-| File / Directory | Purpose |
-|-----------------|---------|
-| `lock`          | PID lock file preventing concurrent sandbox instances |
-| `ca.json`       | Per-project CA certificate and private key for TLS interception |
-| `disk.img`      | Sparse ext4 disk image for persistent VM storage |
-| `image`         | Reference to the cached OCI image |
-| `run.json`      | Metadata from the last run (timestamp, working directory) |
-| `run.log`       | Supervisor log output |
-| `overlay/`      | Overlayfs upper directory for writable mount layers |
-| `ca/`           | CA certificate overlay injected into the VM |
+| File / Directory | Purpose                                                         |
+|------------------|-----------------------------------------------------------------|
+| `lock`           | PID lock file preventing concurrent sandbox instances           |
+| `ca.json`        | Per-project CA certificate and private key for TLS interception |
+| `disk.img`       | Sparse ext4 disk image for persistent VM storage                |
+| `image`          | Reference to the cached OCI image                               |
+| `run.json`       | Metadata from the last run (timestamp, working directory)       |
+| `overlay/`       | Overlayfs upper directory for writable mount layers             |
+| `ca/`            | CA certificate overlay injected into the VM                     |
 
 You should never need to touch these files directly. If something goes wrong,
 `airlock rm` and a fresh `airlock start` is the cleanest recovery path.

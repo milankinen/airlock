@@ -212,7 +212,7 @@ pub fn lock(
 // -- Private helpers --
 
 /// Ensure `.airlock/` exists, write `.gitignore`, and return the cache dir path.
-fn ensure_cache_dir(host_cwd: &Path) -> anyhow::Result<PathBuf> {
+pub fn ensure_cache_dir(host_cwd: &Path) -> anyhow::Result<PathBuf> {
     let cache_dir = host_cwd.join(".airlock");
     std::fs::create_dir_all(&cache_dir)?;
 

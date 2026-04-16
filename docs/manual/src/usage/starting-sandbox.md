@@ -119,7 +119,7 @@ airlock start --log-level debug
 ```
 
 Log levels are `trace`, `debug`, `info` (default), `warn`, and `error`.
-Supervisor logs are also written to `.airlock/sandbox/run.log`.
+Logs are written to `.airlock/airlock.log`.
 
 ## Quiet mode
 

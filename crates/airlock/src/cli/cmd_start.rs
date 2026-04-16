@@ -12,8 +12,7 @@ use tokio::task::LocalSet;
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::{self, CliArgs, LogLevel};
-use crate::project::{self, Project};
-use crate::{cli_server, config, network, oci, rpc, terminal, vm};
+use crate::{cli_server, config, network, oci, project, rpc, terminal, vm};
 
 /// Default `airlock.toml` written when initializing a new sandbox.
 const DEFAULT_CONFIG: &str = "[vm]\n# image = \"alpine:latest\"\n";
@@ -55,7 +54,18 @@ pub async fn run(args: StartArgs, extra_args: Vec<String>) -> i32 {
         }
     };
 
-    // Ensure a config file exists; offer to initialize if not
+    // Step 1: Create .airlock/ directory and initialize logging early
+    // so that config loading and preset resolution are observable.
+    let cache_dir = match project::ensure_cache_dir(&host_cwd) {
+        Ok(d) => d,
+        Err(e) => {
+            cli::error!("Failed to create .airlock directory: {e}");
+            return 1;
+        }
+    };
+    setup_logging(args.log_level, &cache_dir);
+
+    // Step 2: Load config and start the VM
     let has_config = ["toml", "json", "yaml", "yml"].iter().any(|ext| {
         host_cwd.join(format!("airlock.{ext}")).exists()
             || host_cwd.join(format!("airlock.local.{ext}")).exists()
@@ -108,7 +118,6 @@ async fn run_inner(
     project_cwd: Option<String>,
 ) -> anyhow::Result<i32> {
     let project = project::lock(host_cwd, config, project_cwd)?;
-    setup_logging(&args, &project);
 
     cli::log!("Preparing sandbox...");
     cli::log!(
@@ -249,15 +258,16 @@ async fn run_inner(
     Ok(exit_code)
 }
 
-fn setup_logging(args: &CliArgs, project: &Project) {
+fn setup_logging(log_level: LogLevel, cache_dir: &std::path::Path) {
+    let filter = CliArgs::log_filter_for(log_level);
     if let Ok(log_file) = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .open(project.sandbox_dir.join("run.log"))
+        .open(cache_dir.join("airlock.log"))
     {
         tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::new(args.log_filter()))
+            .with_env_filter(EnvFilter::new(filter))
             .with_writer(std::sync::Mutex::new(log_file))
             .with_ansi(false)
             .init();

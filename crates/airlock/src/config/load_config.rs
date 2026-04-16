@@ -36,7 +36,9 @@ pub fn load(project_root: &Path) -> anyhow::Result<Config> {
     // 2. Load user config — for each slot, use the first extension found
     let mut user_config = serde_json::Value::Object(serde_json::Map::new());
     for base_path in &bases {
-        if let Some(value) = load_first(base_path)? {
+        if let Some((path, value)) = load_first(base_path)? {
+            tracing::debug!("config: loaded {}", path.display());
+            tracing::trace!("config: {}: {value}", path.display());
             user_config = merge_json(user_config, value);
         }
     }
@@ -50,18 +52,20 @@ pub fn load(project_root: &Path) -> anyhow::Result<Config> {
         &mut HashSet::new(),
     )?;
 
+    tracing::trace!("config: merged result: {merged}");
+
     parse_config(merged)
 }
 
 /// Try each supported extension for `base` and parse the first file found.
-fn load_first(base: &Path) -> anyhow::Result<Option<serde_json::Value>> {
+fn load_first(base: &Path) -> anyhow::Result<Option<(PathBuf, serde_json::Value)>> {
     for ext in EXTENSIONS {
-        let path = base.with_extension(ext);
+        let path = PathBuf::from(format!("{}.{ext}", base.display()));
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
         let value = parse_file(&path, &content)?;
-        return Ok(Some(value));
+        return Ok(Some((path, value)));
     }
     Ok(None)
 }
@@ -96,6 +100,7 @@ pub(super) fn apply_with_presets(
 
     for name in preset_names {
         if applied.contains(&name) {
+            tracing::debug!("config: preset `{name}` already applied, skipping");
             continue;
         }
         if chain.contains(&name) {
@@ -108,6 +113,7 @@ pub(super) fn apply_with_presets(
         let preset_config =
             resolve(&name).ok_or_else(|| anyhow::anyhow!("unknown preset: `{name}`"))?;
 
+        tracing::debug!("config: applying preset `{name}`");
         chain.push(name.clone());
         base = apply_with_presets(base, preset_config, resolve, chain, applied)?;
         chain.pop();
