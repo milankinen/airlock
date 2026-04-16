@@ -109,8 +109,12 @@ async fn run_inner(args: ExecArgs) -> anyhow::Result<i32> {
     }
     let cwd = cwd.unwrap_or_else(|| project.guest_cwd.to_string_lossy().into_owned());
     req.get().set_cwd(&cwd);
-    let mut env_b = req.get().init_env(env.len() as u32);
-    for (i, e) in env.iter().enumerate() {
+
+    // Merge config env vars (from airlock.toml / airlock.local.toml) with CLI-passed ones.
+    // CLI `-e` flags take precedence over config values.
+    let resolved_env = resolve_config_env(&project, &env)?;
+    let mut env_b = req.get().init_env(resolved_env.len() as u32);
+    for (i, e) in resolved_env.iter().enumerate() {
         env_b.set(i as u32, e.as_str());
     }
 
@@ -180,6 +184,34 @@ fn apply_login_shell(cmd: String, args: Vec<String>) -> (String, Vec<String>) {
         new_args.extend(args);
         ("bash".to_string(), new_args)
     }
+}
+
+/// Resolve config env vars (with `${VAR}` substitution) and merge with CLI-passed env.
+/// CLI `-e KEY=VALUE` entries override config values for the same key.
+fn resolve_config_env(
+    project: &project::Project,
+    cli_env: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let host_env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    let mut merged: Vec<String> = Vec::new();
+
+    // Collect keys from CLI env so we can skip config entries that are overridden.
+    let cli_keys: std::collections::HashSet<&str> = cli_env
+        .iter()
+        .filter_map(|e| e.split_once('=').map(|(k, _)| k))
+        .collect();
+
+    for (key, template) in &project.config.env {
+        if cli_keys.contains(key.as_str()) {
+            continue;
+        }
+        let value = subst::substitute(template, &host_env)
+            .map_err(|e| anyhow::anyhow!("env.{key}: {e}"))?;
+        merged.push(format!("{key}={value}"));
+    }
+
+    merged.extend_from_slice(cli_env);
+    Ok(merged)
 }
 
 fn is_shell_name(cmd: &str) -> bool {
