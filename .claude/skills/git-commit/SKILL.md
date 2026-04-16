@@ -9,12 +9,21 @@ IMPORTANT: `mise lint` command MUST SUCCEED before commiting ANYTHING
 to version control. Fix the formatting and linting errors before continuing.
 This is non-negotiable. DO NOT SKIP THIS STEP!
 
+IMPORTANT: Always review the full `git diff` of staged/unstaged changes
+before committing. Verify the diff matches the intended changes and does
+not include unrelated modifications. DO NOT SKIP THIS STEP!
+
+IMPORTANT: Check whether the commited changes affect any user-facing behavior,
+configuration, CLI options, or features documented in `docs/manual/`.
+If so, the relevant manual documentation MUST be updated as part of
+the same commit. MANUAL MUST ALWAYS BE UP-TO-DATE! DO NOT SKIP THIS STEP!
+
 # Git commit messages
 
 Format:
 
 ```
-<what changed, imperative mood, max 72 chars>;
+<what changed, imperative mood, max 80 chars>
 
 <why this change was made and why this approach was chosen>
 ```
@@ -23,6 +32,7 @@ The first line describes **what** was changed — terse, imperative mood
 ("Add X;", "Fix Y;", not "Added X" or "Fixes Y"). Always end with ";".
 
 The body describes **why**:
+
 - Why the change was needed
 - Why this approach was chosen over alternatives (if non-obvious)
 
@@ -41,11 +51,13 @@ trigger this memory reclaim. See next commit for more details about the
 co-operation implementation.
 ```
 
-IMPORTANT: save a detailed work log entry to `docs/log/` as an individual
-file named `<yyyy-mm-dd>-<title>.md` to document the design/implementation
-rationale BEFORE the commit and add the file to the commit. DO NOT SKIP
-THIS STEP!
+IMPORTANT: If the commit contains changes to the technical implementation
+(crates/, VM, supervisor), save a detailed work log entry to `docs/log/`
+as an individual file named `<yyyy-mm-dd>-<title>.md` to document the
+design/implementation rationale BEFORE the commit and add the file to
+the commit. Other changes (docs, config, skills, scripts) do not need
+a log entry. DO NOT SKIP THIS STEP!
 
 IMPORTANT: NEVER commit changes unless explicitly asked and ALWAYS
-confirm the commit message from the user before commit. DO NOT SKIP 
+confirm the commit message from the user before commit. DO NOT SKIP
 THIS STEP!
