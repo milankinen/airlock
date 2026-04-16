@@ -1,0 +1,5 @@
+[vm]
+# image = "alpine:latest"
+
+[env]
+FOO = "bar"

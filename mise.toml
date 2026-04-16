@@ -33,9 +33,10 @@ run = "mdbook serve docs/manual"
 [tasks.dev]
 description = "Build, sign, and run"
 raw = true
+dir = "{{ config_root }}/dev"
 depends = ["build:dev", "build:dev-image"]
 env.RUST_BACKTRACE = "1"
-run = "exec target/debug/airlock"
+run = "exec ../target/debug/airlock"
 
 [tasks.claude]
 description = "Build, sign, and run"
