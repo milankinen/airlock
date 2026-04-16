@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Tests for network middleware (Lua scripting).
+# Tests for network middleware (Lua scripting) and port forwarding.
 # Requires KVM (Linux) or Apple Virtualization (macOS) + docker.
 
 load helpers
@@ -13,11 +13,9 @@ setup_file() {
     require_vm_support
     vm_setup_file
 
-    # Start a simple HTTP server on the host.
+    # Start a simple HTTP server on the host for port-forward tests.
     mkdir -p http_root
     echo "hello-from-host" > http_root/index.html
-    mkdir -p http_root/forbidden
-    echo "secret-content" > http_root/forbidden/index.html
     python3 -m http.server 18081 --directory http_root \
         >"$FILE_TEMP_DIR/http_server.log" 2>&1 &
     HTTP_PID=$!
@@ -32,12 +30,12 @@ default_mode = "deny"
 [network.ports.test-server]
 host = [18081]
 
-[network.rules.localhost]
-allow = ["localhost:18081"]
+[network.rules.example]
+allow = ["example.org:443"]
 
-[[network.rules.localhost.middleware]]
+[[network.rules.example.middleware]]
 script = '''
-if req:path():find("^/forbidden") then
+if req.path:find("^/forbidden") then
     req:deny()
 end
 '''
@@ -56,13 +54,23 @@ setup() {
     cd "$FILE_TEMP_DIR" || return 1
 }
 
-@test "middleware allows non-forbidden path" {
+@test "port-forwarded localhost reaches host HTTP server" {
     run_vm sh -c 'sleep 2 && wget -q -O- --timeout=5 http://localhost:18081/index.html 2>&1'
     assert_success
     assert_output_contains "hello-from-host"
 }
 
-@test "middleware denies forbidden path" {
-    run_vm sh -c 'sleep 2 && wget -q -O- --timeout=5 http://localhost:18081/forbidden/ 2>&1'
+@test "non-forwarded port is denied" {
+    run_vm sh -c 'sleep 2 && wget -q -O- --timeout=5 http://localhost:19999/ 2>&1'
+    assert_failure
+}
+
+@test "middleware allows non-forbidden HTTPS path" {
+    run_vm sh -c 'wget -q -O- --timeout=10 https://example.org/ 2>&1'
+    assert_success
+}
+
+@test "middleware denies forbidden HTTPS path" {
+    run_vm sh -c 'wget -q -O- --timeout=10 https://example.org/forbidden 2>&1'
     assert_failure
 }

@@ -54,10 +54,11 @@ pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network>
         .values()
         .filter(|s| s.enabled)
         .map(|s| {
-            let guest = crate::util::expand_tilde(&s.guest, std::path::Path::new(container_home))
-                .to_string_lossy()
-                .into_owned();
-            let host = project.expand_host_tilde(&s.host);
+            let guest =
+                crate::util::expand_tilde(&s.host.target, std::path::Path::new(container_home))
+                    .to_string_lossy()
+                    .into_owned();
+            let host = project.expand_host_tilde(&s.host.source);
             (guest, host)
         })
         .collect();
@@ -100,20 +101,27 @@ impl Network {
     /// Resolve a host:port to a `ResolvedTarget`.
     ///
     /// Logic:
-    /// 0. If this is a port-forwarded localhost connection → always allowed.
+    /// 0. If localhost → port-forwarded connections are always allowed;
+    ///    non-forwarded localhost is allowed/denied by `default_mode`.
+    ///    Middleware is never applied to localhost.
     /// 1. If any deny target matches → `allowed = false` immediately.
     /// 2. If any allow target matches → `allowed = true`; middleware collected.
     /// 3. If neither matched → `allowed` follows `default_mode`.
     pub fn resolve_target(&self, host: &str, port: u16) -> ResolvedTarget {
-        // Port-forwarded localhost connections are always allowed.
-        if is_localhost_ip(host)
-            && let Some(&host_port) = self.port_forwards.get(&port)
-        {
+        // Localhost connections never get middleware (no TLS interception
+        // for loopback traffic). Port-forwarded ports are always allowed;
+        // others follow default_mode.
+        if is_localhost(host) {
+            let (resolved_port, allowed) = if let Some(&host_port) = self.port_forwards.get(&port) {
+                (host_port, true)
+            } else {
+                (port, matches!(self.default_mode, DefaultMode::Allow))
+            };
             return ResolvedTarget {
                 host: "127.0.0.1".to_string(),
-                port: host_port,
+                port: resolved_port,
                 middleware: vec![],
-                allowed: true,
+                allowed,
             };
         }
 
@@ -150,6 +158,6 @@ impl Network {
     }
 }
 
-fn is_localhost_ip(host: &str) -> bool {
-    host == "127.0.0.1" || host == "::1"
+fn is_localhost(host: &str) -> bool {
+    host == "localhost" || host == "127.0.0.1" || host == "::1"
 }

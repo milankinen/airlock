@@ -15,16 +15,15 @@ On Linux, the socket is typically at `/var/run/docker.sock`:
 # airlock.toml
 [network.sockets.docker]
 host = "/var/run/docker.sock"
-guest = "/var/run/docker.sock"
 ```
 
-On macOS with Docker Desktop, the socket lives in the user's home directory:
+On macOS with Docker Desktop, the socket lives in the user's home directory,
+so use `source:target` syntax to map it to the standard guest path:
 
 ```toml
 # airlock.local.toml
 [network.sockets.docker]
-host = "~/.docker/run/docker.sock"
-guest = "/var/run/docker.sock"
+host = "~/.docker/run/docker.sock:/var/run/docker.sock"
 ```
 
 The guest path stays the same in both cases — the Docker CLI inside the VM

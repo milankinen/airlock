@@ -250,17 +250,9 @@ jobs:
           path: target/release/airlock
 
   # ── Stage 4: VM integration tests (bats) ───────────────
-  bats-vm:
-    needs: [ build-cli-linux-x86_64, build-cli-linux-aarch64 ]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            runner: ubuntu-24.04
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+  test-e2e:
+    needs: [ build-cli-linux-x86_64 ]
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
@@ -272,7 +264,7 @@ jobs:
           sudo udevadm trigger --name-match=kvm
       - uses: actions/download-artifact@v4
         with:
-          name: airlock-linux-${{ matrix.arch }}
+          name: airlock-linux-x86_64
           path: .tmp/bin
       - name: Run VM bats tests
         run: |

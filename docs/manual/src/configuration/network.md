@@ -99,7 +99,14 @@ used for Docker socket access:
 ```toml
 [network.sockets.docker]
 host = "/var/run/docker.sock"
-guest = "/var/run/docker.sock"
+```
+
+When the host and guest paths differ, use `"source:target"` syntax
+(host path : guest path):
+
+```toml
+[network.sockets.docker]
+host = "~/.docker/run/docker.sock:/var/run/docker.sock"
 ```
 
 The socket appears at the specified guest path and connections are relayed

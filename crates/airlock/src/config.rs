@@ -224,20 +224,77 @@ pub mod config {
     }
 
     /// Forward a host Unix socket into the guest container.
+    ///
+    /// The `host` field uses `source:target` syntax (host path : guest path),
+    /// or a plain path if the same on both sides.
+    ///
+    /// ```toml
+    /// [network.sockets.docker]
+    /// host = "~/.docker/run/docker.sock:/var/run/docker.sock"
+    /// ```
     #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
     pub struct SocketForward {
         /// Enable/disable this socket forward
         #[config(default_t = true)]
         pub enabled: bool,
-        /// Host socket path (e.g., "/var/run/docker.sock")
-        pub host: String,
-        /// Guest socket path (e.g., "/var/run/docker.sock")
-        pub guest: String,
+        /// Socket path mapping: `"source:target"` (host:guest) or plain path
+        /// (same on both sides).
+        pub host: SocketMapping,
     }
 
     impl WellKnown for SocketForward {
         type Deserializer = de::Nested<SocketForward>;
         const DE: Self::Deserializer = de::nested();
+    }
+
+    /// A socket path mapping: host path to guest path.
+    ///
+    /// Accepts either a plain path (same on both sides: `"/var/run/docker.sock"`)
+    /// or a `"source:target"` string (e.g. `"~/.docker/run/docker.sock:/var/run/docker.sock"`).
+    ///
+    /// The delimiter is the **last** colon, so paths with colons in early
+    /// components are supported (though uncommon for Unix sockets).
+    #[derive(Debug, Clone)]
+    pub struct SocketMapping {
+        pub source: String,
+        pub target: String,
+    }
+
+    impl serde::Serialize for SocketMapping {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            if self.source == self.target {
+                s.serialize_str(&self.source)
+            } else {
+                s.serialize_str(&format!("{}:{}", self.source, self.target))
+            }
+        }
+    }
+
+    impl<'de> serde::Deserialize<'de> for SocketMapping {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            let s = String::deserialize(d)?;
+            // Split on the last colon that is followed by a `/` or `~` (path start).
+            // This avoids splitting on colons that are part of directory names.
+            if let Some(pos) = s.rfind(':') {
+                let target = &s[pos + 1..];
+                if target.starts_with('/') || target.starts_with('~') {
+                    return Ok(SocketMapping {
+                        source: s[..pos].to_string(),
+                        target: target.to_string(),
+                    });
+                }
+            }
+            Ok(SocketMapping {
+                source: s.clone(),
+                target: s,
+            })
+        }
+    }
+
+    impl WellKnown for SocketMapping {
+        type Deserializer =
+            smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
+        const DE: Self::Deserializer = smart_config::de::Serde;
     }
 
     /// Named port forward group — exposes host TCP ports to the guest.
