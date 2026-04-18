@@ -1,55 +1,24 @@
 # GitHub Copilot CLI preset
-# Based on: https://docs.github.com/en/copilot/reference/copilot-allowlist-reference
+
+[env]
+COPILOT_GITHUB_TOKEN = "github_pat_NOTReal"
 
 [network.rules.copilot-cli]
 allow = [
-    # GitHub core (path-restricted via middleware below)
-    "github.com",
-    "api.github.com",
-    # Copilot proxy (no path restriction)
-    "copilot-proxy.githubusercontent.com",
-    "origin-tracker.githubusercontent.com",
-    # Telemetry (path-restricted via middleware below)
-    "copilot-telemetry.githubusercontent.com",
-    "collector.github.com",
-    # Copilot API endpoints
-    "*.githubcopilot.com",
-    "*.individual.githubcopilot.com",
-    "*.business.githubcopilot.com",
-    "*.enterprise.githubcopilot.com",
-    # Experimentation
-    "default.exp-tas.com",
+    "api.github.com:443",
+    "*.githubcopilot.com:443",
 ]
 
-# Path restrictions per the allowlist reference.
-# Hosts with middleware get TLS interception to inspect HTTP paths.
-
-[network.middleware.copilot-cli-paths]
-target = [
-    "github.com",
-    "api.github.com",
-    "copilot-telemetry.githubusercontent.com",
-    "collector.github.com",
-]
+[network.middleware.copilot-cli-api-token]
+target = ["*.githubcopilot.com:443", "api.github.com:443"]
+env.TOKEN = "${COPILOT_GITHUB_TOKEN}"
 script = """
-local h = req.host
-local p = req.path
-if h == "github.com" then
-  if not (p:find("^/login") or p:find("^/enterprises/")) then
-    req:deny()
-  end
-elseif h == "api.github.com" then
-  if not (p == "/user" or p:find("^/copilot_internal/")) then
-    req:deny()
-  end
-elseif h == "copilot-telemetry.githubusercontent.com" or h == "collector.github.com" then
-  if p ~= "/telemetry" then
-    req:deny()
-  end
+if env.TOKEN and (req:hostMatches("*.githubcopilot.com") or req.path:sub(1, 17) == "/copilot_internal") then
+  req:setHeader("Authorization", "Bearer " .. env.TOKEN)
 end
 """
 
 [mounts.copilot-gh-config]
-missing = "warn"
-source = "~/.config/gh"
+source = "~/.airlock/copilot"
 target = "~/.config/gh"
+missing = "create-dir"

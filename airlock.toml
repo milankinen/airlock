@@ -1,4 +1,4 @@
-presets = ["debian", "claude-code", "rust"]
+presets = ["debian", "rust", "claude-code", "openai-codex", "copilot-cli"]
 
 [vm]
 image = "airlock:dev"
@@ -8,8 +8,6 @@ image = "airlock:dev"
 SUPERVISOR_BUILD_HOST = "true"
 # We can use host's docker image
 SKIP_DEV_IMAGE_BUILD = "true"
-# Allow --dangerously-skip-permissions inside vm
-IS_SANDBOX = "1"
 # Git configs
 GIT_AUTHOR_NAME = "${GIT_AUTHOR_NAME:-}"
 GIT_AUTHOR_EMAIL = "${GIT_AUTHOR_EMAIL:-}"
@@ -19,3 +17,6 @@ CARGO_TARGET_DIR = "/tmp/cargo"
 
 [disk]
 size = "20 GB"
+
+[network]
+policy = "deny-by-default"

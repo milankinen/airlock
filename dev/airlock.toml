@@ -1,5 +1,4 @@
-[vm]
-# image = "alpine:latest"
+presets = ["debian", "rust", "claude-code", "openai-codex", "copilot-cli"]
 
-[env]
-FOO = "bar"
+[vm]
+image = "airlock:dev"

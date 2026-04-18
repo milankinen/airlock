@@ -1,0 +1,26 @@
+# OpenAI codex development preset
+
+[env]
+# Placeholder to use inside VM
+OPENAI_API_KEY = "real-api-key-will-be-injected"
+
+[network.rules.codex]
+allow = [
+    "api.openai.com:443",
+    "auth.openai.com:443",
+]
+
+[mounts.codex-dir]
+source = "~/.airlock/codex"
+target = "~/.codex"
+missing = "create-dir"
+
+# Inject real api key at host middleware
+[network.middleware.codex-api-key]
+target = ["api.openai.com:443"]
+env.API_KEY = "${OPENAI_API_KEY}"
+script = """
+if env.API_KEY then
+  req:setHeader("Authorization", "Bearer " .. env.API_KEY)
+end
+"""
