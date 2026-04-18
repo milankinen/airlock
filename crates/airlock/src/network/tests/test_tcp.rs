@@ -18,20 +18,15 @@ fn plain_http_get() {
 
 #[test]
 fn host_not_allowed_is_denied() {
-    run_network(
-        vec!["example.com".into()],
-        vec![],
-        vec![],
-        |proxy| async move {
-            let conn = TestConnection::connect(&proxy, "127.0.0.1", 80).await;
-            assert!(conn.is_none(), "connection should be denied");
-        },
-    );
+    run_network(vec!["example.com".into()], vec![], |proxy| async move {
+        let conn = TestConnection::connect(&proxy, "127.0.0.1", 80).await;
+        assert!(conn.is_none(), "connection should be denied");
+    });
 }
 
 #[test]
 fn wildcard_host_allowed() {
-    run_network(vec!["*.0.0.1".into()], vec![], vec![], |proxy| async move {
+    run_network(vec!["*.0.0.1".into()], vec![], |proxy| async move {
         let addr = serve(Router::new().route("/", get(|| async { "ok" }))).await;
         let conn = TestConnection::connect(&proxy, "127.0.0.1", addr.port()).await;
         assert!(conn.is_some(), "127.0.0.1 should match *.0.0.1");
@@ -48,7 +43,7 @@ fn star_allows_everything() {
 
 #[test]
 fn empty_allowed_hosts_denies_all() {
-    run_network(vec![], vec![], vec![], |proxy| async move {
+    run_network(vec![], vec![], |proxy| async move {
         let conn = TestConnection::connect(&proxy, "127.0.0.1", 80).await;
         assert!(conn.is_none(), "empty allowed_hosts should deny everything");
     });

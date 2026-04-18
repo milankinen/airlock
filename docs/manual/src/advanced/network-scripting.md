@@ -53,9 +53,10 @@ VM's system trust store the first time you start a sandbox. Processes inside
 the container see valid certificates for intercepted connections — no manual
 trust configuration is needed.
 
-Connections without matching middleware get raw TLS passthrough (no
-interception), so only the traffic you explicitly script is decrypted on the
-host.
+All allowed TLS connections are intercepted so requests are visible in the
+Monitor tab, regardless of whether a middleware script matches. Middleware
+runs only for connections that match its target; connections with no matching
+middleware are still MITM-decrypted but pass through unmodified.
 
 ## Request API
 

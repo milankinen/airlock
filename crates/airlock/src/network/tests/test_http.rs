@@ -12,7 +12,6 @@ where
 {
     run_network(
         vec!["*".into()],
-        vec![],
         vec![("noop", "-- triggers HTTP detection")],
         f,
     );

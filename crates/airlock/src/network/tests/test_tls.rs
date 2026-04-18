@@ -150,41 +150,6 @@ fn tls_mitm_basic() {
 }
 
 #[test]
-fn tls_passthrough() {
-    let (server_tls, server_ca_pem) = make_server_tls();
-    let server_ca_for_container = server_ca_pem.clone();
-
-    run_with_config(
-        TestNetworkConfig {
-            tls_passthrough: vec!["127.0.0.1".into()],
-            ..Default::default()
-        },
-        |proxy, _log, _mitm_ca_pem| async move {
-            let addr = serve_https(
-                Router::new().route("/", get(|| async { "passthrough-ok" })),
-                server_tls,
-            )
-            .await;
-
-            let conn = TestConnection::connect(&proxy, "127.0.0.1", addr.port())
-                .await
-                .expect("should connect");
-            // For passthrough, container TLS goes directly to server — trust server CA
-            let resp = tls_roundtrip(
-                conn.into_stream(),
-                &server_ca_for_container,
-                "127.0.0.1",
-                addr.port(),
-                "/",
-            )
-            .await;
-            assert!(resp.contains("200"), "expected 200: {resp}");
-            assert!(resp.contains("passthrough-ok"), "expected body: {resp}");
-        },
-    );
-}
-
-#[test]
 fn tls_mitm_with_middleware() {
     let (server_tls, server_ca_pem) = make_server_tls();
 

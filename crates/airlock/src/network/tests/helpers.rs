@@ -53,7 +53,6 @@ pub async fn serve(app: Router) -> SocketAddr {
 /// Test network configuration
 pub struct TestNetworkConfig {
     pub allowed_hosts: Vec<String>,
-    pub tls_passthrough: Vec<String>,
     pub middleware_scripts: Vec<(&'static str, &'static str)>,
     /// Extra CA PEMs to trust (e.g. test server CAs)
     pub trust_cas: Vec<String>,
@@ -63,7 +62,6 @@ impl Default for TestNetworkConfig {
     fn default() -> Self {
         Self {
             allowed_hosts: vec!["*".into()],
-            tls_passthrough: vec![],
             middleware_scripts: vec![],
             trust_cas: vec![],
         }
@@ -72,24 +70,17 @@ impl Default for TestNetworkConfig {
 
 pub fn run_network<F, Fut>(
     allowed_hosts: Vec<String>,
-    tls_passthrough: Vec<String>,
     middleware_scripts: Vec<(&'static str, &'static str)>,
     f: F,
 ) where
     F: FnOnce(network_proxy::Client) -> Fut,
     Fut: Future<Output = ()>,
 {
-    run_network_with_log(
-        allowed_hosts,
-        tls_passthrough,
-        middleware_scripts,
-        |proxy, _log| f(proxy),
-    );
+    run_network_with_log(allowed_hosts, middleware_scripts, |proxy, _log| f(proxy));
 }
 
 pub fn run_network_with_log<F, Fut>(
     allowed_hosts: Vec<String>,
-    tls_passthrough: Vec<String>,
     middleware_scripts: Vec<(&'static str, &'static str)>,
     f: F,
 ) where
@@ -99,7 +90,6 @@ pub fn run_network_with_log<F, Fut>(
     run_with_config(
         TestNetworkConfig {
             allowed_hosts,
-            tls_passthrough,
             middleware_scripts,
             ..Default::default()
         },
@@ -113,7 +103,7 @@ where
     F: FnOnce(network_proxy::Client) -> Fut,
     Fut: Future<Output = ()>,
 {
-    run_network(vec!["*".into()], vec![], vec![], f);
+    run_network(vec!["*".into()], vec![], f);
 }
 
 /// Full test runner: provides proxy, request log, and the MITM CA PEM
@@ -138,6 +128,7 @@ where
 fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
     // Build rules from test config (no middleware — rules are pure allow/deny).
     let mut rules = BTreeMap::new();
+    let middleware_targets = cfg.allowed_hosts.clone();
 
     // Main allow rule
     if !cfg.allowed_hosts.is_empty() {
@@ -145,53 +136,25 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
             "test-allow".to_string(),
             NetworkRule {
                 enabled: true,
-                allow: cfg.allowed_hosts.clone(),
+                allow: cfg.allowed_hosts,
                 deny: vec![],
             },
         );
     }
 
-    // Build middleware from test config.
-    // Middleware targets default to allowed_hosts if present.
-    // If no scripts and no explicit passthrough, add a no-op middleware
-    // so TLS interception is enabled (matches old test behavior).
+    // Build middleware from test config. Middleware targets default to
+    // allowed_hosts. MITM is always on for allowed targets regardless of
+    // middleware presence, so no synthetic no-op middleware is needed.
     let mut middleware_config = BTreeMap::new();
-    let middleware_targets = cfg.allowed_hosts.clone();
-    let has_passthrough = !cfg.tls_passthrough.is_empty();
 
-    // Explicit TLS passthrough: allowed targets (no middleware → passthrough)
-    if has_passthrough {
-        rules.insert(
-            "test-passthrough".to_string(),
-            NetworkRule {
-                enabled: true,
-                allow: cfg.tls_passthrough,
-                deny: vec![],
-            },
-        );
-    }
-
-    if !cfg.middleware_scripts.is_empty() {
-        for (i, (_, script)) in cfg.middleware_scripts.iter().enumerate() {
-            middleware_config.insert(
-                format!("test-mw-{i}"),
-                MiddlewareRule {
-                    enabled: true,
-                    target: middleware_targets.clone(),
-                    env: BTreeMap::new(),
-                    script: script.to_string(),
-                },
-            );
-        }
-    } else if !has_passthrough {
-        // No-op middleware forces MITM (old test default behavior)
+    for (i, (_, script)) in cfg.middleware_scripts.iter().enumerate() {
         middleware_config.insert(
-            "test-noop".to_string(),
+            format!("test-mw-{i}"),
             MiddlewareRule {
                 enabled: true,
-                target: middleware_targets,
+                target: middleware_targets.clone(),
                 env: BTreeMap::new(),
-                script: String::new(),
+                script: script.to_string(),
             },
         );
     }

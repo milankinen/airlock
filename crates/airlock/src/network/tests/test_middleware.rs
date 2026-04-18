@@ -9,7 +9,7 @@ where
     F: FnOnce(network_proxy::Client) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    run_network(vec!["*".into()], vec![], scripts, f);
+    run_network(vec!["*".into()], scripts, f);
 }
 
 fn with_middleware_log<F, Fut>(scripts: Vec<(&'static str, &'static str)>, f: F)
@@ -17,7 +17,7 @@ where
     F: FnOnce(network_proxy::Client, RequestLog) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    run_network_with_log(vec!["*".into()], vec![], scripts, f);
+    run_network_with_log(vec!["*".into()], scripts, f);
 }
 
 #[test]

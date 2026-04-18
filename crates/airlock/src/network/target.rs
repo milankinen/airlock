@@ -41,11 +41,3 @@ pub struct ResolvedTarget {
     /// False if denied by policy, deny rule, or no allow rule matched.
     pub allowed: bool,
 }
-
-impl ResolvedTarget {
-    /// Should TLS be passed through (no MITM) for this target?
-    /// Only allowed targets without middleware get raw passthrough.
-    pub fn is_passthrough(&self) -> bool {
-        self.allowed && self.middleware.is_empty()
-    }
-}

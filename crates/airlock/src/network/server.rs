@@ -156,8 +156,8 @@ fn spawn_socket_connection(path: &str, client_sink: tcp_sink::Client) -> tcp_sin
     capnp_rpc::new_client(io::ChannelSink::new(tx, error))
 }
 
-/// Main connection handler: detect TLS, decide on passthrough vs. intercept,
-/// detect HTTP, and route to the appropriate relay.
+/// Main connection handler: detect TLS, intercept (MITM) if so, detect HTTP,
+/// and route to the appropriate relay.
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     target: ResolvedTarget,
@@ -169,14 +169,6 @@ async fn handle_connection(
 ) -> anyhow::Result<()> {
     let (is_tls, first) = tls::detect(&mut rx).await;
     let addr = format!("{}:{}", target.host, target.port);
-
-    // Passthrough: raw relay, container↔server TLS end-to-end
-    if target.is_passthrough() {
-        debug!("passthrough: {addr}");
-        let (container, server) = tcp::establish(&addr, first, rx, client_sink).await?;
-        Box::pin(tcp::relay(container, server)).await;
-        return Ok(());
-    }
 
     // Establish connection pair
     let (container, server) = if is_tls {
