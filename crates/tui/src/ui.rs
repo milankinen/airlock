@@ -11,40 +11,36 @@ use crate::pty::TuiTerminalSink;
 use crate::tabs::network::NetworkWidget;
 use crate::tabs::sandbox::TerminalWidget;
 
-/// Tab bar height (1 line for tabs + 1 border).
-const TAB_BAR_HEIGHT: u16 = 1;
-/// Bottom status bar height.
-const STATUS_BAR_HEIGHT: u16 = 1;
+/// Tab bar height: 1 blank gap row + 1 tabs row. Rendered at the bottom.
+pub const TAB_BAR_HEIGHT: u16 = 2;
 
-/// Calculate the body area (everything between tab bar and status bar).
+/// Calculate the body area (everything above the bottom tab bar).
 pub fn body_area(size: Rect) -> Rect {
-    if size.height < TAB_BAR_HEIGHT + STATUS_BAR_HEIGHT + 1 {
+    if size.height < TAB_BAR_HEIGHT + 1 {
         return Rect::default();
     }
-    Rect::new(
-        size.x,
-        size.y + TAB_BAR_HEIGHT,
-        size.width,
-        size.height - TAB_BAR_HEIGHT - STATUS_BAR_HEIGHT,
-    )
+    Rect::new(size.x, size.y, size.width, size.height - TAB_BAR_HEIGHT)
 }
 
-/// Calculate clickable tab header rectangles for mouse handling.
+/// Calculate clickable tab header rectangles for mouse handling. Must match
+/// the layout produced by `render_tab_bar`.
 pub fn tab_header_rects(size: Rect) -> Vec<(Tab, Rect)> {
-    // " Sandbox " = 9 chars, " Network (42) " = ~14 chars
-    // We'll just return fixed-width rects in the tab bar row.
     let mut rects = Vec::new();
-    let y = size.y;
-    let mut x = 1u16; // 1 char padding
+    if size.height == 0 {
+        return rects;
+    }
+    // Tabs live on the bottom row of the terminal.
+    let y = size.y + size.height - 1;
+    let mut x = size.x + 1; // 1 char left padding
 
-    // Sandbox tab
-    let w = 9; // " Sandbox "
-    rects.push((Tab::Sandbox, Rect::new(x, y, w, 1)));
-    x += w + 1;
+    // "  F1 Sandbox  " = 14 chars
+    let sandbox_w = 14;
+    rects.push((Tab::Sandbox, Rect::new(x, y, sandbox_w, 1)));
+    x += sandbox_w + 1;
 
-    // Network tab (wider to accommodate counter pill)
-    let w = 18; // " Network (999) "
-    rects.push((Tab::Network, Rect::new(x, y, w, 1)));
+    // "  F2 Network (99999)  " — widest plausible label
+    let network_w = 22;
+    rects.push((Tab::Network, Rect::new(x, y, network_w, 1)));
 
     rects
 }
@@ -56,15 +52,8 @@ pub fn render(f: &mut Frame<'_>, app: &App, sink: &TuiTerminalSink) {
         return;
     }
 
-    let [tab_area, body, status_area] = Layout::vertical([
-        Constraint::Length(TAB_BAR_HEIGHT),
-        Constraint::Min(1),
-        Constraint::Length(STATUS_BAR_HEIGHT),
-    ])
-    .areas(size);
-
-    // Tab bar
-    render_tab_bar(f, tab_area, app);
+    let [body, tab_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(TAB_BAR_HEIGHT)]).areas(size);
 
     // Body content
     match app.active_tab {
@@ -79,82 +68,60 @@ pub fn render(f: &mut Frame<'_>, app: &App, sink: &TuiTerminalSink) {
         }
     }
 
-    // Status bar
-    render_status_bar(f, status_area, app);
+    // Tab bar at the bottom
+    render_tab_bar(f, tab_area, app);
 }
 
 fn render_tab_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
-    let mut spans = vec![Span::raw(" ")];
+    let sandbox_sel = app.active_tab == Tab::Sandbox;
+    let network_sel = app.active_tab == Tab::Network;
 
-    // Sandbox tab
-    let sandbox_style = if app.active_tab == Tab::Sandbox {
-        Style::default()
-            .fg(Color::White)
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Gray)
+    // Each tab has its own bg: DarkGray when selected, Black (inherits bar
+    // bg) otherwise. The hotkey stays yellow on whichever bg the tab has.
+    let tab_bg = |selected: bool| -> Color {
+        if selected {
+            Color::DarkGray
+        } else {
+            Color::Black
+        }
     };
-    spans.push(Span::styled(" Sandbox ", sandbox_style));
-    spans.push(Span::raw(" "));
+    let title_style = |selected: bool, bg: Color| -> Style {
+        let mut s = Style::default().bg(bg);
+        if selected {
+            s = s.fg(Color::White).add_modifier(Modifier::BOLD);
+        } else {
+            s = s.fg(Color::Gray);
+        }
+        s
+    };
+    let hotkey_style = |bg: Color| -> Style { Style::default().fg(Color::Yellow).bg(bg) };
 
-    // Network tab with counter pill
-    let net_style = if app.active_tab == Tab::Network {
-        Style::default()
-            .fg(Color::White)
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
+    let sb_bg = tab_bg(sandbox_sel);
+    let nw_bg = tab_bg(network_sel);
 
     let count = app.network.total_count();
-    let pill = if count > 0 {
-        let pill_color = if app.network.denied_count > 0 {
-            Color::Red
-        } else {
-            Color::Green
-        };
-        vec![
-            Span::styled(" Network ", net_style),
-            Span::styled(
-                format!(" {count} "),
-                Style::default()
-                    .fg(Color::White)
-                    .bg(pill_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]
+    let network_title = if count > 0 {
+        format!(" Network ({count})  ")
     } else {
-        vec![Span::styled(" Network ", net_style)]
+        " Network  ".to_string()
     };
-    spans.extend(pill);
+
+    let spans = vec![
+        Span::raw(" "),
+        Span::styled("  ", Style::default().bg(sb_bg)),
+        Span::styled("F1", hotkey_style(sb_bg)),
+        Span::styled(" Sandbox  ", title_style(sandbox_sel, sb_bg)),
+        Span::raw(" "),
+        Span::styled("  ", Style::default().bg(nw_bg)),
+        Span::styled("F2", hotkey_style(nw_bg)),
+        Span::styled(network_title, title_style(network_sel, nw_bg)),
+    ];
 
     let line = Line::from(spans);
+    // Paint the bg only on the bottom tabs row (height 1); the row above is
+    // a blank gap at the terminal's default bg.
+    let tabs_row = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
     Paragraph::new(line)
         .style(Style::default().bg(Color::Black))
-        .render(area, f.buffer_mut());
-}
-
-fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
-    let mouse_hint = if app.mouse_captured {
-        " Select"
-    } else {
-        " Capture"
-    };
-    let line = Line::from(vec![
-        Span::styled(" F1", Style::default().fg(Color::Yellow)),
-        Span::raw(" Sandbox  "),
-        Span::styled("F2", Style::default().fg(Color::Yellow)),
-        Span::raw(" Network  "),
-        Span::styled("F12", Style::default().fg(Color::Yellow)),
-        Span::raw(mouse_hint),
-        Span::raw("  "),
-        Span::styled("Ctrl+Q", Style::default().fg(Color::Yellow)),
-        Span::raw(" Quit"),
-    ]);
-
-    Paragraph::new(line)
-        .style(Style::default().bg(Color::DarkGray).fg(Color::White))
-        .render(area, f.buffer_mut());
+        .render(tabs_row, f.buffer_mut());
 }

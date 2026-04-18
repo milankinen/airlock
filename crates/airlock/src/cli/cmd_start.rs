@@ -206,8 +206,12 @@ async fn run_inner(
     // Both produce a stdin::Client for the supervisor RPC.
     let (stdin_tx, stdin_client, pty_size) = if monitor {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        // The TUI tab bar occupies rows at the bottom; the guest PTY only
+        // gets the body area. Advertising the full terminal size would let
+        // the guest draw past vt100's grid and collapse onto the last row.
+        let body_rows = rows.saturating_sub(airlock_tui::TAB_BAR_HEIGHT);
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let tui_stdin = airlock_tui::TuiStdin::new(rx, Some((rows, cols)));
+        let tui_stdin = airlock_tui::TuiStdin::new(rx, Some((body_rows, cols)));
         let pty_size = tui_stdin.pty_size();
         (Some(tx), capnp_rpc::new_client(tui_stdin), pty_size)
     } else {

@@ -20,6 +20,7 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, Mouse
 pub use input::{TuiInputEvent, TuiStdin};
 use pty::TuiTerminalSink;
 use ratatui::DefaultTerminal;
+pub use ui::TAB_BAR_HEIGHT;
 
 /// A network connection event emitted by the host-side proxy.
 #[derive(Debug, Clone)]
@@ -281,7 +282,6 @@ fn handle_key(
 ) -> anyhow::Result<Option<i32>> {
     // Global shortcuts
     match (key.modifiers, key.code) {
-        (KeyModifiers::CONTROL, KeyCode::Char('q')) => return Ok(Some(130)),
         (_, KeyCode::F(1)) => {
             app.active_tab = Tab::Sandbox;
             return Ok(None);
