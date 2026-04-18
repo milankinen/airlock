@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 use tokio::sync::broadcast;
@@ -91,6 +92,7 @@ pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network>
         port_forwards,
         socket_map,
         events,
+        next_id: AtomicU64::new(0),
     })
 }
 
@@ -124,6 +126,9 @@ pub struct Network {
     /// Network events to subscribe to
     // TODO: this NetworkEvent should be Network event agnostic to any TUI
     events: broadcast::Sender<airlock_tui::NetworkEvent>,
+    /// Monotonic counter for connection ids. Used by the TUI to pair
+    /// `Disconnect` events with their originating `Connect`.
+    next_id: AtomicU64,
 }
 
 impl Network {
@@ -158,7 +163,6 @@ impl Network {
 
         // deny-always denies everything.
         if matches!(policy, Policy::DenyAlways) {
-            self.emit_event(host, port, false);
             return denied(host, port);
         }
 
@@ -175,7 +179,6 @@ impl Network {
 
         // allow-always skips rules, collects middleware.
         if matches!(policy, Policy::AllowAlways) {
-            self.emit_event(host, port, true);
             return ResolvedTarget {
                 host: host.to_string(),
                 port,
@@ -187,7 +190,6 @@ impl Network {
         // Deny rules win unconditionally.
         for target in &self.deny_targets {
             if target.matches(host, port) {
-                self.emit_event(host, port, false);
                 return denied(host, port);
             }
         }
@@ -196,8 +198,6 @@ impl Network {
         let allowed = port_forwarded
             || matches!(policy, Policy::AllowByDefault)
             || self.allow_targets.iter().any(|t| t.matches(host, port));
-
-        self.emit_event(host, port, allowed);
 
         let middleware = if allowed {
             self.collect_middleware(host, port)
@@ -218,14 +218,20 @@ impl Network {
         matches!(self.policy(), Policy::DenyAlways)
     }
 
-    /// Broadcast a connection event to any subscribers (e.g. the TUI monitor).
-    /// Silently drops the event when there are no subscribers — and short-
-    /// circuits *before* any string cloning in that common case.
-    fn emit_event(&self, host: &str, port: u16, allowed: bool) {
+    /// Allocate a fresh monotonic id for a new connection.
+    pub fn next_connection_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Broadcast a `Connect` event. Silently drops when there are no
+    /// subscribers (common case on non-monitor runs) — and short-circuits
+    /// before any string cloning in that case.
+    pub fn emit_connect(&self, id: u64, host: &str, port: u16, allowed: bool) {
         if self.events.receiver_count() == 0 {
             return;
         }
         let info = airlock_tui::ConnectInfo {
+            id,
             timestamp: std::time::SystemTime::now(),
             host: host.to_string(),
             port,
@@ -234,6 +240,20 @@ impl Network {
         let _ = self
             .events
             .send(airlock_tui::NetworkEvent::Connect(Arc::new(info)));
+    }
+
+    /// Broadcast a `Disconnect` event matching a prior `emit_connect`.
+    pub fn emit_disconnect(&self, id: u64) {
+        if self.events.receiver_count() == 0 {
+            return;
+        }
+        let info = airlock_tui::DisconnectInfo {
+            id,
+            timestamp: std::time::SystemTime::now(),
+        };
+        let _ = self
+            .events
+            .send(airlock_tui::NetworkEvent::Disconnect(Arc::new(info)));
     }
 
     /// Collect compiled middleware from all matching middleware targets.

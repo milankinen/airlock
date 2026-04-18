@@ -48,8 +48,12 @@ pub struct NetworkTab {
     pub sub_tab: NetworkSubTab,
     pub connections: Vec<ConnectionEntry>,
     pub requests: Vec<RequestEntry>,
-    pub allowed_count: u32,
-    pub denied_count: u32,
+    /// Lifetime counters, incremented on every event. Kept separate from
+    /// the per-list vecs so they persist past the 100-entry buffer cap.
+    pub connection_allowed: u32,
+    pub connection_denied: u32,
+    pub request_allowed: u32,
+    pub request_denied: u32,
     /// Selection in the Requests sub-tab. Display index (0 = newest).
     selected_request: Option<usize>,
     /// Selection in the Connections sub-tab. Display index (0 = newest).
@@ -77,8 +81,10 @@ impl NetworkTab {
             sub_tab: NetworkSubTab::default(),
             connections: Vec::new(),
             requests: Vec::new(),
-            allowed_count: 0,
-            denied_count: 0,
+            connection_allowed: 0,
+            connection_denied: 0,
+            request_allowed: 0,
+            request_denied: 0,
             selected_request: None,
             selected_connection: None,
             details: None,
@@ -155,7 +161,11 @@ impl NetworkTab {
     pub fn push_event(&mut self, ev: NetworkEvent, settings: &TuiSettings) {
         match ev {
             NetworkEvent::Connect(info) => {
-                self.bump_count(info.allowed);
+                bump(
+                    info.allowed,
+                    &mut self.connection_allowed,
+                    &mut self.connection_denied,
+                );
                 self.connections.push(ConnectionEntry::from_info(&info));
                 on_push_selection(&mut self.selected_connection, self.connections.len());
                 cap_entries(
@@ -164,8 +174,28 @@ impl NetworkTab {
                     &mut self.selected_connection,
                 );
             }
+            NetworkEvent::Disconnect(info) => {
+                // Older entries may already have been evicted by the
+                // per-list cap; that's fine — no entry to mark, so we just
+                // drop the event.
+                if let Some(entry) = self.connections.iter_mut().find(|c| c.id == info.id) {
+                    entry.disconnected_at = Some(info.timestamp);
+                    // Keep the open-entry detail view in sync so closing
+                    // and re-opening the row isn't required to see the
+                    // disconnect time.
+                    if let Some(DetailView::Connection(open)) = self.details.as_mut()
+                        && open.id == info.id
+                    {
+                        open.disconnected_at = Some(info.timestamp);
+                    }
+                }
+            }
             NetworkEvent::Request(info) => {
-                self.bump_count(info.allowed);
+                bump(
+                    info.allowed,
+                    &mut self.request_allowed,
+                    &mut self.request_denied,
+                );
                 self.requests.push(RequestEntry::from_info(&info));
                 on_push_selection(&mut self.selected_request, self.requests.len());
                 cap_entries(
@@ -177,16 +207,34 @@ impl NetworkTab {
         }
     }
 
-    fn bump_count(&mut self, allowed: bool) {
-        if allowed {
-            self.allowed_count += 1;
-        } else {
-            self.denied_count += 1;
-        }
+    /// Combined event count (allowed + denied, connections + requests).
+    /// Used as the badge on the Monitor tab header.
+    pub fn total_count(&self) -> u32 {
+        self.connection_allowed
+            + self.connection_denied
+            + self.request_allowed
+            + self.request_denied
     }
 
-    pub fn total_count(&self) -> u32 {
-        self.allowed_count + self.denied_count
+    /// Running (allowed, denied) counters for the currently-visible sub-tab.
+    /// Details view falls back to its parent sub-tab's counters.
+    pub fn visible_counts(&self) -> (u32, u32) {
+        let tab = match self.sub_tab {
+            NetworkSubTab::Details => {
+                self.details
+                    .as_ref()
+                    .map_or(NetworkSubTab::Requests, |d| match d {
+                        DetailView::Request(_) => NetworkSubTab::Requests,
+                        DetailView::Connection(_) => NetworkSubTab::Connections,
+                    })
+            }
+            other => other,
+        };
+        match tab {
+            NetworkSubTab::Requests => (self.request_allowed, self.request_denied),
+            NetworkSubTab::Connections => (self.connection_allowed, self.connection_denied),
+            NetworkSubTab::Details => (0, 0),
+        }
     }
 
     /// Jump directly to the given sub-tab and close any open details view.
@@ -374,6 +422,15 @@ fn on_push_selection(selected: &mut Option<usize>, new_len: usize) {
     }
 }
 
+/// Tick the matching allowed/denied counter for one event.
+fn bump(allowed: bool, allowed_ctr: &mut u32, denied_ctr: &mut u32) {
+    if allowed {
+        *allowed_ctr += 1;
+    } else {
+        *denied_ctr += 1;
+    }
+}
+
 /// Evict oldest entries (front of vec) until `vec.len() <= max`. Keeps
 /// display-index selection valid by clamping to the new last display index.
 fn cap_entries<T>(vec: &mut Vec<T>, max: usize, selected: &mut Option<usize>) {
@@ -450,12 +507,8 @@ impl Widget for NetworkWidget<'_> {
             }
         }
 
-        footer::render_footer(
-            footer_area,
-            self.tab.allowed_count,
-            self.tab.denied_count,
-            buf,
-        );
+        let (allowed, denied) = self.tab.visible_counts();
+        footer::render_footer(footer_area, allowed, denied, buf);
 
         // Dropdown overlay renders last so it paints on top of body content.
         if let Some(dropdown) = self.tab.dropdown.as_ref() {

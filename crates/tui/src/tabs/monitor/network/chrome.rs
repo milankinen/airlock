@@ -40,8 +40,10 @@ pub fn render_frame(area: Rect, policy: Policy, buf: &mut Buffer) -> (Rect, Rect
         + max_label_w
         + suffix.chars().count()) as u16;
     let dim_style = Style::default().fg(Color::DarkGray);
+    // Cyan matches the `R`/`C` accelerator tint on the sub-tab labels so
+    // the keyboard hints read as a unified vocabulary.
     let shortcut_style = Style::default()
-        .fg(Color::White)
+        .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
     let label_style = Style::default()
         .fg(policy.color())

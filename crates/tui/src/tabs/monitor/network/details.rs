@@ -113,7 +113,12 @@ fn request_lines(r: &RequestEntry) -> Vec<Line<'static>> {
 fn connection_lines(c: &ConnectionEntry) -> Vec<Line<'static>> {
     let status_color = if c.allowed { Color::Green } else { Color::Red };
     let status_text = if c.allowed { "Allowed" } else { "Denied" };
-    vec![
+    let (state_text, state_color) = if c.allowed && c.disconnected_at.is_none() {
+        ("Open", Color::Green)
+    } else {
+        ("Closed", Color::DarkGray)
+    };
+    let mut out = vec![
         Line::from(""),
         field(
             "Status",
@@ -125,26 +130,42 @@ fn connection_lines(c: &ConnectionEntry) -> Vec<Line<'static>> {
             ),
         ),
         field(
-            "Observed",
+            "State",
+            Span::styled(
+                state_text,
+                Style::default()
+                    .fg(state_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ),
+        field(
+            "Connected",
             Span::styled(
                 format_timestamp(c.timestamp),
                 Style::default().fg(Color::Gray),
             ),
         ),
-        field(
-            "Target",
-            Span::styled(
-                format!("{}:{}", c.host, c.port),
-                Style::default().fg(Color::Gray),
-            ),
+    ];
+    if let Some(ts) = c.disconnected_at {
+        out.push(field(
+            "Disconnected",
+            Span::styled(format_timestamp(ts), Style::default().fg(Color::Gray)),
+        ));
+    }
+    out.push(field(
+        "Target",
+        Span::styled(
+            format!("{}:{}", c.host, c.port),
+            Style::default().fg(Color::Gray),
         ),
-    ]
+    ));
+    out
 }
 
 fn field(label: &str, value: Span<'static>) -> Line<'static> {
     Line::from(vec![
         Span::raw("  "),
-        Span::styled(format!("{label:<10}"), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{label:<12}"), Style::default().fg(Color::DarkGray)),
         Span::raw("  "),
         value,
     ])

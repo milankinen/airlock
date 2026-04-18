@@ -25,21 +25,21 @@ airlock start --monitor
 
 ### Network panel
 
-Two sub-tabs (newest entries at the top, up to 100 of each):
+Two sub-tabs (newest entries at the top, up to 100 of each). Both have
+a gray header row naming the columns.
 
 - **Requests** (default) — one row per HTTP request the middleware
-  handled, with method, path, target host:port, and whether it was
-  allowed or denied. Denied HTTP requests are included here too: the
-  proxy captures the full request before responding with `403 Forbidden`
-  instead of refusing at the TCP layer, so you can see exactly what was
-  attempted.
-- **Connections** — one row per raw TCP connection attempt, with target
-  host:port and allow/deny.
-
-Rows share the same layout: a colored `⦿` bullet (green for allowed,
-red for denied), a local timestamp, the request or connection target,
-and a fixed-width `Allowed` / `Denied` status column. A footer tracks
-running allow/deny counts.
+  handled. Columns: `Received at`, `Endpoint` (method + path),
+  `Target` (host:port), `Result` (`Allowed` green / `Denied` red).
+  Denied HTTP requests are included here too: the proxy captures the
+  full request before responding with `403 Forbidden` instead of
+  refusing at the TCP layer, so you can see exactly what was attempted.
+- **Connections** — one row per raw TCP connection. Columns: a colored
+  `⦿` bullet, `Target` (host:port, white), `Connected at`,
+  `Disconnected at`, `Result`. The bullet signals connection lifecycle:
+  **green** means the connection is still open (`Disconnected at` is
+  blank), **gray** means it closed, **red** means the connection was
+  denied. A footer tracks running allow/deny counts.
 
 Use `↑` / `↓` to move the row selection (PgUp/PgDn, Home, End also
 work), and press `Enter` to open a **details** sub-tab with the full

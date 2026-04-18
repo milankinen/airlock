@@ -44,7 +44,10 @@ impl network_proxy::Server for Network {
                         "denied"
                     }
                 );
+                let id = self.next_connection_id();
+                self.emit_connect(id, &net_target.host, net_target.port, net_target.allowed);
                 let sink = spawn_tcp_connection(
+                    id,
                     net_target,
                     client_sink,
                     self.tls_client.clone(),
@@ -58,14 +61,18 @@ impl network_proxy::Server for Network {
 
                 if self.is_deny_always() {
                     debug!("denied: socket {guest_path} (denied by policy)");
-                    self.emit_event(&guest_path, 0, false);
+                    let id = self.next_connection_id();
+                    self.emit_connect(id, &guest_path, 0, false);
+                    self.emit_disconnect(id);
                     results.get().init_result().set_denied("denied by policy");
                     return Ok(());
                 }
 
                 let Some(host_path) = self.socket_map.get(&guest_path) else {
                     debug!("denied: socket {guest_path} (no matching rule)");
-                    self.emit_event(&guest_path, 0, false);
+                    let id = self.next_connection_id();
+                    self.emit_connect(id, &guest_path, 0, false);
+                    self.emit_disconnect(id);
                     results
                         .get()
                         .init_result()
@@ -85,6 +92,7 @@ impl network_proxy::Server for Network {
 /// Spawn a background task for a TCP connection: detect TLS, optionally
 /// intercept, apply middleware, and relay bytes bidirectionally.
 fn spawn_tcp_connection(
+    id: u64,
     target: ResolvedTarget,
     client_sink: tcp_sink::Client,
     tls_client: Arc<rustls::ClientConfig>,
@@ -103,13 +111,23 @@ fn spawn_tcp_connection(
             client_sink,
             &tls_client,
             &interceptor,
-            events,
+            events.clone(),
         ))
         .await;
 
         if let Err(e) = result {
             debug!("connection {addr} error: {e}");
             *task_error.borrow_mut() = Some(format!("{e}"));
+        }
+
+        // Matching `Disconnect` — lets the TUI flip the row's indicator
+        // from green (open) to gray (closed) and record the close time.
+        if events.receiver_count() > 0 {
+            let info = airlock_tui::DisconnectInfo {
+                id,
+                timestamp: std::time::SystemTime::now(),
+            };
+            let _ = events.send(airlock_tui::NetworkEvent::Disconnect(Arc::new(info)));
         }
     });
 

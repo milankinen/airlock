@@ -4,11 +4,14 @@ use std::time::SystemTime;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
-use super::row::{MiddleColumns, build_row};
+use super::row::{
+    RESULT_COLS, TIMESTAMP_COLS, apply_row_highlight, format_timestamp, pad_left, pad_right,
+    truncate_left, truncate_right,
+};
 
 /// A single HTTP request log entry. Retains the full header set so the
 /// Details sub-tab can show them without a second subscribe.
@@ -63,50 +66,106 @@ impl Widget for RequestsWidget<'_> {
             return;
         }
 
-        // Display newest first. Scroll so the selected row stays visible:
-        // `sel` is pinned to the bottom once it moves past the visible area.
-        let total = self.entries.len();
-        let visible = area.height as usize;
-        let selected = self.selected.unwrap_or(0);
-        let start = selected.saturating_sub(visible.saturating_sub(1));
-        let end = (start + visible).min(total);
+        // Target column width — picked up front so header and rows align.
+        let target_w = target_column_width(self.entries);
 
-        let lines: Vec<Line> = (start..end)
-            .map(|display_idx| {
-                // display index 0 = newest = entries[last]
-                let vec_idx = total - 1 - display_idx;
-                let e = &self.entries[vec_idx];
-                let left = format!("{} {}", e.method, e.path);
-                let right = format!("{}:{}", e.host, e.port);
-                let mut row = build_row(
-                    e.timestamp,
-                    e.allowed,
-                    MiddleColumns {
-                        left: &left,
-                        right: &right,
-                    },
-                    area.width,
-                );
-                if self.selected == Some(display_idx) {
-                    apply_selection_highlight(&mut row);
-                }
-                row
-            })
-            .collect();
+        // Layout (must match `build_request_row`):
+        //   "  " + received(16) + "  " + ENDPOINT(expand) + " " +
+        //   target(N) + " " + status(7) + " "
+        // (Two spaces after `received` give the timestamp a bit of
+        // breathing room before the white endpoint column.)
+        let fixed = 2 + TIMESTAMP_COLS + 2 + 1 + target_w + 1 + RESULT_COLS + 1;
+        let endpoint_w = (area.width as usize).saturating_sub(fixed);
+
+        let header = {
+            let style = Style::default().fg(Color::DarkGray);
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    pad_right(
+                        &truncate_right("Received at", TIMESTAMP_COLS),
+                        TIMESTAMP_COLS,
+                    ),
+                    style,
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    pad_right(&truncate_right("Endpoint", endpoint_w), endpoint_w),
+                    style,
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    pad_right(&truncate_right("Target", target_w), target_w),
+                    style,
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    pad_right(&truncate_right("Result", RESULT_COLS), RESULT_COLS),
+                    style,
+                ),
+            ])
+        };
+
+        let body_height = area.height.saturating_sub(1) as usize;
+        if body_height == 0 {
+            Paragraph::new(header).render(area, buf);
+            return;
+        }
+
+        let total = self.entries.len();
+        let selected = self.selected.unwrap_or(0);
+        let start = selected.saturating_sub(body_height.saturating_sub(1));
+        let end = (start + body_height).min(total);
+
+        let mut lines = Vec::with_capacity(1 + end - start);
+        lines.push(header);
+        for display_idx in start..end {
+            let vec_idx = total - 1 - display_idx;
+            let e = &self.entries[vec_idx];
+            let mut row = build_request_row(e, target_w, endpoint_w);
+            if self.selected == Some(display_idx) {
+                apply_row_highlight(&mut row);
+            }
+            lines.push(row);
+        }
 
         Paragraph::new(lines).render(area, buf);
     }
 }
 
-/// Paint every span on the line with a dark-gray background to mark it as
-/// selected. Preserves each span's existing fg so bullet colors and status
-/// text stay readable.
-pub(super) fn apply_selection_highlight(line: &mut Line<'_>) {
-    for span in &mut line.spans {
-        let mut style = span.style;
-        style = style
-            .bg(Color::Rgb(50, 50, 50))
-            .add_modifier(Modifier::BOLD);
-        span.style = style;
-    }
+/// Cap the Target column at the widest current entry's `host:port`, bounded
+/// at 30 columns so a single long host name can't starve the Endpoint
+/// column. At least 12 so short targets still render with breathing room.
+fn target_column_width(entries: &[RequestEntry]) -> usize {
+    let max = entries
+        .iter()
+        .map(|e| format!("{}:{}", e.host, e.port).chars().count())
+        .max()
+        .unwrap_or(12);
+    max.clamp(12, 30)
+}
+
+fn build_request_row(e: &RequestEntry, target_w: usize, endpoint_w: usize) -> Line<'static> {
+    let status_text = if e.allowed { "Allowed" } else { "Denied" };
+    let status_padded = pad_right(status_text, RESULT_COLS);
+    let status_color = if e.allowed { Color::Green } else { Color::Red };
+
+    let received = format_timestamp(e.timestamp);
+    let target = format!("{}:{}", e.host, e.port);
+    let target = pad_left(&truncate_left(&target, target_w), target_w);
+
+    let endpoint = format!("{} {}", e.method, e.path);
+    let endpoint = pad_right(&truncate_right(&endpoint, endpoint_w), endpoint_w);
+
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(received, Style::default().fg(Color::DarkGray)),
+        Span::raw("  "),
+        Span::styled(endpoint, Style::default().fg(Color::White)),
+        Span::raw(" "),
+        Span::styled(target, Style::default().fg(Color::DarkGray)),
+        Span::raw(" "),
+        Span::styled(status_padded, Style::default().fg(status_color)),
+        Span::raw(" "),
+    ])
 }

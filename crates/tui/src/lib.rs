@@ -40,6 +40,9 @@ pub struct StatsSnapshot {
 pub enum NetworkEvent {
     /// Raw TCP connect decision (allow/deny at connection time).
     Connect(Arc<ConnectInfo>),
+    /// Previously-connected TCP connection closed. The `id` matches the
+    /// `ConnectInfo::id` of the `Connect` event that opened it.
+    Disconnect(Arc<DisconnectInfo>),
     /// HTTP request observed by the middleware.
     Request(Arc<RequestInfo>),
 }
@@ -48,10 +51,20 @@ pub enum NetworkEvent {
 /// channel only bumps a refcount on recv rather than cloning fields.
 #[derive(Debug)]
 pub struct ConnectInfo {
+    /// Monotonic per-process connection id — used to link a later
+    /// `DisconnectInfo` back to its `ConnectInfo`.
+    pub id: u64,
     pub timestamp: SystemTime,
     pub host: String,
     pub port: u16,
     pub allowed: bool,
+}
+
+/// Event payload for a TCP connection closing.
+#[derive(Debug)]
+pub struct DisconnectInfo {
+    pub id: u64,
+    pub timestamp: SystemTime,
 }
 
 /// HTTP request event payload. Wrapped in `Arc` on the wire.

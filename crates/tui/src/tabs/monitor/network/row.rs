@@ -1,87 +1,21 @@
 //! Shared row-rendering helpers for the network panel. Both Requests and
-//! Connections rows share the same bullet + timestamp + target + status
-//! skeleton; this module centralizes the styling and truncation logic.
+//! Connections rows share the same column vocabulary (timestamp widths,
+//! status widths, truncation, selection highlight); this module hosts
+//! those utilities.
 
 use std::time::SystemTime;
 
-use ratatui::style::{Color, Style};
-use ratatui::text::{Line, Span};
+use ratatui::style::{Color, Modifier};
+use ratatui::text::Line;
 
-/// One column of content shown between the timestamp and the status.
-#[derive(Clone, Copy)]
-pub struct MiddleColumns<'a> {
-    /// Left-aligned text (e.g. `"POST /foo/bar"`) — truncated on the right.
-    pub left: &'a str,
-    /// Right-aligned text (e.g. `"api.example.com:443"`) — truncated on
-    /// the left with an ellipsis.
-    pub right: &'a str,
-}
+/// Width of the leading `⦿` bullet (1 char, no padding).
+pub const BULLET_COLS: usize = 1;
+/// Width of a fixed-width timestamp column, sized for `"Mon DD, HH:MM:SS"`.
+pub const TIMESTAMP_COLS: usize = 16;
+/// Width of the trailing `Allowed` / `Denied` column.
+pub const RESULT_COLS: usize = 7;
 
-/// Fixed width of the status column. `"Allowed"` is 7 chars; `"Denied"`
-/// is padded to the same width so the status column aligns between rows.
-const STATUS_W: usize = 7;
-
-/// Build a row: bullet + timestamp + MIDDLE + status.
-///
-/// `total_width` is the inner-panel row width (after the panel border).
-pub fn build_row(
-    timestamp: SystemTime,
-    allowed: bool,
-    middle: MiddleColumns<'_>,
-    total_width: u16,
-) -> Line<'static> {
-    let bullet_color = if allowed { Color::Green } else { Color::Red };
-    let status_text = if allowed { "Allowed" } else { "Denied" };
-    let status_padded = pad_right(status_text, STATUS_W);
-
-    let ts = format_timestamp(timestamp);
-    let ts_len = ts.chars().count();
-
-    // Fixed spacing:
-    //   "  " + bullet(1) + "  " + ts + "  " + [middle] + "  " + status(7) + " "
-    let fixed = 2 + 1 + 2 + ts_len + 2 + 2 + STATUS_W + 1;
-    let middle_w = (total_width as usize).saturating_sub(fixed);
-
-    let (left, right) = split_middle(middle.left, middle.right, middle_w);
-
-    Line::from(vec![
-        Span::raw("  "),
-        Span::styled("⦿", Style::default().fg(bullet_color)),
-        Span::raw("  "),
-        Span::styled(ts, Style::default().fg(Color::DarkGray)),
-        Span::raw("  "),
-        Span::styled(left, Style::default().fg(Color::Gray)),
-        Span::styled(right, Style::default().fg(Color::DarkGray)),
-        Span::raw("  "),
-        Span::styled(status_padded, Style::default().fg(bullet_color)),
-        Span::raw(" "),
-    ])
-}
-
-/// Split `total` middle columns between `left` (left-aligned,
-/// right-truncated with `…`) and `right` (right-aligned, left-truncated
-/// with `…`). Returned pair has a combined width of exactly `total`; the
-/// left column absorbs any gap as trailing spaces.
-fn split_middle(left: &str, right: &str, total: usize) -> (String, String) {
-    if total == 0 {
-        return (String::new(), String::new());
-    }
-    // Give `right` up to half the space (clamped to its natural length).
-    let right_max = (total / 2).min(right.chars().count());
-    let right_rendered = truncate_left(right, right_max);
-    let right_len = right_rendered.chars().count();
-
-    // Left gets everything else. Reserve 2 cols of internal gap (absorbed as
-    // trailing padding on the left column) when `right` has content.
-    let gap = if right_len == 0 { 0 } else { 2 };
-    let left_w = total.saturating_sub(right_len);
-    let left_content_w = left_w.saturating_sub(gap);
-    let left_rendered = truncate_right(left, left_content_w);
-    let left_padded = pad_right(&left_rendered, left_w);
-    (left_padded, right_rendered)
-}
-
-fn truncate_right(s: &str, width: usize) -> String {
+pub fn truncate_right(s: &str, width: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= width {
         return s.to_string();
@@ -97,7 +31,7 @@ fn truncate_right(s: &str, width: usize) -> String {
     out
 }
 
-fn truncate_left(s: &str, width: usize) -> String {
+pub fn truncate_left(s: &str, width: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= width {
         return s.to_string();
@@ -115,13 +49,24 @@ fn truncate_left(s: &str, width: usize) -> String {
     out
 }
 
-fn pad_right(s: &str, width: usize) -> String {
+pub fn pad_right(s: &str, width: usize) -> String {
     let n = s.chars().count();
     if n >= width {
         return s.to_string();
     }
     let mut out = String::from(s);
     out.extend(std::iter::repeat_n(' ', width - n));
+    out
+}
+
+pub fn pad_left(s: &str, width: usize) -> String {
+    let n = s.chars().count();
+    if n >= width {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(width);
+    out.extend(std::iter::repeat_n(' ', width - n));
+    out.push_str(s);
     out
 }
 
@@ -149,4 +94,17 @@ pub fn format_timestamp(t: SystemTime) -> String {
         "{} {:02}, {:02}:{:02}:{:02}",
         mon, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec
     )
+}
+
+/// Paint every span on the line with a dark-gray background to mark it as
+/// selected. Preserves each span's existing fg so bullet colors and status
+/// text stay readable.
+pub fn apply_row_highlight(line: &mut Line<'_>) {
+    for span in &mut line.spans {
+        let mut style = span.style;
+        style = style
+            .bg(Color::Rgb(50, 50, 50))
+            .add_modifier(Modifier::BOLD);
+        span.style = style;
+    }
 }
