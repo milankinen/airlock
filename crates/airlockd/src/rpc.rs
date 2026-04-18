@@ -14,6 +14,7 @@ use futures::AsyncReadExt;
 
 use crate::init::{CacheConfig, DirMountConfig, FileMountConfig, InitConfig, MountConfig};
 use crate::process::{SpawnedProcess, spawn_root, spawn_user};
+use crate::stats::Collector;
 
 /// Unix socket forwarding pair: host-side path and guest-side path.
 pub struct SocketForwardConfig {
@@ -72,6 +73,7 @@ pub async fn start<Init: AsyncFn(StartConfig) -> anyhow::Result<SpawnedProcess>>
     let client: supervisor::Client = capnp_rpc::new_client(SupervisorImpl {
         start_tx: std::cell::RefCell::new(Some(conn_tx)),
         exec_creds: std::cell::RefCell::new(None),
+        stats: std::cell::RefCell::new(Collector::new()),
     });
     let rpc = RpcSystem::new(Box::new(network), Some(client.client));
 
@@ -103,6 +105,7 @@ type ConnPayload = (StartConfig, HostProcess);
 struct SupervisorImpl {
     start_tx: std::cell::RefCell<Option<tokio::sync::oneshot::Sender<ConnPayload>>>,
     exec_creds: std::cell::RefCell<Option<(u32, u32, bool)>>,
+    stats: std::cell::RefCell<Collector>,
 }
 
 impl supervisor::Server for SupervisorImpl {
@@ -298,5 +301,37 @@ impl supervisor::Server for SupervisorImpl {
             Ok(Err(msg)) => Err(capnp::Error::failed(msg)),
             Err(_) => Err(capnp::Error::failed("exec setup dropped".into())),
         }
+    }
+
+    async fn poll_stats(
+        self: Rc<Self>,
+        _params: supervisor::PollStatsParams,
+        mut results: supervisor::PollStatsResults,
+    ) -> Result<(), capnp::Error> {
+        let snapshot = self.stats.borrow_mut().poll();
+
+        let mut out = results.get().init_snapshot();
+
+        {
+            let mut cpu = out.reborrow().init_cpu();
+            let mut pc = cpu.reborrow().init_per_core(snapshot.per_core.len() as u32);
+            for (i, v) in snapshot.per_core.iter().enumerate() {
+                pc.set(i as u32, *v);
+            }
+        }
+        {
+            let mut mem = out.reborrow().init_memory();
+            mem.set_total_bytes(snapshot.total_bytes);
+            mem.set_used_bytes(snapshot.used_bytes);
+        }
+        {
+            let (one, five, fifteen) = snapshot.load_avg;
+            let mut la = out.reborrow().init_load_average();
+            la.set_one(one);
+            la.set_five(five);
+            la.set_fifteen(fifteen);
+        }
+
+        Ok(())
     }
 }

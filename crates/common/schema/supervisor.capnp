@@ -37,6 +37,33 @@ interface Supervisor {
     cwd   :Text,
     env   :List(Text),
   ) -> (proc :Process);
+
+  # Sample guest CPU and memory stats for the host monitor UI. The
+  # implementation diffs /proc/stat across consecutive calls to compute
+  # per-core %; the first call returns zeroed per-core values.
+  pollStats @3 () -> (snapshot :StatsSnapshot);
+}
+
+struct StatsSnapshot {
+  cpu         @0 :CpuStats;
+  memory      @1 :MemoryStats;
+  loadAverage @2 :LoadAverage;
+}
+
+struct CpuStats {
+  # Per-core utilization 0..100 at snapshot time.
+  perCore @0 :List(UInt8);
+}
+
+struct MemoryStats {
+  totalBytes @0 :UInt64;
+  usedBytes  @1 :UInt64;
+}
+
+struct LoadAverage {
+  one     @0 :Float32;
+  five    @1 :Float32;
+  fifteen @2 :Float32;
 }
 
 # CLI server interface — exposed over the unix socket by `airlock go`.

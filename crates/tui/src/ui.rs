@@ -8,7 +8,7 @@ use ratatui::widgets::{Paragraph, Widget};
 
 use crate::app::{App, Tab};
 use crate::pty::TuiTerminalSink;
-use crate::tabs::network::NetworkWidget;
+use crate::tabs::monitor::MonitorWidget;
 use crate::tabs::sandbox::TerminalWidget;
 
 /// Tab bar height: 1 blank gap row + 1 tabs row. Rendered at the bottom.
@@ -38,9 +38,9 @@ pub fn tab_header_rects(size: Rect) -> Vec<(Tab, Rect)> {
     rects.push((Tab::Sandbox, Rect::new(x, y, sandbox_w, 1)));
     x += sandbox_w + 1;
 
-    // "  F2 Network (99999)  " — widest plausible label
+    // "  F2 Monitor (99999)  " — widest plausible label
     let network_w = 22;
-    rects.push((Tab::Network, Rect::new(x, y, network_w, 1)));
+    rects.push((Tab::Monitor, Rect::new(x, y, network_w, 1)));
 
     rects
 }
@@ -63,8 +63,8 @@ pub fn render(f: &mut Frame<'_>, app: &App, sink: &TuiTerminalSink) {
                 f.set_cursor_position(pos);
             }
         }
-        Tab::Network => {
-            NetworkWidget::new(&app.network, &app.policy).render(body, f.buffer_mut());
+        Tab::Monitor => {
+            MonitorWidget::new(&app.monitor, &app.policy).render(body, f.buffer_mut());
         }
     }
 
@@ -74,7 +74,7 @@ pub fn render(f: &mut Frame<'_>, app: &App, sink: &TuiTerminalSink) {
 
 fn render_tab_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
     let sandbox_sel = app.active_tab == Tab::Sandbox;
-    let network_sel = app.active_tab == Tab::Network;
+    let network_sel = app.active_tab == Tab::Monitor;
 
     // Each tab has its own bg: DarkGray when selected, Black (inherits bar
     // bg) otherwise. The hotkey stays yellow on whichever bg the tab has.
@@ -99,11 +99,11 @@ fn render_tab_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
     let sb_bg = tab_bg(sandbox_sel);
     let nw_bg = tab_bg(network_sel);
 
-    let count = app.network.total_count();
+    let count = app.monitor.network.total_count();
     let network_title = if count > 0 {
-        format!(" Network ({count})  ")
+        format!(" Monitor ({count})  ")
     } else {
-        " Network  ".to_string()
+        " Monitor  ".to_string()
     };
 
     let spans = vec![

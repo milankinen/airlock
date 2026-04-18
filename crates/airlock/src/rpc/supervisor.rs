@@ -12,6 +12,15 @@ use crate::project::Project;
 use crate::rpc::logging::LogSinkImpl;
 use crate::rpc::process::Process;
 
+/// Snapshot of guest resource usage returned by [`Supervisor::poll_stats`].
+#[derive(Debug, Clone, Default)]
+pub struct StatsSnapshot {
+    pub per_core: Vec<u8>,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub load_avg: (f32, f32, f32),
+}
+
 /// Host-side handle to the in-VM supervisor, wrapping the Cap'n Proto client.
 #[derive(Clone)]
 pub struct Supervisor {
@@ -203,6 +212,29 @@ impl Supervisor {
         }
         let response = req.send().promise.await?;
         Ok(Process::new(response.get()?.get_proc()?))
+    }
+
+    /// Sample guest CPU/memory/load for the monitor UI.
+    pub async fn poll_stats(&self) -> anyhow::Result<StatsSnapshot> {
+        let req = self.supervisor.poll_stats_request();
+        let response = req.send().promise.await?;
+        let snap = response.get()?.get_snapshot()?;
+
+        let cpu = snap.get_cpu()?;
+        let per_core: Vec<u8> = cpu.get_per_core()?.iter().collect();
+
+        let mem = snap.get_memory()?;
+        let total_bytes = mem.get_total_bytes();
+        let used_bytes = mem.get_used_bytes();
+
+        let la = snap.get_load_average()?;
+
+        Ok(StatsSnapshot {
+            per_core,
+            total_bytes,
+            used_bytes,
+            load_avg: (la.get_one(), la.get_five(), la.get_fifteen()),
+        })
     }
 
     /// Request the supervisor to sync filesystems before the VM is destroyed.

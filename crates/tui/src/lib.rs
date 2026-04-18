@@ -22,10 +22,28 @@ use pty::TuiTerminalSink;
 use ratatui::DefaultTerminal;
 pub use ui::TAB_BAR_HEIGHT;
 
-/// A network connection event emitted by the host-side proxy.
+/// Snapshot of guest resource usage, displayed on the Monitor tab.
+#[derive(Debug, Clone, Default)]
+pub struct StatsSnapshot {
+    pub per_core: Vec<u8>,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub load_avg: (f32, f32, f32),
+}
+
+/// A network event emitted by the host-side proxy for the Monitor tab.
 #[derive(Debug, Clone)]
 pub enum NetworkEvent {
+    /// Raw TCP connect decision (allow/deny at connection time).
     Connect {
+        host: String,
+        port: u16,
+        allowed: bool,
+    },
+    /// HTTP request observed by the middleware.
+    Request {
+        method: String,
+        path: String,
         host: String,
         port: u16,
         allowed: bool,
@@ -38,6 +56,8 @@ enum TuiEvent {
     Output(Vec<u8>),
     /// Network connection event for the monitor tab.
     Network(NetworkEvent),
+    /// Guest resource snapshot for the monitor tab's CPU/memory widgets.
+    Stats(StatsSnapshot),
     /// Process exited with the given code.
     Exit(i32),
     /// Terminal event from crossterm.
@@ -61,6 +81,11 @@ impl TuiSender {
     /// Send a network event to the TUI network tab.
     pub fn send_network(&self, ev: NetworkEvent) {
         let _ = self.tx.send(TuiEvent::Network(ev));
+    }
+
+    /// Send a guest stats snapshot to the TUI monitor tab.
+    pub fn send_stats(&self, snapshot: StatsSnapshot) {
+        let _ = self.tx.send(TuiEvent::Stats(snapshot));
     }
 
     /// Notify the TUI that the sandbox process has exited.
@@ -99,11 +124,16 @@ impl Drop for TuiHandle {
 ///
 /// - `stdin_tx`: channel for sending keystrokes/resize to the RPC stdin server
 /// - `policy`: network policy string displayed in the network tab header
-pub fn spawn(stdin_tx: tokio::sync::mpsc::Sender<TuiInputEvent>, policy: String) -> TuiHandle {
+pub fn spawn(
+    stdin_tx: tokio::sync::mpsc::Sender<TuiInputEvent>,
+    policy: String,
+    project_path: String,
+) -> TuiHandle {
     let (tx, rx) = std_mpsc::channel();
     let crossterm_tx = tx.clone();
 
-    let join = std::thread::spawn(move || tui_main(rx, crossterm_tx, stdin_tx, policy));
+    let join =
+        std::thread::spawn(move || tui_main(rx, crossterm_tx, stdin_tx, policy, project_path));
 
     TuiHandle {
         tx: TuiSender { tx },
@@ -118,6 +148,7 @@ fn tui_main(
     crossterm_tx: std_mpsc::Sender<TuiEvent>,
     stdin_tx: tokio::sync::mpsc::Sender<TuiInputEvent>,
     policy: String,
+    project_path: String,
 ) -> anyhow::Result<i32> {
     // Enter alternate screen, raw mode, mouse capture, and kitty keyboard protocol
     let mut terminal = ratatui::init();
@@ -142,6 +173,7 @@ fn tui_main(
         crossterm_tx,
         &stdin_tx,
         policy,
+        project_path,
         kitty_enabled,
     );
 
@@ -168,10 +200,11 @@ fn run_tui_loop(
     crossterm_tx: std_mpsc::Sender<TuiEvent>,
     stdin_tx: &tokio::sync::mpsc::Sender<TuiInputEvent>,
     policy: String,
+    project_path: String,
     kitty_enabled: bool,
 ) -> anyhow::Result<i32> {
     let mut sink = TuiTerminalSink::new(80, 24);
-    let mut app = App::new(policy);
+    let mut app = App::new(policy, project_path);
     let mut mouse_captured = true;
 
     // Resize vt100 parser to match terminal body area
@@ -246,7 +279,10 @@ fn handle_event(
             sink.write(&data);
         }
         TuiEvent::Network(ev) => {
-            app.network.push_event(ev);
+            app.monitor.network.push_event(ev);
+        }
+        TuiEvent::Stats(snapshot) => {
+            app.monitor.apply_stats(snapshot);
         }
         TuiEvent::Exit(code) => {
             return Ok(Some(code));
@@ -287,7 +323,7 @@ fn handle_key(
             return Ok(None);
         }
         (_, KeyCode::F(2)) => {
-            app.active_tab = Tab::Network;
+            app.active_tab = Tab::Monitor;
             return Ok(None);
         }
         (_, KeyCode::F(12)) => {
@@ -311,13 +347,26 @@ fn handle_key(
                 let _ = stdin_tx.blocking_send(TuiInputEvent::Data(bytes));
             }
         }
-        Tab::Network => match key.code {
-            KeyCode::Up => app.network.scroll_up(1),
-            KeyCode::Down => app.network.scroll_down(1),
-            KeyCode::PageUp => app.network.scroll_up(20),
-            KeyCode::PageDown => app.network.scroll_down(20),
-            KeyCode::Home => app.network.scroll_to_top(),
-            KeyCode::End => app.network.scroll_to_bottom(),
+        Tab::Monitor => match key.code {
+            KeyCode::Up => app.monitor.network.scroll_up(1),
+            KeyCode::Down => app.monitor.network.scroll_down(1),
+            KeyCode::PageUp => app.monitor.network.scroll_up(20),
+            KeyCode::PageDown => app.monitor.network.scroll_down(20),
+            KeyCode::Home => app.monitor.network.scroll_to_top(),
+            KeyCode::End => app.monitor.network.scroll_to_bottom(),
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                app.monitor.network.toggle_sub_tab();
+            }
+            KeyCode::Char('r' | 'R') => {
+                app.monitor
+                    .network
+                    .select_sub_tab(crate::tabs::monitor::network::NetworkSubTab::Requests);
+            }
+            KeyCode::Char('c' | 'C') => {
+                app.monitor
+                    .network
+                    .select_sub_tab(crate::tabs::monitor::network::NetworkSubTab::Connections);
+            }
             _ => {}
         },
     }
@@ -344,16 +393,22 @@ fn handle_mouse(
                     && mouse.column < rect.x + rect.width
                 {
                     app.active_tab = *tab;
-                    break;
+                    return Ok(());
                 }
+            }
+            // Sub-tab click inside the monitor tab.
+            if app.active_tab == Tab::Monitor
+                && let Some(sub) = app.monitor.network.sub_tab_at(mouse.column, mouse.row)
+            {
+                app.monitor.network.select_sub_tab(sub);
             }
         }
         MouseEventKind::ScrollUp => match app.active_tab {
-            Tab::Network => app.network.scroll_up(3),
+            Tab::Monitor => app.monitor.network.scroll_up(3),
             Tab::Sandbox => sink.scroll_up(3),
         },
         MouseEventKind::ScrollDown => match app.active_tab {
-            Tab::Network => app.network.scroll_down(3),
+            Tab::Monitor => app.monitor.network.scroll_down(3),
             Tab::Sandbox => sink.scroll_down(3),
         },
         _ => {}

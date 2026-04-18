@@ -260,13 +260,37 @@ async fn run_inner(
         // TUI monitor mode: spawn TUI on its own thread, keep process
         // polling on the LocalSet so RPC is never blocked by rendering.
         drop(terminal);
-        let tui = airlock_tui::spawn(stdin_tx, policy_str);
+        let project_path = project.host_cwd.display().to_string();
+        let tui = airlock_tui::spawn(stdin_tx, policy_str, project_path);
 
         // Forward network events from the tokio channel to the TUI thread
         let net_tx = tui.tx.clone();
         tokio::task::spawn_local(async move {
             while let Some(ev) = event_rx.recv().await {
                 net_tx.send_network(ev);
+            }
+        });
+
+        // Poll guest CPU/memory stats once per second and forward to the TUI.
+        let stats_tx = tui.tx.clone();
+        let stats_supervisor = supervisor.clone();
+        tokio::task::spawn_local(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                match stats_supervisor.poll_stats().await {
+                    Ok(snap) => stats_tx.send_stats(airlock_tui::StatsSnapshot {
+                        per_core: snap.per_core,
+                        total_bytes: snap.total_bytes,
+                        used_bytes: snap.used_bytes,
+                        load_avg: snap.load_avg,
+                    }),
+                    Err(e) => {
+                        tracing::debug!("poll_stats failed: {e}");
+                        break;
+                    }
+                }
             }
         });
 

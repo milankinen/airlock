@@ -9,6 +9,7 @@ mod logging;
 mod net;
 mod process;
 mod rpc;
+mod stats;
 mod util;
 mod vsock;
 

@@ -18,6 +18,7 @@ use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::sync::mpsc;
 use tracing::{debug, trace};
 
 use crate::network::http::executor::LocalExecutor;
@@ -75,6 +76,7 @@ pub async fn relay(
     container: io::Transport,
     server: io::Transport,
     target: ResolvedTarget,
+    event_tx: Option<mpsc::Sender<airlock_tui::NetworkEvent>>,
 ) -> anyhow::Result<()> {
     let client_io = hyper_util::rt::TokioIo::new(tokio::io::join(container.read, container.write));
     let server_io = hyper_util::rt::TokioIo::new(tokio::io::join(server.read, server.write));
@@ -95,10 +97,16 @@ pub async fn relay(
     };
 
     let middleware = target.middleware;
+    let target_host = target.host.clone();
+    let target_port = target.port;
+    let allowed = target.allowed;
     let service = service_fn(move |req: Request<Incoming>| {
         let sender = sender.clone();
         let middleware = middleware.clone();
+        let event_tx = event_tx.clone();
+        let target_host = target_host.clone();
         async move {
+            emit_request_event(event_tx.as_ref(), &req, &target_host, target_port, allowed);
             let result = middleware::run(req, &middleware, move |req| {
                 let sender = sender.clone();
                 async move { sender.send(req).await.map_err(|e| anyhow::anyhow!("{e}")) }
@@ -122,6 +130,33 @@ pub async fn relay(
         .serve_connection(client_io, service)
         .await
         .map_err(|e| anyhow::anyhow!("http proxy: {e}"))
+}
+
+/// Emit a `NetworkEvent::Request` describing this HTTP request to the TUI
+/// monitor, if a channel is connected.
+///
+/// The `allowed` flag reflects the connection-level TCP decision. HTTP-level
+/// denies (e.g. via Lua middleware) are not yet surfaced separately.
+fn emit_request_event(
+    event_tx: Option<&mpsc::Sender<airlock_tui::NetworkEvent>>,
+    req: &Request<Incoming>,
+    target_host: &str,
+    target_port: u16,
+    allowed: bool,
+) {
+    let Some(tx) = event_tx else { return };
+    let method = req.method().to_string();
+    let path = req
+        .uri()
+        .path_and_query()
+        .map_or_else(|| "/".to_string(), ToString::to_string);
+    let _ = tx.try_send(airlock_tui::NetworkEvent::Request {
+        method,
+        path,
+        host: target_host.to_string(),
+        port: target_port,
+        allowed,
+    });
 }
 
 /// Check if a line matches an HTTP request line or h2 connection preface.

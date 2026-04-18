@@ -3,6 +3,7 @@
     - [Starting a sandbox](./usage/starting-sandbox.md)
     - [Attaching to a running sandbox](./usage/attaching-to-running-sandbox.md)
     - [Managing project data](./usage/managing-project.md)
+- [Monitor mode](./monitor.md)
 - [Configuration](./configuration.md)
     - [VM Options](./configuration/vm.md)
     - [Disk and Cache](./configuration/disk.md)
