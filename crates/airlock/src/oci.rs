@@ -15,6 +15,7 @@ use oci_client::config::ConfigFile as OciConfig;
 use oci_client::secrets::RegistryAuth;
 
 use crate::cli;
+use crate::oci::credentials::ToRegistryAuth;
 use crate::project::Project;
 
 /// Metadata written to `image_dir/meta.json` after a successful image pull.
@@ -86,8 +87,8 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
     let registry_host: String = image_name
         .parse::<oci_client::Reference>()
         .map_or_else(|_| image_name.clone(), |r| r.resolve_registry().to_string());
-    let mut auth =
-        credentials::load(&registry_host).map_or(RegistryAuth::Anonymous, |c| c.to_auth());
+    let mut auth = credentials::load(&project.vault, &registry_host)
+        .map_or(RegistryAuth::Anonymous, |c| c.to_auth());
 
     // Resolve image reference to a digest. On auth failure, prompt for
     // credentials and retry in a loop until success or user interrupts.
@@ -101,7 +102,7 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
                     .await
                 {
                     Ok(img) => {
-                        credentials::save(&registry_host, &creds)?;
+                        credentials::save(&project.vault, &registry_host, &creds)?;
                         break img;
                     }
                     Err(e) if registry::is_auth_error(&e) => {

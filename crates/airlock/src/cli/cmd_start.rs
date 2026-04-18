@@ -13,6 +13,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::cli::{self, CliArgs, LogLevel};
 use crate::runtime::{MonitorRuntime, RawTerminalRuntime, Runtime, Terminal};
+use crate::vault::Vault;
 use crate::{cli_server, config, network, oci, project, rpc, runtime, vm};
 
 /// Default `airlock.toml` written when initializing a new sandbox.
@@ -39,7 +40,7 @@ pub struct StartArgs {
 }
 
 /// Entry point for `airlock start [--log-level <level>] [-- extra-args...]`.
-pub async fn main(args: StartArgs, extra_args: Vec<String>) -> i32 {
+pub async fn main(args: StartArgs, extra_args: Vec<String>, vault: Vault) -> i32 {
     let local = LocalSet::new();
     cli::set_verbose(args.verbose);
 
@@ -110,6 +111,7 @@ pub async fn main(args: StartArgs, extra_args: Vec<String>) -> i32 {
                     config,
                     host_cwd,
                     sandbox_cwd,
+                    vault,
                     MonitorRuntime::new(),
                 )
                 .await
@@ -119,6 +121,7 @@ pub async fn main(args: StartArgs, extra_args: Vec<String>) -> i32 {
                     config,
                     host_cwd,
                     sandbox_cwd,
+                    vault,
                     RawTerminalRuntime::new(),
                 )
                 .await
@@ -136,9 +139,10 @@ async fn run(
     config: config::Config,
     host_cwd: std::path::PathBuf,
     project_cwd: Option<String>,
+    vault: Vault,
     mut runtime: impl Runtime,
 ) -> anyhow::Result<i32> {
-    let project = project::lock(host_cwd, config, project_cwd)?;
+    let project = project::lock(host_cwd, config, project_cwd, vault)?;
     print_preparing(&project);
 
     let image = oci::prepare(&project).await?;

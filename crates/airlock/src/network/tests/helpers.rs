@@ -169,7 +169,8 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
     };
     let (request_log, log_fn) = RequestLog::new();
     let (allow_targets, deny_targets) = rules::resolve(&config);
-    let middleware_targets = rules::resolve_middleware(&config, &log_fn).unwrap();
+    let vault = crate::vault::Vault::new();
+    let middleware_targets = rules::resolve_middleware(&config, &vault, &log_fn).unwrap();
 
     // MITM CA
     let mitm_ca_key = rcgen::KeyPair::generate().unwrap();

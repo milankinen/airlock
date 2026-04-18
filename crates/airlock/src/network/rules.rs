@@ -2,6 +2,7 @@ use super::http;
 use super::middleware::LogFn;
 use super::target::{MiddlewareTarget, NetworkTarget};
 use crate::config::config::Network;
+use crate::vault::Vault;
 
 /// Resolve config rules into allow and deny target lists.
 /// Disabled rules are skipped.
@@ -38,7 +39,11 @@ pub fn resolve(network: &Network) -> (Vec<NetworkTarget>, Vec<NetworkTarget>) {
 
 /// Compile middleware from the `network.middleware` config section.
 /// Each enabled middleware rule is compiled and paired with its target patterns.
-pub fn resolve_middleware(network: &Network, log: &LogFn) -> anyhow::Result<Vec<MiddlewareTarget>> {
+pub fn resolve_middleware(
+    network: &Network,
+    vault: &Vault,
+    log: &LogFn,
+) -> anyhow::Result<Vec<MiddlewareTarget>> {
     let mut targets = Vec::new();
 
     for mw in network.middleware.values() {
@@ -46,7 +51,7 @@ pub fn resolve_middleware(network: &Network, log: &LogFn) -> anyhow::Result<Vec<
             continue;
         }
 
-        let compiled = http::middleware::compile(&mw.script, &mw.env, log.clone())?;
+        let compiled = http::middleware::compile(&mw.script, &mw.env, vault, log.clone())?;
 
         for target_str in &mw.target {
             let (host, port) = parse_target(target_str);

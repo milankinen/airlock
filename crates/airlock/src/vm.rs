@@ -335,9 +335,10 @@ fn resolve_cmd(args: &CliArgs, image: &OciImage) -> Vec<String> {
 /// Resolve the final container environment: image env with project overrides applied.
 fn resolve_env(project: &Project, image: &OciImage) -> anyhow::Result<Vec<String>> {
     let mut env = image.env.clone();
-    let host_env: std::collections::HashMap<String, String> = std::env::vars().collect();
     for (key, template) in &project.config.env {
-        let value = subst::substitute(template, &host_env)
+        let value = project
+            .vault
+            .subst(template)
             .map_err(|e| anyhow::anyhow!("env.{key}: {e}"))?;
         env.retain(|existing| !existing.starts_with(&format!("{key}=")));
         env.push(format!("{key}={value}"));

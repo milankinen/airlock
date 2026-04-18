@@ -75,6 +75,9 @@ notify = "6"
 sysinfo = { version = "0.38", features = ["system"] }
 pty-process = { version = "0.5", features = ["async"] }
 
+# Secrets
+keyring = { version = "3", default-features = false }
+
 # DNS + cache
 scc = "2"
 simple-dns = "0.9"

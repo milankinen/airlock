@@ -39,11 +39,13 @@ struct Inner {
 /// `req` is a local parameter rather than a global, preventing races.
 ///
 /// `env_vars` maps variable names to their descriptions; values are resolved
-/// from the host environment and exposed to the script as the `env` global
-/// table (nil for any variable not set on the host).
+/// through `Vault::subst` (host env first, vault as fallback) and exposed
+/// to the script as the `env` global table. Templates that can't be
+/// resolved become nil.
 pub fn compile(
     script: &str,
     env_vars: &BTreeMap<String, String>,
+    vault: &crate::vault::Vault,
     log: middleware::LogFn,
 ) -> anyhow::Result<CompiledMiddleware> {
     let lua = Lua::new();
@@ -56,12 +58,12 @@ pub fn compile(
     lua.globals().set("log", log_fn)?;
 
     // Expose declared env vars as the `env` global table.
-    // Values are subst templates expanded from the host environment.
-    // Any template that references an undefined host variable resolves to nil.
-    let host_env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    // Templates that fail to resolve become nil. `Vault::subst` handles
+    // the vault-wins-over-host-env precedence and the no-`${...}` fast
+    // path internally.
     let env_table = lua.create_table()?;
     for (key, template) in env_vars {
-        let value = subst::substitute(template, &host_env).ok();
+        let value = vault.subst(template).ok();
         env_table.set(key.as_str(), value)?;
     }
     lua.globals().set("env", env_table)?;

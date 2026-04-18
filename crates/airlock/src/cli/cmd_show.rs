@@ -2,6 +2,7 @@
 
 use clap::Args;
 
+use crate::vault::Vault;
 use crate::{cli, project};
 
 /// CLI arguments for `airlock show`.
@@ -9,8 +10,8 @@ use crate::{cli, project};
 pub struct ShowArgs {}
 
 /// Print sandbox metadata (path, status, image, config) to stdout.
-pub fn main(_args: &ShowArgs) -> i32 {
-    let project = match project::load() {
+pub fn main(_args: &ShowArgs, vault: Vault) -> i32 {
+    let project = match project::load(vault) {
         Ok(s) => s,
         Err(e) => {
             cli::error!("Project data loading failed: {e:#}");

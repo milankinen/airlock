@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::config::Config;
+use crate::vault::Vault;
 
 /// A resolved project: its working directory, sandbox paths, config, and CA.
 pub struct Project {
@@ -28,6 +29,10 @@ pub struct Project {
     pub ca_key: String,
     /// True if the CA keypair was generated during this session (first run).
     pub ca_newly_generated: bool,
+    /// Keyring-backed secret storage. Built lazy: no keyring I/O
+    /// happens until the first `get_*`/`set_*` call, so commands that
+    /// don't reference secrets never trigger an unlock prompt.
+    pub vault: Vault,
     lock_path: Option<PathBuf>,
 }
 
@@ -129,7 +134,11 @@ impl Drop for Project {
 /// Resolves the project from the current working directory, loads its config,
 /// and returns a `Project`. No lock is acquired and no CA is generated —
 /// use this for read-only subcommands (`info`, `down`, `exec`).
-pub fn load() -> anyhow::Result<Project> {
+///
+/// `vault` is the process-global vault handle created in `main`; every
+/// `Project` in one process shares the same instance so secrets loaded
+/// once are reused across commands.
+pub fn load(vault: Vault) -> anyhow::Result<Project> {
     let home_dir =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
     let host_cwd = {
@@ -155,6 +164,7 @@ pub fn load() -> anyhow::Result<Project> {
         ca_cert,
         ca_key,
         ca_newly_generated: false,
+        vault,
         lock_path: None,
     })
 }
@@ -171,6 +181,7 @@ pub fn lock(
     host_cwd: PathBuf,
     config: Config,
     sandbox_cwd_override: Option<String>,
+    vault: Vault,
 ) -> anyhow::Result<Project> {
     let home_dir =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
@@ -205,6 +216,7 @@ pub fn lock(
         ca_cert,
         ca_key,
         ca_newly_generated,
+        vault,
         lock_path: Some(lock_path),
     })
 }

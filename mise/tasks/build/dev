@@ -8,5 +8,5 @@ set -euo pipefail
 cargo build -p airlock-cli --features dev "$@"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
-  codesign --entitlements entitlements.plist --force -s - target/debug/airlock 2>/dev/null || true
+  codesign --entitlements entitlements.plist --force -s "${APPLE_SIGNIN_ID:--}" target/debug/airlock 2>/dev/null || true
 fi

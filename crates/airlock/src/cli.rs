@@ -6,6 +6,7 @@
 
 pub mod cmd_exec;
 pub mod cmd_rm;
+pub mod cmd_secret;
 pub mod cmd_show;
 pub mod cmd_start;
 

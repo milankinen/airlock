@@ -4,6 +4,7 @@ use clap::Args;
 use dialoguer::Select;
 use dialoguer::theme::ColorfulTheme;
 
+use crate::vault::Vault;
 use crate::{cli, project};
 
 /// CLI arguments for `airlock rm`.
@@ -15,8 +16,8 @@ pub struct RmArgs {
 }
 
 /// Remove the sandbox directory after confirmation (unless `--force`).
-pub fn main(args: &RmArgs) -> i32 {
-    let project = match project::load() {
+pub fn main(args: &RmArgs, vault: Vault) -> i32 {
+    let project = match project::load(vault) {
         Ok(s) => s,
         Err(e) => {
             cli::error!("{e:#}");

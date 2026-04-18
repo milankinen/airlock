@@ -52,7 +52,7 @@ pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network>
     let net = &project.config.network;
     let log = middleware::tracing_log();
     let (allow_targets, deny_targets) = rules::resolve(net);
-    let middleware_targets = rules::resolve_middleware(net, &log)?;
+    let middleware_targets = rules::resolve_middleware(net, &project.vault, &log)?;
 
     let interceptor = tls::TlsInterceptor::new(&project.ca_cert, &project.ca_key)?;
 

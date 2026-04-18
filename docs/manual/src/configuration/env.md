@@ -14,19 +14,19 @@ EDITOR = "vim"
 TERM = "xterm-256color"
 ```
 
-## Host variable substitution
+## Variable substitution
 
-More commonly, you'll want to forward a value from the host environment into
-the sandbox. Use the `${VAR}` syntax:
+To forward a value from the host into the sandbox, use the `${VAR}` syntax:
 
 ```toml
 [env]
 API_TOKEN = "${MY_API_TOKEN}"
 ```
 
-When airlock starts, it reads `MY_API_TOKEN` from the host environment and
-injects it as `API_TOKEN` inside the container. If the host variable isn't
-set, the value defaults to an empty string.
+When airlock starts, it resolves `MY_API_TOKEN` first from the host
+environment and then from the user secret vault (see below), and injects
+the result as `API_TOKEN` inside the container. Starting the sandbox
+fails if the variable is not defined in either source.
 
 You can provide a fallback value with `${VAR:default}`:
 
@@ -34,4 +34,22 @@ You can provide a fallback value with `${VAR:default}`:
 [env]
 LOG_LEVEL = "${LOG_LEVEL:info}"
 ```
+
+## Secret vault
+
+Secrets that shouldn't live in your shell environment can be stored in
+the system keyring with `airlock secret`:
+
+```sh
+airlock secret add MY_API_TOKEN   # prompts twice for the value
+airlock secret ls                 # names and save times (values never shown)
+airlock secret rm MY_API_TOKEN
+```
+
+Vault entries are referenced with the same `${VAR}` syntax as host env
+vars. The host env is consulted first and the vault is the fallback, so
+common templates like `${PATH}` never open the keyring — only names
+the host env doesn't define fall through to the vault. If a shell var
+of the same name already exists and you want the saved secret to win,
+unset it in the invoking shell (or give the secret a different name).
 

@@ -12,6 +12,7 @@ use futures::AsyncReadExt;
 use tokio::task::LocalSet;
 
 use crate::runtime::{self, RawTerminalRuntime};
+use crate::vault::Vault;
 use crate::{cli, project, rpc};
 
 /// CLI arguments for `airlock exec`.
@@ -34,11 +35,11 @@ pub struct ExecArgs {
 }
 
 /// Entry point for `airlock exec <cmd> [args...]`.
-pub async fn main(args: ExecArgs) -> i32 {
+pub async fn main(args: ExecArgs, vault: Vault) -> i32 {
     let local = LocalSet::new();
     local
         .run_until(async {
-            run(args).await.unwrap_or_else(|e| {
+            run(args, vault).await.unwrap_or_else(|e| {
                 cli::error!("{e:#}");
                 1
             })
@@ -46,7 +47,7 @@ pub async fn main(args: ExecArgs) -> i32 {
         .await
 }
 
-async fn run(args: ExecArgs) -> anyhow::Result<i32> {
+async fn run(args: ExecArgs, vault: Vault) -> anyhow::Result<i32> {
     let ExecArgs {
         cmd,
         args,
@@ -54,7 +55,7 @@ async fn run(args: ExecArgs) -> anyhow::Result<i32> {
         env,
         login,
     } = args;
-    let project = project::load()?;
+    let project = project::load(vault)?;
     let (cmd, args) = if login {
         apply_login_shell(cmd, args)
     } else {
@@ -193,7 +194,6 @@ fn resolve_config_env(
     project: &project::Project,
     cli_env: &[String],
 ) -> anyhow::Result<Vec<String>> {
-    let host_env: std::collections::HashMap<String, String> = std::env::vars().collect();
     let mut merged: Vec<String> = Vec::new();
 
     // Collect keys from CLI env so we can skip config entries that are overridden.
@@ -206,7 +206,9 @@ fn resolve_config_env(
         if cli_keys.contains(key.as_str()) {
             continue;
         }
-        let value = subst::substitute(template, &host_env)
+        let value = project
+            .vault
+            .subst(template)
             .map_err(|e| anyhow::anyhow!("env.{key}: {e}"))?;
         merged.push(format!("{key}={value}"));
     }
