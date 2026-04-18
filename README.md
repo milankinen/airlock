@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./docs/manual/src/logo.png" alt="airlock" style="max-height: 256px;" />
+  <img src="./docs/manual/src/logo.png" alt="airlock" width="624" />
 </p>
 <p align="center">
    <a href="https://milankinen.github.io/airlock">
