@@ -207,15 +207,6 @@ impl NetworkTab {
         }
     }
 
-    /// Combined event count (allowed + denied, connections + requests).
-    /// Used as the badge on the Monitor tab header.
-    pub fn total_count(&self) -> u32 {
-        self.connection_allowed
-            + self.connection_denied
-            + self.request_allowed
-            + self.request_denied
-    }
-
     /// Running (allowed, denied) counters for the currently-visible sub-tab.
     /// Details view falls back to its parent sub-tab's counters.
     pub fn visible_counts(&self) -> (u32, u32) {

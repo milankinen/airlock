@@ -1,7 +1,7 @@
 //! Layout and rendering for the TUI.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
@@ -94,17 +94,10 @@ fn render_tab_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
         }
         s
     };
-    let hotkey_style = |bg: Color| -> Style { Style::default().fg(Color::Yellow).bg(bg) };
+    let hotkey_style = |bg: Color| -> Style { Style::default().fg(Color::Cyan).bg(bg) };
 
     let sb_bg = tab_bg(sandbox_sel);
     let nw_bg = tab_bg(network_sel);
-
-    let count = app.monitor.network.total_count();
-    let network_title = if count > 0 {
-        format!(" Monitor ({count})  ")
-    } else {
-        " Monitor  ".to_string()
-    };
 
     let spans = vec![
         Span::raw(" "),
@@ -114,14 +107,67 @@ fn render_tab_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
         Span::raw(" "),
         Span::styled("  ", Style::default().bg(nw_bg)),
         Span::styled("F2", hotkey_style(nw_bg)),
-        Span::styled(network_title, title_style(network_sel, nw_bg)),
+        Span::styled(" Monitor  ", title_style(network_sel, nw_bg)),
     ];
 
     let line = Line::from(spans);
     // Paint the bg only on the bottom tabs row (height 1); the row above is
     // a blank gap at the terminal's default bg.
     let tabs_row = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
+    let bar_style = Style::default().bg(Color::Black);
     Paragraph::new(line)
-        .style(Style::default().bg(Color::Black))
+        .style(bar_style)
         .render(tabs_row, f.buffer_mut());
+
+    // Right-aligned status indicators on the same row.
+    let status = build_status_line(app);
+    Paragraph::new(status)
+        .style(bar_style)
+        .alignment(Alignment::Right)
+        .render(tabs_row, f.buffer_mut());
+}
+
+fn build_status_line(app: &App) -> Line<'static> {
+    let label = Style::default().fg(Color::Gray);
+    let value = Style::default().fg(Color::DarkGray);
+    let sep = Span::styled(" │ ", value);
+
+    let cpu_pct = app.monitor.cpu.mean();
+    let mem_used = format_bytes(app.monitor.memory.used_bytes);
+    let mem_total = format_bytes(app.monitor.memory.total_bytes);
+    let allowed = app.monitor.network.request_allowed;
+    let denied = app.monitor.network.request_denied;
+
+    Line::from(vec![
+        Span::styled("CPU ", label),
+        Span::styled(format!("{cpu_pct}%"), value),
+        sep.clone(),
+        Span::styled("Memory ", label),
+        Span::styled(format!("{mem_used} / {mem_total}"), value),
+        sep,
+        Span::styled("Network ", label),
+        Span::styled(format!("{allowed}"), Style::default().fg(Color::Green)),
+        Span::raw(" "),
+        Span::styled(format!("{denied}"), Style::default().fg(Color::Red)),
+        Span::raw(" "),
+    ])
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    const TIB: u64 = GIB * 1024;
+
+    if bytes >= TIB {
+        format!("{:.1} TiB", bytes as f64 / TIB as f64)
+    } else if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.0} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.0} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }

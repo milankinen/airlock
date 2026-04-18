@@ -161,7 +161,7 @@ fn build_request_row(e: &RequestEntry, target_w: usize, endpoint_w: usize) -> Li
         Span::raw("  "),
         Span::styled(received, Style::default().fg(Color::DarkGray)),
         Span::raw("  "),
-        Span::styled(endpoint, Style::default().fg(Color::White)),
+        Span::raw(endpoint),
         Span::raw(" "),
         Span::styled(target, Style::default().fg(Color::DarkGray)),
         Span::raw(" "),

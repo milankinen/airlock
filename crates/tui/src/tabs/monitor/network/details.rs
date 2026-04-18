@@ -56,13 +56,7 @@ fn request_lines(r: &RequestEntry) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         ),
     ));
-    out.push(field(
-        "Received",
-        Span::styled(
-            format_timestamp(r.timestamp),
-            Style::default().fg(Color::Gray),
-        ),
-    ));
+    out.push(field("Received", Span::raw(format_timestamp(r.timestamp))));
     out.push(field(
         "Method",
         Span::styled(
@@ -72,25 +66,14 @@ fn request_lines(r: &RequestEntry) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         ),
     ));
-    out.push(field(
-        "Target",
-        Span::styled(
-            format!("{}:{}", r.host, r.port),
-            Style::default().fg(Color::Gray),
-        ),
-    ));
-    out.push(field(
-        "Path",
-        Span::styled(r.path.clone(), Style::default().fg(Color::Gray)),
-    ));
+    out.push(field("Target", Span::raw(format!("{}:{}", r.host, r.port))));
+    out.push(field("Path", Span::raw(r.path.clone())));
     out.push(Line::from(""));
     out.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(
             "Headers",
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         ),
     ]));
     if r.headers.is_empty() {
@@ -103,7 +86,7 @@ fn request_lines(r: &RequestEntry) -> Vec<Line<'static>> {
             out.push(Line::from(vec![
                 Span::raw("    "),
                 Span::styled(format!("{name}: "), Style::default().fg(Color::DarkGray)),
-                Span::styled(value.clone(), Style::default().fg(Color::Gray)),
+                Span::raw(value.clone()),
             ]));
         }
     }
@@ -138,27 +121,12 @@ fn connection_lines(c: &ConnectionEntry) -> Vec<Line<'static>> {
                     .add_modifier(Modifier::BOLD),
             ),
         ),
-        field(
-            "Connected",
-            Span::styled(
-                format_timestamp(c.timestamp),
-                Style::default().fg(Color::Gray),
-            ),
-        ),
+        field("Connected", Span::raw(format_timestamp(c.timestamp))),
     ];
     if let Some(ts) = c.disconnected_at {
-        out.push(field(
-            "Disconnected",
-            Span::styled(format_timestamp(ts), Style::default().fg(Color::Gray)),
-        ));
+        out.push(field("Disconnected", Span::raw(format_timestamp(ts))));
     }
-    out.push(field(
-        "Target",
-        Span::styled(
-            format!("{}:{}", c.host, c.port),
-            Style::default().fg(Color::Gray),
-        ),
-    ));
+    out.push(field("Target", Span::raw(format!("{}:{}", c.host, c.port))));
     out
 }
 

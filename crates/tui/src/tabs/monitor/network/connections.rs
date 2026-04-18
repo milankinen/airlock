@@ -161,7 +161,7 @@ fn build_connection_row(e: &ConnectionEntry, target_w: usize) -> Line<'static> {
         Span::raw("  "),
         Span::styled("⦿", Style::default().fg(bullet_color)),
         Span::raw("  "),
-        Span::styled(target, Style::default().fg(Color::White)),
+        Span::raw(target),
         Span::raw(" "),
         Span::styled(connected, Style::default().fg(Color::DarkGray)),
         Span::raw("  "),

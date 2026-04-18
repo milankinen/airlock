@@ -113,8 +113,7 @@ pub fn render_policy_dropdown(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .style(Style::default().bg(Color::Black));
+        .border_style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(rect);
     block.render(rect, buf);
 
@@ -124,11 +123,10 @@ pub fn render_policy_dropdown(
         let active = *policy == highlighted;
         let style = if active {
             Style::default()
-                .fg(Color::White)
                 .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default()
         };
         let line = Line::from(Span::styled(
             format!(" {:<w$} ", policy.title(), w = label_w as usize),
@@ -229,11 +227,9 @@ pub fn render_sub_tabs(
 /// clickable close hint.
 fn render_details_label(rect: Rect, text: &str, active: bool, buf: &mut Buffer) {
     let word_style = if active {
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default()
     };
     let close_style = Style::default()
         .fg(Color::DarkGray)
@@ -254,11 +250,9 @@ fn render_label(rect: Rect, text: &str, active: bool, buf: &mut Buffer) {
     let pad_style = Style::default();
 
     let word_style = if active {
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default()
     };
     let mut shortcut_style = Style::default()
         .fg(Color::Cyan)
