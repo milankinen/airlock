@@ -64,6 +64,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-virtualization",
  "oci-client",
+ "parking_lot",
  "quick_cache",
  "rcgen",
  "regex",

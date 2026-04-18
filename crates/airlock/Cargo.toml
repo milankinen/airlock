@@ -42,6 +42,7 @@ libc = { workspace = true }
 mlua = { workspace = true }
 notify = { workspace = true }
 oci-client = { workspace = true }
+parking_lot = { workspace = true }
 quick_cache = { workspace = true }
 rcgen = { workspace = true, features = ["pem", "x509-parser"] }
 regex = { workspace = true }

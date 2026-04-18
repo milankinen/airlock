@@ -18,7 +18,7 @@ use tokio::task::LocalSet;
 use crate::config::config::{self, MiddlewareRule, NetworkRule, Policy};
 use crate::network::middleware::LogFn;
 use crate::network::tls::TlsInterceptor;
-use crate::network::{Network, rules};
+use crate::network::{Network, NetworkState, rules};
 
 /// Collects log messages from Lua `log()` calls for test assertions.
 #[derive(Clone)]
@@ -233,7 +233,9 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
         request_log,
         mitm_ca_pem,
         Network {
-            policy: Policy::DenyByDefault,
+            state: Arc::new(parking_lot::RwLock::new(NetworkState {
+                policy: Policy::DenyByDefault,
+            })),
             tls_client: Arc::new(tls_client),
             interceptor: Rc::new(interceptor),
             allow_targets,

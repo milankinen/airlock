@@ -64,7 +64,7 @@ pub fn render(f: &mut Frame<'_>, app: &App, sink: &TuiTerminalSink) {
             }
         }
         Tab::Monitor => {
-            MonitorWidget::new(&app.monitor, &app.policy).render(body, f.buffer_mut());
+            MonitorWidget::new(&app.monitor, app.network.policy()).render(body, f.buffer_mut());
         }
     }
 

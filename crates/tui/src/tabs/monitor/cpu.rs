@@ -1,9 +1,10 @@
 //! CPU widget — btop-style per-core utilization bars + load average.
 //!
 //! Each core gets one row: `c0 ▮▮▮▮░░  42%`. The bar uses `▮` / `░`
-//! glyphs and half-block `▌` for sub-cell precision. Colors ramp
-//! green → yellow → red with utilization. A load-avg footer sits on
-//! the last row when the box is tall enough.
+//! glyphs and half-block `▌` for sub-cell precision. The bar fill and
+//! percentage tail share a utilization-driven color ramp (green →
+//! yellow → orange → red). A load-avg footer sits on the last row
+//! when the box is tall enough.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
@@ -165,8 +166,7 @@ fn render_body(area: Rect, state: &CpuState, buf: &mut Buffer) {
             width: content.width,
             height: histogram_rows,
         };
-        let color = color_for(state.mean());
-        super::histogram::render(hist, &state.history, color, buf);
+        super::histogram::render(hist, &state.history, color_for(state.mean()), buf);
     }
 }
 
@@ -215,10 +215,8 @@ fn render_core_row(row: Rect, idx: usize, pct: u8, buf: &mut Buffer) {
     .render(tail_rect, buf);
 }
 
-/// Render a horizontal bar filled to `pct` percent into `area`.
-///
-/// Bar is always drawn in gray regardless of load — the accompanying
-/// percentage tail carries the usage color.
+/// Render a horizontal bar filled to `pct` percent into `area`. Fill color
+/// matches the percentage tail so each row reads as one visual unit.
 fn render_bar(area: Rect, pct: u8, buf: &mut Buffer) {
     let cells = u32::from(area.width);
     if cells == 0 {
@@ -227,7 +225,7 @@ fn render_bar(area: Rect, pct: u8, buf: &mut Buffer) {
     let half_cells = (u32::from(pct) * cells * 2 + 50) / 100;
     let full = (half_cells / 2) as u16;
     let half = (half_cells % 2) as u16;
-    let fg = Style::default().fg(Color::Gray);
+    let fg = Style::default().fg(color_for(pct));
     let bg = Style::default().fg(Color::DarkGray);
 
     for i in 0..area.width {
@@ -247,7 +245,7 @@ fn color_for(pct: u8) -> Color {
     match pct {
         0..=49 => Color::Green,
         50..=69 => Color::Yellow,
-        70..=84 => Color::Rgb(255, 140, 0), // orange
+        70..=84 => Color::Rgb(255, 140, 0),
         _ => Color::Red,
     }
 }

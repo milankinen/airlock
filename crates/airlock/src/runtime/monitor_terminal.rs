@@ -2,6 +2,8 @@
 //! network-event / stats-poll forwarders.
 
 use airlock_protocol::supervisor_capnp::stdin;
+use futures::StreamExt;
+use tokio::sync::mpsc;
 
 use super::{PtySize, Runtime, SignalStream, Terminal};
 use crate::network::Network;
@@ -11,12 +13,22 @@ use crate::rpc;
 /// Build a TUI-backed runtime. `attach_stdin` must be called before `launch`
 /// so the supervisor gets its channel-backed stdin client.
 pub struct MonitorRuntime {
-    stdin_tx: Option<tokio::sync::mpsc::Sender<airlock_tui::TuiInputEvent>>,
+    stdin_tx: Option<mpsc::Sender<airlock_tui::TuiInputEvent>>,
+    /// Sender given to the TUI so it can request signals (e.g. SIGINT when
+    /// the user presses `q`). Taken in `launch`.
+    sig_tx: Option<mpsc::Sender<i32>>,
+    /// Receiver drained by `signals()` and merged into the signal stream.
+    sig_rx: Option<mpsc::Receiver<i32>>,
 }
 
 impl MonitorRuntime {
     pub fn new() -> Self {
-        Self { stdin_tx: None }
+        let (sig_tx, sig_rx) = mpsc::channel(8);
+        Self {
+            stdin_tx: None,
+            sig_tx: Some(sig_tx),
+            sig_rx: Some(sig_rx),
+        }
     }
 }
 
@@ -42,8 +54,22 @@ impl Runtime for MonitorRuntime {
         Ok((capnp_rpc::new_client(tui_stdin), pty_size))
     }
 
-    fn signals(&self) -> anyhow::Result<SignalStream> {
-        super::signals()
+    fn signals(&mut self) -> anyhow::Result<SignalStream> {
+        let os = super::signals()?;
+        let Some(mut tui_rx) = self.sig_rx.take() else {
+            return Ok(os);
+        };
+        let merged = async_stream::stream! {
+            let mut os = os;
+            loop {
+                tokio::select! {
+                    Some(sig) = os.next() => yield sig,
+                    Some(sig) = tui_rx.recv() => yield sig,
+                    else => break,
+                }
+            }
+        };
+        Ok(Box::pin(merged))
     }
 
     fn launch(
@@ -55,9 +81,13 @@ impl Runtime for MonitorRuntime {
         let stdin_tx = self
             .stdin_tx
             .ok_or_else(|| anyhow::anyhow!("attach_stdin must be called before launch"))?;
-        let policy_str = format!("{:?}", project.config.network.policy).to_lowercase();
+        let sig_tx = self
+            .sig_tx
+            .ok_or_else(|| anyhow::anyhow!("signals must be called before launch"))?;
         let project_path = project.host_cwd.display().to_string();
-        let tui = airlock_tui::spawn(stdin_tx, policy_str, project_path);
+        let control: std::sync::Arc<dyn airlock_tui::NetworkControl> =
+            std::sync::Arc::new(network.control());
+        let tui = airlock_tui::spawn(stdin_tx, sig_tx, control, project_path);
 
         // Forward network events from the broadcast channel to the TUI thread.
         let net_tx = tui.tx.clone();

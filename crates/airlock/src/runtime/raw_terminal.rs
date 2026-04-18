@@ -83,7 +83,7 @@ impl Runtime for RawTerminalRuntime {
         Ok((capnp_rpc::new_client(stdin), pty_size))
     }
 
-    fn signals(&self) -> anyhow::Result<SignalStream> {
+    fn signals(&mut self) -> anyhow::Result<SignalStream> {
         super::signals()
     }
 

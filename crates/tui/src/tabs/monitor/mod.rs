@@ -69,11 +69,11 @@ impl MonitorTab {
 /// Widget that renders the full Monitor tab body.
 pub struct MonitorWidget<'a> {
     tab: &'a MonitorTab,
-    policy: &'a str,
+    policy: crate::Policy,
 }
 
 impl<'a> MonitorWidget<'a> {
-    pub fn new(tab: &'a MonitorTab, policy: &'a str) -> Self {
+    pub fn new(tab: &'a MonitorTab, policy: crate::Policy) -> Self {
         Self { tab, policy }
     }
 }
@@ -97,7 +97,6 @@ impl Widget for MonitorWidget<'_> {
             NetworkWidget::new(&self.tab.network, self.policy).render(left, buf);
             render_right_column(right, &self.tab.cpu, &self.tab.memory, buf);
         } else {
-            // Terminal too narrow for two columns — show network panel only.
             NetworkWidget::new(&self.tab.network, self.policy).render(body_area, buf);
         }
     }

@@ -47,8 +47,10 @@ pub trait Runtime {
     /// Create the supervisor stdin client plus the guest PTY size.
     fn attach_stdin(&mut self) -> anyhow::Result<(stdin::Client, PtySize)>;
 
-    /// Host signal stream to forward to the guest process.
-    fn signals(&self) -> anyhow::Result<SignalStream>;
+    /// Stream of signal numbers to forward to the guest process. Runtimes
+    /// may merge host OS signals with TUI-originated signals (e.g. the
+    /// monitor runtime emits SIGINT when the user presses `q`).
+    fn signals(&mut self) -> anyhow::Result<SignalStream>;
 
     /// Consume the runtime and start the output sink. Also takes ownership of
     /// terminal raw mode — the raw runtime enables it here, the monitor

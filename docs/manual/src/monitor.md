@@ -40,12 +40,20 @@ running allow/deny counts.
 Switch sub-tabs with `r` / `c` or click the sub-tab labels (mouse
 capture must be on — see below).
 
+### Policy selector
+
+The top-right of the network panel shows the active policy (e.g.
+`policy: Deny by default ▾`). Press `p` or click the label to open a
+dropdown and pick a new policy live — the change takes effect on the
+next connection the sandbox makes. Colors hint at the strictness:
+green (`Always allow`), blue (`*-by-default`), red (`Always deny`).
+
 ### CPU widget
 
-One row per guest CPU core, with a gray utilization bar and a trailing
-percentage that ramps green → yellow → orange → red with load. Below
-the per-core rows is the guest's 1/5/15-minute load average and a
-short history sparkline of the mean utilization across cores.
+One row per guest CPU core, with a utilization bar and trailing
+percentage that both ramp green → yellow → orange → red with load.
+Below the per-core rows is the guest's 1/5/15-minute load average and
+a short history sparkline of the mean utilization across cores.
 
 ### Memory widget
 
@@ -54,14 +62,15 @@ Total and used bytes (reported the way `free` and `htop` do:
 
 ## Keyboard shortcuts
 
-| Key      | Action                                                     |
-|----------|------------------------------------------------------------|
-| `F1`     | Switch to Sandbox tab                                      |
-| `F2`     | Switch to Monitor tab                                      |
-| `r`      | On Monitor tab: show Requests sub-tab                      |
-| `c`      | On Monitor tab: show Connections sub-tab                   |
-| `F12`    | Toggle mouse capture (release to select text with drag)    |
-| `Ctrl+Q` | Quit                                                       |
+| Key             | Action                                                |
+|-----------------|-------------------------------------------------------|
+| `F1`            | Switch to Sandbox tab                                 |
+| `F2`            | Switch to Monitor tab                                 |
+| `r`             | On Monitor tab: show Requests sub-tab                 |
+| `c`             | On Monitor tab: show Connections sub-tab              |
+| `p`             | On Monitor tab: open the policy dropdown              |
+| `q` / `Ctrl+D`  | On Monitor tab: ask the sandbox process to exit       |
+| `F12`           | Toggle mouse capture (release to select text)         |
 
 ## Mouse capture
 

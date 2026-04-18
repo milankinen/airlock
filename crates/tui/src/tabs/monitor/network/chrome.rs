@@ -5,26 +5,54 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget};
 
 use super::NetworkSubTab;
+use crate::Policy;
 
-/// Draw the rounded border + title + right-aligned mode indicator.
-/// `mode_label` is display-only in the current design (e.g. `"always-allow"`).
-/// Returns the inner content rect.
-pub fn render_frame(area: Rect, mode_label: &str, buf: &mut Buffer) -> Rect {
+/// Draw the rounded border + left title + right-aligned "policy: …" anchor.
+/// Returns the inner content rect plus the anchor rect (for click detection).
+pub fn render_frame(area: Rect, policy: Policy, buf: &mut Buffer) -> (Rect, Rect) {
     let title = Line::from(Span::styled(
         " network ",
         Style::default().add_modifier(Modifier::BOLD),
     ));
-    let label = if mode_label.is_empty() {
-        "always-allow"
-    } else {
-        mode_label
-    };
+    let label = policy.title();
+    // Fixed-width anchor so the label's left edge doesn't dance as the
+    // policy changes. " p" — "p" is the keyboard shortcut, lifted to
+    // white + bold so it reads as a hint. "olicy:" and " ▾ " fade into
+    // the title bar. For shorter labels, the gap before " ▾ " is filled
+    // with `─` so the anchor's total width stays constant.
+    let leading = " ";
+    let shortcut = "p";
+    let rest = "olicy: ";
+    let suffix = " ▾ ";
+    let max_label_w = Policy::ALL
+        .iter()
+        .map(|p| p.title().chars().count())
+        .max()
+        .unwrap_or(0);
+    let fill_len = max_label_w.saturating_sub(label.chars().count());
+    let fill: String = "─".repeat(fill_len);
+    let anchor_width = (leading.chars().count()
+        + shortcut.chars().count()
+        + rest.chars().count()
+        + max_label_w
+        + suffix.chars().count()) as u16;
+    let dim_style = Style::default().fg(Color::DarkGray);
+    let shortcut_style = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let label_style = Style::default()
+        .fg(policy.color())
+        .add_modifier(Modifier::BOLD);
     let mode = Line::from(vec![
-        Span::styled(format!(" {label} "), Style::default().fg(Color::Yellow)),
-        Span::styled("▾ ", Style::default().fg(Color::DarkGray)),
+        Span::raw(leading),
+        Span::styled(shortcut, shortcut_style),
+        Span::styled(rest, dim_style),
+        Span::styled(label, label_style),
+        Span::styled(fill, dim_style),
+        Span::styled(suffix, dim_style),
     ])
     .alignment(Alignment::Right);
 
@@ -36,7 +64,78 @@ pub fn render_frame(area: Rect, mode_label: &str, buf: &mut Buffer) -> Rect {
         .title(mode);
     let inner = block.inner(area);
     block.render(area, buf);
-    inner
+
+    // Anchor sits on the top border row, right-aligned with a 1-column gap
+    // before the rounded corner.
+    let anchor_x = area
+        .x
+        .saturating_add(area.width)
+        .saturating_sub(anchor_width + 1);
+    let anchor = Rect::new(anchor_x, area.y, anchor_width, 1);
+    (inner, anchor)
+}
+
+/// Render the policy dropdown overlay anchored under the title label. Returns
+/// the per-row click rects (one entry per `Policy::ALL` variant).
+pub fn render_policy_dropdown(
+    panel: Rect,
+    anchor: Rect,
+    highlighted: Policy,
+    buf: &mut Buffer,
+) -> Vec<(Policy, Rect)> {
+    // Width: fit the longest label plus 1 space of padding between the
+    // text and each border; cap at panel width.
+    let label_w = Policy::ALL
+        .iter()
+        .map(|p| p.title().chars().count() as u16)
+        .max()
+        .unwrap_or(0);
+    let width = (label_w + 4).min(panel.width); // "│ label │"
+    let height = (Policy::ALL.len() as u16) + 2; // items + top/bottom border
+    if width < 6 || height > panel.height {
+        return Vec::new();
+    }
+
+    // Align the item text with the policy label in the title bar. The title
+    // reads " policy: <label> ▾ "; `<label>` starts 9 cols into the anchor
+    // (1 leading space + "policy: "). Inside the dropdown, the label starts
+    // 2 cols into the box (1 border + 1 padding). So `anchor.x + 9 = x + 2`
+    // ⇒ `x = anchor.x + 7`. Nudge left if the panel can't hold that.
+    let desired_x = anchor.x.saturating_add(7);
+    let max_x = panel.x + panel.width.saturating_sub(width);
+    let x = desired_x.min(max_x).max(panel.x);
+    let y = anchor.y + 1;
+    let rect = Rect::new(x, y, width, height);
+
+    Clear.render(rect, buf);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .style(Style::default().bg(Color::Black));
+    let inner = block.inner(rect);
+    block.render(rect, buf);
+
+    let mut rects = Vec::with_capacity(Policy::ALL.len());
+    for (i, policy) in Policy::ALL.iter().enumerate() {
+        let row = Rect::new(inner.x, inner.y + i as u16, inner.width, 1);
+        let active = *policy == highlighted;
+        let style = if active {
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let line = Line::from(Span::styled(
+            format!(" {:<w$} ", policy.title(), w = label_w as usize),
+            style,
+        ));
+        Paragraph::new(line).render(row, buf);
+        rects.push((*policy, row));
+    }
+    rects
 }
 
 /// Render the sub-tab labels with a blank top-margin row and a bottom

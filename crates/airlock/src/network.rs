@@ -6,6 +6,7 @@
 //! (based on config rules), whether to intercept TLS (for HTTP middleware),
 //! and how to relay traffic to the real server.
 
+mod control;
 mod http;
 mod io;
 mod matchers;
@@ -23,8 +24,10 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
+pub use self::control::NetworkControl;
 use crate::config::config::Policy;
 use crate::network::http::middleware::CompiledMiddleware;
 use crate::network::target::{MiddlewareTarget, NetworkTarget, ResolvedTarget};
@@ -79,7 +82,7 @@ pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network>
     );
 
     Ok(Network {
-        policy: net.policy,
+        state: Arc::new(RwLock::new(NetworkState { policy: net.policy })),
         tls_client: Arc::new(tls_client),
         interceptor: Rc::new(interceptor),
         allow_targets,
@@ -91,10 +94,21 @@ pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network>
     })
 }
 
+/// Mutable runtime state shared between the network task and the TUI.
+/// Kept intentionally small: the TUI reaches in via [`NetworkControl`], the
+/// network task reaches in via [`Network::policy`] and friends.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NetworkState {
+    pub policy: Policy,
+}
+
 /// Host-side network proxy state, implementing the `NetworkProxy` RPC
 /// interface that the guest supervisor calls for every outbound connection.
 pub struct Network {
-    policy: Policy,
+    /// Mutable runtime state. Reads on the hot path use `parking_lot::RwLock`
+    /// reads (no contention, no poisoning). The TUI holds a clone of this
+    /// `Arc` through [`NetworkControl`] to mutate policy live.
+    state: Arc<RwLock<NetworkState>>,
     tls_client: Arc<rustls::ClientConfig>,
     interceptor: Rc<tls::TlsInterceptor>,
     /// Allow-rule targets.
@@ -117,6 +131,19 @@ impl Network {
         self.events.subscribe()
     }
 
+    /// Return a thread-safe handle for mutating runtime state. Handed to the
+    /// TUI by [`MonitorRuntime::launch`]; the TUI uses it to flip policy /
+    /// toggle rules without touching `Network` internals.
+    pub fn control(&self) -> NetworkControl {
+        NetworkControl::new(self.state.clone())
+    }
+
+    /// Current top-level policy. Called on the hot connect path — one
+    /// uncontended `RwLock` read.
+    pub fn policy(&self) -> Policy {
+        self.state.read().policy
+    }
+
     /// Resolve a host:port to a `ResolvedTarget`.
     ///
     /// Logic:
@@ -127,8 +154,10 @@ impl Network {
     /// 4. Allow rules → allow with middleware.
     /// 5. No match → `allow-by-default` allows, `deny-by-default` denies.
     pub fn resolve_target(&self, host: &str, port: u16) -> ResolvedTarget {
+        let policy = self.policy();
+
         // deny-always denies everything.
-        if matches!(self.policy, Policy::DenyAlways) {
+        if matches!(policy, Policy::DenyAlways) {
             self.emit_event(host, port, false);
             return denied(host, port);
         }
@@ -145,7 +174,7 @@ impl Network {
         };
 
         // allow-always skips rules, collects middleware.
-        if matches!(self.policy, Policy::AllowAlways) {
+        if matches!(policy, Policy::AllowAlways) {
             self.emit_event(host, port, true);
             return ResolvedTarget {
                 host: host.to_string(),
@@ -165,7 +194,7 @@ impl Network {
 
         // Allow rules.
         let allowed = port_forwarded
-            || matches!(self.policy, Policy::AllowByDefault)
+            || matches!(policy, Policy::AllowByDefault)
             || self.allow_targets.iter().any(|t| t.matches(host, port));
 
         self.emit_event(host, port, allowed);
@@ -186,7 +215,7 @@ impl Network {
 
     /// Whether the policy is `deny-always` (blocks everything including sockets).
     pub fn is_deny_always(&self) -> bool {
-        matches!(self.policy, Policy::DenyAlways)
+        matches!(self.policy(), Policy::DenyAlways)
     }
 
     /// Broadcast a connection event to any subscribers (e.g. the TUI monitor).

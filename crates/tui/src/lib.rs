@@ -8,16 +8,18 @@
 
 mod app;
 pub mod input;
+mod network_control;
 pub mod pty;
 mod tabs;
 mod ui;
 
-use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::Duration;
 
 use app::{App, Tab};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 pub use input::{TuiInputEvent, TuiStdin};
+pub use network_control::{NetworkControl, Policy};
 use pty::TuiTerminalSink;
 use ratatui::DefaultTerminal;
 pub use ui::TAB_BAR_HEIGHT;
@@ -123,17 +125,21 @@ impl Drop for TuiHandle {
 /// Spawn the TUI on a dedicated thread and return a handle for communication.
 ///
 /// - `stdin_tx`: channel for sending keystrokes/resize to the RPC stdin server
-/// - `policy`: network policy string displayed in the network tab header
+/// - `sig_tx`: channel for TUI-initiated signals (e.g. SIGINT when the user
+///   presses `q` or Ctrl+D on the monitor tab)
+/// - `network`: live handle into host network state (policy + future toggles)
 pub fn spawn(
     stdin_tx: tokio::sync::mpsc::Sender<TuiInputEvent>,
-    policy: String,
+    sig_tx: tokio::sync::mpsc::Sender<i32>,
+    network: Arc<dyn NetworkControl>,
     project_path: String,
 ) -> TuiHandle {
     let (tx, rx) = std_mpsc::channel();
     let crossterm_tx = tx.clone();
 
-    let join =
-        std::thread::spawn(move || tui_main(rx, crossterm_tx, stdin_tx, policy, project_path));
+    let join = std::thread::spawn(move || {
+        tui_main(rx, crossterm_tx, stdin_tx, sig_tx, network, project_path)
+    });
 
     TuiHandle {
         tx: TuiSender { tx },
@@ -147,7 +153,8 @@ fn tui_main(
     rx: std_mpsc::Receiver<TuiEvent>,
     crossterm_tx: std_mpsc::Sender<TuiEvent>,
     stdin_tx: tokio::sync::mpsc::Sender<TuiInputEvent>,
-    policy: String,
+    sig_tx: tokio::sync::mpsc::Sender<i32>,
+    network: Arc<dyn NetworkControl>,
     project_path: String,
 ) -> anyhow::Result<i32> {
     // Enter alternate screen, raw mode, mouse capture, and kitty keyboard protocol
@@ -172,7 +179,8 @@ fn tui_main(
         &rx,
         crossterm_tx,
         &stdin_tx,
-        policy,
+        &sig_tx,
+        network,
         project_path,
         kitty_enabled,
     );
@@ -194,17 +202,19 @@ fn tui_main(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_tui_loop(
     terminal: &mut DefaultTerminal,
     rx: &std_mpsc::Receiver<TuiEvent>,
     crossterm_tx: std_mpsc::Sender<TuiEvent>,
     stdin_tx: &tokio::sync::mpsc::Sender<TuiInputEvent>,
-    policy: String,
+    sig_tx: &tokio::sync::mpsc::Sender<i32>,
+    network: Arc<dyn NetworkControl>,
     project_path: String,
     kitty_enabled: bool,
 ) -> anyhow::Result<i32> {
     let mut sink = TuiTerminalSink::new(80, 24);
-    let mut app = App::new(policy, project_path);
+    let mut app = App::new(network, project_path);
     let mut mouse_captured = true;
 
     // Resize vt100 parser to match terminal body area
@@ -240,6 +250,7 @@ fn run_tui_loop(
                 &mut app,
                 &mut sink,
                 stdin_tx,
+                sig_tx,
                 terminal,
                 kitty_enabled,
                 &mut mouse_captured,
@@ -253,6 +264,7 @@ fn run_tui_loop(
                 &mut app,
                 &mut sink,
                 stdin_tx,
+                sig_tx,
                 terminal,
                 kitty_enabled,
                 &mut mouse_captured,
@@ -270,6 +282,7 @@ fn handle_event(
     app: &mut App,
     sink: &mut TuiTerminalSink,
     stdin_tx: &tokio::sync::mpsc::Sender<TuiInputEvent>,
+    sig_tx: &tokio::sync::mpsc::Sender<i32>,
     terminal: &mut DefaultTerminal,
     kitty_enabled: bool,
     mouse_captured: &mut bool,
@@ -288,8 +301,15 @@ fn handle_event(
             return Ok(Some(code));
         }
         TuiEvent::Terminal(Event::Key(key)) => {
-            if let Some(code) = handle_key(key, app, sink, stdin_tx, kitty_enabled, mouse_captured)?
-            {
+            if let Some(code) = handle_key(
+                key,
+                app,
+                sink,
+                stdin_tx,
+                sig_tx,
+                kitty_enabled,
+                mouse_captured,
+            )? {
                 return Ok(Some(code));
             }
         }
@@ -308,11 +328,13 @@ fn handle_event(
 }
 
 /// Handle a key event. Returns `Some(code)` if the TUI should exit.
+#[allow(clippy::too_many_arguments)]
 fn handle_key(
     key: KeyEvent,
     app: &mut App,
     sink: &mut TuiTerminalSink,
     stdin_tx: &tokio::sync::mpsc::Sender<TuiInputEvent>,
+    sig_tx: &tokio::sync::mpsc::Sender<i32>,
     kitty_enabled: bool,
     mouse_captured: &mut bool,
 ) -> anyhow::Result<Option<i32>> {
@@ -347,28 +369,66 @@ fn handle_key(
                 let _ = stdin_tx.blocking_send(TuiInputEvent::Data(bytes));
             }
         }
-        Tab::Monitor => match key.code {
-            KeyCode::Up => app.monitor.network.scroll_up(1),
-            KeyCode::Down => app.monitor.network.scroll_down(1),
-            KeyCode::PageUp => app.monitor.network.scroll_up(20),
-            KeyCode::PageDown => app.monitor.network.scroll_down(20),
-            KeyCode::Home => app.monitor.network.scroll_to_top(),
-            KeyCode::End => app.monitor.network.scroll_to_bottom(),
-            KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                app.monitor.network.toggle_sub_tab();
+        Tab::Monitor => {
+            if app.monitor.network.dropdown_open() {
+                match key.code {
+                    KeyCode::Up => app.monitor.network.nudge_policy_highlight(-1),
+                    KeyCode::Down => app.monitor.network.nudge_policy_highlight(1),
+                    KeyCode::Enter => {
+                        if let Some(p) = app.monitor.network.highlighted_policy() {
+                            app.network.set_policy(p);
+                        }
+                        app.monitor.network.close_policy_dropdown();
+                    }
+                    KeyCode::Esc => app.monitor.network.close_policy_dropdown(),
+                    _ => {}
+                }
+                return Ok(None);
             }
-            KeyCode::Char('r' | 'R') => {
-                app.monitor
-                    .network
-                    .select_sub_tab(crate::tabs::monitor::network::NetworkSubTab::Requests);
+            match key.code {
+                KeyCode::Up => app.monitor.network.scroll_up(1),
+                KeyCode::Down => app.monitor.network.scroll_down(1),
+                KeyCode::PageUp => app.monitor.network.scroll_up(20),
+                KeyCode::PageDown => app.monitor.network.scroll_down(20),
+                KeyCode::Home => app.monitor.network.scroll_to_top(),
+                KeyCode::End => app.monitor.network.scroll_to_bottom(),
+                KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                    app.monitor.network.toggle_sub_tab();
+                }
+                KeyCode::Char('r' | 'R') => {
+                    app.monitor
+                        .network
+                        .select_sub_tab(crate::tabs::monitor::network::NetworkSubTab::Requests);
+                }
+                KeyCode::Char('c' | 'C') => {
+                    app.monitor
+                        .network
+                        .select_sub_tab(crate::tabs::monitor::network::NetworkSubTab::Connections);
+                }
+                KeyCode::Char('p' | 'P') => {
+                    app.monitor
+                        .network
+                        .open_policy_dropdown(app.network.policy());
+                }
+                // `q` or Ctrl+D from the monitor tab asks the sandbox
+                // process to exit. SIGHUP first — it's the canonical
+                // "controlling terminal went away" signal and interactive
+                // shells like bash exit on it (SIGINT/SIGTERM get ignored
+                // at an idle prompt). SIGTERM follows as a fallback for
+                // anything that doesn't handle HUP. The TUI itself shuts
+                // down when the process's exit event arrives on the main
+                // channel, so we don't return early.
+                KeyCode::Char('q' | 'Q') if key.modifiers.is_empty() => {
+                    let _ = sig_tx.blocking_send(1);
+                    let _ = sig_tx.blocking_send(15);
+                }
+                KeyCode::Char('d' | 'D') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let _ = sig_tx.blocking_send(1);
+                    let _ = sig_tx.blocking_send(15);
+                }
+                _ => {}
             }
-            KeyCode::Char('c' | 'C') => {
-                app.monitor
-                    .network
-                    .select_sub_tab(crate::tabs::monitor::network::NetworkSubTab::Connections);
-            }
-            _ => {}
-        },
+        }
     }
 
     Ok(None)
@@ -386,6 +446,15 @@ fn handle_mouse(
 
     match mouse.kind {
         MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+            // While the policy dropdown is open, it consumes clicks: pick a
+            // row or close on any other click.
+            if app.active_tab == Tab::Monitor && app.monitor.network.dropdown_open() {
+                if let Some(p) = app.monitor.network.dropdown_row_at(mouse.column, mouse.row) {
+                    app.network.set_policy(p);
+                }
+                app.monitor.network.close_policy_dropdown();
+                return Ok(());
+            }
             for (tab, rect) in &tab_rects {
                 if mouse.row >= rect.y
                     && mouse.row < rect.y + rect.height
@@ -395,6 +464,18 @@ fn handle_mouse(
                     app.active_tab = *tab;
                     return Ok(());
                 }
+            }
+            // Policy title anchor click opens the dropdown.
+            if app.active_tab == Tab::Monitor
+                && app
+                    .monitor
+                    .network
+                    .is_policy_anchor(mouse.column, mouse.row)
+            {
+                app.monitor
+                    .network
+                    .open_policy_dropdown(app.network.policy());
+                return Ok(());
             }
             // Sub-tab click inside the monitor tab.
             if app.active_tab == Tab::Monitor
