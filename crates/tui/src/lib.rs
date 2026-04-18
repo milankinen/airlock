@@ -8,7 +8,7 @@
 
 mod app;
 pub mod input;
-mod pty;
+pub mod pty;
 mod tabs;
 mod ui;
 

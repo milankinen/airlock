@@ -252,6 +252,10 @@ async fn run_inner(
         }
     });
 
+    // When AIRLOCK_PTY_DUMP=1, write all guest PTY output to
+    // <sandbox_dir>/pty.dump for offline replay/diagnosis.
+    let mut pty_dump = pty_dump_file(&project.sandbox_dir);
+
     let exit_code = if let (Some(stdin_tx), Some(mut event_rx)) = (stdin_tx, event_rx) {
         // TUI monitor mode: spawn TUI on its own thread, keep process
         // polling on the LocalSet so RPC is never blocked by rendering.
@@ -271,6 +275,7 @@ async fn run_inner(
         loop {
             match proc.poll().await {
                 Ok(rpc::ProcessEvent::Stdout(data) | rpc::ProcessEvent::Stderr(data)) => {
+                    write_pty_dump(pty_dump.as_mut(), &data);
                     tui_tx.send_output(data);
                 }
                 Ok(rpc::ProcessEvent::Exit(code)) => {
@@ -295,11 +300,13 @@ async fn run_inner(
                         data.len(),
                         String::from_utf8_lossy(&data)
                     );
+                    write_pty_dump(pty_dump.as_mut(), &data);
                     let _ = std::io::stdout().write_all(&data);
                     let _ = std::io::stdout().flush();
                 }
                 Ok(rpc::ProcessEvent::Stderr(data)) => {
                     tracing::trace!("host stderr: {} bytes", data.len());
+                    write_pty_dump(pty_dump.as_mut(), &data);
                     let _ = std::io::stderr().write_all(&data);
                     let _ = std::io::stderr().flush();
                 }
@@ -317,6 +324,35 @@ async fn run_inner(
     // Drain file-sync events then destroy VM.
     vm.shutdown().await;
     Ok(exit_code)
+}
+
+/// Open the PTY dump file if `AIRLOCK_PTY_DUMP=1`, otherwise `None`.
+fn pty_dump_file(sandbox_dir: &std::path::Path) -> Option<std::fs::File> {
+    if std::env::var("AIRLOCK_PTY_DUMP").as_deref() != Ok("1") {
+        return None;
+    }
+    let path = sandbox_dir.join("pty.dump");
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+    {
+        Ok(f) => {
+            cli::log!("PTY dump: {}", path.display());
+            Some(f)
+        }
+        Err(e) => {
+            cli::error!("Failed to open PTY dump {}: {e}", path.display());
+            None
+        }
+    }
+}
+
+fn write_pty_dump(file: Option<&mut std::fs::File>, data: &[u8]) {
+    if let Some(f) = file {
+        let _ = f.write_all(data);
+    }
 }
 
 fn setup_logging(log_level: LogLevel, cache_dir: &std::path::Path) {
