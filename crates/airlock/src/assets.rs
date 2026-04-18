@@ -52,15 +52,18 @@ impl Assets {
 
             #[cfg(target_os = "linux")]
             {
-                use std::os::unix::fs::PermissionsExt;
-
-                let ch = dir.join("cloud-hypervisor");
-                std::fs::write(&ch, include_bytes!("../../../target/vm/cloud-hypervisor"))?;
-                std::fs::set_permissions(&ch, std::fs::Permissions::from_mode(0o755))?;
-
-                let vfs = dir.join("virtiofsd");
-                std::fs::write(&vfs, include_bytes!("../../../target/vm/virtiofsd"))?;
-                std::fs::set_permissions(&vfs, std::fs::Permissions::from_mode(0o755))?;
+                // Write to temp files first, then rename — avoids ETXTBSY if a
+                // previous virtiofsd/cloud-hypervisor process is still running.
+                write_executable(
+                    &dir,
+                    "cloud-hypervisor",
+                    include_bytes!("../../../target/vm/cloud-hypervisor"),
+                )?;
+                write_executable(
+                    &dir,
+                    "virtiofsd",
+                    include_bytes!("../../../target/vm/virtiofsd"),
+                )?;
             }
 
             std::fs::write(&checksum_file, CHECKSUM)?;
@@ -103,6 +106,18 @@ impl Assets {
     pub fn init(_project: &Project) -> anyhow::Result<Assets> {
         anyhow::bail!("Assets::init not supported in tests")
     }
+}
+
+/// Write an executable to `dir/name` via a temp file + rename to avoid ETXTBSY.
+#[cfg(all(target_os = "linux", not(test)))]
+fn write_executable(dir: &std::path::Path, name: &str, data: &[u8]) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = dir.join(format!(".{name}.tmp"));
+    std::fs::write(&tmp, data)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+    std::fs::rename(&tmp, dir.join(name))?;
+    Ok(())
 }
 
 /// Resolve an asset path: use `custom` if provided (with tilde expansion and
