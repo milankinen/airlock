@@ -18,20 +18,21 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, trace};
 
 use super::io;
+use crate::network::target::ResolvedTarget;
 
-/// Establish TLS MITM: accept TLS from container, connect to real server with matching ALPN.
-pub async fn establish(
+/// Accept a TLS handshake from the container (MITM) and wrap the decrypted
+/// stream in a `Transport`. The container sees a valid cert for its intended
+/// hostname signed by our CA. Returns the negotiated ALPN so the caller can
+/// either match it when dialing the real server (allow path) or use it to
+/// serve a denial (deny path) without reaching the upstream.
+pub async fn accept_container(
     host: &str,
-    port: u16,
     first: Bytes,
     rx: mpsc::Receiver<Bytes>,
     client_sink: tcp_sink::Client,
     interceptor: &TlsInterceptor,
-    tls_client: &Arc<rustls::ClientConfig>,
-) -> anyhow::Result<(io::Transport, io::Transport)> {
-    let addr = format!("{host}:{port}");
+) -> anyhow::Result<(io::Transport, Option<Bytes>)> {
     let sni_host = extract_sni(&first).unwrap_or_else(|| host.to_string());
-
     let rpc_io = io::RpcTransport::new(first, rx, client_sink);
     let (tls_stream, alpn) = tokio::time::timeout(
         crate::constants::TLS_HANDSHAKE_TIMEOUT,
@@ -42,38 +43,47 @@ pub async fn establish(
 
     let is_h2 = alpn.as_deref() == Some(b"h2");
     debug!(
-        "tls accepted: {addr} alpn={:?}",
+        "tls accepted: {host} alpn={:?}",
         alpn.as_deref().map(String::from_utf8_lossy)
     );
 
-    // Connect to real server, matching the container's ALPN
-    let server_stream = TcpStream::connect(&addr).await?;
-    let mut config = (**tls_client).clone();
-    config.alpn_protocols = match &alpn {
-        Some(proto) => vec![proto.to_vec()],
-        None => vec![b"http/1.1".to_vec()],
-    };
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
-        .map_err(|e| anyhow::anyhow!("invalid hostname: {e}"))?;
-    let server_tls = connector.connect(server_name, server_stream).await?;
-    let server_h2 = server_tls.get_ref().1.alpn_protocol() == Some(b"h2");
-    trace!("tls to server: {addr} h2={server_h2}");
-
     let (cr, cw) = tokio::io::split(tls_stream);
-    let (sr, sw) = tokio::io::split(server_tls);
     Ok((
         io::Transport {
             read: Box::new(cr),
             write: Box::new(cw),
             h2: is_h2,
         },
-        io::Transport {
-            read: Box::new(sr),
-            write: Box::new(sw),
-            h2: server_h2,
-        },
+        alpn,
     ))
+}
+
+/// Dial the real server over TLS with matching ALPN. Only called on the
+/// allow path.
+pub async fn connect_server(
+    target: &ResolvedTarget,
+    alpn: Option<&[u8]>,
+    tls_client: &Arc<rustls::ClientConfig>,
+) -> anyhow::Result<io::Transport> {
+    let addr = format!("{}:{}", target.host, target.port);
+    let server_stream = TcpStream::connect(&addr).await?;
+    let mut config = (**tls_client).clone();
+    config.alpn_protocols = match alpn {
+        Some(proto) => vec![proto.to_vec()],
+        None => vec![b"http/1.1".to_vec()],
+    };
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    let server_name = rustls::pki_types::ServerName::try_from(target.host.clone())
+        .map_err(|e| anyhow::anyhow!("invalid hostname: {e}"))?;
+    let server_tls = connector.connect(server_name, server_stream).await?;
+    let server_h2 = server_tls.get_ref().1.alpn_protocol() == Some(b"h2");
+    trace!("tls to server: {addr} h2={server_h2}");
+    let (sr, sw) = tokio::io::split(server_tls);
+    Ok(io::Transport {
+        read: Box::new(sr),
+        write: Box::new(sw),
+        h2: server_h2,
+    })
 }
 
 /// TLS interceptor with per-hostname cert caching.

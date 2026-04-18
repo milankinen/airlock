@@ -25,10 +25,14 @@ airlock start --monitor
 
 ### Network panel
 
-Two sub-tabs:
+Two sub-tabs (newest entries at the top, up to 100 of each):
 
-- **Requests** — one row per HTTP request the middleware handled, with
-  method, path, target host:port, and whether it was allowed or denied.
+- **Requests** (default) — one row per HTTP request the middleware
+  handled, with method, path, target host:port, and whether it was
+  allowed or denied. Denied HTTP requests are included here too: the
+  proxy captures the full request before responding with `403 Forbidden`
+  instead of refusing at the TCP layer, so you can see exactly what was
+  attempted.
 - **Connections** — one row per raw TCP connection attempt, with target
   host:port and allow/deny.
 
@@ -36,6 +40,11 @@ Rows share the same layout: a colored `⦿` bullet (green for allowed,
 red for denied), a local timestamp, the request or connection target,
 and a fixed-width `Allowed` / `Denied` status column. A footer tracks
 running allow/deny counts.
+
+Use `↑` / `↓` to move the row selection (PgUp/PgDn, Home, End also
+work), and press `Enter` to open a **details** sub-tab with the full
+snapshot — including captured request headers for HTTP. Close it with
+`Esc`, `x`, or the `×` in the tab label.
 
 Switch sub-tabs with `r` / `c` or click the sub-tab labels (mouse
 capture must be on — see below).
@@ -62,15 +71,20 @@ Total and used bytes (reported the way `free` and `htop` do:
 
 ## Keyboard shortcuts
 
-| Key             | Action                                                |
-|-----------------|-------------------------------------------------------|
-| `F1`            | Switch to Sandbox tab                                 |
-| `F2`            | Switch to Monitor tab                                 |
-| `r`             | On Monitor tab: show Requests sub-tab                 |
-| `c`             | On Monitor tab: show Connections sub-tab              |
-| `p`             | On Monitor tab: open the policy dropdown              |
-| `q` / `Ctrl+D`  | On Monitor tab: ask the sandbox process to exit       |
-| `F12`           | Toggle mouse capture (release to select text)         |
+| Key                     | Action                                                |
+|-------------------------|-------------------------------------------------------|
+| `F1`                    | Switch to Sandbox tab                                 |
+| `F2`                    | Switch to Monitor tab                                 |
+| `r`                     | On Monitor tab: show Requests sub-tab                 |
+| `c`                     | On Monitor tab: show Connections sub-tab              |
+| `↑` / `↓`               | Move row selection in Requests / Connections          |
+| `PgUp` / `PgDn`         | Jump the selection a page at a time                   |
+| `Home` / `End`          | Jump to the newest / oldest entry                     |
+| `Enter`                 | Open the selected row in a details sub-tab           |
+| `Esc` / `x`             | Close the details sub-tab                             |
+| `p`                     | On Monitor tab: open the policy dropdown              |
+| `q` / `Ctrl+D`          | On Monitor tab: ask the sandbox process to exit       |
+| `F12`                   | Toggle mouse capture (release to select text)         |
 
 ## Mouse capture
 

@@ -219,13 +219,21 @@ impl Network {
     }
 
     /// Broadcast a connection event to any subscribers (e.g. the TUI monitor).
-    /// Silently drops the event when there are no subscribers.
+    /// Silently drops the event when there are no subscribers — and short-
+    /// circuits *before* any string cloning in that common case.
     fn emit_event(&self, host: &str, port: u16, allowed: bool) {
-        let _ = self.events.send(airlock_tui::NetworkEvent::Connect {
+        if self.events.receiver_count() == 0 {
+            return;
+        }
+        let info = airlock_tui::ConnectInfo {
+            timestamp: std::time::SystemTime::now(),
             host: host.to_string(),
             port,
             allowed,
-        });
+        };
+        let _ = self
+            .events
+            .send(airlock_tui::NetworkEvent::Connect(Arc::new(info)));
     }
 
     /// Collect compiled middleware from all matching middleware targets.

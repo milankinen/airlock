@@ -10,11 +10,12 @@ mod app;
 pub mod input;
 mod network_control;
 pub mod pty;
+mod settings;
 mod tabs;
 mod ui;
 
 use std::sync::{Arc, mpsc as std_mpsc};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use app::{App, Tab};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -22,6 +23,7 @@ pub use input::{TuiInputEvent, TuiStdin};
 pub use network_control::{NetworkControl, Policy};
 use pty::TuiTerminalSink;
 use ratatui::DefaultTerminal;
+pub use settings::TuiSettings;
 pub use ui::TAB_BAR_HEIGHT;
 
 /// Snapshot of guest resource usage, displayed on the Monitor tab.
@@ -37,19 +39,31 @@ pub struct StatsSnapshot {
 #[derive(Debug, Clone)]
 pub enum NetworkEvent {
     /// Raw TCP connect decision (allow/deny at connection time).
-    Connect {
-        host: String,
-        port: u16,
-        allowed: bool,
-    },
+    Connect(Arc<ConnectInfo>),
     /// HTTP request observed by the middleware.
-    Request {
-        method: String,
-        path: String,
-        host: String,
-        port: u16,
-        allowed: bool,
-    },
+    Request(Arc<RequestInfo>),
+}
+
+/// TCP-level connect event payload. Wrapped in `Arc` so the broadcast
+/// channel only bumps a refcount on recv rather than cloning fields.
+#[derive(Debug)]
+pub struct ConnectInfo {
+    pub timestamp: SystemTime,
+    pub host: String,
+    pub port: u16,
+    pub allowed: bool,
+}
+
+/// HTTP request event payload. Wrapped in `Arc` on the wire.
+#[derive(Debug)]
+pub struct RequestInfo {
+    pub timestamp: SystemTime,
+    pub method: String,
+    pub path: String,
+    pub host: String,
+    pub port: u16,
+    pub allowed: bool,
+    pub headers: Vec<(String, String)>,
 }
 
 /// Events sent to the TUI thread.
@@ -298,7 +312,7 @@ fn handle_event(
             sink.write(&data);
         }
         TuiEvent::Network(ev) => {
-            app.monitor.network.push_event(ev);
+            app.monitor.network.push_event(ev, &app.settings);
         }
         TuiEvent::Stats(snapshot) => {
             app.monitor.apply_stats(snapshot);
@@ -429,13 +443,49 @@ fn handle_key(
                 }
                 return Ok(None);
             }
+            if app.monitor.network.details_open() {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('x' | 'X') => {
+                        app.monitor.network.close_details();
+                    }
+                    KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                        app.monitor.network.toggle_sub_tab();
+                    }
+                    KeyCode::Char('r' | 'R') => {
+                        app.monitor
+                            .network
+                            .select_sub_tab(crate::tabs::monitor::network::NetworkSubTab::Requests);
+                    }
+                    KeyCode::Char('c' | 'C') => {
+                        app.monitor.network.select_sub_tab(
+                            crate::tabs::monitor::network::NetworkSubTab::Connections,
+                        );
+                    }
+                    KeyCode::Char('p' | 'P') => {
+                        app.monitor
+                            .network
+                            .open_policy_dropdown(app.network.policy());
+                    }
+                    KeyCode::Char('q' | 'Q') if key.modifiers.is_empty() => {
+                        let _ = sig_tx.blocking_send(1);
+                        let _ = sig_tx.blocking_send(15);
+                    }
+                    KeyCode::Char('d' | 'D') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        let _ = sig_tx.blocking_send(1);
+                        let _ = sig_tx.blocking_send(15);
+                    }
+                    _ => {}
+                }
+                return Ok(None);
+            }
             match key.code {
-                KeyCode::Up => app.monitor.network.scroll_up(1),
-                KeyCode::Down => app.monitor.network.scroll_down(1),
-                KeyCode::PageUp => app.monitor.network.scroll_up(20),
-                KeyCode::PageDown => app.monitor.network.scroll_down(20),
-                KeyCode::Home => app.monitor.network.scroll_to_top(),
-                KeyCode::End => app.monitor.network.scroll_to_bottom(),
+                KeyCode::Up => app.monitor.network.select_up(),
+                KeyCode::Down => app.monitor.network.select_down(),
+                KeyCode::PageUp => app.monitor.network.select_page_up(),
+                KeyCode::PageDown => app.monitor.network.select_page_down(),
+                KeyCode::Home => app.monitor.network.select_newest(),
+                KeyCode::End => app.monitor.network.select_oldest(),
+                KeyCode::Enter => app.monitor.network.open_details(),
                 KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
                     app.monitor.network.toggle_sub_tab();
                 }
@@ -521,19 +571,43 @@ fn handle_mouse(
                     .open_policy_dropdown(app.network.policy());
                 return Ok(());
             }
+            // Details sub-tab close button (×). Check before the generic
+            // sub-tab hit test so the × inside the details label rect takes
+            // precedence over re-selecting the already-active details tab.
+            if app.active_tab == Tab::Monitor
+                && app
+                    .monitor
+                    .network
+                    .is_details_close(mouse.column, mouse.row)
+            {
+                app.monitor.network.close_details();
+                return Ok(());
+            }
             // Sub-tab click inside the monitor tab.
             if app.active_tab == Tab::Monitor
                 && let Some(sub) = app.monitor.network.sub_tab_at(mouse.column, mouse.row)
             {
-                app.monitor.network.select_sub_tab(sub);
+                use crate::tabs::monitor::network::NetworkSubTab;
+                match sub {
+                    NetworkSubTab::Details => {} // clicking the active details tab is a no-op
+                    _ => app.monitor.network.select_sub_tab(sub),
+                }
             }
         }
         MouseEventKind::ScrollUp => match app.active_tab {
-            Tab::Monitor => app.monitor.network.scroll_up(3),
+            Tab::Monitor => {
+                for _ in 0..3 {
+                    app.monitor.network.select_up();
+                }
+            }
             Tab::Sandbox => sink.scroll_up(3),
         },
         MouseEventKind::ScrollDown => match app.active_tab {
-            Tab::Monitor => app.monitor.network.scroll_down(3),
+            Tab::Monitor => {
+                for _ in 0..3 {
+                    app.monitor.network.select_down();
+                }
+            }
             Tab::Sandbox => sink.scroll_down(3),
         },
         _ => {}

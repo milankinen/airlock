@@ -1,14 +1,17 @@
-//! Network panel — rounded-border box with two sub-tabs:
-//! `Requests` (HTTP) and `Connections` (raw TCP).
+//! Network panel — rounded-border box with sub-tabs:
+//! `Requests` (HTTP), `Connections` (raw TCP), and `Details` (shown on
+//! demand when the user presses Enter on a selected row).
 //!
 //! Responsibilities of this module:
-//! - `NetworkTab`: panel state (active sub-tab, counters, scroll).
+//! - `NetworkTab`: panel state (active sub-tab, counters, selection,
+//!   open detail view).
 //! - `NetworkWidget`: the panel's outer chrome (border, title, mode
 //!   indicator, sub-tab bar, footer). Body rendering is delegated to
 //!   the per-sub-tab widget modules.
 
 mod chrome;
 mod connections;
+mod details;
 mod footer;
 mod requests;
 mod row;
@@ -16,19 +19,23 @@ mod row;
 use std::cell::Cell;
 
 pub use connections::ConnectionEntry;
+pub use details::DetailView;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::widgets::Widget;
 pub use requests::RequestEntry;
 
-use crate::{NetworkEvent, Policy};
+use crate::{NetworkEvent, Policy, TuiSettings};
 
 /// Which network sub-tab is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NetworkSubTab {
-    Requests,
     #[default]
+    Requests,
     Connections,
+    /// Detail view for the currently-open entry. Only valid while
+    /// `NetworkTab::details` is `Some`.
+    Details,
 }
 
 /// Open-dropdown state for the policy selector. Closed when `None`.
@@ -43,13 +50,21 @@ pub struct NetworkTab {
     pub requests: Vec<RequestEntry>,
     pub allowed_count: u32,
     pub denied_count: u32,
-    scroll_offset: usize,
+    /// Selection in the Requests sub-tab. Display index (0 = newest).
+    selected_request: Option<usize>,
+    /// Selection in the Connections sub-tab. Display index (0 = newest).
+    selected_connection: Option<usize>,
+    /// When `Some`, the Details sub-tab is open and shows this entry.
+    details: Option<DetailView>,
     /// `Some` when the policy dropdown is open.
     dropdown: Option<PolicyDropdown>,
-    /// Last rendered click rects for the Requests / Connections sub-tab
-    /// labels. Populated during render; consumed by mouse input.
+    /// Last rendered click rects for the sub-tab labels. Populated during
+    /// render; consumed by mouse input.
     requests_rect: Cell<Option<Rect>>,
     connections_rect: Cell<Option<Rect>>,
+    details_rect: Cell<Option<Rect>>,
+    /// Click rect for the `×` close button on the Details sub-tab.
+    details_close_rect: Cell<Option<Rect>>,
     /// Rect of the "policy: …" title anchor in the border line.
     policy_anchor: Cell<Option<Rect>>,
     /// Click rects for each dropdown row (in `Policy::ALL` order).
@@ -64,10 +79,14 @@ impl NetworkTab {
             requests: Vec::new(),
             allowed_count: 0,
             denied_count: 0,
-            scroll_offset: 0,
+            selected_request: None,
+            selected_connection: None,
+            details: None,
             dropdown: None,
             requests_rect: Cell::new(None),
             connections_rect: Cell::new(None),
+            details_rect: Cell::new(None),
+            details_close_rect: Cell::new(None),
             policy_anchor: Cell::new(None),
             dropdown_rects: Cell::new(Vec::new()),
         }
@@ -128,27 +147,32 @@ impl NetworkTab {
         hit
     }
 
-    pub fn push_event(&mut self, ev: NetworkEvent) {
+    pub fn details_open(&self) -> bool {
+        self.details.is_some()
+    }
+
+    /// Append an event to the matching sub-tab, capped by `settings`.
+    pub fn push_event(&mut self, ev: NetworkEvent, settings: &TuiSettings) {
         match ev {
-            NetworkEvent::Connect {
-                host,
-                port,
-                allowed,
-            } => {
-                self.bump_count(allowed);
-                self.connections
-                    .push(ConnectionEntry::new(host, port, allowed));
+            NetworkEvent::Connect(info) => {
+                self.bump_count(info.allowed);
+                self.connections.push(ConnectionEntry::from_info(&info));
+                on_push_selection(&mut self.selected_connection, self.connections.len());
+                cap_entries(
+                    &mut self.connections,
+                    settings.max_tcp_connections,
+                    &mut self.selected_connection,
+                );
             }
-            NetworkEvent::Request {
-                method,
-                path,
-                host,
-                port,
-                allowed,
-            } => {
-                self.bump_count(allowed);
-                self.requests
-                    .push(RequestEntry::new(method, path, host, port, allowed));
+            NetworkEvent::Request(info) => {
+                self.bump_count(info.allowed);
+                self.requests.push(RequestEntry::from_info(&info));
+                on_push_selection(&mut self.selected_request, self.requests.len());
+                cap_entries(
+                    &mut self.requests,
+                    settings.max_http_requests,
+                    &mut self.selected_request,
+                );
             }
         }
     }
@@ -165,25 +189,37 @@ impl NetworkTab {
         self.allowed_count + self.denied_count
     }
 
-    /// Cycle to the next sub-tab. With two sub-tabs this is also "previous".
-    pub fn toggle_sub_tab(&mut self) {
-        self.sub_tab = match self.sub_tab {
-            NetworkSubTab::Requests => NetworkSubTab::Connections,
-            NetworkSubTab::Connections => NetworkSubTab::Requests,
-        };
-        self.scroll_offset = 0;
+    /// Jump directly to the given sub-tab and close any open details view.
+    /// The caller is responsible for passing `Requests` or `Connections` —
+    /// `Details` is opened via `open_details`.
+    pub fn select_sub_tab(&mut self, tab: NetworkSubTab) {
+        if tab == NetworkSubTab::Details {
+            return;
+        }
+        self.details = None;
+        self.sub_tab = tab;
     }
 
-    /// Jump directly to the given sub-tab and reset scroll.
-    pub fn select_sub_tab(&mut self, tab: NetworkSubTab) {
-        if self.sub_tab != tab {
-            self.sub_tab = tab;
-            self.scroll_offset = 0;
-        }
+    /// Cycle between the Requests and Connections sub-tabs. If the Details
+    /// sub-tab is active, return to the owning parent.
+    pub fn toggle_sub_tab(&mut self) {
+        let target = match self.sub_tab {
+            NetworkSubTab::Requests => NetworkSubTab::Connections,
+            NetworkSubTab::Connections => NetworkSubTab::Requests,
+            NetworkSubTab::Details => {
+                self.details
+                    .as_ref()
+                    .map_or(NetworkSubTab::Requests, |d| match d {
+                        DetailView::Request(_) => NetworkSubTab::Requests,
+                        DetailView::Connection(_) => NetworkSubTab::Connections,
+                    })
+            }
+        };
+        self.select_sub_tab(target);
     }
 
     /// Return the sub-tab whose rendered label rect contains `(col, row)`,
-    /// or `None` if the click was outside either label.
+    /// or `None` if the click was outside any label.
     pub fn sub_tab_at(&self, col: u16, row: u16) -> Option<NetworkSubTab> {
         let hit = |r: Option<Rect>| {
             r.is_some_and(|r| {
@@ -194,33 +230,163 @@ impl NetworkTab {
             Some(NetworkSubTab::Requests)
         } else if hit(self.connections_rect.get()) {
             Some(NetworkSubTab::Connections)
+        } else if hit(self.details_rect.get()) {
+            Some(NetworkSubTab::Details)
         } else {
             None
         }
     }
 
-    pub fn scroll_up(&mut self, n: usize) {
-        self.scroll_offset = self.scroll_offset.saturating_sub(n);
+    /// Hit-test a click against the `×` close button on the Details sub-tab.
+    pub fn is_details_close(&self, col: u16, row: u16) -> bool {
+        self.details_close_rect.get().is_some_and(|r| {
+            col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+        })
     }
 
-    pub fn scroll_down(&mut self, n: usize) {
-        let max = self.entry_count().saturating_sub(1);
-        self.scroll_offset = (self.scroll_offset + n).min(max);
+    // ── Selection helpers ───────────────────────────────────
+
+    /// Move the selection up by one row (toward the newest entry).
+    pub fn select_up(&mut self) {
+        self.move_selection(-1);
     }
 
-    pub fn scroll_to_top(&mut self) {
-        self.scroll_offset = 0;
+    /// Move the selection down by one row (toward the oldest entry).
+    pub fn select_down(&mut self) {
+        self.move_selection(1);
     }
 
-    pub fn scroll_to_bottom(&mut self) {
-        self.scroll_offset = self.entry_count().saturating_sub(1);
+    pub fn select_page_up(&mut self) {
+        self.move_selection(-20);
     }
 
-    fn entry_count(&self) -> usize {
+    pub fn select_page_down(&mut self) {
+        self.move_selection(20);
+    }
+
+    /// Jump to the newest entry.
+    pub fn select_newest(&mut self) {
+        if self.list_len() > 0 {
+            self.set_selection(0);
+        }
+    }
+
+    /// Jump to the oldest entry.
+    pub fn select_oldest(&mut self) {
+        let len = self.list_len();
+        if len > 0 {
+            self.set_selection(len - 1);
+        }
+    }
+
+    fn move_selection(&mut self, delta: i32) {
+        let len = self.list_len();
+        if len == 0 {
+            return;
+        }
+        let cur = self.current_selection().unwrap_or(0) as i32;
+        let next = (cur + delta).clamp(0, (len as i32) - 1) as usize;
+        self.set_selection(next);
+    }
+
+    fn list_len(&self) -> usize {
         match self.sub_tab {
             NetworkSubTab::Requests => self.requests.len(),
             NetworkSubTab::Connections => self.connections.len(),
+            NetworkSubTab::Details => 0,
         }
+    }
+
+    fn current_selection(&self) -> Option<usize> {
+        match self.sub_tab {
+            NetworkSubTab::Requests => self.selected_request,
+            NetworkSubTab::Connections => self.selected_connection,
+            NetworkSubTab::Details => None,
+        }
+    }
+
+    fn set_selection(&mut self, idx: usize) {
+        match self.sub_tab {
+            NetworkSubTab::Requests => self.selected_request = Some(idx),
+            NetworkSubTab::Connections => self.selected_connection = Some(idx),
+            NetworkSubTab::Details => {}
+        }
+    }
+
+    /// Open the Details sub-tab with a snapshot of the currently selected
+    /// entry. No-op when nothing is selected.
+    pub fn open_details(&mut self) {
+        match self.sub_tab {
+            NetworkSubTab::Requests => {
+                if let Some(sel) = self.selected_request
+                    && let Some(entry) = display_nth(&self.requests, sel)
+                {
+                    self.details = Some(DetailView::Request(entry.clone()));
+                    self.sub_tab = NetworkSubTab::Details;
+                }
+            }
+            NetworkSubTab::Connections => {
+                if let Some(sel) = self.selected_connection
+                    && let Some(entry) = display_nth(&self.connections, sel)
+                {
+                    self.details = Some(DetailView::Connection(entry.clone()));
+                    self.sub_tab = NetworkSubTab::Details;
+                }
+            }
+            NetworkSubTab::Details => {}
+        }
+    }
+
+    /// Close the Details sub-tab and return to its parent sub-tab.
+    pub fn close_details(&mut self) {
+        let parent = self
+            .details
+            .as_ref()
+            .map_or(NetworkSubTab::Requests, |d| match d {
+                DetailView::Request(_) => NetworkSubTab::Requests,
+                DetailView::Connection(_) => NetworkSubTab::Connections,
+            });
+        self.details = None;
+        self.sub_tab = parent;
+    }
+}
+
+/// Return the nth entry in display order (0 = newest = last vec entry).
+fn display_nth<T>(vec: &[T], display_idx: usize) -> Option<&T> {
+    vec.len()
+        .checked_sub(1)
+        .and_then(|last| last.checked_sub(display_idx))
+        .and_then(|vec_idx| vec.get(vec_idx))
+}
+
+/// Update a display-index selection after appending a new entry. Selection
+/// at 0 (newest) stays at 0 — "follow newest" semantics. Selection at `n>0`
+/// shifts to `n+1` so it keeps pointing to the same underlying entry.
+fn on_push_selection(selected: &mut Option<usize>, new_len: usize) {
+    match *selected {
+        None => {
+            if new_len > 0 {
+                *selected = Some(0);
+            }
+        }
+        Some(0) => {} // track newest
+        Some(n) => *selected = Some((n + 1).min(new_len.saturating_sub(1))),
+    }
+}
+
+/// Evict oldest entries (front of vec) until `vec.len() <= max`. Keeps
+/// display-index selection valid by clamping to the new last display index.
+fn cap_entries<T>(vec: &mut Vec<T>, max: usize, selected: &mut Option<usize>) {
+    while vec.len() > max {
+        vec.remove(0);
+    }
+    let len = vec.len();
+    if len == 0 {
+        *selected = None;
+    } else if let Some(n) = *selected
+        && n >= len
+    {
+        *selected = Some(len - 1);
     }
 }
 
@@ -255,18 +421,32 @@ impl Widget for NetworkWidget<'_> {
         ])
         .areas(inner);
 
-        let (req_rect, conn_rect) = chrome::render_sub_tabs(tabs_area, self.tab.sub_tab, buf);
-        self.tab.requests_rect.set(Some(req_rect));
-        self.tab.connections_rect.set(Some(conn_rect));
+        let details_label = self.tab.details.as_ref().map(|d| match d {
+            DetailView::Request(_) => "Request details",
+            DetailView::Connection(_) => "Connection details",
+        });
+        let rects = chrome::render_sub_tabs(tabs_area, self.tab.sub_tab, details_label, buf);
+        self.tab.requests_rect.set(Some(rects.requests));
+        self.tab.connections_rect.set(Some(rects.connections));
+        self.tab.details_rect.set(rects.details);
+        self.tab.details_close_rect.set(rects.details_close);
 
         match self.tab.sub_tab {
             NetworkSubTab::Requests => {
-                requests::RequestsWidget::new(&self.tab.requests, self.tab.scroll_offset)
+                requests::RequestsWidget::new(&self.tab.requests, self.tab.selected_request)
                     .render(body_area, buf);
             }
             NetworkSubTab::Connections => {
-                connections::ConnectionsWidget::new(&self.tab.connections, self.tab.scroll_offset)
-                    .render(body_area, buf);
+                connections::ConnectionsWidget::new(
+                    &self.tab.connections,
+                    self.tab.selected_connection,
+                )
+                .render(body_area, buf);
+            }
+            NetworkSubTab::Details => {
+                if let Some(d) = self.tab.details.as_ref() {
+                    details::DetailsWidget::new(d).render(body_area, buf);
+                }
             }
         }
 

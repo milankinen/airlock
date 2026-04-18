@@ -26,6 +26,21 @@ pub struct Transport {
     pub h2: bool,
 }
 
+impl Transport {
+    /// A black-hole transport used as the "server" side when policy denies
+    /// the connection: reads return EOF, writes are discarded. Paired with
+    /// [`super::tcp::relay`] it causes the relay to tear the connection
+    /// down immediately; paired with [`super::http::relay`] it short-
+    /// circuits at the `!target.allowed` branch before the sender is used.
+    pub fn null() -> Self {
+        Self {
+            read: Box::new(tokio::io::empty()),
+            write: Box::new(tokio::io::sink()),
+            h2: false,
+        }
+    }
+}
+
 /// Prepend buffered bytes to an `AsyncRead` stream.
 pub struct PrefixedRead {
     prefix: Bytes,

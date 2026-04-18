@@ -7,15 +7,27 @@ use tracing::debug;
 
 use super::io;
 
-/// Establish plain TCP connection.
-pub async fn establish(
-    addr: &str,
+/// Wrap the RPC channel to the guest in a `Transport` without touching the
+/// real server. Used on both the allow path (paired with `connect_server`)
+/// and the deny path (where we hand the transport to a 403-serving hyper
+/// instance instead).
+pub fn container_transport(
     first: Bytes,
     rx: mpsc::Receiver<Bytes>,
     client_sink: tcp_sink::Client,
-) -> anyhow::Result<(io::Transport, io::Transport)> {
-    debug!("plain tcp: {addr}");
+) -> io::Transport {
     let rpc_io = io::RpcTransport::new(first, rx, client_sink);
+    let (cr, cw) = tokio::io::split(rpc_io);
+    io::Transport {
+        read: Box::new(cr),
+        write: Box::new(cw),
+        h2: false,
+    }
+}
+
+/// Open a plain TCP socket to the real server.
+pub async fn connect_server(addr: &str) -> anyhow::Result<io::Transport> {
+    debug!("plain tcp: {addr}");
     let server = tokio::time::timeout(
         crate::constants::TCP_CONNECT_TIMEOUT,
         TcpStream::connect(addr),
@@ -23,19 +35,11 @@ pub async fn establish(
     .await
     .map_err(|_| anyhow::anyhow!("connection timed out: {addr}"))??;
     let (sr, sw) = server.into_split();
-    let (cr, cw) = tokio::io::split(rpc_io);
-    Ok((
-        io::Transport {
-            read: Box::new(cr),
-            write: Box::new(cw),
-            h2: false,
-        },
-        io::Transport {
-            read: Box::new(sr),
-            write: Box::new(sw),
-            h2: false,
-        },
-    ))
+    Ok(io::Transport {
+        read: Box::new(sr),
+        write: Box::new(sw),
+        h2: false,
+    })
 }
 
 /// Bidirectional relay between two transports.

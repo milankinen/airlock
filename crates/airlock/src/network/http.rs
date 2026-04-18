@@ -71,6 +71,11 @@ pub async fn detect(reader: &mut (impl AsyncRead + Unpin)) -> Result<Bytes, Byte
 type ResponseBody = Either<Incoming, Full<Bytes>>;
 
 /// Run hyper HTTP proxy with middleware interception.
+///
+/// When `target.allowed` is false, `server` is a [`io::Transport::null`]
+/// black hole. We still run a hyper server against the container so the
+/// request headers are parsed and surfaced in the Requests sub-tab, but we
+/// short-circuit with a 403 before touching the server transport.
 pub async fn relay(
     container: io::Transport,
     server: io::Transport,
@@ -78,6 +83,26 @@ pub async fn relay(
     events: tokio::sync::broadcast::Sender<airlock_tui::NetworkEvent>,
 ) -> anyhow::Result<()> {
     let client_io = hyper_util::rt::TokioIo::new(tokio::io::join(container.read, container.write));
+
+    if !target.allowed {
+        let target_host = target.host.clone();
+        let target_port = target.port;
+        let service = service_fn(move |req: Request<Incoming>| {
+            let events = events.clone();
+            let target_host = target_host.clone();
+            async move {
+                emit_request_event(&events, &req, &target_host, target_port, false);
+                let body: ResponseBody =
+                    Either::Right(Full::new(Bytes::from("denied by network policy\n")));
+                Ok::<_, hyper::Error>(Response::builder().status(403).body(body).unwrap())
+            }
+        });
+        return hyper_util::server::conn::auto::Builder::new(LocalExecutor)
+            .serve_connection(client_io, service)
+            .await
+            .map_err(|e| anyhow::anyhow!("http deny: {e}"));
+    }
+
     let server_io = hyper_util::rt::TokioIo::new(tokio::io::join(server.read, server.write));
     debug!("http proxy: server h2 = {}", server.h2);
 
@@ -132,10 +157,8 @@ pub async fn relay(
 }
 
 /// Broadcast a `NetworkEvent::Request` describing this HTTP request. Silently
-/// drops the event when there are no subscribers.
-///
-/// The `allowed` flag reflects the connection-level TCP decision. HTTP-level
-/// denies (e.g. via Lua middleware) are not yet surfaced separately.
+/// drops the event when there are no subscribers — and short-circuits *before*
+/// cloning any request fields in that common case (non-monitor runs).
 fn emit_request_event(
     events: &tokio::sync::broadcast::Sender<airlock_tui::NetworkEvent>,
     req: &Request<Incoming>,
@@ -143,18 +166,36 @@ fn emit_request_event(
     target_port: u16,
     allowed: bool,
 ) {
+    if events.receiver_count() == 0 {
+        return;
+    }
     let method = req.method().to_string();
     let path = req
         .uri()
         .path_and_query()
         .map_or_else(|| "/".to_string(), ToString::to_string);
-    let _ = events.send(airlock_tui::NetworkEvent::Request {
+    let headers: Vec<(String, String)> = req
+        .headers()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str().to_string(),
+                v.to_str().unwrap_or("<binary>").to_string(),
+            )
+        })
+        .collect();
+    let info = airlock_tui::RequestInfo {
+        timestamp: std::time::SystemTime::now(),
         method,
         path,
         host: target_host.to_string(),
         port: target_port,
         allowed,
-    });
+        headers,
+    };
+    let _ = events.send(airlock_tui::NetworkEvent::Request(std::sync::Arc::new(
+        info,
+    )));
 }
 
 /// Check if a line matches an HTTP request line or h2 connection preface.

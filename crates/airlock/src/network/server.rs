@@ -29,17 +29,21 @@ impl network_proxy::Server for Network {
                 let host = tcp.get_host()?.to_str()?.to_string();
                 let port = tcp.get_port();
 
+                // Deferred deny: we accept the guest's TCP connect even when
+                // policy denies, so that an HTTP request on top of it still
+                // reaches the relay layer and can be surfaced in the Requests
+                // sub-tab with full method/path/header detail. The relay then
+                // answers with 403 instead of forwarding upstream. Plain
+                // non-HTTP denies close the connection after detection.
                 let net_target = self.resolve_target(&host, port);
-                if !net_target.allowed {
-                    debug!("denied: {host}:{port}");
-                    results
-                        .get()
-                        .init_result()
-                        .set_denied("denied by network rules");
-                    return Ok(());
-                }
-
-                debug!("connect {host}:{port}");
+                debug!(
+                    "connect {host}:{port} ({})",
+                    if net_target.allowed {
+                        "allowed"
+                    } else {
+                        "denied"
+                    }
+                );
                 let sink = spawn_tcp_connection(
                     net_target,
                     client_sink,
@@ -158,7 +162,11 @@ fn spawn_socket_connection(path: &str, client_sink: tcp_sink::Client) -> tcp_sin
 
 /// Main connection handler: detect TLS, intercept (MITM) if so, detect HTTP,
 /// and route to the appropriate relay.
-#[allow(clippy::too_many_arguments)]
+///
+/// When the policy denies the target we still accept TLS and peek for HTTP —
+/// that's the whole point of deferring the deny decision to this phase, so
+/// denied HTTP requests surface in the Requests sub-tab with full detail
+/// instead of vanishing behind an early TCP reset.
 async fn handle_connection(
     target: ResolvedTarget,
     mut rx: mpsc::Receiver<Bytes>,
@@ -170,24 +178,19 @@ async fn handle_connection(
     let (is_tls, first) = tls::detect(&mut rx).await;
     let addr = format!("{}:{}", target.host, target.port);
 
-    // Establish connection pair
-    let (container, server) = if is_tls {
-        tls::establish(
-            &target.host,
-            target.port,
-            first,
-            rx,
-            client_sink,
-            interceptor,
-            tls_client,
-        )
-        .await?
+    // Container-side transport first — same for allow and deny.
+    let (container, alpn) = if is_tls {
+        tls::accept_container(&target.host, first, rx, client_sink, interceptor).await?
     } else {
-        tcp::establish(&addr, first, rx, client_sink).await?
+        (tcp::container_transport(first, rx, client_sink), None)
     };
 
-    // Detect HTTP and route
     let (container, is_http) = detect_http(container).await;
+    let server = match (target.allowed, is_tls) {
+        (false, _) => io::Transport::null(),
+        (true, true) => tls::connect_server(&target, alpn.as_deref(), tls_client).await?,
+        (true, false) => tcp::connect_server(&addr).await?,
+    };
     if is_http {
         Box::pin(http::relay(container, server, target, events)).await?;
     } else {

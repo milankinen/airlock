@@ -19,8 +19,14 @@ fn plain_http_get() {
 #[test]
 fn host_not_allowed_is_denied() {
     run_network(vec!["example.com".into()], vec![], |proxy| async move {
-        let conn = TestConnection::connect(&proxy, "127.0.0.1", 80).await;
-        assert!(conn.is_none(), "connection should be denied");
+        // Denies are deferred to the relay phase so that denied HTTP
+        // requests can still be surfaced in the monitor. The connect
+        // itself succeeds; the 403 comes back over the stream.
+        let mut conn = TestConnection::connect(&proxy, "127.0.0.1", 80)
+            .await
+            .expect("connect is always accepted; deny surfaces at relay");
+        let resp = conn.roundtrip(&http_get(80, "/")).await;
+        assert!(resp.contains("403"), "expected 403, got: {resp}");
     });
 }
 
@@ -44,8 +50,11 @@ fn star_allows_everything() {
 #[test]
 fn empty_allowed_hosts_denies_all() {
     run_network(vec![], vec![], |proxy| async move {
-        let conn = TestConnection::connect(&proxy, "127.0.0.1", 80).await;
-        assert!(conn.is_none(), "empty allowed_hosts should deny everything");
+        let mut conn = TestConnection::connect(&proxy, "127.0.0.1", 80)
+            .await
+            .expect("connect is always accepted; deny surfaces at relay");
+        let resp = conn.roundtrip(&http_get(80, "/")).await;
+        assert!(resp.contains("403"), "expected 403, got: {resp}");
     });
 }
 

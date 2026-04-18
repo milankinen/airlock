@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use crate::NetworkControl;
+use crate::settings::TuiSettings;
 use crate::tabs::monitor::MonitorTab;
 
 /// Which tab is currently active.
@@ -26,6 +27,7 @@ pub struct App {
     /// paste support (BusyBox ash etc.) mis-parse the markers and eat
     /// surrounding bytes.
     pub guest_bracketed_paste: bool,
+    pub settings: TuiSettings,
 }
 
 impl App {
@@ -36,6 +38,7 @@ impl App {
             network,
             mouse_captured: true,
             guest_bracketed_paste: false,
+            settings: TuiSettings::default(),
         }
     }
 }

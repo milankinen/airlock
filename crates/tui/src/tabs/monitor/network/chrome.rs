@@ -138,11 +138,32 @@ pub fn render_policy_dropdown(
     rects
 }
 
+/// Rects produced by `render_sub_tabs`, for mouse hit-testing.
+pub struct SubTabRects {
+    pub requests: Rect,
+    pub connections: Rect,
+    /// `Some` only when the details tab is currently visible.
+    pub details: Option<Rect>,
+    /// Click rect for the `×` close glyph at the end of the details label.
+    pub details_close: Option<Rect>,
+}
+
 /// Render the sub-tab labels with a blank top-margin row and a bottom
-/// separator. Returns the clickable rects for `Requests` and `Connections`.
-pub fn render_sub_tabs(area: Rect, active: NetworkSubTab, buf: &mut Buffer) -> (Rect, Rect) {
+/// separator. `details_label` is `Some(text)` (e.g. "Request details") only
+/// while the details sub-tab is visible.
+pub fn render_sub_tabs(
+    area: Rect,
+    active: NetworkSubTab,
+    details_label: Option<&str>,
+    buf: &mut Buffer,
+) -> SubTabRects {
     if area.height == 0 {
-        return (Rect::default(), Rect::default());
+        return SubTabRects {
+            requests: Rect::default(),
+            connections: Rect::default(),
+            details: None,
+            details_close: None,
+        };
     }
 
     // Layout: top-margin row (blank) | labels row | separator row.
@@ -167,6 +188,22 @@ pub fn render_sub_tabs(area: Rect, active: NetworkSubTab, buf: &mut Buffer) -> (
         buf,
     );
 
+    let (details_rect, details_close_rect) = if let Some(text) = details_label {
+        // Details label + trailing " × ". Shortcut-letter styling doesn't
+        // apply (no single-letter accelerator) so render it as a plain word.
+        let word_len = text.chars().count() as u16;
+        // " " + word + " × " (space-×-space as close button).
+        let label_w = word_len + 4;
+        let close_w: u16 = 3;
+        let label_x = area.x + left_pad + req_w + gap + conn_w + gap;
+        let label_rect = Rect::new(label_x, labels_y, label_w, 1);
+        let close_rect = Rect::new(label_x + label_w - close_w, labels_y, close_w, 1);
+        render_details_label(label_rect, text, active == NetworkSubTab::Details, buf);
+        (Some(label_rect), Some(close_rect))
+    } else {
+        (None, None)
+    };
+
     if area.height > 2 {
         let sep_row = Rect::new(area.x, sep_y, area.width, 1);
         let sep: String = "─".repeat(area.width as usize);
@@ -177,7 +214,34 @@ pub fn render_sub_tabs(area: Rect, active: NetworkSubTab, buf: &mut Buffer) -> (
         .render(sep_row, buf);
     }
 
-    (req_rect, conn_rect)
+    SubTabRects {
+        requests: req_rect,
+        connections: conn_rect,
+        details: details_rect,
+        details_close: details_close_rect,
+    }
+}
+
+/// Render the third sub-tab label (details). Active highlighting mirrors
+/// `render_label`; the trailing ` × ` is always dim so it reads as a
+/// clickable close hint.
+fn render_details_label(rect: Rect, text: &str, active: bool, buf: &mut Buffer) {
+    let word_style = if active {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    let close_style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
+    let line = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(text.to_string(), word_style),
+        Span::styled(" × ", close_style),
+    ]);
+    Paragraph::new(line).render(rect, buf);
 }
 
 /// Render one sub-tab label with a leading/trailing space, the shortcut
