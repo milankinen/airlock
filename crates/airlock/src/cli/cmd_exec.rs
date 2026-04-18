@@ -11,7 +11,8 @@ use clap::Args;
 use futures::AsyncReadExt;
 use tokio::task::LocalSet;
 
-use crate::{cli, project, rpc, terminal};
+use crate::runtime::{self, RawTerminalRuntime};
+use crate::{cli, project, rpc};
 
 /// CLI arguments for `airlock exec`.
 #[derive(Args, Debug)]
@@ -33,11 +34,11 @@ pub struct ExecArgs {
 }
 
 /// Entry point for `airlock exec <cmd> [args...]`.
-pub async fn run(args: ExecArgs) -> i32 {
+pub async fn main(args: ExecArgs) -> i32 {
     let local = LocalSet::new();
     local
         .run_until(async {
-            run_inner(args).await.unwrap_or_else(|e| {
+            run(args).await.unwrap_or_else(|e| {
                 cli::error!("{e:#}");
                 1
             })
@@ -45,7 +46,7 @@ pub async fn run(args: ExecArgs) -> i32 {
         .await
 }
 
-async fn run_inner(args: ExecArgs) -> anyhow::Result<i32> {
+async fn run(args: ExecArgs) -> anyhow::Result<i32> {
     let ExecArgs {
         cmd,
         args,
@@ -88,7 +89,7 @@ async fn run_inner(args: ExecArgs) -> anyhow::Result<i32> {
         rpc_sys.bootstrap(capnp_rpc::rpc_twoparty_capnp::Side::Server);
     tokio::task::spawn_local(rpc_sys);
 
-    let mut terminal = terminal::setup();
+    let mut terminal = RawTerminalRuntime::new();
     let stdin = terminal.stdin()?;
     let pty_size = stdin.pty_size();
 
@@ -126,7 +127,7 @@ async fn run_inner(args: ExecArgs) -> anyhow::Result<i32> {
 
     // Forward host signals to the container process
     let signal_proc = proc.clone();
-    let mut signals = terminal::signals()?;
+    let mut signals = runtime::signals()?;
     tokio::task::spawn_local(async move {
         use futures::StreamExt;
         while let Some(signum) = signals.next().await {

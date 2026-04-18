@@ -3,10 +3,7 @@
 //! The signal numbers emitted are Linux signal numbers (not host numbers),
 //! because they are forwarded to the Linux VM process.
 
-use std::pin::Pin;
-
 use async_stream::stream;
-use futures::Stream;
 use tokio::signal::unix::{SignalKind, signal};
 
 // Linux signal numbers — the target is always the Linux VM,
@@ -20,7 +17,7 @@ const SIGUSR2: i32 = 12;
 
 /// Create a stream that yields Linux signal numbers when the host receives
 /// SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, or SIGUSR2.
-pub fn signals() -> anyhow::Result<Pin<Box<dyn Stream<Item = i32>>>> {
+pub fn signals() -> anyhow::Result<super::SignalStream> {
     let mut sighup = signal(SignalKind::hangup())?;
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigquit = signal(SignalKind::quit())?;

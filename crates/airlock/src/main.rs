@@ -11,12 +11,13 @@ pub(crate) mod network;
 mod oci;
 mod project;
 mod rpc;
-mod terminal;
+mod runtime;
 mod util;
 mod vm;
 
-use clap::{CommandFactory, FromArgMatches};
-use cli::{Cli, Command};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
+
+use crate::cli::{cmd_exec, cmd_rm, cmd_show, cmd_start};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -26,39 +27,74 @@ async fn main() {
     let raw_args: Vec<String> = std::env::args().collect();
     let (airlock_args, extra_args) = split_at_separator(&raw_args);
 
-    let matches = Cli::command()
+    let matches = Program::command()
         .version(cli::version_string().leak() as &str)
         .after_help(cli::platform_status())
         .get_matches_from(&airlock_args);
-    let parsed = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
-    cli::initialize(&parsed.global);
+    let parsed = Program::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    cli::initialize(parsed.global.quiet);
 
     let exit_code = match parsed.command {
-        Command::Start(args) => cli::cmd_start::run(args, extra_args).await,
+        Command::Start(args) => cli::cmd_start::main(args, extra_args).await,
         Command::Exec(args) => {
             if !extra_args.is_empty() {
                 cli::error!("'--' args are not supported with 'exec'");
                 std::process::exit(2);
             }
-            cli::cmd_exec::run(args).await
+            cli::cmd_exec::main(args).await
         }
         Command::Show(ref args) => {
             if !extra_args.is_empty() {
                 cli::error!("'--' args are only supported with 'start'");
                 std::process::exit(2);
             }
-            cli::cmd_show::run(args)
+            cli::cmd_show::main(args)
         }
         Command::Rm(ref args) => {
             if !extra_args.is_empty() {
                 cli::error!("'--' args are only supported with 'start'");
                 std::process::exit(2);
             }
-            cli::cmd_rm::run(args)
+            cli::cmd_rm::main(args)
         }
     };
 
     std::process::exit(exit_code);
+}
+
+/// Top-level CLI definition. Clap derives argument parsing from this struct.
+#[derive(Parser)]
+#[command(
+    name = "airlock",
+    version,
+    about = "Lightweight VM sandbox for running untrusted code"
+)]
+struct Program {
+    #[command(flatten)]
+    pub global: GlobalArgs,
+
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Args, Debug)]
+struct GlobalArgs {
+    /// Suppress airlock cli output
+    #[arg(short, long, default_value_t = false)]
+    quiet: bool,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Start the sandbox VM for the current project directory
+    Start(cmd_start::StartArgs),
+    /// Remove the current project data
+    Rm(cmd_rm::RmArgs),
+    /// Execute a command inside the running sandbox VM
+    #[command(alias = "x")]
+    Exec(cmd_exec::ExecArgs),
+    /// Show the current project info
+    Show(cmd_show::ShowArgs),
 }
 
 /// Split argv at "--". Returns (args before --, args after --).

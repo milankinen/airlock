@@ -12,7 +12,8 @@ use tokio::task::LocalSet;
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::{self, CliArgs, LogLevel};
-use crate::{cli_server, config, network, oci, project, rpc, terminal, vm};
+use crate::runtime::{MonitorRuntime, RawTerminalRuntime, Runtime, Terminal};
+use crate::{cli_server, config, network, oci, project, rpc, runtime, vm};
 
 /// Default `airlock.toml` written when initializing a new sandbox.
 const DEFAULT_CONFIG: &str = "[vm]\n# image = \"alpine:latest\"\n";
@@ -38,7 +39,8 @@ pub struct StartArgs {
 }
 
 /// Entry point for `airlock start [--log-level <level>] [-- extra-args...]`.
-pub async fn run(args: StartArgs, extra_args: Vec<String>) -> i32 {
+pub async fn main(args: StartArgs, extra_args: Vec<String>) -> i32 {
+    let local = LocalSet::new();
     cli::set_verbose(args.verbose);
 
     #[cfg(target_os = "linux")]
@@ -100,29 +102,157 @@ pub async fn run(args: StartArgs, extra_args: Vec<String>) -> i32 {
 
     let cli_args = CliArgs::new(args.log_level, extra_args, args.login);
     let sandbox_cwd = args.sandbox_cwd;
-    let monitor = args.monitor;
-    let local = LocalSet::new();
     local
         .run_until(async {
-            run_inner(cli_args, config, host_cwd, sandbox_cwd, monitor)
+            let result = if args.monitor {
+                run(
+                    cli_args,
+                    config,
+                    host_cwd,
+                    sandbox_cwd,
+                    MonitorRuntime::new(),
+                )
                 .await
-                .unwrap_or_else(|e| {
-                    cli::error!("Error: {e:?}");
-                    1
-                })
+            } else {
+                run(
+                    cli_args,
+                    config,
+                    host_cwd,
+                    sandbox_cwd,
+                    RawTerminalRuntime::new(),
+                )
+                .await
+            };
+            result.unwrap_or_else(|e| {
+                cli::error!("Error: {e:?}");
+                1
+            })
         })
         .await
 }
 
-async fn run_inner(
+async fn run(
     args: CliArgs,
     config: config::Config,
     host_cwd: std::path::PathBuf,
     project_cwd: Option<String>,
-    monitor: bool,
+    mut runtime: impl Runtime,
 ) -> anyhow::Result<i32> {
     let project = project::lock(host_cwd, config, project_cwd)?;
+    print_preparing(&project);
 
+    let image = oci::prepare(&project).await?;
+    let network = network::setup(&project, &image.container_home)?;
+
+    print_mounts_and_rules(&project);
+
+    // Check if user interrupted during setup (e.g. Ctrl+C during download)
+    if cli::is_interrupted() {
+        return Ok(130); // 128 + SIGINT
+    }
+
+    cli::log!("Booting VM...");
+    let (vm, vsock_fd) = vm::start(&args, &project, &image).await?;
+    project.save_meta();
+
+    let supervisor = rpc::Supervisor::connect(vsock_fd)?;
+
+    let (stdin_client, pty_size) = runtime.attach_stdin()?;
+    let signals = runtime.signals()?;
+
+    // Launch the output sink (enters raw mode for the raw runtime, spawns the
+    // TUI thread for the monitor runtime) before `supervisor.start` consumes
+    // `network`.
+    let mut terminal = runtime.launch(&project, &network, supervisor.clone())?;
+    // When AIRLOCK_PTY_DUMP=1, write all guest PTY output to
+    // <sandbox_dir>/pty.dump for offline replay/diagnosis.
+    let mut pty_dump = pty_dump_file(&project.sandbox_dir);
+
+    // Connected to airlockd - finalize vm init start main proc
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let epoch = now.as_secs();
+    let epoch_nanos = now.subsec_nanos();
+    let proc = supervisor
+        .start(
+            &args,
+            &project,
+            &vm,
+            stdin_client,
+            pty_size,
+            network,
+            epoch,
+            epoch_nanos,
+        )
+        .await?;
+
+    // Start CLI server so `airlock exec` can attach processes to this VM
+    let sock_path = project
+        .sandbox_dir
+        .join(airlock_protocol::CLI_SOCK_FILENAME);
+    tokio::task::spawn_local(cli_server::serve(sock_path, supervisor.clone()));
+
+    spawn_signal_forwarder(signals, proc.clone());
+    let exit_code = poll_proc(&proc, &mut terminal, pty_dump.as_mut()).await;
+    let final_code = terminal.exit(exit_code);
+
+    // Sync filesystems before killing VM
+    supervisor.shutdown().await;
+
+    // Drain file-sync events then destroy VM.
+    vm.shutdown().await;
+    Ok(final_code)
+}
+
+/// Forward host signals (SIGHUP/SIGINT/SIGQUIT/SIGTERM/SIGUSR1/SIGUSR2) to the
+/// guest process on a background task.
+fn spawn_signal_forwarder(mut signals: runtime::SignalStream, proc: rpc::Process) {
+    tokio::task::spawn_local(async move {
+        use futures::StreamExt;
+        while let Some(signum) = signals.next().await {
+            tracing::debug!("forwarding signal {signum} to VM");
+            if let Err(e) = proc.signal(signum).await {
+                tracing::error!("signal forward failed: {e}");
+            }
+        }
+    });
+}
+
+/// Drive the guest process to completion: relay stdout/stderr into `terminal`
+/// (and optional PTY dump) until an Exit event or RPC error is observed.
+async fn poll_proc(
+    proc: &rpc::Process,
+    terminal: &mut impl Terminal,
+    mut pty_dump: Option<&mut std::fs::File>,
+) -> i32 {
+    loop {
+        match proc.poll().await {
+            Ok(rpc::ProcessEvent::Exit(code)) => return code,
+            Ok(rpc::ProcessEvent::Stdout(data)) => {
+                tracing::trace!(
+                    "host stdout: {} bytes: {:?}",
+                    data.len(),
+                    String::from_utf8_lossy(&data)
+                );
+                write_pty_dump(pty_dump.as_deref_mut(), &data);
+                terminal.stdout(&data);
+            }
+            Ok(rpc::ProcessEvent::Stderr(data)) => {
+                tracing::trace!("host stderr: {} bytes", data.len());
+                write_pty_dump(pty_dump.as_deref_mut(), &data);
+                terminal.stderr(&data);
+            }
+            Err(e) => {
+                tracing::trace!("host poll error: {e}");
+                return 1;
+            }
+        }
+    }
+}
+
+/// Print the "Preparing sandbox" header with image name and CA cert status.
+fn print_preparing(project: &project::Project) {
     cli::log!("Preparing sandbox...");
     cli::log!(
         "  {} config loaded, image: {}",
@@ -132,20 +262,10 @@ async fn run_inner(
     if project.ca_newly_generated {
         cli::log!("  {} ca cert generated", cli::check());
     }
+}
 
-    let mut terminal = terminal::setup();
-    let image = oci::prepare(&args, &project, &terminal).await?;
-
-    // Create network event channel for TUI monitor
-    let (event_tx, event_rx) = if monitor {
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-    let network = network::setup(&project, &image.container_home, event_tx)?;
-
-    // Show mounts and network rules grouped (verbose)
+/// Verbose-only: list enabled mounts and network rules grouped by kind.
+fn print_mounts_and_rules(project: &project::Project) {
     let enabled_mounts: Vec<_> = project
         .config
         .mounts
@@ -180,174 +300,6 @@ async fn run_inner(
             );
         }
     }
-
-    // Check if user interrupted during setup (e.g. Ctrl+C during download)
-    if cli::is_interrupted() {
-        return Ok(130); // 128 + SIGINT
-    }
-
-    // Enter raw mode only after downloads complete so Ctrl+C works during setup
-    terminal.enter_raw_mode();
-
-    let policy_str = format!("{:?}", project.config.network.policy).to_lowercase();
-
-    cli::log!("Booting VM...");
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let epoch = now.as_secs();
-    let epoch_nanos = now.subsec_nanos();
-    let (vm, vsock_fd) = vm::start(&args, &project, &image).await?;
-    project.save_meta();
-
-    let supervisor = rpc::Supervisor::connect(vsock_fd)?;
-
-    // In monitor mode, use channel-based stdin; otherwise use real terminal stdin.
-    // Both produce a stdin::Client for the supervisor RPC.
-    let (stdin_tx, stdin_client, pty_size) = if monitor {
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        // The TUI tab bar occupies rows at the bottom; the guest PTY only
-        // gets the body area. Advertising the full terminal size would let
-        // the guest draw past vt100's grid and collapse onto the last row.
-        let body_rows = rows.saturating_sub(airlock_tui::TAB_BAR_HEIGHT);
-        let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let tui_stdin = airlock_tui::TuiStdin::new(rx, Some((body_rows, cols)));
-        let pty_size = tui_stdin.pty_size();
-        (Some(tx), capnp_rpc::new_client(tui_stdin), pty_size)
-    } else {
-        let stdin = terminal.stdin()?;
-        let pty_size = stdin.pty_size();
-        (None, capnp_rpc::new_client(stdin), pty_size)
-    };
-
-    let proc = supervisor
-        .start(
-            &args,
-            &project,
-            &vm,
-            stdin_client,
-            pty_size,
-            network,
-            epoch,
-            epoch_nanos,
-        )
-        .await?;
-
-    // Start CLI server so `airlock exec` can attach processes to this VM
-    let sock_path = project
-        .sandbox_dir
-        .join(airlock_protocol::CLI_SOCK_FILENAME);
-    tokio::task::spawn_local(cli_server::serve(sock_path, supervisor.clone()));
-
-    // Forward host signals to the VM process
-    let signal_proc = proc.clone();
-    let mut signals = terminal::signals()?;
-    tokio::task::spawn_local(async move {
-        use futures::StreamExt;
-        while let Some(signum) = signals.next().await {
-            tracing::debug!("forwarding signal {signum} to VM");
-            if let Err(e) = signal_proc.signal(signum).await {
-                tracing::error!("signal forward failed: {e}");
-            }
-        }
-    });
-
-    // When AIRLOCK_PTY_DUMP=1, write all guest PTY output to
-    // <sandbox_dir>/pty.dump for offline replay/diagnosis.
-    let mut pty_dump = pty_dump_file(&project.sandbox_dir);
-
-    let exit_code = if let (Some(stdin_tx), Some(mut event_rx)) = (stdin_tx, event_rx) {
-        // TUI monitor mode: spawn TUI on its own thread, keep process
-        // polling on the LocalSet so RPC is never blocked by rendering.
-        drop(terminal);
-        let project_path = project.host_cwd.display().to_string();
-        let tui = airlock_tui::spawn(stdin_tx, policy_str, project_path);
-
-        // Forward network events from the tokio channel to the TUI thread
-        let net_tx = tui.tx.clone();
-        tokio::task::spawn_local(async move {
-            while let Some(ev) = event_rx.recv().await {
-                net_tx.send_network(ev);
-            }
-        });
-
-        // Poll guest CPU/memory stats once per second and forward to the TUI.
-        let stats_tx = tui.tx.clone();
-        let stats_supervisor = supervisor.clone();
-        tokio::task::spawn_local(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                ticker.tick().await;
-                match stats_supervisor.poll_stats().await {
-                    Ok(snap) => stats_tx.send_stats(airlock_tui::StatsSnapshot {
-                        per_core: snap.per_core,
-                        total_bytes: snap.total_bytes,
-                        used_bytes: snap.used_bytes,
-                        load_avg: snap.load_avg,
-                    }),
-                    Err(e) => {
-                        tracing::debug!("poll_stats failed: {e}");
-                        break;
-                    }
-                }
-            }
-        });
-
-        // Process poll loop — forward output to TUI, signal exit when done
-        let tui_tx = tui.tx.clone();
-        loop {
-            match proc.poll().await {
-                Ok(rpc::ProcessEvent::Stdout(data) | rpc::ProcessEvent::Stderr(data)) => {
-                    write_pty_dump(pty_dump.as_mut(), &data);
-                    tui_tx.send_output(data);
-                }
-                Ok(rpc::ProcessEvent::Exit(code)) => {
-                    tui_tx.send_exit(code);
-                    break;
-                }
-                Err(_) => {
-                    tui_tx.send_exit(1);
-                    break;
-                }
-            }
-        }
-        tui.join()?
-    } else {
-        // Standard mode: direct stdout relay
-        loop {
-            match proc.poll().await {
-                Ok(rpc::ProcessEvent::Exit(code)) => break code,
-                Ok(rpc::ProcessEvent::Stdout(data)) => {
-                    tracing::trace!(
-                        "host stdout: {} bytes: {:?}",
-                        data.len(),
-                        String::from_utf8_lossy(&data)
-                    );
-                    write_pty_dump(pty_dump.as_mut(), &data);
-                    let _ = std::io::stdout().write_all(&data);
-                    let _ = std::io::stdout().flush();
-                }
-                Ok(rpc::ProcessEvent::Stderr(data)) => {
-                    tracing::trace!("host stderr: {} bytes", data.len());
-                    write_pty_dump(pty_dump.as_mut(), &data);
-                    let _ = std::io::stderr().write_all(&data);
-                    let _ = std::io::stderr().flush();
-                }
-                Err(e) => {
-                    tracing::trace!("host poll error: {e}");
-                    break 1;
-                }
-            }
-        }
-    };
-
-    // Sync filesystems before killing VM
-    supervisor.shutdown().await;
-
-    // Drain file-sync events then destroy VM.
-    vm.shutdown().await;
-    Ok(exit_code)
 }
 
 /// Open the PTY dump file if `AIRLOCK_PTY_DUMP=1`, otherwise `None`.

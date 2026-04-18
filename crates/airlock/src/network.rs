@@ -23,21 +23,19 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
+use tokio::sync::broadcast;
 
 use crate::config::config::Policy;
 use crate::network::http::middleware::CompiledMiddleware;
 use crate::network::target::{MiddlewareTarget, NetworkTarget, ResolvedTarget};
 use crate::project::Project;
 
+const NETWORK_EVENTS_BUFFER: usize = 10;
+
 /// Build the [`Network`] from the sandbox config: load native CA roots,
 /// compile middleware scripts, resolve network targets, and prepare the
 /// TLS interceptor with the sandbox's CA.
-pub fn setup(
-    project: &Project,
-    container_home: &str,
-    event_tx: Option<mpsc::Sender<airlock_tui::NetworkEvent>>,
-) -> anyhow::Result<Network> {
+pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network> {
     let mut root_store = rustls::RootCertStore::empty();
     for cert in rustls_native_certs::load_native_certs().expect("native certs") {
         let _ = root_store.add(cert);
@@ -56,6 +54,8 @@ pub fn setup(
 
     let port_forwards: HashMap<u16, u16> =
         rules::port_forwards_from_config(net).into_iter().collect();
+
+    let (events, _) = broadcast::channel(NETWORK_EVENTS_BUFFER);
 
     let socket_map: HashMap<String, PathBuf> = net
         .sockets
@@ -87,7 +87,7 @@ pub fn setup(
         middleware_targets,
         port_forwards,
         socket_map,
-        event_tx,
+        events,
     })
 }
 
@@ -107,11 +107,16 @@ pub struct Network {
     port_forwards: HashMap<u16, u16>,
     /// Guest socket path → host socket path mapping for Unix socket forwarding.
     pub(super) socket_map: HashMap<String, PathBuf>,
-    /// Optional channel to send connection events to the TUI monitor.
-    event_tx: Option<mpsc::Sender<airlock_tui::NetworkEvent>>,
+    /// Network events to subscribe to
+    // TODO: this NetworkEvent should be Network event agnostic to any TUI
+    events: broadcast::Sender<airlock_tui::NetworkEvent>,
 }
 
 impl Network {
+    pub fn events(&self) -> broadcast::Receiver<airlock_tui::NetworkEvent> {
+        self.events.subscribe()
+    }
+
     /// Resolve a host:port to a `ResolvedTarget`.
     ///
     /// Logic:
@@ -184,15 +189,14 @@ impl Network {
         matches!(self.policy, Policy::DenyAlways)
     }
 
-    /// Send a network event to the TUI monitor, if connected.
+    /// Broadcast a connection event to any subscribers (e.g. the TUI monitor).
+    /// Silently drops the event when there are no subscribers.
     fn emit_event(&self, host: &str, port: u16, allowed: bool) {
-        if let Some(tx) = &self.event_tx {
-            let _ = tx.try_send(airlock_tui::NetworkEvent::Connect {
-                host: host.to_string(),
-                port,
-                allowed,
-            });
-        }
+        let _ = self.events.send(airlock_tui::NetworkEvent::Connect {
+            host: host.to_string(),
+            port,
+            allowed,
+        });
     }
 
     /// Collect compiled middleware from all matching middleware targets.

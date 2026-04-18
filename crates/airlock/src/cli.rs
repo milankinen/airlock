@@ -11,27 +11,12 @@ pub mod cmd_start;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::ValueEnum;
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::signal::unix::SignalKind;
 use tokio::sync::watch;
 
 // -- CLI argument parsing --
-
-/// Top-level CLI definition. Clap derives argument parsing from this struct.
-#[derive(Parser)]
-#[command(
-    name = "airlock",
-    version,
-    about = "Lightweight VM sandbox for running untrusted code"
-)]
-pub struct Cli {
-    #[command(flatten)]
-    pub global: GlobalArgs,
-
-    #[command(subcommand)]
-    pub command: Command,
-}
 
 #[cfg(target_os = "linux")]
 pub fn platform_status() -> String {
@@ -47,26 +32,6 @@ pub fn platform_status() -> String {
 #[cfg(not(target_os = "linux"))]
 pub fn platform_status() -> String {
     String::new()
-}
-
-#[derive(Args, Debug)]
-pub struct GlobalArgs {
-    /// Suppress airlock cli output
-    #[arg(short, long, default_value_t = false)]
-    pub quiet: bool,
-}
-
-#[derive(Subcommand)]
-pub enum Command {
-    /// Start the sandbox VM for the current project directory
-    Start(cmd_start::StartArgs),
-    /// Remove the current project data
-    Rm(cmd_rm::RmArgs),
-    /// Execute a command inside the running sandbox VM
-    #[command(alias = "x")]
-    Exec(cmd_exec::ExecArgs),
-    /// Show the current project info
-    Show(cmd_show::ShowArgs),
 }
 
 /// Runtime arguments for the `up` command. Constructed from parsed CLI args
@@ -165,9 +130,9 @@ fn release_version() -> Option<String> {
 }
 
 /// Initialize the console; call at the very beginning of the program.
-pub fn initialize(global: &GlobalArgs) {
+pub fn initialize(quiet: bool) {
     let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    SILENT.store(global.quiet, Ordering::Relaxed);
+    SILENT.store(quiet, Ordering::Relaxed);
     IS_TTY.store(is_tty, Ordering::Relaxed);
 
     let tx = INTERRUPTED.0.clone();

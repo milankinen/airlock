@@ -241,7 +241,7 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
             middleware_targets,
             port_forwards: std::collections::HashMap::default(),
             socket_map: std::collections::HashMap::default(),
-            event_tx: None,
+            events: tokio::sync::broadcast::channel(1).0,
         },
     )
 }

@@ -1,21 +1,31 @@
+//! Non-monitor `Runtime`: writes guest output straight through to the host's
+//! real stdout/stderr and manages raw mode on the host terminal.
+
+use std::io::Write;
+
+use airlock_protocol::supervisor_capnp::stdin;
+
+use super::{PtySize, Runtime, SignalStream, Terminal};
+use crate::network::Network;
+use crate::project::Project;
 use crate::rpc;
 
-/// Detect whether stdin is a TTY and create a [`Terminal`] handle.
-pub fn setup() -> Terminal {
-    let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    Terminal {
-        is_tty,
-        guard: None,
-    }
-}
-
 /// Manages raw mode entry/exit and provides stdin/resize event sources.
-pub struct Terminal {
+pub struct RawTerminalRuntime {
     is_tty: bool,
     guard: Option<TerminalGuard>,
 }
 
-impl Terminal {
+impl RawTerminalRuntime {
+    /// Detect whether stdin is a TTY and build a handle.
+    pub fn new() -> Self {
+        let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+        Self {
+            is_tty,
+            guard: None,
+        }
+    }
+
     /// Returns true if stdin is a terminal.
     #[allow(dead_code)]
     pub fn is_tty(&self) -> bool {
@@ -45,7 +55,6 @@ impl Terminal {
     /// Create an RPC stdin server, optionally with resize events if TTY.
     pub fn stdin(&self) -> anyhow::Result<rpc::Stdin> {
         let (pty_size, resizes) = if self.is_tty {
-            // crossterm::terminal::size() returns (cols, rows)
             let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
             tracing::debug!("host terminal size: {rows}x{cols}");
             let pty_size = (rows, cols);
@@ -56,6 +65,59 @@ impl Terminal {
             (None, None)
         };
         Ok(rpc::Stdin::new(tokio::io::stdin(), pty_size, resizes))
+    }
+}
+
+impl Default for RawTerminalRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Runtime for RawTerminalRuntime {
+    type Terminal = RawTerminal;
+
+    fn attach_stdin(&mut self) -> anyhow::Result<(stdin::Client, PtySize)> {
+        let stdin = self.stdin()?;
+        let pty_size = stdin.pty_size();
+        Ok((capnp_rpc::new_client(stdin), pty_size))
+    }
+
+    fn signals(&self) -> anyhow::Result<SignalStream> {
+        super::signals()
+    }
+
+    fn launch(
+        mut self,
+        _project: &Project,
+        _network: &Network,
+        _supervisor: rpc::Supervisor,
+    ) -> anyhow::Result<RawTerminal> {
+        self.enter_raw_mode();
+        Ok(RawTerminal { _guard: self.guard })
+    }
+}
+
+/// Output sink: writes guest bytes directly to the host stdout/stderr.
+pub struct RawTerminal {
+    /// Kept for its `Drop` impl: restores cooked mode and `modifyOtherKeys`
+    /// when the sandbox exits.
+    _guard: Option<TerminalGuard>,
+}
+
+impl Terminal for RawTerminal {
+    fn stdout(&mut self, bytes: &[u8]) {
+        let _ = std::io::stdout().write_all(bytes);
+        let _ = std::io::stdout().flush();
+    }
+
+    fn stderr(&mut self, bytes: &[u8]) {
+        let _ = std::io::stderr().write_all(bytes);
+        let _ = std::io::stderr().flush();
+    }
+
+    fn exit(self, exit_code: i32) -> i32 {
+        exit_code
     }
 }
 

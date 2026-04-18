@@ -15,7 +15,7 @@ pub struct RmArgs {
 }
 
 /// Remove the sandbox directory after confirmation (unless `--force`).
-pub fn run(args: &RmArgs) -> i32 {
+pub fn main(args: &RmArgs) -> i32 {
     let project = match project::load() {
         Ok(s) => s,
         Err(e) => {

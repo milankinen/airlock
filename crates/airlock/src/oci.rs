@@ -15,9 +15,7 @@ use oci_client::config::ConfigFile as OciConfig;
 use oci_client::secrets::RegistryAuth;
 
 use crate::cli;
-use crate::cli::CliArgs;
 use crate::project::Project;
-use crate::terminal::Terminal;
 
 /// Metadata written to `image_dir/meta.json` after a successful image pull.
 /// Hard-linked to `sandbox/image` — serves as both the GC ref (nlink > 1 means
@@ -57,11 +55,7 @@ pub struct OciImage {
 }
 
 /// Resolve, download, and prepare the OCI image for the sandbox.
-pub async fn prepare(
-    _args: &CliArgs,
-    project: &Project,
-    _terminal: &Terminal,
-) -> anyhow::Result<OciImage> {
+pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
     let stored_meta = read_sandbox_image_meta(&project.sandbox_dir);
     let image_cfg = &project.config.vm.image;
     let image_name = &image_cfg.name;

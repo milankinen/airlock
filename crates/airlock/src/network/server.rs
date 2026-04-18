@@ -45,7 +45,7 @@ impl network_proxy::Server for Network {
                     client_sink,
                     self.tls_client.clone(),
                     self.interceptor.clone(),
-                    self.event_tx.clone(),
+                    self.events.clone(),
                 );
                 results.get().init_result().set_server(sink);
             }
@@ -85,7 +85,7 @@ fn spawn_tcp_connection(
     client_sink: tcp_sink::Client,
     tls_client: Arc<rustls::ClientConfig>,
     interceptor: Rc<tls::TlsInterceptor>,
-    event_tx: Option<mpsc::Sender<airlock_tui::NetworkEvent>>,
+    events: tokio::sync::broadcast::Sender<airlock_tui::NetworkEvent>,
 ) -> tcp_sink::Client {
     let (tx, rx) = mpsc::channel::<Bytes>(1);
     let error: io::RelayError = Rc::new(RefCell::new(None));
@@ -99,7 +99,7 @@ fn spawn_tcp_connection(
             client_sink,
             &tls_client,
             &interceptor,
-            event_tx,
+            events,
         ))
         .await;
 
@@ -165,7 +165,7 @@ async fn handle_connection(
     client_sink: tcp_sink::Client,
     tls_client: &Arc<rustls::ClientConfig>,
     interceptor: &tls::TlsInterceptor,
-    event_tx: Option<mpsc::Sender<airlock_tui::NetworkEvent>>,
+    events: tokio::sync::broadcast::Sender<airlock_tui::NetworkEvent>,
 ) -> anyhow::Result<()> {
     let (is_tls, first) = tls::detect(&mut rx).await;
     let addr = format!("{}:{}", target.host, target.port);
@@ -197,7 +197,7 @@ async fn handle_connection(
     // Detect HTTP and route
     let (container, is_http) = detect_http(container).await;
     if is_http {
-        Box::pin(http::relay(container, server, target, event_tx)).await?;
+        Box::pin(http::relay(container, server, target, events)).await?;
     } else {
         Box::pin(tcp::relay(container, server)).await;
     }
