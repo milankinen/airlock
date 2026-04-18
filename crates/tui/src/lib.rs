@@ -169,6 +169,10 @@ fn tui_main(
         )?;
     }
     crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
+    // Bracketed paste: crossterm reports paste as `Event::Paste(String)`
+    // instead of dozens of individual key events (which would include the
+    // Enter between lines and execute pasted code immediately).
+    crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
 
     // Ensure terminal is restored on all exit paths. Explicit `Show` after
     // `ratatui::restore()` is required because ratatui may have issued `Hide`
@@ -185,6 +189,7 @@ fn tui_main(
         kitty_enabled,
     );
 
+    crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste)?;
     crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)?;
     if kitty_enabled {
         crossterm::execute!(
@@ -289,6 +294,7 @@ fn handle_event(
 ) -> anyhow::Result<Option<i32>> {
     match event {
         TuiEvent::Output(data) => {
+            scan_bracketed_paste_mode(&data, &mut app.guest_bracketed_paste);
             sink.write(&data);
         }
         TuiEvent::Network(ev) => {
@@ -322,9 +328,47 @@ fn handle_event(
             sink.resize(body.height, body.width);
             let _ = stdin_tx.blocking_send(TuiInputEvent::Resize(body.height, body.width));
         }
+        TuiEvent::Terminal(Event::Paste(text)) => {
+            // Only forward paste while the sandbox tab is active. Wrap in
+            // bracketed paste markers only when the guest shell asked for
+            // them (`\e[?2004h`); shells without support (BusyBox ash, dash)
+            // mis-parse the markers and silently eat surrounding bytes.
+            if app.active_tab == Tab::Sandbox {
+                let bytes = if app.guest_bracketed_paste {
+                    let mut b = Vec::with_capacity(text.len() + 12);
+                    b.extend_from_slice(b"\x1b[200~");
+                    b.extend_from_slice(text.as_bytes());
+                    b.extend_from_slice(b"\x1b[201~");
+                    b
+                } else {
+                    text.into_bytes()
+                };
+                let _ = stdin_tx.blocking_send(TuiInputEvent::Data(bytes));
+            }
+        }
         TuiEvent::Terminal(_) => {}
     }
     Ok(None)
+}
+
+/// Scan guest PTY output for the DEC private mode toggles that enable or
+/// disable bracketed paste (`\e[?2004h` / `\e[?2004l`). Used to decide
+/// whether to wrap host pastes in `\e[200~...\e[201~` before forwarding —
+/// shells that don't support it (BusyBox ash) mis-parse the markers and
+/// eat surrounding bytes.
+///
+/// Doesn't try to handle the sequence being split across chunks: the guest
+/// re-emits on every prompt redraw, so a single miss resolves itself.
+fn scan_bracketed_paste_mode(data: &[u8], enabled: &mut bool) {
+    const ENABLE: &[u8] = b"\x1b[?2004h";
+    const DISABLE: &[u8] = b"\x1b[?2004l";
+    for window in data.windows(ENABLE.len()) {
+        if window == ENABLE {
+            *enabled = true;
+        } else if window == DISABLE {
+            *enabled = false;
+        }
+    }
 }
 
 /// Handle a key event. Returns `Some(code)` if the TUI should exit.

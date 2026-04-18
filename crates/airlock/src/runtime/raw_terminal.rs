@@ -40,6 +40,13 @@ impl RawTerminalRuntime {
     /// leaves keys with well-known behavior alone, so Ctrl+C stays `0x03` for
     /// PTY line discipline. The guest app sees a distinguishable Shift+Enter
     /// without needing to negotiate the kitty protocol through the pipe.
+    ///
+    /// Bracketed paste mode is intentionally *not* forced here: the guest
+    /// shell drives it via its own `\e[?2004h` which passes straight through
+    /// to the host terminal. Shells that support bracketed paste (bash, zsh)
+    /// get wrapped pastes; those that don't (BusyBox ash) get raw bytes and
+    /// behave like any normal terminal — forcing it on would feed markers to
+    /// shells that mis-parse them.
     pub fn enter_raw_mode(&mut self) {
         if self.is_tty && self.guard.is_none() {
             let raw_mode_enabled = crossterm::terminal::enable_raw_mode().is_ok();
