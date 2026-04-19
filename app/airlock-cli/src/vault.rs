@@ -14,10 +14,14 @@
 //! - `keyring`: OS keychain / Secret Service (the pre-existing backend).
 //! - `disabled`: no-op; reads return empty, writes are dropped.
 //!
-//! `Vault::new()` delegates to a `Storage` trait object — each variant is
-//! an implementation of that trait. Switching the backend is one line
-//! in `settings.toml`; the rest of the pipeline (`${VAR}` substitution,
-//! registry credential lookup, the `secret` subcommand) is unaware.
+//! Each backend is an implementation of the `Storage` trait in its own
+//! sibling file under `vault/`. This module owns the facade: the
+//! `Vault` handle, substitution logic, the shared on-disk `Envelope`
+//! format (so a plaintext-vs-encrypted mismatch is rejected before
+//! anything writes), and the shared I/O helpers. Switching the
+//! backend is one line in `settings.toml`; the rest of the pipeline
+//! (`${VAR}` substitution, registry credential lookup, the `secret`
+//! subcommand) is unaware.
 //!
 //! ## On-disk envelope
 //!
@@ -49,6 +53,11 @@
 //! via `anyhow`. For `encrypted-file`, a wrong passphrase surfaces as
 //! a decrypt error.
 
+mod disabled;
+mod encrypted;
+mod file;
+mod keyring;
+
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -58,34 +67,26 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use anyhow::{Context, anyhow, bail};
-use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
-use chacha20poly1305::aead::{Aead, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use disabled::DisabledStorage;
+use encrypted::{EncryptedFileStorage, PassphraseSource};
+use file::FileStorage;
+use keyring::KeyringStorage;
 use parking_lot::{Mutex, MutexGuard};
-use rand::TryRngCore;
-use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 
 use crate::settings::Settings;
 
-const KEYRING_SERVICE: &str = "airlock-vault";
-const KEYRING_ACCOUNT: &str = "default";
-
-/// Env var used to supply the encrypted-vault passphrase non-interactively
-/// (CI, scripts, and headless shells without a TTY).
-const PASSPHRASE_ENV: &str = "AIRLOCK_VAULT_PASSPHRASE";
-
 // Argon2id parameters — OWASP 2023 "second recommendation": 19 MiB
 // memory, t=2, p=1. These land on the fast side of safe for an
 // interactive unlock on a laptop (~100-300 ms).
-const ARGON2_M_KIB: u32 = 19_456;
-const ARGON2_T: u32 = 2;
-const ARGON2_P: u32 = 1;
-const ARGON2_KEY_BYTES: usize = 32;
-const SALT_BYTES: usize = 16;
-const NONCE_BYTES: usize = 12;
+pub(crate) const ARGON2_M_KIB: u32 = 19_456;
+pub(crate) const ARGON2_T: u32 = 2;
+pub(crate) const ARGON2_P: u32 = 1;
+pub(crate) const ARGON2_KEY_BYTES: usize = 32;
+pub(crate) const SALT_BYTES: usize = 16;
+pub(crate) const NONCE_BYTES: usize = 12;
 
 /// One user-managed secret.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -118,7 +119,7 @@ pub struct RegistryCreds {
 }
 
 #[derive(Default, Serialize, Deserialize)]
-struct VaultData {
+pub(crate) struct VaultData {
     #[serde(default)]
     secrets: BTreeMap<String, SecretEntry>,
     #[serde(default)]
@@ -355,7 +356,7 @@ pub fn validate_secret_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── Storage trait + backends ────────────────────────────────────────────────
+// ── Storage trait + dispatcher ─────────────────────────────────────────────
 
 /// Backend that persists the vault JSON blob. Vault hands the trait a
 /// plain `VaultData` JSON string and takes the same back on load — any
@@ -377,265 +378,51 @@ fn boxed_storage(storage_type: VaultStorageType) -> Box<dyn Storage> {
             Settings::dir()
                 .unwrap_or(PathBuf::from("."))
                 .join("vault.default.enc.json"),
-            interactive_passphrase(),
+            encrypted::interactive_passphrase(),
         )),
         VaultStorageType::Keyring => Box::new(KeyringStorage),
     }
 }
 
-/// Tagged on-disk envelope for the file backends. `type` distinguishes
-/// plaintext from encrypted so we can refuse to reinterpret one as the
-/// other when the user flips the setting — better to fail loudly than
-/// to silently zero out a vault.
+// ── Shared on-disk envelope ────────────────────────────────────────────────
+//
+// Both file backends share a tagged envelope so a `settings.vault` flip
+// refuses to reinterpret one kind of file as the other rather than
+// silently zeroing a vault. Defined here (not in `encrypted.rs`) so
+// `file.rs` can match on it without a sibling-module import.
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "kebab-case")]
-enum Envelope {
+pub(crate) enum Envelope {
     File(VaultData),
     EncryptedFile(EncryptedBlob),
 }
 
 #[derive(Serialize, Deserialize)]
-struct EncryptedBlob {
-    kdf: KdfParams,
+pub(crate) struct EncryptedBlob {
+    pub(crate) kdf: KdfParams,
     /// 12-byte ChaCha20-Poly1305 nonce, base64 (unpadded).
-    nonce: String,
+    pub(crate) nonce: String,
     /// AEAD ciphertext + 16-byte tag, base64 (unpadded).
-    ciphertext: String,
+    pub(crate) ciphertext: String,
 }
 
 #[derive(Serialize, Deserialize)]
-struct KdfParams {
-    algo: String,
+pub(crate) struct KdfParams {
+    pub(crate) algo: String,
     /// 16-byte salt, base64 (unpadded).
-    salt: String,
+    pub(crate) salt: String,
     /// Memory cost (KiB).
-    m: u32,
+    pub(crate) m: u32,
     /// Time cost (iterations).
-    t: u32,
+    pub(crate) t: u32,
     /// Parallelism.
-    p: u32,
+    pub(crate) p: u32,
 }
 
-// ── File storage ────────────────────────────────────────────────────────────
+// ── File I/O helpers ───────────────────────────────────────────────────────
 
-pub struct FileStorage {
-    path: PathBuf,
-}
-
-impl FileStorage {
-    pub fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-}
-
-impl Storage for FileStorage {
-    fn load(&self) -> anyhow::Result<Option<String>> {
-        let Some(raw) = read_vault_file(&self.path)? else {
-            return Ok(None);
-        };
-        match serde_json::from_str::<Envelope>(&raw)
-            .with_context(|| format!("parse vault file {}", self.path.display()))?
-        {
-            Envelope::File(data) => Ok(Some(
-                serde_json::to_string(&data).context("re-serialize vault data")?,
-            )),
-            Envelope::EncryptedFile(_) => bail!(
-                "{} is an encrypted vault, but settings.vault = \"file\". \
-                 Set settings.vault = \"encrypted-file\" (or delete the file to start fresh).",
-                self.path.display()
-            ),
-        }
-    }
-
-    fn store(&self, data: &str) -> anyhow::Result<()> {
-        let parsed: VaultData = serde_json::from_str(data).context("parse vault data")?;
-        let envelope = Envelope::File(parsed);
-        let json = serde_json::to_string_pretty(&envelope).context("serialize vault envelope")?;
-        atomic_write(&self.path, json.as_bytes())
-    }
-}
-
-// ── Encrypted-file storage ─────────────────────────────────────────────────
-
-/// Supplies the passphrase for an `EncryptedFileStorage`. Abstracted so
-/// tests can inject a fixed value without a TTY or env-var round-trip.
-pub trait PassphraseSource: Send + Sync + 'static {
-    /// Ask for the passphrase of an existing vault.
-    fn unlock(&self) -> anyhow::Result<String>;
-    /// Ask for a new passphrase when the vault is being created.
-    fn create(&self) -> anyhow::Result<String>;
-}
-
-pub struct EncryptedFileStorage {
-    path: PathBuf,
-    passphrase: Box<dyn PassphraseSource>,
-    /// Cached key, derived on first unlock/create and reused on
-    /// subsequent operations so the user only prompts once per process.
-    key: Mutex<Option<[u8; ARGON2_KEY_BYTES]>>,
-    /// Cached salt for an existing vault — reused so the derived key
-    /// stays stable across reads in one process. `None` until the
-    /// first successful load, or until a fresh vault is created.
-    salt: Mutex<Option<[u8; SALT_BYTES]>>,
-}
-
-impl EncryptedFileStorage {
-    pub fn new(path: PathBuf, passphrase: Box<dyn PassphraseSource>) -> Self {
-        Self {
-            path,
-            passphrase,
-            key: Mutex::new(None),
-            salt: Mutex::new(None),
-        }
-    }
-
-    fn derive_key(passphrase: &str, salt: &[u8]) -> anyhow::Result<[u8; ARGON2_KEY_BYTES]> {
-        let params = Params::new(ARGON2_M_KIB, ARGON2_T, ARGON2_P, Some(ARGON2_KEY_BYTES))
-            .map_err(|e| anyhow!("invalid argon2 params: {e}"))?;
-        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-        let mut out = [0u8; ARGON2_KEY_BYTES];
-        argon2
-            .hash_password_into(passphrase.as_bytes(), salt, &mut out)
-            .map_err(|e| anyhow!("argon2id kdf failed: {e}"))?;
-        Ok(out)
-    }
-}
-
-impl Storage for EncryptedFileStorage {
-    fn load(&self) -> anyhow::Result<Option<String>> {
-        let Some(raw) = read_vault_file(&self.path)? else {
-            return Ok(None);
-        };
-        let envelope: Envelope = serde_json::from_str(&raw)
-            .with_context(|| format!("parse vault file {}", self.path.display()))?;
-        let blob = match envelope {
-            Envelope::EncryptedFile(b) => b,
-            Envelope::File(_) => bail!(
-                "{} is a plaintext vault, but settings.vault = \"encrypted-file\". \
-                 Set settings.vault = \"file\" (or delete the file to re-create encrypted).",
-                self.path.display()
-            ),
-        };
-
-        if blob.kdf.algo != "argon2id" {
-            bail!("unsupported vault KDF algo: {}", blob.kdf.algo);
-        }
-        let salt = decode_b64_array::<SALT_BYTES>(&blob.kdf.salt, "salt")?;
-        let nonce = decode_b64_array::<NONCE_BYTES>(&blob.nonce, "nonce")?;
-        let ciphertext = STANDARD_NO_PAD
-            .decode(&blob.ciphertext)
-            .context("decode vault ciphertext")?;
-
-        let passphrase = self.passphrase.unlock()?;
-        let key = Self::derive_key(&passphrase, &salt)?;
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
-        let plaintext = cipher
-            .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
-            .map_err(|_| anyhow!("decrypt vault: wrong passphrase or corrupt data"))?;
-
-        *self.key.lock() = Some(key);
-        *self.salt.lock() = Some(salt);
-
-        Ok(Some(
-            String::from_utf8(plaintext).context("decrypted vault is not valid UTF-8")?,
-        ))
-    }
-
-    fn store(&self, data: &str) -> anyhow::Result<()> {
-        // Reuse the salt (and therefore the derived key) across saves
-        // in the same process. On a brand-new vault there is no cached
-        // salt yet — mint one and prompt for a new passphrase.
-        let (salt, key) = {
-            let mut salt_slot = self.salt.lock();
-            let mut key_slot = self.key.lock();
-            if let (Some(s), Some(k)) = (*salt_slot, *key_slot) {
-                (s, k)
-            } else {
-                let mut salt = [0u8; SALT_BYTES];
-                OsRng
-                    .try_fill_bytes(&mut salt)
-                    .context("generate vault salt")?;
-                let passphrase = self.passphrase.create()?;
-                let key = Self::derive_key(&passphrase, &salt)?;
-                *salt_slot = Some(salt);
-                *key_slot = Some(key);
-                (salt, key)
-            }
-        };
-
-        let mut nonce = [0u8; NONCE_BYTES];
-        OsRng
-            .try_fill_bytes(&mut nonce)
-            .context("generate vault nonce")?;
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
-        let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce), data.as_bytes())
-            .map_err(|e| anyhow!("encrypt vault: {e}"))?;
-
-        let envelope = Envelope::EncryptedFile(EncryptedBlob {
-            kdf: KdfParams {
-                algo: "argon2id".to_string(),
-                salt: STANDARD_NO_PAD.encode(salt),
-                m: ARGON2_M_KIB,
-                t: ARGON2_T,
-                p: ARGON2_P,
-            },
-            nonce: STANDARD_NO_PAD.encode(nonce),
-            ciphertext: STANDARD_NO_PAD.encode(&ciphertext),
-        });
-        let json =
-            serde_json::to_string_pretty(&envelope).context("serialize encrypted envelope")?;
-        atomic_write(&self.path, json.as_bytes())
-    }
-}
-
-fn decode_b64_array<const N: usize>(s: &str, label: &str) -> anyhow::Result<[u8; N]> {
-    let bytes = STANDARD_NO_PAD
-        .decode(s)
-        .with_context(|| format!("decode vault {label}"))?;
-    <[u8; N]>::try_from(bytes.as_slice())
-        .map_err(|_| anyhow!("vault {label} has wrong length: expected {N} bytes"))
-}
-
-// ── Keyring storage ─────────────────────────────────────────────────────────
-
-pub struct KeyringStorage;
-
-impl Storage for KeyringStorage {
-    fn load(&self) -> anyhow::Result<Option<String>> {
-        match keyring_entry()?.get_password() {
-            Ok(s) => Ok(Some(s)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(anyhow!("read airlock vault from keyring: {e}")),
-        }
-    }
-
-    fn store(&self, data: &str) -> anyhow::Result<()> {
-        keyring_entry()?
-            .set_password(data)
-            .context("write airlock vault to keyring")
-    }
-}
-
-fn keyring_entry() -> anyhow::Result<keyring::Entry> {
-    keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).context("construct airlock keyring entry")
-}
-
-// ── Disabled storage ────────────────────────────────────────────────────────
-
-pub struct DisabledStorage;
-
-impl Storage for DisabledStorage {
-    fn load(&self) -> anyhow::Result<Option<String>> {
-        Ok(None)
-    }
-    fn store(&self, _: &str) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
-// ── File I/O helpers ────────────────────────────────────────────────────────
-
-fn read_vault_file(path: &Path) -> anyhow::Result<Option<String>> {
+pub(crate) fn read_vault_file(path: &Path) -> anyhow::Result<Option<String>> {
     match std::fs::read_to_string(path) {
         Ok(s) => Ok(Some(s)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -646,7 +433,7 @@ fn read_vault_file(path: &Path) -> anyhow::Result<Option<String>> {
 /// Write `bytes` to `path` atomically and with mode 0600. Goes via a
 /// sibling tempfile + rename so a crash mid-write can't leave the
 /// vault truncated. The parent directory is created if missing.
-fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create vault directory {}", parent.display()))?;
@@ -674,80 +461,15 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── Interactive passphrase source ──────────────────────────────────────────
-
-/// Production passphrase source: checks `AIRLOCK_VAULT_PASSPHRASE`
-/// first (covers CI / non-interactive runs), then falls back to a
-/// suppressed-echo terminal prompt. On successful input the prompt
-/// line is erased so the terminal stays clean.
-pub struct InteractivePassphrase;
-
-fn interactive_passphrase() -> Box<dyn PassphraseSource> {
-    Box::new(InteractivePassphrase)
+pub(crate) fn decode_b64_array<const N: usize>(s: &str, label: &str) -> anyhow::Result<[u8; N]> {
+    let bytes = STANDARD_NO_PAD
+        .decode(s)
+        .with_context(|| format!("decode vault {label}"))?;
+    <[u8; N]>::try_from(bytes.as_slice())
+        .map_err(|_| anyhow!("vault {label} has wrong length: expected {N} bytes"))
 }
 
-impl PassphraseSource for InteractivePassphrase {
-    fn unlock(&self) -> anyhow::Result<String> {
-        if let Ok(p) = std::env::var(PASSPHRASE_ENV) {
-            return Ok(p);
-        }
-        prompt_once("Vault passphrase")
-    }
-
-    fn create(&self) -> anyhow::Result<String> {
-        if let Ok(p) = std::env::var(PASSPHRASE_ENV) {
-            if p.is_empty() {
-                bail!("{PASSPHRASE_ENV} is empty");
-            }
-            return Ok(p);
-        }
-        prompt_create()
-    }
-}
-
-fn prompt_once(label: &str) -> anyhow::Result<String> {
-    if !crate::cli::is_interactive() {
-        bail!(
-            "no TTY available to prompt for the vault passphrase — set {PASSPHRASE_ENV} \
-             or run from an interactive terminal"
-        );
-    }
-    let term = console::Term::stderr();
-    let pass = dialoguer::Password::with_theme(&dialoguer::theme::ColorfulTheme::default())
-        .with_prompt(label)
-        .report(false)
-        .interact_on(&term)
-        .context("read vault passphrase")?;
-    // Erase the prompt line so the terminal stays clean.
-    let _ = term.clear_last_lines(1);
-    if pass.is_empty() {
-        bail!("vault passphrase must not be empty");
-    }
-    Ok(pass)
-}
-
-fn prompt_create() -> anyhow::Result<String> {
-    if !crate::cli::is_interactive() {
-        bail!(
-            "no TTY available to set a new vault passphrase — set {PASSPHRASE_ENV} \
-             or run from an interactive terminal"
-        );
-    }
-    let term = console::Term::stderr();
-    let pass = dialoguer::Password::with_theme(&dialoguer::theme::ColorfulTheme::default())
-        .with_prompt("New vault passphrase")
-        .with_confirmation("Confirm passphrase", "Passphrases do not match")
-        .report(false)
-        .interact_on(&term)
-        .context("read vault passphrase")?;
-    let _ = term.clear_last_lines(2);
-    if pass.is_empty() {
-        bail!("vault passphrase must not be empty");
-    }
-    Ok(pass)
-}
-
-// ── Tests ───────────────────────────────────────────────────────────────────
+// ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
