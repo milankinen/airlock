@@ -54,9 +54,9 @@ Two variants are available on the [GitHub releases](https://github.com/milankine
 
 * **Bundled** (default, installed by `install.sh`) — includes an
   airlock-compatible Linux VM (kernel and initramfs). The bundled VM component
-  is **GPLv2**; the airlock binary itself remains **MIT OR Apache-2.0**.
+  is GPLv2; the airlock binary itself remains MIT OR Apache-2.0.
 * **Distroless** (`install.sh --distroless`) — does not bundle any kernel or
-  initramfs. Licensed entirely under **MIT OR Apache-2.0**.
+  initramfs. Licensed entirely under MIT OR Apache-2.0.
 
 When using the distroless build, you must supply your own kernel and initramfs
 with the capabilities required by the `airlockd` supervisor.
