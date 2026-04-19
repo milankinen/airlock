@@ -233,8 +233,7 @@ fn build_oci_image(image_dir: &Path, digest: String) -> anyhow::Result<OciImage>
 
     let cfg = image_config.config.as_ref();
     let (uid, gid) = parse_user(cfg.and_then(|c| c.user.as_deref()).unwrap_or("0:0"));
-    let rootfs = image_dir.join("rootfs");
-    let container_home = lookup_home_dir(&rootfs, uid)?;
+    let container_home = lookup_home_dir(&meta.layers, uid)?;
 
     // Resolve container command: entrypoint + cmd merged
     let cmd: Vec<String> = {
@@ -664,18 +663,28 @@ fn format_size(bytes: i64) -> String {
     }
 }
 
-/// Look up a user's home directory from the container rootfs /etc/passwd.
-fn lookup_home_dir(rootfs: &Path, uid: u32) -> anyhow::Result<String> {
-    let passwd_path = rootfs.join("etc/passwd");
-    let content = std::fs::read_to_string(&passwd_path)
-        .map_err(|e| anyhow::anyhow!("cannot read container /etc/passwd: {e}"))?;
-
-    for line in content.lines() {
-        let fields: Vec<&str> = line.split(':').collect();
-        if fields.len() >= 6 && fields[2].parse::<u32>().ok() == Some(uid) {
-            return Ok(fields[5].to_string());
+/// Look up a user's home directory by walking `/etc/passwd` in the per-layer
+/// cache, topmost first. The first layer with a matching uid wins.
+///
+/// Reads from individual layer trees under `~/.cache/airlock/oci/layers/` —
+/// the host no longer needs a merged `images/<d>/rootfs/` for this lookup.
+/// Whiteouts manifest as empty files (which parse to zero matches and fall
+/// through to the next layer); this is coarser than real overlayfs semantics
+/// but is a safe superset for the common case of images that never delete
+/// `/etc/passwd` in an upper layer.
+fn lookup_home_dir(layer_digests: &[String], uid: u32) -> anyhow::Result<String> {
+    for digest in layer_digests {
+        let passwd_path = crate::cache::layer_dir(digest)?.join("rootfs/etc/passwd");
+        let Ok(content) = std::fs::read_to_string(&passwd_path) else {
+            continue;
+        };
+        for line in content.lines() {
+            let fields: Vec<&str> = line.split(':').collect();
+            if fields.len() >= 6 && fields[2].parse::<u32>().ok() == Some(uid) {
+                return Ok(fields[5].to_string());
+            }
         }
     }
 
-    anyhow::bail!("no home directory found for uid {uid} in container /etc/passwd")
+    anyhow::bail!("no home directory found for uid {uid} in any layer /etc/passwd")
 }
