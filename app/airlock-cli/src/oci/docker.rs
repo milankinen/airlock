@@ -1,12 +1,15 @@
-//! Docker-daemon image export: check if an image exists locally and extract
-//! it via `docker image save` without pulling from a registry.
+//! Docker-daemon image export: check if an image exists locally and
+//! stream-split its `docker image save` output into per-layer tarballs
+//! staged under the shared layer cache.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 
 use super::OciConfig;
+use crate::cache;
 
 /// Docker save manifest.json entry (Docker-specific, not OCI standard)
 #[derive(serde::Deserialize)]
@@ -15,6 +18,17 @@ struct DockerManifestEntry {
     config: String,
     #[serde(rename = "Layers")]
     layers: Vec<String>,
+}
+
+/// Output of [`save_layer_tarballs`]: parsed image config plus the ordered
+/// layer digests (bottom-up, as `docker save` reports them).
+pub struct DockerSave {
+    /// Parsed image config (entrypoint, cmd, env, user).
+    pub image_config: OciConfig,
+    /// Raw config bytes, to be persisted to `image_config.json`.
+    pub image_config_bytes: Vec<u8>,
+    /// Layer digests in manifest order (bottom-up), with the `sha256:` prefix.
+    pub layer_digests: Vec<String>,
 }
 
 /// Check if an image exists in the local Docker daemon.
@@ -65,22 +79,25 @@ pub fn image_arch(image_id: &str) -> Option<String> {
     if arch.is_empty() { None } else { Some(arch) }
 }
 
-/// Extract an image from the local Docker daemon into a rootfs directory,
-/// and return the parsed image config.
+/// Stream `docker image save` and split its blobs into per-layer tarballs
+/// staged under `~/.cache/airlock/oci/layers/`.
 ///
-/// Streams `docker image save` output, writing blobs to temporary files
-/// to avoid loading entire layers into memory. Then unpacks layers from
-/// the files in order.
-pub fn save_and_extract(
-    image_ref: &str,
-    rootfs: &Path,
-    image_config_dest: &Path,
-) -> anyhow::Result<OciConfig> {
-    std::fs::create_dir_all(rootfs)?;
-
-    let blob_dir = image_config_dest
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("invalid image config path"))?;
+/// Every `blobs/sha256/<hex>` entry goes to `<hex>.download.tmp`. Once
+/// `manifest.json` has been parsed we know which blob is the config and
+/// which are layers:
+///
+/// - Config blob → read into memory, returned in [`DockerSave`], and the
+///   staging file is deleted.
+/// - Layer blob (already cached, i.e. `<digest>/.ok` exists) → staging file
+///   deleted.
+/// - Layer blob (not cached) → renamed to `<hex>.download`, ready for
+///   `layer::ensure_layer_cached` to extract.
+///
+/// Any blob that's neither the config nor a manifest-listed layer is
+/// dropped as unused. On any error, all staging files created by this
+/// call are cleaned up before returning.
+pub fn save_layer_tarballs(image_ref: &str) -> anyhow::Result<DockerSave> {
+    let layers_root = cache::layers_root()?;
 
     let child = Command::new("docker")
         .args(["image", "save", image_ref])
@@ -92,62 +109,95 @@ pub fn save_and_extract(
     let mut archive = tar::Archive::new(stdout);
 
     let mut manifest_json: Option<Vec<DockerManifestEntry>> = None;
+    // hex → .download.tmp path, so we can rename or delete after parsing
+    // the manifest. A HashMap because docker save may emit the same blob
+    // multiple times across image tags.
+    let mut staged: HashMap<String, PathBuf> = HashMap::new();
 
-    // Stream through the tar, writing blobs to disk
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.to_string_lossy().to_string();
+    let result = (|| -> anyhow::Result<DockerSave> {
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            let path = entry.path()?.to_string_lossy().to_string();
 
-        if path == "manifest.json" {
-            let mut buf = Vec::new();
-            entry.read_to_end(&mut buf)?;
-            manifest_json = Some(serde_json::from_slice(&buf)?);
-        } else if path.starts_with("blobs/") && entry.header().entry_type().is_file() {
-            let dest = blob_dir.join(&path);
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)?;
+            if path == "manifest.json" {
+                let mut buf = Vec::new();
+                entry.read_to_end(&mut buf)?;
+                manifest_json = Some(serde_json::from_slice(&buf)?);
+                continue;
             }
-            let mut file = File::create(&dest)?;
+            let Some(hex) = path.strip_prefix("blobs/sha256/") else {
+                continue;
+            };
+            if !entry.header().entry_type().is_file() {
+                continue;
+            }
+            if staged.contains_key(hex) {
+                // Same blob emitted twice — drain and ignore the duplicate.
+                std::io::copy(&mut entry, &mut std::io::sink())?;
+                continue;
+            }
+            let tmp = layers_root.join(format!("{hex}.download.tmp"));
+            let mut file = File::create(&tmp)?;
             std::io::copy(&mut entry, &mut file)?;
+            staged.insert(hex.to_string(), tmp);
         }
+
+        let manifest = manifest_json
+            .and_then(|m| m.into_iter().next())
+            .ok_or_else(|| anyhow::anyhow!("no manifest.json in docker save output"))?;
+
+        let config_hex = manifest
+            .config
+            .strip_prefix("blobs/sha256/")
+            .unwrap_or(&manifest.config)
+            .to_string();
+        let config_tmp = staged
+            .remove(&config_hex)
+            .ok_or_else(|| anyhow::anyhow!("config blob {config_hex} missing in docker save"))?;
+        let image_config_bytes = std::fs::read(&config_tmp)?;
+        let _ = std::fs::remove_file(&config_tmp);
+        let image_config: OciConfig = serde_json::from_slice(&image_config_bytes)?;
+
+        // Rename needed layers into place; drop cached or duplicate blobs.
+        let mut layer_digests = Vec::with_capacity(manifest.layers.len());
+        let mut seen: HashSet<String> = HashSet::new();
+        for layer_ref in &manifest.layers {
+            let hex = layer_ref
+                .strip_prefix("blobs/sha256/")
+                .unwrap_or(layer_ref)
+                .to_string();
+            let digest = format!("sha256:{hex}");
+            layer_digests.push(digest.clone());
+            if !seen.insert(hex.clone()) {
+                continue;
+            }
+            let Some(tmp) = staged.remove(&hex) else {
+                // Previous iteration already renamed (duplicate layer in
+                // manifest) — nothing to do.
+                continue;
+            };
+            let layer_cached = cache::layer_dir(&digest)
+                .map(|d| d.join(".ok").exists())
+                .unwrap_or(false);
+            if layer_cached {
+                let _ = std::fs::remove_file(&tmp);
+            } else {
+                let download = layers_root.join(format!("{hex}.download"));
+                std::fs::rename(&tmp, &download)?;
+            }
+        }
+
+        Ok(DockerSave {
+            image_config,
+            image_config_bytes,
+            layer_digests,
+        })
+    })();
+
+    // Clean up any staging files still on disk (error paths, unused blobs).
+    for (_, tmp) in staged {
+        let _ = std::fs::remove_file(&tmp);
     }
 
-    let manifest = manifest_json
-        .and_then(|m| m.into_iter().next())
-        .ok_or_else(|| anyhow::anyhow!("no manifest.json in docker save output"))?;
-
-    // Parse the config blob
-    let config_path = blob_dir.join(&manifest.config);
-    let config_bytes = std::fs::read(&config_path)?;
-    let image_config: OciConfig = serde_json::from_slice(&config_bytes)?;
-    std::fs::write(image_config_dest, &config_bytes)?;
-
-    // Extract layers in order from disk files
-    for layer_ref in &manifest.layers {
-        let layer_path = blob_dir.join(layer_ref);
-        let file = File::open(&layer_path)?;
-
-        // Layer blobs may be gzip-compressed or plain tar — peek at magic bytes
-        let mut buf_reader = std::io::BufReader::new(file);
-        let mut magic = [0u8; 2];
-        let n = buf_reader.read(&mut magic)?;
-
-        let reader: Box<dyn Read> = if n == 2 && magic == [0x1f, 0x8b] {
-            Box::new(flate2::read::GzDecoder::new(
-                std::io::Cursor::new(magic).chain(buf_reader),
-            ))
-        } else {
-            Box::new(std::io::Cursor::new(magic[..n].to_vec()).chain(buf_reader))
-        };
-
-        let mut layer_archive = tar::Archive::new(reader);
-        layer_archive.set_preserve_permissions(true);
-        layer_archive.set_overwrite(true);
-        layer_archive.unpack(rootfs)?;
-    }
-
-    // Clean up blob files (rootfs is already extracted)
-    let _ = std::fs::remove_dir_all(blob_dir.join("blobs"));
-
-    Ok(image_config)
+    result
 }

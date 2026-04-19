@@ -71,14 +71,15 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
     let image_name = &image_cfg.name;
 
     // Fast path: if we already have a cached image for this name, skip
-    // the network round-trip to resolve tag → digest.
+    // the network round-trip to resolve tag → digest. The image is
+    // considered ready when `meta.json` exists and every listed layer
+    // has its `.ok` marker — there's no merged rootfs to check anymore.
     if let Some(ref meta) = stored_meta
         && meta.name == *image_name
         && !meta.layers.is_empty()
     {
         let image_dir = crate::cache::image_dir(&meta.digest)?;
-        if image_dir.join("rootfs").exists()
-            && image_dir.join("meta.json").exists()
+        if image_dir.join("meta.json").exists()
             && meta.layers.iter().all(|d| {
                 crate::cache::layer_dir(d)
                     .map(|p| p.join(".ok").exists())
@@ -146,8 +147,7 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
                 // Only keep old if the cache is still intact; otherwise
                 // fall through and let the new image be used.
                 let old_image_dir = crate::cache::image_dir(old_digest.trim())?;
-                if old_image_dir.join("rootfs").exists() && old_image_dir.join("meta.json").exists()
-                {
+                if old_image_dir.join("meta.json").exists() {
                     digest_changed = false;
                     image.digest = old_digest.trim().to_string();
                 }
@@ -414,8 +414,13 @@ enum ImageSource {
     Registry(Box<registry::RegistryImage>),
 }
 
-/// Ensure the image is fully downloaded and extracted in the cache.
-/// Re-downloads if the extraction was incomplete.
+/// Ensure every layer is cached under `~/.cache/airlock/oci/layers/` and
+/// persist the image's `meta.json` + `image_config.json`.
+///
+/// There is no merged `rootfs/` on the host anymore — the guest composes
+/// overlayfs straight from the per-layer cache. Both registry and docker
+/// paths converge on the same per-layer staging pipeline (see
+/// [`layer::ensure_layer_cached`]).
 async fn ensure_image(
     resolved: &mut ResolvedImage,
     image_name: &str,
@@ -423,233 +428,224 @@ async fn ensure_image(
     insecure: bool,
 ) -> anyhow::Result<PathBuf> {
     let dir = crate::cache::image_dir(&resolved.digest)?;
-    let rootfs = dir.join("rootfs");
     let meta_path = dir.join("meta.json");
-
-    if rootfs.exists() && meta_path.exists() {
-        if matches!(resolved.source, ImageSource::Docker { .. }) {
-            let config_path = dir.join("image_config.json");
-            if config_path.exists() {
-                let data = std::fs::read(&config_path)?;
-                resolved.config = serde_json::from_slice(&data)?;
-            }
-        }
-        return Ok(dir);
-    }
-
-    // Migration: old cache has .complete but no meta.json — write meta.json and continue.
-    let complete_marker = dir.join(".complete");
-    if rootfs.exists() && complete_marker.exists() {
-        let meta = ImageMeta {
-            digest: resolved.digest.clone(),
-            name: image_name.to_string(),
-            layers: Vec::new(),
-        };
-        std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
-        let _ = std::fs::remove_file(&complete_marker);
-        if matches!(resolved.source, ImageSource::Docker { .. }) {
-            let config_path = dir.join("image_config.json");
-            if config_path.exists() {
-                let data = std::fs::read(&config_path)?;
-                resolved.config = serde_json::from_slice(&data).unwrap_or_default();
-            }
-        }
-        return Ok(dir);
-    }
-
-    // Incomplete or corrupt image — clean up and re-extract
-    if rootfs.exists() {
-        tracing::debug!("image extraction incomplete, cleaning up");
-        let _ = std::fs::remove_dir_all(&rootfs);
-        let _ = std::fs::remove_file(&meta_path);
-        let _ = std::fs::remove_file(&complete_marker);
-    }
-
     std::fs::create_dir_all(&dir)?;
 
-    // Clean up any .tmp files from interrupted downloads
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            if entry.path().extension().is_some_and(|ext| ext == "tmp") {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
-
-    match &resolved.source {
+    let ordered_layers = match &resolved.source {
         ImageSource::Docker { image_ref } => {
-            let sp = cli::spinner("exporting from docker...");
-            resolved.config =
-                docker::save_and_extract(image_ref, &rootfs, &dir.join("image_config.json"))?;
-
-            // Docker save gives a merged rootfs, not individual layers. Mirror
-            // it into the layer cache as a single synthetic layer keyed by the
-            // image digest, so the guest can compose overlayfs the same way
-            // as the registry path. Hardlink-copy to avoid doubling disk use.
-            mirror_merged_rootfs_into_layer_cache(&rootfs, &resolved.digest)?;
-
-            let meta = ImageMeta {
-                digest: resolved.digest.clone(),
-                name: image_name.to_string(),
-                layers: vec![crate::cache::digest_name(&resolved.digest).to_string()],
-            };
-            std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
-            sp.finish_and_clear();
-            cli::log!("  {} exported from docker", cli::check());
+            let image_ref = image_ref.clone();
+            let (cfg, layers) = ensure_docker_image(&image_ref, &dir)?;
+            resolved.config = cfg;
+            layers
         }
         ImageSource::Registry(reg) => {
-            let layers = &reg.manifest.layers;
-
-            let layer_paths: Vec<PathBuf> = (0..layers.len())
-                .map(|i| dir.join(format!("layer_{i}.tar.gz")))
-                .collect();
-
-            let to_download: Vec<usize> = layers
-                .iter()
-                .enumerate()
-                .filter(|(i, l)| !registry::is_layer_valid(l, &layer_paths[*i]))
-                .map(|(i, _)| i)
-                .collect();
-            let cached_count = layers.len() - to_download.len();
-            if cached_count > 0 {
-                cli::log!(
-                    "  {} {} of {} layers found from cache",
-                    cli::check(),
-                    cached_count,
-                    layers.len()
-                );
-            }
-
-            if !to_download.is_empty() {
-                let mp = cli::multi_progress();
-                let reference = &reg.reference;
-                let mp_ref = &mp;
-                let layer_paths_ref = &layer_paths;
-
-                let download = async {
-                    let mut stream = stream::iter(to_download.iter().copied())
-                        .map(|i| async move {
-                            let layer_desc = &layers[i];
-                            let layer_path = &layer_paths_ref[i];
-                            let _ = std::fs::remove_file(layer_path);
-                            let label = format!("layer {:>2}", i + 1);
-                            let per_layer =
-                                cli::layer_progress_bar(mp_ref, layer_desc.size as u64, &label);
-                            let result = registry::pull_layer(
-                                reference,
-                                layer_desc,
-                                layer_path,
-                                Some(&per_layer),
-                                None,
-                                auth,
-                                insecure,
-                            )
-                            .await;
-                            per_layer.finish_and_clear();
-                            mp_ref.remove(&per_layer);
-                            result
-                        })
-                        .buffer_unordered(3);
-
-                    while let Some(res) = stream.next().await {
-                        res?;
-                    }
-                    Ok::<(), anyhow::Error>(())
-                };
-
-                tokio::select! {
-                    res = download => { res?; }
-                    () = cli::interrupted() => {
-                        let _ = mp.clear();
-                        anyhow::bail!("interrupted");
-                    }
-                }
-                let _ = mp.clear();
-
-                let downloaded_bytes: u64 =
-                    to_download.iter().map(|i| layers[*i].size as u64).sum();
-                cli::log!(
-                    "  {} downloaded {}",
-                    cli::check(),
-                    cli::dim(&format!(
-                        "{} layers, {}",
-                        to_download.len(),
-                        format_size(downloaded_bytes as i64)
-                    ))
-                );
-            }
-
-            let sp = cli::spinner("extracting layers...");
-            let layer_refs: Vec<&Path> = layer_paths.iter().map(PathBuf::as_path).collect();
-            layer::extract_layers(&layer_refs, &rootfs)?;
-
-            // Also populate the per-layer cache so future images that share
-            // a layer can skip re-downloading and re-extracting. Runs in
-            // parallel (bounded by CPU count) via spawn_blocking.
-            let cpu = std::thread::available_parallelism()
-                .map(std::num::NonZeroUsize::get)
-                .unwrap_or(4);
-            let extract_jobs: Vec<(String, PathBuf)> = layers
-                .iter()
-                .zip(layer_paths.iter())
-                .map(|(l, p)| (l.digest.clone(), p.clone()))
-                .collect();
-            let mut stream = stream::iter(extract_jobs)
-                .map(|(digest, path)| {
-                    tokio::task::spawn_blocking(move || layer::extract_layer_cached(&digest, &path))
-                })
-                .buffer_unordered(cpu);
-            while let Some(res) = stream.next().await {
-                res??;
-            }
-            drop(stream);
-
-            sp.finish_and_clear();
-            cli::log!("  {} extracted layers", cli::check());
-
-            let config_json = serde_json::to_string_pretty(&resolved.config)?;
-            std::fs::write(dir.join("image_config.json"), config_json)?;
-            // OCI manifests list layers bottom→top. overlayfs wants the topmost
-            // layer first in `lowerdir=`, so reverse when persisting.
-            let mut layer_digests: Vec<String> = layers
-                .iter()
-                .map(|l| crate::cache::digest_name(&l.digest).to_string())
-                .collect();
-            layer_digests.reverse();
-            let meta = ImageMeta {
-                digest: resolved.digest.clone(),
-                name: image_name.to_string(),
-                layers: layer_digests,
-            };
-            std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
+            ensure_registry_image(reg, resolved, &dir, auth, insecure).await?
         }
-    }
+    };
+
+    let meta = ImageMeta {
+        digest: resolved.digest.clone(),
+        name: image_name.to_string(),
+        layers: ordered_layers,
+    };
+    std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
 
     Ok(dir)
 }
 
-/// Mirror a merged rootfs tree into the per-layer cache as a single synthetic
-/// layer, hardlinking regular files to avoid doubling disk use. Idempotent via
-/// the `.ok` marker in the layer dir.
-fn mirror_merged_rootfs_into_layer_cache(rootfs: &Path, digest: &str) -> anyhow::Result<()> {
-    let layer_root = crate::cache::layer_dir(digest)?;
-    let marker = layer_root.join(".ok");
-    let layer_rootfs = layer_root.join("rootfs");
-    if marker.exists() && layer_rootfs.is_dir() {
+/// Stream `docker image save` and extract each referenced layer through the
+/// shared per-layer cache. Returns the parsed image config plus layer
+/// digests in topmost-first order.
+fn ensure_docker_image(
+    image_ref: &str,
+    image_dir: &Path,
+) -> anyhow::Result<(OciConfig, Vec<String>)> {
+    let sp = cli::spinner("exporting from docker...");
+    let save = docker::save_layer_tarballs(image_ref)?;
+    std::fs::write(
+        image_dir.join("image_config.json"),
+        &save.image_config_bytes,
+    )?;
+
+    for digest in &save.layer_digests {
+        layer::ensure_layer_cached(digest, |_tmp| {
+            anyhow::bail!(
+                "docker save stream did not include blob for layer {digest} \
+                 (manifest referenced a layer that was not in the export)"
+            )
+        })?;
+    }
+
+    sp.finish_and_clear();
+    cli::log!("  {} exported from docker", cli::check());
+
+    // Docker save manifests are bottom-up; overlayfs wants topmost first.
+    let mut ordered: Vec<String> = save
+        .layer_digests
+        .iter()
+        .map(|d| crate::cache::digest_name(d).to_string())
+        .collect();
+    ordered.reverse();
+    Ok((save.image_config, ordered))
+}
+
+/// Pull-and-extract for registry-sourced images. Layer downloads run
+/// concurrently (bounded); each layer is streamed to its
+/// `<digest>.download.tmp` path and extracted through the shared per-layer
+/// cache. Returns layer digests in topmost-first order.
+async fn ensure_registry_image(
+    reg: &registry::RegistryImage,
+    resolved: &ResolvedImage,
+    image_dir: &Path,
+    auth: &RegistryAuth,
+    insecure: bool,
+) -> anyhow::Result<Vec<String>> {
+    let layers = &reg.manifest.layers;
+
+    let cached_count = layers
+        .iter()
+        .filter(|l| {
+            crate::cache::layer_dir(&l.digest)
+                .map(|p| p.join(".ok").exists())
+                .unwrap_or(false)
+        })
+        .count();
+    if cached_count > 0 {
+        cli::log!(
+            "  {} {} of {} layers found from cache",
+            cli::check(),
+            cached_count,
+            layers.len()
+        );
+    }
+
+    let to_fetch: Vec<usize> = layers
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| {
+            !crate::cache::layer_dir(&l.digest)
+                .map(|p| p.join(".ok").exists())
+                .unwrap_or(false)
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    if !to_fetch.is_empty() {
+        let mp = cli::multi_progress();
+        let reference = &reg.reference;
+        let mp_ref = &mp;
+
+        let fetch = async {
+            let mut stream = stream::iter(to_fetch.iter().copied())
+                .map(|i| async move {
+                    let layer_desc = &layers[i];
+                    let label = format!("layer {:>2}", i + 1);
+                    let per_layer = cli::layer_progress_bar(mp_ref, layer_desc.size as u64, &label);
+                    let result =
+                        fetch_and_extract_layer(reference, layer_desc, &per_layer, auth, insecure)
+                            .await;
+                    per_layer.finish_and_clear();
+                    mp_ref.remove(&per_layer);
+                    result
+                })
+                .buffer_unordered(3);
+
+            while let Some(res) = stream.next().await {
+                res?;
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+
+        tokio::select! {
+            res = fetch => { res?; }
+            () = cli::interrupted() => {
+                let _ = mp.clear();
+                anyhow::bail!("interrupted");
+            }
+        }
+        let _ = mp.clear();
+
+        let downloaded_bytes: u64 = to_fetch.iter().map(|i| layers[*i].size as u64).sum();
+        cli::log!(
+            "  {} downloaded {}",
+            cli::check(),
+            cli::dim(&format!(
+                "{} layers, {}",
+                to_fetch.len(),
+                format_size(downloaded_bytes as i64)
+            ))
+        );
+    }
+
+    let config_json = serde_json::to_string_pretty(&resolved.config)?;
+    std::fs::write(image_dir.join("image_config.json"), config_json)?;
+
+    // OCI manifests list layers bottom→top; overlayfs wants topmost first.
+    let mut ordered: Vec<String> = layers
+        .iter()
+        .map(|l| crate::cache::digest_name(&l.digest).to_string())
+        .collect();
+    ordered.reverse();
+    Ok(ordered)
+}
+
+/// Download one layer blob into `<digest>.download.tmp` and extract it
+/// through the shared per-layer cache. `ensure_layer_cached` is a no-op
+/// when `.ok` already exists, so the `to_fetch` filter in the caller is
+/// a latency optimization, not a correctness requirement.
+async fn fetch_and_extract_layer(
+    reference: &oci_client::Reference,
+    layer_desc: &oci_client::manifest::OciDescriptor,
+    per_layer: &indicatif::ProgressBar,
+    auth: &RegistryAuth,
+    insecure: bool,
+) -> anyhow::Result<()> {
+    let digest = layer_desc.digest.clone();
+    let reference = reference.clone();
+    let layer_desc = layer_desc.clone();
+    let per_layer = per_layer.clone();
+    let auth = auth.clone();
+
+    // `ensure_layer_cached` does blocking I/O (tar extraction); keep it off
+    // the async runtime. The fetch closure runs async code via a oneshot
+    // channel trick — but simpler here: do the download on the blocking
+    // thread by blocking on a oneshot from an async task. Instead, invert:
+    // pull the blob async → write to .download.tmp → spawn blocking
+    // extraction.
+    let layers_root = crate::cache::layers_root()?;
+    let hex = crate::cache::digest_name(&digest).to_string();
+    let download = layers_root.join(format!("{hex}.download"));
+    let download_tmp = layers_root.join(format!("{hex}.download.tmp"));
+
+    // Short-circuit fast path identical to ensure_layer_cached.
+    let layer_dir = crate::cache::layer_dir(&digest)?;
+    if layer_dir.join(".ok").exists() && layer_dir.join("rootfs").is_dir() {
         return Ok(());
     }
-    let _ = std::fs::remove_dir_all(&layer_root);
-    std::fs::create_dir_all(&layer_root)?;
-    let status = std::process::Command::new("cp")
-        .arg("-al")
-        .arg(rootfs)
-        .arg(&layer_rootfs)
-        .status()
-        .map_err(|e| anyhow::anyhow!("cp -al exec failed: {e}"))?;
-    if !status.success() {
-        anyhow::bail!("cp -al failed while mirroring docker rootfs into layer cache");
+
+    if !download.exists() {
+        let _ = std::fs::remove_file(&download_tmp);
+        registry::pull_layer(
+            &reference,
+            &layer_desc,
+            &download_tmp,
+            Some(&per_layer),
+            None,
+            &auth,
+            insecure,
+        )
+        .await?;
+        std::fs::rename(&download_tmp, &download)?;
     }
-    std::fs::File::create(&marker)?;
+
+    tokio::task::spawn_blocking(move || {
+        layer::ensure_layer_cached(&digest, |_tmp| {
+            // .download already exists from the async pull above, so the
+            // fetch closure is not called. If somehow it is, fail loudly.
+            anyhow::bail!("unreachable: layer tarball missing after pull")
+        })
+    })
+    .await??;
     Ok(())
 }
 

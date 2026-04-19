@@ -369,7 +369,8 @@ overlayfs lowerdir so containers trust it automatically.
 
 ### Image cache
 
-Images are cached at `~/.cache/airlock/images/<manifest-digest>/`:
+Images are cached at `~/.cache/airlock/oci/`, split into per-image
+metadata and a shared per-layer extraction cache:
 
 ```
 ~/.cache/airlock/
@@ -379,15 +380,23 @@ Images are cached at `~/.cache/airlock/images/<manifest-digest>/`:
     cloud-hypervisor         # (Linux only) hypervisor binary
     virtiofsd                # (Linux only) VirtioFS daemon
     checksum                 # triggers re-extraction when binary is updated
-  images/<digest>/
-    rootfs/                  # All OCI layers merged (read-only, shared)
-    image_config.json        # OCI image config (CMD, ENV, user, etc.)
-    meta.json                # {"digest": "sha256:...", "name": "alpine:latest"}
-    layer_*.tar.gz           # Raw layer blobs
+  oci/
+    images/<digest>/
+      image_config.json      # OCI image config (CMD, ENV, user, etc.)
+      meta.json              # {"digest": …, "name": …, "layers": […]}
+    layers/<digest>/
+      rootfs/                # Extracted layer tree (whiteouts kept as xattrs)
+      .ok                    # Completion marker
+    layers/<digest>.download.tmp   # In-flight download (swept on next run)
+    layers/<digest>.download       # Complete tarball pending extraction
+    layers/<digest>.tmp/           # In-flight extraction (swept on next run)
 ```
 
-The image cache is shared across all projects. Platform is fixed to
-`linux/arm64` (matching the VM architecture).
+The image cache is shared across all projects. Layers are
+content-addressable by digest, so two images that share a base layer
+extract it only once. There is no merged per-image rootfs — the guest
+composes overlayfs directly from the per-layer trees. Platform is
+fixed to `linux/arm64` (matching the VM architecture).
 
 `meta.json` is written as the final step of a successful image pull — its
 presence signals that the image is complete and ready to use (replaces the

@@ -87,10 +87,13 @@ pub async fn resolve(
     })
 }
 
-/// Download a single layer blob to disk with optional progress reporting.
-/// Uses a temp file + atomic rename to avoid partial downloads. Both the
-/// per-layer and overall progress bars, when provided, are incremented by
-/// the same number of bytes as data is written.
+/// Download a single layer blob to `dest` with optional progress reporting.
+///
+/// The caller is responsible for placing `dest` at the appropriate staging
+/// path (`<digest>.download.tmp`) and for atomically renaming into place
+/// after return. Both the per-layer and overall progress bars, when
+/// provided, are incremented by the same number of bytes as data is
+/// written.
 pub async fn pull_layer(
     reference: &Reference,
     layer: &oci_client::manifest::OciDescriptor,
@@ -105,9 +108,7 @@ pub async fn pull_layer(
     let registry = reference.resolve_registry();
     client.store_auth_if_needed(registry, auth).await;
 
-    // Download to a temp file, then rename on success
-    let tmp = dest.with_extension("tmp");
-    let file = tokio::fs::File::create(&tmp).await?;
+    let file = tokio::fs::File::create(dest).await?;
     let bars: Vec<ProgressBar> = per_layer.into_iter().chain(overall).cloned().collect();
     let mut writer: Box<dyn AsyncWrite + Unpin> = if bars.is_empty() {
         Box::new(file)
@@ -118,25 +119,16 @@ pub async fn pull_layer(
     writer.flush().await?;
     drop(writer);
 
-    // Verify size
-    let metadata = tokio::fs::metadata(&tmp).await?;
+    let metadata = tokio::fs::metadata(dest).await?;
     let expected = layer.size as u64;
     if metadata.len() != expected {
-        let _ = tokio::fs::remove_file(&tmp).await;
+        let _ = tokio::fs::remove_file(dest).await;
         anyhow::bail!(
             "layer size mismatch: expected {expected} bytes, got {}",
             metadata.len()
         );
     }
-
-    // Atomically move into place
-    tokio::fs::rename(&tmp, dest).await?;
     Ok(())
-}
-
-/// Check if a previously downloaded layer file is valid (correct size).
-pub fn is_layer_valid(layer: &oci_client::manifest::OciDescriptor, path: &Path) -> bool {
-    path.metadata().is_ok_and(|m| m.len() == layer.size as u64)
 }
 
 /// Wraps an `AsyncWrite` and increments every attached progress bar on each
