@@ -7,6 +7,13 @@
 
 use std::path::PathBuf;
 
+/// Shared lock for tests that mutate the process-wide `HOME` env var.
+/// Any test that calls `std::env::set_var("HOME", …)` to redirect the
+/// cache must hold this lock so concurrent tests don't see each other's
+/// value.
+#[cfg(test)]
+pub(crate) static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Strip a leading `<algo>:` from a digest, returning just the hash portion.
 /// `sha256:abc123…` → `abc123…`. Used as the on-disk directory name and as
 /// the layer identifier passed to the guest (so guest paths match host paths).

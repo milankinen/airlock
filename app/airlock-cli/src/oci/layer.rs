@@ -174,16 +174,11 @@ pub fn extract_layer_cached(digest: &str, tarball: &Path) -> anyhow::Result<Path
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use std::sync::Mutex;
-
     use flate2::Compression;
     use flate2::write::GzEncoder;
 
     use super::*;
-
-    /// Tests mutate the process-wide `HOME` env var (read by `cache::cache_dir`)
-    /// so they must not run in parallel.
-    static HOME_LOCK: Mutex<()> = Mutex::new(());
+    use crate::cache::HOME_LOCK;
 
     /// Build a tiny gzipped tar from in-memory `(path, content)` entries.
     /// Paths starting with `.wh.` represent whiteouts; content is ignored.

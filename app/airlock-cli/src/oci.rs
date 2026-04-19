@@ -6,12 +6,14 @@
 
 mod credentials;
 mod docker;
+mod gc;
 mod layer;
 mod registry;
 
 use std::path::{Path, PathBuf};
 
 use futures::stream::{self, StreamExt};
+pub use gc::sweep as gc_sweep;
 use oci_client::config::ConfigFile as OciConfig;
 use oci_client::secrets::RegistryAuth;
 
@@ -157,12 +159,14 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
                 // Remove overlay files dir and CA overlay (both rebuilt on next start)
                 let _ = std::fs::remove_dir_all(project.sandbox_dir.join("overlay"));
                 let _ = std::fs::remove_dir_all(project.sandbox_dir.join("ca"));
-                // Remove image ref hard link
+                // Remove image ref hard link — drops this sandbox's liveness signal
+                // for the old image, so the sweep below may collect it.
                 let _ = std::fs::remove_file(project.sandbox_dir.join("image"));
                 spinner.finish_and_clear();
                 cli::log!("  {} old environment erased", cli::check());
-                // GC: remove image cache if no other sandbox references it
-                gc_unused_image(old_digest.trim())?;
+                // GC: remove images with no remaining sandbox refs, plus any
+                // layers they uniquely owned.
+                gc::sweep();
             }
             ImageChangeAction::Cancel => anyhow::bail!("cancelled by user"),
         }
@@ -172,14 +176,23 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
     let image_dir = ensure_image(&mut image, image_name, &auth, image_cfg.insecure).await?;
 
     if digest_changed {
-        // Hard-link meta.json into the sandbox directory.
-        // Link count > 1 on meta.json means the image is still in use (GC guard).
+        // Hard-link meta.json into the sandbox directory. Link count > 1 on
+        // meta.json is the GC guard — without it, a sibling sandbox creating
+        // a new image could trigger a sweep that wrongly deletes this one.
+        // Fail hard on error: the cache and the sandbox should live on the
+        // same filesystem under $HOME, so the only realistic cause is a
+        // config problem we want to surface.
         let meta_path = image_dir.join("meta.json");
         let sandbox_image = project.sandbox_dir.join("image");
         let _ = std::fs::remove_file(&sandbox_image);
-        if let Err(e) = std::fs::hard_link(&meta_path, &sandbox_image) {
-            tracing::debug!("image ref hard-link failed (cross-device?): {e}");
-        }
+        std::fs::hard_link(&meta_path, &sandbox_image).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to hardlink image ref {} → {}: {e} \
+                 (both paths must live on the same filesystem)",
+                meta_path.display(),
+                sandbox_image.display()
+            )
+        })?;
     }
 
     let overlay_dir = project.sandbox_dir.join("overlay");
@@ -616,34 +629,6 @@ async fn ensure_image(
     }
 
     Ok(dir)
-}
-
-/// Remove an image from the cache if no sandbox holds a hard-link ref to it.
-///
-/// Each sandbox that uses an image hard-links `image_cache/meta.json` to
-/// `sandbox/.airlock/sandbox/image`. A link count of 1 on `meta.json` means
-/// only the cache's own copy remains — safe to delete.
-fn gc_unused_image(digest: &str) -> anyhow::Result<()> {
-    let image_dir = crate::cache::image_dir(digest)?;
-    if !image_dir.exists() {
-        return Ok(());
-    }
-
-    let meta_file = image_dir.join("meta.json");
-    if meta_file.exists() {
-        use std::os::unix::fs::MetadataExt;
-        if std::fs::metadata(&meta_file).is_ok_and(|m| m.nlink() > 1) {
-            // At least one sandbox still holds a hard link — keep the image.
-            return Ok(());
-        }
-    }
-
-    // No sandbox references this image — delete it
-    let sp = cli::spinner("cleaning unused image...");
-    let _ = std::fs::remove_dir_all(&image_dir);
-    sp.finish_and_clear();
-    cli::log!("  {} cleaned unused image", cli::check());
-    Ok(())
 }
 
 /// Mirror a merged rootfs tree into the per-layer cache as a single synthetic

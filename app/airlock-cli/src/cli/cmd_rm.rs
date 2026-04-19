@@ -5,7 +5,7 @@ use dialoguer::Select;
 use dialoguer::theme::ColorfulTheme;
 
 use crate::vault::Vault;
-use crate::{cli, project};
+use crate::{cli, oci, project};
 
 /// CLI arguments for `airlock rm`.
 #[derive(Args, Debug)]
@@ -51,6 +51,10 @@ pub fn main(args: &RmArgs, vault: Vault) -> i32 {
         cli::error!("Failed to remove project data: {e}");
         return 1;
     }
+
+    // The sandbox's image hardlink went away with its cache dir — sweep any
+    // image/layers that no longer have live refs.
+    oci::gc_sweep();
 
     cli::log!("Sandbox removed");
     0
