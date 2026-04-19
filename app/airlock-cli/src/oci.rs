@@ -73,7 +73,7 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
     // Fast path: if we already have a cached image for this name, skip
     // the network round-trip to resolve tag → digest. The image is
     // considered ready when `meta.json` exists and every listed layer
-    // has its `.ok` marker — there's no merged rootfs to check anymore.
+    // has a `rootfs/` dir — there's no merged rootfs to check anymore.
     if let Some(ref meta) = stored_meta
         && meta.name == *image_name
         && !meta.layers.is_empty()
@@ -82,7 +82,7 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
         if image_dir.join("meta.json").exists()
             && meta.layers.iter().all(|d| {
                 crate::cache::layer_dir(d)
-                    .map(|p| p.join(".ok").exists())
+                    .map(|p| p.join("rootfs").is_dir())
                     .unwrap_or(false)
             })
         {
@@ -506,7 +506,7 @@ async fn ensure_registry_image(
         .iter()
         .filter(|l| {
             crate::cache::layer_dir(&l.digest)
-                .map(|p| p.join(".ok").exists())
+                .map(|p| p.join("rootfs").is_dir())
                 .unwrap_or(false)
         })
         .count();
@@ -524,7 +524,7 @@ async fn ensure_registry_image(
         .enumerate()
         .filter(|(_, l)| {
             !crate::cache::layer_dir(&l.digest)
-                .map(|p| p.join(".ok").exists())
+                .map(|p| p.join("rootfs").is_dir())
                 .unwrap_or(false)
         })
         .map(|(i, _)| i)
@@ -591,8 +591,8 @@ async fn ensure_registry_image(
 
 /// Download one layer blob into `<digest>.download.tmp` and extract it
 /// through the shared per-layer cache. `ensure_layer_cached` is a no-op
-/// when `.ok` already exists, so the `to_fetch` filter in the caller is
-/// a latency optimization, not a correctness requirement.
+/// when the layer's `rootfs/` already exists, so the `to_fetch` filter
+/// in the caller is a latency optimization, not a correctness requirement.
 async fn fetch_and_extract_layer(
     reference: &oci_client::Reference,
     layer_desc: &oci_client::manifest::OciDescriptor,
@@ -619,7 +619,7 @@ async fn fetch_and_extract_layer(
 
     // Short-circuit fast path identical to ensure_layer_cached.
     let layer_dir = crate::cache::layer_dir(&digest)?;
-    if layer_dir.join(".ok").exists() && layer_dir.join("rootfs").is_dir() {
+    if layer_dir.join("rootfs").is_dir() {
         return Ok(());
     }
 

@@ -52,8 +52,9 @@ pub fn image_dir(digest: &str) -> anyhow::Result<PathBuf> {
 }
 
 /// Root of the per-layer cache (`~/.cache/airlock/oci/layers/`), created if
-/// absent. Each entry is `<layer-digest>/rootfs/` plus a `.ok` completion
-/// marker.
+/// absent. Each entry is `<layer-digest>/rootfs/`; the directory's presence
+/// is itself the completion marker (it only appears via the atomic rename
+/// from `<layer-digest>.tmp/`).
 pub fn layers_root() -> anyhow::Result<PathBuf> {
     let dir = oci_root()?.join("layers");
     std::fs::create_dir_all(&dir)?;

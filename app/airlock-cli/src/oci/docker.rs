@@ -88,8 +88,8 @@ pub fn image_arch(image_id: &str) -> Option<String> {
 ///
 /// - Config blob → read into memory, returned in [`DockerSave`], and the
 ///   staging file is deleted.
-/// - Layer blob (already cached, i.e. `<digest>/.ok` exists) → staging file
-///   deleted.
+/// - Layer blob (already cached, i.e. `<digest>/rootfs/` exists) → staging
+///   file deleted.
 /// - Layer blob (not cached) → renamed to `<hex>.download`, ready for
 ///   `layer::ensure_layer_cached` to extract.
 ///
@@ -177,7 +177,7 @@ pub fn save_layer_tarballs(image_ref: &str) -> anyhow::Result<DockerSave> {
                 continue;
             };
             let layer_cached = cache::layer_dir(&digest)
-                .map(|d| d.join(".ok").exists())
+                .map(|d| d.join("rootfs").is_dir())
                 .unwrap_or(false);
             if layer_cached {
                 let _ = std::fs::remove_file(&tmp);

@@ -7,7 +7,7 @@
 //! <digest>.download.tmp   # in-flight download
 //! <digest>.download       # complete tarball, pending extraction
 //! <digest>.tmp/rootfs/    # in-flight extraction
-//! <digest>/               # finished: rootfs/ + .ok marker
+//! <digest>/               # finished: rootfs/ (rename = commit)
 //! ```
 //!
 //! Each transition is an atomic rename, so a crash at any point leaves a
@@ -30,23 +30,23 @@ const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
 /// Ensure a layer is extracted into the shared cache, downloading the
 /// tarball through `fetch` only if it's not already on disk.
 ///
-/// - Fast path: `<digest>/.ok` exists → return immediately.
+/// - Fast path: `<digest>/rootfs/` exists → return immediately. The
+///   directory only becomes visible via the atomic rename at the end of
+///   extraction, so its presence is itself the commit marker.
 /// - Tarball path: if `<digest>.download` exists (from a previous run or
 ///   from a pre-staging caller like the docker path), skip `fetch` and
 ///   go straight to extraction.
 /// - Otherwise: call `fetch(&tmp_path)` to write the tarball at
 ///   `<digest>.download.tmp`, rename to `<digest>.download`, then extract.
 ///
-/// After a successful extraction the tarball is removed — the
-/// extracted rootfs + `.ok` marker is the canonical cache entry.
+/// After a successful extraction the tarball is removed.
 pub fn ensure_layer_cached<F>(digest: &str, fetch: F) -> anyhow::Result<PathBuf>
 where
     F: FnOnce(&Path) -> anyhow::Result<()>,
 {
     let layer_dir = cache::layer_dir(digest)?;
     let rootfs = layer_dir.join("rootfs");
-    let marker = layer_dir.join(".ok");
-    if marker.exists() && rootfs.is_dir() {
+    if rootfs.is_dir() {
         return Ok(rootfs);
     }
 
@@ -74,7 +74,8 @@ where
 }
 
 /// Extract `tarball` into `<layer_dir>.tmp/rootfs/` then atomically rename
-/// into `layer_dir/` and touch the `.ok` marker. Whiteouts are preserved:
+/// into `layer_dir/`. The rename is the commit point — readers only see
+/// `layer_dir/` once extraction finished cleanly. Whiteouts are preserved:
 ///
 /// - `.wh.<name>` becomes an empty regular file at `<name>` with a
 ///   `user.overlay.whiteout="y"` xattr. Overlayfs mounted with
@@ -162,7 +163,6 @@ fn extract_tarball_to_cache(layer_dir: &Path, tarball: &Path) -> anyhow::Result<
         std::fs::remove_dir_all(layer_dir)?;
     }
     std::fs::rename(&tmp, layer_dir)?;
-    std::fs::File::create(layer_dir.join(".ok"))?;
     Ok(())
 }
 
@@ -238,7 +238,6 @@ mod tests {
 
         assert_eq!(std::fs::read(rootfs.join("etc/hello")).unwrap(), b"world");
         assert!(rootfs.join("bin/sh").exists());
-        assert!(rootfs.parent().unwrap().join(".ok").exists());
     }
 
     #[test]
@@ -304,17 +303,17 @@ mod tests {
         std::fs::write(&tarball, build_tarball(&[("a", b"1")])).unwrap();
 
         let first = ensure_layer_cached("sha256:deadbeef4", fetch_from(tarball.clone())).unwrap();
-        let marker = first.parent().unwrap().join(".ok");
-        let mtime = std::fs::metadata(&marker).unwrap().modified().unwrap();
+        let layer_dir = first.parent().unwrap().to_path_buf();
+        let mtime = std::fs::metadata(&layer_dir).unwrap().modified().unwrap();
 
-        // Second call: .ok exists, fetch must not be called.
+        // Second call: rootfs/ exists, fetch must not be called.
         let second = ensure_layer_cached("sha256:deadbeef4", |_| {
-            panic!("fetch must not be called when .ok exists")
+            panic!("fetch must not be called when rootfs/ exists")
         })
         .unwrap();
         assert_eq!(first, second);
         assert_eq!(
-            std::fs::metadata(&marker).unwrap().modified().unwrap(),
+            std::fs::metadata(&layer_dir).unwrap().modified().unwrap(),
             mtime
         );
         // Tarball removed after extraction.
