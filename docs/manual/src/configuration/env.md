@@ -46,6 +46,20 @@ airlock secret ls                 # names and save times (values never shown)
 airlock secret rm MY_API_TOKEN
 ```
 
+The vault is **off by default** because the first access triggers a
+system keyring unlock prompt that is surprising on first contact. To
+enable it, create `~/.airlock/settings.toml` with:
+
+```toml
+vault_enabled = true
+```
+
+Settings may also be written in JSON (`settings.json`) or YAML
+(`settings.yaml` / `settings.yml`); TOML wins if more than one file
+exists. The same flag also controls whether OCI registry credentials
+are persisted to the keyring after a successful login — with the vault
+disabled, airlock re-prompts on every pull that requires auth.
+
 Vault entries are referenced with the same `${VAR}` syntax as host env
 vars. The host env is consulted first and the vault is the fallback, so
 common templates like `${PATH}` never open the keyring — only names

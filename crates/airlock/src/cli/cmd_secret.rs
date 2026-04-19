@@ -5,8 +5,8 @@
 //! `crate::vault`.
 //!
 //! `add` never takes the value on the command line — interactive
-//! prompt (double-entry for confirmation) or `--stdin`. This is a
-//! hard rule: argv values leak via shell history and `ps`.
+//! prompt or `--stdin`. This is a hard rule: argv values leak via
+//! shell history and `ps`.
 
 use std::io::Read;
 
@@ -16,6 +16,7 @@ use dialoguer::Password;
 use dialoguer::theme::ColorfulTheme;
 
 use crate::cli;
+use crate::settings::Settings;
 use crate::vault::{Vault, validate_secret_name};
 
 #[derive(Args, Debug)]
@@ -30,7 +31,7 @@ enum SecretCmd {
     /// never shown).
     Ls,
     /// Add or overwrite a secret. Prompts interactively for the
-    /// value (twice, to confirm). Use `--stdin` to pipe the value.
+    /// value with echo suppressed. Use `--stdin` to pipe the value.
     Add {
         /// Secret name — must match `[A-Z_][A-Z0-9_]*` so it can be
         /// referenced via `${NAME}` in config.
@@ -48,7 +49,17 @@ enum SecretCmd {
     },
 }
 
-pub fn main(args: SecretArgs, vault: &Vault) -> i32 {
+pub fn main(args: SecretArgs, vault: &Vault, settings: &Settings) -> i32 {
+    if !settings.vault_enabled {
+        cli::error!(
+            "the airlock vault is disabled. Enable it to store user \
+             secrets and registry credentials in the system keyring.\n\n\
+             To enable, create {} with:\n\n  \
+             vault_enabled = true\n",
+            Settings::expected_path().display()
+        );
+        return 1;
+    }
     match run(args, vault) {
         Ok(()) => 0,
         Err(e) => {
@@ -142,30 +153,19 @@ fn read_from_stdin() -> anyhow::Result<String> {
     Ok(buf)
 }
 
-/// Double-prompt for the value. Up to 3 attempts on mismatch; abort
-/// with an error if the TTY isn't interactive.
+/// Prompt once for the value with echo suppressed; accept whatever
+/// the user types. Abort with an error if the TTY isn't interactive.
 fn read_from_prompt() -> anyhow::Result<String> {
     if !cli::is_interactive() {
         bail!("no TTY available — use `--stdin` to pipe the value in");
     }
     let theme = ColorfulTheme::default();
     let term = console::Term::stderr();
-    for attempt in 1..=3 {
-        let value = Password::with_theme(&theme)
-            .with_prompt("Value")
-            .interact_on(&term)?;
-        let confirm = Password::with_theme(&theme)
-            .with_prompt("Confirm")
-            .interact_on(&term)?;
-        if value == confirm {
-            return Ok(value);
-        }
-        cli::error!("values do not match");
-        if attempt == 3 {
-            bail!("aborting after 3 mismatched attempts");
-        }
-    }
-    unreachable!()
+    Password::with_theme(&theme)
+        .with_prompt("Value")
+        .allow_empty_password(true)
+        .interact_on(&term)
+        .context("read secret value")
 }
 
 // ── Formatting ───────────────────────────────────────────────────────────────

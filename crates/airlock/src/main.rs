@@ -12,6 +12,7 @@ mod oci;
 mod project;
 mod rpc;
 mod runtime;
+mod settings;
 mod util;
 mod vault;
 mod vm;
@@ -19,6 +20,7 @@ mod vm;
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::cli::{cmd_exec, cmd_rm, cmd_secret, cmd_show, cmd_start};
+use crate::settings::Settings;
 use crate::vault::Vault;
 
 #[tokio::main(flavor = "current_thread")]
@@ -36,11 +38,26 @@ async fn main() {
     let parsed = Program::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     cli::initialize(parsed.global.quiet);
 
-    // One Vault per process, created here and threaded into every
-    // subcommand. `Vault::new` is cheap (no keyring I/O); the keyring
-    // is only contacted on the first `get_*`/`set_*`. `Vault` is
-    // cheaply cloneable (Arc inside) so we can pass it by value.
-    let vault = Vault::default();
+    // Application-wide settings from `~/.airlock/settings.*`. Absent
+    // file → defaults. A malformed file fails loudly so the user
+    // doesn't silently fall back to defaults.
+    let settings = match Settings::load() {
+        Ok(s) => s,
+        Err(e) => {
+            cli::error!("{e:#}");
+            std::process::exit(1);
+        }
+    };
+
+    // One Vault per process, threaded into every subcommand. When
+    // `vault_enabled = false`, the vault uses a noop keyring — no
+    // I/O, no unlock prompts, reads return empty. `Vault` is cheaply
+    // cloneable (Arc inside) so we pass it by value.
+    let vault = if settings.vault_enabled {
+        Vault::new()
+    } else {
+        Vault::disabled()
+    };
 
     let exit_code = match parsed.command {
         Command::Start(args) => cli::cmd_start::main(args, extra_args, vault).await,
@@ -70,7 +87,7 @@ async fn main() {
                 cli::error!("'--' args are only supported with 'start'");
                 std::process::exit(2);
             }
-            cli::cmd_secret::main(args, &vault)
+            cli::cmd_secret::main(args, &vault, &settings)
         }
     };
 

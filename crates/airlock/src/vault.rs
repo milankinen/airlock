@@ -152,6 +152,16 @@ impl Vault {
         Self::new_with(DefaultKeyring, std::env::vars().collect())
     }
 
+    /// Construct a vault that never talks to the keyring: reads yield
+    /// `None`, writes are silently dropped. Used when
+    /// `settings.vault_enabled = false` so the rest of the pipeline
+    /// (substitution, registry auth) still has a `Vault` to call but
+    /// no unlock prompts or sidecar state appear. Env substitution
+    /// still works from the host-env snapshot.
+    pub fn disabled() -> Self {
+        Self::new_with(NoopKeyring, std::env::vars().collect())
+    }
+
     /// Build a vault against a custom keyring backend and a fixed
     /// env-var map. Intended for tests — the real CLI uses
     /// `Vault::new()`. Supplying the env explicitly makes substitution
@@ -366,6 +376,21 @@ impl Keyring for DefaultKeyring {
 
 fn entry() -> anyhow::Result<keyring::Entry> {
     keyring::Entry::new(SERVICE, ACCOUNT).context("construct airlock keyring entry")
+}
+
+/// Inert keyring backend. `load` always returns `Ok(None)` (empty
+/// vault) and `store` is a no-op. Used by `Vault::disabled()` so the
+/// secret vault can be turned off without plumbing a separate
+/// "is-enabled" flag through every accessor.
+struct NoopKeyring;
+
+impl Keyring for NoopKeyring {
+    fn load(&self) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+    fn store(&self, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

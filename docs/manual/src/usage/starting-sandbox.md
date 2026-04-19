@@ -87,9 +87,12 @@ The three resolution modes are:
 - `docker` — use the local Docker daemon only; fail if the image isn't found
 - `registry` — always pull from the registry, ignore Docker
 
-For private registries, airlock supports standard OCI registry authentication
-through the Docker credential store (keychain on macOS, credential helpers on
-Linux). If you can `docker pull` an image, airlock can pull it too.
+For private registries, airlock prompts for a username and password the first
+time it sees a `401 Unauthorized` response. When the vault is enabled (see
+[Environment Variables](../configuration/env.md#secret-vault)), credentials
+are saved to the system keyring, keyed by registry host, and reused on
+subsequent pulls. With the vault disabled, airlock prompts on every pull that
+requires auth.
 
 For development registries served over plain HTTP, set `insecure = true`:
 

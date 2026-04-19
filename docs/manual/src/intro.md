@@ -86,7 +86,7 @@ overlayfs root filesystem inside the guest. The image can be anything: Ubuntu, A
 Fedora, a custom CI image — if it runs on Linux, it works.
 
 * Pull images from any reachable OCI registry (authentication supported via
-  keychain or filesystem credentials) — no Docker required
+  the built-in vault backed by the system keyring) — no Docker required
 * Or use images from a local Docker daemon if you have one
 * Selectively expose host environment variables into the VM
 * Share host directories via fast VirtioFS mounts (bidirectional sync,
@@ -126,8 +126,6 @@ setup — same image, same network rules, same mounts. Local overrides go in
   failures for better recovery
 * MCP proxy for stdio-based MCP servers (e.g. Playwright MCP from inside the VM)
 * System-admin-managed configuration defaults and policies
-* System secret store integration for secure environment variable mounting
-  (macOS Keychain, Linux libsecret)
 
 ## Similar projects
 
