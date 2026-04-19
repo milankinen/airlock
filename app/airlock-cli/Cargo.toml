@@ -56,6 +56,7 @@ subst = { workspace = true }
 sysinfo = { workspace = true }
 tar = { workspace = true }
 thiserror = { workspace = true }
+xattr = { workspace = true }
 timeago = "0.6.0"
 tls-parser = { workspace = true }
 tokio = { workspace = true, features = ["full"] }

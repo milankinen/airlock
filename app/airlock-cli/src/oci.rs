@@ -11,6 +11,7 @@ mod registry;
 
 use std::path::{Path, PathBuf};
 
+use futures::stream::{self, StreamExt};
 use oci_client::config::ConfigFile as OciConfig;
 use oci_client::secrets::RegistryAuth;
 
@@ -465,7 +466,6 @@ async fn ensure_image(
                 let layer_paths_ref = &layer_paths;
 
                 let download = async {
-                    use futures::stream::{self, StreamExt};
                     let mut stream = stream::iter(to_download.iter().copied())
                         .map(|i| async move {
                             let layer_desc = &layers[i];
@@ -521,6 +521,28 @@ async fn ensure_image(
             let sp = cli::spinner("extracting layers...");
             let layer_refs: Vec<&Path> = layer_paths.iter().map(PathBuf::as_path).collect();
             layer::extract_layers(&layer_refs, &rootfs)?;
+
+            // Also populate the per-layer cache so future images that share
+            // a layer can skip re-downloading and re-extracting. Runs in
+            // parallel (bounded by CPU count) via spawn_blocking.
+            let cpu = std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(4);
+            let extract_jobs: Vec<(String, PathBuf)> = layers
+                .iter()
+                .zip(layer_paths.iter())
+                .map(|(l, p)| (l.digest.clone(), p.clone()))
+                .collect();
+            let mut stream = stream::iter(extract_jobs)
+                .map(|(digest, path)| {
+                    tokio::task::spawn_blocking(move || layer::extract_layer_cached(&digest, &path))
+                })
+                .buffer_unordered(cpu);
+            while let Some(res) = stream.next().await {
+                res??;
+            }
+            drop(stream);
+
             sp.finish_and_clear();
             cli::log!("  {} extracted layers", cli::check());
 
