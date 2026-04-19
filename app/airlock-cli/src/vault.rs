@@ -70,7 +70,9 @@ use anyhow::{Context, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use disabled::DisabledStorage;
-use encrypted::{EncryptedFileStorage, PassphraseSource};
+use encrypted::EncryptedFileStorage;
+#[cfg(test)]
+use encrypted::PassphraseSource;
 use file::FileStorage;
 use keyring::KeyringStorage;
 use parking_lot::{Mutex, MutexGuard};
