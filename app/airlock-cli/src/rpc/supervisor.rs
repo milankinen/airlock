@@ -62,6 +62,13 @@ impl Supervisor {
         Ok(Self { supervisor: client })
     }
 
+    /// Clone of the underlying capnp client. Used to hand a late-bound
+    /// reference to components like [`Network`](crate::network::Network)
+    /// that need to fire specific RPCs after the handshake.
+    pub fn client(&self) -> supervisor::Client {
+        self.supervisor.clone()
+    }
+
     /// Send the initial `Supervisor.start()` RPC to bootstrap the VM and
     /// launch the main container process. Returns a [`Process`] handle for
     /// polling output and forwarding signals.

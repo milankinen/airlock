@@ -33,7 +33,9 @@ async fn run() -> anyhow::Result<()> {
     let conn_fd = vsock::accept(&listen_fd)?;
     drop(listen_fd);
 
-    let exit_code = rpc::start(conn_fd, async |cfg| {
+    let deny_tracker = net::deny_status::DenyTracker::new();
+
+    let exit_code = rpc::start(conn_fd, deny_tracker.clone(), async |cfg| {
         logging::init(cfg.log_sink, &cfg.log_filter);
 
         info!("setup vm");
@@ -48,6 +50,7 @@ async fn run() -> anyhow::Result<()> {
         net::dns::start(dns.clone()).await?;
         net::socket::start(&cfg.network, cfg.sockets)?;
         net::start_proxy(cfg.network.clone(), dns).await?;
+        net::deny_status::start(deny_tracker.clone()).await?;
 
         info!("start: {} {}", cfg.cmd, cfg.args.join(" "));
         let proc = process::spawn_user(

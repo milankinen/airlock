@@ -211,6 +211,7 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
             socket_map: std::collections::HashMap::default(),
             events: tokio::sync::broadcast::channel(1).0,
             next_id: std::sync::atomic::AtomicU64::new(0),
+            deny_reporter: crate::network::DenyReporter::new(),
         },
     )
 }

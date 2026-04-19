@@ -7,6 +7,7 @@
 //! and how to relay traffic to the real server.
 
 mod control;
+mod deny_reporter;
 mod http;
 mod io;
 mod matchers;
@@ -29,6 +30,7 @@ use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
 pub use self::control::NetworkControl;
+pub use self::deny_reporter::DenyReporter;
 use crate::config::config::Policy;
 use crate::network::http::middleware::CompiledMiddleware;
 use crate::network::target::{MiddlewareTarget, NetworkTarget, ResolvedTarget};
@@ -93,6 +95,7 @@ pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network>
         socket_map,
         events,
         next_id: AtomicU64::new(0),
+        deny_reporter: DenyReporter::new(),
     })
 }
 
@@ -129,11 +132,20 @@ pub struct Network {
     /// Monotonic counter for connection ids. Used by the TUI to pair
     /// `Disconnect` events with their originating `Connect`.
     next_id: AtomicU64,
+    /// Host → guest notifier for every denied connection. Populated once
+    /// the supervisor handshake completes; no-op until then.
+    pub(super) deny_reporter: Rc<DenyReporter>,
 }
 
 impl Network {
     pub fn events(&self) -> broadcast::Receiver<airlock_monitor::NetworkEvent> {
         self.events.subscribe()
+    }
+
+    /// Handle used by the host to wire up the supervisor client after the
+    /// vsock handshake. See [`DenyReporter::attach`].
+    pub fn deny_reporter(&self) -> Rc<DenyReporter> {
+        self.deny_reporter.clone()
     }
 
     /// Return a thread-safe handle for mutating runtime state. Handed to the

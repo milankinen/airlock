@@ -22,8 +22,8 @@ use tracing::{debug, trace};
 
 use crate::network::http::executor::LocalExecutor;
 use crate::network::http::senders::{H1Sender, H2Sender, RequestSender};
-use crate::network::io;
 use crate::network::target::ResolvedTarget;
+use crate::network::{DenyReporter, io};
 
 const MAX_DETECT_SIZE: usize = 4096;
 
@@ -81,17 +81,21 @@ pub async fn relay(
     server: io::Transport,
     target: ResolvedTarget,
     events: tokio::sync::broadcast::Sender<airlock_monitor::NetworkEvent>,
+    deny_reporter: Rc<DenyReporter>,
 ) -> anyhow::Result<()> {
     let client_io = hyper_util::rt::TokioIo::new(tokio::io::join(container.read, container.write));
 
     if !target.allowed {
         let target_host = target.host.clone();
         let target_port = target.port;
+        let deny_reporter = deny_reporter.clone();
         let service = service_fn(move |req: Request<Incoming>| {
             let events = events.clone();
             let target_host = target_host.clone();
+            let deny_reporter = deny_reporter.clone();
             async move {
                 emit_request_event(&events, &req, &target_host, target_port, false);
+                deny_reporter.report();
                 let body: ResponseBody =
                     Either::Right(Full::new(Bytes::from("denied by network policy\n")));
                 Ok::<_, hyper::Error>(Response::builder().status(403).body(body).unwrap())
@@ -129,9 +133,10 @@ pub async fn relay(
         let middleware = middleware.clone();
         let events = events.clone();
         let target_host = target_host.clone();
+        let deny_reporter = deny_reporter.clone();
         async move {
             emit_request_event(&events, &req, &target_host, target_port, allowed);
-            let result = middleware::run(req, &middleware, move |req| {
+            let result = middleware::run(req, &middleware, deny_reporter, move |req| {
                 let sender = sender.clone();
                 async move { sender.send(req).await.map_err(|e| anyhow::anyhow!("{e}")) }
             })

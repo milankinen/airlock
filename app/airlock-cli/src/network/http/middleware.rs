@@ -18,7 +18,7 @@ use hyper::body::Incoming;
 use mlua::{Function, Lua, UserData, UserDataFields, UserDataMethods};
 use tracing::trace;
 
-use crate::network::{matchers, middleware};
+use crate::network::{DenyReporter, matchers, middleware};
 
 type RequestBody = Either<Incoming, Full<Bytes>>;
 
@@ -105,6 +105,7 @@ fn is_denied(e: &mlua::Error) -> bool {
 pub async fn run<F, Fut>(
     req: hyper::Request<Incoming>,
     middleware: &[CompiledMiddleware],
+    deny_reporter: Rc<DenyReporter>,
     send: F,
 ) -> anyhow::Result<hyper::Response<Either<Incoming, Full<Bytes>>>>
 where
@@ -185,12 +186,15 @@ where
     let result = next(parts, Either::Left(body)).await;
     match result {
         Ok(resp) => Ok(resp),
-        Err(ref e) if is_denied(e) => Ok(hyper::Response::builder()
-            .status(403)
-            .body(Either::Right(Full::new(Bytes::from(
-                "Denied by network rules\n",
-            ))))
-            .unwrap()),
+        Err(ref e) if is_denied(e) => {
+            deny_reporter.report();
+            Ok(hyper::Response::builder()
+                .status(403)
+                .body(Either::Right(Full::new(Bytes::from(
+                    "Denied by network rules\n",
+                ))))
+                .unwrap())
+        }
         Err(e) => anyhow::bail!("{e}"),
     }
 }

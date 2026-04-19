@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use super::target::ResolvedTarget;
-use super::{Network, http, io, tcp, tls};
+use super::{DenyReporter, Network, http, io, tcp, tls};
 
 impl network_proxy::Server for Network {
     async fn connect(
@@ -53,6 +53,7 @@ impl network_proxy::Server for Network {
                     self.tls_client.clone(),
                     self.interceptor.clone(),
                     self.events.clone(),
+                    self.deny_reporter.clone(),
                 );
                 results.get().init_result().set_server(sink);
             }
@@ -64,6 +65,7 @@ impl network_proxy::Server for Network {
                     let id = self.next_connection_id();
                     self.emit_connect(id, &guest_path, 0, false);
                     self.emit_disconnect(id);
+                    self.deny_reporter.report();
                     results.get().init_result().set_denied("denied by policy");
                     return Ok(());
                 }
@@ -73,6 +75,7 @@ impl network_proxy::Server for Network {
                     let id = self.next_connection_id();
                     self.emit_connect(id, &guest_path, 0, false);
                     self.emit_disconnect(id);
+                    self.deny_reporter.report();
                     results
                         .get()
                         .init_result()
@@ -98,6 +101,7 @@ fn spawn_tcp_connection(
     tls_client: Arc<rustls::ClientConfig>,
     interceptor: Rc<tls::TlsInterceptor>,
     events: tokio::sync::broadcast::Sender<airlock_monitor::NetworkEvent>,
+    deny_reporter: Rc<DenyReporter>,
 ) -> tcp_sink::Client {
     let (tx, rx) = mpsc::channel::<Bytes>(1);
     let error: io::RelayError = Rc::new(RefCell::new(None));
@@ -112,6 +116,7 @@ fn spawn_tcp_connection(
             &tls_client,
             &interceptor,
             events.clone(),
+            deny_reporter,
         ))
         .await;
 
@@ -192,6 +197,7 @@ async fn handle_connection(
     tls_client: &Arc<rustls::ClientConfig>,
     interceptor: &tls::TlsInterceptor,
     events: tokio::sync::broadcast::Sender<airlock_monitor::NetworkEvent>,
+    deny_reporter: Rc<DenyReporter>,
 ) -> anyhow::Result<()> {
     let (is_tls, first) = tls::detect(&mut rx).await;
     let addr = format!("{}:{}", target.host, target.port);
@@ -210,8 +216,18 @@ async fn handle_connection(
         (true, false) => tcp::connect_server(&addr).await?,
     };
     if is_http {
-        Box::pin(http::relay(container, server, target, events)).await?;
+        Box::pin(http::relay(
+            container,
+            server,
+            target,
+            events,
+            deny_reporter,
+        ))
+        .await?;
     } else {
+        if !target.allowed {
+            deny_reporter.report();
+        }
         Box::pin(tcp::relay(container, server)).await;
     }
     Ok(())

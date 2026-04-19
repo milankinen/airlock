@@ -150,6 +150,7 @@ version = "0.1.0"
 dependencies = [
  "airlock-common",
  "anyhow",
+ "axum",
  "bytes",
  "capnp",
  "capnp-rpc",

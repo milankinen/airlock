@@ -160,6 +160,7 @@ async fn run(
     project.save_meta();
 
     let supervisor = rpc::Supervisor::connect(vsock_fd)?;
+    network.deny_reporter().attach(supervisor.client());
 
     let (stdin_client, pty_size) = runtime.attach_stdin()?;
     let signals = runtime.signals()?;

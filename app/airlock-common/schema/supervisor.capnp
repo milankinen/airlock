@@ -47,6 +47,11 @@ interface Supervisor {
   # implementation diffs /proc/stat across consecutive calls to compute
   # per-core %; the first call returns zeroed per-core values.
   pollStats @3 () -> (snapshot :StatsSnapshot);
+
+  # Host-to-guest notification that a network request was just denied.
+  # The guest caches the timestamp in memory and serves it over HTTP
+  # on port DENY_STATUS_PORT so tools inside the VM can poll it.
+  reportDeny @4 (epoch :UInt64) -> ();
 }
 
 struct StatsSnapshot {

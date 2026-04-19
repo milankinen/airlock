@@ -7,12 +7,14 @@
 
 use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use airlock_common::supervisor_capnp::*;
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
 
 use crate::init::{CacheConfig, DirMountConfig, FileMountConfig, InitConfig, MountConfig};
+use crate::net::deny_status::DenyTracker;
 use crate::process::{SpawnedProcess, spawn_root, spawn_user};
 use crate::stats::Collector;
 
@@ -54,6 +56,7 @@ pub struct HostProcess {
 /// main process exits. Returns the process exit code.
 pub async fn start<Init: AsyncFn(StartConfig) -> anyhow::Result<SpawnedProcess>>(
     conn_fd: OwnedFd,
+    deny_tracker: Arc<DenyTracker>,
     init: Init,
 ) -> anyhow::Result<i32> {
     let std_stream = unsafe { std::net::TcpStream::from_raw_fd(conn_fd.into_raw_fd()) };
@@ -74,6 +77,7 @@ pub async fn start<Init: AsyncFn(StartConfig) -> anyhow::Result<SpawnedProcess>>
         start_tx: std::cell::RefCell::new(Some(conn_tx)),
         exec_creds: std::cell::RefCell::new(None),
         stats: std::cell::RefCell::new(Collector::new()),
+        deny_tracker,
     });
     let rpc = RpcSystem::new(Box::new(network), Some(client.client));
 
@@ -106,6 +110,7 @@ struct SupervisorImpl {
     start_tx: std::cell::RefCell<Option<tokio::sync::oneshot::Sender<ConnPayload>>>,
     exec_creds: std::cell::RefCell<Option<(u32, u32, bool)>>,
     stats: std::cell::RefCell<Collector>,
+    deny_tracker: Arc<DenyTracker>,
 }
 
 impl supervisor::Server for SupervisorImpl {
@@ -307,6 +312,16 @@ impl supervisor::Server for SupervisorImpl {
             Ok(Err(msg)) => Err(capnp::Error::failed(msg)),
             Err(_) => Err(capnp::Error::failed("exec setup dropped".into())),
         }
+    }
+
+    async fn report_deny(
+        self: Rc<Self>,
+        params: supervisor::ReportDenyParams,
+        _results: supervisor::ReportDenyResults,
+    ) -> Result<(), capnp::Error> {
+        let epoch = params.get()?.get_epoch();
+        self.deny_tracker.record(epoch);
+        Ok(())
     }
 
     async fn poll_stats(
