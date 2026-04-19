@@ -4,6 +4,7 @@
 //! a single Cap'n Proto RPC connection from the host CLI, then bootstraps the
 //! guest environment (mounts, networking, DNS) and spawns the user's command.
 
+mod admin;
 mod init;
 mod logging;
 mod net;
@@ -33,9 +34,10 @@ async fn run() -> anyhow::Result<()> {
     let conn_fd = vsock::accept(&listen_fd)?;
     drop(listen_fd);
 
-    let deny_tracker = net::deny_status::DenyTracker::new();
+    let admin_state = admin::AdminState::new();
+    let deny_tracker = admin_state.deny_tracker.clone();
 
-    let exit_code = rpc::start(conn_fd, deny_tracker.clone(), async |cfg| {
+    let exit_code = rpc::start(conn_fd, deny_tracker, async |cfg| {
         logging::init(cfg.log_sink, &cfg.log_filter);
 
         info!("setup vm");
@@ -50,7 +52,7 @@ async fn run() -> anyhow::Result<()> {
         net::dns::start(dns.clone()).await?;
         net::socket::start(&cfg.network, cfg.sockets)?;
         net::start_proxy(cfg.network.clone(), dns).await?;
-        net::deny_status::start(deny_tracker.clone()).await?;
+        admin::start(admin_state.clone()).await?;
 
         info!("start: {} {}", cfg.cmd, cfg.args.join(" "));
         let proc = process::spawn_user(

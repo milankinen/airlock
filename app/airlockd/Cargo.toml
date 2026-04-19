@@ -21,6 +21,7 @@ airlock-common = { workspace = true }
 futures = { workspace = true }
 libc = { workspace = true }
 pty-process = { workspace = true }
+quick_cache = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 scc = { workspace = true }

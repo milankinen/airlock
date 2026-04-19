@@ -16,8 +16,3 @@ pub const SUPERVISOR_PORT: u32 = 1024;
 /// Filename of the Unix domain socket that `airlock go` creates on the host so
 /// that `airlock exec` can attach sidecar processes to the running container.
 pub const CLI_SOCK_FILENAME: &str = "cli.sock";
-
-/// Guest-side TCP port where the supervisor serves the deny-status HTTP
-/// endpoint (`GET /last_deny`). Bound on all guest interfaces so container
-/// tooling can query it without coordinating addresses.
-pub const DENY_STATUS_PORT: u16 = 1337;

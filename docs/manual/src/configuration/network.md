@@ -160,19 +160,3 @@ host = [8080, "9000:3000"]  # host 9000 → guest 3000
 Like other config entries, port forward groups can be disabled with
 `enabled = false`.
 
-## Deny-status endpoint
-
-The in-VM supervisor exposes a tiny HTTP endpoint on port `1337` so tools
-running inside the sandbox can tell whether a network request was recently
-blocked:
-
-```sh
-curl -s http://localhost:1337/last_deny
-# 1713540912
-```
-
-The body is the Unix epoch (seconds) of the most recent denied connection —
-socket, TCP, HTTP, or middleware `req:deny()` — or empty if no deny has
-happened this run. Useful for scripts that want to surface a clear "this
-failed because of the sandbox policy" message instead of a generic network
-error.

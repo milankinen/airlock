@@ -49,8 +49,9 @@ interface Supervisor {
   pollStats @3 () -> (snapshot :StatsSnapshot);
 
   # Host-to-guest notification that a network request was just denied.
-  # The guest caches the timestamp in memory and serves it over HTTP
-  # on port DENY_STATUS_PORT so tools inside the VM can poll it.
+  # `epoch` is Unix-epoch milliseconds. The guest caches the timestamp
+  # so the admin HTTP service at `http://admin.airlock/` can correlate
+  # it with Claude Code tool failures reported via hook endpoints.
   reportDeny @4 (epoch :UInt64) -> ();
 }
 

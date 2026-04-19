@@ -37,7 +37,11 @@ impl DnsState {
 
     /// Return the IP for `hostname`, allocating a new one if first seen.
     pub fn allocate(&self, hostname: &str) -> Ipv4Addr {
-        if hostname == "localhost" {
+        if hostname == "localhost" || hostname == "admin.airlock" {
+            // `admin.airlock` is reserved for the in-VM admin HTTP service.
+            // Loopback bypasses the transparent proxy's iptables redirect
+            // (see `init::linux::setup_networking`), so the request lands
+            // directly on the server bound to `127.0.0.1:80`.
             return Ipv4Addr::LOCALHOST;
         }
         if let Some(entry) = self.host_to_ip.get(hostname) {

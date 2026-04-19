@@ -13,8 +13,8 @@ use airlock_common::supervisor_capnp::*;
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
 
+use crate::admin::DenyTracker;
 use crate::init::{CacheConfig, DirMountConfig, FileMountConfig, InitConfig, MountConfig};
-use crate::net::deny_status::DenyTracker;
 use crate::process::{SpawnedProcess, spawn_root, spawn_user};
 use crate::stats::Collector;
 

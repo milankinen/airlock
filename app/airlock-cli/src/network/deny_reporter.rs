@@ -46,7 +46,7 @@ impl DenyReporter {
         };
         let epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
+            .map_or(0, |d| d.as_millis() as u64);
         let mut req = client.report_deny_request();
         req.get().set_epoch(epoch);
         tokio::task::spawn_local(async move {

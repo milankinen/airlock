@@ -14,6 +14,7 @@
 - [Tips and Tricks](./tips.md)
     - [Pairing with mise](./tips/mise.md)
     - [Docker Inside the VM](./tips/docker.md)
+- [Experimental: Claude hooks](./experimental-claude-hooks.md)
 - [Advanced Usage](./advanced.md)
     - [Network Scripting](./advanced/network-scripting.md)
     - [Custom Kernel](./advanced/custom-kernel.md)

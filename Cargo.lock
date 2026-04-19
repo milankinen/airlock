@@ -157,6 +157,7 @@ dependencies = [
  "futures",
  "libc",
  "pty-process",
+ "quick_cache",
  "scc",
  "serde",
  "serde_json",
