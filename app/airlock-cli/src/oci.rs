@@ -69,6 +69,14 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
             .all(|d| crate::cache::layer_dir(d).is_ok_and(|p| p.is_dir()))
     {
         tracing::debug!("image cache hit for {image_name}");
+        // Invariant: `sandbox/image` must be a hardlink to the canonical
+        // cache file so sweep GC sees the sandbox as a live reference.
+        // Heal it on every prepare — the link may have been severed by a
+        // cache wipe, a cache-path migration, or a prior run that pre-dated
+        // this invariant, leaving our entry as a sweep target.
+        let image_path = crate::cache::image_path(&img.image_id)?;
+        let sandbox_image = project.sandbox_dir.join("image");
+        ensure_image_hardlink(&sandbox_image, &image_path, img)?;
         cli::log!(
             "  {} image cached {}",
             cli::check(),
@@ -116,7 +124,7 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
     };
 
     // Check if image changed before downloading
-    let mut digest_changed = stored_digest
+    let digest_changed = stored_digest
         .as_deref()
         .is_none_or(|s| s.trim() != image.digest);
 
@@ -129,7 +137,6 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
                 // fall through and let the new image be used.
                 let old_image_path = crate::cache::image_path(old_digest.trim())?;
                 if old_image_path.exists() {
-                    digest_changed = false;
                     image.digest = old_digest.trim().to_string();
                 }
             }
@@ -155,25 +162,15 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
     // Download/ensure image (auth already resolved above).
     let oci_image = ensure_image(&mut image, image_name, &auth, image_cfg.insecure).await?;
 
-    if digest_changed {
-        // Hard-link the cached image file into the sandbox directory. nlink > 1
-        // on `images/<digest>` is the GC guard — without it, a sibling sandbox
-        // creating a new image could trigger a sweep that wrongly deletes this
-        // one. Fail hard on error: the cache and the sandbox should live on
-        // the same filesystem under $HOME, so the only realistic cause is a
-        // config problem we want to surface.
-        let image_path = crate::cache::image_path(&oci_image.image_id)?;
-        let sandbox_image = project.sandbox_dir.join("image");
-        let _ = std::fs::remove_file(&sandbox_image);
-        std::fs::hard_link(&image_path, &sandbox_image).map_err(|e| {
-            anyhow::anyhow!(
-                "failed to hardlink image ref {} → {}: {e} \
-                 (both paths must live on the same filesystem)",
-                image_path.display(),
-                sandbox_image.display()
-            )
-        })?;
-    }
+    // Hard-link the cached image file into the sandbox directory. nlink > 1
+    // on `images/<digest>` is the GC guard — without it, a sibling sandbox
+    // creating a new image could trigger a sweep that wrongly deletes this
+    // one. Enforce unconditionally: even when the digest hasn't changed, a
+    // previous run may have left the sandbox with a standalone copy instead
+    // of a hardlink.
+    let image_path = crate::cache::image_path(&oci_image.image_id)?;
+    let sandbox_image = project.sandbox_dir.join("image");
+    ensure_image_hardlink(&sandbox_image, &image_path, &oci_image)?;
 
     let overlay_dir = project.sandbox_dir.join("overlay");
     std::fs::create_dir_all(&overlay_dir)?;
@@ -200,6 +197,46 @@ fn read_cached_image(path: &Path) -> Option<OciImage> {
     let wrapped: CachedImage = serde_json::from_slice(&data).ok()?;
     let CachedImage::V1(image) = wrapped;
     Some(image)
+}
+
+/// Ensure `sandbox_image` is a hardlink to `images/<digest>` — the GC
+/// liveness signal. No-op when the inodes already match; otherwise severs
+/// the old `sandbox_image` and links it fresh. If the canonical cache file
+/// is missing (cache wipe, path migration), the sandbox copy is written
+/// back out first so we have something to link to.
+///
+/// Fails hard on link error because the only plausible cause is a
+/// cross-filesystem config problem (both paths are under `$HOME`), and
+/// silently falling through would leave the sandbox un-GC-protected.
+fn ensure_image_hardlink(
+    sandbox_image: &Path,
+    image_path: &Path,
+    image: &OciImage,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let linked = match (
+        std::fs::metadata(sandbox_image),
+        std::fs::metadata(image_path),
+    ) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    };
+    if linked {
+        return Ok(());
+    }
+    if !image_path.exists() {
+        write_cached_image(image_path, image)?;
+    }
+    let _ = std::fs::remove_file(sandbox_image);
+    std::fs::hard_link(image_path, sandbox_image).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to hardlink image ref {} → {}: {e} \
+             (both paths must live on the same filesystem)",
+            image_path.display(),
+            sandbox_image.display()
+        )
+    })?;
+    Ok(())
 }
 
 /// Write a cached image atomically: serialize, write to `<path>.tmp`, rename.
