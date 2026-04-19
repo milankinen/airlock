@@ -3,7 +3,7 @@
 //! Configuration is loaded from up to four files (global, home, project,
 //! local), merged with deep-merge semantics, and validated by `smart-config`.
 
-mod de;
+pub(crate) mod de;
 pub(crate) mod load_config;
 pub(crate) mod presets;
 #[cfg(test)]

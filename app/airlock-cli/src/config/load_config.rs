@@ -6,7 +6,7 @@ use smart_config::DescribeConfig;
 use crate::config::de::format_error;
 use crate::config::{Config, presets};
 
-const EXTENSIONS: &[&str] = &["toml", "json", "yaml", "yml"];
+pub(crate) const EXTENSIONS: &[&str] = &["toml", "json", "yaml", "yml"];
 
 /// Load configuration from hierarchical config files.
 ///
@@ -70,7 +70,7 @@ fn load_first(base: &Path) -> anyhow::Result<Option<(PathBuf, serde_json::Value)
     Ok(None)
 }
 
-fn parse_file(path: &Path, content: &str) -> anyhow::Result<serde_json::Value> {
+pub(crate) fn parse_file(path: &Path, content: &str) -> anyhow::Result<serde_json::Value> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("toml") => {
             toml::from_str(content).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))

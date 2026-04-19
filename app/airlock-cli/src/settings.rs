@@ -1,46 +1,40 @@
 //! Application-wide user settings loaded from `~/.airlock/settings.*`.
 //!
-//! Resolved once at `main` and threaded into subcommands. Supports TOML
-//! (preferred), JSON, and YAML so users can bring whichever format their
-//! dotfiles already speak; the first matching filename wins.
-//!
-//! Absent file → all-default settings. That keeps `airlock` usable with
-//! zero configuration — settings exist only for the opt-in features that
-//! would otherwise surprise first-time users (right now: secret storage).
+//! Resolved once at `main` and threaded into subcommands. Shares the
+//! smart-config pipeline with the project-level `airlock.toml` loader
+//! (`crate::config::load_config`): same TOML/JSON/YAML auto-detect,
+//! same parse-error formatting. Missing file → defaults, which keeps
+//! `airlock` usable with zero configuration.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use anyhow::{Context, Result, anyhow, bail};
+use smart_config::{ConfigRepository, ConfigSchema, DescribeConfig, DeserializeConfig, Json};
+
+use crate::config::de::format_error;
+use crate::config::load_config::{EXTENSIONS, parse_file};
+use crate::vault::VaultStorageType;
 
 /// All user-tunable settings. Add fields here; the default for each
 /// field must keep `airlock` usable without a settings file.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Clone, Debug, Default, DescribeConfig, DeserializeConfig)]
 pub struct Settings {
-    /// Enable the keyring-backed vault for user secrets *and* registry
-    /// credentials. When `false`, `airlock secret` refuses to run and
-    /// the vault behaves as if empty (no keyring I/O, no unlock
-    /// prompts); registry auth falls back to re-prompting on 401. Off
-    /// by default because the keyring unlock is surprising on first
-    /// contact.
-    pub vault_enabled: bool,
+    /// Vault configuration. Nested under `[vault]` so future vault-related
+    /// knobs (passphrase caching policy, custom storage path, ...) fit
+    /// alongside `storage` without polluting the top-level namespace.
+    #[config(nest)]
+    pub vault: VaultSettings,
 }
 
-/// File names tried in order under `~/.airlock/`. TOML leads because the
-/// rest of airlock's config already speaks TOML.
-const CANDIDATES: &[(&str, Format)] = &[
-    ("settings.toml", Format::Toml),
-    ("settings.json", Format::Json),
-    ("settings.yaml", Format::Yaml),
-    ("settings.yml", Format::Yaml),
-];
-
-#[derive(Clone, Copy)]
-enum Format {
-    Toml,
-    Json,
-    Yaml,
+/// Settings under the `[vault]` table.
+#[derive(Clone, Debug, Default, DescribeConfig, DeserializeConfig)]
+pub struct VaultSettings {
+    /// Which backend stores user secrets and registry credentials.
+    /// Defaults to `file` — a mode-0600 JSON file under `~/.airlock/`.
+    /// Switch to `encrypted-file` for AEAD-at-rest, `keyring` for the
+    /// system keychain, or `disabled` to turn the vault off entirely.
+    #[config(default)]
+    pub storage: VaultStorageType,
 }
 
 impl Settings {
@@ -56,22 +50,19 @@ impl Settings {
     }
 
     fn load_from(dir: &Path) -> Result<Self> {
-        for (name, fmt) in CANDIDATES {
-            let path = dir.join(name);
+        // Same extension ordering (TOML → JSON → YAML) as the project
+        // config loader. TOML wins if multiple files exist, so a stray
+        // `settings.json` can't shadow the user's primary `settings.toml`.
+        for ext in EXTENSIONS {
+            let path = dir.join(format!("settings.{ext}"));
             if !path.exists() {
                 continue;
             }
-            let raw = std::fs::read_to_string(&path)
+            let content = std::fs::read_to_string(&path)
                 .with_context(|| format!("read settings file {}", path.display()))?;
-            let settings: Self = match fmt {
-                Format::Toml => toml::from_str(&raw)
-                    .with_context(|| format!("parse settings file {}", path.display()))?,
-                Format::Json => serde_json::from_str(&raw)
-                    .with_context(|| format!("parse settings file {}", path.display()))?,
-                Format::Yaml => serde_yaml::from_str(&raw)
-                    .with_context(|| format!("parse settings file {}", path.display()))?,
-            };
-            return Ok(settings);
+            let value = parse_file(&path, &content)?;
+            return parse_settings(value)
+                .with_context(|| format!("load settings file {}", path.display()));
         }
         Ok(Self::default())
     }
@@ -85,16 +76,28 @@ impl Settings {
     }
 }
 
+/// Feed the parsed file (as a JSON object) through smart-config using
+/// the same pipeline as the project config loader. Unknown fields and
+/// type mismatches surface here as structured parse errors.
+fn parse_settings(value: serde_json::Value) -> Result<Settings> {
+    let serde_json::Value::Object(map) = value else {
+        bail!("settings must be a table");
+    };
+    let schema = ConfigSchema::new(&Settings::DESCRIPTION, "");
+    let source = Json::new("settings", map);
+    let repo = ConfigRepository::new(&schema).with(source);
+    let parser = repo.single::<Settings>()?;
+    parser
+        .parse()
+        .map_err(|errors| anyhow!(format_error("invalid settings", errors)))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
 
-    /// Unique per-test directory under the system temp dir. Plain
-    /// `env::temp_dir()` is shared, so we suffix each call with a
-    /// monotonic counter + nanosecond timestamp so parallel tests
-    /// don't stomp each other.
     fn fresh_dir() -> PathBuf {
         static N: AtomicU32 = AtomicU32::new(0);
         let id = N.fetch_add(1, Ordering::Relaxed);
@@ -112,31 +115,39 @@ mod tests {
         let base = fresh_dir();
         let missing = base.join("nope");
         let s = Settings::load_from(&missing).unwrap();
-        assert!(!s.vault_enabled);
+        assert_eq!(s.vault.storage, VaultStorageType::File);
     }
 
     #[test]
     fn toml_roundtrip() {
         let dir = fresh_dir();
-        std::fs::write(dir.join("settings.toml"), "vault_enabled = true\n").unwrap();
+        std::fs::write(
+            dir.join("settings.toml"),
+            "vault.storage = \"encrypted-file\"\n",
+        )
+        .unwrap();
         let s = Settings::load_from(&dir).unwrap();
-        assert!(s.vault_enabled);
+        assert_eq!(s.vault.storage, VaultStorageType::EncryptedFile);
     }
 
     #[test]
     fn json_roundtrip() {
         let dir = fresh_dir();
-        std::fs::write(dir.join("settings.json"), r#"{"vault_enabled": true}"#).unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"vault": {"storage": "keyring"}}"#,
+        )
+        .unwrap();
         let s = Settings::load_from(&dir).unwrap();
-        assert!(s.vault_enabled);
+        assert_eq!(s.vault.storage, VaultStorageType::Keyring);
     }
 
     #[test]
     fn yaml_roundtrip() {
         let dir = fresh_dir();
-        std::fs::write(dir.join("settings.yml"), "vault_enabled: true\n").unwrap();
+        std::fs::write(dir.join("settings.yml"), "vault:\n  storage: disabled\n").unwrap();
         let s = Settings::load_from(&dir).unwrap();
-        assert!(s.vault_enabled);
+        assert_eq!(s.vault.storage, VaultStorageType::Disabled);
     }
 
     /// TOML wins when multiple candidates exist — stable ordering
@@ -145,23 +156,30 @@ mod tests {
     #[test]
     fn toml_wins_over_json() {
         let dir = fresh_dir();
-        std::fs::write(dir.join("settings.toml"), "vault_enabled = true\n").unwrap();
-        std::fs::write(dir.join("settings.json"), r#"{"vault_enabled": false}"#).unwrap();
+        std::fs::write(dir.join("settings.toml"), "vault.storage = \"keyring\"\n").unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"vault": {"storage": "disabled"}}"#,
+        )
+        .unwrap();
         let s = Settings::load_from(&dir).unwrap();
-        assert!(s.vault_enabled);
-    }
-
-    #[test]
-    fn unknown_field_errors() {
-        let dir = fresh_dir();
-        std::fs::write(dir.join("settings.toml"), "completely_made_up = true\n").unwrap();
-        assert!(Settings::load_from(&dir).is_err());
+        assert_eq!(s.vault.storage, VaultStorageType::Keyring);
     }
 
     #[test]
     fn malformed_file_errors() {
         let dir = fresh_dir();
         std::fs::write(dir.join("settings.toml"), "not valid = toml =").unwrap();
+        assert!(Settings::load_from(&dir).is_err());
+    }
+
+    /// Unknown enum variants must not silently degrade to the default —
+    /// a typo in `vault.storage = "file"` would otherwise be
+    /// indistinguishable from "user didn't set it".
+    #[test]
+    fn bad_vault_value_errors() {
+        let dir = fresh_dir();
+        std::fs::write(dir.join("settings.toml"), "vault.storage = \"typo\"\n").unwrap();
         assert!(Settings::load_from(&dir).is_err());
     }
 }

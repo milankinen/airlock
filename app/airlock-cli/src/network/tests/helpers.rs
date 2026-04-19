@@ -169,7 +169,9 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
     };
     let (request_log, log_fn) = RequestLog::new();
     let (allow_targets, deny_targets) = rules::resolve(&config);
-    let vault = crate::vault::Vault::new();
+    // Tests don't need real secret storage — a disabled vault gives
+    // the substitution machinery a no-op backend and never prompts.
+    let vault = crate::vault::Vault::for_storage_type(crate::vault::VaultStorageType::Disabled);
     let middleware_targets = rules::resolve_middleware(&config, &vault, &log_fn).unwrap();
 
     // MITM CA

@@ -1,79 +1,94 @@
-//! System-keyring-backed secret storage for airlock.
+//! Secret storage for airlock.
 //!
 //! Holds two kinds of items:
 //!
 //! - `secrets`: user-managed secrets (`airlock secret add/ls/rm`)
 //!   exposed to projects via `${NAME}` substitution.
-//! - `registries`: image-registry credentials (previously a per-OS
-//!   pile; unified here so there's one place to look).
+//! - `registries`: image-registry credentials.
 //!
-//! Both kinds live inside a **single** keyring entry. Its password is
-//! a JSON blob of the whole vault. One read on first access, one
-//! write per mutation — no sidecar index, so name enumeration can't
-//! drift from actual stored values (the failure mode `rcman::list_keys`
-//! exhibits).
+//! Both kinds live inside a **single** `VaultData` blob. Where that blob
+//! lives is chosen by `settings.vault`:
 //!
-//! The blob sits in the OS keychain/secret service:
+//! - `file` (default): `~/.airlock/vault.json`, mode 0600, plain JSON.
+//! - `encrypted-file`: same path, AEAD-encrypted with a passphrase.
+//! - `keyring`: OS keychain / Secret Service (the pre-existing backend).
+//! - `disabled`: no-op; reads return empty, writes are dropped.
 //!
-//! - macOS: Keychain Services (via `apple-native`).
-//! - Linux: Secret Service over D-Bus (via `sync-secret-service`).
+//! `Vault::new()` delegates to a `Storage` trait object — each variant is
+//! an implementation of that trait. Switching the backend is one line
+//! in `settings.toml`; the rest of the pipeline (`${VAR}` substitution,
+//! registry credential lookup, the `secret` subcommand) is unaware.
 //!
-//! Windows is not a target.
+//! ## On-disk envelope
+//!
+//! The file-backed storages share `~/.airlock/vault.json`, wrapped in
+//! a tagged envelope so we can tell at load time which format applies
+//! and refuse cross-type reads (saves a class of "you lost all your
+//! secrets because I silently reinterpreted the file" bugs):
+//!
+//! ```json
+//! { "type": "file",           "data": { ...VaultData... } }
+//! { "type": "encrypted-file", "data": { "kdf": {...}, "nonce": "...", "ciphertext": "..." } }
+//! ```
 //!
 //! ## Lazy opening
 //!
-//! `Vault::new()` does **not** touch the keyring. The first call to any
-//! getter or setter opens it, which is what actually triggers the OS
-//! unlock prompt on Linux. This means `airlock` commands that don't
-//! reference secrets (e.g. `airlock show` on a project with no env
-//! substitution) never prompt at all. `Vault::subst` preserves this
-//! by consulting the host-env snapshot first — a template like
-//! `${PATH}` resolves without ever opening the vault, so only
-//! references to names that the host env doesn't define fall through
-//! to the keyring.
-//!
-//! ## In-memory lifetime of secret values
-//!
-//! Values are stored and returned as plain `String`. No zeroization:
-//! the JSON blob, `keyring`'s internal buffers, and every serde
-//! intermediate would also need to be zeroized to make it meaningful,
-//! and the CLI is short-lived enough that the incremental defense
-//! against post-process memory scraping isn't worth the complexity.
-//! Anything with read access to this process's heap can already see
-//! every secret.
+//! `Vault::new()` does **not** touch storage. The first call to any
+//! getter or setter opens it. For `encrypted-file` that's the call
+//! that prompts for a passphrase; for `keyring` on Linux it's the call
+//! that may trigger a Secret Service unlock. `Vault::subst` consults
+//! the host-env snapshot first — a template like `${PATH}` resolves
+//! without ever opening the vault, so only references to names that
+//! the host env doesn't define fall through.
 //!
 //! ## Concurrency
 //!
-//! `Vault` guards its in-memory state with a `Mutex<Option<VaultData>>`
-//! (`None` = unopened). Each operation takes the lock, reads or mutates,
-//! and — on writes — flushes the blob through the keyring before
-//! dropping the lock. Reads return owned clones so the lock is never
-//! held across foreign code. One `Vault` per process.
+//! `Vault` guards its in-memory `VaultData` with a `Mutex<Option<_>>`
+//! (`None` = unopened). Reads clone the needed fields out so the lock
+//! is never held across foreign code. One `Vault` per process.
 //!
 //! ## Error model
 //!
-//! "Keyring has no entry" is not an error — it's the initial state
-//! (empty vault). Any other keyring error bubbles up via `anyhow`.
-//! Missing D-Bus / Secret Service on Linux surfaces as
-//! `keyring::Error::PlatformFailure`; callers should treat it as
-//! "secrets unavailable on this host".
-//!
+//! "No vault yet" (file absent / no keyring entry) is not an error —
+//! it's the initial state (empty vault). Everything else bubbles up
+//! via `anyhow`. For `encrypted-file`, a wrong passphrase surfaces as
+//! a decrypt error.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
+use argon2::{Algorithm, Argon2, Params, Version};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD_NO_PAD;
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use parking_lot::{Mutex, MutexGuard};
+use rand::TryRngCore;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 
-/// Keyring service identifier — the "app name" under which every
-/// airlock install stores its single vault entry.
-const SERVICE: &str = "airlock-vault";
+const KEYRING_SERVICE: &str = "airlock-vault";
+const KEYRING_ACCOUNT: &str = "vault";
 
-/// Keyring username/account identifier for the vault entry. Pairs
-/// with `SERVICE` to form the unique keyring key.
-const ACCOUNT: &str = "vault";
+/// Env var used to supply the encrypted-vault passphrase non-interactively
+/// (CI, scripts, and headless shells without a TTY).
+const PASSPHRASE_ENV: &str = "AIRLOCK_VAULT_PASSPHRASE";
+
+// Argon2id parameters — OWASP 2023 "second recommendation": 19 MiB
+// memory, t=2, p=1. These land on the fast side of safe for an
+// interactive unlock on a laptop (~100-300 ms).
+const ARGON2_M_KIB: u32 = 19_456;
+const ARGON2_T: u32 = 2;
+const ARGON2_P: u32 = 1;
+const ARGON2_KEY_BYTES: usize = 32;
+const SALT_BYTES: usize = 16;
+const NONCE_BYTES: usize = 12;
 
 /// One user-managed secret.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -97,8 +112,8 @@ pub struct SecretMeta {
     pub saved_at: SystemTime,
 }
 
-/// Plain registry credentials, decoupled from the keyring storage so
-/// callers can construct them without touching the internal entry types.
+/// Plain registry credentials, decoupled from storage so callers can
+/// construct them without touching internal entry types.
 #[derive(Clone, Debug)]
 pub struct RegistryCreds {
     pub username: String,
@@ -113,77 +128,93 @@ struct VaultData {
     registries: BTreeMap<String, RegistryEntry>,
 }
 
-/// Process-global vault handle. `Vault::new()` is cheap and doesn't
-/// contact the keyring — each accessor opens it lazily on first use.
-///
-/// Clonable: all state lives behind an internal `Arc`, so clones share
-/// the same keyring backend and in-memory cache. That way callers can
-/// pass `Vault` by value without wrapping it in an outer `Arc`.
+/// Which backend `Vault` uses. Matches `settings.vault.storage`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VaultStorageType {
+    /// Inert backend. Reads empty, writes dropped. `airlock secret`
+    /// refuses to run.
+    Disabled,
+    /// Plaintext JSON at `~/.airlock/vault.json` (mode 0600).
+    #[default]
+    File,
+    /// AEAD-encrypted JSON at `~/.airlock/vault.json`. Passphrase via
+    /// `AIRLOCK_VAULT_PASSPHRASE` or interactive prompt.
+    EncryptedFile,
+    /// OS keychain / Secret Service.
+    Keyring,
+}
+
+impl smart_config::de::WellKnown for VaultStorageType {
+    type Deserializer =
+        smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
+    const DE: Self::Deserializer = smart_config::de::Serde;
+}
+
+/// Process-global vault handle. Cheap to clone (internal `Arc`). One
+/// per process is the expected usage.
 #[derive(Clone)]
 pub struct Vault {
     inner: Arc<VaultInner>,
 }
 
 struct VaultInner {
-    keyring: Box<dyn Keyring>,
+    storage: Box<dyn Storage>,
     data: Mutex<Option<VaultData>>,
-    /// Host environment snapshot, captured at construction. Used as a
-    /// fallback source for `${NAME}` substitution (vault secrets win
-    /// on collision). Frozen so tests can inject a known env without
-    /// mutating the live process environment, and so substitution
-    /// stays deterministic for the lifetime of the process even if
-    /// something else changes `std::env` under us.
+    /// Host environment snapshot for `${NAME}` substitution. Frozen so
+    /// tests can inject a known env and so substitution stays
+    /// deterministic even if something else mutates `std::env` mid-run.
     env: HashMap<String, String>,
+    /// Which backend this vault was constructed with — surfaced so the
+    /// CLI can warn the user when they `secret add` into a plaintext
+    /// file.
+    storage_type: VaultStorageType,
 }
 
 impl Default for Vault {
     fn default() -> Self {
-        Self::new()
+        Self::for_storage_type(VaultStorageType::default())
     }
 }
 
 impl Vault {
-    /// Construct an unopened vault handle backed by the real system
-    /// keyring. The first getter/setter call reads from that keyring
-    /// — that is the call that may trigger an unlock prompt. The host
-    /// environment is snapshotted now so substitution is stable for
-    /// the rest of the process lifetime.
-    pub fn new() -> Self {
-        Self::new_with(DefaultKeyring, std::env::vars().collect())
+    /// Construct a vault for the given storage backend, reading the
+    /// host environment snapshot now.
+    pub fn for_storage_type(storage_type: VaultStorageType) -> Self {
+        Self::new_with(
+            boxed_storage(storage_type),
+            std::env::vars().collect(),
+            storage_type,
+        )
     }
 
-    /// Construct a vault that never talks to the keyring: reads yield
-    /// `None`, writes are silently dropped. Used when
-    /// `settings.vault_enabled = false` so the rest of the pipeline
-    /// (substitution, registry auth) still has a `Vault` to call but
-    /// no unlock prompts or sidecar state appear. Env substitution
-    /// still works from the host-env snapshot.
-    pub fn disabled() -> Self {
-        Self::new_with(NoopKeyring, std::env::vars().collect())
-    }
-
-    /// Build a vault against a custom keyring backend and a fixed
-    /// env-var map. Intended for tests — the real CLI uses
-    /// `Vault::new()`. Supplying the env explicitly makes substitution
-    /// tests deterministic without mutating `std::env`.
-    pub fn new_with(keyring: impl Keyring, env: HashMap<String, String>) -> Self {
+    /// Build a vault against a custom storage backend and a fixed env
+    /// map. Intended for tests; the real CLI uses `Vault::for_storage_type`.
+    pub fn new_with(
+        storage: Box<dyn Storage>,
+        env: HashMap<String, String>,
+        storage_type: VaultStorageType,
+    ) -> Self {
         Self {
             inner: Arc::new(VaultInner {
-                keyring: Box::new(keyring),
+                storage,
                 data: Mutex::new(None),
                 env,
+                storage_type,
             }),
         }
     }
 
-    /// Open the vault: fetch the blob from the keyring and parse it,
-    /// or start from an empty `VaultData` if there is no stored blob.
-    /// Idempotent — once opened, subsequent calls just re-take the
-    /// lock. Returns an `OpenedVault` whose drop releases the lock.
+    /// Which backend this vault uses. Surfaces the active selection so
+    /// subcommands can specialize (e.g. `secret add` warns on `File`).
+    pub fn storage_type(&self) -> VaultStorageType {
+        self.inner.storage_type
+    }
+
     fn open(&self) -> anyhow::Result<OpenedVault<'_>> {
         let mut guard = self.inner.data.lock();
         if guard.is_none() {
-            let data = match self.inner.keyring.load()? {
+            let data = match self.inner.storage.load()? {
                 Some(json) => serde_json::from_str::<VaultData>(&json)
                     .context("parse airlock vault blob — storage may be corrupt")?,
                 None => VaultData::default(),
@@ -193,16 +224,12 @@ impl Vault {
         Ok(OpenedVault(guard))
     }
 
-    /// Serialize the current in-memory state and push it to the keyring.
     fn flush(&self, data: &VaultData) -> anyhow::Result<()> {
         let json = serde_json::to_string(data).context("serialize airlock vault")?;
-        self.inner.keyring.store(&json)
+        self.inner.storage.store(&json)
     }
 
     /// Lookup a user secret by name. Opens the vault on first use.
-    /// Template substitution goes through `Vault::subst` instead; this
-    /// stays as the natural single-name accessor for future features
-    /// and the unit tests.
     #[allow(dead_code)]
     pub fn get_secret(&self, name: &str) -> anyhow::Result<Option<String>> {
         let opened = self.open()?;
@@ -227,9 +254,9 @@ impl Vault {
         self.flush(opened.data())
     }
 
-    /// Remove a user secret. Returns `Ok(false)` when the name was
-    /// not present — this lets the CLI report "nothing to do" without
-    /// conflating it with real storage errors.
+    /// Remove a user secret. `Ok(false)` when the name was not present
+    /// — lets the CLI report "nothing to do" without conflating it
+    /// with real storage errors.
     pub fn remove_secret(&self, name: &str) -> anyhow::Result<bool> {
         let mut opened = self.open()?;
         let existed = opened.data_mut().secrets.remove(name).is_some();
@@ -253,10 +280,7 @@ impl Vault {
             .collect())
     }
 
-    /// Lookup registry credentials for `host`. Returns a plain
-    /// `RegistryCreds` — the in-keyring `Zeroizing` wrapper is shed
-    /// for caller ergonomics since the result is immediately handed
-    /// to the OCI client.
+    /// Lookup registry credentials for `host`.
     pub fn get_registry(&self, host: &str) -> anyhow::Result<Option<RegistryCreds>> {
         let opened = self.open()?;
         Ok(opened.data().registries.get(host).map(|e| RegistryCreds {
@@ -284,26 +308,17 @@ impl Vault {
 
     /// Expand `${NAME}` tokens in `template`. Host env is consulted
     /// first and the vault is the fallback — so common templates like
-    /// `${PATH}` or `${HOME}` never contact the keyring. Only a name
-    /// the host env doesn't define falls through to the vault, which
-    /// is the path that may prompt for keyring unlock.
+    /// `${PATH}` or `${HOME}` never hit the vault.
     pub fn subst(&self, template: &str) -> anyhow::Result<String> {
-        subst::substitute(template, self).map_err(|e| anyhow::anyhow!("{e}"))
+        subst::substitute(template, self).map_err(|e| anyhow!("{e}"))
     }
 }
 
-/// A handle to the opened vault. Holds the `Mutex` guard so callers
-/// have exclusive access to `VaultData` for the duration of one
-/// operation; dropping it releases the lock.
 struct OpenedVault<'a>(MutexGuard<'a, Option<VaultData>>);
 
 impl<'a> subst::VariableMap<'a> for Vault {
     type Value = String;
     fn get(&'a self, key: &str) -> Option<Self::Value> {
-        // Host env first so the common case (`${PATH}`, `${HOME}`, ...)
-        // resolves without ever contacting the keyring. Only fall back
-        // to the vault when env has no match — that's the path that
-        // may open the vault and potentially prompt for unlock.
         if let Some(value) = self.inner.env.get(key) {
             return Some(value.clone());
         }
@@ -314,8 +329,6 @@ impl<'a> subst::VariableMap<'a> for Vault {
 }
 
 impl OpenedVault<'_> {
-    /// Reference into the decoded vault data. Safe to `unwrap` because
-    /// `Vault::open` populates the `Option` before returning.
     fn data(&self) -> &VaultData {
         self.0.as_ref().expect("opened vault has data")
     }
@@ -345,46 +358,283 @@ pub fn validate_secret_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Backend for storing/retrieving the vault blob. The production
-/// implementation is `RealKeyring` (OS keychain / Secret Service); tests
-/// plug in an in-memory fake to exercise vault logic without touching
-/// the real keyring.
-pub trait Keyring: Send + Sync + 'static {
-    /// Return the stored blob, or `None` if no vault has been saved yet.
+// ── Storage trait + backends ────────────────────────────────────────────────
+
+/// Backend that persists the vault JSON blob. Vault hands the trait a
+/// plain `VaultData` JSON string and takes the same back on load — any
+/// on-disk envelope or encryption is the backend's concern.
+pub trait Storage: Send + Sync + 'static {
     fn load(&self) -> anyhow::Result<Option<String>>;
-    /// Persist the blob, overwriting any previous value.
     fn store(&self, data: &str) -> anyhow::Result<()>;
 }
 
-struct DefaultKeyring;
+fn boxed_storage(storage_type: VaultStorageType) -> Box<dyn Storage> {
+    match storage_type {
+        VaultStorageType::Disabled => Box::new(DisabledStorage),
+        VaultStorageType::File => Box::new(FileStorage::default_path()),
+        VaultStorageType::EncryptedFile => Box::new(EncryptedFileStorage::new(
+            default_vault_path(),
+            interactive_passphrase(),
+        )),
+        VaultStorageType::Keyring => Box::new(KeyringStorage),
+    }
+}
 
-impl Keyring for DefaultKeyring {
+/// Default vault file location. Returns `~/.airlock/vault.json`,
+/// falling back to `./vault.json` only if the home directory can't
+/// be resolved (which shouldn't happen on the supported platforms).
+fn default_vault_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".airlock")
+        .join("vault.json")
+}
+
+/// Tagged on-disk envelope for the file backends. `type` distinguishes
+/// plaintext from encrypted so we can refuse to reinterpret one as the
+/// other when the user flips the setting — better to fail loudly than
+/// to silently zero out a vault.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "kebab-case")]
+enum Envelope {
+    File(VaultData),
+    EncryptedFile(EncryptedBlob),
+}
+
+#[derive(Serialize, Deserialize)]
+struct EncryptedBlob {
+    kdf: KdfParams,
+    /// 12-byte ChaCha20-Poly1305 nonce, base64 (unpadded).
+    nonce: String,
+    /// AEAD ciphertext + 16-byte tag, base64 (unpadded).
+    ciphertext: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct KdfParams {
+    algo: String,
+    /// 16-byte salt, base64 (unpadded).
+    salt: String,
+    /// Memory cost (KiB).
+    m: u32,
+    /// Time cost (iterations).
+    t: u32,
+    /// Parallelism.
+    p: u32,
+}
+
+// ── File storage ────────────────────────────────────────────────────────────
+
+pub struct FileStorage {
+    path: PathBuf,
+}
+
+impl FileStorage {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+    fn default_path() -> Self {
+        Self::new(default_vault_path())
+    }
+}
+
+impl Storage for FileStorage {
     fn load(&self) -> anyhow::Result<Option<String>> {
-        match entry()?.get_password() {
-            Ok(s) => Ok(Some(s)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(anyhow::anyhow!("read airlock vault from keyring: {e}")),
+        let Some(raw) = read_vault_file(&self.path)? else {
+            return Ok(None);
+        };
+        match serde_json::from_str::<Envelope>(&raw)
+            .with_context(|| format!("parse vault file {}", self.path.display()))?
+        {
+            Envelope::File(data) => Ok(Some(
+                serde_json::to_string(&data).context("re-serialize vault data")?,
+            )),
+            Envelope::EncryptedFile(_) => bail!(
+                "{} is an encrypted vault, but settings.vault = \"file\". \
+                 Set settings.vault = \"encrypted-file\" (or delete the file to start fresh).",
+                self.path.display()
+            ),
         }
     }
 
     fn store(&self, data: &str) -> anyhow::Result<()> {
-        entry()?
+        let parsed: VaultData = serde_json::from_str(data).context("parse vault data")?;
+        let envelope = Envelope::File(parsed);
+        let json = serde_json::to_string_pretty(&envelope).context("serialize vault envelope")?;
+        atomic_write(&self.path, json.as_bytes())
+    }
+}
+
+// ── Encrypted-file storage ─────────────────────────────────────────────────
+
+/// Supplies the passphrase for an `EncryptedFileStorage`. Abstracted so
+/// tests can inject a fixed value without a TTY or env-var round-trip.
+pub trait PassphraseSource: Send + Sync + 'static {
+    /// Ask for the passphrase of an existing vault.
+    fn unlock(&self) -> anyhow::Result<String>;
+    /// Ask for a new passphrase when the vault is being created.
+    fn create(&self) -> anyhow::Result<String>;
+}
+
+pub struct EncryptedFileStorage {
+    path: PathBuf,
+    passphrase: Box<dyn PassphraseSource>,
+    /// Cached key, derived on first unlock/create and reused on
+    /// subsequent operations so the user only prompts once per process.
+    key: Mutex<Option<[u8; ARGON2_KEY_BYTES]>>,
+    /// Cached salt for an existing vault — reused so the derived key
+    /// stays stable across reads in one process. `None` until the
+    /// first successful load, or until a fresh vault is created.
+    salt: Mutex<Option<[u8; SALT_BYTES]>>,
+}
+
+impl EncryptedFileStorage {
+    pub fn new(path: PathBuf, passphrase: Box<dyn PassphraseSource>) -> Self {
+        Self {
+            path,
+            passphrase,
+            key: Mutex::new(None),
+            salt: Mutex::new(None),
+        }
+    }
+
+    fn derive_key(passphrase: &str, salt: &[u8]) -> anyhow::Result<[u8; ARGON2_KEY_BYTES]> {
+        let params = Params::new(ARGON2_M_KIB, ARGON2_T, ARGON2_P, Some(ARGON2_KEY_BYTES))
+            .map_err(|e| anyhow!("invalid argon2 params: {e}"))?;
+        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+        let mut out = [0u8; ARGON2_KEY_BYTES];
+        argon2
+            .hash_password_into(passphrase.as_bytes(), salt, &mut out)
+            .map_err(|e| anyhow!("argon2id kdf failed: {e}"))?;
+        Ok(out)
+    }
+}
+
+impl Storage for EncryptedFileStorage {
+    fn load(&self) -> anyhow::Result<Option<String>> {
+        let Some(raw) = read_vault_file(&self.path)? else {
+            return Ok(None);
+        };
+        let envelope: Envelope = serde_json::from_str(&raw)
+            .with_context(|| format!("parse vault file {}", self.path.display()))?;
+        let blob = match envelope {
+            Envelope::EncryptedFile(b) => b,
+            Envelope::File(_) => bail!(
+                "{} is a plaintext vault, but settings.vault = \"encrypted-file\". \
+                 Set settings.vault = \"file\" (or delete the file to re-create encrypted).",
+                self.path.display()
+            ),
+        };
+
+        if blob.kdf.algo != "argon2id" {
+            bail!("unsupported vault KDF algo: {}", blob.kdf.algo);
+        }
+        let salt = decode_b64_array::<SALT_BYTES>(&blob.kdf.salt, "salt")?;
+        let nonce = decode_b64_array::<NONCE_BYTES>(&blob.nonce, "nonce")?;
+        let ciphertext = STANDARD_NO_PAD
+            .decode(&blob.ciphertext)
+            .context("decode vault ciphertext")?;
+
+        let passphrase = self.passphrase.unlock()?;
+        let key = Self::derive_key(&passphrase, &salt)?;
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let plaintext = cipher
+            .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
+            .map_err(|_| anyhow!("decrypt vault: wrong passphrase or corrupt data"))?;
+
+        *self.key.lock() = Some(key);
+        *self.salt.lock() = Some(salt);
+
+        Ok(Some(
+            String::from_utf8(plaintext).context("decrypted vault is not valid UTF-8")?,
+        ))
+    }
+
+    fn store(&self, data: &str) -> anyhow::Result<()> {
+        // Reuse the salt (and therefore the derived key) across saves
+        // in the same process. On a brand-new vault there is no cached
+        // salt yet — mint one and prompt for a new passphrase.
+        let (salt, key) = {
+            let mut salt_slot = self.salt.lock();
+            let mut key_slot = self.key.lock();
+            if let (Some(s), Some(k)) = (*salt_slot, *key_slot) {
+                (s, k)
+            } else {
+                let mut salt = [0u8; SALT_BYTES];
+                OsRng
+                    .try_fill_bytes(&mut salt)
+                    .context("generate vault salt")?;
+                let passphrase = self.passphrase.create()?;
+                let key = Self::derive_key(&passphrase, &salt)?;
+                *salt_slot = Some(salt);
+                *key_slot = Some(key);
+                (salt, key)
+            }
+        };
+
+        let mut nonce = [0u8; NONCE_BYTES];
+        OsRng
+            .try_fill_bytes(&mut nonce)
+            .context("generate vault nonce")?;
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce), data.as_bytes())
+            .map_err(|e| anyhow!("encrypt vault: {e}"))?;
+
+        let envelope = Envelope::EncryptedFile(EncryptedBlob {
+            kdf: KdfParams {
+                algo: "argon2id".to_string(),
+                salt: STANDARD_NO_PAD.encode(salt),
+                m: ARGON2_M_KIB,
+                t: ARGON2_T,
+                p: ARGON2_P,
+            },
+            nonce: STANDARD_NO_PAD.encode(nonce),
+            ciphertext: STANDARD_NO_PAD.encode(&ciphertext),
+        });
+        let json =
+            serde_json::to_string_pretty(&envelope).context("serialize encrypted envelope")?;
+        atomic_write(&self.path, json.as_bytes())
+    }
+}
+
+fn decode_b64_array<const N: usize>(s: &str, label: &str) -> anyhow::Result<[u8; N]> {
+    let bytes = STANDARD_NO_PAD
+        .decode(s)
+        .with_context(|| format!("decode vault {label}"))?;
+    <[u8; N]>::try_from(bytes.as_slice())
+        .map_err(|_| anyhow!("vault {label} has wrong length: expected {N} bytes"))
+}
+
+// ── Keyring storage ─────────────────────────────────────────────────────────
+
+pub struct KeyringStorage;
+
+impl Storage for KeyringStorage {
+    fn load(&self) -> anyhow::Result<Option<String>> {
+        match keyring_entry()?.get_password() {
+            Ok(s) => Ok(Some(s)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(anyhow!("read airlock vault from keyring: {e}")),
+        }
+    }
+
+    fn store(&self, data: &str) -> anyhow::Result<()> {
+        keyring_entry()?
             .set_password(data)
             .context("write airlock vault to keyring")
     }
 }
 
-fn entry() -> anyhow::Result<keyring::Entry> {
-    keyring::Entry::new(SERVICE, ACCOUNT).context("construct airlock keyring entry")
+fn keyring_entry() -> anyhow::Result<keyring::Entry> {
+    keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).context("construct airlock keyring entry")
 }
 
-/// Inert keyring backend. `load` always returns `Ok(None)` (empty
-/// vault) and `store` is a no-op. Used by `Vault::disabled()` so the
-/// secret vault can be turned off without plumbing a separate
-/// "is-enabled" flag through every accessor.
-struct NoopKeyring;
+// ── Disabled storage ────────────────────────────────────────────────────────
 
-impl Keyring for NoopKeyring {
+pub struct DisabledStorage;
+
+impl Storage for DisabledStorage {
     fn load(&self) -> anyhow::Result<Option<String>> {
         Ok(None)
     }
@@ -393,26 +643,185 @@ impl Keyring for NoopKeyring {
     }
 }
 
+// ── File I/O helpers ────────────────────────────────────────────────────────
+
+fn read_vault_file(path: &Path) -> anyhow::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow!("read vault file {}: {e}", path.display())),
+    }
+}
+
+/// Write `bytes` to `path` atomically and with mode 0600. Goes via a
+/// sibling tempfile + rename so a crash mid-write can't leave the
+/// vault truncated. The parent directory is created if missing.
+fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create vault directory {}", parent.display()))?;
+    }
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("vault path has no file name: {}", path.display()))?;
+    let mut tmp = path.to_path_buf();
+    tmp.set_file_name(format!("{}.tmp", file_name.to_string_lossy()));
+
+    let mut f: File = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("create vault tempfile {}", tmp.display()))?;
+    f.write_all(bytes)
+        .with_context(|| format!("write vault tempfile {}", tmp.display()))?;
+    f.sync_all()
+        .with_context(|| format!("fsync vault tempfile {}", tmp.display()))?;
+    drop(f);
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename vault tempfile to {}", path.display()))?;
+    Ok(())
+}
+
+// ── Interactive passphrase source ──────────────────────────────────────────
+
+/// Production passphrase source: checks `AIRLOCK_VAULT_PASSPHRASE`
+/// first (covers CI / non-interactive runs), then falls back to a
+/// suppressed-echo terminal prompt. On successful input the prompt
+/// line is erased so the terminal stays clean.
+pub struct InteractivePassphrase;
+
+fn interactive_passphrase() -> Box<dyn PassphraseSource> {
+    Box::new(InteractivePassphrase)
+}
+
+impl PassphraseSource for InteractivePassphrase {
+    fn unlock(&self) -> anyhow::Result<String> {
+        if let Ok(p) = std::env::var(PASSPHRASE_ENV) {
+            return Ok(p);
+        }
+        prompt_once("Vault passphrase")
+    }
+
+    fn create(&self) -> anyhow::Result<String> {
+        if let Ok(p) = std::env::var(PASSPHRASE_ENV) {
+            if p.is_empty() {
+                bail!("{PASSPHRASE_ENV} is empty");
+            }
+            return Ok(p);
+        }
+        prompt_create()
+    }
+}
+
+fn prompt_once(label: &str) -> anyhow::Result<String> {
+    if !crate::cli::is_interactive() {
+        bail!(
+            "no TTY available to prompt for the vault passphrase — set {PASSPHRASE_ENV} \
+             or run from an interactive terminal"
+        );
+    }
+    let term = console::Term::stderr();
+    let pass = dialoguer::Password::with_theme(&dialoguer::theme::ColorfulTheme::default())
+        .with_prompt(label)
+        .report(false)
+        .interact_on(&term)
+        .context("read vault passphrase")?;
+    // Erase the prompt line so the terminal stays clean.
+    let _ = term.clear_last_lines(1);
+    if pass.is_empty() {
+        bail!("vault passphrase must not be empty");
+    }
+    Ok(pass)
+}
+
+fn prompt_create() -> anyhow::Result<String> {
+    if !crate::cli::is_interactive() {
+        bail!(
+            "no TTY available to set a new vault passphrase — set {PASSPHRASE_ENV} \
+             or run from an interactive terminal"
+        );
+    }
+    let term = console::Term::stderr();
+    let pass = dialoguer::Password::with_theme(&dialoguer::theme::ColorfulTheme::default())
+        .with_prompt("New vault passphrase")
+        .with_confirmation("Confirm passphrase", "Passphrases do not match")
+        .report(false)
+        .interact_on(&term)
+        .context("read vault passphrase")?;
+    let _ = term.clear_last_lines(2);
+    if pass.is_empty() {
+        bail!("vault passphrase must not be empty");
+    }
+    Ok(pass)
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
 
-    /// In-memory `Keyring` double used by tests. Holds the "stored"
-    /// blob behind a mutex so the `&self` trait methods can mutate it.
+    /// In-memory `Storage` double for tests.
     #[derive(Default)]
-    struct FakeKeyring {
+    struct FakeStorage {
         blob: StdMutex<Option<String>>,
     }
 
-    impl Keyring for FakeKeyring {
+    impl Storage for FakeStorage {
         fn load(&self) -> anyhow::Result<Option<String>> {
             Ok(self.blob.lock().unwrap().clone())
         }
         fn store(&self, data: &str) -> anyhow::Result<()> {
             *self.blob.lock().unwrap() = Some(data.to_string());
             Ok(())
+        }
+    }
+
+    struct SharedStorage(Arc<FakeStorage>);
+
+    impl Storage for SharedStorage {
+        fn load(&self) -> anyhow::Result<Option<String>> {
+            self.0.load()
+        }
+        fn store(&self, data: &str) -> anyhow::Result<()> {
+            self.0.store(data)
+        }
+    }
+
+    fn vault_with(storage: impl Storage, env: &[(&str, &str)]) -> Vault {
+        Vault::new_with(
+            Box::new(storage),
+            env.iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            VaultStorageType::File,
+        )
+    }
+
+    fn fresh_tmp(name: &str) -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("airlock-vault-test-{ts}-{id}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    struct FixedPassphrase(&'static str);
+    impl PassphraseSource for FixedPassphrase {
+        fn unlock(&self) -> anyhow::Result<String> {
+            Ok(self.0.to_string())
+        }
+        fn create(&self) -> anyhow::Result<String> {
+            Ok(self.0.to_string())
         }
     }
 
@@ -428,73 +837,37 @@ mod tests {
     #[test]
     fn validate_secret_name_rejects_bad_names() {
         assert!(validate_secret_name("").is_err());
-        assert!(validate_secret_name("foo").is_err(), "lowercase rejected");
-        assert!(validate_secret_name("1X").is_err(), "digit-first rejected");
-        assert!(validate_secret_name("A-B").is_err(), "dash rejected");
-        assert!(validate_secret_name("A.B").is_err(), "dot rejected");
-        assert!(validate_secret_name("A B").is_err(), "space rejected");
+        assert!(validate_secret_name("foo").is_err());
+        assert!(validate_secret_name("1X").is_err());
+        assert!(validate_secret_name("A-B").is_err());
+        assert!(validate_secret_name("A.B").is_err());
+        assert!(validate_secret_name("A B").is_err());
     }
 
-    /// JSON serialization must round-trip a full vault. Guards against
-    /// silent schema drift if `SecretEntry` or `RegistryEntry` gain
-    /// fields without `#[serde(default)]`.
     #[test]
-    fn vault_data_roundtrips_json() {
-        let mut data = VaultData::default();
-        data.secrets.insert(
-            "DATABASE_URL".to_string(),
-            SecretEntry {
-                value: "postgres://...".to_string(),
-                saved_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
-            },
-        );
-        data.registries.insert(
-            "ghcr.io".to_string(),
-            RegistryEntry {
-                username: "alice".to_string(),
-                password: "hunter2".to_string(),
-                saved_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
-            },
-        );
-        let json = serde_json::to_string(&data).unwrap();
-        let back: VaultData = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.secrets.len(), 1);
+    fn secret_roundtrip_through_fake_storage() {
+        let vault = vault_with(FakeStorage::default(), &[]);
+        vault.set_secret("DATABASE_URL", "value-1").unwrap();
         assert_eq!(
-            back.secrets.get("DATABASE_URL").unwrap().value,
-            "postgres://..."
+            vault.get_secret("DATABASE_URL").unwrap(),
+            Some("value-1".to_string())
         );
-        assert_eq!(back.registries.get("ghcr.io").unwrap().username, "alice");
+        vault.set_secret("DATABASE_URL", "value-2").unwrap();
+        assert_eq!(
+            vault.get_secret("DATABASE_URL").unwrap(),
+            Some("value-2".to_string())
+        );
+        assert!(vault.remove_secret("DATABASE_URL").unwrap());
+        assert!(vault.get_secret("DATABASE_URL").unwrap().is_none());
+        assert!(!vault.remove_secret("DATABASE_URL").unwrap());
     }
 
-    /// Full set/get/overwrite/remove flow against a `FakeKeyring` —
-    /// exercises the vault's state machine (opening, flushing) without
-    /// needing a real keyring.
+    /// `Vault::for_storage_type(Disabled)` must construct without touching any
+    /// backend — preserves the zero-config "airlock just works" path.
     #[test]
-    fn secret_roundtrip_through_fake_keyring() {
-        let vault = Vault::new_with(FakeKeyring::default(), HashMap::new());
-        let name = "DATABASE_URL";
-
-        vault.set_secret(name, "value-1").unwrap();
-        assert_eq!(vault.get_secret(name).unwrap(), Some("value-1".to_string()));
-
-        // Overwrite.
-        vault.set_secret(name, "value-2").unwrap();
-        assert_eq!(vault.get_secret(name).unwrap(), Some("value-2".to_string()));
-
-        // Remove: first call returns true, second is a no-op.
-        assert!(vault.remove_secret(name).unwrap());
-        assert!(vault.get_secret(name).unwrap().is_none());
-        assert!(!vault.remove_secret(name).unwrap(), "idempotent remove");
-    }
-
-    /// The vault must not contact the keyring until the caller asks
-    /// for something. A read-only accessor with nothing to read still
-    /// opens (to parse the blob), but constructing the `Vault` alone
-    /// must stay silent — this is the whole point of lazy opening.
-    #[test]
-    fn construction_does_not_touch_keyring() {
-        struct PanickingKeyring;
-        impl Keyring for PanickingKeyring {
+    fn construction_does_not_touch_storage() {
+        struct PanickingStorage;
+        impl Storage for PanickingStorage {
             fn load(&self) -> anyhow::Result<Option<String>> {
                 panic!("load called during construction");
             }
@@ -502,31 +875,17 @@ mod tests {
                 panic!("store called during construction");
             }
         }
-        // Construct and drop. No load/store must fire.
-        let _ = Vault::new_with(PanickingKeyring, HashMap::new());
+        let _ = Vault::new_with(
+            Box::new(PanickingStorage),
+            HashMap::new(),
+            VaultStorageType::File,
+        );
     }
 
-    /// `FakeKeyring` shared across two `Vault` handles — each vault
-    /// owns its `Keyring` box, so to simulate two processes talking to
-    /// the same underlying storage we share state via `Arc`.
-    struct SharedKeyring(Arc<FakeKeyring>);
-
-    impl Keyring for SharedKeyring {
-        fn load(&self) -> anyhow::Result<Option<String>> {
-            self.0.load()
-        }
-        fn store(&self, data: &str) -> anyhow::Result<()> {
-            self.0.store(data)
-        }
-    }
-
-    /// A second `Vault` sharing the same backing keyring must see
-    /// writes performed by the first. Confirms the flush path actually
-    /// pushes JSON to the backend rather than just mutating in-memory.
     #[test]
     fn second_vault_sees_flushed_writes() {
-        let shared = Arc::new(FakeKeyring::default());
-        let a = Vault::new_with(SharedKeyring(shared.clone()), HashMap::new());
+        let shared = Arc::new(FakeStorage::default());
+        let a = vault_with(SharedStorage(shared.clone()), &[]);
         a.set_secret("TOKEN", "abc123").unwrap();
         a.set_registry(
             "ghcr.io",
@@ -536,38 +895,24 @@ mod tests {
             },
         )
         .unwrap();
-
-        let b = Vault::new_with(SharedKeyring(shared), HashMap::new());
+        let b = vault_with(SharedStorage(shared), &[]);
         assert_eq!(b.get_secret("TOKEN").unwrap(), Some("abc123".to_string()));
         let creds = b.get_registry("ghcr.io").unwrap().unwrap();
         assert_eq!(creds.username, "alice");
         assert_eq!(creds.password, "hunter2");
     }
 
-    /// Empty values and bad names must be rejected at the API, never
-    /// reaching the keyring.
     #[test]
     fn set_secret_rejects_empty_and_bad_names() {
-        let vault = Vault::new_with(FakeKeyring::default(), HashMap::new());
+        let vault = vault_with(FakeStorage::default(), &[]);
         assert!(vault.set_secret("FOO", "").is_err());
         assert!(vault.set_secret("lowercase", "x").is_err());
     }
 
-    fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-            .collect()
-    }
-
-    /// A template with no `${...}` must be returned verbatim and must
-    /// not open the vault — opening the vault is what prompts for a
-    /// keychain unlock on Linux, so the fast path keeps `airlock start`
-    /// silent for projects whose env is fully literal.
     #[test]
     fn subst_literal_skips_vault_open() {
-        struct PanickingKeyring;
-        impl Keyring for PanickingKeyring {
+        struct PanickingStorage;
+        impl Storage for PanickingStorage {
             fn load(&self) -> anyhow::Result<Option<String>> {
                 panic!("vault should not open for a literal template");
             }
@@ -575,27 +920,27 @@ mod tests {
                 panic!("vault should not write for a literal template");
             }
         }
-        let vault = Vault::new_with(PanickingKeyring, HashMap::new());
+        let vault = Vault::new_with(
+            Box::new(PanickingStorage),
+            HashMap::new(),
+            VaultStorageType::File,
+        );
         assert_eq!(vault.subst("plain-value").unwrap(), "plain-value");
         assert_eq!(vault.subst("").unwrap(), "");
     }
 
-    /// Env-only lookup: no secret in vault, value comes from the
-    /// snapshotted env map.
     #[test]
     fn subst_resolves_from_env() {
-        let vault = Vault::new_with(FakeKeyring::default(), env(&[("HOME_DIR", "/home/alice")]));
+        let vault = vault_with(FakeStorage::default(), &[("HOME_DIR", "/home/alice")]);
         assert_eq!(
             vault.subst("prefix:${HOME_DIR}/suffix").unwrap(),
             "prefix:/home/alice/suffix"
         );
     }
 
-    /// Secret-only lookup: no matching env entry, value comes from the
-    /// vault.
     #[test]
     fn subst_resolves_from_vault() {
-        let vault = Vault::new_with(FakeKeyring::default(), HashMap::new());
+        let vault = vault_with(FakeStorage::default(), &[]);
         vault.set_secret("DATABASE_URL", "postgres://db").unwrap();
         assert_eq!(
             vault.subst("url=${DATABASE_URL}").unwrap(),
@@ -603,32 +948,134 @@ mod tests {
         );
     }
 
-    /// Env must win when both sources define the same name. Host env
-    /// is consulted first so routine templates (`${PATH}`, `${HOME}`)
-    /// don't trigger a keyring unlock — that UX cost is worse than
-    /// the footgun of a shell var shadowing a saved secret, which
-    /// users can fix by renaming or unsetting.
     #[test]
     fn subst_env_wins_over_vault() {
-        let vault = Vault::new_with(FakeKeyring::default(), env(&[("TOKEN", "from-env")]));
+        let vault = vault_with(FakeStorage::default(), &[("TOKEN", "from-env")]);
         vault.set_secret("TOKEN", "from-vault").unwrap();
         assert_eq!(vault.subst("${TOKEN}").unwrap(), "from-env");
     }
 
-    /// An unknown variable has no value in either source — `subst`
-    /// surfaces the underlying `subst` crate error as `anyhow::Error`.
     #[test]
     fn subst_missing_variable_errors() {
-        let vault = Vault::new_with(FakeKeyring::default(), HashMap::new());
+        let vault = vault_with(FakeStorage::default(), &[]);
         assert!(vault.subst("${NOPE}").is_err());
     }
 
-    /// One template can mix multiple references, drawing from both
-    /// sources in a single pass.
     #[test]
     fn subst_mixes_vault_and_env_in_one_template() {
-        let vault = Vault::new_with(FakeKeyring::default(), env(&[("USER", "alice")]));
+        let vault = vault_with(FakeStorage::default(), &[("USER", "alice")]);
         vault.set_secret("TOKEN", "s3cret").unwrap();
         assert_eq!(vault.subst("${USER}:${TOKEN}").unwrap(), "alice:s3cret");
+    }
+
+    // ── File storage ─────────────────────────────────────────────────────
+
+    #[test]
+    fn file_storage_roundtrip() {
+        let path = fresh_tmp("vault.json");
+        let storage = FileStorage::new(path.clone());
+        let vault = Vault::new_with(Box::new(storage), HashMap::new(), VaultStorageType::File);
+
+        vault.set_secret("TOKEN", "abc").unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"type\": \"file\""), "{raw}");
+
+        let vault2 = Vault::new_with(
+            Box::new(FileStorage::new(path)),
+            HashMap::new(),
+            VaultStorageType::File,
+        );
+        assert_eq!(vault2.get_secret("TOKEN").unwrap(), Some("abc".to_string()));
+    }
+
+    /// Missing file → empty vault (not an error).
+    #[test]
+    fn file_storage_missing_file_is_empty() {
+        let path = fresh_tmp("never-written.json");
+        let vault = Vault::new_with(
+            Box::new(FileStorage::new(path)),
+            HashMap::new(),
+            VaultStorageType::File,
+        );
+        assert!(vault.list_secrets().unwrap().is_empty());
+    }
+
+    /// A file written by the encrypted backend must not silently open
+    /// as a plain-file vault (data loss).
+    #[test]
+    fn file_storage_rejects_encrypted_envelope() {
+        let path = fresh_tmp("vault.json");
+        EncryptedFileStorage::new(path.clone(), Box::new(FixedPassphrase("pw")))
+            .store(r#"{"secrets":{},"registries":{}}"#)
+            .unwrap();
+        let err = FileStorage::new(path).load().unwrap_err();
+        assert!(err.to_string().contains("encrypted vault"), "got: {err:#}");
+    }
+
+    // ── Encrypted-file storage ──────────────────────────────────────────
+
+    #[test]
+    fn encrypted_file_storage_roundtrip() {
+        let path = fresh_tmp("vault.json");
+        let storage = EncryptedFileStorage::new(path.clone(), Box::new(FixedPassphrase("hunter2")));
+        let vault = Vault::new_with(
+            Box::new(storage),
+            HashMap::new(),
+            VaultStorageType::EncryptedFile,
+        );
+
+        vault.set_secret("TOKEN", "abc").unwrap();
+        vault.set_secret("OTHER", "xyz").unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"type\": \"encrypted-file\""), "{raw}");
+        assert!(!raw.contains("abc"), "ciphertext leaked plaintext: {raw}");
+
+        let vault2 = Vault::new_with(
+            Box::new(EncryptedFileStorage::new(
+                path,
+                Box::new(FixedPassphrase("hunter2")),
+            )),
+            HashMap::new(),
+            VaultStorageType::EncryptedFile,
+        );
+        assert_eq!(vault2.get_secret("TOKEN").unwrap(), Some("abc".to_string()));
+        assert_eq!(vault2.get_secret("OTHER").unwrap(), Some("xyz".to_string()));
+    }
+
+    #[test]
+    fn encrypted_file_storage_rejects_wrong_passphrase() {
+        let path = fresh_tmp("vault.json");
+        let storage = EncryptedFileStorage::new(path.clone(), Box::new(FixedPassphrase("right")));
+        let vault = Vault::new_with(
+            Box::new(storage),
+            HashMap::new(),
+            VaultStorageType::EncryptedFile,
+        );
+        vault.set_secret("TOKEN", "abc").unwrap();
+
+        let bad = Vault::new_with(
+            Box::new(EncryptedFileStorage::new(
+                path,
+                Box::new(FixedPassphrase("wrong")),
+            )),
+            HashMap::new(),
+            VaultStorageType::EncryptedFile,
+        );
+        let err = bad.get_secret("TOKEN").unwrap_err();
+        assert!(err.to_string().contains("wrong passphrase"), "got: {err:#}");
+    }
+
+    #[test]
+    fn encrypted_file_storage_rejects_plaintext_envelope() {
+        let path = fresh_tmp("vault.json");
+        FileStorage::new(path.clone())
+            .store(r#"{"secrets":{},"registries":{}}"#)
+            .unwrap();
+        let err = EncryptedFileStorage::new(path, Box::new(FixedPassphrase("pw")))
+            .load()
+            .unwrap_err();
+        assert!(err.to_string().contains("plaintext vault"), "got: {err:#}");
     }
 }

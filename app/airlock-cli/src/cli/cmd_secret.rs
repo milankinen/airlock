@@ -1,8 +1,8 @@
-//! `airlock secret` — manage user secrets stored in the system keyring.
+//! `airlock secret` — manage user secrets stored in the configured
+//! vault backend.
 //!
-//! Three subcommands: `ls`, `add`, `rm`. All storage goes through the
-//! single `Vault` (one JSON blob in one keyring entry); see
-//! `crate::vault`.
+//! Three subcommands: `ls`, `add`, `rm`. Storage goes through the
+//! single `Vault` (one JSON blob); see `crate::vault`.
 //!
 //! `add` never takes the value on the command line — interactive
 //! prompt or `--stdin`. This is a hard rule: argv values leak via
@@ -12,12 +12,12 @@ use std::io::Read;
 
 use anyhow::{Context, bail};
 use clap::{Args, Subcommand};
-use dialoguer::Password;
 use dialoguer::theme::ColorfulTheme;
+use dialoguer::{Confirm, Password};
 
 use crate::cli;
 use crate::settings::Settings;
-use crate::vault::{Vault, validate_secret_name};
+use crate::vault::{Vault, VaultStorageType, validate_secret_name};
 
 #[derive(Args, Debug)]
 pub struct SecretArgs {
@@ -41,6 +41,10 @@ enum SecretCmd {
         /// piping secrets from scripts.
         #[arg(long)]
         stdin: bool,
+        /// Skip the plaintext-vault confirmation. Has no effect on
+        /// encrypted/keyring vaults.
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
     /// Remove a secret.
     Rm {
@@ -49,13 +53,15 @@ enum SecretCmd {
     },
 }
 
-pub fn main(args: SecretArgs, vault: &Vault, settings: &Settings) -> i32 {
-    if !settings.vault_enabled {
+pub fn main(args: SecretArgs, vault: &Vault, _settings: &Settings) -> i32 {
+    if vault.storage_type() == VaultStorageType::Disabled {
         cli::error!(
             "the airlock vault is disabled. Enable it to store user \
-             secrets and registry credentials in the system keyring.\n\n\
-             To enable, create {} with:\n\n  \
-             vault_enabled = true\n",
+             secrets and registry credentials.\n\n\
+             Edit {} and set:\n\n  \
+             vault.storage = \"file\"            # plain 0600 JSON, or\n  \
+             vault.storage = \"encrypted-file\"  # passphrase-encrypted, or\n  \
+             vault.storage = \"keyring\"         # system keychain / Secret Service\n",
             Settings::expected_path().display()
         );
         return 1;
@@ -72,7 +78,7 @@ pub fn main(args: SecretArgs, vault: &Vault, settings: &Settings) -> i32 {
 fn run(args: SecretArgs, vault: &Vault) -> anyhow::Result<()> {
     match args.cmd {
         SecretCmd::Ls => list(vault),
-        SecretCmd::Add { name, stdin } => add(vault, &name, stdin),
+        SecretCmd::Add { name, stdin, yes } => add(vault, &name, stdin, yes),
         SecretCmd::Rm { name } => remove(vault, &name),
     }
 }
@@ -102,8 +108,11 @@ fn list(vault: &Vault) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn add(vault: &Vault, name: &str, use_stdin: bool) -> anyhow::Result<()> {
+fn add(vault: &Vault, name: &str, use_stdin: bool, yes: bool) -> anyhow::Result<()> {
     validate_secret_name(name)?;
+    if vault.storage_type() == VaultStorageType::File && !yes {
+        confirm_plaintext_vault()?;
+    }
     let value = if use_stdin {
         read_from_stdin()?
     } else {
@@ -124,6 +133,44 @@ fn remove(vault: &Vault, name: &str) -> anyhow::Result<()> {
         cli::log!("  {} removed secret {name}", cli::check());
     } else {
         cli::log!("No secret named {name}");
+    }
+    Ok(())
+}
+
+// ── Plaintext-vault confirmation ─────────────────────────────────────────────
+
+/// Warn the user — once per `secret add` — that the `file` backend
+/// stores secrets as cleartext JSON, and ask whether to proceed. Point
+/// at the two better options so the warning carries actionable advice
+/// instead of just friction. A non-interactive shell fails closed; the
+/// caller can pass `--yes` when scripting.
+fn confirm_plaintext_vault() -> anyhow::Result<()> {
+    let msg = "\
+Your vault backend is \"file\" — secrets will be written as plaintext \
+JSON to ~/.airlock/vault.json (mode 0600). Anyone with read access to \
+that file can recover them.
+
+For stronger at-rest protection, set one of these in \
+~/.airlock/settings.toml:
+
+  vault.storage = \"encrypted-file\"  # AEAD-encrypted, passphrase on first use
+                                      # (AIRLOCK_VAULT_PASSPHRASE for non-interactive)
+  vault.storage = \"keyring\"         # OS keychain / Secret Service
+
+Proceed with the plaintext vault?";
+    if !cli::is_interactive() {
+        bail!(
+            "vault is \"file\" (plaintext). Re-run with --yes to confirm, or switch to \
+             \"encrypted-file\" / \"keyring\" in ~/.airlock/settings.toml."
+        );
+    }
+    let ok = Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt(msg)
+        .default(false)
+        .interact()
+        .context("confirm plaintext vault")?;
+    if !ok {
+        bail!("cancelled");
     }
     Ok(())
 }

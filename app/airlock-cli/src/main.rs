@@ -49,15 +49,11 @@ async fn main() {
         }
     };
 
-    // One Vault per process, threaded into every subcommand. When
-    // `vault_enabled = false`, the vault uses a noop keyring — no
-    // I/O, no unlock prompts, reads return empty. `Vault` is cheaply
-    // cloneable (Arc inside) so we pass it by value.
-    let vault = if settings.vault_enabled {
-        Vault::new()
-    } else {
-        Vault::disabled()
-    };
+    // One Vault per process, threaded into every subcommand. The
+    // backend is selected by `settings.vault`; for `disabled` the
+    // vault is an inert no-op so no callee has to special-case it.
+    // `Vault` is cheaply cloneable (Arc inside) and passed by value.
+    let vault = Vault::for_storage_type(settings.vault.storage);
 
     let exit_code = match parsed.command {
         Command::Start(args) => cli::cmd_start::main(args, extra_args, vault).await,

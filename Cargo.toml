@@ -78,6 +78,10 @@ pty-process = { version = "0.5", features = ["async"] }
 
 # Secrets
 keyring = { version = "3", default-features = false }
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+base64 = "0.22"
+rand = "0.9"
 
 # DNS + cache
 scc = "2"
