@@ -1,0 +1,34 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://admin.airlock/claude/hooks/pre-tool-use"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://admin.airlock/claude/hooks/post-tool-use"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://admin.airlock/claude/hooks/post-tool-use-failure"
+          }
+        ]
+      }
+    ]
+  }
+}

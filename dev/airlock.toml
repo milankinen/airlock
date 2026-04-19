@@ -2,3 +2,6 @@ presets = ["debian", "rust", "claude-code", "openai-codex", "copilot-cli"]
 
 [vm]
 image = "airlock:dev"
+
+[network]
+policy = "deny-by-default"
