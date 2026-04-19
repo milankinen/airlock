@@ -25,7 +25,7 @@ Always format code you produce. Use `mise format`
 
 ## Temporary files
 
-IMPORTANT: Write temporary files **ALWAYS** to this project's `.tmp`
+IMPORTANT: Write temporary files **ALWAYS** to this project's `dev/tmp`
 directory instead of `/tmp`. Delete temporary files immediately
 after their use unless told otherwise.
 

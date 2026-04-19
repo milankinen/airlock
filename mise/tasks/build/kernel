@@ -1,6 +1,6 @@
 #!/bin/bash
 #MISE description="Build the kernel using Docker"
-#MISE sources=["vm/kernel/config-*", "vm/kernel/build.sh"]
+#MISE sources=["app/vm-kernel/config-*", "app/vm-kernel/build.sh"]
 #MISE outputs=["target/vm/Image"]
 set -euo pipefail
 
@@ -15,8 +15,8 @@ mkdir -p target/vm
 docker run --rm \
   -e "ARCH=${ARCH}" \
   -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
-  -v "$PWD/vm/kernel/${CONFIG}:/config:ro" \
-  -v "$PWD/vm/kernel/build.sh:/build.sh:ro" \
+  -v "$PWD/app/vm-kernel/${CONFIG}:/config:ro" \
+  -v "$PWD/app/vm-kernel/build.sh:/build.sh:ro" \
   -v "$PWD/target/vm:/out" \
   alpine:3.23 sh -c 'sh /build.sh && chown "$HOST_UID:$HOST_GID" /out/Image'
 SIZE=$(du -h target/vm/Image | cut -f1)

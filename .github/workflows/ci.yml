@@ -76,7 +76,7 @@ jobs:
         id: kernel-cache
         with:
           path: target/vm/Image
-          key: kernel-aarch64-${{ hashFiles('vm/kernel/config-arm64', 'vm/kernel/build.sh') }}
+          key: kernel-aarch64-${{ hashFiles('app/vm-kernel/config-arm64', 'app/vm-kernel/build.sh') }}
       - if: steps.kernel-cache.outputs.cache-hit != 'true'
         run: mise run build:kernel
       - uses: actions/upload-artifact@v4
@@ -94,7 +94,7 @@ jobs:
         id: kernel-cache
         with:
           path: target/vm/Image
-          key: kernel-x86_64-${{ hashFiles('vm/kernel/config-x86_64', 'vm/kernel/build.sh') }}
+          key: kernel-x86_64-${{ hashFiles('app/vm-kernel/config-x86_64', 'app/vm-kernel/build.sh') }}
       - if: steps.kernel-cache.outputs.cache-hit != 'true'
         run: mise run build:kernel
       - uses: actions/upload-artifact@v4

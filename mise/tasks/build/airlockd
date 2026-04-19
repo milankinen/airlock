@@ -1,6 +1,6 @@
 #!/bin/bash
 #MISE description="Build airlockd supervisor for Linux (musl)"
-#MISE sources=["crates/airlockd/src/**/*.rs", "crates/airlockd/Cargo.toml", "crates/common/src/**/*.rs", "crates/common/schema/**/*.capnp", "crates/airlockd/builder.dockerfile"]
+#MISE sources=["app/airlockd/src/**/*.rs", "app/airlockd/Cargo.toml", "app/airlock-common/src/**/*.rs", "app/airlock-common/schema/**/*.capnp", "app/airlockd/builder.dockerfile"]
 #MISE outputs=["target/vm/airlockd"]
 set -euo pipefail
 
@@ -14,11 +14,11 @@ mkdir -p target/vm
 
 if [[ "${SUPERVISOR_BUILD_HOST:-}" == "true" ]]; then
   echo "Building airlockd (native, ${TARGET})..."
-  cargo build --release -p airlock-supervisor --target "${TARGET}"
+  cargo build --release -p airlockd --target "${TARGET}"
   cp "target/${TARGET}/release/airlockd" target/vm/airlockd
 else
   echo "Preparing airlockd builder..."
-  docker build --progress=quiet -t airlock-supervisor-builder -f crates/airlockd/builder.dockerfile crates/airlockd
+  docker build --progress=quiet -t airlockd-builder -f app/airlockd/builder.dockerfile app/airlockd
   echo "Building airlockd (docker, ${TARGET})..."
   [ -f target/vm/airlockd ] && rm target/vm/airlockd
   docker run --rm \
@@ -27,12 +27,12 @@ else
     -v "$PWD/target/vm:/out" \
     -v airlock-cargo-cache:/cargo-cache \
     -v airlock-target-cache:/target \
-    airlock-supervisor-builder sh -c "
+    airlockd-builder sh -c "
       export CARGO_HOME=/cargo-cache
       export RUSTUP_HOME=/cargo-cache
       cd /workspace
       rustup target add ${TARGET}
-      cargo build --release -p airlock-supervisor --target ${TARGET} --target-dir /target
+      cargo build --release -p airlockd --target ${TARGET} --target-dir /target
       cp /target/${TARGET}/release/airlockd /out/airlockd
       chown \${HOST_UID}:\${HOST_GID} /out/airlockd
     "

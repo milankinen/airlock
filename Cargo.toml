@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/airlock", "crates/common", "crates/airlockd", "crates/tui"]
+members = ["app/airlock-cli", "app/airlock-common", "app/airlockd", "app/airlock-monitor"]
 resolver = "3"
 
 [workspace.package]
@@ -97,8 +97,8 @@ terminput-crossterm = "0.4"
 vt100 = "0.16"
 
 # Internal
-airlock-protocol = { path = "crates/common" }
-airlock-tui = { path = "crates/tui" }
+airlock-common = { path = "app/airlock-common" }
+airlock-monitor = { path = "app/airlock-monitor" }
 
 [workspace.lints.clippy]
 pedantic = { level = "deny", priority = -1 }

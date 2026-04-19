@@ -1,7 +1,7 @@
 #!/bin/bash
 #MISE description="Build the CLI binary"
 #MISE depends=["build:initramfs", "build:kernel", "fetch:cloud-hypervisor", "build:virtiofsd"]
-#MISE sources=["crates/airlock/**/*", "crates/protocol/**/*", "crates/tui/**/*", "Cargo.toml", "Cargo.lock", "target/vm/*"]
+#MISE sources=["app/airlock-cli/**/*", "app/airlock-common/**/*", "app/airlock-monitor/**/*", "Cargo.toml", "Cargo.lock", "target/vm/*"]
 #MISE outputs=["target/debug/airlock"]
 set -euo pipefail
 

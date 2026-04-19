@@ -45,8 +45,8 @@ dependencies = [
 name = "airlock-cli"
 version = "0.1.0"
 dependencies = [
- "airlock-protocol",
- "airlock-tui",
+ "airlock-common",
+ "airlock-monitor",
  "anyhow",
  "async-stream",
  "axum",
@@ -104,7 +104,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "airlock-protocol"
+name = "airlock-common"
 version = "0.1.0"
 dependencies = [
  "capnp",
@@ -112,10 +112,28 @@ dependencies = [
 ]
 
 [[package]]
-name = "airlock-supervisor"
+name = "airlock-monitor"
 version = "0.1.0"
 dependencies = [
- "airlock-protocol",
+ "airlock-common",
+ "anyhow",
+ "capnp",
+ "capnp-rpc",
+ "crossterm",
+ "libc",
+ "ratatui",
+ "terminput",
+ "terminput-crossterm",
+ "tokio",
+ "tracing",
+ "vt100",
+]
+
+[[package]]
+name = "airlockd"
+version = "0.1.0"
+dependencies = [
+ "airlock-common",
  "anyhow",
  "bytes",
  "capnp",
@@ -131,24 +149,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "airlock-tui"
-version = "0.1.0"
-dependencies = [
- "airlock-protocol",
- "anyhow",
- "capnp",
- "capnp-rpc",
- "crossterm",
- "libc",
- "ratatui",
- "terminput",
- "terminput-crossterm",
- "tokio",
- "tracing",
- "vt100",
 ]
 
 [[package]]

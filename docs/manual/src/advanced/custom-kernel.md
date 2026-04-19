@@ -24,7 +24,7 @@ directory. When these are set, airlock uses them instead of the bundled files.
 
 The kernel must be compatible with airlock's guest supervisor (`airlockd`).
 The repository's
-[vm/kernel](https://github.com/milankinen/airlock/tree/main/vm/kernel)
+[app/vm-kernel](https://github.com/milankinen/airlock/tree/main/app/vm-kernel)
 directory contains the kernel configs used for official builds — these are
 a good starting point if you want to compile your own.
 
@@ -51,7 +51,7 @@ curl -fsSL https://raw.githubusercontent.com/milankinen/airlock/main/install.sh 
 
 ## Building a kernel
 
-The official kernel build script lives at `vm/kernel/build.sh` in the
+The official kernel build script lives at `app/vm-kernel/build.sh` in the
 repository. It downloads the configured Linux version, applies the airlock
 kernel config, and produces a kernel image and initramfs. Both x86_64 and
 ARM64 architectures are supported.
