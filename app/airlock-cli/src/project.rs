@@ -83,39 +83,6 @@ impl Project {
             format!("{} → {}", self.host_cwd.display(), self.guest_cwd.display())
         }
     }
-
-    /// Install the sandbox CA cert into `sandbox_dir/ca/` as an extra overlayfs
-    /// lowerdir. The supervisor mounts this as the highest-priority lowerdir so
-    /// it overrides the base image without touching the upperdir.
-    pub fn install_ca_cert(&self, image_rootfs: &Path) -> anyhow::Result<()> {
-        let ca_cert = self.ca_cert.as_bytes();
-        // CA overlay lives at sandbox_dir/ca/ (not overlay/ca/)
-        let overlay_ca_dir = self.sandbox_dir.join("ca");
-
-        let ca_stores = [
-            "etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu/Alpine
-            "etc/ssl/cert.pem",                  // Alpine/LibreSSL
-            "etc/pki/tls/certs/ca-bundle.crt",   // RHEL/CentOS/Fedora
-            "etc/ssl/ca-bundle.pem",             // openSUSE/SLES
-            "etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", // RHEL/Fedora
-        ];
-
-        for ca_store in ca_stores {
-            let dest = overlay_ca_dir.join(ca_store);
-            let existing = std::fs::read(image_rootfs.join(ca_store)).unwrap_or_default();
-            let mut out = existing;
-            if !out.ends_with(b"\n") && !out.is_empty() {
-                out.push(b'\n');
-            }
-            out.extend_from_slice(ca_cert);
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&dest, &out)?;
-        }
-
-        Ok(())
-    }
 }
 
 impl Drop for Project {

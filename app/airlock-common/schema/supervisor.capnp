@@ -26,6 +26,10 @@ interface Supervisor {
     dirs        :List(DirMount),
     files       :List(FileMount),
     caches      :List(CacheMount),
+    # Project CA cert in PEM form. Appended to the image's CA bundles by
+    # guest init after the overlayfs rootfs is mounted. Empty when the
+    # project has no CA (vault disabled / TLS interception off).
+    caCert      :Data,
   ) -> (proc :Process);
 
   shutdown @1 () -> ();

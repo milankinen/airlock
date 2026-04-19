@@ -29,7 +29,6 @@ pub fn setup(
     set_clock(config.epoch, config.epoch_nanos);
 
     // 1. Mount well-known VirtioFS shares
-    mount_virtiofs("ca")?;
     mount_virtiofs("layers")?;
 
     // 2. Mount user dir shares (includes "project" and "dir_N" mounts)
@@ -232,14 +231,17 @@ fn assemble_rootfs(mounts: &MountConfig) -> anyhow::Result<()> {
         }
     }
 
-    // overlayfs: ca (highest priority) + per-layer rootfs trees (lowerdirs,
-    // topmost-first) + project state (upperdir).
+    // overlayfs: per-layer rootfs trees (lowerdirs, topmost-first) +
+    // project state (upperdir). The project CA is staged as an extra tmpfs
+    // lowerdir placed on top of the image layers (see `prepare_ca_overlay`),
+    // so CA writes never land on the persistent upperdir — without that, the
+    // appended CA would accumulate across reboots when the upperdir is kept.
     //
     // `userxattr` makes overlayfs honor whiteouts encoded as `user.overlay.*`
     // xattrs, which is how the host-side extractor preserves whiteouts without
     // needing CAP_MKNOD. Requires kernel >= 5.11.
-    let ca_exists = Path::new("/mnt/ca").is_dir();
-    debug!("overlayfs ca layer: exists={ca_exists}");
+    let ca_overlay = prepare_ca_overlay(mounts)?;
+
     let layer_dirs: Vec<String> = mounts
         .image_layers
         .iter()
@@ -248,15 +250,15 @@ fn assemble_rootfs(mounts: &MountConfig) -> anyhow::Result<()> {
     if layer_dirs.is_empty() {
         anyhow::bail!("no image layers supplied");
     }
-    for dir in &layer_dirs {
+    let mut lower_dirs: Vec<String> = Vec::with_capacity(layer_dirs.len() + 1);
+    if let Some(dir) = ca_overlay {
+        lower_dirs.push(dir.to_string());
+    }
+    lower_dirs.extend(layer_dirs.iter().cloned());
+    for dir in &lower_dirs {
         debug!("overlayfs lower: {dir} exists={}", Path::new(dir).is_dir());
     }
-    let mut lower_parts: Vec<String> = Vec::with_capacity(layer_dirs.len() + 1);
-    if ca_exists {
-        lower_parts.push("/mnt/ca".to_string());
-    }
-    lower_parts.extend(layer_dirs);
-    let lower = lower_parts.join(":");
+    let lower = lower_dirs.join(":");
     let opts = format!("lowerdir={lower},upperdir={upper},workdir={work},userxattr");
     info!("overlayfs opts: {opts}");
     let opts_cstr = std::ffi::CString::new(opts.as_str()).unwrap();
@@ -643,4 +645,123 @@ fn run_cmd(args: &[&str]) -> anyhow::Result<()> {
     }
     debug!("{cmd_str}: ok");
     Ok(())
+}
+
+/// CA bundle paths known across common distros. Each path is relative to the
+/// rootfs. Guest init merges the project CA into each existing bundle (read
+/// from the image's lower layers) and falls back to writing the Debian/Ubuntu
+/// path when none are present, so `SSL_CERT_FILE` can point at a predictable
+/// location in minimal images.
+const CA_BUNDLE_PATHS: &[&str] = &[
+    "etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu/Alpine
+    "etc/ssl/cert.pem",                  // Alpine/LibreSSL
+    "etc/pki/tls/certs/ca-bundle.crt",   // RHEL/CentOS/Fedora
+    "etc/ssl/ca-bundle.pem",             // openSUSE/SLES
+    "etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", // RHEL/Fedora
+];
+
+/// Drop-in anchor locations for distro trust-update tools. When the user or
+/// a package postinst runs `update-ca-certificates` / `update-ca-trust` /
+/// `trust extract-compat` it rebuilds the bundles from these directories —
+/// so shipping the project CA as a plain file here makes it survive any
+/// future rebuild of `etc/ssl/certs/ca-certificates.crt` on the upperdir.
+const CA_ANCHOR_PATHS: &[&str] = &[
+    "usr/local/share/ca-certificates/airlock.crt", // Debian/Ubuntu/Alpine — update-ca-certificates
+    "etc/pki/ca-trust/source/anchors/airlock.crt", // RHEL/Fedora/CentOS — update-ca-trust
+    "etc/pki/trust/anchors/airlock.crt",           // openSUSE/SLES — update-ca-certificates
+    "etc/ca-certificates/trust-source/anchors/airlock.crt", // Arch — trust extract-compat
+];
+
+/// tmpfs lowerdir holding pre-merged CA bundles. Placed above the image
+/// layers in the overlayfs stack so the project CA is visible without any
+/// write ever landing on the persistent upperdir.
+const CA_OVERLAY_DIR: &str = "/mnt/ca-overlay";
+
+/// Build a tmpfs lowerdir containing per-bundle copies of every CA bundle the
+/// image ships, each with the project CA appended. Returns the tmpfs path
+/// when anything was written (so the caller can splice it into `lowerdir`),
+/// or `None` when there's no project CA to inject.
+///
+/// This runs **before** overlayfs is mounted: for each well-known bundle path
+/// we walk `image_layers` topmost-first, take the first layer that ships a
+/// non-empty copy of that file, append the project CA, and drop the result
+/// into the tmpfs at the same relative path. Doing the merge against the
+/// pristine layer content — not the already-merged overlayfs view — is what
+/// prevents the CA from accumulating across reboots when the upperdir is
+/// persisted on the project disk.
+fn prepare_ca_overlay(mounts: &MountConfig) -> anyhow::Result<Option<&'static str>> {
+    if mounts.ca_cert.is_empty() {
+        return Ok(None);
+    }
+    std::fs::create_dir_all(CA_OVERLAY_DIR)?;
+    mount_fs(
+        "ca-overlay",
+        CA_OVERLAY_DIR,
+        "tmpfs",
+        libc::MS_NOSUID | libc::MS_NODEV,
+        "mode=0755",
+    )?;
+
+    let mut wrote_any = false;
+    for rel in CA_BUNDLE_PATHS {
+        let Some(base) = find_bundle_in_layers(&mounts.image_layers, rel)? else {
+            continue;
+        };
+        write_ca_bundle(rel, &base, &mounts.ca_cert)?;
+        wrote_any = true;
+        debug!("ca: merged /{rel} from image layers");
+    }
+    if !wrote_any {
+        write_ca_bundle(CA_BUNDLE_PATHS[0], &[], &mounts.ca_cert)?;
+        debug!(
+            "ca: wrote fallback /{} (no CA bundle shipped by image)",
+            CA_BUNDLE_PATHS[0]
+        );
+    }
+
+    // Drop the raw CA into every well-known anchor directory so trust-update
+    // tools regenerate bundles that still include it. Cheap and harmless when
+    // the tool isn't installed — the file just sits there unread.
+    for rel in CA_ANCHOR_PATHS {
+        write_ca_bundle(rel, &[], &mounts.ca_cert)?;
+        debug!("ca: dropped anchor /{rel}");
+    }
+    Ok(Some(CA_OVERLAY_DIR))
+}
+
+/// Find the first layer that ships `rel` (topmost-first) and return its
+/// contents. An empty file in a layer is treated as "masked here" — either an
+/// overlayfs whiteout placeholder from our extractor or a deliberately empty
+/// bundle — and stops the walk so we don't resurrect content the image meant
+/// to hide. `None` means no layer had the path at all.
+fn find_bundle_in_layers(layers: &[String], rel: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    for digest in layers {
+        let path = Path::new("/mnt/layers")
+            .join(digest)
+            .join("rootfs")
+            .join(rel);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_file() && meta.len() > 0 => {
+                return Ok(Some(std::fs::read(&path)?));
+            }
+            Ok(_) => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(None)
+}
+
+fn write_ca_bundle(rel: &str, base: &[u8], ca_cert: &[u8]) -> anyhow::Result<()> {
+    let target = Path::new(CA_OVERLAY_DIR).join(rel);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut out = base.to_vec();
+    if !out.is_empty() && !out.ends_with(b"\n") {
+        out.push(b'\n');
+    }
+    out.extend_from_slice(ca_cert);
+    std::fs::write(&target, &out)
+        .map_err(|e| anyhow::anyhow!("write CA bundle {}: {e}", target.display()))
 }

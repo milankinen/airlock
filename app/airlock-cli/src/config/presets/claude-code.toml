@@ -5,6 +5,8 @@
 CLAUDE_CODE_OAUTH_TOKEN = "real-token-will-be-injected"
 # Tell that we're inside sandbox
 IS_SANDBOX = "1"
+# Claude uses Node certs - must add airlock CA to the trusted certs
+NODE_EXTRA_CA_CERTS = "/etc/ssl/certs/ca-certificates.crt"
 
 [network.rules.claude-code]
 allow = [

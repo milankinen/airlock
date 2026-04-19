@@ -121,10 +121,7 @@ pub async fn start(
     image: &OciImage,
 ) -> anyhow::Result<(VmInstance, OwnedFd)> {
     let assets = Assets::init(project)?;
-    // CA overlay lives at sandbox_dir/ca/; files overlay at sandbox_dir/overlay/
     let overlay_dir = project.sandbox_dir.join("overlay");
-
-    project.install_ca_cert(&image.rootfs)?;
 
     let mounts = assemble_mounts(project, image)?;
     let shares = prepare_shares(image, &mounts, &project.sandbox_dir)?;
@@ -219,7 +216,6 @@ fn assemble_mounts(
 ///
 /// File mounts are hard-linked (copy fallback on EXDEV) into
 /// `overlay/files/{rw,ro}/{key}` and exposed as two consolidated shares.
-/// CA overlay lives at `sandbox_dir/ca/`; files overlay at `sandbox_dir/overlay/files/`.
 fn prepare_shares(
     _image: &OciImage,
     mounts: &[mount::ResolvedMount],
@@ -233,15 +229,6 @@ fn prepare_shares(
         host_path: crate::cache::layers_root()?,
         read_only: true,
     }];
-    // CA overlay is at sandbox_dir/ca/ (was overlay/ca/)
-    let ca_dir = sandbox_dir.join("ca");
-    if ca_dir.exists() {
-        shares.push(VmShare {
-            tag: "ca".to_string(),
-            host_path: ca_dir,
-            read_only: true,
-        });
-    }
 
     for m in mounts
         .iter()

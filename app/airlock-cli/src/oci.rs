@@ -45,8 +45,6 @@ fn read_sandbox_image_meta(sandbox_dir: &Path) -> Option<ImageMeta> {
 /// Everything needed to configure the container process (returned by `prepare`).
 /// Mount resolution, disk setup, and command/env overrides happen in `vm::start`.
 pub struct OciImage {
-    /// Path to the shared read-only image rootfs in the image cache.
-    pub rootfs: PathBuf,
     /// OCI image digest, used by supervisor to detect image changes.
     pub image_id: String,
     /// Ordered layer digests — topmost-first. The guest mounts the shared
@@ -156,8 +154,9 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
             }
             ImageChangeAction::Recreate => {
                 let spinner = cli::spinner("erasing old environment...");
-                // Remove overlay files dir and CA overlay (both rebuilt on next start)
+                // File-mount staging dir is rebuilt on every start.
                 let _ = std::fs::remove_dir_all(project.sandbox_dir.join("overlay"));
+                // Legacy CA overlay dir from before CA moved to RPC.
                 let _ = std::fs::remove_dir_all(project.sandbox_dir.join("ca"));
                 // Remove image ref hard link — drops this sandbox's liveness signal
                 // for the old image, so the sweep below may collect it.
@@ -268,7 +267,6 @@ fn build_oci_image(image_dir: &Path, digest: String) -> anyhow::Result<OciImage>
     }
 
     Ok(OciImage {
-        rootfs,
         image_id: digest,
         image_layers: meta
             .layers

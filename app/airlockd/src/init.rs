@@ -51,6 +51,11 @@ pub struct MountConfig {
     pub dirs: Vec<DirMountConfig>,
     pub files: Vec<FileMountConfig>,
     pub caches: Vec<CacheConfig>,
+    /// Project CA cert (PEM bytes). Empty when the project has no CA. When
+    /// non-empty, guest init appends it to the image's CA bundles after the
+    /// overlayfs rootfs is mounted, so TLS clients in the container trust
+    /// the sandbox's MITM proxy without needing a host-side overlay layer.
+    pub ca_cert: Vec<u8>,
 }
 
 #[cfg(target_os = "linux")]

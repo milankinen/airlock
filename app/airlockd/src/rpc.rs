@@ -216,6 +216,7 @@ impl supervisor::Server for SupervisorImpl {
                 dirs,
                 files,
                 caches,
+                ca_cert: params.get_ca_cert()?.to_vec(),
             },
             pty_size,
         };

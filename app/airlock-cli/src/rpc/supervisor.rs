@@ -141,6 +141,7 @@ impl Supervisor {
         for (i, d) in vm.image_layers.iter().enumerate() {
             layers_b.set(i as u32, d);
         }
+        req.get().set_ca_cert(project.ca_cert.as_bytes());
 
         let dirs: Vec<_> = vm
             .mounts
