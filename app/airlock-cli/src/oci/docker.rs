@@ -25,8 +25,6 @@ struct DockerManifestEntry {
 pub struct DockerSave {
     /// Parsed image config (entrypoint, cmd, env, user).
     pub image_config: OciConfig,
-    /// Raw config bytes, to be persisted to `image_config.json`.
-    pub image_config_bytes: Vec<u8>,
     /// Layer digests in manifest order (bottom-up), with the `sha256:` prefix.
     pub layer_digests: Vec<String>,
 }
@@ -82,14 +80,17 @@ pub fn image_arch(image_id: &str) -> Option<String> {
 /// Stream `docker image save` and split its blobs into per-layer tarballs
 /// staged under `~/.cache/airlock/oci/layers/`.
 ///
-/// Every `blobs/sha256/<hex>` entry goes to `<hex>.download.tmp`. Once
-/// `manifest.json` has been parsed we know which blob is the config and
-/// which are layers:
+/// Every `blobs/sha256/<hex>` entry goes to `<hex>.download.tmp` unless
+/// its hex already exists as a cached layer dir, in which case the bytes
+/// are drained to `sink()` — avoids writing potentially gigabytes of
+/// already-extracted base layers to disk just to delete them after
+/// parsing the manifest. Once `manifest.json` has been parsed we know
+/// which blob is the config and which are layers:
 ///
 /// - Config blob → read into memory, returned in [`DockerSave`], and the
 ///   staging file is deleted.
-/// - Layer blob (already cached, i.e. `<digest>/rootfs/` exists) → staging
-///   file deleted.
+/// - Layer blob (cached inline, skipped during stream) → no staging file
+///   to clean up.
 /// - Layer blob (not cached) → renamed to `<hex>.download`, ready for
 ///   `layer::ensure_layer_cached` to extract.
 ///
@@ -136,6 +137,16 @@ pub fn save_layer_tarballs(image_ref: &str) -> anyhow::Result<DockerSave> {
                 std::io::copy(&mut entry, &mut std::io::sink())?;
                 continue;
             }
+            // If this hex is already a cached layer, skip it inline. We
+            // don't know yet whether it's classified as "layer" or "config"
+            // in the manifest, but config blobs never collide with layer
+            // digests (different content, different sha256), so a
+            // `rootfs/` hit can only be a cached layer.
+            let digest = format!("sha256:{hex}");
+            if cache::layer_dir(&digest).is_ok_and(|d| d.join("rootfs").is_dir()) {
+                std::io::copy(&mut entry, &mut std::io::sink())?;
+                continue;
+            }
             let tmp = layers_root.join(format!("{hex}.download.tmp"));
             let mut file = File::create(&tmp)?;
             std::io::copy(&mut entry, &mut file)?;
@@ -154,11 +165,12 @@ pub fn save_layer_tarballs(image_ref: &str) -> anyhow::Result<DockerSave> {
         let config_tmp = staged
             .remove(&config_hex)
             .ok_or_else(|| anyhow::anyhow!("config blob {config_hex} missing in docker save"))?;
-        let image_config_bytes = std::fs::read(&config_tmp)?;
+        let image_config: OciConfig = serde_json::from_slice(&std::fs::read(&config_tmp)?)?;
         let _ = std::fs::remove_file(&config_tmp);
-        let image_config: OciConfig = serde_json::from_slice(&image_config_bytes)?;
 
-        // Rename needed layers into place; drop cached or duplicate blobs.
+        // Rename staged layer blobs into `.download` for extraction.
+        // Cached layers were dropped inline during streaming, so any layer
+        // whose hex is still in `staged` is known to be non-cached.
         let mut layer_digests = Vec::with_capacity(manifest.layers.len());
         let mut seen: HashSet<String> = HashSet::new();
         for layer_ref in &manifest.layers {
@@ -172,24 +184,16 @@ pub fn save_layer_tarballs(image_ref: &str) -> anyhow::Result<DockerSave> {
                 continue;
             }
             let Some(tmp) = staged.remove(&hex) else {
-                // Previous iteration already renamed (duplicate layer in
-                // manifest) — nothing to do.
+                // Either cached (skipped in the stream) or a duplicate
+                // already renamed above — nothing to do.
                 continue;
             };
-            let layer_cached = cache::layer_dir(&digest)
-                .map(|d| d.join("rootfs").is_dir())
-                .unwrap_or(false);
-            if layer_cached {
-                let _ = std::fs::remove_file(&tmp);
-            } else {
-                let download = layers_root.join(format!("{hex}.download"));
-                std::fs::rename(&tmp, &download)?;
-            }
+            let download = layers_root.join(format!("{hex}.download"));
+            std::fs::rename(&tmp, &download)?;
         }
 
         Ok(DockerSave {
             image_config,
-            image_config_bytes,
             layer_digests,
         })
     })();

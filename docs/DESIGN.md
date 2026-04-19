@@ -353,7 +353,7 @@ nothing under `.airlock/` is tracked by version control.
       run.log                    # tracing log from last `airlock up`
       lock                       # PID lockfile (one VM per project at a time)
       cli.sock                   # Unix socket for `airlock exec` RPC
-      image                      # hard-link to image_cache/meta.json (GC ref + digest)
+      image                      # hard-link to image_cache/<digest> (GC ref + cached image)
 ```
 
 `airlock down` removes the entire `.airlock/` directory. The config file is
@@ -381,12 +381,10 @@ metadata and a shared per-layer extraction cache:
     virtiofsd                # (Linux only) VirtioFS daemon
     checksum                 # triggers re-extraction when binary is updated
   oci/
-    images/<digest>/
-      image_config.json      # OCI image config (CMD, ENV, user, etc.)
-      meta.json              # {"digest": …, "name": …, "layers": […]}
+    images/<digest>            # Schema-tagged JSON: the fully-baked `OciImage`
+                               # (name, layers, uid/gid, cmd, env, container_home)
     layers/<digest>/
-      rootfs/                # Extracted layer tree (whiteouts kept as xattrs)
-      .ok                    # Completion marker
+      rootfs/                      # Extracted layer tree (whiteouts as xattrs)
     layers/<digest>.download.tmp   # In-flight download (swept on next run)
     layers/<digest>.download       # Complete tarball pending extraction
     layers/<digest>.tmp/           # In-flight extraction (swept on next run)
@@ -398,15 +396,21 @@ extract it only once. There is no merged per-image rootfs — the guest
 composes overlayfs directly from the per-layer trees. Platform is
 fixed to `linux/arm64` (matching the VM architecture).
 
-`meta.json` is written as the final step of a successful image pull — its
-presence signals that the image is complete and ready to use (replaces the
-old `.complete` marker). It is hard-linked to `sandbox/image`; a link count
-greater than 1 on `meta.json` means at least one sandbox references the
+Each `images/<digest>` entry is a single JSON file carrying the
+serialized `OciImage` (wrapped in a `{"schema":"v1", …}` envelope for
+forward-compatible schema evolution). It is written atomically via
+`.tmp` rename and then hard-linked to `sandbox/image`; a link count
+greater than 1 on the file means at least one sandbox references the
 image, preventing GC.
 
-`sandbox/image` is the per-project GC ref and also the stored-digest source:
-reading it as JSON gives the digest used to detect image changes across runs.
-When the digest changes the overlay upper layer is reset.
+A `<digest>/rootfs/` directory only exists through the atomic rename
+from `<digest>.tmp/`, so its presence is itself the completion marker
+— no separate `.ok` file is needed.
+
+`sandbox/image` is the per-project GC ref and also the stored-image
+source: reading it as JSON gives the full cached `OciImage`, including
+the digest used to detect image changes across runs. When the digest
+changes the overlay upper layer is reset.
 
 ### Locking
 

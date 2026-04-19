@@ -1,8 +1,8 @@
 //! Sweep-based garbage collector for the OCI cache.
 //!
 //! An image is considered live when some sandbox holds a hardlink to its
-//! `meta.json` (link count > 1). A layer is live when at least one live
-//! image's `meta.json` lists its digest. Everything else is deleted.
+//! `images/<digest>` file (link count > 1). A layer is live when at least
+//! one live image lists its digest. Everything else is deleted.
 //!
 //! Run this only after user-initiated removals (`Recreate`, `airlock rm`).
 //! Running it on every `prepare()` would race with sibling sandboxes in
@@ -14,13 +14,15 @@ use std::path::Path;
 
 use crate::cache;
 
+/// Minimal shape for parsing just the layer list from a cached image file —
+/// avoids pulling in the full `OciImage` deserialization path here.
 #[derive(serde::Deserialize)]
-struct MetaLayers {
+struct CachedLayers {
     #[serde(default)]
-    layers: Vec<String>,
+    image_layers: Vec<String>,
 }
 
-/// Remove every image dir whose `meta.json` has link count 1 (no sandbox
+/// Remove every cached image file whose link count is 1 (no sandbox
 /// references), then every layer dir not referenced by a surviving image.
 /// Stray staging entries (`.download`, `.download.tmp`, `.tmp`) are always
 /// removed — they're only meaningful mid-pull.
@@ -39,15 +41,16 @@ fn sweep_images() {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_dir() {
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() {
+            // Ignore leftover directories from the old layout (harmless) and
+            // whatever else shows up; only files are real cache entries.
             continue;
         }
-        let meta = path.join("meta.json");
-        let in_use = std::fs::metadata(&meta)
-            .map(|m| m.nlink() > 1)
-            .unwrap_or(false);
-        if !in_use {
-            let _ = std::fs::remove_dir_all(&path);
+        if meta.nlink() <= 1 {
+            let _ = std::fs::remove_file(&path);
         }
     }
 }
@@ -61,14 +64,13 @@ fn collect_live_layers() -> HashSet<String> {
         return live;
     };
     for entry in entries.flatten() {
-        let meta_path = entry.path().join("meta.json");
-        let Ok(data) = std::fs::read(&meta_path) else {
+        let Ok(data) = std::fs::read(entry.path()) else {
             continue;
         };
-        let Ok(parsed) = serde_json::from_slice::<MetaLayers>(&data) else {
+        let Ok(parsed) = serde_json::from_slice::<CachedLayers>(&data) else {
             continue;
         };
-        for d in parsed.layers {
+        for d in parsed.image_layers {
             live.insert(cache::digest_name(&d).to_string());
         }
     }
@@ -126,32 +128,36 @@ mod tests {
         base
     }
 
-    /// Build a live image: write meta.json, then hardlink it into a sandbox
-    /// path so meta.json's nlink > 1 (the GC liveness signal).
-    fn make_live_image(digest: &str, layers: &[&str]) {
-        let dir = cache::image_dir(digest).unwrap();
-        std::fs::create_dir_all(&dir).unwrap();
-        let meta = dir.join("meta.json");
+    /// Write a cached image file with the given layer list.
+    fn write_cached_image(digest: &str, layers: &[&str]) -> std::path::PathBuf {
+        let path = cache::image_path(digest).unwrap();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
         let json = serde_json::json!({
-            "digest": digest,
+            "schema": "v1",
+            "image_id": digest,
             "name": "test",
-            "layers": layers,
+            "image_layers": layers,
+            "container_home": "/root",
+            "uid": 0,
+            "gid": 0,
+            "cmd": ["/bin/sh"],
+            "env": [],
         });
-        std::fs::write(&meta, serde_json::to_vec(&json).unwrap()).unwrap();
-        let link = dir.join("sandbox-ref");
-        std::fs::hard_link(&meta, &link).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        path
+    }
+
+    /// Build a live image: write the cached file, then hardlink it so nlink > 1.
+    fn make_live_image(digest: &str, layers: &[&str]) {
+        let path = write_cached_image(digest, layers);
+        let link = path.with_extension("sandbox-ref");
+        std::fs::hard_link(&path, &link).unwrap();
     }
 
     fn make_orphan_image(digest: &str, layers: &[&str]) {
-        let dir = cache::image_dir(digest).unwrap();
-        std::fs::create_dir_all(&dir).unwrap();
-        let meta = dir.join("meta.json");
-        let json = serde_json::json!({
-            "digest": digest,
-            "name": "test",
-            "layers": layers,
-        });
-        std::fs::write(&meta, serde_json::to_vec(&json).unwrap()).unwrap();
+        write_cached_image(digest, layers);
     }
 
     fn make_layer(digest: &str) {
@@ -176,7 +182,7 @@ mod tests {
 
         sweep();
 
-        assert!(cache::image_dir("sha256:live").unwrap().exists());
+        assert!(cache::image_path("sha256:live").unwrap().exists());
         assert!(cache::layer_dir("sha256:L1").unwrap().exists());
         assert!(cache::layer_dir("sha256:L2").unwrap().exists());
     }
@@ -196,7 +202,7 @@ mod tests {
 
         sweep();
 
-        assert!(!cache::image_dir("sha256:orphan").unwrap().exists());
+        assert!(!cache::image_path("sha256:orphan").unwrap().exists());
         assert!(!cache::layer_dir("sha256:X").unwrap().exists());
     }
 
@@ -217,8 +223,8 @@ mod tests {
 
         sweep();
 
-        assert!(cache::image_dir("sha256:keep").unwrap().exists());
-        assert!(!cache::image_dir("sha256:drop").unwrap().exists());
+        assert!(cache::image_path("sha256:keep").unwrap().exists());
+        assert!(!cache::image_path("sha256:drop").unwrap().exists());
         assert!(cache::layer_dir("sha256:shared").unwrap().exists());
         assert!(!cache::layer_dir("sha256:gone").unwrap().exists());
     }

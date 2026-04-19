@@ -39,15 +39,17 @@ fn oci_root() -> anyhow::Result<PathBuf> {
 }
 
 /// Root of the image cache (`~/.cache/airlock/oci/images/`), created if
-/// absent. Each entry is `<image-digest>/` holding `meta.json` (+ `image_config.json`).
+/// absent. Each entry is a single `<image-digest>` JSON file holding the
+/// fully-baked `OciImage` (schema-tagged via `crate::oci::CachedImage`).
 pub fn images_root() -> anyhow::Result<PathBuf> {
     let dir = oci_root()?.join("images");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
-/// Directory for a cached OCI image, keyed by its digest hash.
-pub fn image_dir(digest: &str) -> anyhow::Result<PathBuf> {
+/// Path to a cached OCI image file, keyed by its digest hash. The path may
+/// or may not exist on disk — callers check.
+pub fn image_path(digest: &str) -> anyhow::Result<PathBuf> {
     Ok(images_root()?.join(digest_name(digest)))
 }
 

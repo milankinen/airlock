@@ -10,7 +10,7 @@ mod gc;
 mod layer;
 mod registry;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use futures::stream::{self, StreamExt};
 pub use gc::sweep as gc_sweep;
@@ -21,32 +21,19 @@ use crate::cli;
 use crate::oci::credentials::ToRegistryAuth;
 use crate::project::Project;
 
-/// Metadata written to `image_dir/meta.json` after a successful image pull.
-/// Hard-linked to `sandbox/image` — serves as both the GC ref (nlink > 1 means
-/// in use) and the stored-digest source (replaces run.json image_digest field).
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ImageMeta {
-    digest: String,
-    name: String,
-    /// Ordered layer digests — topmost-first. The guest passes these as
-    /// overlayfs lowerdirs pointing under `/mnt/layers/<digest>/rootfs`.
-    /// Missing on older cached images; callers must tolerate an empty vec.
-    #[serde(default)]
-    layers: Vec<String>,
-}
-
-/// Read `sandbox/image` as `ImageMeta`. Returns `None` if absent or not yet
-/// in the new format (migration from old empty `.ref` hard-link).
-fn read_sandbox_image_meta(sandbox_dir: &Path) -> Option<ImageMeta> {
-    let data = std::fs::read(sandbox_dir.join("image")).ok()?;
-    serde_json::from_slice(&data).ok()
-}
-
 /// Everything needed to configure the container process (returned by `prepare`).
 /// Mount resolution, disk setup, and command/env overrides happen in `vm::start`.
+///
+/// Serialized to disk at `images/<digest>` wrapped in [`CachedImage`]; the
+/// same file is hardlinked to `<sandbox>/image` as the GC liveness signal.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct OciImage {
     /// OCI image digest, used by supervisor to detect image changes.
     pub image_id: String,
+    /// Image reference the user asked for (e.g. `alpine:3.20`). Stored so the
+    /// fast path can confirm the cached entry still matches the project's
+    /// configured image name without re-resolving the tag.
+    pub name: String,
     /// Ordered layer digests — topmost-first. The guest mounts the shared
     /// `/mnt/layers/<digest>/rootfs` cache as overlayfs lowerdirs in this order.
     pub image_layers: Vec<String>,
@@ -66,40 +53,34 @@ pub struct OciImage {
 
 /// Resolve, download, and prepare the OCI image for the sandbox.
 pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
-    let stored_meta = read_sandbox_image_meta(&project.sandbox_dir);
+    let stored = read_cached_image(&project.sandbox_dir.join("image"));
     let image_cfg = &project.config.vm.image;
     let image_name = &image_cfg.name;
 
     // Fast path: if we already have a cached image for this name, skip
     // the network round-trip to resolve tag → digest. The image is
-    // considered ready when `meta.json` exists and every listed layer
-    // has a `rootfs/` dir — there's no merged rootfs to check anymore.
-    if let Some(ref meta) = stored_meta
-        && meta.name == *image_name
-        && !meta.layers.is_empty()
+    // considered ready when every listed layer has a `rootfs/` dir.
+    if let Some(ref img) = stored
+        && img.name == *image_name
+        && !img.image_layers.is_empty()
+        && img
+            .image_layers
+            .iter()
+            .all(|d| crate::cache::layer_dir(d).is_ok_and(|p| p.join("rootfs").is_dir()))
     {
-        let image_dir = crate::cache::image_dir(&meta.digest)?;
-        if image_dir.join("meta.json").exists()
-            && meta.layers.iter().all(|d| {
-                crate::cache::layer_dir(d)
-                    .map(|p| p.join("rootfs").is_dir())
-                    .unwrap_or(false)
-            })
-        {
-            tracing::debug!("image cache hit for {image_name}");
-            cli::log!(
-                "  {} image cached {}",
-                cli::check(),
-                cli::dim(&meta.digest[..19.min(meta.digest.len())])
-            );
-            let overlay_dir = project.sandbox_dir.join("overlay");
-            std::fs::create_dir_all(&overlay_dir)?;
-            cli::log!("  {} environment ready", cli::check());
-            return build_oci_image(&image_dir, meta.digest.clone());
-        }
+        tracing::debug!("image cache hit for {image_name}");
+        cli::log!(
+            "  {} image cached {}",
+            cli::check(),
+            cli::dim(&img.image_id[..19.min(img.image_id.len())])
+        );
+        let overlay_dir = project.sandbox_dir.join("overlay");
+        std::fs::create_dir_all(&overlay_dir)?;
+        cli::log!("  {} environment ready", cli::check());
+        return Ok(stored.unwrap());
     }
 
-    let stored_digest = stored_meta.map(|m| m.digest);
+    let stored_digest = stored.map(|i| i.image_id);
 
     // Set up registry auth: use stored credentials, fall back to anonymous.
     let registry_host: String = image_name
@@ -146,8 +127,8 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
             ImageChangeAction::KeepOld => {
                 // Only keep old if the cache is still intact; otherwise
                 // fall through and let the new image be used.
-                let old_image_dir = crate::cache::image_dir(old_digest.trim())?;
-                if old_image_dir.join("meta.json").exists() {
+                let old_image_path = crate::cache::image_path(old_digest.trim())?;
+                if old_image_path.exists() {
                     digest_changed = false;
                     image.digest = old_digest.trim().to_string();
                 }
@@ -172,23 +153,23 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
     }
 
     // Download/ensure image (auth already resolved above).
-    let image_dir = ensure_image(&mut image, image_name, &auth, image_cfg.insecure).await?;
+    let oci_image = ensure_image(&mut image, image_name, &auth, image_cfg.insecure).await?;
 
     if digest_changed {
-        // Hard-link meta.json into the sandbox directory. Link count > 1 on
-        // meta.json is the GC guard — without it, a sibling sandbox creating
-        // a new image could trigger a sweep that wrongly deletes this one.
-        // Fail hard on error: the cache and the sandbox should live on the
-        // same filesystem under $HOME, so the only realistic cause is a
+        // Hard-link the cached image file into the sandbox directory. nlink > 1
+        // on `images/<digest>` is the GC guard — without it, a sibling sandbox
+        // creating a new image could trigger a sweep that wrongly deletes this
+        // one. Fail hard on error: the cache and the sandbox should live on
+        // the same filesystem under $HOME, so the only realistic cause is a
         // config problem we want to surface.
-        let meta_path = image_dir.join("meta.json");
+        let image_path = crate::cache::image_path(&oci_image.image_id)?;
         let sandbox_image = project.sandbox_dir.join("image");
         let _ = std::fs::remove_file(&sandbox_image);
-        std::fs::hard_link(&meta_path, &sandbox_image).map_err(|e| {
+        std::fs::hard_link(&image_path, &sandbox_image).map_err(|e| {
             anyhow::anyhow!(
                 "failed to hardlink image ref {} → {}: {e} \
                  (both paths must live on the same filesystem)",
-                meta_path.display(),
+                image_path.display(),
                 sandbox_image.display()
             )
         })?;
@@ -198,42 +179,58 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
     std::fs::create_dir_all(&overlay_dir)?;
     cli::log!("  {} environment ready", cli::check());
 
-    build_oci_image(&image_dir, image.digest)
+    Ok(oci_image)
 }
 
-/// Build an `OciImage` from a cached image directory.
-fn build_oci_image(image_dir: &Path, digest: String) -> anyhow::Result<OciImage> {
-    let config_path = image_dir.join("image_config.json");
-    let image_config: OciConfig = if let Ok(data) = std::fs::read(&config_path) {
-        serde_json::from_slice(&data).unwrap_or_default()
-    } else {
-        OciConfig::default()
-    };
+/// On-disk wrapper for a cached [`OciImage`]. Internally tagged so the JSON
+/// carries `"schema":"v1"` alongside the image fields — future schema bumps
+/// just add a new variant and `serde` picks the right one based on the tag.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "schema")]
+enum CachedImage {
+    #[serde(rename = "v1")]
+    V1(OciImage),
+}
 
-    let meta_path = image_dir.join("meta.json");
-    let meta: ImageMeta = std::fs::read(&meta_path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "missing or corrupt {}",
-                meta_path
-                    .strip_prefix(image_dir)
-                    .unwrap_or(&meta_path)
-                    .display()
-            )
-        })?;
-    if meta.layers.is_empty() {
-        anyhow::bail!(
-            "cached image at {} has no layer list — remove the sandbox's .airlock/sandbox/image \
-             to force a re-pull",
-            image_dir.display()
-        );
+/// Read a cached image JSON file and unwrap it into an [`OciImage`]. Returns
+/// `None` when the file is absent, unreadable, or written by an
+/// unrecognized schema version — callers treat any of those as a cache miss.
+fn read_cached_image(path: &Path) -> Option<OciImage> {
+    let data = std::fs::read(path).ok()?;
+    let wrapped: CachedImage = serde_json::from_slice(&data).ok()?;
+    let CachedImage::V1(image) = wrapped;
+    Some(image)
+}
+
+/// Write a cached image atomically: serialize, write to `<path>.tmp`, rename.
+/// Rename is the commit point, same idiom as the layer cache.
+fn write_cached_image(path: &Path, image: &OciImage) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    let bytes = serde_json::to_vec_pretty(&CachedImage::V1(image.clone()))?;
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Bake the parsed OCI image config plus the ordered layer list into an
+/// `OciImage`: extracts uid/gid, merges entrypoint+cmd, applies env defaults,
+/// and resolves `$HOME` from the per-layer `/etc/passwd`.
+fn build_oci_image(
+    image_id: String,
+    name: String,
+    ordered_layers: Vec<String>,
+    image_config: &OciConfig,
+) -> anyhow::Result<OciImage> {
+    if ordered_layers.is_empty() {
+        anyhow::bail!("image {image_id} has no layers");
     }
 
     let cfg = image_config.config.as_ref();
     let (uid, gid) = parse_user(cfg.and_then(|c| c.user.as_deref()).unwrap_or("0:0"));
-    let container_home = lookup_home_dir(&meta.layers, uid)?;
+    let container_home = lookup_home_dir(&ordered_layers, uid)?;
 
     // Resolve container command: entrypoint + cmd merged
     let cmd: Vec<String> = {
@@ -266,12 +263,9 @@ fn build_oci_image(image_dir: &Path, digest: String) -> anyhow::Result<OciImage>
     }
 
     Ok(OciImage {
-        image_id: digest,
-        image_layers: meta
-            .layers
-            .iter()
-            .map(|d| crate::cache::digest_name(d).to_string())
-            .collect(),
+        image_id,
+        name,
+        image_layers: ordered_layers,
         container_home,
         uid,
         gid,
@@ -414,8 +408,9 @@ enum ImageSource {
     Registry(Box<registry::RegistryImage>),
 }
 
-/// Ensure every layer is cached under `~/.cache/airlock/oci/layers/` and
-/// persist the image's `meta.json` + `image_config.json`.
+/// Ensure every layer is cached under `~/.cache/airlock/oci/layers/`, bake
+/// the image metadata into an [`OciImage`], and persist it as a single
+/// schema-tagged JSON file at `images/<digest>`.
 ///
 /// There is no merged `rootfs/` on the host anymore — the guest composes
 /// overlayfs straight from the per-layer cache. Both registry and docker
@@ -426,46 +421,53 @@ async fn ensure_image(
     image_name: &str,
     auth: &RegistryAuth,
     insecure: bool,
-) -> anyhow::Result<PathBuf> {
-    let dir = crate::cache::image_dir(&resolved.digest)?;
-    let meta_path = dir.join("meta.json");
-    std::fs::create_dir_all(&dir)?;
+) -> anyhow::Result<OciImage> {
+    let image_path = crate::cache::image_path(&resolved.digest)?;
+
+    // Digest-keyed cache hit: a sibling project already pulled this exact
+    // image and all its layers are still on disk. Skip the source-specific
+    // pull entirely. We refresh the stored name so the per-sandbox fast
+    // path in `prepare()` (which matches on name) sees the current tag.
+    if let Some(mut cached) = read_cached_image(&image_path)
+        && !cached.image_layers.is_empty()
+        && cached
+            .image_layers
+            .iter()
+            .all(|d| crate::cache::layer_dir(d).is_ok_and(|p| p.join("rootfs").is_dir()))
+    {
+        if cached.name != image_name {
+            cached.name = image_name.to_string();
+            write_cached_image(&image_path, &cached)?;
+        }
+        return Ok(cached);
+    }
 
     let ordered_layers = match &resolved.source {
         ImageSource::Docker { image_ref } => {
             let image_ref = image_ref.clone();
-            let (cfg, layers) = ensure_docker_image(&image_ref, &dir)?;
+            let (cfg, layers) = ensure_docker_image(&image_ref)?;
             resolved.config = cfg;
             layers
         }
-        ImageSource::Registry(reg) => {
-            ensure_registry_image(reg, resolved, &dir, auth, insecure).await?
-        }
+        ImageSource::Registry(reg) => ensure_registry_image(reg, auth, insecure).await?,
     };
 
-    let meta = ImageMeta {
-        digest: resolved.digest.clone(),
-        name: image_name.to_string(),
-        layers: ordered_layers,
-    };
-    std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
-
-    Ok(dir)
+    let image = build_oci_image(
+        resolved.digest.clone(),
+        image_name.to_string(),
+        ordered_layers,
+        &resolved.config,
+    )?;
+    write_cached_image(&image_path, &image)?;
+    Ok(image)
 }
 
 /// Stream `docker image save` and extract each referenced layer through the
 /// shared per-layer cache. Returns the parsed image config plus layer
 /// digests in topmost-first order.
-fn ensure_docker_image(
-    image_ref: &str,
-    image_dir: &Path,
-) -> anyhow::Result<(OciConfig, Vec<String>)> {
+fn ensure_docker_image(image_ref: &str) -> anyhow::Result<(OciConfig, Vec<String>)> {
     let sp = cli::spinner("exporting from docker...");
     let save = docker::save_layer_tarballs(image_ref)?;
-    std::fs::write(
-        image_dir.join("image_config.json"),
-        &save.image_config_bytes,
-    )?;
 
     for digest in &save.layer_digests {
         layer::ensure_layer_cached(digest, |_tmp| {
@@ -495,8 +497,6 @@ fn ensure_docker_image(
 /// cache. Returns layer digests in topmost-first order.
 async fn ensure_registry_image(
     reg: &registry::RegistryImage,
-    resolved: &ResolvedImage,
-    image_dir: &Path,
     auth: &RegistryAuth,
     insecure: bool,
 ) -> anyhow::Result<Vec<String>> {
@@ -576,9 +576,6 @@ async fn ensure_registry_image(
             ))
         );
     }
-
-    let config_json = serde_json::to_string_pretty(&resolved.config)?;
-    std::fs::write(image_dir.join("image_config.json"), config_json)?;
 
     // OCI manifests list layers bottom→top; overlayfs wants topmost first.
     let mut ordered: Vec<String> = layers
