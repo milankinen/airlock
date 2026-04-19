@@ -53,20 +53,14 @@ pub struct OciImage {
 
 /// Resolve, download, and prepare the OCI image for the sandbox.
 pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
-    let stored = read_cached_image(&project.sandbox_dir.join("image"));
+    let sandbox_image = project.sandbox_dir.join("image");
     let image_cfg = &project.config.vm.image;
     let image_name = &image_cfg.name;
 
-    // Fast path: if we already have a cached image for this name, skip
-    // the network round-trip to resolve tag → digest. The image is
-    // considered ready when every listed layer directory exists.
-    if let Some(ref img) = stored
+    // Fast path: if we already have a cached, ready-to-use image under
+    // the same name, skip the network round-trip to resolve tag → digest.
+    if let Some(img) = read_ready_image(&sandbox_image)
         && img.name == *image_name
-        && !img.image_layers.is_empty()
-        && img
-            .image_layers
-            .iter()
-            .all(|d| crate::cache::layer_dir(d).is_ok_and(|p| p.is_dir()))
     {
         tracing::debug!("image cache hit for {image_name}");
         // Invariant: `sandbox/image` must be a hardlink to the canonical
@@ -75,8 +69,7 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
         // cache wipe, a cache-path migration, or a prior run that pre-dated
         // this invariant, leaving our entry as a sweep target.
         let image_path = crate::cache::image_path(&img.image_id)?;
-        let sandbox_image = project.sandbox_dir.join("image");
-        ensure_image_hardlink(&sandbox_image, &image_path, img)?;
+        ensure_image_hardlink(&sandbox_image, &image_path, &img)?;
         cli::log!(
             "  {} image cached {}",
             cli::check(),
@@ -85,45 +78,50 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
         let overlay_dir = project.sandbox_dir.join("overlay");
         std::fs::create_dir_all(&overlay_dir)?;
         cli::log!("  {} environment ready", cli::check());
-        return Ok(stored.unwrap());
+        return Ok(img);
     }
 
-    let stored_digest = stored.map(|i| i.image_id);
+    // Fall-through: read just the stored digest (if any) for change detection.
+    let stored_digest = read_cached_image(&sandbox_image).map(|i| i.image_id);
 
     // Set up registry auth: use stored credentials, fall back to anonymous.
     let registry_host: String = image_name
         .parse::<oci_client::Reference>()
         .map_or_else(|_| image_name.clone(), |r| r.resolve_registry().to_string());
-    let mut auth = credentials::load(&project.vault, &registry_host)
-        .map_or(RegistryAuth::Anonymous, |c| c.to_auth());
 
-    // Resolve image reference to a digest. On auth failure, prompt for
+    // Resolve image reference to a digest. Start with anonymous, then
+    // use credentials from vault and if that fails as well, prompt for
     // credentials and retry in a loop until success or user interrupts.
+    let mut auth = RegistryAuth::Anonymous;
+    let mut updated_creds = None;
     let mut image = loop {
         match resolve_image(image_name, image_cfg.resolution, image_cfg.insecure, &auth).await {
-            Ok(img) => break img,
-            Err(e) if registry::is_auth_error(&e) => {
-                let creds = credentials::prompt(&registry_host)?;
-                auth = creds.to_auth();
-                match resolve_image(image_name, image_cfg.resolution, image_cfg.insecure, &auth)
-                    .await
-                {
-                    Ok(img) => {
-                        credentials::save(&project.vault, &registry_host, &creds)?;
-                        break img;
-                    }
-                    Err(e) if registry::is_auth_error(&e) => {
-                        cli::error!("authentication failed, try again");
-                        // loop back to prompt again
-                    }
-                    Err(e) => return Err(e),
+            Ok(img) => {
+                if let Some(creds) = updated_creds {
+                    credentials::save(&project.vault, &registry_host, &creds)?;
                 }
+                break img;
+            }
+            Err(e) if registry::is_auth_error(&e) => {
+                if cli::is_interrupted() {
+                    anyhow::bail!("cancelled by user");
+                }
+                if auth == RegistryAuth::Anonymous
+                    && let Some(creds) = credentials::load(&project.vault, &registry_host)
+                {
+                    auth = creds.to_auth();
+                    continue;
+                }
+                cli::error!("authentication failed, try again");
+                let creds = credentials::prompt(&registry_host)?;
+                updated_creds = Some(creds.clone());
+                auth = creds.to_auth();
             }
             Err(e) => return Err(e),
         }
     };
 
-    // Check if image changed before downloading
+    // Check if image changed before downloading.
     let digest_changed = stored_digest
         .as_deref()
         .is_none_or(|s| s.trim() != image.digest);
@@ -141,15 +139,9 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
                 }
             }
             ImageChangeAction::Recreate => {
-                let spinner = cli::spinner("erasing old environment...");
-                // File-mount staging dir is rebuilt on every start.
-                let _ = std::fs::remove_dir_all(project.sandbox_dir.join("overlay"));
-                // Legacy CA overlay dir from before CA moved to RPC.
-                let _ = std::fs::remove_dir_all(project.sandbox_dir.join("ca"));
                 // Remove image ref hard link — drops this sandbox's liveness signal
                 // for the old image, so the sweep below may collect it.
                 let _ = std::fs::remove_file(project.sandbox_dir.join("image"));
-                spinner.finish_and_clear();
                 cli::log!("  {} old environment erased", cli::check());
                 // GC: remove images with no remaining sandbox refs, plus any
                 // layers they uniquely owned.
@@ -160,8 +152,10 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
     }
 
     // Download/ensure image (auth already resolved above).
-    let oci_image = ensure_image(&mut image, image_name, &auth, image_cfg.insecure).await?;
-
+    let oci_image = tokio::select! {
+        res = ensure_image(&mut image, image_name, &auth, image_cfg.insecure) => res?,
+        () = cli::interrupted() => anyhow::bail!("cancelled by user"),
+    };
     // Hard-link the cached image file into the sandbox directory. nlink > 1
     // on `images/<digest>` is the GC guard — without it, a sibling sandbox
     // creating a new image could trigger a sweep that wrongly deletes this
@@ -169,7 +163,6 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
     // previous run may have left the sandbox with a standalone copy instead
     // of a hardlink.
     let image_path = crate::cache::image_path(&oci_image.image_id)?;
-    let sandbox_image = project.sandbox_dir.join("image");
     ensure_image_hardlink(&sandbox_image, &image_path, &oci_image)?;
 
     let overlay_dir = project.sandbox_dir.join("overlay");
@@ -197,6 +190,21 @@ fn read_cached_image(path: &Path) -> Option<OciImage> {
     let wrapped: CachedImage = serde_json::from_slice(&data).ok()?;
     let CachedImage::V1(image) = wrapped;
     Some(image)
+}
+
+/// Like [`read_cached_image`], but also requires every referenced layer to
+/// still exist on disk. Returns `None` for both "no such file" and "file
+/// there but some layer was swept" — both mean the caller must re-resolve.
+fn read_ready_image(path: &Path) -> Option<OciImage> {
+    let image = read_cached_image(path)?;
+    if image.image_layers.is_empty() {
+        return None;
+    }
+    image
+        .image_layers
+        .iter()
+        .all(|d| crate::cache::layer_dir(d).is_ok_and(|p| p.is_dir()))
+        .then_some(image)
 }
 
 /// Ensure `sandbox_image` is a hardlink to `images/<digest>` — the GC
@@ -465,13 +473,7 @@ async fn ensure_image(
     // image and all its layers are still on disk. Skip the source-specific
     // pull entirely. We refresh the stored name so the per-sandbox fast
     // path in `prepare()` (which matches on name) sees the current tag.
-    if let Some(mut cached) = read_cached_image(&image_path)
-        && !cached.image_layers.is_empty()
-        && cached
-            .image_layers
-            .iter()
-            .all(|d| crate::cache::layer_dir(d).is_ok_and(|p| p.is_dir()))
-    {
+    if let Some(mut cached) = read_ready_image(&image_path) {
         if cached.name != image_name {
             cached.name = image_name.to_string();
             write_cached_image(&image_path, &cached)?;
@@ -482,13 +484,12 @@ async fn ensure_image(
     let ordered_layers = match &resolved.source {
         ImageSource::Docker { image_ref } => {
             let image_ref = image_ref.clone();
-            let (cfg, layers) = ensure_docker_image(&image_ref)?;
+            let (cfg, layers) = ensure_docker_image(&image_ref).await?;
             resolved.config = cfg;
             layers
         }
         ImageSource::Registry(reg) => ensure_registry_image(reg, auth, insecure).await?,
     };
-
     let image = build_oci_image(
         resolved.digest.clone(),
         image_name.to_string(),
@@ -502,18 +503,39 @@ async fn ensure_image(
 /// Stream `docker image save` and extract each referenced layer through the
 /// shared per-layer cache. Returns the parsed image config plus layer
 /// digests in topmost-first order.
-fn ensure_docker_image(image_ref: &str) -> anyhow::Result<(OciConfig, Vec<String>)> {
+///
+/// The whole pipeline (save + per-layer extract) races against
+/// [`cli::interrupted`]; on Ctrl+C the docker child is killed via the
+/// save-side drop guard and the extract loop stops at the current layer.
+/// Any partial `.tmp/` extraction is left behind for the next sweep GC.
+async fn ensure_docker_image(image_ref: &str) -> anyhow::Result<(OciConfig, Vec<String>)> {
     let sp = cli::spinner("exporting from docker...");
-    let save = docker::save_layer_tarballs(image_ref)?;
 
-    for digest in &save.layer_digests {
-        layer::ensure_layer_cached(digest, |_tmp| {
-            anyhow::bail!(
-                "docker save stream did not include blob for layer {digest} \
-                 (manifest referenced a layer that was not in the export)"
-            )
-        })?;
-    }
+    let image_ref = image_ref.to_string();
+    let pipeline = async {
+        let save = docker::save_layer_tarballs(&image_ref).await?;
+        for digest in &save.layer_digests {
+            let digest = digest.clone();
+            tokio::task::spawn_blocking(move || {
+                layer::ensure_layer_cached(&digest, |_tmp| {
+                    anyhow::bail!(
+                        "docker save stream did not include blob for layer {digest} \
+                         (manifest referenced a layer that was not in the export)"
+                    )
+                })
+            })
+            .await??;
+        }
+        Ok::<_, anyhow::Error>(save)
+    };
+
+    let save = tokio::select! {
+        res = pipeline => res?,
+        () = cli::interrupted() => {
+            sp.finish_and_clear();
+            anyhow::bail!("cancelled by user");
+        }
+    };
 
     sp.finish_and_clear();
     cli::log!("  {} exported from docker", cli::check());
@@ -570,20 +592,30 @@ async fn ensure_registry_image(
     if !to_fetch.is_empty() {
         let mp = cli::multi_progress();
         let reference = &reg.reference;
-        let mp_ref = &mp;
+
+        // Bar per layer — cached layers get pre-filled so the display shows
+        // progress for the whole image, not just the slice we're downloading.
+        let fetch_set: std::collections::HashSet<usize> = to_fetch.iter().copied().collect();
+        let bars: Vec<indicatif::ProgressBar> = layers
+            .iter()
+            .enumerate()
+            .map(|(i, layer_desc)| {
+                let label = format!("layer {:>2}", i + 1);
+                let pb = cli::layer_progress_bar(&mp, layer_desc.size as u64, &label);
+                if !fetch_set.contains(&i) {
+                    pb.set_position(layer_desc.size as u64);
+                }
+                pb
+            })
+            .collect();
+        let bars_ref = &bars;
 
         let fetch = async {
             let mut stream = stream::iter(to_fetch.iter().copied())
                 .map(|i| async move {
                     let layer_desc = &layers[i];
-                    let label = format!("layer {:>2}", i + 1);
-                    let per_layer = cli::layer_progress_bar(mp_ref, layer_desc.size as u64, &label);
-                    let result =
-                        fetch_and_extract_layer(reference, layer_desc, &per_layer, auth, insecure)
-                            .await;
-                    per_layer.finish_and_clear();
-                    mp_ref.remove(&per_layer);
-                    result
+                    let per_layer = &bars_ref[i];
+                    fetch_and_extract_layer(reference, layer_desc, per_layer, auth, insecure).await
                 })
                 .buffer_unordered(3);
 
@@ -597,7 +629,7 @@ async fn ensure_registry_image(
             res = fetch => { res?; }
             () = cli::interrupted() => {
                 let _ = mp.clear();
-                anyhow::bail!("interrupted");
+                anyhow::bail!("cancelled by user");
             }
         }
         let _ = mp.clear();

@@ -5,8 +5,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdout, Command, Stdio};
 
 use super::OciConfig;
 use crate::cache;
@@ -77,6 +77,20 @@ pub fn image_arch(image_id: &str) -> Option<String> {
     if arch.is_empty() { None } else { Some(arch) }
 }
 
+/// Drop guard that kills and reaps a `docker image save` child when the
+/// enclosing future is cancelled. Successful callers `take()` the child
+/// out first so the guard is a no-op on the happy path.
+struct DockerSaveGuard(Option<Child>);
+
+impl Drop for DockerSaveGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// Stream `docker image save` and split its blobs into per-layer tarballs
 /// staged under `~/.cache/airlock/oci/layers/`.
 ///
@@ -97,16 +111,38 @@ pub fn image_arch(image_id: &str) -> Option<String> {
 /// Any blob that's neither the config nor a manifest-listed layer is
 /// dropped as unused. On any error, all staging files created by this
 /// call are cleaned up before returning.
-pub fn save_layer_tarballs(image_ref: &str) -> anyhow::Result<DockerSave> {
+///
+/// The tar-streaming loop runs on `spawn_blocking`; the outer future owns
+/// the docker child via a drop guard, so a cancelled future (e.g. Ctrl+C
+/// via a parent `tokio::select!`) kills docker, which closes stdout, which
+/// lets the detached blocking task finish promptly.
+pub async fn save_layer_tarballs(image_ref: &str) -> anyhow::Result<DockerSave> {
     let layers_root = cache::layers_root()?;
 
-    let child = Command::new("docker")
+    let mut child = Command::new("docker")
         .args(["image", "save", image_ref])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut guard = DockerSaveGuard(Some(child));
 
-    let stdout = child.stdout.expect("piped stdout");
+    let result =
+        tokio::task::spawn_blocking(move || save_from_stream(stdout, &layers_root)).await?;
+
+    // Success path: reap the docker child normally so the guard's Drop
+    // doesn't try to kill an already-exited process.
+    if let Some(mut child) = guard.0.take() {
+        let _ = child.wait();
+    }
+    result
+}
+
+/// Sync tar-streaming pipeline. Consumes `docker image save` stdout and
+/// produces a [`DockerSave`] plus pre-staged `.download` files for every
+/// non-cached layer. Separated from the async wrapper so the whole
+/// blocking I/O loop is a single `spawn_blocking` unit.
+fn save_from_stream(stdout: ChildStdout, layers_root: &Path) -> anyhow::Result<DockerSave> {
     let mut archive = tar::Archive::new(stdout);
 
     let mut manifest_json: Option<Vec<DockerManifestEntry>> = None;
