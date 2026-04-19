@@ -140,10 +140,10 @@ pub fn save_layer_tarballs(image_ref: &str) -> anyhow::Result<DockerSave> {
             // If this hex is already a cached layer, skip it inline. We
             // don't know yet whether it's classified as "layer" or "config"
             // in the manifest, but config blobs never collide with layer
-            // digests (different content, different sha256), so a
-            // `rootfs/` hit can only be a cached layer.
+            // digests (different content, different sha256), so a layer
+            // dir hit can only be a cached layer.
             let digest = format!("sha256:{hex}");
-            if cache::layer_dir(&digest).is_ok_and(|d| d.join("rootfs").is_dir()) {
+            if cache::layer_dir(&digest).is_ok_and(|d| d.is_dir()) {
                 std::io::copy(&mut entry, &mut std::io::sink())?;
                 continue;
             }

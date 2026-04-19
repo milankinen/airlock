@@ -6,8 +6,8 @@
 //! ```text
 //! <digest>.download.tmp   # in-flight download
 //! <digest>.download       # complete tarball, pending extraction
-//! <digest>.tmp/rootfs/    # in-flight extraction
-//! <digest>/               # finished: rootfs/ (rename = commit)
+//! <digest>.tmp/           # in-flight extraction
+//! <digest>/               # finished layer tree (rename = commit)
 //! ```
 //!
 //! Each transition is an atomic rename, so a crash at any point leaves a
@@ -30,9 +30,9 @@ const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
 /// Ensure a layer is extracted into the shared cache, downloading the
 /// tarball through `fetch` only if it's not already on disk.
 ///
-/// - Fast path: `<digest>/rootfs/` exists → return immediately. The
-///   directory only becomes visible via the atomic rename at the end of
-///   extraction, so its presence is itself the commit marker.
+/// - Fast path: `<digest>/` exists → return immediately. The directory
+///   only becomes visible via the atomic rename at the end of extraction,
+///   so its presence is itself the commit marker.
 /// - Tarball path: if `<digest>.download` exists (from a previous run or
 ///   from a pre-staging caller like the docker path), skip `fetch` and
 ///   go straight to extraction.
@@ -45,9 +45,8 @@ where
     F: FnOnce(&Path) -> anyhow::Result<()>,
 {
     let layer_dir = cache::layer_dir(digest)?;
-    let rootfs = layer_dir.join("rootfs");
-    if rootfs.is_dir() {
-        return Ok(rootfs);
+    if layer_dir.is_dir() {
+        return Ok(layer_dir);
     }
 
     let parent = layer_dir
@@ -70,11 +69,11 @@ where
 
     extract_tarball_to_cache(&layer_dir, &download)?;
     let _ = std::fs::remove_file(&download);
-    Ok(rootfs)
+    Ok(layer_dir)
 }
 
-/// Extract `tarball` into `<layer_dir>.tmp/rootfs/` then atomically rename
-/// into `layer_dir/`. The rename is the commit point — readers only see
+/// Extract `tarball` into `<layer_dir>.tmp/` then atomically rename into
+/// `layer_dir/`. The rename is the commit point — readers only see
 /// `layer_dir/` once extraction finished cleanly. Whiteouts are preserved:
 ///
 /// - `.wh.<name>` becomes an empty regular file at `<name>` with a
@@ -94,8 +93,6 @@ fn extract_tarball_to_cache(layer_dir: &Path, tarball: &Path) -> anyhow::Result<
     let tmp = parent.join(format!("{dir_name}.tmp"));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
-    let rootfs_tmp = tmp.join("rootfs");
-    std::fs::create_dir_all(&rootfs_tmp)?;
 
     // Layer blobs may be gzip-compressed (OCI spec, registry pulls) or plain
     // tar (`docker image save` with the classic driver) — dispatch on magic.
@@ -126,7 +123,7 @@ fn extract_tarball_to_cache(layer_dir: &Path, tarball: &Path) -> anyhow::Result<
         {
             let parent_rel = path.parent().unwrap_or_else(|| Path::new(""));
             if name == OPAQUE_WHITEOUT {
-                let dir = rootfs_tmp.join(parent_rel);
+                let dir = tmp.join(parent_rel);
                 std::fs::create_dir_all(&dir)?;
                 xattr::set(&dir, "user.overlay.opaque", b"y").map_err(|e| {
                     anyhow::anyhow!(
@@ -136,7 +133,7 @@ fn extract_tarball_to_cache(layer_dir: &Path, tarball: &Path) -> anyhow::Result<
                     )
                 })?;
             } else {
-                let dir = rootfs_tmp.join(parent_rel);
+                let dir = tmp.join(parent_rel);
                 std::fs::create_dir_all(&dir)?;
                 let target = dir.join(target_name);
                 let _ = std::fs::remove_file(&target);
@@ -156,7 +153,7 @@ fn extract_tarball_to_cache(layer_dir: &Path, tarball: &Path) -> anyhow::Result<
         // `unpack_in` resolves the entry path relative to the extraction root
         // and — critically — rewrites hardlink targets to stay inside it, so
         // `ln /absolute/host/path /extract/root/foo` never happens.
-        entry.unpack_in(&rootfs_tmp)?;
+        entry.unpack_in(&tmp)?;
     }
 
     if layer_dir.exists() {
@@ -233,11 +230,11 @@ mod tests {
         )
         .unwrap();
 
-        let rootfs = ensure_layer_cached("sha256:deadbeef1", fetch_from(tarball))
+        let layer = ensure_layer_cached("sha256:deadbeef1", fetch_from(tarball))
             .expect("extract should succeed");
 
-        assert_eq!(std::fs::read(rootfs.join("etc/hello")).unwrap(), b"world");
-        assert!(rootfs.join("bin/sh").exists());
+        assert_eq!(std::fs::read(layer.join("etc/hello")).unwrap(), b"world");
+        assert!(layer.join("bin/sh").exists());
     }
 
     #[test]
@@ -256,14 +253,14 @@ mod tests {
         )
         .unwrap();
 
-        let rootfs = ensure_layer_cached("sha256:deadbeef2", fetch_from(tarball)).unwrap();
+        let layer = ensure_layer_cached("sha256:deadbeef2", fetch_from(tarball)).unwrap();
 
-        let whiteout = rootfs.join("etc/gone");
+        let whiteout = layer.join("etc/gone");
         assert!(whiteout.exists(), "whiteout placeholder file must exist");
         assert_eq!(std::fs::metadata(&whiteout).unwrap().len(), 0);
         let val = xattr::get(&whiteout, "user.overlay.whiteout").unwrap();
         assert_eq!(val.as_deref(), Some(b"y" as &[u8]));
-        assert!(rootfs.join("etc/keep").exists());
+        assert!(layer.join("etc/keep").exists());
     }
 
     #[test]
@@ -282,12 +279,12 @@ mod tests {
         )
         .unwrap();
 
-        let rootfs = ensure_layer_cached("sha256:deadbeef3", fetch_from(tarball)).unwrap();
+        let layer = ensure_layer_cached("sha256:deadbeef3", fetch_from(tarball)).unwrap();
 
-        let opaque_dir = rootfs.join("opt/app");
+        let opaque_dir = layer.join("opt/app");
         let val = xattr::get(&opaque_dir, "user.overlay.opaque").unwrap();
         assert_eq!(val.as_deref(), Some(b"y" as &[u8]));
-        assert!(rootfs.join("opt/app/new").exists());
+        assert!(layer.join("opt/app/new").exists());
     }
 
     #[test]
@@ -303,22 +300,21 @@ mod tests {
         std::fs::write(&tarball, build_tarball(&[("a", b"1")])).unwrap();
 
         let first = ensure_layer_cached("sha256:deadbeef4", fetch_from(tarball.clone())).unwrap();
-        let layer_dir = first.parent().unwrap().to_path_buf();
-        let mtime = std::fs::metadata(&layer_dir).unwrap().modified().unwrap();
+        let mtime = std::fs::metadata(&first).unwrap().modified().unwrap();
 
-        // Second call: rootfs/ exists, fetch must not be called.
+        // Second call: <digest>/ exists, fetch must not be called.
         let second = ensure_layer_cached("sha256:deadbeef4", |_| {
-            panic!("fetch must not be called when rootfs/ exists")
+            panic!("fetch must not be called when <digest>/ exists")
         })
         .unwrap();
         assert_eq!(first, second);
         assert_eq!(
-            std::fs::metadata(&layer_dir).unwrap().modified().unwrap(),
+            std::fs::metadata(&first).unwrap().modified().unwrap(),
             mtime
         );
         // Tarball removed after extraction.
-        let layer_parent = first.parent().unwrap().parent().unwrap();
-        let name = first.parent().unwrap().file_name().unwrap();
+        let layer_parent = first.parent().unwrap();
+        let name = first.file_name().unwrap();
         let download = layer_parent.join(format!("{}.download", name.to_string_lossy()));
         assert!(
             !download.exists(),
@@ -340,8 +336,8 @@ mod tests {
         let tarball = tmp.join("layer.tar");
         std::fs::write(&tarball, build_plain_tarball(&[("etc/plain", b"ok")])).unwrap();
 
-        let rootfs = ensure_layer_cached("sha256:deadbeef7", fetch_from(tarball)).unwrap();
-        assert_eq!(std::fs::read(rootfs.join("etc/plain")).unwrap(), b"ok");
+        let layer = ensure_layer_cached("sha256:deadbeef7", fetch_from(tarball)).unwrap();
+        assert_eq!(std::fs::read(layer.join("etc/plain")).unwrap(), b"ok");
     }
 
     #[test]
@@ -361,12 +357,12 @@ mod tests {
         let download = layers_root.join(format!("{name}.download"));
         std::fs::write(&download, build_tarball(&[("staged", b"yes")])).unwrap();
 
-        let rootfs = ensure_layer_cached(digest, |_| {
+        let layer = ensure_layer_cached(digest, |_| {
             panic!("fetch must not be called when .download exists")
         })
         .unwrap();
 
-        assert!(rootfs.join("staged").exists());
+        assert!(layer.join("staged").exists());
         assert!(!download.exists(), "staged tarball removed after extract");
     }
 
@@ -388,8 +384,8 @@ mod tests {
         let tarball_src = tmp.join("layer.tar.gz");
         std::fs::write(&tarball_src, build_tarball(&[("ok", b"yes")])).unwrap();
 
-        let rootfs = ensure_layer_cached(digest, fetch_from(tarball_src)).unwrap();
-        assert!(rootfs.join("ok").exists());
+        let layer = ensure_layer_cached(digest, fetch_from(tarball_src)).unwrap();
+        assert!(layer.join("ok").exists());
         assert!(!stale.exists());
     }
 

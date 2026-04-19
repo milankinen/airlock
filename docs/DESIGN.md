@@ -383,8 +383,7 @@ metadata and a shared per-layer extraction cache:
   oci/
     images/<digest>            # Schema-tagged JSON: the fully-baked `OciImage`
                                # (name, layers, uid/gid, cmd, env, container_home)
-    layers/<digest>/
-      rootfs/                      # Extracted layer tree (whiteouts as xattrs)
+    layers/<digest>/               # Extracted layer tree (whiteouts as xattrs)
     layers/<digest>.download.tmp   # In-flight download (swept on next run)
     layers/<digest>.download       # Complete tarball pending extraction
     layers/<digest>.tmp/           # In-flight extraction (swept on next run)
@@ -403,7 +402,7 @@ forward-compatible schema evolution). It is written atomically via
 greater than 1 on the file means at least one sandbox references the
 image, preventing GC.
 
-A `<digest>/rootfs/` directory only exists through the atomic rename
+A `<digest>/` layer directory only exists through the atomic rename
 from `<digest>.tmp/`, so its presence is itself the completion marker
 — no separate `.ok` file is needed.
 

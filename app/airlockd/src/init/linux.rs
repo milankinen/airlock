@@ -245,7 +245,7 @@ fn assemble_rootfs(mounts: &MountConfig) -> anyhow::Result<()> {
     let layer_dirs: Vec<String> = mounts
         .image_layers
         .iter()
-        .map(|d| format!("/mnt/layers/{d}/rootfs"))
+        .map(|d| format!("/mnt/layers/{d}"))
         .collect();
     if layer_dirs.is_empty() {
         anyhow::bail!("no image layers supplied");
@@ -736,10 +736,7 @@ fn prepare_ca_overlay(mounts: &MountConfig) -> anyhow::Result<Option<&'static st
 /// to hide. `None` means no layer had the path at all.
 fn find_bundle_in_layers(layers: &[String], rel: &str) -> anyhow::Result<Option<Vec<u8>>> {
     for digest in layers {
-        let path = Path::new("/mnt/layers")
-            .join(digest)
-            .join("rootfs")
-            .join(rel);
+        let path = Path::new("/mnt/layers").join(digest).join(rel);
         match std::fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_file() && meta.len() > 0 => {
                 return Ok(Some(std::fs::read(&path)?));

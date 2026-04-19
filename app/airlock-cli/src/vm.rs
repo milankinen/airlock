@@ -221,7 +221,7 @@ fn prepare_shares(
     mounts: &[mount::ResolvedMount],
     sandbox_dir: &Path,
 ) -> anyhow::Result<Vec<VmShare>> {
-    // The guest composes the image rootfs via overlayfs from `/mnt/layers/<d>/rootfs`.
+    // The guest composes the image rootfs via overlayfs from `/mnt/layers/<d>`.
     // Share the shared per-layer cache root once; the guest reads only the
     // digests listed in `imageLayers` for this image.
     let mut shares = vec![VmShare {

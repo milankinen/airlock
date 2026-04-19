@@ -1,8 +1,8 @@
 //! OCI image resolution, download, and extraction.
 //!
 //! Handles both Docker-daemon images and remote registry pulls, caches
-//! layers and rootfs locally, and returns an `OciImage` with all the
-//! metadata needed by the VM to start the container.
+//! layers locally, and returns an `OciImage` with all the metadata
+//! needed by the VM to start the container.
 
 mod credentials;
 mod docker;
@@ -35,7 +35,7 @@ pub struct OciImage {
     /// configured image name without re-resolving the tag.
     pub name: String,
     /// Ordered layer digests — topmost-first. The guest mounts the shared
-    /// `/mnt/layers/<digest>/rootfs` cache as overlayfs lowerdirs in this order.
+    /// `/mnt/layers/<digest>` cache as overlayfs lowerdirs in this order.
     pub image_layers: Vec<String>,
     /// Container home directory (e.g. `/root`), for guest-path `~` expansion.
     pub container_home: String,
@@ -59,14 +59,14 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
 
     // Fast path: if we already have a cached image for this name, skip
     // the network round-trip to resolve tag → digest. The image is
-    // considered ready when every listed layer has a `rootfs/` dir.
+    // considered ready when every listed layer directory exists.
     if let Some(ref img) = stored
         && img.name == *image_name
         && !img.image_layers.is_empty()
         && img
             .image_layers
             .iter()
-            .all(|d| crate::cache::layer_dir(d).is_ok_and(|p| p.join("rootfs").is_dir()))
+            .all(|d| crate::cache::layer_dir(d).is_ok_and(|p| p.is_dir()))
     {
         tracing::debug!("image cache hit for {image_name}");
         cli::log!(
@@ -412,9 +412,9 @@ enum ImageSource {
 /// the image metadata into an [`OciImage`], and persist it as a single
 /// schema-tagged JSON file at `images/<digest>`.
 ///
-/// There is no merged `rootfs/` on the host anymore — the guest composes
-/// overlayfs straight from the per-layer cache. Both registry and docker
-/// paths converge on the same per-layer staging pipeline (see
+/// There is no merged rootfs on the host — the guest composes overlayfs
+/// straight from the per-layer cache. Both registry and docker paths
+/// converge on the same per-layer staging pipeline (see
 /// [`layer::ensure_layer_cached`]).
 async fn ensure_image(
     resolved: &mut ResolvedImage,
@@ -433,7 +433,7 @@ async fn ensure_image(
         && cached
             .image_layers
             .iter()
-            .all(|d| crate::cache::layer_dir(d).is_ok_and(|p| p.join("rootfs").is_dir()))
+            .all(|d| crate::cache::layer_dir(d).is_ok_and(|p| p.is_dir()))
     {
         if cached.name != image_name {
             cached.name = image_name.to_string();
@@ -506,7 +506,7 @@ async fn ensure_registry_image(
         .iter()
         .filter(|l| {
             crate::cache::layer_dir(&l.digest)
-                .map(|p| p.join("rootfs").is_dir())
+                .map(|p| p.is_dir())
                 .unwrap_or(false)
         })
         .count();
@@ -524,7 +524,7 @@ async fn ensure_registry_image(
         .enumerate()
         .filter(|(_, l)| {
             !crate::cache::layer_dir(&l.digest)
-                .map(|p| p.join("rootfs").is_dir())
+                .map(|p| p.is_dir())
                 .unwrap_or(false)
         })
         .map(|(i, _)| i)
@@ -588,8 +588,8 @@ async fn ensure_registry_image(
 
 /// Download one layer blob into `<digest>.download.tmp` and extract it
 /// through the shared per-layer cache. `ensure_layer_cached` is a no-op
-/// when the layer's `rootfs/` already exists, so the `to_fetch` filter
-/// in the caller is a latency optimization, not a correctness requirement.
+/// when the layer dir already exists, so the `to_fetch` filter in the
+/// caller is a latency optimization, not a correctness requirement.
 async fn fetch_and_extract_layer(
     reference: &oci_client::Reference,
     layer_desc: &oci_client::manifest::OciDescriptor,
@@ -616,7 +616,7 @@ async fn fetch_and_extract_layer(
 
     // Short-circuit fast path identical to ensure_layer_cached.
     let layer_dir = crate::cache::layer_dir(&digest)?;
-    if layer_dir.join("rootfs").is_dir() {
+    if layer_dir.is_dir() {
         return Ok(());
     }
 
@@ -660,14 +660,14 @@ fn format_size(bytes: i64) -> String {
 /// cache, topmost first. The first layer with a matching uid wins.
 ///
 /// Reads from individual layer trees under `~/.cache/airlock/oci/layers/` —
-/// the host no longer needs a merged `images/<d>/rootfs/` for this lookup.
-/// Whiteouts manifest as empty files (which parse to zero matches and fall
-/// through to the next layer); this is coarser than real overlayfs semantics
-/// but is a safe superset for the common case of images that never delete
+/// the host has no merged rootfs to consult for this lookup. Whiteouts
+/// manifest as empty files (which parse to zero matches and fall through
+/// to the next layer); this is coarser than real overlayfs semantics but
+/// is a safe superset for the common case of images that never delete
 /// `/etc/passwd` in an upper layer.
 fn lookup_home_dir(layer_digests: &[String], uid: u32) -> anyhow::Result<String> {
     for digest in layer_digests {
-        let passwd_path = crate::cache::layer_dir(digest)?.join("rootfs/etc/passwd");
+        let passwd_path = crate::cache::layer_dir(digest)?.join("etc/passwd");
         let Ok(content) = std::fs::read_to_string(&passwd_path) else {
             continue;
         };
