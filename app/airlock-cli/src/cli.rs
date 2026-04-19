@@ -1,7 +1,7 @@
 //! CLI argument parsing, console output, and interruption handling.
 //!
 //! Use `cli::log!("message")` for status messages,
-//! `cli::progress_bar()` / `cli::spinner()` for progress,
+//! `cli::layer_progress_bar()` / `cli::spinner()` for progress,
 //! and `cli::interrupted()` for Ctrl+C cancellation.
 
 pub mod cmd_exec;
@@ -13,7 +13,7 @@ pub mod cmd_start;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::ValueEnum;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use tokio::signal::unix::SignalKind;
 use tokio::sync::watch;
 
@@ -220,18 +220,27 @@ pub(crate) use _error as error;
 pub(crate) use _log as log;
 pub(crate) use _verbose as verbose;
 
-/// Create a progress bar for downloading (unless silent).
-pub fn progress_bar(total: u64, prefix: &str) -> ProgressBar {
+/// Create a `MultiProgress` container for composing several bars in parallel.
+/// Hidden in silent mode so nothing renders.
+pub fn multi_progress() -> MultiProgress {
+    let mp = MultiProgress::new();
     if is_silent() {
-        return ProgressBar::hidden();
+        mp.set_draw_target(ProgressDrawTarget::hidden());
     }
-    let pb = ProgressBar::new(total);
+    mp
+}
+
+/// Create a per-layer progress bar registered inside a `MultiProgress`.
+pub fn layer_progress_bar(mp: &MultiProgress, total: u64, label: &str) -> ProgressBar {
+    let pb = mp.add(ProgressBar::new(total));
     pb.set_style(
-        ProgressStyle::with_template("  {prefix} [{bar:30}] {bytes}/{total_bytes} {bytes_per_sec}")
-            .unwrap()
-            .progress_chars("=> "),
+        ProgressStyle::with_template(
+            "  {prefix:<10} [{bar:20}] {bytes:>10}/{total_bytes:<10} {bytes_per_sec}",
+        )
+        .unwrap()
+        .progress_chars("=> "),
     );
-    pb.set_prefix(prefix.to_string());
+    pb.set_prefix(label.to_string());
     pb
 }
 

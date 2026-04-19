@@ -88,12 +88,15 @@ pub async fn resolve(
 }
 
 /// Download a single layer blob to disk with optional progress reporting.
-/// Uses a temp file + atomic rename to avoid partial downloads.
+/// Uses a temp file + atomic rename to avoid partial downloads. Both the
+/// per-layer and overall progress bars, when provided, are incremented by
+/// the same number of bytes as data is written.
 pub async fn pull_layer(
     reference: &Reference,
     layer: &oci_client::manifest::OciDescriptor,
     dest: &Path,
-    progress: Option<&ProgressBar>,
+    per_layer: Option<&ProgressBar>,
+    overall: Option<&ProgressBar>,
     auth: &RegistryAuth,
     insecure: bool,
 ) -> anyhow::Result<()> {
@@ -105,13 +108,11 @@ pub async fn pull_layer(
     // Download to a temp file, then rename on success
     let tmp = dest.with_extension("tmp");
     let file = tokio::fs::File::create(&tmp).await?;
-    let mut writer: Box<dyn AsyncWrite + Unpin> = if let Some(pb) = progress {
-        Box::new(ProgressWriter {
-            inner: file,
-            progress: pb.clone(),
-        })
-    } else {
+    let bars: Vec<ProgressBar> = per_layer.into_iter().chain(overall).cloned().collect();
+    let mut writer: Box<dyn AsyncWrite + Unpin> = if bars.is_empty() {
         Box::new(file)
+    } else {
+        Box::new(ProgressWriter { inner: file, bars })
     };
     client.pull_blob(reference, layer, &mut writer).await?;
     writer.flush().await?;
@@ -138,10 +139,12 @@ pub fn is_layer_valid(layer: &oci_client::manifest::OciDescriptor, path: &Path) 
     path.metadata().is_ok_and(|m| m.len() == layer.size as u64)
 }
 
-/// Wraps an `AsyncWrite` and increments a progress bar on each write.
+/// Wraps an `AsyncWrite` and increments every attached progress bar on each
+/// write. Used to drive the per-layer bar and the overall-total bar from the
+/// same byte stream.
 struct ProgressWriter {
     inner: tokio::fs::File,
-    progress: ProgressBar,
+    bars: Vec<ProgressBar>,
 }
 
 impl AsyncWrite for ProgressWriter {
@@ -153,7 +156,9 @@ impl AsyncWrite for ProgressWriter {
         let this = &mut *self;
         match Pin::new(&mut this.inner).poll_write(cx, buf) {
             Poll::Ready(Ok(n)) => {
-                this.progress.inc(n as u64);
+                for bar in &this.bars {
+                    bar.inc(n as u64);
+                }
                 Poll::Ready(Ok(n))
             }
             other => other,

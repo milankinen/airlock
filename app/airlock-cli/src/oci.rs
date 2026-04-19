@@ -437,38 +437,86 @@ async fn ensure_image(
         }
         ImageSource::Registry(reg) => {
             let layers = &reg.manifest.layers;
-            let total_bytes: u64 = layers.iter().map(|l| l.size as u64).sum();
-            let pb = cli::progress_bar(total_bytes, "downloading");
 
-            let mut layer_paths = Vec::new();
-            for (i, layer_desc) in layers.iter().enumerate() {
-                let layer_path = dir.join(format!("layer_{i}.tar.gz"));
-                if registry::is_layer_valid(layer_desc, &layer_path) {
-                    pb.inc(layer_desc.size as u64);
-                } else {
-                    let _ = std::fs::remove_file(&layer_path);
-                    tokio::select! {
-                        result = registry::pull_layer(&reg.reference, layer_desc, &layer_path, Some(&pb), auth, insecure) => {
-                            result?;
-                        }
-                        () = cli::interrupted() => {
-                            pb.finish_and_clear();
-                            anyhow::bail!("interrupted");
-                        }
+            let layer_paths: Vec<PathBuf> = (0..layers.len())
+                .map(|i| dir.join(format!("layer_{i}.tar.gz")))
+                .collect();
+
+            let to_download: Vec<usize> = layers
+                .iter()
+                .enumerate()
+                .filter(|(i, l)| !registry::is_layer_valid(l, &layer_paths[*i]))
+                .map(|(i, _)| i)
+                .collect();
+            let cached_count = layers.len() - to_download.len();
+            if cached_count > 0 {
+                cli::log!(
+                    "  {} {} of {} layers found from cache",
+                    cli::check(),
+                    cached_count,
+                    layers.len()
+                );
+            }
+
+            if !to_download.is_empty() {
+                let mp = cli::multi_progress();
+                let reference = &reg.reference;
+                let mp_ref = &mp;
+                let layer_paths_ref = &layer_paths;
+
+                let download = async {
+                    use futures::stream::{self, StreamExt};
+                    let mut stream = stream::iter(to_download.iter().copied())
+                        .map(|i| async move {
+                            let layer_desc = &layers[i];
+                            let layer_path = &layer_paths_ref[i];
+                            let _ = std::fs::remove_file(layer_path);
+                            let label = format!("layer {:>2}", i + 1);
+                            let per_layer =
+                                cli::layer_progress_bar(mp_ref, layer_desc.size as u64, &label);
+                            let result = registry::pull_layer(
+                                reference,
+                                layer_desc,
+                                layer_path,
+                                Some(&per_layer),
+                                None,
+                                auth,
+                                insecure,
+                            )
+                            .await;
+                            per_layer.finish_and_clear();
+                            mp_ref.remove(&per_layer);
+                            result
+                        })
+                        .buffer_unordered(3);
+
+                    while let Some(res) = stream.next().await {
+                        res?;
+                    }
+                    Ok::<(), anyhow::Error>(())
+                };
+
+                tokio::select! {
+                    res = download => { res?; }
+                    () = cli::interrupted() => {
+                        let _ = mp.clear();
+                        anyhow::bail!("interrupted");
                     }
                 }
-                layer_paths.push(layer_path);
+                let _ = mp.clear();
+
+                let downloaded_bytes: u64 =
+                    to_download.iter().map(|i| layers[*i].size as u64).sum();
+                cli::log!(
+                    "  {} downloaded {}",
+                    cli::check(),
+                    cli::dim(&format!(
+                        "{} layers, {}",
+                        to_download.len(),
+                        format_size(downloaded_bytes as i64)
+                    ))
+                );
             }
-            pb.finish_and_clear();
-            cli::log!(
-                "  {} downloaded {}",
-                cli::check(),
-                cli::dim(&format!(
-                    "{} layers, {}",
-                    layers.len(),
-                    format_size(total_bytes as i64)
-                ))
-            );
 
             let sp = cli::spinner("extracting layers...");
             let layer_refs: Vec<&Path> = layer_paths.iter().map(PathBuf::as_path).collect();
