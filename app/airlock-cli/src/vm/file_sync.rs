@@ -9,7 +9,11 @@
 //! to a copy) so the host source file stays up-to-date.
 
 use std::collections::HashMap;
-use std::os::unix::fs::MetadataExt;
+use std::fs::File;
+use std::io;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -143,42 +147,63 @@ async fn watch_loop(
             let Some(_) = old_state else { continue };
 
             let overlay_path = files_rw_dir.join(filename);
-            sync_file(&overlay_path, source).await;
+            sync_file(&overlay_path, source);
         }
     }
 
     Ok(())
 }
 
-/// Sync `overlay_path` back to `source` using the cheapest available method:
+/// Sync `overlay_path` back to `source` using the cheapest available method.
 ///
-/// 1. Same inode → hard link is intact, source already has the new content.
-/// 2. Re-establish the hard link atomically (`hard_link` + `rename`), so future
-///    direct writes flow back without needing another sync event.
-/// 3. Fall back to `tokio::fs::copy` (e.g. cross-device, permissions).
-async fn sync_file(overlay_path: &Path, source: &Path) {
-    // Step 1: if both paths share an inode the hard link is still intact —
-    // source already has the updated content, nothing to do.
-    let overlay_ino = match std::fs::metadata(overlay_path) {
-        Ok(m) => m.ino(),
+/// The overlay file is writable by the guest over virtiofs, so between
+/// successive sync events the guest can legitimately (atomic rename) or
+/// maliciously (symlink swap) replace the directory entry. To avoid a
+/// check-then-use TOCTOU the overlay is opened **once** with `O_NOFOLLOW`
+/// at the top, and every subsequent operation targets the resulting FD:
+///
+/// 1. `fstat` the FD; reject non-regular entries (a symlink would have
+///    failed the `O_NOFOLLOW` open with `ELOOP` already).
+/// 2. Same inode as `source` → hard link is intact, nothing to do.
+/// 3. Re-establish the hard link atomically by calling `linkat` on the
+///    FD via `/proc/self/fd/<n>` (Linux), then `rename` into place so
+///    future direct writes flow back without needing another sync event.
+/// 4. Fall back to an FD-based copy (cross-device, non-Linux, or linkat
+///    refused the operation).
+fn sync_file(overlay_path: &Path, source: &Path) {
+    let overlay_file = match open_nofollow(overlay_path) {
+        Ok(f) => f,
         Err(e) => {
-            tracing::warn!("file sync stat {}: {e}", overlay_path.display());
+            // ELOOP here means the guest planted a symlink — skip loudly.
+            tracing::warn!("file sync open {}: {e}", overlay_path.display());
             return;
         }
     };
-    if std::fs::metadata(source).is_ok_and(|m| m.ino() == overlay_ino) {
+    let overlay_meta = match overlay_file.metadata() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("file sync fstat {}: {e}", overlay_path.display());
+            return;
+        }
+    };
+    if !overlay_meta.file_type().is_file() {
+        tracing::warn!(
+            "file sync skipped non-regular overlay entry {}",
+            overlay_path.display()
+        );
         return;
     }
 
-    // Step 2: atomically re-establish the hard link so future direct writes
-    // flow through without another sync event.
-    //   hard_link(overlay → tmp)  — create link in source's directory
-    //   rename(tmp → source)      — atomically replace source
+    if std::fs::metadata(source).is_ok_and(|m| m.ino() == overlay_meta.ino()) {
+        return;
+    }
+
     let tmp = source.with_file_name(format!(
         ".{}.airlock_sync",
         source.file_name().unwrap_or_default().to_string_lossy()
     ));
-    if std::fs::hard_link(overlay_path, &tmp).is_ok() {
+
+    if linkat_from_fd(&overlay_file, &tmp).is_ok() {
         if std::fs::rename(&tmp, source).is_ok() {
             tracing::debug!(
                 "file sync (hard-link): {} → {}",
@@ -190,13 +215,78 @@ async fn sync_file(overlay_path: &Path, source: &Path) {
         let _ = std::fs::remove_file(&tmp);
     }
 
-    // Step 3: fall back to an async copy (offloads I/O to a blocking thread).
-    match tokio::fs::copy(overlay_path, source).await {
-        Ok(_) => tracing::debug!(
+    match copy_fd_to_path(&overlay_file, &tmp, source) {
+        Ok(()) => tracing::debug!(
             "file sync (copy): {} → {}",
             overlay_path.display(),
             source.display()
         ),
         Err(e) => tracing::warn!("file sync {}: {e}", source.display()),
     }
+}
+
+/// Open `path` with `O_NOFOLLOW` so a symbolic link at `path` aborts the
+/// open with `ELOOP` rather than silently redirecting the read. Subsequent
+/// operations use the returned FD, never the path.
+fn open_nofollow(path: &Path) -> io::Result<File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+/// Create a new hard link at `dest` pointing at the same inode as the open
+/// file behind `fd`, without ever using a path that a concurrent attacker
+/// could swap. On Linux this is `linkat(AT_FDCWD, "/proc/self/fd/N", ..., AT_SYMLINK_FOLLOW)`
+/// — the proc magic link resolves to the FD's underlying inode so the
+/// operation targets exactly what we fstat'd, regardless of what lives at
+/// `overlay_path` by the time the syscall runs.
+#[cfg(target_os = "linux")]
+fn linkat_from_fd(fd: &File, dest: &Path) -> io::Result<()> {
+    let src = std::ffi::CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd()))?;
+    let dst = std::ffi::CString::new(dest.as_os_str().as_bytes())?;
+    let rc = unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            src.as_ptr(),
+            libc::AT_FDCWD,
+            dst.as_ptr(),
+            libc::AT_SYMLINK_FOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// macOS lacks `/proc/self/fd` and `linkat(AT_EMPTY_PATH)`, so there's no
+/// portable way to create a hard link from an already-open FD. Signal
+/// "unsupported" so `sync_file` falls through to the FD-based copy path.
+#[cfg(not(target_os = "linux"))]
+fn linkat_from_fd(_fd: &File, _dest: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "linkat from fd not available on this platform",
+    ))
+}
+
+/// Copy the current contents of the open file behind `fd` to `dest`,
+/// staged through `tmp` and atomically renamed at the end. Reads come
+/// from the FD (not the original path) so a post-open symlink swap can't
+/// redirect the source of the copy. `tmp` is created with `O_CREAT|O_EXCL`
+/// + mode `0600` so it can't clobber an existing entry.
+fn copy_fd_to_path(fd: &File, tmp: &Path, dest: &Path) -> io::Result<()> {
+    let mut src = fd;
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(tmp)?;
+    let copy_result = io::copy(&mut src, &mut out).map(|_| ());
+    let rename_result = copy_result.and_then(|()| std::fs::rename(tmp, dest));
+    if rename_result.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    rename_result
 }
