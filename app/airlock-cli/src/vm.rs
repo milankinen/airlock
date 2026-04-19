@@ -90,6 +90,7 @@ pub struct VmInstance {
     /// File-sync handle — gracefully drained by `shutdown()`, aborted on drop.
     sync_handle: Option<file_sync::SyncHandle>,
     pub image_id: String,
+    pub image_layers: Vec<String>,
     pub mounts: Vec<mount::ResolvedMount>,
     pub disk_image: PathBuf,
     pub caches: Vec<disk::CacheEntry>,
@@ -164,6 +165,7 @@ pub async fn start(
             vm_handle,
             sync_handle,
             image_id: image.image_id.clone(),
+            image_layers: image.image_layers.clone(),
             mounts,
             disk_image,
             caches,
@@ -219,13 +221,16 @@ fn assemble_mounts(
 /// `overlay/files/{rw,ro}/{key}` and exposed as two consolidated shares.
 /// CA overlay lives at `sandbox_dir/ca/`; files overlay at `sandbox_dir/overlay/files/`.
 fn prepare_shares(
-    image: &OciImage,
+    _image: &OciImage,
     mounts: &[mount::ResolvedMount],
     sandbox_dir: &Path,
 ) -> anyhow::Result<Vec<VmShare>> {
+    // The guest composes the image rootfs via overlayfs from `/mnt/layers/<d>/rootfs`.
+    // Share the shared per-layer cache root once; the guest reads only the
+    // digests listed in `imageLayers` for this image.
     let mut shares = vec![VmShare {
-        tag: "base".to_string(),
-        host_path: image.rootfs.clone(),
+        tag: "layers".to_string(),
+        host_path: crate::cache::layers_root()?,
         read_only: true,
     }];
     // CA overlay is at sandbox_dir/ca/ (was overlay/ca/)

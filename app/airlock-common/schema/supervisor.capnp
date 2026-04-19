@@ -21,10 +21,11 @@ interface Supervisor {
     nestedVirt :Bool,
     harden     :Bool,
     # Mount configuration (replaces mounts.json)
-    imageId    :Text,
-    dirs       :List(DirMount),
-    files      :List(FileMount),
-    caches     :List(CacheMount),
+    imageId     :Text,
+    imageLayers :List(Text),
+    dirs        :List(DirMount),
+    files       :List(FileMount),
+    caches      :List(CacheMount),
   ) -> (proc :Process);
 
   shutdown @1 () -> ();

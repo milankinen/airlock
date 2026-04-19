@@ -26,6 +26,11 @@ use crate::project::Project;
 struct ImageMeta {
     digest: String,
     name: String,
+    /// Ordered layer digests — topmost-first. The guest passes these as
+    /// overlayfs lowerdirs pointing under `/mnt/layers/<digest>/rootfs`.
+    /// Missing on older cached images; callers must tolerate an empty vec.
+    #[serde(default)]
+    layers: Vec<String>,
 }
 
 /// Read `sandbox/image` as `ImageMeta`. Returns `None` if absent or not yet
@@ -42,6 +47,9 @@ pub struct OciImage {
     pub rootfs: PathBuf,
     /// OCI image digest, used by supervisor to detect image changes.
     pub image_id: String,
+    /// Ordered layer digests — topmost-first. The guest mounts the shared
+    /// `/mnt/layers/<digest>/rootfs` cache as overlayfs lowerdirs in this order.
+    pub image_layers: Vec<String>,
     /// Container home directory (e.g. `/root`), for guest-path `~` expansion.
     pub container_home: String,
     /// Container uid (from image config).
@@ -66,9 +74,17 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
     // the network round-trip to resolve tag → digest.
     if let Some(ref meta) = stored_meta
         && meta.name == *image_name
+        && !meta.layers.is_empty()
     {
         let image_dir = crate::cache::image_dir(&meta.digest)?;
-        if image_dir.join("rootfs").exists() && image_dir.join("meta.json").exists() {
+        if image_dir.join("rootfs").exists()
+            && image_dir.join("meta.json").exists()
+            && meta.layers.iter().all(|d| {
+                crate::cache::layer_dir(d)
+                    .map(|p| p.join(".ok").exists())
+                    .unwrap_or(false)
+            })
+        {
             tracing::debug!("image cache hit for {image_name}");
             cli::log!(
                 "  {} image cached {}",
@@ -182,6 +198,27 @@ fn build_oci_image(image_dir: &Path, digest: String) -> anyhow::Result<OciImage>
         OciConfig::default()
     };
 
+    let meta_path = image_dir.join("meta.json");
+    let meta: ImageMeta = std::fs::read(&meta_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "missing or corrupt {}",
+                meta_path
+                    .strip_prefix(image_dir)
+                    .unwrap_or(&meta_path)
+                    .display()
+            )
+        })?;
+    if meta.layers.is_empty() {
+        anyhow::bail!(
+            "cached image at {} has no layer list — remove the sandbox's .airlock/sandbox/image \
+             to force a re-pull",
+            image_dir.display()
+        );
+    }
+
     let cfg = image_config.config.as_ref();
     let (uid, gid) = parse_user(cfg.and_then(|c| c.user.as_deref()).unwrap_or("0:0"));
     let rootfs = image_dir.join("rootfs");
@@ -220,6 +257,11 @@ fn build_oci_image(image_dir: &Path, digest: String) -> anyhow::Result<OciImage>
     Ok(OciImage {
         rootfs,
         image_id: digest,
+        image_layers: meta
+            .layers
+            .iter()
+            .map(|d| crate::cache::digest_name(d).to_string())
+            .collect(),
         container_home,
         uid,
         gid,
@@ -391,6 +433,7 @@ async fn ensure_image(
         let meta = ImageMeta {
             digest: resolved.digest.clone(),
             name: image_name.to_string(),
+            layers: Vec::new(),
         };
         std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
         let _ = std::fs::remove_file(&complete_marker);
@@ -428,9 +471,17 @@ async fn ensure_image(
             let sp = cli::spinner("exporting from docker...");
             resolved.config =
                 docker::save_and_extract(image_ref, &rootfs, &dir.join("image_config.json"))?;
+
+            // Docker save gives a merged rootfs, not individual layers. Mirror
+            // it into the layer cache as a single synthetic layer keyed by the
+            // image digest, so the guest can compose overlayfs the same way
+            // as the registry path. Hardlink-copy to avoid doubling disk use.
+            mirror_merged_rootfs_into_layer_cache(&rootfs, &resolved.digest)?;
+
             let meta = ImageMeta {
                 digest: resolved.digest.clone(),
                 name: image_name.to_string(),
+                layers: vec![crate::cache::digest_name(&resolved.digest).to_string()],
             };
             std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
             sp.finish_and_clear();
@@ -548,9 +599,17 @@ async fn ensure_image(
 
             let config_json = serde_json::to_string_pretty(&resolved.config)?;
             std::fs::write(dir.join("image_config.json"), config_json)?;
+            // OCI manifests list layers bottom→top. overlayfs wants the topmost
+            // layer first in `lowerdir=`, so reverse when persisting.
+            let mut layer_digests: Vec<String> = layers
+                .iter()
+                .map(|l| crate::cache::digest_name(&l.digest).to_string())
+                .collect();
+            layer_digests.reverse();
             let meta = ImageMeta {
                 digest: resolved.digest.clone(),
                 name: image_name.to_string(),
+                layers: layer_digests,
             };
             std::fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
         }
@@ -584,6 +643,31 @@ fn gc_unused_image(digest: &str) -> anyhow::Result<()> {
     let _ = std::fs::remove_dir_all(&image_dir);
     sp.finish_and_clear();
     cli::log!("  {} cleaned unused image", cli::check());
+    Ok(())
+}
+
+/// Mirror a merged rootfs tree into the per-layer cache as a single synthetic
+/// layer, hardlinking regular files to avoid doubling disk use. Idempotent via
+/// the `.ok` marker in the layer dir.
+fn mirror_merged_rootfs_into_layer_cache(rootfs: &Path, digest: &str) -> anyhow::Result<()> {
+    let layer_root = crate::cache::layer_dir(digest)?;
+    let marker = layer_root.join(".ok");
+    let layer_rootfs = layer_root.join("rootfs");
+    if marker.exists() && layer_rootfs.is_dir() {
+        return Ok(());
+    }
+    let _ = std::fs::remove_dir_all(&layer_root);
+    std::fs::create_dir_all(&layer_root)?;
+    let status = std::process::Command::new("cp")
+        .arg("-al")
+        .arg(rootfs)
+        .arg(&layer_rootfs)
+        .status()
+        .map_err(|e| anyhow::anyhow!("cp -al exec failed: {e}"))?;
+    if !status.success() {
+        anyhow::bail!("cp -al failed while mirroring docker rootfs into layer cache");
+    }
+    std::fs::File::create(&marker)?;
     Ok(())
 }
 

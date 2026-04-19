@@ -44,6 +44,10 @@ pub struct CacheConfig {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct MountConfig {
     pub image_id: String,
+    /// Ordered layer digests (topmost-first) composing the image rootfs. Each
+    /// entry names a subdirectory under `/mnt/layers/<digest>/rootfs/` that
+    /// will be used as an overlayfs lowerdir.
+    pub image_layers: Vec<String>,
     pub dirs: Vec<DirMountConfig>,
     pub files: Vec<FileMountConfig>,
     pub caches: Vec<CacheConfig>,

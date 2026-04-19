@@ -25,7 +25,7 @@ provides a familiar image-based environment.
 │  │ VM (Linux, ARM64)                                        │   │
 │  │                                                          │   │
 │  │  init                                                    │   │
-│  │  ├─ Mount VirtioFS shares (base image, overlay, mounts)  │   │
+│  │  ├─ Mount VirtioFS shares (image layers, overlay, mounts)│   │
 │  │  ├─ Assemble overlayfs rootfs                            │   │
 │  │  ├─ Setup networking (iptables + DNS)                    │   │
 │  │  └─ Launch supervisor (airlockd)                         │   │
@@ -139,10 +139,11 @@ Inside the VM, the init script mounts essential filesystems (`/proc`, `/sys`,
 `/dev`, `/cgroup2`) then launches the supervisor (`airlockd`). The supervisor's
 init closure (called on the first `start` RPC) does the heavy setup:
 
-1. **Mount VirtioFS shares** — `base` (read-only image rootfs), `ca` (CA cert
-   lowerdir), and `files/rw` + `files/ro` (file mount staging) are mounted as
-   needed. The full mount list is received via the `start` RPC (no separate
-   `mounts.json`).
+1. **Mount VirtioFS shares** — `layers` (shared per-layer OCI cache at
+   `~/.cache/airlock/layers/`, read-only), `ca` (CA cert lowerdir), and
+   `files/rw` + `files/ro` (file mount staging) are mounted as needed. The
+   full mount list and the ordered image-layer digest list are received via
+   the `start` RPC (no separate `mounts.json`).
 
 2. **Set system clock** — host passes a Unix epoch in the start RPC so the
    guest clock is correct from the start.
@@ -155,8 +156,12 @@ init closure (called on the first `start` RPC) does the heavy setup:
    enlarged.
 
 5. **Assemble overlayfs rootfs**:
-   - **lower**: CA cert layer (`/mnt/ca`) if present, then base image
-     (`/mnt/base`). Leftmost = highest priority.
+   - **lower**: CA cert layer (`/mnt/ca`) if present, then one lowerdir per
+     image layer at `/mnt/layers/<layer-digest>/rootfs` in topmost-first
+     order. Leftmost = highest priority. Mounted with `userxattr` so
+     overlayfs honors whiteouts encoded by the host-side extractor as
+     `user.overlay.whiteout` / `user.overlay.opaque` xattrs (requires kernel
+     >= 5.11).
    - **upper + work**: on the ext4 disk (`/mnt/disk/overlay/rootfs` and
      `/mnt/disk/overlay/work`). The overlay is reset if the image ID changes.
    - After mounting: file mounts become symlinks inside the rootfs pointing
@@ -245,7 +250,7 @@ is written to `sandbox/ca/` mirroring the distro's CA store paths (e.g.
 `/mnt/overlay/ca` as the highest-priority lowerdir:
 
 ```
-lowerdir=/mnt/ca:/mnt/base
+lowerdir=/mnt/ca:/mnt/layers/<top-digest>/rootfs:…:/mnt/layers/<bottom-digest>/rootfs
 ```
 
 The cert appears as a regular file inside the container, which is required by

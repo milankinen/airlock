@@ -66,9 +66,11 @@ airlock start --sandbox-cwd /tmp
 
 ## Image pulling and caching
 
-airlock pulls OCI images and caches them locally at `~/.cache/airlock/images/`.
-On subsequent runs, the cached image is reused unless the remote tag has
-changed.
+airlock pulls OCI images and caches them locally under `~/.cache/airlock/oci/`.
+Image manifests live in `oci/images/<digest>/` and the underlying layer trees
+in a shared `oci/layers/<layer-digest>/` cache that deduplicates across
+images. On subsequent runs, the cached image is reused unless the remote tag
+has changed.
 
 By default, airlock tries the local Docker daemon first and falls back to
 pulling from the OCI registry. This can be controlled with the `resolution`

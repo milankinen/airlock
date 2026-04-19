@@ -158,11 +158,10 @@ pub fn extract_layer_cached(digest: &str, tarball: &Path) -> anyhow::Result<Path
             continue;
         }
 
-        let dest = rootfs_tmp.join(&path);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        entry.unpack(&dest)?;
+        // `unpack_in` resolves the entry path relative to the extraction root
+        // and — critically — rewrites hardlink targets to stay inside it, so
+        // `ln /absolute/host/path /extract/root/foo` never happens.
+        entry.unpack_in(&rootfs_tmp)?;
     }
 
     if layer_dir.exists() {

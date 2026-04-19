@@ -208,6 +208,11 @@ impl supervisor::Server for SupervisorImpl {
             },
             mount_config: MountConfig {
                 image_id: params.get_image_id()?.to_str()?.to_string(),
+                image_layers: params
+                    .get_image_layers()?
+                    .iter()
+                    .map(|s| s.map(|t| t.to_str().unwrap_or("").to_string()))
+                    .collect::<Result<Vec<_>, _>>()?,
                 dirs,
                 files,
                 caches,

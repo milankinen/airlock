@@ -137,6 +137,10 @@ impl Supervisor {
 
         // Mount configuration
         req.get().set_image_id(&vm.image_id);
+        let mut layers_b = req.get().init_image_layers(vm.image_layers.len() as u32);
+        for (i, d) in vm.image_layers.iter().enumerate() {
+            layers_b.set(i as u32, d);
+        }
 
         let dirs: Vec<_> = vm
             .mounts

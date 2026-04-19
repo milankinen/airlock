@@ -29,8 +29,8 @@ pub fn setup(
     set_clock(config.epoch, config.epoch_nanos);
 
     // 1. Mount well-known VirtioFS shares
-    mount_virtiofs("base")?;
     mount_virtiofs("ca")?;
+    mount_virtiofs("layers")?;
 
     // 2. Mount user dir shares (includes "project" and "dir_N" mounts)
     for dir in &mounts.dirs {
@@ -232,15 +232,32 @@ fn assemble_rootfs(mounts: &MountConfig) -> anyhow::Result<()> {
         }
     }
 
-    // overlayfs: ca (highest priority) + base image (lowerdirs) + project state (upperdir)
+    // overlayfs: ca (highest priority) + per-layer rootfs trees (lowerdirs,
+    // topmost-first) + project state (upperdir).
+    //
+    // `userxattr` makes overlayfs honor whiteouts encoded as `user.overlay.*`
+    // xattrs, which is how the host-side extractor preserves whiteouts without
+    // needing CAP_MKNOD. Requires kernel >= 5.11.
     let ca_exists = Path::new("/mnt/ca").is_dir();
     debug!("overlayfs ca layer: exists={ca_exists}");
-    let lower = if ca_exists {
-        "/mnt/ca:/mnt/base".to_string()
-    } else {
-        "/mnt/base".to_string()
-    };
-    let opts = format!("lowerdir={lower},upperdir={upper},workdir={work}");
+    let layer_dirs: Vec<String> = mounts
+        .image_layers
+        .iter()
+        .map(|d| format!("/mnt/layers/{d}/rootfs"))
+        .collect();
+    if layer_dirs.is_empty() {
+        anyhow::bail!("no image layers supplied");
+    }
+    for dir in &layer_dirs {
+        debug!("overlayfs lower: {dir} exists={}", Path::new(dir).is_dir());
+    }
+    let mut lower_parts: Vec<String> = Vec::with_capacity(layer_dirs.len() + 1);
+    if ca_exists {
+        lower_parts.push("/mnt/ca".to_string());
+    }
+    lower_parts.extend(layer_dirs);
+    let lower = lower_parts.join(":");
+    let opts = format!("lowerdir={lower},upperdir={upper},workdir={work},userxattr");
     info!("overlayfs opts: {opts}");
     let opts_cstr = std::ffi::CString::new(opts.as_str()).unwrap();
     let overlay_type = std::ffi::CString::new("overlay").unwrap();
