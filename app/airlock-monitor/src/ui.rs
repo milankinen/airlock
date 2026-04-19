@@ -138,7 +138,15 @@ fn build_status_line(app: &App) -> Line<'static> {
     let allowed = app.monitor.network.request_allowed;
     let denied = app.monitor.network.request_denied;
 
-    Line::from(vec![
+    let mut spans = Vec::with_capacity(16);
+    if !app.mouse_captured {
+        spans.push(Span::styled(
+            "Selection mode — Ctrl+C to copy, Esc to exit",
+            Style::default().fg(Color::Yellow),
+        ));
+        spans.push(sep.clone());
+    }
+    spans.extend([
         Span::styled("CPU ", label),
         Span::styled(format!("{cpu_pct}%"), value),
         sep.clone(),
@@ -150,7 +158,8 @@ fn build_status_line(app: &App) -> Line<'static> {
         Span::raw(" "),
         Span::styled(format!("{denied}"), Style::default().fg(Color::Red)),
         Span::raw(" "),
-    ])
+    ]);
+    Line::from(spans)
 }
 
 fn format_bytes(bytes: u64) -> String {

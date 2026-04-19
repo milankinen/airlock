@@ -347,7 +347,7 @@ fn handle_event(
             }
         }
         TuiEvent::Terminal(Event::Mouse(mouse)) => {
-            handle_mouse(mouse, app, sink, terminal)?;
+            handle_mouse(mouse, app, sink, terminal, mouse_captured)?;
         }
         TuiEvent::Terminal(Event::Resize(cols, rows)) => {
             let size = ratatui::layout::Rect::new(0, 0, cols, rows);
@@ -419,17 +419,20 @@ fn handle_key(
             app.active_tab = Tab::Monitor;
             return Ok(None);
         }
-        (_, KeyCode::F(12)) => {
-            *mouse_captured = !*mouse_captured;
-            if *mouse_captured {
-                crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
-            } else {
-                crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)?;
-            }
-            app.mouse_captured = *mouse_captured;
-            return Ok(None);
-        }
         _ => {}
+    }
+
+    // Auto-exit selection mode: Esc or Ctrl+C in the sandbox tab re-enables
+    // mouse capture so the click-to-select flow is reversible.
+    if app.active_tab == Tab::Sandbox
+        && !*mouse_captured
+        && (key.code == KeyCode::Esc
+            || (key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c')))
+    {
+        crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
+        *mouse_captured = true;
+        app.mouse_captured = true;
+        return Ok(None);
     }
 
     match app.active_tab {
@@ -546,6 +549,7 @@ fn handle_mouse(
     app: &mut App,
     sink: &mut TuiTerminalSink,
     terminal: &mut DefaultTerminal,
+    mouse_captured: &mut bool,
 ) -> anyhow::Result<()> {
     let size = terminal.size()?;
     let size = ratatui::layout::Rect::new(0, 0, size.width, size.height);
@@ -605,6 +609,16 @@ fn handle_mouse(
                     NetworkSubTab::Details => {} // clicking the active details tab is a no-op
                     _ => app.monitor.network.select_sub_tab(sub),
                 }
+                return Ok(());
+            }
+            // Click inside the sandbox body: drop mouse capture so the
+            // terminal's native selection takes over. The first click is
+            // consumed; the user's drag-to-select starts on the next press.
+            // Esc / Ctrl+C restores capture (see handle_key).
+            if app.active_tab == Tab::Sandbox && *mouse_captured {
+                crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)?;
+                *mouse_captured = false;
+                app.mouse_captured = false;
             }
         }
         MouseEventKind::ScrollUp => match app.active_tab {

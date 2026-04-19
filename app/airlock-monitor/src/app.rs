@@ -19,7 +19,8 @@ pub struct App {
     pub monitor: MonitorTab,
     pub network: Arc<dyn NetworkControl>,
     /// Whether mouse events are captured. When `false`, the host terminal
-    /// handles clicks natively (enabling text selection). Toggled with F12.
+    /// handles clicks natively (enabling text selection). Auto-disabled on
+    /// a click inside the sandbox tab; re-enabled on Esc or Ctrl+C.
     pub mouse_captured: bool,
     /// Tracks whether the guest has enabled bracketed paste mode
     /// (`\e[?2004h`). Only when true do we wrap pasted text in

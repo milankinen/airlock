@@ -84,11 +84,15 @@ Total and used bytes (reported the way `free` and `htop` do:
 | `Esc` / `x`             | Close the details sub-tab                             |
 | `p`                     | On Monitor tab: open the policy dropdown              |
 | `q` / `Ctrl+D`          | On Monitor tab: ask the sandbox process to exit       |
-| `F12`                   | Toggle mouse capture (release to select text)         |
 
-## Mouse capture
+## Selecting text
 
-`F12` toggles mouse capture. When capture is off, the host terminal
-handles drag natively so you can select and copy text. When capture is
-on, clicks route into the TUI — use this to click sub-tab labels or
-scroll the sandbox tab's scrollback with the wheel.
+Clicking inside the Sandbox tab releases mouse capture so the host
+terminal can handle drag natively — select text with the mouse and
+copy it with your terminal's copy shortcut (`Ctrl+C` on most Linux
+terminals, `Cmd+C` on macOS). The footer shows a `Selection mode`
+hint while capture is released. Press `Esc` or `Ctrl+C` to restore
+mouse capture so clicks route back into the TUI.
+
+The first click in the Sandbox tab is consumed by the mode switch
+itself; start the drag on the next press.
