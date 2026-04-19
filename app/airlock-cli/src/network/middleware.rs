@@ -19,7 +19,7 @@ pub(super) fn sandbox(lua: &Lua) -> mlua::Result<()> {
     }
 
     let _ = lua.set_hook(
-        mlua::HookTriggers::new().every_nth_instruction(1_000_000),
+        mlua::HookTriggers::new().every_nth_instruction(100_000),
         |_lua, _debug| Err(mlua::Error::runtime("script exceeded instruction limit")),
     );
 
