@@ -1,10 +1,16 @@
 //! `airlock exec` — attach a process to a running VM container.
 //!
-//! Connects to the `cli.sock` Unix socket exposed by a running `airlock start` session
-//! and sends a `CliService.exec()` RPC to spawn a new process inside the
-//! container. I/O is bridged between the host terminal and the guest process.
+//! Walks up from the current working directory looking for
+//! `.airlock/sandbox/cli.sock` and connects there. The command,
+//! the caller's CWD, and any `-e KEY=VAL` overrides are forwarded
+//! to the `airlock start` process, which already holds the
+//! resolved sandbox environment (image env + `airlock.toml` env).
+//! The server merges overrides into that base and asks the
+//! supervisor to spawn the process. `exec` therefore never loads
+//! the project, the vault, or the settings itself.
 
 use std::io::Write;
+use std::path::PathBuf;
 
 use airlock_common::supervisor_capnp::*;
 use clap::Args;
@@ -12,8 +18,7 @@ use futures::AsyncReadExt;
 use tokio::task::LocalSet;
 
 use crate::runtime::{self, RawTerminalRuntime};
-use crate::vault::Vault;
-use crate::{cli, project, rpc};
+use crate::{cli, rpc};
 
 /// CLI arguments for `airlock exec`.
 #[derive(Args, Debug)]
@@ -35,11 +40,11 @@ pub struct ExecArgs {
 }
 
 /// Entry point for `airlock exec <cmd> [args...]`.
-pub async fn main(args: ExecArgs, vault: Vault) -> i32 {
+pub async fn main(args: ExecArgs) -> i32 {
     let local = LocalSet::new();
     local
         .run_until(async {
-            run(args, vault).await.unwrap_or_else(|e| {
+            run(args).await.unwrap_or_else(|e| {
                 cli::error!("{e:#}");
                 1
             })
@@ -47,7 +52,7 @@ pub async fn main(args: ExecArgs, vault: Vault) -> i32 {
         .await
 }
 
-async fn run(args: ExecArgs, vault: Vault) -> anyhow::Result<i32> {
+async fn run(args: ExecArgs) -> anyhow::Result<i32> {
     let ExecArgs {
         cmd,
         args,
@@ -55,13 +60,20 @@ async fn run(args: ExecArgs, vault: Vault) -> anyhow::Result<i32> {
         env,
         login,
     } = args;
-    let project = project::load(vault)?;
     let (cmd, args) = if login {
         apply_login_shell(cmd, args)
     } else {
         (cmd, args)
     };
-    let sock_path = project.sandbox_dir.join(airlock_common::CLI_SOCK_FILENAME);
+
+    let host_cwd = std::env::current_dir().map_err(|e| anyhow::anyhow!("get cwd: {e}"))?;
+    let sock_path = find_cli_sock(&host_cwd).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no running sandbox — looked for .airlock/sandbox/cli.sock from {} upward. \
+             is 'airlock start' running in this project?",
+            host_cwd.display()
+        )
+    })?;
 
     let stream = tokio::net::UnixStream::connect(&sock_path)
         .await
@@ -70,9 +82,12 @@ async fn run(args: ExecArgs, vault: Vault) -> anyhow::Result<i32> {
                 e.kind(),
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
             ) {
-                anyhow::anyhow!("no running VM — is 'airlock up' running in this project?")
+                anyhow::anyhow!(
+                    "stale cli.sock at {} — is 'airlock start' still running?",
+                    sock_path.display()
+                )
             } else {
-                anyhow::anyhow!("failed to connect to VM: {e}")
+                anyhow::anyhow!("failed to connect to {}: {e}", sock_path.display())
             }
         })?;
 
@@ -92,7 +107,6 @@ async fn run(args: ExecArgs, vault: Vault) -> anyhow::Result<i32> {
     let stdin = terminal.stdin()?;
     let pty_size = stdin.pty_size();
 
-    // Build exec request
     let mut req = cli_service.exec_request();
     req.get().set_stdin(capnp_rpc::new_client(stdin));
     if let Some((rows, cols)) = pty_size {
@@ -107,24 +121,19 @@ async fn run(args: ExecArgs, vault: Vault) -> anyhow::Result<i32> {
     for (i, a) in args.iter().enumerate() {
         args_b.set(i as u32, a.as_str());
     }
-    let cwd = cwd.unwrap_or_else(|| project.guest_cwd.to_string_lossy().into_owned());
+    let cwd = cwd.unwrap_or_else(|| host_cwd.to_string_lossy().into_owned());
     req.get().set_cwd(&cwd);
 
-    // Merge config env vars (from airlock.toml / airlock.local.toml) with CLI-passed ones.
-    // CLI `-e` flags take precedence over config values.
-    let resolved_env = resolve_config_env(&project, &env)?;
-    let mut env_b = req.get().init_env(resolved_env.len() as u32);
-    for (i, e) in resolved_env.iter().enumerate() {
+    let mut env_b = req.get().init_env(env.len() as u32);
+    for (i, e) in env.iter().enumerate() {
         env_b.set(i as u32, e.as_str());
     }
 
     let response = req.send().promise.await?;
     let proc = rpc::Process::new(response.get()?.get_proc()?);
 
-    // Enter raw mode after the RPC handshake completes
     terminal.enter_raw_mode();
 
-    // Forward host signals to the container process
     let signal_proc = proc.clone();
     let mut signals = runtime::signals()?;
     tokio::task::spawn_local(async move {
@@ -137,7 +146,6 @@ async fn run(args: ExecArgs, vault: Vault) -> anyhow::Result<i32> {
         }
     });
 
-    // Output relay
     let exit_code = loop {
         match proc.poll().await {
             Ok(rpc::ProcessEvent::Exit(code)) => break code,
@@ -165,6 +173,22 @@ async fn run(args: ExecArgs, vault: Vault) -> anyhow::Result<i32> {
     Ok(exit_code)
 }
 
+/// Walk up from `start` looking for `.airlock/sandbox/<CLI_SOCK_FILENAME>`.
+/// Returns the first match, or `None` if nothing is found before the
+/// filesystem root.
+fn find_cli_sock(start: &std::path::Path) -> Option<PathBuf> {
+    for dir in start.ancestors() {
+        let candidate = dir
+            .join(".airlock")
+            .join("sandbox")
+            .join(airlock_common::CLI_SOCK_FILENAME);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Wrap `(cmd, args)` for execution inside a login shell.
 ///
 /// If `cmd` is a lone shell binary (no args), adds `-l` directly.
@@ -184,35 +208,6 @@ fn apply_login_shell(cmd: String, args: Vec<String>) -> (String, Vec<String>) {
         new_args.extend(args);
         ("bash".to_string(), new_args)
     }
-}
-
-/// Resolve config env vars (with `${VAR}` substitution) and merge with CLI-passed env.
-/// CLI `-e KEY=VALUE` entries override config values for the same key.
-fn resolve_config_env(
-    project: &project::Project,
-    cli_env: &[String],
-) -> anyhow::Result<Vec<String>> {
-    let mut merged: Vec<String> = Vec::new();
-
-    // Collect keys from CLI env so we can skip config entries that are overridden.
-    let cli_keys: std::collections::HashSet<&str> = cli_env
-        .iter()
-        .filter_map(|e| e.split_once('=').map(|(k, _)| k))
-        .collect();
-
-    for (key, template) in &project.config.env {
-        if cli_keys.contains(key.as_str()) {
-            continue;
-        }
-        let value = project
-            .vault
-            .subst(template)
-            .map_err(|e| anyhow::anyhow!("env.{key}: {e}"))?;
-        merged.push(format!("{key}={value}"));
-    }
-
-    merged.extend_from_slice(cli_env);
-    Ok(merged)
 }
 
 fn is_shell_name(cmd: &str) -> bool {

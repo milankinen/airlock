@@ -192,9 +192,13 @@ async fn run(
         )
         .await?;
 
-    // Start CLI server so `airlock exec` can attach processes to this VM
+    // Start CLI server so `airlock exec` can attach processes to this VM.
+    // The server needs a copy of the sandbox's resolved env so it can layer
+    // `airlock exec -e KEY=VAL` overrides on top without the exec client
+    // having to re-resolve the project.
     let sock_path = project.sandbox_dir.join(airlock_common::CLI_SOCK_FILENAME);
-    tokio::task::spawn_local(cli_server::serve(sock_path, supervisor.clone()));
+    let base_env = vm.env.clone();
+    tokio::task::spawn_local(cli_server::serve(sock_path, supervisor.clone(), base_env));
 
     spawn_signal_forwarder(signals, proc.clone());
     let exit_code = poll_proc(&proc, &mut terminal, pty_dump.as_mut()).await;

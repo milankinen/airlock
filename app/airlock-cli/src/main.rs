@@ -62,7 +62,7 @@ async fn main() {
                 cli::error!("'--' args are not supported with 'exec'");
                 std::process::exit(2);
             }
-            cli::cmd_exec::main(args, vault).await
+            cli::cmd_exec::main(args).await
         }
         Command::Show(ref args) => {
             if !extra_args.is_empty() {

@@ -1,9 +1,11 @@
 /// Unix-socket Cap'n Proto server bridging `airlock exec` clients into the running VM.
 ///
-/// `airlock go` spawns this server after the VM is up. `airlock exec` connects here and
-/// calls `CliService.exec()`. The server bridges the exec's `Stdin` capability
-/// through to the supervisor, and wraps the returned `Process` to relay output
-/// back over the unix socket.
+/// `airlock start` spawns this server after the VM is up. `airlock exec` connects here
+/// and calls `CliService.exec()`. The exec's `env` list is interpreted as
+/// *overrides* layered on top of the sandbox's resolved base env (image env +
+/// `airlock.toml` env) — so the exec client never has to know what the sandbox
+/// was launched with. The merged env is then forwarded to the supervisor
+/// along with the bridged stdin/process capabilities.
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -22,8 +24,10 @@ impl Drop for SockGuard {
 }
 
 /// Accept `airlock exec` connections on a Unix socket and bridge each into the
-/// running VM supervisor via Cap'n Proto RPC.
-pub async fn serve(sock_path: PathBuf, supervisor: Supervisor) {
+/// running VM supervisor via Cap'n Proto RPC. `base_env` is the sandbox's
+/// resolved environment (image env + config env) — `exec` clients send
+/// overrides which are merged onto this before each child is spawned.
+pub async fn serve(sock_path: PathBuf, supervisor: Supervisor, base_env: Vec<String>) {
     let _ = tokio::fs::remove_file(&sock_path).await;
     let listener = match tokio::net::UnixListener::bind(&sock_path) {
         Ok(l) => l,
@@ -34,11 +38,13 @@ pub async fn serve(sock_path: PathBuf, supervisor: Supervisor) {
     };
     let _guard = SockGuard(sock_path);
 
+    let base_env = Rc::new(base_env);
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let sup = supervisor.clone();
-                handle_connection(stream, sup);
+                let env = base_env.clone();
+                handle_connection(stream, sup, env);
             }
             Err(e) => {
                 tracing::debug!("cli server accept error: {e}");
@@ -49,7 +55,11 @@ pub async fn serve(sock_path: PathBuf, supervisor: Supervisor) {
 }
 
 /// Set up a Cap'n Proto RPC system for a single `airlock exec` client connection.
-fn handle_connection(stream: tokio::net::UnixStream, supervisor: Supervisor) {
+fn handle_connection(
+    stream: tokio::net::UnixStream,
+    supervisor: Supervisor,
+    base_env: Rc<Vec<String>>,
+) {
     let (reader, writer) = tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
     let network = capnp_rpc::twoparty::VatNetwork::new(
         reader,
@@ -57,7 +67,10 @@ fn handle_connection(stream: tokio::net::UnixStream, supervisor: Supervisor) {
         capnp_rpc::rpc_twoparty_capnp::Side::Server,
         capnp::message::ReaderOptions::default(),
     );
-    let service: cli_service::Client = capnp_rpc::new_client(CliServiceImpl { supervisor });
+    let service: cli_service::Client = capnp_rpc::new_client(CliServiceImpl {
+        supervisor,
+        base_env,
+    });
     let rpc = capnp_rpc::RpcSystem::new(Box::new(network), Some(service.client));
     tokio::task::spawn_local(rpc);
 }
@@ -65,6 +78,7 @@ fn handle_connection(stream: tokio::net::UnixStream, supervisor: Supervisor) {
 /// Implements the `CliService` Cap'n Proto interface exposed to `airlock exec` clients.
 struct CliServiceImpl {
     supervisor: Supervisor,
+    base_env: Rc<Vec<String>>,
 }
 
 impl cli_service::Server for CliServiceImpl {
@@ -94,11 +108,13 @@ impl cli_service::Server for CliServiceImpl {
             .map(|a| a.map(|s| s.to_str().unwrap_or("").to_string()))
             .collect::<Result<Vec<_>, _>>()?;
         let cwd = params.get_cwd()?.to_str()?.to_string();
-        let env: Vec<String> = params
+        let overrides: Vec<String> = params
             .get_env()?
             .iter()
             .map(|e| e.map(|s| s.to_str().unwrap_or("").to_string()))
             .collect::<Result<Vec<_>, _>>()?;
+
+        let env = merge_env(&self.base_env, &overrides);
 
         let proc = self
             .supervisor
@@ -112,6 +128,23 @@ impl cli_service::Server for CliServiceImpl {
             .set_proc(capnp_rpc::new_client(ProcessBridge { inner: proc }));
         Ok(())
     }
+}
+
+/// Layer `KEY=VALUE` overrides over `base`. For each override, any prior
+/// entry with the same key is dropped and the override is appended at the
+/// end — matching the precedence `vm::resolve_env` uses for
+/// `airlock.toml` over image env.
+fn merge_env(base: &[String], overrides: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = base.to_vec();
+    for entry in overrides {
+        let Some((key, _)) = entry.split_once('=') else {
+            continue;
+        };
+        let prefix = format!("{key}=");
+        out.retain(|e| !e.starts_with(&prefix));
+        out.push(entry.clone());
+    }
+    out
 }
 
 /// Bridges `Stdin.read()` calls from the vsock supervisor to the `airlock exec`
@@ -203,5 +236,38 @@ impl process::Server for ProcessBridge {
     ) -> Result<(), capnp::Error> {
         let _ = self.inner.signal(9).await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_appends_new_keys_and_replaces_existing() {
+        let base = vec!["PATH=/bin".into(), "HOME=/root".into(), "TERM=xterm".into()];
+        let out = merge_env(
+            &base,
+            &[
+                "HOME=/tmp".into(), // overrides existing
+                "NEW=1".into(),     // appended
+            ],
+        );
+        assert_eq!(
+            out,
+            vec![
+                "PATH=/bin".to_string(),
+                "TERM=xterm".into(),
+                "HOME=/tmp".into(),
+                "NEW=1".into(),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_ignores_malformed_entries() {
+        let base = vec!["A=1".to_string()];
+        let out = merge_env(&base, &["malformed".into(), "B=2".into()]);
+        assert_eq!(out, vec!["A=1".to_string(), "B=2".into()]);
     }
 }
