@@ -1,4 +1,4 @@
-# Docker Inside the VM
+# Docker inside the VM
 
 There are two ways to get Docker working inside an airlock sandbox:
 forwarding the host's Docker socket (quick, but with security trade-offs)

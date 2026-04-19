@@ -1,4 +1,4 @@
-# VM Options
+# VM options
 
 The `[vm]` section controls the virtual machine image and resource allocation.
 
@@ -54,41 +54,36 @@ The minimum is 512 MB, and the maximum is the total system RAM.
 
 ## Security hardening
 
-The `harden` option (enabled by default) applies additional isolation inside
-the VM: namespace restrictions and the `no-new-privileges` flag. This
-prevents processes in the container from escalating their permissions:
+The VM boundary is already the primary isolation layer, but `harden`
+(enabled by default) adds a second belt inside the guest: namespace
+restrictions and the `no-new-privileges` flag on the container process.
+`no-new-privileges` means a setuid binary inside the sandbox can no longer
+elevate to root — useful against local-privilege-escalation tricks an
+agent might trip into, even though the blast radius is already confined
+to the VM.
 
 ```toml
 [vm]
 harden = true   # default
 ```
 
-You might need to disable hardening if you're running Docker inside the VM or
-doing other tasks that require broader kernel capabilities.
+Disable it only when a workload genuinely needs the broader kernel
+capabilities it takes away — the most common case is running Docker
+inside the VM, which needs to create its own namespaces and mounts.
 
 ## Nested KVM (Linux only)
 
-On Linux hosts with KVM support, you can enable nested virtualisation inside
-the VM:
+On Linux hosts with KVM support, you can expose `/dev/kvm` into the
+guest so VMs running *inside* the sandbox get hardware acceleration:
 
 ```toml
 [vm]
 kvm = true
 ```
 
-This is only available on Linux and requires `/dev/kvm` access on the host.
+This is what you need for, say, running `qemu-system-*` or another
+hypervisor from inside the sandbox without falling back to software
+emulation. It's only available on Linux and requires `/dev/kvm`
+access on the host — Apple Virtualization on macOS doesn't expose
+nested virt.
 
-## Custom kernel and initramfs
-
-If you're using the **distroless** build of airlock (which doesn't bundle a
-kernel), or you need a custom kernel for other reasons, you can point to
-external files:
-
-```toml
-[vm]
-kernel = "/path/to/vmlinux"
-initramfs = "/path/to/initramfs.cpio.gz"
-```
-
-For details on the distroless build variant, kernel requirements, and
-building your own kernel, see [Custom Kernel](../advanced/custom-kernel.md).

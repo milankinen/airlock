@@ -1,4 +1,4 @@
-# Monitor mode
+# Monitor dashboard
 
 The `--monitor` (`-m`) flag opens a tabbed TUI control panel alongside
 the sandbox shell. It's most useful when you want to observe what the
@@ -8,6 +8,8 @@ being blocked by policy, and how it's using CPU and memory.
 ```bash
 airlock start --monitor
 ```
+
+![Monitor dashboard](./monitor.png)
 
 ## Tabs
 
@@ -71,19 +73,19 @@ Total and used bytes (reported the way `free` and `htop` do:
 
 ## Keyboard shortcuts
 
-| Key                     | Action                                                |
-|-------------------------|-------------------------------------------------------|
-| `F1`                    | Switch to Sandbox tab                                 |
-| `F2`                    | Switch to Monitor tab                                 |
-| `r`                     | On Monitor tab: show Requests sub-tab                 |
-| `c`                     | On Monitor tab: show Connections sub-tab              |
-| `↑` / `↓`               | Move row selection in Requests / Connections          |
-| `PgUp` / `PgDn`         | Jump the selection a page at a time                   |
-| `Home` / `End`          | Jump to the newest / oldest entry                     |
-| `Enter`                 | Open the selected row in a details sub-tab           |
-| `Esc` / `x`             | Close the details sub-tab                             |
-| `p`                     | On Monitor tab: open the policy dropdown              |
-| `q` / `Ctrl+D`          | On Monitor tab: ask the sandbox process to exit       |
+| Key             | Action                                          |
+|-----------------|-------------------------------------------------|
+| `F1`            | Switch to Sandbox tab                           |
+| `F2`            | Switch to Monitor tab                           |
+| `r`             | On Monitor tab: show Requests sub-tab           |
+| `c`             | On Monitor tab: show Connections sub-tab        |
+| `↑` / `↓`       | Move row selection in Requests / Connections    |
+| `PgUp` / `PgDn` | Jump the selection a page at a time             |
+| `Home` / `End`  | Jump to the newest / oldest entry               |
+| `Enter`         | Open the selected row in a details sub-tab      |
+| `Esc` / `x`     | Close the details sub-tab                       |
+| `p`             | On Monitor tab: open the policy dropdown        |
+| `q` / `Ctrl+D`  | On Monitor tab: ask the sandbox process to exit |
 
 ## Selecting text
 

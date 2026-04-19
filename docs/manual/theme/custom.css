@@ -21,3 +21,14 @@
     border-width: 3px;
     margin-top: 8px;
 }
+
+.architecture-diagram {
+    margin: 1.5em auto;
+    max-width: 720px;
+}
+
+.architecture-diagram svg {
+    width: 100%;
+    height: auto;
+    display: block;
+}

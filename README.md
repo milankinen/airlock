@@ -20,10 +20,9 @@ sandbox VM that boots in seconds, has scriptable network control, and can run
 any Linux-based OCI image. A single self-contained, daemonless binary — no
 Docker required. Works with both macOS and Linux.
 
-See the [user manual](https://milankinen.github.io/airlock) or the
-[design document](docs/DESIGN.md) for more details.
+See the [user manual](https://milankinen.github.io/airlock) for more detail.
 
-![Demo](demo.svg)
+![Demo](docs/manual/src/demo.svg)
 
 ## Quick start
 
@@ -39,6 +38,14 @@ export PATH=$PATH:~/.local/bin
 ```bash
 airlock start
 ```
+
+**Built-in sandbox monitor**:
+
+```bash
+airlock start --monitor
+```
+
+![Monitor dashboard](docs/manual/src/monitor.png)
 
 ## License
 

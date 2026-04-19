@@ -1,4 +1,4 @@
-# Disk and Cache
+# Disk and cache
 
 airlock creates a sparse ext4 disk image for each project sandbox. This disk
 persists writes that happen outside of mounted host directories — things like

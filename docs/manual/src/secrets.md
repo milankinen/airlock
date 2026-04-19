@@ -1,0 +1,153 @@
+# Secrets management
+
+Most projects need secrets — API tokens, deploy keys, per-environment
+passwords. The usual workaround is to export them as shell variables
+and reference them from config with `${VAR}`, but that's both
+inconvenient (you have to remember to export them every session) and
+leaky (the value ends up in your shell history, in every child
+process's environment, and often in log output). airlock ships a small
+**secret vault** so you can save a value once and reference it the
+same way you would any other `${VAR}` — but without the value ever
+appearing in your shell env.
+
+Vault entries are consulted as a fallback to the host environment, so
+common templates like `${PATH}` still resolve from the shell without
+the vault ever being opened. Only names the shell doesn't define fall
+through to the vault.
+
+## Quick start
+
+Save, list, and remove secrets with the `airlock secret` subcommand:
+
+```sh
+airlock secret add MY_API_TOKEN     # prompts for the value
+airlock secret ls                   # lists saved names (not values)
+airlock secret rm MY_API_TOKEN
+```
+
+Reference the saved value from `[env]` the same way as any host env
+variable:
+
+```toml
+[env]
+API_TOKEN = "${MY_API_TOKEN}"
+```
+
+On `airlock start`, the template is expanded using the host env first
+and the vault as fallback, and the result is injected as `API_TOKEN`
+inside the sandbox. The same substitution applies in Lua middleware
+`env` tables (see [Network scripting](./advanced/network-scripting.md)).
+
+## Choosing a storage backend
+
+The vault can be backed by one of four storage types, picked with
+`vault.storage` in `~/.airlock/settings.toml`:
+
+| Backend                    | At-rest protection                   | Prompts on use | Headless / CI friendly |
+| -------------------------- | ------------------------------------ | -------------- | ---------------------- |
+| `encrypted-file` (default) | AEAD (ChaCha20-Poly1305 + Argon2id)  | Passphrase     | Yes (via env var)      |
+| `file`                     | `chmod 600` only (cleartext JSON)    | None           | Yes                    |
+| `keyring`                  | OS keychain / Secret Service         | OS unlock      | GUI-dependent          |
+| `disabled`                 | N/A — `airlock secret` is turned off | None           | Yes                    |
+
+```toml
+# ~/.airlock/settings.toml
+vault.storage = "keyring"
+```
+
+Settings may also be written in JSON (`settings.json`) or YAML
+(`settings.yaml` / `settings.yml`); TOML wins if more than one file
+exists.
+
+### `encrypted-file` — passphrase-encrypted JSON
+
+Secrets live in `~/.airlock/vault.default.enc.json`, with the `data`
+field as an Argon2id-derived-key + ChaCha20-Poly1305-encrypted blob.
+The passphrase is taken from `AIRLOCK_VAULT_PASSPHRASE` if set,
+otherwise airlock prompts on the terminal. You'll be prompted twice on
+first use (new vault) and once per process thereafter; the prompt line
+is erased on successful input so the terminal stays clean.
+
+**Why it's the default**: works on every platform, protects the
+secrets at rest (so a backup snapshot or stolen disk image doesn't
+leak them), and degrades cleanly in CI via the environment variable:
+
+```sh
+export AIRLOCK_VAULT_PASSPHRASE='correct horse battery staple'
+airlock start
+```
+
+**Drawbacks**: you have to type the passphrase once per shell session,
+and the protection is only as strong as the passphrase itself — a
+short or reused one is a weak link.
+
+### `keyring` — system keychain / Secret Service
+
+Stores the vault in the macOS Keychain or the Linux Secret Service
+(GNOME Keyring, KWallet). First access per session triggers the OS
+unlock prompt; afterwards the keyring is unlocked for the rest of the
+session and no further prompts appear.
+
+**Why you might pick it**: the most ergonomic option on a desktop
+machine — the unlock piggybacks on your login session, and you don't
+manage a separate passphrase.
+
+**Drawbacks**:
+- On headless SSH sessions the graphical unlock can't render, so the
+  first vault access hangs or fails. Use `encrypted-file` for
+  CI / remote-development boxes.
+- On Linux, the secret-service daemon has to be running; minimal
+  desktop setups and some WSL environments don't ship one.
+- The vault is bound to the OS user account — backing it up or moving
+  it between machines isn't straightforward.
+
+### `file` — plaintext JSON
+
+Secrets and registry credentials are written to
+`~/.airlock/vault.default.json` with mode `0600`. No crypto, no
+prompts, works everywhere.
+
+**Why you might pick it**: zero friction. Useful for throwaway test
+boxes or when you're debugging the vault itself and need to inspect
+the on-disk format.
+
+**Drawbacks**: anyone who can read that file — including backup
+snapshots, disk forensics, or a sloppy `tar` of your home directory —
+reads the secrets. `airlock secret add` shows a one-time warning when
+this backend is active; pass `--yes` to skip the confirmation in
+scripts.
+
+### `disabled` — vault turned off
+
+`airlock secret` refuses to run. `${VAR}` templates resolve only
+against the host env, and if a referenced name isn't set there,
+`airlock start` fails with a clear error. Registry auth falls back to
+re-prompting on every 401 (credentials are never saved).
+
+**Why you might pick it**: you already have a secrets pipeline you
+trust (a 1Password CLI wrapper, a Vault agent, etc.) and you want
+airlock to stay out of the way.
+
+## Recommendation
+
+- **On a desktop / laptop you use daily** — `keyring`. The unlock
+  piggybacks on your OS login, secrets get OS-level at-rest
+  protection, and the UX is indistinguishable from any other app that
+  uses the system password store.
+- **On a shared box, a CI runner, or a dev container** —
+  `encrypted-file` with `AIRLOCK_VAULT_PASSPHRASE` supplied as a job
+  secret. You get the same at-rest protection without depending on a
+  desktop session.
+- **For throwaway environments** — `file` is fine if you understand
+  what you're giving up.
+- **If you already manage secrets elsewhere** — `disabled`, and source
+  the values into your shell env before running `airlock start`.
+
+## Registry credentials
+
+Private OCI registries also store credentials through the vault. When
+a pull gets a `401 Unauthorized`, airlock prompts for username and
+password, and — if the vault is enabled — saves them keyed by registry
+host. Subsequent pulls from the same host reuse the saved creds
+without a prompt. With `disabled`, the pull still works but airlock
+re-prompts on every `401`.

@@ -91,10 +91,9 @@ The three resolution modes are:
 
 For private registries, airlock prompts for a username and password the first
 time it sees a `401 Unauthorized` response. When the vault is enabled (see
-[Environment Variables](../configuration/env.md#secret-vault)), credentials
-are saved to the system keyring, keyed by registry host, and reused on
-subsequent pulls. With the vault disabled, airlock prompts on every pull that
-requires auth.
+[Secrets management](../secrets.md)), credentials are saved and keyed by
+registry host so subsequent pulls reuse them. With the vault disabled,
+airlock prompts on every pull that requires auth.
 
 For development registries served over plain HTTP, set `insecure = true`:
 
@@ -105,11 +104,11 @@ resolution = "registry"
 insecure = true
 ```
 
-## Monitor mode
+## Monitor dashboard
 
 Pass `--monitor` (`-m`) to open a tabbed TUI control panel alongside the
 sandbox shell, with live network, CPU, and memory views. See the
-[Monitor mode](../monitor.md) chapter for details.
+[Monitor dashboard](../monitor.md) chapter for details.
 
 ## Verbose output
 

@@ -1,4 +1,4 @@
-# Custom Kernel
+# Custom kernel
 
 By default, the standard (bundled) build of airlock ships with a Linux kernel
 and initramfs compiled into the binary. This is the easiest way to get

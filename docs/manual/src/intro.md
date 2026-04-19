@@ -29,6 +29,8 @@ to run them on the host machine anymore. The main design principles are:
 * **Shareable** — sandbox configuration lives in version control and can be
   shared across a team or company
 
+![Demo](./demo.svg)
+
 ## Motivation
 
 **tl;dr** I kept running into the same problem: AI agents need broad access
@@ -119,13 +121,11 @@ setup — same image, same network rules, same mounts. Local overrides go in
 `airlock.local.toml` (gitignored). Built-in presets for common ecosystems
 (Rust, Python, Node.js, and more) provide sensible defaults out of the box.
 
-## Coming up
+## Coming up next!
 
-* Real-time network monitoring UI with toggleable policies
-* Denied network request backpropagation to the VM, so agents can hook into
-  failures for better recovery
 * MCP proxy for stdio-based MCP servers (e.g. Playwright MCP from inside the VM)
 * System-admin-managed configuration defaults and policies
+* Network configuration editing from the Monitor dashboard
 
 ## Similar projects
 

@@ -1,4 +1,4 @@
-# Environment Variables
+# Environment variables
 
 The `[env]` section defines environment variables that are injected into the
 container at startup. This is the primary mechanism for passing configuration
@@ -24,7 +24,7 @@ API_TOKEN = "${MY_API_TOKEN}"
 ```
 
 When airlock starts, it resolves `MY_API_TOKEN` first from the host
-environment and then from the user secret vault (see below), and injects
+environment and then from the [secret vault](../secrets.md), and injects
 the result as `API_TOKEN` inside the container. Starting the sandbox
 fails if the variable is not defined in either source.
 
@@ -35,83 +35,13 @@ You can provide a fallback value with `${VAR:default}`:
 LOG_LEVEL = "${LOG_LEVEL:info}"
 ```
 
-## Secret vault
+Substitution is handled by the [`subst`](https://github.com/fizyr/subst)
+crate — see its docs for the full reference on escaping, nested
+expansions, and other forms.
 
-Secrets that shouldn't live in your shell environment can be stored in
-the airlock vault with `airlock secret`:
+## Secrets
 
-```sh
-airlock secret add MY_API_TOKEN
-airlock secret ls
-airlock secret rm MY_API_TOKEN
-```
-
-### Choosing a storage backend
-
-The backend is picked with `vault.storage = "<backend>"` in
-`~/.airlock/settings.toml`. The default is `encrypted-file`, which keeps
-secrets under passphrase-derived AEAD at rest while still working in
-headless sessions where a system keyring would pop a graphical unlock
-prompt (the passphrase can be supplied non-interactively via
-`AIRLOCK_VAULT_PASSPHRASE`).
-
-| Backend                    | At-rest protection                   | Prompts on use | Headless / CI friendly |
-| -------------------------- | ------------------------------------ | -------------- | ---------------------- |
-| `encrypted-file` (default) | AEAD (ChaCha20-Poly1305 + Argon2id)  | Passphrase     | Yes (via env var)      |
-| `file`                     | `chmod 600` only (cleartext JSON)    | None           | Yes                    |
-| `keyring`                  | OS keychain / Secret Service         | OS unlock      | GUI-dependent          |
-| `disabled`                 | N/A — `airlock secret` is turned off | None           | Yes                    |
-
-```toml
-# ~/.airlock/settings.toml
-vault.storage = "file"
-```
-
-Settings may also be written in JSON (`settings.json`) or YAML
-(`settings.yaml` / `settings.yml`); TOML wins if more than one file
-exists.
-
-### `file` — plaintext JSON
-
-Secrets and registry credentials are written to `~/.airlock/vault.json`
-with mode `0600`. No crypto, no prompts, works everywhere — but anyone
-who can read that file can read the secrets. `airlock secret add` shows
-a one-time warning when this backend is active; pass `--yes` to skip
-the confirmation in scripts.
-
-### `encrypted-file` — passphrase-encrypted JSON
-
-Same file, but the `data` field is an Argon2id-derived-key +
-ChaCha20-Poly1305-encrypted blob. The passphrase is taken from the
-`AIRLOCK_VAULT_PASSPHRASE` environment variable if set, otherwise
-airlock prompts for it on the terminal. You'll be prompted twice on
-first use (new vault) and once per process thereafter. The prompt line
-is erased on successful input so the terminal stays clean.
-
-For CI or non-interactive runs:
-
-```sh
-export AIRLOCK_VAULT_PASSPHRASE='correct horse battery staple'
-airlock start
-```
-
-### `keyring` — system keychain / Secret Service
-
-Stores the vault in the macOS Keychain or the Linux Secret Service.
-First use triggers the OS unlock prompt. Well-suited to desktop use;
-less suited to headless SSH sessions (where a graphical unlock can't
-render) — use `encrypted-file` there instead.
-
-### `disabled` — turn the vault off
-
-`airlock secret` refuses to run. Registry auth falls back to
-re-prompting on every 401 that needs credentials.
-
-### Referencing vault entries
-
-Vault entries are referenced with the same `${VAR}` syntax as host env
-vars. The host env is consulted first and the vault is the fallback, so
-common templates like `${PATH}` never open the vault — only names
-the host env doesn't define fall through. If a shell var of the same
-name already exists and you want the saved secret to win, unset it in
-the invoking shell (or give the secret a different name).
+Values you don't want to keep in your shell environment can be saved in
+the airlock secret vault and referenced by the same `${VAR}` syntax.
+See the [Secrets management](../secrets.md) chapter for the full
+reference — storage backends, trade-offs, and recommendations.

@@ -1,4 +1,4 @@
-# Network Scripting
+# Network scripting
 
 Middleware entries under `[network.middleware]` trigger transparent TLS
 interception on matching connections. This gives your Lua scripts access to

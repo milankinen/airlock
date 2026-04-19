@@ -110,7 +110,7 @@ script = '...'
 
 For a complete guide to the scripting API — including request/response
 inspection, body manipulation, and chaining multiple middleware layers — see
-[Network Scripting](../advanced/network-scripting.md).
+[Network scripting](../advanced/network-scripting.md).
 
 ## Unix socket forwarding
 
@@ -136,8 +136,13 @@ forwards can be disabled with `enabled = false`.
 
 ## Port forwarding
 
-Host TCP ports can be forwarded into the VM so that the guest can reach host
-services transparently. Forwarded ports are configured under `[network.ports]`:
+Some projects run supporting services on the host — a local PostgreSQL,
+a Redis, a dev-mode backend on port 3000 — and the sandboxed process
+needs to talk to them. Rather than expose those services to the network,
+airlock can forward specific host TCP ports into the VM so that
+`localhost:<port>` inside the sandbox transparently reaches the host
+service, while everything else on loopback stays confined to the guest.
+Forwarded ports are configured under `[network.ports]`:
 
 ```toml
 [network.ports.local-services]
