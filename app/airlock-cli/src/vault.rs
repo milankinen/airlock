@@ -9,8 +9,8 @@
 //! Both kinds live inside a **single** `VaultData` blob. Where that blob
 //! lives is chosen by `settings.vault`:
 //!
-//! - `file` (default): `~/.airlock/vault.json`, mode 0600, plain JSON.
-//! - `encrypted-file`: same path, AEAD-encrypted with a passphrase.
+//! - `file` (default): `~/.airlock/vault.default.json`, mode 0600, plain JSON.
+//! - `encrypted-file`: `~/.airlock/vault.default.enc.json`, AEAD-encrypted with a passphrase.
 //! - `keyring`: OS keychain / Secret Service (the pre-existing backend).
 //! - `disabled`: no-op; reads return empty, writes are dropped.
 //!
@@ -20,11 +20,6 @@
 //! registry credential lookup, the `secret` subcommand) is unaware.
 //!
 //! ## On-disk envelope
-//!
-//! The file-backed storages share `~/.airlock/vault.json`, wrapped in
-//! a tagged envelope so we can tell at load time which format applies
-//! and refuse cross-type reads (saves a class of "you lost all your
-//! secrets because I silently reinterpreted the file" bugs):
 //!
 //! ```json
 //! { "type": "file",           "data": { ...VaultData... } }
@@ -73,8 +68,10 @@ use rand::TryRngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 
+use crate::settings::Settings;
+
 const KEYRING_SERVICE: &str = "airlock-vault";
-const KEYRING_ACCOUNT: &str = "vault";
+const KEYRING_ACCOUNT: &str = "default";
 
 /// Env var used to supply the encrypted-vault passphrase non-interactively
 /// (CI, scripts, and headless shells without a TTY).
@@ -135,10 +132,10 @@ pub enum VaultStorageType {
     /// Inert backend. Reads empty, writes dropped. `airlock secret`
     /// refuses to run.
     Disabled,
-    /// Plaintext JSON at `~/.airlock/vault.json` (mode 0600).
+    /// Plaintext JSON at `~/.airlock/vault.default.json` (mode 0600).
     #[default]
     File,
-    /// AEAD-encrypted JSON at `~/.airlock/vault.json`. Passphrase via
+    /// AEAD-encrypted JSON at `~/.airlock/vault.default.enc.json`. Passphrase via
     /// `AIRLOCK_VAULT_PASSPHRASE` or interactive prompt.
     EncryptedFile,
     /// OS keychain / Secret Service.
@@ -371,23 +368,19 @@ pub trait Storage: Send + Sync + 'static {
 fn boxed_storage(storage_type: VaultStorageType) -> Box<dyn Storage> {
     match storage_type {
         VaultStorageType::Disabled => Box::new(DisabledStorage),
-        VaultStorageType::File => Box::new(FileStorage::default_path()),
+        VaultStorageType::File => Box::new(FileStorage::new(
+            Settings::dir()
+                .unwrap_or(PathBuf::from("."))
+                .join("vault.default.json"),
+        )),
         VaultStorageType::EncryptedFile => Box::new(EncryptedFileStorage::new(
-            default_vault_path(),
+            Settings::dir()
+                .unwrap_or(PathBuf::from("."))
+                .join("vault.default.enc.json"),
             interactive_passphrase(),
         )),
         VaultStorageType::Keyring => Box::new(KeyringStorage),
     }
-}
-
-/// Default vault file location. Returns `~/.airlock/vault.json`,
-/// falling back to `./vault.json` only if the home directory can't
-/// be resolved (which shouldn't happen on the supported platforms).
-fn default_vault_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".airlock")
-        .join("vault.json")
 }
 
 /// Tagged on-disk envelope for the file backends. `type` distinguishes
@@ -432,9 +425,6 @@ pub struct FileStorage {
 impl FileStorage {
     pub fn new(path: PathBuf) -> Self {
         Self { path }
-    }
-    fn default_path() -> Self {
-        Self::new(default_vault_path())
     }
 }
 

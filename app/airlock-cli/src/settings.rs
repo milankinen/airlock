@@ -38,15 +38,23 @@ pub struct VaultSettings {
 }
 
 impl Settings {
+    pub fn dir() -> Result<PathBuf> {
+        let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory missing"))?;
+        Ok(home.join(".airlock"))
+    }
+
+    /// Human-readable path where the TOML settings file should live.
+    /// Used in error messages that ask the user to create/edit it.
+    pub fn expected_path() -> PathBuf {
+        PathBuf::from("~/.airlock/settings.toml")
+    }
+
     /// Load settings from the first matching `~/.airlock/settings.*`
     /// file. Missing file → defaults. Parse errors bubble up so the
     /// user notices a malformed file instead of silently getting
     /// defaults.
     pub fn load() -> Result<Self> {
-        let Some(home) = dirs::home_dir() else {
-            return Ok(Self::default());
-        };
-        Self::load_from(&home.join(".airlock"))
+        Self::load_from(&Self::dir()?)
     }
 
     fn load_from(dir: &Path) -> Result<Self> {
@@ -65,14 +73,6 @@ impl Settings {
                 .with_context(|| format!("load settings file {}", path.display()));
         }
         Ok(Self::default())
-    }
-
-    /// Human-readable path where the TOML settings file should live.
-    /// Used in error messages that ask the user to create/edit it.
-    pub fn expected_path() -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("~"))
-            .join(".airlock/settings.toml")
     }
 }
 

@@ -92,6 +92,11 @@ pub fn red(s: &str) -> String {
     console::style(s).red().to_string()
 }
 
+/// Format a value as yellow text (for warnings)
+pub fn yellow(s: &str) -> String {
+    console::style(s).yellow().to_string()
+}
+
 /// Build the version string shown by `-V`.
 ///
 /// In release builds the release action appends `<version><len:u32le>` to

@@ -146,18 +146,17 @@ fn remove(vault: &Vault, name: &str) -> anyhow::Result<()> {
 /// caller can pass `--yes` when scripting.
 fn confirm_plaintext_vault() -> anyhow::Result<()> {
     let msg = "\
-Your vault backend is \"file\" — secrets will be written as plaintext \
-JSON to ~/.airlock/vault.json (mode 0600). Anyone with read access to \
-that file can recover them.
+Your vault backend is \"file\" — secrets will be written as plaintext
+JSON to ~/.airlock/vault.json (mode 0600). Anyone with read access to
+that file can recover them. For stronger at-rest protection, set one of
+these in ~/.airlock/settings.toml:
 
-For stronger at-rest protection, set one of these in \
-~/.airlock/settings.toml:
-
-  vault.storage = \"encrypted-file\"  # AEAD-encrypted, passphrase on first use
-                                      # (AIRLOCK_VAULT_PASSPHRASE for non-interactive)
-  vault.storage = \"keyring\"         # OS keychain / Secret Service
-
-Proceed with the plaintext vault?";
+# RECOMMENDED: Keychain (macOS) / Secret Service (Linux)
+vault.storage = \"keyring\"
+# AEAD-encrypted, passphrase on first use (AIRLOCK_VAULT_PASSPHRASE for non-interactive)
+vault.storage = \"encrypted-file\"
+";
+    println!("{}", cli::yellow(msg));
     if !cli::is_interactive() {
         bail!(
             "vault is \"file\" (plaintext). Re-run with --yes to confirm, or switch to \
@@ -165,7 +164,7 @@ Proceed with the plaintext vault?";
         );
     }
     let ok = Confirm::with_theme(&ColorfulTheme::default())
-        .with_prompt(msg)
+        .with_prompt("Proceed with the plaintext vault?")
         .default(false)
         .interact()
         .context("confirm plaintext vault")?;
