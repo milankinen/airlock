@@ -10,6 +10,7 @@ use oci_client::client::{ClientConfig, ClientProtocol};
 use oci_client::manifest::OciImageManifest;
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use super::OciConfig;
@@ -94,6 +95,12 @@ pub async fn resolve(
 /// after return. Both the per-layer and overall progress bars, when
 /// provided, are incremented by the same number of bytes as data is
 /// written.
+///
+/// The blob is hashed with SHA-256 while streaming and compared against the
+/// digest from the manifest before return; on mismatch the staged file is
+/// removed and an error is surfaced. Size is also checked. This protects
+/// against a compromised or MITM'd registry serving a same-size, different
+/// blob, and does not depend on transitive checks inside `oci-client`.
 pub async fn pull_layer(
     reference: &Reference,
     layer: &oci_client::manifest::OciDescriptor,
@@ -110,22 +117,36 @@ pub async fn pull_layer(
 
     let file = tokio::fs::File::create(dest).await?;
     let bars: Vec<ProgressBar> = per_layer.into_iter().chain(overall).cloned().collect();
-    let mut writer: Box<dyn AsyncWrite + Unpin> = if bars.is_empty() {
-        Box::new(file)
-    } else {
-        Box::new(ProgressWriter { inner: file, bars })
+    let mut writer = HashingWriter {
+        inner: ProgressWriter { inner: file, bars },
+        hasher: Sha256::new(),
     };
-    client.pull_blob(reference, layer, &mut writer).await?;
-    writer.flush().await?;
-    drop(writer);
+    let pull_result = client.pull_blob(reference, layer, &mut writer).await;
+    let flush_result = writer.flush().await;
+    let digest = writer.hasher.finalize();
+
+    if let Err(e) = pull_result {
+        let _ = tokio::fs::remove_file(dest).await;
+        return Err(e.into());
+    }
+    flush_result?;
 
     let metadata = tokio::fs::metadata(dest).await?;
-    let expected = layer.size as u64;
-    if metadata.len() != expected {
+    let expected_size = layer.size as u64;
+    if metadata.len() != expected_size {
         let _ = tokio::fs::remove_file(dest).await;
         anyhow::bail!(
-            "layer size mismatch: expected {expected} bytes, got {}",
+            "layer size mismatch: expected {expected_size} bytes, got {}",
             metadata.len()
+        );
+    }
+
+    let actual_digest = format!("sha256:{}", hex::encode(digest));
+    if !actual_digest.eq_ignore_ascii_case(&layer.digest) {
+        let _ = tokio::fs::remove_file(dest).await;
+        anyhow::bail!(
+            "layer digest mismatch: expected {}, got {actual_digest}",
+            layer.digest
         );
     }
     Ok(())
@@ -151,6 +172,39 @@ impl AsyncWrite for ProgressWriter {
                 for bar in &this.bars {
                     bar.inc(n as u64);
                 }
+                Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Feeds the byte stream through a SHA-256 hasher on the way to the inner
+/// writer. Only the bytes actually accepted by the inner writer are hashed
+/// so partial-write short counts stay consistent with on-disk content.
+struct HashingWriter {
+    inner: ProgressWriter,
+    hasher: Sha256,
+}
+
+impl AsyncWrite for HashingWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = &mut *self;
+        match Pin::new(&mut this.inner).poll_write(cx, buf) {
+            Poll::Ready(Ok(n)) => {
+                this.hasher.update(&buf[..n]);
                 Poll::Ready(Ok(n))
             }
             other => other,
