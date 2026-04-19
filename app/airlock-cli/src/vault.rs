@@ -9,8 +9,8 @@
 //! Both kinds live inside a **single** `VaultData` blob. Where that blob
 //! lives is chosen by `settings.vault`:
 //!
-//! - `file` (default): `~/.airlock/vault.default.json`, mode 0600, plain JSON.
-//! - `encrypted-file`: `~/.airlock/vault.default.enc.json`, AEAD-encrypted with a passphrase.
+//! - `encrypted-file` (default): `~/.airlock/vault.default.enc.json`, AEAD-encrypted with a passphrase.
+//! - `file`: `~/.airlock/vault.default.json`, mode 0600, plain JSON.
 //! - `keyring`: OS keychain / Secret Service (the pre-existing backend).
 //! - `disabled`: no-op; reads return empty, writes are dropped.
 //!
@@ -133,10 +133,10 @@ pub enum VaultStorageType {
     /// refuses to run.
     Disabled,
     /// Plaintext JSON at `~/.airlock/vault.default.json` (mode 0600).
-    #[default]
     File,
     /// AEAD-encrypted JSON at `~/.airlock/vault.default.enc.json`. Passphrase via
     /// `AIRLOCK_VAULT_PASSPHRASE` or interactive prompt.
+    #[default]
     EncryptedFile,
     /// OS keychain / Secret Service.
     Keyring,

@@ -49,20 +49,22 @@ airlock secret rm MY_API_TOKEN
 ### Choosing a storage backend
 
 The backend is picked with `vault.storage = "<backend>"` in
-`~/.airlock/settings.toml`. The default is `file`, which makes the vault
-work out of the box on any machine — including headless sessions where
-a system keyring would try to pop a graphical unlock prompt.
+`~/.airlock/settings.toml`. The default is `encrypted-file`, which keeps
+secrets under passphrase-derived AEAD at rest while still working in
+headless sessions where a system keyring would pop a graphical unlock
+prompt (the passphrase can be supplied non-interactively via
+`AIRLOCK_VAULT_PASSPHRASE`).
 
-| Backend          | At-rest protection                   | Prompts on use | Headless / CI friendly |
-| ---------------- | ------------------------------------ | -------------- | ---------------------- |
-| `file` (default) | `chmod 600` only (cleartext JSON)    | None           | Yes                    |
-| `encrypted-file` | AEAD (ChaCha20-Poly1305 + Argon2id)  | Passphrase     | Yes (via env var)      |
-| `keyring`        | OS keychain / Secret Service         | OS unlock      | GUI-dependent          |
-| `disabled`       | N/A — `airlock secret` is turned off | None           | Yes                    |
+| Backend                    | At-rest protection                   | Prompts on use | Headless / CI friendly |
+| -------------------------- | ------------------------------------ | -------------- | ---------------------- |
+| `encrypted-file` (default) | AEAD (ChaCha20-Poly1305 + Argon2id)  | Passphrase     | Yes (via env var)      |
+| `file`                     | `chmod 600` only (cleartext JSON)    | None           | Yes                    |
+| `keyring`                  | OS keychain / Secret Service         | OS unlock      | GUI-dependent          |
+| `disabled`                 | N/A — `airlock secret` is turned off | None           | Yes                    |
 
 ```toml
 # ~/.airlock/settings.toml
-vault.storage = "encrypted-file"
+vault.storage = "file"
 ```
 
 Settings may also be written in JSON (`settings.json`) or YAML

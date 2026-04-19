@@ -115,19 +115,15 @@ mod tests {
         let base = fresh_dir();
         let missing = base.join("nope");
         let s = Settings::load_from(&missing).unwrap();
-        assert_eq!(s.vault.storage, VaultStorageType::File);
+        assert_eq!(s.vault.storage, VaultStorageType::EncryptedFile);
     }
 
     #[test]
     fn toml_roundtrip() {
         let dir = fresh_dir();
-        std::fs::write(
-            dir.join("settings.toml"),
-            "vault.storage = \"encrypted-file\"\n",
-        )
-        .unwrap();
+        std::fs::write(dir.join("settings.toml"), "vault.storage = \"file\"\n").unwrap();
         let s = Settings::load_from(&dir).unwrap();
-        assert_eq!(s.vault.storage, VaultStorageType::EncryptedFile);
+        assert_eq!(s.vault.storage, VaultStorageType::File);
     }
 
     #[test]
