@@ -1,6 +1,6 @@
 //! Paths into the `~/.cache/airlock/` global cache directory.
 //!
-//! The global cache holds the kernel, initramfs, and an `oci/` subtree
+//! The global cache holds VM boot assets (under `vm/`) and an `oci/` subtree
 //! with extracted OCI image rootfs trees and individual OCI layer trees.
 //! Per-sandbox state (CA, disk image, overlay, etc.) lives in
 //! `<project>/.airlock/sandbox/` — see `sandbox.rs`.
@@ -31,7 +31,7 @@ pub fn cache_dir() -> anyhow::Result<PathBuf> {
 
 /// Root of the OCI cache (`~/.cache/airlock/oci/`), created if absent.
 /// Holds the `images/` and `layers/` subtrees — kept under a dedicated
-/// namespace so other cache kinds (kernel, assets, …) don't collide.
+/// namespace so other cache kinds (VM assets, …) don't collide.
 fn oci_root() -> anyhow::Result<PathBuf> {
     let dir = cache_dir()?.join("oci");
     std::fs::create_dir_all(&dir)?;

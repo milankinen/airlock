@@ -69,7 +69,7 @@ issues at startup.
 - **Initramfs**: Alpine 3.23 with the `airlockd` supervisor binary and a
   minimal init script. Built inside Docker as a gzipped cpio archive;
   also embedded in the binary.
-- Both are extracted to `~/.cache/airlock/kernel/` on first run. A checksum
+- Both are extracted to `~/.cache/airlock/vm/` on first run. A checksum
   check re-extracts them if the binary is updated.
 
 ### Virtio devices

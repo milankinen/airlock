@@ -2,7 +2,7 @@
 //!
 //! These files are compiled into the `airlock` binary via `include_bytes!`. On
 //! first run (or after a build changes the checksum), they are extracted to
-//! `~/.cache/airlock/kernel/` so the hypervisor can memory-map them.
+//! `~/.cache/airlock/vm/` so the hypervisor can memory-map them.
 //!
 //! Custom kernel/initramfs paths can be set in `[vm]` config; when present
 //! they override the bundled files.
@@ -31,7 +31,7 @@ impl Assets {
     pub fn init(project: &Project) -> anyhow::Result<Assets> {
         const CHECKSUM: &str = env!("AIRLOCK_ASSETS_CHECKSUM");
 
-        let dir = crate::cache::cache_dir()?.join("kernel");
+        let dir = crate::cache::cache_dir()?.join("vm");
         let checksum_file = dir.join("checksum");
 
         let cached_checksum = std::fs::read_to_string(&checksum_file).unwrap_or_default();
