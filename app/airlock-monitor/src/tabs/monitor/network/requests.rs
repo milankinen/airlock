@@ -95,7 +95,7 @@ impl Widget for RequestsWidget<'_> {
                 ),
                 Span::raw(" "),
                 Span::styled(
-                    pad_right(&truncate_right("Target", target_w), target_w),
+                    pad_left(&truncate_right("Target", target_w), target_w),
                     style,
                 ),
                 Span::raw(" "),

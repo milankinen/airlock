@@ -48,12 +48,12 @@ impl Policy {
     }
 
     /// Accent color used in the policy title. `always` variants flag the
-    /// extremes (green / red); the `by-default` variants share blue as the
+    /// extremes (green / red); the `by-default` variants share cyan as the
     /// neutral middle.
     pub fn color(self) -> Color {
         match self {
             Policy::AllowAlways => Color::Green,
-            Policy::AllowByDefault | Policy::DenyByDefault => Color::Blue,
+            Policy::AllowByDefault | Policy::DenyByDefault => Color::Cyan,
             Policy::DenyAlways => Color::Red,
         }
     }

@@ -97,14 +97,21 @@ pub fn format_timestamp(t: SystemTime) -> String {
 }
 
 /// Paint every span on the line with a dark-gray background to mark it as
-/// selected. Preserves each span's existing fg so bullet colors and status
-/// text stay readable.
+/// selected. Also promotes normal (unset) fg to white and `DarkGray` to a
+/// slightly lighter gray so the row reads clearly against the highlight
+/// background without losing the dimmed/primary distinction. Other explicit
+/// colors (bullet, status green/red) are preserved.
 pub fn apply_row_highlight(line: &mut Line<'_>) {
     for span in &mut line.spans {
-        let mut style = span.style;
-        style = style
+        let fg = match span.style.fg {
+            None | Some(Color::Reset) => Color::White,
+            Some(Color::DarkGray) => Color::Rgb(160, 160, 160),
+            Some(other) => other,
+        };
+        span.style = span
+            .style
             .bg(Color::Rgb(50, 50, 50))
+            .fg(fg)
             .add_modifier(Modifier::BOLD);
-        span.style = style;
     }
 }

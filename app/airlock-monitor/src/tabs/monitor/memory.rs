@@ -114,7 +114,7 @@ fn render_body(area: Rect, state: &MemoryState, buf: &mut Buffer) {
     Paragraph::new(lines).render(text_area, buf);
 
     if spark_area.height > 0 && !state.history.is_empty() {
-        super::histogram::render(spark_area, &state.history, Color::Blue, buf);
+        super::histogram::render(spark_area, &state.history, Color::Cyan, buf);
     }
 }
 
