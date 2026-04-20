@@ -12,6 +12,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 
+use anyhow::Context;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Either, Full};
 use hyper::body::Incoming;
@@ -40,8 +41,9 @@ struct Inner {
 ///
 /// `env_vars` maps variable names to their descriptions; values are resolved
 /// through `Vault::subst` (host env first, vault as fallback) and exposed
-/// to the script as the `env` global table. Templates that can't be
-/// resolved become nil.
+/// to the script as the `env` global table. A template that references an
+/// undefined name fails compilation — matches `[env]` behaviour in
+/// `vm::resolve_env` so middleware never runs with silently-missing inputs.
 pub fn compile(
     script: &str,
     env_vars: &BTreeMap<String, String>,
@@ -57,13 +59,16 @@ pub fn compile(
     })?;
     lua.globals().set("log", log_fn)?;
 
-    // Expose declared env vars as the `env` global table.
-    // Templates that fail to resolve become nil. `Vault::subst` handles
-    // the vault-wins-over-host-env precedence and the no-`${...}` fast
-    // path internally.
+    // Expose declared env vars as the `env` global table. Unresolved
+    // templates fail compilation rather than becoming nil — a missing
+    // `${VAR}` in a security-sensitive middleware script (e.g. the token
+    // used to authenticate an outbound request) must not silently pass
+    // through as an empty check.
     let env_table = lua.create_table()?;
     for (key, template) in env_vars {
-        let value = vault.subst(template).ok();
+        let value = vault
+            .subst(template)
+            .with_context(|| format!("resolve middleware env.{key}"))?;
         env_table.set(key.as_str(), value)?;
     }
     lua.globals().set("env", env_table)?;

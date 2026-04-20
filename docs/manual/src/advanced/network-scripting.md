@@ -36,15 +36,15 @@ Define the mapping in the middleware config:
 target = ["api.example.com:443"]
 env.TOKEN = "${MY_API_KEY}"
 script = '''
-if not env.TOKEN then
-    req:deny()
-end
 req:setHeader("Authorization", "Bearer " .. env.TOKEN)
 '''
 ```
 
-The `${VAR}` syntax reads from the host environment at startup. Inside the
-script, undefined variables are `nil`.
+The `${VAR}` syntax reads from the host environment first and the
+[secret vault](../secrets.md) as fallback. If a referenced name resolves
+in neither, `airlock start` aborts with an error — middleware never runs
+with silently-missing inputs, so scripts can treat every declared entry
+as present.
 
 ## TLS interception
 
