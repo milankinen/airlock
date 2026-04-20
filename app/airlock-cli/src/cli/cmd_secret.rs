@@ -59,9 +59,9 @@ pub fn main(args: SecretArgs, vault: &Vault, _settings: &Settings) -> i32 {
             "the airlock vault is disabled. Enable it to store user \
              secrets and registry credentials.\n\n\
              Edit {} and set:\n\n  \
-             vault.storage = \"file\"            # plain 0600 JSON, or\n  \
+             vault.storage = \"keyring\"         # system keychain / Secret Service (default), or\n  \
              vault.storage = \"encrypted-file\"  # passphrase-encrypted, or\n  \
-             vault.storage = \"keyring\"         # system keychain / Secret Service\n",
+             vault.storage = \"file\"            # plain 0600 JSON\n",
             Settings::expected_path().display()
         );
         return 1;

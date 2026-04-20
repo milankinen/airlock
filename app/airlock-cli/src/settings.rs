@@ -30,9 +30,10 @@ pub struct Settings {
 #[derive(Clone, Debug, Default, DescribeConfig, DeserializeConfig)]
 pub struct VaultSettings {
     /// Which backend stores user secrets and registry credentials.
-    /// Defaults to `file` — a mode-0600 JSON file under `~/.airlock/`.
-    /// Switch to `encrypted-file` for AEAD-at-rest, `keyring` for the
-    /// system keychain, or `disabled` to turn the vault off entirely.
+    /// Defaults to `keyring` — the OS keychain (macOS Keychain /
+    /// Linux Secret Service). Switch to `encrypted-file` for a
+    /// passphrase-encrypted JSON file, `file` for mode-0600 plaintext,
+    /// or `disabled` to turn the vault off entirely.
     #[config(default)]
     pub storage: VaultStorageType,
 }
@@ -115,7 +116,7 @@ mod tests {
         let base = fresh_dir();
         let missing = base.join("nope");
         let s = Settings::load_from(&missing).unwrap();
-        assert_eq!(s.vault.storage, VaultStorageType::EncryptedFile);
+        assert_eq!(s.vault.storage, VaultStorageType::Keyring);
     }
 
     #[test]

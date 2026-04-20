@@ -43,21 +43,43 @@ inside the sandbox. The same substitution applies in Lua middleware
 The vault can be backed by one of four storage types, picked with
 `vault.storage` in `~/.airlock/settings.toml`:
 
-| Backend                    | At-rest protection                   | Prompts on use | Headless / CI friendly |
-| -------------------------- | ------------------------------------ | -------------- | ---------------------- |
-| `encrypted-file` (default) | AEAD (ChaCha20-Poly1305 + Argon2id)  | Passphrase     | Yes (via env var)      |
-| `file`                     | `chmod 600` only (cleartext JSON)    | None           | Yes                    |
-| `keyring`                  | OS keychain / Secret Service         | OS unlock      | GUI-dependent          |
-| `disabled`                 | N/A — `airlock secret` is turned off | None           | Yes                    |
+| Backend             | At-rest protection                   | Prompts on use | Headless / CI friendly |
+| ------------------- | ------------------------------------ | -------------- | ---------------------- |
+| `keyring` (default) | OS keychain / Secret Service         | OS unlock      | GUI-dependent          |
+| `encrypted-file`    | AEAD (ChaCha20-Poly1305 + Argon2id)  | Passphrase     | Yes (via env var)      |
+| `file`              | `chmod 600` only (cleartext JSON)    | None           | Yes                    |
+| `disabled`          | N/A — `airlock secret` is turned off | None           | Yes                    |
 
 ```toml
 # ~/.airlock/settings.toml
-vault.storage = "keyring"
+vault.storage = "encrypted-file"
 ```
 
 Settings may also be written in JSON (`settings.json`) or YAML
 (`settings.yaml` / `settings.yml`); TOML wins if more than one file
 exists.
+
+### `keyring` — system keychain / Secret Service
+
+Stores the vault in the macOS Keychain or the Linux Secret Service
+(GNOME Keyring, KWallet). First access per session triggers the OS
+unlock prompt; afterwards the keyring is unlocked for the rest of the
+session and no further prompts appear.
+
+**Why it's the default**: on a normal desktop / laptop the unlock
+piggybacks on your OS login, so there's no extra passphrase to
+remember and secrets still get OS-level at-rest protection. The UX is
+indistinguishable from any other app that uses the system password
+store.
+
+**Drawbacks**:
+- On headless SSH sessions the graphical unlock can't render, so the
+  first vault access hangs or fails. Use `encrypted-file` for
+  CI / remote-development boxes.
+- On Linux, the secret-service daemon has to be running; minimal
+  desktop setups and some WSL environments don't ship one.
+- The vault is bound to the OS user account — backing it up or moving
+  it between machines isn't straightforward.
 
 ### `encrypted-file` — passphrase-encrypted JSON
 
@@ -68,9 +90,9 @@ otherwise airlock prompts on the terminal. You'll be prompted twice on
 first use (new vault) and once per process thereafter; the prompt line
 is erased on successful input so the terminal stays clean.
 
-**Why it's the default**: works on every platform, protects the
-secrets at rest (so a backup snapshot or stolen disk image doesn't
-leak them), and degrades cleanly in CI via the environment variable:
+**Why you might pick it**: works on every platform including headless
+boxes where no keychain is available, and degrades cleanly in CI via
+the environment variable:
 
 ```sh
 export AIRLOCK_VAULT_PASSPHRASE='correct horse battery staple'
@@ -80,26 +102,6 @@ airlock start
 **Drawbacks**: you have to type the passphrase once per shell session,
 and the protection is only as strong as the passphrase itself — a
 short or reused one is a weak link.
-
-### `keyring` — system keychain / Secret Service
-
-Stores the vault in the macOS Keychain or the Linux Secret Service
-(GNOME Keyring, KWallet). First access per session triggers the OS
-unlock prompt; afterwards the keyring is unlocked for the rest of the
-session and no further prompts appear.
-
-**Why you might pick it**: the most ergonomic option on a desktop
-machine — the unlock piggybacks on your login session, and you don't
-manage a separate passphrase.
-
-**Drawbacks**:
-- On headless SSH sessions the graphical unlock can't render, so the
-  first vault access hangs or fails. Use `encrypted-file` for
-  CI / remote-development boxes.
-- On Linux, the secret-service daemon has to be running; minimal
-  desktop setups and some WSL environments don't ship one.
-- The vault is bound to the OS user account — backing it up or moving
-  it between machines isn't straightforward.
 
 ### `file` — plaintext JSON
 
@@ -128,16 +130,12 @@ re-prompting on every 401 (credentials are never saved).
 trust (a 1Password CLI wrapper, a Vault agent, etc.) and you want
 airlock to stay out of the way.
 
-## Recommendation
+## When to switch away from the default
 
-- **On a desktop / laptop you use daily** — `keyring`. The unlock
-  piggybacks on your OS login, secrets get OS-level at-rest
-  protection, and the UX is indistinguishable from any other app that
-  uses the system password store.
 - **On a shared box, a CI runner, or a dev container** —
   `encrypted-file` with `AIRLOCK_VAULT_PASSPHRASE` supplied as a job
-  secret. You get the same at-rest protection without depending on a
-  desktop session.
+  secret. You get OS-independent at-rest protection without depending
+  on a desktop keychain session.
 - **For throwaway environments** — `file` is fine if you understand
   what you're giving up.
 - **If you already manage secrets elsewhere** — `disabled`, and source
