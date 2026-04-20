@@ -53,6 +53,14 @@ interface Supervisor {
   # so the admin HTTP service at `http://admin.airlock/` can correlate
   # it with Claude Code tool failures reported via hook endpoints.
   reportDeny @4 (epoch :UInt64) -> ();
+
+  # Host → guest TCP port forward. The host has accepted a local TCP
+  # connection from some host process destined for a guest service;
+  # this opens TCP to 127.0.0.1:<port> inside the VM and bridges bytes
+  # via the sink pair. Raw relay — no rules, no interception. Failures
+  # to connect inside the guest surface as Cap'n Proto exceptions so
+  # the host closes the accepted socket.
+  openLocalTcp @5 (port :UInt16, client :TcpSink) -> (server :TcpSink);
 }
 
 struct StatsSnapshot {

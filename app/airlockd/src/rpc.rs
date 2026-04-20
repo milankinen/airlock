@@ -15,6 +15,7 @@ use futures::AsyncReadExt;
 
 use crate::admin::DenyTracker;
 use crate::init::{CacheConfig, DirMountConfig, FileMountConfig, InitConfig, MountConfig};
+use crate::net::proxy;
 use crate::process::{SpawnedProcess, spawn_root, spawn_user};
 use crate::stats::Collector;
 
@@ -321,6 +322,22 @@ impl supervisor::Server for SupervisorImpl {
     ) -> Result<(), capnp::Error> {
         let epoch = params.get()?.get_epoch();
         self.deny_tracker.record(epoch);
+        Ok(())
+    }
+
+    async fn open_local_tcp(
+        self: Rc<Self>,
+        params: supervisor::OpenLocalTcpParams,
+        mut results: supervisor::OpenLocalTcpResults,
+    ) -> Result<(), capnp::Error> {
+        let params = params.get()?;
+        let port = params.get_port();
+        let client = params.get_client()?;
+
+        let server = proxy::open_local_tcp(port, client)
+            .await
+            .map_err(|e| capnp::Error::failed(format!("open 127.0.0.1:{port}: {e}")))?;
+        results.get().set_server(server);
         Ok(())
     }
 

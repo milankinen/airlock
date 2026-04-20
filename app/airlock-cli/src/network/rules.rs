@@ -84,8 +84,7 @@ pub fn resolve_middleware(
     Ok(targets)
 }
 
-/// Derive port forward mappings from config.
-/// For `network.ports` (host→guest): source = host port, target = guest port.
+/// Derive guest → host port forward mappings from config.
 /// Returns `(guest_port, host_port)` pairs from all enabled port forward groups.
 pub fn port_forwards_from_config(network: &Network) -> Vec<(u16, u16)> {
     let mut forwards = Vec::new();
@@ -94,7 +93,27 @@ pub fn port_forwards_from_config(network: &Network) -> Vec<(u16, u16)> {
             continue;
         }
         for mapping in &pf.host {
-            let pair = (mapping.target, mapping.source);
+            let pair = (mapping.guest, mapping.host);
+            if !forwards.contains(&pair) {
+                forwards.push(pair);
+            }
+        }
+    }
+    forwards
+}
+
+/// Derive host → guest port forward mappings from config.
+/// Returns `(host_port, guest_port)` pairs from all enabled port forward
+/// groups — the host binds `127.0.0.1:<host_port>` and each connection
+/// is bridged into the guest on `127.0.0.1:<guest_port>`.
+pub fn reverse_port_forwards_from_config(network: &Network) -> Vec<(u16, u16)> {
+    let mut forwards = Vec::new();
+    for pf in network.ports.values() {
+        if !pf.enabled {
+            continue;
+        }
+        for mapping in &pf.guest {
+            let pair = (mapping.host, mapping.guest);
             if !forwards.contains(&pair) {
                 forwards.push(pair);
             }

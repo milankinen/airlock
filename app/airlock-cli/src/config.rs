@@ -306,18 +306,27 @@ pub mod config {
         const DE: Self::Deserializer = smart_config::de::Serde;
     }
 
-    /// Named port forward group — exposes host TCP ports to the guest.
+    /// Named port forward group — forwards TCP ports between host and guest
+    /// in either direction.
     #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
     pub struct PortForward {
         /// Enable/disable this port forward group
         #[config(default_t = true)]
         pub enabled: bool,
-        /// List of ports to forward. Each entry is either a plain port number
-        /// (same port on guest and host) or `"source:target"` string.
-        /// For `network.ports` (host→guest): source is the host port, target
-        /// is the guest port.
+        /// Guest → host forwards. Each entry is either a plain port number
+        /// (same port on both sides) or a `"host:guest"` string. A guest
+        /// process connecting to `localhost:<guest_port>` reaches the
+        /// listed host port.
         #[config(default)]
         pub host: Vec<PortMapping>,
+        /// Host → guest forwards. Each entry is either a plain port number
+        /// (same port on both sides) or a `"host:guest"` string. A host
+        /// process connecting to `127.0.0.1:<host_port>` reaches the
+        /// listed guest port. Host-originated traffic bypasses all rules,
+        /// policy, and middleware — the host is trusted. Listeners bind
+        /// on `127.0.0.1` only.
+        #[config(default)]
+        pub guest: Vec<PortMapping>,
     }
 
     impl WellKnown for PortForward {
@@ -325,34 +334,39 @@ pub mod config {
         const DE: Self::Deserializer = de::nested();
     }
 
-    /// A directional port mapping between two endpoints.
+    /// A port mapping between a host port and a guest port.
     ///
     /// Accepts either a plain integer (same port both sides: `8080`)
-    /// or a `"source:target"` string (e.g. `"9000:8081"`).
+    /// or a `"host:guest"` string (e.g. `"9000:8081"`).
     ///
-    /// The meaning of source/target depends on context:
-    /// - `network.ports` (host→guest): source = host port, target = guest port
+    /// The left side of the colon is always the host port and the right
+    /// side is always the guest port, regardless of which list it appears
+    /// in. The direction of the forward is determined by the list:
+    /// - `[network.ports.<name>].host` forwards guest → host (the guest
+    ///   side originates the connection, reaching the host port).
+    /// - `[network.ports.<name>].guest` forwards host → guest (the host
+    ///   side originates the connection, reaching the guest port).
     #[derive(Debug, Clone, Copy)]
     pub struct PortMapping {
-        pub source: u16,
-        pub target: u16,
+        pub host: u16,
+        pub guest: u16,
     }
 
     impl PortMapping {
         pub fn same(port: u16) -> Self {
             Self {
-                source: port,
-                target: port,
+                host: port,
+                guest: port,
             }
         }
     }
 
     impl serde::Serialize for PortMapping {
         fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-            if self.source == self.target {
-                s.serialize_u16(self.source)
+            if self.host == self.guest {
+                s.serialize_u16(self.host)
             } else {
-                s.serialize_str(&format!("{}:{}", self.source, self.target))
+                s.serialize_str(&format!("{}:{}", self.host, self.guest))
             }
         }
     }
@@ -364,7 +378,7 @@ pub mod config {
                 type Value = PortMapping;
 
                 fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                    f.write_str("a port number or \"source:target\" string")
+                    f.write_str("a port number or \"host:guest\" string")
                 }
 
                 fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<PortMapping, E> {
@@ -378,12 +392,12 @@ pub mod config {
                 }
 
                 fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<PortMapping, E> {
-                    let (source, target) = v
+                    let (host, guest) = v
                         .split_once(':')
-                        .ok_or_else(|| serde::de::Error::custom("expected \"source:target\""))?;
-                    let source: u16 = source.parse().map_err(serde::de::Error::custom)?;
-                    let target: u16 = target.parse().map_err(serde::de::Error::custom)?;
-                    Ok(PortMapping { source, target })
+                        .ok_or_else(|| serde::de::Error::custom("expected \"host:guest\""))?;
+                    let host: u16 = host.parse().map_err(serde::de::Error::custom)?;
+                    let guest: u16 = guest.parse().map_err(serde::de::Error::custom)?;
+                    Ok(PortMapping { host, guest })
                 }
             }
             d.deserialize_any(Visitor)

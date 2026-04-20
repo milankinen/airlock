@@ -31,7 +31,7 @@ pub struct StartArgs {
     /// Run the container command inside a login shell (sources /etc/profile, ~/.profile)
     #[arg(short = 'l', long)]
     pub login: bool,
-    /// Show detailed output (mounts, network rules)
+    /// Show detailed output (mounts, network rules, sockets, port forwards)
     #[arg(short = 'v', long)]
     pub verbose: bool,
     /// Open TUI monitoring control panel (tabbed sandbox + network view)
@@ -155,12 +155,25 @@ async fn run(
         return Ok(130); // 128 + SIGINT
     }
 
+    // Bind reverse port forward listeners before booting the VM so that
+    // bind errors (e.g. EADDRINUSE) surface immediately, without the VM
+    // boot output in the way. The listeners are held until the supervisor
+    // is ready, at which point accept loops are spawned against them.
+    let reverse_forwards = network::reverse_forward::bind(
+        network::rules::reverse_port_forwards_from_config(&project.config.network),
+    )
+    .await?;
+
     cli::log!("Booting VM...");
     let (vm, vsock_fd) = vm::start(&args, &project, &image).await?;
     project.save_meta();
 
     let supervisor = rpc::Supervisor::connect(vsock_fd)?;
     network.deny_reporter().attach(supervisor.client());
+
+    // Wire the pre-bound reverse port forward listeners into the now-ready
+    // supervisor. Accept loops run for the lifetime of the tokio local set.
+    network::reverse_forward::serve(reverse_forwards, &supervisor.client());
 
     let (stdin_client, pty_size) = runtime.attach_stdin()?;
     let signals = runtime.signals()?;
@@ -271,7 +284,8 @@ fn print_preparing(project: &project::Project) {
     }
 }
 
-/// Verbose-only: list enabled mounts and network rules grouped by kind.
+/// Verbose-only: list enabled mounts, network rules, socket forwards,
+/// and TCP port forwards grouped by kind.
 fn print_mounts_and_rules(project: &project::Project) {
     let enabled_mounts: Vec<_> = project
         .config
@@ -305,6 +319,43 @@ fn print_mounts_and_rules(project: &project::Project) {
                 rule.allow.len(),
                 rule.deny.len()
             );
+        }
+    }
+
+    let enabled_sockets: Vec<_> = project
+        .config
+        .network
+        .sockets
+        .iter()
+        .filter(|(_, s)| s.enabled)
+        .collect();
+    if !enabled_sockets.is_empty() {
+        cli::verbose!("  {} sockets: {}", cli::bullet(), enabled_sockets.len());
+        for (key, sock) in &enabled_sockets {
+            cli::verbose!(
+                "      {key}: {} \u{2192} {}",
+                sock.host.source,
+                sock.host.target
+            );
+        }
+    }
+
+    let enabled_ports: Vec<_> = project
+        .config
+        .network
+        .ports
+        .iter()
+        .filter(|(_, p)| p.enabled && !(p.host.is_empty() && p.guest.is_empty()))
+        .collect();
+    if !enabled_ports.is_empty() {
+        cli::verbose!("  {} port forwards: {}", cli::bullet(), enabled_ports.len());
+        for (key, pf) in &enabled_ports {
+            for m in &pf.host {
+                cli::verbose!("      {key}: host :{} \u{2190} guest :{}", m.host, m.guest);
+            }
+            for m in &pf.guest {
+                cli::verbose!("      {key}: host :{} \u{2192} guest :{}", m.host, m.guest);
+            }
         }
     }
 }

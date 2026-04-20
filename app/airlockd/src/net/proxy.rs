@@ -91,6 +91,33 @@ async fn handle_connection(
     Ok(())
 }
 
+/// Open a local TCP connection inside the guest and bridge it to the host via
+/// two sinks. Used by `Supervisor.openLocalTcp`: the host has accepted a local
+/// TCP connection destined for a guest service; we connect to
+/// `127.0.0.1:<port>` here and relay bytes raw in both directions.
+///
+/// `client` is the host-side sink (guest → host bytes). The returned sink is
+/// what the host uses to push bytes into the guest's local TCP connection.
+/// A connect failure surfaces as an error the caller turns into a Cap'n Proto
+/// exception.
+pub(crate) async fn open_local_tcp(
+    port: u16,
+    client: tcp_sink::Client,
+) -> anyhow::Result<tcp_sink::Client> {
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+
+    let (server_tx, mut server_rx) = tokio::sync::mpsc::channel::<Bytes>(1);
+    let server_sink: tcp_sink::Client =
+        capnp_rpc::new_client(ChannelSink(RefCell::new(Some(server_tx))));
+
+    tokio::task::spawn_local(async move {
+        let (mut read, mut write) = stream.into_split();
+        relay(&mut read, &mut write, client, &mut server_rx).await;
+    });
+
+    Ok(server_sink)
+}
+
 /// Bidirectional byte relay between a local TCP stream and a remote RPC sink.
 async fn relay(
     local_read: &mut (impl AsyncReadExt + Unpin),

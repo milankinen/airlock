@@ -13,6 +13,7 @@ mod http;
 mod io;
 mod matchers;
 mod middleware;
+pub mod reverse_forward;
 pub(crate) mod rules;
 mod server;
 pub(crate) mod target;
@@ -61,6 +62,7 @@ pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network>
         &labeled_passthrough(net),
         &labeled_middleware(net),
     )?;
+    check_target_conflicts::check_reverse_forward_conflicts(&labeled_reverse_forwards(net))?;
 
     let interceptor = tls::TlsInterceptor::new(&project.ca_cert, &project.ca_key)?;
 
@@ -151,6 +153,29 @@ fn labeled_middleware(
                     host: host.to_string(),
                     port: port.and_then(|p| p.parse::<u16>().ok()),
                 },
+            });
+        }
+    }
+    out
+}
+
+/// Extract labeled reverse port forwards (`.guest` entries) from the
+/// config for host-port conflict checking.
+fn labeled_reverse_forwards(
+    net: &crate::config::config::Network,
+) -> Vec<check_target_conflicts::LabeledReverseForward> {
+    let mut out = Vec::new();
+    for (group_name, pf) in &net.ports {
+        if !pf.enabled {
+            continue;
+        }
+        for mapping in &pf.guest {
+            out.push(check_target_conflicts::LabeledReverseForward {
+                label: format!(
+                    "ports `{group_name}` guest=`{}:{}`",
+                    mapping.host, mapping.guest
+                ),
+                host_port: mapping.host,
             });
         }
     }

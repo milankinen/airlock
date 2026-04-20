@@ -6,5 +6,6 @@ image = "airlock:dev"
 [network]
 policy = "deny-by-default"
 
-[network.ports.test]
+[network.ports.dev]
 host = [40000, 18000]
+guest = ["40080:8080"]

@@ -163,30 +163,75 @@ forwards can be disabled with `enabled = false`.
 
 ## Port forwarding
 
+Port forwards bridge TCP between the host and the guest in either
+direction. Each forward is declared under `[network.ports.<group>]` and
+every entry uses the same `"host:guest"` string syntax — the **left
+side is always the host port, the right side is always the guest
+port**, regardless of which direction the forward runs.
+
+A plain integer shorthand (`[5432]`, `[3000]`) means the same port on
+both sides.
+
+### Guest → host (`host = [...]`)
+
 Some projects run supporting services on the host — a local PostgreSQL,
 a Redis, a dev-mode backend on port 3000 — and the sandboxed process
-needs to talk to them. Rather than expose those services to the network,
-airlock can forward specific host TCP ports into the VM so that
-`localhost:<port>` inside the sandbox transparently reaches the host
-service, while everything else on loopback stays confined to the guest.
-Forwarded ports are configured under `[network.ports]`:
+needs to talk to them. Rather than expose those services to the
+network, airlock can forward specific host TCP ports into the VM so
+that `localhost:<port>` inside the sandbox transparently reaches the
+host service, while everything else on loopback stays confined to the
+guest.
 
 ```toml
 [network.ports.local-services]
 host = [5432, 6379]
 ```
 
-This makes the host's PostgreSQL and Redis available at `localhost:5432` and
-`localhost:6379` inside the sandbox. Port forwarding bypasses network rules
-entirely — forwarded ports are always allowed regardless of `policy` (except
-`deny-always`, which blocks everything).
+This makes the host's PostgreSQL and Redis available at
+`localhost:5432` and `localhost:6379` inside the sandbox. Guest → host
+forwards bypass network rules entirely — they're always allowed
+regardless of `policy` (except `deny-always`, which blocks everything).
 
-Each entry in `host` is either a plain port number (same port on both sides)
-or a `"source:target"` string for port remapping (host port → guest port):
+Each entry is either a plain port (same port on both sides) or a
+`"host:guest"` string:
 
 ```toml
 [network.ports.dev]
-host = [8080, "9000:3000"]  # host 9000 → guest 3000
+host = [8080, "9000:3000"]  # guest `localhost:3000` → host port 9000
+```
+
+### Host → guest (`guest = [...]`)
+
+The inverse: a service running *inside* the sandbox can be reached
+from the host. airlock binds a listener on `127.0.0.1:<host_port>` and
+every accepted connection is bridged to `127.0.0.1:<guest_port>`
+inside the guest.
+
+```toml
+[network.ports.web]
+guest = ["5000:4000"]  # host `127.0.0.1:5000` → guest `localhost:4000`
+```
+
+Notes:
+
+- **Loopback only.** Listeners bind on `127.0.0.1`; the forward is
+  not reachable from the LAN.
+- **No rules, no policy.** Host → guest traffic bypasses
+  `allow`/`deny`/middleware entirely — the host is trusted, and
+  `deny-always` does *not* block reverse forwards.
+- **Startup-time bind.** If the host port is already in use the
+  sandbox fails to start with a clear error.
+- **Host-port collisions are an error.** Two `.guest` entries sharing
+  the same host port is rejected at startup.
+
+### Combined example
+
+Both directions can be declared side by side in the same group:
+
+```toml
+[network.ports.dev]
+host  = ["9000:3000"]   # host :9000 ← guest :3000
+guest = ["5000:4000"]   # host :5000 → guest :4000
 ```
 
 Like other config entries, port forward groups can be disabled with

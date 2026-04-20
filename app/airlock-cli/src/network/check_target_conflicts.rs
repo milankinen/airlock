@@ -1,12 +1,53 @@
 //! Startup-time validation of network targets.
 //!
-//! The only check today is detecting overlap between passthrough rule
-//! targets and middleware targets. Both sides use the same
-//! `host[:port]` pattern syntax, which is narrow enough that intersection
-//! can be decided by a small case analysis (see [`targets_overlap`])
-//! rather than a generic regex-intersection engine.
+//! Two checks live here:
+//!
+//! 1. Overlap between passthrough rule targets and middleware targets —
+//!    the two are semantically incompatible (passthrough skips
+//!    interception; middleware requires it), so any overlap is a
+//!    config error. Both sides use the same `host[:port]` pattern
+//!    syntax, which is narrow enough that intersection can be decided
+//!    by a small case analysis (see [`targets_overlap`]) rather than
+//!    a generic regex-intersection engine.
+//!
+//! 2. Duplicate host-side ports across `.guest` reverse port forwards
+//!    ([`check_reverse_forward_conflicts`]). Two `.guest` entries
+//!    can't both bind the same `127.0.0.1:<port>`.
 
 use super::target::NetworkTarget;
+
+/// A labeled reverse port forward, used for error messages when two
+/// `.guest` entries collide on the same host port.
+pub struct LabeledReverseForward {
+    pub label: String,
+    pub host_port: u16,
+}
+
+/// Reject configs where two `.guest` reverse port forwards share a
+/// host port — only one listener can bind `127.0.0.1:<port>`. Same
+/// guest port on the other side is fine (two host ports forwarding
+/// into the same guest service is legal).
+///
+/// Error messages name every offending pair by label.
+pub fn check_reverse_forward_conflicts(forwards: &[LabeledReverseForward]) -> anyhow::Result<()> {
+    let mut conflicts: Vec<String> = Vec::new();
+    for (i, a) in forwards.iter().enumerate() {
+        for b in &forwards[i + 1..] {
+            if a.host_port == b.host_port {
+                conflicts.push(format!("{} conflicts with {}", a.label, b.label));
+            }
+        }
+    }
+
+    if conflicts.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "network config: reverse port forward(s) share a host port:\n  {}",
+            conflicts.join("\n  ")
+        );
+    }
+}
 
 /// A parsed target tagged with a human-readable label, used for error
 /// messages when a conflict is reported.
@@ -254,5 +295,35 @@ mod tests {
         let pt = vec![labeled("pt", "api.example.com:5432")];
         let mw = vec![labeled("mitm", "api.example.com:443")];
         assert!(check_passthrough_conflicts(&pt, &mw).is_ok());
+    }
+
+    // ── check_reverse_forward_conflicts tests ───────────
+
+    fn rf(label: &str, host_port: u16) -> LabeledReverseForward {
+        LabeledReverseForward {
+            label: label.to_string(),
+            host_port,
+        }
+    }
+
+    #[test]
+    fn reverse_forwards_unique_host_ports_pass() {
+        let f = vec![rf("group-a 5000:4000", 5000), rf("group-b 5001:4000", 5001)];
+        assert!(check_reverse_forward_conflicts(&f).is_ok());
+    }
+
+    #[test]
+    fn reverse_forwards_duplicate_host_port_errors() {
+        let f = vec![rf("group-a 5000:4000", 5000), rf("group-b 5000:4001", 5000)];
+        let err = check_reverse_forward_conflicts(&f).unwrap_err().to_string();
+        assert!(err.contains("group-a"), "missing label a: {err}");
+        assert!(err.contains("group-b"), "missing label b: {err}");
+    }
+
+    #[test]
+    fn reverse_forwards_same_guest_port_is_allowed() {
+        // Two host ports fanning into the same guest port is legal.
+        let f = vec![rf("a 5000:4000", 5000), rf("b 5001:4000", 5001)];
+        assert!(check_reverse_forward_conflicts(&f).is_ok());
     }
 }
