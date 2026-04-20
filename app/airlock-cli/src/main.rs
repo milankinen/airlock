@@ -18,6 +18,7 @@ mod vault;
 mod vm;
 
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
+use tokio::task::LocalSet;
 
 use crate::cli::{cmd_exec, cmd_rm, cmd_secret, cmd_show, cmd_start};
 use crate::settings::Settings;
@@ -55,37 +56,46 @@ async fn main() {
     // `Vault` is cheaply cloneable (Arc inside) and passed by value.
     let vault = Vault::for_storage_type(settings.vault.storage);
 
-    let exit_code = match parsed.command {
-        Command::Start(args) => cli::cmd_start::main(args, extra_args, vault).await,
-        Command::Exec(args) => {
-            if !extra_args.is_empty() {
-                cli::error!("'--' args are not supported with 'exec'");
-                std::process::exit(2);
-            }
-            cli::cmd_exec::main(args).await
-        }
-        Command::Show(ref args) => {
-            if !extra_args.is_empty() {
-                cli::error!("'--' args are only supported with 'start'");
-                std::process::exit(2);
-            }
-            cli::cmd_show::main(args, vault)
-        }
-        Command::Remove(ref args) => {
-            if !extra_args.is_empty() {
-                cli::error!("'--' args are only supported with 'start'");
-                std::process::exit(2);
-            }
-            cli::cmd_rm::main(args, vault)
-        }
-        Command::Secrets(args) => {
-            if !extra_args.is_empty() {
-                cli::error!("'--' args are only supported with 'start'");
-                std::process::exit(2);
-            }
-            cli::cmd_secret::main(args, &vault, &settings)
-        }
-    };
+    let local = LocalSet::new();
+    let exit_code = local
+        .run_until(async {
+            let result: anyhow::Result<i32> = match parsed.command {
+                Command::Start(args) => cli::cmd_start::main(args, extra_args, vault).await,
+                Command::Exec(args) => {
+                    if !extra_args.is_empty() {
+                        cli::error!("'--' args are not supported with 'exec'");
+                        std::process::exit(2);
+                    }
+                    cli::cmd_exec::main(args).await
+                }
+                Command::Show(ref args) => {
+                    if !extra_args.is_empty() {
+                        cli::error!("'--' args are only supported with 'start'");
+                        std::process::exit(2);
+                    }
+                    Ok(cli::cmd_show::main(args, vault))
+                }
+                Command::Remove(ref args) => {
+                    if !extra_args.is_empty() {
+                        cli::error!("'--' args are only supported with 'start'");
+                        std::process::exit(2);
+                    }
+                    Ok(cli::cmd_rm::main(args, vault))
+                }
+                Command::Secrets(args) => {
+                    if !extra_args.is_empty() {
+                        cli::error!("'--' args are only supported with 'start'");
+                        std::process::exit(2);
+                    }
+                    Ok(cli::cmd_secret::main(args, &vault, &settings))
+                }
+            };
+            result.unwrap_or_else(|e| {
+                cli::error!("Error: {e:?}");
+                1
+            })
+        })
+        .await;
 
     std::process::exit(exit_code);
 }

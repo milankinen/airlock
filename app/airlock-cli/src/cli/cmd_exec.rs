@@ -15,10 +15,9 @@ use std::path::PathBuf;
 use airlock_common::supervisor_capnp::*;
 use clap::Args;
 use futures::AsyncReadExt;
-use tokio::task::LocalSet;
 
+use crate::rpc;
 use crate::runtime::{self, RawTerminalRuntime};
-use crate::{cli, rpc};
 
 /// CLI arguments for `airlock exec`.
 #[derive(Args, Debug)]
@@ -40,19 +39,7 @@ pub struct ExecArgs {
 }
 
 /// Entry point for `airlock exec <cmd> [args...]`.
-pub async fn main(args: ExecArgs) -> i32 {
-    let local = LocalSet::new();
-    local
-        .run_until(async {
-            run(args).await.unwrap_or_else(|e| {
-                cli::error!("{e:#}");
-                1
-            })
-        })
-        .await
-}
-
-async fn run(args: ExecArgs) -> anyhow::Result<i32> {
+pub async fn main(args: ExecArgs) -> anyhow::Result<i32> {
     let ExecArgs {
         cmd,
         args,

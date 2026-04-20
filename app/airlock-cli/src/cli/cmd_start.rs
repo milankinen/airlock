@@ -8,7 +8,6 @@ use std::io::Write;
 use clap::Args;
 use dialoguer::Select;
 use dialoguer::theme::ColorfulTheme;
-use tokio::task::LocalSet;
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::{self, CliArgs, LogLevel};
@@ -40,8 +39,7 @@ pub struct StartArgs {
 }
 
 /// Entry point for `airlock start [--log-level <level>] [-- extra-args...]`.
-pub async fn main(args: StartArgs, extra_args: Vec<String>, vault: Vault) -> i32 {
-    let local = LocalSet::new();
+pub async fn main(args: StartArgs, extra_args: Vec<String>, vault: Vault) -> anyhow::Result<i32> {
     cli::set_verbose(args.verbose);
 
     #[cfg(target_os = "linux")]
@@ -51,7 +49,7 @@ pub async fn main(args: StartArgs, extra_args: Vec<String>, vault: Vault) -> i32
         Ok(p) => std::fs::canonicalize(&p).unwrap_or(p),
         Err(e) => {
             cli::error!("Cannot determine current directory: {e}");
-            return 1;
+            return Ok(1);
         }
     };
 
@@ -61,7 +59,7 @@ pub async fn main(args: StartArgs, extra_args: Vec<String>, vault: Vault) -> i32
         Ok(d) => d,
         Err(e) => {
             cli::error!("Failed to create .airlock directory: {e}");
-            return 1;
+            return Ok(1);
         }
     };
     setup_logging(args.log_level, &cache_dir);
@@ -74,7 +72,7 @@ pub async fn main(args: StartArgs, extra_args: Vec<String>, vault: Vault) -> i32
     if !has_config {
         if !cli::is_interactive() {
             cli::error!("No airlock.toml found in {}", host_cwd.display());
-            return 2;
+            return Ok(2);
         }
         let selection = Select::with_theme(&ColorfulTheme::default())
             .with_prompt(format!("No airlock.toml found in {}", host_cwd.display()))
@@ -84,11 +82,11 @@ pub async fn main(args: StartArgs, extra_args: Vec<String>, vault: Vault) -> i32
             .unwrap_or(1);
         if selection != 0 {
             cli::error!("Aborted.");
-            return 0;
+            return Ok(0);
         }
         if let Err(e) = std::fs::write(host_cwd.join("airlock.toml"), DEFAULT_CONFIG) {
             cli::error!("Failed to create airlock.toml: {e}");
-            return 1;
+            return Ok(1);
         }
         cli::log!("Created airlock.toml in {}", host_cwd.display());
     }
@@ -97,41 +95,33 @@ pub async fn main(args: StartArgs, extra_args: Vec<String>, vault: Vault) -> i32
         Ok(c) => c,
         Err(e) => {
             cli::error!("Config error: {e:#}");
-            return 2;
+            return Ok(2);
         }
     };
 
     let cli_args = CliArgs::new(args.log_level, extra_args, args.login);
     let sandbox_cwd = args.sandbox_cwd;
-    local
-        .run_until(async {
-            let result = if args.monitor {
-                run(
-                    cli_args,
-                    config,
-                    host_cwd,
-                    sandbox_cwd,
-                    vault,
-                    MonitorRuntime::new(),
-                )
-                .await
-            } else {
-                run(
-                    cli_args,
-                    config,
-                    host_cwd,
-                    sandbox_cwd,
-                    vault,
-                    RawTerminalRuntime::new(),
-                )
-                .await
-            };
-            result.unwrap_or_else(|e| {
-                cli::error!("Error: {e:?}");
-                1
-            })
-        })
+    if args.monitor {
+        run(
+            cli_args,
+            config,
+            host_cwd,
+            sandbox_cwd,
+            vault,
+            MonitorRuntime::new(),
+        )
         .await
+    } else {
+        run(
+            cli_args,
+            config,
+            host_cwd,
+            sandbox_cwd,
+            vault,
+            RawTerminalRuntime::new(),
+        )
+        .await
+    }
 }
 
 async fn run(
