@@ -18,6 +18,7 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use flate2::read::GzDecoder;
+use indicatif::ProgressBar;
 
 use crate::cache;
 
@@ -40,7 +41,15 @@ const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
 ///   `<digest>.download.tmp`, rename to `<digest>.download`, then extract.
 ///
 /// After a successful extraction the tarball is removed.
-pub fn ensure_layer_cached<F>(digest: &str, fetch: F) -> anyhow::Result<PathBuf>
+///
+/// `progress`, when provided, is re-used as the extraction bar: its length
+/// is reset to the tarball size, its position to zero, and its message to
+/// `extracting` before bytes start streaming through.
+pub fn ensure_layer_cached<F>(
+    digest: &str,
+    fetch: F,
+    progress: Option<&ProgressBar>,
+) -> anyhow::Result<PathBuf>
 where
     F: FnOnce(&Path) -> anyhow::Result<()>,
 {
@@ -67,8 +76,11 @@ where
         std::fs::rename(&download_tmp, &download)?;
     }
 
-    extract_tarball_to_cache(&layer_dir, &download)?;
+    extract_tarball_to_cache(&layer_dir, &download, progress)?;
     let _ = std::fs::remove_file(&download);
+    if let Some(pb) = progress {
+        pb.set_message("ready");
+    }
     Ok(layer_dir)
 }
 
@@ -81,7 +93,11 @@ where
 ///   `userxattr` treats that as a whiteout.
 /// - `.wh..wh..opq` sets `user.overlay.opaque="y"` on the parent directory,
 ///   marking it as opaque in overlayfs terms.
-fn extract_tarball_to_cache(layer_dir: &Path, tarball: &Path) -> anyhow::Result<()> {
+fn extract_tarball_to_cache(
+    layer_dir: &Path,
+    tarball: &Path,
+    progress: Option<&ProgressBar>,
+) -> anyhow::Result<()> {
     let parent = layer_dir
         .parent()
         .ok_or_else(|| anyhow::anyhow!("layer dir has no parent"))?;
@@ -97,6 +113,19 @@ fn extract_tarball_to_cache(layer_dir: &Path, tarball: &Path) -> anyhow::Result<
     // Layer blobs may be gzip-compressed (OCI spec, registry pulls) or plain
     // tar (`docker image save` with the classic driver) — dispatch on magic.
     let file = std::fs::File::open(tarball)?;
+    let file: Box<dyn Read> = match progress {
+        Some(pb) => {
+            let total = file.metadata().map(|m| m.len()).unwrap_or(0);
+            pb.set_length(total);
+            pb.set_position(0);
+            pb.set_message("extracting");
+            Box::new(ProgressReader {
+                inner: file,
+                bar: pb.clone(),
+            })
+        }
+        None => Box::new(file),
+    };
     let mut reader = BufReader::new(file);
     let mut magic = [0u8; 2];
     let n = reader.read(&mut magic)?;
@@ -161,6 +190,22 @@ fn extract_tarball_to_cache(layer_dir: &Path, tarball: &Path) -> anyhow::Result<
     }
     std::fs::rename(&tmp, layer_dir)?;
     Ok(())
+}
+
+/// `Read` wrapper that increments a progress bar by the number of bytes
+/// each `read` returns. Used to drive the extraction phase of the same
+/// per-layer bar that tracked the download.
+struct ProgressReader<R: Read> {
+    inner: R,
+    bar: ProgressBar,
+}
+
+impl<R: Read> Read for ProgressReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.bar.inc(n as u64);
+        Ok(n)
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -230,7 +275,7 @@ mod tests {
         )
         .unwrap();
 
-        let layer = ensure_layer_cached("sha256:deadbeef1", fetch_from(tarball))
+        let layer = ensure_layer_cached("sha256:deadbeef1", fetch_from(tarball), None)
             .expect("extract should succeed");
 
         assert_eq!(std::fs::read(layer.join("etc/hello")).unwrap(), b"world");
@@ -253,7 +298,7 @@ mod tests {
         )
         .unwrap();
 
-        let layer = ensure_layer_cached("sha256:deadbeef2", fetch_from(tarball)).unwrap();
+        let layer = ensure_layer_cached("sha256:deadbeef2", fetch_from(tarball), None).unwrap();
 
         let whiteout = layer.join("etc/gone");
         assert!(whiteout.exists(), "whiteout placeholder file must exist");
@@ -279,7 +324,7 @@ mod tests {
         )
         .unwrap();
 
-        let layer = ensure_layer_cached("sha256:deadbeef3", fetch_from(tarball)).unwrap();
+        let layer = ensure_layer_cached("sha256:deadbeef3", fetch_from(tarball), None).unwrap();
 
         let opaque_dir = layer.join("opt/app");
         let val = xattr::get(&opaque_dir, "user.overlay.opaque").unwrap();
@@ -299,13 +344,16 @@ mod tests {
         let tarball = tmp.join("layer.tar.gz");
         std::fs::write(&tarball, build_tarball(&[("a", b"1")])).unwrap();
 
-        let first = ensure_layer_cached("sha256:deadbeef4", fetch_from(tarball.clone())).unwrap();
+        let first =
+            ensure_layer_cached("sha256:deadbeef4", fetch_from(tarball.clone()), None).unwrap();
         let mtime = std::fs::metadata(&first).unwrap().modified().unwrap();
 
         // Second call: <digest>/ exists, fetch must not be called.
-        let second = ensure_layer_cached("sha256:deadbeef4", |_| {
-            panic!("fetch must not be called when <digest>/ exists")
-        })
+        let second = ensure_layer_cached(
+            "sha256:deadbeef4",
+            |_| panic!("fetch must not be called when <digest>/ exists"),
+            None,
+        )
         .unwrap();
         assert_eq!(first, second);
         assert_eq!(
@@ -336,7 +384,7 @@ mod tests {
         let tarball = tmp.join("layer.tar");
         std::fs::write(&tarball, build_plain_tarball(&[("etc/plain", b"ok")])).unwrap();
 
-        let layer = ensure_layer_cached("sha256:deadbeef7", fetch_from(tarball)).unwrap();
+        let layer = ensure_layer_cached("sha256:deadbeef7", fetch_from(tarball), None).unwrap();
         assert_eq!(std::fs::read(layer.join("etc/plain")).unwrap(), b"ok");
     }
 
@@ -357,9 +405,11 @@ mod tests {
         let download = layers_root.join(format!("{name}.download"));
         std::fs::write(&download, build_tarball(&[("staged", b"yes")])).unwrap();
 
-        let layer = ensure_layer_cached(digest, |_| {
-            panic!("fetch must not be called when .download exists")
-        })
+        let layer = ensure_layer_cached(
+            digest,
+            |_| panic!("fetch must not be called when .download exists"),
+            None,
+        )
         .unwrap();
 
         assert!(layer.join("staged").exists());
@@ -384,7 +434,7 @@ mod tests {
         let tarball_src = tmp.join("layer.tar.gz");
         std::fs::write(&tarball_src, build_tarball(&[("ok", b"yes")])).unwrap();
 
-        let layer = ensure_layer_cached(digest, fetch_from(tarball_src)).unwrap();
+        let layer = ensure_layer_cached(digest, fetch_from(tarball_src), None).unwrap();
         assert!(layer.join("ok").exists());
         assert!(!stale.exists());
     }

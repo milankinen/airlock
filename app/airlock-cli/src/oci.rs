@@ -517,12 +517,16 @@ async fn ensure_docker_image(image_ref: &str) -> anyhow::Result<(OciConfig, Vec<
         for digest in &save.layer_digests {
             let digest = digest.clone();
             tokio::task::spawn_blocking(move || {
-                layer::ensure_layer_cached(&digest, |_tmp| {
-                    anyhow::bail!(
-                        "docker save stream did not include blob for layer {digest} \
-                         (manifest referenced a layer that was not in the export)"
-                    )
-                })
+                layer::ensure_layer_cached(
+                    &digest,
+                    |_tmp| {
+                        anyhow::bail!(
+                            "docker save stream did not include blob for layer {digest} \
+                             (manifest referenced a layer that was not in the export)"
+                        )
+                    },
+                    None,
+                )
             })
             .await??;
         }
@@ -600,14 +604,15 @@ async fn ensure_registry_image(
             .iter()
             .enumerate()
             .map(|(i, layer_desc)| {
-                let label = format!("layer {:>2}", i + 1);
-                let pb = cli::layer_progress_bar(&mp, layer_desc.size as u64, &label);
+                let pb = cli::layer_progress_bar(&mp, layer_desc.size as u64);
                 if !fetch_set.contains(&i) {
                     pb.set_position(layer_desc.size as u64);
+                    pb.set_message("cached");
                 }
                 pb
             })
             .collect();
+        let _spacer = cli::progress_spacer(&mp);
         let bars_ref = &bars;
 
         let fetch = async {
@@ -705,11 +710,15 @@ async fn fetch_and_extract_layer(
     }
 
     tokio::task::spawn_blocking(move || {
-        layer::ensure_layer_cached(&digest, |_tmp| {
-            // .download already exists from the async pull above, so the
-            // fetch closure is not called. If somehow it is, fail loudly.
-            anyhow::bail!("unreachable: layer tarball missing after pull")
-        })
+        layer::ensure_layer_cached(
+            &digest,
+            |_tmp| {
+                // .download already exists from the async pull above, so the
+                // fetch closure is not called. If somehow it is, fail loudly.
+                anyhow::bail!("unreachable: layer tarball missing after pull")
+            },
+            Some(&per_layer),
+        )
     })
     .await??;
     Ok(())

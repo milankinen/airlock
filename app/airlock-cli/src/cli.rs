@@ -236,16 +236,29 @@ pub fn multi_progress() -> MultiProgress {
 }
 
 /// Create a per-layer progress bar registered inside a `MultiProgress`.
-pub fn layer_progress_bar(mp: &MultiProgress, total: u64, label: &str) -> ProgressBar {
+///
+/// The leading `{msg}` doubles as a phase label — callers set it to
+/// `downloading`, `extracting`, `ready`, or `cached` as the layer moves
+/// through the pipeline. The same bar is reused across phases so each image
+/// layer occupies exactly one line.
+pub fn layer_progress_bar(mp: &MultiProgress, total: u64) -> ProgressBar {
     let pb = mp.add(ProgressBar::new(total));
     pb.set_style(
-        ProgressStyle::with_template(
-            "  {prefix:<10} [{bar:20}] {bytes:>10}/{total_bytes:<10} {bytes_per_sec}",
-        )
-        .unwrap()
-        .progress_chars("=> "),
+        ProgressStyle::with_template("  {msg:<11} [{bar:25.240}] {bytes:>10}/{total_bytes:<10}")
+            .unwrap()
+            .progress_chars("━╸ "),
     );
-    pb.set_prefix(label.to_string());
+    pb.set_message("downloading");
+    pb
+}
+
+/// Append a zero-height spacer as the last line of a `MultiProgress` so
+/// there's a blank line between the bars and whatever the terminal prints
+/// next. Returned bar lives as long as the `MultiProgress` and is cleared
+/// by the same `mp.clear()` that removes the real bars.
+pub fn progress_spacer(mp: &MultiProgress) -> ProgressBar {
+    let pb = mp.add(ProgressBar::new(1));
+    pb.set_style(ProgressStyle::with_template("").unwrap());
     pb
 }
 
