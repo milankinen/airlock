@@ -1,30 +1,30 @@
 # Presets
 
-Presets are built-in configuration bundles that provide sensible defaults for
-common ecosystems. Instead of manually listing every package registry and
-cache directory for your tech stack, you pick the relevant presets and they
-handle the details.
+Presets are built-in configuration bundles that ship with airlock. Instead
+of manually listing every package registry and cache directory for your
+tech stack — or every API endpoint and credential mount for an AI agent —
+you pick the relevant presets and they handle the details.
 
 ## Using presets
 
 Add presets to the top-level `presets` array in your config:
 
 ```toml
-presets = ["rust", "debian"]
+presets = ["debian", "rust", "claude-code"]
 
 [vm]
 image = "ubuntu:24.04"
 ```
 
-Presets are applied as a base layer — your own configuration always takes
+Presets are applied as a base layer; your own configuration always takes
 priority and overrides anything a preset defines. Multiple presets can be
 combined freely.
 
 ## Distribution presets
 
 These open network access to the package repositories for each Linux
-distribution, so that `apt install`, `apk add`, and friends work out of
-the box.
+distribution so that `apt install`, `apk add`, and friends work out of the
+box.
 
 - **`alpine`** — Alpine Linux package mirrors
 - **`debian`** — Debian and Ubuntu package repositories (including PPAs and
@@ -33,13 +33,13 @@ the box.
 - **`arch`** — Arch Linux and AUR repositories
 - **`suse`** — openSUSE and SUSE update servers
 
-Pick the one that matches your base image. If you're using `ubuntu:24.04`,
-the `debian` preset is what you want.
+Pick the one that matches your base image. For `ubuntu:24.04`, the
+`debian` preset is the right choice.
 
 ## Language presets
 
-These open network access to language-specific package registries so that
-your package manager can fetch dependencies.
+These open network access to language-specific package registries so your
+package manager can fetch dependencies.
 
 - **`rust`** — crates.io and Rust toolchain downloads
 - **`python`** — PyPI
@@ -47,21 +47,22 @@ your package manager can fetch dependencies.
 
 ## AI agent presets
 
-These configure network access, credentials, and file mounts for popular
-AI coding agents. They handle the full setup: allowing the right API
-endpoints, forwarding authentication tokens from the host, and mounting
-settings directories into the sandbox.
+These configure network rules, credential forwarding, and settings mounts
+for popular AI coding agents. Each agent has its own chapter with the full
+setup — what the preset wires up, which secret or environment variable it
+expects, and an example `airlock.toml`:
 
-- **`claude-code`** — Anthropic API access, OAuth token forwarding, and
-  Claude settings
-- **`copilot-cli`** — GitHub Copilot endpoints with path-level middleware
-  restrictions, and GitHub CLI config
-- **`codex`** — OpenAI API access and Codex settings
+- [Claude Code](./presets/claude-code.md)
+- [GitHub Copilot CLI](./presets/copilot-cli.md)
+- [OpenAI Codex](./presets/openai-codex.md)
+
+Missing a preset for your favourite agent? PRs welcome — the presets live
+as small TOML files under `app/airlock-cli/src/config/presets/`.
 
 ## Combining presets with custom rules
 
 A typical project config combines a distribution preset with a language
-preset and adds project-specific rules on top:
+preset and an agent preset, then adds project-specific rules on top:
 
 ```toml
 presets = ["debian", "python", "claude-code"]
@@ -88,8 +89,8 @@ internal API — all in a deny-by-default sandbox.
 
 ## Overriding preset rules
 
-Since presets are just regular configuration applied at a lower priority,
-you can override or disable any rule they define. If a preset opens network
+Since presets are regular configuration applied at a lower priority, you
+can override or disable any rule they define. If a preset opens network
 access to something you don't need, disable it in your project config or
 local overrides:
 
@@ -99,5 +100,5 @@ local overrides:
 enabled = false
 ```
 
-See the [Configuration](../configuration.md) chapter for more on how the
-hierarchical config system works with `enabled` flags.
+See the [Configuration](./configuration.md) chapter for more on how the
+hierarchical config system and `enabled` flags work together.

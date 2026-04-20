@@ -108,7 +108,7 @@ insecure = true
 
 Pass `--monitor` (`-m`) to open a tabbed TUI control panel alongside the
 sandbox shell, with live network, CPU, and memory views. See the
-[Monitor dashboard](../monitor.md) chapter for details.
+[Monitor dashboard](./monitor.md) chapter for details.
 
 ## Verbose output
 
