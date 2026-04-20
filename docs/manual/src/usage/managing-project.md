@@ -36,20 +36,22 @@ Network rules (default: deny):
 
 ## Removing sandbox state
 
-The `airlock rm` command removes the sandbox state for the current project.
-This deletes the `.airlock/sandbox/` directory, which includes the disk
-image, CA certificate, overlay data, and run logs:
+The `airlock remove` command removes the sandbox state for the current
+project. This deletes the `.airlock/sandbox/` directory, which includes the
+disk image, CA certificate, overlay data, and run logs:
 
 ```bash
-airlock rm
+airlock remove
 ```
 
 You'll be asked to confirm before anything is deleted. To skip the
 confirmation prompt (useful in scripts), pass `--force`:
 
 ```bash
-airlock rm --force
+airlock remove --force
 ```
+
+The short alias `airlock rm` also works.
 
 After removal, running `airlock start` again creates a fresh sandbox from
 scratch — new disk, new CA cert, fresh image pull if needed. The project

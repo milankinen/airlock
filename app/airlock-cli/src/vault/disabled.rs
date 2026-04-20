@@ -1,5 +1,5 @@
 //! Inert backend. Reads return empty, writes are dropped. Used when
-//! `settings.vault = "disabled"` so `airlock secret` can refuse to run
+//! `settings.vault = "disabled"` so `airlock secrets` can refuse to run
 //! without a separate "is the vault on" check elsewhere.
 
 use super::Storage;

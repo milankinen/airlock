@@ -14,14 +14,14 @@ pub fn main(_args: &ShowArgs, vault: Vault) -> i32 {
     let project = match project::load(vault) {
         Ok(s) => s,
         Err(e) => {
-            cli::error!("Project data loading failed: {e:#}");
+            cli::error!("Sandbox details loading failed: {e:#}");
             return 1;
         }
     };
 
     if !project.sandbox_dir.exists() {
         cli::error!(
-            "No project data for {} — run `airlock start` first",
+            "No sandbox for {} — run `airlock start` first",
             project.host_cwd.display()
         );
         return 1;

@@ -1,8 +1,8 @@
-//! `airlock secret` — manage user secrets stored in the configured
+//! `airlock secrets` — manage user secrets stored in the configured
 //! vault backend.
 //!
-//! Three subcommands: `ls`, `add`, `rm`. Storage goes through the
-//! single `Vault` (one JSON blob); see `crate::vault`.
+//! Three subcommands: `list`, `add`, `remove`. Storage goes through
+//! the single `Vault` (one JSON blob); see `crate::vault`.
 //!
 //! `add` never takes the value on the command line — interactive
 //! prompt or `--stdin`. This is a hard rule: argv values leak via
@@ -27,9 +27,11 @@ pub struct SecretArgs {
 
 #[derive(Subcommand, Debug)]
 enum SecretCmd {
-    /// List all stored secrets (names + timestamps only; values are
-    /// never shown).
-    Ls,
+    /// List all stored secrets. Shows names, timestamps, and a masked
+    /// `****`-prefixed preview of the last few value chars (for
+    /// disambiguation only — the full value is never printed).
+    #[command(alias = "ls")]
+    List,
     /// Add or overwrite a secret. Prompts interactively for the
     /// value with echo suppressed. Use `--stdin` to pipe the value.
     Add {
@@ -47,7 +49,8 @@ enum SecretCmd {
         yes: bool,
     },
     /// Remove a secret.
-    Rm {
+    #[command(alias = "rm")]
+    Remove {
         /// Secret name.
         name: String,
     },
@@ -77,18 +80,19 @@ pub fn main(args: SecretArgs, vault: &Vault, _settings: &Settings) -> i32 {
 
 fn run(args: SecretArgs, vault: &Vault) -> anyhow::Result<()> {
     match args.cmd {
-        SecretCmd::Ls => list(vault),
+        SecretCmd::List => list(vault),
         SecretCmd::Add { name, stdin, yes } => add(vault, &name, stdin, yes),
-        SecretCmd::Rm { name } => remove(vault, &name),
+        SecretCmd::Remove { name } => remove(vault, &name),
     }
 }
 
 // ── Subcommands ──────────────────────────────────────────────────────────────
 
 fn list(vault: &Vault) -> anyhow::Result<()> {
-    let items = vault.list_secrets().context("read airlock vault")?;
+    let mut items = vault.list_secrets().context("read airlock vault")?;
+    items.sort_by(|a, b| a.name.cmp(&b.name));
     if items.is_empty() {
-        cli::log!("No secrets stored. Add one with `airlock secret add <NAME>`.");
+        cli::log!("No secrets stored. Add one with `airlock secrets add <NAME>`.");
         return Ok(());
     }
     let name_w = items
@@ -97,11 +101,18 @@ fn list(vault: &Vault) -> anyhow::Result<()> {
         .max()
         .unwrap_or(4)
         .max("NAME".len());
-    println!("{:<name_w$}  SAVED AT", "NAME");
+    let value_w = items
+        .iter()
+        .map(|m| m.preview.chars().count())
+        .max()
+        .unwrap_or(5)
+        .max("VALUE".len());
+    println!("{:<name_w$}  {:<value_w$}  SAVED AT", "NAME", "VALUE");
     for item in items {
         println!(
-            "{:<name_w$}  {}",
+            "{:<name_w$}  {:<value_w$}  {}",
             item.name,
+            item.preview,
             format_local_time(item.saved_at)
         );
     }
@@ -177,7 +188,7 @@ vault.storage = \"encrypted-file\"
 // ── Value input ──────────────────────────────────────────────────────────────
 
 /// Read value from stdin. Errors if stdin is a TTY (prevents users
-/// from running `airlock secret add FOO --stdin` and then typing into
+/// from running `airlock secrets add FOO --stdin` and then typing into
 /// their terminal, which would echo the secret).
 fn read_from_stdin() -> anyhow::Result<String> {
     // SAFETY: `libc::isatty` on fd 0 is side-effect-free.

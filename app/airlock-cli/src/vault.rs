@@ -2,7 +2,7 @@
 //!
 //! Holds two kinds of items:
 //!
-//! - `secrets`: user-managed secrets (`airlock secret add/ls/rm`)
+//! - `secrets`: user-managed secrets (`airlock secrets add/list/remove`)
 //!   exposed to projects via `${NAME}` substitution.
 //! - `registries`: image-registry credentials.
 //!
@@ -105,11 +105,36 @@ struct RegistryEntry {
     saved_at: SystemTime,
 }
 
-/// Metadata returned by `list_secrets` — values intentionally omitted.
+/// Metadata returned by `list_secrets`. Values are omitted; `preview`
+/// is a short masked suffix (`****` plus 0/2/4 trailing chars depending
+/// on value length) intended only for disambiguating similarly-named
+/// entries. See `secret_preview`.
 #[derive(Clone, Debug)]
 pub struct SecretMeta {
     pub name: String,
     pub saved_at: SystemTime,
+    pub preview: String,
+}
+
+/// Masked preview of a secret value, safe to show alongside its name.
+/// Always prefixed with `****` so total length doesn't leak. Reveals
+/// the last 4 chars when the value is ≥16 chars, the last 2 when ≥8,
+/// nothing shorter — below 8 chars even two leaked chars are a
+/// material fraction of the secret's entropy.
+pub fn secret_preview(value: &str) -> String {
+    let len = value.chars().count();
+    let tail = if len >= 16 {
+        4
+    } else if len >= 8 {
+        2
+    } else {
+        0
+    };
+    let mut out = String::from("****");
+    if tail > 0 {
+        out.extend(value.chars().skip(len - tail));
+    }
+    out
 }
 
 /// Plain registry credentials, decoupled from storage so callers can
@@ -132,7 +157,7 @@ pub(crate) struct VaultData {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum VaultStorageType {
-    /// Inert backend. Reads empty, writes dropped. `airlock secret`
+    /// Inert backend. Reads empty, writes dropped. `airlock secrets`
     /// refuses to run.
     Disabled,
     /// Plaintext JSON at `~/.airlock/vault.default.json` (mode 0600).
@@ -266,7 +291,8 @@ impl Vault {
         Ok(existed)
     }
 
-    /// Enumerate secrets (names + timestamps only — no values).
+    /// Enumerate secrets (names, timestamps, masked previews — no
+    /// full values).
     pub fn list_secrets(&self) -> anyhow::Result<Vec<SecretMeta>> {
         let opened = self.open()?;
         Ok(opened
@@ -276,6 +302,7 @@ impl Vault {
             .map(|(name, entry)| SecretMeta {
                 name: name.clone(),
                 saved_at: entry.saved_at,
+                preview: secret_preview(&entry.value),
             })
             .collect())
     }
@@ -479,6 +506,34 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
+
+    #[test]
+    fn secret_preview_hides_short_values() {
+        assert_eq!(secret_preview(""), "****");
+        assert_eq!(secret_preview("abc"), "****");
+        // 7 chars — still below the 8-char threshold.
+        assert_eq!(secret_preview("abcdefg"), "****");
+    }
+
+    #[test]
+    fn secret_preview_reveals_two_chars_between_8_and_15() {
+        assert_eq!(secret_preview("abcdefgh"), "****gh");
+        assert_eq!(secret_preview("password1234567"), "****67");
+    }
+
+    #[test]
+    fn secret_preview_reveals_four_chars_at_16_and_above() {
+        assert_eq!(secret_preview("abcdefghijklmnop"), "****mnop");
+        assert_eq!(secret_preview("sk_live_abcdefghijklmnopqrstuv"), "****stuv");
+    }
+
+    #[test]
+    fn secret_preview_counts_codepoints_not_bytes() {
+        // 16 codepoints, each 2 bytes in UTF-8 — triggers the 4-char
+        // branch on codepoint count, not the 32-byte total.
+        let value: String = "ñ".repeat(16);
+        assert_eq!(secret_preview(&value), "****ññññ");
+    }
 
     /// In-memory `Storage` double for tests.
     #[derive(Default)]

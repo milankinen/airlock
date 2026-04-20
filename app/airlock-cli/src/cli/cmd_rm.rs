@@ -36,7 +36,7 @@ pub fn main(args: &RmArgs, vault: Vault) -> i32 {
 
     if !args.force {
         let selection = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("Remove project data?")
+            .with_prompt("Remove sandbox?")
             .items(["Yes", "No"])
             .default(1)
             .interact()
@@ -48,7 +48,7 @@ pub fn main(args: &RmArgs, vault: Vault) -> i32 {
     }
 
     if let Err(e) = std::fs::remove_dir_all(&project.cache_dir) {
-        cli::error!("Failed to remove project data: {e}");
+        cli::error!("Failed to remove sandbox: {e}");
         return 1;
     }
 

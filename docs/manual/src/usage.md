@@ -35,7 +35,7 @@ airlock start                       # Boot a sandbox VM and open a shell
 airlock start -- ls /usr            # Run a one-off command in the VM
 airlock exec bash                   # Attach to a running VM
 airlock show                        # Show sandbox status and config
-airlock rm                          # Remove sandbox state
+airlock remove                      # Remove sandbox state
 ```
 
 The first time you run `airlock start` in a project directory, airlock will

@@ -71,14 +71,14 @@ async fn main() {
             }
             cli::cmd_show::main(args, vault)
         }
-        Command::Rm(ref args) => {
+        Command::Remove(ref args) => {
             if !extra_args.is_empty() {
                 cli::error!("'--' args are only supported with 'start'");
                 std::process::exit(2);
             }
             cli::cmd_rm::main(args, vault)
         }
-        Command::Secret(args) => {
+        Command::Secrets(args) => {
             if !extra_args.is_empty() {
                 cli::error!("'--' args are only supported with 'start'");
                 std::process::exit(2);
@@ -117,14 +117,16 @@ enum Command {
     /// Start the sandbox VM for the current project directory
     Start(cmd_start::StartArgs),
     /// Remove the current project data
-    Rm(cmd_rm::RmArgs),
+    #[command(alias = "rm")]
+    Remove(cmd_rm::RmArgs),
     /// Execute a command inside the running sandbox VM
     #[command(alias = "x")]
     Exec(cmd_exec::ExecArgs),
     /// Show the current project info
     Show(cmd_show::ShowArgs),
     /// Manage secrets stored in the system keyring
-    Secret(cmd_secret::SecretArgs),
+    #[command(alias = "secret")]
+    Secrets(cmd_secret::SecretArgs),
 }
 
 /// Split argv at "--". Returns (args before --, args after --).

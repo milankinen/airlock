@@ -17,13 +17,21 @@ through to the vault.
 
 ## Quick start
 
-Save, list, and remove secrets with the `airlock secret` subcommand:
+Save, list, and remove secrets with the `airlock secrets` subcommand:
 
 ```sh
-airlock secret add MY_API_TOKEN     # prompts for the value
-airlock secret ls                   # lists saved names (not values)
-airlock secret rm MY_API_TOKEN
+airlock secrets add MY_API_TOKEN     # prompts for the value
+airlock secrets list                 # lists saved names + masked previews
+airlock secrets remove MY_API_TOKEN
 ```
+
+The short aliases `secret`, `ls`, and `rm` also work.
+
+`list` prints a `VALUE` column with a `****`-prefixed preview — the last
+four chars of the value when it's at least 16 chars long, two chars when
+at least 8, and no suffix at all for anything shorter. It's meant purely
+for disambiguating entries when you have several similarly-named tokens
+stored; the full value is never printed anywhere.
 
 Reference the saved value from `[env]` the same way as any host env
 variable:
@@ -48,7 +56,7 @@ The vault can be backed by one of four storage types, picked with
 | `keyring` (default) | OS keychain / Secret Service         | OS unlock      | GUI-dependent          |
 | `encrypted-file`    | AEAD (ChaCha20-Poly1305 + Argon2id)  | Passphrase     | Yes (via env var)      |
 | `file`              | `chmod 600` only (cleartext JSON)    | None           | Yes                    |
-| `disabled`          | N/A — `airlock secret` is turned off | None           | Yes                    |
+| `disabled`          | N/A — `airlock secrets` is turned off | None          | Yes                    |
 
 ```toml
 # ~/.airlock/settings.toml
@@ -115,13 +123,13 @@ the on-disk format.
 
 **Drawbacks**: anyone who can read that file — including backup
 snapshots, disk forensics, or a sloppy `tar` of your home directory —
-reads the secrets. `airlock secret add` shows a one-time warning when
+reads the secrets. `airlock secrets add` shows a one-time warning when
 this backend is active; pass `--yes` to skip the confirmation in
 scripts.
 
 ### `disabled` — vault turned off
 
-`airlock secret` refuses to run. `${VAR}` templates resolve only
+`airlock secrets` refuses to run. `${VAR}` templates resolve only
 against the host env, and if a referenced name isn't set there,
 `airlock start` fails with a clear error. Registry auth falls back to
 re-prompting on every 401 (credentials are never saved).
