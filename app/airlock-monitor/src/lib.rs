@@ -483,8 +483,7 @@ fn handle_key(
                             .open_policy_dropdown(app.network.policy());
                     }
                     KeyCode::Char('q' | 'Q') if key.modifiers.is_empty() => {
-                        let _ = sig_tx.blocking_send(1);
-                        let _ = sig_tx.blocking_send(15);
+                        app.active_tab = Tab::Sandbox;
                     }
                     KeyCode::Char('d' | 'D') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         let _ = sig_tx.blocking_send(1);
@@ -520,17 +519,16 @@ fn handle_key(
                         .network
                         .open_policy_dropdown(app.network.policy());
                 }
-                // `q` or Ctrl+D from the monitor tab asks the sandbox
-                // process to exit. SIGHUP first — it's the canonical
-                // "controlling terminal went away" signal and interactive
-                // shells like bash exit on it (SIGINT/SIGTERM get ignored
-                // at an idle prompt). SIGTERM follows as a fallback for
-                // anything that doesn't handle HUP. The TUI itself shuts
-                // down when the process's exit event arrives on the main
-                // channel, so we don't return early.
+                // Ctrl+D from the monitor tab asks the sandbox process to
+                // exit. SIGHUP first — it's the canonical "controlling
+                // terminal went away" signal and interactive shells like
+                // bash exit on it (SIGINT/SIGTERM get ignored at an idle
+                // prompt). SIGTERM follows as a fallback for anything that
+                // doesn't handle HUP. The TUI itself shuts down when the
+                // process's exit event arrives on the main channel, so we
+                // don't return early.
                 KeyCode::Char('q' | 'Q') if key.modifiers.is_empty() => {
-                    let _ = sig_tx.blocking_send(1);
-                    let _ = sig_tx.blocking_send(15);
+                    app.active_tab = Tab::Sandbox;
                 }
                 KeyCode::Char('d' | 'D') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     let _ = sig_tx.blocking_send(1);

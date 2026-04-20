@@ -85,7 +85,8 @@ Total and used bytes (reported the way `free` and `htop` do:
 | `Enter`         | Open the selected row in a details sub-tab      |
 | `Esc` / `x`     | Close the details sub-tab                       |
 | `p`             | On Monitor tab: open the policy dropdown        |
-| `q` / `Ctrl+D`  | On Monitor tab: ask the sandbox process to exit |
+| `q`             | On Monitor tab: switch back to Sandbox tab      |
+| `Ctrl+D`        | On Monitor tab: ask the sandbox process to exit |
 
 ## Selecting text
 
