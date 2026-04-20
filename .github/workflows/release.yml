@@ -14,15 +14,12 @@ on:
         type: string
 
 jobs:
-  release:
+  resolve-ci-run:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
-      ci_run_id: ${{ steps.ci-run.outputs.run_id }}
-    permissions:
-      contents: write
+      run_id: ${{ steps.ci-run.outputs.run_id }}
     steps:
-      - uses: actions/checkout@v4
       - name: Resolve CI run ID
         id: ci-run
         env:
@@ -40,19 +37,101 @@ jobs:
               --jq '.[0].databaseId')
           fi
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
-      - name: Download artifacts from CI run
+
+  sign-macos:
+    needs: resolve-ci-run
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download macOS binaries from CI
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          RUN_ID="${{ steps.ci-run.outputs.run_id }}"
-          echo "Downloading artifacts from CI run $RUN_ID"
-          for name in airlock-macos-aarch64 airlock-linux-x86_64 airlock-linux-aarch64 \
-                      airlock-macos-aarch64-distroless airlock-linux-x86_64-distroless airlock-linux-aarch64-distroless; do
-            gh run download "$RUN_ID" \
+          for name in airlock-macos-aarch64 airlock-macos-aarch64-distroless; do
+            gh run download "${{ needs.resolve-ci-run.outputs.run_id }}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --name "$name" \
+              --dir "artifacts/$name"
+          done
+      - name: Import Developer ID certificate
+        env:
+          CERT_B64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          CERT_PASS: ${{ secrets.APPLE_CERT_P12_PASSWORD }}
+          KEYCHAIN_PASS: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          P12="$RUNNER_TEMP/cert.p12"
+          echo "$CERT_B64" | base64 --decode > "$P12"
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+          security import "$P12" -k "$KEYCHAIN" -P "$CERT_PASS" -T /usr/bin/codesign
+          security list-keychain -d user -s "$KEYCHAIN" $(security list-keychain -d user | tr -d '"')
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN"
+          rm -f "$P12"
+      - name: Append version trailer and sign
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          for dir in artifacts/airlock-macos-aarch64 artifacts/airlock-macos-aarch64-distroless; do
+            BIN="$dir/airlock"
+            chmod +x "$BIN"
+            python3 -c "import sys; v=sys.argv[1].encode('utf-8'); sys.stdout.buffer.write(v + len(v).to_bytes(4, 'little'))" "$VERSION" >> "$BIN"
+            codesign --entitlements entitlements.plist \
+                     --force \
+                     --sign "$APPLE_SIGNING_IDENTITY" \
+                     --identifier airlock.cli \
+                     --options runtime \
+                     --timestamp \
+                     "$BIN"
+            codesign --verify --deep --strict --verbose=2 "$BIN"
+            codesign --display --verbose=2 "$BIN"
+          done
+      - name: Clean up keychain
+        if: always()
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          if [ -f "$KEYCHAIN" ]; then
+            security delete-keychain "$KEYCHAIN" || true
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: airlock-macos-aarch64-signed
+          path: artifacts/airlock-macos-aarch64/airlock
+      - uses: actions/upload-artifact@v4
+        with:
+          name: airlock-macos-aarch64-distroless-signed
+          path: artifacts/airlock-macos-aarch64-distroless/airlock
+
+  release:
+    needs: [resolve-ci-run, sign-macos]
+    runs-on: ubuntu-latest
+    outputs:
+      ci_run_id: ${{ needs.resolve-ci-run.outputs.run_id }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download Linux artifacts from CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for name in airlock-linux-x86_64 airlock-linux-aarch64 \
+                      airlock-linux-x86_64-distroless airlock-linux-aarch64-distroless; do
+            gh run download "${{ needs.resolve-ci-run.outputs.run_id }}" \
               --repo "$GITHUB_REPOSITORY" \
               --name "$name" \
               --dir "artifacts/${name#airlock-}"
           done
+      - uses: actions/download-artifact@v4
+        with:
+          name: airlock-macos-aarch64-signed
+          path: artifacts/macos-aarch64
+      - uses: actions/download-artifact@v4
+        with:
+          name: airlock-macos-aarch64-distroless-signed
+          path: artifacts/macos-aarch64-distroless
       - name: Package release artifacts
         run: |
           VERSION="${{ github.event.inputs.version }}"
@@ -65,7 +144,14 @@ jobs:
             DIR="${variant##*:}"
             ARCHIVE="airlock-${VERSION}-${NAME}.tar.gz"
             chmod +x "artifacts/${DIR}/airlock"
-            python3 -c "import sys; v=sys.argv[1].encode('utf-8'); sys.stdout.buffer.write(v + len(v).to_bytes(4, 'little'))" "$VERSION" >> "artifacts/${DIR}/airlock"
+            # Version trailer for macOS was already appended before codesign;
+            # Linux binaries still need it here.
+            case "$DIR" in
+              macos-*) ;;
+              *)
+                python3 -c "import sys; v=sys.argv[1].encode('utf-8'); sys.stdout.buffer.write(v + len(v).to_bytes(4, 'little'))" "$VERSION" >> "artifacts/${DIR}/airlock"
+                ;;
+            esac
             tar -czf "$ARCHIVE" -C "artifacts/${DIR}" airlock
             sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
           done
