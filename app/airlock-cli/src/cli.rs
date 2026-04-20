@@ -99,9 +99,9 @@ pub fn yellow(s: &str) -> String {
 
 /// Build the version string shown by `-V`.
 ///
-/// In release builds the release action appends `<version><len:u32le>` to
-/// the binary; we detect that here and show it alongside the git hash.
-/// Falls back to the Cargo package version in dev builds.
+/// In release builds the release action patches `AIRLOCK_VERSION_SLOT` in
+/// the binary with the version bytes; we read them here. Falls back to the
+/// Cargo package version in dev builds.
 pub fn version_string() -> String {
     let git_hash = env!("GIT_HASH");
     let distroless = cfg!(feature = "distroless");
@@ -113,26 +113,33 @@ pub fn version_string() -> String {
     }
 }
 
-/// Read the release version appended to the binary by the release action.
-/// Format: `<utf8 version string><length as u32 little-endian>`.
+// 16-byte sentinel + 64-byte version slot. The release action locates the
+// sentinel and overwrites the slot bytes before code signing. Bytes live
+// inside the binary's rodata, so the signature stays valid under
+// `codesign --strict`. `#[no_mangle]` + `#[used]` force external linkage so
+// the linker's dead-strip pass cannot remove the static.
+#[used]
+#[unsafe(no_mangle)]
+pub static AIRLOCK_VERSION_SLOT: [u8; 80] = {
+    let mut buf = [0u8; 80];
+    let sentinel = *b"AIRLK-VER-f3a7c2";
+    let mut i = 0;
+    while i < sentinel.len() {
+        buf[i] = sentinel[i];
+        i += 1;
+    }
+    buf
+};
+
 fn release_version() -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(std::env::current_exe().ok()?).ok()?;
-    let file_len = f.seek(SeekFrom::End(0)).ok()?;
-    if file_len < 4 {
-        return None;
-    }
-    f.seek(SeekFrom::End(-4)).ok()?;
-    let mut len_bytes = [0u8; 4];
-    f.read_exact(&mut len_bytes).ok()?;
-    let len = u32::from_le_bytes(len_bytes) as usize;
-    if len == 0 || len >= 20 || (file_len as usize) < len + 4 {
-        return None;
-    }
-    f.seek(SeekFrom::End(-(len as i64 + 4))).ok()?;
-    let mut ver_bytes = vec![0u8; len];
-    f.read_exact(&mut ver_bytes).ok()?;
-    Some(String::from_utf8_lossy(&ver_bytes).into_owned())
+    const SENTINEL_LEN: usize = 16;
+    // `read_volatile` prevents LTO from folding the slot's compile-time
+    // initializer into the call site.
+    let bytes = unsafe { std::ptr::read_volatile(&raw const AIRLOCK_VERSION_SLOT) };
+    let tail = &bytes[SENTINEL_LEN..];
+    let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+    let s = std::str::from_utf8(&tail[..end]).ok()?;
+    (!s.is_empty()).then(|| s.to_string())
 }
 
 /// Initialize the console; call at the very beginning of the program.

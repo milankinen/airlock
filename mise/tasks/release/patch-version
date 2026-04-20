@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+#MISE description="Patch the release version into a pre-built airlock binary"
+"""Patch an airlock release version into a pre-built binary.
+
+The binary embeds a 16-byte sentinel followed by a 64-byte zero-padded slot.
+This script finds the sentinel (must occur exactly once) and writes the
+version string into the slot. Because the edit stays inside the Mach-O /
+ELF rodata region, a subsequent `codesign --strict` pass accepts the result.
+"""
+
+import pathlib
+import sys
+
+SENTINEL = b"AIRLK-VER-f3a7c2"
+SLOT_SIZE = 80
+DATA_SIZE = SLOT_SIZE - len(SENTINEL)
+
+
+def main() -> None:
+    if len(sys.argv) != 3:
+        sys.exit(f"usage: {sys.argv[0]} <binary-path> <version>")
+    binary = pathlib.Path(sys.argv[1])
+    version = sys.argv[2]
+
+    version_bytes = version.encode("utf-8")
+    if len(version_bytes) > DATA_SIZE:
+        sys.exit(
+            f"error: version too long ({len(version_bytes)} > {DATA_SIZE} bytes)"
+        )
+
+    data = binary.read_bytes()
+    positions = []
+    start = 0
+    while True:
+        idx = data.find(SENTINEL, start)
+        if idx < 0:
+            break
+        positions.append(idx)
+        start = idx + 1
+
+    if not positions:
+        sys.exit("error: version sentinel not found in binary")
+    if len(positions) > 1:
+        sys.exit(
+            f"error: version sentinel found {len(positions)} times, expected 1"
+        )
+
+    pos = positions[0]
+    payload = version_bytes + b"\x00" * (DATA_SIZE - len(version_bytes))
+    buf = bytearray(data)
+    buf[pos + len(SENTINEL) : pos + SLOT_SIZE] = payload
+    binary.write_bytes(bytes(buf))
+    print(f"patched {binary} with version {version!r} at offset {pos}")
+
+
+if __name__ == "__main__":
+    main()

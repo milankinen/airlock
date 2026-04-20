@@ -69,7 +69,7 @@ jobs:
           security list-keychain -d user -s "$KEYCHAIN" $(security list-keychain -d user | tr -d '"')
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN"
           rm -f "$P12"
-      - name: Append version trailer and sign
+      - name: Patch version slot and sign
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
@@ -77,7 +77,7 @@ jobs:
           for dir in artifacts/airlock-macos-aarch64 artifacts/airlock-macos-aarch64-distroless; do
             BIN="$dir/airlock"
             chmod +x "$BIN"
-            python3 -c "import sys; v=sys.argv[1].encode('utf-8'); sys.stdout.buffer.write(v + len(v).to_bytes(4, 'little'))" "$VERSION" >> "$BIN"
+            mise/tasks/release/patch-version "$BIN" "$VERSION"
             codesign --entitlements entitlements.plist \
                      --force \
                      --sign "$APPLE_SIGNING_IDENTITY" \
@@ -144,13 +144,11 @@ jobs:
             DIR="${variant##*:}"
             ARCHIVE="airlock-${VERSION}-${NAME}.tar.gz"
             chmod +x "artifacts/${DIR}/airlock"
-            # Version trailer for macOS was already appended before codesign;
-            # Linux binaries still need it here.
+            # macOS binaries already had the slot patched before codesign;
+            # re-patching here would invalidate the signature.
             case "$DIR" in
               macos-*) ;;
-              *)
-                python3 -c "import sys; v=sys.argv[1].encode('utf-8'); sys.stdout.buffer.write(v + len(v).to_bytes(4, 'little'))" "$VERSION" >> "artifacts/${DIR}/airlock"
-                ;;
+              *) mise/tasks/release/patch-version "artifacts/${DIR}/airlock" "$VERSION" ;;
             esac
             tar -czf "$ARCHIVE" -C "artifacts/${DIR}" airlock
             sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
