@@ -138,6 +138,7 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
                 enabled: true,
                 allow: cfg.allowed_hosts,
                 deny: vec![],
+                passthrough: false,
             },
         );
     }
@@ -168,7 +169,7 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
         sockets: BTreeMap::default(),
     };
     let (request_log, log_fn) = RequestLog::new();
-    let (allow_targets, deny_targets) = rules::resolve(&config);
+    let rule_targets = rules::resolve(&config);
     // Tests don't need real secret storage — a disabled vault gives
     // the substitution machinery a no-op backend and never prompts.
     let vault = crate::vault::Vault::for_storage_type(crate::vault::VaultStorageType::Disabled);
@@ -204,8 +205,9 @@ fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
             })),
             tls_client: Arc::new(tls_client),
             interceptor: Rc::new(interceptor),
-            allow_targets,
-            deny_targets,
+            allow_targets: rule_targets.allow,
+            deny_targets: rule_targets.deny,
+            passthrough_targets: rule_targets.passthrough,
             middleware_targets,
             port_forwards: std::collections::HashMap::default(),
             socket_map: std::collections::HashMap::default(),

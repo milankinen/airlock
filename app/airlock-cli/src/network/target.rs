@@ -40,4 +40,18 @@ pub struct ResolvedTarget {
     /// Whether this connection is permitted.
     /// False if denied by policy, deny rule, or no allow rule matched.
     pub allowed: bool,
+    /// Skip TLS/HTTP interception and relay the connection as plain TCP.
+    /// Set for targets matching a passthrough rule and for localhost
+    /// port-forwarded destinations (which may carry non-HTTP protocols
+    /// whose first bytes can't be sniffed without deadlocking).
+    pub passthrough: bool,
+}
+
+impl ResolvedTarget {
+    /// True when the allowed connection should skip all interception and
+    /// be relayed as plain TCP. Denied connections never passthrough —
+    /// they still need to reach the 403 code path.
+    pub fn is_passthrough(&self) -> bool {
+        self.allowed && self.passthrough
+    }
 }

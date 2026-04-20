@@ -408,6 +408,13 @@ pub mod config {
     ///
     /// `deny` is checked first and wins unconditionally. If no rule matches,
     /// the connection follows the network `policy`.
+    ///
+    /// With `passthrough = true`, `allow` targets skip TLS/HTTP interception
+    /// entirely — the connection is a pure TCP relay. Required for protocols
+    /// that aren't HTTP and whose first bytes from the client can't be
+    /// sniffed (e.g. Postgres, whose 8-byte SSLRequest would deadlock the
+    /// HTTP detector). Incompatible with middleware on the same target; a
+    /// conflict is reported at startup.
     #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
     pub struct NetworkRule {
         /// Enable/disable rule
@@ -419,6 +426,11 @@ pub mod config {
         /// Hosts/ports to deny unconditionally (deny wins over allow).
         #[config(default)]
         pub deny: Vec<String>,
+        /// When true, allowed targets are relayed as plain TCP without any
+        /// TLS or HTTP interception. Middleware on the same target is an
+        /// error.
+        #[config(default)]
+        pub passthrough: bool,
     }
 
     impl WellKnown for NetworkRule {

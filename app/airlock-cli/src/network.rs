@@ -6,6 +6,7 @@
 //! (based on config rules), whether to intercept TLS (for HTTP middleware),
 //! and how to relay traffic to the real server.
 
+mod check_target_conflicts;
 mod control;
 mod deny_reporter;
 mod http;
@@ -53,8 +54,13 @@ pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network>
 
     let net = &project.config.network;
     let log = middleware::tracing_log();
-    let (allow_targets, deny_targets) = rules::resolve(net);
+    let rule_targets = rules::resolve(net);
     let middleware_targets = rules::resolve_middleware(net, &project.vault, &log)?;
+
+    check_target_conflicts::check_passthrough_conflicts(
+        &labeled_passthrough(net),
+        &labeled_middleware(net),
+    )?;
 
     let interceptor = tls::TlsInterceptor::new(&project.ca_cert, &project.ca_key)?;
 
@@ -78,9 +84,10 @@ pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network>
         .collect();
 
     tracing::debug!(
-        "network: {} allow, {} deny, {} middleware targets",
-        allow_targets.len(),
-        deny_targets.len(),
+        "network: {} allow, {} deny, {} passthrough, {} middleware targets",
+        rule_targets.allow.len(),
+        rule_targets.deny.len(),
+        rule_targets.passthrough.len(),
         middleware_targets.len()
     );
 
@@ -88,8 +95,9 @@ pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network>
         state: Arc::new(RwLock::new(NetworkState { policy: net.policy })),
         tls_client: Arc::new(tls_client),
         interceptor: Rc::new(interceptor),
-        allow_targets,
-        deny_targets,
+        allow_targets: rule_targets.allow,
+        deny_targets: rule_targets.deny,
+        passthrough_targets: rule_targets.passthrough,
         middleware_targets,
         port_forwards,
         socket_map,
@@ -97,6 +105,56 @@ pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network>
         next_id: AtomicU64::new(0),
         deny_reporter: DenyReporter::new(),
     })
+}
+
+/// Extract labeled passthrough targets from the config for conflict
+/// checking. Each entry carries a display label — the validator treats
+/// that label as opaque, so formatting lives here where the config shape
+/// is known.
+fn labeled_passthrough(
+    net: &crate::config::config::Network,
+) -> Vec<check_target_conflicts::LabeledTarget> {
+    let mut out = Vec::new();
+    for (rule_name, rule) in &net.rules {
+        if !rule.enabled || !rule.passthrough {
+            continue;
+        }
+        for allow in &rule.allow {
+            let (host, port) = rules::parse_target(allow);
+            out.push(check_target_conflicts::LabeledTarget {
+                label: format!("rule `{rule_name}` allow=`{allow}` (passthrough)"),
+                target: NetworkTarget {
+                    host: host.to_string(),
+                    port: port.and_then(|p| p.parse::<u16>().ok()),
+                },
+            });
+        }
+    }
+    out
+}
+
+/// Extract labeled middleware targets from the config for conflict
+/// checking. Paired with [`labeled_passthrough`].
+fn labeled_middleware(
+    net: &crate::config::config::Network,
+) -> Vec<check_target_conflicts::LabeledTarget> {
+    let mut out = Vec::new();
+    for (mw_name, mw) in &net.middleware {
+        if !mw.enabled {
+            continue;
+        }
+        for target_str in &mw.target {
+            let (host, port) = rules::parse_target(target_str);
+            out.push(check_target_conflicts::LabeledTarget {
+                label: format!("middleware `{mw_name}` target=`{target_str}`"),
+                target: NetworkTarget {
+                    host: host.to_string(),
+                    port: port.and_then(|p| p.parse::<u16>().ok()),
+                },
+            });
+        }
+    }
+    out
 }
 
 /// Mutable runtime state shared between the network task and the TUI.
@@ -120,6 +178,9 @@ pub struct Network {
     allow_targets: Vec<NetworkTarget>,
     /// Deny-rule targets (deny wins unconditionally).
     deny_targets: Vec<NetworkTarget>,
+    /// Passthrough subset of `allow_targets` — connections matching any of
+    /// these skip TLS/HTTP interception entirely and are relayed raw.
+    passthrough_targets: Vec<NetworkTarget>,
     /// Compiled middleware with target patterns.
     middleware_targets: Vec<MiddlewareTarget>,
     /// Port forward mappings: guest_port → host_port.
@@ -189,40 +250,46 @@ impl Network {
             (host, port, false)
         };
 
-        // allow-always skips rules, collects middleware.
-        if matches!(policy, Policy::AllowAlways) {
-            return ResolvedTarget {
-                host: host.to_string(),
-                port,
-                middleware: self.collect_middleware(host, port),
-                allowed: true,
-            };
-        }
-
-        // Deny rules win unconditionally.
-        for target in &self.deny_targets {
-            if target.matches(host, port) {
-                return denied(host, port);
-            }
-        }
-
-        // Allow rules.
-        let allowed = port_forwarded
-            || matches!(policy, Policy::AllowByDefault)
-            || self.allow_targets.iter().any(|t| t.matches(host, port));
-
+        let allowed = self.is_allowed(host, port, policy) || port_forwarded;
         let middleware = if allowed {
             self.collect_middleware(host, port)
         } else {
             vec![]
         };
 
+        // Port-forwarded destinations always passthrough — the guest side
+        // is talking to an arbitrary protocol on localhost, not necessarily
+        // HTTP; intercepting would break non-HTTP forwards (e.g. Postgres).
+        let passthrough = allowed && (port_forwarded || self.is_passthrough_target(host, port));
+
         ResolvedTarget {
             host: host.to_string(),
             port,
             middleware,
             allowed,
+            passthrough,
         }
+    }
+
+    fn is_passthrough_target(&self, host: &str, port: u16) -> bool {
+        self.passthrough_targets
+            .iter()
+            .any(|t| t.matches(host, port))
+    }
+
+    fn is_allowed(&self, host: &str, port: u16, policy: Policy) -> bool {
+        // always-allow policy overrules deny targets
+        if matches!(policy, Policy::AllowAlways) {
+            return true;
+        }
+        // Deny rules win unconditionally.
+        for target in &self.deny_targets {
+            if target.matches(host, port) {
+                return false;
+            }
+        }
+        matches!(policy, Policy::AllowByDefault)
+            || self.allow_targets.iter().any(|t| t.matches(host, port))
     }
 
     /// Whether the policy is `deny-always` (blocks everything including sockets).
@@ -284,9 +351,87 @@ fn denied(host: &str, port: u16) -> ResolvedTarget {
         port,
         middleware: vec![],
         allowed: false,
+        passthrough: false,
     }
 }
 
 fn is_localhost(host: &str) -> bool {
     host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+#[cfg(test)]
+mod labeled_target_tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::config::config::{self, MiddlewareRule, NetworkRule};
+
+    fn rule(allow: &[&str], passthrough: bool, enabled: bool) -> NetworkRule {
+        NetworkRule {
+            enabled,
+            allow: allow.iter().map(|s| (*s).to_string()).collect(),
+            deny: vec![],
+            passthrough,
+        }
+    }
+
+    fn mw(target: &[&str], enabled: bool) -> MiddlewareRule {
+        MiddlewareRule {
+            enabled,
+            target: target.iter().map(|s| (*s).to_string()).collect(),
+            env: BTreeMap::new(),
+            script: "function on_request(req) return req end".to_string(),
+        }
+    }
+
+    fn net(
+        rules: Vec<(&str, NetworkRule)>,
+        middleware: Vec<(&str, MiddlewareRule)>,
+    ) -> config::Network {
+        config::Network {
+            policy: Policy::DenyByDefault,
+            rules: rules.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            middleware: middleware
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            ports: BTreeMap::default(),
+            sockets: BTreeMap::default(),
+        }
+    }
+
+    #[test]
+    fn labeled_passthrough_skips_non_passthrough_and_disabled() {
+        let n = net(
+            vec![
+                ("pt-on", rule(&["a:1"], true, true)),
+                ("pt-off", rule(&["b:2"], true, false)),
+                ("plain", rule(&["c:3"], false, true)),
+            ],
+            vec![],
+        );
+        let got: Vec<String> = labeled_passthrough(&n)
+            .into_iter()
+            .map(|lt| lt.label)
+            .collect();
+        assert_eq!(got.len(), 1);
+        assert!(got[0].contains("pt-on"), "got: {got:?}");
+    }
+
+    #[test]
+    fn labeled_middleware_skips_disabled() {
+        let n = net(
+            vec![],
+            vec![
+                ("mw-on", mw(&["a:1"], true)),
+                ("mw-off", mw(&["b:2"], false)),
+            ],
+        );
+        let got: Vec<String> = labeled_middleware(&n)
+            .into_iter()
+            .map(|lt| lt.label)
+            .collect();
+        assert_eq!(got.len(), 1);
+        assert!(got[0].contains("mw-on"), "got: {got:?}");
+    }
 }

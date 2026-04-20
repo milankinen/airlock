@@ -46,12 +46,12 @@ Patterns support wildcards for both host and port:
 ```toml
 [network.rules.company-services]
 allow = [
-    "*.prod.example.com",          # any subdomain
-    "registry.example.com:443",    # specific port
-    "*:80",                        # any host on port 80
+    "*.prod.example.com", # any subdomain
+    "registry.example.com:443", # specific port
+    "*:80", # any host on port 80
 ]
 deny = [
-    "internal.prod.example.com",   # except this one
+    "internal.prod.example.com", # except this one
 ]
 ```
 
@@ -66,6 +66,33 @@ Rules can be disabled without removing them:
 enabled = false
 allow = ["*"]
 ```
+
+### Passthrough
+
+By default, every allowed connection is peeked at to detect TLS and HTTP so
+that the traffic can be intercepted and surfaced in the monitor. For
+non-HTTP protocols whose first bytes are neither ASCII request lines nor
+a TLS `ClientHello`, that detection would deadlock waiting for input the
+protocol will never send (Postgres' 8-byte `SSLRequest` is the classic
+example).
+
+Mark such rules with `passthrough = true` to skip all detection and relay
+the connection as plain TCP:
+
+```toml
+[network.rules.database]
+allow = ["db.example.com:5432"]
+passthrough = true
+```
+
+A passthrough target cannot also be covered by middleware — the two are
+incompatible, and airlock refuses to start if it finds a rule target that
+also appears in any middleware `target` list, naming the offending rule
+and middleware.
+
+Port and unix socket forwards are always passthrough: the guest-side
+`localhost:<port>` may carry arbitrary traffic to whatever service runs
+on the host port, so interception is suppressed automatically.
 
 ## Middleware
 

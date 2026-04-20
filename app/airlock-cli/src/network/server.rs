@@ -190,6 +190,12 @@ fn spawn_socket_connection(path: &str, client_sink: tcp_sink::Client) -> tcp_sin
 /// that's the whole point of deferring the deny decision to this phase, so
 /// denied HTTP requests surface in the Requests sub-tab with full detail
 /// instead of vanishing behind an early TCP reset.
+///
+/// Passthrough targets bypass all detection: the connection is opened to the
+/// real server immediately and relayed as raw bytes. This is required for
+/// non-HTTP protocols whose first bytes from the client can't be sniffed
+/// (Postgres' 8-byte `SSLRequest` deadlocks the HTTP detector waiting for
+/// `\r\n`).
 async fn handle_connection(
     target: ResolvedTarget,
     mut rx: mpsc::Receiver<Bytes>,
@@ -199,8 +205,17 @@ async fn handle_connection(
     events: tokio::sync::broadcast::Sender<airlock_monitor::NetworkEvent>,
     deny_reporter: Rc<DenyReporter>,
 ) -> anyhow::Result<()> {
-    let (is_tls, first) = tls::detect(&mut rx).await;
     let addr = format!("{}:{}", target.host, target.port);
+
+    if target.is_passthrough() {
+        debug!("passthrough: {addr}");
+        let container = tcp::container_transport(Bytes::new(), rx, client_sink);
+        let server = tcp::connect_server(&addr).await?;
+        Box::pin(tcp::relay(container, server)).await;
+        return Ok(());
+    }
+
+    let (is_tls, first) = tls::detect(&mut rx).await;
 
     // Container-side transport first — same for allow and deny.
     let (container, alpn) = if is_tls {
