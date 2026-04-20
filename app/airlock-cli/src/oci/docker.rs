@@ -179,11 +179,11 @@ fn save_from_stream(stdout: ChildStdout, layers_root: &Path) -> anyhow::Result<D
             // digests (different content, different sha256), so a layer
             // dir hit can only be a cached layer.
             let digest = format!("sha256:{hex}");
-            if cache::layer_dir(&digest).is_ok_and(|d| d.is_dir()) {
+            if cache::layer_dir(&cache::layer_key(&digest)).is_ok_and(|d| d.is_dir()) {
                 std::io::copy(&mut entry, &mut std::io::sink())?;
                 continue;
             }
-            let tmp = layers_root.join(format!("{hex}.download.tmp"));
+            let tmp = layers_root.join(format!("{}.download.tmp", cache::layer_key(&digest)));
             let mut file = File::create(&tmp)?;
             std::io::copy(&mut entry, &mut file)?;
             staged.insert(hex.to_string(), tmp);
@@ -224,7 +224,7 @@ fn save_from_stream(stdout: ChildStdout, layers_root: &Path) -> anyhow::Result<D
                 // already renamed above — nothing to do.
                 continue;
             };
-            let download = layers_root.join(format!("{hex}.download"));
+            let download = layers_root.join(format!("{}.download", cache::layer_key(&digest)));
             std::fs::rename(&tmp, &download)?;
         }
 

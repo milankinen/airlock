@@ -17,9 +17,9 @@ pub use gc::sweep as gc_sweep;
 use oci_client::config::ConfigFile as OciConfig;
 use oci_client::secrets::RegistryAuth;
 
-use crate::cli;
 use crate::oci::credentials::ToRegistryAuth;
 use crate::project::Project;
+use crate::{cache, cli};
 
 /// Everything needed to configure the container process (returned by `prepare`).
 /// Mount resolution, disk setup, and command/env overrides happen in `vm::start`.
@@ -34,8 +34,10 @@ pub struct OciImage {
     /// fast path can confirm the cached entry still matches the project's
     /// configured image name without re-resolving the tag.
     pub name: String,
-    /// Ordered layer digests — topmost-first. The guest mounts the shared
-    /// `/mnt/layers/<digest>` cache as overlayfs lowerdirs in this order.
+    /// Ordered layer keys — topmost-first. Each entry is a versioned layer
+    /// name ([`cache::layer_key`]), matching both the on-disk directory name
+    /// under `~/.cache/airlock/oci/layers/<key>` and the guest mount path
+    /// `/mnt/layers/<key>`.
     pub image_layers: Vec<String>,
     /// Container home directory (e.g. `/root`), for guest-path `~` expansion.
     pub container_home: String,
@@ -173,13 +175,15 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
 }
 
 /// On-disk wrapper for a cached [`OciImage`]. Internally tagged so the JSON
-/// carries `"schema":"v1"` alongside the image fields — future schema bumps
-/// just add a new variant and `serde` picks the right one based on the tag.
+/// carries `"schema":"v2"` alongside the image fields. The schema version
+/// is bumped in lockstep with [`crate::cache::LAYER_FORMAT`] so a layer
+/// format change makes every old image JSON fail to deserialize and force
+/// a clean re-pull.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(tag = "schema")]
 enum CachedImage {
-    #[serde(rename = "v1")]
-    V1(OciImage),
+    #[serde(rename = "v2")]
+    V2(OciImage),
 }
 
 /// Read a cached image JSON file and unwrap it into an [`OciImage`]. Returns
@@ -188,7 +192,7 @@ enum CachedImage {
 fn read_cached_image(path: &Path) -> Option<OciImage> {
     let data = std::fs::read(path).ok()?;
     let wrapped: CachedImage = serde_json::from_slice(&data).ok()?;
-    let CachedImage::V1(image) = wrapped;
+    let CachedImage::V2(image) = wrapped;
     Some(image)
 }
 
@@ -203,7 +207,7 @@ fn read_ready_image(path: &Path) -> Option<OciImage> {
     image
         .image_layers
         .iter()
-        .all(|d| crate::cache::layer_dir(d).is_ok_and(|p| p.is_dir()))
+        .all(|k| cache::layer_dir(k).is_ok_and(|p| p.is_dir()))
         .then_some(image)
 }
 
@@ -254,7 +258,7 @@ fn write_cached_image(path: &Path, image: &OciImage) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("tmp");
-    let bytes = serde_json::to_vec_pretty(&CachedImage::V1(image.clone()))?;
+    let bytes = serde_json::to_vec_pretty(&CachedImage::V2(image.clone()))?;
     std::fs::write(&tmp, &bytes)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
@@ -548,7 +552,7 @@ async fn ensure_docker_image(image_ref: &str) -> anyhow::Result<(OciConfig, Vec<
     let mut ordered: Vec<String> = save
         .layer_digests
         .iter()
-        .map(|d| crate::cache::digest_name(d).to_string())
+        .map(|d| cache::layer_key(d))
         .collect();
     ordered.reverse();
     Ok((save.image_config, ordered))
@@ -568,7 +572,7 @@ async fn ensure_registry_image(
     let cached_count = layers
         .iter()
         .filter(|l| {
-            crate::cache::layer_dir(&l.digest)
+            cache::layer_dir(&cache::layer_key(&l.digest))
                 .map(|p| p.is_dir())
                 .unwrap_or(false)
         })
@@ -586,7 +590,7 @@ async fn ensure_registry_image(
         .iter()
         .enumerate()
         .filter(|(_, l)| {
-            !crate::cache::layer_dir(&l.digest)
+            !cache::layer_dir(&cache::layer_key(&l.digest))
                 .map(|p| p.is_dir())
                 .unwrap_or(false)
         })
@@ -652,10 +656,7 @@ async fn ensure_registry_image(
     }
 
     // OCI manifests list layers bottom→top; overlayfs wants topmost first.
-    let mut ordered: Vec<String> = layers
-        .iter()
-        .map(|l| crate::cache::digest_name(&l.digest).to_string())
-        .collect();
+    let mut ordered: Vec<String> = layers.iter().map(|l| cache::layer_key(&l.digest)).collect();
     ordered.reverse();
     Ok(ordered)
 }
@@ -683,13 +684,13 @@ async fn fetch_and_extract_layer(
     // thread by blocking on a oneshot from an async task. Instead, invert:
     // pull the blob async → write to .download.tmp → spawn blocking
     // extraction.
-    let layers_root = crate::cache::layers_root()?;
-    let hex = crate::cache::digest_name(&digest).to_string();
-    let download = layers_root.join(format!("{hex}.download"));
-    let download_tmp = layers_root.join(format!("{hex}.download.tmp"));
+    let layers_root = cache::layers_root()?;
+    let key = cache::layer_key(&digest);
+    let download = layers_root.join(format!("{key}.download"));
+    let download_tmp = layers_root.join(format!("{key}.download.tmp"));
 
     // Short-circuit fast path identical to ensure_layer_cached.
-    let layer_dir = crate::cache::layer_dir(&digest)?;
+    let layer_dir = cache::layer_dir(&key)?;
     if layer_dir.is_dir() {
         return Ok(());
     }
@@ -743,9 +744,9 @@ fn format_size(bytes: i64) -> String {
 /// to the next layer); this is coarser than real overlayfs semantics but
 /// is a safe superset for the common case of images that never delete
 /// `/etc/passwd` in an upper layer.
-fn lookup_home_dir(layer_digests: &[String], uid: u32) -> anyhow::Result<String> {
-    for digest in layer_digests {
-        let passwd_path = crate::cache::layer_dir(digest)?.join("etc/passwd");
+fn lookup_home_dir(layer_keys: &[String], uid: u32) -> anyhow::Result<String> {
+    for key in layer_keys {
+        let passwd_path = cache::layer_dir(key)?.join("etc/passwd");
         let Ok(content) = std::fs::read_to_string(&passwd_path) else {
             continue;
         };

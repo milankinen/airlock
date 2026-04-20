@@ -14,6 +14,8 @@
 //! of the composed rootfs and masks `.airlock/` so the container can't
 //! reach back into sandbox internals (CA keys, disk image, lock file).
 
+use std::io::Read;
+use std::os::fd::FromRawFd;
 use std::path::Path;
 
 use tracing::{debug, info};
@@ -110,7 +112,19 @@ pub(super) fn assemble(mounts: &MountConfig) -> anyhow::Result<()> {
         debug!("overlayfs lower: {dir} exists={}", Path::new(dir).is_dir());
     }
     let lower = lower_dirs.join(":");
-    let opts = format!("lowerdir={lower},upperdir={upper},workdir={work},userxattr");
+    // Force `index=off,xino=off`. With `index=on` (the default for RW
+    // overlays) the kernel records a file-handle-based origin xattr on the
+    // upperdir root pointing into the lower, then re-verifies it on every
+    // remount. virtiofsd assigns fresh inode ids across VM restarts, so the
+    // verification fails on the 2nd mount with ESTALE:
+    //     overlayfs: failed to verify upper root origin
+    // `xino=off` matters for the same reason — with `CONFIG_OVERLAY_FS_XINO_AUTO=y`
+    // the kernel would otherwise encode a layer identity into upper inode
+    // numbers that likewise goes stale after a virtiofsd restart.
+    // We don't need `index` (only used for hardlink consistency across
+    // copy-ups, which we don't rely on).
+    let opts =
+        format!("lowerdir={lower},upperdir={upper},workdir={work},userxattr,index=off,xino=off");
     info!("overlayfs opts: {opts}");
     let opts_cstr = std::ffi::CString::new(opts.as_str()).unwrap();
     let overlay_type = std::ffi::CString::new("overlay").unwrap();
@@ -126,6 +140,9 @@ pub(super) fn assemble(mounts: &MountConfig) -> anyhow::Result<()> {
     };
     if ret != 0 {
         let err = std::io::Error::last_os_error();
+        for line in recent_kmsg_overlay_lines() {
+            tracing::error!("kmsg: {line}");
+        }
         anyhow::bail!("failed to mount overlayfs: {err}");
     }
     info!("assembled rootfs via overlayfs");
@@ -174,6 +191,32 @@ pub(super) fn assemble(mounts: &MountConfig) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Drain `/dev/kmsg` non-blocking and return the most recent lines that
+/// mention "overlay". Used to surface the kernel's own error message when
+/// `mount(2)` returns a generic errno like ESTALE.
+fn recent_kmsg_overlay_lines() -> Vec<String> {
+    let fd = unsafe { libc::open(c"/dev/kmsg".as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
+    if fd < 0 {
+        return Vec::new();
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut buf = [0u8; 4096];
+    let mut lines: Vec<String> = Vec::new();
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let line = String::from_utf8_lossy(&buf[..n]).into_owned();
+                if line.to_lowercase().contains("overlay") {
+                    lines.push(line.trim_end().to_string());
+                }
+            }
+        }
+    }
+    let take = lines.len().saturating_sub(20);
+    lines.split_off(take)
 }
 
 /// Reset the overlay upper layer if the base image changed.

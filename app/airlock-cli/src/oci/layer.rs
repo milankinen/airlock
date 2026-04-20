@@ -53,7 +53,8 @@ pub fn ensure_layer_cached<F>(
 where
     F: FnOnce(&Path) -> anyhow::Result<()>,
 {
-    let layer_dir = cache::layer_dir(digest)?;
+    let key = cache::layer_key(digest);
+    let layer_dir = cache::layer_dir(&key)?;
     if layer_dir.is_dir() {
         return Ok(layer_dir);
     }
@@ -89,10 +90,13 @@ where
 /// `layer_dir/` once extraction finished cleanly. Whiteouts are preserved:
 ///
 /// - `.wh.<name>` becomes an empty regular file at `<name>` with a
-///   `user.overlay.whiteout="y"` xattr. Overlayfs mounted with
-///   `userxattr` treats that as a whiteout.
+///   `user.overlay.whiteout="y"` xattr, and the parent directory gets
+///   `user.overlay.opaque="x"` (the userspace opt-in marker — without it
+///   overlayfs only honors the whiteout on lookup, not during readdir, so
+///   the deleted name reappears in directory listings). The "x" marker is
+///   distinct from "y": the latter hides lowers entirely.
 /// - `.wh..wh..opq` sets `user.overlay.opaque="y"` on the parent directory,
-///   marking it as opaque in overlayfs terms.
+///   marking it as fully opaque (lowers hidden at that directory).
 fn extract_tarball_to_cache(
     layer_dir: &Path,
     tarball: &Path,
@@ -175,6 +179,26 @@ fn extract_tarball_to_cache(
                         target.display()
                     )
                 })?;
+                // Mark the parent directory as containing xattr whiteouts.
+                // overlayfs only scans entries for xattr-based whiteouts when
+                // the parent carries `user.overlay.opaque="x"` — without it
+                // the lookup path still returns ENOENT (it reads the xattr
+                // directly) but the readdir merge-iteration path treats the
+                // file as a plain 0-byte regular and the "deleted" name
+                // reappears in directory listings. Note: value "x" is the
+                // userspace opt-in marker, distinct from "y" which makes the
+                // whole dir opaque (lowers hidden). Don't overwrite an
+                // existing "y".
+                let opq = xattr::get(&dir, "user.overlay.opaque").ok().flatten();
+                if opq.as_deref() != Some(b"y") {
+                    xattr::set(&dir, "user.overlay.opaque", b"x").map_err(|e| {
+                        anyhow::anyhow!(
+                            "set user.overlay.opaque=x on {}: {e} \
+                             (host filesystem must support user xattrs)",
+                            dir.display()
+                        )
+                    })?;
+                }
             }
             continue;
         }
@@ -306,6 +330,11 @@ mod tests {
         let val = xattr::get(&whiteout, "user.overlay.whiteout").unwrap();
         assert_eq!(val.as_deref(), Some(b"y" as &[u8]));
         assert!(layer.join("etc/keep").exists());
+        // Parent dir must carry `user.overlay.opaque="x"` so overlayfs
+        // recognizes xattr whiteouts inside it during readdir, not just
+        // lookup.
+        let parent_opq = xattr::get(layer.join("etc"), "user.overlay.opaque").unwrap();
+        assert_eq!(parent_opq.as_deref(), Some(b"x" as &[u8]));
     }
 
     #[test]
@@ -368,6 +397,13 @@ mod tests {
             !download.exists(),
             "tarball should be removed after extract"
         );
+        // Layer dir on disk must carry the `{LAYER_FORMAT}.` prefix — if it
+        // didn't, pre-migration cached layers (without `user.overlay.opaque=x`
+        // on whiteout parents) would silently shadow fresh extracts.
+        assert!(
+            name.to_string_lossy()
+                .starts_with(&format!("{}.", cache::LAYER_FORMAT))
+        );
     }
 
     #[test]
@@ -398,11 +434,11 @@ mod tests {
             std::env::set_var("HOME", &tmp);
         }
         let digest = "sha256:deadbeef5";
-        // Pre-stage a complete tarball at <digest>.download as if a previous
+        // Pre-stage a complete tarball at <key>.download as if a previous
         // process had downloaded it but crashed before extraction.
         let layers_root = cache::layers_root().unwrap();
-        let name = cache::digest_name(digest);
-        let download = layers_root.join(format!("{name}.download"));
+        let key = cache::layer_key(digest);
+        let download = layers_root.join(format!("{key}.download"));
         std::fs::write(&download, build_tarball(&[("staged", b"yes")])).unwrap();
 
         let layer = ensure_layer_cached(
@@ -427,8 +463,8 @@ mod tests {
         }
         let digest = "sha256:deadbeef6";
         let layers_root = cache::layers_root().unwrap();
-        let name = cache::digest_name(digest);
-        let stale = layers_root.join(format!("{name}.download.tmp"));
+        let key = cache::layer_key(digest);
+        let stale = layers_root.join(format!("{key}.download.tmp"));
         std::fs::write(&stale, b"partial garbage").unwrap();
 
         let tarball_src = tmp.join("layer.tar.gz");

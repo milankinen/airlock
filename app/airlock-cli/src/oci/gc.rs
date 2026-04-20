@@ -70,9 +70,9 @@ fn collect_live_layers() -> HashSet<String> {
         let Ok(parsed) = serde_json::from_slice::<CachedLayers>(&data) else {
             continue;
         };
-        for d in parsed.image_layers {
-            live.insert(cache::digest_name(&d).to_string());
-        }
+        // `image_layers` holds versioned layer keys (e.g. `2.<hex>`) that
+        // match the on-disk dir name 1:1 — no normalization needed.
+        live.extend(parsed.image_layers);
     }
     live
 }
@@ -128,17 +128,20 @@ mod tests {
         base
     }
 
-    /// Write a cached image file with the given layer list.
+    /// Write a cached image file with the given layer list. Each `layers`
+    /// entry is a raw digest — this helper normalizes to the versioned
+    /// [`cache::layer_key`] form actually written by the real code.
     fn write_cached_image(digest: &str, layers: &[&str]) -> std::path::PathBuf {
         let path = cache::image_path(digest).unwrap();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
+        let keys: Vec<String> = layers.iter().map(|d| cache::layer_key(d)).collect();
         let json = serde_json::json!({
-            "schema": "v1",
+            "schema": "v2",
             "image_id": digest,
             "name": "test",
-            "image_layers": layers,
+            "image_layers": keys,
             "container_home": "/root",
             "uid": 0,
             "gid": 0,
@@ -161,7 +164,7 @@ mod tests {
     }
 
     fn make_layer(digest: &str) {
-        let dir = cache::layer_dir(digest).unwrap();
+        let dir = cache::layer_dir(&cache::layer_key(digest)).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("marker"), b"x").unwrap();
     }
@@ -183,8 +186,16 @@ mod tests {
         sweep();
 
         assert!(cache::image_path("sha256:live").unwrap().exists());
-        assert!(cache::layer_dir("sha256:L1").unwrap().exists());
-        assert!(cache::layer_dir("sha256:L2").unwrap().exists());
+        assert!(
+            cache::layer_dir(&cache::layer_key("sha256:L1"))
+                .unwrap()
+                .exists()
+        );
+        assert!(
+            cache::layer_dir(&cache::layer_key("sha256:L2"))
+                .unwrap()
+                .exists()
+        );
     }
 
     #[test]
@@ -203,7 +214,11 @@ mod tests {
         sweep();
 
         assert!(!cache::image_path("sha256:orphan").unwrap().exists());
-        assert!(!cache::layer_dir("sha256:X").unwrap().exists());
+        assert!(
+            !cache::layer_dir(&cache::layer_key("sha256:X"))
+                .unwrap()
+                .exists()
+        );
     }
 
     #[test]
@@ -225,8 +240,16 @@ mod tests {
 
         assert!(cache::image_path("sha256:keep").unwrap().exists());
         assert!(!cache::image_path("sha256:drop").unwrap().exists());
-        assert!(cache::layer_dir("sha256:shared").unwrap().exists());
-        assert!(!cache::layer_dir("sha256:gone").unwrap().exists());
+        assert!(
+            cache::layer_dir(&cache::layer_key("sha256:shared"))
+                .unwrap()
+                .exists()
+        );
+        assert!(
+            !cache::layer_dir(&cache::layer_key("sha256:gone"))
+                .unwrap()
+                .exists()
+        );
     }
 
     #[test]

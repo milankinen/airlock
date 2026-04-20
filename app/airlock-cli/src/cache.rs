@@ -7,6 +7,15 @@
 
 use std::path::PathBuf;
 
+/// On-disk format version for the per-layer cache. Bumped whenever the
+/// on-disk contract changes (e.g. the extractor now sets
+/// `user.overlay.opaque="x"` on parent dirs of xattr whiteouts; layers
+/// produced without that mark can't be reused). Every layer dir and
+/// staging file is prefixed with `{LAYER_FORMAT}.`, and the image JSON
+/// schema is bumped in lockstep so stale caches are ignored instead of
+/// silently poisoning fresh runs.
+pub const LAYER_FORMAT: u32 = 2;
+
 /// Shared lock for tests that mutate the process-wide `HOME` env var.
 /// Any test that calls `std::env::set_var("HOME", …)` to redirect the
 /// cache must hold this lock so concurrent tests don't see each other's
@@ -15,10 +24,22 @@ use std::path::PathBuf;
 pub(crate) static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Strip a leading `<algo>:` from a digest, returning just the hash portion.
-/// `sha256:abc123…` → `abc123…`. Used as the on-disk directory name and as
-/// the layer identifier passed to the guest (so guest paths match host paths).
+/// `sha256:abc123…` → `abc123…`. Used as the input to [`layer_key`]; not
+/// used directly as an on-disk name (the layer cache is versioned — see
+/// [`LAYER_FORMAT`]).
 pub fn digest_name(digest: &str) -> &str {
     digest.split(':').next_back().unwrap_or(digest)
+}
+
+/// Normalize an OCI digest into the versioned layer key used as both the
+/// on-disk directory name and the identifier passed to the guest (so guest
+/// mount paths match host paths). Embedding [`LAYER_FORMAT`] into every
+/// layer name means a format bump automatically invalidates the old cache
+/// without needing to locate and wipe it — old dirs stay around until
+/// [`crate::oci::gc_sweep`] reaps them, but they're ignored by anything
+/// that consults the cache.
+pub fn layer_key(digest: &str) -> String {
+    format!("{LAYER_FORMAT}.{}", digest_name(digest))
 }
 
 /// Root cache directory (`~/.cache/airlock/`), created if absent.
@@ -63,7 +84,10 @@ pub fn layers_root() -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Directory for a single cached OCI layer, keyed by its digest hash.
-pub fn layer_dir(digest: &str) -> anyhow::Result<PathBuf> {
-    Ok(layers_root()?.join(digest_name(digest)))
+/// Directory for a single cached OCI layer, keyed by the versioned
+/// [`layer_key`]. Callers holding a raw OCI digest must convert via
+/// `layer_key` first; callers that read a key back from `image_layers`
+/// (stored in the image JSON) pass it through unchanged.
+pub fn layer_dir(key: &str) -> anyhow::Result<PathBuf> {
+    Ok(layers_root()?.join(key))
 }
