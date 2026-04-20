@@ -20,9 +20,29 @@ sandbox VM that boots in seconds, has scriptable network control, and can run
 any Linux-based OCI image. A single self-contained, daemonless binary — no
 Docker required. Works with both macOS and Linux.
 
-See the [user manual](https://milankinen.github.io/airlock) for more detail.
+See the [user manual](https://milankinen.github.io/airlock) for more details.
 
 ![Demo](docs/manual/src/demo.svg)
+
+## Features
+
+- [Scriptable network control](https://milankinen.github.io/airlock/configuration/network.html) — allow/deny
+  patterns per project, with
+  per-host [Lua middleware](https://milankinen.github.io/airlock/advanced/network-scripting.html) to inject auth
+  headers, rewrite URLs, or inspect bodies.
+- [Presets](https://milankinen.github.io/airlock/configuration/presets.html) — one-line `presets = ["rust"]` (or
+  `python`, `node`, `claude-code`, …) wires up the registries and mounts each toolchain needs.
+- [Monitor dashboard](https://milankinen.github.io/airlock/monitor.html) — a live TUI showing every outbound request
+  and connection, CPU + memory use, and a hot-switchable network policy.
+- [File & directory mounts](https://milankinen.github.io/airlock/configuration/mounts.html) — share `~/.ssh/config`,
+  `mise.toml`, or whole directories with bidirectional sync, per-mount read-only / read-write.
+- [Secrets vault](https://milankinen.github.io/airlock/secrets.html) — save API tokens once (OS keychain, encrypted
+  file, or disabled), reference them from config as `${VAR}`. Never leaks into your shell history.
+- [Host port & socket forwarding](https://milankinen.github.io/airlock/configuration/network.html#port-forwarding) —
+  reach the host's PostgreSQL, Redis, or Docker socket from inside the sandbox without exposing them to the network.
+- [Agent hooks integration](https://milankinen.github.io/airlock/tips/experimental-claude-hooks.html)
+  — hook network denies back to the Agent so it sees *why* a tool failed and can stop to ask instead of
+  retrying blindly.
 
 ## Quick start
 
