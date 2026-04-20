@@ -124,3 +124,35 @@ harden = false
 
 This gives processes inside the container the full set of kernel
 capabilities they need to create namespaces and manage cgroups.
+
+### Container networking
+
+airlock intercepts outbound TCP via an `iptables` REDIRECT rule installed
+in the VM's root network namespace. `dockerd` launches each container in
+its own network namespace, and that REDIRECT rule does not exist there —
+so packets from inside a container have no route out of the VM and
+external connections (Docker Hub pulls, `pypi.org`, etc.) hang and time
+out.
+
+Container-to-container traffic on a bridge network is unaffected — the
+limitation only hits container → outside-world traffic. So if your stack
+only talks to itself at runtime, the default Compose bridge works fine.
+
+**Fallback: `network_mode: host`.** If a container genuinely needs
+outbound access at runtime (long-lived, dynamically fetches URLs, etc.),
+run it in host network mode so it rejoins the VM's root netns and
+inherits the REDIRECT rule:
+
+```yaml
+services:
+  app:
+    image: my-app
+    network_mode: host
+```
+
+Trade-offs: you lose Compose's service-name DNS (use `127.0.0.1` for
+peer containers) and every host-net container shares the same port
+space inside the VM.
+
+A proper fix — routing container-netns traffic through airlock's
+network proxy — is on the roadmap.

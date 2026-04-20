@@ -1,0 +1,19 @@
+services:
+  valkey:
+    image: valkey/valkey
+    network_mode: host
+    command: [ "valkey-server", "--bind", "127.0.0.1" ]
+  app:
+    build:
+      context: .
+      dockerfile: app.dockerfile
+      network: host
+      secrets:
+        - airlock_ca
+    network_mode: host
+    depends_on:
+      - valkey
+
+secrets:
+  airlock_ca:
+    file: /etc/ssl/certs/ca-certificates.crt

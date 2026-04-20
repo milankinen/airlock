@@ -1,0 +1,19 @@
+[vm]
+image = "airlock-example:docker"
+
+# Forward the Flask app's port so the host browser can reach
+# http://localhost:8000 once `docker compose up` is running.
+[network.ports.app]
+guest = [8000]
+
+# Start `dockerd` as a sidecar daemon before the shell opens. The
+# bind-mount puts Docker's storage on /airlock/disk so images and the
+# build cache survive sandbox restarts. `harden = false` because
+# dockerd itself needs unprivileged-namespace + cgroup access.
+[daemons.dockerd]
+command = [
+    "sh", "-c",
+    "mkdir -p /airlock/disk/docker /var/lib/docker && mount --bind /airlock/disk/docker /var/lib/docker && exec dockerd",
+]
+harden = false
+timeout = 10
