@@ -6,6 +6,7 @@ pub(crate) mod cli;
 mod cli_server;
 mod config;
 mod constants;
+mod daemon;
 
 pub(crate) mod network;
 mod oci;

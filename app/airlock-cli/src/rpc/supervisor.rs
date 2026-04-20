@@ -5,8 +5,11 @@
 
 use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
 
-use airlock_common::supervisor_capnp::*;
+use airlock_common::supervisor_capnp::{
+    DaemonState as WireDaemonState, RestartPolicy as WireRestartPolicy, *,
+};
 
+use crate::config::config::RestartPolicy;
 use crate::network::Network;
 use crate::project::Project;
 use crate::rpc::logging::LogSinkImpl;
@@ -19,6 +22,41 @@ pub struct StatsSnapshot {
     pub total_bytes: u64,
     pub used_bytes: u64,
     pub load_avg: (f32, f32, f32),
+}
+
+/// Host-side daemon specification, serialized into the `start` RPC. Built
+/// from the TOML config after env templates have been expanded.
+#[derive(Debug, Clone)]
+pub struct DaemonSpec {
+    pub name: String,
+    pub command: Vec<String>,
+    /// `KEY=VALUE` strings, image env already merged in by the builder.
+    pub env: Vec<String>,
+    pub cwd: String,
+    /// Linux signal number for graceful shutdown.
+    pub signal: i32,
+    /// Milliseconds to wait after sending `signal` before SIGKILL. `0` =
+    /// wait forever.
+    pub timeout_ms: u32,
+    pub restart: RestartPolicy,
+    /// Max restart attempts after the initial launch. `0` = no cap.
+    pub max_restarts: u32,
+    pub harden: bool,
+}
+
+/// Current state of a named daemon, returned by
+/// [`Supervisor::poll_daemons`]. `Stopped` and `Killed` are terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonState {
+    Running,
+    Stopped,
+    Killed,
+}
+
+impl DaemonState {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, DaemonState::Stopped | DaemonState::Killed)
+    }
 }
 
 /// Host-side handle to the in-VM supervisor, wrapping the Cap'n Proto client.
@@ -83,6 +121,7 @@ impl Supervisor {
         network: Network,
         epoch: u64,
         epoch_nanos: u32,
+        daemons: &[DaemonSpec],
     ) -> anyhow::Result<Process> {
         let log_sink: log_sink::Client = capnp_rpc::new_client(LogSinkImpl);
 
@@ -187,6 +226,29 @@ impl Supervisor {
             }
         }
 
+        let mut daemons_b = req.get().init_daemons(daemons.len() as u32);
+        for (i, d) in daemons.iter().enumerate() {
+            let mut entry = daemons_b.reborrow().get(i as u32);
+            entry.set_name(d.name.as_str());
+            let mut command_b = entry.reborrow().init_command(d.command.len() as u32);
+            for (j, c) in d.command.iter().enumerate() {
+                command_b.set(j as u32, c.as_str());
+            }
+            let mut env_b = entry.reborrow().init_env(d.env.len() as u32);
+            for (j, e) in d.env.iter().enumerate() {
+                env_b.set(j as u32, e.as_str());
+            }
+            entry.set_cwd(d.cwd.as_str());
+            entry.set_signal(d.signal);
+            entry.set_timeout_ms(d.timeout_ms);
+            entry.set_restart(match d.restart {
+                RestartPolicy::Always => WireRestartPolicy::Always,
+                RestartPolicy::OnFailure => WireRestartPolicy::OnFailure,
+            });
+            entry.set_max_restarts(d.max_restarts);
+            entry.set_harden(d.harden);
+        }
+
         let response = req.send().promise.await?;
         let proc = response.get()?.get_proc()?;
 
@@ -254,6 +316,36 @@ impl Supervisor {
         let req = self.supervisor.shutdown_request();
         if let Err(e) = req.send().promise.await {
             tracing::debug!("shutdown RPC: {e}");
+        }
+    }
+
+    /// Snapshot of every declared daemon's current state. The guest holds
+    /// authoritative state; the host polls during shutdown to drive UI
+    /// until all daemons reach a terminal state.
+    pub async fn poll_daemons(&self) -> anyhow::Result<Vec<(String, DaemonState)>> {
+        let req = self.supervisor.poll_daemons_request();
+        let response = req.send().promise.await?;
+        let states = response.get()?.get_states()?;
+        let mut out = Vec::with_capacity(states.len() as usize);
+        for entry in states {
+            let name = entry.get_name()?.to_str()?.to_string();
+            let state = match entry.get_state()? {
+                WireDaemonState::Running => DaemonState::Running,
+                WireDaemonState::Stopped => DaemonState::Stopped,
+                WireDaemonState::Killed => DaemonState::Killed,
+            };
+            out.push((name, state));
+        }
+        Ok(out)
+    }
+
+    /// Fire-and-forget: ask the supervisor to start graceful shutdown for
+    /// every still-running daemon. Follow up with [`Self::poll_daemons`]
+    /// until all daemons reach a terminal state.
+    pub async fn shutdown_daemons(&self) {
+        let req = self.supervisor.shutdown_daemons_request();
+        if let Err(e) = req.send().promise.await {
+            tracing::debug!("shutdown_daemons RPC: {e}");
         }
     }
 }

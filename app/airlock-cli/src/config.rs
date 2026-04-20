@@ -36,6 +36,9 @@ pub struct Config {
     /// Values support `${VAR}` substitution from the host environment.
     #[config(default)]
     pub env: BTreeMap<String, String>,
+    /// Sidecar processes started in parallel with the main shell.
+    #[config(default)]
+    pub daemons: BTreeMap<String, Daemon>,
 }
 
 #[allow(clippy::module_inception)]
@@ -553,6 +556,147 @@ pub mod config {
 
     impl WellKnown for CacheMount {
         type Deserializer = de::Nested<CacheMount>;
+        const DE: Self::Deserializer = de::nested();
+    }
+
+    /// Restart policy for a daemon process.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum RestartPolicy {
+        /// Restart on any exit until `max-restarts` is reached (default).
+        #[default]
+        Always,
+        /// Restart only on non-zero exit; stop the loop on clean exit.
+        OnFailure,
+    }
+
+    impl WellKnown for RestartPolicy {
+        type Deserializer =
+            smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
+        const DE: Self::Deserializer = smart_config::de::Serde;
+    }
+
+    /// Unix signal used to ask a daemon to shut down gracefully.
+    ///
+    /// Accepts the canonical name (e.g. `"SIGTERM"`) — unknown names fail
+    /// config parse. Numeric signal numbers are not accepted, to avoid
+    /// cross-platform portability traps.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub enum Signal {
+        #[default]
+        Term,
+        Int,
+        Hup,
+        Quit,
+        Usr1,
+        Usr2,
+        Kill,
+    }
+
+    impl Signal {
+        /// Linux signal number (architecture-independent for these signals).
+        #[allow(dead_code)] // used once the host wires daemons into capnp start()
+        pub fn as_number(self) -> i32 {
+            match self {
+                Signal::Hup => 1,
+                Signal::Int => 2,
+                Signal::Quit => 3,
+                Signal::Kill => 9,
+                Signal::Usr1 => 10,
+                Signal::Term => 15,
+                Signal::Usr2 => 12,
+            }
+        }
+    }
+
+    impl std::fmt::Display for Signal {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let s = match self {
+                Signal::Term => "SIGTERM",
+                Signal::Int => "SIGINT",
+                Signal::Hup => "SIGHUP",
+                Signal::Quit => "SIGQUIT",
+                Signal::Usr1 => "SIGUSR1",
+                Signal::Usr2 => "SIGUSR2",
+                Signal::Kill => "SIGKILL",
+            };
+            f.write_str(s)
+        }
+    }
+
+    impl serde::Serialize for Signal {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_str(&self.to_string())
+        }
+    }
+
+    impl<'de> serde::Deserialize<'de> for Signal {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            let s = String::deserialize(d)?;
+            match s.as_str() {
+                "SIGTERM" => Ok(Signal::Term),
+                "SIGINT" => Ok(Signal::Int),
+                "SIGHUP" => Ok(Signal::Hup),
+                "SIGQUIT" => Ok(Signal::Quit),
+                "SIGUSR1" => Ok(Signal::Usr1),
+                "SIGUSR2" => Ok(Signal::Usr2),
+                "SIGKILL" => Ok(Signal::Kill),
+                other => Err(serde::de::Error::custom(format!(
+                    "unknown signal '{other}' — expected one of SIGTERM, SIGINT, SIGHUP, \
+                     SIGQUIT, SIGUSR1, SIGUSR2, SIGKILL"
+                ))),
+            }
+        }
+    }
+
+    impl WellKnown for Signal {
+        type Deserializer =
+            smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
+        const DE: Self::Deserializer = smart_config::de::Serde;
+    }
+
+    /// Sidecar process declared under `[daemons.<name>]`.
+    ///
+    /// Daemons are spawned in parallel with the main shell. They are
+    /// restarted per `restart`/`max-restarts`, and on sandbox shutdown
+    /// are sent `signal`, then SIGKILL'd after `timeout` seconds.
+    #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
+    pub struct Daemon {
+        /// Enable/disable this daemon
+        #[config(default_t = true)]
+        pub enabled: bool,
+        /// Argv for the daemon process
+        pub command: Vec<String>,
+        /// Working directory inside the container (default "/")
+        #[config(default_t = String::from("/"))]
+        pub cwd: String,
+        /// Signal used for graceful shutdown (default SIGTERM).
+        #[config(default)]
+        pub signal: Signal,
+        /// Grace period in seconds after sending `signal` before SIGKILL
+        /// is sent. `0` means wait forever.
+        #[config(default_t = 10)]
+        pub timeout: u32,
+        /// Restart policy: `"always"` (default) or `"on-failure"`.
+        #[config(default)]
+        pub restart: RestartPolicy,
+        /// Maximum number of restarts after the initial launch. `0` means
+        /// no cap.
+        #[config(default_t = 10)]
+        pub max_restarts: u32,
+        /// Apply process hardening (namespace isolation, no-new-privileges).
+        /// Defaults to true; can be set to false even when the main shell
+        /// is hardened (e.g. to run `dockerd`).
+        #[config(default_t = true)]
+        pub harden: bool,
+        /// Environment variables for the daemon process. Values support
+        /// `${VAR}` substitution from the host environment.
+        #[config(default)]
+        pub env: BTreeMap<String, String>,
+    }
+
+    impl WellKnown for Daemon {
+        type Deserializer = de::Nested<Daemon>;
         const DE: Self::Deserializer = de::nested();
     }
 }

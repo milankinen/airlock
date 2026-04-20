@@ -13,7 +13,7 @@ use tracing_subscriber::EnvFilter;
 use crate::cli::{self, CliArgs, LogLevel};
 use crate::runtime::{MonitorRuntime, RawTerminalRuntime, Runtime, Terminal};
 use crate::vault::Vault;
-use crate::{cli_server, config, network, oci, project, rpc, runtime, vm};
+use crate::{cli_server, config, daemon, network, oci, project, rpc, runtime, vm};
 
 /// Default `airlock.toml` written when initializing a new sandbox.
 const DEFAULT_CONFIG: &str = "[vm]\n# image = \"alpine:latest\"\n";
@@ -176,6 +176,9 @@ async fn run(
     // <sandbox_dir>/pty.dump for offline replay/diagnosis.
     let mut pty_dump = pty_dump_file(&project.sandbox_dir);
 
+    let daemon_specs = daemon::build_specs(&project, &vm.env)?;
+    let daemon_names: Vec<String> = daemon_specs.iter().map(|d| d.name.clone()).collect();
+
     // Connected to airlockd - finalize vm init start main proc
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -192,6 +195,7 @@ async fn run(
             network,
             epoch,
             epoch_nanos,
+            &daemon_specs,
         )
         .await?;
 
@@ -206,6 +210,10 @@ async fn run(
     spawn_signal_forwarder(signals, proc.clone());
     let exit_code = poll_proc(&proc, &mut terminal, pty_dump.as_mut()).await;
     let final_code = terminal.exit(exit_code);
+
+    if !daemon_names.is_empty() {
+        daemon::run_shutdown(&supervisor, &daemon_names).await;
+    }
 
     // Sync filesystems before killing VM
     supervisor.shutdown().await;
@@ -348,6 +356,8 @@ fn print_mounts_and_rules(project: &project::Project) {
             }
         }
     }
+
+    daemon::print_verbose(project);
 }
 
 /// Open the PTY dump file if `AIRLOCK_PTY_DUMP=1`, otherwise `None`.

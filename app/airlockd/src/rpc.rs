@@ -5,6 +5,7 @@
 //! to attach sidecar processes. The `shutdown()` call syncs filesystems before
 //! the VM is destroyed.
 
+use std::cell::RefCell;
 use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -14,6 +15,7 @@ use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
 
 use crate::admin::DenyTracker;
+use crate::daemon::{self, DaemonSet, DaemonSpec};
 use crate::init::{CacheConfig, DirMountConfig, FileMountConfig, InitConfig, MountConfig};
 use crate::net::proxy;
 use crate::process::{SpawnedProcess, spawn_root, spawn_user};
@@ -43,6 +45,12 @@ pub struct StartConfig {
     pub init_config: InitConfig,
     pub mount_config: MountConfig,
     pub pty_size: Option<(u16, u16)>,
+    /// Sidecar daemons to start after init. The callback decides when to
+    /// call `DaemonSet::start_all` (typically right after `init::setup`).
+    pub daemons: Vec<DaemonSpec>,
+    /// Shared slot the init callback writes the constructed `DaemonSet` into
+    /// so `pollDaemons`/`shutdownDaemons` can reach it later.
+    pub daemon_set_slot: Rc<RefCell<Option<DaemonSet>>>,
 }
 
 /// Host-side handles for a single process's I/O.
@@ -74,11 +82,13 @@ pub async fn start<Init: AsyncFn(StartConfig) -> anyhow::Result<SpawnedProcess>>
 
     let (conn_tx, conn_rx) = tokio::sync::oneshot::channel::<ConnPayload>();
 
+    let daemon_set: Rc<RefCell<Option<DaemonSet>>> = Rc::new(RefCell::new(None));
     let client: supervisor::Client = capnp_rpc::new_client(SupervisorImpl {
-        start_tx: std::cell::RefCell::new(Some(conn_tx)),
-        exec_creds: std::cell::RefCell::new(None),
-        stats: std::cell::RefCell::new(Collector::new()),
+        start_tx: RefCell::new(Some(conn_tx)),
+        exec_creds: RefCell::new(None),
+        stats: RefCell::new(Collector::new()),
         deny_tracker,
+        daemon_set,
     });
     let rpc = RpcSystem::new(Box::new(network), Some(client.client));
 
@@ -108,10 +118,13 @@ type ConnPayload = (StartConfig, HostProcess);
 /// subsequent calls are rejected because the VM only supports one init sequence.
 /// `uid_gid` is set during `start()` and read by `exec()` to reuse container credentials.
 struct SupervisorImpl {
-    start_tx: std::cell::RefCell<Option<tokio::sync::oneshot::Sender<ConnPayload>>>,
-    exec_creds: std::cell::RefCell<Option<(u32, u32, bool)>>,
-    stats: std::cell::RefCell<Collector>,
+    start_tx: RefCell<Option<tokio::sync::oneshot::Sender<ConnPayload>>>,
+    exec_creds: RefCell<Option<(u32, u32, bool)>>,
+    stats: RefCell<Collector>,
     deny_tracker: Arc<DenyTracker>,
+    /// Populated by the init callback once daemons have been started. Held
+    /// by `Rc` so the same handle lives in `StartConfig.daemon_set_slot`.
+    daemon_set: Rc<RefCell<Option<DaemonSet>>>,
 }
 
 impl supervisor::Server for SupervisorImpl {
@@ -175,6 +188,8 @@ impl supervisor::Server for SupervisorImpl {
             })
             .collect::<Result<Vec<_>, capnp::Error>>()?;
 
+        let daemons = daemon::parse_specs(params.get_daemons()?)?;
+
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
 
         let cfg = StartConfig {
@@ -225,6 +240,8 @@ impl supervisor::Server for SupervisorImpl {
                 ca_cert: params.get_ca_cert()?.to_vec(),
             },
             pty_size,
+            daemons,
+            daemon_set_slot: Rc::clone(&self.daemon_set),
         };
 
         let host_proc = HostProcess {
@@ -370,6 +387,31 @@ impl supervisor::Server for SupervisorImpl {
             la.set_fifteen(fifteen);
         }
 
+        Ok(())
+    }
+
+    async fn poll_daemons(
+        self: Rc<Self>,
+        _params: supervisor::PollDaemonsParams,
+        mut results: supervisor::PollDaemonsResults,
+    ) -> Result<(), capnp::Error> {
+        let snapshot = match self.daemon_set.borrow().as_ref() {
+            Some(ds) => ds.snapshot(),
+            None => Vec::new(),
+        };
+        let list = results.get().init_states(snapshot.len() as u32);
+        daemon::write_status_list(&snapshot, list);
+        Ok(())
+    }
+
+    async fn shutdown_daemons(
+        self: Rc<Self>,
+        _params: supervisor::ShutdownDaemonsParams,
+        _results: supervisor::ShutdownDaemonsResults,
+    ) -> Result<(), capnp::Error> {
+        if let Some(ds) = self.daemon_set.borrow().as_ref() {
+            ds.shutdown_all();
+        }
         Ok(())
     }
 }

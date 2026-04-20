@@ -30,6 +30,9 @@ interface Supervisor {
     # guest init after the overlayfs rootfs is mounted. Empty when the
     # project has no CA (vault disabled / TLS interception off).
     caCert      :Data,
+    # Sidecar processes to start in parallel with the main shell. The
+    # supervisor owns their lifecycle (restart loop, graceful shutdown).
+    daemons     :List(DaemonSpec),
   ) -> (proc :Process);
 
   shutdown @1 () -> ();
@@ -61,6 +64,55 @@ interface Supervisor {
   # to connect inside the guest surface as Cap'n Proto exceptions so
   # the host closes the accepted socket.
   openLocalTcp @5 (port :UInt16, client :TcpSink) -> (server :TcpSink);
+
+  # Snapshot of every declared daemon's current state. Called repeatedly
+  # (e.g. every 100ms) by the host during shutdown UI to drive per-daemon
+  # spinners. Daemons are identified by name across polls.
+  pollDaemons @6 () -> (states :List(DaemonStatus));
+
+  # Fire-and-forget: ask the supervisor to start graceful shutdown for
+  # every still-running daemon. Host follows up with `pollDaemons` until
+  # all daemons reach a terminal state (`stopped` or `killed`).
+  shutdownDaemons @7 () -> ();
+}
+
+struct DaemonSpec {
+  name        @0 :Text;
+  # argv[0] plus arguments.
+  command     @1 :List(Text);
+  # "KEY=VALUE" pairs. Image env is already layered in by the host.
+  env         @2 :List(Text);
+  cwd         @3 :Text;
+  # Signal sent on graceful shutdown (numeric, Linux signal number).
+  signal      @4 :Int32;
+  # Milliseconds to wait for the process to exit after the signal, then
+  # SIGKILL. `0` means wait forever.
+  timeoutMs   @5 :UInt32;
+  restart     @6 :RestartPolicy;
+  # Max restart attempts after the initial launch. `0` = no cap.
+  maxRestarts @7 :UInt32;
+  # Per-daemon hardening override. Independent of the main-shell toggle.
+  harden      @8 :Bool;
+}
+
+enum RestartPolicy {
+  always    @0;
+  onFailure @1;
+}
+
+enum DaemonState {
+  # Currently alive, or between restarts inside the restart loop.
+  running @0;
+  # Terminated cleanly (shutdown, max-restarts reached, or on-failure
+  # clean exit). Terminal.
+  stopped @1;
+  # SIGKILL'd after the graceful-shutdown timeout elapsed. Terminal.
+  killed  @2;
+}
+
+struct DaemonStatus {
+  name  @0 :Text;
+  state @1 :DaemonState;
 }
 
 struct StatsSnapshot {

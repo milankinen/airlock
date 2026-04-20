@@ -5,6 +5,7 @@
 //! guest environment (mounts, networking, DNS) and spawns the user's command.
 
 mod admin;
+mod daemon;
 mod init;
 mod logging;
 mod net;
@@ -53,6 +54,12 @@ async fn run() -> anyhow::Result<()> {
         net::socket::start(&cfg.network, cfg.sockets)?;
         net::start_proxy(cfg.network.clone(), dns).await?;
         admin::start(admin_state.clone()).await?;
+
+        if !cfg.daemons.is_empty() {
+            info!("starting {} daemon(s)", cfg.daemons.len());
+            let set = daemon::DaemonSet::start_all(cfg.daemons, cfg.uid, cfg.gid);
+            *cfg.daemon_set_slot.borrow_mut() = Some(set);
+        }
 
         info!("start: {} {}", cfg.cmd, cfg.args.join(" "));
         let proc = process::spawn_user(

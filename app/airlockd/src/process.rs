@@ -60,35 +60,125 @@ pub fn spawn_user(
     harden: bool,
     pty_size: Option<(u16, u16)>,
 ) -> Result<SpawnedProcess, anyhow::Error> {
-    let cwd = cwd.to_string();
-    // harden is only used in the Linux-specific pre_exec block below
-    #[cfg(not(target_os = "linux"))]
-    let _ = harden;
+    let env_pairs = env_string_pairs(env);
+    let (diag_r, diag_w) = open_diag_pipe();
+    let pre_exec = build_pre_exec(cwd.to_string(), uid, gid, harden, diag_w);
 
-    let env_pairs: Vec<(String, String)> = env
-        .iter()
+    let result = spawn(cmd, args, Some(env_pairs), pre_exec, pty_size);
+    finish_diag_pipe(diag_r, diag_w, result)
+}
+
+/// Spawn a sidecar daemon process with file-backed stdout/stderr. Same
+/// chroot + setuid/setgid + optional hardening as [`spawn_user`], but:
+///
+/// - stdin is `/dev/null` (no host stream to wire in),
+/// - stdout and stderr are dup'd from caller-owned `File`s so each restart
+///   appends to the same open file description (offset preserved).
+///
+/// Returns the `tokio::process::Child` directly — there is no host
+/// `HostProcess` to attach, and the daemon's restart loop owns the child.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_daemon(
+    cmd: &str,
+    args: &[String],
+    env: &[String],
+    cwd: &str,
+    uid: u32,
+    gid: u32,
+    harden: bool,
+    stdout_file: &std::fs::File,
+    stderr_file: &std::fs::File,
+) -> anyhow::Result<tokio::process::Child> {
+    use std::process::Stdio;
+
+    let env_pairs = env_string_pairs(env);
+    let (diag_r, diag_w) = open_diag_pipe();
+    let pre_exec = build_pre_exec(cwd.to_string(), uid, gid, harden, diag_w);
+
+    let stdout_dup = stdout_file.try_clone().context("dup daemon stdout")?;
+    let stderr_dup = stderr_file.try_clone().context("dup daemon stderr")?;
+
+    let mut command = tokio::process::Command::new(cmd);
+    command
+        .args(args)
+        .env_clear()
+        .envs(env_pairs)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_dup))
+        .stderr(Stdio::from(stderr_dup));
+    // Safety: pre_exec runs post-fork in child; only async-signal-safe calls.
+    unsafe { command.pre_exec(pre_exec) };
+    let result = command.spawn().map_err(anyhow::Error::from);
+    finish_diag_pipe(diag_r, diag_w, result)
+}
+
+fn env_string_pairs(env: &[String]) -> Vec<(String, String)> {
+    env.iter()
         .filter_map(|e| {
             let mut parts = e.splitn(2, '=');
             let k = parts.next()?.to_string();
             let v = parts.next().unwrap_or("").to_string();
             Some((k, v))
         })
-        .collect();
+        .collect()
+}
 
-    // Diagnostic pipe: the pre_exec writes a static step name on failure so
-    // the parent can add context to the error.  O_CLOEXEC closes it
-    // automatically on exec (the success path), giving the parent clean EOF.
-    // pipe2 is Linux-specific; on other platforms the diagnostic is skipped.
+/// Open the diagnostic pipe used by the pre-exec hook to report which step
+/// failed. `O_CLOEXEC` closes the write end automatically on a successful
+/// exec, giving the parent a clean EOF. Returns `(-1, -1)` off-Linux.
+fn open_diag_pipe() -> (i32, i32) {
     #[cfg(target_os = "linux")]
-    let [diag_r, diag_w] = {
+    {
         let mut fds = [-1i32; 2];
         unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-        fds
-    };
+        (fds[0], fds[1])
+    }
     #[cfg(not(target_os = "linux"))]
-    let [diag_r, diag_w] = [-1i32, -1i32];
+    {
+        (-1, -1)
+    }
+}
 
-    let pre_exec = move || {
+/// Close the pipe FDs and, on spawn failure, read any tag the pre-exec
+/// child wrote and attach it to the error as context.
+fn finish_diag_pipe<T>(diag_r: i32, diag_w: i32, result: anyhow::Result<T>) -> anyhow::Result<T> {
+    if diag_w >= 0 {
+        unsafe { libc::close(diag_w) };
+    }
+    let result = if result.is_err() && diag_r >= 0 {
+        let mut buf = [0u8; 64];
+        let n = unsafe { libc::read(diag_r, buf.as_mut_ptr().cast(), buf.len()) };
+        if n > 0 {
+            let step = String::from_utf8_lossy(&buf[..n as usize]).into_owned();
+            result.with_context(|| step)
+        } else {
+            result
+        }
+    } else {
+        result
+    };
+    if diag_r >= 0 {
+        unsafe { libc::close(diag_r) };
+    }
+    result
+}
+
+/// Build the post-fork/pre-exec hook: harden → chroot → chdir → setgid →
+/// setuid. On any hard failure it writes a short step tag to `diag_w`
+/// so the parent can attach it as context.
+fn build_pre_exec(
+    cwd: String,
+    uid: u32,
+    gid: u32,
+    harden: bool,
+    diag_w: i32,
+) -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
+    // harden is only consumed on Linux; keep the parameter unconditional
+    // so the signature stays stable across platforms.
+    #[cfg(not(target_os = "linux"))]
+    let _ = harden;
+
+    move || {
         // Save errno first, then write the step tag (write(2) might change it).
         macro_rules! fail {
             ($tag:expr) => {{
@@ -111,8 +201,6 @@ pub fn spawn_user(
             // namespaces. Network namespace is intentionally shared so the
             // container has network access. Failures are ignored — the primary
             // security (NO_NEW_PRIVS + chroot + setuid) remains in effect.
-            // Each flag is tried individually; the diagnostic pipe only fires
-            // for hard failures below (chroot, setgid, setuid).
             unsafe { libc::unshare(libc::CLONE_NEWNS) };
             unsafe { libc::unshare(libc::CLONE_NEWIPC) };
             unsafe { libc::unshare(libc::CLONE_NEWUTS) };
@@ -137,34 +225,7 @@ pub fn spawn_user(
             fail!(b"setuid");
         }
         Ok(())
-    };
-
-    let result = spawn(cmd, args, Some(env_pairs), pre_exec, pty_size);
-
-    // Close parent's write end so read() sees EOF once the child exits.
-    if diag_w >= 0 {
-        unsafe { libc::close(diag_w) };
     }
-
-    // On failure, read the step tag the child wrote and add it as context.
-    let result = if result.is_err() && diag_r >= 0 {
-        let mut buf = [0u8; 64];
-        let n = unsafe { libc::read(diag_r, buf.as_mut_ptr().cast(), buf.len()) };
-        if n > 0 {
-            let step = String::from_utf8_lossy(&buf[..n as usize]);
-            result.with_context(|| format!("{step}"))
-        } else {
-            result
-        }
-    } else {
-        result
-    };
-
-    if diag_r >= 0 {
-        unsafe { libc::close(diag_r) };
-    }
-
-    result
 }
 
 /// Core spawn primitive. Handles PTY/pipe dispatch, env setup, and an optional
