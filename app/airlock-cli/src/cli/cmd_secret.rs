@@ -135,13 +135,13 @@ fn add(vault: &Vault, name: &str, use_stdin: bool, yes: bool) -> anyhow::Result<
     vault
         .set_secret(name, &value)
         .context("write airlock vault")?;
-    cli::log!("  {} stored secret {name}", cli::check());
+    cli::log!("{} stored secret {name}", cli::check());
     Ok(())
 }
 
 fn remove(vault: &Vault, name: &str) -> anyhow::Result<()> {
     if vault.remove_secret(name).context("write airlock vault")? {
-        cli::log!("  {} removed secret {name}", cli::check());
+        cli::log!("{} removed secret {name}", cli::check());
     } else {
         cli::log!("No secret named {name}");
     }
