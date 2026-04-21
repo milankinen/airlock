@@ -65,6 +65,21 @@ pub(super) fn setup(mounts: &MountConfig, nested_virt: bool) -> anyhow::Result<(
         "mode=1777,size=65536k",
     )?;
 
+    // /tmp — a dedicated tmpfs so /tmp is not part of the overlayfs rootfs.
+    // BuildKit's containerd image store mounts its transient overlay at
+    // /tmp/containerd-mount*; if /tmp inherits the outer overlay's
+    // userxattr/xattr semantics the differ fails with EOPNOTSUPP on
+    // security.capability reads. A plain tmpfs side-steps that. noexec
+    // is intentionally omitted — build tools execute scripts from /tmp.
+    std::fs::create_dir_all(format!("{root}/tmp"))?;
+    super::mount::fs(
+        "tmp",
+        &format!("{root}/tmp"),
+        "tmpfs",
+        libc::MS_NOSUID | libc::MS_NODEV,
+        "mode=1777",
+    )?;
+
     // /airlock/disk — ext4 project disk (or tmpfs fallback) exposed directly so
     // container workloads that need a non-overlayfs filesystem (e.g. Docker's
     // overlayfs snapshotter) can bind-mount a subdirectory as needed.
