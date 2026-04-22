@@ -160,16 +160,20 @@ pub async fn main(args: ExecArgs) -> anyhow::Result<i32> {
     Ok(exit_code)
 }
 
-/// Walk up from `start` looking for `.airlock/sandbox/<CLI_SOCK_FILENAME>`.
-/// Returns the first match, or `None` if nothing is found before the
-/// filesystem root.
+/// Walk up from `start` looking for `.airlock/sandbox/`. For each
+/// match resolve the CLI sock path — which is either that directory's
+/// `cli.sock` or a hash-keyed fallback under `~/.cache/airlock/sock/`
+/// when the in-sandbox path would exceed the `AF_UNIX` limit. Returns
+/// the first resolved path that exists on disk.
 fn find_cli_sock(start: &std::path::Path) -> Option<PathBuf> {
     for dir in start.ancestors() {
-        let candidate = dir
-            .join(".airlock")
-            .join("sandbox")
-            .join(airlock_common::CLI_SOCK_FILENAME);
-        if candidate.exists() {
+        let sandbox_dir = dir.join(".airlock").join("sandbox");
+        if !sandbox_dir.is_dir() {
+            continue;
+        }
+        if let Ok(candidate) = crate::cache::cli_sock_path(&sandbox_dir)
+            && candidate.exists()
+        {
             return Some(candidate);
         }
     }

@@ -5,7 +5,9 @@
 //! Per-sandbox state (CA, disk image, overlay, etc.) lives in
 //! `<project>/.airlock/sandbox/` — see `sandbox.rs`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 /// On-disk format version for the per-layer cache. Bumped whenever the
 /// on-disk contract changes (e.g. the extractor now sets
@@ -48,6 +50,33 @@ pub fn cache_dir() -> anyhow::Result<PathBuf> {
     let dir = home.join(".cache").join("airlock");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
+}
+
+/// Where the CLI RPC Unix socket lives for the sandbox at `sandbox_dir`.
+///
+/// Default is `<sandbox_dir>/cli.sock`. `AF_UNIX` has a hard 104-byte
+/// `sun_path` limit on macOS (108 on Linux); deeply nested project
+/// paths overflow that, so we fall back to
+/// `~/.cache/airlock/sock/<hash>.sock` — a short, stable location
+/// derived from the sandbox dir so `airlock start` and `airlock exec`
+/// both compute the same path without any pointer file.
+///
+/// The parent directory is created on demand.
+pub fn cli_sock_path(sandbox_dir: &Path) -> anyhow::Result<PathBuf> {
+    // 103 = min(sun_path) across linux/macos, minus trailing NUL.
+    const SUN_PATH_SAFE: usize = 103;
+
+    let default = sandbox_dir.join(airlock_common::CLI_SOCK_FILENAME);
+    if default.as_os_str().len() <= SUN_PATH_SAFE {
+        return Ok(default);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(sandbox_dir.as_os_str().as_encoded_bytes());
+    let hash = hex::encode(&hasher.finalize()[..8]);
+    let dir = cache_dir()?.join("sock");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir.join(format!("{hash}.sock")))
 }
 
 /// Root of the OCI cache (`~/.cache/airlock/oci/`), created if absent.

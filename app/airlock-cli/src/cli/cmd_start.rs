@@ -226,7 +226,7 @@ async fn run(
     // The server needs a copy of the sandbox's resolved env so it can layer
     // `airlock exec -e KEY=VAL` overrides on top without the exec client
     // having to re-resolve the project.
-    let sock_path = project.sandbox_dir.join(airlock_common::CLI_SOCK_FILENAME);
+    let sock_path = crate::cache::cli_sock_path(&project.sandbox_dir)?;
     let base_env = vm.env.clone();
     tokio::task::spawn_local(cli_server::serve(sock_path, supervisor.clone(), base_env));
 
