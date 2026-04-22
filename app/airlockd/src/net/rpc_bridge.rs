@@ -29,7 +29,7 @@ use tracing::error;
 /// Send a `NetworkProxy.connect` request for a TCP target and return
 /// the host-side sink. Callers decide whether to log errors at `debug`
 /// (expected; e.g. remote denied) or `error` (unexpected).
-pub(crate) async fn rpc_connect_tcp(
+pub async fn rpc_connect_tcp(
     network: &network_proxy::Client,
     host: &str,
     port: u16,
@@ -63,7 +63,7 @@ pub(crate) async fn rpc_connect_tcp(
 /// sink is what the host uses to push bytes into the guest's local TCP
 /// connection. A connect failure surfaces as an error the caller turns
 /// into a Cap'n Proto exception.
-pub(crate) async fn open_local_tcp(
+pub async fn open_local_tcp(
     port: u16,
     client: tcp_sink::Client,
 ) -> anyhow::Result<tcp_sink::Client> {
@@ -83,7 +83,7 @@ pub(crate) async fn open_local_tcp(
 /// Bidirectional byte relay between a local TCP stream and a remote
 /// RPC sink. Whichever direction ends first tears down the other:
 /// the client sink is closed and the local write half is shut down.
-pub(crate) async fn relay(
+pub async fn relay(
     local_read: &mut (impl AsyncReadExt + Unpin),
     local_write: &mut (impl AsyncWriteExt + Unpin),
     remote_sink: tcp_sink::Client,
@@ -132,20 +132,20 @@ pub(crate) async fn relay(
 /// When a `notify` is attached, every successful `send`/`close` pings
 /// it so a consumer that can't await the channel directly (notably the
 /// sync smoltcp poll loop) can be woken without polling.
-pub(crate) struct ChannelSink {
+pub struct ChannelSink {
     tx: RefCell<Option<mpsc::Sender<Bytes>>>,
     notify: Option<Rc<Notify>>,
 }
 
 impl ChannelSink {
-    pub(crate) fn new(tx: mpsc::Sender<Bytes>) -> Self {
+    pub fn new(tx: mpsc::Sender<Bytes>) -> Self {
         Self {
             tx: RefCell::new(Some(tx)),
             notify: None,
         }
     }
 
-    pub(crate) fn with_notify(tx: mpsc::Sender<Bytes>, notify: Rc<Notify>) -> Self {
+    pub fn with_notify(tx: mpsc::Sender<Bytes>, notify: Rc<Notify>) -> Self {
         Self {
             tx: RefCell::new(Some(tx)),
             notify: Some(notify),

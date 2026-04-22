@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 /// Example: with `root = /mnt/overlay/rootfs` and `guest_path = /var/run/docker.sock`,
 /// if `var/run` is a symlink to `/run`, this returns
 /// `/mnt/overlay/rootfs/run/docker.sock` rather than `/run/docker.sock`.
+#[allow(dead_code)]
 pub fn resolve_in_root(root: &Path, guest_path: &str) -> PathBuf {
     let mut path = root.to_path_buf();
     for component in Path::new(guest_path).components() {

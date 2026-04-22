@@ -49,11 +49,11 @@ async fn run() -> anyhow::Result<()> {
             cfg.nested_virt,
         )?;
 
-        let dns = Rc::new(net::dns::DnsState::new());
-        net::dns::start(dns.clone()).await?;
-        net::host_socket_forward::start(&cfg.network, cfg.sockets)?;
-        net::host_port_forward::start(&cfg.init_config.host_ports, cfg.network.clone()).await?;
-        net::tcp_proxy::start(cfg.network.clone(), dns)?;
+        let dns = Rc::new(net::DnsState::new());
+        net::start_dns(dns.clone()).await?;
+        net::start_host_socket_forward(&cfg.network, cfg.sockets)?;
+        net::start_host_port_forward(&cfg.init_config.host_ports, cfg.network.clone()).await?;
+        net::start_tcp_proxy(cfg.network.clone(), dns)?;
         admin::start(admin_state.clone()).await?;
 
         if !cfg.daemons.is_empty() {

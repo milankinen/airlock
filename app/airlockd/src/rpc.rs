@@ -17,11 +17,12 @@ use futures::AsyncReadExt;
 use crate::admin::DenyTracker;
 use crate::daemon::{self, DaemonSet, DaemonSpec};
 use crate::init::{CacheConfig, DirMountConfig, FileMountConfig, InitConfig, MountConfig};
-use crate::net::rpc_bridge;
+use crate::net;
 use crate::process::{SpawnedProcess, spawn_root, spawn_user};
 use crate::stats::Collector;
 
 /// Unix socket forwarding pair: host-side path and guest-side path.
+#[allow(dead_code)]
 pub struct SocketForwardConfig {
     pub host: String,
     pub guest: String,
@@ -351,7 +352,7 @@ impl supervisor::Server for SupervisorImpl {
         let port = params.get_port();
         let client = params.get_client()?;
 
-        let server = rpc_bridge::open_local_tcp(port, client)
+        let server = net::open_local_tcp(port, client)
             .await
             .map_err(|e| capnp::Error::failed(format!("open 127.0.0.1:{port}: {e}")))?;
         results.get().set_server(server);
