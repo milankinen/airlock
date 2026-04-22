@@ -140,7 +140,7 @@ The static picture: what runs where, and how the pieces talk.
   <text x="573" y="303" class="arch-conn" text-anchor="middle">chroot + exec</text>
   <path class="arch-arrow-line" d="M 722,308 C 722,298 722,298 722,288" marker-end="url(#arch-arrow)" stroke-dasharray="3 3"/>
   <rect x="653" y="292" width="132" height="14" class="arch-label-bg"/>
-  <text x="722" y="303" class="arch-conn" text-anchor="middle">iptables → TCP proxy</text>
+  <text x="722" y="303" class="arch-conn" text-anchor="middle">TUN → TCP proxy</text>
 </svg>
 </div>
 
@@ -158,9 +158,10 @@ The static picture: what runs where, and how the pieces talk.
 - **VirtioFS** (not drawn) — each directory/file mount and the
   per-layer OCI cache are exported as VirtioFS shares, mounted by
   init at `/mnt/<tag>`, and bind-mounted into the rootfs.
-- **iptables → TCP proxy** (dashed) — all guest TCP is redirected to
-  an in-VM proxy listener which dials back through `NetworkProxy` on
-  the vsock.
+- **TUN → TCP proxy** (dashed) — all guest TCP egress routes through
+  `airlock0`, a TUN device owned by the supervisor. A userspace TCP
+  stack (smoltcp) accepts each flow and dials back through
+  `NetworkProxy` on the vsock.
 
 ### Startup flow
 

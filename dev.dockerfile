@@ -27,5 +27,8 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 RUN curl -fsSL https://gh.io/copilot-install | bash
 RUN npm i -g @openai/codex
 
+# network debugging tools
+RUN apt-get install -y iproute2 tcpdump iptables
+
 ENTRYPOINT ["/bin/bash"]
 

@@ -1,36 +1,48 @@
 # Networking
 
-All outbound network access from the container goes through a
-host-side proxy. There is no route from the VM to the outside world
-except via the supervisor's vsock RPC — the kernel is built without a
-real egress NIC, and iptables inside the VM redirects every outbound
-TCP connection to an in-VM proxy listener that relays through RPC.
+All outbound network access from the VM goes through a host-side
+proxy. There is no route from the VM to the outside world except via
+the supervisor's vsock RPC — the kernel is built without a real
+egress NIC, and every outbound TCP connection is intercepted by a
+userspace TCP/IP stack (smoltcp) running on an in-VM TUN device
+(`airlock0`). The TUN is wired as the VM's default route, so every
+packet that isn't loopback-local ends up in the proxy regardless of
+which netns it originated in (including Docker containers).
 
 ```
 container socket()/connect(host, port)
   → virtual DNS maps host → synthetic IP in 10.2.0.0/16
-  → iptables TCP REDIRECT to 127.0.0.1:15001 (in-VM proxy)
-  → SO_ORIGINAL_DST recovers the synthetic IP, reverses → host
+  → default route sends packet to airlock0 (TUN device)
+  → smoltcp parses the SYN, creates a listener for (dst_ip, dst_port)
+  → TCP handshake completes inside smoltcp
+  → DNS reverse-lookup maps synthetic IP back to hostname
   → supervisor.NetworkProxy.connect(host:port) over vsock
   → CLI on host resolves host, dials real server (+ optional TLS MITM)
-  → bidirectional byte relay
+  → bidirectional byte relay (smoltcp socket ↔ RPC sinks)
 ```
+
+The TUN-based approach replaced an earlier iptables `REDIRECT` design.
+The fatal flaw of iptables REDIRECT is that the OUTPUT chain only
+fires for *locally originated* traffic. Packets forwarded from a
+container netns traverse PREROUTING, not OUTPUT, so they never hit
+the rule and never reached the proxy. A TUN at the default route
+catches everything — no chain-matching subtleties.
 
 ## Virtual DNS
 
 The container's `/etc/resolv.conf` points at `nameserver 10.0.0.1`,
-which is a minimal UDP DNS server the supervisor runs inside the VM.
-Instead of forwarding DNS queries to the host, the supervisor
-allocates a **synthetic IP** from `10.2.0.0/16` for each hostname that
-gets queried and caches the bidirectional mapping.
+which is a minimal UDP DNS server the supervisor runs inside the VM
+on loopback. Instead of forwarding queries to the host, the supervisor
+allocates a **synthetic IP** from `10.2.0.0/16` for each hostname and
+caches the bidirectional mapping.
 
 This matters because the proxy sees an IP, not a name. When the
-container `connect()`s to the synthetic IP, iptables `REDIRECT`
-rewrites the destination to `127.0.0.1:15001` but preserves the
-original in the socket's `SO_ORIGINAL_DST`. The proxy recovers the
-synthetic IP, reverse-looks it up in the DNS cache, and has the real
-hostname for policy evaluation and TLS SNI. This works uniformly for
-HTTP, HTTPS, and raw TCP — there is no protocol-specific logic.
+container `connect()`s to the synthetic IP, the packet routes via the
+TUN; smoltcp snoops the SYN and creates a listener for that specific
+`(dst_ip, dst_port)`. On accept, the proxy reverse-looks up the
+synthetic IP in the DNS cache and has the real hostname for policy
+evaluation and TLS SNI. This works uniformly for HTTP, HTTPS, and raw
+TCP — there is no protocol-specific logic.
 
 Real DNS resolution happens on the host: the synthetic IP never
 escapes the VM. The CLI gets the hostname, calls the system resolver,
@@ -72,8 +84,8 @@ the `start` RPC and injected into the rootfs by guest init — see
 [Mounts / CA certificate injection](./mounts.md#ca-certificate-injection).
 
 All TLS logic runs **in the CLI**, not in the supervisor. The
-in-VM proxy is a pure TCP relay: `SO_ORIGINAL_DST` + DNS reverse
-lookup + raw byte forwarding over vsock. The CLI then:
+in-VM proxy is a pure TCP relay: DNS reverse lookup + raw byte
+forwarding over vsock. The CLI then:
 
 1. Incrementally reads the first bytes of the stream and uses
    `tls-parser` to validate the TLS record header. First byte `0x16`
@@ -109,13 +121,16 @@ scripting API.
 
 ## Localhost port forwarding
 
-Ports declared as "host ports" in the config get per-port iptables
-`REDIRECT` rules inside the VM so that connections to
-`127.0.0.1:<port>` are transparently forwarded to the host. Other
-localhost traffic passes through directly so local VM services still
-work. The redirected traffic lands on the in-VM proxy listener, which
-opens a new connection back to the host port via the `NetworkProxy`
-RPC.
+Ports declared as "host ports" in the config get a dedicated
+`TcpListener` bound by the supervisor on `127.0.0.1:<port>` before any
+user process or daemon starts — so the supervisor always wins the
+bind race. On accept, the listener opens a `NetworkProxy.connect`
+call targeted at `127.0.0.1:<port>` and relays bytes both ways. No
+iptables rules, no `SO_ORIGINAL_DST`, no shared proxy port: each
+listener already knows its port.
+
+Other localhost traffic is unaffected — it stays on `lo` and reaches
+whatever is listening on the VM's loopback.
 
 ## Unix socket forwarding
 

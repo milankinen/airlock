@@ -88,6 +88,15 @@ scc = "2"
 simple-dns = "0.9"
 quick_cache = "0.6"
 
+# Userspace TCP/IP for TUN-based netns-transparent interception
+smoltcp = { version = "0.13", default-features = false, features = [
+    "std",
+    "log",
+    "medium-ip",
+    "proto-ipv4",
+    "socket-tcp",
+] }
+
 # TLS parsing
 tls-parser = "0.12"
 

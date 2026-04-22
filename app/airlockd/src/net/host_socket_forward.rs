@@ -5,7 +5,6 @@
 //! the `NetworkProxy` RPC interface, which connects to the corresponding
 //! host-side Unix socket (e.g. a Docker socket or SSH agent).
 
-use std::cell::RefCell;
 use std::path::Path;
 
 use airlock_common::supervisor_capnp::{connect_result, network_proxy, tcp_sink};
@@ -14,7 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tracing::{debug, error, info};
 
-use super::proxy::ChannelSink;
+use super::rpc_bridge::ChannelSink;
 use crate::rpc::SocketForwardConfig;
 
 /// Bind all socket listeners synchronously, then spawn the accept loops.
@@ -91,8 +90,7 @@ async fn relay(
 
     // Set up RPC channel for server→local data
     let (server_tx, mut server_rx) = tokio::sync::mpsc::channel::<Bytes>(1);
-    let server_sink: tcp_sink::Client =
-        capnp_rpc::new_client(ChannelSink(RefCell::new(Some(server_tx))));
+    let server_sink: tcp_sink::Client = capnp_rpc::new_client(ChannelSink::new(server_tx));
 
     // Call host NetworkProxy.connect with the guest socket path.
     // The CLI maps guest → host path (with tilde expansion) on its side.

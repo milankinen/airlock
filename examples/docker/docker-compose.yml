@@ -1,19 +1,20 @@
 services:
   valkey:
     image: valkey/valkey
-    network_mode: host
-    command: [ "valkey-server", "--bind", "127.0.0.1" ]
+
   app:
-    build:
-      context: .
-      dockerfile: app.dockerfile
-      network: host
-      secrets:
-        - airlock_ca
-    network_mode: host
+    image: ghcr.io/astral-sh/uv:python3.12-alpine
+    working_dir: /app
+    volumes:
+      - ./app.py:/app/app.py:ro
+      # The airlock CA bundle is injected into the VM at this path.
+      # uv reads it via SSL_CERT_FILE when resolving the script's deps
+      # over the MITM'd HTTPS to PyPI.
+      - /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro
+    environment:
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+    command: [ "uv", "run", "/app/app.py" ]
+    ports:
+      - "8000:8000"
     depends_on:
       - valkey
-
-secrets:
-  airlock_ca:
-    file: /etc/ssl/certs/ca-certificates.crt

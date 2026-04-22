@@ -1,14 +1,17 @@
-//! Guest networking: bring loopback up, give it a routable /8 so the
-//! in-VM proxy can listen on 10.0.0.1, and redirect all outbound TCP
-//! through the proxy on port 15001. Also writes `/etc/resolv.conf`
-//! pointing at the proxy's DNS listener.
+//! Guest networking: bring loopback up and give it `10.0.0.1/32` so
+//! the in-VM DNS server can listen there. All other egress runs
+//! through the TCP proxy on the TUN (see `net::tcp_proxy`), which
+//! installs its own default route on `airlock0`. Host-published ports
+//! are handled by per-port loopback listeners (see
+//! `net::host_port_forward`), so no iptables rules are required.
 
 use std::process::Command;
 
 use tracing::{debug, info};
 
-/// Configure loopback networking and iptables rules.
-pub(super) fn setup(host_ports: &[u16]) -> anyhow::Result<()> {
+/// Configure loopback networking. The default route is installed by
+/// `tcp_proxy::start` once `airlock0` is up.
+pub(super) fn setup(_host_ports: &[u16]) -> anyhow::Result<()> {
     run_cmd(&["/sbin/ip", "link", "set", "lo", "up"])?;
 
     write_sysctl("/proc/sys/net/ipv4/conf/lo/route_localnet", "1")?;
@@ -16,69 +19,10 @@ pub(super) fn setup(host_ports: &[u16]) -> anyhow::Result<()> {
     write_sysctl("/proc/sys/net/ipv4/conf/lo/rp_filter", "0")?;
     write_sysctl("/proc/sys/net/ipv4/ip_forward", "1")?;
 
-    run_cmd(&["/sbin/ip", "addr", "add", "10.0.0.1/8", "dev", "lo"])?;
-    run_cmd(&[
-        "/sbin/ip", "route", "add", "default", "via", "10.0.0.1", "dev", "lo",
-    ])?;
-
-    for port in host_ports {
-        run_cmd(&[
-            "/usr/sbin/iptables",
-            "-t",
-            "nat",
-            "-A",
-            "OUTPUT",
-            "-p",
-            "tcp",
-            "-d",
-            "127.0.0.1",
-            "--dport",
-            &port.to_string(),
-            "-j",
-            "REDIRECT",
-            "--to-port",
-            "15001",
-        ])?;
-    }
-    run_cmd(&[
-        "/usr/sbin/iptables",
-        "-t",
-        "nat",
-        "-A",
-        "OUTPUT",
-        "-p",
-        "tcp",
-        "-d",
-        "127.0.0.1",
-        "-j",
-        "RETURN",
-    ])?;
-    run_cmd(&[
-        "/usr/sbin/iptables",
-        "-t",
-        "nat",
-        "-A",
-        "OUTPUT",
-        "-p",
-        "tcp",
-        "--dport",
-        "15001",
-        "-j",
-        "RETURN",
-    ])?;
-    run_cmd(&[
-        "/usr/sbin/iptables",
-        "-t",
-        "nat",
-        "-A",
-        "OUTPUT",
-        "-p",
-        "tcp",
-        "-j",
-        "REDIRECT",
-        "--to-port",
-        "15001",
-    ])?;
+    // Only the /32 — if we reserved the whole /8 for lo, the virtual-DNS
+    // IPs we hand out (10.2.0.0/16) would shadow the default airlock0
+    // route and sink to lo with no listener.
+    run_cmd(&["/sbin/ip", "addr", "add", "10.0.0.1/32", "dev", "lo"])?;
 
     info!("networking configured");
     Ok(())

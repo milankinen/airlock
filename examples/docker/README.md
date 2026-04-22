@@ -21,7 +21,7 @@ docker build -t airlock-example:docker -f sandbox.dockerfile .
 Then start the daemon.
 
 ```bash
-airlock start -- docker compose up --build
+airlock start -- docker compose up
 ```
 
 Now you can open (host) browser at http://localhost:8000 to see

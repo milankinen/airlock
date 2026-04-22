@@ -17,7 +17,7 @@ use futures::AsyncReadExt;
 use crate::admin::DenyTracker;
 use crate::daemon::{self, DaemonSet, DaemonSpec};
 use crate::init::{CacheConfig, DirMountConfig, FileMountConfig, InitConfig, MountConfig};
-use crate::net::proxy;
+use crate::net::rpc_bridge;
 use crate::process::{SpawnedProcess, spawn_root, spawn_user};
 use crate::stats::Collector;
 
@@ -351,7 +351,7 @@ impl supervisor::Server for SupervisorImpl {
         let port = params.get_port();
         let client = params.get_client()?;
 
-        let server = proxy::open_local_tcp(port, client)
+        let server = rpc_bridge::open_local_tcp(port, client)
             .await
             .map_err(|e| capnp::Error::failed(format!("open 127.0.0.1:{port}: {e}")))?;
         results.get().set_server(server);

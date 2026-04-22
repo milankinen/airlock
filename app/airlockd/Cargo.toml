@@ -26,6 +26,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 scc = { workspace = true }
 simple-dns = { workspace = true }
+smoltcp = { workspace = true }
 tokio = { workspace = true, features = ["rt", "net", "io-util", "macros", "process", "time"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }

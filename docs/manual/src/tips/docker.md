@@ -127,32 +127,16 @@ capabilities they need to create namespaces and manage cgroups.
 
 ### Container networking
 
-airlock intercepts outbound TCP via an `iptables` REDIRECT rule installed
-in the VM's root network namespace. `dockerd` launches each container in
-its own network namespace, and that REDIRECT rule does not exist there —
-so packets from inside a container have no route out of the VM and
-external connections (Docker Hub pulls, `pypi.org`, etc.) hang and time
-out.
+Container egress works on the default Compose bridge — no `network_mode:
+host` workarounds needed. airlock's TCP proxy runs on a TUN device
+(`airlock0`) wired as the VM's default route, so every outbound packet
+ends up in the proxy regardless of which netns it came from. Docker's
+own bridge + MASQUERADE rules pass traffic through unchanged; the
+proxy just sees MASQUERADE'd source IPs (the VM's airlock0 address),
+which is fine because airlock keys policy on the *destination*.
 
-Container-to-container traffic on a bridge network is unaffected — the
-limitation only hits container → outside-world traffic. So if your stack
-only talks to itself at runtime, the default Compose bridge works fine.
-
-**Fallback: `network_mode: host`.** If a container genuinely needs
-outbound access at runtime (long-lived, dynamically fetches URLs, etc.),
-run it in host network mode so it rejoins the VM's root netns and
-inherits the REDIRECT rule:
-
-```yaml
-services:
-  app:
-    image: my-app
-    network_mode: host
-```
-
-Trade-offs: you lose Compose's service-name DNS (use `127.0.0.1` for
-peer containers) and every host-net container shares the same port
-space inside the VM.
-
-A proper fix — routing container-netns traffic through airlock's
-network proxy — is on the roadmap.
+Compose's service-name DNS works as expected (it's internal to the
+bridge network and never touches airlock's virtual DNS). Published
+ports (`ports: ["8000:8000"]`) also work via the standard loopback
+path: docker-proxy binds the VM's `127.0.0.1:<port>`, and airlock's
+`guest = [8000]` reverse-forward exposes that on the host.

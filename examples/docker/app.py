@@ -1,14 +1,22 @@
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "flask==3.1.2",
+#     "valkey==6.1.1",
+# ]
+# ///
+
 from flask import Flask
 from valkey import Valkey
 
 app = Flask(__name__)
-valkey = Valkey(host='valkey', port=6379)
+valkey_client = Valkey(host="valkey", port=6379)
 
 
-@app.route('/')
+@app.route("/")
 def hello():
-    valkey.incr('hits')
-    counter = str(valkey.get('hits'), 'utf-8')
+    valkey_client.incr("hits")
+    counter = str(valkey_client.get("hits"), "utf-8")
     return "This webpage has been viewed " + counter + " time(s)"
 
 

@@ -25,9 +25,10 @@ mounts win over earlier dir bind mounts.
    - `files/rw` and/or `files/ro` — only mounted when the config has
      any file mounts of that kind.
 
-3. **Networking** (`net::setup`) — loopback `10.0.0.1/8`, default
-   route, iptables rules for localhost port forwarding (host port → in-VM
-   TCP proxy on port 15001).
+3. **Networking** (`net::setup`) — loopback with `10.0.0.1/32` for
+   the in-VM DNS server and sysctl tuning. The default route is
+   installed later by `tcp_proxy::start` once `airlock0` (the TUN
+   device) is up. No iptables rules are required.
 
 4. **Project disk** (`disk::setup`) — formats the ext4 image if blank
    (`mkfs.ext4`), mounts it at `/mnt/disk`. Resizes the filesystem if

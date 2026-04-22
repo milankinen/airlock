@@ -51,8 +51,9 @@ async fn run() -> anyhow::Result<()> {
 
         let dns = Rc::new(net::dns::DnsState::new());
         net::dns::start(dns.clone()).await?;
-        net::socket::start(&cfg.network, cfg.sockets)?;
-        net::start_proxy(cfg.network.clone(), dns).await?;
+        net::host_socket_forward::start(&cfg.network, cfg.sockets)?;
+        net::host_port_forward::start(&cfg.init_config.host_ports, cfg.network.clone()).await?;
+        net::tcp_proxy::start(cfg.network.clone(), dns)?;
         admin::start(admin_state.clone()).await?;
 
         if !cfg.daemons.is_empty() {
