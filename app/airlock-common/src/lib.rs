@@ -40,3 +40,10 @@ pub const NETWORK_PORT: u32 = 1025;
 /// Filename of the Unix domain socket that `airlock go` creates on the host so
 /// that `airlock exec` can attach sidecar processes to the running container.
 pub const CLI_SOCK_FILENAME: &str = "cli.sock";
+
+/// Read-buffer size used by every TCP/Unix relay loop that pushes bytes
+/// into a `TcpSink.send` call. Bigger chunks mean fewer capnp messages
+/// (less framing overhead) but do not measurably improve throughput
+/// beyond this value in practice — TCP batching in the guest and
+/// host kernels already coalesces bytes before they reach a relay.
+pub const RELAY_CHUNK_SIZE: usize = 8 * 1024;

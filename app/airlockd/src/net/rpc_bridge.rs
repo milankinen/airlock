@@ -90,7 +90,7 @@ pub async fn relay(
     remote_rx: &mut mpsc::Receiver<Bytes>,
 ) {
     let to_remote = async {
-        let mut buf = [0u8; 8192];
+        let mut buf = vec![0u8; airlock_common::RELAY_CHUNK_SIZE];
         loop {
             match local_read.read(&mut buf).await {
                 Ok(0) => break,

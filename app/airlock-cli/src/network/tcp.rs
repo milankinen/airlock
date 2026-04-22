@@ -46,7 +46,7 @@ pub async fn connect_server(addr: &str) -> anyhow::Result<io::Transport> {
 /// When either direction closes, both sides are fully shut down.
 pub async fn relay(mut container: io::Transport, mut server: io::Transport) {
     let c2s = async {
-        let mut buf = [0u8; 8192];
+        let mut buf = vec![0u8; airlock_common::RELAY_CHUNK_SIZE];
         loop {
             match container.read.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
@@ -60,7 +60,7 @@ pub async fn relay(mut container: io::Transport, mut server: io::Transport) {
     };
 
     let s2c = async {
-        let mut buf = [0u8; 8192];
+        let mut buf = vec![0u8; airlock_common::RELAY_CHUNK_SIZE];
         loop {
             match server.read.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
