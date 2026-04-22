@@ -46,10 +46,11 @@ impl<S: tracing::Subscriber> Layer<S> for RpcLayer {
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
         let level = match *event.metadata().level() {
-            tracing::Level::ERROR => 3,
-            tracing::Level::WARN => 2,
-            tracing::Level::INFO => 1,
-            tracing::Level::DEBUG | tracing::Level::TRACE => 0,
+            tracing::Level::ERROR => 4,
+            tracing::Level::WARN => 3,
+            tracing::Level::INFO => 2,
+            tracing::Level::DEBUG => 1,
+            tracing::Level::TRACE => 0,
         };
 
         let mut visitor = MsgVisitor(String::new());

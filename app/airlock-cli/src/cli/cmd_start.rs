@@ -8,6 +8,7 @@ use std::io::Write;
 use clap::Args;
 use dialoguer::Select;
 use dialoguer::theme::ColorfulTheme;
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::{self, CliArgs, LogLevel};
@@ -198,6 +199,7 @@ async fn run(
             &daemon_specs,
         )
         .await?;
+    info!("vm process started");
 
     // Start CLI server so `airlock exec` can attach processes to this VM.
     // The server needs a copy of the sandbox's resolved env so it can layer
@@ -209,17 +211,25 @@ async fn run(
 
     spawn_signal_forwarder(signals, proc.clone());
     let exit_code = poll_proc(&proc, &mut terminal, pty_dump.as_mut()).await;
+    info!("vm process exited, code = {exit_code}");
+
     let final_code = terminal.exit(exit_code);
+    info!("terminal exit, final code = {final_code}");
 
     if !daemon_names.is_empty() {
+        info!("daemon shutdown");
         daemon::run_shutdown(&supervisor, &daemon_names).await;
     }
 
     // Sync filesystems before killing VM
+    info!("supervisor shutdown");
     supervisor.shutdown().await;
 
     // Drain file-sync events then destroy VM.
+    info!("vm shutdown");
     vm.shutdown().await;
+
+    info!("all done, exit");
     Ok(final_code)
 }
 
@@ -262,7 +272,8 @@ async fn poll_proc(
                 terminal.stderr(&data);
             }
             Err(e) => {
-                tracing::trace!("host poll error: {e}");
+                // poll errors should not happen
+                tracing::error!("host poll error: {e}");
                 return 1;
             }
         }

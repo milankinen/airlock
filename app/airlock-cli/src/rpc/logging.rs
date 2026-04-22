@@ -16,10 +16,11 @@ impl log_sink::Server for LogSinkImpl {
         let message = params.get_message()?.to_str()?;
 
         match level {
-            0 => tracing::debug!(target: "airlock::airlockd", "{message}"),
-            1 => tracing::info!(target: "airlock::airlockd", "{message}"),
-            2 => tracing::warn!(target: "airlock::airlockd", "{message}"),
-            _ => tracing::error!(target: "airlock::airlockd", "{message}"),
+            1 => tracing::debug!(target: "airlock::airlockd", "{message}"),
+            2 => tracing::info!(target: "airlock::airlockd", "{message}"),
+            3 => tracing::warn!(target: "airlock::airlockd", "{message}"),
+            4 => tracing::error!(target: "airlock::airlockd", "{message}"),
+            _ => tracing::trace!(target: "airlock::airlockd", "{message}"),
         }
         Ok(())
     }
