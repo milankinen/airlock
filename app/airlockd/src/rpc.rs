@@ -422,4 +422,14 @@ impl supervisor::Server for SupervisorImpl {
         }
         Ok(())
     }
+
+    async fn sync_clock(
+        self: Rc<Self>,
+        params: supervisor::SyncClockParams,
+        _results: supervisor::SyncClockResults,
+    ) -> Result<(), capnp::Error> {
+        let params = params.get()?;
+        crate::init::set_clock(params.get_epoch(), params.get_epoch_nanos());
+        Ok(())
+    }
 }

@@ -16,7 +16,9 @@ mounts win over earlier dir bind mounts.
 
 1. **Clock** (`clock::set`) — the host passes Unix epoch + nanos in
    the `start` RPC; the guest sets the system clock so timestamps are
-   correct from the start.
+   correct from the start. The host re-pushes the wall-clock every
+   minute via `Supervisor.syncClock` to correct drift after host
+   sleeps (VMs have no RTC).
 
 2. **VirtioFS shares** (`mount::virtiofs`):
    - `layers` — shared per-layer OCI cache (read-only).

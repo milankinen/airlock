@@ -216,6 +216,12 @@ async fn run(
         .await?;
     info!("vm process started");
 
+    // Push the host wall-clock into the guest every minute so the VM
+    // clock stays in sync across host sleeps (laptop lid closed,
+    // suspend). VMs have no RTC, so without this the guest time
+    // drifts by exactly the sleep duration.
+    supervisor.spawn_clock_sync(std::time::Duration::from_secs(60));
+
     // Start CLI server so `airlock exec` can attach processes to this VM.
     // The server needs a copy of the sandbox's resolved env so it can layer
     // `airlock exec -e KEY=VAL` overrides on top without the exec client

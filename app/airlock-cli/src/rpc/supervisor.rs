@@ -106,6 +106,35 @@ impl Supervisor {
         self.supervisor.clone()
     }
 
+    /// Spawn a background task that pushes the host wall-clock into the
+    /// guest every `interval`. VMs have no RTC, so long host sleeps
+    /// (laptop lid closed, suspend) cause the guest clock to drift —
+    /// breaking TLS validation and every `mtime`-driven build tool.
+    /// The RPC is cheap (one UInt64 + UInt32 round-trip) and idempotent;
+    /// we just keep re-setting the guest clock to the current host
+    /// value.
+    pub fn spawn_clock_sync(&self, interval: std::time::Duration) {
+        let supervisor = self.supervisor.clone();
+        tokio::task::spawn_local(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // Skip the immediate first tick — the guest's clock was
+            // just set by `Supervisor.start`.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let mut req = supervisor.sync_clock_request();
+                req.get().set_epoch(now.as_secs());
+                req.get().set_epoch_nanos(now.subsec_nanos());
+                if let Err(e) = req.send().promise.await {
+                    tracing::debug!("clock sync: {e}");
+                }
+            }
+        });
+    }
+
     /// Send the initial `Supervisor.start()` RPC to bootstrap the VM and
     /// launch the main container process. Returns a [`Process`] handle for
     /// polling output and forwarding signals.

@@ -83,3 +83,14 @@ pub fn setup(
 ) -> anyhow::Result<()> {
     unimplemented!("supervisor only runs inside the Linux VM");
 }
+
+/// Reapply the host wall-clock to the guest. Idempotent; called at
+/// startup via `setup` and periodically thereafter via the
+/// `Supervisor.syncClock` RPC to correct drift after host sleeps.
+#[cfg(target_os = "linux")]
+pub fn set_clock(epoch: u64, epoch_nanos: u32) {
+    linux::set_clock(epoch, epoch_nanos);
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn set_clock(_epoch: u64, _epoch_nanos: u32) {}

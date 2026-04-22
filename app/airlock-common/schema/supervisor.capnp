@@ -81,6 +81,12 @@ interface Supervisor {
   # every still-running daemon. Host follows up with `pollDaemons` until
   # all daemons reach a terminal state (`stopped` or `killed`).
   shutdownDaemons @7 () -> ();
+
+  # Reapply the host wall-clock to the guest. VMs have no RTC; the
+  # initial clock is set in `start @0`, but long host sleeps (laptop
+  # lid closed) cause the guest time to drift. The host polls this
+  # every few seconds to keep them within wake-up-jitter of each other.
+  syncClock @8 (epoch :UInt64, epochNanos :UInt32) -> ();
 }
 
 struct DaemonSpec {

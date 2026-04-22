@@ -19,6 +19,12 @@ mod mount;
 mod net;
 mod overlay;
 
+/// Apply the host wall-clock to `CLOCK_REALTIME`. See
+/// [`super::set_clock`].
+pub(super) fn set_clock(epoch: u64, epoch_nanos: u32) {
+    clock::set(epoch, epoch_nanos);
+}
+
 /// Run all guest initialization steps in order, including container mounts.
 pub fn setup(
     config: &InitConfig,
