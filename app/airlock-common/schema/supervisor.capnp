@@ -1,10 +1,17 @@
 @0x947ecba86848333b;
 
+using Network = import "network.capnp";
+
+# In-VM supervisor RPC. Runs over the primary vsock port
+# (SUPERVISOR_PORT). The `NetworkProxy` capability is NOT passed
+# through `start` anymore — it is the bootstrap capability of the
+# separate network vsock (NETWORK_PORT). Splitting the flows gives
+# bulk network transfers independent buffers so they cannot stall
+# pty / stats / daemon traffic on this channel.
 interface Supervisor {
   start @0 (
     stdin      :Stdin,
     pty        :PtyConfig,
-    network    :NetworkProxy,
     logs       :LogSink,
     logFilter  :Text,
     epoch      :UInt64,
@@ -63,7 +70,7 @@ interface Supervisor {
   # via the sink pair. Raw relay — no rules, no interception. Failures
   # to connect inside the guest surface as Cap'n Proto exceptions so
   # the host closes the accepted socket.
-  openLocalTcp @5 (port :UInt16, client :TcpSink) -> (server :TcpSink);
+  openLocalTcp @5 (port :UInt16, client :Network.TcpSink) -> (server :Network.TcpSink);
 
   # Snapshot of every declared daemon's current state. Called repeatedly
   # (e.g. every 100ms) by the host during shutdown UI to drive per-daemon
@@ -137,19 +144,6 @@ struct LoadAverage {
   fifteen @2 :Float32;
 }
 
-# CLI server interface — exposed over the unix socket by `airlock go`.
-# `airlock exec` connects here to attach new processes to the running container.
-interface CliService @0xb5ce8d3c8a4a7d2f {
-  exec @0 (
-    stdin :Stdin,
-    pty   :PtyConfig,
-    cmd   :Text,
-    args  :List(Text),
-    cwd   :Text,
-    env   :List(Text)
-  ) -> (proc :Process);
-}
-
 struct SocketForward {
   host @0 :Text;
   guest @1 :Text;
@@ -215,35 +209,6 @@ struct DataFrame {
     eof @0 :Void;
     data @1 :Data;
   }
-}
-
-interface NetworkProxy {
-  connect @0 (target :ConnectTarget, client :TcpSink)
-    -> (result :ConnectResult);
-}
-
-struct ConnectTarget {
-  union {
-    tcp @0 :TcpTarget;
-    socket @1 :Text;
-  }
-}
-
-struct TcpTarget {
-  host @0 :Text;
-  port @1 :UInt16;
-}
-
-struct ConnectResult {
-  union {
-    server @0 :TcpSink;
-    denied @1 :Text;
-  }
-}
-
-interface TcpSink {
-  send @0 (data :Data) -> stream;
-  close @1 () -> ();
 }
 
 interface LogSink {

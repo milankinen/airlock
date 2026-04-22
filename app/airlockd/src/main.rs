@@ -1,8 +1,9 @@
 //! In-VM supervisor process.
 //!
-//! Runs as PID 1 inside the guest Linux VM. Listens on a virtio-vsock port for
-//! a single Cap'n Proto RPC connection from the host CLI, then bootstraps the
-//! guest environment (mounts, networking, DNS) and spawns the user's command.
+//! Runs as PID 1 inside the guest Linux VM. Accepts two vsock
+//! connections from the host CLI — the supervisor RPC channel and the
+//! network-proxy RPC channel — bootstraps the guest environment
+//! (mounts, networking, DNS), and spawns the user's command.
 
 mod admin;
 mod daemon;
@@ -15,8 +16,12 @@ mod stats;
 mod util;
 mod vsock;
 
+use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
 use std::rc::Rc;
 
+use airlock_common::network_capnp::network_proxy;
+use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
+use futures::AsyncReadExt;
 use tokio::task::LocalSet;
 use tracing::info;
 
@@ -24,21 +29,32 @@ use tracing::info;
 #[allow(clippy::large_futures)]
 async fn main() -> anyhow::Result<()> {
     let local = LocalSet::new();
-    local.run_until(run()).await?;
+    local.run_until(airlockd()).await?;
     Ok(())
 }
 
-/// Single-connection lifecycle: accept the host CLI connection, set up the
-/// guest, run the user's process, then idle until the VM is torn down.
-async fn run() -> anyhow::Result<()> {
-    let listen_fd = vsock::listen(airlock_common::SUPERVISOR_PORT)?;
-    let conn_fd = vsock::accept(&listen_fd)?;
-    drop(listen_fd);
+/// Single-connection lifecycle: accept the host CLI connections
+/// (supervisor + network), set up the guest, run the user's process,
+/// then idle until the VM is torn down.
+async fn airlockd() -> anyhow::Result<()> {
+    // Supervisor channel first — accept blocks until the host connects.
+    let sup_listen = vsock::listen(airlock_common::SUPERVISOR_PORT)?;
+    let sup_conn = vsock::accept(&sup_listen)?;
+    drop(sup_listen);
+
+    // Network channel second. The host opens this right after the
+    // supervisor one so bulk transfers on `NetworkProxy.connect` get
+    // their own socket buffers and cannot head-of-line-block pty /
+    // stats / daemon traffic on the supervisor channel.
+    let net_listen = vsock::listen(airlock_common::NETWORK_PORT)?;
+    let net_conn = vsock::accept(&net_listen)?;
+    drop(net_listen);
+    let network = bootstrap_network_client(net_conn)?;
 
     let admin_state = admin::AdminState::new();
     let deny_tracker = admin_state.deny_tracker.clone();
 
-    let exit_code = rpc::start(conn_fd, deny_tracker, async |cfg| {
+    let exit_code = rpc::start(sup_conn, deny_tracker, network, async |cfg| {
         logging::init(cfg.log_sink, &cfg.log_filter);
 
         info!("setup vm");
@@ -86,4 +102,26 @@ async fn run() -> anyhow::Result<()> {
     std::future::pending::<()>().await;
 
     Ok(())
+}
+
+/// Turn the accepted network-channel fd into a `NetworkProxy` client
+/// capability. The guest is the capnp *client* side here (the host
+/// serves the bootstrap `NetworkProxy`), even though the guest accepted
+/// the vsock connection — vsock direction and capnp side are
+/// independent.
+fn bootstrap_network_client(conn_fd: OwnedFd) -> anyhow::Result<network_proxy::Client> {
+    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(conn_fd.into_raw_fd()) };
+    std_stream.set_nonblocking(true)?;
+    let stream = tokio::net::TcpStream::from_std(std_stream)?;
+    let (reader, writer) = tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
+    let transport = twoparty::VatNetwork::new(
+        reader,
+        writer,
+        rpc_twoparty_capnp::Side::Client,
+        capnp::message::ReaderOptions::default(),
+    );
+    let mut rpc = RpcSystem::new(Box::new(transport), None);
+    let network: network_proxy::Client = rpc.bootstrap(rpc_twoparty_capnp::Side::Server);
+    tokio::task::spawn_local(rpc);
+    Ok(network)
 }

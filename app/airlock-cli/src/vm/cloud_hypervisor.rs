@@ -140,10 +140,10 @@ impl CloudHypervisorBackend {
         })
     }
 
-    /// Connect to the in-VM supervisor via the cloud-hypervisor vsock socket.
-    /// Performs the `CONNECT <port>` handshake that cloud-hypervisor expects.
-    pub fn vsock_connect(&self) -> anyhow::Result<OwnedFd> {
-        let port = airlock_common::SUPERVISOR_PORT;
+    /// Open a vsock connection to the given guest port via the
+    /// cloud-hypervisor vsock socket. Performs the `CONNECT <port>`
+    /// handshake that cloud-hypervisor expects.
+    pub fn vsock_connect(&self, port: u32) -> anyhow::Result<OwnedFd> {
         let mut stream = UnixStream::connect(&self.vsock_socket_path).map_err(|e| {
             anyhow::anyhow!("vsock connect to {}: {e}", self.vsock_socket_path.display())
         })?;

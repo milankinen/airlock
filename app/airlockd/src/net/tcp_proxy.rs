@@ -44,7 +44,7 @@ use std::os::unix::io::AsRawFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant as StdInstant};
 
-use airlock_common::supervisor_capnp::network_proxy;
+use airlock_common::network_capnp::network_proxy;
 use bytes::Bytes;
 use smoltcp::iface::{Config, Interface, PollIngressSingleResult, Route, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};

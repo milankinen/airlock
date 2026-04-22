@@ -211,7 +211,7 @@ pub struct Network {
     /// Port forward mappings: guest_port → host_port.
     port_forwards: HashMap<u16, u16>,
     /// Guest socket path → host socket path mapping for Unix socket forwarding.
-    pub(super) socket_map: HashMap<String, PathBuf>,
+    pub(crate) socket_map: HashMap<String, PathBuf>,
     /// Network events to subscribe to
     // TODO: this NetworkEvent should be Network event agnostic to any TUI
     events: broadcast::Sender<airlock_monitor::NetworkEvent>,

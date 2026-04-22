@@ -9,6 +9,7 @@
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use airlock_common::cli_capnp::*;
 use airlock_common::supervisor_capnp::*;
 use futures::AsyncReadExt;
 

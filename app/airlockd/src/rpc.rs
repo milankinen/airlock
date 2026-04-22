@@ -10,6 +10,7 @@ use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use airlock_common::network_capnp::network_proxy;
 use airlock_common::supervisor_capnp::*;
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
@@ -67,6 +68,7 @@ pub struct HostProcess {
 pub async fn start<Init: AsyncFn(StartConfig) -> anyhow::Result<SpawnedProcess>>(
     conn_fd: OwnedFd,
     deny_tracker: Arc<DenyTracker>,
+    network: network_proxy::Client,
     init: Init,
 ) -> anyhow::Result<i32> {
     let std_stream = unsafe { std::net::TcpStream::from_raw_fd(conn_fd.into_raw_fd()) };
@@ -74,7 +76,7 @@ pub async fn start<Init: AsyncFn(StartConfig) -> anyhow::Result<SpawnedProcess>>
     let stream = tokio::net::TcpStream::from_std(std_stream)?;
     let (reader, writer) = tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
 
-    let network = twoparty::VatNetwork::new(
+    let transport = twoparty::VatNetwork::new(
         reader,
         writer,
         rpc_twoparty_capnp::Side::Server,
@@ -90,8 +92,9 @@ pub async fn start<Init: AsyncFn(StartConfig) -> anyhow::Result<SpawnedProcess>>
         stats: RefCell::new(Collector::new()),
         deny_tracker,
         daemon_set,
+        network: network.clone(),
     });
-    let rpc = RpcSystem::new(Box::new(network), Some(client.client));
+    let rpc = RpcSystem::new(Box::new(transport), Some(client.client));
 
     tokio::task::spawn_local(rpc);
     let (cfg, host_proc) = conn_rx.await.expect("host connection failed");
@@ -126,6 +129,10 @@ struct SupervisorImpl {
     /// Populated by the init callback once daemons have been started. Held
     /// by `Rc` so the same handle lives in `StartConfig.daemon_set_slot`.
     daemon_set: Rc<RefCell<Option<DaemonSet>>>,
+    /// Bootstrap capability of the separate network vsock connection,
+    /// threaded into `StartConfig` so downstream net modules can reach
+    /// the host without going through this supervisor channel.
+    network: network_proxy::Client,
 }
 
 impl supervisor::Server for SupervisorImpl {
@@ -196,7 +203,7 @@ impl supervisor::Server for SupervisorImpl {
         let cfg = StartConfig {
             log_sink: params.get_logs()?,
             log_filter: params.get_log_filter()?.to_str()?.to_string(),
-            network: params.get_network()?,
+            network: self.network.clone(),
             sockets: params
                 .get_sockets()?
                 .iter()

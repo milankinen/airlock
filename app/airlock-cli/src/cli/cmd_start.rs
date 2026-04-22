@@ -180,6 +180,21 @@ async fn run(
     let daemon_specs = daemon::build_specs(&project, &vm.env)?;
     let daemon_names: Vec<String> = daemon_specs.iter().map(|d| d.name.clone()).collect();
 
+    // Extract socket-forward metadata before Network is consumed by
+    // the NetworkProxy RPC server.
+    let socket_fwds: Vec<(String, String)> = network
+        .socket_map
+        .iter()
+        .map(|(guest, host)| (host.to_string_lossy().into_owned(), guest.clone()))
+        .collect();
+
+    // Open the dedicated vsock for NetworkProxy RPC and serve `Network`
+    // as its bootstrap capability. Keeps bulk byte relays off the
+    // supervisor channel so pty / stats / daemon traffic can't be
+    // head-of-line-blocked.
+    let network_fd = vm.vsock_connect(airlock_common::NETWORK_PORT).await?;
+    rpc::serve_network(network_fd, network)?;
+
     // Connected to airlockd - finalize vm init start main proc
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -193,7 +208,7 @@ async fn run(
             &vm,
             stdin_client,
             pty_size,
-            network,
+            &socket_fwds,
             epoch,
             epoch_nanos,
             &daemon_specs,

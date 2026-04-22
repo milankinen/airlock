@@ -10,7 +10,6 @@ use airlock_common::supervisor_capnp::{
 };
 
 use crate::config::config::RestartPolicy;
-use crate::network::Network;
 use crate::project::Project;
 use crate::rpc::logging::LogSinkImpl;
 use crate::rpc::process::Process;
@@ -118,19 +117,12 @@ impl Supervisor {
         vm: &crate::vm::VmInstance,
         stdin: stdin::Client,
         pty_size: Option<(u16, u16)>,
-        network: Network,
+        socket_fwds: &[(String, String)],
         epoch: u64,
         epoch_nanos: u32,
         daemons: &[DaemonSpec],
     ) -> anyhow::Result<Process> {
         let log_sink: log_sink::Client = capnp_rpc::new_client(LogSinkImpl);
-
-        // Collect socket forwards before network is moved into the RPC capability.
-        let socket_fwds: Vec<(String, String)> = network
-            .socket_map
-            .iter()
-            .map(|(guest, host)| (host.to_string_lossy().into_owned(), guest.clone()))
-            .collect();
 
         let mut req = self.supervisor.start_request();
         req.get().set_stdin(stdin);
@@ -141,7 +133,6 @@ impl Supervisor {
         } else {
             req.get().init_pty().set_none(());
         }
-        req.get().set_network(capnp_rpc::new_client(network));
         req.get().set_logs(log_sink);
         req.get().set_log_filter(args.log_filter());
 

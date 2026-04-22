@@ -20,7 +20,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use airlock_common::supervisor_capnp::{connect_result, network_proxy, tcp_sink};
+use airlock_common::network_capnp::{connect_result, network_proxy, tcp_sink};
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Notify, mpsc};

@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
-use airlock_common::supervisor_capnp::tcp_sink;
+use airlock_common::network_capnp::tcp_sink;
 use bytes::{Buf, Bytes};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;

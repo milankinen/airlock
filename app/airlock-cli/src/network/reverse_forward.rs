@@ -22,7 +22,8 @@ use std::cell::RefCell;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::rc::Rc;
 
-use airlock_common::supervisor_capnp::{supervisor, tcp_sink};
+use airlock_common::network_capnp::tcp_sink;
+use airlock_common::supervisor_capnp::supervisor;
 use anyhow::Context;
 use bytes::Bytes;
 use tokio::net::{TcpListener, TcpStream};

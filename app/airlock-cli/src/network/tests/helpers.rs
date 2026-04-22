@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use airlock_common::supervisor_capnp::{connect_result, network_proxy, tcp_sink};
+use airlock_common::network_capnp::{connect_result, network_proxy, tcp_sink};
 use axum::Router;
 use bytes::{Buf, Bytes};
 use capnp_rpc::{rpc_twoparty_capnp, twoparty};

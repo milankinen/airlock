@@ -1,4 +1,4 @@
-use airlock_common::supervisor_capnp::network_proxy;
+use airlock_common::network_capnp::network_proxy;
 use axum::Router;
 use axum::extract::Path;
 use axum::routing::{get, post};

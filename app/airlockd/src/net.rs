@@ -42,7 +42,7 @@ mod tun;
 use std::rc::Rc;
 
 #[cfg(not(target_os = "linux"))]
-use airlock_common::supervisor_capnp::{network_proxy, tcp_sink};
+use airlock_common::network_capnp::{network_proxy, tcp_sink};
 #[cfg(target_os = "linux")]
 pub use dns::DnsState;
 #[cfg(target_os = "linux")]

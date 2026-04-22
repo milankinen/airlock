@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use airlock_common::supervisor_capnp::tcp_sink;
+use airlock_common::network_capnp::tcp_sink;
 use bytes::Bytes;
 use quick_cache::sync::Cache;
 use rcgen::{CertificateParams, Issuer, KeyPair};

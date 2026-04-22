@@ -12,7 +12,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use airlock_common::supervisor_capnp::*;
+use airlock_common::cli_capnp::*;
 use clap::Args;
 use futures::AsyncReadExt;
 

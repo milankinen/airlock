@@ -12,7 +12,7 @@
 //! Outbound traffic to destinations *other* than these loopback ports
 //! flows through the TCP proxy on the TUN (see `net::tcp_proxy`).
 
-use airlock_common::supervisor_capnp::network_proxy;
+use airlock_common::network_capnp::network_proxy;
 use bytes::Bytes;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info};

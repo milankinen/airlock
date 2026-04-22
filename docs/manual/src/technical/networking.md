@@ -2,12 +2,22 @@
 
 All outbound network access from the VM goes through a host-side
 proxy. There is no route from the VM to the outside world except via
-the supervisor's vsock RPC — the kernel is built without a real
+two vsock RPC connections — the kernel is built without a real
 egress NIC, and every outbound TCP connection is intercepted by a
 userspace TCP/IP stack (smoltcp) running on an in-VM TUN device
 (`airlock0`). The TUN is wired as the VM's default route, so every
 packet that isn't loopback-local ends up in the proxy regardless of
 which netns it originated in (including Docker containers).
+
+The host ↔ guest RPC is split across two vsock ports so bulk network
+traffic can never head-of-line-block interactive traffic:
+
+- `SUPERVISOR_PORT` — supervisor RPC, pty, logs, stats, daemon
+  control. Everything *except* network byte relays.
+- `NETWORK_PORT` — `NetworkProxy.connect` and its per-connection
+  byte sinks. Independent socket buffers, independent `RpcSystem`,
+  independent flow control. A slow reader on one never stalls the
+  other.
 
 ```
 container socket()/connect(host, port)

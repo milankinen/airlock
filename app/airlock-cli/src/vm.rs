@@ -111,6 +111,29 @@ impl VmInstance {
             handle.shutdown().await;
         }
     }
+
+    /// Open a vsock connection to the given guest port. Retries every
+    /// 200ms for up to ~12 s because the guest may still be booting
+    /// (first call) or may have just started listening on a new port
+    /// after the initial handshake (subsequent calls).
+    pub async fn vsock_connect(&self, port: u32) -> anyhow::Result<OwnedFd> {
+        const MAX_ATTEMPTS: u32 = 60;
+        const DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+        let mut last_err = None;
+        for _ in 0..MAX_ATTEMPTS {
+            match self.vm_handle.vsock_connect(port).await {
+                Ok(fd) => return Ok(fd),
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(DELAY).await;
+                }
+            }
+        }
+        Err(anyhow::anyhow!(
+            "vsock connect to port {port} failed after {MAX_ATTEMPTS} attempts: {}",
+            last_err.expect("at least one attempt")
+        ))
+    }
 }
 
 /// Boot the VM with the given config and image. Returns a `VmInstance` (for
@@ -154,27 +177,28 @@ pub async fn start(
         kvm: project.config.vm.kvm,
     };
 
-    let (vm_handle, vsock_fd) = boot_backend(&vm_config).await?;
+    let vm_handle = boot_backend(&vm_config).await?;
     let sync_handle = file_sync::start(&mounts, &overlay_dir);
 
-    Ok((
-        VmInstance {
-            vm_handle,
-            sync_handle,
-            image_id: image.image_id.clone(),
-            image_layers: image.image_layers.clone(),
-            mounts,
-            disk_image,
-            caches,
-            container_home: image.container_home.clone(),
-            cmd,
-            env,
-            cwd,
-            uid: image.uid,
-            gid: image.gid,
-        },
-        vsock_fd,
-    ))
+    let vm = VmInstance {
+        vm_handle,
+        sync_handle,
+        image_id: image.image_id.clone(),
+        image_layers: image.image_layers.clone(),
+        mounts,
+        disk_image,
+        caches,
+        container_home: image.container_home.clone(),
+        cmd,
+        env,
+        cwd,
+        uid: image.uid,
+        gid: image.gid,
+    };
+    // Wait for the in-VM supervisor to start listening. Reuses the
+    // same retry loop as every other vsock we open later.
+    let vsock_fd = vm.vsock_connect(airlock_common::SUPERVISOR_PORT).await?;
+    Ok((vm, vsock_fd))
 }
 
 /// Build the sandbox dir mount and resolve all enabled user mounts.
@@ -374,55 +398,22 @@ fn log_config(project: &Project, shares: &[VmShare]) {
     }
 }
 
-/// Start the platform-specific VM backend and wait for the supervisor vsock.
-async fn boot_backend(
-    vm_config: &config::VmConfig,
-) -> anyhow::Result<(Box<dyn VmHandle>, OwnedFd)> {
+/// Start the platform-specific VM backend. Waiting for a particular
+/// vsock port to be ready is caller responsibility — see
+/// [`VmInstance::vsock_connect`].
+#[cfg_attr(not(target_os = "macos"), allow(clippy::unused_async))]
+async fn boot_backend(vm_config: &config::VmConfig) -> anyhow::Result<Box<dyn VmHandle>> {
     #[cfg(target_os = "macos")]
     {
         let mut backend = apple::AppleVmBackend::new(vm_config)?;
         backend.start().await?;
-        let vsock_fd = {
-            let mut attempts = 0;
-            loop {
-                match backend.vsock_connect(airlock_common::SUPERVISOR_PORT).await {
-                    Ok(fd) => break fd,
-                    Err(e) => {
-                        attempts += 1;
-                        if attempts >= 30 {
-                            return Err(anyhow::anyhow!(
-                                "supervisor not reachable after {attempts} attempts: {e}"
-                            ));
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                }
-            }
-        };
-        Ok((Box::new(backend), vsock_fd))
+        Ok(Box::new(backend))
     }
 
     #[cfg(target_os = "linux")]
     {
         let backend = cloud_hypervisor::CloudHypervisorBackend::start(vm_config)?;
-        let vsock_fd = {
-            let mut attempts = 0u32;
-            loop {
-                match backend.vsock_connect() {
-                    Ok(fd) => break fd,
-                    Err(e) => {
-                        attempts += 1;
-                        if attempts >= 60 {
-                            return Err(anyhow::anyhow!(
-                                "supervisor not reachable after {attempts} attempts: {e}"
-                            ));
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    }
-                }
-            }
-        };
-        Ok((Box::new(backend), vsock_fd))
+        Ok(Box::new(backend))
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -436,6 +427,12 @@ async fn boot_backend(
 #[allow(dead_code)]
 trait VmHandle {
     fn wait_for_stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>>;
+    /// Open a fresh vsock connection to the given guest port. Used to
+    /// open the network-proxy channel after the supervisor one is up.
+    fn vsock_connect(
+        &self,
+        port: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<OwnedFd>> + '_>>;
 }
 
 #[cfg(target_os = "macos")]
@@ -443,11 +440,23 @@ impl VmHandle for apple::AppleVmBackend {
     fn wait_for_stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>> {
         Box::pin(apple::AppleVmBackend::wait_for_stop_impl(self))
     }
+    fn vsock_connect(
+        &self,
+        port: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<OwnedFd>> + '_>> {
+        Box::pin(apple::AppleVmBackend::vsock_connect(self, port))
+    }
 }
 
 #[cfg(target_os = "linux")]
 impl VmHandle for cloud_hypervisor::CloudHypervisorBackend {
     fn wait_for_stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>> {
         Box::pin(cloud_hypervisor::CloudHypervisorBackend::wait_for_stop_impl(self))
+    }
+    fn vsock_connect(
+        &self,
+        port: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<OwnedFd>> + '_>> {
+        Box::pin(async move { cloud_hypervisor::CloudHypervisorBackend::vsock_connect(self, port) })
     }
 }

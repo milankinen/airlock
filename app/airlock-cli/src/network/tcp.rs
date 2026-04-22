@@ -1,4 +1,4 @@
-use airlock_common::supervisor_capnp::tcp_sink;
+use airlock_common::network_capnp::tcp_sink;
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
