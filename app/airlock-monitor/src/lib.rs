@@ -421,30 +421,34 @@ fn handle_key(
     kitty_enabled: bool,
     mouse_captured: &mut bool,
 ) -> anyhow::Result<Option<i32>> {
-    // Global shortcuts
+    // Global shortcuts. F2 also exits selection mode since the Monitor
+    // tab is entirely click-driven — leaving the user stuck in
+    // passthrough-mouse on Monitor would be confusing.
     match (key.modifiers, key.code) {
         (_, KeyCode::F(1)) => {
             app.active_tab = Tab::Sandbox;
             return Ok(None);
         }
         (_, KeyCode::F(2)) => {
+            if !*mouse_captured {
+                crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
+                *mouse_captured = true;
+                app.mouse_captured = true;
+            }
             app.active_tab = Tab::Monitor;
             return Ok(None);
         }
         _ => {}
     }
 
-    // Auto-exit selection mode: Esc or Ctrl+C in the sandbox tab re-enables
-    // mouse capture so the click-to-select flow is reversible.
-    if app.active_tab == Tab::Sandbox
-        && !*mouse_captured
-        && (key.code == KeyCode::Esc
-            || (key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c')))
-    {
+    // Auto-exit selection mode: any keypress on the Sandbox tab
+    // re-enables mouse capture. Fall through so the same key still
+    // reaches the normal Sandbox handler below — the user intent is
+    // "keep typing", not "eat this keystroke".
+    if app.active_tab == Tab::Sandbox && !*mouse_captured {
         crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
         *mouse_captured = true;
         app.mouse_captured = true;
-        return Ok(None);
     }
 
     match app.active_tab {
@@ -473,7 +477,13 @@ fn handle_key(
             }
             if app.monitor.network.details_open() {
                 match key.code {
+                    // `q`, Esc, and X all close the details pane first,
+                    // staying on the Monitor tab. A second `q` from the
+                    // list view then goes back to Sandbox (below).
                     KeyCode::Esc | KeyCode::Char('x' | 'X') => {
+                        app.monitor.network.close_details();
+                    }
+                    KeyCode::Char('q' | 'Q') if key.modifiers.is_empty() => {
                         app.monitor.network.close_details();
                     }
                     KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
@@ -493,9 +503,6 @@ fn handle_key(
                         app.monitor
                             .network
                             .open_policy_dropdown(app.network.policy());
-                    }
-                    KeyCode::Char('q' | 'Q') if key.modifiers.is_empty() => {
-                        app.active_tab = Tab::Sandbox;
                     }
                     KeyCode::Char('d' | 'D') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         let _ = sig_tx.blocking_send(1);
