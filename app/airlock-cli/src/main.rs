@@ -40,7 +40,7 @@ async fn main() {
     let (airlock_args, extra_args) = split_at_separator(&raw_args);
 
     let matches = Program::command()
-        .version(cli::version_string().leak() as &str)
+        .version(cli::version_string(true).leak() as &str)
         .after_help(cli::platform_status())
         .get_matches_from(&airlock_args);
     let parsed = Program::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());

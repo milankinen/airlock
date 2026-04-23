@@ -45,15 +45,18 @@ pub struct MonitorTab {
     pub cpu: CpuState,
     pub memory: MemoryState,
     pub project_path: String,
+    /// airlock CLI version string; rendered in the tab header.
+    pub version: String,
 }
 
 impl MonitorTab {
-    pub fn new(project_path: String) -> Self {
+    pub fn new(project_path: String, version: String) -> Self {
         Self {
             network: NetworkTab::new(),
             cpu: CpuState::new(),
             memory: MemoryState::new(),
             project_path,
+            version,
         }
     }
 
@@ -87,7 +90,7 @@ impl Widget for MonitorWidget<'_> {
         let [header_area, body_area] =
             Layout::vertical([Constraint::Length(HEADER_HEIGHT), Constraint::Min(1)]).areas(area);
 
-        render_header(header_area, &self.tab.project_path, buf);
+        render_header(header_area, &self.tab.project_path, &self.tab.version, buf);
 
         if body_area.width > RIGHT_COL_WIDTH + 10 {
             let [left, right] =
@@ -102,7 +105,7 @@ impl Widget for MonitorWidget<'_> {
     }
 }
 
-fn render_header(area: Rect, project_path: &str, buf: &mut Buffer) {
+fn render_header(area: Rect, project_path: &str, version: &str, buf: &mut Buffer) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -120,10 +123,16 @@ fn render_header(area: Rect, project_path: &str, buf: &mut Buffer) {
 
     // Title on the left, project path right-aligned on the same row.
     let title_row = Rect::new(inner.x, inner.y, inner.width, 1);
-    Paragraph::new(Line::from(Span::styled(
-        " airlock sandbox monitor",
-        Style::default().add_modifier(Modifier::BOLD),
-    )))
+    Paragraph::new(Line::from(vec![
+        Span::styled(
+            " airlock sandbox monitor",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" ({version})"),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]))
     .render(title_row, buf);
 
     Paragraph::new(

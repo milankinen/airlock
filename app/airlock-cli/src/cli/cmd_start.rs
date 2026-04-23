@@ -64,6 +64,7 @@ pub async fn main(args: StartArgs, extra_args: Vec<String>, vault: Vault) -> any
         }
     };
     setup_logging(args.log_level, &cache_dir);
+    info!("airlock version {}", cli::version_string(true));
 
     // Step 2: Load config and start the VM
     let has_config = ["toml", "json", "yaml", "yml"].iter().any(|ext| {

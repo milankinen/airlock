@@ -87,7 +87,13 @@ impl Runtime for MonitorRuntime {
         let project_path = project.host_cwd.display().to_string();
         let control: std::sync::Arc<dyn airlock_monitor::NetworkControl> =
             std::sync::Arc::new(network.control());
-        let tui = airlock_monitor::spawn(stdin_tx, sig_tx, control, project_path);
+        let tui = airlock_monitor::spawn(
+            stdin_tx,
+            sig_tx,
+            control,
+            project_path,
+            crate::cli::version_string(false),
+        );
 
         // Forward network events from the broadcast channel to the TUI thread.
         let net_tx = tui.tx.clone();

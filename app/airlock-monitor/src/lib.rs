@@ -160,12 +160,21 @@ pub fn spawn(
     sig_tx: tokio::sync::mpsc::Sender<i32>,
     network: Arc<dyn NetworkControl>,
     project_path: String,
+    version: String,
 ) -> TuiHandle {
     let (tx, rx) = std_mpsc::channel();
     let crossterm_tx = tx.clone();
 
     let join = std::thread::spawn(move || {
-        tui_main(rx, crossterm_tx, stdin_tx, sig_tx, network, project_path)
+        tui_main(
+            rx,
+            crossterm_tx,
+            stdin_tx,
+            sig_tx,
+            network,
+            project_path,
+            version,
+        )
     });
 
     TuiHandle {
@@ -183,6 +192,7 @@ fn tui_main(
     sig_tx: tokio::sync::mpsc::Sender<i32>,
     network: Arc<dyn NetworkControl>,
     project_path: String,
+    version: String,
 ) -> anyhow::Result<i32> {
     // Enter alternate screen, raw mode, mouse capture, and kitty keyboard protocol
     let mut terminal = ratatui::init();
@@ -213,6 +223,7 @@ fn tui_main(
         &sig_tx,
         network,
         project_path,
+        version,
         kitty_enabled,
     );
 
@@ -243,10 +254,11 @@ fn run_tui_loop(
     sig_tx: &tokio::sync::mpsc::Sender<i32>,
     network: Arc<dyn NetworkControl>,
     project_path: String,
+    version: String,
     kitty_enabled: bool,
 ) -> anyhow::Result<i32> {
     let mut sink = TuiTerminalSink::new(80, 24);
-    let mut app = App::new(network, project_path);
+    let mut app = App::new(network, project_path, version);
     let mut mouse_captured = true;
 
     // Resize vt100 parser to match terminal body area

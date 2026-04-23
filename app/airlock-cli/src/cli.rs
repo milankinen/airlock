@@ -102,14 +102,19 @@ pub fn yellow(s: &str) -> String {
 /// In release builds the release action patches `AIRLOCK_VERSION_SLOT` in
 /// the binary with the version bytes; we read them here. Falls back to the
 /// Cargo package version in dev builds.
-pub fn version_string() -> String {
+pub fn version_string(include_hash: bool) -> String {
     let git_hash = env!("GIT_HASH");
     let distroless = cfg!(feature = "distroless");
+    let hash_suffix = if include_hash {
+        format!(" ({git_hash})")
+    } else {
+        String::new()
+    };
     match release_version() {
-        Some(v) if distroless => format!("{v} [distroless] ({git_hash})"),
-        Some(v) => format!("{v} ({git_hash})"),
-        None if distroless => format!("{} [distroless] ({git_hash})", env!("CARGO_PKG_VERSION")),
-        None => format!("{} ({git_hash})", env!("CARGO_PKG_VERSION")),
+        Some(v) if distroless => format!("{v} [distroless]{hash_suffix}"),
+        Some(v) => format!("{v}{hash_suffix}"),
+        None if distroless => format!("{} [distroless]{hash_suffix}", env!("CARGO_PKG_VERSION")),
+        None => format!("{}{hash_suffix}", env!("CARGO_PKG_VERSION")),
     }
 }
 
