@@ -2,15 +2,9 @@
   <img src="./docs/manual/src/logo.png" alt="airlock" width="624" />
 </p>
 <p align="center">
-   <a href="https://milankinen.github.io/airlock">
-      <img src="https://img.shields.io/badge/docs-user_manual-blue?style=for-the-badge" alt="User manual" />
-   </a>
-   <a href="https://github.com/milankinen/airlock/actions/workflows/ci.yml">
-      <img src="https://img.shields.io/github/actions/workflow/status/milankinen/airlock/ci.yml?style=for-the-badge" alt="Build" />
-   </a>
-   <a href="https://github.com/milankinen/airlock/releases/latest">
-      <img src="https://img.shields.io/github/v/release/milankinen/airlock?style=for-the-badge" alt="Release" />
-   </a>
+   <a href="https://milankinen.github.io/airlock"><img src="https://img.shields.io/badge/docs-user_manual-blue?style=for-the-badge" alt="User manual" /></a>
+   <a href="https://github.com/milankinen/airlock/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/milankinen/airlock/ci.yml?style=for-the-badge" alt="Build" /></a>
+   <a href="https://github.com/milankinen/airlock/releases/latest"><img src="https://img.shields.io/github/v/release/milankinen/airlock?style=for-the-badge" alt="Release" /></a>
 </p>
 
 ---
