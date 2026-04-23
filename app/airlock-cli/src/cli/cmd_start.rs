@@ -421,13 +421,52 @@ fn write_pty_dump(file: Option<&mut std::fs::File>, data: &[u8]) {
     }
 }
 
+/// Hard cap on `airlock.log` at startup. If the existing file is
+/// larger than this, we trim the beginning so each run appends to a
+/// bounded tail rather than nuking the file (crash logs from the
+/// previous run survive long enough to be useful).
+const LOG_MAX_BYTES: u64 = 1024 * 1024;
+
+/// If `airlock.log` exceeds [`LOG_MAX_BYTES`], rewrite the file with
+/// just its last N bytes so the new run starts with ≤1 MB of history.
+/// Best-effort; failure is silent (logging still works, just wasn't
+/// trimmed).
+fn rotate_log(path: &std::path::Path) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.len() <= LOG_MAX_BYTES {
+        return;
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    else {
+        return;
+    };
+    let skip = meta.len() - LOG_MAX_BYTES;
+    if file.seek(SeekFrom::Start(skip)).is_err() {
+        return;
+    }
+    let mut tail = Vec::with_capacity(LOG_MAX_BYTES as usize);
+    if file.read_to_end(&mut tail).is_err() {
+        return;
+    }
+    let _ = file.set_len(0);
+    let _ = file.seek(SeekFrom::Start(0));
+    let _ = file.write_all(&tail);
+}
+
 fn setup_logging(log_level: LogLevel, cache_dir: &std::path::Path) {
     let filter = CliArgs::log_filter_for(log_level);
+    let log_path = cache_dir.join("airlock.log");
+    rotate_log(&log_path);
     if let Ok(log_file) = std::fs::OpenOptions::new()
         .create(true)
-        .write(true)
-        .truncate(true)
-        .open(cache_dir.join("airlock.log"))
+        .append(true)
+        .open(&log_path)
     {
         tracing_subscriber::fmt()
             .with_env_filter(EnvFilter::new(filter))

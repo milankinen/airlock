@@ -7,6 +7,7 @@ mod cli_server;
 mod config;
 mod constants;
 mod daemon;
+mod diagnostics;
 
 pub(crate) mod network;
 mod oci;
@@ -27,6 +28,11 @@ use crate::vault::Vault;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // Install panic + fatal-signal instrumentation *before* anything
+    // else — if some later init panics we still want to see it.
+    diagnostics::install_panic_hook();
+    diagnostics::install_fatal_signal_handlers();
+
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     // Split argv at "--" before clap sees it
@@ -98,6 +104,10 @@ async fn main() {
         })
         .await;
 
+    // Last trace before exit. Its absence in airlock.log after the
+    // sandbox disappears means the process died abnormally — look
+    // for a panic or "[airlock] fatal signal N" marker above it.
+    tracing::info!("cli exit: code={exit_code}");
     std::process::exit(exit_code);
 }
 
