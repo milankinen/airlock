@@ -1,5 +1,5 @@
 <p style="display: flex; justify-content: center;">
-  <img src="logo.png" alt="airlock" style="height: 256px;" />
+  <img src="logo.png" alt="airlock" style="max-height: 256px;" />
 </p>
 <p style="display: flex; justify-content: center; gap: 0.5rem; padding-bottom: 1rem;">
 
