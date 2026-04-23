@@ -10,7 +10,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
-use tracing::debug;
+use tracing::{debug, error};
 
 use super::config::VmConfig;
 
@@ -161,34 +161,27 @@ impl CloudHypervisorBackend {
 
         Ok(OwnedFd::from(stream))
     }
-
-    pub async fn wait_for_stop_impl(&self) {
-        // Poll the CH process
-        loop {
-            if let Some(ref child) = self.ch_child {
-                let path = format!("/proc/{}", child.id());
-                if !Path::new(&path).exists() {
-                    break;
-                }
-            } else {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-    }
 }
 
 impl Drop for CloudHypervisorBackend {
     fn drop(&mut self) {
         // Kill cloud-hypervisor
         if let Some(mut child) = self.ch_child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            if let Err(e) = child.kill() {
+                error!("cloud-hypervisor kill: {e}");
+            }
+            if let Err(e) = child.wait() {
+                error!("cloud-hypervisor wait: {e}");
+            }
         }
         // Kill all virtiofsd processes
         for mut child in self.virtiofsd_children.drain(..) {
-            let _ = child.kill();
-            let _ = child.wait();
+            if let Err(e) = child.kill() {
+                error!("virtiofsd kill: {e}");
+            }
+            if let Err(e) = child.wait() {
+                error!("virtiofsd wait: {e}");
+            }
         }
         cleanup_sockets(&self.runtime_dir, &self.runtime_dir.join("vfs"));
     }

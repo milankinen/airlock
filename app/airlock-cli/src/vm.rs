@@ -424,9 +424,7 @@ async fn boot_backend(vm_config: &config::VmConfig) -> anyhow::Result<Box<dyn Vm
 }
 
 /// Trait for VM backends. Dropping the handle kills the VM.
-#[allow(dead_code)]
 trait VmHandle {
-    fn wait_for_stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>>;
     /// Open a fresh vsock connection to the given guest port. Used to
     /// open the network-proxy channel after the supervisor one is up.
     fn vsock_connect(
@@ -437,9 +435,6 @@ trait VmHandle {
 
 #[cfg(target_os = "macos")]
 impl VmHandle for apple::AppleVmBackend {
-    fn wait_for_stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>> {
-        Box::pin(apple::AppleVmBackend::wait_for_stop_impl(self))
-    }
     fn vsock_connect(
         &self,
         port: u32,
@@ -450,9 +445,6 @@ impl VmHandle for apple::AppleVmBackend {
 
 #[cfg(target_os = "linux")]
 impl VmHandle for cloud_hypervisor::CloudHypervisorBackend {
-    fn wait_for_stop(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>> {
-        Box::pin(cloud_hypervisor::CloudHypervisorBackend::wait_for_stop_impl(self))
-    }
     fn vsock_connect(
         &self,
         port: u32,

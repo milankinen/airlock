@@ -82,7 +82,7 @@ keyring = { workspace = true, features = ["sync-secret-service", "crypto-rust", 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { workspace = true, features = ["apple-native"] }
 security-framework = "3"
-objc2 = "0.6"
+objc2 = { version = "0.6", features = ["exception"] }
 objc2-foundation = { version = "0.3", features = ["NSFileHandle", "NSString", "NSURL", "NSArray", "NSError", "NSDictionary"] }
 objc2-virtualization = { version = "0.3", features = [
     "VZVirtualMachine",

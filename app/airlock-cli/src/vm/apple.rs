@@ -5,7 +5,9 @@
 //! async world.
 
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::Mutex;
+use std::panic::{AssertUnwindSafe, UnwindSafe};
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::{Arc, Mutex};
 
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
@@ -13,13 +15,40 @@ use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2_foundation::{NSArray, NSError, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::*;
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 use super::config::VmConfig;
 
 struct PipeEnds {
     read: OwnedFd,
     write: OwnedFd,
+}
+
+/// Run `f` inside `objc2::exception::catch`, converting any thrown
+/// Obj-C exception into an error string.
+///
+/// Without this wrapper, an `NSException` thrown by the Virtualization
+/// framework would unwind through a Rust frame and trigger
+/// "Rust cannot catch foreign exceptions" → `abort()` → SIGABRT.
+/// That's the suspected cause of the silent-exit bug; catching the
+/// exception here turns it into a cleanly-reportable error instead.
+fn catch_obj<R, F: FnOnce() -> R + UnwindSafe>(f: F) -> std::result::Result<R, String> {
+    objc2::exception::catch(f).map_err(|exc| match exc {
+        Some(e) => format!("ObjC exception: {e:?}"),
+        None => "ObjC exception (nil)".to_string(),
+    })
+}
+
+/// Report an Obj-C exception (or any other error string) back to an
+/// awaiting oneshot. Used from the outer error-recovery path of every
+/// dispatch-queue callback.
+fn deliver_err<T>(
+    tx: &Mutex<Option<tokio::sync::oneshot::Sender<std::result::Result<T, String>>>>,
+    msg: String,
+) {
+    if let Some(sender) = tx.lock().unwrap().take() {
+        let _ = sender.send(Err(msg));
+    }
 }
 
 /// Create a Unix pipe and return both ends as owned file descriptors.
@@ -35,21 +64,31 @@ fn create_pipe() -> anyhow::Result<PipeEnds> {
 }
 
 /// macOS VM backend using the Apple Virtualization.framework.
-#[allow(dead_code)]
+#[allow(dead_code, clippy::used_underscore_binding)]
 pub struct AppleVmBackend {
-    /// Raw pointer to the VM object. Only accessed on the dispatch queue.
-    /// Stored as usize to avoid Send issues with raw pointers.
-    vm_ptr: usize,
-    /// Prevent the Retained from being dropped while the VM is alive.
-    _vm: Retained<VZVirtualMachine>,
+    /// Live pointer to the VM object, nulled by `Drop` before `_vm`
+    /// releases the underlying retain. Every dispatch-queue callback
+    /// loads this atomically and bails on null — so a callback that
+    /// was queued before Drop but runs after never dereferences
+    /// freed memory. Using `AtomicPtr` (not `usize`) makes the
+    /// happens-before relationship between Drop's `swap` and the
+    /// callback's `load` explicit.
+    vm: std::sync::Arc<AtomicPtr<VZVirtualMachine>>,
+    /// Holds the +1 retain count of the VM object. `Option` so Drop
+    /// can `take()` it after nulling `vm` and stopping the VM, so
+    /// the object is freed strictly *after* any concurrent callback
+    /// has observed the null.
+    _vm: Option<Retained<VZVirtualMachine>>,
     vm_queue: dispatch2::DispatchRetained<DispatchQueue>,
     host_to_guest_write: OwnedFd,
     guest_to_host_read: OwnedFd,
 }
 
-// Safety: all VM operations are dispatched to the serial VM queue.
-// The struct itself is only moved between tokio tasks on the same thread
-// (current_thread runtime). The raw pointer is only dereferenced on the queue.
+// Safety: the struct is only moved between tokio tasks on the same
+// thread (current_thread runtime). All VM method calls are dispatched
+// to the serial VM queue, which synchronises access. The `AtomicPtr`
+// check in every callback means a dispatched callback cannot observe
+// a freed VM.
 unsafe impl Send for AppleVmBackend {}
 
 impl AppleVmBackend {
@@ -58,26 +97,34 @@ impl AppleVmBackend {
         let host_to_guest = create_pipe()?;
         let guest_to_host = create_pipe()?;
 
-        let vm_config = unsafe { Self::create_vm_config(config, &host_to_guest, &guest_to_host)? };
+        // Wrap VZ framework calls in `catch_obj` so an NSException thrown
+        // during config construction / validation / VM init becomes a
+        // Rust error instead of aborting the process.
+        let vm_config = catch_obj(AssertUnwindSafe(|| unsafe {
+            Self::create_vm_config(config, &host_to_guest, &guest_to_host)
+        }))
+        .map_err(|e| anyhow::anyhow!(e))??;
 
-        unsafe {
+        catch_obj(AssertUnwindSafe(|| unsafe {
             vm_config
                 .validateWithError()
-                .map_err(|e| anyhow::anyhow!(format!("VM configuration validation failed: {e}")))?;
-        }
+                .map_err(|e| anyhow::anyhow!(format!("VM configuration validation failed: {e}")))
+        }))
+        .map_err(|e| anyhow::anyhow!(e))??;
         debug!("VM configuration validated");
 
         let vm_queue = DispatchQueue::new("com.airlock.vm", dispatch2::DispatchQueueAttr::SERIAL);
 
-        let vm = unsafe {
+        let vm = catch_obj(AssertUnwindSafe(|| unsafe {
             VZVirtualMachine::initWithConfiguration_queue(
                 VZVirtualMachine::alloc(),
                 &vm_config,
                 &vm_queue,
             )
-        };
+        }))
+        .map_err(|e| anyhow::anyhow!(e))?;
 
-        let vm_ptr = (&raw const *vm) as usize;
+        let vm_raw = (&raw const *vm).cast_mut();
 
         // Drop the guest-side pipe ends on the host. The VM has its own
         // dup'd copies via NSFileHandle. When the VM shuts down and closes
@@ -86,8 +133,8 @@ impl AppleVmBackend {
         drop(guest_to_host.write);
 
         Ok(Self {
-            vm_ptr,
-            _vm: vm,
+            vm: std::sync::Arc::new(AtomicPtr::new(vm_raw)),
+            _vm: Some(vm),
             vm_queue,
             host_to_guest_write: host_to_guest.write,
             guest_to_host_read: guest_to_host.read,
@@ -231,14 +278,34 @@ impl AppleVmBackend {
 
 impl Drop for AppleVmBackend {
     fn drop(&mut self) {
-        // Best-effort synchronous stop via requestStop
-        let vm_addr = self.vm_ptr;
-        self.vm_queue.exec_sync(move || unsafe {
-            let vm = &*(vm_addr as *const VZVirtualMachine);
-            if vm.canStop() {
-                let _ = vm.requestStopWithError();
-            }
-        });
+        // Take the pointer out of the atomic *before* doing anything
+        // else. Any callback queued earlier that hasn't run yet will
+        // see null on its `load()` and bail. `_vm` still holds the
+        // retain so the object is alive during this Drop body.
+        //
+        // The exec_sync closure is required to be `Send`; raw pointers
+        // are `!Send` so we move the value in as a `usize` and cast
+        // back inside the queue callback (same trick as start/stop).
+        let vm_raw = self.vm.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !vm_raw.is_null() {
+            let vm_addr = vm_raw as usize;
+            self.vm_queue.exec_sync(move || {
+                // Swallow any ObjC exception in Drop — we're tearing
+                // down and there's nowhere to report it to.
+                let res = catch_obj(AssertUnwindSafe(|| unsafe {
+                    let vm = &*(vm_addr as *const VZVirtualMachine);
+                    if vm.canStop() {
+                        let _ = vm.requestStopWithError();
+                    }
+                }));
+                if let Err(e) = res {
+                    error!("VM stop exception: {e}");
+                }
+            });
+        }
+        // Drop the retain *after* exec_sync — which, because the queue
+        // is serial, guarantees no other callback is running on it.
+        let _ = self._vm.take();
     }
 }
 
@@ -248,24 +315,41 @@ impl AppleVmBackend {
         info!("starting VM...");
 
         let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<(), String>>();
-        let tx = Mutex::new(Some(tx));
-        let vm_addr = self.vm_ptr;
+        let tx = Arc::new(Mutex::new(Some(tx)));
+        let tx_outer = tx.clone();
+        let vm_ptr = self.vm.clone();
 
-        self.vm_queue.exec_async(move || unsafe {
-            let vm = &*(vm_addr as *const VZVirtualMachine);
-
-            let handler = RcBlock::new(move |err_ptr: *mut NSError| {
-                let result = if err_ptr.is_null() {
-                    Ok(())
-                } else {
-                    let err = &*err_ptr;
-                    Err(format!("{}", err.localizedDescription()))
-                };
-                if let Some(tx) = tx.lock().unwrap().take() {
-                    let _ = tx.send(result);
+        self.vm_queue.exec_async(move || {
+            let tx_body = tx.clone();
+            let caught = catch_obj(AssertUnwindSafe(move || {
+                let vm_raw = vm_ptr.load(Ordering::Acquire);
+                if vm_raw.is_null() {
+                    deliver_err(&tx_body, "VM dropped before start".into());
+                    return;
                 }
-            });
-            vm.startWithCompletionHandler(&handler);
+                let vm = unsafe { &*vm_raw };
+                let tx_handler = tx_body.clone();
+                let handler = RcBlock::new(move |err_ptr: *mut NSError| {
+                    let caught = catch_obj(AssertUnwindSafe(|| {
+                        if err_ptr.is_null() {
+                            Ok(())
+                        } else {
+                            let err = unsafe { &*err_ptr };
+                            Err(format!("{}", err.localizedDescription()))
+                        }
+                    }));
+                    let result = caught.unwrap_or_else(Err);
+                    if let Some(s) = tx_handler.lock().unwrap().take() {
+                        let _ = s.send(result);
+                    }
+                });
+                unsafe {
+                    vm.startWithCompletionHandler(&handler);
+                }
+            }));
+            if let Err(msg) = caught {
+                deliver_err(&tx_outer, msg);
+            }
         });
 
         rx.await
@@ -279,24 +363,40 @@ impl AppleVmBackend {
     #[allow(dead_code)]
     pub async fn stop(&mut self) -> anyhow::Result<()> {
         let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<(), String>>();
-        let tx = Mutex::new(Some(tx));
-        let vm_addr = self.vm_ptr;
+        let tx = Arc::new(Mutex::new(Some(tx)));
+        let tx_outer = tx.clone();
+        let vm_ptr = self.vm.clone();
 
         self.vm_queue.exec_async(move || {
-            let handler = RcBlock::new(move |err_ptr: *mut NSError| {
-                let result = if err_ptr.is_null() {
-                    Ok(())
-                } else {
-                    let err = unsafe { &*err_ptr };
-                    Err(format!("{err}"))
-                };
-                if let Some(tx) = tx.lock().unwrap().take() {
-                    let _ = tx.send(result);
+            let tx_body = tx.clone();
+            let caught = catch_obj(AssertUnwindSafe(move || {
+                let vm_raw = vm_ptr.load(Ordering::Acquire);
+                if vm_raw.is_null() {
+                    deliver_err(&tx_body, "VM dropped before stop".into());
+                    return;
                 }
-            });
-            unsafe {
-                let vm = &*(vm_addr as *const VZVirtualMachine);
-                vm.stopWithCompletionHandler(&handler);
+                let tx_handler = tx_body.clone();
+                let handler = RcBlock::new(move |err_ptr: *mut NSError| {
+                    let caught = catch_obj(AssertUnwindSafe(|| {
+                        if err_ptr.is_null() {
+                            Ok(())
+                        } else {
+                            let err = unsafe { &*err_ptr };
+                            Err(format!("{err}"))
+                        }
+                    }));
+                    let result = caught.unwrap_or_else(Err);
+                    if let Some(s) = tx_handler.lock().unwrap().take() {
+                        let _ = s.send(result);
+                    }
+                });
+                unsafe {
+                    let vm = &*vm_raw;
+                    vm.stopWithCompletionHandler(&handler);
+                }
+            }));
+            if let Err(msg) = caught {
+                deliver_err(&tx_outer, msg);
             }
         });
 
@@ -308,70 +408,65 @@ impl AppleVmBackend {
         Ok(())
     }
 
-    pub async fn wait_for_stop_impl(&self) {
-        let vm_addr = self.vm_ptr;
-        let queue = self.vm_queue.clone();
-        loop {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            queue.exec_async(move || {
-                let state = unsafe { (*(vm_addr as *const VZVirtualMachine)).state() };
-                let _ = tx.send(state);
-            });
-            if let Ok(state) = rx.await
-                && (state == VZVirtualMachineState::Stopped
-                    || state == VZVirtualMachineState::Error)
-            {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-    }
-
     /// Connect to a vsock port inside the VM, returning an owned fd.
     pub async fn vsock_connect(&self, port: u32) -> anyhow::Result<OwnedFd> {
         let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<i32, String>>();
-        let tx = Mutex::new(Some(tx));
-        let vm_addr = self.vm_ptr;
+        let tx = Arc::new(Mutex::new(Some(tx)));
+        let tx_outer = tx.clone();
+        let vm_ptr = self.vm.clone();
 
         self.vm_queue.exec_async(move || {
-            unsafe {
-                let vm = &*(vm_addr as *const VZVirtualMachine);
-                let devices = vm.socketDevices();
-                let Some(device) = devices.firstObject_unchecked() else {
-                    if let Some(tx) = tx.lock().unwrap().take() {
-                        let _ = tx.send(Err("no vsock device".into()));
-                    }
+            let tx_body = tx.clone();
+            let caught = catch_obj(AssertUnwindSafe(move || {
+                let vm_raw = vm_ptr.load(Ordering::Acquire);
+                if vm_raw.is_null() {
+                    deliver_err(&tx_body, "VM dropped".into());
                     return;
-                };
-                // Downcast VZSocketDevice → VZVirtioSocketDevice
-                // Safety: we configured exactly one VZVirtioSocketDeviceConfiguration
-                let device_ptr =
-                    std::ptr::from_ref::<VZSocketDevice>(device).cast::<VZVirtioSocketDevice>();
-                let device = &*device_ptr;
+                }
+                unsafe {
+                    let vm = &*vm_raw;
+                    let devices = vm.socketDevices();
+                    let Some(device) = devices.firstObject_unchecked() else {
+                        deliver_err(&tx_body, "no vsock device".into());
+                        return;
+                    };
+                    // Downcast VZSocketDevice → VZVirtioSocketDevice
+                    // Safety: we configured exactly one VZVirtioSocketDeviceConfiguration
+                    let device_ptr =
+                        std::ptr::from_ref::<VZSocketDevice>(device).cast::<VZVirtioSocketDevice>();
+                    let device = &*device_ptr;
 
-                let handler = RcBlock::new(
-                    move |conn_ptr: *mut VZVirtioSocketConnection, err_ptr: *mut NSError| {
-                        let result = if err_ptr.is_null() && !conn_ptr.is_null() {
-                            let conn = &*conn_ptr;
-                            // Dup the fd so it outlives the connection object
-                            let fd = libc::dup(conn.fileDescriptor());
-                            if fd < 0 {
-                                Err("failed to dup vsock fd".into())
-                            } else {
-                                Ok(fd)
+                    let tx_handler = tx_body.clone();
+                    let handler = RcBlock::new(
+                        move |conn_ptr: *mut VZVirtioSocketConnection, err_ptr: *mut NSError| {
+                            let caught = catch_obj(AssertUnwindSafe(|| {
+                                if err_ptr.is_null() && !conn_ptr.is_null() {
+                                    let conn = &*conn_ptr;
+                                    // Dup the fd so it outlives the connection.
+                                    let fd = libc::dup(conn.fileDescriptor());
+                                    if fd < 0 {
+                                        Err("failed to dup vsock fd".into())
+                                    } else {
+                                        Ok(fd)
+                                    }
+                                } else if !err_ptr.is_null() {
+                                    let err = &*err_ptr;
+                                    Err(format!("{}", err.localizedDescription()))
+                                } else {
+                                    Err("vsock connect returned null".into())
+                                }
+                            }));
+                            let result = caught.unwrap_or_else(Err);
+                            if let Some(s) = tx_handler.lock().unwrap().take() {
+                                let _ = s.send(result);
                             }
-                        } else if !err_ptr.is_null() {
-                            let err = &*err_ptr;
-                            Err(format!("{}", err.localizedDescription()))
-                        } else {
-                            Err("vsock connect returned null".into())
-                        };
-                        if let Some(tx) = tx.lock().unwrap().take() {
-                            let _ = tx.send(result);
-                        }
-                    },
-                );
-                device.connectToPort_completionHandler(port, &handler);
+                        },
+                    );
+                    device.connectToPort_completionHandler(port, &handler);
+                }
+            }));
+            if let Err(msg) = caught {
+                deliver_err(&tx_outer, msg);
             }
         });
 
