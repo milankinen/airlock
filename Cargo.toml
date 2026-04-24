@@ -68,7 +68,12 @@ subst = "0.3"
 toml = "1"
 
 # Scripting
-mlua = { version = "0.11", features = ["luajit", "vendored", "anyhow", "async", "serialize"] }
+# PUC Lua 5.4 — not LuaJIT. LuaJIT on Apple Silicon under hardened
+# runtime needs either a MAP_JIT-aware fork (upstream hasn't shipped
+# one) or the permissive `allow-unsigned-executable-memory`
+# entitlement, neither of which we want. Our middleware scripts use
+# only standard Lua, so the interpreter-only stdlib is a clean fit.
+mlua = { version = "0.11", features = ["lua54", "vendored", "anyhow", "async", "serialize"] }
 
 # System
 parking_lot = "0.12"
