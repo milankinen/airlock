@@ -9,4 +9,4 @@ mod supervisor;
 pub use network::serve_network;
 pub use process::*;
 pub use stdin::Stdin;
-pub use supervisor::{DaemonSpec, DaemonState, Supervisor};
+pub use supervisor::{DaemonSpec, DaemonState, MaskSpec, Supervisor};

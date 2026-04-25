@@ -173,21 +173,47 @@ pub(super) fn assemble(mounts: &MountConfig) -> anyhow::Result<()> {
         }
     }
 
-    // Mask .airlock/: bind an empty read-only directory over the sandbox
-    // directory's .airlock/ so the container user cannot accidentally read or
-    // modify sandbox internals (CA keys, disk image, lock file, etc.).
+    // Mask .airlock/ and any user-declared `[mask.<name>]` paths.
+    // Per-mask source dirs live under `<mask_root>/project/<name>` so
+    // each block stays isolated from the others. The tree is recreated
+    // fresh on every VM start so the host config is the source of truth.
     if let Some(project_mount) = mounts.dirs.iter().find(|d| d.tag == "project") {
-        let mask_src = if has_disk {
-            std::fs::create_dir_all("/mnt/disk/mask")?;
+        let mask_root = if has_disk {
             "/mnt/disk/mask"
         } else {
-            std::fs::create_dir_all("/tmp/airlock-mask")?;
             "/tmp/airlock-mask"
         };
-        let dst = crate::util::resolve_in_root(rootfs, &project_mount.target).join(".airlock");
-        std::fs::create_dir_all(&dst)?;
-        super::mount::bind(mask_src, &dst.to_string_lossy(), true)?;
-        info!("masked .airlock at {}", dst.display());
+        let project_mask_root = format!("{mask_root}/project");
+        // Wipe and recreate the per-mask source tree so a re-configured
+        // mask doesn't inherit stale state from a previous boot.
+        let _ = std::fs::remove_dir_all(&project_mask_root);
+        std::fs::create_dir_all(&project_mask_root)?;
+
+        let project_root = crate::util::resolve_in_root(rootfs, &project_mount.target);
+
+        // Built-in: hide the sandbox's own .airlock/ directory so the
+        // container can't read CA keys, disk image, lock file, etc.
+        {
+            let src = format!("{project_mask_root}/.airlock");
+            std::fs::create_dir_all(&src)?;
+            let dst = project_root.join(".airlock");
+            std::fs::create_dir_all(&dst)?;
+            super::mount::bind(&src, &dst.to_string_lossy(), true)?;
+            info!("masked .airlock at {}", dst.display());
+        }
+
+        // User-declared masks: empty per-mask source dir + bind mount
+        // over each declared path inside the project.
+        for mask in &mounts.masks {
+            let src = format!("{project_mask_root}/{}", mask.name);
+            std::fs::create_dir_all(&src)?;
+            for rel in &mask.paths {
+                let dst = project_root.join(rel);
+                std::fs::create_dir_all(&dst)?;
+                super::mount::bind(&src, &dst.to_string_lossy(), true)?;
+                info!("mask {}: hid {}", mask.name, dst.display());
+            }
+        }
     }
 
     Ok(())

@@ -17,7 +17,9 @@ use futures::AsyncReadExt;
 
 use crate::admin::DenyTracker;
 use crate::daemon::{self, DaemonSet, DaemonSpec};
-use crate::init::{CacheConfig, DirMountConfig, FileMountConfig, InitConfig, MountConfig};
+use crate::init::{
+    CacheConfig, DirMountConfig, FileMountConfig, InitConfig, MaskConfig, MountConfig,
+};
 use crate::net;
 use crate::process::{SpawnedProcess, spawn_root, spawn_user};
 use crate::stats::Collector;
@@ -198,6 +200,22 @@ impl supervisor::Server for SupervisorImpl {
 
         let daemons = daemon::parse_specs(params.get_daemons()?)?;
 
+        let masks = params
+            .get_masks()?
+            .iter()
+            .map(|m| {
+                let paths = m
+                    .get_paths()?
+                    .iter()
+                    .map(|p| Ok(p?.to_str()?.to_string()))
+                    .collect::<Result<Vec<_>, capnp::Error>>()?;
+                Ok(MaskConfig {
+                    name: m.get_name()?.to_str()?.to_string(),
+                    paths,
+                })
+            })
+            .collect::<Result<Vec<_>, capnp::Error>>()?;
+
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
 
         let cfg = StartConfig {
@@ -245,6 +263,7 @@ impl supervisor::Server for SupervisorImpl {
                 dirs,
                 files,
                 caches,
+                masks,
                 ca_cert: params.get_ca_cert()?.to_vec(),
             },
             pty_size,

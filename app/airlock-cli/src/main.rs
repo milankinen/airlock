@@ -8,6 +8,7 @@ mod config;
 mod constants;
 mod daemon;
 mod diagnostics;
+mod masking;
 
 pub(crate) mod network;
 mod oci;

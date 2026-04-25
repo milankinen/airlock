@@ -39,6 +39,16 @@ pub struct CacheConfig {
     pub paths: Vec<String>,
 }
 
+/// A `[mask.<name>]` block: project-relative paths to bind-mount with
+/// an empty directory so the sandbox can't see them. Recreated fresh
+/// on every VM start; per-mask source dirs live under
+/// `/mnt/disk/mask/project/<name>` so each block stays isolated.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct MaskConfig {
+    pub name: String,
+    pub paths: Vec<String>,
+}
+
 /// All mount configuration received from the host via the start RPC.
 /// Replaces the mounts.json file previously written to the overlay share.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -51,6 +61,7 @@ pub struct MountConfig {
     pub dirs: Vec<DirMountConfig>,
     pub files: Vec<FileMountConfig>,
     pub caches: Vec<CacheConfig>,
+    pub masks: Vec<MaskConfig>,
     /// Project CA cert (PEM bytes). Empty when the project has no CA. When
     /// non-empty, guest init appends it to the image's CA bundles after the
     /// overlayfs rootfs is mounted, so TLS clients in the container trust

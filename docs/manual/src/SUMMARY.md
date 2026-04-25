@@ -11,6 +11,7 @@
     - [Mounts](./configuration/mounts.md)
     - [Network](./configuration/network.md)
     - [Daemons](./configuration/daemons.md)
+    - [Masks](./configuration/masks.md)
 - [Presets](./presets.md)
     - [Claude Code](./presets/claude-code.md)
     - [GitHub Copilot CLI](./presets/copilot-cli.md)

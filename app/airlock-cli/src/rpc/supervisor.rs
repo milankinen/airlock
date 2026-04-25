@@ -43,6 +43,16 @@ pub struct DaemonSpec {
     pub harden: bool,
 }
 
+/// Host-side directory mask spec, serialised into the start RPC and
+/// applied by guest init. Matches `MaskSpec` in supervisor.capnp.
+#[derive(Debug, Clone)]
+pub struct MaskSpec {
+    pub name: String,
+    /// Project-relative paths to mask. Already validated to be plain
+    /// relative paths (no leading `/` / `~`, no `..` segments).
+    pub paths: Vec<String>,
+}
+
 /// Current state of a named daemon, returned by
 /// [`Supervisor::poll_daemons`]. `Stopped` and `Killed` are terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,6 +160,7 @@ impl Supervisor {
         epoch: u64,
         epoch_nanos: u32,
         daemons: &[DaemonSpec],
+        masks: &[MaskSpec],
     ) -> anyhow::Result<Process> {
         let log_sink: log_sink::Client = capnp_rpc::new_client(LogSinkImpl);
 
@@ -267,6 +278,16 @@ impl Supervisor {
             });
             entry.set_max_restarts(d.max_restarts);
             entry.set_harden(d.harden);
+        }
+
+        let mut masks_b = req.get().init_masks(masks.len() as u32);
+        for (i, m) in masks.iter().enumerate() {
+            let mut entry = masks_b.reborrow().get(i as u32);
+            entry.set_name(m.name.as_str());
+            let mut paths_b = entry.reborrow().init_paths(m.paths.len() as u32);
+            for (j, p) in m.paths.iter().enumerate() {
+                paths_b.set(j as u32, p.as_str());
+            }
         }
 
         let response = req.send().promise.await?;

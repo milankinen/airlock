@@ -39,6 +39,11 @@ pub struct Config {
     /// Sidecar processes started in parallel with the main shell.
     #[config(default)]
     pub daemons: BTreeMap<String, Daemon>,
+    /// Subdirectories of the project mount to hide from the sandbox by
+    /// bind-mounting an empty directory over them. Used to keep parts
+    /// of a monorepo invisible to AI agents that operate inside the VM.
+    #[config(default)]
+    pub mask: BTreeMap<String, Mask>,
 }
 
 #[allow(clippy::module_inception)]
@@ -697,6 +702,29 @@ pub mod config {
 
     impl WellKnown for Daemon {
         type Deserializer = de::Nested<Daemon>;
+        const DE: Self::Deserializer = de::nested();
+    }
+
+    /// Hide subdirectories of the project mount from the in-VM
+    /// sandbox by overlaying an empty directory on top of them.
+    ///
+    /// Each `paths` entry is interpreted relative to the project
+    /// root and must be a plain relative path — leading `/` or `~`
+    /// are rejected. The masked tree is fully recreated on every
+    /// VM start, so the source-of-truth here is the config, not the
+    /// guest's prior state.
+    #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
+    pub struct Mask {
+        /// Enable/disable this mask.
+        #[config(default_t = true)]
+        pub enabled: bool,
+        /// Project-relative paths to mask. Must not start with `/`
+        /// or `~`, must not contain `..`.
+        pub paths: Vec<String>,
+    }
+
+    impl WellKnown for Mask {
+        type Deserializer = de::Nested<Mask>;
         const DE: Self::Deserializer = de::nested();
     }
 }

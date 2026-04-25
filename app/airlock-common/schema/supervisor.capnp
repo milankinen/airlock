@@ -40,6 +40,10 @@ interface Supervisor {
     # Sidecar processes to start in parallel with the main shell. The
     # supervisor owns their lifecycle (restart loop, graceful shutdown).
     daemons     :List(DaemonSpec),
+    # Subdirectories of the project mount that get bind-mounted with an
+    # empty directory by guest init, hiding their contents from the
+    # sandbox. Used to cordon off parts of a monorepo from AI agents.
+    masks       :List(MaskSpec),
   ) -> (proc :Process);
 
   shutdown @1 () -> ();
@@ -87,6 +91,16 @@ interface Supervisor {
   # lid closed) cause the guest time to drift. The host polls this
   # every few seconds to keep them within wake-up-jitter of each other.
   syncClock @8 (epoch :UInt64, epochNanos :UInt32) -> ();
+}
+
+struct MaskSpec {
+  # Mask block name from the user's config (e.g. "secret-monorepo").
+  # Used by the supervisor to derive the per-mask source-dir path
+  # under /mnt/disk/mask/project/<name>.
+  name             @0 :Text;
+  # Project-relative paths to mask. Already validated by the host:
+  # no leading `/` or `~`, no `..` segments.
+  paths            @1 :List(Text);
 }
 
 struct DaemonSpec {

@@ -14,7 +14,7 @@ use tracing_subscriber::EnvFilter;
 use crate::cli::{self, CliArgs, LogLevel};
 use crate::runtime::{MonitorRuntime, RawTerminalRuntime, Runtime, Terminal};
 use crate::vault::Vault;
-use crate::{cli_server, config, daemon, network, oci, project, rpc, runtime, vm};
+use crate::{cli_server, config, daemon, masking, network, oci, project, rpc, runtime, vm};
 
 /// Default `airlock.toml` written when initializing a new sandbox.
 const DEFAULT_CONFIG: &str = "[vm]\n# image = \"alpine:latest\"\n";
@@ -180,6 +180,7 @@ async fn run(
 
     let daemon_specs = daemon::build_specs(&project, &vm.env)?;
     let daemon_names: Vec<String> = daemon_specs.iter().map(|d| d.name.clone()).collect();
+    let mask_specs = masking::build_specs(&project)?;
 
     // Extract socket-forward metadata before Network is consumed by
     // the NetworkProxy RPC server.
@@ -213,6 +214,7 @@ async fn run(
             epoch,
             epoch_nanos,
             &daemon_specs,
+            &mask_specs,
         )
         .await?;
     info!("vm process started");
@@ -391,6 +393,7 @@ fn print_mounts_and_rules(project: &project::Project) {
     }
 
     daemon::print_verbose(project);
+    masking::print_verbose(project);
 }
 
 /// Open the PTY dump file if `AIRLOCK_PTY_DUMP=1`, otherwise `None`.
