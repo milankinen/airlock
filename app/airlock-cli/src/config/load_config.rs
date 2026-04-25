@@ -11,7 +11,7 @@ pub(crate) const EXTENSIONS: &[&str] = &["toml", "json", "yaml", "yml"];
 /// Load configuration from hierarchical config files.
 ///
 /// Files are loaded in order (later overrides former):
-/// 1. `~/.cache/airlock/config.<ext>`
+/// 1. `~/.airlock/config.<ext>`
 /// 2. `~/.airlock.<ext>`
 /// 3. `<project_root>/airlock.<ext>`
 /// 4. `<project_root>/airlock.local.<ext>`
@@ -24,7 +24,7 @@ pub(crate) const EXTENSIONS: &[&str] = &["toml", "json", "yaml", "yml"];
 pub fn load(project_root: &Path) -> anyhow::Result<Config> {
     let home = dirs::home_dir().unwrap_or_default();
     let bases: [PathBuf; 4] = [
-        home.join(".cache/airlock/config"),
+        home.join(".airlock/config"),
         home.join(".airlock"),
         project_root.join("airlock"),
         project_root.join("airlock.local"),

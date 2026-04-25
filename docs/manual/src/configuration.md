@@ -9,10 +9,9 @@ control so that every team member gets the same sandbox setup.
 Configuration is loaded from up to four locations, with later files overriding
 earlier ones:
 
-1. `~/.cache/airlock/config.toml` — global system defaults
-2. `~/.airlock.toml` — user-level settings (e.g. preferred CPU/memory)
-3. `airlock.toml` — project config (checked into version control)
-4. `airlock.local.toml` — local overrides (gitignored)
+1. `~/.airlock/config.toml` or `~/.airlock.toml` — user-level settings (e.g. preferred CPU/memory)
+2. `airlock.toml` — project config (checked into version control)
+3. `airlock.local.toml` — local overrides (gitignored)
 
 This layering means a company can ship global defaults, individual developers
 can set personal preferences, and each project defines its own sandbox — with
