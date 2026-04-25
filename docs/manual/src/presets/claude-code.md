@@ -63,3 +63,18 @@ airlock secrets add CLAUDE_CODE_OAUTH_TOKEN
 ```bash
 airlock start --monitor -- claude --dangerously-skip-permissions
 ```
+
+## Mounting your host Claude settings
+
+By default, the `claude-code` preset mounts Claude settings from the
+`~/.airlock/claude` directory so the sandboxed Claude doesn't touch
+your primary host settings. If you'd rather share the host settings
+into the VM, point the default mount sources at them:
+
+```toml 
+[mounts.claude-settings]
+source = "~/.claude"
+
+[mounts.claude-json]
+source = "~/.claude.json"
+```
