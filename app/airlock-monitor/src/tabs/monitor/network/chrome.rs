@@ -155,6 +155,8 @@ pub fn render_sub_tabs(
     area: Rect,
     active: NetworkSubTab,
     details_label: Option<&str>,
+    highlight_requests_letter: bool,
+    highlight_connections_letter: bool,
     buf: &mut Buffer,
 ) -> SubTabRects {
     if area.height == 0 {
@@ -180,11 +182,18 @@ pub fn render_sub_tabs(
     let req_rect = Rect::new(area.x + left_pad, labels_y, req_w, 1);
     let conn_rect = Rect::new(area.x + left_pad + req_w + gap, labels_y, conn_w, 1);
 
-    render_label(req_rect, "Requests", active == NetworkSubTab::Requests, buf);
+    render_label(
+        req_rect,
+        "Requests",
+        active == NetworkSubTab::Requests,
+        highlight_requests_letter,
+        buf,
+    );
     render_label(
         conn_rect,
         "Connections",
         active == NetworkSubTab::Connections,
+        highlight_connections_letter,
         buf,
     );
 
@@ -242,33 +251,41 @@ fn render_details_label(rect: Rect, text: &str, active: bool, buf: &mut Buffer) 
     Paragraph::new(line).render(rect, buf);
 }
 
-/// Render one sub-tab label with a leading/trailing space, the shortcut
-/// letter tinted cyan, and an underline under the word (but not the
-/// surrounding padding spaces) when active.
-fn render_label(rect: Rect, text: &str, active: bool, buf: &mut Buffer) {
-    // Outer padding: never underlined — just neutral default.
+/// Render one sub-tab label with a leading/trailing space and an
+/// underline under the word (but not the surrounding padding spaces)
+/// when active. The first letter is tinted cyan only when
+/// `highlight_letter` is true — the caller passes `false` if the user
+/// has rebound the action to something other than that letter, so the
+/// hint doesn't lie.
+fn render_label(rect: Rect, text: &str, active: bool, highlight_letter: bool, buf: &mut Buffer) {
     let pad_style = Style::default();
-
     let word_style = if active {
         Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
     } else {
         Style::default()
     };
-    let mut shortcut_style = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
-    if active {
-        shortcut_style = shortcut_style.add_modifier(Modifier::UNDERLINED);
-    }
 
-    let first = text.chars().next().map(String::from).unwrap_or_default();
-    let rest: String = text.chars().skip(1).collect();
-
-    let line = Line::from(vec![
-        Span::styled(" ", pad_style),
-        Span::styled(first, shortcut_style),
-        Span::styled(rest, word_style),
-        Span::styled(" ", pad_style),
-    ]);
+    let line = if highlight_letter {
+        let mut shortcut_style = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        if active {
+            shortcut_style = shortcut_style.add_modifier(Modifier::UNDERLINED);
+        }
+        let first = text.chars().next().map(String::from).unwrap_or_default();
+        let rest: String = text.chars().skip(1).collect();
+        Line::from(vec![
+            Span::styled(" ", pad_style),
+            Span::styled(first, shortcut_style),
+            Span::styled(rest, word_style),
+            Span::styled(" ", pad_style),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" ", pad_style),
+            Span::styled(text.to_string(), word_style),
+            Span::styled(" ", pad_style),
+        ])
+    };
     Paragraph::new(line).render(rect, buf);
 }

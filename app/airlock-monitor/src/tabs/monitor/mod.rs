@@ -73,11 +73,20 @@ impl MonitorTab {
 pub struct MonitorWidget<'a> {
     tab: &'a MonitorTab,
     policy: crate::Policy,
+    bindings: &'a crate::keys::KeyBindings,
 }
 
 impl<'a> MonitorWidget<'a> {
-    pub fn new(tab: &'a MonitorTab, policy: crate::Policy) -> Self {
-        Self { tab, policy }
+    pub fn new(
+        tab: &'a MonitorTab,
+        policy: crate::Policy,
+        bindings: &'a crate::keys::KeyBindings,
+    ) -> Self {
+        Self {
+            tab,
+            policy,
+            bindings,
+        }
     }
 }
 
@@ -97,10 +106,11 @@ impl Widget for MonitorWidget<'_> {
                 Layout::horizontal([Constraint::Min(10), Constraint::Length(RIGHT_COL_WIDTH)])
                     .areas(body_area);
 
-            NetworkWidget::new(&self.tab.network, self.policy).render(left, buf);
+            NetworkWidget::new(&self.tab.network, self.policy, self.bindings).render(left, buf);
             render_right_column(right, &self.tab.cpu, &self.tab.memory, buf);
         } else {
-            NetworkWidget::new(&self.tab.network, self.policy).render(body_area, buf);
+            NetworkWidget::new(&self.tab.network, self.policy, self.bindings)
+                .render(body_area, buf);
         }
     }
 }

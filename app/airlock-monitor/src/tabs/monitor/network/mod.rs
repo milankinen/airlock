@@ -442,11 +442,20 @@ fn cap_entries<T>(vec: &mut Vec<T>, max: usize, selected: &mut Option<usize>) {
 pub struct NetworkWidget<'a> {
     tab: &'a NetworkTab,
     policy: crate::Policy,
+    bindings: &'a crate::keys::KeyBindings,
 }
 
 impl<'a> NetworkWidget<'a> {
-    pub fn new(tab: &'a NetworkTab, policy: crate::Policy) -> Self {
-        Self { tab, policy }
+    pub fn new(
+        tab: &'a NetworkTab,
+        policy: crate::Policy,
+        bindings: &'a crate::keys::KeyBindings,
+    ) -> Self {
+        Self {
+            tab,
+            policy,
+            bindings,
+        }
     }
 }
 
@@ -473,7 +482,33 @@ impl Widget for NetworkWidget<'_> {
             DetailView::Request(_) => "Request details",
             DetailView::Connection(_) => "Connection details",
         });
-        let rects = chrome::render_sub_tabs(tabs_area, self.tab.sub_tab, details_label, buf);
+        // First-letter highlight stays only when the user kept the
+        // default `r` / `c` bindings — otherwise the cyan letter would
+        // mislead about what's actually bound.
+        let highlight_letter = |action: crate::keys::Action, label: &str| -> bool {
+            let Some(first) = label.chars().next() else {
+                return false;
+            };
+            self.bindings
+                .primary(action)
+                .is_some_and(|(code, mods)| match code {
+                    crossterm::event::KeyCode::Char(c) => {
+                        mods.is_empty() && c.eq_ignore_ascii_case(&first)
+                    }
+                    _ => false,
+                })
+        };
+        let highlight_requests = highlight_letter(crate::keys::Action::SelectRequests, "Requests");
+        let highlight_connections =
+            highlight_letter(crate::keys::Action::SelectConnections, "Connections");
+        let rects = chrome::render_sub_tabs(
+            tabs_area,
+            self.tab.sub_tab,
+            details_label,
+            highlight_requests,
+            highlight_connections,
+            buf,
+        );
         self.tab.requests_rect.set(Some(rects.requests));
         self.tab.connections_rect.set(Some(rects.connections));
         self.tab.details_rect.set(rects.details);

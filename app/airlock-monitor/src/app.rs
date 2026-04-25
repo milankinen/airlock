@@ -32,14 +32,19 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(network: Arc<dyn NetworkControl>, project_path: String, version: String) -> Self {
+    pub fn new(
+        network: Arc<dyn NetworkControl>,
+        project_path: String,
+        version: String,
+        settings: TuiSettings,
+    ) -> Self {
         Self {
             active_tab: Tab::Sandbox,
             monitor: MonitorTab::new(project_path, version),
             network,
             mouse_captured: true,
             guest_bracketed_paste: false,
-            settings: TuiSettings::default(),
+            settings,
         }
     }
 }

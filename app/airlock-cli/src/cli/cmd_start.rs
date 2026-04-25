@@ -40,7 +40,12 @@ pub struct StartArgs {
 }
 
 /// Entry point for `airlock start [--log-level <level>] [-- extra-args...]`.
-pub async fn main(args: StartArgs, extra_args: Vec<String>, vault: Vault) -> anyhow::Result<i32> {
+pub async fn main(
+    args: StartArgs,
+    extra_args: Vec<String>,
+    vault: Vault,
+    settings: &crate::settings::Settings,
+) -> anyhow::Result<i32> {
     cli::set_verbose(args.verbose);
 
     #[cfg(target_os = "linux")]
@@ -104,13 +109,26 @@ pub async fn main(args: StartArgs, extra_args: Vec<String>, vault: Vault) -> any
     let cli_args = CliArgs::new(args.log_level, extra_args, args.login);
     let sandbox_cwd = args.sandbox_cwd;
     if args.monitor {
+        let keys = match crate::settings::keys::into_bindings(&settings.monitor.keys) {
+            Ok(b) => b,
+            Err(e) => {
+                cli::error!("invalid monitor key bindings:\n{e}");
+                return Ok(2);
+            }
+        };
+        let monitor_settings = airlock_monitor::TuiSettings {
+            max_http_requests: settings.monitor.buffers.http,
+            max_tcp_connections: settings.monitor.buffers.tcp,
+            scrollback: settings.monitor.buffers.scrollback,
+            keys,
+        };
         run(
             cli_args,
             config,
             host_cwd,
             sandbox_cwd,
             vault,
-            MonitorRuntime::new(),
+            MonitorRuntime::new(monitor_settings),
         )
         .await
     } else {

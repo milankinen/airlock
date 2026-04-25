@@ -68,7 +68,9 @@ async fn main() {
     let exit_code = local
         .run_until(async {
             let result: anyhow::Result<i32> = match parsed.command {
-                Command::Start(args) => cli::cmd_start::main(args, extra_args, vault).await,
+                Command::Start(args) => {
+                    cli::cmd_start::main(args, extra_args, vault, &settings).await
+                }
                 Command::Exec(args) => {
                     if !extra_args.is_empty() {
                         cli::error!("'--' args are not supported with 'exec'");

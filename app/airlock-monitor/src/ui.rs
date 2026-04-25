@@ -22,26 +22,60 @@ pub fn body_area(size: Rect) -> Rect {
     Rect::new(size.x, size.y, size.width, size.height - TAB_BAR_HEIGHT)
 }
 
+/// One entry in the bottom tab bar. Computed once from the user's
+/// keybindings and reused by both `render_tab_bar` and
+/// `tab_header_rects` so the click hitboxes always match what's drawn.
+struct TabEntry {
+    tab: Tab,
+    shortcut: String,
+    name: &'static str,
+}
+
+impl TabEntry {
+    /// Total visual width: 2 leading spaces, shortcut, 1 separator,
+    /// name, 2 trailing spaces.
+    fn width(&self) -> u16 {
+        // ASCII-only by construction, so .len() == display width.
+        (2 + self.shortcut.len() + 1 + self.name.len() + 2) as u16
+    }
+}
+
+fn tab_entries(app: &App) -> [TabEntry; 2] {
+    use crate::keys::{Action, format_key};
+    let shortcut = |a: Action, fallback: &str| -> String {
+        app.settings
+            .keys
+            .primary(a)
+            .map_or_else(|| fallback.to_string(), format_key)
+    };
+    [
+        TabEntry {
+            tab: Tab::Sandbox,
+            shortcut: shortcut(Action::SwitchSandbox, "F1"),
+            name: "Sandbox",
+        },
+        TabEntry {
+            tab: Tab::Monitor,
+            shortcut: shortcut(Action::SwitchMonitor, "F2"),
+            name: "Monitor",
+        },
+    ]
+}
+
 /// Calculate clickable tab header rectangles for mouse handling. Must match
 /// the layout produced by `render_tab_bar`.
-pub fn tab_header_rects(size: Rect) -> Vec<(Tab, Rect)> {
+pub fn tab_header_rects(size: Rect, app: &App) -> Vec<(Tab, Rect)> {
     let mut rects = Vec::new();
     if size.height == 0 {
         return rects;
     }
-    // Tabs live on the bottom row of the terminal.
     let y = size.y + size.height - 1;
     let mut x = size.x + 1; // 1 char left padding
-
-    // "  F1 Sandbox  " = 14 chars
-    let sandbox_w = 14;
-    rects.push((Tab::Sandbox, Rect::new(x, y, sandbox_w, 1)));
-    x += sandbox_w + 1;
-
-    // "  F2 Monitor (99999)  " — widest plausible label
-    let network_w = 22;
-    rects.push((Tab::Monitor, Rect::new(x, y, network_w, 1)));
-
+    for entry in tab_entries(app) {
+        let w = entry.width();
+        rects.push((entry.tab, Rect::new(x, y, w, 1)));
+        x += w + 1;
+    }
     rects
 }
 
@@ -64,7 +98,8 @@ pub fn render(f: &mut Frame<'_>, app: &App, sink: &TuiTerminalSink) {
             }
         }
         Tab::Monitor => {
-            MonitorWidget::new(&app.monitor, app.network.policy()).render(body, f.buffer_mut());
+            MonitorWidget::new(&app.monitor, app.network.policy(), &app.settings.keys)
+                .render(body, f.buffer_mut());
         }
     }
 
@@ -96,19 +131,25 @@ fn render_tab_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
     };
     let hotkey_style = |bg: Color| -> Style { Style::default().fg(Color::Cyan).bg(bg) };
 
-    let sb_bg = tab_bg(sandbox_sel);
-    let nw_bg = tab_bg(network_sel);
-
-    let spans = vec![
-        Span::raw(" "),
-        Span::styled("  ", Style::default().bg(sb_bg)),
-        Span::styled("F1", hotkey_style(sb_bg)),
-        Span::styled(" Sandbox  ", title_style(sandbox_sel, sb_bg)),
-        Span::raw(" "),
-        Span::styled("  ", Style::default().bg(nw_bg)),
-        Span::styled("F2", hotkey_style(nw_bg)),
-        Span::styled(" Monitor  ", title_style(network_sel, nw_bg)),
-    ];
+    let entries = tab_entries(app);
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(1 + entries.len() * 4);
+    for (i, entry) in entries.iter().enumerate() {
+        let selected = match entry.tab {
+            Tab::Sandbox => sandbox_sel,
+            Tab::Monitor => network_sel,
+        };
+        let bg = tab_bg(selected);
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled("  ", Style::default().bg(bg)));
+        spans.push(Span::styled(entry.shortcut.clone(), hotkey_style(bg)));
+        spans.push(Span::styled(
+            format!(" {}  ", entry.name),
+            title_style(selected, bg),
+        ));
+    }
 
     let line = Line::from(spans);
     // Paint the bg only on the bottom tabs row (height 1); the row above is

@@ -25,7 +25,7 @@ fn main() {
     let data = std::fs::read(&path).expect("read dump");
     eprintln!("replaying {} bytes at {rows}x{cols}", data.len());
 
-    let mut sink = airlock_monitor::pty::TuiTerminalSink::new(rows, cols);
+    let mut sink = airlock_monitor::pty::TuiTerminalSink::new(rows, cols, 1000);
     sink.write(&data);
     let screen = sink.screen();
     let (rows, cols) = screen.size();

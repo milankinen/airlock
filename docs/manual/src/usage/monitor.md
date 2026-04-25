@@ -88,6 +88,95 @@ Total and used bytes (reported the way `free` and `htop` do:
 | `q`             | On Monitor tab: switch back to Sandbox tab      |
 | `Ctrl+D`        | On Monitor tab: ask the sandbox process to exit |
 
+## Personal settings
+
+Buffer caps, terminal scrollback, and key bindings are personal
+preferences — they live in `~/.airlock/settings.toml`, not in the
+per-project `airlock.toml`. All fields default to the values used
+here, so there's nothing to set unless you want to change them.
+
+### Buffer caps and scrollback
+
+The Monitor tab keeps a rolling buffer of recent network activity.
+Once either buffer fills up, the oldest entries are dropped to make
+room for new ones (the lifetime allowed/denied counters are not
+affected). The Sandbox tab's vt100 terminal keeps a separate
+scrollback buffer.
+
+```toml
+[monitor.buffers]
+http = 100   # default; max HTTP request entries
+tcp = 100   # default; max TCP connection entries
+scrollback = 1000  # default; vt100 scrollback rows for the Sandbox tab
+```
+
+Bumping the buffers helps long sessions keep more history visible;
+bumping `scrollback` lets you scroll further back into long build
+output. Both are in-memory and don't persist across sandbox restarts.
+
+### Key bindings
+
+Shortcuts live in `[monitor.keys]` as an action-name → key(s) map.
+Each value is either a single key string or a list of keys. Only the
+actions you list here are overridden — the rest keep their defaults,
+so a single `back = "esc"` is a complete config.
+
+```toml
+[monitor.keys]
+switch-sandbox = "f1"               # force-switch to Sandbox tab
+switch-monitor = "f2"               # force-switch to Monitor tab
+back = "q"                # step back: list → Sandbox tab; modal → close
+cancel = ["esc", "x"]       # dismiss the topmost modal
+confirm = "enter"            # open details / apply policy
+kill-sandbox = "ctrl+d"           # send SIGHUP+SIGTERM to the sandbox process
+select-up = "up"
+select-down = "down"
+select-page-up = "pageup"
+select-page-down = "pagedown"
+select-newest = "home"
+select-oldest = "end"
+toggle-sub-tab = ["tab", "left", "right"]   # Requests ↔ Connections
+select-requests = "r"
+select-connections = "c"
+open-policy = "p"                # open the network-policy dropdown
+```
+
+#### Key string format
+
+`[<modifier>+]*<key>`. Modifiers (case-insensitive): `ctrl`, `alt` (or
+`option` / `meta`), `shift`, `super` (or `cmd` / `command`). Keys:
+
+- single ASCII chars: `q`, `1`, `+`, `?`, …
+- named keys: `enter`, `esc` / `escape`, `tab`, `backspace`, `delete`,
+  `space`, `up`, `down`, `left`, `right`, `home`, `end`, `pageup`,
+  `pagedown`, `f1`–`f12`
+
+Examples: `q`, `ctrl+d`, `shift+tab`, `f2`, `alt+enter`.
+
+`shift+<letter>` is treated the same as the lowercase letter — terminals
+emit shifted letters as plain uppercase chars without a separate modifier
+flag, so binding `shift+a` would never fire. Use a different modifier or
+key if you want a shifted variant.
+
+#### Action semantics
+
+Actions are context-aware — `back` and `confirm` mean different things
+depending on what's open:
+
+| Action    | List view             | Details pane  | Policy dropdown          |
+|-----------|-----------------------|---------------|--------------------------|
+| `back`    | switch to Sandbox tab | close details | close dropdown           |
+| `cancel`  | (no-op)               | close details | close dropdown           |
+| `confirm` | open details          | (no-op)       | apply highlighted policy |
+
+The navigation actions (`select-*`, `toggle-sub-tab`, `open-policy`,
+`kill-sandbox`) only apply on the Monitor tab. The Sandbox tab is full
+keystroke passthrough — only the two `switch-*` shortcuts are intercepted.
+
+Invalid key strings (unknown modifier, unknown key name) are reported
+up front when the sandbox starts; airlock refuses to launch the TUI
+rather than silently dropping a binding.
+
 ## Selecting text
 
 Clicking inside the Sandbox tab releases mouse capture so the host

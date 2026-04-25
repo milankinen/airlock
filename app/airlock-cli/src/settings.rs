@@ -6,9 +6,13 @@
 //! same parse-error formatting. Missing file → defaults, which keeps
 //! `airlock` usable with zero configuration.
 
+pub(crate) mod keys;
+
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
+pub use keys::KeyList;
 use smart_config::{ConfigRepository, ConfigSchema, DescribeConfig, DeserializeConfig, Json};
 
 use crate::config::de::format_error;
@@ -17,13 +21,18 @@ use crate::vault::VaultStorageType;
 
 /// All user-tunable settings. Add fields here; the default for each
 /// field must keep `airlock` usable without a settings file.
-#[derive(Clone, Debug, Default, DescribeConfig, DeserializeConfig)]
+#[derive(Clone, Debug, DescribeConfig, DeserializeConfig)]
 pub struct Settings {
     /// Vault configuration. Nested under `[vault]` so future vault-related
     /// knobs (passphrase caching policy, custom storage path, ...) fit
     /// alongside `storage` without polluting the top-level namespace.
     #[config(nest)]
     pub vault: VaultSettings,
+    /// Monitor TUI tuning (buffer caps, terminal scrollback, key
+    /// bindings). Personal preferences kept out of the per-project
+    /// `airlock.toml`.
+    #[config(nest)]
+    pub monitor: MonitorSettings,
 }
 
 /// Settings under the `[vault]` table.
@@ -36,6 +45,39 @@ pub struct VaultSettings {
     /// or `disabled` to turn the vault off entirely.
     #[config(default)]
     pub storage: VaultStorageType,
+}
+
+/// Settings under the `[monitor]` table.
+#[derive(Clone, Debug, DescribeConfig, DeserializeConfig)]
+pub struct MonitorSettings {
+    /// Buffer caps and scrollback for the TUI.
+    #[config(nest)]
+    pub buffers: MonitorBuffers,
+    /// Per-action key bindings. Action names match the canonical
+    /// kebab-case list (see `airlock_monitor::keys::SPEC`); each value
+    /// is either a single key string (`back = "q"`) or an array
+    /// (`cancel = ["esc", "x"]`). Unset actions keep their defaults.
+    #[config(default)]
+    pub keys: BTreeMap<String, KeyList>,
+}
+
+/// Settings under the `[monitor.buffers]` table. Defaults match the
+/// values previously hard-coded in `airlock-monitor`.
+#[derive(Clone, Debug, DescribeConfig, DeserializeConfig)]
+pub struct MonitorBuffers {
+    /// Maximum HTTP request entries kept in the monitor buffer.
+    /// Once the cap is hit, the oldest entries are dropped.
+    #[config(default_t = 100)]
+    pub http: usize,
+    /// Maximum TCP connection entries kept in the monitor buffer.
+    /// Once the cap is hit, the oldest entries are dropped.
+    #[config(default_t = 100)]
+    pub tcp: usize,
+    /// Scrollback rows retained by the embedded vt100 terminal that
+    /// drives the sandbox tab. Trades memory for how far back the
+    /// user can scroll into the sandbox session.
+    #[config(default_t = 1000)]
+    pub scrollback: u16,
 }
 
 impl Settings {
@@ -73,7 +115,10 @@ impl Settings {
             return parse_settings(value)
                 .with_context(|| format!("load settings file {}", path.display()));
         }
-        Ok(Self::default())
+        // No file → still go through smart-config with an empty
+        // source so per-field `default_t` annotations apply (notably
+        // the `keys` defaults, which would be empty under derive(Default)).
+        parse_settings(serde_json::Value::Object(serde_json::Map::new()))
     }
 }
 

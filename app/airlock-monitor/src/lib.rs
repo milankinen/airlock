@@ -8,6 +8,7 @@
 
 mod app;
 pub mod input;
+pub mod keys;
 mod network_control;
 pub mod pty;
 mod settings;
@@ -20,6 +21,7 @@ use std::time::{Duration, SystemTime};
 use app::{App, Tab};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 pub use input::{TuiInputEvent, TuiStdin};
+pub use keys::{Action, KeyBindings};
 pub use network_control::{NetworkControl, Policy};
 use pty::TuiTerminalSink;
 use ratatui::DefaultTerminal;
@@ -161,6 +163,7 @@ pub fn spawn(
     network: Arc<dyn NetworkControl>,
     project_path: String,
     version: String,
+    settings: TuiSettings,
 ) -> TuiHandle {
     let (tx, rx) = std_mpsc::channel();
     let crossterm_tx = tx.clone();
@@ -174,6 +177,7 @@ pub fn spawn(
             network,
             project_path,
             version,
+            settings,
         )
     });
 
@@ -185,6 +189,7 @@ pub fn spawn(
 
 /// TUI thread entry point — runs synchronously, never touches the async runtime.
 #[allow(clippy::needless_pass_by_value)] // owned values required by thread::spawn move
+#[allow(clippy::too_many_arguments)]
 fn tui_main(
     rx: std_mpsc::Receiver<TuiEvent>,
     crossterm_tx: std_mpsc::Sender<TuiEvent>,
@@ -193,6 +198,7 @@ fn tui_main(
     network: Arc<dyn NetworkControl>,
     project_path: String,
     version: String,
+    settings: TuiSettings,
 ) -> anyhow::Result<i32> {
     // Enter alternate screen, raw mode, mouse capture, and kitty keyboard protocol
     let mut terminal = ratatui::init();
@@ -224,6 +230,7 @@ fn tui_main(
         network,
         project_path,
         version,
+        settings,
         kitty_enabled,
     );
 
@@ -255,10 +262,11 @@ fn run_tui_loop(
     network: Arc<dyn NetworkControl>,
     project_path: String,
     version: String,
+    settings: TuiSettings,
     kitty_enabled: bool,
 ) -> anyhow::Result<i32> {
-    let mut sink = TuiTerminalSink::new(80, 24);
-    let mut app = App::new(network, project_path, version);
+    let mut sink = TuiTerminalSink::new(80, 24, settings.scrollback);
+    let mut app = App::new(network, project_path, version, settings);
     let mut mouse_captured = true;
 
     // Resize vt100 parser to match terminal body area
@@ -421,15 +429,17 @@ fn handle_key(
     kitty_enabled: bool,
     mouse_captured: &mut bool,
 ) -> anyhow::Result<Option<i32>> {
-    // Global shortcuts. F2 also exits selection mode since the Monitor
-    // tab is entirely click-driven — leaving the user stuck in
-    // passthrough-mouse on Monitor would be confusing.
-    match (key.modifiers, key.code) {
-        (_, KeyCode::F(1)) => {
+    let action = app.settings.keys.lookup(&key);
+
+    // Global shortcuts. SwitchMonitor also exits selection mode since
+    // the Monitor tab is entirely click-driven — leaving the user stuck
+    // in passthrough-mouse on Monitor would be confusing.
+    match action {
+        Some(Action::SwitchSandbox) => {
             app.active_tab = Tab::Sandbox;
             return Ok(None);
         }
-        (_, KeyCode::F(2)) => {
+        Some(Action::SwitchMonitor) => {
             if !*mouse_captured {
                 crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
                 *mouse_captured = true;
@@ -453,6 +463,8 @@ fn handle_key(
 
     match app.active_tab {
         Tab::Sandbox => {
+            // Sandbox is passthrough — nothing the user can rebind here.
+            // Forward the raw keystroke to the guest PTY.
             if let Some(bytes) = key_to_bytes(key, kitty_enabled) {
                 // Any key input jumps back to the live view.
                 sink.scroll_to_bottom();
@@ -460,105 +472,102 @@ fn handle_key(
             }
         }
         Tab::Monitor => {
-            if app.monitor.network.dropdown_open() {
-                match key.code {
-                    KeyCode::Up => app.monitor.network.nudge_policy_highlight(-1),
-                    KeyCode::Down => app.monitor.network.nudge_policy_highlight(1),
-                    KeyCode::Enter => {
-                        if let Some(p) = app.monitor.network.highlighted_policy() {
-                            app.network.set_policy(p);
-                        }
-                        app.monitor.network.close_policy_dropdown();
-                    }
-                    KeyCode::Esc => app.monitor.network.close_policy_dropdown(),
-                    _ => {}
-                }
-                return Ok(None);
-            }
-            if app.monitor.network.details_open() {
-                match key.code {
-                    // `q`, Esc, and X all close the details pane first,
-                    // staying on the Monitor tab. A second `q` from the
-                    // list view then goes back to Sandbox (below).
-                    KeyCode::Esc | KeyCode::Char('x' | 'X') => {
-                        app.monitor.network.close_details();
-                    }
-                    KeyCode::Char('q' | 'Q') if key.modifiers.is_empty() => {
-                        app.monitor.network.close_details();
-                    }
-                    KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                        app.monitor.network.toggle_sub_tab();
-                    }
-                    KeyCode::Char('r' | 'R') => {
-                        app.monitor
-                            .network
-                            .select_sub_tab(crate::tabs::monitor::network::NetworkSubTab::Requests);
-                    }
-                    KeyCode::Char('c' | 'C') => {
-                        app.monitor.network.select_sub_tab(
-                            crate::tabs::monitor::network::NetworkSubTab::Connections,
-                        );
-                    }
-                    KeyCode::Char('p' | 'P') => {
-                        app.monitor
-                            .network
-                            .open_policy_dropdown(app.network.policy());
-                    }
-                    KeyCode::Char('d' | 'D') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        let _ = sig_tx.blocking_send(1);
-                        let _ = sig_tx.blocking_send(15);
-                    }
-                    _ => {}
-                }
-                return Ok(None);
-            }
-            match key.code {
-                KeyCode::Up => app.monitor.network.select_up(),
-                KeyCode::Down => app.monitor.network.select_down(),
-                KeyCode::PageUp => app.monitor.network.select_page_up(),
-                KeyCode::PageDown => app.monitor.network.select_page_down(),
-                KeyCode::Home => app.monitor.network.select_newest(),
-                KeyCode::End => app.monitor.network.select_oldest(),
-                KeyCode::Enter => app.monitor.network.open_details(),
-                KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                    app.monitor.network.toggle_sub_tab();
-                }
-                KeyCode::Char('r' | 'R') => {
-                    app.monitor
-                        .network
-                        .select_sub_tab(crate::tabs::monitor::network::NetworkSubTab::Requests);
-                }
-                KeyCode::Char('c' | 'C') => {
-                    app.monitor
-                        .network
-                        .select_sub_tab(crate::tabs::monitor::network::NetworkSubTab::Connections);
-                }
-                KeyCode::Char('p' | 'P') => {
-                    app.monitor
-                        .network
-                        .open_policy_dropdown(app.network.policy());
-                }
-                // Ctrl+D from the monitor tab asks the sandbox process to
-                // exit. SIGHUP first — it's the canonical "controlling
-                // terminal went away" signal and interactive shells like
-                // bash exit on it (SIGINT/SIGTERM get ignored at an idle
-                // prompt). SIGTERM follows as a fallback for anything that
-                // doesn't handle HUP. The TUI itself shuts down when the
-                // process's exit event arrives on the main channel, so we
-                // don't return early.
-                KeyCode::Char('q' | 'Q') if key.modifiers.is_empty() => {
-                    app.active_tab = Tab::Sandbox;
-                }
-                KeyCode::Char('d' | 'D') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let _ = sig_tx.blocking_send(1);
-                    let _ = sig_tx.blocking_send(15);
-                }
-                _ => {}
-            }
+            handle_monitor_action(action, app, sig_tx);
         }
     }
 
     Ok(None)
+}
+
+/// Apply a resolved [`Action`] in the Monitor-tab context. Sub-state
+/// (dropdown / details / list) decides what each action means; keys
+/// without an action binding are ignored.
+fn handle_monitor_action(
+    action: Option<Action>,
+    app: &mut App,
+    sig_tx: &tokio::sync::mpsc::Sender<i32>,
+) {
+    use crate::tabs::monitor::network::NetworkSubTab;
+
+    let Some(action) = action else {
+        return;
+    };
+
+    if app.monitor.network.dropdown_open() {
+        match action {
+            Action::SelectUp => app.monitor.network.nudge_policy_highlight(-1),
+            Action::SelectDown => app.monitor.network.nudge_policy_highlight(1),
+            Action::Confirm => {
+                if let Some(p) = app.monitor.network.highlighted_policy() {
+                    app.network.set_policy(p);
+                }
+                app.monitor.network.close_policy_dropdown();
+            }
+            Action::Cancel | Action::Back => app.monitor.network.close_policy_dropdown(),
+            _ => {}
+        }
+        return;
+    }
+
+    if app.monitor.network.details_open() {
+        match action {
+            // `Back` and `Cancel` both close the details pane first,
+            // staying on the Monitor tab. A second `Back` from the list
+            // view then goes back to Sandbox (below).
+            Action::Cancel | Action::Back => app.monitor.network.close_details(),
+            Action::ToggleSubTab => app.monitor.network.toggle_sub_tab(),
+            Action::SelectRequests => app.monitor.network.select_sub_tab(NetworkSubTab::Requests),
+            Action::SelectConnections => {
+                app.monitor
+                    .network
+                    .select_sub_tab(NetworkSubTab::Connections);
+            }
+            Action::OpenPolicy => app
+                .monitor
+                .network
+                .open_policy_dropdown(app.network.policy()),
+            Action::KillSandbox => {
+                let _ = sig_tx.blocking_send(1);
+                let _ = sig_tx.blocking_send(15);
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    match action {
+        Action::SelectUp => app.monitor.network.select_up(),
+        Action::SelectDown => app.monitor.network.select_down(),
+        Action::SelectPageUp => app.monitor.network.select_page_up(),
+        Action::SelectPageDown => app.monitor.network.select_page_down(),
+        Action::SelectNewest => app.monitor.network.select_newest(),
+        Action::SelectOldest => app.monitor.network.select_oldest(),
+        Action::Confirm => app.monitor.network.open_details(),
+        Action::ToggleSubTab => app.monitor.network.toggle_sub_tab(),
+        Action::SelectRequests => app.monitor.network.select_sub_tab(NetworkSubTab::Requests),
+        Action::SelectConnections => {
+            app.monitor
+                .network
+                .select_sub_tab(NetworkSubTab::Connections);
+        }
+        Action::OpenPolicy => app
+            .monitor
+            .network
+            .open_policy_dropdown(app.network.policy()),
+        // Ctrl+D from the monitor tab asks the sandbox process to exit.
+        // SIGHUP first — it's the canonical "controlling terminal went
+        // away" signal and interactive shells like bash exit on it
+        // (SIGINT/SIGTERM get ignored at an idle prompt). SIGTERM
+        // follows as a fallback for anything that doesn't handle HUP.
+        // The TUI itself shuts down when the process's exit event
+        // arrives on the main channel, so we don't return early.
+        Action::Back => app.active_tab = Tab::Sandbox,
+        Action::KillSandbox => {
+            let _ = sig_tx.blocking_send(1);
+            let _ = sig_tx.blocking_send(15);
+        }
+        _ => {}
+    }
 }
 
 fn handle_mouse(
@@ -570,7 +579,7 @@ fn handle_mouse(
 ) -> anyhow::Result<()> {
     let size = terminal.size()?;
     let size = ratatui::layout::Rect::new(0, 0, size.width, size.height);
-    let tab_rects = ui::tab_header_rects(size);
+    let tab_rects = ui::tab_header_rects(size, app);
 
     match mouse.kind {
         MouseEventKind::Down(crossterm::event::MouseButton::Left) => {

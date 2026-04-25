@@ -19,22 +19,20 @@ pub struct MonitorRuntime {
     sig_tx: Option<mpsc::Sender<i32>>,
     /// Receiver drained by `signals()` and merged into the signal stream.
     sig_rx: Option<mpsc::Receiver<i32>>,
+    /// Buffer caps and scrollback for the TUI. Built from the user's
+    /// `[monitor]` config section by the CLI before construction.
+    settings: airlock_monitor::TuiSettings,
 }
 
 impl MonitorRuntime {
-    pub fn new() -> Self {
+    pub fn new(settings: airlock_monitor::TuiSettings) -> Self {
         let (sig_tx, sig_rx) = mpsc::channel(8);
         Self {
             stdin_tx: None,
             sig_tx: Some(sig_tx),
             sig_rx: Some(sig_rx),
+            settings,
         }
-    }
-}
-
-impl Default for MonitorRuntime {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -93,6 +91,7 @@ impl Runtime for MonitorRuntime {
             control,
             project_path,
             crate::cli::version_string(false),
+            self.settings,
         );
 
         // Forward network events from the broadcast channel to the TUI thread.

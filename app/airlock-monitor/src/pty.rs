@@ -10,9 +10,9 @@ pub struct TuiTerminalSink {
 }
 
 impl TuiTerminalSink {
-    pub fn new(rows: u16, cols: u16) -> Self {
+    pub fn new(rows: u16, cols: u16, scrollback: u16) -> Self {
         Self {
-            parser: vt100::Parser::new(rows, cols, 1000),
+            parser: vt100::Parser::new(rows, cols, scrollback as usize),
             csi: CsiRewriter::new(),
         }
     }
@@ -169,7 +169,7 @@ mod tests {
         // Without the rewrite, `vt100` ignores HVP positioning and both writes
         // land on the same row. With the rewrite, they land on their intended
         // rows.
-        let mut sink = TuiTerminalSink::new(6, 20);
+        let mut sink = TuiTerminalSink::new(6, 20, 100);
         sink.write(b"\x1b[2;3HA");
         sink.write(b"\x1b[4;3fB");
         let screen = sink.screen();
