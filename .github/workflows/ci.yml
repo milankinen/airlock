@@ -195,6 +195,30 @@ jobs:
           name: airlock-macos-aarch64
           path: target/release/airlock
 
+  build-cli-macos-x86_64:
+    needs: [ build-kernel-x86_64, build-initramfs-x86_64 ]
+    runs-on: macos-26-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Install capnp
+        run: brew install capnp
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: kernel-x86_64
+          path: target/vm
+      - uses: actions/download-artifact@v4
+        with:
+          name: initramfs-x86_64
+          path: target/vm
+      - run: cargo build --release -p airlock-cli
+      - run: codesign --entitlements entitlements.plist --force -s - target/release/airlock
+      - uses: actions/upload-artifact@v4
+        with:
+          name: airlock-macos-x86_64
+          path: target/release/airlock
+
   build-cli-linux-x86_64:
     needs: [ build-kernel-x86_64, build-initramfs-x86_64, fetch-vmm-x86_64 ]
     runs-on: ubuntu-24.04
@@ -286,6 +310,22 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: airlock-macos-aarch64-distroless
+          path: target/release/airlock
+
+  build-cli-macos-x86_64-distroless:
+    needs: [ lint-macos, lint-linux, test-macos, test-linux ]
+    runs-on: macos-26-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Install capnp
+        run: brew install capnp
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release -p airlock-cli --features distroless
+      - run: codesign --entitlements entitlements.plist --force -s - target/release/airlock
+      - uses: actions/upload-artifact@v4
+        with:
+          name: airlock-macos-x86_64-distroless
           path: target/release/airlock
 
   build-cli-linux-x86_64-distroless:

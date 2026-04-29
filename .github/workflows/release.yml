@@ -47,7 +47,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          for name in airlock-macos-aarch64 airlock-macos-aarch64-distroless; do
+          for name in airlock-macos-aarch64 airlock-macos-x86_64 \
+                      airlock-macos-aarch64-distroless airlock-macos-x86_64-distroless; do
             gh run download "${{ needs.resolve-ci-run.outputs.run_id }}" \
               --repo "$GITHUB_REPOSITORY" \
               --name "$name" \
@@ -74,7 +75,8 @@ jobs:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
           VERSION="${{ github.event.inputs.version }}"
-          for dir in artifacts/airlock-macos-aarch64 artifacts/airlock-macos-aarch64-distroless; do
+          for dir in artifacts/airlock-macos-aarch64 artifacts/airlock-macos-x86_64 \
+                     artifacts/airlock-macos-aarch64-distroless artifacts/airlock-macos-x86_64-distroless; do
             BIN="$dir/airlock"
             chmod +x "$BIN"
             mise/tasks/release/patch-version "$BIN" "$VERSION"
@@ -101,8 +103,16 @@ jobs:
           path: artifacts/airlock-macos-aarch64/airlock
       - uses: actions/upload-artifact@v4
         with:
+          name: airlock-macos-x86_64-signed
+          path: artifacts/airlock-macos-x86_64/airlock
+      - uses: actions/upload-artifact@v4
+        with:
           name: airlock-macos-aarch64-distroless-signed
           path: artifacts/airlock-macos-aarch64-distroless/airlock
+      - uses: actions/upload-artifact@v4
+        with:
+          name: airlock-macos-x86_64-distroless-signed
+          path: artifacts/airlock-macos-x86_64-distroless/airlock
 
   release:
     needs: [resolve-ci-run, sign-macos]
@@ -130,14 +140,26 @@ jobs:
           path: artifacts/macos-aarch64
       - uses: actions/download-artifact@v4
         with:
+          name: airlock-macos-x86_64-signed
+          path: artifacts/macos-x86_64
+      - uses: actions/download-artifact@v4
+        with:
           name: airlock-macos-aarch64-distroless-signed
           path: artifacts/macos-aarch64-distroless
+      - uses: actions/download-artifact@v4
+        with:
+          name: airlock-macos-x86_64-distroless-signed
+          path: artifacts/macos-x86_64-distroless
       - name: Package release artifacts
         run: |
           VERSION="${{ github.event.inputs.version }}"
 
-          for variant in darwin-aarch64-bundled:macos-aarch64 linux-x86_64-bundled:linux-x86_64 linux-aarch64-bundled:linux-aarch64 \
+          for variant in darwin-aarch64-bundled:macos-aarch64 \
+                         darwin-x86_64-bundled:macos-x86_64 \
+                         linux-x86_64-bundled:linux-x86_64 \
+                         linux-aarch64-bundled:linux-aarch64 \
                          darwin-aarch64-distroless:macos-aarch64-distroless \
+                         darwin-x86_64-distroless:macos-x86_64-distroless \
                          linux-x86_64-distroless:linux-x86_64-distroless \
                          linux-aarch64-distroless:linux-aarch64-distroless; do
             NAME="${variant%%:*}"
@@ -163,12 +185,16 @@ jobs:
           gh release create "$VERSION" \
             airlock-${VERSION}-darwin-aarch64-bundled.tar.gz \
             airlock-${VERSION}-darwin-aarch64-bundled.tar.gz.sha256 \
+            airlock-${VERSION}-darwin-x86_64-bundled.tar.gz \
+            airlock-${VERSION}-darwin-x86_64-bundled.tar.gz.sha256 \
             airlock-${VERSION}-linux-x86_64-bundled.tar.gz \
             airlock-${VERSION}-linux-x86_64-bundled.tar.gz.sha256 \
             airlock-${VERSION}-linux-aarch64-bundled.tar.gz \
             airlock-${VERSION}-linux-aarch64-bundled.tar.gz.sha256 \
             airlock-${VERSION}-darwin-aarch64-distroless.tar.gz \
             airlock-${VERSION}-darwin-aarch64-distroless.tar.gz.sha256 \
+            airlock-${VERSION}-darwin-x86_64-distroless.tar.gz \
+            airlock-${VERSION}-darwin-x86_64-distroless.tar.gz.sha256 \
             airlock-${VERSION}-linux-x86_64-distroless.tar.gz \
             airlock-${VERSION}-linux-x86_64-distroless.tar.gz.sha256 \
             airlock-${VERSION}-linux-aarch64-distroless.tar.gz \

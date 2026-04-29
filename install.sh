@@ -34,7 +34,7 @@ esac
 
 # Validate supported combinations
 case "${OS}-${ARCH}" in
-  darwin-aarch64|linux-x86_64|linux-aarch64) ;;
+  darwin-aarch64|darwin-x86_64|linux-x86_64|linux-aarch64) ;;
   *) err "unsupported platform: ${OS}-${ARCH}" ;;
 esac
 
