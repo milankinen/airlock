@@ -106,13 +106,15 @@ pub fn set_clock(epoch: u64, epoch_nanos: u32) {
 #[cfg(not(target_os = "linux"))]
 pub fn set_clock(_epoch: u64, _epoch_nanos: u32) {}
 
-/// Spawn a background task that runs `fstrim /mnt/disk` every 10
-/// minutes. Lets the host disk image shrink live as files are deleted
-/// inside the sandbox instead of staying inflated until exit.
+/// Spawn a background task that periodically reclaims sandbox
+/// resources back to the host: `fstrim /mnt/disk` (sparse-image hole
+/// punching) and `drop_caches=2` (kernel slab eviction, which lets
+/// the host virtiofs proxy close cached FDs). Runs every 10 minutes
+/// for the lifetime of the supervisor.
 #[cfg(target_os = "linux")]
-pub fn start_disk_trim() {
-    linux::start_disk_trim();
+pub fn start_periodic_maintenance() {
+    linux::start_periodic_maintenance();
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn start_disk_trim() {}
+pub fn start_periodic_maintenance() {}

@@ -64,9 +64,10 @@ async fn airlockd() -> anyhow::Result<()> {
             &cfg.sockets,
             cfg.nested_virt,
         )?;
-        // Reclaim deleted blocks back to the host disk image every
-        // 10 minutes; runs for the lifetime of the supervisor.
-        init::start_disk_trim();
+        // Periodic resource reclaim back to the host: trim the sparse
+        // disk image and drop the dentry/inode slab so the virtiofs
+        // proxy on the host stops accumulating FDs.
+        init::start_periodic_maintenance();
 
         let dns = Rc::new(net::DnsState::new());
         net::start_dns(dns.clone()).await?;

@@ -33,15 +33,34 @@ mounts win over earlier dir bind mounts.
    device) is up. No iptables rules are required.
 
 4. **Project disk** (`disk::setup`) — formats the ext4 image if blank
-   (`mkfs.ext4`), mounts it at `/mnt/disk`. Resizes the filesystem if
-   the disk image was enlarged since the last boot. After mounting,
-   the supervisor spawns a background task that runs the `FITRIM`
-   ioctl on `/mnt/disk` every 10 minutes — the sparse disk image
-   doesn't reclaim space on its own as files are deleted, and a
-   periodic batched discard avoids the per-write tax of mounting with
-   `discard`. The trim is best-effort: errors (including hypervisors
-   that don't pass `VIRTIO_BLK_F_DISCARD` through) are logged and
-   swallowed.
+   (`mkfs.ext4`), mounts it at `/mnt/disk`, resizes the filesystem if
+   the disk image was enlarged since the last boot, and bumps
+   `vm.vfs_cache_pressure` to `200` so the kernel reclaims dentry /
+   inode slab more aggressively (the host virtiofs proxy holds an FD
+   open for every cached entry; under airlock's default RAM
+   allocation natural pressure rarely arrives, so without the bump
+   FDs accumulate into the hundreds of thousands and trip macOS's
+   per-process limit).
+
+   The supervisor then spawns a background task that runs every 10
+   minutes for the lifetime of the VM and does two reclaim steps in
+   sequence:
+
+   - `FITRIM` on `/mnt/disk` — the sparse disk image doesn't reclaim
+     space on its own as files are deleted; periodic batched discard
+     avoids the per-write tax of mounting with `discard`. ext4 tracks
+     already-trimmed extents so steady-state invocations are
+     near-no-ops.
+   - `echo 2 > /proc/sys/vm/drop_caches` — releases dentry/inode
+     slab without touching the page cache, so file *contents* aren't
+     re-fetched from the host (only metadata walks re-stat on next
+     access). This is what actually keeps the virtiofs proxy's FD
+     count bounded; the `vfs_cache_pressure` bump alone only changes
+     the *relative* reclaim weight, which doesn't help when there's
+     no pressure to begin with.
+
+   Both are best-effort: errors (including hypervisors that don't
+   pass `VIRTIO_BLK_F_DISCARD` through) are logged and swallowed.
 
 5. **Overlay assembly** (`overlay::assemble`):
    - **CA tmpfs** (`ca::prepare_overlay`): if the `caCert` field is
