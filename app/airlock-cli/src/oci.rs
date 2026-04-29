@@ -39,7 +39,13 @@ pub struct OciImage {
     /// under `~/.cache/airlock/oci/layers/<key>` and the guest mount path
     /// `/mnt/layers/<key>`.
     pub image_layers: Vec<String>,
-    /// Container home directory (e.g. `/root`), for guest-path `~` expansion.
+    /// Container home directory derived from the image's user record
+    /// (e.g. `/root`). For guest-path `~` expansion the
+    /// [`effective_container_home`] helper should be preferred — the
+    /// user can override `HOME` from `[env]`, in which case tilde
+    /// expansion needs to track the override or we'd resolve to a
+    /// path that doesn't match what `$HOME` actually points to inside
+    /// the sandbox.
     pub container_home: String,
     /// Container uid (from image config).
     pub uid: u32,
@@ -321,6 +327,27 @@ fn build_oci_image(
         cmd,
         env,
     })
+}
+
+/// Resolve the home directory that `~` should expand to for paths the
+/// sandbox sees. Falls back to the OCI image's user record when the
+/// project doesn't set `HOME` in `[env]`; otherwise honours the user's
+/// override (with vault `${VAR}` substitution, same as every other
+/// `[env]` value).
+///
+/// Without this, a `target = "~/foo"` mount with `[env].HOME = "/x"`
+/// would expand the `~` against the image's home (`/root`) but the
+/// sandbox shell would resolve `$HOME` as `/x` — paths land in the
+/// wrong place and tools that re-tilde a result of the mount mismatch
+/// what's actually mounted.
+pub fn effective_container_home(project: &Project, image: &OciImage) -> anyhow::Result<String> {
+    if let Some(template) = project.config.env.get("HOME") {
+        return project
+            .vault
+            .subst(template)
+            .map_err(|e| anyhow::anyhow!("env.HOME: {e}"));
+    }
+    Ok(image.container_home.clone())
 }
 
 /// Wrap a command vector for execution inside a login shell.

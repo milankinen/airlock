@@ -138,20 +138,25 @@ impl VmInstance {
 
 /// Boot the VM with the given config and image. Returns a `VmInstance` (for
 /// cleanup on drop) and the vsock fd connected to the in-VM supervisor.
+///
+/// `container_home` is the resolved guest home — `[env].HOME` if the
+/// user overrode it, otherwise the image's user-record home. Used for
+/// `~/...` expansion of mount, cache, and socket-forward paths.
 pub async fn start(
     args: &CliArgs,
     project: &Project,
     image: &OciImage,
+    container_home: &str,
 ) -> anyhow::Result<(VmInstance, OwnedFd)> {
     let assets = Assets::init(project)?;
     let overlay_dir = project.sandbox_dir.join("overlay");
 
-    let mounts = assemble_mounts(project, image)?;
+    let mounts = assemble_mounts(project, container_home)?;
     let shares = prepare_shares(image, &mounts, &project.sandbox_dir)?;
     let (disk_image, caches) = disk::prepare(
         &project.sandbox_dir,
         &project.config.disk,
-        &image.container_home,
+        container_home,
         &project.host_cwd,
     )?;
     let cmd = resolve_cmd(args, image);
@@ -188,7 +193,7 @@ pub async fn start(
         mounts,
         disk_image,
         caches,
-        container_home: image.container_home.clone(),
+        container_home: container_home.to_string(),
         cmd,
         env,
         cwd,
@@ -204,7 +209,7 @@ pub async fn start(
 /// Build the sandbox dir mount and resolve all enabled user mounts.
 fn assemble_mounts(
     project: &Project,
-    image: &OciImage,
+    container_home: &str,
 ) -> anyhow::Result<Vec<mount::ResolvedMount>> {
     let project_mount = mount::ResolvedMount {
         mount_type: mount::MountType::Dir {
@@ -226,7 +231,7 @@ fn assemble_mounts(
     let user_mounts = mount::resolve_mounts(
         &enabled_mounts,
         &project.host_home,
-        &image.container_home,
+        container_home,
         &project.host_cwd,
         &project.guest_cwd,
     )?;

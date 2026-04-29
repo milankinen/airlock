@@ -19,6 +19,29 @@ read_only = true
 The `source` is a path on the host and `target` is the path inside the
 container. Both support `~` expansion to the respective home directory.
 
+### Container-side `~` and `HOME`
+
+The default home directory inside the sandbox comes from the OCI
+image's user record — typically `/root` for images that run as root.
+If you override `HOME` via [`[env]`](./env.md), `~` in mount targets
+expands to your value instead, so the path the file is mounted at
+matches what `$HOME/...` resolves to inside the shell:
+
+```toml
+[env]
+HOME = "/home/dev"
+
+[mounts.ssh-config]
+source = "~/.ssh/config"   # host: ~/.ssh/config (your host home)
+target = "~/.ssh/config"   # guest: /home/dev/.ssh/config
+```
+
+Without the override, the same `target = "~/.ssh/config"` would mount
+at `/root/.ssh/config` while the shell's `$HOME` reported `/root` —
+either way, `~` and `$HOME` agree. The override is only needed when
+the image's home doesn't match where you actually want files to land
+(e.g. running as a non-root user the image doesn't ship with).
+
 ## Read-only mounts
 
 Setting `read_only = true` prevents the container from writing to the mount.

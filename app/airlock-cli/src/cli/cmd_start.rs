@@ -156,7 +156,14 @@ async fn run(
     print_preparing(&project);
 
     let image = oci::prepare(&project).await?;
-    let network = network::setup(&project, &image.container_home)?;
+    let container_home = match oci::effective_container_home(&project, &image) {
+        Ok(h) => h,
+        Err(e) => {
+            cli::error!("{e:#}");
+            return Ok(2);
+        }
+    };
+    let network = network::setup(&project, &container_home)?;
 
     print_mounts_and_rules(&project);
 
@@ -175,7 +182,7 @@ async fn run(
     .await?;
 
     cli::log!("Booting VM...");
-    let (vm, vsock_fd) = vm::start(&args, &project, &image).await?;
+    let (vm, vsock_fd) = vm::start(&args, &project, &image, &container_home).await?;
     project.save_meta();
 
     let supervisor = rpc::Supervisor::connect(vsock_fd)?;
