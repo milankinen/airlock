@@ -34,7 +34,14 @@ mounts win over earlier dir bind mounts.
 
 4. **Project disk** (`disk::setup`) — formats the ext4 image if blank
    (`mkfs.ext4`), mounts it at `/mnt/disk`. Resizes the filesystem if
-   the disk image was enlarged since the last boot.
+   the disk image was enlarged since the last boot. After mounting,
+   the supervisor spawns a background task that runs the `FITRIM`
+   ioctl on `/mnt/disk` every 10 minutes — the sparse disk image
+   doesn't reclaim space on its own as files are deleted, and a
+   periodic batched discard avoids the per-write tax of mounting with
+   `discard`. The trim is best-effort: errors (including hypervisors
+   that don't pass `VIRTIO_BLK_F_DISCARD` through) are logged and
+   swallowed.
 
 5. **Overlay assembly** (`overlay::assemble`):
    - **CA tmpfs** (`ca::prepare_overlay`): if the `caCert` field is

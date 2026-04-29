@@ -25,6 +25,11 @@ pub(super) fn set_clock(epoch: u64, epoch_nanos: u32) {
     clock::set(epoch, epoch_nanos);
 }
 
+/// Spawn the periodic `fstrim` task. See [`super::start_disk_trim`].
+pub(super) fn start_disk_trim() {
+    disk::start_periodic_trim();
+}
+
 /// Run all guest initialization steps in order, including container mounts.
 pub fn setup(
     config: &InitConfig,
