@@ -2,25 +2,28 @@
 ///
 /// Supported pattern forms:
 /// - `*` — matches any host.
-/// - `*.<suffix>` — matches exactly one leading label: `<label>.<suffix>`
-///   where `<label>` is non-empty and contains no dots. So
-///   `*.example.com` matches `api.example.com` but NOT the apex
-///   `example.com` and NOT `a.b.example.com`. This follows RFC 6125
-///   TLS wildcard rules.
+/// - `*.<suffix>` — matches any subdomain of `<suffix>`, including
+///   nested subdomains. So `*.example.com` matches `api.example.com`
+///   and `a.b.example.com`, but NOT the apex `example.com`.
 /// - anything else — exact string match, with localhost aliases
 ///   (`localhost`, `127.0.0.1`, `::1`) treated as equivalent.
 ///
 /// Patterns beginning with `*` but not `*.` (e.g. `*foo.com`) are not
 /// wildcards in this scheme and will never match any real hostname.
+///
+/// This intentionally deviates from RFC 6125 (TLS certificate wildcard
+/// rules), which restricts `*` to a single DNS label. We follow the
+/// convention used by modern HTTP proxies and CDNs (Nginx, Envoy,
+/// Cloudflare) where `*.example.com` matches all subdomain depths.
+/// If strict single-label matching is needed in the future, this
+/// function must be redesigned.
 pub fn host_matches(host: &str, pattern: &str) -> bool {
     if pattern == "*" {
         true
     } else if let Some(suffix) = pattern.strip_prefix("*.") {
         match host.strip_suffix(suffix) {
-            Some(prefix) => match prefix.strip_suffix('.') {
-                Some(label) => !label.is_empty() && !label.contains('.'),
-                None => false,
-            },
+            // prefix must be at least "x." — a non-empty label followed by a dot.
+            Some(prefix) => prefix.len() > 1 && prefix.ends_with('.'),
             None => false,
         }
     } else if is_localhost(pattern) {
@@ -46,20 +49,20 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_matches_exactly_one_leading_label() {
+    fn wildcard_matches_single_subdomain() {
         assert!(host_matches("api.example.com", "*.example.com"));
         assert!(host_matches("www.example.com", "*.example.com"));
     }
 
     #[test]
-    fn wildcard_does_not_match_apex() {
-        assert!(!host_matches("example.com", "*.example.com"));
+    fn wildcard_matches_nested_subdomains() {
+        assert!(host_matches("a.b.example.com", "*.example.com"));
+        assert!(host_matches("x.y.z.example.com", "*.example.com"));
     }
 
     #[test]
-    fn wildcard_does_not_match_multiple_labels() {
-        assert!(!host_matches("a.b.example.com", "*.example.com"));
-        assert!(!host_matches("x.y.z.example.com", "*.example.com"));
+    fn wildcard_does_not_match_without_subdomain() {
+        assert!(!host_matches("example.com", "*.example.com"));
     }
 
     #[test]
