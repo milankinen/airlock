@@ -110,18 +110,18 @@ pub async fn relay(
     let server_io = hyper_util::rt::TokioIo::new(tokio::io::join(server.read, server.write));
     debug!("http proxy: server h2 = {}", server.h2);
 
-    let sender: Rc<dyn RequestSender> = if server.h2 {
+    let (sender, upstream_conn): (Rc<dyn RequestSender>, _) = if server.h2 {
         let (sender, conn): (hyper::client::conn::http2::SendRequest<ResponseBody>, _) =
             hyper::client::conn::http2::handshake(LocalExecutor, server_io).await?;
-        tokio::task::spawn_local(conn);
+        let handle = tokio::task::spawn_local(conn);
         debug!("h2 client handshake complete");
-        Rc::new(H2Sender(sender))
+        (Rc::new(H2Sender(sender)), handle)
     } else {
         let (sender, conn): (hyper::client::conn::http1::SendRequest<ResponseBody>, _) =
             hyper::client::conn::http1::handshake(server_io).await?;
-        tokio::task::spawn_local(conn);
+        let handle = tokio::task::spawn_local(conn);
         debug!("h1 client handshake complete");
-        Rc::new(H1Sender(RefCell::new(sender)))
+        (Rc::new(H1Sender(RefCell::new(sender))), handle)
     };
 
     let middleware = target.middleware;
@@ -155,10 +155,25 @@ pub async fn relay(
         }
     });
 
-    hyper_util::server::conn::auto::Builder::new(LocalExecutor)
-        .serve_connection(client_io, service)
-        .await
-        .map_err(|e| anyhow::anyhow!("http proxy: {e}"))
+    // Mirror upstream connection state: when the upstream server closes the
+    // connection, gracefully shut down the guest-side server so the guest
+    // sees a clean close and naturally reconnects. Without this, a stale
+    // sender produces "operation was canceled" 502s for every subsequent
+    // request on the same guest connection.
+    let builder = hyper_util::server::conn::auto::Builder::new(LocalExecutor);
+    let connection = builder.serve_connection(client_io, service);
+    let mut connection = std::pin::pin!(connection);
+
+    tokio::select! {
+        result = &mut connection => {
+            result.map_err(|e| anyhow::anyhow!("http proxy: {e}"))
+        }
+        _ = upstream_conn => {
+            debug!("upstream connection closed, shutting down guest connection");
+            connection.as_mut().graceful_shutdown();
+            connection.await.map_err(|e| anyhow::anyhow!("http proxy shutdown: {e}"))
+        }
+    }
 }
 
 /// Broadcast a `NetworkEvent::Request` describing this HTTP request. Silently
