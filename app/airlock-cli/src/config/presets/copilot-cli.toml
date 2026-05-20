@@ -1,24 +1,38 @@
 # GitHub Copilot CLI preset
+#
+# API hosts from:
+# https://docs.github.com/en/copilot/how-tos/copilot-on-github/customize-copilot/customize-cloud-agent/customize-the-agent-environment
 
 [env]
 COPILOT_GITHUB_TOKEN = "github_pat_NOTReal"
 
 [network.rules.copilot-cli]
 allow = [
+    "github.com:443",
     "api.github.com:443",
     "*.githubcopilot.com:443",
 ]
 
+# Middleware targets only the API hosts — not telemetry.*.githubcopilot.com —
+# so the token is not sent to telemetry endpoints.
 [network.middleware.copilot-cli-api-token]
-target = ["*.githubcopilot.com:443", "api.github.com:443"]
+target = [
+    "api.individual.githubcopilot.com:443",
+    "api.business.githubcopilot.com:443",
+    "api.enterprise.githubcopilot.com:443",
+    "api.github.com:443",
+]
 env.TOKEN = "${COPILOT_GITHUB_TOKEN}"
 script = """
-if env.TOKEN and (req:hostMatches("*.githubcopilot.com") or req.path:sub(1, 17) == "/copilot_internal") then
+local copilot = req:hostMatches("*.githubcopilot.com")
+local github = req:hostMatches("api.github.com")
+  and (req.path:sub(1, 9) == "/copilot/" or req.path:sub(1, 18) == "/copilot_internal/")
+if env.TOKEN and (copilot or github) then
   req:setHeader("Authorization", "Bearer " .. env.TOKEN)
 end
 """
 
-[mounts.copilot-gh-config]
-source = "~/.airlock/copilot"
-target = "~/.config/gh"
+[mounts.copilot-session]
+source = "~/.airlock/copilot-cli"
+target = "~/.copilot"
 missing = "create-dir"
