@@ -14,6 +14,7 @@
 //!    ([`check_reverse_forward_conflicts`]). Two `.guest` entries
 //!    can't both bind the same `127.0.0.1:<port>`.
 
+use super::matchers;
 use super::target::NetworkTarget;
 
 /// A labeled reverse port forward, used for error messages when two
@@ -87,19 +88,20 @@ pub fn check_passthrough_conflicts(
 }
 
 /// True iff there exists at least one concrete `(host, port)` that both
-/// targets would match, using the same pattern semantics as
+/// targets would match, using the same wildcard semantics as
 /// [`super::matchers::host_matches`]:
 ///
 /// - `*` matches any host.
-/// - `*.<suffix>` matches exactly one leading label (no apex, no
-///   multi-label prefix).
+/// - `*.<suffix>` matches any subdomain of `<suffix>` at any depth —
+///   `*.example.com` matches both `api.example.com` and `a.b.example.com`.
 /// - anything else is an exact literal (with localhost aliases).
 ///
-/// Under these rules, two `*.suffix` wildcards overlap iff their
-/// suffixes are identical — a multi-label difference can never be
-/// bridged by a single-label wildcard. Wildcard × literal reduces to
-/// "does the literal match the wildcard." `*` vs anything always
-/// overlaps.
+/// Two `*.suffix` wildcards overlap when their suffixes are equal, or when
+/// one suffix is a dot-separated sub-suffix of the other (e.g.
+/// `*.example.com` and `*.prod.example.com` overlap because any host
+/// matching the narrower pattern also matches the broader one). Wildcard ×
+/// literal reduces to "does the literal match the wildcard." `*` vs
+/// anything always overlaps.
 fn targets_overlap(a: &NetworkTarget, b: &NetworkTarget) -> bool {
     ports_overlap(a.port, b.port) && hosts_overlap(&a.host, &b.host)
 }
@@ -116,22 +118,19 @@ fn hosts_overlap(a: &str, b: &str) -> bool {
         return true;
     }
     match (a.strip_prefix("*."), b.strip_prefix("*.")) {
-        (Some(sa), Some(sb)) => sa == sb,
-        (Some(suffix), None) => wildcard_matches_literal(suffix, b),
-        (None, Some(suffix)) => wildcard_matches_literal(suffix, a),
+        // Both wildcards: *.A and *.B overlap iff A==B, or one suffix contains
+        // the other as a dot-separated sub-suffix (e.g. "example.com" and
+        // "prod.example.com"), because a multi-label host like `x.prod.example.com`
+        // would match both `*.example.com` and `*.prod.example.com` at runtime.
+        (Some(sa), Some(sb)) => {
+            sa == sb
+                || sa.strip_suffix(sb).is_some_and(|p| p.ends_with('.'))
+                || sb.strip_suffix(sa).is_some_and(|p| p.ends_with('.'))
+        }
+        // Wildcard × literal: delegate to host_matches so semantics stay in sync.
+        (Some(_sa), None) => matchers::host_matches(b, a),
+        (None, Some(_sb)) => matchers::host_matches(a, b),
         (None, None) => a == b || (is_localhost(a) && is_localhost(b)),
-    }
-}
-
-/// `*.<suffix>` matches `host` iff `host = <label>.<suffix>` where
-/// `<label>` is non-empty and contains no dots.
-fn wildcard_matches_literal(suffix: &str, host: &str) -> bool {
-    match host.strip_suffix(suffix) {
-        Some(prefix) => match prefix.strip_suffix('.') {
-            Some(label) => !label.is_empty() && !label.contains('.'),
-            None => false,
-        },
-        None => false,
     }
 }
 
@@ -187,12 +186,12 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_subdomain_covers_single_label_subdomain_only() {
+    fn wildcard_subdomain_covers_subdomains_at_any_depth() {
         assert!(targets_overlap(&t("*.example.com"), &t("api.example.com")));
-        // Apex is NOT matched by `*.example.com` (RFC 6125).
+        // Multi-label hosts are matched: `*.example.com` matches `a.b.example.com`.
+        assert!(targets_overlap(&t("*.example.com"), &t("a.b.example.com")));
+        // Apex is NOT matched by `*.example.com`.
         assert!(!targets_overlap(&t("*.example.com"), &t("example.com")));
-        // Multi-label host is NOT matched by a single-label wildcard.
-        assert!(!targets_overlap(&t("*.example.com"), &t("a.b.example.com")));
     }
 
     #[test]
@@ -202,13 +201,13 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_wildcard_overlaps_only_when_suffixes_equal() {
-        // Different suffixes can never overlap: a single-label wildcard
-        // can't bridge a multi-label difference.
-        assert!(!targets_overlap(
+    fn wildcard_wildcard_overlap() {
+        // Nested suffix overlaps: `a.prod.example.com` matches both.
+        assert!(targets_overlap(
             &t("*.example.com"),
             &t("*.prod.example.com")
         ));
+        // Unrelated suffixes never overlap.
         assert!(!targets_overlap(&t("*.example.com"), &t("*.foo.com")));
         // Same suffix overlaps.
         assert!(targets_overlap(&t("*.example.com"), &t("*.example.com")));
@@ -275,12 +274,12 @@ mod tests {
     }
 
     #[test]
-    fn nested_wildcards_with_different_suffixes_do_not_conflict() {
-        // `*.example.com` only matches one-label subdomains, so it
-        // cannot overlap a deeper wildcard like `*.prod.example.com`.
+    fn nested_wildcards_with_suffix_relationship_conflict() {
+        // `a.prod.example.com` matches both `*.example.com` (multi-label)
+        // and `*.prod.example.com`, so these patterns overlap.
         let pt = vec![labeled("pt", "*.example.com")];
         let mw = vec![labeled("mitm", "*.prod.example.com")];
-        assert!(check_passthrough_conflicts(&pt, &mw).is_ok());
+        assert!(check_passthrough_conflicts(&pt, &mw).is_err());
     }
 
     #[test]
