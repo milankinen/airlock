@@ -48,6 +48,23 @@ pub async fn serve(app: Router) -> SocketAddr {
     addr
 }
 
+/// Start a test HTTP server that can be shut down on demand.
+/// Returns the address and a oneshot sender; dropping the sender stops the server.
+pub async fn serve_with_shutdown(app: Router) -> (SocketAddr, tokio::sync::oneshot::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = rx.await;
+            })
+            .await
+            .unwrap();
+    });
+    (addr, tx)
+}
+
 // ── Network + RPC harness ───────────────────────────────
 
 /// Test network configuration
@@ -397,6 +414,10 @@ impl tcp_sink::Server for CollectorSink {
 
 pub fn http_get(port: u16, path: &str) -> String {
     format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
+}
+
+pub fn http_get_keepalive(port: u16, path: &str) -> String {
+    format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n")
 }
 
 pub fn http_post(port: u16, path: &str, body: &str) -> String {

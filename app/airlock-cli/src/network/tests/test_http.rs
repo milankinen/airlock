@@ -100,3 +100,69 @@ fn http_preserves_response_headers() {
         );
     });
 }
+
+#[test]
+fn http_keepalive_multiple_requests() {
+    with_noop_middleware(|proxy| async move {
+        let addr = serve(Router::new().route(
+            "/{*path}",
+            get(|Path(p): Path<String>| async move { format!("path={p}") }),
+        ))
+        .await;
+
+        let mut conn = TestConnection::connect(&proxy, "127.0.0.1", addr.port())
+            .await
+            .unwrap();
+
+        // First request without Connection: close (keep-alive by default in HTTP/1.1)
+        conn.send(http_get_keepalive(addr.port(), "/first").as_bytes())
+            .await;
+        let resp = conn.recv(500).await;
+        assert!(resp.contains("200"), "first request: {resp}");
+        assert!(resp.contains("path=first"), "first body: {resp}");
+
+        // Second request on the same connection
+        conn.send(http_get_keepalive(addr.port(), "/second").as_bytes())
+            .await;
+        let resp = conn.recv(500).await;
+        assert!(resp.contains("200"), "second request: {resp}");
+        assert!(resp.contains("path=second"), "second body: {resp}");
+    });
+}
+
+/// When the upstream server closes the connection, the relay should
+/// propagate the close to the guest so it can reconnect naturally
+/// instead of getting 502 "operation was canceled" on subsequent requests.
+#[test]
+fn http_upstream_close_propagates_to_guest() {
+    with_noop_middleware(|proxy| async move {
+        let (addr, shutdown_tx) =
+            serve_with_shutdown(Router::new().route("/", get(|| async { "hello" }))).await;
+
+        let mut conn = TestConnection::connect(&proxy, "127.0.0.1", addr.port())
+            .await
+            .unwrap();
+
+        // First request succeeds
+        conn.send(http_get_keepalive(addr.port(), "/").as_bytes())
+            .await;
+        let resp = conn.recv(500).await;
+        assert!(
+            resp.contains("200"),
+            "initial request should succeed: {resp}"
+        );
+
+        // Shut down the upstream server
+        let _ = shutdown_tx.send(());
+        // Give the server time to close
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // The guest connection should close (recv returns empty or connection
+        // closed). If the old bug were present, we'd get a 502 instead.
+        let resp = conn.recv(1000).await;
+        assert!(
+            !resp.contains("502"),
+            "should not get 502 after upstream close: {resp}"
+        );
+    });
+}
