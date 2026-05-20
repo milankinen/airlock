@@ -51,7 +51,14 @@ view) **are** part of the user's world; keep those.
 
 - Plain heading, then one unordered list.
 - Each bullet starts with a **bolded short phrase** stating the
-  change, followed by a sentence or two of explanation.
+  change, followed by **one short sentence** of explanation. A
+  second sentence is only allowed when it carries genuinely new
+  information (a migration step, a non-obvious caveat). It is **not**
+  for restating the bold phrase, hedging, or padding with "you can
+  now..." style filler.
+- Default is "one bullet ≈ one tweet." If you find yourself writing
+  "in other words", "this means", or a parenthetical that re-says
+  the same thing, cut it.
 - **Each bullet must be one unbroken line** in markdown source. No
   mid-bullet hard line breaks. Most markdown renderers reflow
   anyway, and keeping it on one line makes the file easy to scan
@@ -80,31 +87,22 @@ Changes since `<previous tag>`:
 
 ## Worked examples
 
-Good:
+Good (one sentence — that's enough):
 
-> **More robust macOS VM backend.** Closes off the two most-likely
-> paths for the rare "sandbox disappeared with a broken terminal"
-> failure: any framework error is now caught cleanly instead of
-> aborting the process, and a late-arriving VM callback can no
-> longer touch freed memory.
+> **Sparse disk shrinks live.** The project disk image now reclaims deleted blocks back to the host every 10 minutes instead of staying at its high-water mark.
 
-Bad (too much implementation detail, multiple lines):
+Good (two-sentence migration note — second sentence is new info, not a restatement):
 
-> **Hardened AppleVmBackend.** Replaced `usize` VM pointer with
-> `Arc<AtomicPtr<VZVirtualMachine>>` and wrapped VZ calls in
-> `objc2::exception::catch` so `NSException` becomes `Err(String)`
-> instead of triggering `abort()`.
+> **User-level `airlock.toml` moves to `~/.airlock/`.** The user-level slot is now `~/.airlock/config.<ext>` (was `~/.cache/airlock/config.<ext>`). Move existing files before the next start.
 
-Good:
+Good (concrete symptom in plain language):
 
-> **Silent-exit diagnostics.** If the CLI ever does exit abnormally,
-> the log now survives restarts (trimmed to about a megabyte on
-> open) and captures every Rust panic or fatal native signal. A
-> final exit-code line marks clean shutdowns — its absence tells
-> you where the process actually died.
+> **`[env].HOME` now drives container-side `~` expansion.** Setting `[env].HOME` used to make `$HOME` and `~` disagree — they agree now.
 
-Bad (code references, low abstraction):
+Bad (padded — second half restates the first):
 
-> **`diagnostics.rs` installed.** Adds a `panic::set_hook` and
-> `libc::signal` handlers for `SIGSEGV/BUS/ILL/ABRT`. Logs land in
-> `airlock.log` via `tracing::error!`.
+> **More robust macOS VM backend.** Closes off the two most-likely paths for the rare "sandbox disappeared with a broken terminal" failure: any framework error is now caught cleanly instead of aborting the process, and a late-arriving VM callback can no longer touch freed memory.
+
+Bad (implementation detail, names internals):
+
+> **Hardened AppleVmBackend.** Replaced `usize` VM pointer with `Arc<AtomicPtr<VZVirtualMachine>>` and wrapped VZ calls in `objc2::exception::catch` so `NSException` becomes `Err(String)` instead of triggering `abort()`.
