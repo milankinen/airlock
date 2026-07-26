@@ -28,7 +28,9 @@
 //!    `SocketStateChanged`, run the FSM so accepted sockets see their
 //!    new state before the next ingress step.
 //! 3. `poll_egress` turns socket-buffered data + FINs into wire packets
-//!    pushed into the Device's tx queue.
+//!    pushed into the Device's tx queue. One call emits at most one
+//!    packet per socket, so it runs in a loop until it reports no
+//!    progress.
 //! 4. `poll_maintenance` advances timers (retransmits, TIME-WAIT).
 //! 5. Drain the Device's tx queue to the TUN fd.
 //! 6. Sleep until any of: TUN readable, host→guest notify, smoltcp's
@@ -46,7 +48,9 @@ use std::time::{Duration, Instant as StdInstant};
 
 use airlock_common::network_capnp::network_proxy;
 use bytes::Bytes;
-use smoltcp::iface::{Config, Interface, PollIngressSingleResult, Route, SocketHandle, SocketSet};
+use smoltcp::iface::{
+    Config, Interface, PollIngressSingleResult, PollResult, Route, SocketHandle, SocketSet,
+};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
@@ -80,6 +84,17 @@ const MAX_CONNS: usize = 256;
 const CHAN_CAP: usize = 8;
 
 type ConnKey = (SocketAddrV4, SocketAddrV4);
+
+#[cfg(feature = "tun-bench")]
+macro_rules! bench_count {
+    ($counter:ident, $n:expr) => {
+        stats::$counter.fetch_add($n, std::sync::atomic::Ordering::Relaxed)
+    };
+}
+#[cfg(not(feature = "tun-bench"))]
+macro_rules! bench_count {
+    ($counter:ident, $n:expr) => {};
+}
 
 /// Per-connection state held in the poll loop.
 struct Conn {
@@ -120,7 +135,22 @@ pub fn start(network: network_proxy::Client, dns: Rc<DnsState>) -> anyhow::Resul
     // RPF would drop them.
     let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{name}/rp_filter"), "0");
 
-    let iface_ip = IpCidr::new(IpAddress::v4(192, 168, 77, 1), 24);
+    spawn_poll_loop(tun, Ipv4Addr::new(192, 168, 77, 1), 24, network, dns)
+}
+
+/// Build the smoltcp interface on an already-configured TUN and spawn the
+/// poll loop. Split from [`start`] so the benchmark in
+/// `tcp_proxy_bench` can run the identical loop on a private TUN whose
+/// bring-up is done with ioctls instead of `/sbin/ip`.
+pub(crate) fn spawn_poll_loop(
+    tun: Tun,
+    ip: Ipv4Addr,
+    prefix: u8,
+    network: network_proxy::Client,
+    dns: Rc<DnsState>,
+) -> anyhow::Result<()> {
+    let name = tun.name().to_string();
+    let iface_ip = IpCidr::new(IpAddress::Ipv4(Ipv4Address::from(ip.octets())), prefix);
     let fd = tun.as_raw_fd();
     let async_fd = AsyncFd::with_interest(fd, Interest::READABLE | Interest::WRITABLE)?;
 
@@ -143,7 +173,7 @@ pub fn start(network: network_proxy::Client, dns: Rc<DnsState>) -> anyhow::Resul
     iface.routes_mut().update(|routes| {
         let _ = routes.push(Route {
             cidr: IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
-            via_router: IpAddress::Ipv4(Ipv4Address::new(192, 168, 77, 1)),
+            via_router: IpAddress::Ipv4(Ipv4Address::from(ip.octets())),
             preferred_until: None,
             expires_at: None,
         });
@@ -164,6 +194,7 @@ pub fn start(network: network_proxy::Client, dns: Rc<DnsState>) -> anyhow::Resul
     tokio::task::spawn_local(async move {
         let start = StdInstant::now();
         loop {
+            bench_count!(ITERS, 1);
             let now = Instant::from_millis(start.elapsed().as_millis() as i64);
 
             // Ingress: process packets one at a time. Run the FSM
@@ -183,14 +214,23 @@ pub fn start(network: network_proxy::Client, dns: Rc<DnsState>) -> anyhow::Resul
             run_fsm(&mut sockets, &mut tracker, &network, &dns, &wake);
 
             // Egress: turn socket-buffered data into device tx packets.
-            let _ = iface.poll_egress(now, &mut device, &mut sockets);
+            // `poll_egress` is bounded work — it emits at most ONE packet
+            // per socket per call — so it must be driven until it reports
+            // no progress, like smoltcp's own `poll()` does. Calling it
+            // once per wakeup caps every connection at one MSS per loop
+            // iteration (~2.5 MiB/s at the observed wakeup rate).
+            while iface.poll_egress(now, &mut device, &mut sockets)
+                == PollResult::SocketStateChanged
+            {}
             // Maintenance: retransmit timers, TIME-WAIT aging.
             iface.poll_maintenance(now);
 
             // Flush pending tx to the TUN.
             while let Some(pkt) = device.tx_queue.pop_front() {
                 match device.tun.write(&pkt) {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        bench_count!(TX_PKTS, 1);
+                    }
                     Err(e) if e.kind() == ErrorKind::WouldBlock => {
                         device.tx_queue.push_front(pkt);
                         break;
@@ -212,6 +252,7 @@ pub fn start(network: network_proxy::Client, dns: Rc<DnsState>) -> anyhow::Resul
             tokio::select! {
                 biased;
                 r = async_fd.readable() => {
+                    bench_count!(WAKE_FD, 1);
                     match r {
                         Ok(mut g) => {
                             drain_rx(&mut device, &mut sockets, &mut tracker);
@@ -223,8 +264,12 @@ pub fn start(network: network_proxy::Client, dns: Rc<DnsState>) -> anyhow::Resul
                         }
                     }
                 }
-                () = wake.notified() => {}
-                () = tokio::time::sleep(timer_wait) => {}
+                () = wake.notified() => {
+                    bench_count!(WAKE_NOTIFY, 1);
+                }
+                () = tokio::time::sleep(timer_wait) => {
+                    bench_count!(WAKE_TIMER, 1);
+                }
             }
         }
     });
@@ -301,6 +346,7 @@ fn run_fsm(
             while conn.pending_tx.is_none() {
                 match conn.from_host_rx.try_recv() {
                     Ok(data) => {
+                        bench_count!(FSM_BYTES_IN, data.len() as u64);
                         if let Some(remaining) = push_to_socket(sock, data) {
                             conn.pending_tx = Some(remaining);
                         }
@@ -421,6 +467,7 @@ fn drain_rx(
                         },
                     );
                 }
+                bench_count!(RX_PKTS, 1);
                 device.rx_queue.push_back(pkt.to_vec());
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => return,
@@ -533,4 +580,19 @@ fn run_ip(args: &[&str]) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Poll-loop counters for the benchmark in `tcp_proxy_bench` — attribute a
+/// throughput ceiling to iteration rate vs. per-iteration work.
+#[cfg(feature = "tun-bench")]
+pub(crate) mod stats {
+    use std::sync::atomic::AtomicU64;
+
+    pub static ITERS: AtomicU64 = AtomicU64::new(0);
+    pub static WAKE_FD: AtomicU64 = AtomicU64::new(0);
+    pub static WAKE_NOTIFY: AtomicU64 = AtomicU64::new(0);
+    pub static WAKE_TIMER: AtomicU64 = AtomicU64::new(0);
+    pub static TX_PKTS: AtomicU64 = AtomicU64::new(0);
+    pub static RX_PKTS: AtomicU64 = AtomicU64::new(0);
+    pub static FSM_BYTES_IN: AtomicU64 = AtomicU64::new(0);
 }

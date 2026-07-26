@@ -32,6 +32,9 @@ mod tcp_proxy;
 #[cfg(target_os = "linux")]
 mod tun;
 
+#[cfg(all(test, target_os = "linux", feature = "tun-bench"))]
+mod tcp_proxy_bench;
+
 // --- Non-Linux stubs ------------------------------------------------
 //
 // airlockd is only ever executed inside the Linux guest VM. These

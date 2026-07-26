@@ -8,6 +8,11 @@ license.workspace = true
 name = "airlockd"
 path = "src/main.rs"
 
+[features]
+# In-VM TUN/smoltcp throughput benchmark (`tun_bench` tests). Needs root +
+# CAP_NET_ADMIN to create TUN devices, so it is opt-in at compile time.
+tun-bench = []
+
 [lints]
 workspace = true
 
