@@ -19,8 +19,8 @@ use base64::engine::general_purpose::STANDARD_NO_PAD;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use parking_lot::Mutex;
-use rand::TryRngCore;
-use rand::rngs::OsRng;
+use rand::TryRng;
+use rand::rngs::SysRng;
 
 use super::{
     ARGON2_KEY_BYTES, ARGON2_M_KIB, ARGON2_P, ARGON2_T, EncryptedBlob, Envelope, KdfParams,
@@ -101,9 +101,9 @@ impl Storage for EncryptedFileStorage {
 
         let passphrase = self.passphrase.unlock()?;
         let key = Self::derive_key(&passphrase, &salt)?;
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let cipher = ChaCha20Poly1305::new(<&Key>::from(&key));
         let plaintext = cipher
-            .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
+            .decrypt(<&Nonce>::from(&nonce), ciphertext.as_ref())
             .map_err(|_| anyhow!("decrypt vault: wrong passphrase or corrupt data"))?;
 
         *self.key.lock() = Some(key);
@@ -125,7 +125,7 @@ impl Storage for EncryptedFileStorage {
                 (s, k)
             } else {
                 let mut salt = [0u8; SALT_BYTES];
-                OsRng
+                SysRng
                     .try_fill_bytes(&mut salt)
                     .context("generate vault salt")?;
                 let passphrase = self.passphrase.create()?;
@@ -137,12 +137,12 @@ impl Storage for EncryptedFileStorage {
         };
 
         let mut nonce = [0u8; NONCE_BYTES];
-        OsRng
+        SysRng
             .try_fill_bytes(&mut nonce)
             .context("generate vault nonce")?;
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let cipher = ChaCha20Poly1305::new(<&Key>::from(&key));
         let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce), data.as_bytes())
+            .encrypt(<&Nonce>::from(&nonce), data.as_bytes())
             .map_err(|e| anyhow!("encrypt vault: {e}"))?;
 
         let envelope = Envelope::EncryptedFile(EncryptedBlob {

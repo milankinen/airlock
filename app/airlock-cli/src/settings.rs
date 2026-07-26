@@ -149,8 +149,7 @@ mod tests {
         let id = N.fetch_add(1, Ordering::Relaxed);
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_nanos());
         let dir = std::env::temp_dir().join(format!("airlock-settings-test-{ts}-{id}"));
         std::fs::create_dir_all(&dir).unwrap();
         dir

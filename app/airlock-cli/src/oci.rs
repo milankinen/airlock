@@ -598,11 +598,7 @@ async fn ensure_registry_image(
 
     let cached_count = layers
         .iter()
-        .filter(|l| {
-            cache::layer_dir(&cache::layer_key(&l.digest))
-                .map(|p| p.is_dir())
-                .unwrap_or(false)
-        })
+        .filter(|l| cache::layer_dir(&cache::layer_key(&l.digest)).is_ok_and(|p| p.is_dir()))
         .count();
     if cached_count > 0 {
         cli::log!(
@@ -616,11 +612,7 @@ async fn ensure_registry_image(
     let to_fetch: Vec<usize> = layers
         .iter()
         .enumerate()
-        .filter(|(_, l)| {
-            !cache::layer_dir(&cache::layer_key(&l.digest))
-                .map(|p| p.is_dir())
-                .unwrap_or(false)
-        })
+        .filter(|(_, l)| !cache::layer_dir(&cache::layer_key(&l.digest)).is_ok_and(|p| p.is_dir()))
         .map(|(i, _)| i)
         .collect();
 

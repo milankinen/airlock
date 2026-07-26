@@ -137,7 +137,7 @@ struct FstrimRange {
 /// Errors are logged and swallowed — both are best-effort.
 pub fn start_periodic_maintenance() {
     tokio::task::spawn_local(async {
-        let interval = Duration::from_secs(600);
+        let interval = Duration::from_mins(10);
         // First fire is one interval after boot rather than at boot
         // itself — at boot there's typically nothing to discard yet
         // and no slab to drop.

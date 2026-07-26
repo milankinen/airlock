@@ -44,20 +44,20 @@ impl DnsState {
             // directly on the server bound to `127.0.0.1:80`.
             return Ipv4Addr::LOCALHOST;
         }
-        if let Some(entry) = self.host_to_ip.get(hostname) {
+        if let Some(entry) = self.host_to_ip.get_sync(hostname) {
             return *entry.get();
         }
         let ip = Ipv4Addr::from(self.next_ip.get());
         self.next_ip.set(self.next_ip.get() + 1);
-        let _ = self.host_to_ip.insert(hostname.to_string(), ip);
-        let _ = self.ip_to_host.insert(ip, hostname.to_string());
+        let _ = self.host_to_ip.insert_sync(hostname.to_string(), ip);
+        let _ = self.ip_to_host.insert_sync(ip, hostname.to_string());
         debug!("dns: {hostname} -> {ip}");
         ip
     }
 
     /// Reverse-lookup: map a virtual IP back to its hostname.
     pub fn reverse(&self, ip: Ipv4Addr) -> Option<String> {
-        self.ip_to_host.get(&ip).map(|e| e.get().clone())
+        self.ip_to_host.get_sync(&ip).map(|e| e.get().clone())
     }
 }
 

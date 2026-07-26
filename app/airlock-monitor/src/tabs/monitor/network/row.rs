@@ -78,8 +78,7 @@ const MONTHS: [&str; 12] = [
 pub fn format_timestamp(t: SystemTime) -> String {
     let secs = t
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let tt = secs as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let ok = unsafe { !libc::localtime_r(&raw const tt, &raw mut tm).is_null() };

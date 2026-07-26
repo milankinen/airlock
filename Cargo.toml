@@ -50,15 +50,15 @@ hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "server-a
 http-body-util = "0.1"
 
 # Cap'n Proto RPC
-capnp = "0.25"
-capnp-rpc = "0.25"
-capnpc = "0.25"
+capnp = "0.26"
+capnp-rpc = "0.26"
+capnpc = "0.26"
 
 # OCI
-oci-client = "0.16"
+oci-client = "0.17"
 flate2 = "1"
 tar = "0.4"
-sha2 = "0.10"
+sha2 = "0.11"
 xattr = "1"
 
 # Config
@@ -73,25 +73,28 @@ toml = "1"
 # one) or the permissive `allow-unsigned-executable-memory`
 # entitlement, neither of which we want. Our middleware scripts use
 # only standard Lua, so the interpreter-only stdlib is a clean fit.
-mlua = { version = "0.11", features = ["lua54", "vendored", "anyhow", "async", "serialize"] }
+mlua = { version = "0.12", features = ["lua54", "vendored", "anyhow", "async", "serialize"] }
 
 # System
 parking_lot = "0.12"
-notify = "6"
-sysinfo = { version = "0.38", features = ["system"] }
+notify = "8"
+sysinfo = { version = "0.39", features = ["system"] }
 pty-process = { version = "0.5", features = ["async"] }
 
 # Secrets
-keyring = { version = "3", default-features = false }
+# The `v1` feature is the simple all-in-one API and picks the credential
+# store per platform: Keychain Services on macOS, Secret Service (over
+# pure-Rust zbus, so no libdbus to vendor) on Linux.
+keyring = { version = "4", default-features = false, features = ["v1"] }
 argon2 = "0.5"
-chacha20poly1305 = "0.10"
-base64 = "0.22"
-rand = "0.9"
+chacha20poly1305 = "0.11"
+base64 = "0.23"
+rand = "0.10"
 
 # DNS + cache
-scc = "2"
-simple-dns = "0.9"
-quick_cache = "0.6"
+scc = "3"
+simple-dns = "0.11"
+quick_cache = "0.7"
 
 # Userspace TCP/IP for TUN-based netns-transparent interception
 smoltcp = { version = "0.13", default-features = false, features = [

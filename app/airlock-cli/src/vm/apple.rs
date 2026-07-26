@@ -409,6 +409,7 @@ impl AppleVmBackend {
     }
 
     /// Connect to a vsock port inside the VM, returning an owned fd.
+    #[allow(dead_code)]
     pub async fn vsock_connect(&self, port: u32) -> anyhow::Result<OwnedFd> {
         let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<i32, String>>();
         let tx = Arc::new(Mutex::new(Some(tx)));

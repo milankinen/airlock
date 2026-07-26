@@ -34,11 +34,10 @@ impl MemoryState {
 
     /// Used percentage 0..100.
     pub fn used_percent(&self) -> u8 {
-        if self.total_bytes == 0 {
-            0
-        } else {
-            ((self.used_bytes * 100) / self.total_bytes).min(100) as u8
-        }
+        (self.used_bytes * 100)
+            .checked_div(self.total_bytes)
+            .unwrap_or(0)
+            .min(100) as u8
     }
 }
 

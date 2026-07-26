@@ -119,7 +119,7 @@ fn extract_tarball_to_cache(
     let file = std::fs::File::open(tarball)?;
     let file: Box<dyn Read> = match progress {
         Some(pb) => {
-            let total = file.metadata().map(|m| m.len()).unwrap_or(0);
+            let total = file.metadata().map_or(0, |m| m.len());
             pb.set_length(total);
             pb.set_position(0);
             pb.set_message("extracting");

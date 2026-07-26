@@ -41,6 +41,7 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 include_dir = { workspace = true }
 indicatif = { workspace = true }
+keyring = { workspace = true }
 libc = { workspace = true }
 mlua = { workspace = true }
 notify = { workspace = true }
@@ -76,11 +77,7 @@ axum = { workspace = true }
 rustls-pemfile = { workspace = true }
 tower = { workspace = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-keyring = { workspace = true, features = ["sync-secret-service", "crypto-rust", "vendored"] }
-
 [target.'cfg(target_os = "macos")'.dependencies]
-keyring = { workspace = true, features = ["apple-native"] }
 security-framework = "3"
 objc2 = { version = "0.6", features = ["exception"] }
 objc2-foundation = { version = "0.3", features = ["NSFileHandle", "NSString", "NSURL", "NSArray", "NSError", "NSDictionary"] }
