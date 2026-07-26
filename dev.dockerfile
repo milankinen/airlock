@@ -1,7 +1,7 @@
 FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y git \
-      curl build-essential capnproto libcapnp-dev musl-tools nodejs
+      curl build-essential capnproto libcapnp-dev musl-tools nodejs iproute2 tcpdump iptables
 RUN curl https://mise.run | sh
 
 
@@ -27,8 +27,6 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 RUN curl -fsSL https://gh.io/copilot-install | bash
 RUN npm i -g @openai/codex
 
-# network debugging tools
-RUN apt-get install -y iproute2 tcpdump iptables
 
 ENTRYPOINT ["/bin/bash"]
 
