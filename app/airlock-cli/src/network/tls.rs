@@ -68,7 +68,16 @@ pub async fn connect_server(
     let addr = format!("{}:{}", target.host, target.port);
     let server_stream = TcpStream::connect(&addr).await?;
     let mut config = (**tls_client).clone();
+    // Offer the container's pick first, but always keep http/1.1 as a
+    // fallback. We advertise h2 to the container long before we know what the
+    // upstream supports, and an upstream that only speaks http/1.1 aborts the
+    // handshake with `no_application_protocol` when h2 is all we offer —
+    // which reaches the guest as a bare FIN mid-TLS ("unexpected eof").
+    // Protocols don't have to match across the proxy: the HTTP relay picks
+    // its upstream client from the *server's* negotiated protocol, so an h2
+    // container talking to an http/1.1 server is a supported bridge.
     config.alpn_protocols = match alpn {
+        Some(proto) if proto != b"http/1.1" => vec![proto.to_vec(), b"http/1.1".to_vec()],
         Some(proto) => vec![proto.to_vec()],
         None => vec![b"http/1.1".to_vec()],
     };

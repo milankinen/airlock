@@ -361,3 +361,295 @@ fn alpn_container_h2_server_h2() {
         },
     );
 }
+
+#[test]
+fn tls_mitm_large_body_arrives_intact() {
+    // Regression: a big, fast response must survive the host → guest RPC
+    // sink byte-for-byte. Anything that reorders, drops or truncates a
+    // chunk here shows up in the guest as a TLS decode error or an
+    // unexpected EOF, because the hole lands inside a TLS record.
+    const SIZE: usize = 8 * 1024 * 1024;
+    let (server_tls, server_ca_pem) = make_server_tls();
+
+    run_with_config(
+        TestNetworkConfig {
+            trust_cas: vec![server_ca_pem],
+            ..Default::default()
+        },
+        |proxy, _log, mitm_ca_pem| async move {
+            let expected: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8).collect();
+            let body = expected.clone();
+            let addr = serve_https(
+                Router::new().route(
+                    "/big",
+                    get(move || {
+                        let body = body.clone();
+                        async move { body }
+                    }),
+                ),
+                server_tls,
+            )
+            .await;
+
+            let conn = TestConnection::connect(&proxy, "127.0.0.1", addr.port())
+                .await
+                .expect("should connect");
+
+            let mut root_store = rustls::RootCertStore::empty();
+            for cert in rustls_pemfile::certs(&mut mitm_ca_pem.as_bytes()) {
+                root_store.add(cert.unwrap()).unwrap();
+            }
+            let tls_config = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+            let server_name =
+                rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
+            let mut tls = connector
+                .connect(server_name, conn.into_stream())
+                .await
+                .unwrap();
+
+            let req = format!(
+                "GET /big HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+                addr.port()
+            );
+            tls.write_all(req.as_bytes()).await.unwrap();
+
+            let mut raw = Vec::new();
+            // Ignore the read error: a truncated stream is exactly what we
+            // want to assert on, and rustls reports it as an I/O error.
+            let read_result = tls.read_to_end(&mut raw).await;
+
+            let split = raw
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .expect("response headers");
+            let got = &raw[split + 4..];
+            assert_eq!(
+                got.len(),
+                expected.len(),
+                "body truncated (read result: {read_result:?})"
+            );
+            assert!(got == expected.as_slice(), "body corrupted");
+        },
+    );
+}
+
+/// Executor for the container-side h2 client — the RPC stream is `!Send`,
+/// so its connection task has to stay on the LocalSet.
+#[derive(Clone)]
+struct LocalExec;
+
+impl<F> hyper::rt::Executor<F> for LocalExec
+where
+    F: Future + 'static,
+{
+    fn execute(&self, fut: F) {
+        tokio::task::spawn_local(async move {
+            fut.await;
+        });
+    }
+}
+
+/// Start an HTTPS server that speaks HTTP/2 only.
+async fn serve_https_h2(
+    app: Router,
+    tls_config: Arc<rustls::ServerConfig>,
+) -> std::net::SocketAddr {
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            let app = app.clone();
+            tokio::spawn(async move {
+                let Ok(tls_stream) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let io = hyper_util::rt::TokioIo::new(tls_stream);
+                let svc = hyper::service::service_fn(
+                    move |req: hyper::Request<hyper::body::Incoming>| {
+                        let mut app = app.clone();
+                        async move {
+                            use tower::Service;
+                            app.call(req).await.map_err(|e| match e {})
+                        }
+                    },
+                );
+                let _ =
+                    hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                        .serve_connection(io, svc)
+                        .await;
+            });
+        }
+    });
+    addr
+}
+
+#[test]
+fn h2_mitm_large_body_arrives_intact() {
+    // End-to-end HTTP/2 through the MITM: container h2 → proxy → upstream
+    // h2, with a body big enough to exercise flow control on both hops.
+    const SIZE: usize = 8 * 1024 * 1024;
+    let (server_tls, server_ca_pem) = make_server_tls_with_alpn(vec![b"h2".to_vec()]);
+
+    run_with_config(
+        TestNetworkConfig {
+            trust_cas: vec![server_ca_pem],
+            ..Default::default()
+        },
+        |proxy, _log, mitm_ca_pem| async move {
+            let expected: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8).collect();
+            let body = expected.clone();
+            let addr = serve_https_h2(
+                Router::new().route(
+                    "/big",
+                    get(move || {
+                        let body = body.clone();
+                        async move { body }
+                    }),
+                ),
+                server_tls,
+            )
+            .await;
+
+            let conn = TestConnection::connect(&proxy, "127.0.0.1", addr.port())
+                .await
+                .expect("should connect");
+
+            let mut root_store = rustls::RootCertStore::empty();
+            for cert in rustls_pemfile::certs(&mut mitm_ca_pem.as_bytes()) {
+                root_store.add(cert.unwrap()).unwrap();
+            }
+            let mut tls_config = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            tls_config.alpn_protocols = vec![b"h2".to_vec()];
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+            let server_name =
+                rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
+            let tls = connector
+                .connect(server_name, conn.into_stream())
+                .await
+                .unwrap();
+            assert_eq!(
+                tls.get_ref().1.alpn_protocol(),
+                Some(b"h2".as_ref()),
+                "MITM should negotiate h2"
+            );
+
+            let io = hyper_util::rt::TokioIo::new(tls);
+            let (mut sender, h2conn) = hyper::client::conn::http2::handshake(LocalExec, io)
+                .await
+                .expect("container h2 handshake");
+            tokio::task::spawn_local(async move {
+                let _ = h2conn.await;
+            });
+
+            let req = hyper::Request::builder()
+                .uri(format!("https://127.0.0.1:{}/big", addr.port()))
+                .body(http_body_util::Empty::<bytes::Bytes>::new())
+                .unwrap();
+            let resp = sender.send_request(req).await.expect("send request");
+            assert_eq!(resp.status(), 200);
+
+            let got = http_body_util::BodyExt::collect(resp.into_body())
+                .await
+                .expect("collect body")
+                .to_bytes();
+            assert_eq!(got.len(), expected.len(), "body truncated");
+            assert!(got.as_ref() == expected.as_slice(), "body corrupted");
+        },
+    );
+}
+
+#[test]
+fn h2_container_h1_only_upstream() {
+    // An upstream that only offers http/1.1 must still work for a container
+    // that negotiated h2 with the MITM: the guest-side hyper server and the
+    // upstream client are independent, so the proxy can bridge h2 → h1.1.
+    // The MITM advertises h2 to the container before it has any idea what
+    // the upstream supports, so this combination is not avoidable.
+    let (server_tls, server_ca_pem) = make_server_tls_with_alpn(vec![b"http/1.1".to_vec()]);
+
+    run_with_config(
+        TestNetworkConfig {
+            trust_cas: vec![server_ca_pem],
+            ..Default::default()
+        },
+        |proxy, _log, mitm_ca_pem| async move {
+            let addr = serve_https(
+                Router::new().route(
+                    "/echo",
+                    get(
+                        |method: axum::http::Method,
+                         uri: axum::http::Uri,
+                         headers: axum::http::HeaderMap| async move {
+                            let host = headers
+                                .get("host")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("<none>")
+                                .to_string();
+                            format!("{method} {uri} host={host}")
+                        },
+                    ),
+                ),
+                server_tls,
+            )
+            .await;
+
+            let conn = TestConnection::connect(&proxy, "127.0.0.1", addr.port())
+                .await
+                .expect("should connect");
+
+            let mut root_store = rustls::RootCertStore::empty();
+            for cert in rustls_pemfile::certs(&mut mitm_ca_pem.as_bytes()) {
+                root_store.add(cert.unwrap()).unwrap();
+            }
+            let mut tls_config = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            tls_config.alpn_protocols = vec![b"h2".to_vec()];
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+            let server_name =
+                rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
+            let tls = connector
+                .connect(server_name, conn.into_stream())
+                .await
+                .expect("MITM TLS handshake");
+            assert_eq!(tls.get_ref().1.alpn_protocol(), Some(b"h2".as_ref()));
+
+            let io = hyper_util::rt::TokioIo::new(tls);
+            let (mut sender, h2conn) = hyper::client::conn::http2::handshake(LocalExec, io)
+                .await
+                .expect("container h2 handshake");
+            tokio::task::spawn_local(async move {
+                let _ = h2conn.await;
+            });
+
+            let req = hyper::Request::builder()
+                .uri(format!("https://127.0.0.1:{}/echo", addr.port()))
+                .body(http_body_util::Empty::<bytes::Bytes>::new())
+                .unwrap();
+            let resp = sender.send_request(req).await.expect("send request");
+            let status = resp.status();
+            let body = http_body_util::BodyExt::collect(resp.into_body())
+                .await
+                .expect("collect body")
+                .to_bytes();
+            let body = String::from_utf8_lossy(&body);
+            assert_eq!(status, 200, "upstream rejected forwarded request: {body}");
+            assert_eq!(
+                body,
+                format!("GET /echo host=127.0.0.1:{}", addr.port()),
+                "forwarded request line/host is wrong"
+            );
+        },
+    );
+}
