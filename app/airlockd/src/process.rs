@@ -308,6 +308,15 @@ fn build_pre_exec(
             let root = std::ffi::CString::new("/").unwrap();
             unsafe { libc::chdir(root.as_ptr()) };
         }
+        // Drop root's supplementary groups before dropping privileges.
+        // Without this the container process, though running as an
+        // unprivileged uid, would keep airlockd's (root's) supplementary
+        // group list — typically including GID 0 — and could reach
+        // group-owned files it shouldn't. Must happen while still root and
+        // before setuid. `setgroups` is async-signal-safe (a bare syscall).
+        if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+            fail!(b"setgroups");
+        }
         // setgid must come before setuid (can't change gid after dropping root)
         if unsafe { libc::setgid(gid) } != 0 {
             fail!(b"setgid");
