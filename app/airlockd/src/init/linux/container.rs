@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::init::MountConfig;
 
@@ -41,9 +41,47 @@ pub(super) fn setup(mounts: &MountConfig, nested_virt: bool) -> anyhow::Result<(
         "",
     )?;
 
-    // /dev — recursive bind from VM /dev (avoids mknod; all devices already present)
-    std::fs::create_dir_all(format!("{root}/dev"))?;
-    super::mount::bind_rec("/dev", &format!("{root}/dev"))?;
+    // /dev — a fresh tmpfs populated with only the standard device nodes.
+    //
+    // We deliberately do NOT recursively bind the VM's /dev: that exposed
+    // block devices like /dev/vda (the raw ext4 project disk) to the
+    // container, letting a container process read/write around the overlay
+    // view and the file-mask bind mounts (which only hide paths at the
+    // filesystem layer) — defeating the guest-side masking guarantees.
+    //
+    // Instead we mirror the OCI runtime default device set. Each node is
+    // bind-mounted from the VM's /dev so we avoid hardcoding major/minor;
+    // block/VM devices are simply never bound. MS_NODEV is intentionally
+    // omitted so the bound char devices work.
+    let dev = format!("{root}/dev");
+    std::fs::create_dir_all(&dev)?;
+    super::mount::fs("dev", &dev, "tmpfs", libc::MS_NOSUID, "mode=0755")?;
+
+    // Standard char devices, plus /dev/fuse when present (BuildKit / rootless
+    // overlay tooling). Absent nodes are skipped.
+    for node in ["null", "zero", "full", "random", "urandom", "tty", "fuse"] {
+        bind_dev_node(&dev, node)?;
+    }
+    // /dev/kvm only for nested virtualization.
+    if nested_virt {
+        if Path::new("/dev/kvm").exists() {
+            bind_dev_node(&dev, "kvm")?;
+        } else {
+            warn!("/dev/kvm requested but not present in VM");
+        }
+    }
+
+    // Standard /dev symlinks the runtime would create.
+    for (link, target) in [
+        ("fd", "/proc/self/fd"),
+        ("stdin", "/proc/self/fd/0"),
+        ("stdout", "/proc/self/fd/1"),
+        ("stderr", "/proc/self/fd/2"),
+    ] {
+        let path = format!("{dev}/{link}");
+        let _ = std::fs::remove_file(&path);
+        std::os::unix::fs::symlink(target, &path)?;
+    }
 
     // /dev/pts
     std::fs::create_dir_all(format!("{root}/dev/pts"))?;
@@ -54,6 +92,11 @@ pub(super) fn setup(mounts: &MountConfig, nested_virt: bool) -> anyhow::Result<(
         libc::MS_NOSUID | libc::MS_NOEXEC,
         "newinstance,ptmxmode=0666,mode=0620",
     )?;
+
+    // /dev/ptmx → the new devpts instance's ptmx (runtime default).
+    let ptmx = format!("{root}/dev/ptmx");
+    let _ = std::fs::remove_file(&ptmx);
+    std::os::unix::fs::symlink("pts/ptmx", &ptmx)?;
 
     // /dev/shm
     std::fs::create_dir_all(format!("{root}/dev/shm"))?;
@@ -117,11 +160,23 @@ pub(super) fn setup(mounts: &MountConfig, nested_virt: bool) -> anyhow::Result<(
         info!("/airlock/.files/ro → /mnt/files/ro");
     }
 
-    // /dev/kvm for nested virtualization (already in /dev bind, but explicit for clarity)
-    if nested_virt && !Path::new("/dev/kvm").exists() {
-        warn!("/dev/kvm requested but not present in VM");
-    }
-
     info!("container mounts configured");
+    Ok(())
+}
+
+/// Expose a single device node from the VM's `/dev` into the container's
+/// `/dev` by bind-mounting it onto a freshly created file. This mirrors what
+/// `mknod` would do without needing to know the node's major/minor, and keeps
+/// block/VM devices (never named here) out of the container. A node absent
+/// from the VM is skipped.
+fn bind_dev_node(dev_root: &str, name: &str) -> anyhow::Result<()> {
+    let src = format!("/dev/{name}");
+    if !Path::new(&src).exists() {
+        debug!("/dev/{name} not present in VM; skipping");
+        return Ok(());
+    }
+    let dst = format!("{dev_root}/{name}");
+    std::fs::File::create(&dst)?;
+    super::mount::bind(&src, &dst, false)?;
     Ok(())
 }

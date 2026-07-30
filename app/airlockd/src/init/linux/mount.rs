@@ -59,26 +59,6 @@ pub(super) fn bind(src: &str, dst: &str, read_only: bool) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Recursive bind mount (MS_BIND | MS_REC).
-pub(super) fn bind_rec(src: &str, dst: &str) -> anyhow::Result<()> {
-    let src_cstr = std::ffi::CString::new(src).unwrap();
-    let dst_cstr = std::ffi::CString::new(dst).unwrap();
-    let ret = unsafe {
-        libc::mount(
-            src_cstr.as_ptr(),
-            dst_cstr.as_ptr(),
-            std::ptr::null(),
-            libc::MS_BIND | libc::MS_REC,
-            std::ptr::null(),
-        )
-    };
-    if ret != 0 {
-        let err = std::io::Error::last_os_error();
-        anyhow::bail!("failed to recursive bind-mount {src} → {dst}: {err}");
-    }
-    Ok(())
-}
-
 /// Mount a filesystem with optional data string.
 pub(super) fn fs(
     source: &str,
