@@ -15,7 +15,7 @@
 //! ([`ensure_layer_cached`]).
 
 use std::io::{BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use flate2::read::GzDecoder;
 use indicatif::ProgressBar;
@@ -156,7 +156,7 @@ fn extract_tarball_to_cache(
         {
             let parent_rel = path.parent().unwrap_or_else(|| Path::new(""));
             if name == OPAQUE_WHITEOUT {
-                let dir = tmp.join(parent_rel);
+                let dir = safe_join(&tmp, parent_rel)?;
                 std::fs::create_dir_all(&dir)?;
                 xattr::set(&dir, "user.overlay.opaque", b"y").map_err(|e| {
                     anyhow::anyhow!(
@@ -166,7 +166,7 @@ fn extract_tarball_to_cache(
                     )
                 })?;
             } else {
-                let dir = tmp.join(parent_rel);
+                let dir = safe_join(&tmp, parent_rel)?;
                 std::fs::create_dir_all(&dir)?;
                 let target = dir.join(target_name);
                 let _ = std::fs::remove_file(&target);
@@ -214,6 +214,48 @@ fn extract_tarball_to_cache(
     }
     std::fs::rename(&tmp, layer_dir)?;
     Ok(())
+}
+
+/// Join `rel` onto the extraction `root` for whiteout handling, refusing any
+/// path that could escape the root.
+///
+/// Whiteout entries are handled with our own filesystem calls (rather than
+/// `entry.unpack_in`, which contains normal entries for us), so we must do
+/// the containment ourselves. A malicious layer can order an earlier entry
+/// that plants a symlink (`etc -> ../../../../home/user`) or use an absolute
+/// whiteout path (`/etc/.wh.passwd`); a naive `root.join(parent_rel)` would
+/// then follow the symlink or, for an absolute `parent_rel`, discard `root`
+/// entirely — turning a whiteout into an arbitrary host-file create/delete.
+///
+/// We rebuild the path one component at a time from `root`, accept only
+/// `Normal` components (rejecting absolute prefixes and any leftover `..`),
+/// and refuse if any existing component along the way is a symlink. Because
+/// the extraction loop is single-threaded and only this function and
+/// `unpack_in` write under `root`, a component that is a symlink can only
+/// have come from an earlier entry in the same layer.
+fn safe_join(root: &Path, rel: &Path) -> anyhow::Result<PathBuf> {
+    let mut cur = root.to_path_buf();
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(c) => {
+                cur.push(c);
+                if let Ok(md) = std::fs::symlink_metadata(&cur)
+                    && md.file_type().is_symlink()
+                {
+                    anyhow::bail!(
+                        "refusing layer: whiteout path traverses a symlink at {}",
+                        cur.display()
+                    );
+                }
+            }
+            Component::CurDir => {}
+            _ => anyhow::bail!(
+                "refusing layer: unsafe whiteout path component in {}",
+                rel.display()
+            ),
+        }
+    }
+    Ok(cur)
 }
 
 /// `Read` wrapper that increments a progress bar by the number of bytes
@@ -473,6 +515,79 @@ mod tests {
         let layer = ensure_layer_cached(digest, fetch_from(tarball_src), None).unwrap();
         assert!(layer.join("ok").exists());
         assert!(!stale.exists());
+    }
+
+    #[test]
+    fn safe_join_accepts_normal_relative_path() {
+        let root = tempfile_dir();
+        assert_eq!(
+            safe_join(&root, Path::new("a/b/c")).unwrap(),
+            root.join("a/b/c")
+        );
+    }
+
+    #[test]
+    fn safe_join_rejects_absolute_path() {
+        let root = tempfile_dir();
+        // An absolute whiteout path (`/etc/.wh.passwd`) would make a naive
+        // `root.join(parent_rel)` discard `root` entirely.
+        assert!(safe_join(&root, Path::new("/etc")).is_err());
+    }
+
+    #[test]
+    fn safe_join_rejects_symlink_component() {
+        let root = tempfile_dir();
+        // An earlier layer entry plants `esc` as a symlink pointing outside.
+        std::os::unix::fs::symlink("/", root.join("esc")).unwrap();
+        assert!(safe_join(&root, Path::new("esc")).is_err());
+        assert!(safe_join(&root, Path::new("esc/passwd")).is_err());
+    }
+
+    #[test]
+    fn ensure_layer_cached_wont_delete_outside_root_via_whiteout() {
+        let _guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile_dir();
+        unsafe {
+            std::env::set_var("HOME", &tmp);
+        }
+
+        // A sentinel host file outside the extraction root. A whiteout that
+        // follows a planted symlink would `remove_file` it.
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("victim"), b"precious").unwrap();
+
+        // Malicious layer: plant `esc -> <outside>`, then whiteout
+        // `esc/.wh.victim` to try to delete `<outside>/victim`.
+        let mut gz = GzEncoder::new(Vec::new(), Compression::fast());
+        {
+            let mut b = tar::Builder::new(&mut gz);
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Symlink);
+            link.set_size(0);
+            b.append_link(&mut link, "esc", &outside).unwrap();
+            let mut wh = tar::Header::new_gnu();
+            wh.set_size(0);
+            wh.set_mode(0o644);
+            wh.set_cksum();
+            b.append_data(&mut wh, "esc/.wh.victim", &b""[..]).unwrap();
+            b.finish().unwrap();
+        }
+        let buf = gz.finish().unwrap();
+        let tarball = tmp.join("evil.tar.gz");
+        std::fs::write(&tarball, buf).unwrap();
+
+        let _ = ensure_layer_cached("sha256:evil1", fetch_from(tarball), None);
+
+        // The security invariant: the file outside the root is untouched,
+        // regardless of whether extraction errored or contained the whiteout.
+        assert!(
+            outside.join("victim").exists(),
+            "whiteout escaped the extraction root and deleted a host file"
+        );
+        assert_eq!(std::fs::read(outside.join("victim")).unwrap(), b"precious");
     }
 
     fn tempfile_dir() -> PathBuf {
