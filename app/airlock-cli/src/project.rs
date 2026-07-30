@@ -33,7 +33,12 @@ pub struct Project {
     /// happens until the first `get_*`/`set_*` call, so commands that
     /// don't reference secrets never trigger an unlock prompt.
     pub vault: Vault,
-    lock_path: Option<PathBuf>,
+    /// Held `flock` on `sandbox/lock` for the lifetime of the `Project`.
+    /// Present only for locked projects (`lock()`); the kernel releases the
+    /// lock when this handle drops or the process exits. Never read — kept
+    /// solely as an RAII guard.
+    #[allow(dead_code)]
+    lock_file: Option<std::fs::File>,
 }
 
 impl Project {
@@ -85,17 +90,6 @@ impl Project {
     }
 }
 
-impl Drop for Project {
-    fn drop(&mut self) {
-        if let Some(lock_path) = &self.lock_path
-            && let Ok(contents) = std::fs::read_to_string(lock_path)
-            && contents.trim() == std::process::id().to_string()
-        {
-            let _ = std::fs::remove_file(lock_path);
-        }
-    }
-}
-
 /// Load project data without locking.
 ///
 /// Resolves the project from the current working directory, loads its config,
@@ -132,7 +126,7 @@ pub fn load(vault: Vault) -> anyhow::Result<Project> {
         ca_key,
         ca_newly_generated: false,
         vault,
-        lock_path: None,
+        lock_file: None,
     })
 }
 
@@ -160,7 +154,7 @@ pub fn lock(
     let sandbox_dir = cache_dir.join("sandbox");
     std::fs::create_dir_all(&sandbox_dir)?;
     let lock_path = sandbox_dir.join("lock");
-    acquire_lock(&lock_path)?;
+    let lock_file = acquire_lock(&lock_path)?;
 
     // Persist guest_cwd in run.json so `airlock exec` can default to it.
     let mut meta = read_run_meta(&sandbox_dir);
@@ -184,7 +178,7 @@ pub fn lock(
         ca_key,
         ca_newly_generated,
         vault,
-        lock_path: Some(lock_path),
+        lock_file: Some(lock_file),
     })
 }
 
@@ -203,15 +197,21 @@ pub fn ensure_cache_dir(host_cwd: &Path) -> anyhow::Result<PathBuf> {
     Ok(cache_dir)
 }
 
-/// Check if a project is running by examining its lock file.
+/// Check if a project is running by probing its sandbox lock.
+///
+/// Attempts a non-blocking exclusive `flock` on `sandbox/lock`: if it can be
+/// taken, no live process holds the lock (not running) and it is released
+/// immediately when the handle drops; if it is contended, a running instance
+/// holds it. This mirrors the acquisition in [`acquire_lock`] and avoids the
+/// `kill(pid, 0)` pitfalls (PID reuse, `EPERM` for another user's process).
 pub fn is_running(sandbox_dir: &Path) -> bool {
-    let Ok(contents) = std::fs::read_to_string(sandbox_dir.join("lock")) else {
+    use std::os::unix::io::AsRawFd;
+    let Ok(file) = std::fs::File::open(sandbox_dir.join("lock")) else {
         return false;
     };
-    let Ok(pid) = contents.trim().parse::<i32>() else {
-        return false;
-    };
-    unsafe { libc::kill(pid, 0) == 0 }
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    // rc == 0 → we grabbed it → nobody was holding it → not running.
+    rc != 0
 }
 
 /// Format the last run time as "X ago".
@@ -257,37 +257,52 @@ struct CaData {
     key: String,
 }
 
-/// Atomic PID lock acquisition via write-then-verify, retrying up to 10 times.
-fn acquire_lock(lock_path: &Path) -> anyhow::Result<()> {
-    let my_pid = std::process::id().to_string();
-    let mut attempts = 0;
-    while attempts < 10 {
-        if let Ok(contents) = std::fs::read_to_string(lock_path) {
-            let stored_pid = contents.trim();
-            if !stored_pid.is_empty()
-                && let Ok(pid) = stored_pid.parse::<i32>()
-                && unsafe { libc::kill(pid, 0) } == 0
-            {
-                anyhow::bail!(
-                    "another airlock instance (pid {pid}) is using this sandbox. \
-                     If this is stale, remove {}",
-                    lock_path.display()
-                );
-            }
-        }
+/// Acquire the sandbox lock, held for the lifetime of the returned handle.
+///
+/// Takes a non-blocking exclusive `flock` on `sandbox/lock` — a real kernel
+/// mutex — so two concurrent `airlock up` runs cannot both believe they hold
+/// the sandbox (the previous write-then-verify scheme let a `rename` clobber
+/// win the race for both). The lock is released automatically when the handle
+/// drops, and by the kernel on process exit even when destructors are skipped
+/// (e.g. `std::process::exit`). The file's contents are our PID, kept purely
+/// for diagnostics.
+fn acquire_lock(lock_path: &Path) -> anyhow::Result<std::fs::File> {
+    use std::io::{Seek, Write};
+    use std::os::unix::io::AsRawFd;
 
-        let tmp = lock_path.with_extension(format!("{my_pid}.tmp"));
-        std::fs::write(&tmp, &my_pid)?;
-        std::fs::rename(&tmp, lock_path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
 
-        let written = std::fs::read_to_string(lock_path)?;
-        if written.trim() == my_pid {
-            return Ok(());
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            let holder = std::fs::read_to_string(lock_path)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            return match holder {
+                Some(pid) => Err(anyhow::anyhow!(
+                    "another airlock instance (pid {pid}) is using this sandbox"
+                )),
+                None => Err(anyhow::anyhow!(
+                    "another airlock instance is using this sandbox"
+                )),
+            };
         }
-        let _ = std::fs::remove_file(&tmp);
-        attempts += 1;
+        return Err(anyhow::anyhow!("failed to lock sandbox: {err}"));
     }
-    Err(anyhow::anyhow!("failed to obtain sandbox lock"))
+
+    // We hold the lock — (re)write our PID for diagnostics.
+    file.set_len(0)?;
+    file.rewind()?;
+    write!(file, "{}", std::process::id())?;
+    file.flush()?;
+    Ok(file)
 }
 
 /// Generate a self-signed CA keypair and write it to `ca.json`.
@@ -321,4 +336,46 @@ fn read_ca(sandbox_dir: &Path) -> anyhow::Result<(String, String)> {
         .map_err(|_| anyhow::anyhow!("CA not found — run `airlock up` first"))?;
     let ca: CaData = serde_json::from_str(&json)?;
     Ok((ca.cert, ca.key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "airlock-lock-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn lock_is_exclusive_and_is_running_tracks_it() {
+        let dir = scratch_dir("excl");
+        let lock = dir.join("lock");
+
+        // No lock file yet → not running.
+        assert!(!is_running(&dir));
+
+        let held = acquire_lock(&lock).expect("first acquire succeeds");
+        // Contended → reported as running.
+        assert!(is_running(&dir));
+        // A second acquisition (independent fd) must be refused, even from
+        // the same process — this is the mutual-exclusion the old scheme lost.
+        assert!(acquire_lock(&lock).is_err());
+
+        drop(held);
+        // Released → not running, and a fresh acquisition succeeds.
+        assert!(!is_running(&dir));
+        let _held2 = acquire_lock(&lock).expect("re-acquire after release succeeds");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
