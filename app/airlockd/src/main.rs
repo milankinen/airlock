@@ -37,6 +37,10 @@ async fn main() -> anyhow::Result<()> {
 /// (supervisor + network), set up the guest, run the user's process,
 /// then idle until the VM is torn down.
 async fn airlockd() -> anyhow::Result<()> {
+    // As PID 1 we must reap orphaned zombies (e.g. double-forking daemons);
+    // start the reaper before anything spawns processes.
+    tokio::task::spawn_local(process::run_orphan_reaper());
+
     // Supervisor channel first — accept blocks until the host connects.
     let sup_listen = vsock::listen(airlock_common::SUPERVISOR_PORT)?;
     let sup_conn = vsock::accept(&sup_listen)?;

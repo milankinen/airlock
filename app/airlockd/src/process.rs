@@ -5,8 +5,11 @@
 //! which bridges its I/O back to the host CLI via RPC.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fmt::Display;
 use std::rc::Rc;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use airlock_common::supervisor_capnp::*;
 use anyhow::Context as _;
@@ -15,6 +18,88 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{error, trace};
 
 use crate::rpc::HostProcess;
+
+/// PIDs of processes airlockd spawned via tokio and reaps itself. The orphan
+/// reaper consults this set so it never steals a status that a `Child::wait`
+/// is waiting for.
+fn own_children() -> &'static Mutex<HashSet<i32>> {
+    static R: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Record a PID airlockd spawned itself, so the orphan reaper leaves it alone.
+fn register_own_child(pid: u32) {
+    own_children().lock().unwrap().insert(pid as i32);
+}
+
+/// Reap orphaned zombie processes reparented to this init.
+///
+/// airlockd runs as PID 1, so any process whose parent exits — e.g. a
+/// double-forking daemon started by the workload — is reparented here. tokio
+/// only reaps the children it spawned, so without this those orphans pile up
+/// as `<defunct>` zombies until PID space is exhausted and the VM can no
+/// longer fork.
+///
+/// We periodically scan `/proc` for zombie children of this process and reap
+/// them, skipping any PID airlockd spawned itself (tracked in
+/// [`own_children`]) so tokio's `Child::wait` still observes those exits. The
+/// scan enumerates via `/proc` rather than `waitpid(-1)` precisely so it can
+/// exclude our own children instead of blindly consuming the first zombie.
+pub async fn run_orphan_reaper() {
+    let me = std::process::id() as i32;
+    let mut ticker = tokio::time::interval(Duration::from_secs(2));
+    loop {
+        ticker.tick().await;
+        reap_orphans_once(me);
+    }
+}
+
+fn reap_orphans_once(me: i32) {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    let mut live: HashSet<i32> = HashSet::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        live.insert(pid);
+
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let Some((ppid, state)) = parse_stat(&stat) else {
+            continue;
+        };
+        if ppid == me && state == 'Z' && !own_children().lock().unwrap().contains(&pid) {
+            // An orphan zombie we did not spawn — reap it.
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        }
+    }
+    // Drop registry entries whose process is gone (tokio reaped it), keeping
+    // the set bounded and letting a reused PID re-register cleanly on spawn.
+    own_children()
+        .lock()
+        .unwrap()
+        .retain(|pid| live.contains(pid));
+}
+
+/// Parse the parent PID and state character from a `/proc/<pid>/stat` line.
+///
+/// The `comm` field (field 2) is wrapped in parentheses and may itself
+/// contain spaces and parentheses, so we split *after* the last `)`; the
+/// state is then the first following field and PPID the second.
+fn parse_stat(stat: &str) -> Option<(i32, char)> {
+    let after_comm = stat[stat.rfind(')')? + 1..].trim_start();
+    let mut fields = after_comm.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let ppid = fields.next()?.parse::<i32>().ok()?;
+    Some((ppid, state))
+}
 
 /// A child process that has been spawned but not yet wired to host I/O.
 pub struct SpawnedProcess {
@@ -109,7 +194,13 @@ pub fn spawn_daemon(
     // Safety: pre_exec runs post-fork in child; only async-signal-safe calls.
     unsafe { command.pre_exec(pre_exec) };
     let result = command.spawn().map_err(anyhow::Error::from);
-    finish_diag_pipe(diag_r, diag_w, result)
+    let result = finish_diag_pipe(diag_r, diag_w, result);
+    if let Ok(child) = &result
+        && let Some(pid) = child.id()
+    {
+        register_own_child(pid);
+    }
+    result
 }
 
 fn env_string_pairs(env: &[String]) -> Vec<(String, String)> {
@@ -260,6 +351,9 @@ where
         };
         // Safety: pre_exec runs post-fork in child; only async-signal-safe calls.
         let child = unsafe { builder.pre_exec(pre_exec) }.spawn(pts)?;
+        if let Some(pid) = child.id() {
+            register_own_child(pid);
+        }
         Ok(SpawnedProcess {
             child,
             pty: Some(pty),
@@ -277,6 +371,9 @@ where
         // Safety: pre_exec runs post-fork in child; only async-signal-safe calls.
         unsafe { command.pre_exec(pre_exec) };
         let child = command.spawn()?;
+        if let Some(pid) = child.id() {
+            register_own_child(pid);
+        }
         Ok(SpawnedProcess { child, pty: None })
     }
 }
@@ -545,5 +642,31 @@ impl process::Server for ProcessImpl {
         let tx = self.signals.borrow().clone();
         let _ = tx.send(Signal::Kill).await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_stat;
+
+    #[test]
+    fn parse_stat_reads_state_and_ppid() {
+        // Simple case: pid 1234, comm "bash", state S, ppid 1.
+        assert_eq!(parse_stat("1234 (bash) S 1 1234 1234 0 -1"), Some((1, 'S')));
+    }
+
+    #[test]
+    fn parse_stat_handles_comm_with_spaces_and_parens() {
+        // The comm field can contain spaces and parentheses; parsing must key
+        // off the LAST ')'. Here comm is "weird ) proc", state Z, ppid 1.
+        assert_eq!(
+            parse_stat("42 (weird ) proc) Z 1 42 42 0 -1 4194560"),
+            Some((1, 'Z'))
+        );
+    }
+
+    #[test]
+    fn parse_stat_rejects_garbage() {
+        assert_eq!(parse_stat("not a stat line"), None);
     }
 }
