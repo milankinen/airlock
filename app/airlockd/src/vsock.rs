@@ -25,7 +25,11 @@ struct SockaddrVm {
 /// Create a vsock listener bound to the given port, accepting from any CID.
 pub fn listen(port: u32) -> std::io::Result<OwnedFd> {
     unsafe {
-        let fd = libc::socket(AF_VSOCK, libc::SOCK_STREAM, 0);
+        // SOCK_CLOEXEC so the listener fd is not inherited across exec into
+        // container processes — otherwise an untrusted process could walk
+        // /proc/self/fd and speak the host RPC protocol directly, escaping
+        // airlockd's mediation.
+        let fd = libc::socket(AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -60,10 +64,13 @@ pub fn listen(port: u32) -> std::io::Result<OwnedFd> {
 /// Accept a single connection on a vsock listener.
 pub fn accept(listen_fd: &OwnedFd) -> std::io::Result<OwnedFd> {
     unsafe {
-        let fd = libc::accept(
+        // accept4 with SOCK_CLOEXEC: the connected fd carries the live host
+        // RPC channel and must not leak into exec'd container processes.
+        let fd = libc::accept4(
             std::os::unix::io::AsRawFd::as_raw_fd(listen_fd),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
+            libc::SOCK_CLOEXEC,
         );
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
