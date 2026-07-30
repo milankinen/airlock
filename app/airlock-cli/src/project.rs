@@ -153,6 +153,9 @@ pub fn lock(
     let cache_dir = ensure_cache_dir(&host_cwd)?;
     let sandbox_dir = cache_dir.join("sandbox");
     std::fs::create_dir_all(&sandbox_dir)?;
+    // The sandbox holds the CA private key; keep other local users out of it.
+    // Best-effort: the key file itself is 0600, so this is defense in depth.
+    harden_dir_permissions(&sandbox_dir);
     let lock_path = sandbox_dir.join("lock");
     let lock_file = acquire_lock(&lock_path)?;
 
@@ -305,6 +308,14 @@ fn acquire_lock(lock_path: &Path) -> anyhow::Result<std::fs::File> {
     Ok(file)
 }
 
+/// Best-effort restrict a directory to owner-only (0700). Failure is ignored
+/// (e.g. filesystems without Unix modes) — the sensitive file inside is
+/// written 0600 regardless, which is the real protection.
+fn harden_dir_permissions(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+}
+
 /// Generate a self-signed CA keypair and write it to `ca.json`.
 fn generate_ca(sandbox_dir: &Path) -> anyhow::Result<()> {
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
@@ -322,10 +333,12 @@ fn generate_ca(sandbox_dir: &Path) -> anyhow::Result<()> {
         cert: cert.pem(),
         key: key_pair.serialize_pem(),
     };
-    std::fs::write(
-        sandbox_dir.join("ca.json"),
-        serde_json::to_string_pretty(&ca_data)?,
-    )?;
+    // ca.json holds the CA *private key*. Write it owner-only (0600) and
+    // atomically (tmp + rename) so a crash can't leave a truncated file that
+    // then blocks every subsequent run (ca.json.exists() would skip
+    // regeneration but read_ca would fail to parse).
+    let json = serde_json::to_string_pretty(&ca_data)?;
+    crate::vault::atomic_write(&sandbox_dir.join("ca.json"), json.as_bytes())?;
 
     Ok(())
 }
@@ -376,6 +389,23 @@ mod tests {
         assert!(!is_running(&dir));
         let _held2 = acquire_lock(&lock).expect("re-acquire after release succeeds");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ca_key_is_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch_dir("ca");
+        generate_ca(&dir).expect("generate CA");
+        let mode = std::fs::metadata(dir.join("ca.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "CA private key file must be owner read/write only"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
