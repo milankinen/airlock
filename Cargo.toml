@@ -113,7 +113,13 @@ axum = "0.8"
 tower = "0.5"
 
 # TUI
-ratatui = "0.30"
+# `unstable-rendered-line-info` exposes `Paragraph::line_count`, which
+# measures height *after* wrapping. The scrollable request-details view
+# needs it to know how far it may scroll; counting wrapped rows by hand
+# would risk silently disagreeing with what ratatui actually renders.
+# Upstream marks it unstable because the wrapping design may change —
+# the call site is a single line, so a breaking change is cheap to absorb.
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 terminput = "0.5"
 terminput-crossterm = "0.4"
 vt100 = "0.16"

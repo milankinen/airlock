@@ -37,16 +37,30 @@ a gray header row naming the columns.
   full request before responding with `403 Forbidden` instead of
   refusing at the TCP layer, so you can see exactly what was attempted.
 - **Connections** — one row per raw TCP connection. Columns: a colored
-  `⦿` bullet, `Target` (host:port, white), `Connected at`,
+  `⦿` bullet, `Target` (host:port, white), `Transferred`, `Connected at`,
   `Disconnected at`, `Result`. The bullet signals connection lifecycle:
   **green** means the connection is still open (`Disconnected at` is
   blank), **gray** means it closed, **red** means the connection was
   denied. A footer tracks running allow/deny counts.
 
+`Transferred` shows `↑ 4.2MB ↓ 61MB` — how much the sandbox sent and
+received on that connection, updating live. It's a measure of network
+traffic rather than of file size, so it counts protocol overhead too
+and will read a little above the size of whatever was actually
+downloaded. Narrow terminals drop the column to leave room for
+`Target`.
+
 Use `↑` / `↓` to move the row selection (PgUp/PgDn, Home, End also
 work), and press `Enter` to open a **details** sub-tab with the full
-snapshot — including captured request headers for HTTP. Close it with
-`Esc`, `x`, or the `×` in the tab label.
+snapshot. Close it with `Esc`, `x`, or the `×` in the tab label.
+
+For an HTTP request the details view shows the headers the sandbox
+sent, and the response status and headers that came back. Requests
+still waiting on a reply show `(no response yet)`. For a connection it
+shows exact byte counts.
+
+When the snapshot is taller than the panel, `↑` / `↓` (and PgUp/PgDn,
+Home/End, or the mouse wheel) scroll it.
 
 Switch sub-tabs with `r` / `c` or click the sub-tab labels (mouse
 capture must be on — see below).
@@ -79,9 +93,9 @@ Total and used bytes (reported the way `free` and `htop` do:
 | `F2`            | Switch to Monitor tab                           |
 | `r`             | On Monitor tab: show Requests sub-tab           |
 | `c`             | On Monitor tab: show Connections sub-tab        |
-| `↑` / `↓`       | Move row selection in Requests / Connections    |
-| `PgUp` / `PgDn` | Jump the selection a page at a time             |
-| `Home` / `End`  | Jump to the newest / oldest entry               |
+| `↑` / `↓`       | Move row selection, or scroll the details view  |
+| `PgUp` / `PgDn` | Same, a page at a time                          |
+| `Home` / `End`  | Jump to either end of the list or details view  |
 | `Enter`         | Open the selected row in a details sub-tab      |
 | `Esc` / `x`     | Close the details sub-tab                       |
 | `p`             | On Monitor tab: open the policy dropdown        |
@@ -186,5 +200,14 @@ terminals, `Cmd+C` on macOS). The footer shows a `Selection mode`
 hint while capture is released. Press `Esc` or `Ctrl+C` to restore
 mouse capture so clicks route back into the TUI.
 
-The first click in the Sandbox tab is consumed by the mode switch
-itself; start the drag on the next press.
+The same works in the Monitor tab's **details** view, so you can copy
+request or response headers out: click inside the body, drag to select,
+copy, then press `Esc` to get the mouse back. While selection mode is
+on the mouse belongs to your terminal, so scrolling and the `×` close
+button only work once you've left it.
+
+The first click is consumed by the mode switch itself; start the drag
+on the next press. The keys that end selection mode don't also do their
+usual job — `Ctrl+C` copies without interrupting whatever is running in
+the sandbox, and `Esc` doesn't close the details view. Press either a
+second time for that.

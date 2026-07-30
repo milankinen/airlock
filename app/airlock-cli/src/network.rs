@@ -21,6 +21,7 @@ mod tcp;
 #[cfg(test)]
 mod tests;
 mod tls;
+mod traffic;
 
 use std::collections::HashMap;
 use std::path::PathBuf;

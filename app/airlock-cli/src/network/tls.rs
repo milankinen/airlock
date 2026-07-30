@@ -4,6 +4,7 @@
 //! TLS, inspects/modifies HTTP traffic, then re-encrypts to the real server.
 //! Per-hostname leaf certificates are generated on demand and cached.
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use airlock_common::network_capnp::tcp_sink;
@@ -17,7 +18,7 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, trace};
 
-use super::io;
+use super::{io, traffic};
 use crate::network::target::ResolvedTarget;
 
 /// Accept a TLS handshake from the container (MITM) and wrap the decrypted
@@ -31,12 +32,43 @@ pub async fn accept_container(
     rx: mpsc::Receiver<Bytes>,
     client_sink: tcp_sink::Client,
     interceptor: &TlsInterceptor,
+    counter: Option<&Rc<traffic::TrafficCounter>>,
 ) -> anyhow::Result<(io::Transport, Option<Bytes>)> {
     let sni_host = extract_sni(&first).unwrap_or_else(|| host.to_string());
     let rpc_io = io::RpcTransport::new(first, rx, client_sink);
+    // Byte counting goes *under* the TLS layer so the Monitor tab reports
+    // wire bytes — encrypted records plus the handshake, matching what a
+    // capture on the guest's interface would show. `first` is re-fed
+    // through this stream, so the ClientHello is counted too.
+    //
+    // Branching on the counter (rather than folding an `Option` into the
+    // wrapper) keeps the unwatched path free of any extra layer; the cost
+    // is one more monomorphization of `handshake`.
+    match counter {
+        Some(c) => {
+            handshake(
+                traffic::count_stream(rpc_io, c),
+                &sni_host,
+                interceptor,
+                host,
+            )
+            .await
+        }
+        None => handshake(rpc_io, &sni_host, interceptor, host).await,
+    }
+}
+
+/// Terminate the container's TLS on `stream` and box the decrypted halves
+/// into a `Transport`.
+async fn handshake<S: AsyncRead + AsyncWrite + Unpin + 'static>(
+    stream: S,
+    sni_host: &str,
+    interceptor: &TlsInterceptor,
+    host: &str,
+) -> anyhow::Result<(io::Transport, Option<Bytes>)> {
     let (tls_stream, alpn) = tokio::time::timeout(
         crate::constants::TLS_HANDSHAKE_TIMEOUT,
-        interceptor.accept(rpc_io, &sni_host),
+        interceptor.accept(stream, sni_host),
     )
     .await
     .map_err(|_| anyhow::anyhow!("TLS handshake timeout"))??;

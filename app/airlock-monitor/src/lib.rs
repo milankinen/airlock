@@ -45,8 +45,14 @@ pub enum NetworkEvent {
     /// Previously-connected TCP connection closed. The `id` matches the
     /// `ConnectInfo::id` of the `Connect` event that opened it.
     Disconnect(Arc<DisconnectInfo>),
+    /// Updated byte counters for a live connection. The `id` matches the
+    /// `ConnectInfo::id` of the `Connect` event that opened it.
+    Traffic(Arc<TrafficInfo>),
     /// HTTP request observed by the middleware.
     Request(Arc<RequestInfo>),
+    /// The response to a previously-reported request. The `id` matches
+    /// the `RequestInfo::id` it answers.
+    Response(Arc<ResponseInfo>),
 }
 
 /// TCP-level connect event payload. Wrapped in `Arc` so the broadcast
@@ -69,15 +75,38 @@ pub struct DisconnectInfo {
     pub timestamp: SystemTime,
 }
 
+/// Cumulative (not delta) byte counters for one connection, sampled on
+/// the raw stream beneath any TLS the proxy terminates — so these are
+/// wire bytes, encrypted records and handshake included.
+#[derive(Debug)]
+pub struct TrafficInfo {
+    pub id: u64,
+    /// Guest → server, cumulative.
+    pub up: u64,
+    /// Server → guest, cumulative.
+    pub down: u64,
+}
+
 /// HTTP request event payload. Wrapped in `Arc` on the wire.
 #[derive(Debug)]
 pub struct RequestInfo {
+    /// Monotonic per-process request id — used to attach the matching
+    /// [`ResponseInfo`] once the upstream reply arrives.
+    pub id: u64,
     pub timestamp: SystemTime,
     pub method: String,
     pub path: String,
     pub host: String,
     pub port: u16,
     pub allowed: bool,
+    pub headers: Vec<(String, String)>,
+}
+
+/// HTTP response event payload, paired to a [`RequestInfo`] by `id`.
+#[derive(Debug)]
+pub struct ResponseInfo {
+    pub id: u64,
+    pub status: u16,
     pub headers: Vec<(String, String)>,
 }
 
@@ -418,6 +447,22 @@ fn scan_bracketed_paste_mode(data: &[u8], enabled: &mut bool) {
     }
 }
 
+/// Whether this key is one of the two that leave selection mode without
+/// also reaching what's underneath: `Esc` (exit) or `Ctrl+C` (copy).
+///
+/// `Ctrl+Shift+C` counts too — it's the copy binding on GNOME Terminal
+/// and Konsole, and crossterm reports the shifted char as `'C'`, so the
+/// comparison is case-insensitive rather than a bare `'c'`.
+fn exits_selection_mode(key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Esc => true,
+        KeyCode::Char(c) => {
+            c.eq_ignore_ascii_case(&'c') && key.modifiers.contains(KeyModifiers::CONTROL)
+        }
+        _ => false,
+    }
+}
+
 /// Handle a key event. Returns `Some(code)` if the TUI should exit.
 #[allow(clippy::too_many_arguments)]
 fn handle_key(
@@ -431,9 +476,11 @@ fn handle_key(
 ) -> anyhow::Result<Option<i32>> {
     let action = app.settings.keys.lookup(&key);
 
-    // Global shortcuts. SwitchMonitor also exits selection mode since
-    // the Monitor tab is entirely click-driven — leaving the user stuck
-    // in passthrough-mouse on Monitor would be confusing.
+    // Global shortcuts. SwitchMonitor also exits selection mode: the
+    // Monitor tab is navigated by clicking, so arriving there with the
+    // mouse still passed through to the terminal would leave the tab
+    // looking inert. (The details view can opt back into selection mode
+    // by being clicked — see `handle_mouse`.)
     match action {
         Some(Action::SwitchSandbox) => {
             app.active_tab = Tab::Sandbox;
@@ -451,14 +498,24 @@ fn handle_key(
         _ => {}
     }
 
-    // Auto-exit selection mode: any keypress on the Sandbox tab
-    // re-enables mouse capture. Fall through so the same key still
-    // reaches the normal Sandbox handler below — the user intent is
-    // "keep typing", not "eat this keystroke".
-    if app.active_tab == Tab::Sandbox && !*mouse_captured {
+    // Auto-exit selection mode: any keypress re-enables mouse capture,
+    // on either tab. The two keys the footer advertises — Esc to exit,
+    // Ctrl+C to copy — are *consumed*, because for both the keystroke
+    // has already done its job by the time we see it and passing it on
+    // would fire a second, unwanted meaning underneath: Esc leaves
+    // insert mode in vim or closes the details pane, and Ctrl+C reaches
+    // the guest as SIGINT and kills whatever is running. The copy itself
+    // is the terminal's doing — capture is off, so it owns the selection
+    // — which is exactly why we must not also forward the key. Every
+    // other key falls through to its normal handler below: the intent
+    // there is "keep working", not "eat this keystroke".
+    if !*mouse_captured {
         crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
         *mouse_captured = true;
         app.mouse_captured = true;
+        if exits_selection_mode(key) {
+            return Ok(None);
+        }
     }
 
     match app.active_tab {
@@ -511,6 +568,15 @@ fn handle_monitor_action(
 
     if app.monitor.network.details_open() {
         match action {
+            // In the details pane the selection keys scroll the body —
+            // there's no row to move between, and long header sets don't
+            // fit on one screen.
+            Action::SelectUp => app.monitor.network.scroll_details(-1),
+            Action::SelectDown => app.monitor.network.scroll_details(1),
+            Action::SelectPageUp => app.monitor.network.scroll_details(-20),
+            Action::SelectPageDown => app.monitor.network.scroll_details(20),
+            Action::SelectNewest => app.monitor.network.scroll_details_to_top(),
+            Action::SelectOldest => app.monitor.network.scroll_details_to_bottom(),
             // `Back` and `Cancel` both close the details pane first,
             // staying on the Monitor tab. A second `Back` from the list
             // view then goes back to Sandbox (below).
@@ -637,6 +703,19 @@ fn handle_mouse(
                 }
                 return Ok(());
             }
+            // Click inside the details body: same deal as the sandbox
+            // body below — drop capture so the user can drag-select the
+            // headers and copy them. Checked after the × and sub-tab hit
+            // tests above so those keep working with the mouse.
+            if app.active_tab == Tab::Monitor
+                && *mouse_captured
+                && app.monitor.network.is_details_body(mouse.column, mouse.row)
+            {
+                crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)?;
+                *mouse_captured = false;
+                app.mouse_captured = false;
+                return Ok(());
+            }
             // Click inside the sandbox body: drop mouse capture so the
             // terminal's native selection takes over. The first click is
             // consumed; the user's drag-to-select starts on the next press.
@@ -647,7 +726,12 @@ fn handle_mouse(
                 app.mouse_captured = false;
             }
         }
+        // In the details pane the wheel scrolls the body; in the list
+        // views it moves the selection.
         MouseEventKind::ScrollUp => match app.active_tab {
+            Tab::Monitor if app.monitor.network.details_open() => {
+                app.monitor.network.scroll_details(-3);
+            }
             Tab::Monitor => {
                 for _ in 0..3 {
                     app.monitor.network.select_up();
@@ -656,6 +740,9 @@ fn handle_mouse(
             Tab::Sandbox => sink.scroll_up(3),
         },
         MouseEventKind::ScrollDown => match app.active_tab {
+            Tab::Monitor if app.monitor.network.details_open() => {
+                app.monitor.network.scroll_details(3);
+            }
             Tab::Monitor => {
                 for _ in 0..3 {
                     app.monitor.network.select_down();
@@ -699,5 +786,52 @@ fn key_to_bytes(key: KeyEvent, kitty_enabled: bool) -> Option<Vec<u8>> {
         None
     } else {
         Some(buf[..n].to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    /// Both keys the selection-mode footer advertises have to be
+    /// swallowed by the mode switch. Forwarding them delivers a second
+    /// meaning the user never asked for — Esc leaves vim's insert mode,
+    /// Ctrl+C lands on the guest as SIGINT.
+    #[test]
+    fn advertised_selection_keys_are_consumed() {
+        assert!(exits_selection_mode(key(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(exits_selection_mode(key(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+    }
+
+    /// GNOME Terminal and Konsole copy with Ctrl+Shift+C, which arrives
+    /// as an uppercase char plus both modifiers.
+    #[test]
+    fn ctrl_shift_c_is_consumed() {
+        assert!(exits_selection_mode(key(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )));
+    }
+
+    /// Everything else still falls through, so ordinary typing keeps
+    /// working on the first keystroke after leaving selection mode.
+    #[test]
+    fn other_keys_fall_through() {
+        for k in [
+            key(KeyCode::Char('c'), KeyModifiers::NONE),
+            key(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            key(KeyCode::Char('a'), KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            key(KeyCode::Up, KeyModifiers::NONE),
+        ] {
+            assert!(!exits_selection_mode(k), "{k:?} should not be consumed");
+        }
     }
 }

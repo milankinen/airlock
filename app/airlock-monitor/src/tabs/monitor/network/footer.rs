@@ -1,12 +1,13 @@
-//! Footer row for the network panel — allowed/denied counts.
+//! Footer row for the network panel — allowed/denied counts, plus a
+//! right-aligned hint while the details view is open.
 
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
-pub fn render_footer(area: Rect, allowed: u32, denied: u32, buf: &mut Buffer) {
+pub fn render_footer(area: Rect, allowed: u32, denied: u32, details_open: bool, buf: &mut Buffer) {
     let line = Line::from(vec![
         Span::raw("  "),
         Span::styled(
@@ -23,4 +24,17 @@ pub fn render_footer(area: Rect, allowed: u32, denied: u32, buf: &mut Buffer) {
         Span::styled(" denied", Style::default().fg(Color::DarkGray)),
     ]);
     Paragraph::new(line).render(area, buf);
+
+    // Click-to-select has no visual affordance of its own, so the details
+    // view spells it out. Rendered second, right-aligned over the same
+    // row — the counts sit far enough left that they don't collide.
+    if details_open {
+        let hint = Line::from(Span::styled(
+            "click to select text  ",
+            Style::default().fg(Color::DarkGray),
+        ));
+        Paragraph::new(hint)
+            .alignment(Alignment::Right)
+            .render(area, buf);
+    }
 }

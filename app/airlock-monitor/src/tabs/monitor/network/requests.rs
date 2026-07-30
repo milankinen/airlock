@@ -17,6 +17,7 @@ use super::row::{
 /// Details sub-tab can show them without a second subscribe.
 #[derive(Clone)]
 pub struct RequestEntry {
+    pub id: u64,
     pub timestamp: SystemTime,
     pub method: String,
     pub path: String,
@@ -24,11 +25,17 @@ pub struct RequestEntry {
     pub port: u16,
     pub allowed: bool,
     pub headers: Vec<(String, String)>,
+    /// Response status, once the reply arrives. `None` while in flight —
+    /// or forever, if the connection died before one came back.
+    pub status: Option<u16>,
+    /// Response headers, empty until the reply arrives.
+    pub response_headers: Vec<(String, String)>,
 }
 
 impl RequestEntry {
     pub fn from_info(info: &crate::RequestInfo) -> Self {
         Self {
+            id: info.id,
             timestamp: info.timestamp,
             method: info.method.clone(),
             path: info.path.clone(),
@@ -36,7 +43,15 @@ impl RequestEntry {
             port: info.port,
             allowed: info.allowed,
             headers: info.headers.clone(),
+            status: None,
+            response_headers: Vec::new(),
         }
+    }
+
+    /// Attach the response half once it arrives.
+    pub fn apply_response(&mut self, info: &crate::ResponseInfo) {
+        self.status = Some(info.status);
+        self.response_headers.clone_from(&info.headers);
     }
 }
 

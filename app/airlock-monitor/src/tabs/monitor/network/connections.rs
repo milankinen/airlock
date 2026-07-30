@@ -9,8 +9,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
 use super::row::{
-    BULLET_COLS, RESULT_COLS, TIMESTAMP_COLS, apply_row_highlight, format_timestamp, pad_right,
-    truncate_right,
+    BULLET_COLS, RESULT_COLS, TIMESTAMP_COLS, TRANSFER_COLS, apply_row_highlight, format_timestamp,
+    format_transfer, pad_right, truncate_right,
 };
 
 /// A single connection log entry.
@@ -24,6 +24,10 @@ pub struct ConnectionEntry {
     /// Set when a matching `Disconnect` event arrives. `None` means the
     /// connection is still open.
     pub disconnected_at: Option<SystemTime>,
+    /// Cumulative bytes guest → server.
+    pub up: u64,
+    /// Cumulative bytes server → guest.
+    pub down: u64,
 }
 
 impl ConnectionEntry {
@@ -35,9 +39,15 @@ impl ConnectionEntry {
             port: info.port,
             allowed: info.allowed,
             disconnected_at: None,
+            up: 0,
+            down: 0,
         }
     }
 }
+
+/// Below this many cells for `host:port`, the transfer column is dropped
+/// rather than squeezing the target into an ellipsis.
+const MIN_TARGET_COLS: usize = 24;
 
 pub struct ConnectionsWidget<'a> {
     entries: &'a [ConnectionEntry],
@@ -66,18 +76,30 @@ impl Widget for ConnectionsWidget<'_> {
         }
 
         // Layout:
-        //   "  " + ⦿(1) + "  " + TARGET(expand) + " " + connected(16) +
-        //   "  " + disconnected(16) + " " + status(7) + " "
+        //   "  " + ⦿(1) + "  " + TARGET(expand) [+ " " + transfer(19)]
+        //   + " " + connected(16) + "  " + disconnected(16) + " " +
+        //   status(7) + " "
         // (Two spaces after the bullet — the extra breath visually
         // separates the status indicator from the white target text;
         // same reasoning between connected/disconnected.)
-        let fixed =
+        let width = area.width as usize;
+        let base =
             2 + BULLET_COLS + 2 + 1 + TIMESTAMP_COLS + 2 + TIMESTAMP_COLS + 1 + RESULT_COLS + 1;
-        let target_w = (area.width as usize).saturating_sub(fixed);
+        // The transfer column is what gets sacrificed first on a narrow
+        // terminal: at 80 columns keeping it would leave ~11 cells for the
+        // target, too few for even a short `host:port`. Better to drop the
+        // column than to render every row as an ellipsis.
+        let show_transfer = width.saturating_sub(base + 1 + TRANSFER_COLS) >= MIN_TARGET_COLS;
+        let fixed = if show_transfer {
+            base + 1 + TRANSFER_COLS
+        } else {
+            base
+        };
+        let target_w = width.saturating_sub(fixed);
 
         let header = {
             let style = Style::default().fg(Color::DarkGray);
-            Line::from(vec![
+            let mut spans = vec![
                 Span::raw("  "),
                 Span::styled(pad_right("", BULLET_COLS), style),
                 Span::raw("  "),
@@ -85,6 +107,15 @@ impl Widget for ConnectionsWidget<'_> {
                     pad_right(&truncate_right("Target", target_w), target_w),
                     style,
                 ),
+            ];
+            if show_transfer {
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(
+                    pad_right(&truncate_right("Transferred", TRANSFER_COLS), TRANSFER_COLS),
+                    style,
+                ));
+            }
+            spans.extend([
                 Span::raw(" "),
                 Span::styled(
                     pad_right(
@@ -106,7 +137,8 @@ impl Widget for ConnectionsWidget<'_> {
                     pad_right(&truncate_right("Result", RESULT_COLS), RESULT_COLS),
                     style,
                 ),
-            ])
+            ]);
+            Line::from(spans)
         };
 
         let body_height = area.height.saturating_sub(1) as usize;
@@ -125,7 +157,7 @@ impl Widget for ConnectionsWidget<'_> {
         for display_idx in start..end {
             let vec_idx = total - 1 - display_idx;
             let e = &self.entries[vec_idx];
-            let mut row = build_connection_row(e, target_w);
+            let mut row = build_connection_row(e, target_w, show_transfer);
             if self.selected == Some(display_idx) {
                 apply_row_highlight(&mut row);
             }
@@ -136,7 +168,11 @@ impl Widget for ConnectionsWidget<'_> {
     }
 }
 
-fn build_connection_row(e: &ConnectionEntry, target_w: usize) -> Line<'static> {
+fn build_connection_row(
+    e: &ConnectionEntry,
+    target_w: usize,
+    show_transfer: bool,
+) -> Line<'static> {
     let open = e.disconnected_at.is_none();
     let bullet_color = if e.allowed && open {
         Color::Green
@@ -157,11 +193,34 @@ fn build_connection_row(e: &ConnectionEntry, target_w: usize) -> Line<'static> {
     let target = format!("{}:{}", e.host, e.port);
     let target = pad_right(&truncate_right(&target, target_w), target_w);
 
-    Line::from(vec![
+    let mut spans = vec![
         Span::raw("  "),
         Span::styled("⦿", Style::default().fg(bullet_color)),
         Span::raw("  "),
         Span::raw(target),
+    ];
+
+    if show_transfer {
+        // Rendered as one pre-padded string rather than styled arrow/figure
+        // spans so the column lines up regardless of how wide each figure is.
+        // Blank rather than `↑ 0B ↓ 0B` before anything moves — a denied
+        // connection never transfers, and zeros there read as noise.
+        let transfer = if e.up == 0 && e.down == 0 {
+            " ".repeat(TRANSFER_COLS)
+        } else {
+            pad_right(
+                &truncate_right(
+                    &format!("↑ {} ↓ {}", format_transfer(e.up), format_transfer(e.down)),
+                    TRANSFER_COLS,
+                ),
+                TRANSFER_COLS,
+            )
+        };
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(transfer, Style::default().fg(Color::DarkGray)));
+    }
+
+    spans.extend([
         Span::raw(" "),
         Span::styled(connected, Style::default().fg(Color::DarkGray)),
         Span::raw("  "),
@@ -169,5 +228,6 @@ fn build_connection_row(e: &ConnectionEntry, target_w: usize) -> Line<'static> {
         Span::raw(" "),
         Span::styled(status_padded, Style::default().fg(status_color)),
         Span::raw(" "),
-    ])
+    ]);
+    Line::from(spans)
 }

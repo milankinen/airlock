@@ -60,6 +60,14 @@ pub struct NetworkTab {
     selected_connection: Option<usize>,
     /// When `Some`, the Details sub-tab is open and shows this entry.
     details: Option<DetailView>,
+    /// First visible wrapped line of the details body. Reset whenever a
+    /// details view opens.
+    details_scroll: u16,
+    /// How far the details body can scroll before the last line sits at
+    /// the bottom of the viewport — `content_lines - viewport_height`,
+    /// or 0 when everything fits. Written during render (only there is
+    /// the wrap width known) and read by the scroll actions.
+    details_max_scroll: Cell<u16>,
     /// `Some` when the policy dropdown is open.
     dropdown: Option<PolicyDropdown>,
     /// Last rendered click rects for the sub-tab labels. Populated during
@@ -69,6 +77,9 @@ pub struct NetworkTab {
     details_rect: Cell<Option<Rect>>,
     /// Click rect for the `×` close button on the Details sub-tab.
     details_close_rect: Cell<Option<Rect>>,
+    /// Body area of the Details sub-tab. Clicking inside it drops mouse
+    /// capture so the terminal's own text selection can take over.
+    details_body_rect: Cell<Option<Rect>>,
     /// Rect of the "policy: …" title anchor in the border line.
     policy_anchor: Cell<Option<Rect>>,
     /// Click rects for each dropdown row (in `Policy::ALL` order).
@@ -88,11 +99,14 @@ impl NetworkTab {
             selected_request: None,
             selected_connection: None,
             details: None,
+            details_scroll: 0,
+            details_max_scroll: Cell::new(0),
             dropdown: None,
             requests_rect: Cell::new(None),
             connections_rect: Cell::new(None),
             details_rect: Cell::new(None),
             details_close_rect: Cell::new(None),
+            details_body_rect: Cell::new(None),
             policy_anchor: Cell::new(None),
             dropdown_rects: Cell::new(Vec::new()),
         }
@@ -190,6 +204,20 @@ impl NetworkTab {
                     }
                 }
             }
+            NetworkEvent::Traffic(info) => {
+                // Same eviction caveat as `Disconnect` — an entry already
+                // dropped by the cap has nothing to update.
+                if let Some(entry) = self.connections.iter_mut().find(|c| c.id == info.id) {
+                    entry.up = info.up;
+                    entry.down = info.down;
+                    if let Some(DetailView::Connection(open)) = self.details.as_mut()
+                        && open.id == info.id
+                    {
+                        open.up = info.up;
+                        open.down = info.down;
+                    }
+                }
+            }
             NetworkEvent::Request(info) => {
                 bump(
                     info.allowed,
@@ -203,6 +231,18 @@ impl NetworkTab {
                     settings.max_http_requests,
                     &mut self.selected_request,
                 );
+            }
+            NetworkEvent::Response(info) => {
+                if let Some(entry) = self.requests.iter_mut().find(|r| r.id == info.id) {
+                    entry.apply_response(&info);
+                    // Keep an open details view in sync so the user doesn't
+                    // have to reopen the row to see the response land.
+                    if let Some(DetailView::Request(open)) = self.details.as_mut()
+                        && open.id == info.id
+                    {
+                        open.apply_response(&info);
+                    }
+                }
             }
         }
     }
@@ -283,6 +323,14 @@ impl NetworkTab {
         })
     }
 
+    /// Hit-test a click against the Details body. Only meaningful while
+    /// the details view is open; the rect is cleared otherwise.
+    pub fn is_details_body(&self, col: u16, row: u16) -> bool {
+        self.details_body_rect.get().is_some_and(|r| {
+            col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+        })
+    }
+
     // ── Selection helpers ───────────────────────────────────
 
     /// Move the selection up by one row (toward the newest entry).
@@ -352,6 +400,38 @@ impl NetworkTab {
         }
     }
 
+    // ── Details scrolling ───────────────────────────────────
+
+    /// First visible line of the details body.
+    pub fn details_scroll(&self) -> u16 {
+        self.details_scroll
+    }
+
+    /// Record how far this body can scroll. Called from render, which is
+    /// the only place the wrap width — and so the true line count — is
+    /// known. Also re-clamps the current offset, so a terminal resize
+    /// that makes the content shorter can't leave the view stranded past
+    /// the end.
+    pub fn set_details_max_scroll(&self, max: u16) {
+        self.details_max_scroll.set(max);
+    }
+
+    /// Scroll the details body by `delta` lines, clamped to the content.
+    pub fn scroll_details(&mut self, delta: i32) {
+        let max = i32::from(self.details_max_scroll.get());
+        let next = (i32::from(self.details_scroll) + delta).clamp(0, max);
+        self.details_scroll = next as u16;
+    }
+
+    /// Jump to the top / bottom of the details body.
+    pub fn scroll_details_to_top(&mut self) {
+        self.details_scroll = 0;
+    }
+
+    pub fn scroll_details_to_bottom(&mut self) {
+        self.details_scroll = self.details_max_scroll.get();
+    }
+
     /// Open the Details sub-tab with a snapshot of the currently selected
     /// entry. No-op when nothing is selected.
     pub fn open_details(&mut self) {
@@ -362,6 +442,7 @@ impl NetworkTab {
                 {
                     self.details = Some(DetailView::Request(entry.clone()));
                     self.sub_tab = NetworkSubTab::Details;
+                    self.details_scroll = 0;
                 }
             }
             NetworkSubTab::Connections => {
@@ -370,6 +451,7 @@ impl NetworkTab {
                 {
                     self.details = Some(DetailView::Connection(entry.clone()));
                     self.sub_tab = NetworkSubTab::Details;
+                    self.details_scroll = 0;
                 }
             }
             NetworkSubTab::Details => {}
@@ -514,6 +596,7 @@ impl Widget for NetworkWidget<'_> {
         self.tab.details_rect.set(rects.details);
         self.tab.details_close_rect.set(rects.details_close);
 
+        self.tab.details_body_rect.set(None);
         match self.tab.sub_tab {
             NetworkSubTab::Requests => {
                 requests::RequestsWidget::new(&self.tab.requests, self.tab.selected_request)
@@ -528,13 +611,22 @@ impl Widget for NetworkWidget<'_> {
             }
             NetworkSubTab::Details => {
                 if let Some(d) = self.tab.details.as_ref() {
-                    details::DetailsWidget::new(d).render(body_area, buf);
+                    let report = |max| self.tab.set_details_max_scroll(max);
+                    details::DetailsWidget::new(d, self.tab.details_scroll(), &report)
+                        .render(body_area, buf);
+                    self.tab.details_body_rect.set(Some(body_area));
                 }
             }
         }
 
         let (allowed, denied) = self.tab.visible_counts();
-        footer::render_footer(footer_area, allowed, denied, buf);
+        footer::render_footer(
+            footer_area,
+            allowed,
+            denied,
+            self.tab.sub_tab == NetworkSubTab::Details,
+            buf,
+        );
 
         // Dropdown overlay renders last so it paints on top of body content.
         if let Some(dropdown) = self.tab.dropdown.as_ref() {
@@ -543,5 +635,187 @@ impl Widget for NetworkWidget<'_> {
         } else {
             self.tab.dropdown_rects.set(Vec::new());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::SystemTime;
+
+    use super::*;
+    use crate::{ConnectInfo, RequestInfo, ResponseInfo, TrafficInfo};
+
+    fn settings() -> TuiSettings {
+        TuiSettings::default()
+    }
+
+    fn connect(id: u64) -> NetworkEvent {
+        NetworkEvent::Connect(Arc::new(ConnectInfo {
+            id,
+            timestamp: SystemTime::UNIX_EPOCH,
+            host: "example.com".into(),
+            port: 443,
+            allowed: true,
+        }))
+    }
+
+    fn request(id: u64) -> NetworkEvent {
+        NetworkEvent::Request(Arc::new(RequestInfo {
+            id,
+            timestamp: SystemTime::UNIX_EPOCH,
+            method: "GET".into(),
+            path: "/".into(),
+            host: "example.com".into(),
+            port: 443,
+            allowed: true,
+            headers: vec![],
+        }))
+    }
+
+    #[test]
+    fn traffic_updates_matching_connection_only() {
+        let mut tab = NetworkTab::new();
+        tab.push_event(connect(1), &settings());
+        tab.push_event(connect(2), &settings());
+
+        tab.push_event(
+            NetworkEvent::Traffic(Arc::new(TrafficInfo {
+                id: 2,
+                up: 10,
+                down: 20,
+            })),
+            &settings(),
+        );
+
+        let by_id = |id: u64| tab.connections.iter().find(|c| c.id == id).unwrap();
+        assert_eq!((by_id(2).up, by_id(2).down), (10, 20));
+        assert_eq!((by_id(1).up, by_id(1).down), (0, 0));
+    }
+
+    /// Counters are cumulative, so a later event replaces rather than adds.
+    #[test]
+    fn traffic_counters_replace_not_accumulate() {
+        let mut tab = NetworkTab::new();
+        tab.push_event(connect(1), &settings());
+        for up in [10, 90, 400] {
+            tab.push_event(
+                NetworkEvent::Traffic(Arc::new(TrafficInfo { id: 1, up, down: 0 })),
+                &settings(),
+            );
+        }
+        assert_eq!(tab.connections[0].up, 400);
+    }
+
+    /// A `Traffic` event for a connection already evicted by the entry cap
+    /// must be dropped, not misapplied to a surviving row.
+    #[test]
+    fn traffic_for_evicted_connection_is_ignored() {
+        let mut settings = settings();
+        settings.max_tcp_connections = 1;
+        let mut tab = NetworkTab::new();
+        tab.push_event(connect(1), &settings);
+        tab.push_event(connect(2), &settings);
+        assert_eq!(tab.connections.len(), 1);
+
+        tab.push_event(
+            NetworkEvent::Traffic(Arc::new(TrafficInfo {
+                id: 1,
+                up: 99,
+                down: 99,
+            })),
+            &settings,
+        );
+        assert_eq!((tab.connections[0].up, tab.connections[0].down), (0, 0));
+    }
+
+    #[test]
+    fn response_attaches_to_its_request() {
+        let mut tab = NetworkTab::new();
+        tab.push_event(request(7), &settings());
+        tab.push_event(request(8), &settings());
+
+        tab.push_event(
+            NetworkEvent::Response(Arc::new(ResponseInfo {
+                id: 8,
+                status: 404,
+                headers: vec![("server".into(), "nginx".into())],
+            })),
+            &settings(),
+        );
+
+        let by_id = |id: u64| tab.requests.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(by_id(8).status, Some(404));
+        assert_eq!(by_id(8).response_headers.len(), 1);
+        assert_eq!(by_id(7).status, None);
+    }
+
+    /// The open details view is a snapshot taken at open time, so a
+    /// response arriving afterwards has to be written through to it too.
+    #[test]
+    fn response_updates_open_details_snapshot() {
+        let mut tab = NetworkTab::new();
+        tab.push_event(request(1), &settings());
+        tab.open_details();
+        assert!(tab.details_open());
+
+        tab.push_event(
+            NetworkEvent::Response(Arc::new(ResponseInfo {
+                id: 1,
+                status: 200,
+                headers: vec![],
+            })),
+            &settings(),
+        );
+
+        match tab.details.as_ref().unwrap() {
+            DetailView::Request(r) => assert_eq!(r.status, Some(200)),
+            DetailView::Connection(_) => panic!("expected a request detail view"),
+        }
+    }
+
+    #[test]
+    fn details_scroll_clamps_to_content() {
+        let mut tab = NetworkTab::new();
+        tab.push_event(request(1), &settings());
+        tab.open_details();
+        tab.set_details_max_scroll(5);
+
+        tab.scroll_details(100);
+        assert_eq!(tab.details_scroll(), 5);
+        tab.scroll_details(-100);
+        assert_eq!(tab.details_scroll(), 0);
+        tab.scroll_details_to_bottom();
+        assert_eq!(tab.details_scroll(), 5);
+        tab.scroll_details_to_top();
+        assert_eq!(tab.details_scroll(), 0);
+    }
+
+    /// Content that fits entirely can't scroll at all.
+    #[test]
+    fn details_scroll_pinned_when_content_fits() {
+        let mut tab = NetworkTab::new();
+        tab.push_event(request(1), &settings());
+        tab.open_details();
+        tab.set_details_max_scroll(0);
+
+        tab.scroll_details(3);
+        assert_eq!(tab.details_scroll(), 0);
+    }
+
+    /// Reopening starts at the top rather than inheriting the previous
+    /// entry's offset.
+    #[test]
+    fn opening_details_resets_scroll() {
+        let mut tab = NetworkTab::new();
+        tab.push_event(request(1), &settings());
+        tab.open_details();
+        tab.set_details_max_scroll(10);
+        tab.scroll_details(4);
+        assert_eq!(tab.details_scroll(), 4);
+
+        tab.close_details();
+        tab.open_details();
+        assert_eq!(tab.details_scroll(), 0);
     }
 }

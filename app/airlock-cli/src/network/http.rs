@@ -94,11 +94,13 @@ pub async fn relay(
             let target_host = target_host.clone();
             let deny_reporter = deny_reporter.clone();
             async move {
-                emit_request_event(&events, &req, &target_host, target_port, false);
+                let id = emit_request_event(&events, &req, &target_host, target_port, false);
                 deny_reporter.report();
                 let body: ResponseBody =
                     Either::Right(Full::new(Bytes::from("denied by network policy\n")));
-                Ok::<_, hyper::Error>(Response::builder().status(403).body(body).unwrap())
+                let resp = Response::builder().status(403).body(body).unwrap();
+                emit_response_event(&events, id, &resp);
+                Ok::<_, hyper::Error>(resp)
             }
         });
         return hyper_util::server::conn::auto::Builder::new(LocalExecutor)
@@ -135,7 +137,7 @@ pub async fn relay(
         let target_host = target_host.clone();
         let deny_reporter = deny_reporter.clone();
         async move {
-            emit_request_event(&events, &req, &target_host, target_port, allowed);
+            let id = emit_request_event(&events, &req, &target_host, target_port, allowed);
             let result = middleware::run(req, &middleware, deny_reporter, move |req| {
                 let sender = sender.clone();
                 async move { sender.send(req).await.map_err(|e| anyhow::anyhow!("{e}")) }
@@ -143,13 +145,18 @@ pub async fn relay(
             .await;
 
             match result {
-                Ok(resp) => Ok::<_, hyper::Error>(resp),
+                Ok(resp) => {
+                    emit_response_event(&events, id, &resp);
+                    Ok::<_, hyper::Error>(resp)
+                }
                 Err(e) => {
                     debug!("middleware error: {e}");
-                    Ok(Response::builder()
+                    let resp = Response::builder()
                         .status(502)
                         .body(Either::Right(Full::new(Bytes::from(format!("{e}\n")))))
-                        .unwrap())
+                        .unwrap();
+                    emit_response_event(&events, id, &resp);
+                    Ok(resp)
                 }
             }
         }
@@ -179,15 +186,18 @@ pub async fn relay(
 /// Broadcast a `NetworkEvent::Request` describing this HTTP request. Silently
 /// drops the event when there are no subscribers — and short-circuits *before*
 /// cloning any request fields in that common case (non-monitor runs).
+///
+/// Returns the id assigned to the request, for pairing with a later
+/// [`emit_response_event`]; `None` when nothing was emitted.
 fn emit_request_event(
     events: &tokio::sync::broadcast::Sender<airlock_monitor::NetworkEvent>,
     req: &Request<Incoming>,
     target_host: &str,
     target_port: u16,
     allowed: bool,
-) {
+) -> Option<u64> {
     if events.receiver_count() == 0 {
-        return;
+        return None;
     }
     let method = req.method().to_string();
     let path = req
@@ -204,7 +214,9 @@ fn emit_request_event(
             )
         })
         .collect();
+    let id = next_request_id();
     let info = airlock_monitor::RequestInfo {
+        id,
         timestamp: std::time::SystemTime::now(),
         method,
         path,
@@ -216,6 +228,49 @@ fn emit_request_event(
     let _ = events.send(airlock_monitor::NetworkEvent::Request(std::sync::Arc::new(
         info,
     )));
+    Some(id)
+}
+
+/// Broadcast the response paired to a prior [`emit_request_event`]. A
+/// `None` id means the request was never reported (no subscribers), so
+/// there's nothing to pair with.
+fn emit_response_event<B>(
+    events: &tokio::sync::broadcast::Sender<airlock_monitor::NetworkEvent>,
+    id: Option<u64>,
+    resp: &Response<B>,
+) {
+    let Some(id) = id else {
+        return;
+    };
+    if events.receiver_count() == 0 {
+        return;
+    }
+    let headers = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.as_str().to_string(),
+                v.to_str().unwrap_or("<binary>").to_string(),
+            )
+        })
+        .collect();
+    let info = airlock_monitor::ResponseInfo {
+        id,
+        status: resp.status().as_u16(),
+        headers,
+    };
+    let _ = events.send(airlock_monitor::NetworkEvent::Response(
+        std::sync::Arc::new(info),
+    ));
+}
+
+/// Monotonic request ids, used only to pair a response back to its
+/// request in the Monitor tab.
+fn next_request_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Check if a line matches an HTTP request line or h2 connection preface.

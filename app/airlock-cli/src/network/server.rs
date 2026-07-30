@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use super::target::ResolvedTarget;
-use super::{DenyReporter, Network, http, io, tcp, tls};
+use super::{DenyReporter, Network, http, io, tcp, tls, traffic};
 
 impl network_proxy::Server for Network {
     async fn connect(
@@ -109,6 +109,9 @@ fn spawn_tcp_connection(
 
     tokio::task::spawn_local(async move {
         let addr = format!("{}:{}", target.host, target.port);
+        // `None` on non-monitor runs, which keeps the relay transports
+        // unwrapped and the byte accounting out of the hot path.
+        let counter = traffic::TrafficCounter::new(id, &events);
         let result = Box::pin(handle_connection(
             target,
             rx,
@@ -117,12 +120,19 @@ fn spawn_tcp_connection(
             &interceptor,
             events.clone(),
             deny_reporter,
+            counter.as_ref(),
         ))
         .await;
 
         if let Err(e) = result {
             debug!("connection {addr} error: {e}");
             *task_error.borrow_mut() = Some(format!("{e}"));
+        }
+
+        // Final totals before the row goes gray. A transfer shorter than
+        // the throttle window would otherwise never report at all.
+        if let Some(counter) = counter.as_ref() {
+            counter.flush();
         }
 
         // Matching `Disconnect` — lets the TUI flip the row's indicator
@@ -196,6 +206,10 @@ fn spawn_socket_connection(path: &str, client_sink: tcp_sink::Client) -> tcp_sin
 /// non-HTTP protocols whose first bytes from the client can't be sniffed
 /// (Postgres' 8-byte `SSLRequest` deadlocks the HTTP detector waiting for
 /// `\r\n`).
+// Every argument here is a distinct collaborator handed down from
+// `spawn_tcp_connection`; bundling them into a struct would just move the
+// same list one level up.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     target: ResolvedTarget,
     mut rx: mpsc::Receiver<Bytes>,
@@ -204,12 +218,14 @@ async fn handle_connection(
     interceptor: &tls::TlsInterceptor,
     events: tokio::sync::broadcast::Sender<airlock_monitor::NetworkEvent>,
     deny_reporter: Rc<DenyReporter>,
+    counter: Option<&Rc<traffic::TrafficCounter>>,
 ) -> anyhow::Result<()> {
     let addr = format!("{}:{}", target.host, target.port);
 
     if target.is_passthrough() {
         debug!("passthrough: {addr}");
         let container = tcp::container_transport(Bytes::new(), rx, client_sink);
+        let container = traffic::count(container, counter);
         let server = tcp::connect_server(&addr).await?;
         Box::pin(tcp::relay(container, server)).await;
         return Ok(());
@@ -218,10 +234,21 @@ async fn handle_connection(
     let (is_tls, first) = tls::detect(&mut rx).await;
 
     // Container-side transport first — same for allow and deny.
+    //
+    // Byte counting attaches to the raw RPC stream on both branches, so
+    // the Monitor tab reports wire bytes. On the TLS branch that has to
+    // happen inside `accept_container`, below the layer it terminates;
+    // here the transport already *is* the raw stream. `detect_http`
+    // re-wraps the read half below to replay the sniffed prefix, but
+    // those bytes were counted on the way in, so they aren't counted
+    // twice.
     let (container, alpn) = if is_tls {
-        tls::accept_container(&target.host, first, rx, client_sink, interceptor).await?
+        tls::accept_container(&target.host, first, rx, client_sink, interceptor, counter).await?
     } else {
-        (tcp::container_transport(first, rx, client_sink), None)
+        (
+            traffic::count(tcp::container_transport(first, rx, client_sink), counter),
+            None,
+        )
     };
 
     let (container, is_http) = detect_http(container).await;
