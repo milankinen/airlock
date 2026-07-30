@@ -11,6 +11,13 @@
 /// Patterns beginning with `*` but not `*.` (e.g. `*foo.com`) are not
 /// wildcards in this scheme and will never match any real hostname.
 ///
+/// Both the host and the pattern are canonicalized before comparison
+/// (lowercased, with a single trailing dot stripped), because DNS and
+/// `TcpStream::connect` are case-insensitive and treat `host.` as `host`.
+/// Without this, `SECRET.example.com` or `secret.example.com.` would slip
+/// past a `deny secret.example.com` rule while still resolving to the
+/// blocked host — a policy bypass.
+///
 /// This intentionally deviates from RFC 6125 (TLS certificate wildcard
 /// rules), which restricts `*` to a single DNS label. We follow the
 /// convention used by modern HTTP proxies and CDNs (Nginx, Envoy,
@@ -18,6 +25,10 @@
 /// If strict single-label matching is needed in the future, this
 /// function must be redesigned.
 pub fn host_matches(host: &str, pattern: &str) -> bool {
+    let host = canonical_host(host);
+    let pattern = canonical_host(pattern);
+    let (host, pattern) = (host.as_str(), pattern.as_str());
+
     if pattern == "*" {
         true
     } else if let Some(suffix) = pattern.strip_prefix("*.") {
@@ -31,6 +42,15 @@ pub fn host_matches(host: &str, pattern: &str) -> bool {
     } else {
         host == pattern
     }
+}
+
+/// Canonicalize a hostname (or host pattern) for case- and trailing-dot-
+/// insensitive comparison: lowercase it and strip a single trailing `.`
+/// (the DNS root label). The `*` and `*.` wildcard markers are ASCII and
+/// pass through unchanged.
+fn canonical_host(host: &str) -> String {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    host.to_ascii_lowercase()
 }
 
 fn is_localhost(host: &str) -> bool {
@@ -72,9 +92,31 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_is_case_sensitive_and_suffix_exact() {
+    fn wildcard_suffix_is_exact() {
         assert!(!host_matches("api.example.org", "*.example.com"));
         assert!(!host_matches("api.xample.com", "*.example.com"));
+    }
+
+    #[test]
+    fn matching_is_case_insensitive() {
+        // Regression: DNS is case-insensitive, so an uppercased host must
+        // not evade a lowercase deny rule (nor a lowercase host a rule with
+        // uppercase in it).
+        assert!(host_matches("SECRET.example.com", "secret.example.com"));
+        assert!(host_matches("secret.example.com", "SECRET.EXAMPLE.COM"));
+        assert!(host_matches("API.EXAMPLE.COM", "*.example.com"));
+        assert!(host_matches("api.example.com", "*.EXAMPLE.COM"));
+        assert!(host_matches("LOCALHOST", "localhost"));
+    }
+
+    #[test]
+    fn trailing_dot_is_ignored() {
+        // Regression: `host.` resolves to `host`, so a trailing dot must
+        // not evade a rule written without one.
+        assert!(host_matches("secret.example.com.", "secret.example.com"));
+        assert!(host_matches("api.example.com.", "*.example.com"));
+        // The apex with a trailing dot still must not match a `*.` wildcard.
+        assert!(!host_matches("example.com.", "*.example.com"));
     }
 
     #[test]

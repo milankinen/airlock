@@ -59,6 +59,10 @@ Deny patterns are always checked first and win unconditionally, regardless of
 allow rules. This makes it safe to use broad wildcards in allow lists while
 still blocking specific destinations.
 
+Host matching is case-insensitive and ignores a trailing dot, so a rule for
+`secret.example.com` also matches `SECRET.example.com` and `secret.example.com.`
+— a destination cannot slip past a deny rule by changing letter case.
+
 Rules can be disabled without removing them:
 
 ```toml
