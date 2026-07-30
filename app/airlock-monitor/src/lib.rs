@@ -298,11 +298,17 @@ fn run_tui_loop(
     let mut app = App::new(network, project_path, version, settings);
     let mut mouse_captured = true;
 
-    // Resize vt100 parser to match terminal body area
+    // Resize vt100 parser to match terminal body area. Skip a degenerate
+    // (zero-sized) body — a terminal shorter than the tab bar yields a 0x0
+    // body, and resizing the vt100 grid to zero rows underflows (panic in
+    // debug, corruption in release). The sink keeps its default size until
+    // the terminal is large enough.
     let size = terminal.size()?;
     let size = ratatui::layout::Rect::new(0, 0, size.width, size.height);
     let body = ui::body_area(size);
-    sink.resize(body.height, body.width);
+    if body.height > 0 && body.width > 0 {
+        sink.resize(body.height, body.width);
+    }
 
     // Crossterm reader thread — sends terminal events into the unified channel
     std::thread::spawn(move || {
@@ -401,8 +407,13 @@ fn handle_event(
         TuiEvent::Terminal(Event::Resize(cols, rows)) => {
             let size = ratatui::layout::Rect::new(0, 0, cols, rows);
             let body = ui::body_area(size);
-            sink.resize(body.height, body.width);
-            let _ = stdin_tx.blocking_send(TuiInputEvent::Resize(body.height, body.width));
+            // Ignore a degenerate body: a terminal shrunk to <=2 rows yields a
+            // 0x0 body, and resizing the vt100 grid (or the guest PTY) to zero
+            // panics/underflows. Keep the last valid size and let render clip.
+            if body.height > 0 && body.width > 0 {
+                sink.resize(body.height, body.width);
+                let _ = stdin_tx.blocking_send(TuiInputEvent::Resize(body.height, body.width));
+            }
         }
         TuiEvent::Terminal(Event::Paste(text)) => {
             // Only forward paste while the sandbox tab is active. Wrap in
