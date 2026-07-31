@@ -127,8 +127,23 @@ impl Storage for EncryptedFileStorage {
             .decode(&blob.ciphertext)
             .context("decode vault ciphertext")?;
 
-        let passphrase = self.passphrase.unlock()?;
-        let key = Self::derive_key(&passphrase, &salt, blob.kdf.m, blob.kdf.t, blob.kdf.p)?;
+        // Reuse the in-memory key if this vault was already unlocked in this
+        // process and the on-disk salt still matches — so a re-read during a
+        // mutation (lock → reload → merge → store) doesn't prompt again.
+        let cached_key = {
+            let key = self.key.lock();
+            let cached_salt = self.salt.lock();
+            match (*key, *cached_salt) {
+                (Some(k), Some(s)) if s == salt => Some(k),
+                _ => None,
+            }
+        };
+        let key = if let Some(k) = cached_key {
+            k
+        } else {
+            let passphrase = self.passphrase.unlock()?;
+            Self::derive_key(&passphrase, &salt, blob.kdf.m, blob.kdf.t, blob.kdf.p)?
+        };
         let cipher = ChaCha20Poly1305::new(<&Key>::from(&key));
         let plaintext = cipher
             .decrypt(<&Nonce>::from(&nonce), ciphertext.as_ref())
@@ -187,6 +202,10 @@ impl Storage for EncryptedFileStorage {
         let json =
             serde_json::to_string_pretty(&envelope).context("serialize encrypted envelope")?;
         atomic_write(&self.path, json.as_bytes())
+    }
+
+    fn lock_path(&self) -> Option<PathBuf> {
+        Some(self.path.with_extension("lock"))
     }
 }
 

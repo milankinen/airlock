@@ -254,6 +254,31 @@ impl Vault {
         self.inner.storage.store(&json)
     }
 
+    /// Perform a mutation as a locked read-modify-write against the *current*
+    /// on-disk state.
+    ///
+    /// The old approach mutated a possibly-stale cached snapshot and flushed
+    /// it wholesale, so a long-running process could erase secrets a
+    /// concurrent `airlock secrets add` had written. Here we take a
+    /// cross-process file lock (for file-backed vaults), reload the latest
+    /// state, apply `f`, write it, and refresh the cache — so concurrent
+    /// changes are merged rather than clobbered.
+    fn mutate<R>(&self, f: impl FnOnce(&mut VaultData) -> R) -> anyhow::Result<R> {
+        let _lock = match self.inner.storage.lock_path() {
+            Some(path) => Some(acquire_file_lock(&path)?),
+            None => None,
+        };
+        let mut data = match self.inner.storage.load()? {
+            Some(json) => serde_json::from_str::<VaultData>(&json)
+                .context("parse airlock vault blob — storage may be corrupt")?,
+            None => VaultData::default(),
+        };
+        let result = f(&mut data);
+        self.flush(&data)?;
+        *self.inner.data.lock() = Some(data);
+        Ok(result)
+    }
+
     /// Lookup a user secret by name. Opens the vault on first use.
     #[allow(dead_code)]
     pub fn get_secret(&self, name: &str) -> anyhow::Result<Option<String>> {
@@ -268,27 +293,22 @@ impl Vault {
         if value.is_empty() {
             bail!("secret value must not be empty");
         }
-        let mut opened = self.open()?;
-        opened.data_mut().secrets.insert(
-            name.to_string(),
-            SecretEntry {
-                value: value.to_string(),
-                saved_at: SystemTime::now(),
-            },
-        );
-        self.flush(opened.data())
+        self.mutate(|data| {
+            data.secrets.insert(
+                name.to_string(),
+                SecretEntry {
+                    value: value.to_string(),
+                    saved_at: SystemTime::now(),
+                },
+            );
+        })
     }
 
     /// Remove a user secret. `Ok(false)` when the name was not present
     /// — lets the CLI report "nothing to do" without conflating it
     /// with real storage errors.
     pub fn remove_secret(&self, name: &str) -> anyhow::Result<bool> {
-        let mut opened = self.open()?;
-        let existed = opened.data_mut().secrets.remove(name).is_some();
-        if existed {
-            self.flush(opened.data())?;
-        }
-        Ok(existed)
+        self.mutate(|data| data.secrets.remove(name).is_some())
     }
 
     /// Enumerate secrets (names, timestamps, masked previews — no
@@ -321,16 +341,16 @@ impl Vault {
         if host.is_empty() {
             bail!("registry host must not be empty");
         }
-        let mut opened = self.open()?;
-        opened.data_mut().registries.insert(
-            host.to_string(),
-            RegistryEntry {
-                username: creds.username.clone(),
-                password: creds.password.clone(),
-                saved_at: SystemTime::now(),
-            },
-        );
-        self.flush(opened.data())
+        self.mutate(|data| {
+            data.registries.insert(
+                host.to_string(),
+                RegistryEntry {
+                    username: creds.username.clone(),
+                    password: creds.password.clone(),
+                    saved_at: SystemTime::now(),
+                },
+            );
+        })
     }
 
     /// Expand `${NAME}` tokens in `template`. Host env is consulted
@@ -358,10 +378,6 @@ impl<'a> subst::VariableMap<'a> for Vault {
 impl OpenedVault<'_> {
     fn data(&self) -> &VaultData {
         self.0.as_ref().expect("opened vault has data")
-    }
-
-    fn data_mut(&mut self) -> &mut VaultData {
-        self.0.as_mut().expect("opened vault has data")
     }
 }
 
@@ -393,6 +409,13 @@ pub fn validate_secret_name(name: &str) -> anyhow::Result<()> {
 pub trait Storage: Send + Sync + 'static {
     fn load(&self) -> anyhow::Result<Option<String>>;
     fn store(&self, data: &str) -> anyhow::Result<()>;
+
+    /// Path of a sidecar lock file used to serialize concurrent mutations
+    /// across processes. `None` for backends that don't need it (keyring,
+    /// disabled, in-memory test doubles).
+    fn lock_path(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 fn boxed_storage(storage_type: VaultStorageType) -> Box<dyn Storage> {
@@ -462,6 +485,34 @@ pub(crate) fn read_vault_file(path: &Path) -> anyhow::Result<Option<String>> {
 /// Write `bytes` to `path` atomically and with mode 0600. Goes via a
 /// sibling tempfile + rename so a crash mid-write can't leave the
 /// vault truncated. The parent directory is created if missing.
+/// Acquire an exclusive advisory lock on `path`, held until the returned
+/// handle drops. Blocking (mutations are brief), so concurrent writers queue
+/// rather than fail. Used to serialize vault read-modify-write across
+/// processes so a stale writer can't clobber a concurrent one's changes.
+fn acquire_file_lock(path: &Path) -> anyhow::Result<File> {
+    use std::os::unix::io::AsRawFd;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create vault directory {}", parent.display()))?;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("open vault lock {}", path.display()))?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(anyhow!(
+            "lock vault {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(file)
+}
+
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -470,8 +521,11 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let file_name = path
         .file_name()
         .ok_or_else(|| anyhow!("vault path has no file name: {}", path.display()))?;
+    // Per-process unique temp name so two processes writing concurrently can't
+    // rename each other's half-written temp file into place.
+    let unique = std::process::id();
     let mut tmp = path.to_path_buf();
-    tmp.set_file_name(format!("{}.tmp", file_name.to_string_lossy()));
+    tmp.set_file_name(format!("{}.{unique}.tmp", file_name.to_string_lossy()));
 
     let mut f: File = OpenOptions::new()
         .write(true)
@@ -755,6 +809,39 @@ mod tests {
             VaultStorageType::File,
         );
         assert_eq!(vault2.get_secret("TOKEN").unwrap(), Some("abc".to_string()));
+    }
+
+    /// Two independent vault handles on the same file (as two processes would
+    /// be) must not lose each other's secrets: a write from one merges onto
+    /// the other's concurrent write instead of clobbering it.
+    #[test]
+    fn concurrent_writers_do_not_lose_secrets() {
+        let path = fresh_tmp("shared.json");
+        let a = Vault::new_with(
+            Box::new(FileStorage::new(path.clone())),
+            HashMap::new(),
+            VaultStorageType::File,
+        );
+        let b = Vault::new_with(
+            Box::new(FileStorage::new(path.clone())),
+            HashMap::new(),
+            VaultStorageType::File,
+        );
+
+        // `a` opens (caching an empty snapshot), then `b` adds a secret, then
+        // `a` adds a different one. The old code flushed a's stale snapshot and
+        // erased b's write; now a re-reads and merges.
+        assert!(a.list_secrets().unwrap().is_empty());
+        b.set_secret("FROM_B", "1").unwrap();
+        a.set_secret("FROM_A", "2").unwrap();
+
+        let fresh = Vault::new_with(
+            Box::new(FileStorage::new(path)),
+            HashMap::new(),
+            VaultStorageType::File,
+        );
+        assert_eq!(fresh.get_secret("FROM_A").unwrap(), Some("2".to_string()));
+        assert_eq!(fresh.get_secret("FROM_B").unwrap(), Some("1".to_string()));
     }
 
     /// Missing file → empty vault (not an error).

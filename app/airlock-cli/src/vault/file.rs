@@ -44,4 +44,8 @@ impl Storage for FileStorage {
         let json = serde_json::to_string_pretty(&envelope).context("serialize vault envelope")?;
         atomic_write(&self.path, json.as_bytes())
     }
+
+    fn lock_path(&self) -> Option<PathBuf> {
+        Some(self.path.with_extension("lock"))
+    }
 }
