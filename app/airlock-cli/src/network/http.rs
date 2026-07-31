@@ -138,11 +138,13 @@ pub async fn relay(
         let deny_reporter = deny_reporter.clone();
         async move {
             let id = emit_request_event(&events, &req, &target_host, target_port, allowed);
-            let result = middleware::run(req, &middleware, deny_reporter, move |req| {
-                let sender = sender.clone();
-                async move { sender.send(req).await.map_err(|e| anyhow::anyhow!("{e}")) }
-            })
-            .await;
+            let connect_host: std::rc::Rc<str> = std::rc::Rc::from(target_host.as_str());
+            let result =
+                middleware::run(req, &middleware, deny_reporter, connect_host, move |req| {
+                    let sender = sender.clone();
+                    async move { sender.send(req).await.map_err(|e| anyhow::anyhow!("{e}")) }
+                })
+                .await;
 
             match result {
                 Ok(resp) => {

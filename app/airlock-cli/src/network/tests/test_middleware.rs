@@ -51,7 +51,7 @@ fn deny_by_path() {
 }
 
 #[test]
-fn deny_by_host() {
+fn spoofed_host_header_does_not_trigger_host_rule() {
     with_middleware(
         vec![(
             "deny evil",
@@ -60,13 +60,16 @@ fn deny_by_host() {
         |proxy| async move {
             let addr = serve(Router::new().route("/", get(|| async { "ok" }))).await;
 
+            // Normal request to the real (localhost) target passes.
             let mut conn = TestConnection::connect(&proxy, "127.0.0.1", addr.port())
                 .await
                 .unwrap();
             let resp = conn.roundtrip(&http_get(addr.port(), "/")).await;
             assert!(resp.contains("200"), "normal host should pass: {resp}");
 
-            // Connect to localhost but send Host: evil.com in the HTTP request
+            // Connecting to localhost but spoofing `Host: evil.com` must NOT
+            // trigger the evil.com rule — `hostMatches` keys off the
+            // authenticated connect target, not the guest-controlled header.
             let mut conn = TestConnection::connect(&proxy, "127.0.0.1", addr.port())
                 .await
                 .unwrap();
@@ -76,7 +79,32 @@ fn deny_by_host() {
                     addr.port()
                 ))
                 .await;
-            assert!(resp.contains("403"), "evil.com should be denied: {resp}");
+            assert!(
+                resp.contains("200"),
+                "spoofed Host must not trigger the rule: {resp}"
+            );
+        },
+    );
+}
+
+#[test]
+fn host_rule_matches_connect_target() {
+    with_middleware(
+        vec![(
+            "deny target",
+            r#"if req:hostMatches("127.0.0.1") then req:deny() end"#,
+        )],
+        |proxy| async move {
+            let addr = serve(Router::new().route("/", get(|| async { "ok" }))).await;
+            // The real connect target (localhost) matches the rule → denied.
+            let mut conn = TestConnection::connect(&proxy, "127.0.0.1", addr.port())
+                .await
+                .unwrap();
+            let resp = conn.roundtrip(&http_get(addr.port(), "/")).await;
+            assert!(
+                resp.contains("403"),
+                "connect target 127.0.0.1 should be denied: {resp}"
+            );
         },
     );
 }

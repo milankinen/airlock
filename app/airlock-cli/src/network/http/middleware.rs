@@ -111,6 +111,7 @@ pub async fn run<F, Fut>(
     req: hyper::Request<Incoming>,
     middleware: &[CompiledMiddleware],
     deny_reporter: Rc<DenyReporter>,
+    connect_host: Rc<str>,
     send: F,
 ) -> anyhow::Result<hyper::Response<Either<Incoming, Full<Bytes>>>>
 where
@@ -138,6 +139,7 @@ where
     for m in middleware.iter().rev() {
         let inner = next;
         let m = m.0.clone();
+        let connect_host = connect_host.clone();
 
         next = Box::new(move |parts, body| -> NextFuture {
             Box::pin(async move {
@@ -145,6 +147,7 @@ where
                     req: Rc::new(RefCell::new(Some((parts, body)))),
                     next: Rc::new(RefCell::new(Some(inner))),
                     resp: Rc::new(RefCell::new(None)),
+                    connect_host,
                 };
 
                 trace!("running http middleware '{:?}'", m.func);
@@ -212,6 +215,10 @@ struct State {
     req: Rc<RefCell<Option<(hyper::http::request::Parts, RequestBody)>>>,
     next: Rc<RefCell<Option<MiddlewareNext>>>,
     resp: Rc<RefCell<Option<ResponseRef>>>,
+    /// The authenticated destination host this connection was authorized for
+    /// (fixed at connect time). Used by `req.host` / `req:hostMatches`, which
+    /// must NOT trust the guest-controlled request URI / `Host` header.
+    connect_host: Rc<str>,
 }
 
 impl State {
@@ -282,19 +289,11 @@ impl UserData for State {
             })
         });
         fields.add_field_method_get("host", |_, this| {
-            this.with_req(|p, _| {
-                let host = p
-                    .uri
-                    .host()
-                    .or_else(|| {
-                        p.headers
-                            .get("host")
-                            .and_then(|v| v.to_str().ok())
-                            .map(|h| h.split(':').next().unwrap_or(h))
-                    })
-                    .unwrap_or("");
-                Ok(host.to_string())
-            })
+            // The authenticated connect target, not the guest-controlled URI /
+            // Host header — the latter can be spoofed to dodge host-based
+            // middleware rules. Scripts wanting the raw header can still read
+            // `req:header("host")`.
+            Ok(this.connect_host.to_string())
         });
     }
 
@@ -318,19 +317,9 @@ impl UserData for State {
             })
         });
         methods.add_method("hostMatches", |_, this, pattern: String| {
-            this.with_req(|p, _| {
-                let host = p
-                    .uri
-                    .host()
-                    .or_else(|| {
-                        p.headers
-                            .get("host")
-                            .and_then(|v| v.to_str().ok())
-                            .map(|h| h.split(':').next().unwrap_or(h))
-                    })
-                    .unwrap_or("");
-                Ok(matchers::host_matches(host, &pattern))
-            })
+            // Match against the authenticated connect target, not the
+            // spoofable request URI / Host header.
+            Ok(matchers::host_matches(&this.connect_host, &pattern))
         });
 
         methods.add_method("deny", |_, _, ()| -> mlua::Result<()> {

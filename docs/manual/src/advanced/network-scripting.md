@@ -66,11 +66,11 @@ The `req` object is available in every middleware script:
 |---|---|
 | `req.method` | HTTP method (`"GET"`, `"POST"`, etc.) |
 | `req.path` | URL path (readable and writable) |
-| `req.host` | Host header |
+| `req.host` | Authenticated destination host (the connect target, not the `Host` header) |
 | `req.headers` | Full headers table (readable and writable) |
-| `req:header(name)` | Read a single header value |
+| `req:header(name)` | Read a single header value (use `req:header("host")` for the raw, client-sent `Host`) |
 | `req:setHeader(name, value)` | Set or overwrite a header |
-| `req:hostMatches(pattern)` | Match host against a wildcard pattern |
+| `req:hostMatches(pattern)` | Match the connect target against a wildcard pattern |
 | `req:body()` | Read the request body (returns a Body object) |
 | `req:setBody(value)` | Replace the body (string, table, Body, or nil) |
 | `req:deny()` | Block the request with a 403 response |
