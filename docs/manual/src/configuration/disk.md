@@ -19,10 +19,13 @@ If you increase `disk.size` in the config, airlock grows the disk image on the
 next start and the ext4 filesystem is automatically expanded inside the VM.
 Existing data is preserved — this is a safe operation.
 
-If you decrease `disk.size`, the disk image is deleted and recreated at the
-new size. This means **all data on the disk is lost**, including installed
-packages and any state not backed by named caches. There is no in-place
-shrink — the only way to reduce the disk size is a full reset.
+If you decrease `disk.size`, airlock asks for confirmation on the next start,
+because shrinking means destroying all data on the disk (the overlay upper
+layer and any state not backed by named caches). Confirm and the disk image is
+erased and recreated at the smaller size; decline and the existing larger disk
+is kept untouched. When running without a terminal (non-interactive), airlock
+never erases the disk on its own — it keeps the larger image and prints a
+warning.
 
 ## Named caches
 

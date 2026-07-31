@@ -28,8 +28,13 @@ pub(super) fn setup(cache_mounts: &[CacheConfig]) -> anyhow::Result<()> {
             !out.contains("ext4")
         }
         Err(e) => {
-            warn!("blkid exec failed: {e}");
-            true
+            // We could not determine the disk's state. Formatting here would
+            // wipe an existing filesystem — and with it the overlay upper
+            // layer and all caches — so treat "unknown" as "do not format".
+            // If the disk really is unformatted, the mount below fails loudly
+            // instead of silently destroying data.
+            warn!("blkid exec failed ({e}); not formatting to avoid data loss");
+            false
         }
     };
 

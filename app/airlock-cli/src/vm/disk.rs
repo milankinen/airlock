@@ -36,13 +36,27 @@ pub fn prepare(
     if image_path.exists() {
         let current_size = fs::metadata(&image_path)?.len();
         if current_size > bytes {
-            fs::remove_file(&image_path)?;
-            create_sparse(&image_path, bytes)?;
-            cli::log!(
-                "  {} disk recreated {}",
-                cli::check(),
-                cli::dim(&format_size(bytes))
-            );
+            // The disk backs the overlay upper layer (all in-sandbox writes)
+            // and the named caches, so shrinking it destroys that data. Only
+            // do it on explicit confirmation, then recreate the image from
+            // scratch at the smaller size — so the user never has to delete
+            // the file by hand. Declining (or no TTY) keeps the larger disk.
+            if prompt_shrink_disk(current_size, bytes)? {
+                fs::remove_file(&image_path)?;
+                create_sparse(&image_path, bytes)?;
+                cli::log!(
+                    "  {} disk recreated {} (previous data erased)",
+                    cli::check(),
+                    cli::dim(&format_size(bytes))
+                );
+            } else {
+                cli::log!(
+                    "  {} disk kept at {} (configured {} is smaller; data preserved)",
+                    cli::yellow("!"),
+                    cli::dim(&format_size(current_size)),
+                    cli::dim(&format_size(bytes))
+                );
+            }
         } else if current_size < bytes {
             grow_sparse(&image_path, bytes)?;
             cli::log!(
@@ -97,6 +111,35 @@ fn format_size(bytes: u64) -> String {
 }
 
 /// Create a new sparse file (allocates no disk blocks until written).
+/// Ask whether to erase and recreate the disk at a smaller size. Returns
+/// `true` only on explicit confirmation. Without a TTY we can't ask, so we
+/// return `false` (keep the larger disk) rather than destroy data silently.
+/// The default selection is the non-destructive one, so an accidental Enter
+/// never wipes the disk.
+fn prompt_shrink_disk(current: u64, target: u64) -> anyhow::Result<bool> {
+    if !cli::is_interactive() {
+        return Ok(false);
+    }
+    let term = dialoguer::console::Term::stderr();
+    let choice = dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
+        .with_prompt(format!(
+            "Configured disk size {} is smaller than the current {}. \
+             Shrinking erases all sandbox data on the disk.",
+            format_size(target),
+            format_size(current),
+        ))
+        .items([
+            "Keep the current disk (no change)",
+            "Erase and recreate at the smaller size (loses all data)",
+        ])
+        .default(0)
+        .clear(true)
+        .interact_on_opt(&term)?
+        .unwrap_or(0);
+    let _ = term.clear_last_lines(1);
+    Ok(choice == 1)
+}
+
 fn create_sparse(path: &Path, size: u64) -> anyhow::Result<()> {
     let file = fs::File::create(path)?;
     file.set_len(size)?;
