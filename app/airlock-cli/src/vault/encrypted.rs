@@ -62,8 +62,14 @@ impl EncryptedFileStorage {
         }
     }
 
-    fn derive_key(passphrase: &str, salt: &[u8]) -> anyhow::Result<[u8; ARGON2_KEY_BYTES]> {
-        let params = Params::new(ARGON2_M_KIB, ARGON2_T, ARGON2_P, Some(ARGON2_KEY_BYTES))
+    fn derive_key(
+        passphrase: &str,
+        salt: &[u8],
+        m_kib: u32,
+        t: u32,
+        p: u32,
+    ) -> anyhow::Result<[u8; ARGON2_KEY_BYTES]> {
+        let params = Params::new(m_kib, t, p, Some(ARGON2_KEY_BYTES))
             .map_err(|e| anyhow!("invalid argon2 params: {e}"))?;
         let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
         let mut out = [0u8; ARGON2_KEY_BYTES];
@@ -73,6 +79,13 @@ impl EncryptedFileStorage {
         Ok(out)
     }
 }
+
+/// Upper bounds on the Argon2 parameters accepted from a vault file, so a
+/// hostile or corrupt file can't force a huge memory allocation (DoS). These
+/// are far above the values we write (19 MiB / t=2 / p=1) yet still sane.
+const MAX_ARGON2_M_KIB: u32 = 1 << 20; // 1 GiB
+const MAX_ARGON2_T: u32 = 16;
+const MAX_ARGON2_P: u32 = 16;
 
 impl Storage for EncryptedFileStorage {
     fn load(&self) -> anyhow::Result<Option<String>> {
@@ -93,6 +106,21 @@ impl Storage for EncryptedFileStorage {
         if blob.kdf.algo != "argon2id" {
             bail!("unsupported vault KDF algo: {}", blob.kdf.algo);
         }
+        // Derive with the parameters recorded in the file, not the current
+        // compile-time constants. Otherwise a vault written with different
+        // Argon2 parameters (a future release that bumps them, or another tool
+        // honoring this self-describing envelope) could never be opened even
+        // with the correct passphrase — the file stores m/t/p precisely so
+        // they may vary. Bound them to keep a hostile file from forcing a huge
+        // allocation.
+        if blob.kdf.m > MAX_ARGON2_M_KIB || blob.kdf.t > MAX_ARGON2_T || blob.kdf.p > MAX_ARGON2_P {
+            bail!(
+                "vault KDF parameters out of bounds (m={} t={} p={})",
+                blob.kdf.m,
+                blob.kdf.t,
+                blob.kdf.p
+            );
+        }
         let salt = decode_b64_array::<SALT_BYTES>(&blob.kdf.salt, "salt")?;
         let nonce = decode_b64_array::<NONCE_BYTES>(&blob.nonce, "nonce")?;
         let ciphertext = STANDARD_NO_PAD
@@ -100,7 +128,7 @@ impl Storage for EncryptedFileStorage {
             .context("decode vault ciphertext")?;
 
         let passphrase = self.passphrase.unlock()?;
-        let key = Self::derive_key(&passphrase, &salt)?;
+        let key = Self::derive_key(&passphrase, &salt, blob.kdf.m, blob.kdf.t, blob.kdf.p)?;
         let cipher = ChaCha20Poly1305::new(<&Key>::from(&key));
         let plaintext = cipher
             .decrypt(<&Nonce>::from(&nonce), ciphertext.as_ref())
@@ -129,7 +157,7 @@ impl Storage for EncryptedFileStorage {
                     .try_fill_bytes(&mut salt)
                     .context("generate vault salt")?;
                 let passphrase = self.passphrase.create()?;
-                let key = Self::derive_key(&passphrase, &salt)?;
+                let key = Self::derive_key(&passphrase, &salt, ARGON2_M_KIB, ARGON2_T, ARGON2_P)?;
                 *salt_slot = Some(salt);
                 *key_slot = Some(key);
                 (salt, key)
@@ -231,4 +259,109 @@ fn prompt_create() -> anyhow::Result<String> {
         bail!("vault passphrase must not be empty");
     }
     Ok(pass)
+}
+
+#[cfg(test)]
+mod tests {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD_NO_PAD;
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+
+    use super::{
+        ARGON2_M_KIB, ARGON2_P, ARGON2_T, EncryptedBlob, EncryptedFileStorage, Envelope, KdfParams,
+        MAX_ARGON2_M_KIB, NONCE_BYTES, PassphraseSource, SALT_BYTES, Storage, atomic_write,
+    };
+
+    struct Fixed(&'static str);
+    impl PassphraseSource for Fixed {
+        fn unlock(&self) -> anyhow::Result<String> {
+            Ok(self.0.to_string())
+        }
+        fn create(&self) -> anyhow::Result<String> {
+            Ok(self.0.to_string())
+        }
+    }
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "airlock-vault-kdf-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    /// Hand-write a vault whose KDF params differ from the current constants
+    /// and confirm it still decrypts — i.e. load() derives with the file's
+    /// params, not the compile-time constants.
+    #[test]
+    fn load_uses_file_kdf_params_not_constants() {
+        let path = tmp("v.enc.json");
+        let pass = "hunter2";
+        let salt = [7u8; SALT_BYTES];
+        let t = ARGON2_T + 1; // deliberately not the default
+
+        let key = EncryptedFileStorage::derive_key(pass, &salt, ARGON2_M_KIB, t, ARGON2_P).unwrap();
+        let mut nonce = [0u8; NONCE_BYTES];
+        nonce[0] = 1;
+        let plaintext = r#"{"secrets":{},"registries":{}}"#;
+        let ct = ChaCha20Poly1305::new(<&Key>::from(&key))
+            .encrypt(<&Nonce>::from(&nonce), plaintext.as_bytes())
+            .unwrap();
+
+        let envelope = Envelope::EncryptedFile(EncryptedBlob {
+            kdf: KdfParams {
+                algo: "argon2id".to_string(),
+                salt: STANDARD_NO_PAD.encode(salt),
+                m: ARGON2_M_KIB,
+                t,
+                p: ARGON2_P,
+            },
+            nonce: STANDARD_NO_PAD.encode(nonce),
+            ciphertext: STANDARD_NO_PAD.encode(&ct),
+        });
+        atomic_write(
+            &path,
+            serde_json::to_string_pretty(&envelope).unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        let out = EncryptedFileStorage::new(path, Box::new(Fixed(pass)))
+            .load()
+            .expect("decrypt with file params");
+        assert_eq!(out.as_deref(), Some(plaintext));
+    }
+
+    /// A vault claiming absurd KDF params must be refused, not attempted
+    /// (a hostile file could otherwise force a huge allocation).
+    #[test]
+    fn load_rejects_out_of_bounds_kdf_params() {
+        let path = tmp("v2.enc.json");
+        let envelope = Envelope::EncryptedFile(EncryptedBlob {
+            kdf: KdfParams {
+                algo: "argon2id".to_string(),
+                salt: STANDARD_NO_PAD.encode([0u8; SALT_BYTES]),
+                m: MAX_ARGON2_M_KIB + 1,
+                t: ARGON2_T,
+                p: ARGON2_P,
+            },
+            nonce: STANDARD_NO_PAD.encode([0u8; NONCE_BYTES]),
+            ciphertext: STANDARD_NO_PAD.encode([0u8; 32]),
+        });
+        atomic_write(
+            &path,
+            serde_json::to_string_pretty(&envelope).unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        let err = EncryptedFileStorage::new(path, Box::new(Fixed("pw")))
+            .load()
+            .unwrap_err();
+        assert!(err.to_string().contains("out of bounds"), "got: {err:#}");
+    }
 }
