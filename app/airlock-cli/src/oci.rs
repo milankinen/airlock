@@ -120,12 +120,36 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
     {
         match prompt_image_changed()? {
             ImageChangeAction::KeepOld => {
-                // Only keep old if the cache is still intact; otherwise
-                // fall through and let the new image be used.
+                // "Still intact" has to mean *ready*, not merely present: the
+                // JSON can outlive its layer trees, which a sweep collects
+                // independently. Checking only for the file and then handing
+                // the old digest to `ensure_image` would miss that, fall
+                // through to the pull path, and persist the **new** image's
+                // layers and config under the **old** digest — poisoning that
+                // cache entry for every sandbox that shares it, and reporting
+                // an `image_id` the supervisor uses for change detection that
+                // describes neither image.
+                //
+                // Returning here instead of rewriting `image.digest` keeps
+                // that mismatch unrepresentable rather than merely unlikely:
+                // no digest can reach `ensure_image` unless it came from the
+                // same resolution as the source beside it.
                 let old_image_path = crate::cache::image_path(old_digest.trim())?;
-                if old_image_path.exists() {
-                    image.digest = old_digest.trim().to_string();
+                if let Some(mut old) = read_ready_image(&old_image_path) {
+                    // Stamp the configured name onto the kept image so the
+                    // name-keyed fast path recognizes it on the next start —
+                    // otherwise every subsequent run re-resolves and asks this
+                    // same question again.
+                    if old.name != *image_name {
+                        old.name.clone_from(image_name);
+                        write_cached_image(&old_image_path, &old)?;
+                    }
+                    return use_cached_image(project, &sandbox_image, old);
                 }
+                cli::log!(
+                    "  {} old environment is incomplete — using the new image",
+                    cli::bullet()
+                );
             }
             ImageChangeAction::Recreate => {
                 // Remove image ref hard link — drops this sandbox's liveness signal
@@ -595,6 +619,11 @@ fn resolve_via_docker(
 }
 
 /// An image resolved to a concrete digest, ready to be downloaded.
+///
+/// Invariant: `digest` names the image that `source` will produce. Both come
+/// from a single [`resolve_image`] call and must not be recombined — swapping
+/// in some other digest makes [`ensure_image`] write one image's content to
+/// another image's cache entry.
 struct ResolvedImage {
     digest: String,
     config: OciConfig,
@@ -900,4 +929,93 @@ fn lookup_home_dir(layer_keys: &[String], uid: u32) -> anyhow::Result<String> {
     }
 
     anyhow::bail!("no home directory found for uid {uid} in any layer /etc/passwd")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::HOME_LOCK;
+
+    fn tempfile_dir() -> std::path::PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "airlock-oci-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    fn sample_image(digest: &str, layers: &[&str]) -> OciImage {
+        OciImage {
+            image_id: digest.to_string(),
+            name: "alpine:3.19".to_string(),
+            image_layers: layers.iter().map(|d| cache::layer_key(d)).collect(),
+            container_home: "/root".to_string(),
+            uid: 0,
+            gid: 0,
+            cmd: vec!["/bin/sh".to_string()],
+            env: vec![],
+        }
+    }
+
+    fn make_layer(digest: &str) {
+        let dir = cache::layer_dir(&cache::layer_key(digest)).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("marker"), b"x").unwrap();
+    }
+
+    /// The "keep old environment" branch decides whether the old image is
+    /// reusable with `read_ready_image`, not with a plain existence check.
+    /// The distinction is the whole fix: an image JSON outlives its layer
+    /// trees (a sweep collects them independently), and treating that
+    /// half-collected state as reusable used to send the old digest down the
+    /// pull path, persisting the *new* image's layers under it.
+    #[test]
+    fn cached_image_missing_layers_is_not_ready() {
+        let _guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile_dir();
+        unsafe {
+            std::env::set_var("HOME", &tmp);
+        }
+
+        let path = cache::image_path("sha256:swept").unwrap();
+        write_cached_image(&path, &sample_image("sha256:swept", &["sha256:L1"])).unwrap();
+
+        // The metadata is on disk and readable...
+        assert!(path.exists(), "image JSON should exist");
+        assert!(read_cached_image(&path).is_some());
+        // ...but its layer tree was swept, so it is not reusable.
+        assert!(
+            read_ready_image(&path).is_none(),
+            "an image whose layers were swept must not count as ready"
+        );
+
+        // Restoring the layer makes the very same entry reusable again.
+        make_layer("sha256:L1");
+        assert!(read_ready_image(&path).is_some());
+    }
+
+    /// A layerless entry can't be composed into a rootfs, so it is never
+    /// "ready" no matter what else is on disk.
+    #[test]
+    fn cached_image_without_layers_is_not_ready() {
+        let _guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile_dir();
+        unsafe {
+            std::env::set_var("HOME", &tmp);
+        }
+
+        let path = cache::image_path("sha256:empty").unwrap();
+        write_cached_image(&path, &sample_image("sha256:empty", &[])).unwrap();
+
+        assert!(read_ready_image(&path).is_none());
+    }
 }
