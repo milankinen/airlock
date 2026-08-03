@@ -28,6 +28,12 @@ const WHITEOUT_PREFIX: &str = ".wh.";
 /// in lower layers.
 const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
 
+/// Monotonic counter that makes staging temp names unique *within* a process,
+/// so two threads extracting different layers never collide on a name either.
+/// Combined with `std::process::id()` it also keeps separate `airlock`
+/// processes off each other's staging dirs.
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Ensure a layer is extracted into the shared cache, downloading the
 /// tarball through `fetch` only if it's not already on disk.
 ///
@@ -69,10 +75,19 @@ where
         .into_owned();
 
     let download = parent.join(format!("{dir_name}.download"));
-    let download_tmp = parent.join(format!("{dir_name}.download.tmp"));
 
     if !download.exists() {
-        let _ = std::fs::remove_file(&download_tmp);
+        // Stage into a process-unique temp file so two `airlock` processes
+        // pulling the same uncached image don't both write the one shared
+        // `<digest>.download.tmp` and corrupt each other's tarball; the rename
+        // to the shared `<digest>.download` name is the commit. A stale
+        // fixed-name tmp left by an older binary is cleaned up here too.
+        let _ = std::fs::remove_file(parent.join(format!("{dir_name}.download.tmp")));
+        let download_tmp = parent.join(format!(
+            "{dir_name}.download.{}.{}.tmp",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         fetch(&download_tmp)?;
         std::fs::rename(&download_tmp, &download)?;
     }
@@ -110,7 +125,14 @@ fn extract_tarball_to_cache(
         .ok_or_else(|| anyhow::anyhow!("layer dir has no file name"))?
         .to_string_lossy()
         .into_owned();
-    let tmp = parent.join(format!("{dir_name}.tmp"));
+    // Stage into a process-unique dir so two `airlock` processes extracting
+    // the same uncached layer never share (and clobber) the one `.tmp` tree.
+    // The final rename below is the cross-process commit point.
+    let tmp = parent.join(format!(
+        "{dir_name}.{}.{}.tmp",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
 
@@ -209,11 +231,25 @@ fn extract_tarball_to_cache(
         entry.unpack_in(&tmp)?;
     }
 
-    if layer_dir.exists() {
-        std::fs::remove_dir_all(layer_dir)?;
+    // Commit via atomic rename. The fast path in `ensure_layer_cached`
+    // returned early if `<digest>/` already existed, so its presence here
+    // means a concurrent `airlock` won the race and published the same layer:
+    // reuse its tree and drop our staging dir rather than deleting a directory
+    // a peer may still be reading. The winner can also appear between this
+    // check and the rename (which then fails with ENOTEMPTY); treat that the
+    // same way.
+    if layer_dir.is_dir() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Ok(());
     }
-    std::fs::rename(&tmp, layer_dir)?;
-    Ok(())
+    match std::fs::rename(&tmp, layer_dir) {
+        Ok(()) => Ok(()),
+        Err(_) if layer_dir.is_dir() => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Join `rel` onto the extraction `root` for whiteout handling, refusing any
@@ -515,6 +551,44 @@ mod tests {
         let layer = ensure_layer_cached(digest, fetch_from(tarball_src), None).unwrap();
         assert!(layer.join("ok").exists());
         assert!(!stale.exists());
+    }
+
+    #[test]
+    fn extract_reuses_existing_winner_dir() {
+        // Models the concurrent-pull commit race: `<digest>/` already exists
+        // (a peer process won), so extraction must reuse it and drop its own
+        // staging tree instead of clobbering a dir a peer may be reading.
+        let _guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile_dir();
+        unsafe {
+            std::env::set_var("HOME", &tmp);
+        }
+
+        let key = cache::layer_key("sha256:winnerdir");
+        let layer_dir = cache::layer_dir(&key).unwrap();
+        std::fs::create_dir_all(&layer_dir).unwrap();
+        std::fs::write(layer_dir.join("winner"), b"kept").unwrap();
+
+        let tarball = tmp.join("layer.tar.gz");
+        std::fs::write(&tarball, build_tarball(&[("loser", b"x")])).unwrap();
+
+        extract_tarball_to_cache(&layer_dir, &tarball, None)
+            .expect("reuse must succeed when the winner dir already exists");
+
+        // Winner's tree is untouched; our entry was not committed over it.
+        assert_eq!(std::fs::read(layer_dir.join("winner")).unwrap(), b"kept");
+        assert!(!layer_dir.join("loser").exists());
+
+        // No staging dir left behind.
+        let parent = layer_dir.parent().unwrap();
+        let stray: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(stray.is_empty(), "staging tmp dir must be cleaned up");
     }
 
     #[test]
