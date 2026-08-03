@@ -58,11 +58,20 @@ pub fn load(project_root: &Path) -> anyhow::Result<Config> {
 }
 
 /// Try each supported extension for `base` and parse the first file found.
-fn load_first(base: &Path) -> anyhow::Result<Option<(PathBuf, serde_json::Value)>> {
+pub(super) fn load_first(base: &Path) -> anyhow::Result<Option<(PathBuf, serde_json::Value)>> {
     for ext in EXTENSIONS {
         let path = PathBuf::from(format!("{}.{ext}", base.display()));
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            // Only a genuinely absent file falls through to the next
+            // extension. Any other error (permission, IO, a directory in
+            // the file's place) means the config exists but can't be
+            // read — fail closed so the sandbox never silently drops the
+            // user's policy in favor of permissive defaults.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(anyhow::anyhow!("read config file {}: {e}", path.display()));
+            }
         };
         let value = parse_file(&path, &content)?;
         return Ok(Some((path, value)));
