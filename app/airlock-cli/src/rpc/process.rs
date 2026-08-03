@@ -30,28 +30,58 @@ impl Process {
     }
 
     /// Poll for the next output event (stdout chunk, stderr chunk, or exit).
+    ///
+    /// A stream `Eof` only marks the end of a stdout/stderr stream, not the
+    /// process exit, so it is skipped: we keep polling until the guest delivers
+    /// the real `exit` event. This is what stops a stdout EOF from masking the
+    /// true exit code. Malformed or unknown frames are logged and surfaced as
+    /// an error instead of being silently reported as `Exit(1)`.
     pub async fn poll(&self) -> anyhow::Result<ProcessEvent> {
-        let response = self.proc.poll_request().send().promise.await?;
-        let next = response.get()?.get_next()?;
+        loop {
+            let response = self.proc.poll_request().send().promise.await?;
+            let next = response.get()?.get_next()?;
 
-        match next.which() {
-            Ok(process_output::Exit(code)) => Ok(ProcessEvent::Exit(code)),
-            Ok(process_output::Stdout(frame)) => {
-                let frame = frame?;
-                match frame.which() {
-                    Ok(data_frame::Data(Ok(data))) => Ok(ProcessEvent::Stdout(data.to_vec())),
-                    Ok(data_frame::Eof(())) => Ok(ProcessEvent::Exit(0)),
-                    _ => Ok(ProcessEvent::Exit(1)),
+            match next.which() {
+                Ok(process_output::Exit(code)) => return Ok(ProcessEvent::Exit(code)),
+                Ok(process_output::Stdout(frame)) => {
+                    let frame = frame?;
+                    match frame.which() {
+                        Ok(data_frame::Data(Ok(data))) => {
+                            return Ok(ProcessEvent::Stdout(data.to_vec()));
+                        }
+                        Ok(data_frame::Eof(())) => {}
+                        Ok(data_frame::Data(Err(e))) => {
+                            tracing::error!("guest stdout frame decode failed: {e}");
+                            anyhow::bail!("guest stdout frame decode failed: {e}");
+                        }
+                        Err(e) => {
+                            tracing::error!("unknown guest stdout frame (schema skew?): {e}");
+                            anyhow::bail!("unknown guest stdout frame: {e}");
+                        }
+                    }
+                }
+                Ok(process_output::Stderr(frame)) => {
+                    let frame = frame?;
+                    match frame.which() {
+                        Ok(data_frame::Data(Ok(data))) => {
+                            return Ok(ProcessEvent::Stderr(data.to_vec()));
+                        }
+                        Ok(data_frame::Eof(())) => {}
+                        Ok(data_frame::Data(Err(e))) => {
+                            tracing::error!("guest stderr frame decode failed: {e}");
+                            anyhow::bail!("guest stderr frame decode failed: {e}");
+                        }
+                        Err(e) => {
+                            tracing::error!("unknown guest stderr frame (schema skew?): {e}");
+                            anyhow::bail!("unknown guest stderr frame: {e}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("unknown guest process output (schema skew?): {e}");
+                    anyhow::bail!("unknown guest process output: {e}");
                 }
             }
-            Ok(process_output::Stderr(frame)) => {
-                let frame = frame?;
-                match frame.which() {
-                    Ok(data_frame::Data(Ok(data))) => Ok(ProcessEvent::Stderr(data.to_vec())),
-                    _ => Ok(ProcessEvent::Exit(1)),
-                }
-            }
-            Err(_) => Ok(ProcessEvent::Exit(1)),
         }
     }
 }
