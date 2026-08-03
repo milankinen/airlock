@@ -38,6 +38,46 @@ resolution = "registry"
 insecure = true
 ```
 
+## Pinning a digest
+
+An image name can pin an exact digest with `@sha256:…`, the same way Docker
+accepts it — with or without a tag:
+
+```toml
+[vm]
+image = "ubuntu:24.04@sha256:8f9e08b6a0b1e0b0f1f2a3c4d5e6f708192a3b4c5d6e7f80912a3b4c5d6e7f80"
+```
+
+The digest decides which image you get; the tag alongside it is just a label.
+Pin one when the sandbox should keep running the same image even if the tag is
+later re-pointed to something else.
+
+If a local Docker image carries the same tag but isn't that exact image,
+airlock ignores it and pulls the pinned one instead.
+
+## Pull policy
+
+`pull-policy` controls how often airlock checks whether the image has changed:
+
+```toml
+[vm.image]
+name = "ubuntu:24.04"
+pull-policy = "if-changed"
+```
+
+- `if-not-present` (default) — once an image is cached under this name, use it
+  and skip the network entirely. Fast, but a tag that has moved in the registry
+  goes unnoticed until you change the name or clear the cache.
+- `if-changed` — check on every start, and keep using the cached image only
+  while it's still current. If it has changed you get the usual "Image has
+  changed" prompt, so nothing is re-created behind your back.
+
+`if-changed` adds a short registry check to every start. If that check can't be
+made — no network, registry down — airlock asks whether to carry on with the
+image you already have. Scripted runs don't ask; they stop with an error.
+
+A pinned digest ignores this setting, since a pinned image can't change.
+
 ## Resources
 
 By default, airlock allocates all available host CPUs and half the system RAM

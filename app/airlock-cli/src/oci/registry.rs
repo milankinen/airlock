@@ -18,7 +18,13 @@ use super::OciConfig;
 /// A fully resolved registry image with manifest and config.
 pub struct RegistryImage {
     pub reference: Reference,
+    /// Digest of the platform-specific manifest actually selected.
     pub digest: String,
+    /// Digest of the multi-platform index the manifest was selected from,
+    /// when the reference resolved to one. A user pinning `@sha256:…` will
+    /// normally have copied the index digest (that is what a registry
+    /// advertises for a tag), so digest-pin checks must accept either.
+    pub list_digest: Option<String>,
     pub manifest: OciImageManifest,
     pub image_config: OciConfig,
 }
@@ -76,13 +82,16 @@ pub async fn resolve(
     let reference: Reference = image_ref.parse()?;
     let client = make_client(insecure);
 
-    let (manifest, digest, config_str) = client.pull_manifest_and_config(&reference, auth).await?;
+    let (manifest, digest, config_str, list_digest) = client
+        .pull_manifest_and_config_and_list_digest(&reference, auth)
+        .await?;
 
     let image_config: OciConfig = serde_json::from_str(&config_str)?;
 
     Ok(RegistryImage {
         reference,
         digest,
+        list_digest,
         manifest,
         image_config,
     })

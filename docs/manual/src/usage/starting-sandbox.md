@@ -70,7 +70,9 @@ airlock pulls OCI images and caches them locally under `~/.cache/airlock/oci/`.
 Image metadata lives in `oci/images/<digest>` (one JSON file per image) and
 the underlying layer trees in a shared `oci/layers/` cache that
 deduplicates across images. On subsequent runs, the cached image is reused
-unless the remote tag has changed.
+without contacting the registry at all — a tag that has since moved goes
+unnoticed. Set `pull-policy = "if-changed"` (see [VM
+options](../configuration/vm.md)) to check for a newer image on every start.
 
 By default, airlock tries the local Docker daemon first and falls back to
 pulling from the OCI registry. This can be controlled with the `resolution`

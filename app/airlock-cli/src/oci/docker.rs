@@ -79,6 +79,38 @@ pub fn image_arch(image_id: &str) -> Option<String> {
     if arch.is_empty() { None } else { Some(arch) }
 }
 
+/// Returns the registry digests the daemon recorded for a local image, i.e.
+/// the `RepoDigests` entries with their `<repo>@` prefix stripped.
+///
+/// Used to check a digest-pinned reference against the daemon's copy. The
+/// list is empty for images that were never pulled from (or pushed to) a
+/// registry — a locally built image has no registry identity, so a pin can
+/// never be satisfied from Docker alone.
+pub fn repo_digests(image_id: &str) -> Vec<String> {
+    let Ok(output) = Command::new("docker")
+        .args([
+            "image",
+            "inspect",
+            "--format",
+            "{{range .RepoDigests}}{{println .}}{{end}}",
+            image_id,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().rsplit_once('@'))
+        .map(|(_, digest)| digest.to_string())
+        .collect()
+}
+
 /// Drop guard that kills and reaps a `docker image save` child when the
 /// enclosing future is cancelled. Successful callers `take()` the child
 /// out first so the guard is a no-op on the happy path.

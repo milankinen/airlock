@@ -97,6 +97,30 @@ pub mod config {
         const DE: Self::Deserializer = smart_config::de::Serde;
     }
 
+    /// When the configured image reference is re-resolved against its source.
+    ///
+    /// Orthogonal to [`Resolution`]: that picks *where* an image comes from,
+    /// this picks *how often* we go ask. Irrelevant for digest-pinned
+    /// references (`repo@sha256:…`), which name one immutable image and are
+    /// therefore never re-resolved for change detection.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum PullPolicy {
+        /// Use the locally cached image whenever one is present under the
+        /// configured name, without contacting the source (default).
+        #[default]
+        IfNotPresent,
+        /// Re-resolve the reference to a digest on every start and reuse the
+        /// cached image only when that digest still matches.
+        IfChanged,
+    }
+
+    impl WellKnown for PullPolicy {
+        type Deserializer =
+            smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
+        const DE: Self::Deserializer = smart_config::de::Serde;
+    }
+
     /// OCI image reference — either a plain image name string or a full config object.
     ///
     /// String form:  `image = "alpine:latest"`
@@ -104,6 +128,8 @@ pub mod config {
     #[derive(Debug, Clone, serde::Serialize)]
     pub struct ImageRef {
         /// Image name (e.g. `alpine:latest`, `localhost:5005/alpine:3`).
+        /// A digest may be pinned with `@sha256:…`, optionally alongside a
+        /// tag (`alpine:3.20@sha256:…`), as Docker tooling accepts.
         pub name: String,
         /// Resolution strategy: `auto` (default), `docker`, or `registry`.
         #[serde(default)]
@@ -111,6 +137,10 @@ pub mod config {
         /// Allow plain HTTP to the registry (for local or dev registries).
         #[serde(default)]
         pub insecure: bool,
+        /// When to re-resolve the reference: `if-not-present` (default) or
+        /// `if-changed`.
+        #[serde(default, rename = "pull-policy")]
+        pub pull_policy: PullPolicy,
     }
 
     impl ImageRef {
@@ -119,7 +149,30 @@ pub mod config {
                 name: name.into(),
                 resolution: Resolution::Auto,
                 insecure: false,
+                pull_policy: PullPolicy::IfNotPresent,
             }
+        }
+
+        /// The digest pinned in the reference, if any (`@sha256:…`).
+        ///
+        /// A pinned reference names exactly one immutable image, so callers
+        /// use this both to skip tag→digest change detection and to verify
+        /// that whatever a source hands back is the image that was asked for.
+        pub fn pinned_digest(&self) -> Option<&str> {
+            let (name, digest) = self.name.rsplit_once('@')?;
+            // Guard against `@` appearing in some other position: a digest is
+            // `<algorithm>:<hex>` and nothing else may follow it. The name
+            // must survive too — stripping the digest has to leave something
+            // to query a source with.
+            let (algorithm, hex) = digest.split_once(':')?;
+            let valid = !name.is_empty()
+                && !algorithm.is_empty()
+                && hex.len() >= 32
+                && hex.chars().all(|c| c.is_ascii_hexdigit())
+                && algorithm
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '.'));
+            valid.then_some(digest)
         }
     }
 
@@ -141,6 +194,11 @@ pub mod config {
                     resolution: Resolution,
                     #[serde(default)]
                     insecure: bool,
+                    // The untagged helper ignores keys it doesn't know, so an
+                    // unaliased snake_case spelling would silently do nothing
+                    // — and every other config section here is snake_case.
+                    #[serde(default, rename = "pull-policy", alias = "pull_policy")]
+                    pull_policy: PullPolicy,
                 },
             }
             match Helper::deserialize(d)? {
@@ -149,10 +207,12 @@ pub mod config {
                     name,
                     resolution,
                     insecure,
+                    pull_policy,
                 } => Ok(ImageRef {
                     name,
                     resolution,
                     insecure,
+                    pull_policy,
                 }),
             }
         }

@@ -17,6 +17,7 @@ pub use gc::sweep as gc_sweep;
 use oci_client::config::ConfigFile as OciConfig;
 use oci_client::secrets::RegistryAuth;
 
+use crate::config::config::PullPolicy;
 use crate::oci::credentials::ToRegistryAuth;
 use crate::project::Project;
 use crate::{cache, cli};
@@ -65,28 +66,23 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
     let image_cfg = &project.config.vm.image;
     let image_name = &image_cfg.name;
 
-    // Fast path: if we already have a cached, ready-to-use image under
-    // the same name, skip the network round-trip to resolve tag → digest.
-    if let Some(img) = read_ready_image(&sandbox_image)
-        && img.name == *image_name
+    // The cached image this sandbox is currently running, if it is both
+    // complete on disk and still the image the config asks for by name.
+    let cached = read_ready_image(&sandbox_image).filter(|img| img.name == *image_name);
+
+    // Fast path: reuse the cached image and skip the network round-trip that
+    // resolves tag → digest.
+    //
+    // `if-changed` gives up that shortcut on purpose — spending the
+    // round-trip is the whole point of the policy. A digest-pinned reference
+    // is exempt either way: it names one immutable image, so a matching name
+    // already implies a matching digest and there is nothing to detect.
+    if let Some(img) = cached.clone()
+        && (image_cfg.pull_policy == PullPolicy::IfNotPresent
+            || image_cfg.pinned_digest().is_some())
     {
         tracing::debug!("image cache hit for {image_name}");
-        // Invariant: `sandbox/image` must be a hardlink to the canonical
-        // cache file so sweep GC sees the sandbox as a live reference.
-        // Heal it on every prepare — the link may have been severed by a
-        // cache wipe, a cache-path migration, or a prior run that pre-dated
-        // this invariant, leaving our entry as a sweep target.
-        let image_path = crate::cache::image_path(&img.image_id)?;
-        ensure_image_hardlink(&sandbox_image, &image_path, &img)?;
-        cli::log!(
-            "  {} image cached {}",
-            cli::check(),
-            cli::dim(&img.image_id[..19.min(img.image_id.len())])
-        );
-        let overlay_dir = project.sandbox_dir.join("overlay");
-        std::fs::create_dir_all(&overlay_dir)?;
-        cli::log!("  {} environment ready", cli::check());
-        return Ok(img);
+        return use_cached_image(project, &sandbox_image, img);
     }
 
     // Fall-through: read just the stored digest (if any) for change detection.
@@ -97,35 +93,20 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
         .parse::<oci_client::Reference>()
         .map_or_else(|_| image_name.clone(), |r| r.resolve_registry().to_string());
 
-    // Resolve image reference to a digest. Start with anonymous, then
-    // use credentials from vault and if that fails as well, prompt for
-    // credentials and retry in a loop until success or user interrupts.
-    let mut auth = RegistryAuth::Anonymous;
-    let mut updated_creds = None;
-    let mut image = loop {
-        match resolve_image(image_name, image_cfg.resolution, image_cfg.insecure, &auth).await {
-            Ok(img) => {
-                if let Some(creds) = updated_creds {
-                    credentials::save(&project.vault, &registry_host, &creds)?;
-                }
-                break img;
+    let (mut image, auth) = match resolve_with_auth(project, image_cfg, &registry_host).await {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            // Under `if-changed` the source was contacted only to ask whether
+            // a newer digest exists. A registry that is down, unreachable, or
+            // mid-outage shouldn't strand a sandbox whose image is already
+            // sitting complete on disk — offer to carry on with it.
+            let Some(img) = cached.filter(|_| !cli::is_interrupted()) else {
+                return Err(e);
+            };
+            if !prompt_resolution_failed(&e)? {
+                return Err(e);
             }
-            Err(e) if registry::is_auth_error(&e) => {
-                if cli::is_interrupted() {
-                    anyhow::bail!("cancelled by user");
-                }
-                if auth == RegistryAuth::Anonymous
-                    && let Some(creds) = credentials::load(&project.vault, &registry_host)
-                {
-                    auth = creds.to_auth();
-                    continue;
-                }
-                cli::error!("authentication failed, try again");
-                let creds = credentials::prompt(&registry_host)?;
-                updated_creds = Some(creds.clone());
-                auth = creds.to_auth();
-            }
-            Err(e) => return Err(e),
+            return use_cached_image(project, &sandbox_image, img);
         }
     };
 
@@ -178,6 +159,74 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
     cli::log!("  {} environment ready", cli::check());
 
     Ok(oci_image)
+}
+
+/// Finish `prepare` with an image already cached on disk: re-establish the GC
+/// hardlink, make sure the overlay dir exists, and report it as ready.
+///
+/// Shared by the fast path and the resolution-failure fallback so both leave
+/// the sandbox in exactly the same state as a freshly pulled image would.
+fn use_cached_image(
+    project: &Project,
+    sandbox_image: &Path,
+    image: OciImage,
+) -> anyhow::Result<OciImage> {
+    // Invariant: `sandbox/image` must be a hardlink to the canonical cache
+    // file so sweep GC sees the sandbox as a live reference. Heal it on every
+    // prepare — the link may have been severed by a cache wipe, a cache-path
+    // migration, or a prior run that pre-dated this invariant, leaving our
+    // entry as a sweep target.
+    let image_path = crate::cache::image_path(&image.image_id)?;
+    ensure_image_hardlink(sandbox_image, &image_path, &image)?;
+    cli::log!(
+        "  {} image cached {}",
+        cli::check(),
+        cli::dim(&image.image_id[..19.min(image.image_id.len())])
+    );
+    let overlay_dir = project.sandbox_dir.join("overlay");
+    std::fs::create_dir_all(&overlay_dir)?;
+    cli::log!("  {} environment ready", cli::check());
+    Ok(image)
+}
+
+/// Resolve the configured reference to a digest, negotiating registry auth.
+///
+/// Starts anonymous, falls back to vault-stored credentials, and finally
+/// prompts — retrying until resolution succeeds or the user interrupts.
+/// Returns the auth that worked so the caller can reuse it for the pull.
+async fn resolve_with_auth(
+    project: &Project,
+    image_cfg: &crate::config::config::ImageRef,
+    registry_host: &str,
+) -> anyhow::Result<(ResolvedImage, RegistryAuth)> {
+    let mut auth = RegistryAuth::Anonymous;
+    let mut updated_creds = None;
+    loop {
+        match resolve_image(image_cfg, &auth).await {
+            Ok(img) => {
+                if let Some(creds) = updated_creds {
+                    credentials::save(&project.vault, registry_host, &creds)?;
+                }
+                return Ok((img, auth));
+            }
+            Err(e) if registry::is_auth_error(&e) => {
+                if cli::is_interrupted() {
+                    anyhow::bail!("cancelled by user");
+                }
+                if auth == RegistryAuth::Anonymous
+                    && let Some(creds) = credentials::load(&project.vault, registry_host)
+                {
+                    auth = creds.to_auth();
+                    continue;
+                }
+                cli::error!("authentication failed, try again");
+                let creds = credentials::prompt(registry_host)?;
+                updated_creds = Some(creds.clone());
+                auth = creds.to_auth();
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// On-disk wrapper for a cached [`OciImage`]. Internally tagged so the JSON
@@ -418,48 +467,65 @@ fn prompt_image_changed() -> anyhow::Result<ImageChangeAction> {
     })
 }
 
+/// Ask whether to fall back to the cached image after resolution failed.
+/// Returns `true` to continue with the cache, `false` to abort.
+///
+/// Non-interactive runs abort: a resolution failure is a genuine error, and
+/// silently substituting a possibly stale image in CI would hide it.
+fn prompt_resolution_failed(err: &anyhow::Error) -> anyhow::Result<bool> {
+    if !cli::is_interactive() {
+        return Ok(false);
+    }
+    let term = dialoguer::console::Term::stderr();
+    let choice = dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+        .with_prompt(format!(
+            "image resolution failed ({err}): do you want to continue with cached image?"
+        ))
+        .default(false)
+        .interact_on_opt(&term)?
+        .unwrap_or(false);
+    let _ = term.clear_last_lines(1);
+    Ok(choice)
+}
+
 /// Full image resolution (with config).
 async fn resolve_image(
-    image_ref: &str,
-    resolution: crate::config::config::Resolution,
-    insecure: bool,
+    image_cfg: &crate::config::config::ImageRef,
     auth: &RegistryAuth,
 ) -> anyhow::Result<ResolvedImage> {
     use crate::config::config::Resolution;
 
-    if !matches!(resolution, Resolution::Registry) {
-        if let Some(image_id) = docker::image_exists(image_ref) {
-            let host_arch = match std::env::consts::ARCH {
-                "x86_64" => "amd64",
-                "aarch64" => "arm64",
-                other => other,
-            };
-            let docker_arch = docker::image_arch(&image_id).unwrap_or_default();
-            if docker_arch.is_empty() || docker_arch == host_arch {
-                cli::log!(
-                    "  {} image resolved via docker {}",
-                    cli::check(),
-                    cli::dim(&image_id[..19.min(image_id.len())])
-                );
-                return Ok(ResolvedImage {
-                    digest: image_id,
-                    config: OciConfig::default(),
-                    source: ImageSource::Docker {
-                        image_ref: image_ref.to_string(),
-                    },
-                });
+    let image_ref = image_cfg.name.as_str();
+    let pinned = image_cfg.pinned_digest();
+
+    if !matches!(image_cfg.resolution, Resolution::Registry) {
+        match resolve_via_docker(image_ref, pinned) {
+            Ok(Some(resolved)) => return Ok(resolved),
+            // Present locally but unusable. Under `docker` there is nowhere
+            // else to look, so surface why rather than the generic not-found.
+            Err(reason) if matches!(image_cfg.resolution, Resolution::Docker) => {
+                anyhow::bail!("{reason}")
             }
-            cli::log!(
-                "  {} docker image is {docker_arch}, need {host_arch} — trying registry",
-                cli::bullet()
-            );
+            Err(reason) => cli::log!("  {} {reason} — trying registry", cli::bullet()),
+            Ok(None) => {}
         }
-        if matches!(resolution, Resolution::Docker) {
+        if matches!(image_cfg.resolution, Resolution::Docker) {
             anyhow::bail!("image {image_ref} not found in Docker daemon");
         }
     }
 
-    let reg = registry::resolve(image_ref, auth, insecure).await?;
+    let reg = registry::resolve(image_ref, auth, image_cfg.insecure).await?;
+    // A pin can name either the multi-platform index or the platform manifest
+    // selected from it; both are legitimate things to copy out of a registry.
+    if let Some(want) = pinned
+        && reg.digest != want
+        && reg.list_digest.as_deref() != Some(want)
+    {
+        anyhow::bail!(
+            "registry resolved {image_ref} to digest {}, which does not match the pinned {want}",
+            reg.digest
+        );
+    }
     cli::log!(
         "  {} image resolved {}",
         cli::check(),
@@ -470,6 +536,62 @@ async fn resolve_image(
         config: reg.image_config.clone(),
         source: ImageSource::Registry(Box::new(reg)),
     })
+}
+
+/// Try to satisfy the reference from the local Docker daemon.
+///
+/// `Ok(None)` means the image simply isn't there; `Err(reason)` means it is,
+/// but can't be used — the caller decides whether that is fatal or just a
+/// reason to try the registry.
+fn resolve_via_docker(
+    image_ref: &str,
+    pinned: Option<&str>,
+) -> Result<Option<ResolvedImage>, String> {
+    // `docker images` matches on repo:tag and knows nothing about the
+    // `@sha256:…` suffix, so query without it and verify the pin separately.
+    let query_ref = match pinned {
+        Some(_) => image_ref
+            .rsplit_once('@')
+            .map_or(image_ref, |(name, _)| name),
+        None => image_ref,
+    };
+    let Some(image_id) = docker::image_exists(query_ref) else {
+        return Ok(None);
+    };
+
+    // A local tag can point somewhere else entirely than the same tag in the
+    // registry, so a pinned digest must be checked against what the daemon
+    // recorded when it pulled the image — not assumed from the name.
+    if let Some(want) = pinned
+        && !docker::repo_digests(&image_id).iter().any(|d| d == want)
+    {
+        return Err(format!(
+            "docker image {query_ref} does not match the pinned digest {want}"
+        ));
+    }
+
+    let host_arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    };
+    let docker_arch = docker::image_arch(&image_id).unwrap_or_default();
+    if !docker_arch.is_empty() && docker_arch != host_arch {
+        return Err(format!("docker image is {docker_arch}, need {host_arch}"));
+    }
+
+    cli::log!(
+        "  {} image resolved via docker {}",
+        cli::check(),
+        cli::dim(&image_id[..19.min(image_id.len())])
+    );
+    Ok(Some(ResolvedImage {
+        digest: image_id,
+        config: OciConfig::default(),
+        source: ImageSource::Docker {
+            image_ref: query_ref.to_string(),
+        },
+    }))
 }
 
 /// An image resolved to a concrete digest, ready to be downloaded.
