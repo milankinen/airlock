@@ -32,20 +32,26 @@ impl Assets {
         const CHECKSUM: &str = env!("AIRLOCK_ASSETS_CHECKSUM");
 
         let dir = crate::cache::cache_dir()?.join("vm");
-        let checksum_file = dir.join("checksum");
+        std::fs::create_dir_all(&dir)?;
 
+        // Serialize the checksum-check-and-extract across processes: take a
+        // blocking exclusive lock before reading the checksum so two concurrent
+        // first-runs (e.g. right after an upgrade) can't both rewrite the boot
+        // assets, and so a booting hypervisor never memory-maps a file another
+        // process is mid-rewrite on. Released when `_lock` drops.
+        let _lock = acquire_extract_lock(&dir.join("lock"))?;
+
+        let checksum_file = dir.join("checksum");
         let cached_checksum = std::fs::read_to_string(&checksum_file).unwrap_or_default();
         if cached_checksum.trim() != CHECKSUM {
-            std::fs::create_dir_all(&dir)?;
-
             #[cfg(not(feature = "distroless"))]
             {
-                std::fs::write(
-                    dir.join("Image"),
-                    include_bytes!("../../../target/vm/Image"),
-                )?;
-                std::fs::write(
-                    dir.join("initramfs.gz"),
+                // Write via temp file + rename so a reader (or a second process)
+                // never observes Image/initramfs truncated mid-write.
+                write_atomic(&dir, "Image", include_bytes!("../../../target/vm/Image"))?;
+                write_atomic(
+                    &dir,
+                    "initramfs.gz",
                     include_bytes!("../../../target/vm/initramfs.gz"),
                 )?;
             }
@@ -120,6 +126,47 @@ fn write_executable(dir: &std::path::Path, name: &str, data: &[u8]) -> anyhow::R
     Ok(())
 }
 
+/// Write `data` to `dir/name` via a sibling temp file + rename, so a reader
+/// never observes the destination truncated mid-write and a concurrent process
+/// can't boot from a half-written file. Cross-platform (unlike
+/// [`write_executable`], no executable bit is set — used for `Image` /
+/// `initramfs.gz`). The temp name carries the pid so a stray temp left by
+/// another process can never be renamed into place.
+#[cfg(not(feature = "distroless"))]
+fn write_atomic(dir: &std::path::Path, name: &str, data: &[u8]) -> anyhow::Result<()> {
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, dir.join(name))?;
+    Ok(())
+}
+
+/// Acquire a blocking exclusive advisory lock on `path`, held until the
+/// returned handle drops. Serializes the checksum-check-and-extract in
+/// [`Assets::init`] across processes. Blocking (not fail-fast) because
+/// extraction is brief: a second process simply waits, then observes the
+/// freshly written checksum and skips re-extracting. Mirrors the `flock`
+/// pattern in `project::acquire_lock` / `vault::acquire_file_lock`.
+#[cfg(not(test))]
+fn acquire_extract_lock(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        anyhow::bail!(
+            "failed to lock VM asset cache {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(file)
+}
+
 /// Resolve an asset path: use `custom` if provided (with tilde expansion and
 /// existence check), otherwise fall back to `bundled`.
 ///
@@ -151,4 +198,42 @@ fn resolve_asset(
     }
 
     Ok(path)
+}
+
+#[cfg(all(test, not(feature = "distroless")))]
+mod tests {
+    use super::write_atomic;
+
+    #[test]
+    fn write_atomic_replaces_file_and_leaves_no_tmp() {
+        let dir = std::env::temp_dir().join(format!(
+            "airlock-assets-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        write_atomic(&dir, "Image", b"kernel-bytes").unwrap();
+        assert_eq!(std::fs::read(dir.join("Image")).unwrap(), b"kernel-bytes");
+
+        // Overwriting an existing asset is atomic and clean.
+        write_atomic(&dir, "Image", b"newer-and-longer-bytes").unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("Image")).unwrap(),
+            b"newer-and-longer-bytes"
+        );
+
+        // No leftover ".tmp" sibling after either write.
+        let leftover: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftover.is_empty(), "temp file left behind: {leftover:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
