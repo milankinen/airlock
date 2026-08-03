@@ -4,9 +4,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
+
+use sha2::{Digest, Sha256};
 
 use super::OciConfig;
 use crate::cache;
@@ -138,11 +140,30 @@ pub async fn save_layer_tarballs(image_ref: &str) -> anyhow::Result<DockerSave> 
     result
 }
 
+/// Copy `reader` into `writer` while computing the SHA-256 of the bytes,
+/// returning the lowercase hex digest. Lets the docker staging path verify
+/// a blob's content against its claimed `blobs/sha256/<hex>` name in a
+/// single streaming pass, the same guarantee `registry::pull_layer` gives
+/// registry downloads.
+fn copy_hashing<R: Read, W: Write>(mut reader: R, mut writer: W) -> std::io::Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        writer.write_all(&buf[..n])?;
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
 /// Sync tar-streaming pipeline. Consumes `docker image save` stdout and
 /// produces a [`DockerSave`] plus pre-staged `.download` files for every
 /// non-cached layer. Separated from the async wrapper so the whole
 /// blocking I/O loop is a single `spawn_blocking` unit.
-fn save_from_stream(stdout: ChildStdout, layers_root: &Path) -> anyhow::Result<DockerSave> {
+fn save_from_stream<R: Read>(stdout: R, layers_root: &Path) -> anyhow::Result<DockerSave> {
     let mut archive = tar::Archive::new(stdout);
 
     let mut manifest_json: Option<Vec<DockerManifestEntry>> = None;
@@ -185,7 +206,21 @@ fn save_from_stream(stdout: ChildStdout, layers_root: &Path) -> anyhow::Result<D
             }
             let tmp = layers_root.join(format!("{}.download.tmp", cache::layer_key(&digest)));
             let mut file = File::create(&tmp)?;
-            std::io::copy(&mut entry, &mut file)?;
+            let actual = copy_hashing(&mut entry, &mut file)?;
+            // Cross-source cache poisoning guard: docker hands us the digest
+            // only as the `blobs/sha256/<hex>` member name, never as verified
+            // content. Hash the bytes we just wrote and reject the blob before
+            // it is renamed into the shared cache, where a later registry pull
+            // for the same digest would otherwise trust it. Mirrors the
+            // SHA-256 check on the registry path (see `registry::pull_layer`).
+            if !actual.eq_ignore_ascii_case(hex) {
+                drop(file);
+                let _ = std::fs::remove_file(&tmp);
+                anyhow::bail!(
+                    "docker layer digest mismatch: blob named sha256:{hex} \
+                     hashes to sha256:{actual}"
+                );
+            }
             staged.insert(hex.to_string(), tmp);
         }
 
@@ -240,4 +275,91 @@ fn save_from_stream(stdout: ChildStdout, layers_root: &Path) -> anyhow::Result<D
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+    use crate::cache::HOME_LOCK;
+
+    /// Build a plain tar from in-memory `(path, content)` entries — mirrors
+    /// what `docker image save` emits with the classic driver.
+    fn build_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut buf);
+            for (path, content) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                b.append_data(&mut header, path, *content).unwrap();
+            }
+            b.finish().unwrap();
+        }
+        buf
+    }
+
+    fn temp_home() -> PathBuf {
+        let base = std::env::temp_dir().join(format!(
+            "airlock-docker-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    #[test]
+    fn copy_hashing_matches_known_vectors() {
+        let mut out = Vec::new();
+        assert_eq!(
+            copy_hashing(Cursor::new(b"abc".to_vec()), &mut out).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(out, b"abc");
+
+        let mut empty = Vec::new();
+        assert_eq!(
+            copy_hashing(Cursor::new(Vec::new()), &mut empty).unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn save_from_stream_rejects_blob_with_mismatched_digest() {
+        let _guard = HOME_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = temp_home();
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let layers_root = cache::layers_root().unwrap();
+
+        // A poisoned blob: named sha256:aaaa... but its content hashes to
+        // something else entirely. This is the cross-source poisoning attempt.
+        let claimed = "a".repeat(64);
+        let tar = build_tar(&[(&format!("blobs/sha256/{claimed}"), b"poison")]);
+
+        let Err(err) = save_from_stream(Cursor::new(tar), &layers_root) else {
+            panic!("mismatched docker blob must be rejected");
+        };
+        assert!(
+            err.to_string().contains("digest mismatch"),
+            "unexpected error: {err}"
+        );
+
+        // The staged tmp file must not be left behind.
+        let tmp = layers_root.join(format!(
+            "{}.download.tmp",
+            cache::layer_key(&format!("sha256:{claimed}"))
+        ));
+        assert!(!tmp.exists(), "staged tmp file leaked after rejection");
+    }
 }
