@@ -1,3 +1,5 @@
+presets = ["python"]
+
 [vm]
 image = "airlock-example:docker"
 
@@ -5,6 +7,14 @@ image = "airlock-example:docker"
 # http://localhost:8000 once `docker compose up` is running.
 [network.ports.app]
 guest = [8000]
+
+[network.rules.images]
+allow = [
+    "ghcr.io",
+    "pkg-containers.githubusercontent.com",
+    "*.docker.io",
+    "*.docker.com"
+]
 
 # Start `dockerd` as a sidecar daemon before the shell opens. The
 # bind-mount puts Docker's storage on /airlock/disk so images and the
