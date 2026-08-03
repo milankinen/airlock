@@ -81,8 +81,14 @@ pub async fn open_local_tcp(
 }
 
 /// Bidirectional byte relay between a local TCP stream and a remote
-/// RPC sink. Whichever direction ends first tears down the other:
-/// the client sink is closed and the local write half is shut down.
+/// RPC sink, honoring half-close.
+///
+/// Each direction runs to completion independently: a one-way EOF only
+/// half-closes *that* direction. When the local side stops sending we signal
+/// EOF to the remote (`close`) but keep delivering the remote's response; when
+/// the remote stops sending we shut down the local write half. The previous
+/// implementation tore down both directions on the first EOF, which truncated
+/// any request→half-close→await-reply protocol (redis-style, RPC).
 pub async fn relay(
     local_read: &mut (impl AsyncReadExt + Unpin),
     local_write: &mut (impl AsyncWriteExt + Unpin),
@@ -107,6 +113,9 @@ pub async fn relay(
                 }
             }
         }
+        // Local won't send more — signal EOF to the remote, but let `to_local`
+        // keep draining the response instead of cancelling it.
+        let _ = remote_sink.close_request().send().promise.await;
     };
 
     let to_local = async {
@@ -116,15 +125,12 @@ pub async fn relay(
                 break;
             }
         }
+        // Remote won't send more — signal EOF to the local peer.
+        let _ = local_write.shutdown().await;
     };
 
-    // When either direction closes, tear down both sides.
-    tokio::select! {
-        () = to_remote => {}
-        () = to_local => {}
-    }
-    let _ = remote_sink.close_request().send().promise.await;
-    let _ = local_write.shutdown().await;
+    // Run both directions to completion so a one-way close only half-closes.
+    tokio::join!(to_remote, to_local);
 }
 
 /// Bridges RPC `TcpSink.send()` push calls into a tokio mpsc channel.

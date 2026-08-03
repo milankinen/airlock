@@ -109,8 +109,10 @@ async fn relay(
         _ => anyhow::bail!("invalid connect result"),
     };
 
-    // Bidirectional relay: local ↔ RPC.
-    // When either direction closes, clean up both sides.
+    // Bidirectional relay: local ↔ RPC, honoring half-close. Each direction
+    // runs to completion independently so a one-way EOF only half-closes that
+    // direction — a `select!` that tore down both on the first EOF truncated
+    // any request→half-close→await-reply protocol.
     let local_to_rpc = async {
         let mut buf = vec![0u8; airlock_common::RELAY_CHUNK_SIZE];
         loop {
@@ -125,6 +127,8 @@ async fn relay(
                 }
             }
         }
+        // Local won't send more — signal EOF to the remote, keep draining it.
+        let _ = client_sink.close_request().send().promise.await;
     };
 
     let rpc_to_local = async {
@@ -133,15 +137,11 @@ async fn relay(
                 break;
             }
         }
+        // Remote won't send more — signal EOF to the local peer.
+        let _ = local_write.shutdown().await;
     };
 
-    tokio::select! {
-        () = local_to_rpc => {}
-        () = rpc_to_local => {}
-    }
-
-    // Clean up both sides regardless of which direction closed
-    let _ = client_sink.close_request().send().promise.await;
-    let _ = local_write.shutdown().await;
+    // Run both directions to completion so a one-way close only half-closes.
+    tokio::join!(local_to_rpc, rpc_to_local);
     Ok(())
 }
