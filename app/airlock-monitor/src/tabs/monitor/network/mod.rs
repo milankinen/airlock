@@ -189,33 +189,36 @@ impl NetworkTab {
                 );
             }
             NetworkEvent::Disconnect(info) => {
-                // Older entries may already have been evicted by the
-                // per-list cap; that's fine — no entry to mark, so we just
-                // drop the event.
+                // The live-list entry may already have been evicted by the
+                // per-list cap; that's fine — there's just no row to mark.
                 if let Some(entry) = self.connections.iter_mut().find(|c| c.id == info.id) {
                     entry.disconnected_at = Some(info.timestamp);
-                    // Keep the open-entry detail view in sync so closing
-                    // and re-opening the row isn't required to see the
-                    // disconnect time.
-                    if let Some(DetailView::Connection(open)) = self.details.as_mut()
-                        && open.id == info.id
-                    {
-                        open.disconnected_at = Some(info.timestamp);
-                    }
+                }
+                // Keep the open detail view in sync independently of the
+                // list. The snapshot is kept by id and outlives eviction, so
+                // it must update even once the underlying row is gone —
+                // otherwise the pane shows a stale "Open" state forever.
+                if let Some(DetailView::Connection(open)) = self.details.as_mut()
+                    && open.id == info.id
+                {
+                    open.disconnected_at = Some(info.timestamp);
                 }
             }
             NetworkEvent::Traffic(info) => {
-                // Same eviction caveat as `Disconnect` — an entry already
+                // Same eviction caveat as `Disconnect` — a row already
                 // dropped by the cap has nothing to update.
                 if let Some(entry) = self.connections.iter_mut().find(|c| c.id == info.id) {
                     entry.up = info.up;
                     entry.down = info.down;
-                    if let Some(DetailView::Connection(open)) = self.details.as_mut()
-                        && open.id == info.id
-                    {
-                        open.up = info.up;
-                        open.down = info.down;
-                    }
+                }
+                // The open detail snapshot tracks the connection by id and
+                // can outlive its row, so update it independently of the
+                // list — otherwise the byte counts freeze after eviction.
+                if let Some(DetailView::Connection(open)) = self.details.as_mut()
+                    && open.id == info.id
+                {
+                    open.up = info.up;
+                    open.down = info.down;
                 }
             }
             NetworkEvent::Request(info) => {
@@ -235,13 +238,15 @@ impl NetworkTab {
             NetworkEvent::Response(info) => {
                 if let Some(entry) = self.requests.iter_mut().find(|r| r.id == info.id) {
                     entry.apply_response(&info);
-                    // Keep an open details view in sync so the user doesn't
-                    // have to reopen the row to see the response land.
-                    if let Some(DetailView::Request(open)) = self.details.as_mut()
-                        && open.id == info.id
-                    {
-                        open.apply_response(&info);
-                    }
+                }
+                // Keep an open details view in sync independently of the
+                // list — an evicted request still shows its snapshot here —
+                // so the user doesn't have to reopen the row to see the
+                // response land.
+                if let Some(DetailView::Request(open)) = self.details.as_mut()
+                    && open.id == info.id
+                {
+                    open.apply_response(&info);
                 }
             }
         }
@@ -644,7 +649,7 @@ mod tests {
     use std::time::SystemTime;
 
     use super::*;
-    use crate::{ConnectInfo, RequestInfo, ResponseInfo, TrafficInfo};
+    use crate::{ConnectInfo, DisconnectInfo, RequestInfo, ResponseInfo, TrafficInfo};
 
     fn settings() -> TuiSettings {
         TuiSettings::default()
@@ -727,6 +732,68 @@ mod tests {
             &settings,
         );
         assert_eq!((tab.connections[0].up, tab.connections[0].down), (0, 0));
+    }
+
+    /// The open details snapshot outlives the live row, so a `Traffic`
+    /// update for a connection already evicted by the cap must still reach
+    /// the snapshot — otherwise the pane shows frozen byte counts forever.
+    #[test]
+    fn traffic_updates_open_details_after_eviction() {
+        let mut settings = settings();
+        settings.max_tcp_connections = 1;
+        let mut tab = NetworkTab::new();
+
+        tab.push_event(connect(1), &settings);
+        tab.select_sub_tab(NetworkSubTab::Connections);
+        tab.open_details();
+        assert!(tab.details_open());
+
+        // Evict connection 1 from the live list.
+        tab.push_event(connect(2), &settings);
+        assert!(tab.connections.iter().all(|c| c.id != 1));
+
+        tab.push_event(
+            NetworkEvent::Traffic(Arc::new(TrafficInfo {
+                id: 1,
+                up: 42,
+                down: 84,
+            })),
+            &settings,
+        );
+
+        match tab.details.as_ref().unwrap() {
+            DetailView::Connection(c) => assert_eq!((c.up, c.down), (42, 84)),
+            DetailView::Request(_) => panic!("expected a connection detail view"),
+        }
+    }
+
+    /// Same eviction case for `Disconnect`: the snapshot must flip to a
+    /// closed state even once its row is gone.
+    #[test]
+    fn disconnect_updates_open_details_after_eviction() {
+        let mut settings = settings();
+        settings.max_tcp_connections = 1;
+        let mut tab = NetworkTab::new();
+
+        tab.push_event(connect(1), &settings);
+        tab.select_sub_tab(NetworkSubTab::Connections);
+        tab.open_details();
+
+        tab.push_event(connect(2), &settings);
+        assert!(tab.connections.iter().all(|c| c.id != 1));
+
+        tab.push_event(
+            NetworkEvent::Disconnect(Arc::new(DisconnectInfo {
+                id: 1,
+                timestamp: SystemTime::UNIX_EPOCH,
+            })),
+            &settings,
+        );
+
+        match tab.details.as_ref().unwrap() {
+            DetailView::Connection(c) => assert!(c.disconnected_at.is_some()),
+            DetailView::Request(_) => panic!("expected a connection detail view"),
+        }
     }
 
     #[test]
