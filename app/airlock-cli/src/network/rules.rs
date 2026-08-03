@@ -123,7 +123,25 @@ pub fn reverse_port_forwards_from_config(network: &Network) -> Vec<(u16, u16)> {
 }
 
 /// Parse a target pattern `host[:port]` into (host, port_str).
+///
+/// Handles IPv6 literals, which a naive `rsplit_once(':')` mangles (`::1`
+/// would parse to host `":"`, port `"1"`, matching nothing):
+/// - `[::1]` / `[::1]:443` — bracketed form, port after `]`.
+/// - `2001:db8::1` — a bare IPv6 literal (more than one colon) has no
+///   unbracketed `:port` form, so the whole string is the host.
+/// - everything else — a hostname or IPv4 with an optional `:port`.
 pub(super) fn parse_target(target: &str) -> (&str, Option<&str>) {
+    if let Some(rest) = target.strip_prefix('[') {
+        // Bracketed IPv6 literal.
+        return match rest.split_once(']') {
+            Some((host, after)) => (host, after.strip_prefix(':').filter(|p| !p.is_empty())),
+            None => (target, None), // malformed; treat whole as host
+        };
+    }
+    if target.matches(':').count() > 1 {
+        // Bare IPv6 literal — no port.
+        return (target, None);
+    }
     match target.rsplit_once(':') {
         Some((host, port)) => (host, Some(port)),
         None => (target, None),
@@ -144,6 +162,30 @@ mod tests {
             deny: vec![],
             passthrough,
         }
+    }
+
+    #[test]
+    fn parse_target_handles_hostnames_and_ipv4() {
+        assert_eq!(parse_target("api.example.com"), ("api.example.com", None));
+        assert_eq!(
+            parse_target("api.example.com:443"),
+            ("api.example.com", Some("443"))
+        );
+        assert_eq!(parse_target("10.0.0.1:80"), ("10.0.0.1", Some("80")));
+    }
+
+    #[test]
+    fn parse_target_handles_ipv6_literals() {
+        // Bare IPv6 → host only, no port (the bug: rsplit would give (":","1")).
+        assert_eq!(parse_target("::1"), ("::1", None));
+        assert_eq!(parse_target("2001:db8::1"), ("2001:db8::1", None));
+        // Bracketed forms carry the port after the closing bracket.
+        assert_eq!(parse_target("[::1]"), ("::1", None));
+        assert_eq!(parse_target("[::1]:443"), ("::1", Some("443")));
+        assert_eq!(
+            parse_target("[2001:db8::1]:8080"),
+            ("2001:db8::1", Some("8080"))
+        );
     }
 
     #[test]
