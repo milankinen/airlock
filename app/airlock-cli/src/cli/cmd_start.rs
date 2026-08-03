@@ -19,6 +19,11 @@ use crate::{cli_server, config, daemon, masking, network, oci, project, rpc, run
 /// Default `airlock.toml` written when initializing a new sandbox.
 const DEFAULT_CONFIG: &str = "[vm]\n# image = \"alpine:latest\"\n";
 
+/// Upper bound on how long we wait for the guest to stop daemons and flush
+/// filesystems during shutdown before forcing the VM down. Generous enough for
+/// a healthy guest's sync, but bounded so a wedged guest can't hang the CLI.
+const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// CLI arguments for `airlock start`.
 #[derive(Args, Debug)]
 pub struct StartArgs {
@@ -185,6 +190,17 @@ async fn run(
     let (vm, vsock_fd) = vm::start(&args, &project, &image, &container_home).await?;
     project.save_meta();
 
+    // A Ctrl+C during boot (the vsock connect can retry for ~12s) sets the
+    // interrupt flag, but the boot path doesn't watch it. Catch it here —
+    // before we enter raw mode and invest in supervisor setup — and tear the
+    // freshly-booted VM back down instead of starting an interactive session
+    // the user already cancelled.
+    if cli::is_interrupted() {
+        info!("interrupted during boot; shutting down VM");
+        vm.shutdown().await;
+        return Ok(130); // 128 + SIGINT
+    }
+
     let supervisor = rpc::Supervisor::connect(vsock_fd)?;
     network.deny_reporter().attach(supervisor.client());
 
@@ -265,14 +281,26 @@ async fn run(
     let final_code = terminal.exit(exit_code);
     info!("terminal exit, final code = {final_code}");
 
-    if !daemon_names.is_empty() {
-        info!("daemon shutdown");
-        daemon::run_shutdown(&supervisor, &daemon_names).await;
+    // Give the guest a bounded chance to stop its daemons and flush
+    // filesystems, then tear the VM down regardless. A wedged guest must not
+    // hang shutdown forever — that previously left the user resorting to
+    // SIGKILL, which skips the VM's Drop and orphans cloud-hypervisor /
+    // virtiofsd plus a stale lock file.
+    let graceful = async {
+        if !daemon_names.is_empty() {
+            info!("daemon shutdown");
+            daemon::run_shutdown(&supervisor, &daemon_names).await;
+        }
+        // Sync filesystems before killing VM.
+        info!("supervisor shutdown");
+        supervisor.shutdown().await;
+    };
+    if tokio::time::timeout(SHUTDOWN_TIMEOUT, graceful)
+        .await
+        .is_err()
+    {
+        info!("guest shutdown timed out after {SHUTDOWN_TIMEOUT:?}; forcing VM teardown");
     }
-
-    // Sync filesystems before killing VM
-    info!("supervisor shutdown");
-    supervisor.shutdown().await;
 
     // Drain file-sync events then destroy VM.
     info!("vm shutdown");
