@@ -48,8 +48,15 @@ pub async fn serve(sock_path: PathBuf, supervisor: Supervisor, base_env: Vec<Str
                 handle_connection(stream, sup, env);
             }
             Err(e) => {
-                tracing::debug!("cli server accept error: {e}");
-                break;
+                // A failed accept() (transient ECONNABORTED, or fd exhaustion
+                // such as EMFILE/ENFILE) must never tear down the server: that
+                // would drop `_guard` and unlink the socket while the VM is
+                // still running, breaking every later `airlock exec`. There is
+                // no accept() error that warrants ending `serve` here, so we
+                // log and keep serving, backing off briefly so a persistent
+                // error can't hot-spin the loop.
+                tracing::warn!("cli server accept error (continuing): {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
     }
