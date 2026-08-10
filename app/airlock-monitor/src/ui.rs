@@ -103,11 +103,13 @@ pub fn render(f: &mut Frame<'_>, app: &App, sink: &TuiTerminalSink) {
         }
     }
 
-    // Tab bar at the bottom
-    render_tab_bar(f, tab_area, app);
+    // Tab bar at the bottom. Whether the guest currently owns the mouse is
+    // recomputed every frame from settings + active tab + parser state, so
+    // the hint can't go stale the way a cached flag on `App` could.
+    render_tab_bar(f, tab_area, app, crate::guest_owns_mouse(app, sink));
 }
 
-fn render_tab_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
+fn render_tab_bar(f: &mut Frame<'_>, area: Rect, app: &App, guest_owns_mouse: bool) {
     let sandbox_sel = app.active_tab == Tab::Sandbox;
     let network_sel = app.active_tab == Tab::Monitor;
 
@@ -161,14 +163,14 @@ fn render_tab_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
         .render(tabs_row, f.buffer_mut());
 
     // Right-aligned status indicators on the same row.
-    let status = build_status_line(app);
+    let status = build_status_line(app, guest_owns_mouse);
     Paragraph::new(status)
         .style(bar_style)
         .alignment(Alignment::Right)
         .render(tabs_row, f.buffer_mut());
 }
 
-fn build_status_line(app: &App) -> Line<'static> {
+fn build_status_line(app: &App, guest_owns_mouse: bool) -> Line<'static> {
     let label = Style::default().fg(Color::Gray);
     let value = Style::default().fg(Color::DarkGray);
     let sep = Span::styled(" │ ", value);
@@ -180,9 +182,18 @@ fn build_status_line(app: &App) -> Line<'static> {
     let denied = app.monitor.network.request_denied;
 
     let mut spans = Vec::with_capacity(16);
+    // The two hints share one slot, and selection mode wins: while capture
+    // is released no mouse event reaches us at all, so nothing is being
+    // forwarded no matter what the guest asked for.
     if !app.mouse_captured {
         spans.push(Span::styled(
             "Selection mode — Ctrl+C to copy, Esc to exit",
+            Style::default().fg(Color::Yellow),
+        ));
+        spans.push(sep.clone());
+    } else if guest_owns_mouse {
+        spans.push(Span::styled(
+            "Mouse → sandbox",
             Style::default().fg(Color::Yellow),
         ));
         spans.push(sep.clone());

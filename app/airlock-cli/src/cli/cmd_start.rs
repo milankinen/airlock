@@ -126,6 +126,7 @@ pub async fn main(
             max_tcp_connections: settings.monitor.buffers.tcp,
             scrollback: settings.monitor.buffers.scrollback,
             keys,
+            mouse_passthrough: settings.monitor.mouse_passthrough.into(),
         };
         run(
             cli_args,

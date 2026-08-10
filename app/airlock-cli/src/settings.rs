@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 pub use keys::KeyList;
+use serde::{Deserialize, Serialize};
 use smart_config::{ConfigRepository, ConfigSchema, DescribeConfig, DeserializeConfig, Json};
 
 use crate::config::de::format_error;
@@ -59,6 +60,44 @@ pub struct MonitorSettings {
     /// (`cancel = ["esc", "x"]`). Unset actions keep their defaults.
     #[config(default)]
     pub keys: BTreeMap<String, KeyList>,
+    /// How many of the Sandbox tab's mouse events reach the sandboxed
+    /// program. Defaults to `none` — the TUI keeps them all, so the
+    /// wheel scrolls its own scrollback. Set to `all` to hand them to
+    /// the sandboxed program instead, which is what makes scrolling work
+    /// inside a mouse-aware program like `claude`.
+    #[config(default)]
+    pub mouse_passthrough: MonitorMousePassthrough,
+}
+
+/// Value of `monitor.mouse_passthrough`. Lives here rather than in
+/// `airlock-monitor` because that crate has no `serde` dependency — the
+/// same split already used for `Policy` and `VaultStorageType`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MonitorMousePassthrough {
+    /// Nothing is passed through: the TUI owns the mouse everywhere,
+    /// wheel scrolls its scrollback, a click in the sandbox body enters
+    /// selection mode.
+    #[default]
+    None,
+    /// Every event on the Sandbox tab goes to the sandboxed program,
+    /// whenever it has mouse reporting enabled.
+    All,
+}
+
+impl smart_config::de::WellKnown for MonitorMousePassthrough {
+    type Deserializer =
+        smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
+    const DE: Self::Deserializer = smart_config::de::Serde;
+}
+
+impl From<MonitorMousePassthrough> for airlock_monitor::MousePassthrough {
+    fn from(value: MonitorMousePassthrough) -> Self {
+        match value {
+            MonitorMousePassthrough::None => Self::None,
+            MonitorMousePassthrough::All => Self::All,
+        }
+    }
 }
 
 /// Settings under the `[monitor.buffers]` table. Defaults match the
@@ -221,6 +260,39 @@ mod tests {
     fn bad_vault_value_errors() {
         let dir = fresh_dir();
         std::fs::write(dir.join("settings.toml"), "vault.storage = \"typo\"\n").unwrap();
+        assert!(Settings::load_from(&dir).is_err());
+    }
+
+    #[test]
+    fn monitor_mouse_passthrough_defaults_to_none() {
+        let dir = fresh_dir();
+        let s = Settings::load_from(&dir).unwrap();
+        assert_eq!(s.monitor.mouse_passthrough, MonitorMousePassthrough::None);
+    }
+
+    #[test]
+    fn monitor_mouse_passthrough_parses_all() {
+        let dir = fresh_dir();
+        std::fs::write(
+            dir.join("settings.toml"),
+            "[monitor]\nmouse_passthrough = \"all\"\n",
+        )
+        .unwrap();
+        let s = Settings::load_from(&dir).unwrap();
+        assert_eq!(s.monitor.mouse_passthrough, MonitorMousePassthrough::All);
+    }
+
+    /// A typo must fail loudly at startup rather than silently leaving
+    /// the mouse with the TUI — the user would have no way to tell the
+    /// difference from "the setting doesn't work".
+    #[test]
+    fn bad_monitor_mouse_passthrough_value_errors() {
+        let dir = fresh_dir();
+        std::fs::write(
+            dir.join("settings.toml"),
+            "[monitor]\nmouse_passthrough = \"guest\"\n",
+        )
+        .unwrap();
         assert!(Settings::load_from(&dir).is_err());
     }
 }

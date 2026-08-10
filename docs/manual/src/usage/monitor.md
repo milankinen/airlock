@@ -104,8 +104,8 @@ Total and used bytes (reported the way `free` and `htop` do:
 
 ## Personal settings
 
-Buffer caps, terminal scrollback, and key bindings are personal
-preferences — they live in `~/.airlock/settings.toml`, not in the
+Buffer caps, terminal scrollback, key bindings, and mouse passthrough are
+personal preferences — they live in `~/.airlock/settings.toml`, not in the
 per-project `airlock.toml`. All fields default to the values used
 here, so there's nothing to set unless you want to change them.
 
@@ -191,6 +191,50 @@ Invalid key strings (unknown modifier, unknown key name) are reported
 up front when the sandbox starts; airlock refuses to launch the TUI
 rather than silently dropping a binding.
 
+### Mouse passthrough
+
+By default the TUI keeps every mouse event for itself, so the wheel
+scrolls the monitor's own scrollback and a click enters selection mode.
+That means a mouse-aware program running in the sandbox — `claude`, an
+editor, `htop` — never sees the wheel, and scrolling inside it does
+nothing.
+
+Set `mouse_passthrough = "all"` to hand those events to the sandboxed
+program instead:
+
+```toml
+[monitor]
+mouse_passthrough = "none"  # default; the TUI owns the mouse everywhere
+# mouse_passthrough = "all" # the sandboxed program owns it on the Sandbox tab
+```
+
+It's an enum rather than a boolean because mouse capture stays on in
+both modes — it has to, or no mouse events would reach airlock at all.
+What changes is where they go afterwards.
+
+Passthrough is deliberately narrow. Events are forwarded only when all
+of the following hold, and fall back to the TUI's own handling
+otherwise:
+
+| Situation                                   | Mouse goes to                                    |
+|---------------------------------------------|--------------------------------------------------|
+| Sandbox tab, program asked for the mouse     | the sandboxed program                            |
+| Sandbox tab, program didn't (a plain shell)  | TUI — wheel scrolls scrollback, click selects    |
+| Sandbox tab, scrolled back                   | TUI — the wheel walks the view back to the bottom |
+| Tab bar row (either tab)                     | TUI — tab switching                              |
+| Monitor tab                                  | TUI — policy dropdown, sub-tabs, details scroll  |
+
+The check against what the program asked for is what makes the setting
+safe to leave on permanently: a program that never enabled mouse
+reporting would otherwise see reports like `^[[<64;10;5M` arrive as
+literal keystrokes at its prompt, and the monitor's scrollback would
+become unreachable. The Monitor tab is never forwarded to — the guest
+isn't visible there, so its coordinates would be meaningless.
+
+While events are actually being passed through, the tab bar shows a
+`Mouse → sandbox` hint in the same slot as the `Selection mode` hint,
+so where the mouse is going is never a mystery.
+
 ## Selecting text
 
 Clicking inside the Sandbox tab releases mouse capture so the host
@@ -211,3 +255,11 @@ on the next press. The keys that end selection mode don't also do their
 usual job — `Ctrl+C` copies without interrupting whatever is running in
 the sandbox, and `Esc` doesn't close the details view. Press either a
 second time for that.
+
+With [`mouse_passthrough = "all"`](#mouse-passthrough), a click in the
+Sandbox tab belongs to the sandboxed program whenever that program has
+mouse reporting on, so it no longer enters selection mode. Most terminals
+still let you select natively while holding **Shift** (xterm, GNOME
+Terminal, Konsole, iTerm2) — that's the escape hatch. Selection mode
+keeps working as described above when the sandboxed program hasn't
+asked for the mouse, and in the Monitor tab's details view either way.

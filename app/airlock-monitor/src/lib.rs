@@ -9,6 +9,7 @@
 mod app;
 pub mod input;
 pub mod keys;
+mod mouse;
 mod network_control;
 pub mod pty;
 mod settings;
@@ -22,8 +23,9 @@ use app::{App, Tab};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 pub use input::{TuiInputEvent, TuiStdin};
 pub use keys::{Action, KeyBindings};
+pub use mouse::MousePassthrough;
 pub use network_control::{NetworkControl, Policy};
-use pty::TuiTerminalSink;
+use pty::{MouseProtocolMode, TuiTerminalSink};
 use ratatui::DefaultTerminal;
 pub use settings::TuiSettings;
 pub use ui::TAB_BAR_HEIGHT;
@@ -402,7 +404,7 @@ fn handle_event(
             }
         }
         TuiEvent::Terminal(Event::Mouse(mouse)) => {
-            handle_mouse(mouse, app, sink, terminal, mouse_captured)?;
+            handle_mouse(mouse, app, sink, stdin_tx, terminal, mouse_captured)?;
         }
         TuiEvent::Terminal(Event::Resize(cols, rows)) => {
             let size = ratatui::layout::Rect::new(0, 0, cols, rows);
@@ -647,15 +649,57 @@ fn handle_monitor_action(
     }
 }
 
+/// Whether mouse events on the Sandbox tab currently belong to the
+/// sandboxed program rather than to the TUI.
+///
+/// Both the event router and the status line ask this, so the hint the
+/// user sees can never disagree with where the events actually go. It is
+/// derived fresh from settings + active tab + parser state, so there is
+/// nothing on `App` to keep in sync.
+///
+/// The guest's own mouse mode is part of the answer on purpose: that is
+/// what makes `mouse_passthrough = "all"` safe to leave on permanently.
+/// A program that never asked for mouse reporting would otherwise receive
+/// `\e[<64;10;5M` as literal keystrokes at its prompt, and the TUI's
+/// scrollback would become unreachable.
+fn guest_owns_mouse(app: &App, sink: &TuiTerminalSink) -> bool {
+    app.settings.mouse_passthrough == MousePassthrough::All
+        && app.active_tab == Tab::Sandbox
+        && sink.mouse_protocol_mode() != MouseProtocolMode::None
+}
+
 fn handle_mouse(
     mouse: MouseEvent,
     app: &mut App,
     sink: &mut TuiTerminalSink,
+    stdin_tx: &tokio::sync::mpsc::Sender<TuiInputEvent>,
     terminal: &mut DefaultTerminal,
     mouse_captured: &mut bool,
 ) -> anyhow::Result<()> {
     let size = terminal.size()?;
     let size = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+
+    // Mouse routed to the sandboxed program: re-encode the event into its
+    // PTY instead of acting on it here. `encode` declines anything outside
+    // the body rect, so the tab bar keeps switching tabs.
+    //
+    // Scrolled-back views are excluded: on-screen rows no longer line up
+    // with guest rows there, so coordinates would be a lie. Falling
+    // through lets the wheel walk the view back down to the live screen,
+    // at which point forwarding resumes.
+    if guest_owns_mouse(app, sink)
+        && sink.scrollback() == 0
+        && let Some(bytes) = mouse::encode(
+            mouse,
+            sink.mouse_protocol_mode(),
+            sink.mouse_protocol_encoding(),
+            ui::body_area(size),
+        )
+    {
+        let _ = stdin_tx.blocking_send(TuiInputEvent::Data(bytes));
+        return Ok(());
+    }
+
     let tab_rects = ui::tab_header_rects(size, app);
 
     match mouse.kind {
