@@ -12,3 +12,7 @@ guest = ["40080:8080"]
 
 [daemons.tick]
 command = ["sh", "-c", "while :; do echo tick; sleep 1; done"]
+
+[clipboard]
+copy = true
+paste = true

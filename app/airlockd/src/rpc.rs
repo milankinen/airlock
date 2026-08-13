@@ -48,6 +48,8 @@ pub struct StartConfig {
     pub harden: bool,
     pub init_config: InitConfig,
     pub mount_config: MountConfig,
+    /// Clipboard grant. A withheld capability disables the bridge outright.
+    pub clipboard: crate::clipboard::ClipboardConfig,
     pub pty_size: Option<(u16, u16)>,
     /// Sidecar daemons to start after init. The callback decides when to
     /// call `DaemonSet::start_all` (typically right after `init::setup`).
@@ -218,7 +220,22 @@ impl supervisor::Server for SupervisorImpl {
 
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
 
+        // A host that grants nothing leaves this default-initialised: both
+        // flags false and a null `sink`, which is exactly "no clipboard".
+        let cb = params.get_clipboard()?;
+        let clipboard = crate::clipboard::ClipboardConfig {
+            copy: cb.get_copy(),
+            paste: cb.get_paste(),
+            sink: if cb.has_sink() {
+                Some(cb.get_sink()?)
+            } else {
+                None
+            },
+            limit: cb.get_limit(),
+        };
+
         let cfg = StartConfig {
+            clipboard,
             log_sink: params.get_logs()?,
             log_filter: params.get_log_filter()?.to_str()?.to_string(),
             network: self.network.clone(),

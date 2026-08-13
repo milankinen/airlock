@@ -1,3 +1,4 @@
+mod test_clipboard;
 mod test_daemons;
 mod test_image_ref;
 mod test_load;

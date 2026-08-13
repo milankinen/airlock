@@ -6,6 +6,7 @@
 //! (mounts, networking, DNS), and spawns the user's command.
 
 mod admin;
+mod clipboard;
 mod daemon;
 mod init;
 mod logging;
@@ -79,6 +80,7 @@ async fn airlockd() -> anyhow::Result<()> {
         net::start_host_port_forward(&cfg.init_config.host_ports, cfg.network.clone()).await?;
         net::start_tcp_proxy(cfg.network.clone(), dns)?;
         admin::start(admin_state.clone()).await?;
+        clipboard::start(cfg.clipboard, cfg.uid, cfg.gid)?;
 
         if !cfg.daemons.is_empty() {
             info!("starting {} daemon(s)", cfg.daemons.len());

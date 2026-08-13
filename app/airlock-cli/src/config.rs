@@ -44,6 +44,11 @@ pub struct Config {
     /// of a monorepo invisible to AI agents that operate inside the VM.
     #[config(default)]
     pub mask: BTreeMap<String, Mask>,
+    /// Clipboard bridge between the sandbox and the host clipboard.
+    /// Both directions are off by default — each one is a deliberate
+    /// hole in the sandbox (see `[clipboard]` in the manual).
+    #[config(nest)]
+    pub clipboard: Clipboard,
 }
 
 #[allow(clippy::module_inception)]
@@ -606,6 +611,32 @@ pub mod config {
         pub enabled: bool,
         /// One or more container paths to back with persistent cache storage
         pub paths: Vec<String>,
+    }
+
+    /// Clipboard bridge configuration (`[clipboard]`).
+    ///
+    /// Each direction is granted separately and both default to off. The
+    /// host never passes the capability into the guest for a disabled
+    /// direction, so a compromised sandbox has nothing to invoke — the
+    /// booleans are a capability grant, not a guest-side policy check.
+    #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
+    pub struct Clipboard {
+        /// Let the sandbox write to the host clipboard. The risk here is
+        /// content rather than volume: text copied out of the sandbox can
+        /// later be pasted into a shell.
+        #[config(default_t = false)]
+        pub copy: bool,
+        /// Largest single guest → host transfer (e.g. "2 MB"). Enforced on
+        /// the host, and again by the guest daemon so an oversized write is
+        /// never buffered. Bounds memory use, not what the content can do.
+        #[serde(serialize_with = "ser_byte_size")]
+        #[config(default_t = ByteSize(1024 * 1024))]
+        pub copy_limit: ByteSize,
+        /// Let the sandbox read the host clipboard. This is a guest-*initiated*
+        /// read with no user interaction, so sandboxed code can take whatever
+        /// was last copied — passwords, tokens. Leave off unless needed.
+        #[config(default_t = false)]
+        pub paste: bool,
     }
 
     impl WellKnown for MissingAction {

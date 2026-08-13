@@ -1,5 +1,6 @@
 //! Host-side Cap'n Proto RPC types for communicating with the in-VM supervisor.
 
+pub(crate) mod clipboard;
 mod logging;
 mod network;
 mod process;

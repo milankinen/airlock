@@ -44,6 +44,10 @@ interface Supervisor {
     # empty directory by guest init, hiding their contents from the
     # sandbox. Used to cordon off parts of a monorepo from AI agents.
     masks       :List(MaskSpec),
+    # Clipboard bridge grant. Default-initialised (both flags false, null
+    # `sink`) is exactly the ungranted state, so a host that never sets
+    # this hands the guest nothing to call.
+    clipboard   :ClipboardConfig,
   ) -> (proc :Process);
 
   shutdown @1 () -> ();
@@ -91,6 +95,34 @@ interface Supervisor {
   # lid closed) cause the guest time to drift. The host polls this
   # every few seconds to keep them within wake-up-jitter of each other.
   syncClock @8 (epoch :UInt64, epochNanos :UInt32) -> ();
+}
+
+# Host clipboard access, handed to the guest as a capability. The guest can
+# only reach the host clipboard through this object, so withholding it (a
+# null `ClipboardConfig.sink`) denies access no matter what runs inside the
+# sandbox — there is no guest-side flag to subvert.
+#
+# The host re-checks the per-direction grant and the size cap on every call;
+# the flags on `ClipboardConfig` exist so the guest knows which shims are
+# worth creating, not to police access.
+interface Clipboard {
+  # Guest → host. Rejected when copy is not granted, or when `data` exceeds
+  # the configured limit.
+  copy  @0 (data :Data) -> ();
+  # Host → guest. Rejected when paste is not granted.
+  paste @1 () -> (data :Data);
+}
+
+struct ClipboardConfig {
+  copy  @0 :Bool;
+  paste @1 :Bool;
+  # Null unless at least one direction is granted.
+  sink  @2 :Clipboard;
+  # Max bytes per guest → host copy. The host enforces this as the real
+  # check; the guest gets told so it can stop reading rather than buffer an
+  # unbounded write. Without it `cat /dev/zero > fifo` would grow the guest
+  # daemon — which is PID 1 — until the VM dies.
+  limit @3 :UInt64;
 }
 
 struct MaskSpec {

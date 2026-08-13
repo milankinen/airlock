@@ -290,6 +290,36 @@ impl Supervisor {
             }
         }
 
+        // Clipboard grant. The capability is only ever built when a
+        // direction is enabled, so an ungranted sandbox holds a null `sink`
+        // and has nothing to call. A host with no clipboard program
+        // downgrades to ungranted with a warning — never a failed start.
+        let cb = &project.config.clipboard;
+        if cb.copy || cb.paste {
+            match crate::rpc::clipboard::detect() {
+                Some(tool) => {
+                    let sink: clipboard::Client =
+                        capnp_rpc::new_client(crate::rpc::clipboard::ClipboardImpl::new(
+                            tool,
+                            cb.copy,
+                            cb.paste,
+                            cb.copy_limit.0,
+                        ));
+                    let mut b = req.get().init_clipboard();
+                    b.set_copy(cb.copy);
+                    b.set_paste(cb.paste);
+                    b.set_limit(cb.copy_limit.0);
+                    b.set_sink(sink);
+                }
+                None => {
+                    crate::cli::log!(
+                        "  {} clipboard disabled: no clipboard program found on the host",
+                        crate::cli::bullet()
+                    );
+                }
+            }
+        }
+
         let response = req.send().promise.await?;
         let proc = response.get()?.get_proc()?;
 
