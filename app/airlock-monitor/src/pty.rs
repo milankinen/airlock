@@ -3,6 +3,11 @@
 //! Process output (stdout/stderr) is fed into the parser, and the resulting
 //! screen cells are rendered to the ratatui buffer by the sandbox tab.
 
+/// The guest's mouse reporting state, as tracked by the parser. Re-exported
+/// so `crate::mouse` can talk about it without spreading `vt100` imports
+/// across the crate.
+pub use vt100::{MouseProtocolEncoding, MouseProtocolMode};
+
 /// Wraps a `vt100::Parser` to receive PTY output and expose screen state.
 pub struct TuiTerminalSink {
     parser: vt100::Parser,
@@ -19,6 +24,27 @@ impl TuiTerminalSink {
 
     pub fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
+    }
+
+    /// Which xterm mouse protocol the guest has enabled, if any
+    /// (`\e[?9h`, `\e[?1000h`, `\e[?1002h`, `\e[?1003h`). `None` means the
+    /// guest never asked for mouse reporting, so forwarding events to it
+    /// would land as literal escape bytes at its prompt.
+    pub fn mouse_protocol_mode(&self) -> MouseProtocolMode {
+        self.parser.screen().mouse_protocol_mode()
+    }
+
+    /// How the guest wants mouse reports encoded — SGR (`\e[?1006h`),
+    /// UTF-8 (`\e[?1005h`), or the default single-byte form.
+    pub fn mouse_protocol_encoding(&self) -> MouseProtocolEncoding {
+        self.parser.screen().mouse_protocol_encoding()
+    }
+
+    /// How many rows the view is scrolled back from the live screen. Zero
+    /// means on-screen rows line up with the guest's own grid, which is a
+    /// precondition for forwarding mouse coordinates to it.
+    pub fn scrollback(&self) -> usize {
+        self.parser.screen().scrollback()
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
