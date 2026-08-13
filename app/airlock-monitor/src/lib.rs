@@ -14,6 +14,7 @@ mod network_control;
 pub mod pty;
 mod settings;
 mod tabs;
+mod terminal;
 mod ui;
 
 use std::sync::{Arc, mpsc as std_mpsc};
@@ -23,7 +24,6 @@ use app::{App, Tab};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 pub use input::{TuiInputEvent, TuiStdin};
 pub use keys::{Action, KeyBindings};
-pub use mouse::MousePassthrough;
 pub use network_control::{NetworkControl, Policy};
 use pty::{MouseProtocolMode, TuiTerminalSink};
 use ratatui::DefaultTerminal;
@@ -298,7 +298,6 @@ fn run_tui_loop(
 ) -> anyhow::Result<i32> {
     let mut sink = TuiTerminalSink::new(80, 24, settings.scrollback);
     let mut app = App::new(network, project_path, version, settings);
-    let mut mouse_captured = true;
 
     // Resize vt100 parser to match terminal body area. Skip a degenerate
     // (zero-sized) body — a terminal shorter than the tab bar yields a 0x0
@@ -342,7 +341,6 @@ fn run_tui_loop(
                 sig_tx,
                 terminal,
                 kitty_enabled,
-                &mut mouse_captured,
             )?
         {
             return Ok(code);
@@ -356,7 +354,6 @@ fn run_tui_loop(
                 sig_tx,
                 terminal,
                 kitty_enabled,
-                &mut mouse_captured,
             )? {
                 return Ok(code);
             }
@@ -374,7 +371,6 @@ fn handle_event(
     sig_tx: &tokio::sync::mpsc::Sender<i32>,
     terminal: &mut DefaultTerminal,
     kitty_enabled: bool,
-    mouse_captured: &mut bool,
 ) -> anyhow::Result<Option<i32>> {
     match event {
         TuiEvent::Output(data) => {
@@ -391,20 +387,12 @@ fn handle_event(
             return Ok(Some(code));
         }
         TuiEvent::Terminal(Event::Key(key)) => {
-            if let Some(code) = handle_key(
-                key,
-                app,
-                sink,
-                stdin_tx,
-                sig_tx,
-                kitty_enabled,
-                mouse_captured,
-            )? {
+            if let Some(code) = handle_key(key, app, sink, stdin_tx, sig_tx, kitty_enabled) {
                 return Ok(Some(code));
             }
         }
         TuiEvent::Terminal(Event::Mouse(mouse)) => {
-            handle_mouse(mouse, app, sink, stdin_tx, terminal, mouse_captured)?;
+            handle_mouse(mouse, app, sink, stdin_tx, terminal)?;
         }
         TuiEvent::Terminal(Event::Resize(cols, rows)) => {
             let size = ratatui::layout::Rect::new(0, 0, cols, rows);
@@ -460,24 +448,10 @@ fn scan_bracketed_paste_mode(data: &[u8], enabled: &mut bool) {
     }
 }
 
-/// Whether this key is one of the two that leave selection mode without
-/// also reaching what's underneath: `Esc` (exit) or `Ctrl+C` (copy).
-///
-/// `Ctrl+Shift+C` counts too — it's the copy binding on GNOME Terminal
-/// and Konsole, and crossterm reports the shifted char as `'C'`, so the
-/// comparison is case-insensitive rather than a bare `'c'`.
-fn exits_selection_mode(key: KeyEvent) -> bool {
-    match key.code {
-        KeyCode::Esc => true,
-        KeyCode::Char(c) => {
-            c.eq_ignore_ascii_case(&'c') && key.modifiers.contains(KeyModifiers::CONTROL)
-        }
-        _ => false,
-    }
-}
-
 /// Handle a key event. Returns `Some(code)` if the TUI should exit.
-#[allow(clippy::too_many_arguments)]
+///
+/// Infallible since capture became unconditional — nothing here writes an
+/// escape sequence to the terminal any more.
 fn handle_key(
     key: KeyEvent,
     app: &mut App,
@@ -485,50 +459,20 @@ fn handle_key(
     stdin_tx: &tokio::sync::mpsc::Sender<TuiInputEvent>,
     sig_tx: &tokio::sync::mpsc::Sender<i32>,
     kitty_enabled: bool,
-    mouse_captured: &mut bool,
-) -> anyhow::Result<Option<i32>> {
+) -> Option<i32> {
     let action = app.settings.keys.lookup(&key);
 
-    // Global shortcuts. SwitchMonitor also exits selection mode: the
-    // Monitor tab is navigated by clicking, so arriving there with the
-    // mouse still passed through to the terminal would leave the tab
-    // looking inert. (The details view can opt back into selection mode
-    // by being clicked — see `handle_mouse`.)
+    // Global shortcuts.
     match action {
         Some(Action::SwitchSandbox) => {
             app.active_tab = Tab::Sandbox;
-            return Ok(None);
+            return None;
         }
         Some(Action::SwitchMonitor) => {
-            if !*mouse_captured {
-                crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
-                *mouse_captured = true;
-                app.mouse_captured = true;
-            }
             app.active_tab = Tab::Monitor;
-            return Ok(None);
+            return None;
         }
         _ => {}
-    }
-
-    // Auto-exit selection mode: any keypress re-enables mouse capture,
-    // on either tab. The two keys the footer advertises — Esc to exit,
-    // Ctrl+C to copy — are *consumed*, because for both the keystroke
-    // has already done its job by the time we see it and passing it on
-    // would fire a second, unwanted meaning underneath: Esc leaves
-    // insert mode in vim or closes the details pane, and Ctrl+C reaches
-    // the guest as SIGINT and kills whatever is running. The copy itself
-    // is the terminal's doing — capture is off, so it owns the selection
-    // — which is exactly why we must not also forward the key. Every
-    // other key falls through to its normal handler below: the intent
-    // there is "keep working", not "eat this keystroke".
-    if !*mouse_captured {
-        crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
-        *mouse_captured = true;
-        app.mouse_captured = true;
-        if exits_selection_mode(key) {
-            return Ok(None);
-        }
     }
 
     match app.active_tab {
@@ -546,7 +490,7 @@ fn handle_key(
         }
     }
 
-    Ok(None)
+    None
 }
 
 /// Apply a resolved [`Action`] in the Monitor-tab context. Sub-state
@@ -652,20 +596,16 @@ fn handle_monitor_action(
 /// Whether mouse events on the Sandbox tab currently belong to the
 /// sandboxed program rather than to the TUI.
 ///
-/// Both the event router and the status line ask this, so the hint the
-/// user sees can never disagree with where the events actually go. It is
-/// derived fresh from settings + active tab + parser state, so there is
+/// Derived fresh from the active tab and parser state, so there is
 /// nothing on `App` to keep in sync.
 ///
 /// The guest's own mouse mode is part of the answer on purpose: that is
-/// what makes `mouse_passthrough = "all"` safe to leave on permanently.
-/// A program that never asked for mouse reporting would otherwise receive
-/// `\e[<64;10;5M` as literal keystrokes at its prompt, and the TUI's
-/// scrollback would become unreachable.
+/// what makes unconditional forwarding safe. A program that never asked
+/// for mouse reporting would otherwise receive `\e[<64;10;5M` as literal
+/// keystrokes at its prompt, and the TUI's scrollback would become
+/// unreachable at a plain shell.
 fn guest_owns_mouse(app: &App, sink: &TuiTerminalSink) -> bool {
-    app.settings.mouse_passthrough == MousePassthrough::All
-        && app.active_tab == Tab::Sandbox
-        && sink.mouse_protocol_mode() != MouseProtocolMode::None
+    app.active_tab == Tab::Sandbox && sink.mouse_protocol_mode() != MouseProtocolMode::None
 }
 
 fn handle_mouse(
@@ -674,10 +614,20 @@ fn handle_mouse(
     sink: &mut TuiTerminalSink,
     stdin_tx: &tokio::sync::mpsc::Sender<TuiInputEvent>,
     terminal: &mut DefaultTerminal,
-    mouse_captured: &mut bool,
 ) -> anyhow::Result<()> {
     let size = terminal.size()?;
     let size = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+
+    // A left click is the gesture someone makes when they mean to select
+    // text, so it's the moment to say how. Recorded before the forwarding
+    // branch below — that branch is the common case, and a hint that only
+    // appeared when the click *didn't* reach the guest would be backwards.
+    if matches!(
+        mouse.kind,
+        MouseEventKind::Down(crossterm::event::MouseButton::Left)
+    ) {
+        app.select_hint_at = Some(std::time::Instant::now());
+    }
 
     // Mouse routed to the sandboxed program: re-encode the event into its
     // PTY instead of acting on it here. `encode` declines anything outside
@@ -758,28 +708,10 @@ fn handle_mouse(
                 }
                 return Ok(());
             }
-            // Click inside the details body: same deal as the sandbox
-            // body below — drop capture so the user can drag-select the
-            // headers and copy them. Checked after the × and sub-tab hit
-            // tests above so those keep working with the mouse.
-            if app.active_tab == Tab::Monitor
-                && *mouse_captured
-                && app.monitor.network.is_details_body(mouse.column, mouse.row)
-            {
-                crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)?;
-                *mouse_captured = false;
-                app.mouse_captured = false;
-                return Ok(());
-            }
-            // Click inside the sandbox body: drop mouse capture so the
-            // terminal's native selection takes over. The first click is
-            // consumed; the user's drag-to-select starts on the next press.
-            // Esc / Ctrl+C restores capture (see handle_key).
-            if app.active_tab == Tab::Sandbox && *mouse_captured {
-                crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)?;
-                *mouse_captured = false;
-                app.mouse_captured = false;
-            }
+            // A click in either body area is not a TUI target — it's
+            // someone reaching for text. Capture stays on (the terminal's
+            // own modifier handles the drag); the hint recorded above is
+            // the whole response.
         }
         // In the details pane the wheel scrolls the body; in the list
         // views it moves the selection.
@@ -848,45 +780,26 @@ fn key_to_bytes(key: KeyEvent, kitty_enabled: bool) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
-        KeyEvent::new(code, modifiers)
+    /// The hint is transient: visible right after a click, gone once the
+    /// window has passed. Checked against the same helper the status line
+    /// uses, so the two cannot drift.
+    #[test]
+    fn select_hint_expires_after_its_window() {
+        let now = std::time::Instant::now();
+        assert!(ui::select_hint_visible(Some(now), now));
+        assert!(ui::select_hint_visible(
+            Some(now),
+            now + Duration::from_millis(1_900)
+        ));
+        assert!(!ui::select_hint_visible(
+            Some(now),
+            now + Duration::from_millis(2_100)
+        ));
     }
 
-    /// Both keys the selection-mode footer advertises have to be
-    /// swallowed by the mode switch. Forwarding them delivers a second
-    /// meaning the user never asked for — Esc leaves vim's insert mode,
-    /// Ctrl+C lands on the guest as SIGINT.
+    /// Before the first click there is nothing to advertise.
     #[test]
-    fn advertised_selection_keys_are_consumed() {
-        assert!(exits_selection_mode(key(KeyCode::Esc, KeyModifiers::NONE)));
-        assert!(exits_selection_mode(key(
-            KeyCode::Char('c'),
-            KeyModifiers::CONTROL
-        )));
-    }
-
-    /// GNOME Terminal and Konsole copy with Ctrl+Shift+C, which arrives
-    /// as an uppercase char plus both modifiers.
-    #[test]
-    fn ctrl_shift_c_is_consumed() {
-        assert!(exits_selection_mode(key(
-            KeyCode::Char('C'),
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT
-        )));
-    }
-
-    /// Everything else still falls through, so ordinary typing keeps
-    /// working on the first keystroke after leaving selection mode.
-    #[test]
-    fn other_keys_fall_through() {
-        for k in [
-            key(KeyCode::Char('c'), KeyModifiers::NONE),
-            key(KeyCode::Char('d'), KeyModifiers::CONTROL),
-            key(KeyCode::Char('a'), KeyModifiers::NONE),
-            key(KeyCode::Enter, KeyModifiers::NONE),
-            key(KeyCode::Up, KeyModifiers::NONE),
-        ] {
-            assert!(!exits_selection_mode(k), "{k:?} should not be consumed");
-        }
+    fn no_hint_before_any_click() {
+        assert!(!ui::select_hint_visible(None, std::time::Instant::now()));
     }
 }

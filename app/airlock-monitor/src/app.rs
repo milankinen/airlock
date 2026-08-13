@@ -18,12 +18,13 @@ pub struct App {
     pub active_tab: Tab,
     pub monitor: MonitorTab,
     pub network: Arc<dyn NetworkControl>,
-    /// Whether mouse events are captured. When `false`, the host terminal
-    /// handles clicks natively (enabling text selection). Auto-disabled on
-    /// a click inside the sandbox tab or the network details body;
-    /// re-enabled by any keypress, with Esc and Ctrl+C consumed rather
-    /// than passed on (see `exits_selection_mode`).
-    pub mouse_captured: bool,
+    /// When the user last left-clicked, or `None` if they haven't yet.
+    ///
+    /// The TUI holds the terminal's mouse capture for the whole session,
+    /// so a plain drag never selects text. A click is the moment someone
+    /// is reaching for a selection, so it briefly surfaces the modifier
+    /// their terminal uses to bypass capture — see `ui::build_status_line`.
+    pub select_hint_at: Option<std::time::Instant>,
     /// Tracks whether the guest has enabled bracketed paste mode
     /// (`\e[?2004h`). Only when true do we wrap pasted text in
     /// `\e[200~...\e[201~` before forwarding — shells without bracketed
@@ -44,7 +45,7 @@ impl App {
             active_tab: Tab::Sandbox,
             monitor: MonitorTab::new(project_path, version),
             network,
-            mouse_captured: true,
+            select_hint_at: None,
             guest_bracketed_paste: false,
             settings,
         }

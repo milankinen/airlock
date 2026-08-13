@@ -16,22 +16,6 @@ use ratatui::layout::Rect;
 
 use crate::pty::{MouseProtocolEncoding, MouseProtocolMode};
 
-/// How much of the mouse is passed through to the sandboxed program
-/// while the Sandbox tab is active.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum MousePassthrough {
-    /// Nothing is passed through: the TUI handles every mouse event
-    /// itself, so the wheel scrolls its own scrollback and a click drops
-    /// capture for text selection.
-    #[default]
-    None,
-    /// Every event inside the sandbox body is re-encoded into the guest
-    /// PTY — but only while the guest actually has mouse reporting
-    /// enabled, so the TUI's own handling stays reachable at a plain
-    /// shell prompt.
-    All,
-}
-
 /// Xterm button codes. Wheel ticks are reported as button presses with
 /// bit 6 set; the horizontal wheel continues the same numbering.
 const BTN_RELEASE: u8 = 3;
@@ -457,10 +441,5 @@ mod tests {
             sgr(ev(down, 41, 20), MouseProtocolMode::PressRelease).as_deref(),
             Some("\x1b[<0;40;20M")
         );
-    }
-
-    #[test]
-    fn passthrough_defaults_to_none() {
-        assert_eq!(MousePassthrough::default(), MousePassthrough::None);
     }
 }

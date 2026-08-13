@@ -2,7 +2,6 @@
 //! user config; defaults match what the values used to be hard-coded to.
 
 use crate::keys::KeyBindings;
-use crate::mouse::MousePassthrough;
 
 pub struct TuiSettings {
     /// Max HTTP request entries kept in the Monitor tab buffer. Older
@@ -16,11 +15,6 @@ pub struct TuiSettings {
     /// Key → action map consulted on every keystroke. Built once at
     /// startup from the user's `[monitor.keys]` config (or defaults).
     pub keys: KeyBindings,
-    /// How much of the mouse the Sandbox tab passes through. Defaults to
-    /// `None`, keeping every event in the TUI; `All` re-encodes them into
-    /// the guest PTY instead, so mouse wheel scrolling works inside the
-    /// sandboxed program.
-    pub mouse_passthrough: MousePassthrough,
 }
 
 impl Default for TuiSettings {
@@ -30,7 +24,6 @@ impl Default for TuiSettings {
             max_tcp_connections: 100,
             scrollback: 1000,
             keys: KeyBindings::defaults(),
-            mouse_passthrough: MousePassthrough::default(),
         }
     }
 }

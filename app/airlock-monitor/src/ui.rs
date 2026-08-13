@@ -1,5 +1,7 @@
 //! Layout and rendering for the TUI.
 
+use std::time::{Duration, Instant};
+
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -103,13 +105,11 @@ pub fn render(f: &mut Frame<'_>, app: &App, sink: &TuiTerminalSink) {
         }
     }
 
-    // Tab bar at the bottom. Whether the guest currently owns the mouse is
-    // recomputed every frame from settings + active tab + parser state, so
-    // the hint can't go stale the way a cached flag on `App` could.
-    render_tab_bar(f, tab_area, app, crate::guest_owns_mouse(app, sink));
+    // Tab bar at the bottom.
+    render_tab_bar(f, tab_area, app);
 }
 
-fn render_tab_bar(f: &mut Frame<'_>, area: Rect, app: &App, guest_owns_mouse: bool) {
+fn render_tab_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
     let sandbox_sel = app.active_tab == Tab::Sandbox;
     let network_sel = app.active_tab == Tab::Monitor;
 
@@ -163,14 +163,25 @@ fn render_tab_bar(f: &mut Frame<'_>, area: Rect, app: &App, guest_owns_mouse: bo
         .render(tabs_row, f.buffer_mut());
 
     // Right-aligned status indicators on the same row.
-    let status = build_status_line(app, guest_owns_mouse);
+    let status = build_status_line(app);
     Paragraph::new(status)
         .style(bar_style)
         .alignment(Alignment::Right)
         .render(tabs_row, f.buffer_mut());
 }
 
-fn build_status_line(app: &App, guest_owns_mouse: bool) -> Line<'static> {
+/// How long the text-selection hint stays up after a click.
+const SELECT_HINT_FOR: Duration = Duration::from_secs(2);
+
+/// Whether the selection hint should be showing at `now`.
+///
+/// Split out so the window can be tested without a terminal, and so the
+/// status line and its test can't disagree about what "visible" means.
+pub(crate) fn select_hint_visible(clicked_at: Option<Instant>, now: Instant) -> bool {
+    clicked_at.is_some_and(|t| now.duration_since(t) < SELECT_HINT_FOR)
+}
+
+fn build_status_line(app: &App) -> Line<'static> {
     let label = Style::default().fg(Color::Gray);
     let value = Style::default().fg(Color::DarkGray);
     let sep = Span::styled(" │ ", value);
@@ -182,18 +193,11 @@ fn build_status_line(app: &App, guest_owns_mouse: bool) -> Line<'static> {
     let denied = app.monitor.network.request_denied;
 
     let mut spans = Vec::with_capacity(16);
-    // The two hints share one slot, and selection mode wins: while capture
-    // is released no mouse event reaches us at all, so nothing is being
-    // forwarded no matter what the guest asked for.
-    if !app.mouse_captured {
+    // Mouse capture is held for the whole session, so a plain drag never
+    // selects. Answer the click by naming the modifier that does.
+    if select_hint_visible(app.select_hint_at, Instant::now()) {
         spans.push(Span::styled(
-            "Selection mode — Ctrl+C to copy, Esc to exit",
-            Style::default().fg(Color::Yellow),
-        ));
-        spans.push(sep.clone());
-    } else if guest_owns_mouse {
-        spans.push(Span::styled(
-            "Mouse → sandbox",
+            format!("Hold {} to select text", crate::terminal::select_modifier()),
             Style::default().fg(Color::Yellow),
         ));
         spans.push(sep.clone());

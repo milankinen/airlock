@@ -77,9 +77,6 @@ pub struct NetworkTab {
     details_rect: Cell<Option<Rect>>,
     /// Click rect for the `×` close button on the Details sub-tab.
     details_close_rect: Cell<Option<Rect>>,
-    /// Body area of the Details sub-tab. Clicking inside it drops mouse
-    /// capture so the terminal's own text selection can take over.
-    details_body_rect: Cell<Option<Rect>>,
     /// Rect of the "policy: …" title anchor in the border line.
     policy_anchor: Cell<Option<Rect>>,
     /// Click rects for each dropdown row (in `Policy::ALL` order).
@@ -106,7 +103,6 @@ impl NetworkTab {
             connections_rect: Cell::new(None),
             details_rect: Cell::new(None),
             details_close_rect: Cell::new(None),
-            details_body_rect: Cell::new(None),
             policy_anchor: Cell::new(None),
             dropdown_rects: Cell::new(Vec::new()),
         }
@@ -324,14 +320,6 @@ impl NetworkTab {
     /// Hit-test a click against the `×` close button on the Details sub-tab.
     pub fn is_details_close(&self, col: u16, row: u16) -> bool {
         self.details_close_rect.get().is_some_and(|r| {
-            col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
-        })
-    }
-
-    /// Hit-test a click against the Details body. Only meaningful while
-    /// the details view is open; the rect is cleared otherwise.
-    pub fn is_details_body(&self, col: u16, row: u16) -> bool {
-        self.details_body_rect.get().is_some_and(|r| {
             col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
         })
     }
@@ -601,7 +589,6 @@ impl Widget for NetworkWidget<'_> {
         self.tab.details_rect.set(rects.details);
         self.tab.details_close_rect.set(rects.details_close);
 
-        self.tab.details_body_rect.set(None);
         match self.tab.sub_tab {
             NetworkSubTab::Requests => {
                 requests::RequestsWidget::new(&self.tab.requests, self.tab.selected_request)
@@ -619,7 +606,6 @@ impl Widget for NetworkWidget<'_> {
                     let report = |max| self.tab.set_details_max_scroll(max);
                     details::DetailsWidget::new(d, self.tab.details_scroll(), &report)
                         .render(body_area, buf);
-                    self.tab.details_body_rect.set(Some(body_area));
                 }
             }
         }
