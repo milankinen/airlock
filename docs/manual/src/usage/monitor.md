@@ -83,8 +83,9 @@ a short history sparkline of the mean utilization across cores.
 
 Total memory, `used` as `<host> (<sandbox>)`, and a history sparkline of
 used%. The first figure is how much memory the sandbox costs on the host
-(what Activity Monitor shows), the second is what the sandbox itself
-reports as used. The status line shows the same
+(on macOS, what Activity Monitor shows for the
+`com.apple.Virtualization.VirtualMachine` process), the second is what the
+sandbox itself reports as used. The status line shows the same
 `Memory <host> (<sandbox>) / <total>`.
 
 ## Keyboard shortcuts

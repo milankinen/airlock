@@ -56,21 +56,35 @@ pub struct Policy {
 
 impl Policy {
     pub fn new(configured: u64) -> Self {
+        // Debugging aid: `AIRLOCK_BALLOON_MAX_PUMP_MIB` lifts the per-cycle
+        // cap so a single pump can cover most of the guest's memory.
+        let max_pump = std::env::var("AIRLOCK_BALLOON_MAX_PUMP_MIB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map_or(2 * GIB, |mib| mib * MIB);
         Self {
             configured,
             tick: Duration::from_secs(10),
             min_gap: 512 * MIB,
             margin_min: 256 * MIB,
-            max_pump: 2 * GIB,
+            max_pump,
             interval: Duration::from_mins(1),
             max_interval: Duration::from_mins(10),
         }
     }
 
     /// How long a pump may keep the balloon inflated while waiting for
-    /// the host footprint to drop: a fixed 2 s plus 2 s per GiB.
+    /// the host footprint to drop: a fixed 2 s plus 2 s per GiB, unless
+    /// `AIRLOCK_BALLOON_TIMEOUT_SECS` overrides it (debugging aid: hold
+    /// the balloon long enough to watch the guest and Activity Monitor).
     pub fn pump_timeout(size: u64) -> Duration {
-        Duration::from_secs(2) + Duration::from_millis(2000 * size / GIB)
+        std::env::var("AIRLOCK_BALLOON_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .map_or_else(
+                || Duration::from_secs(2) + Duration::from_millis(2000 * size / GIB),
+                Duration::from_secs,
+            )
     }
 }
 
@@ -154,6 +168,13 @@ impl State {
 /// Holds a strong reference to the backend only for the duration of a
 /// tick so it never delays VM teardown.
 pub(super) async fn run(policy: Policy, vm: Weak<dyn VmHandle>, supervisor: Supervisor) {
+    if let Some(hold) = std::env::var("AIRLOCK_BALLOON_HOLD_MIB")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        hold_forever(&policy, vm, supervisor, hold * MIB).await;
+        return;
+    }
     let mut state = State::new(&policy);
     loop {
         tokio::time::sleep(policy.tick).await;
@@ -171,9 +192,15 @@ pub(super) async fn run(policy: Policy, vm: Weak<dyn VmHandle>, supervisor: Supe
             host: vm.host_memory_bytes(),
         };
         let Some(size) = state.plan_pump(&policy, sample, Instant::now()) else {
+            debug!(
+                total_mib = sample.total / MIB,
+                free_mib = sample.free / MIB,
+                host_mib = sample.host.map(|h| h / MIB),
+                "balloon: nothing to pump"
+            );
             continue;
         };
-        let freed = match pump(&*vm, &policy, size).await {
+        let freed = match pump(&*vm, &supervisor, &policy, sample, size).await {
             Ok(freed) => freed,
             Err(e) => {
                 warn!("balloon pump failed: {e}");
@@ -181,6 +208,41 @@ pub(super) async fn run(policy: Policy, vm: Weak<dyn VmHandle>, supervisor: Supe
             }
         };
         state.record(&policy, size, freed, Instant::now());
+    }
+}
+
+/// Debugging mode (`AIRLOCK_BALLOON_HOLD_MIB`): once the guest has `hold`
+/// plus a margin free, inflate by `hold` and never deflate, logging the
+/// host's view of the helper every tick so the effect of the balloon —
+/// and of host memory pressure while it is inflated — is recorded
+/// without watching Activity Monitor.
+async fn hold_forever(policy: &Policy, vm: Weak<dyn VmHandle>, supervisor: Supervisor, hold: u64) {
+    let mut inflated = false;
+    loop {
+        tokio::time::sleep(policy.tick).await;
+        let Some(vm) = vm.upgrade() else { break };
+        let Ok(snap) = supervisor.poll_stats().await else {
+            continue;
+        };
+        let host = vm.host_memory_bytes();
+        let resident = vm.host_resident_bytes();
+        if !inflated && snap.free_bytes >= hold + policy.margin_min {
+            match set_target(&*vm, policy.configured - hold).await {
+                Ok(()) => {
+                    inflated = true;
+                    info!(hold_mib = hold / MIB, "balloon hold: inflating");
+                }
+                Err(e) => warn!("balloon hold failed: {e}"),
+            }
+        }
+        info!(
+            inflated,
+            host_mib = host.map(|b| b / MIB),
+            host_resident_mib = resident.map(|b| b / MIB),
+            guest_total_mib = snap.total_bytes / MIB,
+            guest_free_mib = snap.free_bytes / MIB,
+            "balloon hold"
+        );
     }
 }
 
@@ -194,9 +256,22 @@ async fn set_target(vm: &dyn VmHandle, bytes: u64) -> anyhow::Result<()> {
 /// dropped by (most of) that or the timeout passes, then deflate. Returns
 /// the host bytes freed. The target is restored on every path after the
 /// first successful inflate.
-async fn pump(vm: &dyn VmHandle, policy: &Policy, size: u64) -> anyhow::Result<u64> {
+async fn pump(
+    vm: &dyn VmHandle,
+    supervisor: &Supervisor,
+    policy: &Policy,
+    sample: Sample,
+    size: u64,
+) -> anyhow::Result<u64> {
     let started = Instant::now();
     let before = vm.host_memory_bytes().unwrap_or(0);
+    let resident_before = vm.host_resident_bytes();
+    info!(
+        requested_mib = size / MIB,
+        host_before_mib = before / MIB,
+        timeout_s = Policy::pump_timeout(size).as_secs(),
+        "balloon pump start"
+    );
     set_target(vm, policy.configured - size).await?;
 
     let deadline = started + Policy::pump_timeout(size);
@@ -208,11 +283,25 @@ async fn pump(vm: &dyn VmHandle, policy: &Policy, size: u64) -> anyhow::Result<u
         }
     };
 
+    // The guest's own view while still inflated tells whether the balloon
+    // driver acted at all (MemTotal or MemFree drops by ~`size`) when the
+    // host footprint didn't move.
+    let during = supervisor.poll_stats().await.ok();
+    let host_during = vm.host_memory_bytes();
+    let resident_during = vm.host_resident_bytes();
     let restored = set_target(vm, policy.configured).await;
     info!(
         requested_mib = size / MIB,
         freed_mib = freed / MIB,
         elapsed_ms = started.elapsed().as_millis(),
+        host_before_mib = before / MIB,
+        host_during_mib = host_during.map(|b| b / MIB),
+        host_resident_before_mib = resident_before.map(|b| b / MIB),
+        host_resident_during_mib = resident_during.map(|b| b / MIB),
+        guest_total_before_mib = sample.total / MIB,
+        guest_free_before_mib = sample.free / MIB,
+        guest_total_during_mib = during.as_ref().map(|s| s.total_bytes / MIB),
+        guest_free_during_mib = during.as_ref().map(|s| s.free_bytes / MIB),
         "balloon pump"
     );
     restored?;

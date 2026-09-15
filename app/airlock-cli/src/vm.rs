@@ -496,6 +496,12 @@ trait VmHandle {
     /// Host-side memory footprint of the VM, if the backend can measure it.
     fn host_memory_bytes(&self) -> Option<u64>;
 
+    /// Resident set size of the VM on the host, if distinct from the
+    /// footprint. Diagnostic only (balloon pump log line).
+    fn host_resident_bytes(&self) -> Option<u64> {
+        None
+    }
+
     /// Whether [`VmHandle::set_memory_target`] does anything. Backends
     /// whose hypervisor reclaims freed guest memory by itself (free page
     /// reporting) return `false`.
@@ -526,6 +532,10 @@ impl VmHandle for apple::AppleVmBackend {
 
     fn host_memory_bytes(&self) -> Option<u64> {
         apple::AppleVmBackend::host_memory_bytes(self)
+    }
+
+    fn host_resident_bytes(&self) -> Option<u64> {
+        apple::AppleVmBackend::host_resident_bytes(self)
     }
 
     fn has_balloon(&self) -> bool {

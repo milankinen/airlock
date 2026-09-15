@@ -82,6 +82,10 @@ pub struct AppleVmBackend {
     vm_queue: dispatch2::DispatchRetained<DispatchQueue>,
     host_to_guest_write: OwnedFd,
     guest_to_host_read: OwnedFd,
+    /// Pid of the `com.apple.Virtualization.VirtualMachine` XPC helper
+    /// that owns this VM's guest memory, resolved lazily on the first
+    /// footprint read (the helper only exists once the VM has started).
+    helper_pid: std::cell::Cell<Option<libc::pid_t>>,
 }
 
 // Safety: the struct is only moved between tokio tasks on the same
@@ -138,6 +142,7 @@ impl AppleVmBackend {
             vm_queue,
             host_to_guest_write: host_to_guest.write,
             guest_to_host_read: guest_to_host.read,
+            helper_pid: std::cell::Cell::new(None),
         })
     }
 
@@ -479,21 +484,36 @@ impl AppleVmBackend {
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 
-    /// Physical footprint of this process. Virtualization.framework maps
-    /// guest RAM into the calling process, so this is the figure Activity
-    /// Monitor shows for the sandbox (plus airlock's own heap).
+    /// Physical footprint of the VM on the host — the figure Activity
+    /// Monitor shows. Virtualization.framework runs each VM in a separate
+    /// `com.apple.Virtualization.VirtualMachine` XPC helper that owns the
+    /// guest RAM, so the airlock process itself stays small; the helper
+    /// is what we measure. Its pid is cached once found and re-resolved
+    /// if it stops answering (VM stopped).
     pub fn host_memory_bytes(&self) -> Option<u64> {
-        let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
-        // Safety: `rusage_info_v4` is the layout `RUSAGE_INFO_V4` fills;
-        // the buffer outlives the call.
+        if let Some(pid) = self.helper_pid.get()
+            && let Some(bytes) = phys_footprint(pid)
+        {
+            return Some(bytes);
+        }
+        let pid = find_vm_helper(unsafe { libc::getpid() })?;
+        debug!(pid, "found Virtualization.framework helper process");
+        self.helper_pid.set(Some(pid));
+        phys_footprint(pid)
+    }
+
+    /// Resident size of the helper (`pti_resident_size`). Diagnostic
+    /// companion to the physical footprint: the two react differently to
+    /// the kinds of "free this" advice the framework may give the kernel.
+    pub fn host_resident_bytes(&self) -> Option<u64> {
+        let pid = self.helper_pid.get()?;
+        let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+        let size = i32::try_from(std::mem::size_of::<libc::proc_taskinfo>()).ok()?;
+        // Safety: `proc_taskinfo` is the layout `PROC_PIDTASKINFO` fills.
         let rc = unsafe {
-            libc::proc_pid_rusage(
-                libc::getpid(),
-                libc::RUSAGE_INFO_V4,
-                (&raw mut info).cast::<libc::rusage_info_t>(),
-            )
+            libc::proc_pidinfo(pid, libc::PROC_PIDTASKINFO, 0, (&raw mut info).cast(), size)
         };
-        (rc == 0).then_some(info.ri_phys_footprint)
+        (rc == size).then_some(info.pti_resident_size)
     }
 
     /// Set the balloon's target: the guest inflates (target below the
@@ -541,4 +561,124 @@ impl AppleVmBackend {
             .map_err(|_| anyhow::anyhow!("balloon channel closed"))?
             .map_err(|e| anyhow::anyhow!(format!("balloon target failed: {e}")))
     }
+}
+
+/// Executable name of the per-VM XPC helper. Matched as a path suffix
+/// because `proc_name` truncates it and the framework's install prefix
+/// may vary.
+const VM_HELPER_NAME: &str = "com.apple.Virtualization.VirtualMachine";
+
+/// `ri_phys_footprint` of `pid`, `None` if the process is gone or the
+/// query is not permitted.
+fn phys_footprint(pid: libc::pid_t) -> Option<u64> {
+    let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+    // Safety: `rusage_info_v4` is the layout `RUSAGE_INFO_V4` fills; the
+    // buffer outlives the call.
+    let rc = unsafe {
+        libc::proc_pid_rusage(
+            pid,
+            libc::RUSAGE_INFO_V4,
+            (&raw mut info).cast::<libc::rusage_info_t>(),
+        )
+    };
+    (rc == 0).then_some(info.ri_phys_footprint)
+}
+
+/// Locate the VM helper launched for process `me`. launchd records the
+/// client that caused an XPC service to start as its "responsible"
+/// process, which tells our helper apart from other sandboxes'. That
+/// lookup is an undocumented libSystem symbol, so it is resolved at
+/// runtime; without it (or if attribution doesn't match) a lone helper
+/// on the system is assumed to be ours, and ambiguity yields `None`.
+fn find_vm_helper(me: libc::pid_t) -> Option<libc::pid_t> {
+    let helpers: Vec<libc::pid_t> = list_pids()
+        .into_iter()
+        .filter(|&pid| {
+            pid > 0
+                && process_path(pid).is_some_and(|p| {
+                    p.strip_suffix(VM_HELPER_NAME)
+                        .is_some_and(|prefix| prefix.ends_with('/'))
+                })
+        })
+        .collect();
+    fn single(pids: &[libc::pid_t]) -> Option<libc::pid_t> {
+        match pids {
+            [pid] => Some(*pid),
+            _ => None,
+        }
+    }
+
+    let mine: Vec<libc::pid_t> = match responsible_pid_fn() {
+        Some(responsible) => helpers
+            .iter()
+            .copied()
+            .filter(|&pid| unsafe { responsible(pid) } == me)
+            .collect(),
+        None => Vec::new(),
+    };
+    let found = single(&mine).or_else(|| single(&helpers));
+    if found.is_none() {
+        debug!(
+            helpers = helpers.len(),
+            attributed = mine.len(),
+            "could not identify this VM's Virtualization.framework helper"
+        );
+    }
+    found
+}
+
+/// All pids on the system (`proc_listpids(PROC_ALL_PIDS)`).
+fn list_pids() -> Vec<libc::pid_t> {
+    const PROC_ALL_PIDS: u32 = 1;
+    let pid_size = std::mem::size_of::<libc::pid_t>();
+    // First call sizes the buffer; add slack for processes spawned in
+    // between. The return value is in bytes.
+    let bytes = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
+    let Ok(bytes) = usize::try_from(bytes) else {
+        return Vec::new();
+    };
+    let mut pids: Vec<libc::pid_t> = vec![0; bytes / pid_size + 64];
+    let Ok(cap) = i32::try_from(pids.len() * pid_size) else {
+        return Vec::new();
+    };
+    let bytes = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, pids.as_mut_ptr().cast(), cap) };
+    let Ok(bytes) = usize::try_from(bytes) else {
+        return Vec::new();
+    };
+    pids.truncate(bytes / pid_size);
+    pids
+}
+
+/// Executable path of `pid` (`proc_pidpath`), `None` when not permitted.
+fn process_path(pid: libc::pid_t) -> Option<String> {
+    // PROC_PIDPATHINFO_MAXSIZE; typed as u32 so no cast is needed.
+    const BUF_LEN: u32 = 4096;
+    let mut buf = vec![0u8; BUF_LEN as usize];
+    let len = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), BUF_LEN) };
+    let len = usize::try_from(len).ok().filter(|&n| n > 0)?;
+    buf.truncate(len);
+    String::from_utf8(buf).ok()
+}
+
+type ResponsiblePidFn = unsafe extern "C" fn(libc::pid_t) -> libc::pid_t;
+
+/// `responsibility_get_pid_responsible_for_pid` from libSystem, looked up
+/// at runtime because it is not in any public header.
+fn responsible_pid_fn() -> Option<ResponsiblePidFn> {
+    let handle = unsafe { libc::dlopen(std::ptr::null(), libc::RTLD_LAZY) };
+    if handle.is_null() {
+        return None;
+    }
+    let sym = unsafe {
+        libc::dlsym(
+            handle,
+            c"responsibility_get_pid_responsible_for_pid".as_ptr(),
+        )
+    };
+    if sym.is_null() {
+        return None;
+    }
+    // Safety: the symbol has this exact C signature on every macOS release
+    // that exports it.
+    Some(unsafe { std::mem::transmute::<*mut libc::c_void, ResponsiblePidFn>(sym) })
 }
