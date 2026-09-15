@@ -75,6 +75,7 @@ impl Runtime for MonitorRuntime {
         project: &Project,
         network: &Network,
         supervisor: rpc::Supervisor,
+        memory: crate::vm::MemoryProbe,
     ) -> anyhow::Result<MonitorTerminal> {
         let stdin_tx = self
             .stdin_tx
@@ -119,6 +120,7 @@ impl Runtime for MonitorRuntime {
                         per_core: snap.per_core,
                         total_bytes: snap.total_bytes,
                         used_bytes: snap.used_bytes,
+                        host_used_bytes: memory.host_bytes(),
                         load_avg: snap.load_avg,
                     }),
                     Err(e) => {

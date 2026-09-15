@@ -96,6 +96,13 @@ impl CloudHypervisorBackend {
         cmd.arg("--cpus").arg(cpus_arg);
         cmd.arg("--memory")
             .arg(format!("size={ram_mib}M,shared=on"));
+        // Reclaim freed guest memory without host involvement: the guest
+        // reports free 2 MiB chunks and cloud-hypervisor discards them
+        // (`free_page_reporting`); `deflate_on_oom` lets the guest take
+        // ballooned pages back by itself under pressure. Balloon size stays
+        // 0 — the host never inflates it on this backend.
+        cmd.arg("--balloon")
+            .arg("size=0,deflate_on_oom=on,free_page_reporting=on");
         let serial_log = config.runtime_dir.join("serial.log");
         cmd.arg("--console").arg("off");
         cmd.arg("--serial")
@@ -161,6 +168,22 @@ impl CloudHypervisorBackend {
 
         Ok(OwnedFd::from(stream))
     }
+
+    /// Resident size of the cloud-hypervisor process. Guest RAM is a
+    /// `shared=on` mapping, which RSS counts, so this tracks what the guest
+    /// has touched minus what free page reporting has given back.
+    pub fn host_memory_bytes(&self) -> Option<u64> {
+        let pid = self.ch_child.as_ref()?.id();
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        parse_vm_rss(&status)
+    }
+}
+
+/// `VmRSS` from `/proc/<pid>/status`, in bytes.
+fn parse_vm_rss(status: &str) -> Option<u64> {
+    let rest = status.lines().find_map(|l| l.strip_prefix("VmRSS:"))?;
+    let kb: u64 = rest.split_ascii_whitespace().next()?.parse().ok()?;
+    Some(kb * 1024)
 }
 
 impl Drop for CloudHypervisorBackend {

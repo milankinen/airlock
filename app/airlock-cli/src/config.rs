@@ -326,6 +326,10 @@ pub mod config {
         /// no-new-privileges). Disable only for debugging or Docker-in-VM use.
         #[config(default_t = true)]
         pub harden: bool,
+        /// Return memory the sandbox has freed to the host via the virtio
+        /// memory balloon (macOS; Linux reclaims by itself).
+        #[config(default_t = true)]
+        pub balloon: bool,
         /// Custom kernel image path (overrides the bundled kernel)
         #[config(default)]
         pub kernel: Option<String>,

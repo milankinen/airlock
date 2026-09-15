@@ -19,7 +19,10 @@ use crate::rpc::process::Process;
 pub struct StatsSnapshot {
     pub per_core: Vec<u8>,
     pub total_bytes: u64,
+    /// `MemTotal - MemAvailable`.
     pub used_bytes: u64,
+    /// `MemFree`. Zero when the guest predates the field.
+    pub free_bytes: u64,
     pub load_avg: (f32, f32, f32),
 }
 
@@ -371,6 +374,7 @@ impl Supervisor {
         let mem = snap.get_memory()?;
         let total_bytes = mem.get_total_bytes();
         let used_bytes = mem.get_used_bytes();
+        let free_bytes = mem.get_free_bytes();
 
         let la = snap.get_load_average()?;
 
@@ -378,6 +382,7 @@ impl Supervisor {
             per_core,
             total_bytes,
             used_bytes,
+            free_bytes,
             load_avg: (la.get_one(), la.get_five(), la.get_fifteen()),
         })
     }

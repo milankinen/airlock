@@ -21,7 +21,7 @@ pub use signals::signals;
 
 use crate::network::Network;
 use crate::project::Project;
-use crate::rpc;
+use crate::{rpc, vm};
 
 pub type PtySize = Option<(u16, u16)>;
 pub type SignalStream = Pin<Box<dyn Stream<Item = i32>>>;
@@ -55,11 +55,13 @@ pub trait Runtime {
     /// Consume the runtime and start the output sink. Also takes ownership of
     /// terminal raw mode — the raw runtime enables it here, the monitor
     /// runtime hands control to the TUI thread. Called after setup/downloads
-    /// so that Ctrl+C works during preparation.
+    /// so that Ctrl+C works during preparation. `memory` reads the VM's
+    /// host-side footprint for the monitor's memory figures.
     fn launch(
         self,
         project: &Project,
         network: &Network,
         supervisor: rpc::Supervisor,
+        memory: vm::MemoryProbe,
     ) -> anyhow::Result<Self::Terminal>;
 }

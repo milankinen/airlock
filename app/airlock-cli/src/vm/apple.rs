@@ -478,4 +478,67 @@ impl AppleVmBackend {
 
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
+
+    /// Physical footprint of this process. Virtualization.framework maps
+    /// guest RAM into the calling process, so this is the figure Activity
+    /// Monitor shows for the sandbox (plus airlock's own heap).
+    pub fn host_memory_bytes(&self) -> Option<u64> {
+        let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+        // Safety: `rusage_info_v4` is the layout `RUSAGE_INFO_V4` fills;
+        // the buffer outlives the call.
+        let rc = unsafe {
+            libc::proc_pid_rusage(
+                libc::getpid(),
+                libc::RUSAGE_INFO_V4,
+                (&raw mut info).cast::<libc::rusage_info_t>(),
+            )
+        };
+        (rc == 0).then_some(info.ri_phys_footprint)
+    }
+
+    /// Set the balloon's target: the guest inflates (target below the
+    /// configured size) or deflates until it has `bytes` of usable memory.
+    /// Returns once the framework has accepted the request; the guest
+    /// acts on it asynchronously. `bytes` must be a multiple of 1 MiB.
+    pub async fn set_memory_target(&self, bytes: u64) -> anyhow::Result<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<(), String>>();
+        let tx = Arc::new(Mutex::new(Some(tx)));
+        let tx_outer = tx.clone();
+        let vm_ptr = self.vm.clone();
+
+        self.vm_queue.exec_async(move || {
+            let tx_body = tx.clone();
+            let caught = catch_obj(AssertUnwindSafe(move || {
+                let vm_raw = vm_ptr.load(Ordering::Acquire);
+                if vm_raw.is_null() {
+                    deliver_err(&tx_body, "VM dropped".into());
+                    return;
+                }
+                unsafe {
+                    let vm = &*vm_raw;
+                    let devices = vm.memoryBalloonDevices();
+                    let Some(device) = devices.firstObject_unchecked() else {
+                        deliver_err(&tx_body, "no memory balloon device".into());
+                        return;
+                    };
+                    // Downcast VZMemoryBalloonDevice → VZVirtioTraditionalMemoryBalloonDevice
+                    // Safety: we configured exactly one
+                    // VZVirtioTraditionalMemoryBalloonDeviceConfiguration.
+                    let device_ptr = std::ptr::from_ref::<VZMemoryBalloonDevice>(device)
+                        .cast::<VZVirtioTraditionalMemoryBalloonDevice>();
+                    (*device_ptr).setTargetVirtualMachineMemorySize(bytes);
+                }
+                if let Some(s) = tx_body.lock().unwrap().take() {
+                    let _ = s.send(Ok(()));
+                }
+            }));
+            if let Err(msg) = caught {
+                deliver_err(&tx_outer, msg);
+            }
+        });
+
+        rx.await
+            .map_err(|_| anyhow::anyhow!("balloon channel closed"))?
+            .map_err(|e| anyhow::anyhow!(format!("balloon target failed: {e}")))
+    }
 }

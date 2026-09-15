@@ -99,6 +99,7 @@ impl Runtime for RawTerminalRuntime {
         _project: &Project,
         _network: &Network,
         _supervisor: rpc::Supervisor,
+        _memory: crate::vm::MemoryProbe,
     ) -> anyhow::Result<RawTerminal> {
         self.enter_raw_mode();
         Ok(RawTerminal { _guard: self.guard })

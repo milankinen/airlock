@@ -13,7 +13,11 @@ const HISTORY_CAPACITY: usize = 120;
 #[derive(Default)]
 pub struct MemoryState {
     pub total_bytes: u64,
+    /// Guest view: `MemTotal - MemAvailable`.
     pub used_bytes: u64,
+    /// Host view: what the host actually spends on the VM. `None` when
+    /// the backend can't tell.
+    pub host_used_bytes: Option<u64>,
     pub history: Vec<u8>,
 }
 
@@ -23,21 +27,35 @@ impl MemoryState {
     }
 
     /// Replace total/used and append the latest used% to the history ring.
-    pub fn set_usage(&mut self, total_bytes: u64, used_bytes: u64) {
+    pub fn set_usage(&mut self, total_bytes: u64, used_bytes: u64, host_used_bytes: Option<u64>) {
         self.total_bytes = total_bytes;
         self.used_bytes = used_bytes;
+        self.host_used_bytes = host_used_bytes;
         if self.history.len() >= HISTORY_CAPACITY {
             self.history.remove(0);
         }
         self.history.push(self.used_percent());
     }
 
-    /// Used percentage 0..100.
+    /// Used percentage 0..100 (guest view).
     pub fn used_percent(&self) -> u8 {
         (self.used_bytes * 100)
             .checked_div(self.total_bytes)
             .unwrap_or(0)
             .min(100) as u8
+    }
+
+    /// `<host> (<guest>)` when the host figure is known, else `<guest>`.
+    pub fn used_label(&self) -> String {
+        let guest = format_bytes(self.used_bytes);
+        match self.host_used_bytes {
+            Some(host) => format!("{} ({guest})", format_bytes(host)),
+            None => guest,
+        }
+    }
+
+    pub fn total_label(&self) -> String {
+        format_bytes(self.total_bytes)
     }
 }
 
@@ -103,11 +121,11 @@ fn render_body(area: Rect, state: &MemoryState, buf: &mut Buffer) {
     let lines = vec![
         Line::from(vec![
             Span::styled(" total  ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format_bytes(state.total_bytes)),
+            Span::raw(state.total_label()),
         ]),
         Line::from(vec![
             Span::styled(" used   ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format_bytes(state.used_bytes)),
+            Span::raw(state.used_label()),
         ]),
     ];
     Paragraph::new(lines).render(text_area, buf);
@@ -153,9 +171,19 @@ mod tests {
     fn set_usage_pushes_history_and_caps() {
         let mut s = MemoryState::new();
         for _ in 0..(HISTORY_CAPACITY + 10) {
-            s.set_usage(100, 50);
+            s.set_usage(100, 50, None);
         }
         assert_eq!(s.history.len(), HISTORY_CAPACITY);
         assert!(s.history.iter().all(|&v| v == 50));
+    }
+
+    #[test]
+    fn used_label_shows_host_then_guest() {
+        let mut s = MemoryState::new();
+        s.set_usage(8 << 30, 1 << 30, None);
+        assert_eq!(s.used_label(), "1.0 GiB");
+        s.set_usage(8 << 30, 1 << 30, Some(3 << 30));
+        assert_eq!(s.used_label(), "3.0 GiB (1.0 GiB)");
+        assert_eq!(s.total_label(), "8.0 GiB");
     }
 }

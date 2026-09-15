@@ -187,7 +187,11 @@ struct CpuStats {
 
 struct MemoryStats {
   totalBytes @0 :UInt64;
+  # `MemTotal - MemAvailable`, the way `free` / `htop` report "used".
   usedBytes  @1 :UInt64;
+  # `MemFree`: pages the guest kernel holds on its free lists. The host
+  # balloon controller only ever reclaims from this figure.
+  freeBytes  @2 :UInt64;
 }
 
 struct LoadAverage {

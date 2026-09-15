@@ -202,7 +202,7 @@ async fn run(
     .await?;
 
     cli::log!("Booting VM...");
-    let (vm, vsock_fd) = vm::start(&args, &project, &image, &container_home).await?;
+    let (mut vm, vsock_fd) = vm::start(&args, &project, &image, &container_home).await?;
     project.save_meta();
 
     // A Ctrl+C during boot (the vsock connect can retry for ~12s) sets the
@@ -218,6 +218,9 @@ async fn run(
 
     let supervisor = rpc::Supervisor::connect(vsock_fd)?;
     network.deny_reporter().attach(supervisor.client());
+    if project.config.vm.balloon {
+        vm.spawn_balloon(supervisor.clone());
+    }
 
     // Wire the pre-bound reverse port forward listeners into the now-ready
     // supervisor. Accept loops run for the lifetime of the tokio local set.
@@ -229,7 +232,7 @@ async fn run(
     // Launch the output sink (enters raw mode for the raw runtime, spawns the
     // TUI thread for the monitor runtime) before `supervisor.start` consumes
     // `network`.
-    let mut terminal = runtime.launch(&project, &network, supervisor.clone())?;
+    let mut terminal = runtime.launch(&project, &network, supervisor.clone(), vm.memory_probe())?;
     // When AIRLOCK_PTY_DUMP=1, write all guest PTY output to
     // <sandbox_dir>/pty.dump for offline replay/diagnosis.
     let mut pty_dump = pty_dump_file(&project.sandbox_dir);

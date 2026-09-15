@@ -92,6 +92,22 @@ memory = "4 GB"
 Memory accepts human-readable sizes like `"512 MB"`, `"4 GB"`, or `"2G"`.
 The minimum is 512 MB, and the maximum is the total system RAM.
 
+### Memory reclaim
+
+airlock uses [memory ballooning](https://en.wikipedia.org/wiki/Memory_ballooning)
+to give memory the sandbox no longer uses back to the host. When a
+memory-hungry job inside the sandbox finishes, the host's memory usage
+drops within a minute or so instead of staying at its peak until the
+sandbox exits. The sandbox always keeps the full `memory` amount available
+to it.
+
+Ballooning is enabled by default. To disable it:
+
+```toml
+[vm]
+balloon = false
+```
+
 ## Security hardening
 
 The VM boundary is already the primary isolation layer, but `harden`

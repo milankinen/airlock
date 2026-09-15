@@ -47,7 +47,16 @@ the embedded kernel and initramfs; the user provides them via
 |-----------------|-------------------------------------------------------|
 | Serial console  | Kernel debug output                                   |
 | Entropy         | `/dev/urandom` in guest                               |
-| Memory balloon  | Future: reclaim unused guest memory                   |
+| Memory balloon  | Give memory the sandbox no longer uses back to the host |
 | vsock           | Host ↔ guest RPC (port 1024)                          |
 | [VirtioFS](https://virtio-fs.gitlab.io/) | Shared filesystems (image layers, dir/file mounts) |
 | Block (ext4)    | Per-project persistent disk                           |
+
+### Memory balloon
+
+On macOS, airlock checks every 10 seconds whether the host is holding
+noticeably more memory than the sandbox is using and, if so, briefly
+inflates the balloon so macOS can take the unused part back. The sandbox
+gets its full memory back right away. On Linux, cloud-hypervisor's free
+page reporting does this automatically. See
+[memory reclaim](../configuration/vm.md#memory-reclaim).

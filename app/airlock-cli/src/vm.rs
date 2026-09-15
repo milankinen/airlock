@@ -5,6 +5,7 @@
 
 #[cfg(target_os = "macos")]
 mod apple;
+mod balloon;
 #[cfg(target_os = "linux")]
 mod cloud_hypervisor;
 mod config;
@@ -14,6 +15,9 @@ pub mod mount;
 
 use std::os::unix::io::OwnedFd;
 use std::path::{Path, PathBuf};
+use std::rc::{Rc, Weak};
+
+use crate::rpc;
 
 #[cfg(target_os = "linux")]
 pub enum KvmStatus {
@@ -85,10 +89,17 @@ use crate::vm::config::VmShare;
 /// A running VM instance. Dropping this kills the VM and stops file sync.
 #[allow(dead_code)]
 pub struct VmInstance {
-    /// Private — dropping kills the VM via the existing backend impls.
-    vm_handle: Box<dyn VmHandle>,
+    /// Private — dropping the last strong reference kills the VM via the
+    /// existing backend impls. The balloon pump and [`MemoryProbe`] hold
+    /// only `Weak`s so they never delay teardown.
+    vm_handle: Rc<dyn VmHandle>,
     /// File-sync handle — gracefully drained by `shutdown()`, aborted on drop.
     sync_handle: Option<file_sync::SyncHandle>,
+    /// Host-driven balloon pump task, see [`balloon`]. `None` until
+    /// [`VmInstance::spawn_balloon`] or when the backend has no balloon.
+    balloon: Option<tokio::task::JoinHandle<()>>,
+    /// `[vm] memory` — the balloon target at rest.
+    pub memory_bytes: u64,
     pub image_id: String,
     pub image_layers: Vec<String>,
     pub mounts: Vec<mount::ResolvedMount>,
@@ -108,9 +119,40 @@ pub struct VmInstance {
 impl VmInstance {
     /// Gracefully shut down file sync (drains pending events) then drop the VM.
     pub async fn shutdown(mut self) {
+        self.stop_balloon().await;
         if let Some(handle) = self.sync_handle.take() {
             handle.shutdown().await;
         }
+    }
+
+    /// Start the host-driven balloon pump for backends that have one (see
+    /// [`balloon`]). No-op on backends without host-driven reclaim.
+    pub fn spawn_balloon(&mut self, supervisor: rpc::Supervisor) {
+        if !self.vm_handle.has_balloon() {
+            tracing::debug!("backend has no host-driven memory balloon; pump disabled");
+            return;
+        }
+        let policy = balloon::Policy::new(self.memory_bytes);
+        let vm = Rc::downgrade(&self.vm_handle);
+        self.balloon = Some(tokio::task::spawn_local(balloon::run(
+            policy, vm, supervisor,
+        )));
+    }
+
+    /// Abort the pump and wait for it to be gone. `abort()` alone only
+    /// schedules cancellation; the task may still hold a strong reference
+    /// to the backend mid-tick, which would postpone the VM stop.
+    async fn stop_balloon(&mut self) {
+        if let Some(task) = self.balloon.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    /// Handle for reading the VM's host-side footprint (the monitor's
+    /// stats loop). Cheap to clone; weak, so it outlives nothing.
+    pub fn memory_probe(&self) -> MemoryProbe {
+        MemoryProbe(Rc::downgrade(&self.vm_handle))
     }
 
     /// Open a vsock connection to the given guest port. Retries every
@@ -189,6 +231,8 @@ pub async fn start(
     let vm = VmInstance {
         vm_handle,
         sync_handle,
+        balloon: None,
+        memory_bytes: vm_config.memory_bytes,
         image_id: image.image_id.clone(),
         image_layers: image.image_layers.clone(),
         mounts,
@@ -406,24 +450,37 @@ fn log_config(project: &Project, shares: &[VmShare]) {
 /// vsock port to be ready is caller responsibility — see
 /// [`VmInstance::vsock_connect`].
 #[cfg_attr(not(target_os = "macos"), allow(clippy::unused_async))]
-async fn boot_backend(vm_config: &config::VmConfig) -> anyhow::Result<Box<dyn VmHandle>> {
+async fn boot_backend(vm_config: &config::VmConfig) -> anyhow::Result<Rc<dyn VmHandle>> {
     #[cfg(target_os = "macos")]
     {
         let mut backend = apple::AppleVmBackend::new(vm_config)?;
         backend.start().await?;
-        Ok(Box::new(backend))
+        Ok(Rc::new(backend))
     }
 
     #[cfg(target_os = "linux")]
     {
         let backend = cloud_hypervisor::CloudHypervisorBackend::start(vm_config)?;
-        Ok(Box::new(backend))
+        Ok(Rc::new(backend))
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = vm_config;
         Err(anyhow::anyhow!("unsupported platform"))
+    }
+}
+
+/// Reads the VM's host-side footprint. Handed to the monitor runtime so
+/// the status line can show `used: <host> (<guest>)`.
+#[derive(Clone)]
+pub struct MemoryProbe(Weak<dyn VmHandle>);
+
+impl MemoryProbe {
+    /// Bytes the host currently spends on the VM, `None` once the VM is
+    /// gone or when the backend can't tell.
+    pub fn host_bytes(&self) -> Option<u64> {
+        self.0.upgrade()?.host_memory_bytes()
     }
 }
 
@@ -435,6 +492,27 @@ trait VmHandle {
         &self,
         port: u32,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<OwnedFd>> + '_>>;
+
+    /// Host-side memory footprint of the VM, if the backend can measure it.
+    fn host_memory_bytes(&self) -> Option<u64>;
+
+    /// Whether [`VmHandle::set_memory_target`] does anything. Backends
+    /// whose hypervisor reclaims freed guest memory by itself (free page
+    /// reporting) return `false`.
+    fn has_balloon(&self) -> bool {
+        false
+    }
+
+    /// Ask the guest to inflate/deflate its memory balloon so it ends up
+    /// with `bytes` of usable memory. `None` when there is no host-driven
+    /// balloon.
+    fn set_memory_target(
+        &self,
+        bytes: u64,
+    ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + '_>>> {
+        let _ = bytes;
+        None
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -445,6 +523,23 @@ impl VmHandle for apple::AppleVmBackend {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<OwnedFd>> + '_>> {
         Box::pin(apple::AppleVmBackend::vsock_connect(self, port))
     }
+
+    fn host_memory_bytes(&self) -> Option<u64> {
+        apple::AppleVmBackend::host_memory_bytes(self)
+    }
+
+    fn has_balloon(&self) -> bool {
+        true
+    }
+
+    fn set_memory_target(
+        &self,
+        bytes: u64,
+    ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + '_>>> {
+        Some(Box::pin(apple::AppleVmBackend::set_memory_target(
+            self, bytes,
+        )))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -454,5 +549,9 @@ impl VmHandle for cloud_hypervisor::CloudHypervisorBackend {
         port: u32,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<OwnedFd>> + '_>> {
         Box::pin(async move { cloud_hypervisor::CloudHypervisorBackend::vsock_connect(self, port) })
+    }
+
+    fn host_memory_bytes(&self) -> Option<u64> {
+        cloud_hypervisor::CloudHypervisorBackend::host_memory_bytes(self)
     }
 }

@@ -187,8 +187,8 @@ fn build_status_line(app: &App) -> Line<'static> {
     let sep = Span::styled(" │ ", value);
 
     let cpu_pct = app.monitor.cpu.mean();
-    let mem_used = format_bytes(app.monitor.memory.used_bytes);
-    let mem_total = format_bytes(app.monitor.memory.total_bytes);
+    let mem_used = app.monitor.memory.used_label();
+    let mem_total = app.monitor.memory.total_label();
     let allowed = app.monitor.network.request_allowed;
     let denied = app.monitor.network.request_denied;
 
@@ -216,25 +216,6 @@ fn build_status_line(app: &App) -> Line<'static> {
         Span::raw(" "),
     ]);
     Line::from(spans)
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = KIB * 1024;
-    const GIB: u64 = MIB * 1024;
-    const TIB: u64 = GIB * 1024;
-
-    if bytes >= TIB {
-        format!("{:.1} TiB", bytes as f64 / TIB as f64)
-    } else if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.0} MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.0} KiB", bytes as f64 / KIB as f64)
-    } else {
-        format!("{bytes} B")
-    }
 }
 
 #[cfg(test)]

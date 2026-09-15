@@ -35,7 +35,10 @@ pub use ui::TAB_BAR_HEIGHT;
 pub struct StatsSnapshot {
     pub per_core: Vec<u8>,
     pub total_bytes: u64,
+    /// Guest view: `MemTotal - MemAvailable`.
     pub used_bytes: u64,
+    /// Host view: what the host actually spends on the VM, when known.
+    pub host_used_bytes: Option<u64>,
     pub load_avg: (f32, f32, f32),
 }
 

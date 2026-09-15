@@ -64,8 +64,11 @@ impl MonitorTab {
     pub fn apply_stats(&mut self, snapshot: crate::StatsSnapshot) {
         self.cpu
             .set_snapshot(snapshot.per_core, Some(snapshot.load_avg));
-        self.memory
-            .set_usage(snapshot.total_bytes, snapshot.used_bytes);
+        self.memory.set_usage(
+            snapshot.total_bytes,
+            snapshot.used_bytes,
+            snapshot.host_used_bytes,
+        );
     }
 }
 

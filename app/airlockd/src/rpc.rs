@@ -422,6 +422,7 @@ impl supervisor::Server for SupervisorImpl {
             let mut mem = out.reborrow().init_memory();
             mem.set_total_bytes(snapshot.total_bytes);
             mem.set_used_bytes(snapshot.used_bytes);
+            mem.set_free_bytes(snapshot.free_bytes);
         }
         {
             let (one, five, fifteen) = snapshot.load_avg;

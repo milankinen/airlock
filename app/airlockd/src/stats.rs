@@ -1,6 +1,6 @@
 //! Guest stats collector for `Supervisor.pollStats` RPC.
 //!
-//! Samples `/proc/stat` (per-core CPU), `/proc/meminfo` (total/available),
+//! Samples `/proc/stat` (per-core CPU), `/proc/meminfo` (total/available/free),
 //! and `/proc/loadavg`. Per-core utilization requires two samples, so
 //! [`Collector`] keeps the previous `/proc/stat` snapshot across calls.
 //! The first call returns zero-filled per-core values.
@@ -17,7 +17,10 @@ struct CpuSample {
 pub struct Snapshot {
     pub per_core: Vec<u8>,
     pub total_bytes: u64,
+    /// `MemTotal - MemAvailable`.
     pub used_bytes: u64,
+    /// `MemFree` — what the host-side balloon controller may reclaim.
+    pub free_bytes: u64,
     pub load_avg: (f32, f32, f32),
 }
 
@@ -41,13 +44,14 @@ impl Collector {
         };
         self.prev = Some(cur);
 
-        let (total_bytes, used_bytes) = read_memory().unwrap_or((0, 0));
+        let (total_bytes, used_bytes, free_bytes) = read_memory().unwrap_or((0, 0, 0));
         let load_avg = read_loadavg().unwrap_or((0.0, 0.0, 0.0));
 
         Snapshot {
             per_core,
             total_bytes,
             used_bytes,
+            free_bytes,
             load_avg,
         }
     }
@@ -98,27 +102,35 @@ fn diff_per_core(prev: &CpuSample, cur: &CpuSample) -> Vec<u8> {
         .collect()
 }
 
-/// Parse `/proc/meminfo` → `(total_bytes, used_bytes)` where `used =
-/// total - available`. Fields are reported in kB.
-fn read_memory() -> Option<(u64, u64)> {
-    let data = fs::read_to_string("/proc/meminfo").ok()?;
+/// Read `/proc/meminfo` → `(total_bytes, used_bytes, free_bytes)`.
+fn read_memory() -> Option<(u64, u64, u64)> {
+    parse_meminfo(&fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+/// Parse `/proc/meminfo` text → `(total_bytes, used_bytes, free_bytes)`
+/// where `used = total - available` and `free = MemFree`. Fields are
+/// reported in kB.
+fn parse_meminfo(data: &str) -> Option<(u64, u64, u64)> {
     let mut total_kb: Option<u64> = None;
     let mut avail_kb: Option<u64> = None;
+    let mut free_kb: Option<u64> = None;
     for line in data.lines() {
         let (key, rest) = line.split_once(':')?;
         let value_kb: u64 = rest.split_ascii_whitespace().next()?.parse().ok()?;
         match key {
             "MemTotal" => total_kb = Some(value_kb),
             "MemAvailable" => avail_kb = Some(value_kb),
+            "MemFree" => free_kb = Some(value_kb),
             _ => {}
         }
-        if total_kb.is_some() && avail_kb.is_some() {
+        if total_kb.is_some() && avail_kb.is_some() && free_kb.is_some() {
             break;
         }
     }
     let total = total_kb? * 1024;
     let avail = avail_kb? * 1024;
-    Some((total, total.saturating_sub(avail)))
+    let free = free_kb? * 1024;
+    Some((total, total.saturating_sub(avail), free))
 }
 
 fn read_loadavg() -> Option<(f32, f32, f32)> {
@@ -154,6 +166,20 @@ mod tests {
         };
         let cur = prev.clone();
         assert_eq!(diff_per_core(&prev, &cur), vec![0]);
+    }
+
+    #[test]
+    fn parse_meminfo_reports_used_and_free() {
+        let data = "MemTotal:       4096 kB\nMemFree:        1024 kB\nMemAvailable:   3072 kB\nBuffers:        10 kB\n";
+        assert_eq!(
+            parse_meminfo(data),
+            Some((4096 * 1024, 1024 * 1024, 1024 * 1024))
+        );
+    }
+
+    #[test]
+    fn parse_meminfo_requires_all_fields() {
+        assert_eq!(parse_meminfo("MemTotal: 4096 kB\nMemFree: 1 kB\n"), None);
     }
 
     #[test]

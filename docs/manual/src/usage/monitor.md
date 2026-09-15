@@ -81,8 +81,11 @@ a short history sparkline of the mean utilization across cores.
 
 ### Memory widget
 
-Total and used bytes (reported the way `free` and `htop` do:
-`used = MemTotal - MemAvailable`), plus a history sparkline of used%.
+Total memory, `used` as `<host> (<sandbox>)`, and a history sparkline of
+used%. The first figure is how much memory the sandbox costs on the host
+(what Activity Monitor shows), the second is what the sandbox itself
+reports as used. The status line shows the same
+`Memory <host> (<sandbox>) / <total>`.
 
 ## Keyboard shortcuts
 
