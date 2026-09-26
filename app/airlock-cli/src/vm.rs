@@ -20,41 +20,28 @@ pub enum KvmStatus {
     Available,
     NotFound,
     NoPermission,
+    Unavailable(std::io::Error),
 }
 
 #[cfg(target_os = "linux")]
 pub fn kvm_status() -> KvmStatus {
-    use std::os::unix::fs::MetadataExt;
-    let path = std::path::Path::new("/dev/kvm");
-    if !path.exists() {
-        return KvmStatus::NotFound;
-    }
-    if let Ok(metadata) = path.metadata() {
-        let mode = metadata.mode();
-        let uid = unsafe { libc::getuid() };
-        let gid = unsafe { libc::getgid() };
-        let dev_uid = metadata.uid();
-        let dev_gid = metadata.gid();
+    kvm_status_at(Path::new("/dev/kvm"))
+}
 
-        let owner_ok = uid == dev_uid && (mode & 0o600 == 0o600);
-        let group_ok = gid == dev_gid && (mode & 0o060 == 0o060);
-        let other_ok = mode & 0o006 == 0o006;
-        let supp_ok = if group_ok {
-            false
-        } else {
-            let ngroups = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
-            let mut groups = vec![0u32; ngroups.max(1) as usize];
-            let n = unsafe { libc::getgroups(groups.len() as i32, groups.as_mut_ptr()) };
-            n > 0 && groups[..n as usize].contains(&dev_gid)
-        };
-
-        if owner_ok || group_ok || supp_ok || other_ok {
-            KvmStatus::Available
-        } else {
-            KvmStatus::NoPermission
-        }
-    } else {
-        KvmStatus::NoPermission
+#[cfg(target_os = "linux")]
+fn kvm_status_at(path: &Path) -> KvmStatus {
+    // Opening instead of inspecting mode bits lets the kernel apply ACLs.
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(_) => KvmStatus::Available,
+        Err(err) => match err.kind() {
+            std::io::ErrorKind::NotFound => KvmStatus::NotFound,
+            std::io::ErrorKind::PermissionDenied => KvmStatus::NoPermission,
+            _ => KvmStatus::Unavailable(err),
+        },
     }
 }
 
@@ -72,6 +59,39 @@ pub fn require_kvm() {
             cli::error!("run: sudo usermod -aG kvm $USER  (then re-login)");
             std::process::exit(1);
         }
+        KvmStatus::Unavailable(err) => {
+            cli::error!("cannot open /dev/kvm: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod kvm_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn kvm_status_classifies_open_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kvm");
+        assert!(matches!(kvm_status_at(&path), KvmStatus::NotFound));
+
+        std::fs::write(&path, b"").unwrap();
+        assert!(matches!(kvm_status_at(&path), KvmStatus::Available));
+
+        if unsafe { libc::geteuid() } != 0 {
+            for mode in [0o400, 0o200] {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+                assert!(matches!(kvm_status_at(&path), KvmStatus::NoPermission));
+            }
+        }
+
+        assert!(matches!(
+            kvm_status_at(dir.path()),
+            KvmStatus::Unavailable(_)
+        ));
     }
 }
 

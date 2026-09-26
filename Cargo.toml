@@ -110,6 +110,7 @@ tls-parser = "0.12"
 
 # Testing
 axum = "0.8"
+tempfile = "3"
 tower = "0.5"
 
 # TUI

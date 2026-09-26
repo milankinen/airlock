@@ -93,6 +93,7 @@ dependencies = [
  "subst",
  "sysinfo",
  "tar",
+ "tempfile",
  "thiserror 2.0.19",
  "timeago",
  "tls-parser",
