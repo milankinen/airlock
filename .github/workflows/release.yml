@@ -13,6 +13,11 @@ on:
         required: false
         type: string
 
+# Never run two releases at once.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   resolve-ci-run:
     if: github.ref == 'refs/heads/main'
@@ -20,22 +25,79 @@ jobs:
     outputs:
       run_id: ${{ steps.ci-run.outputs.run_id }}
     steps:
+      - name: Validate version input
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if ! [[ "$VERSION" =~ ^v[0-9]{4}\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid version '$VERSION', expected vYYYY.M.N"
+            exit 1
+          fi
+      # The CI run must be for the exact commit being released
+      # ($GITHUB_SHA). Do NOT pick "latest successful run on main": the
+      # workflow-runs listing API can return stale result sets, which
+      # once shipped binaries from a weeks-old commit (v2026.9.3).
       - name: Resolve CI run ID
         id: ci-run
         env:
           GH_TOKEN: ${{ github.token }}
+          INPUT_RUN_ID: ${{ github.event.inputs.run_id }}
         run: |
-          RUN_ID="${{ github.event.inputs.run_id }}"
+          set -euo pipefail
+          echo "Release commit: $GITHUB_SHA"
+          RUN_ID="$INPUT_RUN_ID"
           if [ -z "$RUN_ID" ]; then
             RUN_ID=$(gh run list \
               --repo "$GITHUB_REPOSITORY" \
               --workflow ci.yml \
               --branch main \
+              --event push \
+              --commit "$GITHUB_SHA" \
               --status success \
               --limit 1 \
               --json databaseId \
-              --jq '.[0].databaseId')
+              --jq '.[0].databaseId // empty')
+            if [ -z "$RUN_ID" ]; then
+              echo "::error::No successful CI run on main for $GITHUB_SHA. Wait for CI to finish, then retry."
+              exit 1
+            fi
           fi
+          if ! [[ "$RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid run ID '$RUN_ID'"
+            exit 1
+          fi
+
+          # Re-fetch the run directly; never trust the listing alone.
+          IFS=$'\t' read -r RUN_SHA RUN_CONCLUSION RUN_PATH RUN_BRANCH RUN_EVENT < <(
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" \
+              --jq '[.head_sha, .conclusion, .path, .head_branch, .event] | @tsv')
+          echo "Resolved CI run $RUN_ID: sha=$RUN_SHA conclusion=$RUN_CONCLUSION path=$RUN_PATH branch=$RUN_BRANCH event=$RUN_EVENT"
+          ERR=0
+          [ "$RUN_SHA" = "$GITHUB_SHA" ] || { echo "::error::CI run $RUN_ID is for $RUN_SHA, not $GITHUB_SHA"; ERR=1; }
+          [ "$RUN_CONCLUSION" = "success" ] || { echo "::error::CI run $RUN_ID concluded '$RUN_CONCLUSION'"; ERR=1; }
+          [ "$RUN_PATH" = ".github/workflows/ci.yml" ] || { echo "::error::Run $RUN_ID is from '$RUN_PATH', not ci.yml"; ERR=1; }
+          [ "$RUN_BRANCH" = "main" ] || { echo "::error::CI run $RUN_ID is on '$RUN_BRANCH', not main"; ERR=1; }
+          [ "$RUN_EVENT" = "push" ] || { echo "::error::CI run $RUN_ID was triggered by '$RUN_EVENT', not push"; ERR=1; }
+          [ "$ERR" = 0 ] || exit 1
+
+          # Every artifact the release consumes must exist, be unexpired
+          # and belong to the release commit.
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/artifacts?per_page=100" \
+            --jq '.artifacts[] | [.name, .workflow_run.head_sha, .expired] | @tsv' > artifacts.tsv
+          cat artifacts.tsv
+          for name in airlock-macos-aarch64 airlock-macos-x86_64 \
+                      airlock-macos-aarch64-distroless airlock-macos-x86_64-distroless \
+                      airlock-linux-x86_64 airlock-linux-aarch64 \
+                      airlock-linux-x86_64-distroless airlock-linux-aarch64-distroless \
+                      manual; do
+            if ! awk -F'\t' -v n="$name" -v s="$GITHUB_SHA" \
+                 '$1 == n && $2 == s && $3 == "false" { found = 1 } END { exit !found }' artifacts.tsv; then
+              echo "::error::Artifact '$name' missing, expired or not from $GITHUB_SHA in CI run $RUN_ID"
+              ERR=1
+            fi
+          done
+          [ "$ERR" = 0 ] || exit 1
+
           echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
 
   sign-macos:
@@ -53,6 +115,12 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --name "$name" \
               --dir "artifacts/$name"
+          done
+      - name: Verify binaries are from the release commit
+        run: |
+          for name in airlock-macos-aarch64 airlock-macos-x86_64 \
+                      airlock-macos-aarch64-distroless airlock-macos-x86_64-distroless; do
+            mise/tasks/release/verify-binary "artifacts/$name/airlock" "$GITHUB_SHA"
           done
       - name: Import Developer ID certificate
         env:
@@ -89,6 +157,19 @@ jobs:
                      "$BIN"
             codesign --verify --deep --strict --verbose=2 "$BIN"
             codesign --display --verbose=2 "$BIN"
+            mise/tasks/release/verify-binary "$BIN" "$GITHUB_SHA" "$VERSION"
+          done
+      - name: Smoke-test native binaries
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          [ "$(uname -m)" = arm64 ] || { echo "::error::Expected an arm64 macOS runner"; exit 1; }
+          for dir in artifacts/airlock-macos-aarch64 artifacts/airlock-macos-aarch64-distroless; do
+            OUT=$("$dir/airlock" -V)
+            echo "$dir: $OUT"
+            case "$OUT" in
+              *"$VERSION"*"(${GITHUB_SHA::7}"*) ;;
+              *) echo "::error::$dir reports '$OUT', expected $VERSION (${GITHUB_SHA::7}...)"; exit 1 ;;
+            esac
           done
       - name: Clean up keychain
         if: always()
@@ -134,6 +215,11 @@ jobs:
               --name "$name" \
               --dir "artifacts/${name#airlock-}"
           done
+      - name: Verify Linux binaries are from the release commit
+        run: |
+          for dir in linux-x86_64 linux-aarch64 linux-x86_64-distroless linux-aarch64-distroless; do
+            mise/tasks/release/verify-binary "artifacts/$dir/airlock" "$GITHUB_SHA"
+          done
       - uses: actions/download-artifact@v4
         with:
           name: airlock-macos-aarch64-signed
@@ -177,6 +263,35 @@ jobs:
           done
 
           sed -i "s/^DEFAULT_VERSION=\"\"/DEFAULT_VERSION=\"${VERSION}\"/" install.sh
+          grep -q "^DEFAULT_VERSION=\"${VERSION}\"$" install.sh \
+            || { echo "::error::Failed to set DEFAULT_VERSION in install.sh"; exit 1; }
+      # Last gate before publishing: re-extract every archive and check its
+      # binary, and run the x86_64 Linux binaries on this runner.
+      - name: Verify release archives
+        run: |
+          set -euo pipefail
+          VERSION="${{ github.event.inputs.version }}"
+          [ "$(uname -m)" = x86_64 ] || { echo "::error::Expected an x86_64 Linux runner"; exit 1; }
+          for archive in airlock-${VERSION}-*.tar.gz; do
+            sha256sum -c "${archive}.sha256"
+            dir="verify/${archive%.tar.gz}"
+            mkdir -p "$dir"
+            tar -xzf "$archive" -C "$dir"
+            mise/tasks/release/verify-binary "$dir/airlock" "$GITHUB_SHA" "$VERSION"
+            case "$archive" in
+              *linux-x86_64*)
+                OUT=$("$dir/airlock" -V)
+                echo "$archive: $OUT"
+                case "$OUT" in
+                  *"$VERSION"*"(${GITHUB_SHA::7}"*) ;;
+                  *) echo "::error::$archive reports '$OUT', expected $VERSION (${GITHUB_SHA::7}...)"; exit 1 ;;
+                esac
+                ;;
+            esac
+          done
+          [ "$(ls airlock-${VERSION}-*.tar.gz | wc -l)" = 8 ] \
+            || { echo "::error::Expected 8 release archives"; exit 1; }
+          rm -rf verify
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -200,6 +315,7 @@ jobs:
             airlock-${VERSION}-linux-aarch64-distroless.tar.gz \
             airlock-${VERSION}-linux-aarch64-distroless.tar.gz.sha256 \
             install.sh \
+            --target "$GITHUB_SHA" \
             --repo "$GITHUB_REPOSITORY" --generate-notes
 
   publish-manual:
