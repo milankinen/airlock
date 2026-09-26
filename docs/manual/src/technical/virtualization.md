@@ -16,8 +16,9 @@ com.apple.security.hypervisor
 airlock uses [Cloud Hypervisor](https://www.cloudhypervisor.org/) with
 KVM acceleration. The `airlock` binary embeds the `cloud-hypervisor` and
 [`virtiofsd`](https://gitlab.com/virtio-fs/virtiofsd) binaries and
-extracts them on first run. KVM requires `/dev/kvm` access. `airlock`
-checks and reports permission issues at startup.
+extracts them on first run. KVM requires read and write access to
+`/dev/kvm`. At startup, `airlock` opens the device to check this access.
+If the device does not open, `airlock` shows the cause and stops.
 
 ## Kernel and initramfs
 

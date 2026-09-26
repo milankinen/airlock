@@ -26,6 +26,7 @@ pub fn platform_status() -> String {
         KvmStatus::Available => format!("{} kvm access granted", check()),
         KvmStatus::NotFound => format!("{} kvm not available", red("!")),
         KvmStatus::NoPermission => format!("{} kvm permission denied", red("!")),
+        KvmStatus::Unavailable(err) => format!("{} kvm unavailable: {err}", red("!")),
     };
     format!("{}:\n  {kvm_line}\n", console::style("Status").underlined())
 }
