@@ -57,6 +57,13 @@ depends = ["build:dev", "build:dev-image"]
 env.RUST_BACKTRACE = "1"
 run = "exec ../target/debug/airlock"
 
+[tasks.airlock]
+description = "Build, sign, and run"
+raw = true
+dir = "{{ cwd }}"
+depends = ["build:dev"]
+run = "exec {{ config_root }}/target/debug/airlock"
+
 [tasks.claude]
 description = "Build, sign, and run"
 quiet = true
