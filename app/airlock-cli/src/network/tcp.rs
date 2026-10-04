@@ -43,7 +43,10 @@ pub async fn connect_server(addr: &str) -> anyhow::Result<io::Transport> {
 }
 
 /// Bidirectional relay between two transports.
-/// When either direction closes, both sides are fully shut down.
+///
+/// When either direction closes, both sides shut down concurrently under a
+/// timeout. An `RpcTransport` shutdown can block on a `close` ack behind
+/// backpressure, so shutdown also drains both read halves to unblock it.
 pub async fn relay(mut container: io::Transport, mut server: io::Transport) {
     let c2s = async {
         let mut buf = vec![0u8; airlock_common::RELAY_CHUNK_SIZE];
@@ -78,6 +81,34 @@ pub async fn relay(mut container: io::Transport, mut server: io::Transport) {
         () = c2s => {}
         () = s2c => {}
     }
-    let _ = server.write.shutdown().await;
-    let _ = container.write.shutdown().await;
+    let shutdown = async { tokio::join!(server.write.shutdown(), container.write.shutdown()) };
+    tokio::pin!(shutdown);
+    let mut container_buf = vec![0u8; airlock_common::RELAY_CHUNK_SIZE];
+    let mut server_buf = vec![0u8; airlock_common::RELAY_CHUNK_SIZE];
+    let drain = async {
+        tokio::join!(
+            drain_to_eof(&mut container.read, &mut container_buf),
+            drain_to_eof(&mut server.read, &mut server_buf),
+        )
+    };
+    let _ = tokio::time::timeout(crate::constants::RELAY_SHUTDOWN_TIMEOUT, async {
+        tokio::select! {
+            _ = &mut shutdown => {}
+            // Both sides hit EOF/error before the shutdown did; keep
+            // waiting for it instead of abandoning it.
+            _ = drain => { let _ = shutdown.await; }
+        }
+    })
+    .await;
+}
+
+/// Reads `src` to EOF or error, discarding the bytes — keeps a peer's own
+/// sends acking while nothing else is draining it.
+async fn drain_to_eof(src: &mut io::BoxRead, buf: &mut [u8]) {
+    loop {
+        match src.read(buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
 }

@@ -38,6 +38,29 @@ container netns traverse PREROUTING, not OUTPUT, so they never
 matched the rule and never reached the proxy. A TUN at the default route
 catches everything — no chain-matching subtleties.
 
+## Flow control
+
+Each connection has its own flow control in both directions. A slow
+reader stops only its own connection. Other connections on the same
+vsock continue.
+
+- Guest to host: when the relay is full, the smoltcp socket keeps the
+  bytes in its receive buffer and closes the TCP window. The relay
+  wakes the smoltcp poll loop each time it forwards a chunk, so the
+  window opens again immediately.
+- Host to guest: the host sends a chunk and then waits for space in
+  the Cap'n Proto stream window (64 KiB per connection). A guest that
+  does not read stops the host from reading the remote server.
+
+When one side of a connection closes, the proxy shuts down both sides
+in parallel. During the shutdown, the proxy reads and discards the
+remaining bytes, so a blocked peer can complete. A 30-second timeout
+limits the shutdown.
+
+If the host side fails during an upload, the guest discards the rest
+of the upload. The guest still receives the data that the server sent
+before the failure, and then a normal TCP close.
+
 ## Virtual DNS
 
 The container's `/etc/resolv.conf` points at `nameserver 10.0.0.1`,

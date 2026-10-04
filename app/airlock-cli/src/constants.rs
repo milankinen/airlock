@@ -8,3 +8,6 @@ pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Timeout for connecting to a host Unix socket.
 pub const SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Timeout for shutting down both sides of a relay.
+pub const RELAY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
