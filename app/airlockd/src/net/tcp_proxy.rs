@@ -33,8 +33,9 @@
 //!    progress.
 //! 4. `poll_maintenance` advances timers (retransmits, TIME-WAIT).
 //! 5. Drain the Device's tx queue to the TUN fd.
-//! 6. Sleep until any of: TUN readable, host→guest notify, smoltcp's
-//!    next timer, or 100ms safety-net.
+//! 6. Sleep until any of: TUN readable, a `wake` notify (host→guest
+//!    bytes arriving, or the relay agent freeing a `to_host` slot
+//!    after draining one), smoltcp's next timer, or 100ms safety-net.
 //!
 //! All in one task, single-threaded. No locks — the Device, Interface,
 //! SocketSet and connection tracker live on the task's stack.
@@ -101,7 +102,7 @@ struct Conn {
     handle: SocketHandle,
     /// Bytes from guest → host. `None` once the guest half-closed and
     /// we've drained the recv buffer — dropping the sender signals the
-    /// relay agent that no more data is coming.
+    /// relay agent that no more data is coming. Bounded by `CHAN_CAP`.
     to_host: Option<mpsc::Sender<Bytes>>,
     /// Bytes from host → guest. The relay agent closes its half when
     /// the host side ends, which surfaces here as `Disconnected`.
@@ -114,6 +115,10 @@ struct Conn {
     /// Set when the host side (relay agent) has closed — either because
     /// the RPC connect was denied/errored or the remote host FIN'd.
     host_closed: bool,
+    /// Set when the relay agent is gone but the guest hasn't half-closed
+    /// yet: nobody can accept more guest bytes, so drain and drop them
+    /// instead of stalling the window.
+    discard_rx: bool,
 }
 
 /// Launch the proxy as a local task. Creates `airlock0`, brings it up,
@@ -185,10 +190,10 @@ pub(crate) fn spawn_poll_loop(
     info!("tcp proxy up on tun '{name}' addr={iface_ip}; intercepting all egress");
 
     // Shared wake-up signal: the TUN fd makes us readable via AsyncFd
-    // when packets arrive, but host→guest bytes come via mpsc channels
-    // that have no fd. Every ChannelSink pings this Notify when it
-    // pushes bytes or closes, letting the poll loop wake out of its
-    // idle sleep without a polling cadence.
+    // when packets arrive, but the mpsc channels have no fd of their
+    // own. ChannelSink pings this on host→guest bytes, close, or drop;
+    // relay_agent pings it after taking a chunk off `to_host` and on
+    // exit.
     let wake = Rc::new(Notify::new());
 
     tokio::task::spawn_local(async move {
@@ -210,7 +215,7 @@ pub(crate) fn spawn_poll_loop(
                 }
             }
             // One more FSM pass for timer-driven state changes + any
-            // host→guest bytes that the wake-up signal delivered.
+            // channel progress the wake-up signal reported.
             run_fsm(&mut sockets, &mut tracker, &network, &dns, &wake);
 
             // Egress: turn socket-buffered data into device tx packets.
@@ -242,8 +247,8 @@ pub(crate) fn spawn_poll_loop(
                 }
             }
 
-            // Sleep until *any* of: TUN fd readable, a host→guest
-            // wake-up, smoltcp's next timer, or the 100ms safety net.
+            // Sleep until *any* of: TUN fd readable, a `wake` notify,
+            // smoltcp's next timer, or the 100ms safety net.
             let timer_wait = iface
                 .poll_delay(now, &sockets)
                 .map_or(Duration::from_millis(100), |d| {
@@ -279,7 +284,8 @@ pub(crate) fn spawn_poll_loop(
 
 /// Per-connection state machine:
 ///  * On first ESTABLISHED, spawn the RPC relay agent.
-///  * Drain smoltcp's recv buffer into the `to_host` channel.
+///  * Drain smoltcp's recv buffer into the `to_host` channel. If the
+///    agent is gone, discard further guest bytes instead (`discard_rx`).
 ///  * Pump `from_host_rx` into smoltcp's tx buffer (with leftover
 ///    bytes parked in `pending_tx` on partial writes).
 ///  * Half-close: once the guest FIN'd and recv is drained, drop
@@ -319,13 +325,33 @@ fn run_fsm(
         // we have both data and channel capacity.
         if let Some(tx) = conn.to_host.clone() {
             while sock.can_recv() {
-                let Ok(permit) = tx.try_reserve() else { break };
+                let permit = match tx.try_reserve() {
+                    Ok(permit) => permit,
+                    Err(mpsc::error::TrySendError::Full(())) => break,
+                    // Reachable only if the RPC connect failed or a
+                    // host-side send errored — the agent's normal exit
+                    // only drops `to_host_rx` after `to_host` is
+                    // already None. Nobody will drain this channel
+                    // again; discard further bytes so the window
+                    // doesn't stay closed.
+                    Err(mpsc::error::TrySendError::Closed(())) => {
+                        conn.to_host = None;
+                        conn.discard_rx = true;
+                        break;
+                    }
+                };
                 let recv = sock.recv(|buf| (buf.len(), Bytes::copy_from_slice(buf)));
                 match recv {
                     Ok(bytes) if !bytes.is_empty() => permit.send(bytes),
                     _ => break,
                 }
             }
+        }
+
+        // Relay agent gone but no FIN from the guest yet: drop further
+        // guest bytes instead of leaving the window closed.
+        if conn.discard_rx {
+            while sock.can_recv() && sock.recv(|b| (b.len(), ())).is_ok() {}
         }
 
         // If the guest half-closed (FIN received and recv buffer
@@ -411,16 +437,22 @@ async fn relay_agent(
         .reverse(*dst.ip())
         .unwrap_or_else(|| dst.ip().to_string());
 
-    let server_sink = capnp_rpc::new_client(ChannelSink::with_notify(from_host_tx, wake));
+    let server_sink = capnp_rpc::new_client(ChannelSink::with_notify(from_host_tx, wake.clone()));
     let client_sink = match rpc_connect_tcp(&network, &hostname, dst.port(), server_sink).await {
         Ok(sink) => sink,
         Err(e) => {
             debug!("tcp-proxy rpc {hostname}:{}: {e}", dst.port());
+            // `to_host_rx` drops here with no agent left to drain it;
+            // wake the poll loop so run_fsm notices `to_host` closed.
+            wake.notify_one();
             return;
         }
     };
 
     while let Some(data) = to_host_rx.recv().await {
+        // Wake the poll loop now that a `to_host` slot is free, so it
+        // can refill it while we await the RPC send below.
+        wake.notify_one();
         let mut req = client_sink.send_request();
         req.get().set_data(&data);
         if req.send().await.is_err() {
@@ -428,6 +460,8 @@ async fn relay_agent(
         }
     }
     let _ = client_sink.close_request().send().promise.await;
+    // Same as above: wake so run_fsm notices `to_host` closed.
+    wake.notify_one();
 }
 
 /// Drain every packet from the TUN, SYN-snoop to register listeners,
@@ -464,6 +498,7 @@ fn drain_rx(
                             agent_spawned: false,
                             pending_tx: None,
                             host_closed: false,
+                            discard_rx: false,
                         },
                     );
                 }

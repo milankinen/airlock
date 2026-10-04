@@ -165,6 +165,16 @@ impl ChannelSink {
     }
 }
 
+impl Drop for ChannelSink {
+    /// The host can release this capability without calling `close()`
+    /// — a denied/failed connect, or an error/reset — which drops
+    /// `tx` silently. Wake on drop too, so the poll loop still
+    /// observes the resulting `Disconnected`.
+    fn drop(&mut self) {
+        self.wake();
+    }
+}
+
 impl tcp_sink::Server for ChannelSink {
     async fn send(self: Rc<Self>, params: tcp_sink::SendParams) -> Result<(), capnp::Error> {
         let data = params.get()?.get_data()?;

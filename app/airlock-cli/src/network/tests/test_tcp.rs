@@ -1,7 +1,19 @@
+use std::cell::Cell;
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
+
 use axum::Router;
 use axum::routing::{get, post};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::Notify;
 
 use super::helpers::*;
+use crate::network::io::Transport;
+use crate::network::tcp;
 
 #[test]
 fn plain_http_get() {
@@ -99,4 +111,102 @@ fn large_response() {
             resp.len()
         );
     });
+}
+
+// ── Relay shutdown backpressure ─────────────────────────
+
+/// Keeps offering one byte, then yields, forever — standing in for a guest
+/// that keeps re-offering an upload as long as something keeps reading it.
+/// Pings `drained` every time a byte is actually handed out.
+struct AlwaysReady {
+    drained: Arc<Notify>,
+    ready: Cell<bool>,
+}
+
+impl AsyncRead for AlwaysReady {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.ready.replace(!self.ready.get()) {
+            buf.put_slice(b"x");
+            self.drained.notify_one();
+            Poll::Ready(Ok(()))
+        } else {
+            // Yield every other poll so a caller that never stops reading
+            // (like `relay`'s drain loop) can't spin forever on one future.
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
+/// `shutdown` only completes once `drained` fires once — standing in for
+/// `RpcTransport::poll_shutdown` waiting on a `close` ack that itself needs
+/// the peer to keep draining.
+struct GatedShutdown {
+    drained: Arc<Notify>,
+    waiting: Option<Pin<Box<dyn Future<Output = ()>>>>,
+}
+
+impl AsyncWrite for GatedShutdown {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.waiting.is_none() {
+            let drained = self.drained.clone();
+            self.waiting = Some(Box::pin(async move { drained.notified().await }));
+        }
+        match self.waiting.as_mut().unwrap().as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(Ok(())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+#[tokio::test]
+async fn relay_drains_container_so_gated_shutdown_does_not_hang() {
+    let drained = Arc::new(Notify::new());
+    let container = Transport {
+        read: Box::new(AlwaysReady {
+            drained: drained.clone(),
+            // Start not ready: if the main loop's c2s read handed out a byte
+            // first, its stored `Notify` permit would open the gate without
+            // the shutdown-phase drain ever running.
+            ready: Cell::new(false),
+        }),
+        write: Box::new(GatedShutdown {
+            drained,
+            waiting: None,
+        }),
+        h2: false,
+    };
+    // The server side closes immediately, which is what ends the relay's
+    // main loop and kicks off the shutdown this test is exercising.
+    let server = Transport {
+        read: Box::new(tokio::io::empty()),
+        write: Box::new(tokio::io::sink()),
+        h2: false,
+    };
+
+    // Without draining `container.read`, `GatedShutdown` never sees its
+    // one required notification and `relay` would hang for the full
+    // `RELAY_SHUTDOWN_TIMEOUT` (30s). A couple of seconds of headroom is
+    // generous for CI while still failing fast if the drain regresses.
+    let result = tokio::time::timeout(Duration::from_secs(2), tcp::relay(container, server)).await;
+    assert!(
+        result.is_ok(),
+        "relay should finish once its drain unblocks the gated shutdown"
+    );
 }
