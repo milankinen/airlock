@@ -4,9 +4,17 @@
 
 The supervisor (`airlockd`) does not use an OCI runtime. After
 assembling the overlayfs rootfs, it spawns container processes
-directly via fork + chroot + exec:
+directly via fork + setns + exec:
 
-- **chroot** into the assembled overlayfs rootfs.
+- **Sandbox mount namespace.** After init assembles the overlayfs
+  rootfs, the supervisor creates one shared mount namespace. It uses
+  `pivot_root` to make the rootfs the root of this namespace, as OCI
+  runtimes do. Then it removes the VM root and all VM mounts from the
+  namespace. Each container process joins this namespace with
+  `setns`. A process that joins the namespace later (`docker exec`,
+  `nsenter -m`) also gets the container rootfs as its root, not the
+  VM root. If the supervisor cannot create the namespace, it uses
+  `chroot` into the rootfs.
 - **uid/gid** switched to the container user (read from `start` RPC
   params). The host resolves the image's `USER` the same way Docker
   does: it looks up names in the image's own `/etc/passwd` and
@@ -94,7 +102,7 @@ without rebooting the VM. The flow:
    resolved base env (image env + `airlock.toml` env resolved once at
    start) and forwards the call to the in-VM supervisor over the
    existing vsock.
-4. The supervisor forks a new process inside the container's chroot
+4. The supervisor forks a new process inside the sandbox mount namespace
    and relays stdio back to the `airlock exec` terminal through a
    bridge that translates between the Unix-socket RPC and the vsock
    RPC.

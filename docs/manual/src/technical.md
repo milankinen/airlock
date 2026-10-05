@@ -135,7 +135,7 @@ The static picture: what runs where, and how the pieces talk.
   </g>
   <rect class="arch-box" x="412" y="308" width="322" height="60" rx="6"/>
   <text x="428" y="332" class="arch-sub">container process</text>
-  <text x="428" y="354" class="arch-item">cmd running under chroot + uid/gid</text>
+  <text x="428" y="354" class="arch-item">cmd in sandbox mount ns + uid/gid</text>
   <path class="arch-arrow-line" d="M 350,142 C 378,142 384,218 412,218" marker-end="url(#arch-arrow)" marker-start="url(#arch-arrow-start)"/>
   <rect x="344" y="168" width="82" height="16" class="arch-label-bg"/>
   <text x="385" y="180" class="arch-conn" text-anchor="middle">vsock · RPC</text>
@@ -147,7 +147,7 @@ The static picture: what runs where, and how the pieces talk.
   <text x="573" y="143" class="arch-conn" text-anchor="middle">exec</text>
   <path class="arch-arrow-line" d="M 573,288 L 573,308" marker-end="url(#arch-arrow)"/>
   <rect x="536" y="292" width="74" height="14" class="arch-label-bg"/>
-  <text x="573" y="303" class="arch-conn" text-anchor="middle">chroot + exec</text>
+  <text x="573" y="303" class="arch-conn" text-anchor="middle">setns + exec</text>
   <path class="arch-arrow-line" d="M 722,308 C 722,298 722,298 722,288" marker-end="url(#arch-arrow)" stroke-dasharray="3 3"/>
   <rect x="653" y="292" width="132" height="14" class="arch-label-bg"/>
   <text x="722" y="303" class="arch-conn" text-anchor="middle">TUN → TCP proxy</text>
@@ -238,7 +238,7 @@ in time.
   <rect class="flow-event" x="520" y="116" width="90" height="28" rx="4"/>
   <text x="565" y="135" class="flow-text" text-anchor="middle">start RPC</text>
   <rect class="flow-event" x="590" y="296" width="110" height="28" rx="4"/>
-  <text x="645" y="315" class="flow-text" text-anchor="middle">chroot + exec</text>
+  <text x="645" y="315" class="flow-text" text-anchor="middle">setns + exec</text>
   <rect class="flow-event" x="630" y="356" width="90" height="28" rx="4"/>
   <text x="675" y="375" class="flow-text" text-anchor="middle">process runs</text>
   <rect class="flow-event" x="630" y="116" width="90" height="28" rx="4"/>
@@ -260,4 +260,4 @@ The invocation walks up the directory tree to `cli.sock` and hands
 `(cmd, args, cwd, env overrides)` to the CLI server. The CLI server
 merges the overrides onto the sandbox's base env and forwards the
 call over the existing vsock to `airlockd`. `airlockd` forks a new
-process inside the container's chroot.
+process inside the sandbox mount namespace.

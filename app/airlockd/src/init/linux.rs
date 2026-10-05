@@ -76,5 +76,12 @@ pub fn setup(
     //    inside dir-bind-mounted directories (e.g. guest_cwd).
     container::setup(mounts, nested_virt)?;
 
+    // 9. The sandbox mount namespace, built from the finished rootfs so it
+    //    carries every mount above. Without it spawns fall back to chroot,
+    //    which works except for setns-based entry (`docker exec`).
+    if let Err(e) = crate::sandbox_ns::create() {
+        tracing::warn!("{e:#}; falling back to chroot");
+    }
+
     Ok(())
 }

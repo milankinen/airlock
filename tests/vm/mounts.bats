@@ -68,3 +68,9 @@ EOF
     [[ "$(cat rw_file.txt)" == "updated-by-guest" ]]
     [[ "$(cat ro_file.txt)" == "ro-file-content" ]]
 }
+
+@test "joining sandbox mount namespace with setns lands in container rootfs" {
+    run_vm sh -c 'nsenter --mount=/proc/self/ns/mnt -- sh -c "test -e /mnt/overlay && echo LEAK || echo CONTAINED"'
+    assert_success
+    assert_output_contains "CONTAINED"
+}

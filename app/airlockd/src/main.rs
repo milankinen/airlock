@@ -17,6 +17,7 @@ mod logging;
 mod net;
 mod process;
 mod rpc;
+mod sandbox_ns;
 mod stats;
 #[cfg(test)]
 mod test_cfg;

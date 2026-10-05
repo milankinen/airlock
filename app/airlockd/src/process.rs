@@ -28,7 +28,7 @@ fn own_children() -> &'static Mutex<HashSet<i32>> {
 }
 
 /// Record a PID airlockd spawned itself, so the orphan reaper leaves it alone.
-fn register_own_child(pid: u32) {
+pub(crate) fn register_own_child(pid: u32) {
     own_children().lock().unwrap().insert(pid as i32);
 }
 
@@ -245,8 +245,8 @@ fn finish_diag_pipe<T>(diag_r: i32, diag_w: i32, result: anyhow::Result<T>) -> a
     result
 }
 
-/// Build the post-fork/pre-exec hook: harden → chroot → chdir → setgid →
-/// setuid. On any hard failure it writes a short step tag to `diag_w`
+/// Build the post-fork/pre-exec hook: setns (or chroot) → harden → chdir →
+/// setgid → setuid. On any hard failure it writes a short step tag to `diag_w`
 /// so the parent can attach it as context.
 fn build_pre_exec(
     cwd: String,
@@ -259,6 +259,9 @@ fn build_pre_exec(
     // so the signature stays stable across platforms.
     #[cfg(not(target_os = "linux"))]
     let _ = harden;
+    // Allocate before fork: the hook itself may only make raw syscalls.
+    let rootfs = std::ffi::CString::new(crate::sandbox_ns::ROOTFS).unwrap();
+    let ns_fd = crate::sandbox_ns::fd();
 
     move || {
         // Save errno first, then write the step tag (write(2) might change it).
@@ -272,6 +275,24 @@ fn build_pre_exec(
                 return Err(err);
             }};
         }
+
+        // Enter the container rootfs: join the shared sandbox mount namespace
+        // (its root *is* the rootfs, see `crate::sandbox_ns`), or chroot when
+        // init could not build it. setns must come before the hardening
+        // unshare below, which then takes a private copy of this namespace.
+        // setns also moves the cwd to the new root; the chdir below fixes it.
+        #[cfg(target_os = "linux")]
+        let entered = match ns_fd {
+            Some(fd) => {
+                if unsafe { libc::setns(fd, libc::CLONE_NEWNS) } != 0 {
+                    fail!(b"setns(sandbox mount ns)");
+                }
+                true
+            }
+            None => false,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let entered = false;
 
         #[cfg(target_os = "linux")]
         if harden {
@@ -288,9 +309,7 @@ fn build_pre_exec(
             unsafe { libc::unshare(libc::CLONE_NEWUTS) };
         }
 
-        // chroot into the assembled container rootfs
-        let rootfs = std::ffi::CString::new("/mnt/overlay/rootfs").unwrap();
-        if unsafe { libc::chroot(rootfs.as_ptr()) } != 0 {
+        if !entered && unsafe { libc::chroot(rootfs.as_ptr()) } != 0 {
             fail!(b"chroot(/mnt/overlay/rootfs)");
         }
         // chdir to the container working directory (fall back to / if missing)
