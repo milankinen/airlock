@@ -1,0 +1,3 @@
+label = "copilot"
+description = "GitHub Copilot"
+kind = "agent"

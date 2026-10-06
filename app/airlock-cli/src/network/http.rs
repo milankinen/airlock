@@ -30,7 +30,8 @@ use tracing::{debug, trace};
 use crate::network::http::executor::LocalExecutor;
 use crate::network::http::senders::{H1Sender, H2Sender, RequestSender};
 use crate::network::http::upgrade::Upgrade;
-use crate::network::target::ResolvedTarget;
+use crate::network::interceptor::Next;
+use crate::network::target::{Endpoint, ResolvedTarget};
 use crate::network::{DenyReporter, io, tcp};
 
 const MAX_DETECT_SIZE: usize = 4096;
@@ -76,7 +77,9 @@ pub async fn detect(reader: &mut (impl AsyncRead + Unpin)) -> Result<Bytes, Byte
     }
 }
 
-type ResponseBody = Either<Incoming, Full<Bytes>>;
+/// Request and response bodies on the relay's send path: streamed from
+/// the peer, or built by the proxy.
+pub type ResponseBody = Either<Incoming, Full<Bytes>>;
 
 /// hyper IO over a boxed read/write pair — both guest and upstream sides.
 type HyperIo = TokioIo<tokio::io::Join<io::BoxRead, io::BoxWrite>>;
@@ -136,6 +139,9 @@ pub async fn relay(
 
     let middleware = target.middleware;
     let secrets = target.secrets;
+    let interceptor = target.interceptor;
+    // The interceptor's view of where the guest connected.
+    let endpoint = Rc::new(Endpoint::new(&target.host, target.port));
     let target_host = target.host.clone();
     let target_port = target.port;
     let allowed = target.allowed;
@@ -144,6 +150,8 @@ pub async fn relay(
         let sender = sender.clone();
         let middleware = middleware.clone();
         let secrets = secrets.clone();
+        let interceptor = interceptor.clone();
+        let endpoint = endpoint.clone();
         let events = events.clone();
         let target_host = target_host.clone();
         let deny_reporter = deny_reporter.clone();
@@ -158,17 +166,33 @@ pub async fn relay(
             }
             let method = req.method().clone();
             let connect_host: std::rc::Rc<str> = std::rc::Rc::from(target_host.as_str());
+            // The innermost step: an interceptor that owns the host (after
+            // middleware, so scripts and the monitor see its surrogates
+            // only), then the upstream.
             let send = {
                 let (upgrade, method) = (upgrade.clone(), method.clone());
-                move |req| {
-                    let sender = sender.clone();
-                    async move {
-                        let resp = sender.send(req).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-                        if wants_upgrade {
-                            upgrade.upstream_replied(&method, &resp);
+                let injected = secrets.clone();
+                move |req| async move {
+                    let upstream: Next = Box::new(move |req| {
+                        Box::pin(async move {
+                            let resp =
+                                sender.send(req).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                            Ok(resp.map(Either::Left))
+                        })
+                    });
+                    let resp = match interceptor {
+                        Some(interceptor) => {
+                            trace!("interceptor {}: {}", interceptor.name(), endpoint.host());
+                            interceptor
+                                .send(&endpoint, req, &injected, upstream)
+                                .await?
                         }
-                        Ok(resp)
+                        None => upstream(req).await?,
+                    };
+                    if wants_upgrade {
+                        upgrade.upstream_replied(&method, &resp);
                     }
+                    Ok(resp)
                 }
             };
             // Unmask before middleware so scripts observe the real request;

@@ -2,7 +2,8 @@
 
 Minimalistic example how to run a full Docker engine inside the
 sandbox as an airlock daemon and make (dockerized) app port
-available in the host machine.
+available in the host machine. The built-in `docker` preset
+configures the daemon and the registry network rules.
 
 See the [user manual](../../docs/manual/src/tips/docker.md) for
 more details.

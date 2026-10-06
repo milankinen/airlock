@@ -1,10 +1,10 @@
 use smart_config::ByteSize;
 
-use crate::config::load_config::parse_config;
+use crate::config::config_values;
 
-fn parse(toml_str: &str) -> anyhow::Result<crate::config::Config> {
+fn parse(toml_str: &str) -> anyhow::Result<crate::config::config_values::ConfigValues> {
     let value: serde_json::Value = toml::from_str(toml_str).unwrap();
-    parse_config(value)
+    config_values::parse(value)
 }
 
 /// Both directions must be off when the section is absent — the clipboard

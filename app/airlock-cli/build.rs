@@ -24,6 +24,13 @@ fn main() {
         println!("cargo:rerun-if-changed=../../target/vm/virtiofsd");
     }
 
+    // The built-in packs (`include_dir!` in `src/packs/builtin.rs`):
+    // cargo scans the directory, so new files rebuild too.
+    println!("cargo:rerun-if-changed=../../packs");
+    // The released list-form presets (`include_dir!` in
+    // `src/config/legacy_presets.rs`).
+    println!("cargo:rerun-if-changed=src/config/presets");
+
     let checksum = format!("{:016x}", hasher.finish());
     println!("cargo:rustc-env=AIRLOCK_ASSETS_CHECKSUM={checksum}");
 

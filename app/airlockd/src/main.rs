@@ -2,10 +2,14 @@
 //!
 //! Runs as PID 1 inside the guest Linux VM. Accepts two vsock
 //! connections from the host CLI — the supervisor RPC channel and the
-//! network-proxy RPC channel — bootstraps the guest environment
-//! (mounts, networking, DNS), and spawns the user's command.
+//! network-proxy RPC channel — and bootstraps the guest environment
+//! (mounts, networking, DNS) on the first `boot` call. Boot starts no
+//! process; the main shell and `airlock exec` both run afterwards via
+//! `spawn`.
 
 mod admin;
+mod bridge;
+mod browser;
 mod clipboard;
 mod daemon;
 mod init;
@@ -35,8 +39,9 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Single-connection lifecycle: accept the host CLI connections
-/// (supervisor + network), set up the guest, run the user's process,
-/// then idle until the VM is torn down.
+/// (supervisor + network), set up the guest on `boot`, then idle — as
+/// PID 1 — until the VM is torn down. Processes (the main shell,
+/// `airlock exec`) run via `spawn`, driven entirely from the host.
 async fn airlockd() -> anyhow::Result<()> {
     // As PID 1 we must reap orphaned zombies (e.g. double-forking daemons);
     // start the reaper before anything spawns processes.
@@ -59,7 +64,7 @@ async fn airlockd() -> anyhow::Result<()> {
     let admin_state = admin::AdminState::new();
     let deny_tracker = admin_state.deny_tracker.clone();
 
-    let exit_code = rpc::start(sup_conn, deny_tracker, network, async |cfg| {
+    rpc::serve(sup_conn, deny_tracker, network, async |cfg| {
         logging::init(cfg.log_sink, &cfg.log_filter);
 
         info!("setup vm");
@@ -81,6 +86,7 @@ async fn airlockd() -> anyhow::Result<()> {
         net::start_tcp_proxy(cfg.network.clone(), dns)?;
         admin::start(admin_state.clone()).await?;
         clipboard::start(cfg.clipboard, cfg.uid, cfg.gid)?;
+        browser::start(cfg.browser, cfg.uid, cfg.gid)?;
 
         if !cfg.daemons.is_empty() {
             info!("starting {} daemon(s)", cfg.daemons.len());
@@ -88,27 +94,16 @@ async fn airlockd() -> anyhow::Result<()> {
             *cfg.daemon_set_slot.borrow_mut() = Some(set);
         }
 
-        info!("start: {} {}", cfg.cmd, cfg.args.join(" "));
-        let proc = process::spawn_user(
-            &cfg.cmd,
-            &cfg.args,
-            &cfg.env,
-            &cfg.cwd,
-            cfg.uid,
-            cfg.gid,
-            cfg.harden,
-            cfg.pty_size,
-        )?;
-        info!("main process started");
+        info!("boot complete");
 
-        Ok(proc)
+        Ok(())
     })
     .await?;
 
-    info!("main process done, exit_code = {exit_code}");
-
-    // Keep supervisor alive until the CLI kills the VM — the main process is
-    // done but sidecar `exec` processes may still be running.
+    // Keep the supervisor alive until the CLI kills the VM — PID 1 idles
+    // here whether boot succeeded (the main process and `airlock exec`
+    // run via `spawn`, driven from the host) or failed (the host saw the
+    // RPC error and decides whether to tear the VM down).
     std::future::pending::<()>().await;
 
     Ok(())

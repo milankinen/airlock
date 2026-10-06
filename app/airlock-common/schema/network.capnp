@@ -8,7 +8,7 @@
 #
 # The guest receives this interface as the bootstrap capability of
 # the network-side Cap'n Proto connection — it is not passed through
-# `Supervisor.start` anymore.
+# `Supervisor.boot` anymore.
 interface NetworkProxy {
   connect @0 (target :ConnectTarget, client :TcpSink)
     -> (result :ConnectResult);

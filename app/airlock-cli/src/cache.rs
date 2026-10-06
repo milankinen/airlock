@@ -2,6 +2,9 @@
 //!
 //! The global cache holds VM boot assets (under `vm/`) and an `oci/` subtree
 //! with extracted OCI image rootfs trees and individual OCI layer trees.
+//! Under `packs/mounts/<name>/`, each pack with a `config.lua` has a
+//! directory of its own for the host side of its mounts (see
+//! [`pack_mounts_dir`]).
 //! Per-sandbox state (CA, disk image, overlay, etc.) lives in
 //! `<project>/.airlock/sandbox/` — see `sandbox.rs`.
 
@@ -49,6 +52,18 @@ pub fn cache_dir() -> anyhow::Result<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
     let dir = home.join(".cache").join("airlock");
     std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// The directory of the pack `name` (`~/.cache/airlock/packs/mounts/<name>/`),
+/// created if absent. The pack's `config.lua` gets it as `pack.directory`
+/// and keeps the host side of its mounts there (for example the agents'
+/// settings and credential files), shared by all sandboxes that use the
+/// pack.
+pub fn pack_mounts_dir(name: &str) -> anyhow::Result<PathBuf> {
+    let dir = cache_dir()?.join("packs").join("mounts").join(name);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.display()))?;
     Ok(dir)
 }
 

@@ -1,0 +1,17 @@
+label = "python"
+description = "Python and the uv package manager"
+kind = "tool"
+
+[[args]]
+key = "python-version"
+type = "choice"
+description = "version"
+default = "latest"
+values = ["latest", "3.13", "3.12", "none"]
+other = true
+
+[[args]]
+key = "pypi-installs"
+type = "bool"
+description = "allow pypi"
+default = true

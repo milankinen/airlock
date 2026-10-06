@@ -45,7 +45,7 @@ impl Storage for FileStorage {
         atomic_write(&self.path, json.as_bytes())
     }
 
-    fn lock_path(&self) -> Option<PathBuf> {
-        Some(self.path.with_extension("lock"))
+    fn lock_path(&self) -> anyhow::Result<Option<PathBuf>> {
+        Ok(Some(self.path.with_extension("lock")))
     }
 }

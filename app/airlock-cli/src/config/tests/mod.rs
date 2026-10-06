@@ -1,9 +1,15 @@
+mod test_agents;
 mod test_clipboard;
 mod test_daemons;
 mod test_env;
+mod test_generated;
 mod test_image_ref;
+mod test_layers;
+mod test_legacy_presets;
 mod test_load;
 mod test_merge;
 mod test_network_targets;
-mod test_presets;
+mod test_pack_entries;
+mod test_packs;
+mod test_services;
 mod test_vm;

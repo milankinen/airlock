@@ -371,7 +371,12 @@ impl AppleVmBackend {
         Ok(())
     }
 
-    #[allow(dead_code)]
+    /// Stop the VM and wait for Virtualization.framework to confirm it. A VM
+    /// that is already stopped (the guest powered off, or it stopped on an
+    /// error) counts as confirmed. Called by `VmInstance::shutdown`; `Drop`
+    /// then finds nothing left to stop (`canStop` is false). The macOS test
+    /// build sees no caller, so it reports this method as dead code.
+    #[cfg_attr(test, allow(dead_code))]
     pub async fn stop(&mut self) -> anyhow::Result<()> {
         let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<(), String>>();
         let tx = Arc::new(Mutex::new(Some(tx)));
@@ -403,6 +408,15 @@ impl AppleVmBackend {
                 });
                 unsafe {
                     let vm = &*vm_raw;
+                    let state = vm.state();
+                    if state == VZVirtualMachineState::Stopped
+                        || state == VZVirtualMachineState::Error
+                    {
+                        if let Some(s) = tx_body.lock().unwrap().take() {
+                            let _ = s.send(Ok(()));
+                        }
+                        return;
+                    }
                     vm.stopWithCompletionHandler(&handler);
                 }
             }));

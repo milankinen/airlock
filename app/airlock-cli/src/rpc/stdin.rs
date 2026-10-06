@@ -66,7 +66,8 @@ impl stdin::Server for Stdin {
                         results.get().init_input().init_stdin().set_eof(());
                     }
                     Ok(n) => {
-                        tracing::trace!("host stdin: {} bytes: {:?}", n, String::from_utf8_lossy(&buf[..n]));
+                        // Byte count only: stdin may carry secrets (a pasted token).
+                        tracing::trace!("host stdin: {n} bytes");
                         results.get().init_input().init_stdin().set_data(&buf[..n]);
                     }
                 }

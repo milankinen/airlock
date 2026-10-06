@@ -1,0 +1,3 @@
+label = "git"
+description = "Git with an SSH client"
+kind = "tool"

@@ -1,31 +1,23 @@
 //! `airlock start` — boot the VM and run the container.
 //!
-//! Orchestrates the full lifecycle: load config → pull OCI image → set up
-//! network rules → boot VM → start supervisor RPC → relay I/O → clean up.
-
-use std::io::Write;
+//! The steps are in [`crate::start`]: the system check, the setup wizard
+//! for a project without config, the config, the stored sandbox (image,
+//! disk, the tool decisions) and the tools' install (an install boot, see
+//! [`crate::packs::install::setup`]). Then the sandbox session
+//! ([`crate::start::run::run_sandbox`]): network rules → boot VM → start
+//! supervisor RPC → relay I/O → ordered shutdown.
 
 use clap::Args;
-use dialoguer::Select;
-use dialoguer::theme::ColorfulTheme;
-use tracing::info;
-use tracing_subscriber::EnvFilter;
 
-use crate::cli::{self, CliArgs, LogLevel};
-use crate::runtime::{MonitorRuntime, RawTerminalRuntime, Runtime, Terminal};
-use crate::vault::Vault;
-use crate::{cli_server, config, daemon, masking, network, oci, project, rpc, runtime, vm};
-
-/// Default `airlock.toml` written when initializing a new sandbox.
-const DEFAULT_CONFIG: &str = "[vm]\n# image = \"alpine:latest\"\n";
-
-/// Upper bound on how long we wait for the guest to stop daemons and flush
-/// filesystems during shutdown before forcing the VM down. Generous enough for
-/// a healthy guest's sync, but bounded so a wedged guest can't hang the CLI.
-const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+use crate::cli::{self, LogLevel};
+use crate::config::config_values::Policy;
+use crate::context::Context;
+use crate::runtime::HostRuntime;
+use crate::{config, packs, project, start};
 
 /// CLI arguments for `airlock start`.
 #[derive(Args, Debug)]
+#[allow(clippy::struct_excessive_bools)] // independent flags
 pub struct StartArgs {
     /// Log level
     #[arg(long, env = "AIRLOCK_LOG_LEVEL", default_value = "info")]
@@ -44,519 +36,98 @@ pub struct StartArgs {
     pub monitor: bool,
     /// Override the `[network] policy` from the config for this run only
     #[arg(long, value_name = "POLICY")]
-    pub network: Option<config::config::Policy>,
+    pub network: Option<Policy>,
+    /// Answer every sandbox question with its default (re-create the sandbox)
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+}
+
+impl StartArgs {
+    /// The options of the sandbox and install steps.
+    fn sandbox_options(&self) -> start::SandboxOptions {
+        start::SandboxOptions {
+            yes: self.yes,
+            log_level: self.log_level,
+            verbose: self.verbose,
+        }
+    }
+
+    /// The config overrides of `--network`, for [`config::LayeredConfig::resolve`].
+    fn config_overrides(&self) -> config::ConfigOverrides {
+        config::ConfigOverrides {
+            network_policy: self.network,
+        }
+    }
 }
 
 /// Entry point for `airlock start [--log-level <level>] [-- extra-args...]`.
 pub async fn main(
     args: StartArgs,
     extra_args: Vec<String>,
-    vault: Vault,
-    settings: &crate::settings::Settings,
+    context: Context,
 ) -> anyhow::Result<i32> {
     cli::set_verbose(args.verbose);
-
-    #[cfg(target_os = "linux")]
-    vm::require_kvm();
-
-    let host_cwd = match std::env::current_dir() {
-        Ok(p) => std::fs::canonicalize(&p).unwrap_or(p),
-        Err(e) => {
-            cli::error!("Cannot determine current directory: {e}");
-            return Ok(1);
-        }
-    };
-
-    // Step 1: Create .airlock/ directory and initialize logging early
-    // so that config loading and preset resolution are observable.
-    let cache_dir = match project::ensure_cache_dir(&host_cwd) {
-        Ok(d) => d,
-        Err(e) => {
-            cli::error!("Failed to create .airlock directory: {e}");
-            return Ok(1);
-        }
-    };
-    setup_logging(args.log_level, &cache_dir);
-    info!("airlock version {}", cli::version_string(true));
-
-    // Step 2: Load config and start the VM
-    let has_config = ["toml", "json", "yaml", "yml"].iter().any(|ext| {
-        host_cwd.join(format!("airlock.{ext}")).exists()
-            || host_cwd.join(format!("airlock.local.{ext}")).exists()
-    });
-    if !has_config {
-        if !cli::is_interactive() {
-            cli::error!("No airlock.toml found in {}", host_cwd.display());
-            return Ok(2);
-        }
-        let selection = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt(format!("No airlock.toml found in {}", host_cwd.display()))
-            .items(["Initialize with defaults", "Cancel"])
-            .default(0)
-            .interact()
-            .unwrap_or(1);
-        if selection != 0 {
-            cli::error!("Aborted.");
-            return Ok(0);
-        }
-        if let Err(e) = std::fs::write(host_cwd.join("airlock.toml"), DEFAULT_CONFIG) {
-            cli::error!("Failed to create airlock.toml: {e}");
-            return Ok(1);
-        }
-        cli::log!("Created airlock.toml in {}", host_cwd.display());
-    }
-
-    let mut config = match config::load(&host_cwd) {
-        Ok(c) => c,
-        Err(e) => {
-            cli::error!("Config error: {e:#}");
-            return Ok(2);
-        }
-    };
-    // `--network` replaces the policy only; rules, middleware, ports, and
-    // sockets from the config still apply. Everything downstream sees the
-    // overridden config as if it came from the file.
-    if let Some(policy) = args.network {
-        info!("network policy overridden by --network: {}", policy.label());
-        config.network.policy = policy;
-    }
-
-    let cli_args = CliArgs::new(args.log_level, extra_args, args.login);
-    let sandbox_cwd = args.sandbox_cwd;
-    if args.monitor {
-        let keys = match crate::settings::keys::into_bindings(&settings.monitor.keys) {
-            Ok(b) => b,
-            Err(e) => {
-                cli::error!("invalid monitor key bindings:\n{e}");
-                return Ok(2);
-            }
-        };
-        let monitor_settings = airlock_monitor::TuiSettings {
-            max_http_requests: settings.monitor.buffers.http,
-            max_tcp_connections: settings.monitor.buffers.tcp,
-            scrollback: settings.monitor.buffers.scrollback,
-            keys,
-        };
-        run(
-            cli_args,
-            config,
-            host_cwd,
-            sandbox_cwd,
-            vault,
-            MonitorRuntime::new(monitor_settings),
-        )
-        .await
-    } else {
-        run(
-            cli_args,
-            config,
-            host_cwd,
-            sandbox_cwd,
-            vault,
-            RawTerminalRuntime::new(),
-        )
-        .await
-    }
+    start::Exit::into_result(Box::pin(run(args, extra_args, context)).await)
 }
 
 async fn run(
-    args: CliArgs,
-    config: config::Config,
-    host_cwd: std::path::PathBuf,
-    project_cwd: Option<String>,
-    vault: Vault,
-    mut runtime: impl Runtime,
-) -> anyhow::Result<i32> {
-    // `lock` also resolves `[env]` (host substitution + surrogates for
-    // masked entries), so a missing variable fails before the image pull.
-    // That is a configuration error like the ones reported above, so it
-    // keeps their exit code rather than the generic runtime failure.
-    let project = match project::lock(host_cwd, config, project_cwd, vault) {
-        Ok(p) => p,
-        Err(e) if e.downcast_ref::<project::EnvError>().is_some() => {
-            cli::error!("Config error: {e:#}");
-            return Ok(2);
-        }
-        Err(e) => return Err(e),
-    };
-    print_preparing(&project);
+    args: StartArgs,
+    extra_args: Vec<String>,
+    context: Context,
+) -> Result<i32, start::Exit> {
+    start::check_system_requirements();
+    let host_cwd = start::resolve_host_cwd()?;
+    start::init_logging(&host_cwd, args.log_level)?;
 
-    let image = oci::prepare(&project).await?;
-    let container_home = oci::effective_container_home(&project, &image);
-    let network = network::setup(&project, &container_home)?;
-
-    print_mounts_and_rules(&project);
-
-    // Check if user interrupted during setup (e.g. Ctrl+C during download)
-    if cli::is_interrupted() {
-        return Ok(130); // 128 + SIGINT
-    }
-
-    // Bind reverse port forward listeners before booting the VM so that
-    // bind errors (e.g. EADDRINUSE) surface immediately, without the VM
-    // boot output in the way. The listeners are held until the supervisor
-    // is ready, at which point accept loops are spawned against them.
-    let reverse_forwards = network::reverse_forward::bind(
-        network::rules::reverse_port_forwards_from_config(&project.config.network),
-    )
+    let packs = packs::init().map_err(start::Exit::config)?;
+    // A project without config gets the setup wizard; its generated file
+    // is saved once the sandbox is stored.
+    let config = Box::pin(start::wizard::load_or_generate_config(
+        &host_cwd,
+        &packs,
+        &context.vault,
+    ))
     .await?;
-
-    cli::log!("Booting VM...");
-    let (vm, vsock_fd) = vm::start(&args, &project, &image, &container_home).await?;
-    project.save_meta();
-
-    // A Ctrl+C during boot (the vsock connect can retry for ~12s) sets the
-    // interrupt flag, but the boot path doesn't watch it. Catch it here —
-    // before we enter raw mode and invest in supervisor setup — and tear the
-    // freshly-booted VM back down instead of starting an interactive session
-    // the user already cancelled.
-    if cli::is_interrupted() {
-        info!("interrupted during boot; shutting down VM");
-        vm.shutdown().await;
-        return Ok(130); // 128 + SIGINT
-    }
-
-    let supervisor = rpc::Supervisor::connect(vsock_fd)?;
-    network.deny_reporter().attach(supervisor.client());
-
-    // Wire the pre-bound reverse port forward listeners into the now-ready
-    // supervisor. Accept loops run for the lifetime of the tokio local set.
-    network::reverse_forward::serve(reverse_forwards, &supervisor.client());
-
-    let (stdin_client, pty_size) = runtime.attach_stdin()?;
-    let signals = runtime.signals()?;
-
-    // Launch the output sink (enters raw mode for the raw runtime, spawns the
-    // TUI thread for the monitor runtime) before `supervisor.start` consumes
-    // `network`.
-    let mut terminal = runtime.launch(&project, &network, supervisor.clone())?;
-    // When AIRLOCK_PTY_DUMP=1, write all guest PTY output to
-    // <sandbox_dir>/pty.dump for offline replay/diagnosis.
-    let mut pty_dump = pty_dump_file(&project.sandbox_dir);
-
-    let daemon_specs = daemon::build_specs(&project, &vm.env)?;
-    let daemon_names: Vec<String> = daemon_specs.iter().map(|d| d.name.clone()).collect();
-    let mask_specs = masking::build_specs(&project)?;
-
-    // Extract socket-forward metadata before Network is consumed by
-    // the NetworkProxy RPC server.
-    let socket_fwds: Vec<(String, String)> = network
-        .socket_map
-        .iter()
-        .map(|(guest, host)| (host.to_string_lossy().into_owned(), guest.clone()))
-        .collect();
-
-    // Open the dedicated vsock for NetworkProxy RPC and serve `Network`
-    // as its bootstrap capability. Keeps bulk byte relays off the
-    // supervisor channel so pty / stats / daemon traffic can't be
-    // head-of-line-blocked.
-    let network_fd = vm.vsock_connect(airlock_common::NETWORK_PORT).await?;
-    rpc::serve_network(network_fd, network)?;
-
-    // Connected to airlockd - finalize vm init start main proc
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let epoch = now.as_secs();
-    let epoch_nanos = now.subsec_nanos();
-    let proc = supervisor
-        .start(
-            &args,
-            &project,
-            &vm,
-            stdin_client,
-            pty_size,
-            &socket_fwds,
-            epoch,
-            epoch_nanos,
-            &daemon_specs,
-            &mask_specs,
-        )
-        .await?;
-    info!("vm process started");
-
-    // Push the host wall-clock into the guest every minute so the VM
-    // clock stays in sync across host sleeps (laptop lid closed,
-    // suspend). VMs have no RTC, so without this the guest time
-    // drifts by exactly the sleep duration.
-    supervisor.spawn_clock_sync(std::time::Duration::from_mins(1));
-
-    // Start CLI server so `airlock exec` can attach processes to this VM.
-    // The server needs a copy of the sandbox's resolved env so it can layer
-    // `airlock exec -e KEY=VAL` overrides on top without the exec client
-    // having to re-resolve the project.
-    let sock_path = crate::cache::cli_sock_path(&project.sandbox_dir)?;
-    let base_env = vm.env.clone();
-    tokio::task::spawn_local(cli_server::serve(sock_path, supervisor.clone(), base_env));
-
-    spawn_signal_forwarder(signals, proc.clone());
-    let exit_code = poll_proc(&proc, &mut terminal, pty_dump.as_mut()).await;
-    info!("vm process exited, code = {exit_code}");
-
-    let final_code = terminal.exit(exit_code);
-    info!("terminal exit, final code = {final_code}");
-
-    // Give the guest a bounded chance to stop its daemons and flush
-    // filesystems, then tear the VM down regardless. A wedged guest must not
-    // hang shutdown forever — that previously left the user resorting to
-    // SIGKILL, which skips the VM's Drop and orphans cloud-hypervisor /
-    // virtiofsd plus a stale lock file.
-    let graceful = async {
-        if !daemon_names.is_empty() {
-            info!("daemon shutdown");
-            daemon::run_shutdown(&supervisor, &daemon_names).await;
-        }
-        // Sync filesystems before killing VM.
-        info!("supervisor shutdown");
-        supervisor.shutdown().await;
-    };
-    if tokio::time::timeout(SHUTDOWN_TIMEOUT, graceful)
+    let resolved = config
+        .resolve(&packs, &args.config_overrides())
         .await
-        .is_err()
-    {
-        info!("guest shutdown timed out after {SHUTDOWN_TIMEOUT:?}; forcing VM teardown");
-    }
+        .map_err(start::Exit::config)?;
+    // The terminal runtime (bad `[monitor.keys]` fail here).
+    let runtime =
+        HostRuntime::new(args.monitor, &context.settings).map_err(|e| start::Exit::error(2, e))?;
 
-    // Drain file-sync events then destroy VM.
-    info!("vm shutdown");
-    vm.shutdown().await;
-
-    info!("all done, exit");
-    Ok(final_code)
-}
-
-/// Forward host signals (SIGHUP/SIGINT/SIGQUIT/SIGTERM/SIGUSR1/SIGUSR2) to the
-/// guest process on a background task.
-fn spawn_signal_forwarder(mut signals: runtime::SignalStream, proc: rpc::Process) {
-    tokio::task::spawn_local(async move {
-        use futures::StreamExt;
-        while let Some(signum) = signals.next().await {
-            tracing::debug!("forwarding signal {signum} to VM");
-            if let Err(e) = proc.signal(signum).await {
-                tracing::error!("signal forward failed: {e}");
-            }
-        }
-    });
-}
-
-/// Drive the guest process to completion: relay stdout/stderr into `terminal`
-/// (and optional PTY dump) until an Exit event or RPC error is observed.
-async fn poll_proc(
-    proc: &rpc::Process,
-    terminal: &mut impl Terminal,
-    mut pty_dump: Option<&mut std::fs::File>,
-) -> i32 {
-    loop {
-        match proc.poll().await {
-            Ok(rpc::ProcessEvent::Exit(code)) => return code,
-            Ok(rpc::ProcessEvent::Stdout(data)) => {
-                tracing::trace!(
-                    "host stdout: {} bytes: {:?}",
-                    data.len(),
-                    String::from_utf8_lossy(&data)
-                );
-                write_pty_dump(pty_dump.as_deref_mut(), &data);
-                terminal.stdout(&data);
-            }
-            Ok(rpc::ProcessEvent::Stderr(data)) => {
-                tracing::trace!("host stderr: {} bytes", data.len());
-                write_pty_dump(pty_dump.as_deref_mut(), &data);
-                terminal.stderr(&data);
-            }
-            Err(e) => {
-                // poll errors should not happen
-                tracing::error!("host poll error: {e}");
-                return 1;
-            }
-        }
+    let options = args.sandbox_options();
+    let sandbox = Box::pin(start::sandbox::ensure_sandbox(
+        &host_cwd,
+        &packs,
+        &resolved,
+        &options,
+        &context.vault,
+    ))
+    .await?;
+    if let Some(generated) = config.generated_project() {
+        start::wizard::save_config(generated)?;
     }
-}
-
-/// Print the "Preparing sandbox" header with image name and CA cert status.
-fn print_preparing(project: &project::Project) {
-    cli::log!("Preparing sandbox...");
-    cli::log!(
-        "  {} config loaded, image: {}",
-        cli::check(),
-        cli::dim(&project.config.vm.image.name)
-    );
-    if project.ca_newly_generated {
-        cli::log!("  {} ca cert generated", cli::check());
-    }
-}
-
-/// Verbose-only: list enabled mounts, network rules, socket forwards,
-/// and TCP port forwards grouped by kind.
-fn print_mounts_and_rules(project: &project::Project) {
-    if !project.env.is_empty() {
-        cli::verbose!(
-            "  {} env: {} vars ({} masked)",
-            cli::bullet(),
-            project.env.len(),
-            project.env.masked_count()
-        );
-    }
-    let enabled_mounts: Vec<_> = project
-        .config
-        .mounts
-        .iter()
-        .filter(|(_, m)| m.enabled)
-        .collect();
-    if !enabled_mounts.is_empty() {
-        cli::verbose!("  {} mounts: {}", cli::bullet(), enabled_mounts.len());
-        for (key, mount) in &enabled_mounts {
-            cli::verbose!("      {key}: {} \u{2192} {}", mount.source, mount.target);
-        }
-    }
-    let enabled_rules: Vec<_> = project
-        .config
-        .network
-        .rules
-        .iter()
-        .filter(|(_, r)| r.enabled)
-        .collect();
-    if !enabled_rules.is_empty() {
-        let policy = project.config.network.policy.label();
-        cli::verbose!(
-            "  {} network rules: {} (policy: {policy})",
-            cli::bullet(),
-            enabled_rules.len()
-        );
-        for (key, rule) in &enabled_rules {
-            let inject = if rule.inject.is_empty() {
-                String::new()
-            } else {
-                format!(" inject {}", rule.inject.len())
-            };
-            cli::verbose!(
-                "      {key}: allow {} deny {}{inject}",
-                rule.allow.len(),
-                rule.deny.len()
-            );
-        }
-    }
-
-    let enabled_sockets: Vec<_> = project
-        .config
-        .network
-        .sockets
-        .iter()
-        .filter(|(_, s)| s.enabled)
-        .collect();
-    if !enabled_sockets.is_empty() {
-        cli::verbose!("  {} sockets: {}", cli::bullet(), enabled_sockets.len());
-        for (key, sock) in &enabled_sockets {
-            cli::verbose!(
-                "      {key}: {} \u{2192} {}",
-                sock.host.source,
-                sock.host.target
-            );
-        }
-    }
-
-    let enabled_ports: Vec<_> = project
-        .config
-        .network
-        .ports
-        .iter()
-        .filter(|(_, p)| p.enabled && !(p.host.is_empty() && p.guest.is_empty()))
-        .collect();
-    if !enabled_ports.is_empty() {
-        cli::verbose!("  {} port forwards: {}", cli::bullet(), enabled_ports.len());
-        for (key, pf) in &enabled_ports {
-            for m in &pf.host {
-                cli::verbose!("      {key}: host :{} \u{2190} guest :{}", m.host, m.guest);
-            }
-            for m in &pf.guest {
-                cli::verbose!("      {key}: host :{} \u{2192} guest :{}", m.host, m.guest);
-            }
-        }
-    }
-
-    daemon::print_verbose(project);
-    masking::print_verbose(project);
-}
-
-/// Open the PTY dump file if `AIRLOCK_PTY_DUMP=1`, otherwise `None`.
-fn pty_dump_file(sandbox_dir: &std::path::Path) -> Option<std::fs::File> {
-    if std::env::var("AIRLOCK_PTY_DUMP").as_deref() != Ok("1") {
-        return None;
-    }
-    let path = sandbox_dir.join("pty.dump");
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&path)
-    {
-        Ok(f) => {
-            cli::log!("PTY dump: {}", path.display());
-            Some(f)
-        }
-        Err(e) => {
-            cli::error!("Failed to open PTY dump {}: {e}", path.display());
-            None
-        }
-    }
-}
-
-fn write_pty_dump(file: Option<&mut std::fs::File>, data: &[u8]) {
-    if let Some(f) = file {
-        let _ = f.write_all(data);
-    }
-}
-
-/// Hard cap on `airlock.log` at startup. If the existing file is
-/// larger than this, we trim the beginning so each run appends to a
-/// bounded tail rather than nuking the file (crash logs from the
-/// previous run survive long enough to be useful).
-const LOG_MAX_BYTES: u64 = 1024 * 1024;
-
-/// If `airlock.log` exceeds [`LOG_MAX_BYTES`], rewrite the file with
-/// just its last N bytes so the new run starts with ≤1 MB of history.
-/// Best-effort; failure is silent (logging still works, just wasn't
-/// trimmed).
-fn rotate_log(path: &std::path::Path) {
-    use std::io::{Read, Seek, SeekFrom, Write};
-    let Ok(meta) = std::fs::metadata(path) else {
-        return;
-    };
-    if meta.len() <= LOG_MAX_BYTES {
-        return;
-    }
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-    else {
-        return;
-    };
-    let skip = meta.len() - LOG_MAX_BYTES;
-    if file.seek(SeekFrom::Start(skip)).is_err() {
-        return;
-    }
-    let mut tail = Vec::with_capacity(LOG_MAX_BYTES as usize);
-    if file.read_to_end(&mut tail).is_err() {
-        return;
-    }
-    let _ = file.set_len(0);
-    let _ = file.seek(SeekFrom::Start(0));
-    let _ = file.write_all(&tail);
-}
-
-fn setup_logging(log_level: LogLevel, cache_dir: &std::path::Path) {
-    let filter = CliArgs::log_filter_for(log_level);
-    let log_path = cache_dir.join("airlock.log");
-    rotate_log(&log_path);
-    if let Ok(log_file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
-        tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::new(filter))
-            .with_writer(std::sync::Mutex::new(log_file))
-            .with_ansi(false)
-            .init();
-    }
+    let project = project::open(
+        &sandbox.lock,
+        resolved.values.clone(),
+        args.sandbox_cwd.clone(),
+        context,
+    )?;
+    Box::pin(start::install::install_tools(
+        &project,
+        &resolved,
+        &sandbox.image,
+        sandbox.installs,
+        &options,
+    ))
+    .await?;
+    Box::pin(start::run::run_sandbox(
+        project,
+        &sandbox.image,
+        extra_args,
+        &args,
+        runtime,
+    ))
+    .await
 }

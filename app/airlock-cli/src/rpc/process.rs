@@ -29,6 +29,12 @@ impl Process {
         Ok(())
     }
 
+    /// Kill the guest process (SIGKILL).
+    pub async fn kill(&self) -> anyhow::Result<()> {
+        self.proc.kill_request().send().promise.await?;
+        Ok(())
+    }
+
     /// Poll for the next output event (stdout chunk, stderr chunk, or exit).
     ///
     /// A stream `Eof` only marks the end of a stdout/stderr stream, not the

@@ -4,9 +4,10 @@
 use airlock_common::supervisor_capnp::stdin;
 use futures::StreamExt;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
-use super::{PtySize, Runtime, SignalStream, Terminal};
-use crate::network::Network;
+use super::{OutputSink, PtySize, Runtime, SignalStream, Terminal};
+use crate::network::NetworkHandle;
 use crate::project::Project;
 use crate::rpc;
 
@@ -73,7 +74,7 @@ impl Runtime for MonitorRuntime {
     fn launch(
         self,
         project: &Project,
-        network: &Network,
+        network: &NetworkHandle,
         supervisor: rpc::Supervisor,
     ) -> anyhow::Result<MonitorTerminal> {
         let stdin_tx = self
@@ -94,10 +95,12 @@ impl Runtime for MonitorRuntime {
             self.settings,
         );
 
+        let mut tasks = JoinSet::new();
+
         // Forward network events from the broadcast channel to the TUI thread.
         let net_tx = tui.tx.clone();
         let mut events = network.events();
-        tokio::task::spawn_local(async move {
+        tasks.spawn_local(async move {
             loop {
                 match events.recv().await {
                     Ok(ev) => net_tx.send_network(ev),
@@ -109,7 +112,7 @@ impl Runtime for MonitorRuntime {
 
         // Poll guest CPU/memory stats once per second and forward to the TUI.
         let stats_tx = tui.tx.clone();
-        tokio::task::spawn_local(async move {
+        tasks.spawn_local(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -129,15 +132,21 @@ impl Runtime for MonitorRuntime {
             }
         });
 
-        Ok(MonitorTerminal { tui: Some(tui) })
+        Ok(MonitorTerminal {
+            tui: Some(tui),
+            _tasks: tasks,
+        })
     }
 }
 
 pub struct MonitorTerminal {
     tui: Option<airlock_monitor::TuiHandle>,
+    /// The network-event and stats forwarders. Dropping the terminal (after
+    /// `exit`) aborts them.
+    _tasks: JoinSet<()>,
 }
 
-impl Terminal for MonitorTerminal {
+impl OutputSink for MonitorTerminal {
     fn stdout(&mut self, bytes: &[u8]) {
         if let Some(tui) = &self.tui {
             tui.tx.send_output(bytes.to_vec());
@@ -149,7 +158,9 @@ impl Terminal for MonitorTerminal {
             tui.tx.send_output(bytes.to_vec());
         }
     }
+}
 
+impl Terminal for MonitorTerminal {
     fn exit(mut self, exit_code: i32) -> i32 {
         let Some(tui) = self.tui.take() else {
             return exit_code;

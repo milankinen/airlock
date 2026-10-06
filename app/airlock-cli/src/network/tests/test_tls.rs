@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::helpers::*;
 
 /// Pre-generate a server CA + leaf cert with configurable ALPN.
-fn make_server_tls_with_alpn(alpn: Vec<Vec<u8>>) -> (Arc<rustls::ServerConfig>, String) {
+pub(super) fn make_server_tls_with_alpn(alpn: Vec<Vec<u8>>) -> (Arc<rustls::ServerConfig>, String) {
     let ca_key = rcgen::KeyPair::generate().unwrap();
     let ca_params = rcgen::CertificateParams::new(vec![]).unwrap();
     let ca_cert = ca_params.self_signed(&ca_key).unwrap();
@@ -493,7 +493,7 @@ fn tls_mitm_large_body_arrives_intact() {
 /// Executor for the container-side h2 client — the RPC stream is `!Send`,
 /// so its connection task has to stay on the LocalSet.
 #[derive(Clone)]
-struct LocalExec;
+pub(super) struct LocalExec;
 
 impl<F> hyper::rt::Executor<F> for LocalExec
 where

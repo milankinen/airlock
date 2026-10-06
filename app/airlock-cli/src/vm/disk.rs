@@ -4,27 +4,29 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::cli;
-use crate::config::config::Disk;
+use crate::cli::prompt::PromptError;
+use crate::cli::prompt::choose::{Choice, Choose};
+use crate::cli::prompt::style::Tone;
+use crate::config::config_values::Disk;
 
 /// Default disk size (10 GB) — used for overlay upper + cache dirs.
 const DEFAULT_DISK_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
-/// Ensure the project disk image exists (for overlay upper + cache).
-/// Always creates one — the disk backs both the rootfs overlay upper
-/// layer and any configured cache mounts.
-///
-/// Returns `(disk_image_path, cache_entries)` where each entry is
-/// `(name, enabled, expanded_container_paths)`.
+/// The disk image file in the sandbox directory.
+pub const DISK_FILE: &str = "disk.img";
+/// The identity of the disk image, next to it: a random id, written anew
+/// with every new image ([`read_id`]).
+pub const DISK_ID_FILE: &str = "disk.id";
+
 /// Named cache entry: `(name, enabled, expanded_container_paths)`.
 pub type CacheEntry = (String, bool, Vec<String>);
 
-pub fn prepare(
-    cache_dir: &Path,
-    config: &Disk,
-    container_home: &str,
-    cwd: &Path,
-) -> anyhow::Result<(PathBuf, Vec<CacheEntry>)> {
-    let image_path = cache_dir.join("disk.img");
+/// Make the project disk image in `cache_dir` match the configured size:
+/// create it, grow it, or (on confirmation) recreate it smaller. The disk
+/// backs both the rootfs overlay upper layer and any configured cache
+/// mounts. Prints a line for each change.
+pub fn ensure(cache_dir: &Path, config: &Disk) -> anyhow::Result<()> {
+    let image_path = cache_dir.join(DISK_FILE);
 
     let bytes = (config.size.0 + 511) & !511;
     let bytes = if bytes > 0 {
@@ -65,6 +67,10 @@ pub fn prepare(
                 cli::dim(&format_size(bytes))
             );
         }
+        // A disk from before identity files.
+        if read_id(cache_dir).is_none() {
+            write_id(cache_dir)?;
+        }
     } else {
         create_sparse(&image_path, bytes)?;
         cli::log!(
@@ -72,6 +78,22 @@ pub fn prepare(
             cli::check(),
             cli::dim(&format_size(bytes))
         );
+    }
+    Ok(())
+}
+
+/// The disk image for a VM boot, and the cache entries. The disk image
+/// is created when it is missing; `airlock start` sizes it earlier, when
+/// it prepares the sandbox ([`ensure`]).
+pub fn prepare(
+    cache_dir: &Path,
+    config: &Disk,
+    container_home: &str,
+    cwd: &Path,
+) -> anyhow::Result<(PathBuf, Vec<CacheEntry>)> {
+    let image_path = cache_dir.join(DISK_FILE);
+    if !image_path.exists() {
+        ensure(cache_dir, config)?;
     }
 
     let container_home = PathBuf::from(container_home);
@@ -110,40 +132,95 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-/// Create a new sparse file (allocates no disk blocks until written).
 /// Ask whether to erase and recreate the disk at a smaller size. Returns
 /// `true` only on explicit confirmation. Without a TTY we can't ask, so we
 /// return `false` (keep the larger disk) rather than destroy data silently.
 /// The default selection is the non-destructive one, so an accidental Enter
-/// never wipes the disk.
+/// never wipes the disk; Esc keeps it too.
 fn prompt_shrink_disk(current: u64, target: u64) -> anyhow::Result<bool> {
     if !cli::is_interactive() {
         return Ok(false);
     }
-    let term = dialoguer::console::Term::stderr();
-    let choice = dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
-        .with_prompt(format!(
-            "Configured disk size {} is smaller than the current {}. \
-             Shrinking erases all sandbox data on the disk.",
-            format_size(target),
-            format_size(current),
-        ))
-        .items([
-            "Keep the current disk (no change)",
-            "Erase and recreate at the smaller size (loses all data)",
-        ])
-        .default(0)
-        .clear(true)
-        .interact_on_opt(&term)?
-        .unwrap_or(0);
-    let _ = term.clear_last_lines(1);
-    Ok(choice == 1)
+    let title = format!(
+        "Configured disk size {} is smaller than the current {}",
+        format_size(target),
+        format_size(current),
+    );
+    let erase = format!("erase and recreate at {}", format_size(target));
+    let question = Choose {
+        title: &title,
+        notes: &["Shrinking erases all sandbox data on the disk."],
+        choices: &[
+            Choice {
+                label: "keep the current disk",
+                tone: Tone::Plain,
+            },
+            Choice {
+                label: &erase,
+                tone: Tone::Danger,
+            },
+        ],
+        default: 0,
+        report: false,
+    };
+    match question.ask() {
+        Ok(choice) => Ok(choice == Some(1)),
+        Err(PromptError::NotInteractive) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
 }
 
+/// Create a new disk image and give it a new identity. The old identity
+/// goes first, so no crash leaves the new image with the old one.
 fn create_sparse(path: &Path, size: u64) -> anyhow::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    remove_id(dir)?;
     let file = fs::File::create(path)?;
     file.set_len(size)?;
+    write_id(dir)
+}
+
+/// The identity of the disk image in `dir`, or `None` when there is no
+/// image or no valid identity file. Every new image (first boot, `airlock
+/// rm`, reset, recreated at a smaller size, deleted by hand) gets a new
+/// random identity, so a re-created disk never looks like the old one,
+/// even with the same inode.
+pub fn read_id(dir: &Path) -> Option<(u64, u64)> {
+    if !dir.join(DISK_FILE).is_file() {
+        return None;
+    }
+    let text = fs::read_to_string(dir.join(DISK_ID_FILE)).ok()?;
+    parse_id(text.trim())
+}
+
+fn parse_id(text: &str) -> Option<(u64, u64)> {
+    if text.len() != 32 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let id = u128::from_str_radix(text, 16).ok()?;
+    Some(((id >> 64) as u64, id as u64))
+}
+
+/// Write a new random identity for the disk image in `dir`.
+fn write_id(dir: &Path) -> anyhow::Result<()> {
+    use rand::TryRng;
+    let mut bytes = [0u8; 16];
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|e| anyhow::anyhow!("random disk id: {e}"))?;
+    fs::write(
+        dir.join(DISK_ID_FILE),
+        format!("{:032x}\n", u128::from_be_bytes(bytes)),
+    )?;
     Ok(())
+}
+
+/// Remove the identity file in `dir`, if any.
+fn remove_id(dir: &Path) -> std::io::Result<()> {
+    match fs::remove_file(dir.join(DISK_ID_FILE)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
 }
 
 /// Grow an existing sparse file to a larger size.

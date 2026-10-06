@@ -17,10 +17,17 @@ pub use gc::sweep as gc_sweep;
 use oci_client::config::ConfigFile as OciConfig;
 use oci_client::secrets::RegistryAuth;
 
-use crate::config::config::PullPolicy;
+use crate::cli::prompt::PromptError;
+use crate::cli::prompt::choose::{Choice, Choose};
+use crate::cli::prompt::style::Tone;
+use crate::config::config_values::{ImageRef, PullPolicy};
 use crate::oci::credentials::ToRegistryAuth;
 use crate::project::Project;
+use crate::vault::Vault;
 use crate::{cache, cli};
+
+/// The `PATH` of a container whose image sets none.
+pub const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// Largest `etc/passwd` / `etc/group` accepted from a layer. Real files are
 /// a few KB; anything bigger is treated as having no records rather than
@@ -28,8 +35,8 @@ use crate::{cache, cli};
 const MAX_LAYER_RECORD_FILE: u64 = 1024 * 1024;
 
 /// Everything needed to configure the container process (returned by `prepare`).
-/// Mount resolution, disk setup, and command/env overrides happen in `vm::start`
-/// (env via the resolved `SandboxEnv`).
+/// Mount resolution, disk setup, and env overrides happen in `vm::start` (env
+/// via the resolved `SandboxEnv`); command overrides in `sandbox::main_argv`.
 ///
 /// Serialized to disk at `images/<digest>` wrapped in [`CachedImage`]; the
 /// same file is hardlinked to `<sandbox>/image` as the GC liveness signal.
@@ -59,7 +66,7 @@ pub struct OciImage {
     /// Container gid (from image config).
     pub gid: u32,
     /// Raw image entrypoint+cmd merged, `/bin/sh` fallback if empty.
-    /// No args.args overrides (those go in vm::start).
+    /// No command overrides (those go in `sandbox::main_argv`).
     pub cmd: Vec<String>,
     /// Base defaults (PATH/TERM/HOME) + image env.
     /// No `[env]` overrides (those are layered in `vm::start` from `SandboxEnv`).
@@ -74,11 +81,71 @@ pub struct OciImage {
     pub user: Option<String>,
 }
 
-/// Resolve, download, and prepare the OCI image for the sandbox.
-pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
-    let sandbox_image = project.sandbox_dir.join("image");
-    let image_cfg = &project.config.vm.image;
+/// What [`prepare`] does when the configured image resolves to a digest
+/// other than the one the sandbox was created with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnImageChange {
+    /// Ask the user: re-create the sandbox, continue with the current one,
+    /// or cancel.
+    Ask,
+    /// Re-create the sandbox without asking (`--yes`).
+    Recreate,
+    /// Stop with [`ImageChangeStop::NeedsTerminal`]: nobody can answer.
+    Refuse,
+}
+
+/// What [`prepare`] did about the image of the sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageChange {
+    /// The image is the one the sandbox was created with (or the sandbox
+    /// had none yet).
+    Unchanged,
+    /// The image changed and the sandbox must be re-created: the caller
+    /// deletes the sandbox disk and the install records.
+    Recreate,
+    /// The image changed, and the sandbox continues with its old image.
+    KeepOld,
+    /// The image changed and the sandbox was to continue with its old
+    /// image, but that is not available any more (not complete in the
+    /// cache): the sandbox continues with the new image.
+    OldImageGone,
+}
+
+/// Why [`prepare`] stopped early (a typed error inside the
+/// `anyhow::Error`).
+#[derive(Debug, thiserror::Error)]
+pub enum ImageChangeStop {
+    /// No terminal to ask on, and no `--yes`.
+    #[error("Sandbox image has been changed. Run in a terminal or pass --yes.")]
+    NeedsTerminal,
+    /// The user chose Cancel (or pressed Esc).
+    #[error("cancelled by user")]
+    Cancelled,
+    /// Ctrl+C while the question was open or the image downloaded.
+    #[error("interrupted")]
+    Interrupted,
+}
+
+/// The prepared image of a sandbox, and what happened to the old one.
+pub struct PreparedImage {
+    pub image: OciImage,
+    pub change: ImageChange,
+}
+
+/// Resolve, download, and prepare the OCI image `image_cfg` for the sandbox
+/// at `sandbox_dir`. `vault` holds the registry credentials.
+pub async fn prepare(
+    sandbox_dir: &Path,
+    image_cfg: &ImageRef,
+    vault: &Vault,
+    on_change: OnImageChange,
+) -> anyhow::Result<PreparedImage> {
+    let sandbox_image = sandbox_dir.join("image");
     let image_name = &image_cfg.name;
+    let unchanged = |image| PreparedImage {
+        image,
+        change: ImageChange::Unchanged,
+    };
 
     // The cached image this sandbox is currently running, if it is both
     // complete on disk and still the image the config asks for by name.
@@ -102,7 +169,7 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
             || image_cfg.pinned_digest().is_some())
     {
         tracing::debug!("image cache hit for {image_name}");
-        return use_cached_image(project, &sandbox_image, img);
+        return use_cached_image(sandbox_dir, &sandbox_image, img).map(unchanged);
     }
 
     // Fall-through: read just the stored digest (if any) for change detection.
@@ -113,7 +180,7 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
         .parse::<oci_client::Reference>()
         .map_or_else(|_| image_name.clone(), |r| r.resolve_registry().to_string());
 
-    let (mut image, auth) = match resolve_with_auth(project, image_cfg, &registry_host).await {
+    let (mut image, auth) = match resolve_with_auth(vault, image_cfg, &registry_host).await {
         Ok(resolved) => resolved,
         Err(e) => {
             // Under `if-changed` the source was contacted only to ask whether
@@ -126,7 +193,7 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
             if !prompt_resolution_failed(&e)? {
                 return Err(e);
             }
-            return use_cached_image(project, &sandbox_image, img);
+            return use_cached_image(sandbox_dir, &sandbox_image, img).map(unchanged);
         }
     };
 
@@ -146,59 +213,67 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
         .as_deref()
         .is_none_or(|s| s.trim() != image.digest);
 
+    let mut change = ImageChange::Unchanged;
     if let Some(old_digest) = stored_digest
         && digest_changed
     {
-        match prompt_image_changed()? {
-            ImageChangeAction::KeepOld => {
-                // "Still intact" has to mean *ready*, not merely present: the
-                // JSON can outlive its layer trees, which a sweep collects
-                // independently. Checking only for the file and then handing
-                // the old digest to `ensure_image` would miss that, fall
-                // through to the pull path, and persist the **new** image's
-                // layers and config under the **old** digest — poisoning that
-                // cache entry for every sandbox that shares it, and reporting
-                // an `image_id` the supervisor uses for change detection that
-                // describes neither image.
-                //
-                // Returning here instead of rewriting `image.digest` keeps
-                // that mismatch unrepresentable rather than merely unlikely:
-                // no digest can reach `ensure_image` unless it came from the
-                // same resolution as the source beside it.
-                let old_image_path = crate::cache::image_path(old_digest.trim())?;
-                if let Some(mut old) = read_ready_image(&old_image_path) {
-                    // Stamp the configured name onto the kept image so the
-                    // name-keyed fast path recognizes it on the next start —
-                    // otherwise every subsequent run re-resolves and asks this
-                    // same question again.
-                    if old.name != *image_name {
-                        old.name.clone_from(image_name);
-                        write_cached_image(&old_image_path, &old)?;
-                    }
-                    return use_cached_image(project, &sandbox_image, old);
+        change = match on_change {
+            OnImageChange::Ask => ask_image_changed()?,
+            OnImageChange::Recreate => ImageChange::Recreate,
+            OnImageChange::Refuse => return Err(ImageChangeStop::NeedsTerminal.into()),
+        };
+        if change == ImageChange::KeepOld {
+            // "Still intact" has to mean *ready*, not merely present: the
+            // JSON can outlive its layer trees, which a sweep collects
+            // independently. Checking only for the file and then handing
+            // the old digest to `ensure_image` would miss that, fall
+            // through to the pull path, and persist the **new** image's
+            // layers and config under the **old** digest — poisoning that
+            // cache entry for every sandbox that shares it, and reporting
+            // an `image_id` the supervisor uses for change detection that
+            // describes neither image.
+            //
+            // Returning here instead of rewriting `image.digest` keeps
+            // that mismatch unrepresentable rather than merely unlikely:
+            // no digest can reach `ensure_image` unless it came from the
+            // same resolution as the source beside it.
+            let old_image_path = crate::cache::image_path(old_digest.trim())?;
+            if let Some(mut old) = read_ready_image(&old_image_path) {
+                // Stamp the configured name onto the kept image so the
+                // name-keyed fast path recognizes it on the next start —
+                // otherwise every subsequent run re-resolves and asks this
+                // same question again.
+                if old.name != *image_name {
+                    old.name.clone_from(image_name);
+                    write_cached_image(&old_image_path, &old)?;
                 }
-                cli::log!(
-                    "  {} old environment is incomplete — using the new image",
-                    cli::bullet()
-                );
+                return use_cached_image(sandbox_dir, &sandbox_image, old).map(|image| {
+                    PreparedImage {
+                        image,
+                        change: ImageChange::KeepOld,
+                    }
+                });
             }
-            ImageChangeAction::Recreate => {
-                // Remove image ref hard link — drops this sandbox's liveness signal
-                // for the old image, so the sweep below may collect it.
-                let _ = std::fs::remove_file(project.sandbox_dir.join("image"));
-                cli::log!("  {} old environment erased", cli::check());
-                // GC: remove images with no remaining sandbox refs, plus any
-                // layers they uniquely owned.
-                gc::sweep();
-            }
-            ImageChangeAction::Cancel => anyhow::bail!("cancelled by user"),
+            change = ImageChange::OldImageGone;
+            cli::log!(
+                "  {} the old image is not available any more — using the new image",
+                cli::bullet()
+            );
+        } else {
+            // Remove image ref hard link — drops this sandbox's liveness signal
+            // for the old image, so the sweep below may collect it.
+            let _ = std::fs::remove_file(&sandbox_image);
+            cli::log!("  {} old environment erased", cli::check());
+            // GC: remove images with no remaining sandbox refs, plus any
+            // layers they uniquely owned.
+            gc::sweep();
         }
     }
 
     // Download/ensure image (auth already resolved above).
     let oci_image = tokio::select! {
         res = ensure_image(&mut image, image_name, &auth, image_cfg.insecure) => res?,
-        () = cli::interrupted() => anyhow::bail!("cancelled by user"),
+        () = cli::interrupted() => return Err(ImageChangeStop::Interrupted.into()),
     };
     // Hard-link the cached image file into the sandbox directory. nlink > 1
     // on `images/<digest>` is the GC guard — without it, a sibling sandbox
@@ -209,11 +284,14 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
     let image_path = crate::cache::image_path(&oci_image.image_id)?;
     ensure_image_hardlink(&sandbox_image, &image_path, &oci_image)?;
 
-    let overlay_dir = project.sandbox_dir.join("overlay");
+    let overlay_dir = sandbox_dir.join("overlay");
     std::fs::create_dir_all(&overlay_dir)?;
     cli::log!("  {} environment ready", cli::check());
 
-    Ok(oci_image)
+    Ok(PreparedImage {
+        image: oci_image,
+        change,
+    })
 }
 
 /// Finish `prepare` with an image already cached on disk: re-establish the GC
@@ -222,7 +300,7 @@ pub async fn prepare(project: &Project) -> anyhow::Result<OciImage> {
 /// Shared by the fast path and the resolution-failure fallback so both leave
 /// the sandbox in exactly the same state as a freshly pulled image would.
 fn use_cached_image(
-    project: &Project,
+    sandbox_dir: &Path,
     sandbox_image: &Path,
     image: OciImage,
 ) -> anyhow::Result<OciImage> {
@@ -238,7 +316,7 @@ fn use_cached_image(
         cli::check(),
         cli::dim(&image.image_id[..19.min(image.image_id.len())])
     );
-    let overlay_dir = project.sandbox_dir.join("overlay");
+    let overlay_dir = sandbox_dir.join("overlay");
     std::fs::create_dir_all(&overlay_dir)?;
     cli::log!("  {} environment ready", cli::check());
     Ok(image)
@@ -250,8 +328,8 @@ fn use_cached_image(
 /// prompts — retrying until resolution succeeds or the user interrupts.
 /// Returns the auth that worked so the caller can reuse it for the pull.
 async fn resolve_with_auth(
-    project: &Project,
-    image_cfg: &crate::config::config::ImageRef,
+    vault: &Vault,
+    image_cfg: &ImageRef,
     registry_host: &str,
 ) -> anyhow::Result<(ResolvedImage, RegistryAuth)> {
     let mut auth = RegistryAuth::Anonymous;
@@ -260,7 +338,7 @@ async fn resolve_with_auth(
         match resolve_image(image_cfg, &auth).await {
             Ok(img) => {
                 if let Some(creds) = updated_creds {
-                    credentials::save(&project.vault, registry_host, &creds)?;
+                    credentials::save(vault, registry_host, &creds)?;
                 }
                 return Ok((img, auth));
             }
@@ -269,7 +347,7 @@ async fn resolve_with_auth(
                     anyhow::bail!("cancelled by user");
                 }
                 if auth == RegistryAuth::Anonymous
-                    && let Some(creds) = credentials::load(&project.vault, registry_host)
+                    && let Some(creds) = credentials::load(vault, registry_host)
                 {
                     auth = creds.to_auth();
                     continue;
@@ -410,7 +488,7 @@ fn build_oci_image(
     // Resolve environment: base defaults → image env (no sandbox overrides here)
     let host_term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
     let mut env: Vec<String> = vec![
-        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+        format!("PATH={DEFAULT_PATH}"),
         format!("TERM={host_term}"),
         format!("HOME={container_home}"),
     ];
@@ -439,7 +517,8 @@ fn build_oci_image(
 /// sandbox sees. Falls back to the OCI image's user record when the
 /// project doesn't set `HOME` in `[env]`; otherwise honours the user's
 /// override as the guest will see it (already `${VAR}`-substituted by
-/// [`crate::project::SandboxEnv::resolve`] in `project::lock`).
+/// [`crate::project::SandboxEnv::resolve`] in `project::open` /
+/// [`crate::project::Project::with_config`]).
 ///
 /// Without this, a `target = "~/foo"` mount with `[env].HOME = "/x"`
 /// would expand the `~` against the image's home (`/root`) but the
@@ -548,39 +627,44 @@ fn resolve_group(layer_keys: &[String], group: &str) -> anyhow::Result<u32> {
     .ok_or_else(|| format!("no group {group} found in any layer /etc/group"))
 }
 
-enum ImageChangeAction {
-    Recreate,
-    KeepOld,
-    Cancel,
-}
-
-fn prompt_image_changed() -> anyhow::Result<ImageChangeAction> {
-    if !cli::is_interactive() {
-        anyhow::bail!("sandbox image has changed");
+/// Ask what to do about the changed image of an existing sandbox. Esc and
+/// Cancel stop with [`ImageChangeStop::Cancelled`].
+fn ask_image_changed() -> anyhow::Result<ImageChange> {
+    let question = Choose {
+        title: "Sandbox image has been changed",
+        notes: &[],
+        choices: &[
+            Choice {
+                label: "re-create sandbox",
+                tone: Tone::Plain,
+            },
+            Choice {
+                label: "continue with current sandbox",
+                tone: Tone::Plain,
+            },
+            Choice {
+                label: "cancel",
+                tone: Tone::Plain,
+            },
+        ],
+        default: 0,
+        report: true,
+    };
+    let choice = question.ask().map_err(|e| match e {
+        PromptError::NotInteractive => anyhow::Error::from(ImageChangeStop::NeedsTerminal),
+        PromptError::Interrupted => ImageChangeStop::Interrupted.into(),
+        PromptError::Io(e) => e.into(),
+    })?;
+    match choice {
+        Some(0) => Ok(ImageChange::Recreate),
+        Some(1) => Ok(ImageChange::KeepOld),
+        _ => Err(ImageChangeStop::Cancelled.into()),
     }
-    let term = dialoguer::console::Term::stderr();
-    let choice = dialoguer::Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
-        .with_prompt("Image has changed. What would you like to do?")
-        .items([
-            "Re-create environment",
-            "Continue using old environment",
-            "Cancel",
-        ])
-        .default(0)
-        .clear(true)
-        .interact_on_opt(&term)?
-        .unwrap_or(2);
-    let _ = term.clear_last_lines(1);
-
-    Ok(match choice {
-        0 => ImageChangeAction::Recreate,
-        1 => ImageChangeAction::KeepOld,
-        _ => ImageChangeAction::Cancel,
-    })
 }
 
 /// Ask whether to fall back to the cached image after resolution failed.
-/// Returns `true` to continue with the cache, `false` to abort.
+/// Returns `true` to continue with the cache, `false` to abort (the
+/// default, Esc, or no terminal).
 ///
 /// Non-interactive runs abort: a resolution failure is a genuine error, and
 /// silently substituting a possibly stale image in CI would hide it.
@@ -588,16 +672,28 @@ fn prompt_resolution_failed(err: &anyhow::Error) -> anyhow::Result<bool> {
     if !cli::is_interactive() {
         return Ok(false);
     }
-    let term = dialoguer::console::Term::stderr();
-    let choice = dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
-        .with_prompt(format!(
-            "image resolution failed ({err}): do you want to continue with cached image?"
-        ))
-        .default(false)
-        .interact_on_opt(&term)?
-        .unwrap_or(false);
-    let _ = term.clear_last_lines(1);
-    Ok(choice)
+    let title = format!("Image resolution failed: {err}");
+    let question = Choose {
+        title: &title,
+        notes: &[],
+        choices: &[
+            Choice {
+                label: "cancel",
+                tone: Tone::Plain,
+            },
+            Choice {
+                label: "continue with the cached image",
+                tone: Tone::Plain,
+            },
+        ],
+        default: 0,
+        report: false,
+    };
+    match question.ask() {
+        Ok(choice) => Ok(choice == Some(1)),
+        Err(PromptError::NotInteractive) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Outcome of re-checking a legacy cache file's uid/gid against a fresh
@@ -683,10 +779,10 @@ fn verify_legacy_user(stored: &OciImage, resolved: &ResolvedImage) -> anyhow::Re
 
 /// Full image resolution (with config).
 async fn resolve_image(
-    image_cfg: &crate::config::config::ImageRef,
+    image_cfg: &crate::config::config_values::ImageRef,
     auth: &RegistryAuth,
 ) -> anyhow::Result<ResolvedImage> {
-    use crate::config::config::Resolution;
+    use crate::config::config_values::Resolution;
 
     let image_ref = image_cfg.name.as_str();
     let pinned = image_cfg.pinned_digest();
@@ -1258,6 +1354,76 @@ impl Refused {
     }
 }
 
+/// Read `rel_path` (e.g. `etc/os-release`) from the image's layers,
+/// topmost layer first, with the same containment rules as the user
+/// lookup ([`read_layer_file`]): a symlink out of its layer or an oversized
+/// file is skipped. An empty file (how a whiteout looks in the layer
+/// cache) falls through to the next layer. `None` when no layer has it.
+pub fn read_image_file(layer_keys: &[String], rel_path: &str) -> Option<String> {
+    let dirs: Vec<_> = layer_keys
+        .iter()
+        .filter_map(|key| cache::layer_dir(key).ok())
+        .collect();
+    read_file_in_layers(&dirs, rel_path)
+}
+
+/// [`read_image_file`] over explicit layer directories, topmost first.
+fn read_file_in_layers(layer_dirs: &[std::path::PathBuf], rel_path: &str) -> Option<String> {
+    for dir in layer_dirs {
+        match read_layer_file(dir, rel_path) {
+            Ok(Some(content)) if !content.is_empty() => return Some(content),
+            Ok(_) => {}
+            Err(Refused { why, .. }) => {
+                tracing::debug!("{rel_path} in {}: {why}, ignoring", dir.display());
+            }
+        }
+    }
+    None
+}
+
+/// The distribution identity of an image, from `os-release`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OsRelease {
+    /// `ID`, e.g. `alpine`, `debian`, `ubuntu`.
+    pub id: String,
+    /// `ID_LIKE`, split on whitespace, e.g. `["debian"]` for Ubuntu.
+    pub id_like: Vec<String>,
+}
+
+/// Read `etc/os-release` (or `usr/lib/os-release`, which it usually links
+/// to) from the image layers. `None` when neither exists or has no `ID`.
+pub fn os_release(image: &OciImage) -> Option<OsRelease> {
+    ["etc/os-release", "usr/lib/os-release"]
+        .iter()
+        .find_map(|rel| read_image_file(&image.image_layers, rel))
+        .and_then(|content| parse_os_release(&content))
+}
+
+/// Parse the `ID` and `ID_LIKE` keys of an os-release file (shell-style
+/// `KEY=value`, optionally quoted).
+fn parse_os_release(content: &str) -> Option<OsRelease> {
+    let mut id = None;
+    let mut id_like = Vec::new();
+    for line in content.lines() {
+        let Some((key, value)) = line.trim().split_once('=') else {
+            continue;
+        };
+        let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+        match key.trim() {
+            "ID" => id = Some(value.to_ascii_lowercase()),
+            "ID_LIKE" => {
+                id_like = value
+                    .split_whitespace()
+                    .map(str::to_ascii_lowercase)
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+    id.filter(|id| !id.is_empty())
+        .map(|id| OsRelease { id, id_like })
+}
+
 /// Look up a user's home directory by uid in the image's `/etc/passwd`.
 fn lookup_home_dir(layer_keys: &[String], uid: u32) -> anyhow::Result<String> {
     lookup_layer_record(layer_keys, "etc/passwd", |f| {
@@ -1759,5 +1925,59 @@ mod tests {
                 "error for USER {user:?} should name the missing entry: {err}"
             );
         }
+    }
+
+    /// Topmost layer wins; an empty (whiteout) file and a symlink out of
+    /// the layer fall through to the next layer.
+    #[test]
+    fn read_file_in_layers_prefers_the_top_and_skips_whiteouts_and_escapes() {
+        let base = tempfile_dir();
+        let top = base.join("top");
+        let mid = base.join("mid");
+        let bottom = base.join("bottom");
+        for d in [&top, &mid, &bottom] {
+            std::fs::create_dir_all(d.join("etc")).unwrap();
+        }
+        std::fs::write(top.join("etc/os-release"), "").unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", mid.join("etc/os-release")).unwrap();
+        std::fs::write(bottom.join("etc/os-release"), "ID=debian\n").unwrap();
+        let layers = vec![top.clone(), mid, bottom];
+        assert_eq!(
+            read_file_in_layers(&layers, "etc/os-release").as_deref(),
+            Some("ID=debian\n")
+        );
+        std::fs::write(top.join("etc/os-release"), "ID=alpine\n").unwrap();
+        assert_eq!(
+            read_file_in_layers(&layers, "etc/os-release").as_deref(),
+            Some("ID=alpine\n")
+        );
+        assert!(read_file_in_layers(&layers, "etc/missing").is_none());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Alpine links `etc/os-release` to `../usr/lib/os-release`; a link
+    /// inside the layer resolves.
+    #[test]
+    fn read_file_in_layers_follows_links_inside_the_layer() {
+        let base = tempfile_dir();
+        std::fs::create_dir_all(base.join("etc")).unwrap();
+        std::fs::create_dir_all(base.join("usr/lib")).unwrap();
+        std::fs::write(base.join("usr/lib/os-release"), "ID=alpine\n").unwrap();
+        std::os::unix::fs::symlink("../usr/lib/os-release", base.join("etc/os-release")).unwrap();
+        assert_eq!(
+            read_file_in_layers(std::slice::from_ref(&base), "etc/os-release").as_deref(),
+            Some("ID=alpine\n")
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn parse_os_release_reads_id_and_id_like() {
+        let ubuntu = parse_os_release("NAME=\"Ubuntu\"\nID=ubuntu\nID_LIKE=debian\n").unwrap();
+        assert_eq!(ubuntu.id, "ubuntu");
+        assert_eq!(ubuntu.id_like, vec!["debian".to_string()]);
+        let rocky = parse_os_release("ID=\"rocky\"\nID_LIKE=\"rhel centos fedora\"").unwrap();
+        assert_eq!(rocky.id_like.len(), 3);
+        assert!(parse_os_release("NAME=x\n").is_none());
     }
 }

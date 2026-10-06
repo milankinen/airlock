@@ -9,15 +9,14 @@
 //! supervisor to spawn the process. `exec` therefore never loads
 //! the project, the vault, or the settings itself.
 
-use std::io::Write;
 use std::path::PathBuf;
 
 use airlock_common::cli_capnp::*;
 use clap::Args;
 use futures::AsyncReadExt;
 
-use crate::rpc;
 use crate::runtime::{self, RawTerminalRuntime};
+use crate::{oci, rpc, sandbox};
 
 /// CLI arguments for `airlock exec`.
 #[derive(Args, Debug)]
@@ -47,11 +46,13 @@ pub async fn main(args: ExecArgs) -> anyhow::Result<i32> {
         env,
         login,
     } = args;
-    let (cmd, args) = if login {
-        apply_login_shell(cmd, args)
+    let argv: Vec<String> = std::iter::once(cmd).chain(args).collect();
+    let argv = if login {
+        oci::apply_login_shell(argv)
     } else {
-        (cmd, args)
+        argv
     };
+    let (cmd, args) = argv.split_first().expect("argv holds the command");
 
     let host_cwd = std::env::current_dir().map_err(|e| anyhow::anyhow!("get cwd: {e}"))?;
     let sock_path = find_cli_sock(&host_cwd).ok_or_else(|| {
@@ -90,20 +91,14 @@ pub async fn main(args: ExecArgs) -> anyhow::Result<i32> {
         rpc_sys.bootstrap(capnp_rpc::rpc_twoparty_capnp::Side::Server);
     tokio::task::spawn_local(rpc_sys);
 
-    let mut terminal = RawTerminalRuntime::new();
-    let stdin = terminal.stdin()?;
+    let raw = RawTerminalRuntime::new();
+    let stdin = raw.stdin()?;
     let pty_size = stdin.pty_size();
 
     let mut req = cli_service.exec_request();
     req.get().set_stdin(capnp_rpc::new_client(stdin));
-    if let Some((rows, cols)) = pty_size {
-        let mut size = req.get().init_pty().init_size();
-        size.set_rows(rows);
-        size.set_cols(cols);
-    } else {
-        req.get().init_pty().set_none(());
-    }
-    req.get().set_cmd(&cmd);
+    rpc::set_pty(req.get().init_pty(), pty_size);
+    req.get().set_cmd(cmd);
     let mut args_b = req.get().init_args(args.len() as u32);
     for (i, a) in args.iter().enumerate() {
         args_b.set(i as u32, a.as_str());
@@ -119,45 +114,9 @@ pub async fn main(args: ExecArgs) -> anyhow::Result<i32> {
     let response = req.send().promise.await?;
     let proc = rpc::Process::new(response.get()?.get_proc()?);
 
-    terminal.enter_raw_mode();
-
-    let signal_proc = proc.clone();
-    let mut signals = runtime::signals()?;
-    tokio::task::spawn_local(async move {
-        use futures::StreamExt;
-        while let Some(signum) = signals.next().await {
-            tracing::debug!("forwarding signal {signum} to exec process");
-            if let Err(e) = signal_proc.signal(signum).await {
-                tracing::error!("signal forward failed: {e}");
-            }
-        }
-    });
-
-    let exit_code = loop {
-        match proc.poll().await {
-            Ok(rpc::ProcessEvent::Exit(code)) => break code,
-            Ok(rpc::ProcessEvent::Stdout(data)) => {
-                tracing::trace!(
-                    "exec stdout: {} bytes: {:?}",
-                    data.len(),
-                    String::from_utf8_lossy(&data)
-                );
-                let _ = std::io::stdout().write_all(&data);
-                let _ = std::io::stdout().flush();
-            }
-            Ok(rpc::ProcessEvent::Stderr(data)) => {
-                tracing::trace!("exec stderr: {} bytes", data.len());
-                let _ = std::io::stderr().write_all(&data);
-                let _ = std::io::stderr().flush();
-            }
-            Err(e) => {
-                tracing::trace!("exec poll error: {e}");
-                break 1;
-            }
-        }
-    };
-
-    Ok(exit_code)
+    let mut terminal = raw.into_terminal();
+    tokio::task::spawn_local(runtime::forward_signals(runtime::signals()?, proc.clone()));
+    Ok(sandbox::io::drive(&proc, &mut terminal).await)
 }
 
 /// Walk up from `start` looking for `.airlock/sandbox/`. For each
@@ -178,33 +137,4 @@ fn find_cli_sock(start: &std::path::Path) -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// Wrap `(cmd, args)` for execution inside a login shell.
-///
-/// If `cmd` is a lone shell binary (no args), adds `-l` directly.
-/// Otherwise wraps as `sh -l -c 'exec "$0" "$@"' cmd args...` — the
-/// `$0`/`$@` trick passes args without any quoting.
-fn apply_login_shell(cmd: String, args: Vec<String>) -> (String, Vec<String>) {
-    let is_lone_shell = args.is_empty() && is_shell_name(&cmd);
-    if is_lone_shell {
-        (cmd, vec!["-l".to_string()])
-    } else {
-        let mut new_args = vec![
-            "-l".to_string(),
-            "-c".to_string(),
-            r#"exec "$0" "$@""#.to_string(),
-            cmd,
-        ];
-        new_args.extend(args);
-        ("bash".to_string(), new_args)
-    }
-}
-
-fn is_shell_name(cmd: &str) -> bool {
-    let name = std::path::Path::new(cmd)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(cmd);
-    matches!(name, "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh") || name.ends_with("sh")
 }

@@ -1,0 +1,9 @@
+label = "debian"
+description = "Debian stable (slim)"
+kind = "distro"
+
+[[args]]
+key = "package-installs"
+type = "bool"
+description = "allow packages"
+default = true

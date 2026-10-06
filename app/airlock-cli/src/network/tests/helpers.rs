@@ -7,19 +7,19 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use airlock_common::network_capnp::{connect_result, network_proxy, tcp_sink};
-use axum::Router;
 use bytes::{Buf, Bytes};
 use capnp_rpc::{rpc_twoparty_capnp, twoparty};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
-use tokio::task::LocalSet;
 
-use crate::config::config::{self, MiddlewareRule, NetworkRule, Policy};
+use crate::config::config_values::{self, MiddlewareRule, NetworkRule, Policy};
+use crate::network::interceptor::Interceptor;
 use crate::network::middleware::LogFn;
 use crate::network::tls::TlsInterceptor;
 use crate::network::{Network, NetworkState, rules};
 use crate::project::{MaskedSecret, SandboxEnv};
+pub use crate::test_support::{block_on_local, serve, serve_with_shutdown};
 
 /// Collects log messages from Lua `log()` calls for test assertions.
 #[derive(Clone)]
@@ -38,34 +38,6 @@ impl RequestLog {
     }
 }
 
-// ── Test HTTP server ────────────────────────────────────
-
-pub async fn serve(app: Router) -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    addr
-}
-
-/// Start a test HTTP server that can be shut down on demand.
-/// Returns the address and a oneshot sender; dropping the sender stops the server.
-pub async fn serve_with_shutdown(app: Router) -> (SocketAddr, tokio::sync::oneshot::Sender<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = rx.await;
-            })
-            .await
-            .unwrap();
-    });
-    (addr, tx)
-}
-
 // ── Network + RPC harness ───────────────────────────────
 
 /// Test network configuration
@@ -78,6 +50,10 @@ pub struct TestNetworkConfig {
     pub inject: Vec<MaskedSecret>,
     /// Hosts allowed by a second rule that never injects anything.
     pub plain_allowed_hosts: Vec<String>,
+    /// Network services, built by the test against its fake upstreams.
+    pub interceptors: Vec<Rc<dyn Interceptor>>,
+    /// Hosts of enabled services that cannot run (denied).
+    pub unavailable_targets: Vec<crate::network::target::NetworkTarget>,
 }
 
 impl Default for TestNetworkConfig {
@@ -88,6 +64,8 @@ impl Default for TestNetworkConfig {
             trust_cas: vec![],
             inject: vec![],
             plain_allowed_hosts: vec![],
+            interceptors: vec![],
+            unavailable_targets: vec![],
         }
     }
 }
@@ -153,19 +131,10 @@ where
 {
     block_on_local(async move {
         let (_log, _mitm_ca_pem, network) = build_network(cfg);
-        let events = network.events();
+        let events = network.handle().events();
         let proxy = start_rpc(network);
         f(proxy, events).await;
     });
-}
-
-fn block_on_local(fut: impl Future<Output = ()>) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let local = LocalSet::new();
-    rt.block_on(local.run_until(fut));
 }
 
 pub fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
@@ -220,12 +189,13 @@ pub fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
     }
 
     // Tests use a deny-by-default model: only explicitly listed hosts are permitted.
-    let config = config::Network {
+    let config = config_values::Network {
         policy: Policy::DenyByDefault,
         rules,
         middleware: middleware_config,
         ports: BTreeMap::default(),
         sockets: BTreeMap::default(),
+        services: BTreeMap::default(),
     };
     let (request_log, log_fn) = RequestLog::new();
     let rule_targets = rules::resolve(&config).unwrap();
@@ -271,6 +241,8 @@ pub fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
             passthrough_targets: rule_targets.passthrough,
             middleware_targets,
             inject_targets,
+            interceptors: cfg.interceptors,
+            unavailable_targets: cfg.unavailable_targets,
             port_forwards: std::collections::HashMap::default(),
             socket_map: std::collections::HashMap::default(),
             // Room for every event a `run_with_events` test reads after
@@ -282,7 +254,7 @@ pub fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
     )
 }
 
-fn start_rpc(network: Network) -> network_proxy::Client {
+pub fn start_rpc(network: Network) -> network_proxy::Client {
     let (client_stream, server_stream) = tokio::io::duplex(4096);
 
     let (sr, sw) = tokio::io::split(server_stream);

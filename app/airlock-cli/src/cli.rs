@@ -9,6 +9,8 @@ pub mod cmd_rm;
 pub mod cmd_secret;
 pub mod cmd_show;
 pub mod cmd_start;
+pub mod logging;
+pub mod prompt;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -34,24 +36,6 @@ pub fn platform_status() -> String {
 #[cfg(not(target_os = "linux"))]
 pub fn platform_status() -> String {
     String::new()
-}
-
-/// Runtime arguments for the `up` command. Constructed from parsed CLI args
-/// plus any extra arguments that appeared after `--`.
-pub struct CliArgs {
-    pub log_level: LogLevel,
-    pub args: Vec<String>,
-    pub login: bool,
-}
-
-impl CliArgs {
-    pub fn new(log_level: LogLevel, extra_args: Vec<String>, login: bool) -> Self {
-        Self {
-            log_level,
-            args: extra_args,
-            login,
-        }
-    }
 }
 
 /// Supervisor log verbosity level, mapped to `tracing` filter strings.
@@ -194,6 +178,31 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Format a `SystemTime` as local `YYYY-MM-DD HH:MM:SS` via
+/// `libc::localtime_r`. Matches the style used in the TUI's network
+/// log — but kept inline here so the CLI doesn't pull in the TUI crate
+/// for one helper.
+pub fn format_local_time(t: std::time::SystemTime) -> String {
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let tt = secs as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let ok = unsafe { !libc::localtime_r(&raw const tt, &raw mut tm).is_null() };
+    if !ok {
+        return "----/--/-- --:--:--".to_string();
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec,
+    )
+}
+
 /// Returns true if the user has pressed Ctrl+C / SIGTERM.
 pub fn is_interrupted() -> bool {
     *INTERRUPTED.1.borrow()
@@ -287,20 +296,42 @@ pub fn spinner(msg: &str) -> ProgressBar {
     pb
 }
 
-impl CliArgs {
-    /// Map the user-facing log level to a `tracing` filter directive.
-    pub fn log_filter(&self) -> &str {
-        Self::log_filter_for(self.log_level)
-    }
-
-    /// Map a log level to a `tracing` filter directive (static version).
-    pub fn log_filter_for(level: LogLevel) -> &'static str {
-        match level {
+impl LogLevel {
+    /// Map the user-facing log level to a `tracing` filter directive, used
+    /// for both the host log file and the guest supervisor.
+    pub fn filter(self) -> &'static str {
+        match self {
             LogLevel::Trace => "info,airlock=trace,airlockd=trace",
             LogLevel::Debug => "warn,airlock=debug,airlockd=trace",
             LogLevel::Info => "warn,airlock=info,airlockd=info",
             LogLevel::Warn => "warn",
             LogLevel::Error => "error",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_level_filter_keeps_the_airlock_targets() {
+        assert_eq!(
+            LogLevel::Trace.filter(),
+            "info,airlock=trace,airlockd=trace"
+        );
+        assert_eq!(
+            LogLevel::Debug.filter(),
+            "warn,airlock=debug,airlockd=trace"
+        );
+        assert_eq!(LogLevel::Info.filter(), "warn,airlock=info,airlockd=info");
+        assert_eq!(LogLevel::Warn.filter(), "warn");
+        assert_eq!(LogLevel::Error.filter(), "error");
+        for level in LogLevel::value_variants() {
+            assert!(
+                tracing_subscriber::EnvFilter::try_new(level.filter()).is_ok(),
+                "{level:?}"
+            );
         }
     }
 }

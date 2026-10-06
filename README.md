@@ -24,6 +24,9 @@ Docker required. Works on both macOS and Linux.
   traffic in real time.
 - **Presets** — secure defaults for Claude Code, OpenAI Codex, and GitHub
   Copilot CLI out of the box (PRs welcome for more).
+- **Agent sign-ins stay on the host** — Claude Code and Codex log in from
+  inside the sandbox as usual, but the real tokens never enter the VM; the
+  sandbox only sees surrogates.
 - **File & directory mounts** — share project files with the agent and nothing more.
 - **Host port & socket forwarding** — reach the host's PostgreSQL, Redis, or Docker.
 - **Agent hook integration** — surface network denials back to the agent so it
@@ -35,6 +38,16 @@ OBS! This quickstart uses Claude Code as the example, but airlock itself
 is agent-agnostic. See the other agent
 [presets](https://milankinen.github.io/airlock/presets.html) for your
 favourite agent's setup.
+
+**The short way:** after installing, run `airlock start` in a project
+that has no airlock config. It asks which distro, agents and languages
+you want, writes the config with versioned
+[presets](https://milankinen.github.io/airlock/presets.html), installs
+them in the sandbox with an open network, and starts the sandbox. Later
+runs reuse the config: `airlock start -- claude` starts the agent, and
+`/login` in Claude signs it in. See
+[Starting a sandbox](https://milankinen.github.io/airlock/usage/starting-sandbox.html).
+The steps below do the same by hand.
 
 ### 1. Install `airlock`
 
@@ -51,34 +64,36 @@ $ export PATH=$PATH:~/.local/bin
 
 ### 2. Start your first sandbox
 
-Navigate to your project directory and start the VM with the default config.
-This creates a placeholder `airlock.toml`, spins up an `alpine:3` sandbox,
-and mounts your project directory into it.
+Navigate to your project directory, create an empty `airlock.toml`, and
+start the VM. With an empty config, airlock starts an `alpine:latest`
+sandbox and mounts your project directory into it. (Without any config,
+`airlock start` runs the setup wizard instead.)
 
 ```bash
+$ touch airlock.toml
 $ airlock start
 ```
 
 ### 3. Set up Claude Code
 
-Edit the project's `airlock.toml` and add the `claude-code` preset. It:
+Edit the project's `airlock.toml` and add the `claude` preset. It:
 
 * Adds network
   [allow rules](https://milankinen.github.io/airlock/configuration/network.html)
-  for the Anthropic APIs.
-* [Masks](https://milankinen.github.io/airlock/configuration/env.html#masking)
-  your API token — the sandbox only sees a random surrogate — and
-  [injects](https://milankinen.github.io/airlock/configuration/network.html#injecting-masked-secrets)
-  the real value into Claude's requests on the host side —
-  **your token is never exposed to the sandbox**.
+  for the Anthropic hosts.
+* Enables the `anthropic`
+  [network service](https://milankinen.github.io/airlock/configuration/network.html#network-services):
+  Claude signs in inside the sandbox, airlock keeps the real tokens on
+  the host and the sandbox only sees random surrogates —
+  **your tokens are never exposed to the sandbox**.
 * Creates Claude placeholder settings under `~/.airlock/claude` and
   [mounts](https://milankinen.github.io/airlock/configuration/mounts.html)
   them into the sandbox so settings persist across sandboxes (you can turn
   this off if you prefer per-sandbox or per-session settings).
 
-You also need an OCI image that ships Claude. We use
-`docker/sandbox-templates:claude-code` as an example. At this point you can
-also set the
+With `version = "1"`, the preset also installs Claude Code in the sandbox
+on the first start, so the default `alpine:latest` image is sufficient.
+At this point you can also set the
 [network policy](https://milankinen.github.io/airlock/configuration/network.html)
 to deny all outbound traffic by default unless explicitly allowed by the
 network rules.
@@ -86,34 +101,36 @@ network rules.
 The complete `airlock.toml` looks like this:
 
 ```toml
-presets = ["claude-code"]
-
 [network]
 policy = "deny-by-default"
 
 [vm]
-image = "docker/sandbox-templates:claude-code"
+image = "alpine:latest"
+
+[presets]
+claude = { version = "1" }
 ```
 
-### 4. Provide the Claude Code token
+Configs of earlier releases with `presets = ["claude-code"]` still work.
+This list form only configures the sandbox, so the image must ship
+Claude (for example `docker/sandbox-templates:claude-code`).
 
-The preset expects the Claude authentication token in the
-`CLAUDE_CODE_OAUTH_TOKEN` environment variable. You can obtain one by
-running `claude setup-token`.
+### 4. Sign in Claude Code
 
-If you'd rather not keep the token in plaintext on your filesystem, store
-it in the
-[airlock secret vault](https://milankinen.github.io/airlock/secrets.html).
-Airlock uses your OS keyring (macOS Keychain, Linux Secret Service) so you
-only get prompted when airlock actually needs the value. Secrets are shared
-across sandboxes, so setting the token once covers every later sandbox as
-well. Add a secret with `airlock secrets`:
+Start Claude in the sandbox and type `/login`:
 
 ```bash
-$ airlock secrets add CLAUDE_CODE_OAUTH_TOKEN
-✔ Value · ********
-✔ stored secret CLAUDE_CODE_OAUTH_TOKEN
+$ airlock start -- claude
 ```
+
+The sign-in page opens in your browser on the host, and the result is
+forwarded back into the sandbox. airlock's proxy keeps the real tokens
+on the host (encrypted, with the key in the
+[airlock vault](https://milankinen.github.io/airlock/secrets.html)) and
+refreshes them itself; Claude only ever sees surrogates. The sign-in is
+shared by all your sandboxes, and `/logout` in any of them signs out
+everywhere. `airlock show` lists the sign-ins. See
+[Coding agents](https://milankinen.github.io/airlock/usage/coding-agents.html).
 
 ### 5. Yolo
 

@@ -43,7 +43,7 @@ struct Inner {
 /// through `Vault::subst` (host env first, vault as fallback) and exposed
 /// to the script as the `env` global table. A template that references an
 /// undefined name fails compilation — matches `[env]` behaviour in
-/// `vm::resolve_env` so middleware never runs with silently-missing inputs.
+/// `project::resolve_env` so middleware never runs with silently-missing inputs.
 pub fn compile(
     script: &str,
     env_vars: &BTreeMap<String, String>,
@@ -102,7 +102,9 @@ fn is_denied(e: &mlua::Error) -> bool {
     }
 }
 
-/// Run all HTTP middleware layers around the send function.
+/// Run all HTTP middleware layers around the send function. `send` is the
+/// rest of the relay (a network service, then the upstream), so its
+/// response body may be one the proxy built.
 ///
 /// Default behaviour is to forward the request. Scripts can call
 /// `req:deny()` to block with 403, tagged with the [`Denied`] extension.
@@ -119,12 +121,10 @@ pub async fn run<F, Fut>(
 ) -> anyhow::Result<hyper::Response<Either<Incoming, Full<Bytes>>>>
 where
     F: FnOnce(hyper::Request<RequestBody>) -> Fut + 'static,
-    Fut: Future<Output = anyhow::Result<hyper::Response<Incoming>>> + 'static,
+    Fut: Future<Output = anyhow::Result<hyper::Response<RequestBody>>> + 'static,
 {
     if middleware.is_empty() {
-        return send(req.map(Either::Left))
-            .await
-            .map(|r| r.map(Either::Left));
+        return send(req.map(Either::Left)).await;
     }
 
     // Innermost: the actual hyper send
@@ -133,7 +133,6 @@ where
             let req = hyper::Request::from_parts(parts, body);
             send(req)
                 .await
-                .map(|r| r.map(Either::Left))
                 .map_err(|e| mlua::Error::runtime(format!("{e}")))
         })
     });

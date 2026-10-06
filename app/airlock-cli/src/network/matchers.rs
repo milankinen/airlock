@@ -47,8 +47,10 @@ pub fn host_matches(host: &str, pattern: &str) -> bool {
 /// Canonicalize a hostname (or host pattern) for case- and trailing-dot-
 /// insensitive comparison: lowercase it and strip a single trailing `.`
 /// (the DNS root label). The `*` and `*.` wildcard markers are ASCII and
-/// pass through unchanged.
-fn canonical_host(host: &str) -> String {
+/// pass through unchanged. The one canonical form of a host name: the
+/// network services build their endpoints with it too
+/// ([`crate::network::target::Endpoint`]).
+pub fn canonical_host(host: &str) -> String {
     let host = host.strip_suffix('.').unwrap_or(host);
     host.to_ascii_lowercase()
 }

@@ -108,23 +108,14 @@ pub struct SpawnedProcess {
 }
 
 impl SpawnedProcess {
-    /// Wire this process's I/O to the host and block until it exits.
-    /// Returns the process exit code.
-    pub async fn attach(self, host: HostProcess) -> i32 {
+    /// Wire this process's I/O to the host and block until it exits. The
+    /// exit code reaches the host as the last frame.
+    pub async fn attach(self, host: HostProcess) {
         match self.pty {
             Some(pty) => attach_pty(self.child, pty, host).await,
             None => attach_pipe(self.child, host).await,
         }
     }
-}
-
-/// Spawn a host-side child process with inherited environment.
-pub fn spawn_root(
-    cmd: &str,
-    args: &[&str],
-    pty_size: Option<(u16, u16)>,
-) -> Result<SpawnedProcess, anyhow::Error> {
-    spawn(cmd, args, None, || Ok(()), pty_size)
 }
 
 /// Spawn a process inside the container rootfs via chroot + setuid/setgid.
@@ -149,7 +140,7 @@ pub fn spawn_user(
     let (diag_r, diag_w) = open_diag_pipe();
     let pre_exec = build_pre_exec(cwd.to_string(), uid, gid, harden, diag_w);
 
-    let result = spawn(cmd, args, Some(env_pairs), pre_exec, pty_size);
+    let result = spawn(cmd, args, env_pairs, pre_exec, pty_size);
     finish_diag_pipe(diag_r, diag_w, result)
 }
 
@@ -331,14 +322,13 @@ fn build_pre_exec(
 /// Core spawn primitive. Handles PTY/pipe dispatch, env setup, and an optional
 /// pre-exec hook. All callers go through here.
 ///
-/// - `env_override`: `None` → inherit environment (PTY mode also sets TERM=linux);
-///   `Some(pairs)` → clear environment and replace with `pairs`.
+/// - `env`: the whole environment of the child (nothing is inherited).
 /// - `pre_exec`: runs in the child after fork, before exec. Must only use
 ///   async-signal-safe operations.
 fn spawn<A, F>(
     cmd: &str,
     args: &[A],
-    env_override: Option<Vec<(String, String)>>,
+    env: Vec<(String, String)>,
     pre_exec: F,
     pty_size: Option<(u16, u16)>,
 ) -> Result<SpawnedProcess, anyhow::Error>
@@ -353,11 +343,10 @@ where
             tracing::warn!("initial pty resize failed: {e}");
         }
         // pty_process::Command is a consuming builder — chain all calls.
-        let builder = pty_process::Command::new(cmd).args(args);
-        let builder = match env_override {
-            Some(pairs) => builder.env_clear().envs(pairs),
-            None => builder.env("TERM", "xterm-256color"),
-        };
+        let builder = pty_process::Command::new(cmd)
+            .args(args)
+            .env_clear()
+            .envs(env);
         // Safety: pre_exec runs post-fork in child; only async-signal-safe calls.
         let child = unsafe { builder.pre_exec(pre_exec) }.spawn(pts)?;
         if let Some(pid) = child.id() {
@@ -373,10 +362,12 @@ where
             .args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        if let Some(pairs) = env_override {
-            command.env_clear().envs(pairs);
-        }
+            .stderr(std::process::Stdio::piped())
+            // Its own process group, as a PTY child has its own session:
+            // host signals reach the children of a shell too (see
+            // `signal_group`).
+            .process_group(0);
+        command.env_clear().envs(env);
         // Safety: pre_exec runs post-fork in child; only async-signal-safe calls.
         unsafe { command.pre_exec(pre_exec) };
         let child = command.spawn()?;
@@ -396,7 +387,7 @@ async fn attach_pty(
     mut child: tokio::process::Child,
     pty: pty_process::Pty,
     mut host: HostProcess,
-) -> i32 {
+) {
     use std::os::unix::io::AsRawFd;
     let pty_fd = pty.as_raw_fd();
     let (mut pty_reader, pty_writer) = pty.into_split();
@@ -451,12 +442,11 @@ async fn attach_pty(
 
     let exit_code = wait_child(&mut child).await;
     log_error(frames_tx.send(Frame::Exit(exit_code)).await);
-    exit_code
 }
 
 /// Relay I/O between a pipe-backed child and the host RPC connection.
 /// Stdout and stderr are forwarded as separate frame types.
-async fn attach_pipe(mut child: tokio::process::Child, mut host: HostProcess) -> i32 {
+async fn attach_pipe(mut child: tokio::process::Child, mut host: HostProcess) {
     let child_stdin = child.stdin.take();
     let mut child_stdout = child.stdout.take();
     let mut child_stderr = child.stderr.take();
@@ -506,12 +496,9 @@ async fn attach_pipe(mut child: tokio::process::Child, mut host: HostProcess) ->
                 }
             },
             s = signals_rx.recv() => match s {
-                Some(Signal::Num(signum)) => {
-                    if let Some(pid) = child.id() {
-                        unsafe { libc::kill(pid as i32, signum) };
-                    }
-                },
+                Some(Signal::Num(signum)) => signal_group(&child, signum),
                 Some(Signal::Kill) => {
+                    signal_group(&child, libc::SIGKILL);
                     log_error(child.start_kill());
                     break;
                 },
@@ -522,7 +509,16 @@ async fn attach_pipe(mut child: tokio::process::Child, mut host: HostProcess) ->
 
     let exit_code = wait_child(&mut child).await;
     log_error(frames_tx.send(Frame::Exit(exit_code)).await);
-    exit_code
+}
+
+/// Send `signum` to the process group of a pipe-mode child (it leads its
+/// own group, see [`spawn`]), so that the processes it started get it
+/// too. The group outlives its leader until the last member exits.
+fn signal_group(child: &tokio::process::Child, signum: i32) {
+    if let Some(pid) = child.id() {
+        trace!("signal ({signum}), process group: {pid}");
+        unsafe { libc::kill(-(pid as i32), signum) };
+    }
 }
 
 async fn wait_child(child: &mut tokio::process::Child) -> i32 {
@@ -552,11 +548,8 @@ async fn relay_stdin_pty(
         match input.which()? {
             process_input::Stdin(frame) => {
                 if let Ok(data_frame::Data(Ok(data))) = frame?.which() {
-                    tracing::trace!(
-                        "guest stdin pty: {} bytes: {:?}",
-                        data.len(),
-                        String::from_utf8_lossy(data)
-                    );
+                    // Byte count only: stdin may carry secrets (a pasted token).
+                    tracing::trace!("guest stdin pty: {} bytes", data.len());
                     writer.write_all(data).await?;
                 } else {
                     tracing::trace!("guest stdin pty: EOF");

@@ -4,25 +4,23 @@ using Network = import "network.capnp";
 
 # In-VM supervisor RPC. Runs over the primary vsock port
 # (SUPERVISOR_PORT). The `NetworkProxy` capability is NOT passed
-# through `start` anymore — it is the bootstrap capability of the
+# through `boot` anymore — it is the bootstrap capability of the
 # separate network vsock (NETWORK_PORT). Splitting the flows gives
 # bulk network transfers independent buffers so they cannot stall
 # pty / stats / daemon traffic on this channel.
 interface Supervisor {
-  start @0 (
-    stdin      :Stdin,
-    pty        :PtyConfig,
+  # Boot the VM: mount the rootfs, bring up networking, and start the
+  # daemons. Carries only VM/boot configuration — no process to run.
+  # Processes (the main shell, `airlock exec`) start afterwards via
+  # `spawn`, which is refused until `boot` has succeeded. The guest
+  # accepts this once per VM; a second call is refused.
+  boot @0 (
     logs       :LogSink,
     logFilter  :Text,
     epoch      :UInt64,
     epochNanos :UInt32,
     hostPorts  :List(UInt16),
     sockets    :List(SocketForward),
-    # Process configuration (replaces config.json)
-    cmd        :Text,
-    args       :List(Text),
-    env        :List(Text),
-    cwd        :Text,
     uid        :UInt32,
     gid        :UInt32,
     nestedVirt :Bool,
@@ -37,8 +35,9 @@ interface Supervisor {
     # guest init after the overlayfs rootfs is mounted. Empty when the
     # project has no CA (vault disabled / TLS interception off).
     caCert      :Data,
-    # Sidecar processes to start in parallel with the main shell. The
-    # supervisor owns their lifecycle (restart loop, graceful shutdown).
+    # Sidecar processes, started during the boot (before any `spawn`).
+    # The supervisor owns their lifecycle (restart loop, graceful
+    # shutdown).
     daemons     :List(DaemonSpec),
     # Subdirectories of the project mount that get bind-mounted with an
     # empty directory by guest init, hiding their contents from the
@@ -48,11 +47,18 @@ interface Supervisor {
     # `sink`) is exactly the ungranted state, so a host that never sets
     # this hands the guest nothing to call.
     clipboard   :ClipboardConfig,
-  ) -> (proc :Process);
+    # Host browser grant. Default-initialised (null `sink`) is exactly the
+    # ungranted state, so a host that never sets this hands the guest
+    # nothing to call.
+    browser     :BrowserConfig,
+  ) -> ();
 
   shutdown @1 () -> ();
 
-  exec @2 (
+  # Start a process inside the booted container, with the uid/gid/harden
+  # settings `boot` recorded. Used for the main shell and `airlock exec`
+  # alike. Refused before `boot` has succeeded.
+  spawn @2 (
     stdin :Stdin,
     pty   :PtyConfig,
     cmd   :Text,
@@ -123,6 +129,23 @@ struct ClipboardConfig {
   # unbounded write. Without it `cat /dev/zero > fifo` would grow the guest
   # daemon — which is PID 1 — until the VM dies.
   limit @3 :UInt64;
+}
+
+# Host browser access, handed to the guest as a capability. The guest can
+# only ask the host to open a URL through this object, so withholding it (a
+# null `BrowserConfig.sink`) denies access no matter what runs inside the
+# sandbox — there is no guest-side flag to subvert.
+#
+# The host re-checks every URL against its own policy; the guest filters
+# to http(s) only so obvious junk never crosses the channel.
+interface Browser {
+  # Guest → host. Rejected when the URL fails the host policy.
+  open @0 (url :Text) -> ();
+}
+
+struct BrowserConfig {
+  # Null unless the host grants browser access for this boot.
+  sink @0 :Browser;
 }
 
 struct MaskSpec {

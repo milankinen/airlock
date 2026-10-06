@@ -11,12 +11,12 @@
 //! single-threaded RPC runtime.
 
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 
 use airlock_common::supervisor_capnp::*;
+
+use crate::config::config_values::Clipboard;
 
 /// A pair of host programs that write and read the system clipboard.
 ///
@@ -67,26 +67,14 @@ const CANDIDATES: &[HostTool] = &[
 
 /// First candidate whose programs are both on `PATH` and whose display
 /// requirement (if any) is satisfied. `None` when the host has no usable
-/// clipboard, which callers report as a warning rather than a hard failure.
-pub fn detect() -> Option<HostTool> {
+/// clipboard.
+fn detect() -> Option<HostTool> {
     CANDIDATES.iter().copied().find(|t| {
         t.requires_env
             .is_none_or(|var| std::env::var_os(var).is_some_and(|v| !v.is_empty()))
-            && on_path(t.write[0])
-            && on_path(t.read[0])
+            && crate::util::on_path(t.write[0])
+            && crate::util::on_path(t.read[0])
     })
-}
-
-/// Whether `program` resolves to an executable file on `PATH`.
-fn on_path(program: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| is_executable(&dir.join(program)))
-}
-
-fn is_executable(path: &Path) -> bool {
-    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 impl HostTool {
@@ -144,21 +132,32 @@ impl HostTool {
 /// Cap'n Proto `Clipboard` server bridging the guest to the host clipboard.
 pub struct ClipboardImpl {
     tool: HostTool,
-    copy: bool,
-    paste: bool,
+    pub(super) copy: bool,
+    pub(super) paste: bool,
     /// Largest accepted guest → host transfer, in bytes.
-    limit: u64,
+    pub(super) limit: u64,
 }
 
-impl ClipboardImpl {
-    pub fn new(tool: HostTool, copy: bool, paste: bool, limit: u64) -> Self {
-        Self {
-            tool,
-            copy,
-            paste,
-            limit,
-        }
+/// The clipboard grant of `config`: `None` when it grants no direction,
+/// so an ungranted sandbox has nothing to call. A host with no clipboard
+/// program downgrades to ungranted with a warning — never a failed start.
+pub fn for_config(config: &Clipboard) -> Option<ClipboardImpl> {
+    if !config.copy && !config.paste {
+        return None;
     }
+    let Some(tool) = detect() else {
+        crate::cli::log!(
+            "  {} clipboard disabled: no clipboard program found on the host",
+            crate::cli::bullet()
+        );
+        return None;
+    };
+    Some(ClipboardImpl {
+        tool,
+        copy: config.copy,
+        paste: config.paste,
+        limit: config.copy_limit.0,
+    })
 }
 
 impl clipboard::Server for ClipboardImpl {
@@ -236,19 +235,6 @@ mod tests {
             read: &["true"],
             requires_env: None,
         }
-    }
-
-    /// `sh` is on PATH everywhere we run; a nonsense name is not.
-    #[test]
-    fn on_path_finds_real_programs() {
-        assert!(on_path("sh"));
-        assert!(!on_path("airlock-definitely-not-a-real-program"));
-    }
-
-    /// A directory named like the program must not count as a hit.
-    #[test]
-    fn on_path_rejects_directories() {
-        assert!(!is_executable(Path::new("/")));
     }
 
     /// Every candidate must name a program in both directions, so a
