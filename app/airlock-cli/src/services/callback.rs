@@ -12,17 +12,21 @@
 //!
 //! - forwards `GET` only (anything else gets `405` from the host), and
 //!   strips `Cookie` and `Authorization` from the browser's requests;
-//! - strips `Set-Cookie` and `Refresh` from the guest's answers and adds
+//! - passes only the guest's answer headers of [`ANSWER_HEADERS`] (and a
+//!   checked `Location`), so no `Set-Cookie`, `Refresh`, CORS or
+//!   `Clear-Site-Data` reaches the browser, and adds
 //!   `Content-Security-Policy: sandbox; default-src 'none'`;
 //! - lets a redirect (`3xx` with `Location`) of the guest lead only to the
 //!   same loopback origin (host and port) or to an `https` page of the
 //!   service ([`Callback::pages`]); any other redirect is replaced by a
 //!   host page that says the sign-in finished;
 //! - closes after [`FOLLOW_UP`]: once a request carried a `code`, the
-//!   browser's follow-ups (a success page) reach the guest for that long;
-//!   later connections are dropped and later requests get the host page.
-//!   A new sign-in on the same port opens the forward again
-//!   ([`CallbackForward::reopen`]).
+//!   browser's follow-ups (a success page) reach the guest for that long.
+//!   A forward that gets no `code` closes after [`UNUSED_LIMIT`], so the
+//!   sandbox cannot hold a host port forever. A closed forward drops later
+//!   connections, answers later requests with the host page, and frees its
+//!   port. A new sign-in on the same port opens a forward that has not
+//!   closed yet again ([`CallbackForward::reopen`]).
 //!
 //! A request that does not parse as HTTP/1 gets an error from the host
 //! and never reaches the guest.
@@ -36,14 +40,14 @@ use bytes::Bytes;
 use http_body_util::{Either, Full};
 use hyper::body::Incoming;
 use hyper::header::{
-    ALLOW, AUTHORIZATION, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, COOKIE, HOST,
-    HeaderValue, LOCATION, REFRESH, SET_COOKIE,
+    ALLOW, AUTHORIZATION, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_SECURITY_POLICY, CONTENT_TYPE,
+    COOKIE, HOST, HeaderMap, HeaderName, HeaderValue, LOCATION,
 };
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::task::JoinSet;
-use tracing::debug;
+use tracing::{debug, warn};
 use url::Url;
 
 use super::ServiceId;
@@ -54,6 +58,13 @@ use crate::rpc::guest_network::GuestNetwork;
 /// How long the browser's follow-ups reach the guest after the first
 /// request with a `code`.
 const FOLLOW_UP: Duration = Duration::from_mins(1);
+
+/// How long a forward waits for its first request with a `code`.
+const UNUSED_LIMIT: Duration = Duration::from_mins(10);
+
+/// The headers of the guest's answers that reach the browser. A
+/// `Location` reaches it too, on a redirect that [`to_browser`] allows.
+const ANSWER_HEADERS: [HeaderName; 3] = [CONTENT_TYPE, CONTENT_LENGTH, CACHE_CONTROL];
 
 /// The policy of the callback answers the guest sends to the browser.
 const CSP: &str = "sandbox; default-src 'none'";
@@ -82,8 +93,12 @@ struct ForwardState {
     port: u16,
     codes: PendingCodes,
     callback: Cell<Callback>,
+    /// When the forward opened, or a new sign-in reopened it.
+    opened: Cell<Instant>,
     /// When the first request with a `code` came.
     code_seen: Cell<Option<Instant>>,
+    /// The forward has closed for good: its port is (being) freed.
+    ended: Cell<bool>,
 }
 
 impl CallbackForward {
@@ -92,22 +107,44 @@ impl CallbackForward {
             port,
             codes,
             callback: Cell::new(callback),
+            opened: Cell::new(Instant::now()),
             code_seen: Cell::new(None),
+            ended: Cell::new(false),
         }))
     }
 
-    /// Open the forward again for a new sign-in of `callback`.
-    pub fn reopen(&self, callback: Callback) {
+    /// Open the forward again for a new sign-in of `callback`. `false`
+    /// when it has closed for good: the sign-in needs a new forward.
+    pub fn reopen(&self, callback: Callback) -> bool {
+        if self.0.ended.get() {
+            return false;
+        }
         self.0.callback.set(callback);
+        self.0.opened.set(Instant::now());
         self.0.code_seen.set(None);
+        true
+    }
+
+    /// When the forward closes: [`FOLLOW_UP`] after the first code, else
+    /// [`UNUSED_LIMIT`] after it opened.
+    fn deadline(&self) -> Instant {
+        match self.0.code_seen.get() {
+            Some(seen) => seen + FOLLOW_UP,
+            None => self.0.opened.get() + UNUSED_LIMIT,
+        }
     }
 
     /// Whether requests still reach the guest.
     fn is_open(&self) -> bool {
-        self.0
-            .code_seen
-            .get()
-            .is_none_or(|t| t.elapsed() < FOLLOW_UP)
+        !self.0.ended.get() && Instant::now() < self.deadline()
+    }
+
+    /// Wait until the forward closes, and mark it closed for good.
+    async fn closed(&self) {
+        while self.is_open() {
+            tokio::time::sleep_until(self.deadline().into()).await;
+        }
+        self.0.ended.set(true);
     }
 
     /// The origin the browser reached the forward at, from `Host`: a
@@ -130,9 +167,10 @@ impl CallbackForward {
 }
 
 /// Serve the bound callback port `forward` for a sign-in of `callback`
-/// (see the module docs): accept loops in `tasks`, each connection relayed
-/// to the same port on `guest`, every request's `code` swapped for a
-/// surrogate kept in `codes`. Returns the forward's state.
+/// (see the module docs): a task in `tasks` that runs the accept loops
+/// until the forward closes and then frees the port, each connection
+/// relayed to the same port on `guest`, every request's `code` swapped for
+/// a surrogate kept in `codes`. Returns the forward's state.
 pub fn serve(
     forward: BoundForward,
     guest: &GuestNetwork,
@@ -140,10 +178,23 @@ pub fn serve(
     codes: &PendingCodes,
     callback: Callback,
 ) -> CallbackForward {
+    let state = CallbackForward::new(forward.guest_port(), callback, codes.clone());
+    serve_until_closed(forward, guest, tasks, state.clone());
+    state
+}
+
+/// Serve `forward` for `state` in a task of `tasks` until `state` closes;
+/// then the port is freed.
+fn serve_until_closed(
+    forward: BoundForward,
+    guest: &GuestNetwork,
+    tasks: &mut JoinSet<()>,
+    state: CallbackForward,
+) {
     let port = forward.guest_port();
-    let state = CallbackForward::new(port, callback, codes.clone());
+    let mut accept_loops = JoinSet::new();
     let (guest, served) = (guest.clone(), state.clone());
-    reverse_forward::serve_with(forward, tasks, move |stream| {
+    reverse_forward::serve_with(forward, &mut accept_loops, move |stream| {
         let (guest, forward) = (guest.clone(), served.clone());
         async move {
             if !forward.is_open() {
@@ -154,7 +205,12 @@ pub fn serve(
             relay_callback(stream, rpc_io, forward).await
         }
     });
-    state
+    tasks.spawn_local(async move {
+        state.closed().await;
+        debug!("sign-in callback on {port} closed; freeing the port");
+        // The accept loops, and their listeners, end with their set.
+        drop(accept_loops);
+    });
 }
 
 type CallbackBody = Either<Incoming, Full<Bytes>>;
@@ -176,6 +232,10 @@ where
                 return Ok(finished_page());
             }
             if req.method() != Method::GET {
+                warn!(
+                    "refused: sign-in callback: a {} request (answered 405)",
+                    req.method()
+                );
                 let mut resp = status_only(StatusCode::METHOD_NOT_ALLOWED);
                 resp.headers_mut()
                     .insert(ALLOW, HeaderValue::from_static("GET"));
@@ -186,7 +246,7 @@ where
             let req = match to_guest(req, &forward) {
                 Ok(req) => req,
                 Err(e) => {
-                    debug!("sign-in callback refused: {e:#}");
+                    warn!("refused: sign-in callback: {e:#} (answered 400)");
                     return Ok(status_only(StatusCode::BAD_REQUEST));
                 }
             };
@@ -195,7 +255,10 @@ where
             match sent.await {
                 Ok(resp) => Ok::<_, hyper::Error>(to_browser(resp, &origin, callback.pages)),
                 Err(e) => {
-                    debug!("sign-in callback to the guest: {e}");
+                    warn!(
+                        "sign-in callback: the agent in the sandbox did not answer: {e} \
+                         (answered 502)"
+                    );
                     Ok(status_only(StatusCode::BAD_GATEWAY))
                 }
             }
@@ -246,16 +309,13 @@ fn to_guest(
     Ok(req)
 }
 
-/// The guest's answer as the browser gets it: no `Set-Cookie` or
-/// `Refresh`, the sandbox CSP, and a redirect only to `origin` or an
-/// `https` page on one of `pages`; any other redirect becomes the host's
-/// [`finished_page`].
-fn to_browser(
-    mut resp: Response<Incoming>,
-    origin: &Url,
-    pages: &[&str],
-) -> Response<CallbackBody> {
-    if resp.status().is_redirection() && resp.headers().contains_key(LOCATION) {
+/// The guest's answer as the browser gets it: only the headers of
+/// [`ANSWER_HEADERS`], the sandbox CSP, and a redirect only to `origin` or
+/// an `https` page on one of `pages`; any other redirect becomes the
+/// host's [`finished_page`].
+fn to_browser(resp: Response<Incoming>, origin: &Url, pages: &[&str]) -> Response<CallbackBody> {
+    let redirect = resp.status().is_redirection() && resp.headers().contains_key(LOCATION);
+    if redirect {
         let allowed = resp
             .headers()
             .get(LOCATION)
@@ -263,15 +323,24 @@ fn to_browser(
             .and_then(|l| origin.join(l).ok())
             .is_some_and(|to| redirect_allowed(&to, origin, pages));
         if !allowed {
-            debug!("sign-in callback: refused a redirect of the guest");
+            warn!(
+                "refused: sign-in callback: a redirect of the agent to a page that is no \
+                 loopback origin or sign-in page (showed the finished page)"
+            );
             return finished_page();
         }
     }
-    let headers = resp.headers_mut();
-    headers.remove(SET_COOKIE);
-    headers.remove(REFRESH);
+    let (mut parts, body) = resp.into_parts();
+    let mut headers = HeaderMap::new();
+    let location = redirect.then_some(LOCATION);
+    for name in ANSWER_HEADERS.into_iter().chain(location) {
+        for value in parts.headers.get_all(&name) {
+            headers.append(name.clone(), value.clone());
+        }
+    }
     headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP));
-    resp.map(Either::Left)
+    parts.headers = headers;
+    Response::from_parts(parts, Either::Left(body))
 }
 
 /// A redirect target the guest may send the browser to.
@@ -489,10 +558,11 @@ mod tests {
         });
     }
 
-    /// The guest's answer reaches the browser without cookies and with the
-    /// sandbox CSP.
+    /// The guest's answer reaches the browser with only the allowed
+    /// headers (no cookies, CORS or site-data commands) and the sandbox
+    /// CSP.
     #[test]
-    fn answers_lose_cookies_and_get_the_sandbox_csp() {
+    fn answers_keep_only_allowed_headers_and_get_the_sandbox_csp() {
         block_on_local(async {
             let got = exchange_with(
                 &forward(),
@@ -501,14 +571,31 @@ mod tests {
                     ("set-cookie", "session=evil; Domain=localhost"),
                     ("refresh", "0; url=https://evil.example/"),
                     ("content-security-policy", "default-src *"),
+                    ("access-control-allow-origin", "*"),
+                    ("clear-site-data", "\"*\""),
+                    ("location", "https://evil.example/"),
+                    ("x-custom", "1"),
+                    ("content-type", "text/html"),
+                    ("cache-control", "no-store"),
                 ],
                 200,
             )
             .await;
             let answer = got.answer.to_ascii_lowercase();
             assert!(answer.starts_with("http/1.1 200"), "{answer}");
-            assert!(!answer.contains("set-cookie"), "{answer}");
-            assert!(!answer.contains("refresh:"), "{answer}");
+            for refused in [
+                "set-cookie",
+                "refresh:",
+                "access-control-allow-origin",
+                "clear-site-data",
+                "location",
+                "x-custom",
+            ] {
+                assert!(!answer.contains(refused), "{refused}: {answer}");
+            }
+            assert!(answer.contains("content-type: text/html"), "{answer}");
+            assert!(answer.contains("cache-control: no-store"), "{answer}");
+            assert!(answer.ends_with("\r\n\r\nok"), "{answer}");
             assert!(
                 answer.contains("content-security-policy: sandbox; default-src 'none'"),
                 "{answer}"
@@ -587,10 +674,58 @@ mod tests {
             assert!(got.seen.is_empty(), "{:?}", got.seen);
             assert!(got.answer.contains("Sign-in finished"), "{}", got.answer);
 
-            forward.reopen(CALLBACK);
+            assert!(forward.reopen(CALLBACK));
             assert!(forward.is_open());
             let got = exchange_with(&forward, &get("/callback?code=real", ""), vec![], 200).await;
             assert_eq!(got.seen.len(), 1);
+        });
+    }
+
+    /// A forward that gets no code closes after [`UNUSED_LIMIT`]; a new
+    /// sign-in on its port before then opens it again.
+    #[test]
+    fn an_unused_forward_closes() {
+        let forward = forward();
+        assert!(forward.is_open());
+        let past = Instant::now().checked_sub(UNUSED_LIMIT).unwrap();
+        forward.0.opened.set(past);
+        assert!(!forward.is_open());
+        assert!(forward.reopen(CALLBACK));
+        assert!(forward.is_open());
+    }
+
+    /// A supervisor that implements nothing: no connection reaches it.
+    struct NoSupervisor;
+    impl airlock_common::supervisor_capnp::supervisor::Server for NoSupervisor {}
+
+    /// A closed forward frees its port and cannot be reopened.
+    #[test]
+    fn a_closed_forward_frees_its_port() {
+        block_on_local(async {
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let bound = reverse_forward::bind_exclusive(port, port).unwrap();
+            let guest = GuestNetwork::new(capnp_rpc::new_client(NoSupervisor));
+            let state = CallbackForward::new(port, CALLBACK, PendingCodes::default());
+            let past = Instant::now().checked_sub(UNUSED_LIMIT).unwrap();
+            state.0.opened.set(past);
+            let mut tasks = JoinSet::new();
+            serve_until_closed(bound, &guest, &mut tasks, state.clone());
+            let mut freed = false;
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+                if let Ok(l) = reverse_forward::bind_exclusive(port, port) {
+                    drop(l);
+                    freed = true;
+                    break;
+                }
+            }
+            assert!(freed, "the closed forward still holds port {port}");
+            assert!(!state.reopen(CALLBACK));
+            assert!(!state.is_open());
         });
     }
 }

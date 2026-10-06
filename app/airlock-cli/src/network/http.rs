@@ -18,6 +18,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 
 use anyhow::Context as _;
+use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{Either, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
@@ -79,7 +80,19 @@ pub async fn detect(reader: &mut (impl AsyncRead + Unpin)) -> Result<Bytes, Byte
 
 /// Request and response bodies on the relay's send path: streamed from
 /// the peer, or built by the proxy.
-pub type ResponseBody = Either<Incoming, Full<Bytes>>;
+pub type ResponseBody = Either<StreamBody, Full<Bytes>>;
+
+/// A streamed body: the peer's own, or a peer's body that an interceptor
+/// wraps (the token scan of [`crate::services::scan`]).
+pub type StreamBody = Either<Incoming, UnsyncBoxBody<Bytes, BoxError>>;
+
+/// The error of a wrapped body.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// A body streamed from the peer, as a [`ResponseBody`].
+pub fn streamed(body: Incoming) -> ResponseBody {
+    Either::Left(Either::Left(body))
+}
 
 /// hyper IO over a boxed read/write pair — both guest and upstream sides.
 type HyperIo = TokioIo<tokio::io::Join<io::BoxRead, io::BoxWrite>>;
@@ -177,7 +190,7 @@ pub async fn relay(
                         Box::pin(async move {
                             let resp =
                                 sender.send(req).await.map_err(|e| anyhow::anyhow!("{e}"))?;
-                            Ok(resp.map(Either::Left))
+                            Ok(resp.map(streamed))
                         })
                     });
                     let resp = match interceptor {

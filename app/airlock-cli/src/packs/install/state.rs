@@ -58,6 +58,18 @@ pub struct InstallState {
     pub image_id: Option<String>,
     #[serde(default)]
     pub packs: BTreeMap<String, Record>,
+    /// A normal (non-install) session ran on the disk since the last
+    /// install boot: code it left can run in the next install boot, so a
+    /// retry asks first ([`super::plan::Why::Retry`]). A file without the
+    /// field counts as `true`.
+    #[serde(default = "session_unknown")]
+    pub ran_session: bool,
+}
+
+/// [`InstallState::ran_session`] of a file without the field: assume a
+/// session ran.
+fn session_unknown() -> bool {
+    true
 }
 
 impl Default for InstallState {
@@ -67,6 +79,7 @@ impl Default for InstallState {
             disk: None,
             image_id: None,
             packs: BTreeMap::new(),
+            ran_session: false,
         }
     }
 }
@@ -168,6 +181,7 @@ pub fn apply(state: &mut InstallState, transitions: &[Transition]) {
                 state.packs.clear();
                 state.disk = None;
                 state.image_id = None;
+                state.ran_session = false;
             }
             Transition::Promote(id) => {
                 if let Some(r) = state.packs.get_mut(id) {
@@ -238,6 +252,7 @@ mod tests {
             disk: Some((1, 2)),
             image_id: Some("sha256:1".into()),
             packs,
+            ran_session: true,
         }
     }
 
@@ -300,7 +315,10 @@ mod tests {
         ));
         assert!(matches!(
             read_json(&tmp, r#"{"version": 1}"#),
-            ReadState::Ok(_)
+            ReadState::Ok(InstallState {
+                ran_session: true,
+                ..
+            })
         ));
     }
 
@@ -358,5 +376,6 @@ mod tests {
         assert!(s.packs.is_empty());
         assert_eq!(s.disk, None);
         assert_eq!(s.image_id, None);
+        assert!(!s.ran_session);
     }
 }

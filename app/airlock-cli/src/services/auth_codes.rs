@@ -21,6 +21,14 @@
 //! live in the memory of this process only; each service has its own
 //! [`PendingCodes`] and keeps at most [`MAX_PENDING`], so a flood of one
 //! service's codes cannot push out another's.
+//!
+//! Claude's manual sign-in is the exception: the user pastes the real
+//! code into the sandbox, so there is no surrogate to redeem. Its
+//! exchange is bound to a sign-in page the browser bridge opened instead
+//! ([`PendingCodes::open_page`]): the exchange's PKCE `code_verifier` must
+//! hash (S256) to the `code_challenge` of a page this process opened for
+//! the service. An opened page works for one exchange and for
+//! [`LIFETIME`]; the service keeps at most [`MAX_PENDING`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,6 +37,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use parking_lot::Mutex;
+use sha2::{Digest as _, Sha256};
 use url::Url;
 
 use super::ServiceId;
@@ -37,11 +46,11 @@ use super::store::random_bytes;
 /// What a surrogate code starts with.
 pub const PREFIX: &str = "airlock-code-";
 
-/// How long a surrogate code works.
+/// How long a surrogate code, and an opened sign-in page, works.
 const LIFETIME: Duration = Duration::from_mins(10);
 
-/// The most codes kept per service; a new one drops the service's oldest.
-/// A sign-in issues one.
+/// The most codes (and opened pages) kept per service; a new one drops
+/// the service's oldest. A sign-in issues one.
 const MAX_PENDING: usize = 32;
 
 /// Where a real code came to the host.
@@ -69,16 +78,28 @@ impl Channel {
     }
 }
 
-/// The surrogate codes issued and not yet used. Cheap to clone; clones
-/// share the codes.
+/// The surrogate codes issued and not yet used, and the sign-in pages
+/// opened and not yet used by a manual exchange. Cheap to clone; clones
+/// share both.
 #[derive(Clone, Default)]
-pub struct PendingCodes(Arc<Mutex<HashMap<String, Pending>>>);
+pub struct PendingCodes {
+    codes: Arc<Mutex<HashMap<String, Pending>>>,
+    pages: Arc<Mutex<Vec<OpenedPage>>>,
+}
 
 struct Pending {
     real: String,
     service: ServiceId,
     channel: Channel,
     issued: Instant,
+}
+
+/// A sign-in page the browser bridge opened.
+struct OpenedPage {
+    /// The page's PKCE `code_challenge` (S256).
+    challenge: String,
+    service: ServiceId,
+    opened: Instant,
 }
 
 impl PendingCodes {
@@ -91,7 +112,7 @@ impl PendingCodes {
         channel: Channel,
     ) -> anyhow::Result<String> {
         let surrogate = format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(random_bytes::<32>()?));
-        let mut codes = self.0.lock();
+        let mut codes = self.codes.lock();
         codes.retain(|_, p| p.issued.elapsed() < LIFETIME);
         while codes.values().filter(|p| p.service == service).count() >= MAX_PENDING {
             let oldest = codes
@@ -118,11 +139,42 @@ impl PendingCodes {
     /// through `channel`: the surrogate is used up either way. `None` for
     /// an unknown, used, expired or foreign surrogate.
     pub fn redeem(&self, surrogate: &str, service: ServiceId, channel: Channel) -> Option<String> {
-        let pending = self.0.lock().remove(surrogate)?;
+        let pending = self.codes.lock().remove(surrogate)?;
         (pending.issued.elapsed() < LIFETIME
             && pending.service == service
             && pending.channel == channel)
             .then_some(pending.real)
+    }
+
+    /// Remember that the browser bridge opened a sign-in page of `service`
+    /// with the PKCE `code_challenge` `challenge`.
+    pub fn open_page(&self, challenge: &str, service: ServiceId) {
+        let mut pages = self.pages.lock();
+        pages.retain(|p| p.opened.elapsed() < LIFETIME);
+        while pages.iter().filter(|p| p.service == service).count() >= MAX_PENDING {
+            let oldest = pages
+                .iter()
+                .position(|p| p.service == service)
+                .expect("the service has pages");
+            pages.remove(oldest);
+        }
+        pages.push(OpenedPage {
+            challenge: challenge.to_string(),
+            service,
+            opened: Instant::now(),
+        });
+    }
+
+    /// Whether `verifier` is the PKCE verifier of a page opened for
+    /// `service` within [`LIFETIME`] ([`Self::open_page`]): its S256
+    /// challenge matches. A match uses the page up.
+    pub fn redeem_page(&self, verifier: &str, service: ServiceId) -> bool {
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        let mut pages = self.pages.lock();
+        let found = pages.iter().position(|p| {
+            p.service == service && p.challenge == challenge && p.opened.elapsed() < LIFETIME
+        });
+        found.map(|i| pages.remove(i)).is_some()
     }
 
     /// `query` with the value of every `code` parameter swapped for a
@@ -255,12 +307,51 @@ mod tests {
             codes.issue("more", ServiceId::Openai, CALLBACK).unwrap();
         }
         assert_eq!(codes.redeem(&first, ServiceId::Openai, CALLBACK), None);
-        assert_eq!(codes.0.lock().len(), MAX_PENDING + 1);
+        assert_eq!(codes.codes.lock().len(), MAX_PENDING + 1);
         assert_eq!(
             codes
                 .redeem(&other, ServiceId::Anthropic, Channel::Callback(40000))
                 .as_deref(),
             Some("other")
         );
+    }
+
+    /// RFC 7636, appendix B: the S256 challenge of the example verifier.
+    const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+    /// An opened page binds one manual exchange: its verifier, its
+    /// service, once.
+    #[test]
+    fn an_opened_page_redeems_its_verifier_once() {
+        let codes = PendingCodes::default();
+        assert!(!codes.redeem_page(VERIFIER, ServiceId::Anthropic));
+        codes.open_page(CHALLENGE, ServiceId::Anthropic);
+        assert!(!codes.redeem_page("another-verifier", ServiceId::Anthropic));
+        assert!(!codes.redeem_page(VERIFIER, ServiceId::Openai));
+        assert!(!codes.redeem_page(CHALLENGE, ServiceId::Anthropic));
+        assert!(codes.redeem_page(VERIFIER, ServiceId::Anthropic));
+        assert!(!codes.redeem_page(VERIFIER, ServiceId::Anthropic));
+    }
+
+    #[test]
+    fn an_opened_page_expires() {
+        let codes = PendingCodes::default();
+        codes.open_page(CHALLENGE, ServiceId::Anthropic);
+        codes.pages.lock()[0].opened = Instant::now().checked_sub(LIFETIME).unwrap();
+        assert!(!codes.redeem_page(VERIFIER, ServiceId::Anthropic));
+    }
+
+    /// Each service keeps its own [`MAX_PENDING`] opened pages.
+    #[test]
+    fn old_pages_are_dropped_per_service() {
+        let codes = PendingCodes::default();
+        codes.open_page(CHALLENGE, ServiceId::Anthropic);
+        codes.open_page(CHALLENGE, ServiceId::Openai);
+        for _ in 0..MAX_PENDING {
+            codes.open_page("other", ServiceId::Anthropic);
+        }
+        assert!(!codes.redeem_page(VERIFIER, ServiceId::Anthropic));
+        assert!(codes.redeem_page(VERIFIER, ServiceId::Openai));
     }
 }

@@ -26,7 +26,7 @@ const GOLDEN_PATH: &str = concat!(
     "/src/config/tests/golden/legacy-presets.json"
 );
 
-/// The 12 released preset names, frozen.
+/// The released preset names (11, plus the later addition `docker`), frozen.
 const NAMES: [&str; 12] = [
     "alpine",
     "arch",
@@ -34,6 +34,22 @@ const NAMES: [&str; 12] = [
     "copilot-cli",
     "debian",
     "docker",
+    "fedora",
+    "nodejs",
+    "openai-codex",
+    "python",
+    "rust",
+    "suse",
+];
+
+/// [`NAMES`] without the later addition `docker`: the 11 names released on
+/// `main`, so these cases double as a main-equivalence check.
+const NAMES_NO_DOCKER: [&str; 11] = [
+    "alpine",
+    "arch",
+    "claude-code",
+    "copilot-cli",
+    "debian",
     "fedora",
     "nodejs",
     "openai-codex",
@@ -159,6 +175,18 @@ fn cases() -> Vec<Case> {
             .user(presets(&NAMES[..5]))
             .local(presets(&NAMES[5..10]))
             .project(presets(&NAMES[10..])),
+    );
+
+    // The same, without `docker`: these cases resolve exactly as on `main`.
+    let mut reversed_no_docker = NAMES_NO_DOCKER;
+    reversed_no_docker.reverse();
+    cases.push(Case::new("all/no-docker/catalog-order").project(presets(&NAMES_NO_DOCKER)));
+    cases.push(Case::new("all/no-docker/reversed").project(presets(&reversed_no_docker)));
+    cases.push(
+        Case::new("all/no-docker/one-per-layer")
+            .user(presets(&NAMES_NO_DOCKER[..4]))
+            .local(presets(&NAMES_NO_DOCKER[4..8]))
+            .project(presets(&NAMES_NO_DOCKER[8..])),
     );
 
     cases.extend(text_cases());

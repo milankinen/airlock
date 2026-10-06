@@ -82,6 +82,8 @@ pub async fn install_tools(
         let install_project = project
             .with_config(resolved.install_config().map_err(Exit::config)?)
             .map_err(|e| Exit::error(1, e))?;
+        // Saved with the first record: no session ran since this install.
+        state.ran_session = false;
         let mut save = |s: &mut InstallState| save_state(&sandbox, &image.image_id, s);
         let run = run_install(
             install_project,
@@ -101,6 +103,12 @@ pub async fn install_tools(
     }
     if install {
         prompt::flush_input();
+    }
+    // The session runs next; a later retry asks first (see
+    // [`InstallState::ran_session`]).
+    if !state.ran_session && !state.packs.is_empty() {
+        state.ran_session = true;
+        save_state(&sandbox, &image.image_id, &mut state)?;
     }
     Ok(())
 }

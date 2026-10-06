@@ -39,25 +39,37 @@
 //!   host to [`crate::network::interceptor::Interceptor::send`] around the
 //!   upstream send, after the monitor event and the Lua middleware, so
 //!   both see surrogates only. The interceptor first pins the request's
-//!   authority to the endpoint ([`oauth::pin_authority`]), swaps
-//!   surrogates for the real tokens on the provider's API paths only,
-//!   answers token-endpoint requests itself where needed, and rewrites
-//!   responses that carry real tokens. Only TLS connections get the
-//!   interceptor: on plain HTTP a surrogate goes out as it is.
+//!   authority to the endpoint ([`oauth::pin_authority`]), handles the
+//!   token hosts' routes itself (code exchange, refresh, revoke; other
+//!   routes there get a local `403`), swaps a known surrogate for its real
+//!   value in the credential headers (`Authorization: Bearer`,
+//!   `x-api-key`) on the API hosts (any path; never another header, never
+//!   a body, never another host), scans every API answer for real tokens
+//!   as it streams ([`scan`]), and puts surrogates in place of the real
+//!   tokens in token answers ([`tokens`]). Only TLS connections get
+//!   the interceptor: on plain HTTP a surrogate goes out as it is.
 //! - The browser bridge ([`crate::rpc::browser`]): each service's
 //!   [`sign_in::LoopbackSignIn`] is a browser grant for its sign-in
 //!   pages, and `airlock start` points `$BROWSER` of the sandbox at the
 //!   guest's browser shim. Once the VM is booted ([`Services::attach`]),
 //!   the grant forwards the page's callback port into the guest
 //!   ([`callback`]), which swaps the authorization code for a surrogate
-//!   code ([`auth_codes`]).
+//!   code ([`auth_codes`]), and keeps the page's PKCE challenge for
+//!   Claude's manual sign-in exchange. The check of a page takes any
+//!   OAuth client and any well-formed scopes ([`sign_in`]): the exchange
+//!   stores the client it used, and refresh and revoke use that one.
 //!
 //! ## Fail closed
 //!
-//! - Dispatch: on an owned host, only the requests a service recognises
-//!   get its handling (token endpoints, the API branch with its swap);
-//!   everything else, also on a host the service does not know, passes
-//!   the backstop of [`oauth`] and never goes out as a raw forward.
+//! - Dispatch: a token host serves only the routes the agents call there
+//!   (token, revoke, and the few sign-in calls of each agent); any other
+//!   route gets a local `403`. An API host takes every path, with the
+//!   credential swap and the answer scan. A host the service does not know passes the backstop of
+//!   [`oauth`]; nothing goes out as a raw forward.
+//! - Unknown token formats: a token answer with a string under a
+//!   token-like key that is in no format the provider's table knows is
+//!   refused whole (local `502`, nothing stored), so a new token format
+//!   never reaches the sandbox ([`tokens`]).
 //! - Strict credentials: on the API branch, an `Authorization` or
 //!   `x-api-key` value must be a surrogate of the service or the real
 //!   value of a masked secret the inject rules put in (the `injected` of
@@ -77,21 +89,32 @@
 //! API request past its real expiry gets whatever the provider answers
 //! (a 401 included); the proxy never refreshes on its own. Real tokens
 //! live encrypted in a database shared by all airlock processes
-//! ([`store`]); its key is in the vault. A sign-out revokes both real
+//! ([`store`]); its key is in the vault. A sign-out or refresh in one
+//! process is seen by the others on their next lookup. A sign-out revokes both real
 //! tokens where the provider allows it, a replaced grant is revoked too,
 //! and the tokens of a refresh that ends after a sign-out are revoked
 //! again (see [`oauth::Grants`]).
 //!
 //! Providers: [`anthropic`] (Claude Code), [`openai`] (Codex). Shared
-//! OAuth 2 logic is in [`oauth`].
+//! OAuth 2 logic is in [`oauth`], the surrogate engine in [`tokens`].
+//!
+//! What stays per provider (and why): the hosts and token-host routes
+//! (the allowlist is the point), the token formats (fail closed needs to
+//! know a real token), the callback ports and paths of the loopback
+//! sign-in (no arbitrary host ports), the device flow and manual sign-in
+//! redirects, the shape of the refresh request (Claude Code's drops
+//! `org:create_api_key`), and the secret-minting `create_api_key`
+//! endpoint (rate limit).
 
 pub mod anthropic;
 pub mod auth_codes;
 pub mod callback;
 pub mod oauth;
 pub mod openai;
+pub mod scan;
 pub mod sign_in;
 pub mod store;
+pub mod tokens;
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -253,7 +276,8 @@ impl Services {
 }
 
 /// Build the services enabled in `config`; each has its own surrogate
-/// codes, shared by its token exchange and its callback forward. Needs the
+/// codes (and opened sign-in pages), shared by its token exchange and its
+/// sign-ins. Needs the
 /// token-store key from the vault of `context` and its database (open
 /// since [`Context::load`]). Fails closed: with the vault `disabled`, or a
 /// key that fails, the services are unavailable and their hosts are

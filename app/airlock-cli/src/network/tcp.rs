@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use super::io;
+use super::target::{self, ResolvedTarget};
 
 /// Wrap the RPC channel to the guest in a `Transport` without touching the
 /// real server. Used on both the allow path (paired with `connect_server`)
@@ -26,20 +27,36 @@ pub fn container_transport(
 }
 
 /// Open a plain TCP socket to the real server.
-pub async fn connect_server(addr: &str) -> anyhow::Result<io::Transport> {
+pub async fn connect_server(target: &ResolvedTarget) -> anyhow::Result<io::Transport> {
+    let addr = format!("{}:{}", target.host, target.port);
     debug!("plain tcp: {addr}");
-    let server = tokio::time::timeout(
-        crate::constants::TCP_CONNECT_TIMEOUT,
-        TcpStream::connect(addr),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("connection timed out: {addr}"))??;
+    let server = tokio::time::timeout(crate::constants::TCP_CONNECT_TIMEOUT, dial(target))
+        .await
+        .map_err(|_| anyhow::anyhow!("connection timed out: {addr}"))??;
     let (sr, sw) = server.into_split();
     Ok(io::Transport {
         read: Box::new(sr),
         write: Box::new(sw),
         h2: false,
     })
+}
+
+/// Open a TCP stream to `target`. A [`ResolvedTarget::public_only`]
+/// target resolves here, and only its public addresses are dialed: the
+/// check covers the addresses the stream connects to, so neither a name
+/// like `localhost` nor DNS rebinding gets past it.
+pub async fn dial(target: &ResolvedTarget) -> anyhow::Result<TcpStream> {
+    let addr = format!("{}:{}", target.host, target.port);
+    if !target.public_only {
+        return Ok(TcpStream::connect(&addr).await?);
+    }
+    let host = target::ip_literal(&target.host).map_or(target.host.clone(), |ip| ip.to_string());
+    let public: Vec<_> = tokio::net::lookup_host((host.as_str(), target.port))
+        .await?
+        .filter(|a| target::is_public_ip(a.ip()))
+        .collect();
+    anyhow::ensure!(!public.is_empty(), "blocked: {addr} has no public address");
+    Ok(TcpStream::connect(&public[..]).await?)
 }
 
 /// Bidirectional relay between two transports.

@@ -242,6 +242,7 @@ pub fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
             middleware_targets,
             inject_targets,
             interceptors: cfg.interceptors,
+            public_only: false,
             unavailable_targets: cfg.unavailable_targets,
             port_forwards: std::collections::HashMap::default(),
             socket_map: std::collections::HashMap::default(),

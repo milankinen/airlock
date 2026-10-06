@@ -10,7 +10,10 @@ use std::time::Duration;
 use axum::Router;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 
 use super::fake_provider::*;
 use super::helpers::*;
@@ -18,11 +21,12 @@ use crate::network::interceptor::Interceptor;
 use crate::services::ServiceId;
 use crate::services::anthropic::{Anthropic, Endpoints};
 use crate::services::auth_codes::{Channel, PendingCodes};
-use crate::services::store::{
-    GrantSecrets, NewGrant, SurrogateKind, Surrogates, TokenStore, list_grants, now_ms,
-};
+use crate::services::store::{NewGrant, TokenStore, list_grants};
+use crate::services::tokens::{Token, TokenKind};
 
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+/// Claude Code's OAuth client of the Anthropic Console sign-in.
+const CONSOLE_CLIENT_ID: &str = "41077d10-94b8-4194-be48-d251e9eb21b4";
 const LOOPBACK: &str = "http://localhost:40000/callback";
 const MANUAL: &str = "https://platform.claude.com/oauth/code/callback";
 /// The code the fake provider issued: what the browser brings back.
@@ -32,15 +36,38 @@ const SCOPE: &str = "org:create_api_key user:inference user:profile";
 
 /// The guest's code exchange body.
 fn code_exchange(code: &str, redirect_uri: &str) -> String {
+    code_exchange_of(CLIENT_ID, code, redirect_uri)
+}
+
+/// The guest's code exchange body for the OAuth client `client_id`.
+fn code_exchange_of(client_id: &str, code: &str, redirect_uri: &str) -> String {
     json!({
         "grant_type": "authorization_code",
         "code": code,
         "redirect_uri": redirect_uri,
-        "client_id": CLIENT_ID,
+        "client_id": client_id,
         "code_verifier": "v",
         "state": "s",
     })
     .to_string()
+}
+
+/// A grant made without the proxy: the real access token and its
+/// surrogate, no refresh token.
+fn grant_of(real: &str, surrogate: &str) -> NewGrant {
+    NewGrant {
+        account_id: "acct".into(),
+        account: None,
+        organization: None,
+        client_id: CLIENT_ID.into(),
+        scopes: vec![],
+        tokens: vec![Token {
+            kind: TokenKind::Access,
+            real: real.into(),
+            surrogate: surrogate.into(),
+            expires_at: None,
+        }],
+    }
 }
 
 /// How the fake provider behaves.
@@ -64,6 +91,9 @@ struct Options {
     revoke_status: u16,
     /// How long a revoke takes.
     revoke_delay: Duration,
+    /// Fields the code exchange answer carries besides (or instead of) the
+    /// usual ones.
+    exchange_extra: Option<Value>,
 }
 
 impl Default for Options {
@@ -78,6 +108,7 @@ impl Default for Options {
             gzip: false,
             revoke_status: 200,
             revoke_delay: Duration::ZERO,
+            exchange_extra: None,
         }
     }
 }
@@ -135,17 +166,25 @@ impl Fake {
             ("POST", "/api/oauth/claude_cli/create_api_key") if authorized => {
                 self.json(json!({ "raw_key": REAL_API_KEY, "name": "claude-code" }))
             }
-            ("GET", "/page/json") => axum::Json(json!({ "access_token": "x" })).into_response(),
-            ("GET", "/page/html") => (
-                [("content-type", "text/html")],
-                "<p>access_token sk-ant-oat01-x</p>",
-            )
+            ("GET", "/v1/gzip/json") if authorized => gzipped("application/json", "{}"),
+            ("GET", "/v1/gzip/sse") if authorized => gzipped("text/event-stream", "data: {}\n\n"),
+            ("GET", "/v1/leak") if authorized => {
+                axum::Json(json!({ "t": self.refresh.lock().unwrap().clone() })).into_response()
+            }
+            ("GET", "/v1/oauth/hello") => match seen.header("x-page") {
+                Some("json") => axum::Json(json!({ "access_token": "x" })).into_response(),
+                Some("html") => (
+                    [("content-type", "text/html")],
+                    "<p>access_token sk-ant-oat01-x</p>",
+                )
+                    .into_response(),
+                Some("big") => axum::Json(json!({
+                    "access_token": "x",
+                    "pad": "a".repeat(70 * 1024),
+                }))
                 .into_response(),
-            ("GET", "/page/big") => axum::Json(json!({
-                "access_token": "x",
-                "pad": "a".repeat(70 * 1024),
-            }))
-            .into_response(),
+                _ => axum::Json(json!({ "ok": true })).into_response(),
+            },
             _ if authorized || seen.header("x-api-key") == Some(REAL_API_KEY) => {
                 "ok".into_response()
             }
@@ -158,16 +197,7 @@ impl Fake {
         if !self.opts.gzip {
             return axum::Json(value).into_response();
         }
-        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        gz.write_all(value.to_string().as_bytes()).unwrap();
-        (
-            [
-                ("content-type", "application/json"),
-                ("content-encoding", "gzip"),
-            ],
-            gz.finish().unwrap(),
-        )
-            .into_response()
+        gzipped("application/json", &value.to_string())
     }
 
     async fn token(&self, seen: &Seen) -> axum::response::Response {
@@ -195,6 +225,9 @@ impl Fake {
                 if self.opts.account {
                     answer["account"] =
                         json!({ "uuid": "acct-1", "email_address": "a@example.com" });
+                }
+                if let Some(Value::Object(extra)) = &self.opts.exchange_extra {
+                    answer.as_object_mut().unwrap().extend(extra.clone());
                 }
                 self.json(answer)
             }
@@ -226,6 +259,18 @@ impl Fake {
             _ => bad.into_response(),
         }
     }
+}
+
+/// A gzip-compressed answer of `content_type`, whatever the request
+/// accepts.
+fn gzipped(content_type: &'static str, body: &str) -> axum::response::Response {
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(body.as_bytes()).unwrap();
+    (
+        [("content-type", content_type), ("content-encoding", "gzip")],
+        gz.finish().unwrap(),
+    )
+        .into_response()
 }
 
 /// Everything one test needs, built before the runtime starts. The token
@@ -395,7 +440,8 @@ fn a_code_exchange_gives_the_guest_surrogates_and_stores_the_real_tokens() {
         assert_eq!(answer["scope"], SCOPE);
         assert_eq!(answer["account"]["email_address"], "a@example.com");
         assert_eq!(answer["organization"]["name"], "Org");
-        assert!(answer.get("refresh_token_expires_in").is_none());
+        assert_eq!(answer["token_type"], "Bearer");
+        assert_eq!(answer["refresh_token_expires_in"], 7_776_000);
 
         // The exchange went upstream with the real code, re-serialized.
         let exchange = r.fake.seen.last();
@@ -406,25 +452,31 @@ fn a_code_exchange_gives_the_guest_surrogates_and_stores_the_real_tokens() {
         assert_eq!(exchange.body, want.to_string());
         let grant = r
             .store
-            .find_by_surrogate(ServiceId::Anthropic, SurrogateKind::Access, access)
+            .grant_of(ServiceId::Anthropic, access, &[TokenKind::Access])
             .await
             .unwrap()
             .expect("the grant is stored");
-        assert_eq!(grant.secrets.access_token, "sk-ant-oat01-REAL-ACCESS-0");
         assert_eq!(
-            grant.secrets.refresh_token.as_deref(),
+            grant.real(TokenKind::Access),
+            Some("sk-ant-oat01-REAL-ACCESS-0")
+        );
+        assert_eq!(
+            grant.real(TokenKind::Refresh),
             Some("sk-ant-ort01-REAL-REFRESH-0")
         );
         assert_eq!(
-            grant.secrets.scopes,
+            grant.scopes,
             ["org:create_api_key", "user:inference", "user:profile"]
         );
+        assert_eq!(grant.client_id, CLIENT_ID);
+        assert_eq!(grant.account.as_deref(), Some("a@example.com"));
+        assert_eq!(grant.organization.as_deref(), Some("Org"));
     });
 }
 
 /// The real code never reaches the guest, so an exchange must bring a
 /// surrogate code: any other code is refused locally. The manual sign-in
-/// is the one exception.
+/// is the one exception, bound to a page the browser bridge opened.
 #[test]
 fn an_exchange_needs_a_surrogate_code_except_for_the_manual_sign_in() {
     let s = setup(Options::default());
@@ -456,18 +508,98 @@ fn an_exchange_needs_a_surrogate_code_except_for_the_manual_sign_in() {
         assert_eq!(resp.status, 400);
         assert_eq!(r.fake.seen.all().len(), 1);
 
-        // The manual sign-in brings the real code itself.
-        let resp = token_request(
-            &proxy,
-            &mitm,
-            &r,
-            "/v1/oauth/token",
-            &code_exchange(REAL_CODE, MANUAL),
-        )
-        .await;
+        // The manual sign-in brings the real code itself: only with the
+        // verifier of a page the bridge opened for this service, once.
+        let manual = code_exchange(REAL_CODE, MANUAL);
+        let resp = token_request(&proxy, &mitm, &r, "/v1/oauth/token", &manual).await;
+        assert_eq!(resp.status, 400, "no page was opened: {}", resp.body);
+        assert_eq!(resp.json()["error"], "invalid_grant");
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(b"v"));
+        r.codes.open_page(&challenge, ServiceId::Openai);
+        r.codes.open_page(
+            &URL_SAFE_NO_PAD.encode(Sha256::digest(b"w")),
+            ServiceId::Anthropic,
+        );
+        let resp = token_request(&proxy, &mitm, &r, "/v1/oauth/token", &manual).await;
+        assert_eq!(resp.status, 400, "another service's or verifier's page");
+        assert_eq!(r.fake.seen.all().len(), 1);
+        r.codes.open_page(&challenge, ServiceId::Anthropic);
+        let resp = token_request(&proxy, &mitm, &r, "/v1/oauth/token", &manual).await;
         assert_eq!(resp.status, 200, "{}", resp.body);
         assert!(!resp.body.contains("REAL"), "{}", resp.body);
-        assert_eq!(r.fake.seen.all().len(), 2);
+        // The new sign-in replaces the first one, which is revoked in the
+        // background: count the exchanges only.
+        let exchanges = || {
+            let seen = r.fake.seen.all();
+            seen.iter().filter(|s| s.path == "/v1/oauth/token").count()
+        };
+        assert_eq!(exchanges(), 2);
+        let resp = token_request(&proxy, &mitm, &r, "/v1/oauth/token", &manual).await;
+        assert_eq!(resp.status, 400, "the page is used up");
+        assert_eq!(exchanges(), 2);
+    });
+}
+
+/// The agent's refresh goes upstream as the provider's refresh: Claude
+/// Code's client id, the grant's scopes without `org:create_api_key`, the
+/// real refresh token, and nothing else of the guest's request.
+#[test]
+fn a_relayed_refresh_sends_only_the_providers_fields() {
+    let s = setup(Options::default());
+    run_with_config(s.config(), |proxy, _log, mitm| async move {
+        let r = s.serve();
+        let answer = sign_in(&proxy, &mitm, &r).await;
+        let refresh = json!({
+            "grant_type": "refresh_token",
+            "refresh_token": answer["refresh_token"],
+            "client_id": "another-client",
+            "scope": "org:create_api_key user:inference",
+            "extra": "x",
+        });
+        let resp = token_request(&proxy, &mitm, &r, "/v1/oauth/token", &refresh.to_string()).await;
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(!resp.body.contains("REAL"), "{}", resp.body);
+        assert_eq!(resp.json()["refresh_token"], answer["refresh_token"]);
+        let sent: Value = serde_json::from_str(&r.fake.seen.last().body).unwrap();
+        assert_eq!(
+            sent,
+            json!({
+                "grant_type": "refresh_token",
+                "refresh_token": "sk-ant-ort01-REAL-REFRESH-0",
+                "client_id": CLIENT_ID,
+                "scope": "user:inference user:profile",
+            })
+        );
+    });
+}
+
+/// API requests ask for an uncompressed answer whatever the guest
+/// accepts; a compressed JSON or SSE answer, and a JSON answer with a real
+/// token, are refused.
+#[test]
+fn api_answers_come_uncompressed_or_not_at_all() {
+    let s = setup(Options::default());
+    run_with_config(s.config(), |proxy, _log, mitm| async move {
+        let r = s.serve();
+        let answer = sign_in(&proxy, &mitm, &r).await;
+        let access = answer["access_token"].as_str().unwrap();
+        let get = |path: &str| {
+            let mut req = get_with_bearer(path, access);
+            req.headers_mut()
+                .insert("accept-encoding", "gzip, br".parse().unwrap());
+            req
+        };
+        let resp = guest_request(&proxy, &mitm, r.api_port, false, get("/v1/messages")).await;
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert_eq!(
+            r.fake.seen.last().header("accept-encoding"),
+            Some("identity")
+        );
+        for path in ["/v1/gzip/json", "/v1/gzip/sse", "/v1/leak"] {
+            let resp = guest_request(&proxy, &mitm, r.api_port, false, get(path)).await;
+            assert_eq!(resp.status, 502, "{path}: {}", resp.body);
+            assert!(!resp.body.contains("REAL"), "{path}: {}", resp.body);
+        }
     });
 }
 
@@ -497,8 +629,9 @@ fn api_requests_carry_the_real_token_upstream_over_h1_and_h2() {
     });
 }
 
-/// Tokens are swapped on the API host only; the token host gets no bearer
-/// swap, and the token paths are token endpoints on the token host only.
+/// Tokens are swapped on the API host only; the token host serves only
+/// its routes, and the token paths are token endpoints on the token host
+/// only. A surrogate in a body goes upstream as it is.
 #[test]
 fn surrogates_are_swapped_on_the_api_host_only() {
     let s = setup_with(Options::default(), &[b"http/1.1"], true);
@@ -517,14 +650,16 @@ fn surrogates_are_swapped_on_the_api_host_only() {
             get_with_bearer("/v1/messages", access),
         )
         .await;
-        assert_eq!(resp.status, 401);
+        assert_eq!(resp.status, 403, "{}", resp.body);
+        assert_eq!(resp.json()["error"], "airlock_route_not_allowed");
+        assert_eq!(r.fake.seen.last().path, "/v1/messages", "not forwarded");
         assert_eq!(
             r.fake.seen.last().header("authorization"),
-            Some(format!("Bearer {access}").as_str())
+            Some("Bearer sk-ant-oat01-REAL-ACCESS-0"),
         );
 
         // A refresh on the API host is no token request: it goes
-        // upstream as it is.
+        // upstream as it is, its body unchanged.
         let resp = guest_request(
             &proxy,
             &mitm,
@@ -946,30 +1081,13 @@ fn compressed_token_answers_are_refused() {
         assert!(list_grants(&r.home.db).await.unwrap().is_empty());
 
         // A grant made without the proxy, for create_api_key.
-        let grant = r
-            .store
-            .insert_grant(NewGrant {
-                service: ServiceId::Anthropic,
-                account_id: "acct".into(),
-                account_label: None,
-                secrets: GrantSecrets {
-                    access_token: r.fake.access(),
-                    access_expires_at: now_ms() + 3_600_000,
-                    refresh_token: None,
-                    id_token: None,
-                    scopes: vec![],
-                    surrogates: Surrogates {
-                        access: "sk-ant-oat01-airlock-test".into(),
-                        previous_access: vec![],
-                        refresh: None,
-                        id_token: None,
-                    },
-                    api_keys: vec![],
-                },
-            })
+        r.store
+            .insert_grant(
+                ServiceId::Anthropic,
+                grant_of(&r.fake.access(), "sk-ant-oat01-airlock-test"),
+            )
             .await
-            .unwrap()
-            .0;
+            .unwrap();
         let mut req = post(
             "/api/oauth/claude_cli/create_api_key",
             "application/json",
@@ -977,9 +1095,7 @@ fn compressed_token_answers_are_refused() {
         );
         req.headers_mut().insert(
             "authorization",
-            format!("Bearer {}", grant.secrets.surrogates.access)
-                .parse()
-                .unwrap(),
+            "Bearer sk-ant-oat01-airlock-test".parse().unwrap(),
         );
         let resp = guest_request(&proxy, &mitm, r.port, false, req).await;
         assert_eq!(resp.status, 502);
@@ -987,28 +1103,33 @@ fn compressed_token_answers_are_refused() {
     });
 }
 
-/// Answers of the token host that carry a token are refused; other pages
-/// pass.
+/// Answers of the token host's connection check that carry a token are
+/// refused; other answers pass. Other routes of the token host are
+/// forbidden.
 #[test]
 fn the_token_host_backstop_refuses_token_answers() {
     let s = setup_with(Options::default(), &[b"http/1.1"], true);
     run_with_config(s.config(), |proxy, _log, mitm| async move {
         let r = s.serve();
-        let get = |path: &str| {
+        let get = |path: &str, page: &str| {
             hyper::Request::get(path)
+                .header("x-page", page)
                 .body(http_body_util::Full::new(bytes::Bytes::new()))
                 .unwrap()
         };
-        let resp = guest_request(&proxy, &mitm, r.port, false, get("/page/json")).await;
+        let resp =
+            guest_request(&proxy, &mitm, r.port, false, get("/v1/oauth/hello", "json")).await;
         assert_eq!(resp.status, 502);
         assert_eq!(resp.json()["error"], "server_error");
-        for page in ["/page/html", "/page/big"] {
-            let resp = guest_request(&proxy, &mitm, r.port, false, get(page)).await;
+        for page in ["html", "big", "plain"] {
+            let resp =
+                guest_request(&proxy, &mitm, r.port, false, get("/v1/oauth/hello", page)).await;
             assert_eq!(resp.status, 200, "{page}");
         }
-        // The API host is not buffered or checked.
-        let resp = guest_request(&proxy, &mitm, r.api_port, false, get("/page/json")).await;
-        assert_eq!(resp.status, 200);
+        let before = r.fake.seen.all().len();
+        let resp = guest_request(&proxy, &mitm, r.port, false, get("/page", "json")).await;
+        assert_eq!(resp.status, 403);
+        assert_eq!(r.fake.seen.all().len(), before);
     });
 }
 
@@ -1037,25 +1158,10 @@ fn plain_http_to_an_owned_host_gets_no_swap() {
     run_with_config(cfg, |proxy, _log, _mitm| async move {
         let surrogate = "sk-ant-oat01-airlock-plain";
         store
-            .insert_grant(NewGrant {
-                service: ServiceId::Anthropic,
-                account_id: "acct".into(),
-                account_label: None,
-                secrets: GrantSecrets {
-                    access_token: "sk-ant-oat01-REAL".into(),
-                    access_expires_at: now_ms() + 3_600_000,
-                    refresh_token: None,
-                    id_token: None,
-                    scopes: vec![],
-                    surrogates: Surrogates {
-                        access: surrogate.into(),
-                        previous_access: vec![],
-                        refresh: None,
-                        id_token: None,
-                    },
-                    api_keys: vec![],
-                },
-            })
+            .insert_grant(
+                ServiceId::Anthropic,
+                grant_of("sk-ant-oat01-REAL", surrogate),
+            )
             .await
             .unwrap();
         let listener = tokio::net::TcpListener::from_std(listener).unwrap();
@@ -1085,12 +1191,13 @@ fn plain_http_to_an_owned_host_gets_no_swap() {
     });
 }
 
-/// Requests that carry no surrogate do not touch the token store (its
-/// databases are not even created). Their credentials are masked secrets
+/// Requests that carry no surrogate work without a sign-in: their
+/// credentials are masked secrets the inject rule puts in. The answer scan
+/// reads the store (it stays empty). Their credentials are masked secrets
 /// the inject rule puts in: the only real credentials an API request may
 /// carry with the service on.
 #[test]
-fn requests_without_surrogates_do_not_touch_the_store() {
+fn requests_without_surrogates_need_no_sign_in() {
     let upstream = FakeUpstream::bind(&[b"http/1.1"]);
     let dir = tempfile::tempdir().unwrap();
     let db = crate::db::Db::open(&dir.path().join(crate::db::DIR)).unwrap();
@@ -1140,8 +1247,9 @@ fn requests_without_surrogates_do_not_touch_the_store() {
         .await;
         assert_eq!(resp.status, 200, "{}", resp.body);
     });
-    assert!(!db.has_database("services.grants"));
-    assert!(!db.has_database("services.lookups"));
+    block_on_local(async move {
+        assert!(list_grants(&db).await.unwrap().is_empty());
+    });
 }
 
 /// A service host is allowed without a rule, but a deny rule still wins.
@@ -1293,4 +1401,257 @@ fn the_hosts_of_an_unavailable_service_are_denied() {
     }
     assert!(network.resolve_target("api.anthropic.com", 80).allowed);
     assert!(network.resolve_target("example.com", 443).allowed);
+}
+
+/// A supervisor that implements nothing: the callback forward's accept
+/// loops only call it for a connection.
+struct NoSupervisor;
+impl airlock_common::supervisor_capnp::supervisor::Server for NoSupervisor {}
+
+/// A free loopback port in Claude Code's callback range.
+fn free_callback_port() -> u16 {
+    loop {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        if (32768..=60999).contains(&port) {
+            return port;
+        }
+    }
+}
+
+/// `claude /login` with an Anthropic Console account: Claude Code's
+/// second OAuth client with its own scopes. The browser bridge opens its
+/// page, the exchange stores its client id, and refresh and revoke send
+/// that client id upstream whatever the guest's requests name.
+#[test]
+fn the_console_client_signs_in_refreshes_and_revokes_with_its_client_id() {
+    use crate::rpc::browser::{BrowserGrant as _, GrantAnswer};
+    use crate::services::sign_in::LoopbackSignIn;
+
+    let s = setup(Options::default());
+    run_with_config(s.config(), |proxy, _log, mitm| async move {
+        let r = s.serve();
+        // The browser check: the Console page with the Console client and
+        // scopes opens, and keeps its PKCE challenge (of the verifier "v").
+        let sign_in = LoopbackSignIn::new(
+            ServiceId::Anthropic,
+            crate::services::anthropic::sign_in_pages(),
+            r.codes.clone(),
+        );
+        sign_in.attach(&crate::rpc::guest_network::GuestNetwork::new(
+            capnp_rpc::new_client(NoSupervisor),
+        ));
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(b"v"));
+        let page = format!(
+            "https://platform.claude.com/oauth/authorize?code=true&client_id={CONSOLE_CLIENT_ID}\
+             &response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A{}%2Fcallback\
+             &scope=user%3Aprofile+user%3Ainference&code_challenge={challenge}\
+             &code_challenge_method=S256&state=s",
+            free_callback_port()
+        );
+        assert_eq!(
+            sign_in.allow(&url::Url::parse(&page).unwrap()),
+            GrantAnswer::Allow
+        );
+        sign_in.detach().await;
+
+        // The manual exchange of that page (its verifier), with the
+        // Console client.
+        let resp = token_request(
+            &proxy,
+            &mitm,
+            &r,
+            "/v1/oauth/token",
+            &code_exchange_of(CONSOLE_CLIENT_ID, REAL_CODE, MANUAL),
+        )
+        .await;
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(!resp.body.contains("REAL"), "{}", resp.body);
+        let answer = resp.json();
+        let exchange: Value = serde_json::from_str(&r.fake.seen.last().body).unwrap();
+        assert_eq!(exchange["client_id"], CONSOLE_CLIENT_ID);
+        let grant = r
+            .store
+            .grant_of(
+                ServiceId::Anthropic,
+                answer["refresh_token"].as_str().unwrap(),
+                &[TokenKind::Refresh],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.client_id, CONSOLE_CLIENT_ID);
+
+        // The refresh names Claude.ai's client: the stored one goes.
+        let resp = token_request(
+            &proxy,
+            &mitm,
+            &r,
+            "/v1/oauth/token",
+            &refresh_body(&answer["refresh_token"]),
+        )
+        .await;
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let sent: Value = serde_json::from_str(&r.fake.seen.last().body).unwrap();
+        assert_eq!(sent["client_id"], CONSOLE_CLIENT_ID);
+
+        // The revoke names another client: the stored one goes.
+        let revoke = json!({ "token": answer["refresh_token"], "client_id": "another-client" });
+        let resp = token_request(
+            &proxy,
+            &mitm,
+            &r,
+            "/v1/oauth/token/revoke",
+            &revoke.to_string(),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let revoked = r.fake.seen.last();
+        assert_eq!(revoked.path, "/v1/oauth/token/revoke");
+        let revoked: Value = serde_json::from_str(&revoked.body).unwrap();
+        assert_eq!(revoked["client_id"], CONSOLE_CLIENT_ID);
+        assert_eq!(revoked["token"], "sk-ant-ort01-REAL-REFRESH-1");
+        assert!(list_grants(&r.home.db).await.unwrap().is_empty());
+    });
+}
+
+/// An exchange without a client id is refused locally.
+#[test]
+fn an_exchange_needs_a_client_id() {
+    let s = setup(Options::default());
+    run_with_config(s.config(), |proxy, _log, mitm| async move {
+        let r = s.serve();
+        let code = r
+            .codes
+            .issue(REAL_CODE, ServiceId::Anthropic, Channel::Callback(40000))
+            .unwrap();
+        let resp = token_request(
+            &proxy,
+            &mitm,
+            &r,
+            "/v1/oauth/token",
+            &code_exchange_of("", &code, LOOPBACK),
+        )
+        .await;
+        assert_eq!(resp.status, 400, "{}", resp.body);
+        assert_eq!(resp.json()["error"], "invalid_request");
+        assert!(r.fake.seen.all().is_empty());
+    });
+}
+
+/// Fail closed: an exchange answer with a value that can be a credential
+/// under another token-like key in no known format, or with an API key,
+/// is refused, and nothing is stored. The standard token fields get
+/// surrogates whatever their format, and OAuth tokens in a known format
+/// anywhere in the answer get surrogates.
+#[test]
+fn an_unknown_token_format_fails_closed() {
+    for (extra, refused) in [
+        (
+            json!({ "session_token": "unknown-format-secret-0123456789" }),
+            true,
+        ),
+        (
+            json!({ "account": { "uuid": "acct-1", "api_key": "unknown-format-key-0123456789" } }),
+            true,
+        ),
+        (json!({ "access_token": "opaque-new-format-token" }), false),
+        (json!({ "session_token": "short" }), false),
+        (
+            json!({ "extra": { "key": "sk-ant-api03-REAL-EXTRA" } }),
+            true,
+        ),
+        (json!({ "refresh_token": 42 }), false),
+        (
+            json!({ "extra": { "t": ["sk-ant-oat01-REAL-EXTRA"] } }),
+            false,
+        ),
+    ] {
+        let s = setup(Options {
+            exchange_extra: Some(extra.clone()),
+            ..Options::default()
+        });
+        run_with_config(s.config(), |proxy, _log, mitm| async move {
+            let r = s.serve();
+            let code = r
+                .codes
+                .issue(REAL_CODE, ServiceId::Anthropic, Channel::Callback(40000))
+                .unwrap();
+            let resp = token_request(
+                &proxy,
+                &mitm,
+                &r,
+                "/v1/oauth/token",
+                &code_exchange(&code, LOOPBACK),
+            )
+            .await;
+            assert!(!resp.body.contains("REAL"), "{extra}: {}", resp.body);
+            let grants = list_grants(&r.home.db).await.unwrap();
+            if refused {
+                assert_eq!(resp.status, 502, "{extra}: {}", resp.body);
+                assert_eq!(resp.json()["error"], "server_error");
+                assert!(grants.is_empty(), "{extra}");
+            } else {
+                assert_eq!(resp.status, 200, "{extra}: {}", resp.body);
+                assert_eq!(grants.len(), 1, "{extra}");
+            }
+        });
+    }
+}
+
+/// A token answer with the fields Anthropic really sends: the tokens get
+/// surrogates, `token_uuid`, `account` and `organization` reach the guest
+/// unchanged.
+#[test]
+fn a_real_world_exchange_answer_passes() {
+    let uuid = "4f0b8a3e-2c1d-4e5f-9a6b-7c8d9e0f1a2b";
+    let s = setup(Options {
+        exchange_extra: Some(json!({
+            "token_uuid": uuid,
+            "access_token": format!("sk-ant-oat01-{}", "A".repeat(95)),
+            "refresh_token": format!("sk-ant-ort01-{}", "B".repeat(95)),
+            "account": { "uuid": "acct-1", "email_address": "a@example.com" },
+            "organization": { "uuid": "org-uuid-1", "name": "Org" },
+        })),
+        ..Options::default()
+    });
+    run_with_config(s.config(), |proxy, _log, mitm| async move {
+        let r = s.serve();
+        let code = r
+            .codes
+            .issue(REAL_CODE, ServiceId::Anthropic, Channel::Callback(40000))
+            .unwrap();
+        let resp = token_request(
+            &proxy,
+            &mitm,
+            &r,
+            "/v1/oauth/token",
+            &code_exchange(&code, LOOPBACK),
+        )
+        .await;
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        let answer = resp.json();
+        assert_eq!(answer["token_uuid"], uuid);
+        assert_eq!(
+            answer["account"],
+            json!({ "uuid": "acct-1", "email_address": "a@example.com" })
+        );
+        assert_eq!(
+            answer["organization"],
+            json!({ "uuid": "org-uuid-1", "name": "Org" })
+        );
+        assert_eq!(answer["expires_in"], 3600);
+        assert_eq!(answer["refresh_token_expires_in"], 7_776_000);
+        assert_eq!(answer["scope"], SCOPE);
+        for (field, prefix) in [
+            ("access_token", "sk-ant-oat01-airlock-"),
+            ("refresh_token", "sk-ant-ort01-airlock-"),
+        ] {
+            assert!(
+                answer[field].as_str().unwrap().starts_with(prefix),
+                "{field}"
+            );
+        }
+        assert!(!resp.body.contains("AAAA") && !resp.body.contains("BBBB"));
+    });
 }

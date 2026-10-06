@@ -35,8 +35,10 @@ pub enum Why {
     /// Not on the disk (as far as the records know).
     New,
     /// An install of the same fingerprint that did not finish (`unconfirmed`
-    /// or `failed`): it was approved for this disk already, so it installs
-    /// again without a question.
+    /// or `failed`), and no session ran on the disk since
+    /// ([`InstallState::ran_session`]): it was approved for this disk
+    /// already, so it installs again without a question. After a session
+    /// it is `New`: the disk may hold code that session left.
     Retry,
 }
 
@@ -82,7 +84,8 @@ pub struct Plan {
 /// | none | yes | `New` |
 /// | `installed`, same fingerprint | yes | nothing |
 /// | `installed`, other fingerprint | yes | changed |
-/// | `unconfirmed` or `failed`, same fingerprint | yes | `Retry` |
+/// | `unconfirmed` or `failed`, same fingerprint | yes; no session since the install | `Retry` |
+/// | `unconfirmed` or `failed`, same fingerprint | yes; a session since the install | `New` |
 /// | `unconfirmed`, other fingerprint | yes | changed |
 /// | `failed`, other fingerprint | yes | `New` |
 /// | `kept`, confirmed, same fingerprint | yes | → `installed`, no run |
@@ -138,6 +141,9 @@ pub fn decide(input: &DecideInput<'_>) -> Plan {
                     PackStatus::Kept { confirmed: true } if same => {
                         plan.transitions.push(Transition::Promote(w.id.clone()));
                         None
+                    }
+                    PackStatus::Unconfirmed | PackStatus::Failed if same && state.ran_session => {
+                        Some(Why::New)
                     }
                     PackStatus::Unconfirmed | PackStatus::Failed if same => Some(Why::Retry),
                     PackStatus::Kept { confirmed: false } if same => Some(Why::New),
@@ -312,6 +318,20 @@ mod tests {
         assert_eq!(plan.pending, vec![pending("a", Why::Retry)]);
         let plan = run(&s, &wanted(&[("a", 'b')]));
         assert_eq!(plan.pending, vec![pending("a", Why::New)]);
+    }
+
+    /// A session since the unfinished install may have left code on the
+    /// disk: the install is `New` (asked), not a silent `Retry`.
+    #[test]
+    fn a_session_since_the_install_makes_a_retry_new() {
+        for status in [PackStatus::Unconfirmed, PackStatus::Failed] {
+            let s = InstallState {
+                ran_session: true,
+                ..state(&[("a", status, 'a')])
+            };
+            let plan = run(&s, &wanted(&[("a", 'a')]));
+            assert_eq!(plan.pending, vec![pending("a", Why::New)], "{status:?}");
+        }
     }
 
     #[test]

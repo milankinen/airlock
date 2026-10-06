@@ -134,7 +134,17 @@ impl Network {
             events,
             next_id: AtomicU64::new(0),
             deny_reporter: DenyReporter::new(),
+            public_only: false,
         })
+    }
+
+    /// Reach public addresses only (the install boot): deny the host's
+    /// loopback, private, link-local and other local destinations, by
+    /// name, by IP literal and by the addresses a name resolves to (see
+    /// [`target::is_public_ip`]).
+    pub fn public_only(mut self) -> Self {
+        self.public_only = true;
+        self
     }
 }
 
@@ -336,6 +346,8 @@ pub struct Network {
     /// Host → guest notifier for every denied connection. Populated once
     /// the supervisor handshake completes; no-op until then.
     pub(super) deny_reporter: Rc<DenyReporter>,
+    /// Connect to public addresses only ([`Network::public_only`]).
+    public_only: bool,
 }
 
 impl Network {
@@ -371,7 +383,9 @@ impl Network {
     /// Resolve a host:port to a `ResolvedTarget`.
     ///
     /// Logic:
-    /// 0. `deny-always` → deny immediately.
+    /// 0. `deny-always` → deny immediately; a public-only network denies
+    ///    local names and non-public IP literals (and checks the resolved
+    ///    addresses on connect).
     /// 1. Localhost port-forward → remap port.
     /// 2. `allow-always` → allow with middleware.
     /// 3. Deny rules → deny wins unconditionally.
@@ -384,7 +398,7 @@ impl Network {
         let policy = self.policy();
 
         // deny-always denies everything.
-        if matches!(policy, Policy::DenyAlways) {
+        if matches!(policy, Policy::DenyAlways) || (self.public_only && is_local_host(host)) {
             return denied(host, port);
         }
 
@@ -444,6 +458,7 @@ impl Network {
             interceptor: interceptor.filter(|_| allowed),
             allowed,
             passthrough,
+            public_only: self.public_only,
         }
     }
 
@@ -556,11 +571,21 @@ fn denied(host: &str, port: u16) -> ResolvedTarget {
         interceptor: None,
         allowed: false,
         passthrough: false,
+        public_only: false,
     }
 }
 
 fn is_localhost(host: &str) -> bool {
     host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+/// Whether `host` names a non-public destination without DNS: a
+/// `localhost` name or a non-public IP literal.
+fn is_local_host(host: &str) -> bool {
+    let name = host.trim_end_matches('.').to_ascii_lowercase();
+    name == "localhost"
+        || name.ends_with(".localhost")
+        || target::ip_literal(host).is_some_and(|ip| !target::is_public_ip(ip))
 }
 
 #[cfg(test)]
@@ -671,5 +696,72 @@ mod labeled_target_tests {
             .collect();
         assert_eq!(got.len(), 1);
         assert!(got[0].contains("mw-on"), "got: {got:?}");
+    }
+}
+
+#[cfg(test)]
+mod public_only_tests {
+    use super::tests::{TestNetworkConfig, build_network};
+    use super::*;
+
+    /// Local, private and metadata destinations, by name and by literal.
+    const LOCAL: [&str; 9] = [
+        "localhost",
+        "LOCALHOST.",
+        "foo.localhost",
+        "127.0.0.1",
+        "::1",
+        "[::1]",
+        "10.0.0.5",
+        "192.168.1.1",
+        "169.254.169.254",
+    ];
+
+    /// The network of the install boot: `allow-always`, everything
+    /// allowed, public destinations only.
+    fn install_network(public_only: bool) -> Network {
+        let (_, _, network) = build_network(TestNetworkConfig::default());
+        network.control().set_policy(Policy::AllowAlways);
+        if public_only {
+            network.public_only()
+        } else {
+            network
+        }
+    }
+
+    #[test]
+    fn public_only_denies_local_destinations_by_name_and_literal() {
+        let network = install_network(true);
+        for host in LOCAL {
+            assert!(!network.resolve_target(host, 80).allowed, "{host}");
+        }
+        let public = network.resolve_target("example.com", 443);
+        assert!(public.allowed && public.public_only);
+    }
+
+    #[test]
+    fn a_normal_network_allows_local_destinations() {
+        let network = install_network(false);
+        for host in LOCAL {
+            let target = network.resolve_target(host, 80);
+            assert!(target.allowed && !target.public_only, "{host}");
+        }
+    }
+
+    /// The resolved addresses decide: `127.1` is no IP literal, but it
+    /// resolves to the loopback.
+    #[tokio::test]
+    async fn public_only_never_dials_a_local_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let target = |host: &str, public_only: bool| ResolvedTarget {
+            public_only,
+            ..denied(host, port)
+        };
+        for host in ["127.0.0.1", "127.1", "localhost"] {
+            let e = tcp::dial(&target(host, true)).await.unwrap_err();
+            assert!(e.to_string().contains("blocked"), "{host}: {e}");
+        }
+        assert!(tcp::dial(&target("127.0.0.1", false)).await.is_ok());
     }
 }

@@ -1,10 +1,17 @@
+use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::Router;
 use axum::routing::get;
+use futures::future::LocalBoxFuture;
+use hyper::{Request, Response};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::helpers::*;
+use crate::network::http::ResponseBody;
+use crate::network::interceptor::{Interceptor, Next};
+use crate::network::target::{Endpoint, InjectedSecret, NetworkTarget};
 
 /// Pre-generate a server CA + leaf cert with configurable ALPN.
 pub(super) fn make_server_tls_with_alpn(alpn: Vec<Vec<u8>>) -> (Arc<rustls::ServerConfig>, String) {
@@ -767,6 +774,135 @@ fn tls_websocket_upgrade_relays_raw_bytes() {
                 "HTTP/1.1 101",
             )
             .await;
+        },
+    );
+}
+
+// ── Owned hosts must never raw-relay (S1) ───────────────
+
+/// An interceptor that owns a fixed set of targets and panics if a request
+/// ever reaches it — used to prove that non-HTTP bytes on an owned host's
+/// connection never get far enough to invoke the service at all.
+struct PanicIfCalled {
+    targets: Vec<NetworkTarget>,
+}
+
+impl Interceptor for PanicIfCalled {
+    fn name(&self) -> &str {
+        const NAME: &str = "panic-if-called";
+        NAME
+    }
+
+    fn targets(&self) -> &[NetworkTarget] {
+        &self.targets
+    }
+
+    fn send<'a>(
+        &'a self,
+        _to: &'a Endpoint,
+        _req: Request<ResponseBody>,
+        _injected: &'a [InjectedSecret],
+        _next: Next,
+    ) -> LocalBoxFuture<'a, anyhow::Result<Response<ResponseBody>>> {
+        Box::pin(async move {
+            panic!("owned host's interceptor must never run for non-HTTP bytes");
+        })
+    }
+}
+
+/// A TLS upstream that only records whether it was ever dialed — standing
+/// in for the real service's upstream, to prove a refused connection never
+/// reaches it. Takes a pre-bound listener so the caller can learn the port
+/// before the network (and the interceptor target naming it) is built.
+fn serve_counting_tls(
+    listener: std::net::TcpListener,
+    tls_config: Arc<rustls::ServerConfig>,
+) -> Arc<AtomicUsize> {
+    listener.set_nonblocking(true).unwrap();
+    let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_task = hits.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            hits_task.fetch_add(1, Ordering::SeqCst);
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let _ = acceptor.accept(stream).await;
+            });
+        }
+    });
+    hits
+}
+
+/// Non-HTTP bytes sent over TLS to an owned host (a network service's
+/// target) must close the connection, not relay the bytes raw to the real
+/// upstream — that would let the guest smuggle arbitrary bytes straight
+/// past the service's fail-closed request handling.
+#[test]
+fn tls_owned_host_non_http_bytes_are_refused_not_relayed() {
+    let (server_tls, server_ca_pem) = make_server_tls();
+
+    // Bind the upstream's port before the network is built, so the
+    // interceptor's target (and the test's connect address) can name it.
+    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = std_listener.local_addr().unwrap();
+    let owned = Rc::new(PanicIfCalled {
+        targets: vec![NetworkTarget {
+            host: "127.0.0.1".into(),
+            port: Some(addr.port()),
+        }],
+    });
+
+    run_with_config(
+        TestNetworkConfig {
+            trust_cas: vec![server_ca_pem],
+            interceptors: vec![owned],
+            ..Default::default()
+        },
+        |proxy, _log, mitm_ca_pem| async move {
+            let hits = serve_counting_tls(std_listener, server_tls);
+
+            let conn = TestConnection::connect(&proxy, "127.0.0.1", addr.port())
+                .await
+                .expect("owned host connects are accepted; the deny surfaces at relay");
+
+            let mut root_store = rustls::RootCertStore::empty();
+            for cert in rustls_pemfile::certs(&mut mitm_ca_pem.as_bytes()) {
+                root_store.add(cert.unwrap()).unwrap();
+            }
+            let tls_config = rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth();
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+            let server_name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
+            let mut tls_stream = connector
+                .connect(server_name, conn.into_stream())
+                .await
+                .unwrap();
+
+            // Not HTTP: no method/path/version on the first line, but a
+            // CRLF so `detect` resolves immediately instead of buffering
+            // to the 4KB cap.
+            tls_stream
+                .write_all(b"NOT AN HTTP REQUEST\r\n")
+                .await
+                .unwrap();
+
+            let mut buf = Vec::new();
+            let _ = tls_stream.read_to_end(&mut buf).await;
+            assert!(
+                buf.is_empty(),
+                "refused connection must not carry any upstream bytes back: {buf:?}"
+            );
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                0,
+                "non-HTTP bytes to an owned host must never reach the real upstream"
+            );
         },
     );
 }

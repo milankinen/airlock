@@ -1,40 +1,54 @@
 //! OAuth 2 logic shared by the services: the proxy's own HTTPS client for
-//! token endpoints, strict parsing of token requests, checks of token
-//! answers, surrogate tokens, the token swap on API requests, and the
-//! relay of the agent's own refresh and revoke of grants.
+//! token endpoints, strict parsing of token requests, the code exchange,
+//! the swap of surrogates in API request headers, and the relay of the
+//! agent's own refresh and revoke of grants.
 //!
-//! Provider specifics (endpoints, request shapes, error codes) stay in the
-//! provider modules behind [`Provider`].
+//! Provider specifics (endpoints, token formats, request shapes, error
+//! codes) stay in the provider modules behind [`Provider`]; the surrogate
+//! engine is [`super::tokens`].
 //!
 //! ## Fail closed
 //!
-//! - A token request (exchange, refresh) must have no query, a JSON or
-//!   form body without duplicate keys, and a grant type of the provider's
-//!   list; anything else gets a local error and is never forwarded. What
-//!   goes upstream is re-serialized from the parsed fields, never the
-//!   guest's bytes.
-//! - A 2xx token answer must be an uncompressed JSON object with the
-//!   expected fields, else the guest gets a local `502 server_error`.
-//! - Every other answer on an owned host's non-API paths (the auth hosts
-//!   `platform.claude.com` and `auth.openai.com`, chatgpt.com outside
-//!   `/backend-api/`) passes [`backstop`]: a JSON answer up to
-//!   [`BODY_LIMIT`] that carries a token field (`access_token`,
-//!   `refresh_token`, `id_token`), a code field (`authorization_code`,
-//!   `code`, `code_verifier`; a surrogate code airlock put there does not
-//!   count) or a string in a provider token format is refused. Larger or
-//!   non-JSON answers pass unchanged: the providers issue their tokens in
-//!   JSON token answers, which the services handle themselves.
-//! - API answers pass [`api_backstop`]: an uncompressed JSON answer with a
-//!   `Content-Length` up to [`BODY_LIMIT`] that holds a real token in an
-//!   Anthropic format (`sk-ant-api`, `sk-ant-oat`, `sk-ant-ort`, without
-//!   the `-airlock-` of a surrogate) is refused. Streams (SSE), compressed
-//!   answers and answers without a length pass unbuffered. A 401 from the
-//!   API passes through unchanged: refreshing is the agent's job, as on a
-//!   host.
-//! - The API credentials are strict ([`Grants::api_credential`]): a
-//!   surrogate of a grant, or a masked secret airlock injected; an unknown
-//!   surrogate gets the provider's "sign in again", anything else
-//!   [`foreign_credential`]. Neither goes upstream.
+//! - A token request (exchange, refresh, revoke) must have no query, a
+//!   JSON or form body without duplicate keys, and a grant type of the
+//!   provider's list; anything else gets a local error and is never
+//!   forwarded. What goes upstream is re-serialized from the parsed
+//!   fields, never the guest's bytes. An exchange must name its
+//!   `client_id`.
+//! - A 2xx token answer must be an uncompressed JSON object whose tokens
+//!   are all in a format of the provider ([`super::tokens::collect`]), and
+//!   carry the tokens the provider requires ([`Provider::exchange_requires`]),
+//!   else the guest gets a local `502 server_error` and nothing is stored.
+//! - The other answers of the token hosts' allowed routes pass
+//!   [`backstop`]: a JSON answer up to [`BODY_LIMIT`] that carries a token
+//!   field (`access_token`, `refresh_token`, `id_token`), a code field
+//!   (`authorization_code`, `code`, `code_verifier`; a surrogate code
+//!   airlock put there does not count) or a real token of the provider is
+//!   refused. Larger or non-JSON answers pass unchanged: the providers
+//!   issue their tokens in JSON token answers, which the services handle
+//!   themselves. Other routes of the token hosts get [`route_not_allowed`].
+//!   An allowed route goes upstream with its own path and no query
+//!   ([`route_to`]), never the guest's spelling of it.
+//! - API requests ask for an uncompressed answer (`Accept-Encoding:
+//!   identity`, whatever the guest sent), and every API answer streams
+//!   through [`super::scan::scan_answer`]: a compressed answer, a real
+//!   token in a response header, or a real value the proxy knows (the
+//!   store's tokens, the request's injected secrets) or a real token shape
+//!   anywhere in the body or trailers is refused (or the stream ends
+//!   before the chunk with it). A 401 from
+//!   the API passes through unchanged: refreshing is the agent's job, as
+//!   on a host.
+//! - API credentials ([`Grants::swap_headers`]): only `Authorization:
+//!   Bearer <token>` and `x-api-key: <value>` change, and only when the
+//!   whole token or value is a known access or API-key surrogate of the
+//!   service. Every other header keeps its surrogates: an upstream may
+//!   reflect a header (an `Origin` into
+//!   `Access-Control-Allow-Origin`, a value into an error message).
+//!   Request bodies are never changed. The credentials are strict: an
+//!   `Authorization` or `x-api-key` value must be such a surrogate, or a
+//!   masked secret airlock injected; an unknown surrogate gets the
+//!   provider's "sign in again", anything else (a refresh or ID-token
+//!   surrogate too) [`foreign_credential`]. Neither goes upstream.
 //! - The authority of every request is the endpoint's
 //!   ([`pin_authority`]).
 //!
@@ -42,48 +56,50 @@
 //!
 //! The agent refreshes its own tokens; the proxy only relays that call
 //! ([`Grants::relay_refresh`]): look up the grant by its refresh
-//! surrogate, read its real refresh token fresh (never a cached copy:
-//! another process may already have rotated it), forward the request
-//! upstream with the proxy's own [`Upstream`] (never the guest's
+//! surrogate in the store as it is now (another process may already have
+//! rotated the real refresh token), send a refresh built by the provider
+//! ([`Provider::refresh_body`]: the provider's own fields, the grant's
+//! stored client id and the real refresh token, nothing of the guest's
+//! request) upstream with the proxy's own [`Upstream`] (never the guest's
 //! connection) in a task of its own — a dropped guest request does not
-//! lose the rotated tokens — and store the answer with
-//! [`super::store::TokenStore::replace_tokens`] in one transaction on the
-//! grant's current record. A sign-out that finishes while the refresh is
-//! in flight leaves no record to store on: the new tokens are revoked
-//! instead. The guest gets surrogates with the upstream's own `expires_in`
-//! / real `exp` — never a minimum or a synthetic one. Races between two
-//! refreshes of the same grant (two sandboxes, a retry) are the agent's
-//! problem, as they would be on a host; the store only guarantees that
-//! each write is atomic.
+//! lose the rotated tokens — and store the answer
+//! ([`super::tokens::apply_refresh`]) in one transaction on the grant's
+//! current record. A sign-out that finishes while the refresh is in
+//! flight leaves no record to store on: the new tokens are revoked
+//! instead. The guest gets surrogates with the upstream's own
+//! `expires_in` / real `exp` — never a minimum or a synthetic one. Races
+//! between two refreshes of the same grant (two sandboxes, a retry) are
+//! the agent's problem, as they would be on a host; the store only
+//! guarantees that each write is atomic.
 //!
 //! ## Revoke
 //!
-//! A sign-out with either surrogate deletes the grant and revokes its
-//! real refresh token, then its access token where the provider revokes
-//! access tokens ([`Provider::revokes_access_tokens`]). A new sign-in that
-//! replaces older grants revokes them too, in the background.
+//! A sign-out with an access or refresh surrogate deletes the grant and
+//! revokes its real refresh token, then its access token where the
+//! provider revokes access tokens ([`Provider::revokes_access_tokens`]),
+//! with the grant's stored client id. A new sign-in that replaces older
+//! grants revokes them too, in the background.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Either, Full, Limited};
 use hyper::header::{
     ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST,
-    HeaderMap, HeaderValue, TRANSFER_ENCODING, USER_AGENT,
+    HeaderMap, HeaderName, HeaderValue, TRANSFER_ENCODING, USER_AGENT,
 };
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde_json::{Map, Value, json};
 
-use super::ServiceId;
 use super::auth_codes::{Channel, PREFIX, PendingCodes};
-use super::store::{Grant, GrantSecrets, NewGrant, SurrogateKind, TokenStore};
+use super::store::{Grant, NewGrant, Snapshot, TokenStore, random_bytes};
+use super::tokens::{self, Formats, TokenKind};
+use super::{ServiceId, scan};
 use crate::network::http::ResponseBody;
 use crate::network::interceptor::Next;
 use crate::network::target::{Endpoint, InjectedSecret};
@@ -94,11 +110,6 @@ pub const BODY_LIMIT: usize = 64 * 1024;
 /// Bound on one call of the proxy to a token endpoint.
 pub const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// What every fake JWT starts with: its fixed header
-/// `{"alg":"none","typ":"JWT"}` (base64url) and the dot. Real tokens never
-/// use `alg` `none`.
-pub const FAKE_JWT_PREFIX: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.";
-
 /// Keys of a JSON answer that carry tokens.
 const TOKEN_KEYS: &[&str] = &["access_token", "refresh_token", "id_token"];
 
@@ -107,49 +118,63 @@ const TOKEN_KEYS: &[&str] = &["access_token", "refresh_token", "id_token"];
 /// ([`super::auth_codes::PREFIX`]) does not count: airlock put it there.
 const CODE_KEYS: &[&str] = &["authorization_code", "code", "code_verifier"];
 
-/// What every surrogate in a provider token format carries: a real token
-/// with it is not issued by the provider.
-const SURROGATE_MARK: &str = "-airlock-";
+/// The header of a credential that is no `Authorization`.
+const X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
 
-/// What the strings of real Anthropic API keys and OAuth tokens start with.
-pub const TOKEN_FORMATS: &[&str] = &["sk-ant-api", "sk-ant-oat", "sk-ant-ort"];
+/// The kinds of token an OAuth token answer may carry.
+const OAUTH_KINDS: &[TokenKind] = &[TokenKind::Access, TokenKind::Refresh, TokenKind::Id];
 
-/// What a provider adds to the shared refresh relay and revoke. `Sync`:
-/// [`Grants::relay_refresh`] moves the `&'static dyn Provider` into a
-/// task of its own.
+/// The surrogate kinds an API credential may be.
+const CREDENTIAL_KINDS: &[TokenKind] = &[TokenKind::Access, TokenKind::ApiKey];
+
+/// The surrogate kinds that sign a grant out.
+const SIGN_OUT_KINDS: &[TokenKind] = &[TokenKind::Access, TokenKind::Refresh];
+
+/// Who a new grant belongs to, from the exchange answer.
+pub struct Account {
+    /// The provider's id of the account; `None`: the answer names none
+    /// (the grant then replaces no other).
+    pub id: Option<String>,
+    /// The email address, for `airlock show`.
+    pub email: Option<String>,
+    pub organization: Option<String>,
+}
+
+/// What a provider adds to the shared exchange, refresh relay and revoke.
+/// `Sync`: [`Grants::relay_refresh`] moves the `&'static dyn Provider`
+/// into a task of its own.
 pub trait Provider: Sync {
     fn id(&self) -> ServiceId;
 
-    /// Path of the token endpoint (refresh).
+    /// The provider's token formats.
+    fn formats(&self) -> &'static Formats;
+
+    /// Path of the token endpoint (exchange, refresh).
     fn token_path(&self) -> &'static str;
 
     /// Path of the revoke endpoint.
     fn revoke_path(&self) -> &'static str;
 
-    /// The JSON body of a revoke of the real `token` (`hint`:
-    /// `access_token` or `refresh_token`).
-    fn revoke_body(&self, token: &str, hint: &str) -> Value;
+    /// The main tokens an exchange answer must carry.
+    fn exchange_requires(&self) -> &'static [TokenKind];
+
+    /// The account of an exchange `answer` (the real tokens still in it).
+    fn account(&self, answer: &Map<String, Value>) -> Account;
+
+    /// The JSON body of a refresh of `grant` with its real
+    /// `refresh_token`: from the provider's own fields and the grant's
+    /// stored client id and scopes (an allowlist), never the guest's.
+    fn refresh_body(&self, grant: &Grant, refresh_token: &str) -> Value;
 
     /// Whether the revoke endpoint takes access tokens too (else a
     /// sign-out revokes the refresh token only).
     fn revokes_access_tokens(&self) -> bool;
 
-    /// Apply a successful upstream refresh `answer` to `secrets` in
-    /// place: the real tokens, their expiry, and any surrogate the
-    /// refresh re-mints (keeping the one it replaces working through
-    /// [`super::store::Surrogates::keep_previous_access`] where that
-    /// applies).
-    fn apply_refresh(
-        &self,
-        secrets: &mut GrantSecrets,
-        answer: &Map<String, Value>,
-    ) -> anyhow::Result<()>;
-
-    /// The guest's refresh answer: `answer` (the upstream's fields, the
-    /// real tokens already removed) with `grant`'s current surrogates
-    /// put back in their place. Leaves `expires_in` as the upstream sent
-    /// it.
-    fn surrogate_answer(&self, grant: &Grant, answer: Map<String, Value>) -> Map<String, Value>;
+    /// Whether the revoke of a token of `hint` (`access_token`,
+    /// `refresh_token`) names the client, as the agent's own revoke does.
+    fn revoke_names_client(&self, _hint: &str) -> bool {
+        true
+    }
 }
 
 /// HTTPS client of the proxy itself, for the token endpoint of a
@@ -236,14 +261,22 @@ pub fn json_response(status: StatusCode, value: &Value) -> Response<ResponseBody
     resp
 }
 
-/// A token-endpoint error answered by the proxy: `{"error": code}`.
-pub fn token_error(status: StatusCode, code: &str) -> Response<ResponseBody> {
+/// A token-endpoint error answered by the proxy: `{"error": code}`. The
+/// log gets a warning with `why`: what airlock refused and why (never a
+/// secret value), so a failing sign-in can be traced.
+pub fn token_error(
+    status: StatusCode,
+    code: &str,
+    why: impl std::fmt::Display,
+) -> Response<ResponseBody> {
+    tracing::warn!("refused: {why} (answered {} {code})", status.as_u16());
     json_response(status, &json!({ "error": code }))
 }
 
-/// The answer to a token answer the proxy refuses to pass on.
-pub fn server_error() -> Response<ResponseBody> {
-    token_error(StatusCode::BAD_GATEWAY, "server_error")
+/// The answer to an answer (or request) the proxy refuses to pass on:
+/// `502`, logged with `why` (see [`token_error`]).
+pub fn server_error(why: impl std::fmt::Display) -> Response<ResponseBody> {
+    token_error(StatusCode::BAD_GATEWAY, "server_error", why)
 }
 
 /// Rebuild a response from its parts and a new (or re-read) body.
@@ -291,33 +324,55 @@ fn is_encoded(headers: &HeaderMap) -> bool {
 }
 
 /// Whether a JSON value carries a token or a code: a token field, a code
-/// field (unless it holds a surrogate code, see [`CODE_KEYS`]), or a
-/// string that starts with one of `formats`.
-pub fn carries_token(value: &Value, formats: &[&str]) -> bool {
-    match value {
-        Value::String(s) => formats.iter().any(|p| s.starts_with(p)),
-        Value::Array(items) => items.iter().any(|v| carries_token(v, formats)),
-        Value::Object(map) => map.iter().any(|(k, v)| {
-            let k = k.as_str();
-            let surrogate_code = matches!(v, Value::String(c) if c.starts_with(PREFIX));
-            TOKEN_KEYS.contains(&k)
-                || (CODE_KEYS.contains(&k) && !surrogate_code)
-                || carries_token(v, formats)
-        }),
-        _ => false,
-    }
+/// field (unless it holds a surrogate code, see [`CODE_KEYS`]), or a real
+/// token of `formats`.
+pub fn carries_token(value: &Value, formats: &Formats) -> bool {
+    token_field(value, formats, &[], "$").is_some()
 }
 
-/// Whether a JSON value holds a string in a provider token format
-/// ([`TOKEN_FORMATS`]) that airlock did not issue (no [`SURROGATE_MARK`]).
-fn carries_real_format(value: &Value) -> bool {
+/// Where a JSON value carries a token or a code (see [`carries_token`]),
+/// as a path such as `$.account.id`, for the log: never the value. The
+/// string values of the keys in `passed` are not checked for real token
+/// formats (identifiers of a flow that look like tokens, for example the
+/// device sign-in's `device_auth_id`); their key names still count.
+fn token_field(value: &Value, formats: &Formats, passed: &[&str], path: &str) -> Option<String> {
+    find_token(value, formats, passed, path, false)
+}
+
+/// [`token_field`] below `path`. `in_error`: the value is inside an
+/// `error` or `errors` field, where `code` is an error code (for example
+/// the device poll's `deviceauth_authorization_pending`), not an
+/// authorization code; its value is still checked for token formats.
+fn find_token(
+    value: &Value,
+    formats: &Formats,
+    passed: &[&str],
+    path: &str,
+    in_error: bool,
+) -> Option<String> {
     match value {
-        Value::String(s) => {
-            TOKEN_FORMATS.iter().any(|p| s.starts_with(p)) && !s.contains(SURROGATE_MARK)
-        }
-        Value::Array(items) => items.iter().any(carries_real_format),
-        Value::Object(map) => map.values().any(carries_real_format),
-        _ => false,
+        Value::String(s) => formats.is_real(s).then(|| path.to_string()),
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .find_map(|(i, v)| find_token(v, formats, passed, &format!("{path}[{i}]"), in_error)),
+        Value::Object(map) => map.iter().find_map(|(k, v)| {
+            let key = k.as_str();
+            let at = format!("{path}.{key}");
+            let surrogate_code = matches!(v, Value::String(c) if c.starts_with(PREFIX));
+            let error_code = in_error && key == "code";
+            if TOKEN_KEYS.contains(&key)
+                || (CODE_KEYS.contains(&key) && !surrogate_code && !error_code)
+            {
+                return Some(at);
+            }
+            if passed.contains(&key) && v.is_string() {
+                return None;
+            }
+            let in_error = in_error || key == "error" || key == "errors";
+            find_token(v, formats, passed, &at, in_error)
+        }),
+        _ => None,
     }
 }
 
@@ -346,68 +401,89 @@ pub fn pin_authority(req: &mut Request<ResponseBody>, to: &Endpoint) -> anyhow::
     Ok(())
 }
 
-/// Forward a request to an owned host that no service rule handles (an
-/// auth host, a non-API path, a host the service does not know), asking
-/// for an uncompressed answer, and pass the answer through [`backstop`].
-/// Never with a token swap.
+/// Forward a request of an allowed route of a token host, asking for an
+/// uncompressed answer, and pass the answer through [`backstop`]. Also
+/// for a host the service does not know. Never with a token swap.
 pub async fn forward_auth_host(
     mut req: Request<ResponseBody>,
     next: Next,
+    formats: &Formats,
+    passed: &[&str],
 ) -> anyhow::Result<Response<ResponseBody>> {
     req.headers_mut()
         .insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
-    backstop(next(req).await?).await
+    backstop(next(req).await?, formats, passed).await
 }
 
-/// The last check of an answer on an owned host's non-API paths (see the
-/// module docs): a JSON answer up to [`BODY_LIMIT`] is read and refused
-/// when it [`carries_token`]; JSON that is compressed (the proxy asked for
-/// none) is refused unread. Larger or non-JSON answers pass unchanged.
-pub async fn backstop(resp: Response<ResponseBody>) -> anyhow::Result<Response<ResponseBody>> {
+/// The local answer to a route of a token host that no service rule
+/// allows: `403`, never forwarded. The log names the method and path.
+pub fn route_not_allowed(
+    service: ServiceId,
+    to: &Endpoint,
+    req: &Request<ResponseBody>,
+) -> Response<ResponseBody> {
+    tracing::warn!(
+        "refused: {}: {} {} on {} is no route of the sign-in (answered 403)",
+        service.name(),
+        req.method(),
+        req.uri().path(),
+        to.host()
+    );
+    json_response(
+        StatusCode::FORBIDDEN,
+        &json!({
+            "error": "airlock_route_not_allowed",
+            "error_description": format!(
+                "airlock: with [network.services] {} enabled, {} serves only the routes of \
+                 the agent's sign-in",
+                service.name(),
+                to.host()
+            ),
+        }),
+    )
+}
+
+/// The last check of an answer of a token host (see the module docs): a
+/// JSON answer up to [`BODY_LIMIT`] is read and refused when it
+/// [`carries_token`]; JSON that is compressed (the proxy asked for none)
+/// is refused unread. Larger or non-JSON answers pass unchanged. The
+/// string values of the keys in `passed` are not checked for token
+/// formats (see [`token_field`]).
+pub async fn backstop(
+    resp: Response<ResponseBody>,
+    formats: &Formats,
+    passed: &[&str],
+) -> anyhow::Result<Response<ResponseBody>> {
     if !is_json(resp.headers()) || content_length(resp.headers()).is_some_and(|n| n > BODY_LIMIT) {
         return Ok(resp);
     }
     if is_encoded(resp.headers()) {
-        tracing::warn!("refused a compressed JSON answer of an auth host");
-        return Ok(server_error());
+        return Ok(server_error("a compressed JSON answer of an auth host"));
     }
     let (parts, body) = resp.into_parts();
     let body = read_body(body).await?;
-    if serde_json::from_slice::<Value>(&body).is_ok_and(|v| carries_token(&v, TOKEN_FORMATS)) {
-        tracing::warn!("refused an auth host answer that carries a token");
-        return Ok(server_error());
-    }
-    Ok(rebuilt(parts, body))
-}
-
-/// The last check of an answer on an API path: an uncompressed JSON
-/// answer with a `Content-Length` up to [`BODY_LIMIT`] is read and refused
-/// when it holds a real token in a provider format
-/// ([`carries_real_format`]). Everything else passes untouched and
-/// unbuffered: streams (SSE), compressed answers, answers without a
-/// length.
-pub async fn api_backstop(resp: Response<ResponseBody>) -> anyhow::Result<Response<ResponseBody>> {
-    let small = content_length(resp.headers()).is_some_and(|n| n <= BODY_LIMIT);
-    if !is_json(resp.headers()) || !small || is_encoded(resp.headers()) {
-        return Ok(resp);
-    }
-    let (parts, body) = resp.into_parts();
-    let body = read_body(body).await?;
-    if serde_json::from_slice::<Value>(&body).is_ok_and(|v| carries_real_format(&v)) {
-        tracing::warn!("refused an API answer that carries a token airlock did not issue");
-        return Ok(server_error());
+    if let Ok(value) = serde_json::from_slice::<Value>(&body)
+        && let Some(field) = token_field(&value, formats, passed, "$")
+    {
+        return Ok(server_error(format_args!(
+            "an auth host answer that carries a token at {field}"
+        )));
     }
     Ok(rebuilt(parts, body))
 }
 
 /// The `Content-Type` is JSON (`application/json` or `+json`).
 fn is_json(headers: &HeaderMap) -> bool {
+    mime_type(headers).is_some_and(|mime| mime == "application/json" || mime.ends_with("+json"))
+}
+
+/// The media type of the `Content-Type`, lowercase, without parameters.
+fn mime_type(headers: &HeaderMap) -> Option<String> {
     headers
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .and_then(|ct| ct.split(';').next())
         .map(|mime| mime.trim().to_ascii_lowercase())
-        .is_some_and(|mime| mime == "application/json" || mime.ends_with("+json"))
 }
 
 /// The `Content-Length`, if it is one number.
@@ -429,6 +505,11 @@ pub fn is_injected(value: &str, injected: &[InjectedSecret]) -> bool {
 /// a surrogate of the service nor a masked secret airlock injected.
 pub fn foreign_credential(service: ServiceId, to: &Endpoint) -> Response<ResponseBody> {
     let name = service.name();
+    tracing::warn!(
+        "refused: {name}: an API request to {} with a credential that is no access or API-key \
+         surrogate of the service and no injected secret (answered 401)",
+        to.host()
+    );
     json_response(
         StatusCode::UNAUTHORIZED,
         &json!({
@@ -447,38 +528,46 @@ pub fn foreign_credential(service: ServiceId, to: &Endpoint) -> Response<Respons
     )
 }
 
-/// A random surrogate: `prefix` and 48 bytes from the CSPRNG, base64url.
-pub fn surrogate(prefix: &str) -> anyhow::Result<String> {
-    Ok(format!(
-        "{prefix}{}",
-        URL_SAFE_NO_PAD.encode(super::store::random_bytes::<48>()?)
-    ))
-}
-
 /// A random account id for a sign-in whose answer names no account: such
 /// a grant never replaces another.
 pub fn random_account_id() -> anyhow::Result<String> {
     Ok(format!(
         "airlock-random-{}",
-        hex::encode(super::store::random_bytes::<16>()?)
+        hex::encode(random_bytes::<16>()?)
     ))
 }
 
-/// The token of an `Authorization: Bearer <token>` header.
-pub fn bearer(headers: &HeaderMap) -> Option<&str> {
-    let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
+/// The token of an `Authorization: Bearer <token>` value.
+fn bearer_token(value: &str) -> Option<&str> {
     let (scheme, token) = value.split_once(' ')?;
-    scheme
-        .eq_ignore_ascii_case("bearer")
-        .then_some(token.trim())
+    scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
 }
 
-/// Put the real access token of `grant` into `Authorization`.
-pub fn set_bearer(headers: &mut HeaderMap, grant: &Grant) -> anyhow::Result<()> {
-    let value = HeaderValue::from_str(&format!("Bearer {}", grant.secrets.access_token))
-        .map_err(|_| anyhow!("the stored access token is not a valid header value"))?;
-    headers.insert(AUTHORIZATION, value);
+/// The URI of `uri` with the path `path` and no query: what an allowed
+/// route forwards, never the guest's spelling of it. Keeps the scheme
+/// and authority of an HTTP/2 request ([`pin_authority`]).
+fn routed_uri(uri: &hyper::Uri, path: &str) -> anyhow::Result<hyper::Uri> {
+    let uri = match (uri.scheme_str(), uri.authority()) {
+        (Some(scheme), Some(authority)) => format!("{scheme}://{authority}{path}"),
+        _ => path.to_string(),
+    };
+    uri.parse().context("route URI")
+}
+
+/// Send `req` to the route `path`: its URI gets that path and no query
+/// (see [`routed_uri`]).
+pub fn route_to(req: &mut Request<ResponseBody>, path: &str) -> anyhow::Result<()> {
+    *req.uri_mut() = routed_uri(req.uri(), path)?;
     Ok(())
+}
+
+/// The `scope` of a token answer, split.
+pub fn scopes_of(answer: &Map<String, Value>) -> Vec<String> {
+    answer
+        .get("scope")
+        .and_then(Value::as_str)
+        .map(|s| s.split_whitespace().map(String::from).collect())
+        .unwrap_or_default()
 }
 
 /// A request path made canonical for matching: percent-decoded, `;`
@@ -539,9 +628,19 @@ impl TokenRequest {
     pub async fn read(
         req: Request<ResponseBody>,
     ) -> anyhow::Result<Result<(hyper::http::request::Parts, Self), Response<ResponseBody>>> {
-        let invalid = || Ok(Err(token_error(StatusCode::BAD_REQUEST, "invalid_request")));
-        if req.uri().query().is_some() || is_encoded(req.headers()) {
-            return invalid();
+        let path = req.uri().path().to_string();
+        let invalid = |why: &str| {
+            Ok(Err(token_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                format_args!("a token request to {path}: {why}"),
+            )))
+        };
+        if req.uri().query().is_some() {
+            return invalid("it has a query");
+        }
+        if is_encoded(req.headers()) {
+            return invalid("its body is compressed");
         }
         let format = match req
             .headers()
@@ -553,7 +652,7 @@ impl TokenRequest {
         {
             Some("application/json") => BodyFormat::Json,
             Some("application/x-www-form-urlencoded") => BodyFormat::Form,
-            _ => return invalid(),
+            _ => return invalid("its content type is not JSON or a form"),
         };
         let (parts, body) = req.into_parts();
         let bytes = read_body(body).await?;
@@ -564,7 +663,7 @@ impl TokenRequest {
             BodyFormat::Form => unique_form(&bytes),
         };
         let Some(fields) = fields else {
-            return invalid();
+            return invalid("its body does not parse, or a field appears twice");
         };
         Ok(Ok((parts, Self { format, fields })))
     }
@@ -591,7 +690,7 @@ impl TokenRequest {
                 ("application/x-www-form-urlencoded", form.finish())
             }
         };
-        parts.uri = path.parse().context("token endpoint path")?;
+        parts.uri = routed_uri(&parts.uri, path)?;
         parts.headers.remove(CONTENT_LENGTH);
         parts.headers.remove(TRANSFER_ENCODING);
         parts
@@ -649,29 +748,47 @@ fn unique_form(body: &[u8]) -> Option<Map<String, Value>> {
 /// to `service` through the channel its `redirect_uri` names
 /// ([`Channel::of_redirect`]; `device_redirect` is the provider's
 /// device-flow redirect). `manual_redirect` names the one `redirect_uri`
-/// whose code the user brings by hand (it is real already and passes
-/// unchanged).
+/// whose code the user brings by hand: it is real already and passes
+/// unchanged, but only when the exchange's `code_verifier` belongs to a
+/// sign-in page the browser bridge opened for `service`
+/// ([`PendingCodes::redeem_page`]), so the sandbox cannot bring a code of
+/// a sign-in the host never opened (another account's).
 pub fn swap_code(
     token: &mut TokenRequest,
     codes: &PendingCodes,
     service: ServiceId,
     manual_redirect: Option<&str>,
     device_redirect: Option<&str>,
-) -> bool {
+) -> Result<(), &'static str> {
     let (Some(code), Some(redirect)) = (token.field("code"), token.field("redirect_uri")) else {
-        return false;
+        return Err("the exchange has no code or no redirect_uri");
     };
     if manual_redirect == Some(redirect) {
-        return !code.starts_with(PREFIX);
+        if code.starts_with(PREFIX) {
+            return Err("the manual exchange carries a surrogate code");
+        }
+        let Some(verifier) = token.field("code_verifier") else {
+            return Err("the manual exchange has no code_verifier");
+        };
+        if !codes.redeem_page(verifier, service) {
+            return Err(
+                "the manual exchange's code_verifier matches no sign-in page that the browser \
+                 bridge opened in the last 10 minutes (or that page was used)",
+            );
+        }
+        return Ok(());
     }
     let Some(channel) = Channel::of_redirect(redirect, device_redirect) else {
-        return false;
+        return Err("the exchange's redirect_uri is no callback port or device flow of airlock");
     };
     let Some(real) = codes.redeem(code, service, channel) else {
-        return false;
+        return Err(
+            "the exchange's code is no surrogate code that airlock issued for this service and \
+             channel in the last 10 minutes (or it was used)",
+        );
     };
     token.fields.insert("code".into(), Value::String(real));
-    true
+    Ok(())
 }
 
 /// The error code of a token-endpoint error body: `{"error": "code"}` or
@@ -692,10 +809,22 @@ pub fn error_code(body: &[u8]) -> Option<String> {
 /// An upstream token-endpoint error relayed to the guest unchanged, once
 /// checked for a leaked real token (the backstop of the module docs
 /// applies here too, even on an error answer).
-fn relay_error(status: StatusCode, bytes: &[u8]) -> Response<ResponseBody> {
+fn relay_error(status: StatusCode, bytes: &[u8], formats: &Formats) -> Response<ResponseBody> {
     match serde_json::from_slice::<Value>(bytes) {
-        Ok(value) if !carries_token(&value, TOKEN_FORMATS) => json_response(status, &value),
-        _ => server_error(),
+        Ok(value) if !carries_token(&value, formats) => {
+            tracing::info!(
+                "token endpoint answered {}{}",
+                status.as_u16(),
+                error_code(bytes)
+                    .map(|c| format!(" ({c})"))
+                    .unwrap_or_default()
+            );
+            json_response(status, &value)
+        }
+        _ => server_error(format_args!(
+            "a token-endpoint error answer ({}) that carries a token or is no JSON",
+            status.as_u16()
+        )),
     }
 }
 
@@ -703,18 +832,27 @@ fn relay_error(status: StatusCode, bytes: &[u8]) -> Response<ResponseBody> {
 pub enum Credential {
     /// The request names no credential.
     None,
-    /// A surrogate of this grant: it gets the real token.
-    Grant(Box<Grant>),
+    /// A surrogate of the grant with this id: its real value went in.
+    Grant(String),
     /// A masked secret the inject rules put in: passes unchanged.
     Injected,
 }
 
-/// The grant lifecycle of one service in this process: the token swap on
-/// API requests, the refresh relay, and revoke.
+/// What [`Grants::swap_headers`] found.
+pub struct Swapped {
+    pub credential: Credential,
+    /// The store, when the swap read it.
+    pub snapshot: Option<Arc<Snapshot>>,
+}
+
+/// The grant lifecycle of one service in this process: the code exchange,
+/// the credential swap on API requests, the refresh relay, and revoke.
 pub struct Grants {
     provider: &'static dyn Provider,
     pub store: Arc<TokenStore>,
     upstream: Upstream,
+    /// The warning that the store cannot be read was logged.
+    store_warned: std::cell::Cell<bool>,
 }
 
 impl Grants {
@@ -727,93 +865,233 @@ impl Grants {
             provider,
             store,
             upstream,
+            store_warned: std::cell::Cell::new(false),
         }
     }
 
-    /// The grant of the access surrogate in `Authorization: Bearer`.
-    /// `Ok(None)`: the header holds no surrogate airlock knows. Values
-    /// without `is_surrogate` are not looked up.
-    pub async fn bearer_grant(
-        &self,
-        headers: &HeaderMap,
-        is_surrogate: fn(&str) -> bool,
-    ) -> anyhow::Result<Option<Grant>> {
-        let Some(token) = bearer(headers).filter(|t| is_surrogate(t)) else {
-            return Ok(None);
-        };
-        self.store
-            .find_by_surrogate(self.provider.id(), SurrogateKind::Access, token)
-            .await
+    fn service(&self) -> ServiceId {
+        self.provider.id()
     }
 
-    /// The strict check of an API request's `Authorization` header (see
-    /// the module docs): an access surrogate of a grant, or a value of
-    /// `injected`. `Err` holds the local answer: `sign_in_again` for a
-    /// surrogate airlock does not know (signed out, or never issued),
-    /// [`foreign_credential`] for any other value.
-    pub async fn api_credential(
+    fn formats(&self) -> &'static Formats {
+        self.provider.formats()
+    }
+
+    /// The credential swap of an API request (see the module docs): an
+    /// `Authorization: Bearer <surrogate>` or `x-api-key: <surrogate>`
+    /// whose whole token is a known access or API-key surrogate of the
+    /// service gets the real value; an injected masked secret passes. No
+    /// other header changes. The store is read only when a credential is
+    /// surrogate-shaped. `Err` holds the local answer: `sign_in_again` for
+    /// a surrogate airlock does not know (signed out, or never issued),
+    /// [`foreign_credential`] for any other value (a refresh or ID-token
+    /// surrogate included: those are no API credential).
+    pub async fn swap_headers(
         &self,
         to: &Endpoint,
-        headers: &HeaderMap,
+        headers: &mut HeaderMap,
         injected: &[InjectedSecret],
-        is_surrogate: fn(&str) -> bool,
         sign_in_again: fn() -> Response<ResponseBody>,
-    ) -> anyhow::Result<Result<Credential, Response<ResponseBody>>> {
-        let Some(value) = headers.get(AUTHORIZATION) else {
-            return Ok(Ok(Credential::None));
-        };
-        let value = value.to_str().unwrap_or_default();
-        let token = bearer(headers);
-        if token.is_some_and(is_surrogate) {
-            return match self.bearer_grant(headers, is_surrogate).await? {
-                Some(grant) => Ok(Ok(Credential::Grant(Box::new(grant)))),
-                None => Ok(Err(sign_in_again())),
-            };
+    ) -> anyhow::Result<Result<Swapped, Response<ResponseBody>>> {
+        let formats = self.formats();
+        let mut credential = Credential::None;
+        let mut snapshot: Option<Arc<Snapshot>> = None;
+        for name in [AUTHORIZATION, X_API_KEY] {
+            let values: Vec<HeaderValue> = headers.get_all(&name).iter().cloned().collect();
+            if values.is_empty() {
+                continue;
+            }
+            headers.remove(&name);
+            for value in values {
+                let text = value.to_str().unwrap_or_default();
+                let token = if name == AUTHORIZATION {
+                    bearer_token(text)
+                } else {
+                    Some(text)
+                };
+                let Some(surrogate) = token.filter(|t| formats.is_surrogate(t)) else {
+                    if is_injected(text, injected)
+                        || token.is_some_and(|t| is_injected(t, injected))
+                    {
+                        if matches!(credential, Credential::None) {
+                            credential = Credential::Injected;
+                        }
+                        headers.append(&name, value);
+                        continue;
+                    }
+                    return Ok(Err(foreign_credential(self.service(), to)));
+                };
+                if snapshot.is_none() {
+                    snapshot = Some(self.store.snapshot(self.service()).await?);
+                }
+                let Some(resolved) = snapshot.as_ref().and_then(|s| s.resolve(surrogate)) else {
+                    return Ok(Err(sign_in_again()));
+                };
+                if !CREDENTIAL_KINDS.contains(&resolved.kind) {
+                    return Ok(Err(foreign_credential(self.service(), to)));
+                }
+                let real = if name == AUTHORIZATION {
+                    format!("Bearer {}", resolved.real)
+                } else {
+                    resolved.real
+                };
+                let mut real = HeaderValue::from_str(&real)
+                    .map_err(|_| anyhow!("a stored token is not a valid header value"))?;
+                real.set_sensitive(true);
+                headers.append(&name, real);
+                credential = Credential::Grant(resolved.grant_id);
+            }
         }
-        if is_injected(value, injected) || token.is_some_and(|t| is_injected(t, injected)) {
-            return Ok(Ok(Credential::Injected));
-        }
-        Ok(Err(foreign_credential(self.provider.id(), to)))
+        Ok(Ok(Swapped {
+            credential,
+            snapshot,
+        }))
     }
 
-    /// An API request: the credential passes [`Self::api_credential`]; an
-    /// access surrogate gets the real token. The answer (a 401 included:
-    /// refreshing is the agent's job) passes [`api_backstop`].
+    /// An API request: [`Self::swap_headers`], then forwarded asking for
+    /// an uncompressed answer, whatever the guest accepts, so that the
+    /// answer (a 401 included: refreshing is the agent's job) passes
+    /// [`scan::scan_answer`]. The body goes as the guest sent it.
     pub async fn forward_api(
         &self,
         to: &Endpoint,
         mut req: Request<ResponseBody>,
         injected: &[InjectedSecret],
         next: Next,
-        is_surrogate: fn(&str) -> bool,
         sign_in_again: fn() -> Response<ResponseBody>,
     ) -> anyhow::Result<Response<ResponseBody>> {
-        let grant = match self
-            .api_credential(to, req.headers(), injected, is_surrogate, sign_in_again)
+        let swapped = match self
+            .swap_headers(to, req.headers_mut(), injected, sign_in_again)
             .await?
         {
-            Ok(Credential::Grant(grant)) => Some(*grant),
-            Ok(Credential::None | Credential::Injected) => None,
+            Ok(swapped) => swapped,
             Err(refused) => return Ok(refused),
         };
-        if let Some(grant) = &grant {
-            set_bearer(req.headers_mut(), grant)?;
+        let known = self.known_reals(&swapped, injected).await?;
+        req.headers_mut()
+            .insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+        scan::scan_answer(next(req).await?, self.formats(), known).await
+    }
+
+    /// The real values an API answer must not carry
+    /// ([`scan::known_reals`]): of the store (read now when the swap did
+    /// not) and of the secrets injected into the request.
+    pub async fn known_reals(
+        &self,
+        swapped: &Swapped,
+        injected: &[InjectedSecret],
+    ) -> anyhow::Result<Vec<String>> {
+        let snapshot = match &swapped.snapshot {
+            Some(snapshot) => snapshot.clone(),
+            None => match self.store.snapshot(self.service()).await {
+                Ok(snapshot) => snapshot,
+                Err(e) => {
+                    // Fail closed: no scan, no answer.
+                    if !self.store_warned.replace(true) {
+                        tracing::warn!(
+                            "{}: cannot read the token store to scan API answers, so they \
+                             fail: {e:#}",
+                            self.service().name()
+                        );
+                    }
+                    return Err(e.context("read the token store for the answer scan"));
+                }
+            },
+        };
+        Ok(scan::known_reals(&snapshot, injected))
+    }
+
+    /// Forward a code exchange (its code already swapped, see
+    /// [`swap_code`]); keep the real tokens as a new grant with the
+    /// exchange's `client_id`, and answer with surrogates.
+    pub async fn exchange(
+        &self,
+        parts: hyper::http::request::Parts,
+        token: TokenRequest,
+        next: Next,
+    ) -> anyhow::Result<Response<ResponseBody>> {
+        let Some(client_id) = token
+            .field("client_id")
+            .filter(|c| !c.is_empty())
+            .map(String::from)
+        else {
+            return Ok(token_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                format_args!(
+                    "{}: a code exchange without client_id",
+                    self.service().name()
+                ),
+            ));
+        };
+        let req = token.into_request(parts, self.provider.token_path())?;
+        let formats = self.formats();
+        let (parts, bytes) = forward_buffered(req, next).await?;
+        if !parts.status.is_success() {
+            return backstop(rebuilt(parts, bytes), formats, &[]).await;
         }
-        api_backstop(next(req).await?).await
+        let Some(answer) = answer_object(&parts, &bytes) else {
+            return Ok(server_error(format_args!(
+                "{}: a sign-in answer that is no uncompressed JSON object",
+                self.service().name()
+            )));
+        };
+        let found = match tokens::collect(formats, &answer, OAUTH_KINDS, true) {
+            Ok(found) => found,
+            Err(refusal) => {
+                return Ok(server_error(format_args!(
+                    "{}: a sign-in answer: {refusal}",
+                    self.service().name()
+                )));
+            }
+        };
+        let required = self.provider.exchange_requires();
+        if let Some(missing) = required
+            .iter()
+            .find(|kind| !found.iter().any(|f| f.kind == **kind && f.primary))
+        {
+            return Ok(server_error(format_args!(
+                "{}: a sign-in answer without a {missing:?} token",
+                self.service().name()
+            )));
+        }
+        let account = self.provider.account(&answer);
+        let tokens = tokens::mint_all(&found)?;
+        let surrogates = tokens
+            .iter()
+            .map(|t| (t.real.clone(), t.surrogate.clone()))
+            .collect();
+        self.insert_grant(NewGrant {
+            account_id: match account.id {
+                Some(id) => id,
+                None => random_account_id()?,
+            },
+            account: account.email,
+            organization: account.organization,
+            client_id,
+            scopes: scopes_of(&answer),
+            tokens,
+        })
+        .await?;
+        tracing::debug!("{}: stored a new sign-in", self.service().name());
+        let mut answer = Value::Object(answer);
+        tokens::substitute(&mut answer, &surrogates);
+        Ok(rebuilt(parts, Bytes::from(answer.to_string())))
     }
 
     /// Store a new grant (see [`TokenStore::insert_grant`]); the grants it
     /// replaces are revoked upstream in the background, best effort.
     pub async fn insert_grant(&self, new: NewGrant) -> anyhow::Result<Grant> {
-        let (grant, replaced) = self.store.insert_grant(new).await?;
-        for secrets in replaced {
+        let (grant, replaced) = self.store.insert_grant(self.service(), new).await?;
+        for old in replaced {
             let (provider, upstream) = (self.provider, self.upstream.clone());
             tokio::task::spawn_local(async move {
                 revoke_tokens(
                     provider,
                     &upstream,
-                    Some(&secrets.access_token),
-                    secrets.refresh_token.as_deref(),
+                    &old.client_id,
+                    old.real(TokenKind::Access),
+                    old.real(TokenKind::Refresh),
                 )
                 .await;
             });
@@ -821,43 +1099,33 @@ impl Grants {
         Ok(grant)
     }
 
-    /// A sign-out: when `token` is the refresh or access surrogate of a
+    /// A sign-out: when `token` is an access or refresh surrogate of a
     /// grant, delete the grant and revoke its real tokens upstream (see
-    /// [`revoke_tokens`]). Runs in a task of its own, so a dropped guest
-    /// request still completes it. Unknown tokens are ignored; the guest
-    /// always gets `200 {}`.
-    pub async fn revoke(
-        &self,
-        token: Option<&str>,
-        is_surrogate: fn(&str) -> bool,
-    ) -> anyhow::Result<Response<ResponseBody>> {
+    /// [`revoke_tokens`]) with the grant's client id. Runs in a task of
+    /// its own, so a dropped guest request still completes it. Unknown
+    /// tokens are ignored; the guest always gets `200 {}`.
+    pub async fn revoke(&self, token: Option<&str>) -> anyhow::Result<Response<ResponseBody>> {
         let done = || json_response(StatusCode::OK, &json!({}));
-        let Some(token) = token.filter(|t| is_surrogate(t)) else {
+        let Some(token) = token.filter(|t| self.formats().is_surrogate(t)) else {
             return Ok(done());
         };
-        let service = self.provider.id();
-        let mut found = None;
-        for kind in [SurrogateKind::Refresh, SurrogateKind::Access] {
-            if let Some(grant) = self.store.find_by_surrogate(service, kind, token).await? {
-                found = Some(grant);
-                break;
-            }
-        }
-        let Some(grant) = found else {
+        let service = self.service();
+        let Some(grant) = self.store.grant_of(service, token, SIGN_OUT_KINDS).await? else {
             return Ok(done());
         };
         let provider = self.provider;
         let store = self.store.clone();
         let upstream = self.upstream.clone();
         let task = tokio::task::spawn_local(async move {
-            if let Err(e) = store.delete_grant(&grant.id).await {
+            if let Err(e) = store.delete_grant(service, &grant.id).await {
                 tracing::warn!("{}: delete a sign-in: {e:#}", service.name());
             }
             revoke_tokens(
                 provider,
                 &upstream,
-                Some(&grant.secrets.access_token),
-                grant.secrets.refresh_token.as_deref(),
+                &grant.client_id,
+                grant.real(TokenKind::Access),
+                grant.real(TokenKind::Refresh),
             )
             .await;
             tracing::debug!("{}: signed out", service.name());
@@ -867,23 +1135,27 @@ impl Grants {
     }
 
     /// Relay the agent's own refresh of the grant of the refresh surrogate
-    /// in `token.fields["refresh_token"]` (see the module docs). A
-    /// request with no `refresh_token` field at all is malformed (`400
-    /// invalid_request`); `unknown()` answers one that has the field but
-    /// not as a surrogate airlock knows (signed out, never issued, or a
-    /// grant with no refresh token).
+    /// in `token.fields["refresh_token"]` (see the module docs); the rest
+    /// of the guest's request stays here. A request with no
+    /// `refresh_token` field at all is malformed (`400 invalid_request`);
+    /// `unknown()` answers one that has the field but not as a surrogate
+    /// airlock knows (signed out, never issued, or a grant with no refresh
+    /// token).
     pub async fn relay_refresh(
         &self,
         token: TokenRequest,
-        is_refresh_surrogate: fn(&str) -> bool,
         unknown: fn() -> Response<ResponseBody>,
     ) -> anyhow::Result<Response<ResponseBody>> {
         if token.field("refresh_token").is_none() {
-            return Ok(token_error(StatusCode::BAD_REQUEST, "invalid_request"));
+            return Ok(token_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                format_args!("{}: a refresh without refresh_token", self.service().name()),
+            ));
         }
         let Some(surrogate) = token
             .field("refresh_token")
-            .filter(|t| is_refresh_surrogate(t))
+            .filter(|t| self.formats().is_surrogate(t))
             .map(String::from)
         else {
             return Ok(unknown());
@@ -894,12 +1166,12 @@ impl Grants {
         // A task of its own: a guest that drops the request mid-flight
         // must not lose the rotated tokens (see the module docs).
         let task = tokio::task::spawn_local(async move {
-            relay_one(provider, &store, &upstream, &surrogate, token.fields).await
+            relay_one(provider, &store, &upstream, &surrogate).await
         });
         match task.await.context("refresh relay task")?? {
             Relayed::Unknown => Ok(unknown()),
             Relayed::Refused(resp) => Ok(resp),
-            Relayed::Answer(answer) => Ok(json_response(StatusCode::OK, &Value::Object(answer))),
+            Relayed::Answer(answer) => Ok(json_response(StatusCode::OK, &answer)),
         }
     }
 }
@@ -908,97 +1180,108 @@ impl Grants {
 enum Relayed {
     /// No grant for the surrogate (deleted, or never issued).
     Unknown,
-    /// The upstream refused the refresh; its answer, checked for a leaked
-    /// token.
+    /// The upstream refused the refresh, or its answer is refused; the
+    /// guest's answer.
     Refused(Response<ResponseBody>),
     /// Stored; the guest's answer (surrogates in place of the real
     /// tokens).
-    Answer(Map<String, Value>),
+    Answer(Value),
 }
 
-/// Look up the grant of `surrogate`, forward `fields` (the agent's own
-/// refresh request, its `refresh_token` field swapped for the real one)
-/// to the provider's token endpoint with the proxy's own [`Upstream`],
-/// and store a successful answer on the grant's current record (see
-/// [`super::store::TokenStore::replace_tokens`]). A grant deleted while
-/// this ran (a sign-out meanwhile) gets the new tokens revoked instead of
-/// stored.
+/// Look up the grant of `surrogate`, send the provider's refresh of it
+/// ([`Provider::refresh_body`], with the real refresh token) to the
+/// provider's token endpoint with the proxy's own [`Upstream`], and store
+/// a successful answer on the grant's current record. An answer with a
+/// string in no known token format under a token-like key is refused (see
+/// [`tokens::collect`]). A grant deleted while this ran (a sign-out
+/// meanwhile) gets the new tokens revoked instead of stored.
 async fn relay_one(
     provider: &'static dyn Provider,
     store: &Arc<TokenStore>,
     upstream: &Upstream,
     surrogate: &str,
-    mut fields: Map<String, Value>,
 ) -> anyhow::Result<Relayed> {
-    let Some(found) = store
-        .find_by_surrogate(provider.id(), SurrogateKind::Refresh, surrogate)
+    let service = provider.id();
+    let formats = provider.formats();
+    // The store as it is now: another process may already have rotated
+    // the real refresh token.
+    let Some(grant) = store
+        .grant_of(service, surrogate, &[TokenKind::Refresh])
         .await?
     else {
         return Ok(Relayed::Unknown);
     };
-    // Never the cache: another process may already have rotated it.
-    let Some(grant) = store.grant(&found.id, provider.id()).await? else {
+    let Some(refresh_token) = grant.real(TokenKind::Refresh) else {
         return Ok(Relayed::Unknown);
     };
-    let Some(refresh_token) = grant.secrets.refresh_token.clone() else {
-        return Ok(Relayed::Unknown);
-    };
-    fields.insert("refresh_token".into(), refresh_token.into());
-    let (status, bytes) = upstream
-        .post_json(provider.token_path(), &Value::Object(fields))
-        .await?;
+    let body = provider.refresh_body(&grant, refresh_token);
+    let (status, bytes) = upstream.post_json(provider.token_path(), &body).await?;
     if !status.is_success() {
-        return Ok(Relayed::Refused(relay_error(status, &bytes)));
+        return Ok(Relayed::Refused(relay_error(status, &bytes, formats)));
     }
     let Ok(Value::Object(answer)) = serde_json::from_slice::<Value>(&bytes) else {
-        return Ok(Relayed::Refused(server_error()));
+        return Ok(Relayed::Refused(server_error(format_args!(
+            "{}: a refresh answer that is no JSON object",
+            service.name()
+        ))));
     };
-    let new_access = answer
-        .get("access_token")
-        .and_then(Value::as_str)
-        .map(String::from);
-    let new_refresh = answer
-        .get("refresh_token")
-        .and_then(Value::as_str)
-        .map(String::from);
-    let mut rest = answer.clone();
-    for key in TOKEN_KEYS {
-        rest.remove(*key);
-    }
-    if carries_token(&Value::Object(rest.clone()), TOKEN_FORMATS) {
-        return Ok(Relayed::Refused(server_error()));
-    }
+    let found = match tokens::collect(formats, &answer, OAUTH_KINDS, true) {
+        Ok(found) => found,
+        Err(refusal) => {
+            return Ok(Relayed::Refused(server_error(format_args!(
+                "{}: a refresh answer: {refusal}",
+                service.name()
+            ))));
+        }
+    };
+    let new_access = found
+        .iter()
+        .find(|f| f.kind == TokenKind::Access)
+        .map(|f| f.real.clone());
+    let new_refresh = found
+        .iter()
+        .find(|f| f.kind == TokenKind::Refresh)
+        .map(|f| f.real.clone());
+    let scopes = scopes_of(&answer);
     let stored = store
-        .replace_tokens(&grant.id, provider.id(), move |secrets| {
-            provider.apply_refresh(secrets, &answer)
+        .update_grant(service, &grant.id, move |grant| {
+            let surrogates = tokens::apply_refresh(grant, &found)?;
+            if !scopes.is_empty() {
+                grant.scopes = scopes;
+            }
+            Ok(surrogates)
         })
         .await?;
-    let Some(grant) = stored else {
+    let Some((_, surrogates)) = stored else {
         tracing::debug!(
             "{}: signed out during a refresh; revoking its tokens",
-            provider.id().name()
+            service.name()
         );
         revoke_tokens(
             provider,
             upstream,
+            &grant.client_id,
             new_access.as_deref(),
             new_refresh.as_deref(),
         )
         .await;
         return Ok(Relayed::Unknown);
     };
-    tracing::debug!("{}: relayed a refresh", provider.id().name());
-    Ok(Relayed::Answer(provider.surrogate_answer(&grant, rest)))
+    tracing::debug!("{}: relayed a refresh", service.name());
+    let mut answer = Value::Object(answer);
+    tokens::substitute(&mut answer, &surrogates);
+    Ok(Relayed::Answer(answer))
 }
 
-/// Revoke the real tokens upstream, best effort (failures are logged):
-/// whichever of `access_token`/`refresh_token` are `Some` — the refresh
-/// token first, then the access token where the provider revokes access
-/// tokens ([`Provider::revokes_access_tokens`]) or there is no refresh
-/// token to revoke instead.
+/// Revoke the real tokens upstream with `client_id`, best effort
+/// (failures are logged): whichever of `access_token`/`refresh_token` are
+/// `Some` — the refresh token first, then the access token where the
+/// provider revokes access tokens ([`Provider::revokes_access_tokens`]) or
+/// there is no refresh token to revoke instead.
 async fn revoke_tokens(
     provider: &dyn Provider,
     upstream: &Upstream,
+    client_id: &str,
     access_token: Option<&str>,
     refresh_token: Option<&str>,
 ) {
@@ -1013,10 +1296,11 @@ async fn revoke_tokens(
     }
     let service = provider.id().name();
     for (token, hint) in tokens {
-        match upstream
-            .post_json(provider.revoke_path(), &provider.revoke_body(token, hint))
-            .await
-        {
+        let mut body = json!({ "token": token, "token_type_hint": hint });
+        if provider.revoke_names_client(hint) {
+            body["client_id"] = client_id.into();
+        }
+        match upstream.post_json(provider.revoke_path(), &body).await {
             Ok((status, _)) if status.is_success() => {}
             Ok((status, body)) => tracing::warn!(
                 "{service}: the provider answered the revoke of a {hint} with {status} {}",
@@ -1025,37 +1309,6 @@ async fn revoke_tokens(
             Err(e) => tracing::warn!("{service}: revoke a {hint}: {e:#}"),
         }
     }
-}
-
-/// A fake unpadded JWT with the claims of `real` (if it is a JWT), `exp`
-/// far ahead and a random nonce, and a random signature. `None` when
-/// `real` is not a JWT.
-pub fn fake_jwt(real: &str, exp_secs: i64) -> anyhow::Result<Option<String>> {
-    let Some(Value::Object(mut claims)) = jwt_claims(real) else {
-        return Ok(None);
-    };
-    claims.insert("exp".into(), exp_secs.into());
-    claims.insert(
-        "airlock_nonce".into(),
-        URL_SAFE_NO_PAD
-            .encode(super::store::random_bytes::<16>()?)
-            .into(),
-    );
-    let payload = URL_SAFE_NO_PAD.encode(Value::Object(claims).to_string());
-    let signature = URL_SAFE_NO_PAD.encode(super::store::random_bytes::<32>()?);
-    Ok(Some(format!("{FAKE_JWT_PREFIX}{payload}.{signature}")))
-}
-
-/// The claims of a JWT (unverified): the decoded middle part.
-pub fn jwt_claims(token: &str) -> Option<Value> {
-    let mut parts = token.split('.');
-    let (Some(_), Some(payload), Some(_), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return None;
-    };
-    let bytes = URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
-    serde_json::from_slice(&bytes).ok()
 }
 
 #[cfg(test)]
@@ -1080,17 +1333,6 @@ mod tests {
     }
 
     #[test]
-    fn the_fake_jwt_prefix_is_its_header() {
-        assert_eq!(
-            FAKE_JWT_PREFIX,
-            format!(
-                "{}.",
-                URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#)
-            )
-        );
-    }
-
-    #[test]
     fn duplicate_keys_are_refused() {
         assert!(serde_json::from_str::<UniqueObject>(r#"{"a":1,"b":2}"#).is_ok());
         assert!(serde_json::from_str::<UniqueObject>(r#"{"a":1,"a":2}"#).is_err());
@@ -1101,6 +1343,7 @@ mod tests {
 
     #[test]
     fn tokens_are_found_anywhere_in_json() {
+        let formats = &super::super::anthropic::FORMATS;
         for v in [
             json!({ "access_token": "x" }),
             json!({ "data": [{ "id_token": 1 }] }),
@@ -1108,11 +1351,74 @@ mod tests {
             json!(["sk-ant-oat01-x"]),
             json!({ "a": { "b": "sk-ant-ort01-y" } }),
         ] {
-            assert!(carries_token(&v, TOKEN_FORMATS), "{v}");
+            assert!(carries_token(&v, formats), "{v}");
         }
         assert!(!carries_token(
-            &json!({ "user_code": "ABCD", "n": 3 }),
-            TOKEN_FORMATS
+            &json!({ "user_code": "ABCD", "n": 3, "k": "sk-ant-oat01-airlock-x" }),
+            formats
         ));
+    }
+
+    /// The device sign-in's identifiers may be JWTs of OpenAI's issuer:
+    /// passed keys keep them; elsewhere such a value is a token, and the
+    /// log names where it was.
+    #[test]
+    fn passed_keys_keep_identifiers_that_look_like_tokens() {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let formats = &super::super::openai::FORMATS;
+        let jwt = format!(
+            "{}.{}.sig",
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#),
+            URL_SAFE_NO_PAD.encode(br#"{"iss":"https://auth.openai.com"}"#),
+        );
+        let answer = json!({ "device_auth_id": jwt, "user_code": "ABCD-1234", "interval": "5" });
+        let passed = ["device_auth_id", "user_code"];
+        assert_eq!(token_field(&answer, formats, &passed, "$"), None);
+        assert_eq!(
+            token_field(&answer, formats, &[], "$").as_deref(),
+            Some("$.device_auth_id")
+        );
+        // An error code is no authorization code; a real token in it is.
+        let pending = json!({ "error": { "code": "deviceauth_authorization_pending" } });
+        assert_eq!(token_field(&pending, formats, &passed, "$"), None);
+        let leak = json!({ "error": { "code": jwt.clone() } });
+        assert_eq!(
+            token_field(&leak, formats, &passed, "$").as_deref(),
+            Some("$.error.code")
+        );
+        assert!(carries_token(&json!({ "code": "c" }), formats));
+        // A token key still counts under any passed list.
+        let leak = json!({ "device_auth_id": "d", "x": [{ "access_token": "t" }] });
+        assert_eq!(
+            token_field(&leak, formats, &passed, "$").as_deref(),
+            Some("$.x[0].access_token")
+        );
+    }
+
+    #[test]
+    fn bearer_tokens() {
+        assert_eq!(bearer_token("Bearer abc"), Some("abc"));
+        assert_eq!(bearer_token("bearer  abc "), Some("abc"));
+        assert_eq!(bearer_token("abc"), None);
+        assert_eq!(bearer_token("Basic abc"), None);
+    }
+
+    /// An allowed route forwards its own path, never the guest's spelling
+    /// or query.
+    #[test]
+    fn routed_uris_drop_the_guests_spelling() {
+        let h1: hyper::Uri = "/x%2f..%2f/v1/oauth/hello?a=1".parse().unwrap();
+        assert_eq!(
+            routed_uri(&h1, "/v1/oauth/hello").unwrap(),
+            "/v1/oauth/hello"
+        );
+        let h2: hyper::Uri = "https://platform.claude.com/V1//oauth/hello?a"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            routed_uri(&h2, "/v1/oauth/hello").unwrap(),
+            "https://platform.claude.com/v1/oauth/hello"
+        );
     }
 }

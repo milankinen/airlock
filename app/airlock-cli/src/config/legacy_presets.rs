@@ -1,10 +1,11 @@
 //! The released list form of `presets` (`presets = ["python", "rust"]`).
 //!
-//! The 12 released names are the files `src/config/presets/<name>.toml`,
-//! byte for byte as released. A file's list is taken out of its value when
-//! the file loads, and its names are checked when the config resolves
-//! (see [`crate::config::LayeredConfig`]). The documents of the lists of all files merge into one value ([`expand`])
-//! that applies beneath every config file, as released.
+//! The 11 released names are the files `src/config/presets/<name>.toml`,
+//! byte for byte as released (`docker` is a later addition). A file's
+//! list is taken out of its value when the file loads, and its names are
+//! checked when the config resolves (see [`crate::config::LayeredConfig`]).
+//! The documents of the lists of all files merge into one value
+//! ([`expand`]) that applies beneath every config file, as released.
 
 use std::collections::HashSet;
 
@@ -64,7 +65,9 @@ pub(crate) fn validate_names(origin: &str, names: &[String], known: &[Pack]) -> 
 
 /// Remove `presets` from `value` and check that it is a list of strings:
 /// the only form it accepts now. A table is an error that hints to use a
-/// `[packs]` table instead. `origin` starts the error messages.
+/// `[packs]` table instead. `null` (for example a YAML `presets:` with no
+/// value) is treated as absent, as [`merge_json`] treats nulls elsewhere.
+/// `origin` starts the error messages.
 pub(crate) fn take_presets_key(
     value: &mut Value,
     origin: &str,
@@ -73,9 +76,7 @@ pub(crate) fn take_presets_key(
         return Ok(None);
     };
     match presets {
-        Value::Null => anyhow::bail!(
-            "{origin}: `presets` is empty; write a list of preset names, or remove it"
-        ),
+        Value::Null => Ok(None),
         Value::Array(items) => {
             let names = items
                 .into_iter()
@@ -176,9 +177,9 @@ fn document(name: &str) -> anyhow::Result<Value> {
 mod tests {
     use super::*;
 
-    /// The 12 released list names, each with its file and, but for the
-    /// distros without a pack (`arch`, `fedora`, `suse`), the name of a
-    /// built-in pack.
+    /// The released list names (11, plus the later addition `docker`),
+    /// each with its file and, but for the distros without a pack
+    /// (`arch`, `fedora`, `suse`), the name of a built-in pack.
     #[test]
     fn legacy_names_are_the_released_ones() {
         let mut names = RELEASED_NAMES.map(|(name, _)| name);

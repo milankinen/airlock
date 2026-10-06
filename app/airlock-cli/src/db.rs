@@ -8,7 +8,7 @@
 //!
 //! ## Adding a database
 //!
-//! Name it `<purpose>.<name>` (as `services.grants`), get its handle with
+//! Name it `<purpose>` or `<purpose>.<name>` (as `services`), get its handle with
 //! [`Db::database`] (created when missing) and use it in the transactions
 //! of [`Db::read`] and [`Db::write`]. Keep the records small: the
 //! map is [`MAP_SIZE`] for all databases together, and the environment
@@ -53,13 +53,12 @@ impl Db {
         open_env(dir).map(Self)
     }
 
-    /// The database `name` (`<purpose>.<name>`), created when missing.
+    /// The database `name`, created when missing.
     pub async fn database<K, V>(&self, name: &str) -> anyhow::Result<Database<K, V>>
     where
         K: Send + 'static,
         V: Send + 'static,
     {
-        debug_assert!(name.contains('.'), "database names are <purpose>.<name>");
         let db = self.clone();
         let name = name.to_string();
         blocking(move || {
@@ -69,6 +68,29 @@ impl Db {
                     .with_context(|| format!("create the database {name}"))?;
             txn.commit()?;
             Ok(database)
+        })
+        .await
+    }
+
+    /// Delete every record of the database `name`, if it exists: `heed`
+    /// cannot delete a named database, so a database no longer in use is
+    /// emptied (its name stays). Returns whether it had records.
+    pub async fn empty_database(&self, name: &str) -> anyhow::Result<bool> {
+        let db = self.clone();
+        let name = name.to_string();
+        blocking(move || {
+            let mut txn = db.0.write_txn()?;
+            let Some(database) =
+                db.0.open_database::<heed::types::Bytes, heed::types::Bytes>(&txn, Some(&name))?
+            else {
+                return Ok(false);
+            };
+            let had = !database.is_empty(&txn)?;
+            if had {
+                database.clear(&mut txn)?;
+            }
+            txn.commit()?;
+            Ok(had)
         })
         .await
     }
@@ -110,6 +132,17 @@ impl Db {
             .open_database::<heed::types::Bytes, heed::types::Bytes>(&txn, Some(name))
             .unwrap()
             .is_some()
+    }
+
+    /// The number of records of the database `name` (0 when it does not
+    /// exist). Blocks.
+    #[cfg(test)]
+    pub fn database_len(&self, name: &str) -> u64 {
+        let txn = self.0.read_txn().unwrap();
+        self.0
+            .open_database::<heed::types::Bytes, heed::types::Bytes>(&txn, Some(name))
+            .unwrap()
+            .map_or(0, |db| db.len(&txn).unwrap())
     }
 }
 

@@ -19,13 +19,13 @@ use hyper::body::Incoming;
 use mlua::{Function, Lua, UserData, UserDataFields, UserDataMethods};
 use tracing::trace;
 
+use crate::network::http::{ResponseBody, streamed};
 use crate::network::{DenyReporter, matchers, middleware};
 
-type RequestBody = Either<Incoming, Full<Bytes>>;
+type RequestBody = ResponseBody;
 
 type MiddlewareNext = Box<dyn FnOnce(hyper::http::request::Parts, RequestBody) -> NextFuture>;
-type NextFuture =
-    Pin<Box<dyn Future<Output = mlua::Result<hyper::Response<Either<Incoming, Full<Bytes>>>>>>>;
+type NextFuture = Pin<Box<dyn Future<Output = mlua::Result<hyper::Response<ResponseBody>>>>>;
 
 /// A compiled Lua middleware script, ready to be invoked per-request.
 #[derive(Clone)]
@@ -118,13 +118,13 @@ pub async fn run<F, Fut>(
     deny_reporter: Rc<DenyReporter>,
     connect_host: Rc<str>,
     send: F,
-) -> anyhow::Result<hyper::Response<Either<Incoming, Full<Bytes>>>>
+) -> anyhow::Result<hyper::Response<ResponseBody>>
 where
     F: FnOnce(hyper::Request<RequestBody>) -> Fut + 'static,
     Fut: Future<Output = anyhow::Result<hyper::Response<RequestBody>>> + 'static,
 {
     if middleware.is_empty() {
-        return send(req.map(Either::Left)).await;
+        return send(req.map(streamed)).await;
     }
 
     // Innermost: the actual hyper send
@@ -193,7 +193,7 @@ where
 
     // Kick off the chain
     let (parts, body) = req.into_parts();
-    let result = next(parts, Either::Left(body)).await;
+    let result = next(parts, streamed(body)).await;
     match result {
         Ok(resp) => Ok(resp),
         Err(ref e) if is_denied(e) => {
@@ -210,7 +210,7 @@ where
     }
 }
 
-type ResponseRef = Rc<RefCell<Option<hyper::Response<Either<Incoming, Full<Bytes>>>>>>;
+type ResponseRef = Rc<RefCell<Option<hyper::Response<ResponseBody>>>>;
 
 /// Shared state between the middleware runner and the Lua UserData methods.
 #[derive(Clone)]
@@ -408,7 +408,7 @@ impl UserData for State {
     }
 }
 
-type HttpResponse = hyper::Response<Either<Incoming, Full<Bytes>>>;
+type HttpResponse = hyper::Response<ResponseBody>;
 
 /// Response userdata — wraps the hyper response parts directly.
 #[derive(Clone)]

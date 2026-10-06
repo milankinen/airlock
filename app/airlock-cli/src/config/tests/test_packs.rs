@@ -72,9 +72,16 @@ fn take_returns_none_when_missing() {
 }
 
 #[test]
-fn take_rejects_null_and_other_types() {
+fn take_treats_null_as_missing() {
+    // A YAML `presets:` with no value, or JSON/TOML `"presets": null`,
+    // parses to this and must act as if the key were absent, as
+    // `merge_json` treats nulls elsewhere.
+    assert_eq!(take(serde_json::json!({ "presets": null })).unwrap(), None);
+}
+
+#[test]
+fn take_rejects_other_types() {
     for (value, text) in [
-        (serde_json::json!({ "presets": null }), "`presets` is empty"),
         (
             serde_json::json!({ "presets": 1 }),
             "must be a list of preset names",
@@ -304,16 +311,6 @@ fn docker_runs_unhardened_daemon_and_allows_registries() {
         "pkg-containers.githubusercontent.com",
     ] {
         assert!(allow.contains(&host.to_string()), "missing {host}");
-    }
-}
-
-#[test]
-fn python_points_tls_at_system_bundle() {
-    let config = parse_bundled("python");
-    for key in ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "PIP_CERT"] {
-        let var = &config.env[key];
-        assert_eq!(var.value, "/etc/ssl/certs/ca-certificates.crt", "{key}");
-        assert!(!var.mask, "{key}");
     }
 }
 

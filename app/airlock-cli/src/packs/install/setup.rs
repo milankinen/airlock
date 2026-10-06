@@ -204,7 +204,8 @@ pub async fn install(
 }
 
 /// Boot the install VM: no network services, browser, clipboard, daemons
-/// or masks (the install config grants none of them).
+/// or masks (the install config grants none of them), and a network that
+/// reaches public addresses only.
 async fn boot_install_vm(
     project: Project,
     image: &OciImage,
@@ -217,7 +218,8 @@ async fn boot_install_vm(
         network::native_tls_client(),
         vec![],
         vec![],
-    )?;
+    )?
+    .public_only();
     let env = boot::guest_env(&project, image, false);
     boot::boot(BootSpec {
         project,

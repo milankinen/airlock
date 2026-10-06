@@ -1,42 +1,47 @@
-//! The `anthropic` service: Claude Code's sign-in (`claude /login`,
-//! `claude setup-token`) and its API use.
+//! The `anthropic` service: Claude Code's sign-ins (`claude /login` with
+//! a Claude.ai subscription or an Anthropic Console account, `claude
+//! setup-token`) and its API use.
 //!
-//! On the token host (`platform.claude.com`), matched on the normalized
-//! path (see [`oauth::normalize_path`]):
+//! On the token host (`platform.claude.com`) only these routes are served,
+//! matched on the normalized path (see [`oauth::normalize_path`]); every
+//! other route gets a local `403` ([`oauth::route_not_allowed`]):
 //!
 //! - `POST /v1/oauth/token` (parsed strictly, see [`oauth`]):
 //!   - `authorization_code`: the `code` must be a surrogate code
 //!     ([`super::auth_codes`]) issued to this service through the
 //!     loopback callback on the port of the `redirect_uri`; it is swapped
-//!     for the real code and the exchange forwarded. The answer's real
-//!     tokens are stored as a new grant and the guest gets surrogates
-//!     (access `sk-ant-oat01-airlock-…`, refresh `sk-ant-ort01-airlock-…`)
-//!     with the upstream's own `expires_in`.
+//!     for the real code and the exchange forwarded with the guest's
+//!     `client_id` (Claude Code has several OAuth clients). The answer's
+//!     real tokens are stored as a new grant with that client id and the
+//!     guest gets surrogates (access `sk-ant-oat01-airlock-…`, refresh
+//!     `sk-ant-ort01-airlock-…`) with the upstream's own `expires_in`.
 //!   - `refresh_token`: Claude Code's own refresh, relayed
-//!     ([`oauth::Grants::relay_refresh`]); an unknown refresh surrogate
-//!     gets `invalid_grant`.
+//!     ([`oauth::Grants::relay_refresh`]) as a refresh of the grant's
+//!     scopes without `org:create_api_key`, with the grant's client id; an
+//!     unknown refresh surrogate gets `invalid_grant`.
 //!   - other grant types: refused locally (`unsupported_grant_type`).
 //! - `POST /v1/oauth/token/revoke` (Claude's `/logout`): a refresh or
 //!   access surrogate deletes its grant and revokes the real refresh
 //!   token upstream (the access token when there is none; Claude Code
 //!   never revokes access tokens); the guest gets `200 {}`.
-//! - Everything else passes [`oauth::backstop`], without a token swap.
+//! - `GET /v1/oauth/hello`: Claude Code's connection check before a
+//!   sign-in; forwarded with that path and no query, its answer passes
+//!   [`oauth::backstop`].
 //!
 //! On the API host (`api.anthropic.com`), every path, with strict
-//! credentials (see [`super`]): `Authorization: Bearer <surrogate>` and
-//! `x-api-key: <surrogate>` get the real values, an injected masked
-//! secret passes, anything else gets a local `401`; a 401 from upstream
-//! passes through unchanged (Claude Code refreshes itself). Answers pass
-//! [`oauth::api_backstop`]. `POST /api/oauth/claude_cli/create_api_key`:
-//! every `sk-ant-api…` string of the answer is replaced by a surrogate
-//! stored with the grant; a grant creates at most three keys an hour,
-//! then the guest gets a local `429`.
+//! credentials and the credential swap of [`oauth::Grants::swap_headers`]
+//! (`Authorization: Bearer` and `x-api-key` only); a 401 from upstream
+//! passes through unchanged (Claude Code refreshes itself). Answers
+//! stream through [`super::scan::scan_answer`]. `POST
+//! /api/oauth/claude_cli/create_api_key`: every `sk-ant-api…` string of
+//! the answer is replaced by a surrogate stored with the grant; a grant
+//! creates at most three keys an hour, then the guest gets a local `429`.
 //!
 //! Any other host (the service owns none) passes [`oauth::backstop`].
 //!
-//! Both the access and the refresh surrogate stay the same for the life
-//! of a grant: Claude Code's own refresh never changes the real access
-//! token's format in a way that needs a new one.
+//! The access and refresh surrogates stay the same for the life of a
+//! grant: they are opaque, so a refresh only changes the real tokens
+//! behind them.
 //!
 //! Known limits:
 //!
@@ -44,7 +49,11 @@
 //!   from `https://platform.claude.com/oauth/code/callback`) brings the
 //!   real authorization code into the sandbox through the clipboard;
 //!   airlock cannot swap it. Its exchange (exactly that `redirect_uri`) is
-//!   forwarded with the real code.
+//!   forwarded with the real code only when its PKCE verifier belongs to
+//!   a sign-in page the browser bridge opened in this process (Claude
+//!   uses one verifier for both of its pages), once, within ten minutes
+//!   (see [`super::auth_codes`]); else `invalid_grant`. Without the
+//!   browser bridge, the manual sign-in does not work.
 //! - Claude Code also talks to `mcp-proxy.anthropic.com` at run time. It is
 //!   not verified which credential it sends there; the service does not
 //!   own that host, so a surrogate sent there stays a surrogate.
@@ -55,26 +64,22 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::future::LocalBoxFuture;
-use hyper::header::HeaderValue;
 use hyper::{Method, Request, Response, StatusCode};
 use serde_json::{Map, Value, json};
 
-use super::ServiceId;
 use super::auth_codes::PendingCodes;
-use super::oauth::{self, Credential, Grants, Provider, TokenRequest, Upstream};
+use super::oauth::{self, Account, Credential, Grants, Provider, TokenRequest, Upstream};
 use super::sign_in::SignInPage;
-use super::store::{
-    self, ApiKey, Grant, GrantSecrets, NewGrant, SurrogateKind, Surrogates, TokenStore, now_ms,
-};
+use super::store::{self, ApiKey, Grant, TokenStore};
+use super::tokens::{self, Format, Formats, TokenKind};
+use super::{ServiceId, scan};
 use crate::network::http::ResponseBody;
 use crate::network::interceptor::{Interceptor, Next};
 use crate::network::target::{Endpoint, InjectedSecret, NetworkTarget};
 
-/// Claude Code's OAuth client id.
-const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-
 const TOKEN_PATH: &str = "/v1/oauth/token";
 const REVOKE_PATH: &str = "/v1/oauth/token/revoke";
+const HELLO_PATH: &str = "/v1/oauth/hello";
 const CREATE_API_KEY_PATH: &str = "/api/oauth/claude_cli/create_api_key";
 
 /// The `redirect_uri` of the manual sign-in.
@@ -83,20 +88,10 @@ const MANUAL_REDIRECT: &str = "https://platform.claude.com/oauth/code/callback";
 const ACCESS_PREFIX: &str = "sk-ant-oat01-airlock-";
 const REFRESH_PREFIX: &str = "sk-ant-ort01-airlock-";
 const API_KEY_PREFIX: &str = "sk-ant-api03-airlock-";
-/// What a real API key in a `create_api_key` answer starts with.
-const REAL_API_KEY_PREFIX: &str = "sk-ant-api";
+const ID_PREFIX: &str = "airlock-id-";
 
-/// The scopes Claude Code asks for: `/login` asks for all, `setup-token`
-/// for `user:inference` only.
-const SCOPES: &[&str] = &[
-    "org:create_api_key",
-    "user:profile",
-    "user:inference",
-    "user:sessions:claude_code",
-    "user:mcp_servers",
-    "user:file_upload",
-    "user:plugins",
-];
+/// The scope a refresh never asks for: Claude Code refreshes without it.
+const NOT_REFRESHED_SCOPE: &str = "org:create_api_key";
 
 /// Claude Code listens for the callback on an ephemeral port of the guest
 /// (Linux: 32768–60999).
@@ -106,6 +101,87 @@ const CALLBACK_PORTS: &[std::ops::RangeInclusive<u16>] = &[32768..=60999];
 /// hosts and the success pages (`platform.claude.com/oauth/code/success`,
 /// the Console's `buy_credits`), and the Claude.ai origin.
 const PAGES: &[&str] = &["platform.claude.com", "claude.com", "claude.ai"];
+
+/// The shortest random part of a real Anthropic token in the scan of
+/// API answers.
+const REAL_SHAPE_MIN: usize = 80;
+
+/// A real token's shape: `sk-ant-<kind><two digits>-` and at least
+/// [`REAL_SHAPE_MIN`] base64url characters.
+fn is_real_shape(run: &str) -> bool {
+    let b = run.as_bytes();
+    b.len() > 13
+        && b[10].is_ascii_digit()
+        && b[11].is_ascii_digit()
+        && b[12] == b'-'
+        && b[13..]
+            .iter()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+            .count()
+            >= REAL_SHAPE_MIN
+}
+
+/// Anthropic's token formats: OAuth access and refresh tokens and API
+/// keys, each by its prefix; then, by key, any other value of a token
+/// answer's `access_token`, `refresh_token` or `id_token` (the surrogate
+/// keeps the prefix Claude Code checks).
+pub static FORMATS: Formats = Formats(&[
+    Format {
+        kind: TokenKind::Access,
+        recognize: |_, v| v.starts_with("sk-ant-oat"),
+        starts: &["sk-ant-oat"],
+        shape: is_real_shape,
+        is_surrogate: |v| v.starts_with(ACCESS_PREFIX),
+        mint: |_| tokens::surrogate(ACCESS_PREFIX),
+        carries_claims: false,
+    },
+    Format {
+        kind: TokenKind::Refresh,
+        recognize: |_, v| v.starts_with("sk-ant-ort"),
+        starts: &["sk-ant-ort"],
+        shape: is_real_shape,
+        is_surrogate: |v| v.starts_with(REFRESH_PREFIX),
+        mint: |_| tokens::surrogate(REFRESH_PREFIX),
+        carries_claims: false,
+    },
+    Format {
+        kind: TokenKind::ApiKey,
+        recognize: |_, v| v.starts_with("sk-ant-api"),
+        starts: &["sk-ant-api"],
+        shape: is_real_shape,
+        is_surrogate: |v| v.starts_with(API_KEY_PREFIX),
+        mint: |_| tokens::surrogate(API_KEY_PREFIX),
+        carries_claims: false,
+    },
+    // By key: the answer's own token fields, whatever their format.
+    Format {
+        kind: TokenKind::Access,
+        recognize: |k, v| k == "access_token" && !v.is_empty(),
+        starts: &[],
+        shape: |_| false,
+        is_surrogate: |v| v.starts_with(ACCESS_PREFIX),
+        mint: |_| tokens::surrogate(ACCESS_PREFIX),
+        carries_claims: false,
+    },
+    Format {
+        kind: TokenKind::Refresh,
+        recognize: |k, v| k == "refresh_token" && !v.is_empty(),
+        starts: &[],
+        shape: |_| false,
+        is_surrogate: |v| v.starts_with(REFRESH_PREFIX),
+        mint: |_| tokens::surrogate(REFRESH_PREFIX),
+        carries_claims: false,
+    },
+    Format {
+        kind: TokenKind::Id,
+        recognize: |k, v| k == "id_token" && !v.is_empty(),
+        starts: &[],
+        shape: |_| false,
+        is_surrogate: |v| v.starts_with(ID_PREFIX),
+        mint: |_| tokens::surrogate(ID_PREFIX),
+        carries_claims: false,
+    },
+]);
 
 /// Where the service's hosts are.
 pub struct Endpoints {
@@ -134,8 +210,6 @@ pub fn sign_in_pages() -> Vec<SignInPage> {
         SignInPage {
             host: "platform.claude.com",
             path: "/oauth/authorize",
-            client_id: CLIENT_ID,
-            scopes: SCOPES,
             callback_ports: CALLBACK_PORTS,
             callback_path: "/callback",
             pages: PAGES,
@@ -143,8 +217,6 @@ pub fn sign_in_pages() -> Vec<SignInPage> {
         SignInPage {
             host: "claude.com",
             path: "/cai/oauth/authorize",
-            client_id: CLIENT_ID,
-            scopes: SCOPES,
             callback_ports: CALLBACK_PORTS,
             callback_path: "/callback",
             pages: PAGES,
@@ -152,19 +224,7 @@ pub fn sign_in_pages() -> Vec<SignInPage> {
     ]
 }
 
-fn is_access_surrogate(s: &str) -> bool {
-    s.starts_with(ACCESS_PREFIX)
-}
-
-fn is_refresh_surrogate(s: &str) -> bool {
-    s.starts_with(REFRESH_PREFIX)
-}
-
-fn is_token_surrogate(s: &str) -> bool {
-    is_access_surrogate(s) || is_refresh_surrogate(s)
-}
-
-/// Refresh and revoke at Anthropic.
+/// Exchange, refresh and revoke at Anthropic.
 struct AnthropicOauth;
 
 static PROVIDER: AnthropicOauth = AnthropicOauth;
@@ -172,6 +232,10 @@ static PROVIDER: AnthropicOauth = AnthropicOauth;
 impl Provider for AnthropicOauth {
     fn id(&self) -> ServiceId {
         ServiceId::Anthropic
+    }
+
+    fn formats(&self) -> &'static Formats {
+        &FORMATS
     }
 
     fn token_path(&self) -> &'static str {
@@ -182,44 +246,50 @@ impl Provider for AnthropicOauth {
         REVOKE_PATH
     }
 
-    fn revoke_body(&self, token: &str, hint: &str) -> Value {
-        json!({ "token": token, "token_type_hint": hint, "client_id": CLIENT_ID })
+    /// `setup-token` issues no refresh token.
+    fn exchange_requires(&self) -> &'static [TokenKind] {
+        &[TokenKind::Access]
+    }
+
+    fn account(&self, answer: &Map<String, Value>) -> Account {
+        let field = |object: &str, name: &str| {
+            answer
+                .get(object)
+                .and_then(|o| o.get(name))
+                .and_then(Value::as_str)
+                .map(String::from)
+        };
+        Account {
+            id: field("account", "uuid"),
+            email: field("account", "email_address"),
+            organization: field("organization", "name"),
+        }
+    }
+
+    /// The grant's scopes without [`NOT_REFRESHED_SCOPE`] (no `scope` when
+    /// none is left), with the grant's client id.
+    fn refresh_body(&self, grant: &Grant, refresh_token: &str) -> Value {
+        let mut body = json!({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": grant.client_id,
+        });
+        let scope: Vec<&str> = grant
+            .scopes
+            .iter()
+            .map(String::as_str)
+            .filter(|s| *s != NOT_REFRESHED_SCOPE)
+            .collect();
+        if !scope.is_empty() {
+            body["scope"] = scope.join(" ").into();
+        }
+        body
     }
 
     /// Claude Code revokes its refresh token only; an access-token revoke
     /// is not known to work.
     fn revokes_access_tokens(&self) -> bool {
         false
-    }
-
-    /// The access surrogate stays the same: Claude Code's real access
-    /// token is an opaque string, not a JWT airlock re-mints.
-    fn apply_refresh(
-        &self,
-        secrets: &mut GrantSecrets,
-        answer: &Map<String, Value>,
-    ) -> anyhow::Result<()> {
-        let Some(access) = answer.get("access_token").and_then(Value::as_str) else {
-            anyhow::bail!("token refresh answered no access token");
-        };
-        secrets.access_token = access.to_string();
-        let expires_in = answer
-            .get("expires_in")
-            .and_then(Value::as_i64)
-            .unwrap_or(3600);
-        secrets.access_expires_at = now_ms() + expires_in * 1000;
-        if let Some(refresh) = answer.get("refresh_token").and_then(Value::as_str) {
-            secrets.refresh_token = Some(refresh.to_string());
-        }
-        let scopes = scopes_of(answer);
-        if !scopes.is_empty() {
-            secrets.scopes = scopes;
-        }
-        Ok(())
-    }
-
-    fn surrogate_answer(&self, grant: &Grant, answer: Map<String, Value>) -> Map<String, Value> {
-        insert_surrogates(answer, grant)
     }
 }
 
@@ -262,37 +332,38 @@ impl Anthropic {
     ) -> anyhow::Result<Response<ResponseBody>> {
         oauth::pin_authority(&mut req, to)?;
         let path = oauth::normalize_path(req.uri().path());
-        let post = req.method() == Method::POST;
+        let method = req.method().clone();
         if *to == self.endpoints.token {
-            match path.as_str() {
-                TOKEN_PATH if post => return self.token(req, next).await,
-                REVOKE_PATH if post => {
+            match (&method, path.as_str()) {
+                (&Method::POST, TOKEN_PATH) => return self.token(req, next).await,
+                (&Method::POST, REVOKE_PATH) => {
                     return match TokenRequest::read(req).await? {
-                        Ok((_, token)) => {
-                            self.grants
-                                .revoke(token.field("token"), is_token_surrogate)
-                                .await
-                        }
+                        Ok((_, token)) => self.grants.revoke(token.field("token")).await,
                         Err(refused) => Ok(refused),
                     };
+                }
+                (&Method::GET, HELLO_PATH) => {
+                    oauth::route_to(&mut req, HELLO_PATH)?;
+                    return oauth::forward_auth_host(req, next, &FORMATS, &[]).await;
                 }
                 _ => {}
             }
         }
-        // Fail closed: only the API host gets a swap; anything else on an
-        // owned host passes the backstop.
-        if *to != self.endpoints.api {
-            return oauth::forward_auth_host(req, next).await;
+        if *to == self.endpoints.api {
+            if method == Method::POST && path == CREATE_API_KEY_PATH {
+                return self.create_api_key(to, req, injected, next).await;
+            }
+            return self
+                .grants
+                .forward_api(to, req, injected, next, sign_in_again)
+                .await;
         }
-        if let Err(refused) = self.swap_api_key(to, &mut req, injected).await? {
-            return Ok(refused);
+        // Fail closed: the token host serves its routes only; a host the
+        // service does not know passes the backstop.
+        if *to == self.endpoints.token {
+            return Ok(oauth::route_not_allowed(ServiceId::Anthropic, to, &req));
         }
-        if post && path == CREATE_API_KEY_PATH {
-            return self.create_api_key(to, req, injected, next).await;
-        }
-        self.grants
-            .forward_api(to, req, injected, next, is_access_surrogate, sign_in_again)
-            .await
+        oauth::forward_auth_host(req, next, &FORMATS, &[]).await
     }
 
     async fn token(
@@ -306,102 +377,28 @@ impl Anthropic {
         };
         match token.field("grant_type") {
             Some("authorization_code") => {
-                if !oauth::swap_code(
+                if let Err(why) = oauth::swap_code(
                     &mut token,
                     &self.codes,
                     ServiceId::Anthropic,
                     Some(MANUAL_REDIRECT),
                     None,
                 ) {
-                    return Ok(oauth::token_error(StatusCode::BAD_REQUEST, "invalid_grant"));
+                    return Ok(oauth::token_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_grant",
+                        format_args!("anthropic: {why}"),
+                    ));
                 }
-                self.exchange(token.into_request(parts, TOKEN_PATH)?, next)
-                    .await
+                self.grants.exchange(parts, token, next).await
             }
-            Some("refresh_token") => {
-                self.grants
-                    .relay_refresh(token, is_refresh_surrogate, invalid_grant)
-                    .await
-            }
-            _ => Ok(oauth::token_error(
+            Some("refresh_token") => self.grants.relay_refresh(token, invalid_grant).await,
+            other => Ok(oauth::token_error(
                 StatusCode::BAD_REQUEST,
                 "unsupported_grant_type",
+                format_args!("anthropic: a token request with grant_type {other:?}"),
             )),
         }
-    }
-
-    /// Forward a code exchange; keep the real tokens, answer with
-    /// surrogates.
-    async fn exchange(
-        &self,
-        req: Request<ResponseBody>,
-        next: Next,
-    ) -> anyhow::Result<Response<ResponseBody>> {
-        let (parts, bytes) = oauth::forward_buffered(req, next).await?;
-        if !parts.status.is_success() {
-            return oauth::backstop(oauth::rebuilt(parts, bytes)).await;
-        }
-        let Some(mut answer) = oauth::answer_object(&parts, &bytes) else {
-            return Ok(oauth::server_error());
-        };
-        let Some(Value::String(access)) = answer.remove("access_token") else {
-            return Ok(oauth::server_error());
-        };
-        let refresh = match answer.remove("refresh_token") {
-            None => None,
-            Some(Value::String(refresh)) => Some(refresh),
-            Some(_) => return Ok(oauth::server_error()),
-        };
-        answer.remove("refresh_token_expires_in");
-        if oauth::carries_token(&Value::Object(answer.clone()), oauth::TOKEN_FORMATS) {
-            return Ok(oauth::server_error());
-        }
-        let expires_in = answer
-            .get("expires_in")
-            .and_then(Value::as_i64)
-            .unwrap_or(3600);
-        let scopes = scopes_of(&answer);
-        let account = answer.get("account");
-        let account_id = match account.and_then(|a| a.get("uuid")).and_then(Value::as_str) {
-            Some(uuid) => uuid.to_string(),
-            None => oauth::random_account_id()?,
-        };
-        let account_label = account
-            .and_then(|a| a.get("email_address"))
-            .and_then(Value::as_str)
-            .map(String::from);
-        let surrogates = Surrogates {
-            access: oauth::surrogate(ACCESS_PREFIX)?,
-            previous_access: vec![],
-            refresh: refresh
-                .as_ref()
-                .map(|_| oauth::surrogate(REFRESH_PREFIX))
-                .transpose()?,
-            id_token: None,
-        };
-        let grant = self
-            .grants
-            .insert_grant(NewGrant {
-                service: ServiceId::Anthropic,
-                account_id,
-                account_label,
-                secrets: GrantSecrets {
-                    access_token: access,
-                    access_expires_at: now_ms() + expires_in * 1000,
-                    refresh_token: refresh,
-                    id_token: None,
-                    scopes,
-                    surrogates,
-                    api_keys: vec![],
-                },
-            })
-            .await?;
-        tracing::debug!("anthropic: stored a new sign-in");
-        let answer = PROVIDER.surrogate_answer(&grant, answer);
-        Ok(oauth::rebuilt(
-            parts,
-            Bytes::from(Value::Object(answer).to_string()),
-        ))
     }
 
     /// `POST create_api_key` with a grant's token: the created key reaches
@@ -414,90 +411,69 @@ impl Anthropic {
         injected: &[InjectedSecret],
         next: Next,
     ) -> anyhow::Result<Response<ResponseBody>> {
-        let grant = match self
+        let swapped = match self
             .grants
-            .api_credential(
-                to,
-                req.headers(),
-                injected,
-                is_access_surrogate,
-                sign_in_again,
-            )
+            .swap_headers(to, req.headers_mut(), injected, sign_in_again)
             .await?
         {
-            Ok(Credential::Grant(grant)) => *grant,
-            // An injected token's key is the user's own: the answer still
-            // passes the API backstop, which refuses a real key.
-            Ok(Credential::None | Credential::Injected) => {
-                let (parts, bytes) = oauth::forward_buffered(req, next).await?;
-                return oauth::api_backstop(oauth::rebuilt(parts, bytes)).await;
-            }
+            Ok(swapped) => swapped,
             Err(refused) => return Ok(refused),
         };
-        if !self.store().take_api_key_slot(&grant.id).await? {
+        let known = self.grants.known_reals(&swapped, injected).await?;
+        let Credential::Grant(grant_id) = swapped.credential else {
+            // An injected token's key is the user's own: the answer still
+            // passes the scan, which refuses a real key.
+            let (parts, bytes) = oauth::forward_buffered(req, next).await?;
+            return scan::scan_answer(oauth::rebuilt(parts, bytes), &FORMATS, known).await;
+        };
+        if !self
+            .store()
+            .take_api_key_slot(ServiceId::Anthropic, &grant_id)
+            .await?
+        {
             return Ok(too_many_api_keys());
         }
-        oauth::set_bearer(req.headers_mut(), &grant)?;
         let (parts, bytes) = oauth::forward_buffered(req, next).await?;
         if !parts.status.is_success() {
-            return oauth::api_backstop(oauth::rebuilt(parts, bytes)).await;
+            return scan::scan_answer(oauth::rebuilt(parts, bytes), &FORMATS, known).await;
         }
         let Some(answer) = oauth::answer_object(&parts, &bytes) else {
-            return Ok(oauth::server_error());
+            return Ok(oauth::server_error(
+                "anthropic: a create_api_key answer that is no uncompressed JSON object",
+            ));
         };
+        // The answer's other fields are not known: only the key formats
+        // count, and an OAuth token in it refuses it.
+        let found = match tokens::collect(&FORMATS, &answer, &[TokenKind::ApiKey], false) {
+            Ok(found) if !found.is_empty() => found,
+            Ok(_) => {
+                return Ok(oauth::server_error(
+                    "anthropic: a create_api_key answer without an API key",
+                ));
+            }
+            Err(refusal) => {
+                return Ok(oauth::server_error(format_args!(
+                    "anthropic: a create_api_key answer: {refusal}"
+                )));
+            }
+        };
+        let keys: Vec<ApiKey> = tokens::mint_all(&found)?
+            .into_iter()
+            .map(|t| ApiKey {
+                real: t.real,
+                surrogate: t.surrogate,
+            })
+            .collect();
+        let surrogates = keys
+            .iter()
+            .map(|k| (k.real.clone(), k.surrogate.clone()))
+            .collect();
+        self.store()
+            .add_api_keys(ServiceId::Anthropic, &grant_id, keys)
+            .await?;
         let mut answer = Value::Object(answer);
-        let mut keys = Vec::new();
-        replace_api_keys(&mut answer, &mut keys)?;
-        if keys.is_empty() || oauth::carries_token(&answer, &["sk-ant-oat", "sk-ant-ort"]) {
-            return Ok(oauth::server_error());
-        }
-        for key in keys {
-            self.store()
-                .add_api_key(&grant.id, ServiceId::Anthropic, key)
-                .await?;
-        }
+        tokens::substitute(&mut answer, &surrogates);
         Ok(oauth::rebuilt(parts, Bytes::from(answer.to_string())))
-    }
-
-    /// The strict check of `x-api-key` (see the module docs), before the
-    /// request goes on: an API-key surrogate of a grant gets the real key;
-    /// a masked secret airlock injected passes. `Err` holds the local
-    /// answer to any other value.
-    async fn swap_api_key(
-        &self,
-        to: &Endpoint,
-        req: &mut Request<ResponseBody>,
-        injected: &[InjectedSecret],
-    ) -> anyhow::Result<Result<(), Response<ResponseBody>>> {
-        let Some(value) = req.headers().get("x-api-key") else {
-            return Ok(Ok(()));
-        };
-        let value = value.to_str().unwrap_or_default().to_string();
-        if !value.starts_with(API_KEY_PREFIX) {
-            return Ok(if oauth::is_injected(&value, injected) {
-                Ok(())
-            } else {
-                Err(oauth::foreign_credential(ServiceId::Anthropic, to))
-            });
-        }
-        let real = self
-            .store()
-            .find_by_surrogate(ServiceId::Anthropic, SurrogateKind::ApiKey, &value)
-            .await?
-            .and_then(|grant| {
-                grant
-                    .secrets
-                    .api_keys
-                    .into_iter()
-                    .find(|k| k.surrogate == value)
-            });
-        let Some(key) = real else {
-            return Ok(Err(sign_in_again()));
-        };
-        let real = HeaderValue::from_str(&key.real)
-            .map_err(|_| anyhow::anyhow!("the stored API key is not a valid header value"))?;
-        req.headers_mut().insert("x-api-key", real);
-        Ok(Ok(()))
     }
 }
 
@@ -521,55 +497,13 @@ impl Interceptor for Anthropic {
     }
 }
 
-/// The `scope` of a token answer, split.
-fn scopes_of(answer: &Map<String, Value>) -> Vec<String> {
-    answer
-        .get("scope")
-        .and_then(Value::as_str)
-        .map(|s| s.split_whitespace().map(String::from).collect())
-        .unwrap_or_default()
-}
-
-/// Put the grant's surrogates into a token answer, leaving `expires_in`
-/// (the upstream's own) as it is.
-fn insert_surrogates(mut answer: Map<String, Value>, grant: &Grant) -> Map<String, Value> {
-    let s = &grant.secrets.surrogates;
-    answer.insert("access_token".into(), s.access.clone().into());
-    match &s.refresh {
-        Some(refresh) => answer.insert("refresh_token".into(), refresh.clone().into()),
-        None => answer.remove("refresh_token"),
-    };
-    answer
-}
-
-/// Replace every real API key string in `value` by a new surrogate; the
-/// pairs go to `keys`.
-fn replace_api_keys(value: &mut Value, keys: &mut Vec<ApiKey>) -> anyhow::Result<()> {
-    match value {
-        Value::String(s) if s.starts_with(REAL_API_KEY_PREFIX) => {
-            let surrogate = oauth::surrogate(API_KEY_PREFIX)?;
-            keys.push(ApiKey {
-                real: std::mem::replace(s, surrogate.clone()),
-                surrogate,
-            });
-        }
-        Value::Array(items) => {
-            for v in items {
-                replace_api_keys(v, keys)?;
-            }
-        }
-        Value::Object(map) => {
-            for v in map.values_mut() {
-                replace_api_keys(v, keys)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 /// The answer to a `create_api_key` beyond the limit of the grant.
 fn too_many_api_keys() -> Response<ResponseBody> {
+    tracing::warn!(
+        "refused: anthropic: a create_api_key beyond {} keys an hour for the sign-in (answered \
+         429)",
+        store::API_KEY_CREATIONS
+    );
     oauth::json_response(
         StatusCode::TOO_MANY_REQUESTS,
         &json!({
@@ -588,11 +522,18 @@ fn too_many_api_keys() -> Response<ResponseBody> {
 /// The answer to a refresh whose surrogate airlock does not know (signed
 /// out, never issued, or no refresh token).
 fn invalid_grant() -> Response<ResponseBody> {
-    oauth::token_error(StatusCode::BAD_REQUEST, "invalid_grant")
+    oauth::token_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_grant",
+        "anthropic: a refresh with a refresh token that is no surrogate of a stored sign-in",
+    )
 }
 
 /// The answer to an API request whose sign-in is unknown.
 fn sign_in_again() -> Response<ResponseBody> {
+    tracing::warn!(
+        "refused: anthropic: an API request with a surrogate of no stored sign-in (answered 401)"
+    );
     oauth::json_response(
         StatusCode::UNAUTHORIZED,
         &json!({
@@ -603,4 +544,66 @@ fn sign_in_again() -> Response<ResponseBody> {
             },
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grant(scopes: &[&str]) -> Grant {
+        let mut grant = Grant::for_tests(vec![]);
+        grant.client_id = "stored-client".into();
+        grant.scopes = scopes.iter().map(ToString::to_string).collect();
+        grant
+    }
+
+    /// A refresh asks for the grant's scopes without
+    /// `org:create_api_key`, with the grant's client id; a grant with no
+    /// other scope asks for none.
+    #[test]
+    fn the_refresh_body_is_claude_codes() {
+        let body = PROVIDER.refresh_body(
+            &grant(&["org:create_api_key", "user:inference", "user:profile"]),
+            "real-refresh",
+        );
+        assert_eq!(
+            body,
+            json!({
+                "grant_type": "refresh_token",
+                "refresh_token": "real-refresh",
+                "client_id": "stored-client",
+                "scope": "user:inference user:profile",
+            })
+        );
+        let body = PROVIDER.refresh_body(&grant(&["org:create_api_key"]), "real-refresh");
+        assert!(body.get("scope").is_none(), "{body}");
+    }
+
+    #[test]
+    fn real_tokens_are_told_from_surrogates() {
+        for real in ["sk-ant-api03-x", "sk-ant-oat01-x", "sk-ant-ort01-x"] {
+            assert!(FORMATS.is_real(real), "{real}");
+        }
+        for other in [
+            "sk-ant-api03-airlock-x",
+            "sk-ant-oat01-airlock-x",
+            "sk-ant-ort01-airlock-x",
+            "rt_abcdefghijklmnopqrstuvwxyz0123456789",
+            "x",
+        ] {
+            assert!(!FORMATS.is_real(other), "{other}");
+        }
+    }
+
+    /// Surrogates have their prefix and 48 random bytes (64 base64url
+    /// characters) after it.
+    #[test]
+    fn surrogates_have_enough_entropy() {
+        for format in FORMATS.0 {
+            let s = (format.mint)("sk-ant-oat01-x").unwrap();
+            assert!((format.is_surrogate)(&s), "{s}");
+            // 48 random bytes, 64 base64url characters, after the prefix.
+            assert!(s.len() >= ID_PREFIX.len() + 64, "{s}");
+        }
+    }
 }
