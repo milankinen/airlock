@@ -13,12 +13,11 @@ use quick_cache::sync::Cache;
 use rcgen::{CertificateParams, Issuer, KeyPair};
 use rustls::ServerConfig;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, trace};
 
-use super::{io, traffic};
+use super::{io, tcp, traffic};
 use crate::network::target::ResolvedTarget;
 
 /// Accept a TLS handshake from the container (MITM) and wrap the decrypted
@@ -98,7 +97,7 @@ pub async fn connect_server(
     tls_client: &Arc<rustls::ClientConfig>,
 ) -> anyhow::Result<io::Transport> {
     let addr = format!("{}:{}", target.host, target.port);
-    let server_stream = TcpStream::connect(&addr).await?;
+    let server_stream = tcp::dial(target).await?;
     let mut config = (**tls_client).clone();
     // Offer the container's pick first, but always keep http/1.1 as a
     // fallback. We advertise h2 to the container long before we know what the

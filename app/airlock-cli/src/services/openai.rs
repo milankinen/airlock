@@ -1,8 +1,9 @@
 //! The `openai` service: Codex's ChatGPT sign-in (`codex login`) and its
 //! use of chatgpt.com.
 //!
-//! On the auth host (`auth.openai.com`), matched on the normalized path
-//! (see [`oauth::normalize_path`]):
+//! On the auth host (`auth.openai.com`) only these routes are served,
+//! matched on the normalized path (see [`oauth::normalize_path`]); every
+//! other route gets a local `403` ([`oauth::route_not_allowed`]):
 //!
 //! - `POST /oauth/token` (parsed strictly, see [`oauth`]):
 //!   - form `authorization_code` (browser and device-code sign-in): the
@@ -10,37 +11,42 @@
 //!     this service through the channel of the `redirect_uri` (the
 //!     loopback callback port, or the device flow's
 //!     `https://auth.openai.com/deviceauth/callback`); it is swapped for
-//!     the real code and the exchange forwarded. The answer's
-//!     real `id_token`, `access_token` and `refresh_token` are stored as a
-//!     new grant. The guest gets fake unpadded JWTs with the real tokens'
-//!     own claims (`exp` included, a random nonce, a random signature) and
-//!     an `airlock-rt-…` refresh surrogate. Codex checks no JWT signature.
+//!     the real code and the exchange forwarded. The answer's real
+//!     `id_token`, `access_token` and `refresh_token` are stored as a new
+//!     grant with the exchange's `client_id`. The guest gets fake unpadded
+//!     JWTs with the real tokens' own claims (`exp` included, a random
+//!     nonce, a random signature) and an `airlock-rt-…` refresh
+//!     surrogate; an access token that is no OpenAI JWT gets an
+//!     `airlock-at-…` surrogate. Codex checks no JWT signature.
 //!   - form token exchange (an API key for the ID token): refused locally
 //!     with `unsupported_grant_type`; Codex treats that as non-fatal.
 //!   - JSON `refresh_token`: Codex's own refresh, relayed
-//!     ([`oauth::Grants::relay_refresh`]); an unknown refresh surrogate
-//!     gets `401 refresh_token_invalidated`. The access and ID-token fake
-//!     JWTs are re-minted with the real tokens' new `exp`; the access
-//!     surrogate they replace keeps working until its own `exp` (see
-//!     [`super::store::Surrogates::previous_access`]).
+//!     ([`oauth::Grants::relay_refresh`]) as Codex sends it: the grant's
+//!     client id and no `scope`; an unknown refresh surrogate gets `401
+//!     refresh_token_invalidated`. The fake JWTs are re-minted with the
+//!     real tokens' new claims; the access surrogate they replace keeps
+//!     working until its own `exp` (see
+//!     [`super::store::Grant::previous_access`]).
 //!   - other grant types: refused locally (`unsupported_grant_type`).
+//! - `POST /api/accounts/deviceauth/usercode` (device-code sign-in):
+//!   forwarded with that path and no query; its answer passes
+//!   [`oauth::backstop`].
 //! - `POST /api/accounts/deviceauth/token` (device-code sign-in): the
 //!   `authorization_code` of the answer becomes a surrogate code.
 //! - `POST /oauth/revoke`: a refresh or access surrogate deletes its grant
 //!   and revokes both real tokens upstream (refresh, then access); the
 //!   guest gets `200 {}`. `codex login` revokes before every sign-in, so
 //!   a new sign-in signs the earlier grant out (as it does on a host).
-//! - Everything else passes [`oauth::backstop`], without a token swap.
 //!
-//! On chatgpt.com, paths under `/backend-api/` (HTTP and the WebSocket
-//! upgrade) whose raw path is already canonical (`normalize_path(p) ==
-//! p`; the upstream may read another spelling differently), with strict
-//! credentials (see [`super`]): `Authorization: Bearer <surrogate>` gets
-//! the real token, an injected masked secret passes, anything else gets
-//! a local `401`; a 401 from upstream passes through unchanged (Codex
-//! refreshes itself). Answers pass [`oauth::api_backstop`]. Other paths,
-//! and any host the service does not know, pass [`oauth::backstop`]
-//! without a swap.
+//! On chatgpt.com, every path (HTTP and the WebSocket upgrade), with
+//! strict credentials and the credential swap of
+//! [`oauth::Grants::swap_headers`] (`Authorization: Bearer` only); a 401
+//! from upstream passes through unchanged (Codex refreshes itself).
+//! Answers stream through [`super::scan::scan_answer`], which ends an
+//! answer with a real access or ID token (a JWT with an OpenAI claim, not
+//! a fake JWT) or a real token of the store (opaque ones, refresh tokens
+//! of any format). Any host the service does not know passes
+//! [`oauth::backstop`].
 //!
 //! Protocol facts: Codex 0.158.0.
 
@@ -53,43 +59,110 @@ use serde_json::{Map, Value, json};
 
 use super::ServiceId;
 use super::auth_codes::{Channel, PendingCodes};
-use super::oauth::{self, Grants, Provider, TokenRequest, Upstream};
+use super::oauth::{self, Account, Grants, Provider, TokenRequest, Upstream};
 use super::sign_in::SignInPage;
-use super::store::{Grant, GrantSecrets, NewGrant, Surrogates, TokenStore, now_ms};
+use super::store::{Grant, TokenStore};
+use super::tokens::{self, FAKE_JWT_PREFIX, Format, Formats, TokenKind};
 use crate::network::http::ResponseBody;
 use crate::network::interceptor::{Interceptor, Next};
 use crate::network::target::{Endpoint, InjectedSecret, NetworkTarget};
 
-/// Codex's OAuth client id.
-const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-
 const TOKEN_PATH: &str = "/oauth/token";
 const REVOKE_PATH: &str = "/oauth/revoke";
+const DEVICE_USERCODE_PATH: &str = "/api/accounts/deviceauth/usercode";
 const DEVICE_TOKEN_PATH: &str = "/api/accounts/deviceauth/token";
+/// The identifiers of the device-code sign-in that Codex polls with
+/// (`deviceauth/usercode` answers them). They may look like tokens (a JWT
+/// of OpenAI's issuer), but they are worth nothing without the user's
+/// approval, and the code that the poll then gets is swapped.
+const DEVICE_IDS: &[&str] = &["device_auth_id", "user_code"];
 /// The `redirect_uri` of the device-code sign-in's exchange.
 const DEVICE_REDIRECT: &str = "https://auth.openai.com/deviceauth/callback";
-/// The API paths on chatgpt.com that get the real token.
-const API_PATH_PREFIX: &str = "/backend-api/";
 
 const REFRESH_PREFIX: &str = "airlock-rt-";
 const ACCESS_PREFIX: &str = "airlock-at-";
+const ID_PREFIX: &str = "airlock-id-";
 
-/// The scopes `codex login` asks for.
-const SCOPES: &[&str] = &[
-    "openid",
-    "profile",
-    "email",
-    "offline_access",
-    "api.connectors.read",
-    "api.connectors.invoke",
-];
+/// The claim of OpenAI's real access and ID tokens with the ChatGPT
+/// account, and their issuer.
+const AUTH_CLAIM: &str = "https://api.openai.com/auth";
+const ISSUER: &str = "https://auth.openai.com";
 
 /// The pages a sign-in callback may send the browser to: the authorize
 /// host and ChatGPT. Codex's own success page is on the loopback origin.
 const PAGES: &[&str] = &["auth.openai.com", "chatgpt.com"];
 
-/// Expiry of a real access token that is no JWT (or has no `exp`).
-const DEFAULT_ACCESS_LIFETIME_MS: i64 = 60 * 60 * 1000;
+/// OpenAI's token formats: access and ID tokens that are JWTs with an
+/// OpenAI claim get fake JWT surrogates; any other value of a token
+/// answer's `access_token`, `refresh_token` or `id_token` gets an opaque
+/// surrogate (the key decides, as the agent reads it: the refresh token's
+/// format is not known).
+pub static FORMATS: Formats = Formats(&[
+    Format {
+        kind: TokenKind::Id,
+        recognize: |k, v| k == "id_token" && is_openai_jwt(v),
+        is_surrogate: is_fake_jwt,
+        mint: mint_fake_jwt,
+        starts: &["eyJ"],
+        shape: |run| tokens::jwt_at_start(run).is_some_and(is_openai_jwt),
+        carries_claims: true,
+    },
+    Format {
+        kind: TokenKind::Access,
+        recognize: |k, v| k != "id_token" && is_openai_jwt(v),
+        is_surrogate: is_fake_jwt,
+        mint: mint_fake_jwt,
+        starts: &["eyJ"],
+        shape: |run| tokens::jwt_at_start(run).is_some_and(is_openai_jwt),
+        carries_claims: true,
+    },
+    // By key: the answer's own token fields, whatever their format.
+    Format {
+        kind: TokenKind::Access,
+        recognize: |k, v| k == "access_token" && !v.is_empty(),
+        is_surrogate: |v| v.starts_with(ACCESS_PREFIX),
+        mint: |_| tokens::surrogate(ACCESS_PREFIX),
+        starts: &[],
+        shape: |_| false,
+        carries_claims: false,
+    },
+    Format {
+        kind: TokenKind::Refresh,
+        recognize: |k, v| k == "refresh_token" && !v.is_empty(),
+        is_surrogate: |v| v.starts_with(REFRESH_PREFIX),
+        mint: |_| tokens::surrogate(REFRESH_PREFIX),
+        starts: &[],
+        shape: |_| false,
+        carries_claims: false,
+    },
+    Format {
+        kind: TokenKind::Id,
+        recognize: |k, v| k == "id_token" && !v.is_empty(),
+        is_surrogate: |v| v.starts_with(ID_PREFIX),
+        mint: |_| tokens::surrogate(ID_PREFIX),
+        starts: &[],
+        shape: |_| false,
+        carries_claims: false,
+    },
+]);
+
+fn is_fake_jwt(v: &str) -> bool {
+    v.starts_with(FAKE_JWT_PREFIX)
+}
+
+/// A JWT with OpenAI's auth claim or issuer that is no fake JWT of
+/// airlock.
+fn is_openai_jwt(v: &str) -> bool {
+    !is_fake_jwt(v)
+        && tokens::jwt_claims(v).is_some_and(|claims| {
+            claims.get(AUTH_CLAIM).is_some()
+                || claims.get("iss").and_then(Value::as_str) == Some(ISSUER)
+        })
+}
+
+fn mint_fake_jwt(real: &str) -> anyhow::Result<String> {
+    tokens::fake_jwt(real)?.ok_or_else(|| anyhow::anyhow!("the token is no JWT"))
+}
 
 /// Where the service's hosts are.
 pub struct Endpoints {
@@ -118,27 +191,13 @@ pub fn sign_in_pages() -> Vec<SignInPage> {
     vec![SignInPage {
         host: "auth.openai.com",
         path: "/oauth/authorize",
-        client_id: CLIENT_ID,
-        scopes: SCOPES,
         callback_ports: &[1455..=1455, 1457..=1457],
         callback_path: "/auth/callback",
         pages: PAGES,
     }]
 }
 
-fn is_access_surrogate(s: &str) -> bool {
-    s.starts_with(oauth::FAKE_JWT_PREFIX) || s.starts_with(ACCESS_PREFIX)
-}
-
-fn is_refresh_surrogate(s: &str) -> bool {
-    s.starts_with(REFRESH_PREFIX)
-}
-
-fn is_token_surrogate(s: &str) -> bool {
-    is_access_surrogate(s) || is_refresh_surrogate(s)
-}
-
-/// Refresh and revoke at OpenAI.
+/// Exchange, refresh and revoke at OpenAI.
 struct OpenaiOauth;
 
 static PROVIDER: OpenaiOauth = OpenaiOauth;
@@ -146,6 +205,10 @@ static PROVIDER: OpenaiOauth = OpenaiOauth;
 impl Provider for OpenaiOauth {
     fn id(&self) -> ServiceId {
         ServiceId::Openai
+    }
+
+    fn formats(&self) -> &'static Formats {
+        &FORMATS
     }
 
     fn token_path(&self) -> &'static str {
@@ -156,8 +219,31 @@ impl Provider for OpenaiOauth {
         REVOKE_PATH
     }
 
-    fn revoke_body(&self, token: &str, hint: &str) -> Value {
-        json!({ "token": token, "token_type_hint": hint, "client_id": CLIENT_ID })
+    /// Codex needs all three.
+    fn exchange_requires(&self) -> &'static [TokenKind] {
+        &[TokenKind::Access, TokenKind::Refresh, TokenKind::Id]
+    }
+
+    /// From the ID token's claims: the ChatGPT account (else the subject)
+    /// and the email address.
+    fn account(&self, answer: &Map<String, Value>) -> Account {
+        let claims = answer
+            .get("id_token")
+            .and_then(Value::as_str)
+            .and_then(tokens::jwt_claims);
+        Account {
+            id: claims.as_ref().and_then(account_id),
+            email: claims.as_ref().and_then(email),
+            organization: None,
+        }
+    }
+
+    fn refresh_body(&self, grant: &Grant, refresh_token: &str) -> Value {
+        json!({
+            "client_id": grant.client_id,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        })
     }
 
     /// Codex falls back to revoking the access token: the endpoint takes
@@ -166,47 +252,9 @@ impl Provider for OpenaiOauth {
         true
     }
 
-    /// Every field of the answer is optional; the refresh surrogate
-    /// always stays. A new access token gets a re-minted fake JWT (its
-    /// own `exp`), or an opaque surrogate when it is not a JWT with an
-    /// `exp` ([`access_surrogate`], as for a code exchange); the
-    /// surrogate it replaces keeps working until its own `exp`
-    /// ([`Surrogates::keep_previous_access`]). A new ID token gets a
-    /// re-minted fake JWT the same way, with no previous-surrogate
-    /// bookkeeping (it is not an authorization credential).
-    fn apply_refresh(
-        &self,
-        secrets: &mut GrantSecrets,
-        answer: &Map<String, Value>,
-    ) -> anyhow::Result<()> {
-        let token = |name: &str| answer.get(name).and_then(Value::as_str).map(String::from);
-        if let Some(access) = token("access_token") {
-            let new_surrogate = access_surrogate(&access)?;
-            let (old_surrogate, old_exp) =
-                (secrets.surrogates.access.clone(), secrets.access_expires_at);
-            if new_surrogate != old_surrogate {
-                secrets
-                    .surrogates
-                    .keep_previous_access(old_surrogate, old_exp);
-            }
-            secrets.surrogates.access = new_surrogate;
-            secrets.access_expires_at = access_expiry(&access);
-            secrets.access_token = access;
-        }
-        if let Some(refresh) = token("refresh_token") {
-            secrets.refresh_token = Some(refresh);
-        }
-        if let Some(id_token) = token("id_token") {
-            if let Some(fake) = remint(&id_token)? {
-                secrets.surrogates.id_token = Some(fake);
-            }
-            secrets.id_token = Some(id_token);
-        }
-        Ok(())
-    }
-
-    fn surrogate_answer(&self, grant: &Grant, answer: Map<String, Value>) -> Map<String, Value> {
-        insert_surrogates(answer, grant)
+    /// Codex's fallback revoke of the access token names no client.
+    fn revoke_names_client(&self, hint: &str) -> bool {
+        hint != "access_token"
     }
 }
 
@@ -240,38 +288,39 @@ impl Openai {
         next: Next,
     ) -> anyhow::Result<Response<ResponseBody>> {
         oauth::pin_authority(&mut req, to)?;
-        let raw_path = req.uri().path();
-        let path = oauth::normalize_path(raw_path);
-        // The swap needs the path as the upstream reads it: only a
-        // canonical one.
-        let api =
-            *to == self.endpoints.chatgpt && path == raw_path && path.starts_with(API_PATH_PREFIX);
-        let post = req.method() == Method::POST;
-        if *to == self.endpoints.auth {
+        let path = oauth::normalize_path(req.uri().path());
+        if *to == self.endpoints.auth && req.method() == Method::POST {
             match path.as_str() {
-                TOKEN_PATH if post => return self.token(req, next).await,
-                REVOKE_PATH if post => {
+                TOKEN_PATH => return self.token(req, next).await,
+                REVOKE_PATH => {
                     return match TokenRequest::read(req).await? {
-                        Ok((_, token)) => {
-                            self.grants
-                                .revoke(token.field("token"), is_token_surrogate)
-                                .await
-                        }
+                        Ok((_, token)) => self.grants.revoke(token.field("token")).await,
                         Err(refused) => Ok(refused),
                     };
                 }
-                DEVICE_TOKEN_PATH if post => return self.device_token(req, next).await,
+                DEVICE_USERCODE_PATH => {
+                    oauth::route_to(&mut req, DEVICE_USERCODE_PATH)?;
+                    return oauth::forward_auth_host(req, next, &FORMATS, DEVICE_IDS).await;
+                }
+                DEVICE_TOKEN_PATH => {
+                    oauth::route_to(&mut req, DEVICE_TOKEN_PATH)?;
+                    return self.device_token(req, next).await;
+                }
                 _ => {}
             }
         }
-        if api {
+        if *to == self.endpoints.chatgpt {
             return self
                 .grants
-                .forward_api(to, req, injected, next, is_access_surrogate, sign_in_again)
+                .forward_api(to, req, injected, next, sign_in_again)
                 .await;
         }
-        // Fail closed: anything else on an owned host passes the backstop.
-        oauth::forward_auth_host(req, next).await
+        // Fail closed: the auth host serves its routes only; a host the
+        // service does not know passes the backstop.
+        if *to == self.endpoints.auth {
+            return Ok(oauth::route_not_allowed(ServiceId::Openai, to, &req));
+        }
+        oauth::forward_auth_host(req, next, &FORMATS, &[]).await
     }
 
     async fn token(
@@ -285,98 +334,29 @@ impl Openai {
         };
         match token.field("grant_type") {
             Some("authorization_code") => {
-                if !oauth::swap_code(
+                if let Err(why) = oauth::swap_code(
                     &mut token,
                     &self.codes,
                     ServiceId::Openai,
                     None,
                     Some(DEVICE_REDIRECT),
                 ) {
-                    return Ok(oauth::token_error(StatusCode::BAD_REQUEST, "invalid_grant"));
+                    return Ok(oauth::token_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_grant",
+                        format_args!("openai: {why}"),
+                    ));
                 }
-                self.exchange(token.into_request(parts, TOKEN_PATH)?, next)
-                    .await
+                self.grants.exchange(parts, token, next).await
             }
-            Some("refresh_token") => {
-                self.grants
-                    .relay_refresh(token, is_refresh_surrogate, invalidated)
-                    .await
-            }
+            Some("refresh_token") => self.grants.relay_refresh(token, invalidated).await,
             // Also the API-key exchange (token exchange): never forwarded.
-            _ => Ok(oauth::token_error(
+            other => Ok(oauth::token_error(
                 StatusCode::BAD_REQUEST,
                 "unsupported_grant_type",
+                format_args!("openai: a token request with grant_type {other:?}"),
             )),
         }
-    }
-
-    /// Forward a code exchange; keep the real tokens, answer with
-    /// surrogates.
-    async fn exchange(
-        &self,
-        req: Request<ResponseBody>,
-        next: Next,
-    ) -> anyhow::Result<Response<ResponseBody>> {
-        let (parts, bytes) = oauth::forward_buffered(req, next).await?;
-        if !parts.status.is_success() {
-            return oauth::backstop(oauth::rebuilt(parts, bytes)).await;
-        }
-        let Some(mut answer) = oauth::answer_object(&parts, &bytes) else {
-            return Ok(oauth::server_error());
-        };
-        let mut take = |name: &str| match answer.remove(name) {
-            Some(Value::String(s)) => Some(s),
-            _ => None,
-        };
-        let (Some(access), Some(refresh), Some(id_token)) = (
-            take("access_token"),
-            take("refresh_token"),
-            take("id_token"),
-        ) else {
-            return Ok(oauth::server_error());
-        };
-        if oauth::carries_token(&Value::Object(answer.clone()), oauth::TOKEN_FORMATS) {
-            return Ok(oauth::server_error());
-        }
-        let claims = oauth::jwt_claims(&id_token);
-        let account_id = match claims.as_ref().and_then(account_id) {
-            Some(id) => id,
-            None => oauth::random_account_id()?,
-        };
-        let surrogates = Surrogates {
-            access: access_surrogate(&access)?,
-            previous_access: vec![],
-            refresh: Some(oauth::surrogate(REFRESH_PREFIX)?),
-            id_token: remint(&id_token)?,
-        };
-        let scopes = answer
-            .get("scope")
-            .and_then(Value::as_str)
-            .map(|s| s.split_whitespace().map(String::from).collect())
-            .unwrap_or_default();
-        let grant = self
-            .grants
-            .insert_grant(NewGrant {
-                service: ServiceId::Openai,
-                account_id,
-                account_label: claims.as_ref().and_then(email),
-                secrets: GrantSecrets {
-                    access_expires_at: access_expiry(&access),
-                    access_token: access,
-                    refresh_token: Some(refresh),
-                    id_token: Some(id_token),
-                    scopes,
-                    surrogates,
-                    api_keys: vec![],
-                },
-            })
-            .await?;
-        tracing::debug!("openai: stored a new sign-in");
-        let answer = insert_surrogates(answer, &grant);
-        Ok(oauth::rebuilt(
-            parts,
-            Bytes::from(Value::Object(answer).to_string()),
-        ))
     }
 
     /// The device-code poll: its `authorization_code` reaches the guest as
@@ -388,13 +368,17 @@ impl Openai {
     ) -> anyhow::Result<Response<ResponseBody>> {
         let (parts, bytes) = oauth::forward_buffered(req, next).await?;
         if !parts.status.is_success() {
-            return oauth::backstop(oauth::rebuilt(parts, bytes)).await;
+            return oauth::backstop(oauth::rebuilt(parts, bytes), &FORMATS, DEVICE_IDS).await;
         }
         let Some(mut answer) = oauth::answer_object(&parts, &bytes) else {
-            return Ok(oauth::server_error());
+            return Ok(oauth::server_error(
+                "openai: a device poll answer that is no uncompressed JSON object",
+            ));
         };
         let Some(Value::String(code)) = answer.get("authorization_code") else {
-            return Ok(oauth::server_error());
+            return Ok(oauth::server_error(
+                "openai: a device poll answer without authorization_code",
+            ));
         };
         let surrogate = self.codes.issue(code, ServiceId::Openai, Channel::Device)?;
         answer.insert("authorization_code".into(), surrogate.into());
@@ -402,8 +386,10 @@ impl Openai {
         // code it is worth nothing. Nothing else may carry a secret.
         let mut rest = answer.clone();
         rest.remove("code_verifier");
-        if oauth::carries_token(&Value::Object(rest), oauth::TOKEN_FORMATS) {
-            return Ok(oauth::server_error());
+        if oauth::carries_token(&Value::Object(rest), &FORMATS) {
+            return Ok(oauth::server_error(
+                "openai: a device poll answer that carries a token besides its code",
+            ));
         }
         Ok(oauth::rebuilt(
             parts,
@@ -432,35 +418,10 @@ impl Interceptor for Openai {
     }
 }
 
-/// The surrogate of a real access token: a fake JWT with the real one's
-/// own `exp` claim, else (no `exp`, or not a JWT) a random token.
-fn access_surrogate(real: &str) -> anyhow::Result<String> {
-    match remint(real)? {
-        Some(jwt) => Ok(jwt),
-        None => oauth::surrogate(ACCESS_PREFIX),
-    }
-}
-
-/// A fake JWT surrogate of `real` with `real`'s own `exp` claim. `None`:
-/// `real` is not a JWT, or has no `exp`.
-fn remint(real: &str) -> anyhow::Result<Option<String>> {
-    let Some(exp) = oauth::jwt_claims(real).and_then(|c| c.get("exp")?.as_i64()) else {
-        return Ok(None);
-    };
-    oauth::fake_jwt(real, exp)
-}
-
-/// When a real access token expires: its JWT `exp`, else an hour from now.
-fn access_expiry(token: &str) -> i64 {
-    oauth::jwt_claims(token)
-        .and_then(|c| c.get("exp").and_then(Value::as_i64))
-        .map_or_else(|| now_ms() + DEFAULT_ACCESS_LIFETIME_MS, |exp| exp * 1000)
-}
-
 /// The ChatGPT account of ID-token claims (else the subject).
 fn account_id(claims: &Value) -> Option<String> {
     claims
-        .get("https://api.openai.com/auth")
+        .get(AUTH_CLAIM)
         .and_then(|a| a.get("chatgpt_account_id"))
         .or_else(|| claims.get("sub"))
         .and_then(Value::as_str)
@@ -481,28 +442,21 @@ fn email(claims: &Value) -> Option<String> {
         .map(String::from)
 }
 
-/// Put the grant's surrogates into a token answer, leaving `expires_in`
-/// (the upstream's own) as it is.
-fn insert_surrogates(mut answer: Map<String, Value>, grant: &Grant) -> Map<String, Value> {
-    let s = &grant.secrets.surrogates;
-    answer.insert("access_token".into(), s.access.clone().into());
-    for (field, value) in [("refresh_token", &s.refresh), ("id_token", &s.id_token)] {
-        match value {
-            Some(v) => answer.insert(field.into(), v.clone().into()),
-            None => answer.remove(field),
-        };
-    }
-    answer
-}
-
 /// The answer to a refresh whose surrogate airlock does not know (signed
 /// out, never issued, or no refresh token).
 fn invalidated() -> Response<ResponseBody> {
-    oauth::token_error(StatusCode::UNAUTHORIZED, "refresh_token_invalidated")
+    oauth::token_error(
+        StatusCode::UNAUTHORIZED,
+        "refresh_token_invalidated",
+        "openai: a refresh with a refresh token that is no surrogate of a stored sign-in",
+    )
 }
 
 /// The answer to an API request whose sign-in is unknown.
 fn sign_in_again() -> Response<ResponseBody> {
+    tracing::warn!(
+        "refused: openai: an API request with a surrogate of no stored sign-in (answered 401)"
+    );
     oauth::json_response(
         StatusCode::UNAUTHORIZED,
         &json!({
@@ -516,39 +470,82 @@ fn sign_in_again() -> Response<ResponseBody> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::services::store::Surrogates;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-    fn secrets() -> GrantSecrets {
-        GrantSecrets {
-            access_token: "real-access".into(),
-            access_expires_at: 1234,
-            refresh_token: Some("real-refresh".into()),
-            id_token: None,
-            scopes: vec![],
-            surrogates: Surrogates {
-                access: "airlock-at-x".into(),
-                previous_access: vec![],
-                refresh: Some("airlock-rt-x".into()),
-                id_token: Some("old".into()),
-            },
-            api_keys: vec![],
+    use super::*;
+
+    fn jwt(claims: &Value) -> String {
+        format!(
+            "eyJhbGciOiJSUzI1NiJ9.{}.sig",
+            URL_SAFE_NO_PAD.encode(claims.to_string())
+        )
+    }
+
+    /// Real tokens outside a token field are OpenAI JWTs; airlock's
+    /// surrogates (fake JWTs, `airlock-…`) and other strings are none.
+    #[test]
+    fn real_tokens_are_told_from_surrogates() {
+        let access = jwt(&json!({ "exp": 1, AUTH_CLAIM: { "chatgpt_plan_type": "plus" } }));
+        let id_token = jwt(&json!({ "exp": 1, "iss": ISSUER }));
+        let fake = tokens::fake_jwt(&access).unwrap().unwrap();
+        for real in [&access, &id_token] {
+            assert!(FORMATS.is_real(real), "{real}");
+        }
+        for other in [
+            fake.as_str(),
+            &jwt(&json!({ "sub": "x" })),
+            "airlock-rt-abcdefghijklmnopqrstuvwxyz0123456789",
+            "airlock-at-x",
+            "rt_short",
+            &format!("rt_{}", "a".repeat(40)),
+            "sk-ant-oat01-x",
+            "a.b.c",
+        ] {
+            assert!(!FORMATS.is_real(other), "{other}");
         }
     }
 
-    /// A refresh answer without an access token keeps the old token and
-    /// its expiry; one without an ID token keeps its surrogate.
+    /// Which format a token answer's strings get, by key.
     #[test]
-    fn a_partial_refresh_answer_keeps_the_rest() {
-        let answer = json!({ "refresh_token": "new-refresh" });
-        let mut got = secrets();
-        PROVIDER
-            .apply_refresh(&mut got, answer.as_object().unwrap())
-            .unwrap();
-        assert_eq!(got.access_token, "real-access");
-        assert_eq!(got.access_expires_at, 1234);
-        assert_eq!(got.refresh_token.as_deref(), Some("new-refresh"));
-        assert_eq!(got.surrogates.id_token.as_deref(), Some("old"));
-        assert_eq!(got.surrogates.access, "airlock-at-x");
+    fn formats_by_key() {
+        let access = jwt(&json!({ "exp": 1, AUTH_CLAIM: {} }));
+        let kind = |k: &str, v: &str| FORMATS.recognize(k, v).map(|f| (f.kind, f.carries_claims));
+        assert_eq!(kind("id_token", &access), Some((TokenKind::Id, true)));
+        assert_eq!(
+            kind("access_token", &access),
+            Some((TokenKind::Access, true))
+        );
+        assert_eq!(
+            kind("access_token", "opaque-access-token-123"),
+            Some((TokenKind::Access, false))
+        );
+        assert_eq!(kind("other", "opaque-access-token-123"), None);
+        assert_eq!(
+            kind("access_token", "short"),
+            Some((TokenKind::Access, false))
+        );
+        assert_eq!(
+            kind("refresh_token", "v1.anything"),
+            Some((TokenKind::Refresh, false))
+        );
+        assert_eq!(kind("id_token", "opaque"), Some((TokenKind::Id, false)));
+        assert_eq!(kind("refresh_token", ""), None);
+    }
+
+    /// The refresh upstream holds Codex's own fields and the stored
+    /// client id only.
+    #[test]
+    fn the_refresh_body_is_codexs() {
+        let mut grant = Grant::for_tests(vec![]);
+        grant.client_id = "stored-client".into();
+        assert_eq!(
+            PROVIDER.refresh_body(&grant, "real-refresh"),
+            json!({
+                "client_id": "stored-client",
+                "grant_type": "refresh_token",
+                "refresh_token": "real-refresh",
+            })
+        );
     }
 }

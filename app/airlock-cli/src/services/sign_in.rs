@@ -11,14 +11,23 @@
 //! The VM is untrusted, so a page opens only when it is one of the
 //! service's [`SignInPage`]s and its OAuth parameters match the page:
 //!
-//! - the page's `client_id`, `response_type=code`,
-//!   `code_challenge_method=S256`, and scopes of the page's set (each
-//!   exactly once); no `response_mode`, no `prompt=none`;
+//! - one non-empty `client_id` (any: an agent can have several OAuth
+//!   clients, and the code exchange stores the one it used),
+//!   `response_type=code`, one `code_challenge` with
+//!   `code_challenge_method=S256`, and one `scope` with at least one
+//!   scope, each a well-formed scope token (RFC 6749, section 3.3) and
+//!   named once (any scope: the provider decides what it grants); no
+//!   `response_mode`, no `prompt=none`;
 //! - exactly one loopback `redirect_uri` on a port and path of the page
 //!   (no arbitrary host ports).
 //!
 //! The browser checks the URL itself (`https`, no user name, port or
 //! fragment, length, characters) before it asks the grants.
+//!
+//! The `code_challenge` of every page that opens is kept
+//! ([`PendingCodes::open_page`]): Claude's manual sign-in exchange, whose
+//! real code the user pastes, works only with the verifier of a page
+//! opened here.
 //!
 //! The callback port is bound exclusively, so the guest never receives
 //! traffic meant for a host program. One forward runs at a time: a
@@ -26,7 +35,9 @@
 //! (Claude Code listens on a new ephemeral port per sign-in); a new
 //! sign-in on the same port opens the forward again. Forwards need the
 //! booted VM: they run between [`LoopbackSignIn::attach`] and
-//! [`LoopbackSignIn::detach`]. Refusals name the host and path only,
+//! [`LoopbackSignIn::detach`]. A forward frees its port once it closes
+//! ([`super::callback`]: no code in time, or the follow-ups after the
+//! code are over). Refusals name the host and path only,
 //! never the query: it carries OAuth state.
 
 use std::cell::RefCell;
@@ -50,10 +61,6 @@ pub struct SignInPage {
     pub host: &'static str,
     /// Exact path of the authorize page.
     pub path: &'static str,
-    /// Required `client_id`.
-    pub client_id: &'static str,
-    /// The scopes the `scope` parameter may name.
-    pub scopes: &'static [&'static str],
     /// Allowed ports of the `redirect_uri`: the loopback ports the sign-in
     /// tool may listen on for its callback.
     pub callback_ports: &'static [RangeInclusive<u16>],
@@ -75,7 +82,8 @@ impl SignInPage {
 pub struct LoopbackSignIn {
     service: ServiceId,
     pages: Vec<SignInPage>,
-    /// Where the callback forwards keep the codes they swapped.
+    /// Where the callback forwards keep the codes they swapped, and the
+    /// grant keeps the challenges of the pages it opened.
     codes: PendingCodes,
     /// The guest from [`Self::attach`] until [`Self::detach`]. Runtime
     /// state: the grant exists before the VM boots, the guest only after.
@@ -122,18 +130,20 @@ impl LoopbackSignIn {
         }
     }
 
-    /// Forward `port` for a sign-in of `callback`. A new port replaces the
-    /// current forward only once its bind succeeded. Synchronous from the
-    /// check to the bind, so concurrent sign-ins cannot race past it.
+    /// Forward `port` for a sign-in of `callback`. A new port, or the port
+    /// of a forward that has closed, replaces the current forward only
+    /// once its bind succeeded. Synchronous from the check to the bind, so
+    /// concurrent sign-ins cannot race past it.
     fn forward(&self, port: u16, callback: Callback) -> Result<(), String> {
         let guest = self.guest.borrow();
         let Some(guest) = guest.as_ref() else {
             return Err("the sandbox is not ready for a sign-in".into());
         };
         let mut current = self.forward.borrow_mut();
-        if let Some(forward) = current.as_ref().filter(|f| f.port == port) {
+        if let Some(forward) = current.as_ref().filter(|f| f.port == port)
+            && forward.state.reopen(callback)
+        {
             // A new sign-in on the same port.
-            forward.state.reopen(callback);
             return Ok(());
         }
         match reverse_forward::bind_exclusive(port, port) {
@@ -162,24 +172,36 @@ impl BrowserGrant for LoopbackSignIn {
             return GrantAnswer::NotMine;
         };
         let place = format!("{}{}", page.host, page.path);
-        let port = match check_params(url, page) {
-            Ok(port) => port,
+        let checked = match check_params(url, page) {
+            Ok(checked) => checked,
             Err(e) => return GrantAnswer::Refuse(format!("refused to open a page: {place}: {e}")),
         };
         let callback = Callback {
             service: self.service,
             pages: page.pages,
         };
-        match self.forward(port, callback) {
-            Ok(()) => GrantAnswer::Allow,
+        match self.forward(checked.port, callback) {
+            Ok(()) => {
+                self.codes.open_page(&checked.challenge, self.service);
+                GrantAnswer::Allow
+            }
             Err(e) => GrantAnswer::Refuse(e),
         }
     }
 }
 
-/// The OAuth parameters of an authorize URL against its page. Returns
-/// the callback port. The error never contains the query.
-fn check_params(url: &Url, page: &SignInPage) -> Result<u16, String> {
+/// What [`check_params`] found in an authorize URL.
+#[derive(Debug)]
+struct Checked {
+    /// The port of the loopback `redirect_uri`.
+    port: u16,
+    /// The PKCE `code_challenge`.
+    challenge: String,
+}
+
+/// The OAuth parameters of an authorize URL against its page. The error
+/// never contains the query.
+fn check_params(url: &Url, page: &SignInPage) -> Result<Checked, String> {
     let one = |name: &str| -> Result<String, String> {
         let values: Vec<String> = url
             .query_pairs()
@@ -191,8 +213,8 @@ fn check_params(url: &Url, page: &SignInPage) -> Result<u16, String> {
             Err(values) => Err(format!("expected one {name}, found {}", values.len())),
         }
     };
-    if one("client_id")? != page.client_id {
-        return Err("the client_id is not the agent's".into());
+    if one("client_id")?.is_empty() {
+        return Err("the client_id is empty".into());
     }
     if one("response_type")? != "code" {
         return Err("the response_type is not code".into());
@@ -200,10 +222,14 @@ fn check_params(url: &Url, page: &SignInPage) -> Result<u16, String> {
     if one("code_challenge_method")? != "S256" {
         return Err("the code_challenge_method is not S256".into());
     }
+    let challenge = one("code_challenge")?;
+    if challenge.is_empty() {
+        return Err("the code_challenge is empty".into());
+    }
     let scope = one("scope")?;
-    let scopes: Vec<&str> = scope.split_whitespace().collect();
-    if scopes.is_empty() || scopes.iter().any(|s| !page.scopes.contains(s)) {
-        return Err("the scope names a scope airlock does not know".into());
+    let scopes: Vec<&str> = scope.split(' ').collect();
+    if scopes.iter().any(|s| !is_scope_token(s)) {
+        return Err("the scope is malformed".into());
     }
     if scopes.iter().collect::<HashSet<_>>().len() != scopes.len() {
         return Err("the scope names a scope twice".into());
@@ -216,7 +242,16 @@ fn check_params(url: &Url, page: &SignInPage) -> Result<u16, String> {
             return Err("the URL asks for prompt=none".into());
         }
     }
-    check_redirect(&one("redirect_uri")?, page)
+    let port = check_redirect(&one("redirect_uri")?, page)?;
+    Ok(Checked { port, challenge })
+}
+
+/// A scope token of RFC 6749, section 3.3: one or more of `%x21 /
+/// %x23-5B / %x5D-7E` (visible ASCII without `"` and `\`).
+fn is_scope_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|c| matches!(c, 0x21 | 0x23..=0x5B | 0x5D..=0x7E))
 }
 
 /// The redirect must be `http://localhost|127.0.0.1:<port><callback_path>`
@@ -285,7 +320,7 @@ mod tests {
             .iter()
             .find(|p| p.is_page_of(&url))
             .ok_or_else(|| "not a sign-in page airlock knows".to_string())?;
-        check_params(&url, page)
+        check_params(&url, page).map(|c| c.port)
     }
 
     #[test]
@@ -304,6 +339,23 @@ mod tests {
         assert!(check_url(&v4, &claude()).is_ok());
         let named = CODEX_URL.replace("127.0.0.1", "localhost");
         assert!(check_url(&named, &codex()).is_ok());
+    }
+
+    /// `claude /login` with an Anthropic Console account: another OAuth
+    /// client and other scopes on the Console's authorize page.
+    #[test]
+    fn the_console_client_passes() {
+        let console = CLAUDE_URL
+            .replace("claude.com/cai/oauth", "platform.claude.com/oauth")
+            .replace(
+                "client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+                "client_id=41077d10-94b8-4194-be48-d251e9eb21b4",
+            )
+            .replace(
+                "scope=user%3Ainference",
+                "scope=user%3Aprofile+user%3Ainference",
+            );
+        assert_eq!(check_url(&console, &claude()).unwrap(), 35527);
     }
 
     #[test]
@@ -341,8 +393,11 @@ mod tests {
             format!("{CLAUDE_URL}&x=`id`"),
             // oversize
             format!("{CLAUDE_URL}&pad={}", "a".repeat(BROWSER_URL_MAX)),
-            // another client, two clients, no client
-            CLAUDE_URL.replace("client_id=9d1c", "client_id=0d1c"),
+            // an empty client, two clients, no client
+            CLAUDE_URL.replace(
+                "client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+                "client_id=",
+            ),
             format!("{CLAUDE_URL}&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e"),
             CLAUDE_URL.replace("client_id=", "client=").clone(),
             // implicit flow, plain PKCE, no PKCE method
@@ -350,8 +405,17 @@ mod tests {
             format!("{CLAUDE_URL}&response_type=code"),
             CLAUDE_URL.replace("code_challenge_method=S256", "code_challenge_method=plain"),
             CLAUDE_URL.replace("&code_challenge_method=S256", ""),
-            // scopes: unknown, empty, missing, twice
-            CLAUDE_URL.replace("scope=user%3Ainference", "scope=user%3Ainference%20admin"),
+            // no challenge, an empty one, two
+            CLAUDE_URL.replace("&code_challenge=Zm9vYmFyYmF6cXV4", ""),
+            CLAUDE_URL.replace("code_challenge=Zm9vYmFyYmF6cXV4", "code_challenge="),
+            format!("{CLAUDE_URL}&code_challenge=Zm9vYmFyYmF6cXV4"),
+            // scopes: malformed, empty, missing, twice
+            CLAUDE_URL.replace("scope=user%3Ainference", "scope=user%3Ainference%20a%22b"),
+            CLAUDE_URL.replace("scope=user%3Ainference", "scope=a%5Cb"),
+            CLAUDE_URL.replace("scope=user%3Ainference", "scope=a%20%20b"),
+            CLAUDE_URL.replace("scope=user%3Ainference", "scope=a%09b"),
+            CLAUDE_URL.replace("scope=user%3Ainference", "scope=%C3%A9"),
+            CLAUDE_URL.replace("scope=user%3Ainference", "scope=%20a"),
             CLAUDE_URL.replace("scope=user%3Ainference", "scope="),
             CLAUDE_URL.replace("&scope=user%3Ainference", ""),
             format!("{CLAUDE_URL}&scope=user%3Aprofile"),
@@ -385,6 +449,12 @@ mod tests {
             "scope=org%3Acreate_api_key%20user%3Aprofile%20user%3Ainference%20user%3Asessions%3Aclaude_code%20user%3Amcp_servers%20user%3Afile_upload%20user%3Aplugins",
         );
         assert!(check_url(&all, &p).is_ok());
+        // Any scope the agent asks for: the provider decides.
+        let new = CLAUDE_URL.replace(
+            "scope=user%3Ainference",
+            "scope=user%3Ainference+new%3Ascope%21",
+        );
+        assert!(check_url(&new, &p).is_ok());
         // The codex pages refuse the claude page and vice versa.
         assert!(check_url(CLAUDE_URL, &codex()).is_err());
         assert!(check_url(CODEX_URL, &p).is_err());
@@ -462,6 +532,27 @@ mod tests {
             assert!(freed, "the replaced forward still holds port {first}");
             sign_in.detach().await;
             drop(reverse_forward::bind_exclusive(second, second).unwrap());
+        });
+    }
+
+    /// RFC 7636, appendix B: a verifier and its S256 challenge.
+    const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+    /// A page that opens keeps its PKCE challenge for one manual
+    /// exchange; a refused page keeps none.
+    #[test]
+    fn an_opened_page_binds_a_manual_exchange() {
+        block_on_local(async {
+            let sign_in = claude_sign_in();
+            let url = claude_url(free_port()).replace("Zm9vYmFyYmF6cXV4", CHALLENGE);
+            let refused = url.replace("response_type=code", "response_type=token");
+            assert!(matches!(allow(&sign_in, &refused), GrantAnswer::Refuse(_)));
+            assert!(!sign_in.codes.redeem_page(VERIFIER, ServiceId::Anthropic));
+            assert_eq!(allow(&sign_in, &url), GrantAnswer::Allow);
+            assert!(!sign_in.codes.redeem_page(VERIFIER, ServiceId::Openai));
+            assert!(sign_in.codes.redeem_page(VERIFIER, ServiceId::Anthropic));
+            sign_in.detach().await;
         });
     }
 

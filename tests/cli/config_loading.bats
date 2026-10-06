@@ -339,18 +339,19 @@ claude-code = { version = 1 }'
     assert_output_contains "$PWD/airlock.toml: \`presets\` must be a list of preset names, not \"python\""
 }
 
-@test "presets: null in YAML reports config error" {
+@test "presets: null in YAML is treated as absent" {
     printf 'presets:\n' > airlock.yaml
     run_airlock show
-    assert_failure 2
-    assert_output_contains "$PWD/airlock.yaml: \`presets\` is empty; write a list of preset names, or remove it"
+    # Should fail on missing sandbox, not on config
+    assert_failure
+    assert_output_not_contains "Config error"
 }
 
-@test "presets: null in JSON reports config error" {
+@test "presets: null in JSON is treated as absent" {
     printf '{"presets": null}\n' > airlock.json
     run_airlock show
-    assert_failure 2
-    assert_output_contains "$PWD/airlock.json: \`presets\` is empty; write a list of preset names, or remove it"
+    assert_failure
+    assert_output_not_contains "Config error"
 }
 
 @test "valid copilot-cli preset loads" {

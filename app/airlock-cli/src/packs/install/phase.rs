@@ -4,6 +4,9 @@
 //! and code already on the persistent disk, with an open network: the
 //! policy is `allow-always`, every rule is disabled, and one
 //! [`INSTALL_RULE`] passes every target through without TLS interception.
+//! The open network is the public internet only: the install boot's
+//! network is [`crate::network::Network::public_only`], so the host's
+//! loopback, the LAN and cloud metadata stay out of reach.
 //! It gets nothing else the config grants: no secrets (no masked or
 //! `${…}` env, no inject), no mounts and no project share, and no ports,
 //! sockets, daemons, masks, middleware or clipboard.

@@ -429,10 +429,6 @@ fn short_and_unknown_names_in_a_list_are_errors() {
 fn presets_value_types_are_checked() {
     for (value, text) in [
         (
-            serde_json::json!({ "presets": null }),
-            "airlock.yaml: `presets` is empty",
-        ),
-        (
             serde_json::json!({ "presets": [1] }),
             "airlock.yaml: `presets` list entries",
         ),
@@ -446,6 +442,19 @@ fn presets_value_types_are_checked() {
             Layer::new("airlock.yaml", value).err().expect("load error")
         );
         assert!(e.starts_with(text), "{e}");
+    }
+}
+
+/// A `presets` of `null` (a YAML `presets:` with no value, or an explicit
+/// JSON `null`) is treated as if the key were absent, not an error.
+#[test]
+fn presets_null_is_treated_as_absent() {
+    let json = serde_json::json!({ "presets": null, "cpus": 4 });
+    let yaml: serde_json::Value = serde_yaml::from_str("presets:\ncpus: 4\n").unwrap();
+    for value in [json, yaml] {
+        let layer = Layer::new("airlock.yaml", value).expect("load");
+        assert_eq!(layer.legacy_presets, None);
+        assert_eq!(layer.value["cpus"], 4);
     }
 }
 
@@ -511,10 +520,11 @@ fn pack_documents_apply() {
     .values;
     assert!(config.network.rules.contains_key("python-packages"));
     assert!(config.network.rules.contains_key("rust-packages"));
-    assert_eq!(
-        config.env["SSL_CERT_FILE"].value,
-        "/etc/ssl/certs/ca-certificates.crt"
-    );
+    for key in ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "PIP_CERT"] {
+        let var = &config.env[key];
+        assert_eq!(var.value, "/etc/ssl/certs/ca-certificates.crt", "{key}");
+        assert!(!var.mask, "{key}");
+    }
 }
 
 #[test]

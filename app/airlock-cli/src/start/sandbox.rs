@@ -8,8 +8,9 @@
 //! it. `--yes` picks the default without a question. Without a terminal and
 //! without `--yes` a needed question is an error (exit code 2); a tool
 //! question fails before the image pull. A new disk, an unchanged sandbox
-//! and the retry of an unfinished install (see [`Why::Retry`]) need no
-//! question.
+//! and the retry of an unfinished install with no session since (see
+//! [`Why::Retry`]) need no question; after a session, the retry gets the
+//! added-tools question.
 
 use std::path::Path;
 
@@ -114,8 +115,9 @@ fn added_tools_notes(change: ImageChange) -> Vec<&'static str> {
         notes.push(OLD_IMAGE_GONE_NOTE);
     }
     notes.extend([
-        "The install runs with unrestricted network inside the existing sandbox; code already \
-         in the sandbox can run during it.",
+        "The install reaches the public internet without limits (local and private addresses \
+         are blocked) inside the existing sandbox; code already in the sandbox can run during \
+         it.",
         "Re-create the sandbox for a clean install.",
     ]);
     notes
@@ -574,6 +576,65 @@ mod tests {
         }
         assert_eq!(
             tool_changes(false, &Plan::default(), NOBODY),
+            ToolChanges::NoQuestion
+        );
+    }
+
+    /// The plan of a pack whose last install failed, on the same disk
+    /// and image; `ran_session`: a session ran since.
+    fn retry_plan(ran_session: bool) -> Plan {
+        let fingerprint = "f".repeat(64);
+        let mut state = InstallState {
+            disk: Some((1, 2)),
+            image_id: Some("sha256:1".into()),
+            ran_session,
+            ..InstallState::default()
+        };
+        state.set("python", install_state::PackStatus::Failed, &fingerprint);
+        plan::decide(&DecideInput {
+            state: &state,
+            wanted: &[Wanted {
+                id: "python".into(),
+                fingerprint,
+            }],
+            disk: Some((1, 2)),
+            image_id: Some("sha256:1"),
+        })
+    }
+
+    /// A retry after a session asks the added-tools question: the disk
+    /// may hold code the session left, and the install boot runs it.
+    #[test]
+    fn a_retry_after_a_session_asks() {
+        let quiet = retry_plan(false);
+        assert_eq!(quiet.pending, [pending("python", Why::Retry)]);
+        for answering in [TTY, YES, NOBODY] {
+            assert_eq!(
+                tool_changes(false, &quiet, answering),
+                ToolChanges::NoQuestion
+            );
+        }
+
+        let mut after_session = retry_plan(true);
+        assert_eq!(tool_changes(false, &after_session, TTY), ToolChanges::Ask);
+        assert_eq!(
+            tool_changes(false, &after_session, YES),
+            ToolChanges::Recreate
+        );
+        assert_eq!(
+            tool_changes(false, &after_session, NOBODY),
+            ToolChanges::NeedsTerminal
+        );
+        assert_eq!(
+            tools_changed_message(&after_session),
+            "Tools changed in the sandbox (added: python). Run in a terminal or pass --yes."
+        );
+        assert_eq!(
+            questions(&mut after_session, &[ToolAnswer::InstallAdded]),
+            (vec![ToolQuestion::Added], false)
+        );
+        assert_eq!(
+            tool_changes(true, &retry_plan(true), NOBODY),
             ToolChanges::NoQuestion
         );
     }

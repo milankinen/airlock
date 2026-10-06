@@ -39,10 +39,25 @@ pub fn main(args: &RmArgs) -> i32 {
             return 1;
         }
     };
-    let paths = project::paths(&host_cwd);
+    run(args, &host_cwd)
+}
 
-    if !paths.cache_dir.exists() {
+/// [`main`]'s body, taking the project directory as an argument so tests
+/// can drive it without touching the process's current directory.
+fn run(args: &RmArgs, host_cwd: &Path) -> i32 {
+    let paths = project::paths(host_cwd);
+
+    // `.airlock` itself may be a symlink (an untrusted repo can commit one
+    // pointing at, say, `~/.airlock`): `start` refuses it (see
+    // `project::airlock_dir_problem_for`), and everything below this point
+    // builds paths by joining onto `cache_dir`, so following it here would
+    // let `rm` reach — and delete — whatever the link points at. Handle it
+    // on its own, without ever resolving through it.
+    let Ok(cache_meta) = std::fs::symlink_metadata(&paths.cache_dir) else {
         return 0;
+    };
+    if cache_meta.file_type().is_symlink() {
+        return rm_symlinked_airlock(args, &paths.cache_dir);
     }
 
     let _lock = match project::lock_if_idle(&paths.sandbox_dir) {
@@ -56,7 +71,7 @@ pub fn main(args: &RmArgs) -> i32 {
 
     if is_user_home_project(&paths.cache_dir) {
         let kept_note = "the other files in ~/.airlock: the project is the home directory";
-        return rm_sandbox_only(args, &paths.sandbox_dir, kept_note);
+        return rm_sandbox_only(args, &paths.cache_dir, &paths.sandbox_dir, kept_note);
     }
     if let Some(marker) = user_file_marker(&paths.cache_dir) {
         cli::log!(
@@ -66,7 +81,7 @@ pub fn main(args: &RmArgs) -> i32 {
         );
         let kept_note =
             format!("the other files in .airlock: it holds user-level files ({marker})");
-        return rm_sandbox_only(args, &paths.sandbox_dir, &kept_note);
+        return rm_sandbox_only(args, &paths.cache_dir, &paths.sandbox_dir, &kept_note);
     }
 
     let local_config = local_config_name(&paths.cache_dir);
@@ -99,7 +114,7 @@ pub fn main(args: &RmArgs) -> i32 {
 /// the project is
 /// the home directory, or [`user_file_marker`] found a user-level file.
 /// `kept_note` says what stays and why.
-fn rm_sandbox_only(args: &RmArgs, sandbox_dir: &Path, kept_note: &str) -> i32 {
+fn rm_sandbox_only(args: &RmArgs, cache_dir: &Path, sandbox_dir: &Path, kept_note: &str) -> i32 {
     if std::fs::symlink_metadata(sandbox_dir).is_err() {
         cli::log!("No sandbox to remove (kept {kept_note})");
         return 0;
@@ -108,6 +123,19 @@ fn rm_sandbox_only(args: &RmArgs, sandbox_dir: &Path, kept_note: &str) -> i32 {
     if !confirm(args, None) {
         cli::error!("Aborted.");
         return 0;
+    }
+
+    // `sandbox_dir` is `cache_dir.join("sandbox")`: re-check that `.airlock`
+    // is still a real directory right before the removal, in case it was
+    // swapped for a symlink while the confirmation prompt above was
+    // waiting. Without this, the path built from it would resolve through
+    // the swapped-in link and the removal below would reach its target.
+    match std::fs::symlink_metadata(cache_dir) {
+        Ok(meta) if !meta.file_type().is_symlink() => {}
+        _ => {
+            cli::error!("{} is now a symbolic link; aborting", cache_dir.display());
+            return 1;
+        }
     }
 
     if let Err(e) = remove_entry(sandbox_dir) {
@@ -120,20 +148,55 @@ fn rm_sandbox_only(args: &RmArgs, sandbox_dir: &Path, kept_note: &str) -> i32 {
     0
 }
 
-/// Prompt to confirm removal (skipped with `--force`). `note`, when given,
-/// is appended to the prompt to flag extra fallout of the removal, such as
-/// the local project config going with it. Esc, no terminal or a failed
-/// prompt is "no".
-fn confirm(args: &RmArgs, note: Option<&str>) -> bool {
-    if args.force {
-        return true;
+/// Remove a symlinked `.airlock` (see [`run`]): only the link goes, after
+/// the normal confirmation (skipped with `--force`); its target, which may
+/// be another project's or a user's real `.airlock`, is never touched or
+/// even followed to look inside.
+fn rm_symlinked_airlock(args: &RmArgs, cache_dir: &Path) -> i32 {
+    let target =
+        std::fs::read_link(cache_dir).map_or_else(|_| "?".to_string(), |p| p.display().to_string());
+
+    if !confirm_prompt(
+        args,
+        &format!(
+            "Remove the .airlock link? It is a symbolic link to {target}; the target is left \
+             untouched."
+        ),
+    ) {
+        cli::error!("Aborted.");
+        return 0;
     }
+
+    if let Err(e) = std::fs::remove_file(cache_dir) {
+        cli::error!("Failed to remove the .airlock link: {e}");
+        return 1;
+    }
+
+    cli::log!("Removed the .airlock link to {target}; its target was not touched");
+    0
+}
+
+/// [`confirm_prompt`] with the standard "Remove sandbox?" prompt. `note`,
+/// when given, is appended to flag extra fallout of the removal, such as
+/// the local project config going with it.
+fn confirm(args: &RmArgs, note: Option<&str>) -> bool {
     let prompt = match note {
         Some(note) => format!("Remove sandbox? {note}"),
         None => "Remove sandbox?".to_string(),
     };
+    confirm_prompt(args, &prompt)
+}
+
+/// Ask `prompt` to confirm removal (skipped with `--force`). Esc, no
+/// terminal or a failed prompt is "no". Used directly by removals that
+/// are not "the sandbox" (e.g. a symlinked `.airlock`), and through
+/// [`confirm`] otherwise.
+fn confirm_prompt(args: &RmArgs, prompt: &str) -> bool {
+    if args.force {
+        return true;
+    }
     let question = YesNo {
-        question: &prompt,
+        question: prompt,
         default: false,
     };
     matches!(question.ask(), Ok(Some(true)))
@@ -311,5 +374,86 @@ mod tests {
             local_config_name(&cache_dir),
             Some("airlock.toml".to_string())
         );
+    }
+
+    /// A symlinked `.airlock` (an untrusted repo can commit one pointing
+    /// at, say, `~/.airlock`) must not be followed: only the link goes,
+    /// its target — here standing in for a user's real `.airlock`, with
+    /// a user-level file and a sandbox — is left untouched.
+    #[test]
+    fn run_removes_only_the_link_for_a_symlinked_airlock() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new("rm-symlink-airlock");
+        let project = tmp.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let victim = tmp.path().join("victim-home");
+        std::fs::create_dir_all(victim.join("sandbox")).unwrap();
+        std::fs::write(victim.join("settings.yaml"), "").unwrap();
+        std::fs::write(victim.join("sandbox/disk.img"), b"data").unwrap();
+
+        symlink(&victim, project.join(".airlock")).unwrap();
+
+        let code = run(&RmArgs { force: true }, &project);
+        assert_eq!(code, 0);
+
+        assert!(std::fs::symlink_metadata(project.join(".airlock")).is_err());
+        assert!(victim.join("settings.yaml").is_file());
+        assert!(victim.join("sandbox/disk.img").is_file());
+    }
+
+    /// A symlinked `.airlock/sandbox` in a home-like `.airlock/` (flagged
+    /// by [`user_file_marker`]) must not be followed either: only the
+    /// link goes, its target is left untouched.
+    #[test]
+    fn rm_sandbox_only_does_not_follow_a_symlinked_sandbox() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new("rm-symlink-sandbox");
+        let project = tmp.path().join("proj");
+        let cache_dir = project.join(".airlock");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("settings.yaml"), "").unwrap();
+
+        let victim = tmp.path().join("victim-sandbox");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("disk.img"), b"data").unwrap();
+
+        symlink(&victim, cache_dir.join("sandbox")).unwrap();
+
+        let code = run(&RmArgs { force: true }, &project);
+        assert_eq!(code, 0);
+
+        assert!(std::fs::symlink_metadata(cache_dir.join("sandbox")).is_err());
+        assert!(victim.join("disk.img").is_file());
+        assert!(cache_dir.join("settings.yaml").is_file());
+    }
+
+    /// The full-removal path (no user markers, so the whole `.airlock/`
+    /// goes) also must not follow a symlinked `.airlock/sandbox`: the
+    /// `std::fs::remove_dir_all(cache_dir)` it uses unlinks a symlink it
+    /// meets while recursing rather than following it, so the victim
+    /// directory stays intact even though `.airlock` itself disappears.
+    #[test]
+    fn full_removal_does_not_follow_a_symlinked_sandbox() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new("rm-full-symlink-sandbox");
+        let project = tmp.path().join("proj");
+        let cache_dir = project.join(".airlock");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let victim = tmp.path().join("victim-sandbox");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("disk.img"), b"data").unwrap();
+
+        symlink(&victim, cache_dir.join("sandbox")).unwrap();
+
+        let code = run(&RmArgs { force: true }, &project);
+        assert_eq!(code, 0);
+
+        assert!(std::fs::symlink_metadata(&cache_dir).is_err());
+        assert!(victim.join("disk.img").is_file());
     }
 }

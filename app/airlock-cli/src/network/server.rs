@@ -226,7 +226,7 @@ async fn handle_connection(
         debug!("passthrough: {addr}");
         let container = tcp::container_transport(Bytes::new(), rx, client_sink);
         let container = traffic::count(container, counter);
-        let server = tcp::connect_server(&addr).await?;
+        let server = tcp::connect_server(&target).await?;
         Box::pin(tcp::relay(container, server)).await;
         return Ok(());
     }
@@ -257,10 +257,23 @@ async fn handle_connection(
         target.interceptor = None;
     }
     let (container, is_http) = detect_http(container).await;
+
+    // An owned host's fail-closed handling (token swaps, backstops) lives
+    // entirely in the HTTP relay's interceptor call. Bytes that don't parse
+    // as HTTP never reach it — relaying them raw to the real upstream would
+    // let a guest smuggle anything (including a real token it captured
+    // some other way) straight past the service. Refuse instead of
+    // connecting upstream at all.
+    if target.interceptor.is_some() && !is_http {
+        debug!("denied: {addr} (owned host sent non-HTTP bytes)");
+        deny_reporter.report();
+        return Ok(());
+    }
+
     let server = match (target.allowed, is_tls) {
         (false, _) => io::Transport::null(),
         (true, true) => tls::connect_server(&target, alpn.as_deref(), tls_client).await?,
-        (true, false) => tcp::connect_server(&addr).await?,
+        (true, false) => tcp::connect_server(&target).await?,
     };
     if is_http {
         Box::pin(http::relay(

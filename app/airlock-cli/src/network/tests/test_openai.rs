@@ -18,12 +18,18 @@ use crate::network::interceptor::Interceptor;
 use crate::services::ServiceId;
 use crate::services::auth_codes::{Channel, PendingCodes};
 use crate::services::openai::{Endpoints, Openai};
-use crate::services::store::{SurrogateKind, TokenStore, list_grants, now_ms};
+use crate::services::store::{TokenStore, list_grants, now_ms};
+use crate::services::tokens::{FAKE_JWT_PREFIX, TokenKind};
 
 /// The code the fake provider issued: what the browser brings back.
 const REAL_CODE: &str = "real-code";
 /// The code of a device-code sign-in.
 const REAL_DEVICE_CODE: &str = "real-device-code";
+
+/// The `n`th real refresh token the fake issues.
+fn real_refresh(n: usize) -> String {
+    format!("v1.REAL-RT-{n}-{}", "x_Y-".repeat(15))
+}
 
 /// The guest's code exchange (a form) with `code`.
 fn code_exchange(code: &str) -> String {
@@ -70,6 +76,11 @@ struct Fake {
     refreshes: AtomicUsize,
     /// The plan in the ID token a refresh issues.
     refreshed_plan: Mutex<Option<String>>,
+    /// Fields a refresh answer carries besides the tokens.
+    refresh_extra: Mutex<Option<Value>>,
+    /// Fields the code exchange answer carries besides (or instead of)
+    /// the usual ones.
+    exchange_extra: Mutex<Option<Value>>,
 }
 
 impl Fake {
@@ -77,10 +88,12 @@ impl Fake {
         let fake = Self {
             seen: SeenLog::default(),
             access: Mutex::new(String::new()),
-            refresh: Mutex::new("REAL-RT-0".into()),
+            refresh: Mutex::new(real_refresh(0)),
             access_lifetime,
             refreshes: AtomicUsize::new(0),
             refreshed_plan: Mutex::new(None),
+            refresh_extra: Mutex::new(None),
+            exchange_extra: Mutex::new(None),
         };
         *fake.access.lock().unwrap() = fake.issue_access(0);
         Arc::new(fake)
@@ -109,7 +122,8 @@ impl Fake {
             &json!({
                 "email": "o@example.com",
                 "sub": "user-1",
-                "exp": now_ms() / 1000 + 3600,
+                // Fixed: the tests compare the ID token of two calls.
+                "exp": 4_102_444_800_i64,
                 "https://api.openai.com/auth": {
                     "chatgpt_account_id": "acc-1",
                     "chatgpt_plan_type": plan,
@@ -144,7 +158,19 @@ impl Fake {
         }
         let expected = format!("Bearer {}", self.access());
         if seen.header("authorization") == Some(expected.as_str()) {
-            "ok".into_response()
+            match seen.path.as_str() {
+                "/backend-api/leak/access" => {
+                    axum::Json(json!({ "t": [self.access()] })).into_response()
+                }
+                "/backend-api/leak/refresh" => {
+                    let refresh = self.refresh.lock().unwrap().clone();
+                    axum::Json(json!({ "t": { "u": refresh } })).into_response()
+                }
+                "/backend-api/json" => {
+                    axum::Json(json!({ "id": "rt_short", "jwt": "a.b.c" })).into_response()
+                }
+                _ => "ok".into_response(),
+            }
         } else {
             (axum::http::StatusCode::UNAUTHORIZED, "no").into_response()
         }
@@ -160,13 +186,16 @@ impl Fake {
                 )
                     .into_response();
             }
-            return axum::Json(json!({
+            let mut answer = json!({
                 "id_token": Self::id_token(),
                 "access_token": self.access(),
                 "refresh_token": *self.refresh.lock().unwrap(),
                 "expires_in": self.access_lifetime,
-            }))
-            .into_response();
+            });
+            if let Some(Value::Object(extra)) = &*self.exchange_extra.lock().unwrap() {
+                answer.as_object_mut().unwrap().extend(extra.clone());
+            }
+            return axum::Json(answer).into_response();
         }
         let body: Value = serde_json::from_str(&seen.body).unwrap_or_default();
         let current = self.refresh.lock().unwrap().clone();
@@ -179,13 +208,16 @@ impl Fake {
         }
         let n = self.refreshes.fetch_add(1, Ordering::SeqCst) + 1;
         *self.access.lock().unwrap() = self.issue_access(n);
-        *self.refresh.lock().unwrap() = format!("REAL-RT-{n}");
+        *self.refresh.lock().unwrap() = real_refresh(n);
         let mut answer = json!({
             "access_token": self.access(),
             "refresh_token": *self.refresh.lock().unwrap(),
         });
         if let Some(plan) = &*self.refreshed_plan.lock().unwrap() {
             answer["id_token"] = Self::id_token_with_plan(plan).into();
+        }
+        if let Some(Value::Object(extra)) = &*self.refresh_extra.lock().unwrap() {
+            answer.as_object_mut().unwrap().extend(extra.clone());
         }
         axum::Json(answer).into_response()
     }
@@ -362,16 +394,20 @@ fn a_code_exchange_gives_the_guest_fake_jwts_and_stores_the_real_tokens() {
         );
         let grant = r
             .store
-            .find_by_surrogate(ServiceId::Openai, SurrogateKind::Access, access)
+            .grant_of(ServiceId::Openai, access, &[TokenKind::Access])
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(grant.secrets.access_token, r.fake.access());
-        assert_eq!(grant.secrets.refresh_token.as_deref(), Some("REAL-RT-0"));
         assert_eq!(
-            grant.secrets.id_token.as_deref(),
-            Some(Fake::id_token().as_str())
+            grant.real(TokenKind::Access),
+            Some(r.fake.access().as_str())
         );
+        assert_eq!(
+            grant.real(TokenKind::Refresh),
+            Some(real_refresh(0).as_str())
+        );
+        assert_eq!(grant.real(TokenKind::Id), Some(Fake::id_token().as_str()));
+        assert_eq!(grant.client_id, "app_EMoamEEZ73f0CkXaXp7hrann");
         let listed = list_grants(&r.home.db).await.unwrap();
         assert_eq!(listed[0].account.as_deref(), Some("o@example.com"));
         assert_eq!(listed[0].service, "openai");
@@ -526,14 +562,15 @@ fn a_revoke_deletes_the_grant_and_revokes_the_real_token_upstream() {
             revokes,
             [
                 json!({
-                    "token": "REAL-RT-0",
+                    "token": real_refresh(0),
                     "token_type_hint": "refresh_token",
                     "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
                 }),
+                // Codex's fallback revoke of the access token names no
+                // client.
                 json!({
                     "token": r.fake.access(),
                     "token_type_hint": "access_token",
-                    "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
                 }),
             ]
         );
@@ -665,9 +702,11 @@ fn a_relayed_refresh_carries_the_claims_of_the_upstream_refresh() {
         let answer = sign_in(&proxy, &mitm, &r).await;
         *r.fake.refreshed_plan.lock().unwrap() = Some("pro".into());
         let refresh = json!({
-            "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+            "client_id": "another-client",
             "grant_type": "refresh_token",
             "refresh_token": answer["refresh_token"],
+            "scope": "openid api.everything",
+            "extra": "x",
         });
         let resp = guest_request(
             &proxy,
@@ -679,6 +718,16 @@ fn a_relayed_refresh_carries_the_claims_of_the_upstream_refresh() {
         .await;
         assert_eq!(resp.status, 200, "{}", resp.body);
         assert_eq!(r.fake.refreshes.load(Ordering::SeqCst), 1);
+        // Only the provider's own fields went upstream.
+        let sent: Value = serde_json::from_str(&r.fake.seen.last().body).unwrap();
+        assert_eq!(
+            sent,
+            json!({
+                "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+                "grant_type": "refresh_token",
+                "refresh_token": real_refresh(0),
+            })
+        );
         let refreshed = resp.json();
         assert_eq!(refreshed["refresh_token"], answer["refresh_token"]);
         let claims = claims_of(refreshed["id_token"].as_str().unwrap());
@@ -690,33 +739,181 @@ fn a_relayed_refresh_carries_the_claims_of_the_upstream_refresh() {
     });
 }
 
-/// The real token goes to chatgpt.com's API paths only: not to other
-/// chatgpt.com paths, and not to the auth host.
+/// A real token anywhere in a refresh answer reaches the guest as a
+/// surrogate; a string in no known format under a token-like key refuses
+/// the answer, and its tokens are not stored.
 #[test]
-fn the_real_token_goes_to_the_api_paths_only() {
+fn a_refresh_answer_is_swapped_or_refused_whole() {
+    let s = setup(60);
+    run_with_config(s.config(), |proxy, _log, mitm| async move {
+        let r = s.serve();
+        let answer = sign_in(&proxy, &mitm, &r).await;
+        let refresh = json!({
+            "grant_type": "refresh_token",
+            "refresh_token": answer["refresh_token"],
+        });
+        let send = || {
+            guest_request(
+                &proxy,
+                &mitm,
+                r.auth_port,
+                false,
+                post("/oauth/token", "application/json", &refresh.to_string()),
+            )
+        };
+        *r.fake.refresh_extra.lock().unwrap() = Some(json!({ "session": Fake::id_token() }));
+        let resp = send().await;
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(!resp.body.contains("REAL"), "{}", resp.body);
+        let session = resp.json()["session"].as_str().unwrap().to_string();
+        assert!(session.starts_with(FAKE_JWT_PREFIX), "{session}");
+
+        *r.fake.refresh_extra.lock().unwrap() =
+            Some(json!({ "session_token": "opaque-secret-value-0123456789" }));
+        let resp = send().await;
+        assert_eq!(resp.status, 502, "{}", resp.body);
+        let grant = r
+            .store
+            .grant_of(
+                ServiceId::Openai,
+                answer["refresh_token"].as_str().unwrap(),
+                &[TokenKind::Refresh],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            grant.real(TokenKind::Refresh),
+            Some(real_refresh(1).as_str()),
+            "the refused refresh stored nothing"
+        );
+    });
+}
+
+/// The refresh token's format is not known: whatever the provider issues
+/// under `refresh_token` (a short opaque value, `v1.…`) gets an
+/// `airlock-rt-…` surrogate, and the real value goes back upstream on
+/// refresh and revoke.
+#[test]
+fn refresh_tokens_of_any_format_get_surrogates() {
+    let s = setup(60);
+    run_with_config(s.config(), |proxy, _log, mitm| async move {
+        let r = s.serve();
+        *r.fake.refresh.lock().unwrap() = "REAL-short".into();
+        let answer = sign_in(&proxy, &mitm, &r).await;
+        let surrogate = answer["refresh_token"].as_str().unwrap().to_string();
+        assert!(surrogate.starts_with("airlock-rt-"), "{surrogate}");
+        let refresh = json!({ "grant_type": "refresh_token", "refresh_token": surrogate });
+        let resp = guest_request(
+            &proxy,
+            &mitm,
+            r.auth_port,
+            false,
+            post("/oauth/token", "application/json", &refresh.to_string()),
+        )
+        .await;
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert!(!resp.body.contains("REAL"), "{}", resp.body);
+        let sent: Value = serde_json::from_str(&r.fake.seen.last().body).unwrap();
+        assert_eq!(sent["refresh_token"], "REAL-short");
+        assert_eq!(
+            resp.json()["refresh_token"],
+            surrogate.as_str(),
+            "stays the same"
+        );
+        assert!(real_refresh(1).starts_with("v1."));
+        let revoke = json!({ "token": surrogate });
+        let resp = guest_request(
+            &proxy,
+            &mitm,
+            r.auth_port,
+            false,
+            post("/oauth/revoke", "application/json", &revoke.to_string()),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let revoked: Vec<Value> = r
+            .fake
+            .seen
+            .all()
+            .into_iter()
+            .filter(|s| s.path == "/oauth/revoke")
+            .map(|s| serde_json::from_str(&s.body).unwrap())
+            .collect();
+        assert_eq!(revoked[0]["token"], real_refresh(1));
+    });
+}
+
+/// An access token that is no JWT gets an opaque surrogate, which works
+/// on chatgpt.com.
+#[test]
+fn an_opaque_access_token_gets_an_opaque_surrogate() {
+    let s = setup(3600);
+    run_with_config(s.config(), |proxy, _log, mitm| async move {
+        let r = s.serve();
+        *r.fake.access.lock().unwrap() = "REAL-opaque-access-token".into();
+        let answer = sign_in(&proxy, &mitm, &r).await;
+        let access = answer["access_token"].as_str().unwrap();
+        assert!(access.starts_with("airlock-at-"), "{access}");
+        let resp = guest_request(
+            &proxy,
+            &mitm,
+            r.chatgpt_port,
+            false,
+            get_with_bearer("/backend-api/codex/models", access),
+        )
+        .await;
+        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert_eq!(
+            r.fake.seen.last().header("authorization"),
+            Some("Bearer REAL-opaque-access-token")
+        );
+    });
+}
+
+/// chatgpt.com API answers ask for no compression, and one with a real
+/// access, ID or refresh token is refused; other JSON passes.
+#[test]
+fn chatgpt_api_answers_with_a_real_token_are_refused() {
     let s = setup(3600);
     run_with_config(s.config(), |proxy, _log, mitm| async move {
         let r = s.serve();
         let answer = sign_in(&proxy, &mitm, &r).await;
         let access = answer["access_token"].as_str().unwrap();
-        for (port, path) in [
-            (r.chatgpt_port, "/backend-apix/codex"),
-            (r.chatgpt_port, "/"),
-            (r.auth_port, "/backend-api/codex/models"),
+        for (path, refused) in [
+            ("/backend-api/leak/access", true),
+            ("/backend-api/leak/refresh", true),
+            ("/backend-api/json", false),
         ] {
-            let resp =
-                guest_request(&proxy, &mitm, port, false, get_with_bearer(path, access)).await;
-            assert_eq!(resp.status, 401, "{path}");
+            let mut req = get_with_bearer(path, access);
+            req.headers_mut()
+                .insert("accept-encoding", "gzip".parse().unwrap());
+            let resp = guest_request(&proxy, &mitm, r.chatgpt_port, false, req).await;
+            assert_eq!(resp.status == 502, refused, "{path}: {}", resp.body);
+            assert!(!resp.body.contains("REAL"), "{path}: {}", resp.body);
             assert_eq!(
-                r.fake.seen.last().header("authorization"),
-                Some(format!("Bearer {access}").as_str()),
-                "{path}"
+                r.fake.seen.last().header("accept-encoding"),
+                Some("identity")
             );
         }
-        // The swap needs the path as the upstream reads it: canonical.
+    });
+}
+
+/// The real token goes to every chatgpt.com path, whatever its spelling,
+/// and never to the auth host, whose other routes are forbidden.
+#[test]
+fn the_real_token_goes_to_chatgpt_only() {
+    let s = setup(3600);
+    run_with_config(s.config(), |proxy, _log, mitm| async move {
+        let r = s.serve();
+        let answer = sign_in(&proxy, &mitm, &r).await;
+        let access = answer["access_token"].as_str().unwrap();
+        let real = format!("Bearer {}", r.fake.access());
         for path in [
+            "/backend-api/codex/models",
+            "/backend-apix/codex",
+            "/",
             "//Backend-API/codex/models",
-            "/api/auth/session%2f..%2f..%2fbackend-api/x",
             "/backend-api/%2e%2e/x",
             "/backend-api/codex/",
         ] {
@@ -728,22 +925,24 @@ fn the_real_token_goes_to_the_api_paths_only() {
                 get_with_bearer(path, access),
             )
             .await;
-            assert_eq!(resp.status, 401, "{path}: {}", resp.body);
+            assert_eq!(resp.status, 200, "{path}: {}", resp.body);
             assert_eq!(
                 r.fake.seen.last().header("authorization"),
-                Some(format!("Bearer {access}").as_str()),
+                Some(real.as_str()),
                 "{path}"
             );
         }
+        let before = r.fake.seen.all().len();
         let resp = guest_request(
             &proxy,
             &mitm,
-            r.chatgpt_port,
+            r.auth_port,
             false,
             get_with_bearer("/backend-api/codex/models", access),
         )
         .await;
-        assert_eq!(resp.status, 200, "{}", resp.body);
+        assert_eq!(resp.status, 403, "{}", resp.body);
+        assert_eq!(r.fake.seen.all().len(), before, "not forwarded");
     });
 }
 

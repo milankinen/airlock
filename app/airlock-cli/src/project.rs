@@ -341,7 +341,8 @@ fn airlock_dir_problem(path: &Path) -> Option<String> {
 fn airlock_dir_problem_for(path: &Path, is_symlink: bool, owner_uid: u32) -> Option<String> {
     if is_symlink {
         return Some(format!(
-            "{} is a symbolic link; airlock does not follow it. Remove it or use a real \
+            "{} is a symbolic link; airlock does not follow it. Run `airlock rm` to remove \
+             just the link (its target is left untouched), or replace it with a real \
              directory.",
             path.display()
         ));
@@ -378,11 +379,33 @@ pub enum IdleLock {
 /// nothing is created. `airlock rm` holds the returned lock while it removes
 /// the sandbox, so a concurrent `airlock start` fails instead of losing its
 /// sandbox mid-boot.
+///
+/// Neither `sandbox_dir` nor `lock` is followed if it is a symlink — a
+/// committed `.airlock/sandbox -> ~/.airlock/sandbox`, or a `lock` symlink
+/// planted inside a real sandbox dir, must not make this reach into
+/// another sandbox's lock (`flock` on it, or worse, blocking on a planted
+/// FIFO). A symlinked `sandbox_dir` is never one this process created, so
+/// it is treated as `Missing` rather than resolved.
 pub fn lock_if_idle(sandbox_dir: &Path) -> IdleLock {
+    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
-    let Ok(file) = std::fs::File::open(sandbox_dir.join("lock")) else {
+
+    if std::fs::symlink_metadata(sandbox_dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        return IdleLock::Missing;
+    }
+    // O_NONBLOCK: opening a planted FIFO at `lock` must not block; the
+    // regular-file check below refuses it.
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(sandbox_dir.join("lock"));
+    let Ok(file) = opened else {
         return IdleLock::Missing;
     };
+    match file.metadata() {
+        Ok(meta) if meta.is_file() => {}
+        _ => return IdleLock::Missing,
+    }
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     // rc == 0 → we grabbed it → nobody was holding it → not running.
     if rc == 0 {
@@ -616,8 +639,9 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "{} is a symbolic link; airlock does not follow it. Remove it or use a real \
-                 directory.",
+                "{} is a symbolic link; airlock does not follow it. Run `airlock rm` to \
+                 remove just the link (its target is left untouched), or replace it with a \
+                 real directory.",
                 dir.join(".airlock").display()
             )
         );
@@ -638,8 +662,9 @@ mod tests {
         assert_eq!(
             airlock_dir_problem_for(path, true, euid),
             Some(
-                "/some/.airlock is a symbolic link; airlock does not follow it. Remove it or \
-                 use a real directory."
+                "/some/.airlock is a symbolic link; airlock does not follow it. Run `airlock \
+                 rm` to remove just the link (its target is left untouched), or replace it \
+                 with a real directory."
                     .to_string()
             )
         );
