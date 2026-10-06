@@ -5,9 +5,16 @@
 #MISE outputs=["target/vm/initramfs.gz"]
 set -euo pipefail
 
+# Sandbox: airlock intercepts TLS, so the container must trust the VM's CAs
+CA_ARGS=()
+if [[ "${IS_SANDBOX:-}" == 1 ]]; then
+  CA_ARGS=(-v /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro)
+fi
+
 echo "Building initramfs..."
 mkdir -p target/vm
 docker run --rm \
+  "${CA_ARGS[@]}" \
   -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
   -v "$PWD/app/vm-initramfs/init:/init-script:ro" \
   -v "$PWD/app/vm-initramfs/build.sh:/build.sh:ro" \

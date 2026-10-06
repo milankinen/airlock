@@ -16,22 +16,50 @@ VIRTIOFSD_VERSION="v1.13.3"
 mkdir -p target/vm
 OUTPUT="target/vm/virtiofsd"
 
-if [[ -f "$OUTPUT" ]]; then
-  echo "virtiofsd already built"
-else
-  echo "Building virtiofsd ${VIRTIOFSD_VERSION}..."
+# Sandbox: airlock intercepts TLS, so the container must trust the VM's CAs
+CA_ARGS=()
+if [[ "${IS_SANDBOX:-}" == 1 ]]; then
+  CA_ARGS=(-v /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro)
+fi
+
+# Usage: build_virtiofsd <out-dir> <work-dir-in-container> [docker-args...]
+build_virtiofsd() {
+  local out="$1" work="$2"; shift 2
   docker run --rm \
-    -v "$PWD/target/vm:/out" \
+    "${CA_ARGS[@]}" \
+    -v "$out:/out" \
     -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
+    "$@" \
     rust:1-slim-trixie sh -c "
       set -e
       apt-get update -qq && apt-get install -y -qq git libcap-ng-dev libseccomp-dev >/dev/null 2>&1
-      cd /tmp
-      git clone --depth=1 --branch ${VIRTIOFSD_VERSION} https://gitlab.com/virtio-fs/virtiofsd.git
+      cd ${work}
+      [ -d virtiofsd ] || git clone --depth=1 --branch ${VIRTIOFSD_VERSION} https://gitlab.com/virtio-fs/virtiofsd.git
       cd virtiofsd
       cargo build --release
       cp target/release/virtiofsd /out/virtiofsd
       chown \"\$HOST_UID:\$HOST_GID\" /out/virtiofsd
     "
+}
+
+if [[ -f "$OUTPUT" ]]; then
+  echo "virtiofsd already built"
+elif [[ -z "${AIRLOCK_DEV_CACHE_DIR:-}" ]]; then
+  echo "Building virtiofsd ${VIRTIOFSD_VERSION}..."
+  build_virtiofsd "$PWD/target/vm" /tmp
+else
+  # Sandbox: one build per version, shared by all worktrees.
+  CACHE="${AIRLOCK_DEV_CACHE_DIR}/virtiofsd/${VIRTIOFSD_VERSION}-$(uname -m)"
+  mkdir -p "$CACHE/build" "$CACHE/staging"
+  exec 9>"$CACHE/lock"
+  flock 9
+  if [[ -f "$CACHE/virtiofsd" ]]; then
+    echo "Using cached virtiofsd ${VIRTIOFSD_VERSION}"
+  else
+    echo "Building virtiofsd ${VIRTIOFSD_VERSION} in ${CACHE}..."
+    build_virtiofsd "$CACHE/staging" /build -v "$CACHE/build:/build"
+    mv "$CACHE/staging/virtiofsd" "$CACHE/virtiofsd"
+  fi
+  cp "$CACHE/virtiofsd" "$OUTPUT"
 fi
 echo "virtiofsd: $OUTPUT ($(du -h "$OUTPUT" | cut -f1))"

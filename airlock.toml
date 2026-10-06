@@ -1,27 +1,57 @@
-presets = ["debian", "rust", "claude-code", "openai-codex", "copilot-cli"]
-
-[vm]
-image = "airlock:dev"
+[packs]
+debian = { version = "1", args = { package-installs = true } }
+claude = { version = "1", args = { acp = true } }
+codex = { version = "1", args = { acp = true } }
+docker = { version = "1" }
+git = { version = "1" }
+mise = { version = "1" }
+rust = { version = "1", args = { cargo-installs = true, toolchain = "none" } }
 
 [env]
 # We can always build natively inside vm
 SUPERVISOR_BUILD_HOST = "true"
-# We can use host's docker image
-SKIP_DEV_IMAGE_BUILD = "true"
-# Git configs
-GIT_AUTHOR_NAME = "${GIT_AUTHOR_NAME:-}"
-GIT_AUTHOR_EMAIL = "${GIT_AUTHOR_EMAIL:-}"
-GIT_COMMITTER_NAME = "${GIT_COMMITTER_NAME:-}"
-GIT_COMMITTER_EMAIL = "${GIT_COMMITTER_EMAIL:-}"
-CARGO_TARGET_DIR = "/tmp/cargo"
 # Claude clipboard integration
 WAYLAND_DISPLAY = "airlock-0"
+# Worktrees live inside the main checkout: trust its mise configs too
+MISE_TRUSTED_CONFIG_PATHS = "/"
 
-[clipboard]
-copy = true
+# Downloads of the VM asset builds (mise build:*)
+[network.rules.vm-build]
+allow = [
+    # initramfs and kernel: Alpine packages
+    "dl-cdn.alpinelinux.org",
+    # kernel: Linux sources
+    "cdn.kernel.org",
+    # virtiofsd: sources
+    "gitlab.com",
+    # cloud-hypervisor: release binary and its download redirect
+    "github.com",
+    "release-assets.githubusercontent.com",
+    "objects.githubusercontent.com",
+]
 
 [disk]
 size = "20 GB"
 
-[network]
-policy = "deny-by-default"
+# Build caches (kache, cargo targets, kernel); see .claude/sandbox
+[disk.cache.build]
+paths = ["/cache"]
+
+# Once a minute, delete the build caches of removed git worktrees
+# (/cache/project/worktree-*; .claude/sandbox/env.sh records the
+# worktree path in .worktree). A cache is kept while the worktree's
+# parent directory is not visible, e.g. the project mount is missing.
+[daemons.worktree-cleanup]
+command = ["bash", "-c", '''
+while :; do
+  for dir in /cache/project/worktree-*/; do
+    [[ -f "$dir.worktree" ]] || continue
+    root="$(cat "$dir.worktree")"
+    [[ -n "$root" && -d "$(dirname "$root")" ]] || continue
+    [[ -e "$root/.git" ]] && continue
+    echo "$(date -Is) removing ${dir%/} (worktree $root is gone)"
+    rm -rf "${dir%/}"
+  done
+  sleep 60
+done
+''']

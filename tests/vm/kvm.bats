@@ -14,7 +14,7 @@ setup_file() {
         return 1
     fi
     require_vm_support
-    export TEST_TEMP_ROOT="$REPO_ROOT/dev/tmp/tests"
+    export TEST_TEMP_ROOT="$REPO_ROOT/.tmp/tests"
     vm_setup_file
     write_config '[vm]
 image = "python:3.13-alpine"

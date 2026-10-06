@@ -6,7 +6,7 @@ description: Use to generate release notes for the next airlock release. Writes 
 # Release notes
 
 Writes release notes for the next airlock release to
-`dev/tmp/release-notes.md`.
+`.tmp/release-notes.md`.
 
 ## Fetching the change set
 
@@ -71,7 +71,7 @@ view) **are** part of the user's world; keep those.
 
 ## Output location
 
-Write to `dev/tmp/release-notes.md`.
+Write to `.tmp/release-notes.md`.
 
 ## Template
 

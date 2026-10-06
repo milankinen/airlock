@@ -10,14 +10,48 @@ case "$HOST_ARCH" in
   *)       ARCH=arm64;    CONFIG=config-arm64 ;;
 esac
 
-echo "Building kernel (${ARCH})..."
+# Sandbox: airlock intercepts TLS, so the container must trust the VM's CAs
+CA_ARGS=()
+if [[ "${IS_SANDBOX:-}" == 1 ]]; then
+  CA_ARGS=(-v /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro)
+fi
+
+# Usage: build_kernel <out-dir> [docker-args...]
+build_kernel() {
+  local out="$1"; shift
+  docker run --rm \
+    "${CA_ARGS[@]}" \
+    -e "ARCH=${ARCH}" \
+    -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
+    -v "$PWD/app/vm-kernel/${CONFIG}:/config:ro" \
+    -v "$PWD/app/vm-kernel/build.sh:/build.sh:ro" \
+    -v "$out:/out" \
+    "$@" \
+    alpine:3.23 sh -c 'sh /build.sh && chown "$HOST_UID:$HOST_GID" /out/Image'
+}
+
 mkdir -p target/vm
-docker run --rm \
-  -e "ARCH=${ARCH}" \
-  -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
-  -v "$PWD/app/vm-kernel/${CONFIG}:/config:ro" \
-  -v "$PWD/app/vm-kernel/build.sh:/build.sh:ro" \
-  -v "$PWD/target/vm:/out" \
-  alpine:3.23 sh -c 'sh /build.sh && chown "$HOST_UID:$HOST_GID" /out/Image'
+
+if [[ -z "${AIRLOCK_DEV_CACHE_DIR:-}" ]]; then
+  echo "Building kernel (${ARCH})..."
+  build_kernel "$PWD/target/vm"
+else
+  # Sandbox: one build per kernel config, shared by all worktrees. The
+  # build tree stays in the cache, so a rebuild after a failure resumes.
+  KEY=$({ echo "$ARCH"; cat "app/vm-kernel/${CONFIG}" app/vm-kernel/build.sh; } | sha256sum | cut -c1-16)
+  CACHE="${AIRLOCK_DEV_CACHE_DIR}/kernel/${ARCH}-${KEY}"
+  mkdir -p "$CACHE/build" "$CACHE/staging"
+  exec 9>"$CACHE/lock"
+  flock 9
+  if [[ -f "$CACHE/Image" ]]; then
+    echo "Using cached kernel (${ARCH}-${KEY})"
+  else
+    echo "Building kernel (${ARCH}-${KEY}) in ${CACHE}..."
+    build_kernel "$CACHE/staging" -v "$CACHE/build:/build" -w /build
+    mv "$CACHE/staging/Image" "$CACHE/Image"
+  fi
+  cp "$CACHE/Image" target/vm/Image
+fi
+
 SIZE=$(du -h target/vm/Image | cut -f1)
 echo "Kernel: target/vm/Image (${SIZE})"

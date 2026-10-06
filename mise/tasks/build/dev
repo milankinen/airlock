@@ -2,11 +2,11 @@
 #MISE description="Build the CLI binary"
 #MISE depends=["build:initramfs", "build:kernel", "fetch:cloud-hypervisor", "build:virtiofsd"]
 #MISE sources=["app/airlock-cli/**/*", "app/airlock-common/**/*", "app/airlock-monitor/**/*", "Cargo.toml", "Cargo.lock", "target/vm/*"]
-#MISE outputs=["target/debug/airlock"]
+#MISE outputs=["{{ env.CARGO_TARGET_DIR | default(value='target') }}/debug/airlock"]
 set -euo pipefail
 
 cargo build -p airlock-cli --features dev "$@"
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
-  codesign --entitlements entitlements.plist --force -s "${APPLE_SIGNIN_ID:--}" target/debug/airlock 2>/dev/null || true
+  codesign --entitlements entitlements.plist --force -s "${APPLE_SIGNIN_ID:--}" "${CARGO_TARGET_DIR:-target}/debug/airlock" 2>/dev/null || true
 fi

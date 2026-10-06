@@ -15,7 +15,7 @@ mkdir -p target/vm
 if [[ "${SUPERVISOR_BUILD_HOST:-}" == "true" ]]; then
   echo "Building airlockd (native, ${TARGET})..."
   cargo build --release -p airlockd --target "${TARGET}"
-  cp "target/${TARGET}/release/airlockd" target/vm/airlockd
+  cp "${CARGO_TARGET_DIR:-target}/${TARGET}/release/airlockd" target/vm/airlockd
 else
   echo "Preparing airlockd builder..."
   docker build --progress=quiet -t airlockd-builder -f app/airlockd/builder.dockerfile app/airlockd

@@ -25,9 +25,21 @@ Always format code you produce. Use `mise format`
 
 ## Temporary files
 
-IMPORTANT: Write temporary files **ALWAYS** to this project's `dev/tmp`
+IMPORTANT: Write temporary files **ALWAYS** to this project's `.tmp`
 directory instead of `/tmp`. Delete temporary files immediately
 after their use unless told otherwise.
+
+## Manual testing
+
+Test airlock changes with `mise airlock` from a test directory under
+`.tmp` (e.g. `.tmp/test-<name>`, with its own `airlock.toml` if needed).
+The task builds the dev binary and runs it in the current directory.
+mise consumes the first `--`, so put one before the airlock arguments:
+
+```bash
+mkdir -p .tmp/test-foo && cd .tmp/test-foo
+mise airlock -- start -- echo hello
+```
 
 ## User manual
 
