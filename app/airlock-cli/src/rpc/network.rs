@@ -5,41 +5,21 @@
 //! capability is the [`Network`](crate::network::Network) impl of
 //! `network_proxy::Server`.
 
-use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
+use std::os::unix::io::OwnedFd;
 
 use airlock_common::network_capnp::network_proxy;
-use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
-use futures::AsyncReadExt;
+use capnp_rpc::{RpcSystem, rpc_twoparty_capnp};
 
+use super::{Driver, driver, vsock_transport};
 use crate::network::Network;
 
 /// Consume `network` and serve it as the bootstrap capability of a
-/// Cap'n Proto RPC system bound to the given vsock fd. The RpcSystem
-/// runs on the current `LocalSet` until the connection drops.
-pub fn serve_network(vsock_fd: OwnedFd, network: Network) -> anyhow::Result<()> {
-    #[cfg(target_os = "macos")]
-    let stream = {
-        let std_stream = unsafe { std::net::TcpStream::from_raw_fd(vsock_fd.into_raw_fd()) };
-        std_stream.set_nonblocking(true)?;
-        tokio::net::TcpStream::from_std(std_stream)?
-    };
-    #[cfg(target_os = "linux")]
-    let stream = {
-        let std_stream =
-            unsafe { std::os::unix::net::UnixStream::from_raw_fd(vsock_fd.into_raw_fd()) };
-        std_stream.set_nonblocking(true)?;
-        tokio::net::UnixStream::from_std(std_stream)?
-    };
-    let (reader, writer) = tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
-
-    let transport = twoparty::VatNetwork::new(
-        reader,
-        writer,
-        rpc_twoparty_capnp::Side::Server,
-        capnp::message::ReaderOptions::default(),
-    );
+/// Cap'n Proto RPC system bound to the given vsock fd. The returned
+/// [`Driver`] serves the connection until it drops; `Network` lives
+/// exactly as long as the driver.
+pub fn serve_network(vsock_fd: OwnedFd, network: Network) -> anyhow::Result<Driver> {
+    let transport = vsock_transport(vsock_fd, rpc_twoparty_capnp::Side::Server)?;
     let bootstrap: network_proxy::Client = capnp_rpc::new_client(network);
-    let rpc = RpcSystem::new(Box::new(transport), Some(bootstrap.client));
-    tokio::task::spawn_local(rpc);
-    Ok(())
+    let rpc = RpcSystem::new(transport, Some(bootstrap.client));
+    Ok(driver(rpc, "network"))
 }

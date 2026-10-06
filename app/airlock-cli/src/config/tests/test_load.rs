@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::config::load_config::load_first;
+use crate::config::files::load_first;
 
 /// Unique base path under the system temp dir (no `tempfile` dep in this
 /// crate; mirrors the manual temp-dir helper used in `oci::gc` tests).

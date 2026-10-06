@@ -1,0 +1,9 @@
+label = "codex"
+description = "OpenAI Codex"
+kind = "agent"
+
+[[args]]
+key = "acp"
+type = "bool"
+description = "acp support"
+default = false

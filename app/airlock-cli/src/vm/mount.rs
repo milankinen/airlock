@@ -53,7 +53,7 @@ impl ResolvedMount {
 /// Expand `~` in mount paths, handle missing sources, and classify as
 /// dir or file mounts.
 pub fn resolve_mounts(
-    mounts: &[(&str, crate::config::config::Mount)],
+    mounts: &[(&str, crate::config::config_values::Mount)],
     host_home: &Path,
     container_home: &str,
     cwd: &Path,
@@ -61,7 +61,7 @@ pub fn resolve_mounts(
 ) -> anyhow::Result<Vec<ResolvedMount>> {
     use std::os::unix::fs::PermissionsExt;
 
-    use crate::config::config::MissingAction;
+    use crate::config::config_values::MissingAction;
 
     let container_home = PathBuf::from(container_home);
     let mut result = Vec::new();
@@ -155,7 +155,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{MountType, resolve_mounts};
-    use crate::config::config::{MissingAction, Mount};
+    use crate::config::config_values::{MissingAction, Mount};
 
     fn mount(source: &str, target: &str) -> Mount {
         Mount {

@@ -1,6 +1,7 @@
 use std::rc::Rc;
 
 use super::http::middleware::CompiledMiddleware;
+use super::interceptor::Interceptor;
 use super::matchers;
 use crate::project::MaskedSecret;
 
@@ -17,6 +18,65 @@ impl NetworkTarget {
     pub fn matches(&self, host: &str, port: u16) -> bool {
         matchers::host_matches(host, &self.host) && self.port.is_none_or(|p| p == port)
     }
+}
+
+/// A host and port the proxy talks to. The host is always canonical
+/// ([`matchers::canonical_host`]: lowercase, no trailing dot), so the
+/// services compare endpoints exactly: the guest's DNS keeps the case of
+/// a name, and `AUTH.OPENAI.COM` or `api.anthropic.com.` is the same host
+/// as the endpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Endpoint {
+    host: String,
+    port: u16,
+}
+
+impl Endpoint {
+    pub fn new(host: &str, port: u16) -> Self {
+        Self {
+            host: matchers::canonical_host(host),
+            port,
+        }
+    }
+
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// `host`, or `host:port` for a port other than 443: the `Host` and
+    /// `:authority` of a request to the endpoint.
+    pub fn authority(&self) -> String {
+        if self.port == 443 {
+            self.host.clone()
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+
+    pub fn target(&self) -> NetworkTarget {
+        NetworkTarget {
+            host: self.host.clone(),
+            port: Some(self.port),
+        }
+    }
+}
+
+/// The targets of `endpoints`, without duplicates.
+pub fn targets_of(endpoints: &[&Endpoint]) -> Vec<NetworkTarget> {
+    let mut out: Vec<NetworkTarget> = Vec::new();
+    for e in endpoints {
+        if !out
+            .iter()
+            .any(|t| t.host == e.host && t.port == Some(e.port))
+        {
+            out.push(e.target());
+        }
+    }
+    out
 }
 
 /// A compiled middleware script with target patterns for matching.
@@ -87,6 +147,10 @@ pub struct ResolvedTarget {
     /// response headers, from all matching rules with `inject`. Empty for
     /// denied and passthrough connections.
     pub secrets: Vec<InjectedSecret>,
+    /// The interceptor that owns the target; it handles every request on
+    /// the connection around the upstream send. `None` for denied
+    /// connections.
+    pub interceptor: Option<Rc<dyn Interceptor>>,
     /// Whether this connection is permitted.
     /// False if denied by policy, deny rule, or no allow rule matched.
     pub allowed: bool,

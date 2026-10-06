@@ -1,0 +1,17 @@
+label = "rust"
+description = "Rust through rustup, with a C toolchain"
+kind = "tool"
+
+[[args]]
+key = "toolchain"
+type = "choice"
+description = "toolchain"
+default = "stable"
+values = ["stable", "beta", "nightly", "none"]
+other = true
+
+[[args]]
+key = "cargo-installs"
+type = "bool"
+description = "allow cargo"
+default = true

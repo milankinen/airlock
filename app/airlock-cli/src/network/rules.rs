@@ -3,7 +3,7 @@ use anyhow::Context;
 use super::http;
 use super::middleware::LogFn;
 use super::target::{InjectTarget, InjectedSecret, MiddlewareTarget, NetworkTarget};
-use crate::config::config::Network;
+use crate::config::config_values::Network;
 use crate::project::SandboxEnv;
 use crate::vault::Vault;
 
@@ -95,9 +95,9 @@ pub fn resolve_middleware(
 
 /// Resolve `inject` lists from enabled rules into targets carrying the
 /// masked secrets. Config loading guarantees every name is a masked `[env]`
-/// entry and that no injecting rule is `passthrough`; `project::lock`
-/// checks the values are injectable. This still errors (rather than
-/// panics) on a missing entry.
+/// entry and that no injecting rule is `passthrough`; `project::open` /
+/// [`crate::project::Project::with_config`] check the values are
+/// injectable. This still errors (rather than panics) on a missing entry.
 pub fn resolve_inject(network: &Network, env: &SandboxEnv) -> anyhow::Result<Vec<InjectTarget>> {
     let mut targets = Vec::new();
 
@@ -220,7 +220,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::config::config::{self, NetworkRule, Policy};
+    use crate::config::config_values::{self, NetworkRule, Policy};
     use crate::project::MaskedSecret;
 
     fn rule(allow: &[&str], passthrough: bool) -> NetworkRule {
@@ -337,13 +337,14 @@ mod tests {
         assert!(msg.contains("`api.example.com:443 `"), "got: {msg}");
     }
 
-    fn net_with_rules(rules: BTreeMap<String, NetworkRule>) -> config::Network {
-        config::Network {
+    fn net_with_rules(rules: BTreeMap<String, NetworkRule>) -> config_values::Network {
+        config_values::Network {
             policy: Policy::DenyByDefault,
             rules,
             middleware: BTreeMap::default(),
             ports: BTreeMap::default(),
             sockets: BTreeMap::default(),
+            services: BTreeMap::default(),
         }
     }
 
@@ -352,12 +353,13 @@ mod tests {
         let mut rules = BTreeMap::new();
         rules.insert("pt".to_string(), rule(&["db.example.com:5432"], true));
         rules.insert("plain".to_string(), rule(&["api.example.com"], false));
-        let net = config::Network {
+        let net = config_values::Network {
             policy: Policy::DenyByDefault,
             rules,
             middleware: BTreeMap::default(),
             ports: BTreeMap::default(),
             sockets: BTreeMap::default(),
+            services: BTreeMap::default(),
         };
         let resolved = resolve(&net).unwrap();
         assert_eq!(resolved.allow.len(), 2);
@@ -374,13 +376,14 @@ mod tests {
         }
     }
 
-    fn net_with(rules: Vec<(&str, NetworkRule)>) -> config::Network {
-        config::Network {
+    fn net_with(rules: Vec<(&str, NetworkRule)>) -> config_values::Network {
+        config_values::Network {
             policy: Policy::DenyByDefault,
             rules: rules.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
             middleware: BTreeMap::default(),
             ports: BTreeMap::default(),
             sockets: BTreeMap::default(),
+            services: BTreeMap::default(),
         }
     }
 
@@ -458,12 +461,13 @@ mod tests {
                 inject: vec![],
             },
         );
-        let net = config::Network {
+        let net = config_values::Network {
             policy: Policy::DenyByDefault,
             rules,
             middleware: BTreeMap::default(),
             ports: BTreeMap::default(),
             sockets: BTreeMap::default(),
+            services: BTreeMap::default(),
         };
         let resolved = resolve(&net).unwrap();
         assert!(resolved.allow.is_empty());

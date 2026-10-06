@@ -26,6 +26,7 @@ use super::{
     ARGON2_KEY_BYTES, ARGON2_M_KIB, ARGON2_P, ARGON2_T, EncryptedBlob, Envelope, KdfParams,
     NONCE_BYTES, SALT_BYTES, Storage, atomic_write, decode_b64_array, read_vault_file,
 };
+use crate::cli::prompt::fields::{Field, Fields, Invalid};
 
 /// Env var used to supply the encrypted-vault passphrase non-interactively
 /// (CI, scripts, and headless shells without a TTY).
@@ -204,8 +205,8 @@ impl Storage for EncryptedFileStorage {
         atomic_write(&self.path, json.as_bytes())
     }
 
-    fn lock_path(&self) -> Option<PathBuf> {
-        Some(self.path.with_extension("lock"))
+    fn lock_path(&self) -> anyhow::Result<Option<PathBuf>> {
+        Ok(Some(self.path.with_extension("lock")))
     }
 }
 
@@ -224,7 +225,7 @@ impl PassphraseSource for InteractivePassphrase {
         if let Ok(p) = std::env::var(PASSPHRASE_ENV) {
             return Ok(p);
         }
-        prompt_once("Vault passphrase")
+        prompt_once("vault passphrase")
     }
 
     fn create(&self) -> anyhow::Result<String> {
@@ -238,6 +239,8 @@ impl PassphraseSource for InteractivePassphrase {
     }
 }
 
+/// Ask for the passphrase (the row `label`) of an existing vault; the
+/// line is erased afterwards.
 fn prompt_once(label: &str) -> anyhow::Result<String> {
     if !crate::cli::is_interactive() {
         bail!(
@@ -245,20 +248,25 @@ fn prompt_once(label: &str) -> anyhow::Result<String> {
              or run from an interactive terminal"
         );
     }
-    let term = console::Term::stderr();
-    let pass = dialoguer::Password::with_theme(&dialoguer::theme::ColorfulTheme::default())
-        .with_prompt(label)
-        .report(false)
-        .interact_on(&term)
+    let form = Fields {
+        title: None,
+        rows: &[Field {
+            label,
+            secret: true,
+        }],
+        keys: "enter unlock · esc cancel",
+    };
+    let texts = form
+        .ask(|texts| required(texts, 0))
         .context("read vault passphrase")?;
-    // Erase the prompt line so the terminal stays clean.
-    let _ = term.clear_last_lines(1);
-    if pass.is_empty() {
-        bail!("vault passphrase must not be empty");
-    }
-    Ok(pass)
+    let Some(mut texts) = texts else {
+        bail!("vault passphrase prompt cancelled");
+    };
+    Ok(texts.swap_remove(0))
 }
 
+/// Ask for the passphrase of a new vault, twice; the lines are erased
+/// afterwards.
 fn prompt_create() -> anyhow::Result<String> {
     if !crate::cli::is_interactive() {
         bail!(
@@ -266,18 +274,48 @@ fn prompt_create() -> anyhow::Result<String> {
              or run from an interactive terminal"
         );
     }
-    let term = console::Term::stderr();
-    let pass = dialoguer::Password::with_theme(&dialoguer::theme::ColorfulTheme::default())
-        .with_prompt("New vault passphrase")
-        .with_confirmation("Confirm passphrase", "Passphrases do not match")
-        .report(false)
-        .interact_on(&term)
-        .context("read vault passphrase")?;
-    let _ = term.clear_last_lines(2);
-    if pass.is_empty() {
-        bail!("vault passphrase must not be empty");
+    let form = Fields {
+        title: Some("Set a vault passphrase"),
+        rows: &[
+            Field {
+                label: "new passphrase",
+                secret: true,
+            },
+            Field {
+                label: "confirm",
+                secret: true,
+            },
+        ],
+        keys: "enter next · esc cancel",
+    };
+    let check = |texts: &[String]| {
+        required(texts, 0)?;
+        if texts[0] == texts[1] {
+            Ok(())
+        } else {
+            Err(Invalid {
+                field: 1,
+                message: "passphrases do not match".to_string(),
+            })
+        }
+    };
+    let texts = form.ask(check).context("read vault passphrase")?;
+    let Some(mut texts) = texts else {
+        bail!("vault passphrase prompt cancelled");
+    };
+    Ok(texts.swap_remove(0))
+}
+
+/// The check of a passphrase form: the passphrase of row `field` is not
+/// empty.
+fn required(texts: &[String], field: usize) -> Result<(), Invalid> {
+    if texts[field].is_empty() {
+        return Err(Invalid {
+            field,
+            message: "vault passphrase must not be empty".to_string(),
+        });
     }
-    Ok(pass)
+    Ok(())
 }
 
 #[cfg(test)]

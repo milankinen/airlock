@@ -1,930 +1,382 @@
-//! Hierarchical TOML configuration with preset support.
+//! Hierarchical TOML configuration with pack support.
 //!
-//! Configuration is loaded from up to four files (global, home, project,
-//! local), merged with deep-merge semantics, and validated by `smart-config`.
+//! [`load`] reads up to six config files (three user files, the local
+//! project file, the project files; see [`files::discover_in`]) into a
+//! [`LayeredConfig`]. Only the project-level files (the local project file
+//! and the project files) may enable packs: a `[packs]` table in a user
+//! file is an error. [`LayeredConfig::resolve`] merges the files with
+//! deep-merge semantics, each over the config values of the packs whose
+//! highest entry it holds, and validates the result with `smart-config`.
 
+pub(crate) mod config_values;
 pub(crate) mod de;
-pub(crate) mod load_config;
-pub(crate) mod presets;
+pub(crate) mod files;
+pub(crate) mod generated;
+pub(crate) mod legacy_presets;
+pub(crate) mod merge;
+pub(crate) mod pack_entries;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
-use config::*;
-pub use load_config::load;
-use smart_config::{DescribeConfig, DeserializeConfig};
+use crate::config::config_values::{ConfigValues, Policy};
+use crate::config::generated::GeneratedConfig;
+use crate::config::merge::{merge_json, normalize_env, pack_conflicts};
+use crate::packs::{ConfiguredPack, Pack, PackManager};
 
-/// Configuration loaded from hierarchical TOML files and validated
-/// by smart-config. Runtime-only fields (args, terminal) are set
-/// separately after loading.
-#[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
-pub struct Config {
-    /// Virtual machine configuration
-    #[config(nest)]
-    pub vm: VirtualMachine,
-    /// Network configuration
-    #[config(nest)]
-    pub network: Network,
-    /// Mount points
-    #[config(default)]
-    pub mounts: BTreeMap<String, Mount>,
-    /// Cache volume (VirtIO block device with ext4)
-    #[config(nest)]
-    pub disk: Disk,
-    /// Environment variables injected into the container.
-    /// Values support `${VAR}` substitution from the host environment.
-    /// An entry may be a plain string or `{ value = "...", mask = true }`;
-    /// masked entries reach the guest as a stable surrogate of the same
-    /// length (see [`config::EnvVar`]).
-    #[config(default)]
-    pub env: BTreeMap<String, config::EnvVar>,
-    /// Sidecar processes started in parallel with the main shell.
-    #[config(default)]
-    pub daemons: BTreeMap<String, Daemon>,
-    /// Subdirectories of the project mount to hide from the sandbox by
-    /// bind-mounting an empty directory over them. Used to keep parts
-    /// of a monorepo invisible to AI agents that operate inside the VM.
-    #[config(default)]
-    pub mask: BTreeMap<String, Mask>,
-    /// Clipboard bridge between the sandbox and the host clipboard.
-    /// Both directions are off by default — each one is a deliberate
-    /// hole in the sandbox (see `[clipboard]` in the manual).
-    #[config(nest)]
-    pub clipboard: Clipboard,
+/// Load the config files of the project in the current directory, with
+/// the user's home directory for the user files.
+pub fn load() -> anyhow::Result<LayeredConfig> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| anyhow::anyhow!("cannot determine the current directory: {e}"))?;
+    let project_root = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    let home = dirs::home_dir().unwrap_or_default();
+    LayeredConfig::load_from(&home, &project_root)
 }
 
-#[allow(clippy::module_inception)]
-pub mod config {
-    use std::cmp::{max, min};
-    use std::collections::BTreeMap;
+/// One config file (or in-memory document) before merging.
+///
+/// `value` is already env-normalized (see [`normalize_env`]), so layers
+/// merge field-wise no matter where they came from. A `presets` list (the
+/// released list form) is taken out of `value`; a `[packs]` table stays.
+#[derive(Clone)]
+struct Layer {
+    /// Where the layer came from (a file path), for logs and errors.
+    origin: String,
+    value: serde_json::Value,
+    /// The names of the file's `presets` list, if it has one.
+    legacy_presets: Option<Vec<String>>,
+}
 
-    use smart_config::de::WellKnown;
-    use smart_config::{ByteSize, DescribeConfig, DeserializeConfig};
-
-    use crate::config::de;
-
-    /// Default to all available host CPUs.
-    pub fn default_cpus() -> u32 {
-        std::thread::available_parallelism().map_or(2, |n| n.get() as u32)
+impl Layer {
+    /// The layer of `value` from `origin`. A `presets` value that is not
+    /// a list of names is an error (see
+    /// [`legacy_presets::take_presets_key`]); the names of a list are
+    /// checked in [`LayeredConfig::resolve`].
+    fn new(origin: impl Into<String>, mut value: serde_json::Value) -> anyhow::Result<Self> {
+        let origin = origin.into();
+        normalize_env(&mut value);
+        let legacy_presets = legacy_presets::take_presets_key(&mut value, &origin)?;
+        Ok(Self {
+            origin,
+            value,
+            legacy_presets,
+        })
     }
 
-    /// Default to half of total system RAM, clamped to [512 MB, total].
-    pub fn default_memory() -> ByteSize {
-        use sysinfo::System;
-        let sys_bytes = System::new_with_specifics(
-            sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()),
-        )
-        .total_memory();
-        let half = sys_bytes / 2;
-        let min_bytes = 512 * 1024 * 1024;
-        ByteSize(min(max(min_bytes, half), sys_bytes))
+    /// The layer of a discovered config file, logged as loaded.
+    fn from_file((path, value): (PathBuf, serde_json::Value)) -> anyhow::Result<Self> {
+        let layer = Self::new(path.display().to_string(), value)?;
+        tracing::debug!("config: loaded {}", layer.origin);
+        tracing::trace!("config: {}: {}", layer.origin, layer.value);
+        Ok(layer)
     }
 
-    #[allow(clippy::trivially_copy_pass_by_ref)] // serde serialize_with requires &T
-    pub fn ser_byte_size<S: serde::Serializer>(size: &ByteSize, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&size.to_string())
+    /// The layer of a discovered user file (see [`Self::from_file`]). A
+    /// `packs` key is an error: packs belong in the project-level files.
+    fn from_user_file(file: (PathBuf, serde_json::Value)) -> anyhow::Result<Self> {
+        let layer = Self::from_file(file)?;
+        anyhow::ensure!(
+            layer.value.get("packs").is_none(),
+            "`[packs]` is allowed only in project config files (airlock.toml, \
+             .airlock/airlock.toml); remove it from {}",
+            layer.origin
+        );
+        Ok(layer)
+    }
+}
+
+/// What `--network` overrides in [`LayeredConfig::resolve`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConfigOverrides {
+    /// `airlock start --network <POLICY>`.
+    pub network_policy: Option<Policy>,
+}
+
+/// The config files of a project, lowest precedence first:
+/// user files < local project file < project files.
+#[derive(Clone)]
+pub struct LayeredConfig {
+    /// `~/.airlock/airlock.<ext>`, `~/.airlock/config.<ext>`, `~/.airlock.<ext>`;
+    /// without `[packs]` when loaded (see [`Layer::from_user_file`]).
+    user: Vec<Layer>,
+    /// `<project_root>/.airlock/airlock.<ext>`
+    local: Option<Layer>,
+    /// `<project_root>/airlock.<ext>`, `<project_root>/airlock.local.<ext>`
+    project: Vec<Layer>,
+    /// The project config the setup wizard generated (see
+    /// [`Self::with_generated_project`]), not written to disk yet.
+    generated: Option<GeneratedConfig>,
+}
+
+impl LayeredConfig {
+    /// True if the project has its own config: a project file or the local
+    /// project file. User files alone do not count.
+    pub fn has_project_config(&self) -> bool {
+        !self.project.is_empty() || self.local.is_some()
     }
 
-    /// How the OCI image is resolved.
-    #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
-    #[serde(rename_all = "lowercase")]
-    pub enum Resolution {
-        /// Try local Docker images, then Podman, then the registry (default).
-        #[default]
-        Auto,
-        /// Only use local Docker images.
-        Docker,
-        /// Only use local Podman images.
-        Podman,
-        /// Only pull from the OCI registry.
-        Registry,
+    /// Add `generated` (the config the setup wizard produced, not written
+    /// to disk yet) as the project config. Only for a project without
+    /// config (see [`Self::has_project_config`]).
+    pub fn with_generated_project(mut self, generated: GeneratedConfig) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            !self.has_project_config(),
+            "the project has a config file already"
+        );
+        let origin = format!("setup wizard ({})", generated.path.display());
+        let value: serde_json::Value =
+            toml::from_str(&generated.toml).map_err(|e| anyhow::anyhow!("{origin}: {e}"))?;
+        self.project = vec![Layer::new(origin, value)?];
+        self.generated = Some(generated);
+        Ok(self)
     }
 
-    impl WellKnown for Resolution {
-        type Deserializer =
-            smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
-        const DE: Self::Deserializer = smart_config::de::Serde;
-    }
-
-    /// When the configured image reference is re-resolved against its source.
-    ///
-    /// Orthogonal to [`Resolution`]: that picks *where* an image comes from,
-    /// this picks *how often* we go ask. Irrelevant for digest-pinned
-    /// references (`repo@sha256:…`), which name one immutable image and are
-    /// therefore never re-resolved for change detection.
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    #[serde(rename_all = "kebab-case")]
-    pub enum PullPolicy {
-        /// Use the locally cached image whenever one is present under the
-        /// configured name, without contacting the source (default).
-        #[default]
-        IfNotPresent,
-        /// Re-resolve the reference to a digest on every start and reuse the
-        /// cached image only when that digest still matches.
-        IfChanged,
-    }
-
-    impl WellKnown for PullPolicy {
-        type Deserializer =
-            smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
-        const DE: Self::Deserializer = smart_config::de::Serde;
-    }
-
-    /// OCI image reference — either a plain image name string or a full config object.
-    ///
-    /// String form:  `image = "alpine:latest"`
-    /// Object form:  `[vm.image]\nname = "localhost:5005/alpine:3"\ninsecure = true`
-    #[derive(Debug, Clone, serde::Serialize)]
-    pub struct ImageRef {
-        /// Image name (e.g. `alpine:latest`, `localhost:5005/alpine:3`).
-        /// A digest may be pinned with `@sha256:…`, optionally alongside a
-        /// tag (`alpine:3.20@sha256:…`), as Docker tooling accepts.
-        pub name: String,
-        /// Resolution strategy: `auto` (default), `docker`, `podman`, or
-        /// `registry`.
-        #[serde(default)]
-        pub resolution: Resolution,
-        /// Allow plain HTTP to the registry (for local or dev registries).
-        #[serde(default)]
-        pub insecure: bool,
-        /// When to re-resolve the reference: `if-not-present` (default) or
-        /// `if-changed`.
-        #[serde(default, rename = "pull-policy")]
-        pub pull_policy: PullPolicy,
-    }
-
-    impl ImageRef {
-        pub fn auto(name: impl Into<String>) -> Self {
-            Self {
-                name: name.into(),
-                resolution: Resolution::Auto,
-                insecure: false,
-                pull_policy: PullPolicy::IfNotPresent,
-            }
-        }
-
-        /// The digest pinned in the reference, if any (`@sha256:…`).
-        ///
-        /// A pinned reference names exactly one immutable image, so callers
-        /// use this both to skip tag→digest change detection and to verify
-        /// that whatever a source hands back is the image that was asked for.
-        pub fn pinned_digest(&self) -> Option<&str> {
-            let (name, digest) = self.name.rsplit_once('@')?;
-            // Guard against `@` appearing in some other position: a digest is
-            // `<algorithm>:<hex>` and nothing else may follow it. The name
-            // must survive too — stripping the digest has to leave something
-            // to query a source with.
-            let (algorithm, hex) = digest.split_once(':')?;
-            let valid = !name.is_empty()
-                && !algorithm.is_empty()
-                && hex.len() >= 32
-                && hex.chars().all(|c| c.is_ascii_hexdigit())
-                && algorithm
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '.'));
-            valid.then_some(digest)
-        }
-    }
-
-    impl std::fmt::Display for ImageRef {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str(&self.name)
-        }
-    }
-
-    impl<'de> serde::Deserialize<'de> for ImageRef {
-        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-            #[derive(serde::Deserialize)]
-            #[serde(untagged)]
-            enum Helper {
-                Simple(String),
-                Full {
-                    name: String,
-                    #[serde(default)]
-                    resolution: Resolution,
-                    #[serde(default)]
-                    insecure: bool,
-                    // The untagged helper ignores keys it doesn't know, so an
-                    // unaliased snake_case spelling would silently do nothing
-                    // — and every other config section here is snake_case.
-                    #[serde(default, rename = "pull-policy", alias = "pull_policy")]
-                    pull_policy: PullPolicy,
-                },
-            }
-            match Helper::deserialize(d)? {
-                Helper::Simple(name) => Ok(ImageRef::auto(name)),
-                Helper::Full {
-                    name,
-                    resolution,
-                    insecure,
-                    pull_policy,
-                } => Ok(ImageRef {
-                    name,
-                    resolution,
-                    insecure,
-                    pull_policy,
-                }),
-            }
-        }
-    }
-
-    impl WellKnown for ImageRef {
-        type Deserializer = smart_config::de::Serde<
-            {
-                smart_config::metadata::BasicTypes::STRING
-                    .or(smart_config::metadata::BasicTypes::OBJECT)
-                    .raw()
-            },
-        >;
-        const DE: Self::Deserializer = smart_config::de::Serde;
-    }
-
-    /// One `[env]` entry — either a plain string or a full config object.
-    ///
-    /// String form:  `TOKEN = "${TOKEN}"`
-    /// Object form:  `TOKEN = { value = "${TOKEN}", mask = true }`
-    ///
-    /// With `mask = true` the guest sees a stable alphanumeric surrogate of
-    /// the same length (derived from the variable name and the length, never
-    /// from the value) instead of the real value. The real value can still
-    /// be substituted into outbound HTTP headers on the host through a
-    /// network rule's `inject` list.
-    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-    pub struct EnvVar {
-        /// Value template; supports `${VAR}` substitution from the host.
-        pub value: String,
-        /// Replace the value with a same-length surrogate inside the guest.
-        pub mask: bool,
-    }
-
-    impl EnvVar {
-        /// A plain, unmasked entry.
-        pub fn plain(value: impl Into<String>) -> Self {
-            Self {
-                value: value.into(),
-                mask: false,
-            }
-        }
-    }
-
-    impl<'de> serde::Deserialize<'de> for EnvVar {
-        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-            use serde::de::Error as _;
-
-            // `deny_unknown_fields` so `{ value = "…", masked = true }` is
-            // an error, not a silent `mask = false` that leaks the real
-            // value into the guest. Dispatching on the raw value (instead of
-            // an untagged enum) keeps that error's own message — which
-            // names the unknown key — instead of serde's generic "did not
-            // match any variant".
-            #[derive(serde::Deserialize)]
-            #[serde(deny_unknown_fields)]
-            struct Full {
-                value: String,
-                #[serde(default)]
-                mask: bool,
-            }
-            match serde_json::Value::deserialize(d)? {
-                serde_json::Value::String(value) => Ok(EnvVar::plain(value)),
-                table @ serde_json::Value::Object(_) => {
-                    let Full { value, mask } =
-                        serde_json::from_value(table).map_err(D::Error::custom)?;
-                    Ok(EnvVar { value, mask })
-                }
-                _ => Err(D::Error::custom(
-                    "expected a string or a table `{ value = \"...\", mask = true }`",
-                )),
-            }
-        }
-    }
-
-    impl WellKnown for EnvVar {
-        type Deserializer = smart_config::de::Serde<
-            {
-                smart_config::metadata::BasicTypes::STRING
-                    .or(smart_config::metadata::BasicTypes::OBJECT)
-                    .raw()
-            },
-        >;
-        const DE: Self::Deserializer = smart_config::de::Serde;
-    }
-
-    /// Virtual machine configurations
-    #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
-    pub struct VirtualMachine {
-        /// OCI image to use
-        #[config(default_t = ImageRef::auto("alpine:latest"))]
-        pub image: ImageRef,
-        /// Number of virtual CPUs
-        #[config(default = default_cpus)]
-        pub cpus: u32,
-        /// Memory size (e.g. "4 GB", "512 MB")
-        #[serde(serialize_with = "ser_byte_size")]
-        #[config(default = default_memory)]
-        pub memory: ByteSize,
-        /// Enable nested virtualization and expose KVM in the guest
-        #[config(default)]
-        pub kvm: bool,
-        /// Apply security hardening to spawned processes (namespace isolation,
-        /// no-new-privileges). Disable only for debugging or Docker-in-VM use.
-        #[config(default_t = true)]
-        pub harden: bool,
-        /// Custom kernel image path (overrides the bundled kernel)
-        #[config(default)]
-        pub kernel: Option<String>,
-        /// Custom initramfs path (overrides the bundled initramfs)
-        #[config(default)]
-        pub initramfs: Option<String>,
-    }
-
-    /// Network policy — controls whether connections are allowed or denied
-    /// before rules are evaluated.
-    ///
-    /// Doubles as the value type of `airlock start --network <POLICY>`; the
-    /// `clap` value names match the on-disk kebab-case form.
-    #[derive(
-        Debug,
-        Clone,
-        Copy,
-        Default,
-        PartialEq,
-        Eq,
-        serde::Serialize,
-        serde::Deserialize,
-        clap::ValueEnum,
-    )]
-    #[serde(rename_all = "kebab-case")]
-    pub enum Policy {
-        /// Skip rules, allow all connections (default).
-        #[default]
-        AllowAlways,
-        /// Skip rules, deny all connections (including port forwards and sockets).
-        DenyAlways,
-        /// Allow connections unless explicitly denied by a rule.
-        AllowByDefault,
-        /// Deny connections unless explicitly allowed by a rule.
-        DenyByDefault,
-    }
-
-    impl Policy {
-        /// Kebab-case name as written in `airlock.toml` and on the CLI.
-        pub fn label(self) -> &'static str {
-            match self {
-                Policy::AllowAlways => "allow-always",
-                Policy::DenyAlways => "deny-always",
-                Policy::AllowByDefault => "allow-by-default",
-                Policy::DenyByDefault => "deny-by-default",
-            }
-        }
-    }
-
-    impl WellKnown for Policy {
-        type Deserializer =
-            smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
-        const DE: Self::Deserializer = smart_config::de::Serde;
-    }
-
-    /// Network configuration
-    #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
-    pub struct Network {
-        /// Network policy: `"allow-always"` (default), `"deny-always"`,
-        /// `"allow-by-default"`, or `"deny-by-default"`.
-        #[config(default)]
-        pub policy: Policy,
-        /// Named network rules (allow/deny patterns).
-        #[config(default)]
-        pub rules: BTreeMap<String, NetworkRule>,
-        /// Named HTTP middleware scripts.
-        #[config(default)]
-        pub middleware: BTreeMap<String, MiddlewareRule>,
-        /// Port forwarding from guest to host.
-        #[config(default)]
-        pub ports: BTreeMap<String, PortForward>,
-        /// Unix socket forwarding from host to guest.
-        #[config(default)]
-        pub sockets: BTreeMap<String, SocketForward>,
-    }
-
-    /// Forward a host Unix socket into the guest container.
-    ///
-    /// The `host` field uses `source:target` syntax (host path : guest path),
-    /// or a plain path if the same on both sides.
-    ///
-    /// ```toml
-    /// [network.sockets.docker]
-    /// host = "~/.docker/run/docker.sock:/var/run/docker.sock"
-    /// ```
-    #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
-    pub struct SocketForward {
-        /// Enable/disable this socket forward
-        #[config(default_t = true)]
-        pub enabled: bool,
-        /// Socket path mapping: `"source:target"` (host:guest) or plain path
-        /// (same on both sides).
-        pub host: SocketMapping,
-    }
-
-    impl WellKnown for SocketForward {
-        type Deserializer = de::Nested<SocketForward>;
-        const DE: Self::Deserializer = de::nested();
-    }
-
-    /// A socket path mapping: host path to guest path.
-    ///
-    /// Accepts either a plain path (same on both sides: `"/var/run/docker.sock"`)
-    /// or a `"source:target"` string (e.g. `"~/.docker/run/docker.sock:/var/run/docker.sock"`).
-    ///
-    /// The delimiter is the **last** colon, so paths with colons in early
-    /// components are supported (though uncommon for Unix sockets).
-    #[derive(Debug, Clone)]
-    pub struct SocketMapping {
-        pub source: String,
-        pub target: String,
-    }
-
-    impl serde::Serialize for SocketMapping {
-        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-            if self.source == self.target {
-                s.serialize_str(&self.source)
-            } else {
-                s.serialize_str(&format!("{}:{}", self.source, self.target))
-            }
-        }
-    }
-
-    impl<'de> serde::Deserialize<'de> for SocketMapping {
-        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-            let s = String::deserialize(d)?;
-            // Split on the last colon that is followed by a `/` or `~` (path start).
-            // This avoids splitting on colons that are part of directory names.
-            if let Some(pos) = s.rfind(':') {
-                let target = &s[pos + 1..];
-                if target.starts_with('/') || target.starts_with('~') {
-                    return Ok(SocketMapping {
-                        source: s[..pos].to_string(),
-                        target: target.to_string(),
-                    });
-                }
-            }
-            Ok(SocketMapping {
-                source: s.clone(),
-                target: s,
+    /// The image that the user files set (`vm.image`), if any: the
+    /// highest user file with one wins.
+    pub fn user_image(&self) -> Option<UserImage> {
+        self.user.iter().rev().find_map(|layer| {
+            // `image = "<ref>"`, or `[vm.image]` with its `name`.
+            let value = layer.value.pointer("/vm/image")?;
+            let name = value.as_str().or_else(|| value.get("name")?.as_str())?;
+            Some(UserImage {
+                name: name.to_string(),
+                value: value.clone(),
             })
+        })
+    }
+
+    /// The project config the setup wizard generated, if
+    /// [`Self::with_generated_project`] added one; it still needs saving
+    /// (see [`crate::start::wizard::save_config`]).
+    pub fn generated_project(&self) -> Option<&GeneratedConfig> {
+        self.generated.as_ref()
+    }
+
+    /// Merge all layers in precedence order, each over the config values
+    /// of its packs, apply `overrides`, and parse and validate the result.
+    ///
+    /// The names of the `presets` lists must be released names (see
+    /// [`legacy_presets::validate_names`]). Each layer's `[packs]` table
+    /// is read on its own and the entries merge per pack (see
+    /// [`pack_entries`]). The config values of the enabled packs (a
+    /// `config.lua` runs here, on every resolve) must not conflict, across
+    /// all layers (see [`pack_conflicts`]). The documents of the `presets`
+    /// lists apply first, then each layer (see [`merge_config`]): the
+    /// config values of the packs whose highest entry is in that layer,
+    /// then the layer's own values (without `packs` or `presets`). So a
+    /// pack overrides the layers below its highest entry (a project pack
+    /// overrides the user files), and the layer of that entry overrides
+    /// the pack.
+    pub async fn resolve(
+        &self,
+        packs: &PackManager,
+        overrides: &ConfigOverrides,
+    ) -> anyhow::Result<ResolvedConfig> {
+        let known = packs.builtin();
+        let legacy_base = self.legacy_base(&known)?;
+        let mut problems = Vec::new();
+        let mut entries = Vec::new();
+        let mut plain_layers = Vec::new();
+        for layer in self.layers() {
+            tracing::trace!("config: reading {}", layer.origin);
+            let mut value = layer.value.clone();
+            let layer_entries =
+                pack_entries::read_layer_packs(&layer.origin, &mut value, &known, &mut problems);
+            let pack_names = layer_entries.iter().map(|e| e.name.clone()).collect();
+            entries.extend(layer_entries);
+            plain_layers.push(PlainLayer { value, pack_names });
         }
+        let configured = pack_entries::configure_packs(entries, packs, &known, &mut problems).await;
+        if !problems.is_empty() {
+            anyhow::bail!("invalid configuration\n{}", problems.join("\n"));
+        }
+        let pack_values = pack_configs(&configured).map_err(|problems| {
+            anyhow::anyhow!("invalid configuration\n{}", problems.join("\n"))
+        })?;
+        let mut values = merge_config(legacy_base, plain_layers, &configured, pack_values)?;
+        if let Some(policy) = overrides.network_policy {
+            tracing::info!("network policy overridden by --network: {}", policy.label());
+            values.network.policy = policy;
+        }
+        Ok(ResolvedConfig {
+            values,
+            packs: configured,
+        })
     }
 
-    impl WellKnown for SocketMapping {
-        type Deserializer =
-            smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
-        const DE: Self::Deserializer = smart_config::de::Serde;
+    /// The layers, lowest precedence first.
+    fn layers(&self) -> impl Iterator<Item = &Layer> {
+        self.user.iter().chain(&self.local).chain(&self.project)
     }
 
-    /// Named port forward group — forwards TCP ports between host and guest
-    /// in either direction.
-    #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
-    pub struct PortForward {
-        /// Enable/disable this port forward group
-        #[config(default_t = true)]
-        pub enabled: bool,
-        /// Guest → host forwards. Each entry is either a plain port number
-        /// (same port on both sides) or a `"host:guest"` string. A guest
-        /// process connecting to `localhost:<guest_port>` reaches the
-        /// listed host port.
-        #[config(default)]
-        pub host: Vec<PortMapping>,
-        /// Host → guest forwards. Each entry is either a plain port number
-        /// (same port on both sides) or a `"host:guest"` string. A host
-        /// process connecting to `127.0.0.1:<host_port>` reaches the
-        /// listed guest port. Host-originated traffic bypasses all rules,
-        /// policy, and middleware — the host is trusted. Listeners bind
-        /// on `127.0.0.1` only.
-        #[config(default)]
-        pub guest: Vec<PortMapping>,
-    }
-
-    impl WellKnown for PortForward {
-        type Deserializer = de::Nested<PortForward>;
-        const DE: Self::Deserializer = de::nested();
-    }
-
-    /// A port mapping between a host port and a guest port.
-    ///
-    /// Accepts either a plain integer (same port both sides: `8080`)
-    /// or a `"host:guest"` string (e.g. `"9000:8081"`).
-    ///
-    /// The left side of the colon is always the host port and the right
-    /// side is always the guest port, regardless of which list it appears
-    /// in. The direction of the forward is determined by the list:
-    /// - `[network.ports.<name>].host` forwards guest → host (the guest
-    ///   side originates the connection, reaching the host port).
-    /// - `[network.ports.<name>].guest` forwards host → guest (the host
-    ///   side originates the connection, reaching the guest port).
-    #[derive(Debug, Clone, Copy)]
-    pub struct PortMapping {
-        pub host: u16,
-        pub guest: u16,
-    }
-
-    impl PortMapping {
-        pub fn same(port: u16) -> Self {
-            Self {
-                host: port,
-                guest: port,
+    /// The documents of the `presets` lists of all layers, merged (see
+    /// [`legacy_presets::expand`]); they apply beneath every layer and its
+    /// packs. A name that is not a released one is an error; `known` (the
+    /// built-in packs) gives its hint.
+    fn legacy_base(&self, known: &[Pack]) -> anyhow::Result<serde_json::Value> {
+        for layer in self.layers() {
+            if let Some(names) = &layer.legacy_presets {
+                legacy_presets::validate_names(&layer.origin, names, known)?;
             }
         }
+        let names = self
+            .layers()
+            .filter_map(|layer| layer.legacy_presets.as_ref())
+            .flatten()
+            .map(String::as_str);
+        legacy_presets::expand(names)
     }
 
-    impl serde::Serialize for PortMapping {
-        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-            if self.host == self.guest {
-                s.serialize_u16(self.host)
-            } else {
-                s.serialize_str(&format!("{}:{}", self.host, self.guest))
+    /// The config of `user`, `local` and `project` (each lowest precedence
+    /// first), with no generated project config yet.
+    fn new(user: Vec<Layer>, local: Option<Layer>, project: Vec<Layer>) -> Self {
+        Self {
+            user,
+            local,
+            project,
+            generated: None,
+        }
+    }
+
+    /// Load the config files of `project_root` with `home` as the home
+    /// directory (see [`files::discover_in`]).
+    fn load_from(home: &Path, project_root: &Path) -> anyhow::Result<Self> {
+        let files = files::discover_in(home, project_root)?;
+        Ok(Self::new(
+            files
+                .user
+                .into_iter()
+                .map(Layer::from_user_file)
+                .collect::<anyhow::Result<_>>()?,
+            files.local.map(Layer::from_file).transpose()?,
+            files
+                .project
+                .into_iter()
+                .map(Layer::from_file)
+                .collect::<anyhow::Result<_>>()?,
+        ))
+    }
+
+    /// The config of in-memory files, each `(origin, value)`, as if they
+    /// were loaded from the user, local and project slots.
+    #[cfg(test)]
+    pub(crate) fn from_values(
+        user: Vec<(&str, serde_json::Value)>,
+        local: Option<(&str, serde_json::Value)>,
+        project: Vec<(&str, serde_json::Value)>,
+    ) -> anyhow::Result<Self> {
+        let layers = |files: Vec<(&str, serde_json::Value)>| {
+            files
+                .into_iter()
+                .map(|(origin, value)| Layer::new(origin, value))
+                .collect::<anyhow::Result<Vec<_>>>()
+        };
+        Ok(Self::new(
+            layers(user)?,
+            local
+                .map(|(origin, value)| Layer::new(origin, value))
+                .transpose()?,
+            layers(project)?,
+        ))
+    }
+}
+
+/// The image of the user files (see [`LayeredConfig::user_image`]).
+#[derive(Clone)]
+pub struct UserImage {
+    /// The image reference (`image`, or the `name` of `[vm.image]`).
+    pub name: String,
+    /// `vm.image` as the file has it.
+    pub value: serde_json::Value,
+}
+
+/// A resolved config and the enabled packs.
+pub struct ResolvedConfig {
+    /// Everything applied (the `--network` policy too, when it is set).
+    pub values: ConfigValues,
+    /// Every enabled `[packs]` entry, in pack order.
+    pub packs: Vec<ConfiguredPack>,
+}
+
+impl ResolvedConfig {
+    /// The config of the install boot (see
+    /// [`crate::packs::install::phase::install_config`]).
+    pub(crate) fn install_config(&self) -> anyhow::Result<ConfigValues> {
+        crate::packs::install::phase::install_config(self.values.clone())
+    }
+}
+
+/// The config values of `packs` (in their order), each env-normalized
+/// (see [`normalize_env`]). A pack whose config fails (its `config.lua`)
+/// and a value that two packs set differently (see [`pack_conflicts`])
+/// are problems, one line each.
+fn pack_configs(packs: &[ConfiguredPack]) -> Result<Vec<serde_json::Value>, Vec<String>> {
+    let mut docs = Vec::new();
+    let mut problems = Vec::new();
+    for pack in packs {
+        let metadata = pack.metadata();
+        tracing::debug!(
+            "config: applying pack `{}` version {}",
+            metadata.name,
+            metadata.version
+        );
+        match pack.config_values() {
+            Ok(mut value) => {
+                normalize_env(&mut value);
+                docs.push((metadata.name.clone(), value));
             }
+            Err(e) => problems.push(format!("* {e:#}")),
         }
     }
+    if !problems.is_empty() {
+        return Err(problems);
+    }
+    let conflicts = pack_conflicts(&docs);
+    if !conflicts.is_empty() {
+        return Err(conflicts
+            .into_iter()
+            .map(|conflict| format!("* {conflict}"))
+            .collect());
+    }
+    Ok(docs.into_iter().map(|(_, value)| value).collect())
+}
 
-    impl<'de> serde::Deserialize<'de> for PortMapping {
-        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-            struct Visitor;
-            impl serde::de::Visitor<'_> for Visitor {
-                type Value = PortMapping;
+/// One layer's part of [`merge_config`]: its own values (without `packs`
+/// and `presets`), and the names of the packs that its `[packs]` table
+/// has entries for.
+struct PlainLayer {
+    value: serde_json::Value,
+    pack_names: Vec<String>,
+}
 
-                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                    f.write_str("a port number or \"host:guest\" string")
-                }
-
-                fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<PortMapping, E> {
-                    let port = u16::try_from(v).map_err(serde::de::Error::custom)?;
-                    Ok(PortMapping::same(port))
-                }
-
-                fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<PortMapping, E> {
-                    let port = u16::try_from(v).map_err(serde::de::Error::custom)?;
-                    Ok(PortMapping::same(port))
-                }
-
-                fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<PortMapping, E> {
-                    let (host, guest) = v
-                        .split_once(':')
-                        .ok_or_else(|| serde::de::Error::custom("expected \"host:guest\""))?;
-                    let host: u16 = host.parse().map_err(serde::de::Error::custom)?;
-                    let guest: u16 = guest.parse().map_err(serde::de::Error::custom)?;
-                    Ok(PortMapping { host, guest })
-                }
-            }
-            d.deserialize_any(Visitor)
+/// Merge `legacy_base` (the documents of the `presets` lists), then each
+/// of `layers` (lowest precedence first): the config values of the packs
+/// whose highest entry is in that layer, then the layer's own values.
+/// `pack_values` are the config values of `packs`, in the same order.
+/// Parse and validate the result.
+fn merge_config(
+    legacy_base: serde_json::Value,
+    layers: Vec<PlainLayer>,
+    packs: &[ConfiguredPack],
+    pack_values: Vec<serde_json::Value>,
+) -> anyhow::Result<ConfigValues> {
+    // Every configured pack has an entry, so it has a layer.
+    let mut layer_packs = vec![Vec::new(); layers.len()];
+    for (pack, value) in packs.iter().zip(pack_values) {
+        let name = &pack.metadata().name;
+        if let Some(top) = layers.iter().rposition(|l| l.pack_names.contains(name)) {
+            layer_packs[top].push(value);
         }
     }
-
-    impl WellKnown for PortMapping {
-        type Deserializer = smart_config::de::Serde<
-            {
-                smart_config::metadata::BasicTypes::INTEGER
-                    .or(smart_config::metadata::BasicTypes::STRING)
-                    .raw()
-            },
-        >;
-        const DE: Self::Deserializer = smart_config::de::Serde;
-    }
-
-    /// A named network rule — allow/deny patterns for host:port targets.
-    ///
-    /// Target syntax: `host[:port]` — omitted port means all ports.
-    /// Both host and port support `*` wildcards. A port that is neither a
-    /// number nor `*` (`:8O80`, `:https`, a trailing space) is a
-    /// configuration error, never a wildcard.
-    ///
-    /// `deny` is checked first and wins unconditionally. If no rule matches,
-    /// the connection follows the network `policy`.
-    ///
-    /// With `passthrough = true`, `allow` targets skip TLS/HTTP interception
-    /// entirely — the connection is a pure TCP relay. Required for protocols
-    /// that aren't HTTP and whose first bytes from the client can't be
-    /// sniffed (e.g. Postgres, whose 8-byte SSLRequest would deadlock the
-    /// HTTP detector). Incompatible with middleware on the same target; a
-    /// conflict is reported at startup.
-    #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
-    pub struct NetworkRule {
-        /// Enable/disable rule
-        #[config(default_t = true)]
-        pub enabled: bool,
-        /// Hosts/ports to allow.
-        #[config(default)]
-        pub allow: Vec<String>,
-        /// Hosts/ports to deny unconditionally (deny wins over allow).
-        #[config(default)]
-        pub deny: Vec<String>,
-        /// When true, allowed targets are relayed as plain TCP without any
-        /// TLS or HTTP interception. Middleware on the same target is an
-        /// error.
-        #[config(default)]
-        pub passthrough: bool,
-        /// Names of masked `[env]` variables whose real value is substituted
-        /// into HTTP request headers (and masked back in response headers)
-        /// for this rule's allow targets. Each name must be defined in
-        /// `[env]` with `mask = true`. Incompatible with `passthrough`.
-        #[config(default)]
-        pub inject: Vec<String>,
-    }
-
-    impl WellKnown for NetworkRule {
-        type Deserializer = de::Nested<NetworkRule>;
-        const DE: Self::Deserializer = de::nested();
-    }
-
-    /// HTTP middleware script with target patterns.
-    ///
-    /// Middleware is applied to allowed connections whose host:port matches
-    /// any entry in `target`. Triggers TLS interception for HTTPS traffic.
-    #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
-    pub struct MiddlewareRule {
-        /// Enable/disable this middleware
-        #[config(default_t = true)]
-        pub enabled: bool,
-        /// Host:port patterns where this middleware applies (same syntax as
-        /// rule allow/deny).
-        #[config(default)]
-        pub target: Vec<String>,
-        /// Variables exposed to the script as the `env` global table.
-        /// Values are subst templates (e.g. `"${HOST_VAR}"`) expanded from
-        /// the host environment. Any template referencing an undefined host
-        /// variable resolves to nil in the script.
-        #[config(default)]
-        pub env: BTreeMap<String, String>,
-        /// Inline Lua script
-        pub script: String,
-    }
-
-    impl WellKnown for MiddlewareRule {
-        type Deserializer = de::Nested<MiddlewareRule>;
-        const DE: Self::Deserializer = de::nested();
-    }
-
-    /// Mount point configuration.
-    #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
-    pub struct Mount {
-        /// Enable/disable mount
-        #[config(default_t = true)]
-        pub enabled: bool,
-        /// Source path in the host
-        pub source: String,
-        /// Target path in the VM container
-        pub target: String,
-        #[config(default_t = false)]
-        pub read_only: bool,
-        /// What to do when the source path doesn't exist.
-        #[config(default_t = MissingAction::Fail)]
-        pub missing: MissingAction,
-        /// Unix permissions for created dirs/files (octal string, e.g. "755").
-        /// Default: "755" for directories, "644" for files.
-        #[config(default)]
-        pub create_mode: Option<String>,
-        /// Initial content written when `missing = "create-file"` creates the file.
-        #[config(default)]
-        pub file_content: Option<String>,
-    }
-
-    #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-    #[serde(rename_all = "kebab-case")]
-    pub enum MissingAction {
-        /// Error out if the source doesn't exist (default).
-        Fail,
-        /// Skip the mount with a warning.
-        Warn,
-        /// Skip the mount silently.
-        Ignore,
-        /// Create the directory and mount it.
-        CreateDir,
-        /// Create the file (with optional content) and mount it.
-        CreateFile,
-    }
-
-    /// VM disk image configuration — sparse raw disk with ext4
-    #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
-    pub struct Disk {
-        /// Disk image size (e.g. "20 GB", "512 MB"). Default 10 GB.
-        #[serde(serialize_with = "ser_byte_size")]
-        #[config(default_t = ByteSize(10 * 1024 * 1024 * 1024))]
-        pub size: ByteSize,
-        /// Container paths to bind-mount from the cache volume
-        #[config(default)]
-        pub cache: BTreeMap<String, CacheMount>,
-    }
-
-    #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
-    pub struct CacheMount {
-        /// Enable/disable mount
-        #[config(default_t = true)]
-        pub enabled: bool,
-        /// One or more container paths to back with persistent cache storage
-        pub paths: Vec<String>,
-    }
-
-    /// Clipboard bridge configuration (`[clipboard]`).
-    ///
-    /// Each direction is granted separately and both default to off. The
-    /// host never passes the capability into the guest for a disabled
-    /// direction, so a compromised sandbox has nothing to invoke — the
-    /// booleans are a capability grant, not a guest-side policy check.
-    #[derive(Debug, serde::Serialize, DescribeConfig, DeserializeConfig)]
-    pub struct Clipboard {
-        /// Let the sandbox write to the host clipboard. The risk here is
-        /// content rather than volume: text copied out of the sandbox can
-        /// later be pasted into a shell.
-        #[config(default_t = false)]
-        pub copy: bool,
-        /// Largest single guest → host transfer (e.g. "2 MB"). Enforced on
-        /// the host, and again by the guest daemon so an oversized write is
-        /// never buffered. Bounds memory use, not what the content can do.
-        #[serde(serialize_with = "ser_byte_size")]
-        #[config(default_t = ByteSize(1024 * 1024))]
-        pub copy_limit: ByteSize,
-        /// Let the sandbox read the host clipboard. This is a guest-*initiated*
-        /// read with no user interaction, so sandboxed code can take whatever
-        /// was last copied — passwords, tokens. Leave off unless needed.
-        #[config(default_t = false)]
-        pub paste: bool,
-    }
-
-    impl WellKnown for MissingAction {
-        type Deserializer =
-            smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
-        const DE: Self::Deserializer = smart_config::de::Serde;
-    }
-
-    impl WellKnown for Mount {
-        type Deserializer = de::Nested<Mount>;
-        const DE: Self::Deserializer = de::nested();
-    }
-
-    impl WellKnown for CacheMount {
-        type Deserializer = de::Nested<CacheMount>;
-        const DE: Self::Deserializer = de::nested();
-    }
-
-    /// Restart policy for a daemon process.
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    #[serde(rename_all = "kebab-case")]
-    pub enum RestartPolicy {
-        /// Restart on any exit until `max-restarts` is reached (default).
-        #[default]
-        Always,
-        /// Restart only on non-zero exit; stop the loop on clean exit.
-        OnFailure,
-    }
-
-    impl WellKnown for RestartPolicy {
-        type Deserializer =
-            smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
-        const DE: Self::Deserializer = smart_config::de::Serde;
-    }
-
-    /// Unix signal used to ask a daemon to shut down gracefully.
-    ///
-    /// Accepts the canonical name (e.g. `"SIGTERM"`) — unknown names fail
-    /// config parse. Numeric signal numbers are not accepted, to avoid
-    /// cross-platform portability traps.
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-    pub enum Signal {
-        #[default]
-        Term,
-        Int,
-        Hup,
-        Quit,
-        Usr1,
-        Usr2,
-        Kill,
-    }
-
-    impl Signal {
-        /// Linux signal number (architecture-independent for these signals).
-        #[allow(dead_code)] // used once the host wires daemons into capnp start()
-        pub fn as_number(self) -> i32 {
-            match self {
-                Signal::Hup => 1,
-                Signal::Int => 2,
-                Signal::Quit => 3,
-                Signal::Kill => 9,
-                Signal::Usr1 => 10,
-                Signal::Term => 15,
-                Signal::Usr2 => 12,
-            }
+    let mut merged = legacy_base;
+    for (layer, pack_values) in layers.into_iter().zip(layer_packs) {
+        for value in pack_values {
+            merged = merge_json(merged, value);
         }
+        merged = merge_json(merged, layer.value);
     }
-
-    impl std::fmt::Display for Signal {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            let s = match self {
-                Signal::Term => "SIGTERM",
-                Signal::Int => "SIGINT",
-                Signal::Hup => "SIGHUP",
-                Signal::Quit => "SIGQUIT",
-                Signal::Usr1 => "SIGUSR1",
-                Signal::Usr2 => "SIGUSR2",
-                Signal::Kill => "SIGKILL",
-            };
-            f.write_str(s)
-        }
-    }
-
-    impl serde::Serialize for Signal {
-        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-            s.serialize_str(&self.to_string())
-        }
-    }
-
-    impl<'de> serde::Deserialize<'de> for Signal {
-        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-            let s = String::deserialize(d)?;
-            match s.as_str() {
-                "SIGTERM" => Ok(Signal::Term),
-                "SIGINT" => Ok(Signal::Int),
-                "SIGHUP" => Ok(Signal::Hup),
-                "SIGQUIT" => Ok(Signal::Quit),
-                "SIGUSR1" => Ok(Signal::Usr1),
-                "SIGUSR2" => Ok(Signal::Usr2),
-                "SIGKILL" => Ok(Signal::Kill),
-                other => Err(serde::de::Error::custom(format!(
-                    "unknown signal '{other}' — expected one of SIGTERM, SIGINT, SIGHUP, \
-                     SIGQUIT, SIGUSR1, SIGUSR2, SIGKILL"
-                ))),
-            }
-        }
-    }
-
-    impl WellKnown for Signal {
-        type Deserializer =
-            smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
-        const DE: Self::Deserializer = smart_config::de::Serde;
-    }
-
-    /// Sidecar process declared under `[daemons.<name>]`.
-    ///
-    /// Daemons are spawned in parallel with the main shell. They are
-    /// restarted per `restart`/`max-restarts`, and on sandbox shutdown
-    /// are sent `signal`, then SIGKILL'd after `timeout` seconds.
-    #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
-    pub struct Daemon {
-        /// Enable/disable this daemon
-        #[config(default_t = true)]
-        pub enabled: bool,
-        /// Argv for the daemon process
-        pub command: Vec<String>,
-        /// Working directory inside the container (default "/")
-        #[config(default_t = String::from("/"))]
-        pub cwd: String,
-        /// Signal used for graceful shutdown (default SIGTERM).
-        #[config(default)]
-        pub signal: Signal,
-        /// Grace period in seconds after sending `signal` before SIGKILL
-        /// is sent. `0` means wait forever.
-        #[config(default_t = 10)]
-        pub timeout: u32,
-        /// Restart policy: `"always"` (default) or `"on-failure"`.
-        #[config(default)]
-        pub restart: RestartPolicy,
-        /// Maximum number of restarts after the initial launch. `0` means
-        /// no cap.
-        #[config(default_t = 10)]
-        pub max_restarts: u32,
-        /// Apply process hardening (namespace isolation, no-new-privileges).
-        /// Defaults to true; can be set to false even when the main shell
-        /// is hardened (e.g. to run `dockerd`).
-        #[config(default_t = true)]
-        pub harden: bool,
-        /// Environment variables for the daemon process. Values support
-        /// `${VAR}` substitution from the host environment.
-        #[config(default)]
-        pub env: BTreeMap<String, String>,
-    }
-
-    impl WellKnown for Daemon {
-        type Deserializer = de::Nested<Daemon>;
-        const DE: Self::Deserializer = de::nested();
-    }
-
-    /// Hide subdirectories of the project mount from the in-VM
-    /// sandbox by overlaying an empty directory on top of them.
-    ///
-    /// Each `paths` entry is interpreted relative to the project
-    /// root and must be a plain relative path — leading `/` or `~`
-    /// are rejected. The masked tree is fully recreated on every
-    /// VM start, so the source-of-truth here is the config, not the
-    /// guest's prior state.
-    #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
-    pub struct Mask {
-        /// Enable/disable this mask.
-        #[config(default_t = true)]
-        pub enabled: bool,
-        /// Project-relative paths to mask. Must not start with `/`
-        /// or `~`, must not contain `..`.
-        pub paths: Vec<String>,
-    }
-
-    impl WellKnown for Mask {
-        type Deserializer = de::Nested<Mask>;
-        const DE: Self::Deserializer = de::nested();
-    }
+    tracing::trace!("config: merged result: {merged}");
+    config_values::parse(merged)
 }

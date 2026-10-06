@@ -13,6 +13,9 @@ use tracing::{debug, info, warn};
 
 use crate::init::MountConfig;
 
+/// `airlock_common::BRIDGE_DIR`, relative to the container rootfs.
+const BRIDGE_REL: &str = "run/airlock";
+
 /// Mount all filesystems that the container process needs inside its rootfs.
 pub(super) fn setup(mounts: &MountConfig, nested_virt: bool) -> anyhow::Result<()> {
     let root = "/mnt/overlay/rootfs";
@@ -123,6 +126,28 @@ pub(super) fn setup(mounts: &MountConfig, nested_virt: bool) -> anyhow::Result<(
         "mode=1777",
     )?;
 
+    // /run/airlock — a per-boot tmpfs for host-bridge FIFOs and shims
+    // (clipboard, browser), so nothing a bridge installs persists in the
+    // overlay upper layer. That layer is guest-controlled: a planted
+    // symlink at /run or /run/airlock would make this mount (which runs
+    // outside the chroot) land on a path of the guest's choosing, so a
+    // symlink at either one skips the tmpfs. The bridges still work then:
+    // they resolve their paths with chroot semantics (`bridge::in_rootfs`),
+    // their files just persist in the upper layer as before this tmpfs.
+    if let Err(e) = refuse_symlinks(Path::new(root), BRIDGE_REL) {
+        warn!("/run/airlock tmpfs skipped: {e:#}");
+    } else {
+        let bridge = format!("{root}/{BRIDGE_REL}");
+        std::fs::create_dir_all(&bridge)?;
+        super::mount::fs(
+            "airlock-run",
+            &bridge,
+            "tmpfs",
+            libc::MS_NOSUID | libc::MS_NODEV,
+            "mode=0755",
+        )?;
+    }
+
     // /airlock/disk — ext4 project disk (or tmpfs fallback) exposed directly so
     // container workloads that need a non-overlayfs filesystem (e.g. Docker's
     // overlayfs snapshotter) can bind-mount a subdirectory as needed.
@@ -164,6 +189,27 @@ pub(super) fn setup(mounts: &MountConfig, nested_virt: bool) -> anyhow::Result<(
     Ok(())
 }
 
+/// Fail if any existing prefix of `rel` below `root` is a symlink.
+///
+/// Uses `symlink_metadata` on the raw path, so a symlink is detected rather
+/// than followed. Missing components are fine: the caller creates them as
+/// plain directories.
+fn refuse_symlinks(root: &Path, rel: &str) -> anyhow::Result<()> {
+    let mut path = root.to_path_buf();
+    for component in Path::new(rel).components() {
+        path.push(component);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                anyhow::bail!("refusing to mount over symlink {}", path.display());
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => anyhow::bail!("stat {}: {e}", path.display()),
+        }
+    }
+    Ok(())
+}
+
 /// Expose a single device node from the VM's `/dev` into the container's
 /// `/dev` by bind-mounting it onto a freshly created file. This mirrors what
 /// `mknod` would do without needing to know the node's major/minor, and keeps
@@ -179,4 +225,63 @@ fn bind_dev_node(dev_root: &str, name: &str) -> anyhow::Result<()> {
     std::fs::File::create(&dst)?;
     super::mount::bind(&src, &dst, false)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh temp root per test, removed on drop.
+    struct TempRoot(std::path::PathBuf);
+
+    impl TempRoot {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("airlock-container-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn plain_or_missing_dirs_are_accepted() {
+        let root = TempRoot::new("plain");
+        assert!(refuse_symlinks(&root.0, BRIDGE_REL).is_ok());
+        std::fs::create_dir_all(root.0.join("run")).unwrap();
+        assert!(refuse_symlinks(&root.0, BRIDGE_REL).is_ok());
+        std::fs::create_dir_all(root.0.join(BRIDGE_REL)).unwrap();
+        assert!(refuse_symlinks(&root.0, BRIDGE_REL).is_ok());
+    }
+
+    #[test]
+    fn symlinked_run_is_refused() {
+        let root = TempRoot::new("run-link");
+        std::fs::create_dir_all(root.0.join("elsewhere/airlock")).unwrap();
+        std::os::unix::fs::symlink("elsewhere", root.0.join("run")).unwrap();
+        assert!(refuse_symlinks(&root.0, BRIDGE_REL).is_err());
+    }
+
+    #[test]
+    fn symlinked_run_airlock_is_refused() {
+        let root = TempRoot::new("airlock-link");
+        std::fs::create_dir_all(root.0.join("run")).unwrap();
+        std::os::unix::fs::symlink("../", root.0.join(BRIDGE_REL)).unwrap();
+        assert!(refuse_symlinks(&root.0, BRIDGE_REL).is_err());
+    }
+
+    /// A dangling symlink is still a symlink: the mount would follow it.
+    #[test]
+    fn dangling_symlink_is_refused() {
+        let root = TempRoot::new("dangling");
+        std::fs::create_dir_all(root.0.join("run")).unwrap();
+        std::os::unix::fs::symlink("/nowhere", root.0.join(BRIDGE_REL)).unwrap();
+        assert!(refuse_symlinks(&root.0, BRIDGE_REL).is_err());
+    }
 }

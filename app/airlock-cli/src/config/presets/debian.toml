@@ -6,6 +6,7 @@ allow = [
     "security.debian.org",
     "archive.ubuntu.com",
     "security.ubuntu.com",
+    "ports.ubuntu.com",
     "ppa.launchpad.net",
     "keyserver.ubuntu.com",
 ]

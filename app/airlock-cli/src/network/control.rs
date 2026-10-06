@@ -10,7 +10,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use super::NetworkState;
-use crate::config::config::Policy;
+use crate::config::config_values::Policy;
 
 /// Clonable, `Send + Sync` handle the TUI uses to read and mutate runtime
 /// network state. All methods hide the lock.

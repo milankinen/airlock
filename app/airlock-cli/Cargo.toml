@@ -29,13 +29,14 @@ capnp-rpc = { workspace = true }
 clap = { workspace = true }
 console = { workspace = true }
 crossterm = { workspace = true }
-dialoguer = { workspace = true }
 dirs = { workspace = true }
 airlock-common = { workspace = true }
 airlock-monitor = { workspace = true }
 flate2 = { workspace = true }
 futures = { workspace = true }
+heed = { workspace = true }
 hex = { workspace = true }
+hmac = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
@@ -69,8 +70,10 @@ tokio = { workspace = true, features = ["full"] }
 tokio-rustls = { workspace = true }
 tokio-util = { workspace = true }
 toml = { workspace = true }
+toml_edit = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+url = { workspace = true }
 
 [dev-dependencies]
 axum = { workspace = true }

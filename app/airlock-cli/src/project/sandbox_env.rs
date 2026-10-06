@@ -19,7 +19,7 @@ use rand::rngs::ChaCha20Rng;
 use rand::{Rng, SeedableRng};
 use sha2::{Digest, Sha256};
 
-use crate::config::config::EnvVar;
+use crate::config::config_values::EnvVar;
 use crate::vault::Vault;
 
 /// Shortest value a network rule may inject. A surrogate this short
@@ -55,6 +55,17 @@ pub struct MaskedSecret {
     pub surrogate: String,
 }
 
+impl MaskedSecret {
+    /// The masked entry `name` with the value `real` and its surrogate.
+    pub fn new(name: &str, real: String) -> Self {
+        Self {
+            name: name.to_string(),
+            surrogate: surrogate_for(name, &real),
+            real,
+        }
+    }
+}
+
 // Manual Debug so a stray `{:?}` on a target or connection never prints the
 // real value (or the surrogate, which is as good as the real one once the
 // proxy is willing to swap it).
@@ -71,6 +82,7 @@ impl fmt::Debug for MaskedSecret {
 ///
 /// No `Debug`: the guest values include substituted secrets for unmasked
 /// entries, and the masked map holds the real ones.
+#[derive(Clone)]
 pub struct SandboxEnv {
     /// Every `[env]` entry in config order with the guest-visible value.
     guest: Vec<(String, String)>,
@@ -90,16 +102,9 @@ impl SandboxEnv {
                 .subst(&entry.value)
                 .map_err(|e| EnvError::new(key, e))?;
             if entry.mask {
-                let surrogate = surrogate_for(key, &real);
-                guest.push((key.clone(), surrogate.clone()));
-                masked.insert(
-                    key.clone(),
-                    MaskedSecret {
-                        name: key.clone(),
-                        real,
-                        surrogate,
-                    },
-                );
+                let secret = MaskedSecret::new(key, real);
+                guest.push((key.clone(), secret.surrogate.clone()));
+                masked.insert(key.clone(), secret);
             } else {
                 guest.push((key.clone(), real));
             }

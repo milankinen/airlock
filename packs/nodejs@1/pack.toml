@@ -1,0 +1,17 @@
+label = "nodejs"
+description = "Node.js and npm through nvm"
+kind = "tool"
+
+[[args]]
+key = "node-version"
+type = "choice"
+description = "version"
+default = "lts"
+values = ["lts", "latest", "none"]
+other = true
+
+[[args]]
+key = "npm-installs"
+type = "bool"
+description = "allow npm"
+default = true

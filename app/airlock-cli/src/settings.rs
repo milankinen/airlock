@@ -1,8 +1,8 @@
 //! Application-wide user settings loaded from `~/.airlock/settings.*`.
 //!
-//! Resolved once at `main` and threaded into subcommands. Shares the
+//! Resolved once at `main` into the [`crate::context::Context`]. Shares the
 //! smart-config pipeline with the project-level `airlock.toml` loader
-//! (`crate::config::load_config`): same TOML/JSON/YAML auto-detect,
+//! (`crate::config::files`): same TOML/JSON/YAML auto-detect,
 //! same parse-error formatting. Missing file → defaults, which keeps
 //! `airlock` usable with zero configuration.
 
@@ -16,7 +16,7 @@ pub use keys::KeyList;
 use smart_config::{ConfigRepository, ConfigSchema, DescribeConfig, DeserializeConfig, Json};
 
 use crate::config::de::format_error;
-use crate::config::load_config::{EXTENSIONS, parse_file};
+use crate::config::files::{EXTENSIONS, parse_file};
 use crate::vault::VaultStorageType;
 
 /// All user-tunable settings. Add fields here; the default for each
@@ -61,6 +61,20 @@ pub struct MonitorSettings {
     pub keys: BTreeMap<String, KeyList>,
 }
 
+impl MonitorSettings {
+    /// Build the TUI settings: buffer caps, scrollback, and the key
+    /// bindings resolved over the defaults. Invalid key bindings are an
+    /// error listing every problem, one per line.
+    pub fn tui_settings(&self) -> Result<airlock_monitor::TuiSettings, String> {
+        Ok(airlock_monitor::TuiSettings {
+            max_http_requests: self.buffers.http,
+            max_tcp_connections: self.buffers.tcp,
+            scrollback: self.buffers.scrollback,
+            keys: keys::into_bindings(&self.keys)?,
+        })
+    }
+}
+
 /// Settings under the `[monitor.buffers]` table. Defaults match the
 /// values previously hard-coded in `airlock-monitor`.
 #[derive(Clone, Debug, DescribeConfig, DeserializeConfig)]
@@ -92,15 +106,11 @@ impl Settings {
         PathBuf::from("~/.airlock/settings.toml")
     }
 
-    /// Load settings from the first matching `~/.airlock/settings.*`
-    /// file. Missing file → defaults. Parse errors bubble up so the
-    /// user notices a malformed file instead of silently getting
-    /// defaults.
-    pub fn load() -> Result<Self> {
-        Self::load_from(&Self::dir()?)
-    }
-
-    fn load_from(dir: &Path) -> Result<Self> {
+    /// Load settings from the first matching `settings.*` file in the
+    /// airlock directory `dir` (`~/.airlock`, see [`Self::dir`]). Missing
+    /// file → defaults. Parse errors bubble up so the user notices a
+    /// malformed file instead of silently getting defaults.
+    pub fn load_from(dir: &Path) -> Result<Self> {
         // Same extension ordering (TOML → JSON → YAML) as the project
         // config loader. TOML wins if multiple files exist, so a stray
         // `settings.json` can't shadow the user's primary `settings.toml`.

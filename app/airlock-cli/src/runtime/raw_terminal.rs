@@ -5,8 +5,8 @@ use std::io::Write;
 
 use airlock_common::supervisor_capnp::stdin;
 
-use super::{PtySize, Runtime, SignalStream, Terminal};
-use crate::network::Network;
+use super::{OutputSink, PtySize, Runtime, SignalStream, Terminal};
+use crate::network::NetworkHandle;
 use crate::project::Project;
 use crate::rpc;
 
@@ -47,7 +47,7 @@ impl RawTerminalRuntime {
     /// get wrapped pastes; those that don't (BusyBox ash) get raw bytes and
     /// behave like any normal terminal — forcing it on would feed markers to
     /// shells that mis-parse them.
-    pub fn enter_raw_mode(&mut self) {
+    fn enter_raw_mode(&mut self) {
         if self.is_tty && self.guard.is_none() {
             let raw_mode_enabled = crossterm::terminal::enable_raw_mode().is_ok();
             let modify_other_keys =
@@ -57,6 +57,14 @@ impl RawTerminalRuntime {
                 modify_other_keys,
             });
         }
+    }
+
+    /// Enter raw mode (see [`enter_raw_mode`](Self::enter_raw_mode)) and
+    /// turn the runtime into the output sink that owns the terminal until
+    /// it drops.
+    pub fn into_terminal(mut self) -> RawTerminal {
+        self.enter_raw_mode();
+        RawTerminal { _guard: self.guard }
     }
 
     /// Create an RPC stdin server, optionally with resize events if TTY.
@@ -95,13 +103,12 @@ impl Runtime for RawTerminalRuntime {
     }
 
     fn launch(
-        mut self,
+        self,
         _project: &Project,
-        _network: &Network,
+        _network: &NetworkHandle,
         _supervisor: rpc::Supervisor,
     ) -> anyhow::Result<RawTerminal> {
-        self.enter_raw_mode();
-        Ok(RawTerminal { _guard: self.guard })
+        Ok(self.into_terminal())
     }
 }
 
@@ -112,7 +119,7 @@ pub struct RawTerminal {
     _guard: Option<TerminalGuard>,
 }
 
-impl Terminal for RawTerminal {
+impl OutputSink for RawTerminal {
     fn stdout(&mut self, bytes: &[u8]) {
         let _ = std::io::stdout().write_all(bytes);
         let _ = std::io::stdout().flush();
@@ -122,7 +129,9 @@ impl Terminal for RawTerminal {
         let _ = std::io::stderr().write_all(bytes);
         let _ = std::io::stderr().flush();
     }
+}
 
+impl Terminal for RawTerminal {
     fn exit(self, exit_code: i32) -> i32 {
         exit_code
     }

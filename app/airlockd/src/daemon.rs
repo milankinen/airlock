@@ -1,5 +1,5 @@
 //! Sidecar daemons — long-running processes declared under `[daemons.<name>]`
-//! that run in parallel with the main shell.
+//! that start during the boot, before any process is spawned.
 //!
 //! Each daemon runs inside its own local task that owns the restart loop,
 //! graceful shutdown, and stdout/stderr file handles. The shared
@@ -113,7 +113,7 @@ pub enum DaemonState {
 }
 
 /// Collection of running daemons. Lifetime matches the sandbox run: created
-/// once inside `Supervisor.start()`, dropped when the VM shuts down.
+/// once on `Supervisor.boot()`, dropped when the VM shuts down.
 pub struct DaemonSet {
     states: Rc<RefCell<BTreeMap<String, DaemonState>>>,
     stops: RefCell<BTreeMap<String, oneshot::Sender<()>>>,

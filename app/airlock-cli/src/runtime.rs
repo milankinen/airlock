@@ -1,39 +1,47 @@
-//! Runtime abstraction for `airlock start`: picks between the raw host
+//! Runtime abstraction for interactive sandboxes: picks between the raw host
 //! terminal (non-monitor) and the TUI monitor control panel, hiding the
-//! branching from `cmd_start`.
+//! branching from the session.
 //!
 //! A [`Runtime`] produces a supervisor [`stdin::Client`] plus a [`Terminal`]
-//! output sink. `cmd_start` then runs a single poll loop regardless of which
-//! variant is in use.
+//! output sink. The caller (`sandbox::interactive::run_interactive`) then
+//! drives the guest process into it with a single loop
+//! (`sandbox::io::drive`) regardless of which variant is in use.
 
 use std::pin::Pin;
 
 use airlock_common::supervisor_capnp::stdin;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 
+mod dump;
+mod host;
 mod monitor_terminal;
 mod raw_terminal;
 mod signals;
 
+pub use dump::DumpSink;
+pub use host::HostRuntime;
 pub use monitor_terminal::MonitorRuntime;
 pub use raw_terminal::RawTerminalRuntime;
 pub use signals::signals;
 
-use crate::network::Network;
+use crate::network::NetworkHandle;
 use crate::project::Project;
 use crate::rpc;
 
 pub type PtySize = Option<(u16, u16)>;
 pub type SignalStream = Pin<Box<dyn Stream<Item = i32>>>;
 
-/// Sink for guest process output and the exit code.
-pub trait Terminal {
+/// Sink for guest process output.
+pub trait OutputSink {
     /// Handle a chunk of bytes the guest wrote to stdout.
     fn stdout(&mut self, bytes: &[u8]);
 
     /// Handle a chunk of bytes the guest wrote to stderr.
     fn stderr(&mut self, bytes: &[u8]);
+}
 
+/// An [`OutputSink`] that owns the user's terminal and receives the exit code.
+pub trait Terminal: OutputSink {
     /// Finalize the terminal with the guest process's exit code. Returns the
     /// exit code airlock should exit with (the TUI may override the guest
     /// code if the user quit the UI).
@@ -55,11 +63,24 @@ pub trait Runtime {
     /// Consume the runtime and start the output sink. Also takes ownership of
     /// terminal raw mode — the raw runtime enables it here, the monitor
     /// runtime hands control to the TUI thread. Called after setup/downloads
-    /// so that Ctrl+C works during preparation.
+    /// so that Ctrl+C works during preparation. Tasks the runtime starts are
+    /// owned by the returned terminal and stop with it.
     fn launch(
         self,
         project: &Project,
-        network: &Network,
+        network: &NetworkHandle,
         supervisor: rpc::Supervisor,
     ) -> anyhow::Result<Self::Terminal>;
+}
+
+/// A task that forwards every signal from `signals` to `proc` until the
+/// stream ends. The caller owns the task (the session spawns it as a
+/// service; `airlock exec` runs it until the process exits).
+pub async fn forward_signals(mut signals: SignalStream, proc: rpc::Process) {
+    while let Some(signum) = signals.next().await {
+        tracing::debug!("forwarding signal {signum} to VM");
+        if let Err(e) = proc.signal(signum).await {
+            tracing::error!("signal forward failed: {e}");
+        }
+    }
 }

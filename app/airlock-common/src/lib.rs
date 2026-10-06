@@ -47,3 +47,18 @@ pub const CLI_SOCK_FILENAME: &str = "cli.sock";
 /// beyond this value in practice — TCP batching in the guest and
 /// host kernels already coalesces bytes before they reach a relay.
 pub const RELAY_CHUNK_SIZE: usize = 8 * 1024;
+
+/// Guest directory for host-bridge FIFOs and shims. A per-boot tmpfs, so
+/// nothing placed here outlives the VM or lands in the persisted rootfs.
+pub const BRIDGE_DIR: &str = "/run/airlock";
+
+/// Guest path of the browser shim. The host points `$BROWSER` at it for
+/// execs that may open a sign-in page.
+pub const BROWSER_SHIM: &str = "/run/airlock/bin/xdg-open";
+
+/// Guest FIFO the browser shim writes URLs to.
+pub const BROWSER_FIFO: &str = "/run/airlock/browser.open";
+
+/// Max bytes of one URL the guest forwards to the host browser. OAuth
+/// authorize URLs are well below this; the host applies the same cap.
+pub const BROWSER_URL_MAX: usize = 8192;

@@ -27,6 +27,13 @@ load helpers
     assert_output_contains "log-level"
 }
 
+@test "airlock start --help lists the pack install flags" {
+    run_airlock start --help
+    assert_success
+    assert_output_contains "--yes"
+    assert_output_not_contains "--reauth"
+}
+
 @test "airlock exec --help shows exec options" {
     run_airlock exec --help
     assert_success
@@ -70,4 +77,37 @@ load helpers
     run_airlock start --network allow-all
     assert_failure 2
     assert_output_contains "invalid value 'allow-all'"
+}
+
+@test "airlock start --help describes the install flags with packs" {
+    run_airlock start --help
+    assert_success
+    assert_output_contains "Answer every sandbox question with its default (re-create the sandbox)"
+    assert_output_not_contains "sign in"
+    assert_output_not_contains "tools"
+}
+
+@test "airlock start --help does not list the removed sign-in flags" {
+    run_airlock start --help
+    assert_success
+    assert_output_not_contains "--no-agent-signin"
+    assert_output_not_contains "--reauth"
+}
+
+@test "airlock start --reauth is not a flag" {
+    run_airlock start --reauth
+    assert_failure 2
+    assert_output_contains "unexpected argument '--reauth'"
+}
+
+@test "airlock start --no-agent-signin is not a flag" {
+    run_airlock start --no-agent-signin
+    assert_failure 2
+    assert_output_contains "unexpected argument '--no-agent-signin'"
+}
+
+@test "airlock agents is not a command" {
+    run_airlock agents
+    assert_failure 2
+    assert_output_contains "unrecognized subcommand 'agents'"
 }

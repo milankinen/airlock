@@ -211,7 +211,7 @@ fn spawn_socket_connection(path: &str, client_sink: tcp_sink::Client) -> tcp_sin
 // same list one level up.
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
-    target: ResolvedTarget,
+    mut target: ResolvedTarget,
     mut rx: mpsc::Receiver<Bytes>,
     client_sink: tcp_sink::Client,
     tls_client: &Arc<rustls::ClientConfig>,
@@ -251,6 +251,11 @@ async fn handle_connection(
         )
     };
 
+    // A network service only handles TLS connections: on plain HTTP the
+    // guest's surrogates go out as they are.
+    if !is_tls {
+        target.interceptor = None;
+    }
     let (container, is_http) = detect_http(container).await;
     let server = match (target.allowed, is_tls) {
         (false, _) => io::Transport::null(),

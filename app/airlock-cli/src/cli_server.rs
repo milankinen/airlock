@@ -1,6 +1,6 @@
 /// Unix-socket Cap'n Proto server bridging `airlock exec` clients into the running VM.
 ///
-/// `airlock start` spawns this server after the VM is up. `airlock exec` connects here
+/// `airlock start` runs this server after the VM is up. `airlock exec` connects here
 /// and calls `CliService.exec()`. The exec's `env` list is interpreted as
 /// *overrides* layered on top of the sandbox's resolved base env (image env +
 /// `airlock.toml` env) — so the exec client never has to know what the sandbox
@@ -12,6 +12,7 @@ use std::rc::Rc;
 use airlock_common::cli_capnp::*;
 use airlock_common::supervisor_capnp::*;
 use futures::AsyncReadExt;
+use tokio::task::JoinSet;
 
 use crate::rpc::{Process, ProcessEvent, Supervisor};
 
@@ -29,6 +30,10 @@ impl Drop for SockGuard {
 /// resolved environment (image env + config env, with surrogates for masked
 /// entries) — `exec` clients send overrides which are merged onto this
 /// before each child is spawned.
+///
+/// The future owns the socket file and every client connection: dropping
+/// it (the VM shutdown aborts it) closes the connections and
+/// unlinks the socket.
 pub async fn serve(sock_path: PathBuf, supervisor: Supervisor, base_env: Vec<String>) {
     let _ = tokio::fs::remove_file(&sock_path).await;
     let listener = match tokio::net::UnixListener::bind(&sock_path) {
@@ -41,30 +46,36 @@ pub async fn serve(sock_path: PathBuf, supervisor: Supervisor, base_env: Vec<Str
     let _guard = SockGuard(sock_path);
 
     let base_env = Rc::new(base_env);
+    let mut connections = JoinSet::new();
     loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let sup = supervisor.clone();
-                let env = base_env.clone();
-                handle_connection(stream, sup, env);
-            }
-            Err(e) => {
-                // A failed accept() (transient ECONNABORTED, or fd exhaustion
-                // such as EMFILE/ENFILE) must never tear down the server: that
-                // would drop `_guard` and unlink the socket while the VM is
-                // still running, breaking every later `airlock exec`. There is
-                // no accept() error that warrants ending `serve` here, so we
-                // log and keep serving, backing off briefly so a persistent
-                // error can't hot-spin the loop.
-                tracing::warn!("cli server accept error (continuing): {e}");
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    let sup = supervisor.clone();
+                    let env = base_env.clone();
+                    connections.spawn_local(handle_connection(stream, sup, env));
+                }
+                Err(e) => {
+                    // A failed accept() (transient ECONNABORTED, or fd exhaustion
+                    // such as EMFILE/ENFILE) must never tear down the server: that
+                    // would drop `_guard` and unlink the socket while the VM is
+                    // still running, breaking every later `airlock exec`. There is
+                    // no accept() error that warrants ending `serve` here, so we
+                    // log and keep serving, backing off briefly so a persistent
+                    // error can't hot-spin the loop.
+                    tracing::warn!("cli server accept error (continuing): {e}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            },
+            // Reap finished connections so the set does not grow.
+            Some(_) = connections.join_next() => {}
         }
     }
 }
 
-/// Set up a Cap'n Proto RPC system for a single `airlock exec` client connection.
-fn handle_connection(
+/// Run a Cap'n Proto RPC system for a single `airlock exec` client connection
+/// until the client disconnects.
+async fn handle_connection(
     stream: tokio::net::UnixStream,
     supervisor: Supervisor,
     base_env: Rc<Vec<String>>,
@@ -81,7 +92,9 @@ fn handle_connection(
         base_env,
     });
     let rpc = capnp_rpc::RpcSystem::new(Box::new(network), Some(service.client));
-    tokio::task::spawn_local(rpc);
+    if let Err(e) = rpc.await {
+        tracing::debug!("cli client connection: {e}");
+    }
 }
 
 /// Implements the `CliService` Cap'n Proto interface exposed to `airlock exec` clients.
@@ -123,11 +136,13 @@ impl cli_service::Server for CliServiceImpl {
             .map(|e| e.map(|s| s.to_str().unwrap_or("").to_string()))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let env = merge_env(&self.base_env, &overrides);
+        // Malformed entries (no `=`) are ignored.
+        let overrides = overrides.iter().filter_map(|e| e.split_once('='));
+        let env = crate::util::merge_env(&self.base_env, overrides, &[]);
 
         let proc = self
             .supervisor
-            .exec(vsock_stdin, pty_size, &user_cmd, &user_args, &cwd, &env)
+            .spawn(vsock_stdin, pty_size, &user_cmd, &user_args, &cwd, &env)
             .await
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
@@ -137,23 +152,6 @@ impl cli_service::Server for CliServiceImpl {
             .set_proc(capnp_rpc::new_client(ProcessBridge { inner: proc }));
         Ok(())
     }
-}
-
-/// Layer `KEY=VALUE` overrides over `base`. For each override, any prior
-/// entry with the same key is dropped and the override is appended at the
-/// end — matching the precedence `vm::resolve_env` uses for
-/// `airlock.toml` over image env.
-fn merge_env(base: &[String], overrides: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = base.to_vec();
-    for entry in overrides {
-        let Some((key, _)) = entry.split_once('=') else {
-            continue;
-        };
-        let prefix = format!("{key}=");
-        out.retain(|e| !e.starts_with(&prefix));
-        out.push(entry.clone());
-    }
-    out
 }
 
 /// Bridges `Stdin.read()` calls from the vsock supervisor to the `airlock exec`
@@ -245,38 +243,5 @@ impl process::Server for ProcessBridge {
     ) -> Result<(), capnp::Error> {
         let _ = self.inner.signal(9).await;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn merge_appends_new_keys_and_replaces_existing() {
-        let base = vec!["PATH=/bin".into(), "HOME=/root".into(), "TERM=xterm".into()];
-        let out = merge_env(
-            &base,
-            &[
-                "HOME=/tmp".into(), // overrides existing
-                "NEW=1".into(),     // appended
-            ],
-        );
-        assert_eq!(
-            out,
-            vec![
-                "PATH=/bin".to_string(),
-                "TERM=xterm".into(),
-                "HOME=/tmp".into(),
-                "NEW=1".into(),
-            ]
-        );
-    }
-
-    #[test]
-    fn merge_ignores_malformed_entries() {
-        let base = vec!["A=1".to_string()];
-        let out = merge_env(&base, &["malformed".into(), "B=2".into()]);
-        assert_eq!(out, vec!["A=1".to_string(), "B=2".into()]);
     }
 }

@@ -1,4 +1,4 @@
-use crate::config::load_config::merge_json;
+use crate::config::merge::merge_json;
 
 fn json(toml_str: &str) -> serde_json::Value {
     toml::from_str(toml_str).unwrap()

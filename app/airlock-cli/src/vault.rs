@@ -6,7 +6,7 @@
 //!   exposed to projects via `${NAME}` substitution.
 //! - `registries`: image-registry credentials.
 //!
-//! Both kinds live inside a **single** `VaultData` blob. Where that blob
+//! All kinds live inside a **single** `VaultData` blob. Where that blob
 //! lives is chosen by `settings.vault`:
 //!
 //! - `keyring` (default): OS keychain / Secret Service.
@@ -46,6 +46,19 @@
 //! (`None` = unopened). Reads clone the needed fields out so the lock
 //! is never held across foreign code. One `Vault` per process.
 //!
+//! Every write is a read-modify-write of the whole blob under a
+//! cross-process lock file (`Storage::lock_path`, for every persistent
+//! backend: `vault.default.lock`, `vault.default.enc.lock`,
+//! `vault.keyring.lock`). So a writer never drops what another process
+//! wrote, in any section. The vault lock is held only inside one vault
+//! call, and no other lock is taken while it is held.
+//!
+//! The blob keeps top-level fields that this version does not know, so a
+//! later format change survives a write by this version. One exception:
+//! the `agents` section of an earlier unreleased version holds real agent
+//! credentials that nothing reads any more, so the next write drops it
+//! ([`RETIRED_AGENTS_SECTION`]).
+//!
 //! ## Error model
 //!
 //! "No vault yet" (file absent / no keyring entry) is not an error —
@@ -57,6 +70,7 @@ mod disabled;
 mod encrypted;
 mod file;
 mod keyring;
+pub(crate) mod ui;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
@@ -76,6 +90,7 @@ use encrypted::PassphraseSource;
 use file::FileStorage;
 use keyring::KeyringStorage;
 use parking_lot::{Mutex, MutexGuard};
+use rand::TryRng as _;
 use serde::{Deserialize, Serialize};
 
 use crate::settings::Settings;
@@ -145,12 +160,25 @@ pub struct RegistryCreds {
     pub password: String,
 }
 
+/// Top-level field of the agent credentials of an earlier unreleased
+/// version (`airlock agents`). Dropped on the next write: it holds real
+/// tokens and keys that no command can show or remove.
+const RETIRED_AGENTS_SECTION: &str = "agents";
+
 #[derive(Default, Serialize, Deserialize)]
 pub(crate) struct VaultData {
     #[serde(default)]
     secrets: BTreeMap<String, SecretEntry>,
     #[serde(default)]
     registries: BTreeMap<String, RegistryEntry>,
+    /// Key of the network services' token store (in `~/.airlock/db/`):
+    /// 32 random bytes, base64. Created once; not a user secret, so
+    /// `airlock secrets` does not list it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    service_store_key: Option<String>,
+    /// Top-level fields of a later format, kept through a write.
+    #[serde(flatten)]
+    unknown: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Which backend `Vault` uses. Matches `settings.vault.storage`.
@@ -239,14 +267,28 @@ impl Vault {
     fn open(&self) -> anyhow::Result<OpenedVault<'_>> {
         let mut guard = self.inner.data.lock();
         if guard.is_none() {
-            let data = match self.inner.storage.load()? {
-                Some(json) => serde_json::from_str::<VaultData>(&json)
-                    .context("parse airlock vault blob — storage may be corrupt")?,
-                None => VaultData::default(),
-            };
-            *guard = Some(data);
+            *guard = Some(self.load()?);
         }
         Ok(OpenedVault(guard))
+    }
+
+    /// Read the current blob from storage (empty when there is none yet).
+    fn load(&self) -> anyhow::Result<VaultData> {
+        match self.inner.storage.load()? {
+            Some(json) => serde_json::from_str::<VaultData>(&json)
+                .context("parse airlock vault blob — storage may be corrupt"),
+            None => Ok(VaultData::default()),
+        }
+    }
+
+    /// Take the cross-process vault lock of the backend, if it has one.
+    /// Held until the returned handle drops.
+    fn lock_storage(&self) -> anyhow::Result<Option<File>> {
+        self.inner
+            .storage
+            .lock_path()?
+            .map(|path| acquire_file_lock(&path))
+            .transpose()
     }
 
     fn flush(&self, data: &VaultData) -> anyhow::Result<()> {
@@ -260,27 +302,21 @@ impl Vault {
     /// The old approach mutated a possibly-stale cached snapshot and flushed
     /// it wholesale, so a long-running process could erase secrets a
     /// concurrent `airlock secrets add` had written. Here we take a
-    /// cross-process file lock (for file-backed vaults), reload the latest
+    /// cross-process lock (every persistent backend), reload the latest
     /// state, apply `f`, write it, and refresh the cache — so concurrent
-    /// changes are merged rather than clobbered.
-    fn mutate<R>(&self, f: impl FnOnce(&mut VaultData) -> R) -> anyhow::Result<R> {
-        let _lock = match self.inner.storage.lock_path() {
-            Some(path) => Some(acquire_file_lock(&path)?),
-            None => None,
-        };
-        let mut data = match self.inner.storage.load()? {
-            Some(json) => serde_json::from_str::<VaultData>(&json)
-                .context("parse airlock vault blob — storage may be corrupt")?,
-            None => VaultData::default(),
-        };
-        let result = f(&mut data);
+    /// changes are merged rather than clobbered. When `f` fails, nothing
+    /// is written.
+    fn mutate<R>(&self, f: impl FnOnce(&mut VaultData) -> anyhow::Result<R>) -> anyhow::Result<R> {
+        let _lock = self.lock_storage()?;
+        let mut data = self.load()?;
+        data.unknown.remove(RETIRED_AGENTS_SECTION);
+        let result = f(&mut data)?;
         self.flush(&data)?;
         *self.inner.data.lock() = Some(data);
         Ok(result)
     }
 
     /// Lookup a user secret by name. Opens the vault on first use.
-    #[allow(dead_code)]
     pub fn get_secret(&self, name: &str) -> anyhow::Result<Option<String>> {
         let opened = self.open()?;
         Ok(opened.data().secrets.get(name).map(|e| e.value.clone()))
@@ -301,6 +337,7 @@ impl Vault {
                     saved_at: SystemTime::now(),
                 },
             );
+            Ok(())
         })
     }
 
@@ -308,7 +345,7 @@ impl Vault {
     /// — lets the CLI report "nothing to do" without conflating it
     /// with real storage errors.
     pub fn remove_secret(&self, name: &str) -> anyhow::Result<bool> {
-        self.mutate(|data| data.secrets.remove(name).is_some())
+        self.mutate(|data| Ok(data.secrets.remove(name).is_some()))
     }
 
     /// Enumerate secrets (names, timestamps, masked previews — no
@@ -350,6 +387,27 @@ impl Vault {
                     saved_at: SystemTime::now(),
                 },
             );
+            Ok(())
+        })
+    }
+
+    /// The key of the network services' token store. Created on first use
+    /// under the vault lock, so concurrent first uses agree on one key.
+    pub fn service_store_key(&self) -> anyhow::Result<[u8; 32]> {
+        let stored = self.open()?.data().service_store_key.clone();
+        if let Some(key) = stored {
+            return decode_b64_array(&key, "service store key");
+        }
+        self.mutate(|data| {
+            if let Some(key) = &data.service_store_key {
+                return decode_b64_array(key, "service store key");
+            }
+            let mut key = [0u8; 32];
+            rand::rngs::SysRng
+                .try_fill_bytes(&mut key)
+                .context("generate the service store key")?;
+            data.service_store_key = Some(STANDARD_NO_PAD.encode(key));
+            Ok(key)
         })
     }
 
@@ -357,7 +415,12 @@ impl Vault {
     /// first and the vault is the fallback — so common templates like
     /// `${PATH}` or `${HOME}` never hit the vault.
     pub fn subst(&self, template: &str) -> anyhow::Result<String> {
-        subst::substitute(template, self).map_err(|e| anyhow!("{e}"))
+        subst::substitute(template, self).map_err(|e| match self.open() {
+            // The variable is missing because the vault did not open: say
+            // why, not only that it is missing.
+            Err(open) => open.context(e.to_string()),
+            Ok(_) => anyhow!("{e}"),
+        })
     }
 }
 
@@ -369,9 +432,7 @@ impl<'a> subst::VariableMap<'a> for Vault {
         if let Some(value) = self.inner.env.get(key) {
             return Some(value.clone());
         }
-        self.open()
-            .ok()
-            .and_then(|v| v.data().secrets.get(key).map(|s| s.value.clone()))
+        self.get_secret(key).ok().flatten()
     }
 }
 
@@ -411,10 +472,11 @@ pub trait Storage: Send + Sync + 'static {
     fn store(&self, data: &str) -> anyhow::Result<()>;
 
     /// Path of a sidecar lock file used to serialize concurrent mutations
-    /// across processes. `None` for backends that don't need it (keyring,
-    /// disabled, in-memory test doubles).
-    fn lock_path(&self) -> Option<PathBuf> {
-        None
+    /// across processes. `None` for backends that don't need it
+    /// (disabled, in-memory test doubles). An error when the backend needs
+    /// a lock but cannot name its path: a write never runs unlocked.
+    fn lock_path(&self) -> anyhow::Result<Option<PathBuf>> {
+        Ok(None)
     }
 }
 
@@ -495,11 +557,15 @@ fn acquire_file_lock(path: &Path) -> anyhow::Result<File> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create vault directory {}", parent.display()))?;
     }
+    // `O_NOFOLLOW`: a symlink planted at the lock path is refused, not
+    // followed to create or lock some other file.
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .with_context(|| format!("open vault lock {}", path.display()))?;
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
@@ -725,6 +791,21 @@ mod tests {
     }
 
     #[test]
+    fn the_service_store_key_is_created_once_and_hidden() {
+        let shared = Arc::new(FakeStorage::default());
+        let a = vault_with(SharedStorage(shared.clone()), &[]);
+        let key = a.service_store_key().unwrap();
+        assert_eq!(a.service_store_key().unwrap(), key);
+        let b = vault_with(SharedStorage(shared), &[]);
+        assert_eq!(
+            b.service_store_key().unwrap(),
+            key,
+            "stored, not regenerated"
+        );
+        assert!(b.list_secrets().unwrap().is_empty(), "not a user secret");
+    }
+
+    #[test]
     fn set_secret_rejects_empty_and_bad_names() {
         let vault = vault_with(FakeStorage::default(), &[]);
         assert!(vault.set_secret("FOO", "").is_err());
@@ -781,6 +862,25 @@ mod tests {
     fn subst_missing_variable_errors() {
         let vault = vault_with(FakeStorage::default(), &[]);
         assert!(vault.subst("${NOPE}").is_err());
+    }
+
+    /// A vault that fails to open is an error for `${NAME}`, not an unset
+    /// variable: the user must see why the secret is missing.
+    #[test]
+    fn subst_surfaces_open_errors() {
+        struct BrokenStorage;
+        impl Storage for BrokenStorage {
+            fn load(&self) -> anyhow::Result<Option<String>> {
+                anyhow::bail!("keyring locked")
+            }
+            fn store(&self, _data: &str) -> anyhow::Result<()> {
+                anyhow::bail!("keyring locked")
+            }
+        }
+        let vault = vault_with(BrokenStorage, &[("HOST", "from-env")]);
+        assert_eq!(vault.subst("${HOST}").unwrap(), "from-env");
+        let err = vault.subst("${TOKEN}").unwrap_err();
+        assert!(format!("{err:#}").contains("keyring locked"), "{err:#}");
     }
 
     #[test]
@@ -932,5 +1032,152 @@ mod tests {
             .load()
             .unwrap_err();
         assert!(err.to_string().contains("plaintext vault"), "got: {err:#}");
+    }
+
+    // ── Vault lock ───────────────────────────────────────────────────────
+
+    /// One stored blob with a lock file, as the keyring backend of two
+    /// processes. With `stall`, the first `store` reports that it runs
+    /// (the writer holds the vault lock), then waits before it writes: a
+    /// writer that did not wait for the lock would load the old blob in
+    /// that window and drop this write.
+    struct LockedStorage {
+        blob: Arc<FakeStorage>,
+        lock: PathBuf,
+        stall: StdMutex<Option<std::sync::mpsc::Sender<()>>>,
+    }
+
+    impl Storage for LockedStorage {
+        fn load(&self) -> anyhow::Result<Option<String>> {
+            self.blob.load()
+        }
+        fn store(&self, data: &str) -> anyhow::Result<()> {
+            if let Some(in_store) = self.stall.lock().unwrap().take() {
+                in_store.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            self.blob.store(data)
+        }
+        fn lock_path(&self) -> anyhow::Result<Option<PathBuf>> {
+            Ok(Some(self.lock.clone()))
+        }
+    }
+
+    #[test]
+    fn concurrent_writers_with_the_vault_lock_both_survive() {
+        let blob = Arc::new(FakeStorage::default());
+        let lock = fresh_tmp("vault.keyring.lock");
+        let (in_store, stalled) = std::sync::mpsc::channel();
+        let a = vault_with(
+            LockedStorage {
+                blob: blob.clone(),
+                lock: lock.clone(),
+                stall: StdMutex::new(Some(in_store)),
+            },
+            &[],
+        );
+        let b = vault_with(
+            LockedStorage {
+                blob: blob.clone(),
+                lock,
+                stall: StdMutex::new(None),
+            },
+            &[],
+        );
+        let writer_a = std::thread::spawn(move || a.set_secret("A", "1"));
+        stalled.recv().unwrap();
+        b.set_secret("B", "2").unwrap();
+        writer_a.join().unwrap().unwrap();
+
+        let fresh = vault_with(SharedStorage(blob), &[]);
+        assert_eq!(fresh.get_secret("A").unwrap(), Some("1".to_string()));
+        assert_eq!(fresh.get_secret("B").unwrap(), Some("2".to_string()));
+    }
+
+    /// A symlink at the lock path is refused: the lock never follows it
+    /// to create or lock another file.
+    #[test]
+    fn the_vault_lock_refuses_a_symlink() {
+        let lock = fresh_tmp("vault.keyring.lock");
+        let target = lock.with_file_name("elsewhere");
+        std::os::unix::fs::symlink(&target, &lock).unwrap();
+        let vault = vault_with(
+            LockedStorage {
+                blob: Arc::new(FakeStorage::default()),
+                lock,
+                stall: StdMutex::new(None),
+            },
+            &[],
+        );
+        let err = vault.set_secret("A", "1").unwrap_err();
+        assert!(format!("{err:#}").contains("open vault lock"), "{err:#}");
+        assert!(!target.exists());
+        assert!(vault.get_secret("A").unwrap().is_none());
+    }
+
+    /// A backend that cannot name its lock path does not write unlocked.
+    #[test]
+    fn a_lock_path_error_stops_the_write() {
+        struct NoLockPath(Arc<FakeStorage>);
+        impl Storage for NoLockPath {
+            fn load(&self) -> anyhow::Result<Option<String>> {
+                self.0.load()
+            }
+            fn store(&self, data: &str) -> anyhow::Result<()> {
+                self.0.store(data)
+            }
+            fn lock_path(&self) -> anyhow::Result<Option<PathBuf>> {
+                anyhow::bail!("no home directory")
+            }
+        }
+        let blob = Arc::new(FakeStorage::default());
+        let vault = vault_with(NoLockPath(blob.clone()), &[]);
+        assert!(vault.set_secret("A", "1").is_err());
+        assert!(blob.load().unwrap().is_none());
+    }
+
+    /// Top-level fields that this version does not know survive a write
+    /// untouched, and they are not secrets. The retired `agents` section
+    /// is the exception: a write drops it.
+    #[test]
+    fn unknown_top_level_fields_survive_a_write() {
+        let later = serde_json::json!({"x": 1});
+        let storage = Arc::new(FakeStorage::default());
+        storage
+            .store(r#"{"secrets":{},"later":{"x":1},"agents":{"claude":{"record":{"version":1}}}}"#)
+            .unwrap();
+        let vault = vault_with(SharedStorage(storage.clone()), &[]);
+        vault.set_secret("TOKEN", "abc").unwrap();
+        let names: Vec<String> = vault
+            .list_secrets()
+            .unwrap()
+            .into_iter()
+            .map(|meta| meta.name)
+            .collect();
+        assert_eq!(names, ["TOKEN"]);
+        assert!(!vault.remove_secret("later").unwrap());
+        let blob: serde_json::Value =
+            serde_json::from_str(&storage.load().unwrap().unwrap()).unwrap();
+        assert_eq!(blob["later"], later);
+        assert!(blob.get(RETIRED_AGENTS_SECTION).is_none());
+        assert!(blob["secrets"]["TOKEN"].is_object());
+
+        // The file backend re-serializes the blob through its envelope.
+        let path = fresh_tmp("vault.json");
+        std::fs::write(
+            &path,
+            r#"{"type":"file","data":{"secrets":{},"future":{"x":1}}}"#,
+        )
+        .unwrap();
+        let vault = Vault::new_with(
+            Box::new(FileStorage::new(path.clone())),
+            HashMap::new(),
+            VaultStorageType::File,
+        );
+        vault.set_secret("TOKEN", "abc").unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["data"]["future"], serde_json::json!({"x": 1}));
+        assert!(raw["data"]["secrets"]["TOKEN"].is_object());
     }
 }

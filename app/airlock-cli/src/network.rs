@@ -9,8 +9,9 @@
 mod check_target_conflicts;
 mod control;
 mod deny_reporter;
-mod http;
-mod io;
+pub(crate) mod http;
+pub(crate) mod interceptor;
+pub(crate) mod io;
 mod matchers;
 mod middleware;
 pub mod reverse_forward;
@@ -34,8 +35,9 @@ use tokio::sync::broadcast;
 
 pub use self::control::NetworkControl;
 pub use self::deny_reporter::DenyReporter;
-use crate::config::config::Policy;
+use crate::config::config_values::Policy;
 use crate::network::http::middleware::CompiledMiddleware;
+use crate::network::interceptor::Interceptor;
 use crate::network::target::{
     InjectTarget, InjectedSecret, MiddlewareTarget, NetworkTarget, ResolvedTarget,
 };
@@ -43,77 +45,130 @@ use crate::project::Project;
 
 const NETWORK_EVENTS_BUFFER: usize = 10;
 
-/// Build the [`Network`] from the sandbox config: load native CA roots,
-/// compile middleware scripts, resolve network and inject targets, and
-/// prepare the TLS interceptor with the sandbox's CA.
-pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network> {
+/// The TLS client config of the proxy's upstream connections: the host's
+/// native CA roots. The network services connect upstream with it too.
+pub fn native_tls_client() -> Arc<rustls::ClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
     for cert in rustls_native_certs::load_native_certs().expect("native certs") {
         let _ = root_store.add(cert);
     }
+    Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth(),
+    )
+}
 
-    let tls_client = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+impl Network {
+    /// Build the network from the sandbox config: compile middleware
+    /// scripts, resolve network and inject targets, and prepare the TLS
+    /// interceptor with the sandbox's CA. `interceptors` handle the hosts
+    /// they own (the network services); `denied_targets` are denied under
+    /// every policy (the hosts of services that cannot run).
+    pub fn new(
+        project: &Project,
+        container_home: &str,
+        tls_client: Arc<rustls::ClientConfig>,
+        interceptors: Vec<Rc<dyn Interceptor>>,
+        denied_targets: Vec<NetworkTarget>,
+    ) -> anyhow::Result<Self> {
+        let net = &project.config.network;
+        let log = middleware::tracing_log();
+        let rule_targets = rules::resolve(net)?;
+        let middleware_targets = rules::resolve_middleware(net, &project.context.vault, &log)?;
+        let inject_targets = rules::resolve_inject(net, &project.env)?;
 
-    let net = &project.config.network;
-    let log = middleware::tracing_log();
-    let rule_targets = rules::resolve(net)?;
-    let middleware_targets = rules::resolve_middleware(net, &project.vault, &log)?;
-    let inject_targets = rules::resolve_inject(net, &project.env)?;
+        check_passthrough(net)?;
+        check_target_conflicts::check_reverse_forward_conflicts(&labeled_reverse_forwards(net))?;
 
-    // Inject needs interception just like middleware, so it conflicts with
-    // passthrough the same way.
+        let interceptor = tls::TlsInterceptor::new(&project.ca_cert, &project.ca_key)?;
+
+        let port_forwards: HashMap<u16, u16> =
+            rules::port_forwards_from_config(net).into_iter().collect();
+
+        let (events, _) = broadcast::channel(NETWORK_EVENTS_BUFFER);
+
+        let socket_map: HashMap<String, PathBuf> = net
+            .sockets
+            .values()
+            .filter(|s| s.enabled)
+            .map(|s| {
+                let guest =
+                    crate::util::expand_tilde(&s.host.target, std::path::Path::new(container_home))
+                        .to_string_lossy()
+                        .into_owned();
+                let host = project.expand_host_tilde(&s.host.source);
+                (guest, host)
+            })
+            .collect();
+
+        tracing::debug!(
+            "network: {} allow, {} deny, {} passthrough, {} middleware, {} inject targets, \
+             interceptors [{}], {} denied service targets",
+            rule_targets.allow.len(),
+            rule_targets.deny.len(),
+            rule_targets.passthrough.len(),
+            middleware_targets.len(),
+            inject_targets.len(),
+            interceptors
+                .iter()
+                .map(|i| i.name())
+                .collect::<Vec<_>>()
+                .join(", "),
+            denied_targets.len(),
+        );
+
+        Ok(Network {
+            state: Arc::new(RwLock::new(NetworkState { policy: net.policy })),
+            tls_client,
+            interceptor: Rc::new(interceptor),
+            allow_targets: rule_targets.allow,
+            deny_targets: rule_targets.deny,
+            passthrough_targets: rule_targets.passthrough,
+            middleware_targets,
+            inject_targets,
+            interceptors,
+            unavailable_targets: denied_targets,
+            port_forwards,
+            socket_map,
+            events,
+            next_id: AtomicU64::new(0),
+            deny_reporter: DenyReporter::new(),
+        })
+    }
+}
+
+/// Check that no passthrough target is also intercepted. Inject needs
+/// interception just like middleware, and so do the hosts of the enabled
+/// network services, so they conflict with passthrough the same way.
+pub(crate) fn check_passthrough(net: &crate::config::config_values::Network) -> anyhow::Result<()> {
     let mut intercepting = labeled_middleware(net)?;
     intercepting.extend(labeled_inject(net)?);
-    check_target_conflicts::check_passthrough_conflicts(&labeled_passthrough(net)?, &intercepting)?;
-    check_target_conflicts::check_reverse_forward_conflicts(&labeled_reverse_forwards(net))?;
+    intercepting.extend(labeled_services(net));
+    check_target_conflicts::check_passthrough_conflicts(&labeled_passthrough(net)?, &intercepting)
+}
 
-    let interceptor = tls::TlsInterceptor::new(&project.ca_cert, &project.ca_key)?;
-
-    let port_forwards: HashMap<u16, u16> =
-        rules::port_forwards_from_config(net).into_iter().collect();
-
-    let (events, _) = broadcast::channel(NETWORK_EVENTS_BUFFER);
-
-    let socket_map: HashMap<String, PathBuf> = net
-        .sockets
-        .values()
-        .filter(|s| s.enabled)
-        .map(|s| {
-            let guest =
-                crate::util::expand_tilde(&s.host.target, std::path::Path::new(container_home))
-                    .to_string_lossy()
-                    .into_owned();
-            let host = project.expand_host_tilde(&s.host.source);
-            (guest, host)
+/// The hosts of the enabled network services, labeled for passthrough
+/// conflict checking.
+fn labeled_services(
+    net: &crate::config::config_values::Network,
+) -> Vec<check_target_conflicts::LabeledTarget> {
+    crate::services::enabled(&net.services)
+        .into_iter()
+        .flat_map(|id| {
+            id.targets()
+                .into_iter()
+                .map(move |target| check_target_conflicts::LabeledTarget {
+                    label: format!(
+                        "service `{}` host `{}:{}`",
+                        id.name(),
+                        target.host,
+                        target.port.map_or("*".to_string(), |p| p.to_string())
+                    ),
+                    target,
+                })
         })
-        .collect();
-
-    tracing::debug!(
-        "network: {} allow, {} deny, {} passthrough, {} middleware, {} inject targets",
-        rule_targets.allow.len(),
-        rule_targets.deny.len(),
-        rule_targets.passthrough.len(),
-        middleware_targets.len(),
-        inject_targets.len()
-    );
-
-    Ok(Network {
-        state: Arc::new(RwLock::new(NetworkState { policy: net.policy })),
-        tls_client: Arc::new(tls_client),
-        interceptor: Rc::new(interceptor),
-        allow_targets: rule_targets.allow,
-        deny_targets: rule_targets.deny,
-        passthrough_targets: rule_targets.passthrough,
-        middleware_targets,
-        inject_targets,
-        port_forwards,
-        socket_map,
-        events,
-        next_id: AtomicU64::new(0),
-        deny_reporter: DenyReporter::new(),
-    })
+        .collect()
 }
 
 /// Extract labeled passthrough targets from the config for conflict
@@ -121,7 +176,7 @@ pub fn setup(project: &Project, container_home: &str) -> anyhow::Result<Network>
 /// that label as opaque, so formatting lives here where the config shape
 /// is known.
 fn labeled_passthrough(
-    net: &crate::config::config::Network,
+    net: &crate::config::config_values::Network,
 ) -> anyhow::Result<Vec<check_target_conflicts::LabeledTarget>> {
     let mut out = Vec::new();
     for (rule_name, rule) in &net.rules {
@@ -145,7 +200,7 @@ fn labeled_passthrough(
 /// Extract labeled middleware targets from the config for conflict
 /// checking. Paired with [`labeled_passthrough`].
 fn labeled_middleware(
-    net: &crate::config::config::Network,
+    net: &crate::config::config_values::Network,
 ) -> anyhow::Result<Vec<check_target_conflicts::LabeledTarget>> {
     let mut out = Vec::new();
     for (mw_name, mw) in &net.middleware {
@@ -170,7 +225,7 @@ fn labeled_middleware(
 /// `inject` list) for passthrough conflict checking. Paired with
 /// [`labeled_passthrough`], like [`labeled_middleware`].
 fn labeled_inject(
-    net: &crate::config::config::Network,
+    net: &crate::config::config_values::Network,
 ) -> anyhow::Result<Vec<check_target_conflicts::LabeledTarget>> {
     let mut out = Vec::new();
     for (rule_name, rule) in &net.rules {
@@ -194,7 +249,7 @@ fn labeled_inject(
 /// Extract labeled reverse port forwards (`.guest` entries) from the
 /// config for host-port conflict checking.
 fn labeled_reverse_forwards(
-    net: &crate::config::config::Network,
+    net: &crate::config::config_values::Network,
 ) -> Vec<check_target_conflicts::LabeledReverseForward> {
     let mut out = Vec::new();
     for (group_name, pf) in &net.ports {
@@ -222,6 +277,26 @@ pub(crate) struct NetworkState {
     pub policy: Policy,
 }
 
+/// Cloneable view of a served [`Network`]: live policy control plus the
+/// monitor event stream. Held by the VM and handed to the runtime.
+#[derive(Clone)]
+pub struct NetworkHandle {
+    control: NetworkControl,
+    events: broadcast::Sender<airlock_monitor::NetworkEvent>,
+}
+
+impl NetworkHandle {
+    /// Thread-safe handle for live network-state edits (the TUI).
+    pub fn control(&self) -> NetworkControl {
+        self.control.clone()
+    }
+
+    /// Subscribe to network events.
+    pub fn events(&self) -> broadcast::Receiver<airlock_monitor::NetworkEvent> {
+        self.events.subscribe()
+    }
+}
+
 /// Host-side network proxy state, implementing the `NetworkProxy` RPC
 /// interface that the guest supervisor calls for every outbound connection.
 pub struct Network {
@@ -242,6 +317,12 @@ pub struct Network {
     middleware_targets: Vec<MiddlewareTarget>,
     /// Masked secrets to inject into HTTP headers, with target patterns.
     inject_targets: Vec<InjectTarget>,
+    /// The enabled network services' interceptors; each owns its targets.
+    interceptors: Vec<Rc<dyn Interceptor>>,
+    /// The hosts of enabled services that cannot run (no token store):
+    /// denied under every policy, so the agents never sign in without
+    /// airlock.
+    unavailable_targets: Vec<NetworkTarget>,
     /// Port forward mappings: guest_port → host_port.
     port_forwards: HashMap<u16, u16>,
     /// Guest socket path → host socket path mapping for Unix socket forwarding.
@@ -258,21 +339,27 @@ pub struct Network {
 }
 
 impl Network {
-    pub fn events(&self) -> broadcast::Receiver<airlock_monitor::NetworkEvent> {
-        self.events.subscribe()
-    }
-
-    /// Handle used by the host to wire up the supervisor client after the
-    /// vsock handshake. See [`DenyReporter::attach`].
+    /// Deny notifier, attached to the supervisor once the vsock handshake
+    /// completes. See [`DenyReporter::attach`].
     pub fn deny_reporter(&self) -> Rc<DenyReporter> {
         self.deny_reporter.clone()
     }
 
     /// Return a thread-safe handle for mutating runtime state. Handed to the
-    /// TUI by [`MonitorRuntime::launch`]; the TUI uses it to flip policy /
+    /// TUI (through [`NetworkHandle`]); the TUI uses it to flip policy /
     /// toggle rules without touching `Network` internals.
-    pub fn control(&self) -> NetworkControl {
+    fn control(&self) -> NetworkControl {
         NetworkControl::new(self.state.clone())
+    }
+
+    /// The parts of the network that outlive it being served: the live
+    /// control and the event stream. Take it before [`crate::rpc::serve_network`]
+    /// consumes the network.
+    pub fn handle(&self) -> NetworkHandle {
+        NetworkHandle {
+            control: self.control(),
+            events: self.events.clone(),
+        }
     }
 
     /// Current top-level policy. Called on the hot connect path — one
@@ -288,8 +375,11 @@ impl Network {
     /// 1. Localhost port-forward → remap port.
     /// 2. `allow-always` → allow with middleware.
     /// 3. Deny rules → deny wins unconditionally.
-    /// 4. Allow rules → allow with middleware.
-    /// 5. No match → `allow-by-default` allows, `deny-by-default` denies.
+    /// 4. A host owned by a network service → allow, intercepted; a host
+    ///    of an enabled service that cannot run → deny (under every
+    ///    policy).
+    /// 5. Allow rules → allow with middleware.
+    /// 6. No match → `allow-by-default` allows, `deny-by-default` denies.
     pub fn resolve_target(&self, host: &str, port: u16) -> ResolvedTarget {
         let policy = self.policy();
 
@@ -309,7 +399,22 @@ impl Network {
             (host, port, false)
         };
 
-        let allowed = self.is_allowed(host, port, policy) || port_forwarded;
+        if !port_forwarded
+            && self
+                .unavailable_targets
+                .iter()
+                .any(|t| t.matches(host, port))
+        {
+            return denied(host, port);
+        }
+        let interceptor = if port_forwarded {
+            None
+        } else {
+            self.interceptor_for(host, port)
+        };
+        let allowed = self.is_allowed(host, port, policy)
+            || port_forwarded
+            || (interceptor.is_some() && !self.is_denied_by_rule(host, port));
         let middleware = if allowed {
             self.collect_middleware(host, port)
         } else {
@@ -319,7 +424,10 @@ impl Network {
         // Port-forwarded destinations always passthrough — the guest side
         // is talking to an arbitrary protocol on localhost, not necessarily
         // HTTP; intercepting would break non-HTTP forwards (e.g. Postgres).
-        let passthrough = allowed && (port_forwarded || self.is_passthrough_target(host, port));
+        // A service host never does: the service must see its requests.
+        let passthrough = allowed
+            && (port_forwarded
+                || (interceptor.is_none() && self.is_passthrough_target(host, port)));
 
         // Secrets only matter where headers are actually rewritten.
         let secrets = if allowed && !passthrough {
@@ -333,9 +441,23 @@ impl Network {
             port,
             middleware,
             secrets,
+            interceptor: interceptor.filter(|_| allowed),
             allowed,
             passthrough,
         }
+    }
+
+    /// The enabled service interceptor that owns `host:port`. Interceptors
+    /// own disjoint hosts, so the first match is the only one.
+    fn interceptor_for(&self, host: &str, port: u16) -> Option<Rc<dyn Interceptor>> {
+        self.interceptors
+            .iter()
+            .find(|s| s.targets().iter().any(|t| t.matches(host, port)))
+            .cloned()
+    }
+
+    fn is_denied_by_rule(&self, host: &str, port: u16) -> bool {
+        self.deny_targets.iter().any(|t| t.matches(host, port))
     }
 
     /// Collect the masked secrets of every inject target matching
@@ -365,10 +487,8 @@ impl Network {
             return true;
         }
         // Deny rules win unconditionally.
-        for target in &self.deny_targets {
-            if target.matches(host, port) {
-                return false;
-            }
+        if self.is_denied_by_rule(host, port) {
+            return false;
         }
         matches!(policy, Policy::AllowByDefault)
             || self.allow_targets.iter().any(|t| t.matches(host, port))
@@ -433,6 +553,7 @@ fn denied(host: &str, port: u16) -> ResolvedTarget {
         port,
         middleware: vec![],
         secrets: vec![],
+        interceptor: None,
         allowed: false,
         passthrough: false,
     }
@@ -447,7 +568,7 @@ mod labeled_target_tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::config::config::{self, MiddlewareRule, NetworkRule};
+    use crate::config::config_values::{self, MiddlewareRule, NetworkRule};
 
     fn rule(allow: &[&str], passthrough: bool, enabled: bool) -> NetworkRule {
         NetworkRule {
@@ -471,8 +592,8 @@ mod labeled_target_tests {
     fn net(
         rules: Vec<(&str, NetworkRule)>,
         middleware: Vec<(&str, MiddlewareRule)>,
-    ) -> config::Network {
-        config::Network {
+    ) -> config_values::Network {
+        config_values::Network {
             policy: Policy::DenyByDefault,
             rules: rules.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
             middleware: middleware
@@ -481,6 +602,7 @@ mod labeled_target_tests {
                 .collect(),
             ports: BTreeMap::default(),
             sockets: BTreeMap::default(),
+            services: BTreeMap::default(),
         }
     }
 

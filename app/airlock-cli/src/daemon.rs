@@ -7,7 +7,7 @@
 //!   2. Drive the post-main-shell shutdown UI: ask the supervisor to stop all
 //!      daemons, then poll until each reports a terminal state.
 //!
-//! Neither helper owns any state — they're called from `cmd_start` at the
+//! Neither helper owns any state — the sandbox session calls them at the
 //! specific lifecycle points they apply to.
 
 use std::collections::BTreeMap;
@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::config::config::RestartPolicy;
+use crate::config::config_values::RestartPolicy;
 use crate::{cli, project, rpc};
 
 /// Expand `${VAR}` templates in each daemon's env map and layer them on
@@ -30,15 +30,19 @@ pub fn build_specs(
         .iter()
         .filter(|(_, d)| d.enabled)
         .map(|(name, d)| {
-            let mut env = image_env.to_vec();
-            for (key, template) in &d.env {
-                let value = project
-                    .vault
-                    .subst(template)
-                    .map_err(|e| anyhow::anyhow!("daemons.{name}.env.{key}: {e}"))?;
-                env.retain(|existing| !existing.starts_with(&format!("{key}=")));
-                env.push(format!("{key}={value}"));
-            }
+            let overrides = d
+                .env
+                .iter()
+                .map(|(key, template)| {
+                    let value = project
+                        .context
+                        .vault
+                        .subst(template)
+                        .map_err(|e| anyhow::anyhow!("daemons.{name}.env.{key}: {e}"))?;
+                    Ok((key, value))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let env = crate::util::merge_env(image_env, overrides, &[]);
             Ok(rpc::DaemonSpec {
                 name: name.clone(),
                 command: d.command.clone(),

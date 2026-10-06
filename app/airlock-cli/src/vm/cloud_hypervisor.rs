@@ -60,6 +60,7 @@ impl CloudHypervisorBackend {
             cmd.stdin(Stdio::null());
             cmd.stdout(Stdio::null());
             cmd.stderr(Stdio::piped());
+            tie_to_airlock(&mut cmd);
 
             debug!("virtiofsd: {:?}", cmd);
             let mut child = cmd
@@ -125,6 +126,7 @@ impl CloudHypervisorBackend {
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::from(log_file));
         cmd.stderr(Stdio::from(log_file_err));
+        tie_to_airlock(&mut cmd);
 
         debug!("cloud-hypervisor: {:?}", cmd);
 
@@ -163,27 +165,74 @@ impl CloudHypervisorBackend {
     }
 }
 
-impl Drop for CloudHypervisorBackend {
-    fn drop(&mut self) {
-        // Kill cloud-hypervisor
-        if let Some(mut child) = self.ch_child.take() {
-            if let Err(e) = child.kill() {
-                error!("cloud-hypervisor kill: {e}");
-            }
-            if let Err(e) = child.wait() {
-                error!("cloud-hypervisor wait: {e}");
-            }
+impl CloudHypervisorBackend {
+    /// Kill cloud-hypervisor and every virtiofsd, and reap each one. `Ok`
+    /// confirms that cloud-hypervisor exited and was reaped; the first
+    /// failure is returned after every process has been handled. A second
+    /// call finds nothing left to stop.
+    pub fn stop(&mut self) -> anyhow::Result<()> {
+        let mut result = Ok(());
+        if let Some(child) = self.ch_child.take() {
+            result = kill_and_reap(child, "cloud-hypervisor");
         }
-        // Kill all virtiofsd processes
-        for mut child in self.virtiofsd_children.drain(..) {
-            if let Err(e) = child.kill() {
-                error!("virtiofsd kill: {e}");
-            }
-            if let Err(e) = child.wait() {
-                error!("virtiofsd wait: {e}");
+        for child in self.virtiofsd_children.drain(..) {
+            let reaped = kill_and_reap(child, "virtiofsd");
+            if result.is_ok() {
+                result = reaped;
             }
         }
         cleanup_sockets(&self.runtime_dir, &self.runtime_dir.join("vfs"));
+        result
+    }
+}
+
+impl Drop for CloudHypervisorBackend {
+    fn drop(&mut self) {
+        if let Err(e) = self.stop() {
+            error!("{e:#}");
+        }
+    }
+}
+
+/// Send SIGKILL to `child` and wait for it. A kill error is only logged (the
+/// process may have exited already); a failed wait means the exit is not
+/// confirmed.
+fn kill_and_reap(mut child: Child, name: &str) -> anyhow::Result<()> {
+    if let Err(e) = child.kill() {
+        error!("{name} kill: {e}");
+    }
+    let status = child
+        .wait()
+        .map_err(|e| anyhow::anyhow!("{name} wait: {e}"))?;
+    debug!("{name} exited: {status}");
+    Ok(())
+}
+
+/// Start `cmd` in its own process group and tie its life to airlock's.
+///
+/// - The terminal's SIGINT (Ctrl+C in cooked mode, e.g. during the boot)
+///   reaches only airlock, which then stops the VM in order (the guest
+///   sync first) instead of losing it at once.
+/// - `PR_SET_PDEATHSIG` kills the process when airlock dies without
+///   stopping it (SIGKILL, crash). The signal fires when the *thread* that
+///   spawned the process exits: the VM is started on the main thread (the
+///   current-thread runtime). The `getppid` check covers airlock dying
+///   before the `prctl`.
+fn tie_to_airlock(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    let parent = libc::pid_t::try_from(std::process::id()).expect("pid fits pid_t");
+    cmd.process_group(0);
+    // Safety: only async-signal-safe calls (two syscalls) after fork.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != parent {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
     }
 }
 
@@ -241,5 +290,26 @@ fn cleanup_sockets(dir: &Path, vfs_dir: &Path) {
                 let _ = std::fs::remove_file(entry.path());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The process leads its own process group: the terminal's SIGINT
+    /// misses it.
+    #[test]
+    fn tied_processes_lead_their_own_group() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("10");
+        tie_to_airlock(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
+        let pid = libc::pid_t::try_from(child.id()).unwrap();
+        let pgid = unsafe { libc::getpgid(pid) };
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(pgid, pid);
+        assert_ne!(pgid, unsafe { libc::getpgrp() });
     }
 }

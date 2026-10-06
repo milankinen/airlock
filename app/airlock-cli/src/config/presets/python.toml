@@ -1,5 +1,13 @@
 # Python development preset
 
+[env]
+# airlock merges its CA into this bundle, so point Python TLS at it.
+# python-build-standalone builds (mise, uv) look for /etc/ssl/cert.pem,
+# which is missing on Debian, and requests/pip ship their own CA lists.
+SSL_CERT_FILE = "/etc/ssl/certs/ca-certificates.crt"
+REQUESTS_CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
+PIP_CERT = "/etc/ssl/certs/ca-certificates.crt"
+
 [network.rules.python-packages]
 allow = [
     "pypi.org",

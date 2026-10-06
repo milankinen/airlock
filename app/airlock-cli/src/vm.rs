@@ -97,9 +97,10 @@ mod kvm_tests {
 
 use crate::assets::Assets;
 use crate::cli;
-use crate::cli::{CliArgs, LogLevel};
+use crate::cli::LogLevel;
 use crate::oci::OciImage;
-use crate::project::{Project, SandboxEnv};
+use crate::project::Project;
+use crate::sandbox::boot::BootOptions;
 use crate::vm::config::VmShare;
 
 /// A running VM instance. Dropping this kills the VM and stops file sync.
@@ -115,10 +116,7 @@ pub struct VmInstance {
     pub disk_image: PathBuf,
     pub caches: Vec<disk::CacheEntry>,
     pub container_home: String,
-    /// Fully resolved command (args.args + login shell applied).
-    pub cmd: Vec<String>,
-    /// Fully resolved environment (guest-visible `[env]` values layered
-    /// over the image env; masked entries carry their surrogate).
+    /// The sandbox env (see [`crate::sandbox::boot::guest_env`]).
     pub env: Vec<String>,
     pub cwd: String,
     pub uid: u32,
@@ -126,11 +124,14 @@ pub struct VmInstance {
 }
 
 impl VmInstance {
-    /// Gracefully shut down file sync (drains pending events) then drop the VM.
-    pub async fn shutdown(mut self) {
+    /// Gracefully shut down file sync (drains pending events), then stop the
+    /// VM and wait until the backend confirms it stopped. An error means the
+    /// stop was not confirmed; the VM is still killed when `self` drops.
+    pub async fn shutdown(mut self) -> anyhow::Result<()> {
         if let Some(handle) = self.sync_handle.take() {
             handle.shutdown().await;
         }
+        self.vm_handle.stop().await
     }
 
     /// Open a vsock connection to the given guest port. Retries every
@@ -160,19 +161,24 @@ impl VmInstance {
 /// Boot the VM with the given config and image. Returns a `VmInstance` (for
 /// cleanup on drop) and the vsock fd connected to the in-VM supervisor.
 ///
+/// `opts.project_share` false leaves out the project mount and runs the
+/// guest in `/`; `opts.quiet` skips the VM resources summary.
+///
 /// `container_home` is the resolved guest home — `[env].HOME` if the
 /// user overrode it, otherwise the image's user-record home. Used for
-/// `~/...` expansion of mount, cache, and socket-forward paths.
+/// `~/...` expansion of mount, cache, and socket-forward paths. `env` is
+/// the sandbox env ([`crate::sandbox::boot::guest_env`]).
 pub async fn start(
-    args: &CliArgs,
     project: &Project,
     image: &OciImage,
     container_home: &str,
+    env: Vec<String>,
+    opts: &BootOptions,
 ) -> anyhow::Result<(VmInstance, OwnedFd)> {
     let assets = Assets::init(project)?;
     let overlay_dir = project.sandbox_dir.join("overlay");
 
-    let mounts = assemble_mounts(project, container_home)?;
+    let mounts = assemble_mounts(project, container_home, opts.project_share)?;
     let shares = prepare_shares(image, &mounts, &project.sandbox_dir)?;
     let (disk_image, caches) = disk::prepare(
         &project.sandbox_dir,
@@ -180,18 +186,30 @@ pub async fn start(
         container_home,
         &project.host_cwd,
     )?;
-    let cmd = resolve_cmd(args, image);
-    let env = resolve_env(image, &project.env);
-    let cwd = project.guest_cwd.to_string_lossy().into_owned();
+    let cwd = if opts.project_share {
+        project.guest_cwd.to_string_lossy().into_owned()
+    } else {
+        "/".to_string()
+    };
 
-    log_config(project, &shares);
+    if !opts.quiet {
+        log_config(project);
+    }
+    for share in &shares {
+        tracing::debug!(
+            "share: tag={}, host_path={}, ro={}",
+            share.tag,
+            share.host_path.display(),
+            share.read_only
+        );
+    }
 
     let vm_config = config::VmConfig {
         cpus: project.config.vm.cpus,
         memory_bytes: project.config.vm.memory.0,
         kernel: assets.kernel,
         initramfs: assets.initramfs,
-        kernel_cmdline: build_kernel_cmdline(args),
+        kernel_cmdline: build_kernel_cmdline(opts.log_level),
         shares,
         cache_disk: Some(disk_image.clone()),
         runtime_dir: project.sandbox_dir.clone(),
@@ -214,7 +232,6 @@ pub async fn start(
         disk_image,
         caches,
         container_home: container_home.to_string(),
-        cmd,
         env,
         cwd,
         uid: image.uid,
@@ -226,19 +243,21 @@ pub async fn start(
     Ok((vm, vsock_fd))
 }
 
-/// Build the sandbox dir mount and resolve all enabled user mounts.
+/// Build the project dir mount (when `project_share`) and resolve all
+/// enabled user mounts.
 fn assemble_mounts(
     project: &Project,
     container_home: &str,
+    project_share: bool,
 ) -> anyhow::Result<Vec<mount::ResolvedMount>> {
-    let project_mount = mount::ResolvedMount {
+    let project_mount = project_share.then(|| mount::ResolvedMount {
         mount_type: mount::MountType::Dir {
             key: "project".to_string(),
         },
         source: project.host_cwd.clone(),
         target: project.guest_cwd.to_string_lossy().into(),
         read_only: false,
-    };
+    });
 
     let mut enabled_mounts: Vec<_> = project
         .config
@@ -256,7 +275,7 @@ fn assemble_mounts(
         &project.guest_cwd,
     )?;
 
-    let mut mounts = vec![project_mount];
+    let mut mounts: Vec<_> = project_mount.into_iter().collect();
     mounts.extend(user_mounts);
     Ok(mounts)
 }
@@ -359,43 +378,17 @@ fn prepare_shares(
     Ok(shares)
 }
 
-/// Resolve the final container command: args override, then login shell wrap.
-fn resolve_cmd(args: &CliArgs, image: &OciImage) -> Vec<String> {
-    let cmd = if args.args.is_empty() {
-        image.cmd.clone()
-    } else {
-        args.args.clone()
-    };
-    if args.login {
-        crate::oci::apply_login_shell(cmd)
-    } else {
-        cmd
-    }
-}
-
-/// Resolve the final container environment: image env with the guest-visible
-/// `[env]` values layered on top. Masked entries contribute their surrogate,
-/// never the real value.
-fn resolve_env(image: &OciImage, sandbox_env: &SandboxEnv) -> Vec<String> {
-    let mut env = image.env.clone();
-    for (key, value) in sandbox_env.guest_entries() {
-        env.retain(|existing| !existing.starts_with(&format!("{key}=")));
-        env.push(format!("{key}={value}"));
-    }
-    env
-}
-
 /// Build the kernel command line string.
-fn build_kernel_cmdline(args: &CliArgs) -> String {
+fn build_kernel_cmdline(log_level: LogLevel) -> String {
     let mut cmdline = "console=hvc0 console=ttyS0 rdinit=/init".to_string();
-    if !matches!(args.log_level, LogLevel::Trace | LogLevel::Debug) {
+    if !matches!(log_level, LogLevel::Trace | LogLevel::Debug) {
         cmdline.push_str(" quiet loglevel=3");
     }
     cmdline
 }
 
-/// Log the resolved VM configuration to the terminal and trace output.
-fn log_config(project: &Project, shares: &[VmShare]) {
+/// Print the VM resources summary (cpus, memory, disk).
+fn log_config(project: &Project) {
     cli::log!(
         "  {} cpus:   {}",
         cli::bullet(),
@@ -411,14 +404,6 @@ fn log_config(project: &Project, shares: &[VmShare]) {
         cli::bullet(),
         cli::dim(&project.config.disk.size.to_string())
     );
-    for share in shares {
-        tracing::debug!(
-            "share: tag={}, host_path={}, ro={}",
-            share.tag,
-            share.host_path.display(),
-            share.read_only
-        );
-    }
 }
 
 /// Start the platform-specific VM backend. Waiting for a particular
@@ -446,32 +431,38 @@ async fn boot_backend(vm_config: &config::VmConfig) -> anyhow::Result<Box<dyn Vm
     }
 }
 
+/// Future returned by the object-safe [`VmHandle`] methods.
+type HandleFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>;
+
 /// Trait for VM backends. Dropping the handle kills the VM.
 trait VmHandle {
     /// Open a fresh vsock connection to the given guest port. Used to
     /// open the network-proxy channel after the supervisor one is up.
-    fn vsock_connect(
-        &self,
-        port: u32,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<OwnedFd>> + '_>>;
+    fn vsock_connect(&self, port: u32) -> HandleFuture<'_, anyhow::Result<OwnedFd>>;
+
+    /// Stop the VM and wait until the backend confirms it stopped. Dropping
+    /// the handle afterwards does not stop it again.
+    fn stop(&mut self) -> HandleFuture<'_, anyhow::Result<()>>;
 }
 
 #[cfg(target_os = "macos")]
 impl VmHandle for apple::AppleVmBackend {
-    fn vsock_connect(
-        &self,
-        port: u32,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<OwnedFd>> + '_>> {
+    fn vsock_connect(&self, port: u32) -> HandleFuture<'_, anyhow::Result<OwnedFd>> {
         Box::pin(apple::AppleVmBackend::vsock_connect(self, port))
+    }
+
+    fn stop(&mut self) -> HandleFuture<'_, anyhow::Result<()>> {
+        Box::pin(apple::AppleVmBackend::stop(self))
     }
 }
 
 #[cfg(target_os = "linux")]
 impl VmHandle for cloud_hypervisor::CloudHypervisorBackend {
-    fn vsock_connect(
-        &self,
-        port: u32,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<OwnedFd>> + '_>> {
+    fn vsock_connect(&self, port: u32) -> HandleFuture<'_, anyhow::Result<OwnedFd>> {
         Box::pin(async move { cloud_hypervisor::CloudHypervisorBackend::vsock_connect(self, port) })
+    }
+
+    fn stop(&mut self) -> HandleFuture<'_, anyhow::Result<()>> {
+        Box::pin(async move { cloud_hypervisor::CloudHypervisorBackend::stop(self) })
     }
 }

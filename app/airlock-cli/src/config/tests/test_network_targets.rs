@@ -1,8 +1,8 @@
-use crate::config::load_config::parse_config;
+use crate::config::config_values;
 
-fn parse(toml_str: &str) -> anyhow::Result<crate::config::Config> {
+fn parse(toml_str: &str) -> anyhow::Result<crate::config::config_values::ConfigValues> {
     let value: serde_json::Value = toml::from_str(toml_str).unwrap();
-    parse_config(value)
+    config_values::parse(value)
 }
 
 #[test]
@@ -87,7 +87,7 @@ fn every_malformed_pattern_is_reported_at_once() {
 
 #[test]
 fn disabled_rule_is_not_validated() {
-    // A rule disabled via `enabled = false` (e.g. an inherited preset rule
+    // A rule disabled via `enabled = false` (e.g. an inherited pack rule
     // the user cannot edit) is skipped, like the inject checks.
     parse(
         r#"

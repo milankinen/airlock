@@ -1,0 +1,9 @@
+label = "alpine"
+description = "Alpine Linux"
+kind = "distro"
+
+[[args]]
+key = "package-installs"
+type = "bool"
+description = "allow packages"
+default = true

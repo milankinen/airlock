@@ -1,0 +1,3 @@
+label = "mise"
+description = "Tool and runtime version manager"
+kind = "tool"

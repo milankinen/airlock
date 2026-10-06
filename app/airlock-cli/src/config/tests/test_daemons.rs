@@ -1,9 +1,9 @@
-use crate::config::config::{RestartPolicy, Signal};
-use crate::config::load_config::parse_config;
+use crate::config::config_values;
+use crate::config::config_values::{RestartPolicy, Signal};
 
-fn parse(toml_str: &str) -> anyhow::Result<crate::config::Config> {
+fn parse(toml_str: &str) -> anyhow::Result<crate::config::config_values::ConfigValues> {
     let value: serde_json::Value = toml::from_str(toml_str).unwrap();
-    parse_config(value)
+    config_values::parse(value)
 }
 
 #[test]

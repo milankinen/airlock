@@ -1,18 +1,25 @@
 //! Host-side RPC client for the in-VM supervisor.
 //!
 //! [`Supervisor`] connects over virtio-vsock and exposes typed methods for
-//! starting and exec'ing processes, plus a shutdown call for filesystem sync.
+//! booting the VM, spawning processes inside it, and a shutdown call for
+//! filesystem sync.
 
-use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
+use std::future::Future;
+use std::os::unix::io::OwnedFd;
 
 use airlock_common::supervisor_capnp::{
     DaemonState as WireDaemonState, RestartPolicy as WireRestartPolicy, *,
 };
+use capnp_rpc::rpc_twoparty_capnp;
 
-use crate::config::config::RestartPolicy;
+use crate::config::config_values::RestartPolicy;
 use crate::project::Project;
+use crate::rpc::browser::{Browser, BrowserImpl};
+use crate::rpc::clipboard::ClipboardImpl;
 use crate::rpc::logging::LogSinkImpl;
 use crate::rpc::process::Process;
+use crate::rpc::{Driver, driver, vsock_transport};
+use crate::vm::VmInstance;
 
 /// Snapshot of guest resource usage returned by [`Supervisor::poll_stats`].
 #[derive(Debug, Clone, Default)]
@@ -23,7 +30,7 @@ pub struct StatsSnapshot {
     pub load_avg: (f32, f32, f32),
 }
 
-/// Host-side daemon specification, serialized into the `start` RPC. Built
+/// Host-side daemon specification, serialized into the `boot` RPC. Built
 /// from the TOML config after env templates have been expanded.
 #[derive(Debug, Clone)]
 pub struct DaemonSpec {
@@ -43,7 +50,7 @@ pub struct DaemonSpec {
     pub harden: bool,
 }
 
-/// Host-side directory mask spec, serialised into the start RPC and
+/// Host-side directory mask spec, serialised into the boot RPC and
 /// applied by guest init. Matches `MaskSpec` in supervisor.capnp.
 #[derive(Debug, Clone)]
 pub struct MaskSpec {
@@ -68,6 +75,24 @@ impl DaemonState {
     }
 }
 
+/// The `Supervisor.boot` inputs: VM/mount configuration built from the
+/// project config. Carries no process to run — the main process and
+/// `airlock exec` both start afterwards via [`Supervisor::spawn`].
+pub struct BootRequest<'a> {
+    pub project: &'a Project,
+    pub vm: &'a VmInstance,
+    /// `tracing` filter directive for the guest (see [`crate::cli::LogLevel::filter`]).
+    pub log_filter: &'a str,
+    /// `(host path, guest path)` socket forwards.
+    pub socket_fwds: &'a [(String, String)],
+    pub daemons: &'a [DaemonSpec],
+    pub masks: &'a [MaskSpec],
+    /// The browser bridge; `None` grants no browser.
+    pub browser: Option<Browser>,
+    /// The clipboard bridge; `None` grants no clipboard.
+    pub clipboard: Option<ClipboardImpl>,
+}
+
 /// Host-side handle to the in-VM supervisor, wrapping the Cap'n Proto client.
 #[derive(Clone)]
 pub struct Supervisor {
@@ -76,107 +101,73 @@ pub struct Supervisor {
 
 impl Supervisor {
     /// Establish an RPC connection to the supervisor over the given vsock fd.
-    pub fn connect(vsock_fd: OwnedFd) -> anyhow::Result<Self> {
-        use futures::AsyncReadExt;
-
-        #[cfg(target_os = "macos")]
-        let stream = {
-            let std_stream = unsafe { std::net::TcpStream::from_raw_fd(vsock_fd.into_raw_fd()) };
-            std_stream.set_nonblocking(true)?;
-            tokio::net::TcpStream::from_std(std_stream)?
-        };
-        #[cfg(target_os = "linux")]
-        let stream = {
-            let std_stream =
-                unsafe { std::os::unix::net::UnixStream::from_raw_fd(vsock_fd.into_raw_fd()) };
-            std_stream.set_nonblocking(true)?;
-            tokio::net::UnixStream::from_std(std_stream)?
-        };
-        let (reader, writer) = tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
-
-        let network = capnp_rpc::twoparty::VatNetwork::new(
-            reader,
-            writer,
-            capnp_rpc::rpc_twoparty_capnp::Side::Client,
-            capnp::message::ReaderOptions::default(),
-        );
-
-        let mut rpc = capnp_rpc::RpcSystem::new(Box::new(network), None);
-        let client: supervisor::Client = rpc.bootstrap(capnp_rpc::rpc_twoparty_capnp::Side::Server);
-
-        tokio::task::spawn_local(rpc);
-
-        Ok(Self { supervisor: client })
+    /// The returned [`Driver`] runs the connection; the handle works only
+    /// while the driver is polled.
+    pub fn connect(vsock_fd: OwnedFd) -> anyhow::Result<(Self, Driver)> {
+        let transport = vsock_transport(vsock_fd, rpc_twoparty_capnp::Side::Client)?;
+        let mut rpc = capnp_rpc::RpcSystem::new(transport, None);
+        let client: supervisor::Client = rpc.bootstrap(rpc_twoparty_capnp::Side::Server);
+        Ok((Self { supervisor: client }, driver(rpc, "supervisor")))
     }
 
     /// Clone of the underlying capnp client. Used to hand a late-bound
-    /// reference to components like [`Network`](crate::network::Network)
-    /// that need to fire specific RPCs after the handshake.
+    /// reference to components like the deny reporter and
+    /// [`crate::rpc::guest_network::GuestNetwork`] that need to fire
+    /// specific RPCs after the handshake.
     pub fn client(&self) -> supervisor::Client {
         self.supervisor.clone()
     }
 
-    /// Spawn a background task that pushes the host wall-clock into the
-    /// guest every `interval`. VMs have no RTC, so long host sleeps
+    /// A task that pushes the host wall-clock into the guest every
+    /// `interval`, forever. VMs have no RTC, so long host sleeps
     /// (laptop lid closed, suspend) cause the guest clock to drift —
     /// breaking TLS validation and every `mtime`-driven build tool.
     /// The RPC is cheap (one UInt64 + UInt32 round-trip) and idempotent;
     /// we just keep re-setting the guest clock to the current host
     /// value.
-    pub fn spawn_clock_sync(&self, interval: std::time::Duration) {
+    pub fn clock_sync(&self, interval: std::time::Duration) -> impl Future<Output = ()> + 'static {
         let supervisor = self.supervisor.clone();
-        tokio::task::spawn_local(async move {
+        async move {
             let mut ticker = tokio::time::interval(interval);
             // Skip the immediate first tick — the guest's clock was
-            // just set by `Supervisor.start`.
+            // just set by `Supervisor.boot`.
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default();
+                let (epoch, nanos) = now();
                 let mut req = supervisor.sync_clock_request();
-                req.get().set_epoch(now.as_secs());
-                req.get().set_epoch_nanos(now.subsec_nanos());
+                req.get().set_epoch(epoch);
+                req.get().set_epoch_nanos(nanos);
                 if let Err(e) = req.send().promise.await {
                     tracing::debug!("clock sync: {e}");
                 }
             }
-        });
+        }
     }
 
-    /// Send the initial `Supervisor.start()` RPC to bootstrap the VM and
-    /// launch the main container process. Returns a [`Process`] handle for
-    /// polling output and forwarding signals.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn start(
-        &self,
-        args: &crate::cli::CliArgs,
-        project: &Project,
-        vm: &crate::vm::VmInstance,
-        stdin: stdin::Client,
-        pty_size: Option<(u16, u16)>,
-        socket_fwds: &[(String, String)],
-        epoch: u64,
-        epoch_nanos: u32,
-        daemons: &[DaemonSpec],
-        masks: &[MaskSpec],
-    ) -> anyhow::Result<Process> {
+    /// Send the `Supervisor.boot()` RPC to bring up the VM: mounts,
+    /// networking, daemons. Carries no process to run; the main process
+    /// and `airlock exec` both start afterwards via [`Self::spawn`]. The
+    /// guest accepts this once per VM.
+    pub async fn boot(&self, boot: BootRequest<'_>) -> anyhow::Result<()> {
+        let BootRequest {
+            project,
+            vm,
+            log_filter,
+            socket_fwds,
+            daemons,
+            masks,
+            browser,
+            clipboard,
+        } = boot;
         let log_sink: log_sink::Client = capnp_rpc::new_client(LogSinkImpl);
 
-        let mut req = self.supervisor.start_request();
-        req.get().set_stdin(stdin);
-        if let Some((rows, cols)) = pty_size {
-            let mut size = req.get().init_pty().init_size();
-            size.set_rows(rows);
-            size.set_cols(cols);
-        } else {
-            req.get().init_pty().set_none(());
-        }
+        let mut req = self.supervisor.boot_request();
         req.get().set_logs(log_sink);
-        req.get().set_log_filter(args.log_filter());
+        req.get().set_log_filter(log_filter);
 
         // Init config: epoch, host ports
+        let (epoch, epoch_nanos) = now();
         req.get().set_epoch(epoch);
         req.get().set_epoch_nanos(epoch_nanos);
         let port_forwards =
@@ -194,19 +185,6 @@ impl Supervisor {
             sf_builder.reborrow().get(i as u32).set_guest(guest);
         }
 
-        // Process configuration
-        req.get()
-            .set_cmd(vm.cmd.first().map_or("/bin/sh", String::as_str));
-        let proc_args = if vm.cmd.len() > 1 { &vm.cmd[1..] } else { &[] };
-        let mut args_b = req.get().init_args(proc_args.len() as u32);
-        for (i, a) in proc_args.iter().enumerate() {
-            args_b.set(i as u32, a);
-        }
-        let mut env_b = req.get().init_env(vm.env.len() as u32);
-        for (i, e) in vm.env.iter().enumerate() {
-            env_b.set(i as u32, e);
-        }
-        req.get().set_cwd(&vm.cwd);
         req.get().set_uid(vm.uid);
         req.get().set_gid(vm.gid);
         req.get().set_nested_virt(project.config.vm.kvm);
@@ -291,43 +269,31 @@ impl Supervisor {
         }
 
         // Clipboard grant. The capability is only ever built when a
-        // direction is enabled, so an ungranted sandbox holds a null `sink`
-        // and has nothing to call. A host with no clipboard program
-        // downgrades to ungranted with a warning — never a failed start.
-        let cb = &project.config.clipboard;
-        if cb.copy || cb.paste {
-            match crate::rpc::clipboard::detect() {
-                Some(tool) => {
-                    let sink: clipboard::Client =
-                        capnp_rpc::new_client(crate::rpc::clipboard::ClipboardImpl::new(
-                            tool,
-                            cb.copy,
-                            cb.paste,
-                            cb.copy_limit.0,
-                        ));
-                    let mut b = req.get().init_clipboard();
-                    b.set_copy(cb.copy);
-                    b.set_paste(cb.paste);
-                    b.set_limit(cb.copy_limit.0);
-                    b.set_sink(sink);
-                }
-                None => {
-                    crate::cli::log!(
-                        "  {} clipboard disabled: no clipboard program found on the host",
-                        crate::cli::bullet()
-                    );
-                }
-            }
+        // direction is granted, so an ungranted sandbox holds a null `sink`
+        // and has nothing to call.
+        if let Some(grant) = clipboard {
+            let mut b = req.get().init_clipboard();
+            b.set_copy(grant.copy);
+            b.set_paste(grant.paste);
+            b.set_limit(grant.limit);
+            let sink: clipboard::Client = capnp_rpc::new_client(grant);
+            b.set_sink(sink);
         }
 
-        let response = req.send().promise.await?;
-        let proc = response.get()?.get_proc()?;
+        // Browser grant: only boots with a network service have one.
+        if let Some(browser) = browser {
+            let sink: browser::Client = capnp_rpc::new_client(BrowserImpl::new(browser));
+            req.get().init_browser().set_sink(sink);
+        }
 
-        Ok(Process::new(proc))
+        req.send().promise.await?;
+        Ok(())
     }
 
-    /// Attach a new process to the running container.
-    pub async fn exec(
+    /// Start a process inside the booted container — the main process and
+    /// `airlock exec` both go through here. Refused before [`Self::boot`]
+    /// has succeeded.
+    pub async fn spawn(
         &self,
         stdin: stdin::Client,
         pty_size: Option<(u16, u16)>,
@@ -336,15 +302,9 @@ impl Supervisor {
         cwd: &str,
         env: &[String],
     ) -> anyhow::Result<Process> {
-        let mut req = self.supervisor.exec_request();
+        let mut req = self.supervisor.spawn_request();
         req.get().set_stdin(stdin);
-        if let Some((rows, cols)) = pty_size {
-            let mut size = req.get().init_pty().init_size();
-            size.set_rows(rows);
-            size.set_cols(cols);
-        } else {
-            req.get().init_pty().set_none(());
-        }
+        super::set_pty(req.get().init_pty(), pty_size);
         req.get().set_cmd(cmd);
         let mut args_b = req.get().init_args(args.len() as u32);
         for (i, a) in args.iter().enumerate() {
@@ -383,11 +343,11 @@ impl Supervisor {
     }
 
     /// Request the supervisor to sync filesystems before the VM is destroyed.
-    pub async fn shutdown(&self) {
+    /// `Ok` means the guest confirmed the sync.
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
         let req = self.supervisor.shutdown_request();
-        if let Err(e) = req.send().promise.await {
-            tracing::debug!("shutdown RPC: {e}");
-        }
+        req.send().promise.await?;
+        Ok(())
     }
 
     /// Snapshot of every declared daemon's current state. The guest holds
@@ -419,4 +379,12 @@ impl Supervisor {
             tracing::debug!("shutdown_daemons RPC: {e}");
         }
     }
+}
+
+/// Host wall-clock as `(seconds, nanoseconds)` since the Unix epoch.
+fn now() -> (u64, u32) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    (now.as_secs(), now.subsec_nanos())
 }

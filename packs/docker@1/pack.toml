@@ -1,0 +1,3 @@
+label = "docker"
+description = "Docker Engine, CLI, Buildx and Compose"
+kind = "tool"

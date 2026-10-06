@@ -1,9 +1,9 @@
-use crate::config::config::EnvVar;
-use crate::config::load_config::{merge_json, normalize_env, parse_config};
+use crate::config::config_values::{self, EnvVar};
+use crate::config::merge::{merge_json, normalize_env};
 
-fn parse(toml_str: &str) -> anyhow::Result<crate::config::Config> {
+fn parse(toml_str: &str) -> anyhow::Result<crate::config::config_values::ConfigValues> {
     let value: serde_json::Value = toml::from_str(toml_str).unwrap();
-    parse_config(value)
+    config_values::parse(value)
 }
 
 #[test]
@@ -107,7 +107,7 @@ fn string_overlay_keeps_base_mask() {
     .unwrap();
     normalize_env(&mut base);
     normalize_env(&mut overlay);
-    let config = parse_config(merge_json(base, overlay)).unwrap();
+    let config = config_values::parse(merge_json(base, overlay)).unwrap();
     let var = &config.env["TOKEN"];
     assert_eq!(var.value, "${B}");
     assert!(var.mask, "overlay string must not un-mask the entry");
@@ -131,7 +131,7 @@ fn mask_only_overlay_on_string_base_keeps_value() {
     .unwrap();
     normalize_env(&mut base);
     normalize_env(&mut overlay);
-    let config = parse_config(merge_json(base, overlay)).unwrap();
+    let config = config_values::parse(merge_json(base, overlay)).unwrap();
     let var = &config.env["TOKEN"];
     assert_eq!(var.value, "${A}");
     assert!(var.mask);

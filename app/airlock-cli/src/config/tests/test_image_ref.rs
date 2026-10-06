@@ -1,5 +1,4 @@
-use crate::config::config::{ImageRef, PullPolicy, Resolution};
-use crate::config::load_config::parse_config;
+use crate::config::config_values::{self, ImageRef, PullPolicy, Resolution};
 
 fn parse(toml_str: &str) -> ImageRef {
     let value: toml::Value = toml::from_str(toml_str).unwrap();
@@ -20,7 +19,7 @@ fn pull_policy_survives_full_config_parse() {
         "#,
     )
     .unwrap();
-    let config = parse_config(value).unwrap();
+    let config = config_values::parse(value).unwrap();
     assert_eq!(config.vm.image.name, "alpine:latest");
     assert_eq!(config.vm.image.pull_policy, PullPolicy::IfChanged);
 }
@@ -34,7 +33,7 @@ fn plain_string_image_survives_full_config_parse() {
         "#,
     )
     .unwrap();
-    let config = parse_config(value).unwrap();
+    let config = config_values::parse(value).unwrap();
     assert_eq!(config.vm.image.pull_policy, PullPolicy::IfNotPresent);
     assert!(config.vm.image.pinned_digest().is_some());
 }

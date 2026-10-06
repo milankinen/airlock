@@ -1,0 +1,35 @@
+# Docker engine inside the VM
+#
+# Starts `dockerd` as a daemon and allows image pulls from Docker Hub and
+# GitHub Container Registry. The image must ship the engine, e.g.
+# `apk add docker docker-compose` on Alpine.
+#
+# Registries accept pushes as well as pulls: a sandboxed process can log
+# in to any account and `docker push` data out through these hosts.
+
+[network.rules.docker-registries]
+allow = [
+    # Docker Hub: registry API, token service and blob storage CDNs
+    "registry-1.docker.io",
+    "auth.docker.io",
+    "production.cloudfront.docker.com",
+    "production.cloudflare.docker.com",
+    "docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com",
+    # GitHub Container Registry and its blob storage
+    "ghcr.io",
+    "pkg-containers.githubusercontent.com",
+]
+
+# Docker's overlayfs storage driver cannot run on top of the VM's overlayfs
+# root, so /var/lib/docker is bind-mounted from the ext4 disk at
+# /airlock/disk. This also keeps images and build cache across sandbox
+# restarts. The bind mount is skipped when a daemon restart finds it
+# already in place. `harden = false` because dockerd must create
+# namespaces and manage cgroups, which hardening blocks.
+[daemons.dockerd]
+command = [
+    "sh", "-c",
+    "mkdir -p /airlock/disk/docker /var/lib/docker && { grep -qs ' /var/lib/docker ' /proc/mounts || mount --bind /airlock/disk/docker /var/lib/docker; } && exec dockerd",
+]
+harden = false
+timeout = 10
