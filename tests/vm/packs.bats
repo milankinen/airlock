@@ -3,7 +3,8 @@
 load helpers
 
 # Pack installs on new and existing sandboxes, with Alpine and Debian
-# images. The tests of each image run in order and use the same sandbox.
+# images. Each image has one test. It runs all steps in order on one
+# sandbox, because each step needs the state of the step before it.
 
 # The config of all packs.
 PACKS='[packs]
@@ -51,7 +52,6 @@ pack_status() {
 # no --yes). The disk is made when the sandbox is prepared, before the
 # install. The install runs in the same boot, not in a separate install VM.
 check_install() {
-    cd "$1" || return 1
     run_airlock start -- sh -c "$VERSIONS"
     assert_success
     assert_output_contains "disk created"
@@ -67,7 +67,6 @@ check_install() {
 
 # Check that a second start installs nothing and the pack commands work.
 check_second_start() {
-    cd "$1" || return 1
     run_airlock start -- sh -c "$VERSIONS"
     assert_success
     assert_output_not_contains "Installing packs"
@@ -79,7 +78,6 @@ check_second_start() {
 # write. The next start then runs the script of the pack again on the same
 # disk. This is a retry, so it asks no question and needs no terminal.
 check_rerun() {
-    cd "$1" || return 1
     sed -i.bak 's/"status": "installed"/"status": "unconfirmed"/' .airlock/sandbox/installs.json
     rm .airlock/sandbox/installs.json.bak
     [[ "$(pack_status rust)" == unconfirmed ]]
@@ -96,9 +94,8 @@ check_rerun() {
 # terminal and without --yes, start fails before the image pull. --yes makes
 # a new sandbox: a new disk with only the packs of the config. The config
 # comes back at the end, but the sandbox stays without mise. Thus this check
-# must run last for its project.
+# must run last for its sandbox.
 check_removed_pack() {
-    cd "$1" || return 1
     sed -i.bak '/^mise = { version = 1 }$/d' airlock.toml
     run_airlock start -- sh -c 'echo NOT-REACHED'
     [[ "$status" -eq 2 ]]
@@ -120,7 +117,6 @@ check_removed_pack() {
 # Check that the list form installs nothing: no install boot, no install
 # records and no python3 in the sandbox (the Alpine image has no python3).
 check_legacy_installs_nothing() {
-    cd "$1" || return 1
     run_airlock start -- sh -c 'command -v python3 || echo NO-PYTHON'
     assert_success
     assert_output_not_contains "Installing packs"
@@ -129,71 +125,44 @@ check_legacy_installs_nothing() {
     [[ ! -e .airlock/sandbox/installs.log ]]
 }
 
-# Test that a new Alpine sandbox installs every pack without a question,
-# and then runs the command.
-#   1. Run start with all packs and no terminal
-#   2. Check the install order, the log and that each pack is installed
-@test "alpine: new sandbox installs every pack without question then runs command" {
-    check_install alpine
-}
-
-# Test that the second start on the Alpine sandbox installs nothing.
-#   1. Run start again
-#   2. Check that there is no install and all pack commands work
-@test "alpine: second start installs nothing" {
-    check_second_start alpine
-}
-
-# Test that unconfirmed records make each pack script run again on the
-# Alpine disk, so that the scripts must be safe to run two times.
-#   1. Change all install records to unconfirmed
-#   2. Run start and check that each pack installs again with no failure
-@test "alpine: unconfirmed install runs every script again" {
-    check_rerun alpine
-}
-
-# Test that a pack removed from the Alpine config needs a terminal or --yes,
-# and --yes makes a new sandbox.
-#   1. Remove mise from the config and check that start fails
-#   2. Run start --yes and check that a new disk has the other packs only
-@test "alpine: removed pack needs terminal or --yes and --yes re-creates sandbox" {
-    check_removed_pack alpine
+# Test the pack life cycle on an Alpine sandbox: a new sandbox installs
+# every pack without a question, a second start installs nothing,
+# unconfirmed records run each script again, and a removed pack needs a
+# terminal or --yes.
+#   1. Run start with all packs and no terminal, and check the installs
+#   2. Run start again and check that there is no install
+#   3. Change all install records to unconfirmed, run start, and check that
+#      each pack installs again with no failure
+#   4. Remove mise from the config and check that start fails, then run
+#      start --yes and check that a new disk has the other packs only
+@test "alpine: packs install, stay, run again and need --yes to remove" {
+    cd alpine
+    check_install
+    check_second_start
+    check_rerun
+    check_removed_pack
 }
 
 # Test that a list-form preset installs no pack.
 #   1. Run start with presets = ["python"] on Alpine
 #   2. Check that there is no install, no python3 and no install files
 @test "list-form preset installs nothing" {
-    check_legacy_installs_nothing legacy-list
+    cd legacy-list
+    check_legacy_installs_nothing
 }
 
-# Test that a new Debian sandbox installs every pack without a question,
-# and then runs the command.
-#   1. Run start with all packs and no terminal
-#   2. Check the install order, the log and that each pack is installed
-@test "debian: new sandbox installs every pack without question then runs command" {
-    check_install debian
-}
-
-# Test that the second start on the Debian sandbox installs nothing.
-#   1. Run start again
-#   2. Check that there is no install and all pack commands work
-@test "debian: second start installs nothing" {
-    check_second_start debian
-}
-
-# Test that unconfirmed records make each pack script run again on the
-# Debian disk, so that the scripts must be safe to run two times.
-#   1. Change all install records to unconfirmed
-#   2. Run start and check that each pack installs again with no failure
-@test "debian: unconfirmed install runs every script again" {
-    check_rerun debian
-}
-
-# Test that a pack removed from the Debian config needs a terminal or
-# --yes, and --yes makes a new sandbox.
-#   1. Remove mise from the config and check that start fails
-#   2. Run start --yes and check that a new disk has the other packs only
-@test "debian: removed pack needs terminal or --yes and --yes re-creates sandbox" {
-    check_removed_pack debian
+# Test the pack life cycle on a Debian sandbox, with the same steps as the
+# Alpine test.
+#   1. Run start with all packs and no terminal, and check the installs
+#   2. Run start again and check that there is no install
+#   3. Change all install records to unconfirmed, run start, and check that
+#      each pack installs again with no failure
+#   4. Remove mise from the config and check that start fails, then run
+#      start --yes and check that a new disk has the other packs only
+@test "debian: packs install, stay, run again and need --yes to remove" {
+    cd debian
+    check_install
+    check_second_start
+    check_rerun
+    check_removed_pack
 }
