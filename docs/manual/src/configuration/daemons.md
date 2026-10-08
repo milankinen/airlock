@@ -119,7 +119,7 @@ exited on its own within the timeout.
 ## Disabling a daemon
 
 You can disable a daemon without removing the entry from the config —
-useful when a preset defines one you don't need:
+useful when a pack defines one you don't need:
 
 ```toml
 [daemons.redis]

@@ -121,7 +121,7 @@ paths inside mounted directories cleanly.
 
 ## CA certificate injection
 
-The `caCert` field on the `start` RPC delivers the project CA
+The `caCert` field on the `boot` RPC delivers the project CA
 certificate (used for TLS interception) to the guest. Guest init builds
 a **tmpfs lowerdir** at `/mnt/ca-overlay` containing per-distro CA
 bundle files with the project CA appended, and splices that tmpfs on

@@ -6,17 +6,24 @@ every team member gets the same sandbox setup.
 
 ## File hierarchy
 
-airlock loads configuration from up to four locations. Later files override
+airlock loads configuration from up to six locations. Later files override
 earlier ones:
 
-1. `~/.airlock/config.toml` — user-level settings (e.g. preferred CPU/memory)
-2. `~/.airlock.toml` — alternative user-level settings file
-3. `airlock.toml` — project config (checked into version control)
-4. `airlock.local.toml` — local overrides (gitignored)
+1. `~/.airlock/airlock.toml` — user-level settings (e.g. preferred CPU/memory)
+2. `~/.airlock/config.toml` — alternative user-level settings file
+3. `~/.airlock.toml` — alternative user-level settings file
+4. `.airlock/airlock.toml` — local project config (not in version control)
+5. `airlock.toml` — project config (checked into version control)
+6. `airlock.local.toml` — local overrides (gitignored)
 
 This layering lets a company ship global defaults and each developer set
 personal preferences. Each project defines its own sandbox, with room for
 local tweaks that don't affect the team.
+
+The [setup wizard](./usage/starting-sandbox.md#setup-wizard) writes the
+first project config to `.airlock/airlock.toml` (`start`) or to
+`airlock.toml` (`start and share`). `airlock rm` removes
+`.airlock/airlock.toml` together with the sandbox.
 
 airlock also accepts JSON and YAML files (e.g. `airlock.json`, `airlock.yaml`).
 For each slot, the first matching extension in the order `.toml`, `.json`,
@@ -24,19 +31,21 @@ For each slot, the first matching extension in the order `.toml`, `.json`,
 
 ## Minimal example
 
-A project that uses Ubuntu with a Rust toolchain preset:
+A project that uses Debian with a Rust toolchain:
 
 ```toml
-presets = ["rust"]
+[packs]
+debian = { version = "1" }
+rust = { version = "1" }
 
 [vm]
-image = "ubuntu:24.04"
 cpus = 4
 memory = "4 GB"
 ```
 
-This is enough to get a working sandbox. The `rust` preset adds network rules
-for `crates.io` and related hosts, so `cargo build` works with no extra rules.
+This is enough to get a working sandbox. The `rust` [pack](./packs.md)
+installs Rust and adds network rules for `crates.io` and related hosts, so
+`cargo build` works with no extra rules.
 
 ## Sandbox state
 
@@ -52,7 +61,7 @@ these rules:
 
 - Object fields merge recursively (e.g. `[vm]` settings from different
   files combine, they do not replace each other)
-- Arrays concatenate (e.g. preset lists from different levels stack)
+- Arrays concatenate (e.g. `allow` lists of the same rule from different levels stack)
 - Later files override scalar values
 - A `null` value never overwrites an existing value
 
@@ -66,7 +75,7 @@ socket forwards — has an `enabled` flag that defaults to `true`. Combined with
 the hierarchical config loading, this gives individuals full control over
 shared configurations.
 
-For example, a preset in the project `airlock.toml` can define a mount and
+For example, a pack in the project `airlock.toml` can define a mount and
 a network rule. A developer can disable either one in their
 `airlock.local.toml` without modifying the shared config:
 
@@ -76,7 +85,7 @@ a network rule. A developer can disable either one in their
 [mounts.ssh-config]
 enabled = false
 
-[network.rules.alpine-packages]
+[network.rules.debian-packages]
 enabled = false
 ```
 

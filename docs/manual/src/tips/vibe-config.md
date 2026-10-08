@@ -1,82 +1,42 @@
 # Vibe coding configuration
 
-airlock's configuration system is [hierarchical](../configuration.md#file-hierarchy).
-That means you can put user-level settings in `~/.airlock/config.toml`
-or `~/.airlock.toml`, and they will apply to every project sandbox by
-default. Per-project configuration overrides them where present.
-
-This is especially handy if you want to "vibe code" and just point your
-agent at a random directory without any extra setup. Since airlock can
-build sandboxes from local Docker images, you can prebake one local
-image with everything you need for your vibe-coding sessions.
-
-Your `~/.airlock/config.toml` (or `~/.airlock.toml`) might look something
-like this:
+Sometimes you want to "vibe code": point an agent at a random directory
+without any extra setup. airlock's configuration is
+[hierarchical](../configuration.md#file-hierarchy), so you can put your
+personal defaults in `~/.airlock/airlock.toml`. They apply to every
+project sandbox:
 
 ```toml
-presets = ["debian", "rust", "claude-code"]
-
-[vm.image]
-name = "vibe:local"
-resolution = "docker"
+# ~/.airlock/airlock.toml
+[vm]
+cpus = 4
+memory = "8 GB"
 
 [network]
 policy = "deny-by-default"
 ```
 
-## Pairing with mise
+A user config cannot enable [packs](../packs.md). Instead, the
+[setup wizard](../usage/starting-sandbox.md#setup-wizard) asks for them on
+the first start in each directory.
 
-If you're using [mise](https://mise.jdx.dev/) for your project tooling,
-airlock pairs extremely well with it. You can use mise's task
-dependencies and `sources` / `outputs` to build a local "vibe coding"
-image and keep it up to date.
+To keep the project files clean, make the wizard write a local config
+(`.airlock/airlock.toml`) by default:
 
-Create `~/.airlock/vibe.dockerfile`, for example:
-
-```dockerfile
-FROM debian:trixie-slim
-
-ENV MISE_TRUSTED_CONFIG_PATHS="/"
-
-# Install development dependencies
-RUN apt-get update && apt-get install -y git curl build-essential
-RUN curl https://mise.run | sh
-RUN curl -fsSL https://claude.ai/install.sh | bash
-RUN /root/.local/bin/mise use -g node@22
-
-# Setup login shell
-RUN echo 'export PATH=~/.local/bin:~/.cargo/bin:$PATH' >> ~/.bashrc && \
-    echo 'eval "$(~/.local/bin/mise activate bash)"' >> ~/.bashrc && \
-    echo '[[ -f ~/.bashrc ]] && source ~/.bashrc' >> ~/.bash_profile
-
-ENTRYPOINT ["/bin/bash"]
-```
-
-Then add a user-level task in `~/.config/mise/config.toml`:
-
-```toml 
-[tasks."vibe:image"]
-description = "Build vibe coding image"
-quiet = true
-hide = true
-dir = "~/.airlock"
-sources = ["~/.airlock/vibe.dockerfile"]
-run = "docker build -t vibe:local -f vibe.dockerfile ."
-
-[tasks.vibe]
-depends = ["vibe:image"]
-tools = { "github:milankinen/airlock" = "latest" }
-description = "Start my vibe coding sandbox"
-quiet = true
-raw = true
-dir = "{{ cwd }}"
-run = "airlock start --monitor"
+```toml
+# ~/.airlock/settings.toml
+[wizard_defaults]
+start = "start"
 ```
 
 ## Running your setup
 
-Now `cd` into any project directory and run:
+Now `cd` into any directory and run:
 
-```bash 
-mise vibe
+```bash
+airlock start --monitor
 ```
+
+The first start opens the wizard. Select the agent and the tools, and
+press Enter. Later starts use the same config and sandbox. `airlock rm`
+removes the sandbox and the local config.

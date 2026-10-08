@@ -132,7 +132,8 @@ scripts.
 `airlock secrets` refuses to run. `${VAR}` templates resolve only
 against the host env, and if a referenced name isn't set there,
 `airlock start` fails with a clear error. Registry auth re-prompts on
-every 401 (airlock never saves the credentials).
+every 401 (airlock never saves the credentials). The [network services](./configuration/network.md#network-services)
+are not available, so agents cannot sign in through airlock.
 
 **Why you might pick it**: you already have a secrets pipeline you
 trust (a 1Password CLI wrapper, a Vault agent, etc.) and you want
@@ -157,3 +158,10 @@ password. If the vault is enabled, airlock saves them keyed by registry
 host. Subsequent pulls from the same host reuse the saved credentials
 without a prompt. With `disabled`, the pull still works but airlock
 re-prompts on every `401`.
+
+## Agent sign-ins
+
+The [network services](./configuration/network.md#network-services) keep
+the real sign-in tokens of the coding agents in `~/.airlock/db/`. airlock
+encrypts them with a key from the vault. airlock makes the key when it
+needs it the first time. `airlock secrets list` does not show it.

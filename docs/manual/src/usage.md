@@ -38,8 +38,9 @@ airlock show                        # Show sandbox status and config
 airlock remove                      # Remove sandbox state
 ```
 
-The first time you run `airlock start` in a project directory, airlock
-asks whether to create a default `airlock.toml`. After that, each subsequent
-`start` reuses the existing configuration and sandbox state.
+The first time you run `airlock start` in a project directory, a setup
+wizard asks for the base image, the coding agents and the tools. After
+that, each subsequent `start` reuses the existing configuration and
+sandbox state.
 
 The following sections cover each of these commands in detail.

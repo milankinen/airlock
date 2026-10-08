@@ -32,3 +32,9 @@
     height: auto;
     display: block;
 }
+
+/* Tables start at the left edge of the content, not in the center */
+.content table {
+    margin-left: 0;
+    margin-right: auto;
+}

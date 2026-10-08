@@ -1,24 +1,37 @@
 # Starting a sandbox
 
 The `airlock start` command starts a sandbox VM in the current project
-directory. If no `airlock.toml` exists yet, airlock offers to create one
-with sensible defaults.
+directory. If the project has no config yet, airlock opens a setup wizard.
 
 ```bash
 airlock start
 ```
 
-On first run, airlock pulls the configured OCI image (Alpine by default),
-generates a per-project CA certificate, and starts the VM. Subsequent runs
-reuse the cached image and existing sandbox state, so startup is near-instant.
+On first run, airlock pulls the configured OCI image, generates a
+per-project CA certificate, installs the [packs](../packs.md) and starts
+the VM. Subsequent runs reuse the cached image and existing sandbox state,
+so startup is near-instant.
 
-## Setup wizard start option
+## Setup wizard
 
-If the project has no config, `airlock start` opens a setup wizard. The
-last row of the wizard has the start options:
+`airlock start` opens the setup wizard when the project has no config and
+no sandbox. The wizard has these sections:
+
+- **Base image**: `alpine` or `debian`. If your user config sets
+  `vm.image`, the wizard also shows `custom`.
+- **Coding agents** and **Tools**: the [packs](../packs.md) to install.
+  Each selected pack shows its args.
+- **Capabilities**: [clipboard](../configuration/clipboard.md) copy and
+  paste.
+
+The last row has the start options:
 
 - `start` writes a local config to `.airlock/airlock.toml`
 - `start and share` writes a shareable config to `airlock.toml`
+- `cancel` writes nothing
+
+airlock writes the config file after it prepares the sandbox. If you
+cancel, or if the start fails before that, no config file stays.
 
 The wizard selects `start and share` first. To select `start` first, set
 this value in `~/.airlock/settings.toml`:
@@ -28,6 +41,24 @@ this value in `~/.airlock/settings.toml`:
 start = "start"  # default: "start-and-share"
 ```
 
+The wizard needs a terminal. Without a terminal, `airlock start` stops
+with exit code 2. Then write `airlock.toml` yourself.
+
+## Sandbox changes
+
+When the image or the [packs](../packs.md) of an existing sandbox change,
+`airlock start` asks what to do. The default answer re-creates the
+sandbox: airlock removes the sandbox disk and installs all packs into a
+new disk.
+
+For an added pack, you can also select "install anyways". Then airlock
+installs the pack into the existing disk. Code that is already on the
+disk can run during the install, with an open network. Use it only if you
+trust the sandbox contents.
+
+Pass `--yes` (`-y`) to select the default answer for all questions, for
+example in scripts.
+
 ## Configuration basics
 
 Sandbox configuration lives in two files at the project root:
@@ -35,7 +66,10 @@ Sandbox configuration lives in two files at the project root:
 - `airlock.toml` — the main config (commit it to version control)
 - `airlock.local.toml` — local overrides, typically gitignored
 
-A minimal config that uses Ubuntu instead of the default Alpine:
+A config can also be in `.airlock/airlock.toml`. The wizard writes it
+there if you select `start`.
+
+A minimal config that uses Ubuntu:
 
 ```toml
 [vm]

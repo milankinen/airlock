@@ -101,8 +101,12 @@ When a rule-based policy is in effect, the decision proceeds:
 2. If any `allow` pattern matches → **allow**.
 3. Otherwise → follow `policy`.
 
-Rules are additive across config files and presets. `enabled = false`
-disables a rule (including one inherited from a preset).
+A host of an enabled [network service](./services.md) is allowed after
+step 1 under every policy except `deny-always`. If the service is not
+available, its hosts are denied under every policy.
+
+Rules are additive across config files and packs. `enabled = false`
+disables a rule (including one inherited from a pack).
 
 Pattern formats (same in `allow` and `deny`):
 
@@ -120,7 +124,7 @@ a typo can never silently widen a rule to every port.
 ## TLS interception
 
 airlock generates a self-signed CA keypair per project and stores it
-in `.airlock/sandbox/ca.json`. The `start` RPC passes the CA certificate PEM
+in `.airlock/sandbox/ca.json`. The `boot` RPC passes the CA certificate PEM
 to the guest, and guest init injects it into the rootfs — see
 [Mounts / CA certificate injection](./mounts.md#ca-certificate-injection).
 

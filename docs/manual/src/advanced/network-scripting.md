@@ -173,6 +173,9 @@ in request headers before the first script runs. It masks them again in
 the response headers and body after the last script returns. Thus
 `res:body()` shows the real values that the server sent.
 
+The tokens of [network services](../configuration/network.md#network-services)
+are different: scripts see only their surrogates.
+
 ## Examples
 
 ### Path-based access control

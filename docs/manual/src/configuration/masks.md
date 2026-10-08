@@ -46,7 +46,7 @@ an empty directory) before applying the mask, so order of `mkdir` and
 
 ## Disabling a mask
 
-You can disable a mask without removing the entry — useful when a preset
+You can disable a mask without removing the entry — useful when a pack
 defines one you don't need:
 
 ```toml

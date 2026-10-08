@@ -120,8 +120,15 @@ control.
 Sandbox configuration lives in a plain `airlock.toml` at the project root.
 Check it into version control, and every team member gets the same sandbox
 setup — same image, same network rules, same mounts. Local overrides go in
-`airlock.local.toml` (gitignored). Built-in presets for common ecosystems
-(Rust, Python, Node.js, and more) provide sensible defaults.
+`airlock.local.toml` (gitignored). On the first start, a setup wizard
+writes the config for you.
+
+### Packs for tools and coding agents
+
+Built-in [packs](./packs.md) install tools and coding agents into the
+sandbox and add the configuration that they need: Rust, Python, Node.js,
+Docker, Claude Code, Codex, Copilot CLI and more. Claude Code and Codex
+sign in inside the sandbox, but the real tokens stay on the host.
 
 ## Similar projects
 

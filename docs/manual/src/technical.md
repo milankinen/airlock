@@ -158,8 +158,8 @@ The static picture: what runs where, and how the pieces talk.
 
 - **vsock · RPC** — two Cap'n Proto RPC connections between the host
   `airlock start` process and the in-VM supervisor. The supervisor
-  channel (port 1024) carries the `start` call (process + mount
-  config + CA), ongoing `exec` calls, stats polling, deny
+  channel (port 1024) carries the `boot` call (mount config + CA),
+  `spawn` calls for the main process and `exec`, stats polling, deny
   notifications, daemon control, and stdio. The network channel
   (port 1025) carries `NetworkProxy.connect` and its per-connection
   byte sinks — the guest receives `NetworkProxy` as that channel's
@@ -236,7 +236,7 @@ in time.
   <rect class="flow-event" x="450" y="296" width="130" height="28" rx="4"/>
   <text x="515" y="315" class="flow-text" text-anchor="middle">listen vsock :1024/:1025</text>
   <rect class="flow-event" x="520" y="116" width="90" height="28" rx="4"/>
-  <text x="565" y="135" class="flow-text" text-anchor="middle">start RPC</text>
+  <text x="565" y="135" class="flow-text" text-anchor="middle">boot + spawn</text>
   <rect class="flow-event" x="590" y="296" width="110" height="28" rx="4"/>
   <text x="645" y="315" class="flow-text" text-anchor="middle">setns + exec</text>
   <rect class="flow-event" x="630" y="356" width="90" height="28" rx="4"/>
@@ -254,6 +254,11 @@ in time.
   <text x="712" y="247" class="flow-axis">stdio</text>
 </svg>
 </div>
+
+If packs need an install, the CLI first runs a separate install boot
+with the same flow. It spawns one install process per pack, then shuts
+the VM down and boots it again for the session. See
+[Packs](./technical/packs.md).
 
 Once the container is running, `airlock exec` reuses the same VM.
 The invocation walks up the directory tree to `cli.sock` and hands

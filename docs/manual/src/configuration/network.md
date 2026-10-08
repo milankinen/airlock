@@ -95,8 +95,9 @@ allow = ["db.example.com:5432"]
 passthrough = true
 ```
 
-A passthrough target cannot also be covered by middleware or by an
-injecting rule — both need interception. airlock refuses to start and
+A passthrough target cannot also be covered by middleware, by an
+injecting rule or by a [network service](#network-services) — all need
+interception. airlock refuses to start and
 names the conflict.
 
 Port and unix socket forwards are always passthrough: the guest-side
@@ -138,6 +139,51 @@ as it would on the host. airlock inserts the real token at the host boundary.
 - airlock unmasks request headers before [middleware](#middleware) runs
   and masks the response after it, so scripts see real values. The
   monitor shows surrogates.
+
+## Network services
+
+A network service lets a coding agent sign in inside the sandbox, but
+keeps the real tokens on the host. The [agent packs](../packs/agents.md)
+turn on their service. You can also set it yourself:
+
+```toml
+[network.services]
+anthropic = true
+```
+
+| Service     | Agent       | Hosts                                       |
+|-------------|-------------|---------------------------------------------|
+| `anthropic` | Claude Code | `platform.claude.com`, `api.anthropic.com`  |
+| `openai`    | Codex       | `auth.openai.com`, `chatgpt.com`            |
+
+When a service is on:
+
+- airlock allows the hosts of the service, also with `deny-by-default`.
+  `deny-always` and `deny` patterns still block them.
+- The sign-in page opens in the browser of the host. If your `[env]` sets
+  `BROWSER`, airlock does not change it.
+- airlock keeps the real tokens on the host and gives the agent
+  surrogates. On the API hosts, airlock replaces the surrogate with the
+  real token.
+- An API request must use a surrogate of the service or an
+  [injected](#injecting-masked-secrets) masked secret. airlock answers
+  other credentials with HTTP 401.
+- airlock refuses an answer that contains a real token (HTTP 502).
+- All sandboxes share the sign-ins. A logout in one sandbox signs out all
+  sandboxes. `airlock show` lists the sign-ins.
+
+airlock encrypts the tokens with a key from the [secret vault](../secrets.md).
+If the vault is `disabled` or airlock cannot read the key, the service is
+not available. Then airlock blocks its hosts and shows a warning. To let
+the agent sign in without airlock, turn off the service:
+
+```toml
+[network.services]
+anthropic = false
+```
+
+Then the real tokens are in the sandbox, and you must allow the hosts with
+your own rules.
 
 ## Middleware
 

@@ -5,8 +5,8 @@ TCP on macOS, real vsock on Linux), both carrying
 [Cap'n Proto](https://capnproto.org/) RPC in twoparty transport mode:
 
 - **Supervisor channel** (`SUPERVISOR_PORT`, 1024) — everything
-  except network bytes: `start`/`exec`, stdio, stats, daemon control,
-  logs, clipboard.
+  except network bytes: `boot`/`spawn`, stdio, stats, daemon control,
+  logs, clipboard, browser.
 - **Network channel** (`NETWORK_PORT`, 1025) — `NetworkProxy` and its
   per-connection byte sinks. The split gives bulk transfers their own
   socket buffers so they cannot stall PTY or stats traffic.
@@ -29,7 +29,7 @@ bespoke framing):
 - **Remote interfaces (capabilities).** Cap'n Proto RPC is object-
   capability style: an RPC argument can itself be an interface
   reference the other side can call back through. airlock leans on
-  this hard — `Supervisor.start(...)` takes a `Stdin` capability as
+  this hard — `Supervisor.spawn(...)` takes a `Stdin` capability as
   an argument, and the guest receives the `NetworkProxy` capability
   as the bootstrap of the network channel. The supervisor
   calls methods on them instead of opening its own egress. There's
@@ -58,11 +58,14 @@ manual does not repeat them — the schemas are commented and always
 current. A short orientation:
 
 - **`Supervisor`** — the supervisor channel's bootstrap capability.
-  `start` starts the container and carries the full process, mount,
-  daemon, mask, and clipboard configuration — there is no
-  `config.json` or `mounts.json` on disk. Later calls attach extra
-  processes, poll stats and daemon state, bridge host → guest TCP,
-  re-sync the guest clock, report network denies, and drive shutdown.
+  `boot` prepares the container and carries the full mount, daemon,
+  mask, clipboard and browser configuration — there is no
+  `config.json` or `mounts.json` on disk. `boot` starts no process.
+  `spawn` starts a process: the main shell, an `airlock exec` process
+  or a pack install. Other calls poll stats and daemon state, bridge
+  host → guest TCP, re-sync the guest clock, report network denies,
+  and drive shutdown. A second `boot` and a `spawn` before `boot` are
+  refused.
 - **`CliService`** — exposed by the running `airlock start` process
   over `<project>/.airlock/sandbox/cli.sock`. `airlock exec` connects
   here. The CLI server merges the sandbox's resolved base env with
@@ -80,6 +83,8 @@ current. A short orientation:
 - **`LogSink`** — guest-side tracing records, streamed to the host's
   `.airlock/airlock.log`.
 - **`Clipboard`** — host clipboard access, handed to the guest inside
-  `start`'s clipboard config. A null capability is the ungranted
+  `boot`'s clipboard config. A null capability is the ungranted
   state — there is no guest-side flag to subvert.
-
+- **`Browser`** — opens a sign-in page in the host browser, for the
+  [network services](./services.md). The guest gets it inside `boot`
+  only when a service is on. A null capability is the ungranted state.

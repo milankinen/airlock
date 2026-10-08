@@ -15,7 +15,7 @@ directly via fork + setns + exec:
   `nsenter -m`) also gets the container rootfs as its root, not the
   VM root. If the supervisor cannot create the namespace, it uses
   `chroot` into the rootfs.
-- **uid/gid** switched to the container user (read from `start` RPC
+- **uid/gid** switched to the container user (read from `spawn` RPC
   params). The host resolves the image's `USER` the same way Docker
   does: it looks up names in the image's own `/etc/passwd` and
   `/etc/group`.
@@ -25,8 +25,9 @@ directly via fork + setns + exec:
 - **Pipe mode**: when stdin is not a TTY, the supervisor uses separate
   stdout/stderr pipes with no PTY.
 
-The `start` RPC call carries all process configuration (`cmd`, `args`,
-`env`, `cwd`, `uid`, `gid`) rather than a `config.json` file.
+The `spawn` RPC call carries all process configuration (`cmd`, `args`,
+`env`, `cwd`, `uid`, `gid`) rather than a `config.json` file. A spawned
+process gets only the env in the call.
 
 ## stdio over RPC
 
@@ -41,7 +42,7 @@ raw-mode keystrokes and resize events reach the container directly.
 Both directions use a pull model:
 
 - **CLI → guest (input + resize)**: the supervisor calls
-  `Stdin.read()` on a capability the CLI passed in at `start` time.
+  `Stdin.read()` on a capability the CLI passed in at `spawn` time.
   Each frame is either keyboard data (`DataFrame`) or a terminal
   resize (`TermSize`) — multiplexed on the same stream so a resize
   can't race a write to the PTY writer half.

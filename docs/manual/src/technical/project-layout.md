@@ -11,6 +11,7 @@ automatically, so version control tracks nothing under `.airlock/`.
   airlock.toml                   # user config (tracked by VCS)
   .airlock/
     .gitignore                   # contains "*" — auto-created
+    airlock.toml                 # local project config (optional)
     airlock.log                  # tracing log from the last run
     sandbox/
       ca.json                    # CA certificate + key PEMs (single JSON file)
@@ -22,13 +23,21 @@ automatically, so version control tracks nothing under `.airlock/`.
       lock                       # PID lockfile (one VM per project)
       cli.sock                   # Unix socket for `airlock exec` RPC
       image                      # hard link to images/<digest> JSON
+      installs.json              # pack install records (see Packs)
+      installs.log               # pack install output (8 MiB cap)
 ```
 
-`airlock rm` removes the entire `.airlock/` directory. The config
-file is untouched.
+airlock creates `.airlock/` with mode 0700. It refuses a symlinked or
+foreign-owned `.airlock/`.
+
+`airlock rm` removes the entire `.airlock/` directory, also the local
+project config. `airlock.toml` and `airlock.local.toml` are untouched.
+If the project is a home directory, or if `.airlock/` holds user-level
+files (vault, `db/`, `settings.*`, `config.*`), `airlock rm` removes
+only `.airlock/sandbox/`. A symlinked `.airlock` is only unlinked.
 
 The CA is a single file — there is no longer a `sandbox/ca/`
-directory. The `start` RPC passes the PEM bytes read from `ca.json`
+directory. The `boot` RPC passes the PEM bytes read from `ca.json`
 to the guest, and the guest injects them after mounting
 overlayfs (see [Mounts / CA certificate injection](./mounts.md#ca-certificate-injection)).
 
@@ -53,9 +62,21 @@ TLS setup or guest CA injection.
   oci/
     images/<digest>              # schema-tagged JSON: the fully-baked OciImage
     layers/<digest>/             # extracted layer tree (whiteouts as xattrs)
-    layers/<digest>.download.tmp # in-flight download (swept on next run)
+    layers/<digest>.download.<pid>.<seq>.tmp
+                                 # in-flight download, one per process (swept on next run)
     layers/<digest>.download     # complete tarball pending extraction
     layers/<digest>.tmp/         # in-flight extraction (swept on next run)
+  packs/mounts/<pack>/           # host side of pack mounts, shared by projects
+```
+
+User-level state lives in `~/.airlock/`:
+
+```
+~/.airlock/
+  settings.toml                  # application settings (vault, wizard defaults)
+  airlock.toml, config.toml      # user config
+  vault.*                        # file vault backends
+  db/                            # LMDB database (network service sign-ins)
 ```
 
 The image cache is shared across all projects. Layers are
@@ -84,4 +105,5 @@ overlay upper layer.
 
 `sandbox/lock` contains the running PID. If the lock file exists and
 the PID is alive, `airlock start` refuses to start (one VM per
-project at a time). airlock silently clears stale locks (dead PID).
+project at a time). `airlock rm` takes the same lock during the
+removal. airlock silently clears stale locks (dead PID).

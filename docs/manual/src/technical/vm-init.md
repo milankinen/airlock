@@ -3,7 +3,7 @@
 Inside the VM, the kernel starts a small init in the initramfs
 that mounts essential filesystems (`/proc`, `/sys`, `/dev`) and then
 starts the supervisor (`airlockd`). The supervisor's `setup` closure
-(driven by the first `start` RPC) does most of the work.
+(driven by the `boot` RPC) does most of the work.
 
 Each stage is a small submodule under `airlockd/src/init/linux/`.
 `init/linux.rs` is just the ordering glue. The order is load-bearing.
@@ -15,7 +15,7 @@ bind mounts.
 ## Stages
 
 1. **Clock** (`clock::set`) — the host passes Unix epoch + nanos in
-   the `start` RPC. The guest sets the system clock so timestamps are
+   the `boot` RPC. The guest sets the system clock so timestamps are
    correct from the start. The host re-pushes the wall-clock every
    minute via `Supervisor.syncClock` to correct drift after host
    sleeps (VMs have no RTC).
@@ -81,7 +81,7 @@ bind mounts.
    - **Upper + work**: on the ext4 disk at `/mnt/disk/overlay/rootfs`
      and `/mnt/disk/overlay/work`. The stage resets the overlay upper
      if the stored image ID (`.image_id` on disk) differs from the one
-     passed in `start`.
+     passed in `boot`.
 
 6. **DNS** (`net::setup_dns`) — writes `nameserver 10.0.0.1` into the
    composed rootfs's `/etc/resolv.conf`. Queries go to the in-VM

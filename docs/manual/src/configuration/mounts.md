@@ -92,7 +92,7 @@ file_content = "[user]\n\tname = Dev\n\temail = dev@example.com\n"
 ## Disabling a mount
 
 You can disable a mount temporarily without removing it from the config. This
-is useful when a preset defines a mount that you don't need:
+is useful when a pack defines a mount that you don't need:
 
 ```toml
 [mounts.ssh-config]
