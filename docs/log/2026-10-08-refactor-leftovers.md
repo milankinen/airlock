@@ -286,3 +286,9 @@ the container rootfs paths of the bridge.
 token with a new scanner, not after the long run. It now pushes the
 token to the same scanner after the run, so the test checks that the
 held-back state of a long run does not hide a later token.
+
+## Test: minted surrogate has exactly 48 random bytes
+
+`minted_surrogate_has_prefix_and_48_random_bytes` checked the length only
+as a rough lower bound. It now strips the known prefix and checks that
+the rest decodes from base64url to exactly 48 bytes.

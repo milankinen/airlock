@@ -589,15 +589,25 @@ mod tests {
     }
 
     /// Test that each format mints a surrogate that it recognizes and that
-    /// has enough random data (48 bytes are 64 base64 characters).
+    /// is a known prefix with 48 random bytes (64 base64url characters).
     ///   1. Mint a surrogate with each format
-    ///   2. Check that the format recognizes it and that it is long enough
+    ///   2. Check that the format recognizes it
+    ///   3. Check that a prefix starts it and that the rest decodes to
+    ///      exactly 48 bytes
     #[test]
     fn minted_surrogate_has_prefix_and_48_random_bytes() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
         for format in FORMATS.0 {
             let s = (format.mint)("sk-ant-oat01-x").unwrap();
             assert!((format.is_surrogate)(&s), "{s}");
-            assert!(s.len() >= ID_PREFIX.len() + 64, "{s}");
+            let rest = [ACCESS_PREFIX, REFRESH_PREFIX, API_KEY_PREFIX, ID_PREFIX]
+                .into_iter()
+                .find_map(|prefix| s.strip_prefix(prefix))
+                .unwrap_or_else(|| panic!("no known prefix: {s}"));
+            let random = URL_SAFE_NO_PAD.decode(rest).unwrap();
+            assert_eq!(random.len(), tokens::SURROGATE_BYTES, "{s}");
         }
     }
 }
