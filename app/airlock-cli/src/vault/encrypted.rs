@@ -41,13 +41,27 @@ pub trait PassphraseSource: Send + Sync + 'static {
 pub struct EncryptedFileStorage {
     path: PathBuf,
     passphrase: Box<dyn PassphraseSource>,
-    /// Cached key. Derived on the first unlock or create, and used again
-    /// after that, so the user gets only one prompt per process.
-    key: Mutex<Option<[u8; ARGON2_KEY_BYTES]>>,
-    /// Cached salt of the vault. Used again, so the derived key stays the
-    /// same across reads in one process. `None` until the first successful
-    /// load, or until a new vault is created.
-    salt: Mutex<Option<[u8; SALT_BYTES]>>,
+    /// Cached key with the KDF inputs that gave it. Made on the first
+    /// unlock or create, and used again after that, so the user gets only
+    /// one prompt per process. `None` until the first successful load, or
+    /// until a new vault is created.
+    unlocked: Mutex<Option<UnlockedKey>>,
+}
+
+/// A derived vault key and the KDF inputs of the file that it opens.
+#[derive(Clone, Copy)]
+struct UnlockedKey {
+    key: [u8; ARGON2_KEY_BYTES],
+    kdf: KdfInputs,
+}
+
+/// The KDF inputs of a vault file, except the passphrase.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct KdfInputs {
+    salt: [u8; SALT_BYTES],
+    m_kib: u32,
+    t: u32,
+    p: u32,
 }
 
 impl EncryptedFileStorage {
@@ -59,30 +73,22 @@ impl EncryptedFileStorage {
         Self {
             path,
             passphrase,
-            key: Mutex::new(None),
-            salt: Mutex::new(None),
+            unlocked: Mutex::new(None),
         }
     }
 
     /// Derive the encryption key from a passphrase with Argon2id.
     /// Args:
     ///  - `passphrase`: User passphrase
-    ///  - `salt`: Per-vault salt
-    ///  - `m_kib`, `t`, `p`: Argon2 memory cost (KiB), time cost and
-    ///    parallelism
-    fn derive_key(
-        passphrase: &str,
-        salt: &[u8],
-        m_kib: u32,
-        t: u32,
-        p: u32,
-    ) -> anyhow::Result<[u8; ARGON2_KEY_BYTES]> {
+    ///  - `kdf`: Per-vault salt and Argon2 parameters
+    fn derive_key(passphrase: &str, kdf: &KdfInputs) -> anyhow::Result<[u8; ARGON2_KEY_BYTES]> {
+        let KdfInputs { salt, m_kib, t, p } = *kdf;
         let params = Params::new(m_kib, t, p, Some(ARGON2_KEY_BYTES))
             .map_err(|e| anyhow!("invalid argon2 params: {e}"))?;
         let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
         let mut out = [0u8; ARGON2_KEY_BYTES];
         argon2
-            .hash_password_into(passphrase.as_bytes(), salt, &mut out)
+            .hash_password_into(passphrase.as_bytes(), &salt, &mut out)
             .map_err(|e| anyhow!("argon2id kdf failed: {e}"))?;
         Ok(out)
     }
@@ -126,36 +132,33 @@ impl Storage for EncryptedFileStorage {
                 blob.kdf.p
             );
         }
-        let salt = decode_b64_array::<SALT_BYTES>(&blob.kdf.salt, "salt")?;
+        let kdf = KdfInputs {
+            salt: decode_b64_array::<SALT_BYTES>(&blob.kdf.salt, "salt")?,
+            m_kib: blob.kdf.m,
+            t: blob.kdf.t,
+            p: blob.kdf.p,
+        };
         let nonce = decode_b64_array::<NONCE_BYTES>(&blob.nonce, "nonce")?;
         let ciphertext = STANDARD_NO_PAD
             .decode(&blob.ciphertext)
             .context("decode vault ciphertext")?;
 
         // Use the cached key again if this process already unlocked the
-        // vault and the salt in the file did not change. Thus a read during
-        // a write (lock → reload → merge → store) does not ask again.
-        let cached_key = {
-            let key = self.key.lock();
-            let cached_salt = self.salt.lock();
-            match (*key, *cached_salt) {
-                (Some(k), Some(s)) if s == salt => Some(k),
-                _ => None,
-            }
-        };
+        // vault and the KDF inputs in the file did not change. Thus a read
+        // during a write (lock → reload → merge → store) does not ask again.
+        let cached_key = self.unlocked.lock().filter(|u| u.kdf == kdf).map(|u| u.key);
         let key = if let Some(k) = cached_key {
             k
         } else {
             let passphrase = self.passphrase.unlock()?;
-            Self::derive_key(&passphrase, &salt, blob.kdf.m, blob.kdf.t, blob.kdf.p)?
+            Self::derive_key(&passphrase, &kdf)?
         };
         let cipher = ChaCha20Poly1305::new(<&Key>::from(&key));
         let plaintext = cipher
             .decrypt(<&Nonce>::from(&nonce), ciphertext.as_ref())
             .map_err(|_| anyhow!("decrypt vault: wrong passphrase or corrupt data"))?;
 
-        *self.key.lock() = Some(key);
-        *self.salt.lock() = Some(salt);
+        *self.unlocked.lock() = Some(UnlockedKey { key, kdf });
 
         Ok(Some(
             String::from_utf8(plaintext).context("decrypted vault is not valid UTF-8")?,
@@ -163,24 +166,33 @@ impl Storage for EncryptedFileStorage {
     }
 
     fn store(&self, data: &str) -> anyhow::Result<()> {
-        // Use the same salt (and thus the same key) for all writes in one
-        // process. A new vault has no cached salt. Then make a salt and ask
-        // for a new passphrase.
-        let (salt, key) = {
-            let mut salt_slot = self.salt.lock();
-            let mut key_slot = self.key.lock();
-            if let (Some(s), Some(k)) = (*salt_slot, *key_slot) {
-                (s, k)
+        // Use the same KDF inputs (and thus the same key) for all writes in
+        // one process. Write back the inputs of the loaded file unchanged,
+        // also when they are not the built-in values. Otherwise the file
+        // gets parameters that do not match its key. A new vault has no
+        // cached key. Then make a salt and ask for a new passphrase.
+        let UnlockedKey { key, kdf } = {
+            let mut slot = self.unlocked.lock();
+            if let Some(unlocked) = *slot {
+                unlocked
             } else {
                 let mut salt = [0u8; SALT_BYTES];
                 SysRng
                     .try_fill_bytes(&mut salt)
                     .context("generate vault salt")?;
+                let kdf = KdfInputs {
+                    salt,
+                    m_kib: ARGON2_M_KIB,
+                    t: ARGON2_T,
+                    p: ARGON2_P,
+                };
                 let passphrase = self.passphrase.create()?;
-                let key = Self::derive_key(&passphrase, &salt, ARGON2_M_KIB, ARGON2_T, ARGON2_P)?;
-                *salt_slot = Some(salt);
-                *key_slot = Some(key);
-                (salt, key)
+                let unlocked = UnlockedKey {
+                    key: Self::derive_key(&passphrase, &kdf)?,
+                    kdf,
+                };
+                *slot = Some(unlocked);
+                unlocked
             }
         };
 
@@ -198,10 +210,10 @@ impl Storage for EncryptedFileStorage {
         let envelope = Envelope::EncryptedFile(EncryptedBlob {
             kdf: KdfParams {
                 algo: "argon2id".to_string(),
-                salt: STANDARD_NO_PAD.encode(salt),
-                m: ARGON2_M_KIB,
-                t: ARGON2_T,
-                p: ARGON2_P,
+                salt: STANDARD_NO_PAD.encode(kdf.salt),
+                m: kdf.m_kib,
+                t: kdf.t,
+                p: kdf.p,
             },
             nonce: STANDARD_NO_PAD.encode(nonce),
             ciphertext: STANDARD_NO_PAD.encode(&ciphertext),
@@ -337,8 +349,9 @@ mod tests {
     use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 
     use super::{
-        ARGON2_M_KIB, ARGON2_P, ARGON2_T, EncryptedBlob, EncryptedFileStorage, Envelope, KdfParams,
-        MAX_ARGON2_M_KIB, NONCE_BYTES, SALT_BYTES, Storage, atomic_write,
+        ARGON2_M_KIB, ARGON2_P, ARGON2_T, EncryptedBlob, EncryptedFileStorage, Envelope, KdfInputs,
+        KdfParams, MAX_ARGON2_M_KIB, NONCE_BYTES, SALT_BYTES, Storage, atomic_write,
+        read_vault_file,
     };
     use crate::test_cfg::temp_dir;
     use crate::test_cfg::vault::FixedPassphrase;
@@ -357,17 +370,26 @@ mod tests {
     }
 
     /// Test that the vault decrypts with the KDF parameters in the file, not
-    /// with the current constants, so that a vault from another version
-    /// still opens.
+    /// with the current constants, and keeps them on a write. Thus a vault
+    /// from another version still opens, also in a later process after a
+    /// write.
     ///   1. Encrypt a blob with a key made with a different `t` value
     ///   2. Write the blob and its KDF parameters to a vault file
     ///   3. Load the file and check the plaintext
+    ///   4. Store new data with the same handle
+    ///   5. Check that the file keeps the `t` value
+    ///   6. Load the file with a new handle and check the new data
     #[test]
-    fn vault_file_decrypts_with_kdf_params_stored_in_it() {
+    fn vault_file_with_other_kdf_params_opens_and_stays_readable_after_write() {
         let salt = [7u8; SALT_BYTES];
         let t = ARGON2_T + 1;
-        let key =
-            EncryptedFileStorage::derive_key("hunter2", &salt, ARGON2_M_KIB, t, ARGON2_P).unwrap();
+        let kdf = KdfInputs {
+            salt,
+            m_kib: ARGON2_M_KIB,
+            t,
+            p: ARGON2_P,
+        };
+        let key = EncryptedFileStorage::derive_key("hunter2", &kdf).unwrap();
         let mut nonce = [0u8; NONCE_BYTES];
         nonce[0] = 1;
         let plaintext = r#"{"secrets":{},"registries":{}}"#;
@@ -386,10 +408,21 @@ mod tests {
             ciphertext: STANDARD_NO_PAD.encode(&ct),
         });
 
-        assert_eq!(
-            load_envelope(&envelope, "hunter2").unwrap().as_deref(),
-            Some(plaintext)
-        );
+        let tmp = temp_dir();
+        let path = tmp.path().join("vault.enc.json");
+        atomic_write(&path, serde_json::to_string(&envelope).unwrap().as_bytes()).unwrap();
+        let open = || EncryptedFileStorage::new(path.clone(), Box::new(FixedPassphrase("hunter2")));
+        let vault = open();
+        assert_eq!(vault.load().unwrap().as_deref(), Some(plaintext));
+
+        let updated = r#"{"secrets":{"A":"b"},"registries":{}}"#;
+        vault.store(updated).unwrap();
+        let raw = read_vault_file(&path).unwrap().unwrap();
+        let Envelope::EncryptedFile(blob) = serde_json::from_str(&raw).unwrap() else {
+            panic!("not an encrypted vault: {raw}");
+        };
+        assert_eq!(blob.kdf.t, t);
+        assert_eq!(open().load().unwrap().as_deref(), Some(updated));
     }
 
     /// Test that the vault refuses KDF parameters above the limits, so that a

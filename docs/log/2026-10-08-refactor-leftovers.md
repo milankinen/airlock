@@ -99,3 +99,21 @@ general error, which also gave exit code 1. The conversion from a
 general error to an early exit now looks for the `[env]` error type in
 the error chain and reports a config error. The install path maps the
 error directly. We kept the type because the conversion now uses it.
+
+## Encrypted vault keeps its Argon2 parameters on write
+
+`load` derived the key with the `m`/`t`/`p` values in the file and
+cached the key and the salt. `store` used the cached key and salt, but
+wrote the built-in Argon2 parameters into the envelope. A vault file
+from another release or tool opened one time, but after the first write
+the file had parameters that did not match its key. The next process
+could not decrypt it, also with the correct passphrase.
+
+Of the two options (cache the parameters, or derive a new key with the
+built-in parameters on write) we chose to cache them. A new key needs
+the passphrase again, which a write in the middle of a run cannot always
+ask for. The cache now holds the key with all KDF inputs (salt and
+parameters). `store` writes them back unchanged, and `load` uses the
+cached key only when all inputs in the file match. The parameter test
+now also writes through the same handle and reads the file in a new
+handle.
