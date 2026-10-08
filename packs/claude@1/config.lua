@@ -28,6 +28,14 @@ if pack.args["acp"] then
     config.env.CLAUDE_CODE_EXECUTABLE = "/usr/local/bin/claude"
 end
 
+-- Tokens from the host environment or the vault, if they exist. The
+-- sandbox sees only masked surrogates. The `claude-tokens` rule below puts
+-- the real values into the API requests.
+local tokens = { "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY" }
+for _, name in ipairs(tokens) do
+    config.env[name] = { value = "${" .. name .. "}", mask = true, optional = true }
+end
+
 config.network = {
     -- The anthropic service owns the sign-in and API hosts
     -- (platform.claude.com, api.anthropic.com). airlock allows them, keeps
@@ -46,6 +54,10 @@ config.network = {
             },
         },
     },
+}
+config.network.rules["claude-tokens"] = {
+    allow = { "api.anthropic.com:443" },
+    inject = tokens,
 }
 
 -- Claude Code keeps its settings, sessions and credential file (with the

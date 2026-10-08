@@ -3,9 +3,10 @@
 //! Resolves the environment variables that the guest sees. For an entry with
 //! `mask = true`, the guest gets only a surrogate value. The real value stays
 //! on the host. The network proxy puts the real value back into outgoing
-//! HTTP requests for rules that inject it.
+//! HTTP requests for rules that inject it. An optional entry whose value
+//! is not defined on the host is left out, and the rules do not inject it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use rand::rngs::ChaCha20Rng;
@@ -97,6 +98,9 @@ pub struct SandboxEnv {
     guest: Vec<(String, String)>,
     /// Masked entries, by variable name.
     masked: BTreeMap<String, MaskedSecret>,
+    /// Optional entries that are left out, because their value reads an
+    /// undefined variable.
+    omitted: BTreeSet<String>,
 }
 
 impl SandboxEnv {
@@ -107,15 +111,28 @@ impl SandboxEnv {
     ///
     /// Returns:
     ///   Environment with substituted values and surrogates for masked
-    ///   entries. [`EnvError`] if a template uses an undefined host
-    ///   variable or vault secret.
+    ///   entries, without the optional entries that read an undefined
+    ///   variable. [`EnvError`] if the template of an other entry uses an
+    ///   undefined host variable or vault secret.
     pub fn resolve(env: &BTreeMap<String, EnvVar>, vault: &Vault) -> Result<Self, EnvError> {
         let mut guest = Vec::with_capacity(env.len());
         let mut masked = BTreeMap::new();
+        let mut omitted = BTreeSet::new();
         for (key, entry) in env {
-            let real = vault
-                .subst(&entry.value)
-                .map_err(|e| EnvError::new(key, e))?;
+            let real = if entry.optional {
+                let defined = vault
+                    .subst_defined(&entry.value)
+                    .map_err(|e| EnvError::new(key, e))?;
+                let Some(real) = defined else {
+                    omitted.insert(key.clone());
+                    continue;
+                };
+                real
+            } else {
+                vault
+                    .subst(&entry.value)
+                    .map_err(|e| EnvError::new(key, e))?
+            };
             if entry.mask {
                 let secret = MaskedSecret::new(key, real);
                 guest.push((key.clone(), secret.surrogate.clone()));
@@ -124,7 +141,11 @@ impl SandboxEnv {
                 guest.push((key.clone(), real));
             }
         }
-        Ok(Self { guest, masked })
+        Ok(Self {
+            guest,
+            masked,
+            omitted,
+        })
     }
 
     /// Make an environment with no entries. The read-only project loader
@@ -133,6 +154,7 @@ impl SandboxEnv {
         Self {
             guest: Vec::new(),
             masked: BTreeMap::new(),
+            omitted: BTreeSet::new(),
         }
     }
 
@@ -145,7 +167,11 @@ impl SandboxEnv {
             .map(|s| (s.name.clone(), s.surrogate.clone()))
             .collect();
         let masked = secrets.into_iter().map(|s| (s.name.clone(), s)).collect();
-        Self { guest, masked }
+        Self {
+            guest,
+            masked,
+            omitted: BTreeSet::new(),
+        }
     }
 
     /// Get the value that the guest sees for `name`: the surrogate for a
@@ -169,10 +195,20 @@ impl SandboxEnv {
         self.masked.get(name)
     }
 
+    /// Check if `name` is an optional entry that is left out, because its
+    /// value reads an undefined variable. Network rules do not inject it.
+    pub fn is_omitted(&self, name: &str) -> bool {
+        self.omitted.contains(name)
+    }
+
     /// Make sure that a network rule can inject `name` into HTTP headers.
     /// The entry must be masked, have at least [`MIN_INJECT_LEN`] bytes,
-    /// and be a valid header value.
+    /// and be a valid header value. An omitted entry (see
+    /// [`SandboxEnv::is_omitted`]) passes, because the rule skips it.
     pub fn check_injectable(&self, name: &str) -> Result<(), EnvError> {
+        if self.is_omitted(name) {
+            return Ok(());
+        }
         let Some(secret) = self.masked.get(name) else {
             return Err(EnvError::new(
                 name,

@@ -134,7 +134,11 @@ pub fn resolve_inject(network: &Network, env: &SandboxEnv) -> anyhow::Result<Vec
             // entry and that no injecting rule is `passthrough`.
             // `project::open` and `Project::with_config` make sure that the
             // values are injectable. A missing entry still gives an error,
-            // not a panic.
+            // not a panic. An optional entry with no value has nothing to
+            // inject.
+            if env.is_omitted(name) {
+                continue;
+            }
             let Some(secret) = env.masked(name) else {
                 anyhow::bail!(
                     "network.rules.{rule_name}.inject: `{name}` must be defined in [env] with mask = true"
@@ -143,6 +147,10 @@ pub fn resolve_inject(network: &Network, env: &SandboxEnv) -> anyhow::Result<Vec
             if !secrets.iter().any(|s| s.name == *name) {
                 secrets.push(InjectedSecret::new(secret.clone()));
             }
+        }
+        // All entries are omitted. Then the rule is a plain allow rule.
+        if secrets.is_empty() {
+            continue;
         }
 
         for target_str in &rule.allow {

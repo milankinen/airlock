@@ -414,6 +414,22 @@ impl Vault {
             Ok(_) => anyhow!("{e}"),
         })
     }
+
+    /// Expand the `${NAME}` tokens in a template, if all names have a
+    /// value. See [`Vault::subst`].
+    ///
+    /// Returns:
+    ///   Expanded text, `None` if a name has no value, or an error if the
+    ///   template is not valid.
+    pub fn subst_defined(&self, template: &str) -> anyhow::Result<Option<String>> {
+        // A vault that does not open has no values. This is not an error
+        // here, because the caller can do without the value.
+        match subst::substitute(template, self) {
+            Ok(value) => Ok(Some(value)),
+            Err(subst::Error::NoSuchVariable(_)) => Ok(None),
+            Err(e) => Err(anyhow!("{e}")),
+        }
+    }
 }
 
 /// Lock guard of an open vault. The data is always `Some`.

@@ -32,23 +32,14 @@ The sign-in is shared:
   pack.
 - A logout in one sandbox signs out all sandboxes.
 
-### OpenAI API key
+### API key
 
-Store the API key in the vault:
+Set `OPENAI_API_KEY` on the host, or store it in the
+[secret vault](../../secrets.md):
 
 ```bash
 airlock secrets add OPENAI_API_KEY
 ```
 
-Then inject the key:
-
-```toml
-[env]
-OPENAI_API_KEY = { value = "${OPENAI_API_KEY}", mask = true }
-
-[network.rules.codex]
-inject = ["OPENAI_API_KEY"]
-```
-
-The sandbox sees only a [masked](../../configuration/env.md#masking)
-surrogate. airlock puts the real key into the requests.
+Codex then uses it automatically. The real value stays on the host. Codex
+gets only a surrogate.

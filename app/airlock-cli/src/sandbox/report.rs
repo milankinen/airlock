@@ -62,10 +62,16 @@ pub(super) fn print_mounts_and_rules(project: &project::Project) {
             enabled_rules.len()
         );
         for (key, rule) in &enabled_rules {
-            let inject = if rule.inject.is_empty() {
+            // Count only the entries that have a value.
+            let injected = rule
+                .inject
+                .iter()
+                .filter(|name| !project.env.is_omitted(name))
+                .count();
+            let inject = if injected == 0 {
                 String::new()
             } else {
-                format!(" inject {}", rule.inject.len())
+                format!(" inject {injected}")
             };
             cli::verbose!(
                 "      {key}: allow {} deny {}{inject}",

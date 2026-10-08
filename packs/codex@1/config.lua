@@ -20,14 +20,21 @@ config.network = {
         openai = true,
     },
     rules = {
-        -- The API, for API-key users (a masked OPENAI_API_KEY in [env]
-        -- with an `inject` rule).
+        -- The API, for API-key users. The real key goes into the
+        -- requests.
         codex = {
             allow = {
                 "api.openai.com:443",
             },
+            inject = { "OPENAI_API_KEY" },
         },
     },
+}
+
+-- The API key from the host environment or the vault, if it exists. The
+-- sandbox sees only a masked surrogate.
+config.env = {
+    OPENAI_API_KEY = { value = "${OPENAI_API_KEY}", mask = true, optional = true },
 }
 
 if pack.args["acp"] then

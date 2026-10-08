@@ -238,19 +238,27 @@ impl WellKnown for ImageRef {
 /// One `[env]` entry: a plain string or a full config object.
 ///
 /// String form:  `TOKEN = "${TOKEN}"`
-/// Object form:  `TOKEN = { value = "${TOKEN}", mask = true }`
+/// Object form:  `TOKEN = { value = "${TOKEN}", mask = true, optional = true }`
 ///
 /// With `mask = true`, the guest sees a stable alphanumeric surrogate of
 /// the same length instead of the real value. The surrogate comes from the
 /// variable name and the length, never from the value. The host can still
 /// put the real value into outbound HTTP headers through the `inject` list
 /// of a network rule.
+///
+/// With `optional = true`, an entry whose template reads an undefined
+/// variable is left out of the guest, and `inject` lists skip it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct EnvVar {
     /// Value template. Supports `${VAR}` substitution from the host.
     pub value: String,
     /// Replace the value with a same-length surrogate inside the guest.
     pub mask: bool,
+    /// Leave the entry out if the template reads an undefined variable.
+    /// Not serialized when false, thus configs without it serialize as
+    /// before.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub optional: bool,
 }
 
 impl EnvVar {
@@ -259,6 +267,7 @@ impl EnvVar {
         Self {
             value: value.into(),
             mask: false,
+            optional: false,
         }
     }
 }
@@ -279,13 +288,22 @@ impl<'de> serde::Deserialize<'de> for EnvVar {
             value: String,
             #[serde(default)]
             mask: bool,
+            #[serde(default)]
+            optional: bool,
         }
         match serde_json::Value::deserialize(d)? {
             serde_json::Value::String(value) => Ok(EnvVar::plain(value)),
             table @ serde_json::Value::Object(_) => {
-                let Full { value, mask } =
-                    serde_json::from_value(table).map_err(D::Error::custom)?;
-                Ok(EnvVar { value, mask })
+                let Full {
+                    value,
+                    mask,
+                    optional,
+                } = serde_json::from_value(table).map_err(D::Error::custom)?;
+                Ok(EnvVar {
+                    value,
+                    mask,
+                    optional,
+                })
             }
             _ => Err(D::Error::custom(
                 "expected a string or a table `{ value = \"...\", mask = true }`",

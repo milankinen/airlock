@@ -32,47 +32,15 @@ The sign-in is shared:
   pack.
 - A logout in one sandbox signs out all sandboxes.
 
-### Long-lived Claude token
+### Token or API key
 
-Create a token on the host with `claude setup-token`, and store it in the
-vault:
+Set `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) or
+`ANTHROPIC_API_KEY` on the host, or store it in the
+[secret vault](../../secrets.md):
 
 ```bash
 airlock secrets add CLAUDE_CODE_OAUTH_TOKEN
 ```
 
-Then inject the token:
-
-```toml
-[env]
-CLAUDE_CODE_OAUTH_TOKEN = { value = "${CLAUDE_CODE_OAUTH_TOKEN}", mask = true }
-
-[network.rules.claude-token]
-allow = ["api.anthropic.com:443"]
-inject = ["CLAUDE_CODE_OAUTH_TOKEN"]
-```
-
-The sandbox sees only a [masked](../../configuration/env.md#masking)
-surrogate. airlock puts the real token into the requests.
-
-### Anthropic API key
-
-Store the API key in the vault:
-
-```bash
-airlock secrets add ANTHROPIC_API_KEY
-```
-
-Then inject the key:
-
-```toml
-[env]
-ANTHROPIC_API_KEY = { value = "${ANTHROPIC_API_KEY}", mask = true }
-
-[network.rules.anthropic-api-key]
-allow = ["api.anthropic.com:443"]
-inject = ["ANTHROPIC_API_KEY"]
-```
-
-The sandbox sees only a masked surrogate. airlock puts the real key into
-the requests.
+Claude Code then uses it automatically. The real value stays on the host.
+Claude Code gets only a surrogate.

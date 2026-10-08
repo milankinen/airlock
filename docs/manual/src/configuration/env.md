@@ -63,8 +63,22 @@ secret, list it in a network rule's
 [`inject`](network.md#injecting-masked-secrets), which swaps the surrogate
 for the real value in HTTP request headers.
 
-- The table form accepts only `value` and `mask` — any other key is an error.
+- The table form accepts only `value`, `mask` and `optional`. Other keys
+  are errors.
 - airlock substitutes `value` first (`${VAR}` works as usual), then masks it.
 - A later config layer that writes the plain string form only replaces the
   value — the entry stays masked. Set `mask = false` to unmask.
 - Daemons and `airlock exec` see the surrogate too.
+
+## Optional entries
+
+Set `optional = true` to use a variable only if it has a value:
+
+```toml
+[env]
+API_TOKEN = { value = "${MY_API_TOKEN}", mask = true, optional = true }
+```
+
+If the host environment and the secret vault do not define
+`MY_API_TOKEN`, airlock does not set `API_TOKEN` in the sandbox, and the
+start continues. An `inject` list skips the entry.
