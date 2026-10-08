@@ -22,6 +22,7 @@ mod project;
 mod rpc;
 mod runtime;
 mod sandbox;
+mod sandboxes;
 pub(crate) mod services;
 mod settings;
 mod start;
@@ -34,7 +35,7 @@ mod vm;
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::task::LocalSet;
 
-use crate::cli::{cmd_exec, cmd_rm, cmd_secret, cmd_show, cmd_start};
+use crate::cli::{cmd_exec, cmd_info, cmd_rm, cmd_sandbox, cmd_secret, cmd_start};
 use crate::context::Context;
 
 #[tokio::main(flavor = "current_thread")]
@@ -78,21 +79,21 @@ async fn main() {
                         cli::error!("'--' args are not supported with 'exec'");
                         std::process::exit(2);
                     }
-                    cli::cmd_exec::main(args).await
+                    cli::cmd_exec::main(args, &context).await
                 }
-                Command::Show(ref args) => {
+                Command::Info(ref args) => {
                     if !extra_args.is_empty() {
                         cli::error!("'--' args are only supported with 'start'");
                         std::process::exit(2);
                     }
-                    Ok(cli::cmd_show::main(args, context).await)
+                    Ok(cli::cmd_info::main(args, context).await)
                 }
                 Command::Remove(ref args) => {
                     if !extra_args.is_empty() {
                         cli::error!("'--' args are only supported with 'start'");
                         std::process::exit(2);
                     }
-                    Ok(cli::cmd_rm::main(args))
+                    Ok(cli::cmd_rm::main(args, &context).await)
                 }
                 Command::Secrets(args) => {
                     if !extra_args.is_empty() {
@@ -100,6 +101,13 @@ async fn main() {
                         std::process::exit(2);
                     }
                     Ok(cli::cmd_secret::main(args, &context))
+                }
+                Command::Sandbox(args) => {
+                    if !extra_args.is_empty() {
+                        cli::error!("'--' args are only supported with 'start'");
+                        std::process::exit(2);
+                    }
+                    Ok(cli::cmd_sandbox::main(args, &context).await)
                 }
             };
             result.unwrap_or_else(|e| {
@@ -142,17 +150,20 @@ struct GlobalArgs {
 enum Command {
     /// Start the sandbox VM for the current project directory
     Start(cmd_start::StartArgs),
-    /// Remove the current project data
+    /// Remove the sandbox of the current project (same as `airlock sandbox rm`)
     #[command(alias = "rm")]
     Remove(cmd_rm::RmArgs),
     /// Execute a command inside the running sandbox VM
     #[command(alias = "x")]
     Exec(cmd_exec::ExecArgs),
-    /// Show the current project info
-    Show(cmd_show::ShowArgs),
+    /// Show the sandbox of the current project (same as `airlock sandbox info`)
+    #[command(alias = "show")]
+    Info(cmd_info::InfoArgs),
     /// Manage secrets stored in the system keyring
     #[command(alias = "secret")]
     Secrets(cmd_secret::SecretArgs),
+    /// List, inspect and remove sandboxes
+    Sandbox(cmd_sandbox::SandboxArgs),
 }
 
 /// Split argv at the first "--".

@@ -47,7 +47,7 @@ pub(super) fn download_tmp_path(layers_root: &Path, key: &str) -> PathBuf {
 /// tarball with `fetch` only if it is not already on disk.
 ///
 /// A layer goes through these on-disk states under
-/// `~/.cache/airlock/oci/layers/`:
+/// `<data>/oci/layers/`:
 ///
 /// ```text
 /// <key>.download.<pid>.<seq>.tmp   # download in progress

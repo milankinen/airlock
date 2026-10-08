@@ -11,17 +11,17 @@
 pub mod env;
 mod exit;
 pub mod install;
+pub mod location;
 pub mod run;
 pub mod sandbox;
 pub mod wizard;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub use exit::Exit;
 use tracing::info;
 
 use crate::cli::{self, LogLevel, logging};
-use crate::project;
 
 /// Command-line options for the sandbox step ([`sandbox::ensure_sandbox`]) and
 /// the install step ([`install::install_tools`]).
@@ -53,21 +53,15 @@ pub fn resolve_host_cwd() -> Result<PathBuf, Exit> {
     }
 }
 
-/// Create `.airlock/` and initialize logging there.
+/// Initialize logging. The log goes to the sandbox directory when the
+/// sandbox step knows it (see [`logging::attach`]).
 /// Args:
-///  - `host_cwd`: Project directory on the host
 ///  - `level`: Log level for the log file
-///
-/// Returns:
-///   Error if the directory creation fails.
 // This runs before the config files load. Thus, config loading, the setup
 // wizard, config resolution and the later steps all write to the log.
-pub fn init_logging(host_cwd: &Path, level: LogLevel) -> Result<(), Exit> {
-    let cache_dir = project::ensure_cache_dir(host_cwd)
-        .map_err(|e| Exit::error(1, format!("Failed to create .airlock directory: {e}")))?;
-    logging::init(level, &cache_dir);
+pub fn init_logging(level: LogLevel) {
+    logging::init(level);
     info!("airlock version {}", cli::version_string(true));
-    Ok(())
 }
 
 #[cfg(test)]

@@ -24,14 +24,12 @@ use crate::config::generated::GeneratedConfig;
 use crate::config::merge::{merge_json, normalize_env, pack_conflicts};
 use crate::packs::{ConfiguredPack, Pack, PackManager};
 
-/// Load the config files of the project in the current directory. The user
-/// files come from the home directory of the user.
-pub fn load() -> anyhow::Result<LayeredConfig> {
-    let cwd = std::env::current_dir()
-        .map_err(|e| anyhow::anyhow!("cannot determine the current directory: {e}"))?;
-    let project_root = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+/// Load the config files of the project `project_root`. The user files come
+/// from the home directory of the user, and the local project file from
+/// `local_dir` (see [`crate::sandboxes::local_config_dir`]).
+pub fn load(project_root: &Path, local_dir: &Path) -> anyhow::Result<LayeredConfig> {
     let home = dirs::home_dir().unwrap_or_default();
-    LayeredConfig::load_from(&home, &project_root)
+    LayeredConfig::load_from(&home, project_root, local_dir)
 }
 
 /// One config file (or in-memory document) before merging.
@@ -84,8 +82,8 @@ impl Layer {
         let layer = Self::from_file(file)?;
         anyhow::ensure!(
             layer.value.get("packs").is_none(),
-            "`[packs]` is allowed only in project config files (airlock.toml, \
-             .airlock/airlock.toml); remove it from {}",
+            "`[packs]` is allowed only in project config files (airlock.toml or the local \
+             project config); remove it from {}",
             layer.origin
         );
         Ok(layer)
@@ -107,7 +105,7 @@ pub struct LayeredConfig {
     /// `~/.airlock.<ext>`. They have no `[packs]` (see
     /// [`Layer::from_user_file`]).
     user: Vec<Layer>,
-    /// `<project_root>/.airlock/airlock.<ext>`
+    /// `<local_dir>/airlock.<ext>` (see [`files::discover_in`])
     local: Option<Layer>,
     /// `<project_root>/airlock.<ext>`, `<project_root>/airlock.local.<ext>`
     project: Vec<Layer>,
@@ -268,9 +266,14 @@ impl LayeredConfig {
     }
 
     /// Load the config files of `project_root`, with `home` as the home
-    /// directory (see [`files::discover_in`]).
-    pub(crate) fn load_from(home: &Path, project_root: &Path) -> anyhow::Result<Self> {
-        let files = files::discover_in(home, project_root)?;
+    /// directory and the local project file in `local_dir` (see
+    /// [`files::discover_in`]).
+    pub(crate) fn load_from(
+        home: &Path,
+        project_root: &Path,
+        local_dir: &Path,
+    ) -> anyhow::Result<Self> {
+        let files = files::discover_in(home, project_root, local_dir)?;
         Ok(Self::new(
             files
                 .user

@@ -67,7 +67,7 @@ current. A short orientation:
   and drive shutdown. A second `boot` and a `spawn` before `boot` are
   refused.
 - **`CliService`** — exposed by the running `airlock start` process
-  over `<project>/.airlock/sandbox/cli.sock`. `airlock exec` connects
+  over `<sandbox>/cli.sock`. `airlock exec` connects
   here. The CLI server merges the sandbox's resolved base env with
   any `-e KEY=VAL` overrides and forwards the call to the in-VM
   supervisor over the existing vsock.
@@ -81,7 +81,7 @@ current. A short orientation:
   and the host bridges bytes to the real destination. See
   [Networking](./networking.md).
 - **`LogSink`** — guest-side tracing records, streamed to the host's
-  `.airlock/airlock.log`.
+  `<sandbox>/airlock.log`.
 - **`Clipboard`** — host clipboard access, handed to the guest inside
   `boot`'s clipboard config. A null capability is the ungranted
   state — there is no guest-side flag to subvert.

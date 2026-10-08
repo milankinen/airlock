@@ -5,7 +5,7 @@
 //! tokens that a provider issued, the surrogates that the sandbox got for
 //! them, and the OAuth client and scopes of the sign-in.
 //!
-//! The store also lists the grants for `airlock show`, and limits how many
+//! The store also lists the grants for `airlock info`, and limits how many
 //! API keys and replaced surrogates a grant can have. A copied database is
 //! useless without the vault.
 
@@ -66,7 +66,7 @@ pub struct Grant {
     /// The provider's account id. A new sign-in of the same account,
     /// client and scopes replaces this grant.
     pub account_id: String,
-    /// The account's email address, for `airlock show`.
+    /// The account's email address, for `airlock info`.
     #[serde(default)]
     pub account: Option<String>,
     /// The organization name, if the provider named one.
@@ -214,7 +214,7 @@ pub struct NewGrant {
 ///  * `<service>.secrets`: this document, sealed with ChaCha20-Poly1305
 ///    under a key from the vault. The AAD is the key name and the format
 ///    version, so a sealed value cannot move to another key.
-///  * `<service>.meta`: plain JSON for `airlock show` ([`list_grants`]).
+///  * `<service>.meta`: plain JSON for `airlock info` ([`list_grants`]).
 ///    No token, no surrogate.
 ///  * `<service>.generation`: a `u64` (big-endian) that every write
 ///    transaction increments.
@@ -255,7 +255,7 @@ impl GrantMeta {
     }
 }
 
-/// The data of a grant that `airlock show` lists: no secrets.
+/// The data of a grant that `airlock info` lists: no secrets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantSummary {
     /// The service name.
@@ -809,7 +809,7 @@ impl TokenStore {
     }
 }
 
-/// List the grants stored in `db`, for `airlock show`. Reads only the
+/// List the grants stored in `db`, for `airlock info`. Reads only the
 /// `<service>.meta` keys, so it does not need the store key.
 pub async fn list_grants(db: &Db) -> anyhow::Result<Vec<GrantSummary>> {
     let table: Table = db.database(DATABASE).await?;

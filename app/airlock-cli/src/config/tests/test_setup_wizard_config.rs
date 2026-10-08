@@ -3,9 +3,9 @@
 
 use crate::config::config_values::PullPolicy;
 use crate::config::generated::{Clipboard, GeneratedConfig, NewEntry, Target};
-use crate::config::{ConfigOverrides, ResolvedConfig};
+use crate::config::{ConfigOverrides, LayeredConfig, ResolvedConfig};
 use crate::packs::ArgValue;
-use crate::test_cfg::{ConfigDirs, resolve_layers};
+use crate::test_cfg::{ConfigDirs, resolve_layers, temp_dir};
 
 /// Return a wizard pack entry at version 1 with the given args.
 fn entry<'a>(name: &'a str, args: Vec<(&'a str, &'a ArgValue)>) -> NewEntry<'a> {
@@ -95,17 +95,18 @@ fn wizard_project_config_resolves_before_save_and_after_reload() {
     // A second in-memory project layer is an error.
     assert!(layers.with_generated_project(generated.clone()).is_err());
 
-    generated.save().unwrap();
+    let local_dir = dirs.project().join(".airlock");
+    generated.save(&local_dir).unwrap();
     assert_eq!(
         std::fs::read_to_string(&generated.path).unwrap(),
         generated.toml
     );
-    assert!(!dirs.project().join(".airlock").exists());
+    assert!(!local_dir.exists());
     assert_wizard_choices(&dirs.resolve().unwrap());
 
     // The project file exists now, so the save of a new config must fail.
     let other = GeneratedConfig::new(&dirs.project(), Target::Project, &[], None, None);
-    let err = other.save().unwrap_err().to_string();
+    let err = other.save(&local_dir).unwrap_err().to_string();
     assert!(err.contains("appeared"), "{err}");
     assert_eq!(
         std::fs::read_to_string(&generated.path).unwrap(),
@@ -113,24 +114,38 @@ fn wizard_project_config_resolves_before_save_and_after_reload() {
     );
 }
 
-/// Test that a local wizard config goes to `.airlock/` with a `.gitignore`,
-/// so that git does not see the local file.
-///   1. Save an empty config for the local target
+/// Test that a local wizard config of a project sandbox goes to `.airlock/`
+/// with a `.gitignore`, so that git does not see the local file. For a
+/// sandbox in the data directory, it goes to the sandbox directory and the
+/// project gets nothing.
+///   1. Save an empty config for the local target in `.airlock/`
 ///   2. Check the `.gitignore`, and that no `airlock.toml` exists
 ///   3. Check that the load finds a project config
 ///   4. Check that a second save fails
+///   5. Save it in a sandbox directory of a second project, and check that
+///      the load with that directory finds it and the project has no files
 #[test]
-fn wizard_local_config_is_saved_after_gitignore() {
+fn wizard_local_config_goes_to_airlock_dir_or_sandbox_dir() {
     let dirs = ConfigDirs::new();
     let generated = GeneratedConfig::new(&dirs.project(), Target::Local, &[], None, None);
     assert_eq!(generated.toml, "");
     assert_eq!(generated.path, dirs.project().join(".airlock/airlock.toml"));
-    generated.save().unwrap();
+    let local_dir = dirs.project().join(".airlock");
+    generated.save(&local_dir).unwrap();
     assert_eq!(
-        std::fs::read_to_string(dirs.project().join(".airlock/.gitignore")).unwrap(),
+        std::fs::read_to_string(local_dir.join(".gitignore")).unwrap(),
         "*\n"
     );
     assert!(!dirs.project().join("airlock.toml").exists());
     assert!(dirs.load().unwrap().has_project_config());
-    assert!(generated.save().is_err());
+    assert!(generated.save(&local_dir).is_err());
+
+    let boxed = ConfigDirs::new();
+    let sandbox = temp_dir();
+    let generated = GeneratedConfig::new(&boxed.project(), Target::Local, &[], None, None);
+    let path = generated.save(sandbox.path()).unwrap();
+    assert_eq!(path, sandbox.path().join("airlock.toml"));
+    assert!(std::fs::read_dir(boxed.project()).unwrap().next().is_none());
+    let layers = LayeredConfig::load_from(&boxed.home(), &boxed.project(), sandbox.path()).unwrap();
+    assert!(layers.has_project_config());
 }

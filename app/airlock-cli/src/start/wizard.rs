@@ -16,12 +16,10 @@ use crate::cli::prompt::Step;
 use crate::cli::prompt::screen::{self, Screen};
 use crate::config::generated::{Clipboard, GeneratedConfig, NewEntry, Target};
 use crate::config::{self, LayeredConfig};
-use crate::packs::install::state;
 use crate::packs::{ConfiguredPack, PackManager};
 use crate::settings::WizardStart;
 use crate::start::wizard::form::{Form, StartChoice};
 use crate::vault::Vault;
-use crate::vm::disk;
 
 /// All answers of the wizard.
 pub struct Answers {
@@ -87,6 +85,10 @@ pub(super) struct Input<'a> {
 /// project has none (see [`LayeredConfig::has_project_config`]).
 /// Args:
 ///  - `host_cwd`: Project directory on the host
+///  - `local_dir`: Directory of the local project config (see
+///    [`crate::sandboxes::local_config_dir`])
+///  - `has_sandbox`: The project has a sandbox with a disk or install
+///    records (see [`crate::sandboxes::has_content`])
 ///  - `packs`: Available packs
 ///  - `vault`: Vault that resolves the `[env]` of the answers
 ///  - `start`: The first start option of the wizard, from the user settings
@@ -97,13 +99,24 @@ pub(super) struct Input<'a> {
 ///   The caller saves it after the sandbox is stored (see [`save_config`]).
 pub async fn load_or_generate_config(
     host_cwd: &Path,
+    local_dir: &Path,
+    has_sandbox: bool,
     packs: &PackManager,
     vault: &Vault,
     start: WizardStart,
 ) -> Result<LayeredConfig, Exit> {
-    let config = config::load().map_err(Exit::config)?;
+    let config = config::load(host_cwd, local_dir).map_err(Exit::config)?;
     if config.has_project_config() {
         return Ok(config);
+    }
+    if has_sandbox {
+        cli::error!(
+            "A sandbox exists in {}, but there is no config. Put the config in airlock.toml or \
+             {} (restore it), or run `airlock rm` to start over.",
+            host_cwd.display(),
+            local_dir.join("airlock.toml").display()
+        );
+        return Err(Exit::Code(2));
     }
     let generated = Box::pin(run_wizard(host_cwd, packs, &config, vault, start)).await?;
     config
@@ -119,9 +132,9 @@ pub async fn load_or_generate_config(
 ///  * The agents and the tools
 ///  * The args of each selected pack
 ///  * The clipboard capabilities (copy, paste)
-///  * The start bar: `start` (local config, `.airlock/airlock.toml`),
-///    `start and share` (shareable config, `airlock.toml`) or `cancel`.
-///    The user settings select the first option.
+///  * The start bar: `start` (local config, in the sandbox directory or in
+///    `.airlock/`), `start and share` (shareable config, `airlock.toml`) or
+///    `cancel`. The user settings select the first option.
 ///
 /// The user files do not select packs, because `[packs]` belongs in the
 /// project files. If the user files set an image, the distro group starts
@@ -145,7 +158,7 @@ pub async fn load_or_generate_config(
 ///   It has the selected packs at their newest version with all their args,
 ///   and `[clipboard]`. The distro pack sets the image, or the file repeats
 ///   the user image. Errors:
-///    * A sandbox without config, or no terminal: exit code 2
+///    * No terminal: exit code 2
 ///    * Esc or `cancel`: exit code 0, or 2 after a failed check (the error
 ///      stays valid)
 ///    * Ctrl+C: exit code 130
@@ -156,14 +169,6 @@ pub async fn run_wizard(
     vault: &Vault,
     start: WizardStart,
 ) -> Result<GeneratedConfig, Exit> {
-    if sandbox_exists(host_cwd) {
-        cli::error!(
-            "A sandbox exists in {}, but there is no config. Put the config in airlock.toml or \
-             .airlock/airlock.toml (restore it), or run `airlock rm` to start over.",
-            host_cwd.display()
-        );
-        return Err(Exit::Code(2));
-    }
     if !prompt::can_prompt() {
         cli::error!(
             "No airlock config in {}. Run `airlock start` in a terminal, or create airlock.toml.",
@@ -181,21 +186,16 @@ pub async fn run_wizard(
 }
 
 /// Save the config of the wizard. Call this after the sandbox is stored.
+/// The local file goes to `local_dir` (see
+/// [`crate::sandboxes::local_config_dir`]).
 // Report only a shareable file (`airlock.toml`). The user must not edit or
 // commit the local file.
-pub fn save_config(generated: &GeneratedConfig) -> Result<(), Exit> {
-    generated.save().map_err(|e| Exit::error(1, e))?;
+pub fn save_config(generated: &GeneratedConfig, local_dir: &Path) -> Result<(), Exit> {
+    generated.save(local_dir).map_err(|e| Exit::error(1, e))?;
     if generated.target == Target::Project {
         cli::log!("  {} created {}", cli::check(), generated.path.display());
     }
     Ok(())
-}
-
-/// Return true if the project at `host_cwd` has a sandbox: a disk or an
-/// install state in `.airlock/sandbox`.
-fn sandbox_exists(host_cwd: &Path) -> bool {
-    let dir = host_cwd.join(".airlock/sandbox");
-    dir.join(disk::DISK_FILE).exists() || dir.join(state::STATE_FILE).exists()
 }
 
 /// How the view ended.
@@ -282,31 +282,4 @@ pub(super) async fn check_answers(input: &Input<'_>, answers: &Answers) -> anyho
         .await?;
     crate::project::resolve_env(&resolved.values, input.vault)?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    //! Tests of the sandbox check before the setup wizard.
-
-    use super::*;
-
-    /// Test that only a disk or an install state counts as a sandbox. The
-    /// wizard refuses to run over a sandbox that lost its config.
-    ///   1. Make a sandbox directory with only a lock file and check that
-    ///      it does not count
-    ///   2. Add an install state and check that it counts
-    ///   3. Replace the install state with a disk and check that it counts
-    #[test]
-    fn sandbox_exists_with_disk_or_install_state_only() {
-        let tmp = crate::test_cfg::temp_dir();
-        let dir = tmp.path().join(".airlock/sandbox");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("lock"), "").unwrap();
-        assert!(!sandbox_exists(tmp.path()));
-        std::fs::write(dir.join(state::STATE_FILE), "{}").unwrap();
-        assert!(sandbox_exists(tmp.path()));
-        std::fs::remove_file(dir.join(state::STATE_FILE)).unwrap();
-        std::fs::write(dir.join(disk::DISK_FILE), "").unwrap();
-        assert!(sandbox_exists(tmp.path()));
-    }
 }

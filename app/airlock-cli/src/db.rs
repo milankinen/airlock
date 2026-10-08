@@ -1,6 +1,6 @@
 //! The airlock database.
 //!
-//! A key-value store in the airlock home directory. All airlock processes of
+//! A key-value store in the airlock data directory. All airlock processes of
 //! the user share it. It contains named databases for different purposes.
 //! This module does not know the contents of any of them.
 
@@ -9,7 +9,7 @@ use std::path::Path;
 use anyhow::{Context as _, bail};
 use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn, WithoutTls};
 
-/// Directory of the database in the airlock home directory.
+/// Directory of the database in the airlock data directory.
 pub const DIR: &str = "db";
 
 /// Maximum size of the environment, for all databases together. LMDB
@@ -167,7 +167,7 @@ fn open_env(dir: &Path) -> anyhow::Result<Env<WithoutTls>> {
     // the files. Only airlock writes them, always through LMDB and this
     // function. A process opens the environment once (one `Db` in the
     // context, and `heed` refuses a second open of the same path). The
-    // directory is private to the user and is in the home directory, not on
+    // directory is private to the user and is in the data directory, not on
     // a network file system.
     let env = unsafe { options.open(dir) }
         .with_context(|| format!("open the database {}", dir.display()))?;

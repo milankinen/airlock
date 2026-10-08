@@ -65,7 +65,7 @@ pub struct Account {
     /// The provider's account id. `None` if the answer names no account.
     /// Then the grant replaces no other grant.
     pub id: Option<String>,
-    /// The email address, for `airlock show`.
+    /// The email address, for `airlock info`.
     pub email: Option<String>,
     /// The organization name, if the answer names one.
     pub organization: Option<String>,

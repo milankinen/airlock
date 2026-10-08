@@ -83,7 +83,11 @@ impl ConfigDirs {
 
     /// Find and parse the config files.
     pub fn load(&self) -> anyhow::Result<LayeredConfig> {
-        LayeredConfig::load_from(&self.home(), &self.project())
+        LayeredConfig::load_from(
+            &self.home(),
+            &self.project(),
+            &self.project().join(".airlock"),
+        )
     }
 
     /// Load and resolve the config files (see [`resolve_layers`]).

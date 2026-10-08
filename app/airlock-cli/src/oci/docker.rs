@@ -164,7 +164,7 @@ impl Drop for DockerSaveGuard {
 }
 
 /// Export a local image and stage its layers as tarballs under
-/// `~/.cache/airlock/oci/layers/`.
+/// `<data>/oci/layers/`.
 ///
 /// Each layer that is not already cached becomes a `<key>.download` file,
 /// ready for [`super::layer::ensure_layer_cached`] to extract. If the

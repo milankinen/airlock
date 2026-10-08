@@ -1,31 +1,34 @@
-# Managing sandbox data
+# Managing sandboxes
 
-## Viewing sandbox status
+## View current sandbox
 
-The `airlock show` command displays the current sandbox configuration and
-status for the project:
+The `airlock info` command shows the sandbox and the configuration 
+of the current project. It is a shortcut for `airlock sandbox info` 
+without an id:
 
 ```bash
-airlock show
+airlock info
+airlock info --json   # Sandbox details as JSON, for scripts
 ```
 
 The output includes the image name, CPU and memory allocation, disk usage,
 the packs and their install status, configured mounts, network rules, the
 sign-ins of the network services, and whether the sandbox is currently
-running. This is a quick way to verify your configuration without opening
-the TOML file.
+running. Use it to see your configuration without opening the TOML
+file.
 
 Example output:
 
 ```
 Path:     /Users/me/my-project
+ID:       k3x7q2ma
 Status:   running
 Image:    debian:stable-slim
 CPUs:     4
 Memory:   2.0 GB
 Last run: 2 minutes ago
 
-Sandbox:  /Users/me/my-project/.airlock/sandbox
+Sandbox:  /Users/me/Library/Application Support/airlock/boxes/k3x7q2ma
 Disk:     1.2 GB / 10.0 GB
 
 Packs:
@@ -34,7 +37,7 @@ Packs:
   rust 1 (toolchain = nightly) — installed
 
 Mounts:
-  claude-dir: /Users/me/.cache/airlock/packs/mounts/claude/claude → ~/.claude
+  claude-dir: /Users/me/Library/Application Support/airlock/packs/mounts/claude/claude → ~/.claude
 
 Network policy: deny-by-default
 Network rules:
@@ -60,61 +63,91 @@ The pack status is one of these:
 | `installed, removed from config` | The pack is still on the disk, but not in the config |
 | `kept, removed from config`      | You selected "continue with current" after you removed the pack |
 
-## Removing sandbox state
+## Listing sandboxes
 
-The `airlock remove` command removes the `.airlock/` directory of the
-current project. This includes the disk image, the CA certificate, the
-logs and the local project config `.airlock/airlock.toml`:
+The `airlock sandbox` command shows the sandboxes in the airlock data
+directory (see [Where airlock keeps sandbox data](#where-airlock-keeps-sandbox-data)):
+
+```bash
+airlock sandbox list              # All sandboxes in the data directory (alias: ls)
+airlock sandbox info k3x7q2ma     # Details of one sandbox (as `airlock info`)
+```
+
+The list shows the id, the status, the last run, the disk use and the
+project directory of each sandbox. If the project directory no longer
+exists, the list shows `(missing)` next to it.
+
+The list does not show sandboxes in a project directory. `airlock info`
+shows them when you run it in their project. If the project directory of
+a sandbox is gone, `airlock sandbox info` shows only the sandbox.
+
+## Removing sandbox
+
+The `airlock remove` command (alias `airlock rm`) removes the sandbox of
+the current project. It is a shortcut for `airlock sandbox remove` without
+an id. This removes the disk image, the CA certificate,
+the install records, the local project config and the other runtime
+state:
 
 ```bash
 airlock remove
 ```
 
-airlock asks you to confirm before it removes anything. To skip the
-confirmation prompt (useful in scripts), pass `--force`:
+The `airlock sandbox remove` command (alias `airlock sandbox rm`) removes
+any sandbox in the data directory by its id (see `airlock sandbox list`).
+Use it for the sandbox of a project directory that no longer exists:
 
 ```bash
-airlock remove --force
+airlock sandbox remove k3x7q2ma
+airlock sandbox remove k3x7q2ma x5bq7d2c   # Remove more than one
 ```
 
-The short alias `airlock rm` also works.
+Both commands ask you to confirm before they remove anything. To skip the
+confirmation prompt (for example in scripts), pass `--force`. airlock
+refuses to remove a running sandbox.
 
-After removal, running `airlock start` again creates a fresh sandbox from
-scratch — new disk, new CA certificate, fresh image pull if needed. Removal does
-not affect the project configuration files (`airlock.toml`,
-`airlock.local.toml`). If the project has no other config, `airlock start`
-opens the setup wizard again.
+After removal, `airlock start` makes a new sandbox: a new disk, a new CA
+certificate, and a new image pull if necessary. Removal does not change
+the project configuration files (`airlock.toml`, `airlock.local.toml`).
+If the project has no other config, `airlock start` opens the setup
+wizard again.
 
 In your home directory, `.airlock/` also holds your user files: user
-config, vault and sign-ins. There, `airlock rm` removes only
+config, vault and settings. There, `airlock rm` removes only
 `.airlock/sandbox/`. If `.airlock` is a symbolic link, `airlock rm`
 removes only the link.
 
-## The `.airlock/` directory
+## Where airlock keeps sandbox data
 
-Each project that uses airlock has a `.airlock/` directory at its root.
-Sandbox state lives inside the project (rather than in a global location
-like `~/.airlock/`) so that each checkout gets its own isolated sandbox.
-Work on two branches in parallel, clone the same repo twice, or
-`airlock rm` a feature branch's state — none of these touches anything
-else. The directory contains a `.gitignore` with `*`, which excludes it
-from version control automatically. Inside it, the `sandbox/`
-subdirectory holds all runtime state. The local project config
-`.airlock/airlock.toml` is next to it.
+airlock stores the sandbox data in the application data directory:
 
-| File / Directory | Purpose                                                         |
-|------------------|-----------------------------------------------------------------|
-| `lock`           | PID lock file preventing concurrent sandbox instances           |
-| `ca.json`        | Per-project CA certificate and private key for TLS interception |
-| `disk.img`       | Sparse ext4 disk image for persistent VM storage                |
-| `image`          | Link to the cached OCI image                                    |
-| `cli.sock`       | Unix socket `airlock exec` connects to                          |
-| `run.json`       | Metadata from the last run (timestamp, working directory)       |
-| `installs.json`  | Install status of the packs                                     |
-| `installs.log`   | Output of the pack installs                                     |
-| `overlay/`       | Internal staging directory for file mounts                      |
+- macOS: `~/Library/Application Support/airlock`
+- Linux: `$XDG_DATA_HOME/airlock` or `~/.local/share/airlock`
 
-The `tracing` log lives one level up, at `.airlock/airlock.log`.
+To use a different directory, set `data_dir` in `~/.airlock/settings.toml`:
 
-You should never need to touch these files directly. If something goes wrong,
-`airlock rm` and a fresh `airlock start` is the cleanest recovery path.
+```toml
+data_dir = "~/airlock-data"
+```
+
+The data directory also holds the image cache. Keep it on one file
+system: airlock links each sandbox to its cached image with a hard link.
+
+## Project-colocated sandboxes
+
+Older airlock versions kept the sandbox in `.airlock/sandbox` in the
+project directory. `airlock start` offers to move such a sandbox into the
+data directory.
+
+To keep new sandboxes in the project directory, set `sandbox_location` in
+`~/.airlock/settings.toml`:
+
+```toml
+sandbox_location = "project-dir"   # default: "cache-dir"
+```
+
+> [!WARNING]
+> A sandbox in the project directory is less secure. The sandbox guest
+> can read the project directory, so the sandbox data (for example the CA
+> private key) is open to code in the sandbox. Keep the default and use
+> the application data directory.

@@ -37,7 +37,7 @@ deployments straightforward.
 - **Initramfs**: Alpine-based with the `airlockd` supervisor binary
   and a minimal init script. Built inside Docker as a gzipped cpio
   archive.
-- airlock extracts both to `~/.cache/airlock/vm/` on first run. A
+- airlock extracts both to `vm/` in the airlock data directory on first run. A
   checksum check re-extracts them if the binary is updated.
 
 The [distroless build variant](../advanced/custom-kernel.md) omits

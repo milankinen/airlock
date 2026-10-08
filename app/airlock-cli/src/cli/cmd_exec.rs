@@ -9,8 +9,9 @@ use airlock_common::cli_capnp::*;
 use clap::Args;
 use futures::AsyncReadExt;
 
+use crate::context::Context;
 use crate::runtime::{self, RawTerminalRuntime};
-use crate::{oci, rpc, sandbox};
+use crate::{oci, rpc, sandbox, sandboxes};
 
 /// CLI arguments for `airlock exec`.
 #[derive(Args, Debug)]
@@ -38,8 +39,8 @@ pub struct ExecArgs {
 // `airlock start` process. That process has the resolved sandbox environment
 // (image env and `airlock.toml` env). It merges the overrides into that env
 // and tells the supervisor to start the process. Thus `exec` never loads the
-// project, the vault or the settings.
-pub async fn main(args: ExecArgs) -> anyhow::Result<i32> {
+// project or the vault. It uses only the sandbox registry of the context.
+pub async fn main(args: ExecArgs, context: &Context) -> anyhow::Result<i32> {
     let ExecArgs {
         cmd,
         args,
@@ -56,9 +57,11 @@ pub async fn main(args: ExecArgs) -> anyhow::Result<i32> {
     let (cmd, args) = argv.split_first().expect("argv holds the command");
 
     let host_cwd = std::env::current_dir().map_err(|e| anyhow::anyhow!("get cwd: {e}"))?;
-    let sock_path = find_cli_sock(&host_cwd).ok_or_else(|| {
+    // The registry has canonical project paths.
+    let lookup_dir = std::fs::canonicalize(&host_cwd).unwrap_or_else(|_| host_cwd.clone());
+    let sock_path = find_cli_sock(context, &lookup_dir).await?.ok_or_else(|| {
         anyhow::anyhow!(
-            "no running sandbox — looked for .airlock/sandbox/cli.sock from {} upward. \
+            "no running sandbox for {} or its parent directories. \
              is 'airlock start' running in this project?",
             host_cwd.display()
         )
@@ -120,23 +123,27 @@ pub async fn main(args: ExecArgs) -> anyhow::Result<i32> {
     Ok(sandbox::io::drive(&proc, &mut terminal).await)
 }
 
-/// Find the CLI socket of the nearest sandbox at or above `start`.
+/// Find the CLI socket of the nearest running sandbox at or above `start`.
+/// Sandboxes in the data directory and in the project both count.
 /// Returns:
 ///   The first socket path that exists, or `None`.
-// For each `.airlock/sandbox/` directory found, the socket path is that
-// directory's `cli.sock`. If that path is longer than the `AF_UNIX` limit,
-// the path is a hash-keyed fallback under `~/.cache/airlock/sock/`.
-fn find_cli_sock(start: &std::path::Path) -> Option<PathBuf> {
-    for dir in start.ancestors() {
-        let sandbox_dir = dir.join(".airlock").join("sandbox");
-        if !sandbox_dir.is_dir() {
+// A sandbox without a socket does not run. The search then goes on to the
+// parent directories. The socket path is `cli.sock` in the sandbox
+// directory. If that path is longer than the `AF_UNIX` limit, the path is a
+// hash-keyed fallback under `<data>/sock/`.
+pub(super) async fn find_cli_sock(
+    context: &Context,
+    start: &std::path::Path,
+) -> anyhow::Result<Option<PathBuf>> {
+    for found in sandboxes::candidates(context, start, true).await? {
+        if !found.dir.is_dir() {
             continue;
         }
-        if let Ok(candidate) = crate::cache::cli_sock_path(&sandbox_dir)
+        if let Ok(candidate) = crate::cache::cli_sock_path(&found.dir)
             && candidate.exists()
         {
-            return Some(candidate);
+            return Ok(Some(candidate));
         }
     }
-    None
+    Ok(None)
 }

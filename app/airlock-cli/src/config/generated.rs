@@ -15,12 +15,15 @@ use crate::project;
 pub enum Target {
     /// `airlock.toml`, next to the project files (under version control).
     Project,
-    /// `.airlock/airlock.toml` (local, because git ignores `.airlock/`).
+    /// `airlock.toml` in the local config directory: the sandbox directory
+    /// of a sandbox in the data directory, else `.airlock/` (git ignores
+    /// it). See [`crate::sandboxes::local_config_dir`].
     Local,
 }
 
 impl Target {
-    /// Path of the target file, relative to the project directory.
+    /// Path of the target file, relative to the project directory. For
+    /// [`Target::Local`], this is the place in a project sandbox.
     pub fn file(self) -> &'static str {
         match self {
             Target::Project => "airlock.toml",
@@ -58,7 +61,8 @@ pub struct NewEntry<'a> {
 pub struct GeneratedConfig {
     /// Location of the file.
     pub target: Target,
-    /// Path of the `target` file in the project.
+    /// Path of the `target` file in the project. For [`Target::Local`],
+    /// [`Self::save`] can write the file to the sandbox directory instead.
     pub path: PathBuf,
     /// TOML content of the file:
     ///  * the pack entries (`[packs] <name> = { version = "1", args = { … } }`,
@@ -92,22 +96,36 @@ impl GeneratedConfig {
     }
 
     /// Write the file as a new file. If a file appeared in the meantime,
-    /// this is an error and the file is not overwritten. For the local
-    /// file, `.airlock/.gitignore` is created first.
-    pub fn save(&self) -> anyhow::Result<()> {
-        if self.target == Target::Local {
-            let host_cwd = self.path.parent().and_then(Path::parent).ok_or_else(|| {
-                anyhow::anyhow!("{} has no project directory", self.path.display())
-            })?;
-            project::ensure_cache_dir(host_cwd)?;
-        }
-        create_new(&self.path, &self.toml).map_err(|e| match e.kind() {
+    /// this is an error and the file is not overwritten.
+    /// Args:
+    ///  - `local_dir`: Local config directory of the project (see
+    ///    [`crate::sandboxes::local_config_dir`]). The local file goes
+    ///    there. For `.airlock/`, `.airlock/.gitignore` is created first.
+    ///
+    /// Returns:
+    ///   The path of the written file.
+    pub fn save(&self, local_dir: &Path) -> anyhow::Result<PathBuf> {
+        let path = match self.target {
+            Target::Project => self.path.clone(),
+            Target::Local => {
+                let in_project = self.path.parent() == Some(local_dir);
+                if in_project {
+                    let host_cwd = local_dir.parent().ok_or_else(|| {
+                        anyhow::anyhow!("{} has no project directory", local_dir.display())
+                    })?;
+                    project::ensure_cache_dir(host_cwd)?;
+                }
+                local_dir.join("airlock.toml")
+            }
+        };
+        create_new(&path, &self.toml).map_err(|e| match e.kind() {
             std::io::ErrorKind::AlreadyExists => anyhow::anyhow!(
                 "{} appeared while the setup questions were open; it was not changed",
-                self.path.display()
+                path.display()
             ),
-            _ => anyhow::anyhow!("create {}: {e}", self.path.display()),
-        })
+            _ => anyhow::anyhow!("create {}: {e}", path.display()),
+        })?;
+        Ok(path)
     }
 }
 

@@ -52,6 +52,11 @@ interface Supervisor {
     # ungranted state. Thus a host that does not set this field gives the
     # guest nothing to call.
     browser     :BrowserConfig,
+    # True if the guest must not hide the `.airlock` directory of the
+    # project. The host sets it when the sandbox data is not in the
+    # project. The default (false) hides the directory, so a host that does
+    # not set this field keeps the sandbox data out of view.
+    skipAirlockMask :Bool,
   ) -> ();
 
   shutdown @1 () -> ();

@@ -246,12 +246,12 @@ fn unreadable_install_state_without_terminal_is_exit_2() {
 /// made.
 ///   1. Start with an `[env]` entry that reads an unset host variable
 ///   2. Check exit code 2
-///   3. Check that no image was prepared and there is no sandbox directory
+///   3. Check that no image was prepared and there is no sandbox
 #[test]
 fn missing_env_variable_fails_start_before_sandbox_is_touched() {
     let project = StartProject::new(test_packs());
     let toml = "[packs]\nalpha = { version = 1 }\n[env]\nMINE = \"${AIRLOCK_TEST_UNSET_VAR}\"\n";
     assert_eq!(code(project.start(toml, false)), 2);
     assert_eq!(prepared(), 0);
-    assert!(!project.sandbox_dir().exists());
+    assert!(project.sandbox().is_none());
 }

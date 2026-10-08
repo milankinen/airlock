@@ -7,9 +7,10 @@
 //!  * Ctrl+C and SIGTERM handling, so that long steps can stop cleanly
 
 pub mod cmd_exec;
+pub mod cmd_info;
 pub mod cmd_rm;
+pub mod cmd_sandbox;
 pub mod cmd_secret;
-pub mod cmd_show;
 pub mod cmd_start;
 pub mod logging;
 pub mod prompt;

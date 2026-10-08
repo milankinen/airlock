@@ -12,6 +12,7 @@ use crate::cli::prompt;
 use crate::cli::prompt::choose::{Choice, Choose};
 use crate::cli::prompt::style::Tone;
 use crate::config::ResolvedConfig;
+use crate::context::Context;
 #[cfg(not(test))]
 use crate::oci::prepare as prepare_image;
 use crate::oci::{ImageChange, ImageChangeStop, OciImage, OnImageChange};
@@ -24,7 +25,6 @@ use crate::project::{self, SandboxLock};
 #[cfg(test)]
 use crate::test_cfg::start::{check_image, prepare_image};
 use crate::util::PinnedDir;
-use crate::vault::Vault;
 use crate::{cli, sandbox};
 
 /// The stored sandbox, ready for the install step.
@@ -204,32 +204,36 @@ fn tools_changed_message(plan: &Plan) -> String {
 /// session after it (see [`Why::Retry`]). After a session, the retry gets the
 /// added-tools question.
 /// Args:
-///  - `host_cwd`: Project directory on the host
+///  - `context`: Process context. Its vault resolves `[env]` and prepares
+///    the image.
+///  - `host_cwd`: Canonical project directory on the host
 ///  - `packs`: Available packs
 ///  - `resolved`: Resolved config
 ///  - `options`: Command-line options
-///  - `vault`: Vault for `[env]` and the image preparation
 ///
 /// Returns:
 ///   The stored sandbox, or the exit for an error or a cancelled question.
-// Steps: check `[env]`, take the lock, read the install records, prepare the
+// Steps: check `[env]`, find or make the sandbox and take its lock (see
+// [`super::location::lock_sandbox`]), read the install records, prepare the
 // image, answer the image and tool questions, re-create the disk if that is
 // the answer, create (or resize) the disk, and save the record changes.
 pub async fn ensure_sandbox(
+    context: &Context,
     host_cwd: &Path,
     packs: &PackManager,
     resolved: &ResolvedConfig,
     options: &SandboxOptions,
-    vault: &Vault,
 ) -> Result<EnsuredSandbox, Exit> {
+    let vault = &context.vault;
     super::env::check_env_early(&resolved.values, vault)?;
-    let lock = SandboxLock::acquire(host_cwd)?;
-    let sandbox_dir = PinnedDir::open(host_cwd, Path::new(".airlock/sandbox"), false)
-        .map_err(anyhow::Error::from)?;
     let answering = Answering {
         can_prompt: prompt::can_prompt(),
         yes: options.yes,
     };
+    let lock =
+        super::location::lock_sandbox(context, host_cwd, answering.can_prompt, answering.yes)
+            .await?;
+    let sandbox_dir = PinnedDir::pin(lock.dir()).map_err(anyhow::Error::from)?;
     let mut state = read_state(&sandbox_dir, answering.can_prompt)?;
     let candidates = install::install_candidates(&resolved.packs);
     let wanted: Vec<Wanted> = candidates

@@ -134,7 +134,11 @@ fn choosing_packs_and_args_with_keys_saves_shared_config_that_resolves() {
     let config = LayeredConfig::from_values(vec![], None, vec![]).unwrap();
     check(&packs, &config, &form).unwrap();
     let dir = temp_dir();
-    save_config(&form.answers(target).config(dir.path())).unwrap();
+    save_config(
+        &form.answers(target).config(dir.path()),
+        &dir.path().join(".airlock"),
+    )
+    .unwrap();
     let text = std::fs::read_to_string(dir.path().join("airlock.toml")).unwrap();
     assert_eq!(
         text,

@@ -182,6 +182,23 @@ impl PinnedDir {
         Ok(file)
     }
 
+    /// Open the file `name` to read and write it. If the file does not
+    /// exist, create it with the permission bits `mode`.
+    pub fn open_read_write(&self, name: impl AsRef<OsStr>, mode: u32) -> io::Result<File> {
+        let name = name.as_ref();
+        let c = file_name(name)?;
+        let fd = open_raw(
+            self.fd.as_raw_fd(),
+            &c,
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            mode,
+        )
+        .map_err(|e| self.context(name, &e))?;
+        let file = File::from(fd);
+        self.check_regular(name, &file.metadata()?)?;
+        Ok(file)
+    }
+
     /// Remove `name` (a file or a symlink, never followed).
     /// Returns:
     ///   `Ok(true)` if it was removed, `Ok(false)` if it did not exist.

@@ -37,7 +37,7 @@ impl Assets {
     pub fn init(project: &Project) -> anyhow::Result<Assets> {
         const CHECKSUM: &str = env!("AIRLOCK_ASSETS_CHECKSUM");
 
-        let dir = crate::cache::cache_dir()?.join("vm");
+        let dir = crate::cache::data_dir()?.join("vm");
         std::fs::create_dir_all(&dir)?;
 
         // Serialize the checksum check and extraction across processes. Take

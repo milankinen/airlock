@@ -1,13 +1,13 @@
-//! Global cache locations.
+//! Airlock data directory locations.
 //!
-//! Gives the locations in the user's global airlock cache. All sandboxes share
-//! this cache. It contains the VM boot assets, the OCI images and layers, the
-//! host side of the pack mounts, and fallback CLI sockets.
-//!
-//! The state of each sandbox is not in the global cache. It is in the project
-//! directory.
+//! Gives the locations in the user's airlock data directory. All sandboxes
+//! share it. It contains the database, the sandboxes that are not in their
+//! project, the VM boot assets, the OCI images and layers, the host side of
+//! the pack mounts, and fallback CLI sockets. The user settings can move
+//! the directory.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
 
@@ -51,23 +51,54 @@ pub fn layer_key(digest: &str) -> String {
     format!("{LAYER_FORMAT}.{}", digest_name(digest))
 }
 
-/// Get the root cache directory (`~/.cache/airlock/`). Creates it if it
-/// does not exist.
-pub fn cache_dir() -> anyhow::Result<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
-    let dir = home.join(".cache").join("airlock");
-    std::fs::create_dir_all(&dir)?;
+/// Data directory of the process, from the user settings (see
+/// [`set_data_dir`]).
+static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Set the data directory of the process. Call it one time, before the
+/// first use. Later calls have no effect.
+pub fn set_data_dir(dir: PathBuf) {
+    let _ = DATA_DIR.set(dir);
+}
+
+/// Get the default data directory: `airlock` in the user data directory of
+/// the platform (`~/Library/Application Support` on macOS,
+/// `$XDG_DATA_HOME` or `~/.local/share` on Linux).
+pub fn default_data_dir() -> anyhow::Result<PathBuf> {
+    let base = dirs::data_dir().ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
+    Ok(base.join("airlock"))
+}
+
+/// Get the airlock data directory. Creates it (mode 0700) if it does not
+/// exist.
+pub fn data_dir() -> anyhow::Result<PathBuf> {
+    let dir = match DATA_DIR.get() {
+        Some(dir) => dir.clone(),
+        None => default_data_dir()?,
+    };
+    create_private_dir(&dir)?;
     Ok(dir)
 }
 
+/// Create `dir` and its missing parents. A new directory gets mode 0700:
+/// the data directory holds the database and the sandbox data.
+pub fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.display()))
+}
+
 /// Get the mount directory of the pack `name`
-/// (`~/.cache/airlock/packs/mounts/<name>/`). Creates it if it does not exist.
+/// (`<data>/packs/mounts/<name>/`). Creates it if it does not exist.
 ///
 /// The pack's `config.lua` gets it as `pack.directory`. The pack keeps the
 /// host side of its mounts there (for example the agent settings and
 /// credential files). All sandboxes that use the pack share it.
 pub fn pack_mounts_dir(name: &str) -> anyhow::Result<PathBuf> {
-    let dir = cache_dir()?.join("packs").join("mounts").join(name);
+    let dir = data_dir()?.join("packs").join("mounts").join(name);
     std::fs::create_dir_all(&dir)
         .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.display()))?;
     Ok(dir)
@@ -76,7 +107,7 @@ pub fn pack_mounts_dir(name: &str) -> anyhow::Result<PathBuf> {
 /// Get the path of the CLI RPC Unix socket for the sandbox at `sandbox_dir`.
 /// Creates the parent directory if necessary.
 /// Returns:
-///   `<sandbox_dir>/cli.sock`, or `~/.cache/airlock/sock/<hash>.sock` if
+///   `<sandbox_dir>/cli.sock`, or `<data>/sock/<hash>.sock` if
 ///   the default path is too long for a Unix socket.
 pub fn cli_sock_path(sandbox_dir: &Path) -> anyhow::Result<PathBuf> {
     // `AF_UNIX` has a hard `sun_path` limit of 104 bytes on macOS (108 on
@@ -95,22 +126,22 @@ pub fn cli_sock_path(sandbox_dir: &Path) -> anyhow::Result<PathBuf> {
     let mut hasher = Sha256::new();
     hasher.update(sandbox_dir.as_os_str().as_encoded_bytes());
     let hash = hex::encode(&hasher.finalize()[..8]);
-    let dir = cache_dir()?.join("sock");
+    let dir = data_dir()?.join("sock");
     std::fs::create_dir_all(&dir)?;
     Ok(dir.join(format!("{hash}.sock")))
 }
 
-/// Get the root of the OCI cache (`~/.cache/airlock/oci/`). Creates it if it
+/// Get the root of the OCI cache (`<data>/oci/`). Creates it if it
 /// does not exist. It contains the `images/` and `layers/` subtrees. They
 /// have their own namespace, so they do not collide with other cache kinds
 /// (VM assets and others).
 fn oci_root() -> anyhow::Result<PathBuf> {
-    let dir = cache_dir()?.join("oci");
+    let dir = data_dir()?.join("oci");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
-/// Get the root of the image cache (`~/.cache/airlock/oci/images/`). Creates
+/// Get the root of the image cache (`<data>/oci/images/`). Creates
 /// it if it does not exist. Each entry is one `<image-digest>` JSON file with
 /// the complete `OciImage` (with a schema tag from `crate::oci::CachedImage`).
 pub fn images_root() -> anyhow::Result<PathBuf> {
@@ -125,7 +156,7 @@ pub fn image_path(digest: &str) -> anyhow::Result<PathBuf> {
     Ok(images_root()?.join(digest_name(digest)))
 }
 
-/// Get the root of the per-layer cache (`~/.cache/airlock/oci/layers/`).
+/// Get the root of the per-layer cache (`<data>/oci/layers/`).
 /// Creates it if it does not exist.
 ///
 /// Each entry is a `<layer-key>/` directory (see [`layer_key`]) with the

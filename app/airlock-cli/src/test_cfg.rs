@@ -8,6 +8,7 @@ pub mod network;
 pub mod oci;
 pub mod packs;
 pub mod provider;
+pub mod sandboxes;
 pub mod services;
 pub mod sinks;
 pub mod start;

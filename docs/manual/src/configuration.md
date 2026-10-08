@@ -12,7 +12,9 @@ earlier ones:
 1. `~/.airlock/airlock.toml` — user-level settings (e.g. preferred CPU/memory)
 2. `~/.airlock/config.toml` — alternative user-level settings file
 3. `~/.airlock.toml` — alternative user-level settings file
-4. `.airlock/airlock.toml` — local project config (not in version control)
+4. Local project config — the `start` option of the setup wizard writes
+   it. It is in the sandbox directory, out of the repository (see
+   [Project layout](./technical/project-layout.md#sandbox-directory))
 5. `airlock.toml` — project config (checked into version control)
 6. `airlock.local.toml` — local overrides (gitignored)
 
@@ -46,13 +48,6 @@ memory = "4 GB"
 This is enough to get a working sandbox. The `rust` [pack](./packs.md)
 installs Rust and adds network rules for `crates.io` and related hosts, so
 `cargo build` works with no extra rules.
-
-## Sandbox state
-
-airlock stores sandbox runtime state (disk image, CA certificate, logs)
-in `.airlock/` inside the project directory. airlock automatically
-excludes this directory from version control. `airlock rm` removes it
-entirely. `airlock start` recreates it from scratch.
 
 ## Merging behaviour
 

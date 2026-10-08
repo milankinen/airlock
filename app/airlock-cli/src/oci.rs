@@ -59,7 +59,7 @@ pub struct OciImage {
     pub name: String,
     /// Layer keys, topmost first. Each key is a versioned layer name
     /// ([`cache::layer_key`]). It is the directory name under
-    /// `~/.cache/airlock/oci/layers/<key>` and the guest mount path
+    /// `<data>/oci/layers/<key>` and the guest mount path
     /// `/mnt/layers/<key>`.
     pub image_layers: Vec<String>,
     /// Container home directory from the image's user record (e.g. `/root`).
@@ -1271,7 +1271,7 @@ fn format_size(bytes: i64) -> String {
 
 /// Find the first `:`-separated record in a file of the image layers.
 ///
-/// Reads the individual layer trees under `~/.cache/airlock/oci/layers/`,
+/// Reads the individual layer trees under `<data>/oci/layers/`,
 /// because the host has no merged rootfs. This is less exact than real
 /// overlayfs:
 ///  * A whiteout is an empty file. It has no matches, so the search

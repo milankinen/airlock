@@ -1,6 +1,6 @@
 //! Application-wide user settings.
 //!
-//! Loads the user's settings from the airlock home directory. The settings
+//! Loads the user's settings from the airlock directory `~/.airlock`. The settings
 //! file can be TOML, JSON or YAML. The CLI loads it once when it starts. If
 //! the file does not exist, the defaults apply, so `airlock` works without
 //! configuration.
@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 pub use keys::KeyList;
+use serde::{Deserialize, Serialize};
 use smart_config::{ConfigRepository, ConfigSchema, DescribeConfig, DeserializeConfig, Json};
 
 use crate::config::de::format_error;
@@ -35,6 +36,17 @@ pub struct Settings {
     /// Default answers of the setup wizard of `airlock start`.
     #[config(nest)]
     pub wizard_defaults: WizardDefaults,
+    /// Where `airlock start` puts the data of a new sandbox:
+    ///  * `cache-dir` (default): in the airlock data directory, out of the
+    ///    reach of the sandbox guest
+    ///  * `project-dir`: in `.airlock/sandbox` in the project. Existing
+    ///    project sandboxes then stay there without a question.
+    #[config(default)]
+    pub sandbox_location: SandboxLocation,
+    /// Airlock data directory: the database, the sandboxes and the image
+    /// cache. `~` expands to the home directory. The default is
+    /// `airlock` in the user data directory of the platform.
+    pub data_dir: Option<String>,
 }
 
 /// Settings under the `[wizard_defaults]` table.
@@ -43,7 +55,8 @@ pub struct WizardDefaults {
     /// The option of the start bar at the start of the setup wizard:
     ///  * `start-and-share` (default): start with a shareable config
     ///    (`airlock.toml`)
-    ///  * `start`: start with a local config (`.airlock/airlock.toml`)
+    ///  * `start`: start with a local config (in the sandbox directory, out
+    ///    of the repository)
     #[config(default)]
     pub start: WizardStart,
 }
@@ -61,6 +74,23 @@ pub enum WizardStart {
 }
 
 impl smart_config::de::WellKnown for WizardStart {
+    type Deserializer =
+        smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
+    const DE: Self::Deserializer = smart_config::de::Serde;
+}
+
+/// Location of the data of a new sandbox. Matches `sandbox_location`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxLocation {
+    /// `.airlock/sandbox` in the project directory.
+    ProjectDir,
+    /// `boxes/<id>` in the airlock data directory.
+    #[default]
+    CacheDir,
+}
+
+impl smart_config::de::WellKnown for SandboxLocation {
     type Deserializer =
         smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
     const DE: Self::Deserializer = smart_config::de::Serde;
@@ -135,6 +165,20 @@ impl Settings {
         Ok(home.join(".airlock"))
     }
 
+    /// Get the airlock data directory: `data_dir` with `~` expanded, or
+    /// `airlock` in the user data directory of the platform.
+    pub fn data_dir(&self) -> Result<PathBuf> {
+        let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory missing"))?;
+        if let Some(dir) = &self.data_dir {
+            let dir = crate::util::expand_tilde(dir, &home);
+            if !dir.is_absolute() {
+                bail!("data_dir must be an absolute path: {}", dir.display());
+            }
+            return Ok(dir);
+        }
+        crate::cache::default_data_dir()
+    }
+
     /// Get the display path of the TOML settings file. For error messages
     /// that tell the user to create or edit the file.
     pub fn expected_path() -> PathBuf {
@@ -207,6 +251,8 @@ mod tests {
         assert_eq!(s.monitor.buffers.http, 100);
         assert_eq!(s.monitor.buffers.scrollback, 1000);
         assert_eq!(s.wizard_defaults.start, WizardStart::StartAndShare);
+        assert_eq!(s.sandbox_location, SandboxLocation::CacheDir);
+        assert_eq!(s.data_dir, None);
 
         std::fs::write(
             dir.path().join("settings.yml"),
@@ -227,6 +273,7 @@ mod tests {
         std::fs::write(
             dir.path().join("settings.toml"),
             "vault.storage = \"file\"\nwizard_defaults.start = \"start\"\n\
+             sandbox_location = \"project-dir\"\ndata_dir = \"~/airlock-data\"\n\
              [monitor.buffers]\nhttp = 5\n",
         )
         .unwrap();
@@ -235,6 +282,8 @@ mod tests {
         assert_eq!(s.monitor.buffers.http, 5);
         assert_eq!(s.monitor.buffers.tcp, 100);
         assert_eq!(s.wizard_defaults.start, WizardStart::Start);
+        assert_eq!(s.sandbox_location, SandboxLocation::ProjectDir);
+        assert_eq!(s.data_dir.as_deref(), Some("~/airlock-data"));
     }
 
     /// Test that a settings file with bad syntax or a bad value fails the
@@ -243,7 +292,11 @@ mod tests {
     ///   2. Check that each load fails with the file name in the error
     #[test]
     fn malformed_or_invalid_settings_file_fails_load() {
-        for content in ["not valid = toml =", "vault.storage = \"typo\"\n"] {
+        for content in [
+            "not valid = toml =",
+            "vault.storage = \"typo\"\n",
+            "sandbox_location = \"typo\"\n",
+        ] {
             let dir = temp_dir();
             std::fs::write(dir.path().join("settings.toml"), content).unwrap();
             let err = format!("{:#}", Settings::load_from(dir.path()).unwrap_err());

@@ -197,7 +197,12 @@ fn project_in_home_directory_reads_local_file_as_project_file_only() {
         ".airlock/airlock.toml",
         "[packs]\npython = { version = 1 }\n",
     );
-    let layers = crate::config::LayeredConfig::load_from(&dirs.project(), &dirs.project()).unwrap();
+    let layers = crate::config::LayeredConfig::load_from(
+        &dirs.project(),
+        &dirs.project(),
+        &dirs.project().join(".airlock"),
+    )
+    .unwrap();
     assert!(layers.has_project_config());
     let resolved = resolve_layers(&layers, ConfigOverrides::default()).unwrap();
     assert_eq!(resolved.packs.len(), 1);
@@ -218,8 +223,8 @@ fn packs_table_in_user_file_is_error() {
     assert_eq!(
         err,
         format!(
-            "`[packs]` is allowed only in project config files (airlock.toml, \
-             .airlock/airlock.toml); remove it from {}",
+            "`[packs]` is allowed only in project config files (airlock.toml or the local \
+             project config); remove it from {}",
             dirs.home().join(".airlock/config.toml").display()
         )
     );

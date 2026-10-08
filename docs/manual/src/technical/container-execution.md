@@ -90,10 +90,12 @@ with that code. When a signal kills the child, the exit code becomes
 `airlock exec` attaches a new process to an already-running container
 without rebooting the VM. The flow:
 
-1. `airlock exec` walks up from the current working directory looking
-   for `.airlock/sandbox/cli.sock`. First hit wins — this is how a
-   sibling project directory still finds its running VM when invoked
-   from a subdirectory.
+1. `airlock exec` looks for a running sandbox in the current working
+   directory and then in each parent directory. For each directory, it
+   checks the registered sandbox in the data directory first, and then
+   `.airlock/sandbox` in the directory. The first sandbox with a
+   `cli.sock` wins. Thus a command in a subdirectory finds the VM of its
+   project.
 2. It connects to that socket (Cap'n Proto RPC over a Unix domain
    socket) and calls `CliService.exec(cmd, args, cwd, env)`. `env`
    carries only the `-e KEY=VAL` overrides the user passed on the

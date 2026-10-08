@@ -34,8 +34,9 @@ After installation, the basic workflow is:
 airlock start                       # Start a sandbox VM and open a shell
 airlock start -- ls /usr            # Run a one-off command in the VM
 airlock exec bash                   # Attach to a running VM
-airlock show                        # Show sandbox status and config
+airlock info                        # Show sandbox status and config
 airlock remove                      # Remove sandbox state
+airlock sandbox list                # List sandboxes
 ```
 
 The first time you run `airlock start` in a project directory, a setup

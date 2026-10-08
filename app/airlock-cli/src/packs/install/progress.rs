@@ -38,7 +38,7 @@ const MAX_LINE: usize = 8 * 1024;
 /// An [`OutputSink`] for the install execs, one pack at a time.
 ///
 /// The stdout of the exec is the status channel, and its stderr is the
-/// log. The install log is `.airlock/sandbox/installs.log` (see
+/// log. The install log is `installs.log` in the sandbox directory (see
 /// [`INSTALLS_LOG`]). With `--verbose`, the last log lines show under the
 /// spinner.
 ///

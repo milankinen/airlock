@@ -345,7 +345,7 @@ impl VmExec<'_> {
 
 /// Remove the old install log and open a new one. Logging is best effort.
 fn open_log(project: &Project) -> Option<std::fs::File> {
-    let dir = PinnedDir::open(&project.host_cwd, Path::new(".airlock/sandbox"), false).ok()?;
+    let dir = PinnedDir::pin(&project.sandbox_dir).ok()?;
     dir.remove(INSTALLS_LOG).ok()?;
     dir.open_append(INSTALLS_LOG, 0o600).ok()
 }

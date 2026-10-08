@@ -67,9 +67,6 @@ paths = ["secrets"]
   to defeat the mask (and has enough privilege to call `umount` or
   walk the underlying mount) can still reach the contents. If you need
   a hard boundary, keep those paths in a separate project entirely.
-- airlock always masks the sandbox's own `.airlock/` directory
-  unconditionally, so processes in the VM can't reach the CA keys,
-  disk image, or lock file.
 - `git status` will report masked files as deleted (the worktree copy
   is gone from the sandbox's view, but the index still references them).
   This is expected. If it bothers you, run git from outside the sandbox

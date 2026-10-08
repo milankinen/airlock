@@ -13,13 +13,14 @@ use crate::settings::Settings;
 use crate::vault::Vault;
 
 /// The process context of a test: the settings in `home` (defaults if
-/// there is no file), `vault`, and the database in `home`. The caller
-/// keeps the `home` directory.
+/// there is no file), `vault`, and `home` as the data directory with the
+/// database in it. The caller keeps the `home` directory.
 pub fn test_context(home: &Path, vault: Vault) -> Context {
     Context {
         settings: Settings::load_from(home).unwrap(),
         vault,
         db: Db::open(&home.join(crate::db::DIR)).unwrap(),
+        data_dir: home.to_path_buf(),
     }
 }
 

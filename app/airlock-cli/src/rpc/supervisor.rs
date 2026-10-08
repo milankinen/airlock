@@ -220,6 +220,10 @@ impl Supervisor {
             layers_b.set(i as u32, d);
         }
         req.get().set_ca_cert(project.ca_cert.as_bytes());
+        // The guest hides `.airlock` only for a sandbox in the project. Then
+        // the sandbox data is in it.
+        req.get()
+            .set_skip_airlock_mask(!project.sandbox_in_project());
 
         let dirs: Vec<_> = vm
             .mounts

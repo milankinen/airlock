@@ -1,14 +1,22 @@
 //! Host log file.
 //!
-//! Writes the diagnostic logs of airlock to a log file in the project, and not
-//! to the terminal.
+//! Writes the diagnostic logs of airlock to a log file in the sandbox
+//! directory, and not to the terminal. The logs from before the sandbox is
+//! known stay in memory, and go to the file when the sandbox directory is
+//! known. The log file does not grow without limit.
 
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::Once;
+use std::sync::{Mutex, Once};
 
 use tracing_subscriber::EnvFilter;
 
 use super::LogLevel;
+use crate::util::PinnedDir;
+
+/// Name of the log file in the sandbox directory.
+pub const LOG_FILE: &str = "airlock.log";
 
 /// Maximum size of `airlock.log` at startup.
 ///
@@ -17,64 +25,118 @@ use super::LogLevel;
 /// logs from the previous run available.
 const LOG_MAX_BYTES: u64 = 1024 * 1024;
 
+/// Maximum size of the logs in memory before the file is known. Later
+/// lines are dropped.
+const BUFFER_MAX_BYTES: usize = 1024 * 1024;
+
 /// Guard for [`init`]. The subscriber can be set only once per process.
 static INIT: Once = Once::new();
 
-/// Send `tracing` output to `<cache_dir>/airlock.log`.
-/// Args:
-///  - `log_level`: Log level for the file
-///  - `cache_dir`: Project `.airlock/` directory
-///
-/// Only the first call in a process has an effect. Later calls do nothing, so
-/// the first level and file stay in use. A command that boots many sandboxes
-/// in one run can call it again. If the file does not open, or a subscriber
-/// is already set, logging stays off and nothing fails.
-// The file is first made smaller if necessary (see [`LOG_MAX_BYTES`]).
-pub fn init(log_level: LogLevel, cache_dir: &Path) {
-    init_with(&INIT, log_level, cache_dir);
+/// Where the log lines go now.
+static SINK: Mutex<Sink> = Mutex::new(Sink::Buffer(Vec::new()));
+
+/// Destination of the log lines.
+enum Sink {
+    /// The log file is not known yet. Keep the lines in memory.
+    Buffer(Vec<u8>),
+    /// The open log file.
+    File(File),
+    /// The log file did not open. Drop the lines.
+    Off,
 }
 
-/// Do [`init`] with the guard `once`. Tests use their own guard, so that
-/// the order of the tests in the process has no effect.
-fn init_with(once: &Once, log_level: LogLevel, cache_dir: &Path) {
-    once.call_once(|| {
-        let log_path = cache_dir.join("airlock.log");
-        rotate_log(&log_path);
-        if let Ok(log_file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-        {
-            let _ = tracing_subscriber::fmt()
-                .with_env_filter(EnvFilter::new(log_level.filter()))
-                .with_writer(std::sync::Mutex::new(log_file))
-                .with_ansi(false)
-                .try_init();
+/// Writer of the subscriber. Each write goes to the current [`Sink`].
+struct SinkWriter;
+
+impl Write for SinkWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut sink = SINK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &mut *sink {
+            Sink::Buffer(lines) if lines.len() + buf.len() <= BUFFER_MAX_BYTES => {
+                lines.extend_from_slice(buf);
+            }
+            // Logging is best effort. A failed write must not fail the run.
+            Sink::File(file) => {
+                let _ = file.write_all(buf);
+            }
+            Sink::Buffer(_) | Sink::Off => {}
         }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Start to collect `tracing` output for the log file. The lines stay in
+/// memory until [`attach`] gives the sandbox directory.
+/// Args:
+///  - `log_level`: Log level for the file
+///
+/// Only the first call in a process has an effect. Later calls do nothing, so
+/// the first level stays in use. If a subscriber is already set, logging
+/// stays off and nothing fails.
+pub fn init(log_level: LogLevel) {
+    INIT.call_once(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new(log_level.filter()))
+            .with_writer(|| SinkWriter)
+            .with_ansi(false)
+            .try_init();
     });
 }
 
-/// Keep only the last [`LOG_MAX_BYTES`] of the log file at `path`.
+/// Send the log to `<sandbox_dir>/airlock.log`, after the lines that are in
+/// memory.
+///
+/// Only the first call in a process has an effect. Later calls do nothing, so
+/// the first file stays in use. A command that boots many sandboxes in one
+/// run can call it again. If the file does not open, logging stays off and
+/// nothing fails. The file is never opened through a symlink.
+// The file is first made smaller if necessary (see [`LOG_MAX_BYTES`]).
+pub fn attach(sandbox_dir: &Path) {
+    attach_with(&SINK, sandbox_dir);
+}
+
+/// Do [`attach`] with the destination `sink`. Tests use their own
+/// destination, so that the order of the tests in the process has no
+/// effect.
+fn attach_with(sink: &Mutex<Sink>, sandbox_dir: &Path) {
+    let mut sink = sink
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Sink::Buffer(lines) = &mut *sink else {
+        return;
+    };
+    let lines = std::mem::take(lines);
+    let opened = PinnedDir::pin(sandbox_dir).and_then(|dir| dir.open_read_write(LOG_FILE, 0o600));
+    *sink = match opened {
+        Ok(mut file) => {
+            rotate_log(&mut file);
+            let _ = file
+                .seek(SeekFrom::End(0))
+                .and_then(|_| file.write_all(&lines));
+            Sink::File(file)
+        }
+        Err(_) => Sink::Off,
+    };
+}
+
+/// Keep only the last [`LOG_MAX_BYTES`] of the log file `file`.
 ///
 /// The new run thus starts with 1 MB of history or less. Errors are ignored.
 /// Logging still works, but the file stays large.
-fn rotate_log(path: &Path) {
-    use std::io::{Read, Seek, SeekFrom, Write};
-    let Ok(meta) = std::fs::metadata(path) else {
+fn rotate_log(file: &mut File) {
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
         return;
     };
-    if meta.len() <= LOG_MAX_BYTES {
+    if len <= LOG_MAX_BYTES {
         return;
     }
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-    else {
-        return;
-    };
-    let skip = meta.len() - LOG_MAX_BYTES;
-    if file.seek(SeekFrom::Start(skip)).is_err() {
+    if file.seek(SeekFrom::Start(len - LOG_MAX_BYTES)).is_err() {
         return;
     }
     let mut tail = Vec::with_capacity(LOG_MAX_BYTES as usize);
@@ -93,35 +155,35 @@ mod tests {
     use super::*;
     use crate::test_cfg::temp_dir;
 
-    /// Test that the log setup cuts an oversized log file to its last part, and
-    /// that only the first setup call has an effect.
+    /// Test that the log setup cuts an oversized log file to its last part,
+    /// writes the lines from before the setup, and that only the first file
+    /// is used.
     ///   1. Write a log that is 10 bytes longer than the limit
-    ///   2. Set up the log in one directory, then in a second directory
+    ///   2. Keep a line in memory, then give the first and the second
+    ///      directory
     ///   3. Check that the log starts with the last bytes of the old content
+    ///      and has the line
     ///   4. Check that the second directory has no log file
     #[test]
-    fn init_trims_oversized_log_to_its_tail_and_later_calls_do_nothing() {
+    fn attach_trims_oversized_log_keeps_early_lines_and_later_calls_do_nothing() {
         let first = temp_dir();
         let second = temp_dir();
-        let path = first.path().join("airlock.log");
+        let path = first.path().join(LOG_FILE);
         let mut content = vec![b'a'; 10];
         content.extend(vec![b'b'; usize::try_from(LOG_MAX_BYTES).unwrap()]);
         std::fs::write(&path, &content).unwrap();
 
-        // A guard of the test, not the guard of the process. Thus another
-        // test that sets up the log first has no effect here.
-        let once = Once::new();
-        init_with(&once, LogLevel::Info, first.path());
-        init_with(&once, LogLevel::Debug, second.path());
+        // A destination of the test, not the destination of the process.
+        // Thus another test that sets up the log first has no effect here.
+        let sink = Mutex::new(Sink::Buffer(b"early-line\n".to_vec()));
+        attach_with(&sink, first.path());
+        attach_with(&sink, second.path());
 
         let after = std::fs::read(&path).unwrap();
-        // The setup can add new log lines after the kept part.
-        assert!(after.len() as u64 >= LOG_MAX_BYTES);
-        assert!(
-            after[..usize::try_from(LOG_MAX_BYTES).unwrap()]
-                .iter()
-                .all(|&b| b == b'b')
-        );
-        assert!(!second.path().join("airlock.log").exists());
+        let limit = usize::try_from(LOG_MAX_BYTES).unwrap();
+        assert!(after.len() > limit);
+        assert!(after[..limit].iter().all(|&b| b == b'b'));
+        assert!(String::from_utf8_lossy(&after[limit..]).contains("early-line"));
+        assert!(!second.path().join(LOG_FILE).exists());
     }
 }

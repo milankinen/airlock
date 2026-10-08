@@ -53,14 +53,15 @@ teardown() {
 # -- Run airlock in an isolated environment --
 
 # Run airlock with HOME set to the temp directory, so that it does not read
-# ~/.airlock or ~/.cache/airlock/config of the real home. Color output and
-# backtraces are off. Stdin is /dev/null, so there is no terminal.
+# ~/.airlock or the airlock data directory of the real home. XDG_DATA_HOME
+# is removed for the same reason. Color output and backtraces are off. Stdin
+# is /dev/null, so there is no terminal.
 # Sets $status, $output and $lines, as the bats "run" command does.
 
 run_airlock() {
     local _home="${TEST_TEMP_DIR:-$FILE_TEMP_DIR}"
     local _output
-    _output="$(env \
+    _output="$(env -u XDG_DATA_HOME \
         NO_COLOR=1 \
         HOME="$_home" \
         RUST_BACKTRACE=0 \
@@ -143,6 +144,9 @@ write_local_config() {
 }
 
 # -- Sandbox state helpers --
+#
+# These helpers make a sandbox in the project directory, as older airlock
+# versions made it. airlock reads the record files of such a sandbox.
 
 # Make a sandbox disk in the current project, with the disk id [1, 2].
 make_sandbox_disk() {

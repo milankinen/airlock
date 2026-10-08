@@ -183,7 +183,8 @@ pub(super) fn assemble(mounts: &MountConfig) -> anyhow::Result<()> {
         }
     }
 
-    // Hide .airlock/ and all user-defined `[mask.<name>]` paths. Each mask
+    // Hide .airlock/ (for a sandbox in the project) and all user-defined
+    // `[mask.<name>]` paths. Each mask
     // has its own source directory under `<mask_root>/project/<name>`, so
     // the blocks stay isolated from each other. The tree is made again at
     // each VM start, so the host config is the source of truth.
@@ -201,9 +202,12 @@ pub(super) fn assemble(mounts: &MountConfig) -> anyhow::Result<()> {
 
         let project_root = crate::util::resolve_in_root(rootfs, &project_mount.target);
 
-        // Built-in: hide the .airlock/ directory of the sandbox, so the
-        // container cannot read CA keys, disk image, lock file and others.
-        {
+        // Built-in: hide the .airlock/ directory of a sandbox in the
+        // project, so the container cannot read CA keys, disk image, lock
+        // file and others. A sandbox in the data directory has nothing
+        // there, and the mount target would make an empty .airlock/ in the
+        // host project.
+        if mounts.mask_airlock_dir {
             let src = format!("{project_mask_root}/.airlock");
             std::fs::create_dir_all(&src)?;
             let dst = project_root.join(".airlock");

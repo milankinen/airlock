@@ -45,7 +45,7 @@ setup() {
     run_airlock start
     assert_failure 2
     assert_output_contains "A sandbox exists in $PWD, but there is no config."
-    assert_output_contains "Put the config in airlock.toml or .airlock/airlock.toml (restore it), or run \`airlock rm\` to start over."
+    assert_output_contains "Put the config in airlock.toml or $PWD/.airlock/airlock.toml (restore it), or run \`airlock rm\` to start over."
 
     rm .airlock/sandbox/disk.*
     echo '{}' >.airlock/sandbox/installs.json
@@ -152,10 +152,13 @@ python = { version = $version }"
 
 # Test that packs on a new sandbox need no question, so start continues
 # without a terminal. The CLI tests have no VM, so the run stops at the
-# image pull. The VM tests check the install.
+# image pull. The VM tests check the install. The new sandbox goes to the
+# data directory, not to the project.
 #   1. Write a config with a pack and make no disk
 #   2. Run start
 #   3. Check that there is no question and that the sandbox prepare starts
+#   4. Check that the project has no .airlock directory and that the
+#      sandbox list has the project
 @test "start with packs and no sandbox disk asks no question without terminal" {
     write_config "$BAD_IMAGE
 
@@ -165,7 +168,42 @@ python = { version = 1 }"
     assert_failure
     assert_output_not_contains "Tools changed"
     assert_output_contains "Preparing sandbox"
-    [[ ! -e .airlock/sandbox/disk.img ]]
+    [[ ! -e .airlock ]]
+    run_airlock sandbox list
+    assert_success
+    assert_output_contains "$PWD"
+}
+
+# Test that --yes moves a sandbox from the project directory into the data
+# directory, before the image pull.
+#   1. Make a sandbox disk in the project and write a config
+#   2. Run start with --yes
+#   3. Check that the move is reported and the project sandbox is gone
+#   4. Check that the sandbox list has the project
+@test "start with --yes moves project sandbox to data directory" {
+    make_sandbox_disk
+    write_config "$BAD_IMAGE"
+    run_airlock start --yes
+    assert_failure
+    assert_output_contains "sandbox moved to"
+    [[ ! -e .airlock/sandbox ]]
+    run_airlock sandbox list
+    assert_success
+    assert_output_contains "$PWD"
+}
+
+# Test that without a terminal and without --yes, a sandbox in the project
+# directory stays there, and start tells the user how to move it.
+#   1. Make a sandbox disk in the project and write a config
+#   2. Run start
+#   3. Check the notice and that the disk stays in the project
+@test "start without terminal keeps project sandbox and tells how to move it" {
+    make_sandbox_disk
+    write_config "$BAD_IMAGE"
+    run_airlock start
+    assert_failure
+    assert_output_contains "run \`airlock start\` in a terminal to move it"
+    [[ -e .airlock/sandbox/disk.img ]]
 }
 
 # Test that a list-form preset is not a pack change, so start asks no
@@ -231,6 +269,6 @@ codex = { version = 1 }"
     echo 'not json' >.airlock/sandbox/installs.json
     run_airlock start
     assert_failure 2
-    assert_output_contains "installs.json is not valid"
+    assert_output_contains "The install records of the sandbox are not valid"
     assert_output_not_contains "Preparing sandbox"
 }

@@ -1,9 +1,10 @@
 //! Project identity and sandbox data.
 //!
 //! Identifies the project that airlock runs in, and manages the sandbox data
-//! that airlock keeps for each project. A lock makes sure that only one
-//! airlock process at a time uses the sandbox of a project. Also resolves the
-//! environment variables that the project gives to the sandbox.
+//! that airlock keeps for each project. The sandbox data is in the airlock
+//! data directory or in the project directory. A lock makes sure that only
+//! one airlock process at a time uses the sandbox of a project. Also resolves
+//! the environment variables that the project gives to the sandbox.
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -14,6 +15,7 @@ pub(crate) mod sandbox_env;
 pub use self::sandbox_env::{EnvError, MaskedSecret, SandboxEnv};
 use crate::config::config_values::{ConfigValues, Disk};
 use crate::context::Context;
+use crate::sandboxes::{Found, PROJECT_SANDBOX};
 use crate::util::PinnedDir;
 use crate::vault::Vault;
 use crate::vm::disk;
@@ -27,7 +29,7 @@ use crate::vm::disk;
 /// original project.
 #[derive(Clone)]
 pub struct Project {
-    /// `.airlock/sandbox/`: CA, overlay, disk image, lock, run metadata.
+    /// Sandbox directory: CA, overlay, disk image, lock, run metadata.
     pub sandbox_dir: PathBuf,
     /// Host user's home directory.
     pub host_home: PathBuf,
@@ -58,6 +60,12 @@ impl Project {
         crate::util::expand_tilde(path, &self.host_home)
     }
 
+    /// Check if the sandbox data is in the project (`.airlock/sandbox`), and
+    /// not in the data directory.
+    pub fn sandbox_in_project(&self) -> bool {
+        self.sandbox_dir == self.host_cwd.join(PROJECT_SANDBOX)
+    }
+
     /// Check if an `airlock start` process runs this project now (see
     /// [`is_running`]).
     pub fn is_running(&self) -> bool {
@@ -81,20 +89,6 @@ impl Project {
                 .as_secs(),
         );
         let _ = write_run_meta(&self.sandbox_dir, &meta);
-    }
-
-    /// Actual and apparent size of the sandbox disk image.
-    /// Returns:
-    ///   `(used, total)` in bytes, or `None` if the disk image does not
-    ///   exist. `used` is the allocated size and `total` is the virtual
-    ///   file size.
-    pub fn disk_usage(&self) -> Option<(u64, u64)> {
-        // The disk is a sparse file: `blocks() * 512` gives the allocated
-        // size.
-        use std::os::unix::fs::MetadataExt;
-        let path = self.sandbox_dir.join("disk.img");
-        let meta = std::fs::metadata(path).ok()?;
-        Some((meta.blocks() * 512, meta.len()))
     }
 
     /// Working directory for display: the host cwd, and `host → guest` when
@@ -134,32 +128,30 @@ pub struct ProjectPaths {
     pub sandbox_dir: PathBuf,
 }
 
-/// Get the sandbox data locations for the project at `host_cwd`. Only
-/// joins paths: it reads and creates nothing, and needs no config.
+/// Get the locations of a sandbox in the project directory `host_cwd`.
+/// Only joins paths: it reads and creates nothing, and needs no config.
 pub fn paths(host_cwd: &Path) -> ProjectPaths {
     let cache_dir = host_cwd.join(".airlock");
-    let sandbox_dir = cache_dir.join("sandbox");
+    let sandbox_dir = host_cwd.join(PROJECT_SANDBOX);
     ProjectPaths {
         cache_dir,
         sandbox_dir,
     }
 }
 
-/// Load the project of the current working directory without a lock. Does
-/// not make a CA and does not resolve `[env]`. For read-only subcommands
-/// (`show`).
+/// Load the project of a found sandbox without a lock. Does not make a CA
+/// and does not resolve `[env]`. For read-only subcommands (`info`).
 /// Args:
 ///  - `config`: Resolved project config
 ///  - `context`: Process-wide context from `main`. All projects in one
 ///    process share its vault, so they load secrets only one time.
-pub fn load(config: ConfigValues, context: Context) -> anyhow::Result<Project> {
+///  - `found`: The sandbox of the project (see
+///    [`crate::sandboxes::resolve_sandbox`])
+pub fn load(config: ConfigValues, context: Context, found: &Found) -> anyhow::Result<Project> {
     let home_dir =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
-    let host_cwd = {
-        let cwd = std::env::current_dir()?;
-        std::fs::canonicalize(&cwd).unwrap_or(cwd)
-    };
-    let ProjectPaths { sandbox_dir, .. } = paths(&host_cwd);
+    let host_cwd = found.project.clone();
+    let sandbox_dir = found.dir.clone();
     let (ca_cert, ca_key) = read_ca(&sandbox_dir).unwrap_or_default();
     let guest_cwd = read_run_meta(&sandbox_dir)
         .guest_cwd
@@ -179,9 +171,10 @@ pub fn load(config: ConfigValues, context: Context) -> anyhow::Result<Project> {
     })
 }
 
-/// Held lock of the sandbox of one project (`.airlock/sandbox/lock`).
+/// Held lock of the sandbox of one project (the `lock` file in the sandbox
+/// directory).
 ///
-/// Taking the lock creates `.airlock/sandbox/`. The lock is released when
+/// Taking the lock creates the sandbox directory. The lock is released when
 /// the value drops or the process exits. [`Project`] holds no lock, so the
 /// caller keeps this value while the sandbox must stay exclusive (usually
 /// the whole run, see [`open`]). A second lock in the same process fails
@@ -196,22 +189,48 @@ pub struct SandboxLock {
 }
 
 impl SandboxLock {
-    /// Create the sandbox directory of the project at `host_cwd` and take
-    /// its lock. Fails when a different airlock instance holds the lock.
+    /// Create the project sandbox (`.airlock/sandbox`) of the project at
+    /// `host_cwd` and take its lock. Fails when a different airlock instance
+    /// holds the lock.
     pub fn acquire(host_cwd: &Path) -> anyhow::Result<Self> {
         let host_cwd = std::fs::canonicalize(host_cwd).unwrap_or_else(|_| host_cwd.to_path_buf());
         ensure_cache_dir(&host_cwd)?;
-        let sandbox_dir = host_cwd.join(".airlock/sandbox");
-        let pinned = PinnedDir::open(&host_cwd, Path::new(".airlock/sandbox"), true)?;
+        let pinned = PinnedDir::open(&host_cwd, Path::new(PROJECT_SANDBOX), true)?;
+        Self::lock(host_cwd.join(PROJECT_SANDBOX), host_cwd, &pinned)
+    }
+
+    /// Create the sandbox `id` in the data directory and take its lock.
+    /// Fails when a different airlock instance holds the lock.
+    /// Args:
+    ///  - `host_cwd`: Canonical project directory
+    ///  - `boxes_dir`: Sandboxes directory in the data directory
+    ///  - `id`: Registry id of the sandbox
+    pub fn acquire_box(host_cwd: &Path, boxes_dir: &Path, id: &str) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            crate::sandboxes::registry::is_valid_id(id),
+            "not a sandbox id: {id}"
+        );
+        crate::cache::create_private_dir(boxes_dir)?;
+        let pinned = PinnedDir::open(boxes_dir, Path::new(id), true)?;
+        Self::lock(boxes_dir.join(id), host_cwd.to_path_buf(), &pinned)
+    }
+
+    /// Take the lock of the sandbox directory `pinned`.
+    fn lock(sandbox_dir: PathBuf, host_cwd: PathBuf, pinned: &PinnedDir) -> anyhow::Result<Self> {
         // The sandbox holds the CA private key. Keep other local users out.
         // This is defense in depth only. The key file is always 0600.
         harden_dir_permissions(&sandbox_dir);
-        let file = acquire_lock(&pinned)?;
+        let file = acquire_lock(pinned)?;
         Ok(Self {
             host_cwd,
             sandbox_dir,
             file,
         })
+    }
+
+    /// Get the sandbox directory.
+    pub fn dir(&self) -> &Path {
+        &self.sandbox_dir
     }
 }
 
@@ -444,28 +463,33 @@ pub fn lock_if_idle(sandbox_dir: &Path) -> IdleLock {
 /// Returns:
 ///   Formatted time, or `None` if `run.json` has no last run.
 pub fn last_run_ago(sandbox_dir: &Path) -> Option<String> {
-    let epoch = read_run_meta(sandbox_dir).last_run?;
+    read_run_meta(sandbox_dir).last_run.map(time_ago)
+}
+
+/// Format the time since the Unix time `epoch` as "X ago".
+pub fn time_ago(epoch: u64) -> String {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     let elapsed = Duration::from_secs(now.saturating_sub(epoch));
-    let f = timeago::Formatter::new();
-    Some(f.convert(elapsed))
+    timeago::Formatter::new().convert(elapsed)
 }
 
 /// Run metadata stored in `run.json`.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
-struct RunMeta {
+pub struct RunMeta {
+    /// Unix time of the last boot.
     #[serde(skip_serializing_if = "Option::is_none")]
-    last_run: Option<u64>,
+    pub last_run: Option<u64>,
+    /// Working directory in the guest of the last run.
     #[serde(skip_serializing_if = "Option::is_none")]
-    guest_cwd: Option<String>,
+    pub guest_cwd: Option<String>,
 }
 
 /// Read `run.json`. Gives default metadata if the file is missing or not
 /// valid.
-fn read_run_meta(sandbox_dir: &Path) -> RunMeta {
+pub fn read_run_meta(sandbox_dir: &Path) -> RunMeta {
     std::fs::read_to_string(sandbox_dir.join("run.json"))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())

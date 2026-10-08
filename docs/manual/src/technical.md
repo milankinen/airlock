@@ -113,7 +113,7 @@ The static picture: what runs where, and how the pieces talk.
   <rect class="arch-box" x="26" y="256" width="324" height="112" rx="6"/>
   <text x="42" y="280" class="arch-sub">airlock exec (sibling invocation)</text>
   <g transform="translate(42, 304)">
-    <text class="arch-item" x="0" y="0">• walks up for .airlock/sandbox/cli.sock</text>
+    <text class="arch-item" x="0" y="0">• finds the nearest sandbox cli.sock</text>
     <text class="arch-item" x="0" y="22">• sends (cmd, args, cwd, env overrides)</text>
     <text class="arch-item" x="0" y="44">• no project load, no vault unlock</text>
   </g>
@@ -261,7 +261,7 @@ the VM down and boots it again for the session. See
 [Packs](./technical/packs.md).
 
 Once the container is running, `airlock exec` reuses the same VM.
-The invocation walks up the directory tree to `cli.sock` and hands
+The invocation finds the `cli.sock` of the nearest running sandbox and hands
 `(cmd, args, cwd, env overrides)` to the CLI server. The CLI server
 merges the overrides onto the sandbox's base env and forwards the
 call over the existing vsock to `airlockd`. `airlockd` forks a new

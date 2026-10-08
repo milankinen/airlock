@@ -116,7 +116,8 @@ airlock start --sandbox-cwd /tmp
 
 ## Image pulling and caching
 
-airlock pulls OCI images and caches them locally under `~/.cache/airlock/oci/`.
+airlock pulls OCI images and caches them locally under `oci/` in the
+airlock data directory (see [Managing sandboxes](./managing-sandbox.md#where-airlock-keeps-sandbox-data)).
 Image metadata lives in `oci/images/<digest>` (one JSON file per image) and
 the underlying layer trees in a shared `oci/layers/` cache that
 deduplicates across images. On subsequent runs, airlock reuses the cached
@@ -171,7 +172,7 @@ socket forwards from the config still apply. airlock writes nothing back to
 `airlock.toml`, and the next `airlock start` without the flag uses the
 configured policy again. With `--verbose`, the network rules summary shows
 the effective policy. airlock also records the override in
-`.airlock/airlock.log`.
+`airlock.log` in the sandbox directory.
 
 This is mainly useful for one-off bootstrap commands that need broader
 network access than the day-to-day session. See
@@ -203,7 +204,8 @@ airlock start --log-level debug
 ```
 
 Log levels are `trace`, `debug`, `info` (default), `warn`, and `error`.
-airlock writes logs to `.airlock/airlock.log`.
+airlock writes logs to `airlock.log` in the sandbox directory.
+`airlock sandbox info` shows the sandbox directory.
 
 ## Quiet mode
 

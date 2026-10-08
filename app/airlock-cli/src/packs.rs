@@ -391,7 +391,7 @@ impl ConfiguredPack {
 /// Installer of a configured pack.
 #[derive(Clone, Debug)]
 pub struct InstallerScript {
-    /// Pack name. It is also the key in `installs.json`.
+    /// Pack name. It is also the key in the install records.
     pub pack: String,
     /// Human-readable pack name.
     pub label: String,

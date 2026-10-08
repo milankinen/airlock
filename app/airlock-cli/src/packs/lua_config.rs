@@ -20,7 +20,7 @@ struct Fail(String);
 /// Run the `config.lua` script of a pack.
 ///
 /// The script runs on the host each time the config resolves. Thus each
-/// `airlock start` and `airlock show` reads the host again.
+/// `airlock start` and `airlock info` reads the host again.
 ///
 /// The script has the full Lua standard library, thus it can read the
 /// host (for example `io.popen("git config get user.name")`).

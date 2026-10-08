@@ -89,6 +89,9 @@ pub struct MountConfig {
     pub caches: Vec<CacheConfig>,
     /// Hidden project paths.
     pub masks: Vec<MaskConfig>,
+    /// Hide the `.airlock` directory of the project. The host clears it
+    /// when the sandbox data is not in the project.
+    pub mask_airlock_dir: bool,
     /// Project CA cert (PEM bytes). Empty when the project has no CA.
     ///
     /// Guest init adds a non-empty cert to the CA bundles of the image after

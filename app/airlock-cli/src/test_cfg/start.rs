@@ -18,12 +18,14 @@ use super::packs::{HostExec, resolve_with};
 use crate::cli::LogLevel;
 use crate::config::ResolvedConfig;
 use crate::config::config_values::ImageRef;
+use crate::context::Context;
 use crate::oci::{ImageChange, ImageChangeStop, OciImage, OnImageChange, PreparedImage};
 use crate::packs::install::progress::InstallProgress;
 use crate::packs::install::setup::{self, Ended, Report, Save, SetupError};
 use crate::packs::install::state::{self, InstallState, ReadState};
 use crate::packs::{InstallerScript, PackManager};
 use crate::project::{self, Project};
+use crate::sandboxes::{self, Found};
 use crate::start::{Exit, SandboxOptions};
 use crate::util::PinnedDir;
 use crate::vault::{Vault, VaultStorageType};
@@ -141,10 +143,12 @@ pub async fn install_boot(
 }
 
 /// A project directory and a home directory for `airlock start` with the
-/// fakes on.
+/// fakes on. The home is also the data directory, so the sandbox goes there.
 pub struct StartProject {
     dir: TempDir,
-    home: TempDir,
+    // Keep the home directory while the context uses it.
+    _home: TempDir,
+    context: Context,
     packs: PackManager,
 }
 
@@ -152,22 +156,55 @@ impl StartProject {
     /// A project with no sandbox that uses the packs `packs`. Resets the
     /// [`FakeHost`] of this thread and turns the fakes on.
     pub fn new(packs: PackManager) -> Self {
+        Self::with_settings(packs, "")
+    }
+
+    /// A project as with [`Self::new`], and the user settings file
+    /// `settings` (TOML).
+    pub fn with_settings(packs: PackManager, settings: &str) -> Self {
         fake_host(|host| {
             *host = FakeHost {
                 enabled: true,
                 ..FakeHost::default()
             };
         });
+        let home = temp_dir();
+        std::fs::write(home.path().join("settings.toml"), settings).unwrap();
+        let context = test_context(
+            home.path(),
+            Vault::for_storage_type(VaultStorageType::Disabled),
+        );
         Self {
             dir: temp_dir(),
-            home: temp_dir(),
+            _home: home,
+            context,
             packs,
         }
     }
 
-    /// The sandbox directory of the project.
+    /// The process context of the starts.
+    pub fn context(&self) -> &Context {
+        &self.context
+    }
+
+    /// The canonical project directory.
+    pub fn project_dir(&self) -> PathBuf {
+        std::fs::canonicalize(self.dir.path()).unwrap()
+    }
+
+    /// The sandbox of the project, if it has one.
+    pub fn sandbox(&self) -> Option<Found> {
+        block_on_local(sandboxes::resolve_sandbox(
+            &self.context,
+            &self.project_dir(),
+            false,
+        ))
+        .unwrap()
+    }
+
+    /// The sandbox directory of the project. Panics if there is no sandbox.
     pub fn sandbox_dir(&self) -> PathBuf {
-        self.dir.path().join(".airlock/sandbox")
+        self.sandbox().expect("a sandbox").dir
     }
 
     /// Run the sandbox and install steps of `airlock start` with the
@@ -197,18 +234,21 @@ impl StartProject {
 
     /// One try of [`Self::start`].
     fn start_once(&self, resolved: &ResolvedConfig, options: &SandboxOptions) -> Result<(), Exit> {
-        let vault = Vault::for_storage_type(VaultStorageType::Disabled);
         block_on_local(async {
             let sandbox = crate::start::sandbox::ensure_sandbox(
-                self.dir.path(),
+                &self.context,
+                &self.project_dir(),
                 &self.packs,
                 resolved,
                 options,
-                &vault,
             )
             .await?;
-            let context = test_context(self.home.path(), vault.clone());
-            let project = project::open(&sandbox.lock, resolved.values.clone(), None, context)?;
+            let project = project::open(
+                &sandbox.lock,
+                resolved.values.clone(),
+                None,
+                self.context.clone(),
+            )?;
             crate::start::install::install_tools(
                 &project,
                 resolved,
@@ -222,7 +262,7 @@ impl StartProject {
 
     /// The install state of the sandbox. Empty when there is no state.
     pub fn state(&self) -> InstallState {
-        let dir = PinnedDir::open(self.dir.path(), Path::new(".airlock/sandbox"), true).unwrap();
+        let dir = PinnedDir::pin(&self.sandbox_dir()).unwrap();
         match state::read(&dir) {
             ReadState::Ok(state) => state,
             ReadState::Absent => InstallState::default(),

@@ -11,11 +11,11 @@ The full set of shares present at boot:
 
 | Tag               | Host path                          | Mode |
 |-------------------|------------------------------------|------|
-| `base`            | `~/.cache/airlock/oci/layers/…`    | ro   |
+| `base`            | `<data>/oci/layers/…`              | ro   |
 | `project`         | project CWD                        | rw   |
 | `dir_0`, `dir_1`… | each `[mounts.*]` directory mount  | configurable |
-| `files_rw`        | `.airlock/sandbox/overlay/files/rw/` | rw |
-| `files_ro`        | `.airlock/sandbox/overlay/files/ro/` | ro |
+| `files_rw`        | `<sandbox>/overlay/files/rw/`      | rw   |
+| `files_ro`        | `<sandbox>/overlay/files/ro/`      | ro   |
 
 airlock creates `files_rw` / `files_ro` only when the project has at
 least one file mount of that kind.
@@ -65,7 +65,7 @@ The fix: one staging directory per mode. airlock hard-links each mount
 from its source into that staging dir under a unique key:
 
 ```
-.airlock/sandbox/overlay/files/rw/
+<sandbox>/overlay/files/rw/
   claude-json      ← hard link to ~/.claude.json
   mise-toml        ← hard link to <project>/mise.toml
 ```

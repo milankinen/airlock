@@ -2,7 +2,7 @@
 - [Installation and usage](./usage.md)
     - [Starting a sandbox](./usage/starting-sandbox.md)
     - [Attaching to a running sandbox](./usage/attaching-to-running-sandbox.md)
-    - [Managing sandbox data](./usage/managing-sandbox.md)
+    - [Managing sandboxes](./usage/managing-sandbox.md)
     - [Monitor dashboard](./usage/monitor.md)
 - [Configuration](./configuration.md)
     - [VM options](./configuration/vm.md)

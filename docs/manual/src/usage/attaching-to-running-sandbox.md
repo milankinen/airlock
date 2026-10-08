@@ -24,15 +24,14 @@ airlock exec python3 -m pytest tests/
 
 ## Working directory
 
-`airlock exec` can be used from any subdirectory under the sandbox
-root; `airlock exec` walks up from the current directory to find a
-running sandbox VM. The executed command has the same working
-directory as in the host machine. To override the directory, use `--cwd`
-(or `-w`):
+You can use `airlock exec` in any subdirectory of the project.
+`airlock exec` looks for a running sandbox in the current directory, then
+in each parent directory. The nearest running sandbox wins. The command
+runs in the same working directory as on the host. To use a different
+directory, use `--cwd` (or `-w`):
 
 ```bash
 # /home/example/my-project
-#   .airlock
 #   airlock.toml
 #   src 
 

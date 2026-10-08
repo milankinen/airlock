@@ -9,7 +9,7 @@ use crate::cli::{self, LogLevel};
 use crate::config::config_values::Policy;
 use crate::context::Context;
 use crate::runtime::HostRuntime;
-use crate::{config, packs, project, start};
+use crate::{config, packs, project, sandboxes, start};
 
 /// CLI arguments for `airlock start`.
 #[derive(Args, Debug)]
@@ -85,13 +85,17 @@ async fn run(
 ) -> Result<i32, start::Exit> {
     start::check_system_requirements();
     let host_cwd = start::resolve_host_cwd()?;
-    start::init_logging(&host_cwd, args.log_level)?;
+    start::init_logging(args.log_level);
 
     let packs = packs::init().map_err(start::Exit::config)?;
     // A project without config gets the setup wizard. The generated file is
     // saved after the sandbox is stored.
+    let has_sandbox = sandboxes::has_content(&context, &host_cwd).await?;
+    let local_dir = sandboxes::find_local_config_dir(&context, &host_cwd).await?;
     let config = Box::pin(start::wizard::load_or_generate_config(
         &host_cwd,
+        &local_dir,
+        has_sandbox,
         &packs,
         &context.vault,
         context.settings.wizard_defaults.start,
@@ -107,15 +111,14 @@ async fn run(
 
     let options = args.sandbox_options();
     let sandbox = Box::pin(start::sandbox::ensure_sandbox(
-        &host_cwd,
-        &packs,
-        &resolved,
-        &options,
-        &context.vault,
+        &context, &host_cwd, &packs, &resolved, &options,
     ))
     .await?;
+    // The log lines so far wait in memory. Now the log file is known.
+    cli::logging::attach(sandbox.lock.dir());
     if let Some(generated) = config.generated_project() {
-        start::wizard::save_config(generated)?;
+        let local_dir = sandboxes::local_config_dir(&host_cwd, sandbox.lock.dir());
+        start::wizard::save_config(generated, &local_dir)?;
     }
     let project = project::open(
         &sandbox.lock,

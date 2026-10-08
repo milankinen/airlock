@@ -36,16 +36,22 @@ setup_file() {
     printf 'presets = ["python"]\n\n[vm]\nimage = "alpine:latest"\n' >legacy-list/airlock.toml
 }
 
+# The sandbox directory of the current project.
+sandbox_dir() {
+    run_airlock sandbox info --json
+    sed -n 's/^  "dir": "\(.*\)",$/\1/p' <<<"$output"
+}
+
 # The names of the packs that have lines in the install log of the last
 # install boot.
 logged_packs() {
-    sed -n 's/^\[\([a-z0-9_-]*\)\] .*/\1/p' .airlock/sandbox/installs.log | sort -u | tr '\n' ' '
+    sed -n 's/^\[\([a-z0-9_-]*\)\] .*/\1/p' "$(sandbox_dir)/installs.log" | sort -u | tr '\n' ' '
 }
 
 # The status of pack $1 in installs.json. The file must be pretty-printed
 # with the status first.
 pack_status() {
-    sed -n "/^    \"$1\": {/,/}/s/.*\"status\": \"\([a-z]*\)\".*/\1/p" .airlock/sandbox/installs.json
+    sed -n "/^    \"$1\": {/,/}/s/.*\"status\": \"\([a-z]*\)\".*/\1/p" "$(sandbox_dir)/installs.json"
 }
 
 # Check that a new disk installs every pack without a question (no terminal,
@@ -78,8 +84,10 @@ check_second_start() {
 # write. The next start then runs the script of the pack again on the same
 # disk. This is a retry, so it asks no question and needs no terminal.
 check_rerun() {
-    sed -i.bak 's/"status": "installed"/"status": "unconfirmed"/' .airlock/sandbox/installs.json
-    rm .airlock/sandbox/installs.json.bak
+    local state
+    state="$(sandbox_dir)/installs.json"
+    sed -i.bak 's/"status": "installed"/"status": "unconfirmed"/' "$state"
+    rm "$state.bak"
     [[ "$(pack_status rust)" == unconfirmed ]]
     run_airlock start -- sh -c "$VERSIONS"
     assert_success
@@ -108,7 +116,7 @@ check_removed_pack() {
     assert_success
     assert_output_contains "disk created"
     assert_output_contains "RECREATED-OK"
-    ! grep -q '"mise"' .airlock/sandbox/installs.json
+    ! grep -q '"mise"' "$(sandbox_dir)/installs.json"
     for id in claude codex copilot nodejs python rust docker git; do
         [[ "$(pack_status "$id")" == installed ]]
     done
@@ -121,8 +129,10 @@ check_legacy_installs_nothing() {
     assert_success
     assert_output_not_contains "Installing packs"
     assert_output_contains "NO-PYTHON"
-    [[ ! -e .airlock/sandbox/installs.json ]]
-    [[ ! -e .airlock/sandbox/installs.log ]]
+    local dir
+    dir="$(sandbox_dir)"
+    [[ ! -e "$dir/installs.json" ]]
+    [[ ! -e "$dir/installs.log" ]]
 }
 
 # Test the pack life cycle on an Alpine sandbox: a new sandbox installs

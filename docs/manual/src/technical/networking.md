@@ -124,7 +124,8 @@ a typo can never silently widen a rule to every port.
 ## TLS interception
 
 airlock generates a self-signed CA keypair per project and stores it
-in `.airlock/sandbox/ca.json`. The `boot` RPC passes the CA certificate PEM
+in `ca.json` in the sandbox directory (see [Project layout](./project-layout.md#ca-keypair)).
+The `boot` RPC passes the CA certificate PEM
 to the guest, and guest init injects it into the rootfs — see
 [Mounts / CA certificate injection](./mounts.md#ca-certificate-injection).
 

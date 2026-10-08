@@ -1,51 +1,108 @@
-//! The `airlock show` command.
+//! The `airlock info` command (alias `show`).
 //!
-//! Prints the details of the project sandbox: status, config, packs and network
-//! services.
+//! Prints the details of a sandbox: status, disk, config, packs and network
+//! services. Without an id, it is the sandbox of the current directory.
+//! `airlock sandbox info` gives the same output for any sandbox.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use clap::Args;
+use serde::Serialize;
 
 use crate::config::ResolvedConfig;
 use crate::context::Context;
 use crate::packs::ConfiguredPack;
 use crate::packs::install::state::{self, InstallState, PackStatus, ReadState};
+use crate::project::read_run_meta;
+use crate::sandboxes::{Found, Location, registry};
 use crate::services::{self, store};
 use crate::util::PinnedDir;
 use crate::vault::VaultStorageType;
-use crate::{cli, config, packs, project};
+use crate::vm::disk;
+use crate::{cli, config, packs, project, sandboxes};
 
-/// CLI arguments for `airlock show`.
+/// CLI arguments for `airlock info`.
 #[derive(Args, Debug)]
-pub struct ShowArgs {}
+pub struct InfoArgs {
+    /// Print the sandbox details as JSON
+    #[arg(long)]
+    pub json: bool,
+}
 
-/// Print sandbox details (path, status, image, config) to stdout.
+/// Print the details of the sandbox of the current directory (see [`run`]).
 /// Returns:
 ///   Process exit code: 0 on success, 2 on a config error, 1 on other errors.
-pub async fn main(_args: &ShowArgs, context: Context) -> i32 {
-    // Check config errors first, with the config error exit code (same as
-    // `start`).
-    let ResolvedConfig { values, packs, .. } = match resolve_config().await {
-        Ok(resolved) => resolved,
+pub async fn main(args: &InfoArgs, context: Context) -> i32 {
+    run(context, None, args.json).await
+}
+
+/// Print the details of the sandbox `id`, or of the sandbox of the current
+/// directory. The text has the sandbox and the config of its project. JSON
+/// has only the sandbox. A sandbox whose project directory is gone shows
+/// only the sandbox.
+/// Returns:
+///   Process exit code: 0 on success, 2 on a config error, 1 on other errors.
+pub(super) async fn run(context: Context, id: Option<&str>, json: bool) -> i32 {
+    let (project_dir, found) = match find(&context, id).await {
+        Ok(found) => found,
         Err(e) => {
-            cli::error!("Config error: {e:#}");
-            return 2;
+            cli::error!("{e:#}");
+            return 1;
         }
     };
-    let project = match project::load(values, context) {
+    // Check config errors first, with the config error exit code (same as
+    // `start`). The local project config is in the sandbox directory or in
+    // the project.
+    let resolved = if project_dir.is_dir() {
+        let local_dir = found.as_ref().map_or_else(
+            || project_dir.join(".airlock"),
+            |found| sandboxes::local_config_dir(&project_dir, &found.dir),
+        );
+        match resolve_config(&project_dir, &local_dir).await {
+            Ok(resolved) => Some(resolved),
+            Err(e) => {
+                cli::error!("Config error: {e:#}");
+                return 2;
+            }
+        }
+    } else {
+        None
+    };
+    let found = match found {
+        Some(found) if std::fs::symlink_metadata(&found.dir).is_ok() => found,
+        _ => {
+            cli::error!(
+                "No sandbox for {} — run `airlock start` first",
+                project_dir.display()
+            );
+            return 1;
+        }
+    };
+    let details = Details::read(&found);
+    if json {
+        return match serde_json::to_string_pretty(&details) {
+            Ok(text) => {
+                println!("{text}");
+                0
+            }
+            Err(e) => {
+                cli::error!("{e}");
+                1
+            }
+        };
+    }
+    let Some(ResolvedConfig { values, packs, .. }) = resolved else {
+        print_sandbox_only(&details);
+        return 0;
+    };
+    let project = match project::load(values, context, &found) {
         Ok(s) => s,
         Err(e) => {
             cli::error!("Sandbox details loading failed: {e:#}");
             return 1;
         }
     };
-
-    if !project.sandbox_dir.exists() {
-        cli::error!(
-            "No sandbox for {} — run `airlock start` first",
-            project.host_cwd.display()
-        );
-        return 1;
-    }
 
     let status = if project.is_running() {
         cli::red("running")
@@ -54,6 +111,9 @@ pub async fn main(_args: &ShowArgs, context: Context) -> i32 {
     };
 
     println!("Path:     {}", project.display_cwd());
+    if let Some(id) = &details.id {
+        println!("ID:       {id}");
+    }
     println!("Status:   {status}");
     println!("Image:    {}", project.config.vm.image);
     println!("CPUs:     {}", project.config.vm.cpus);
@@ -65,12 +125,8 @@ pub async fn main(_args: &ShowArgs, context: Context) -> i32 {
 
     println!("Sandbox:  {}", project.sandbox_dir.display());
 
-    if let Some((used, total)) = project.disk_usage() {
-        println!(
-            "Disk:     {} / {}",
-            cli::format_bytes(used),
-            cli::format_bytes(total)
-        );
+    if let Some(disk) = details.disk_text() {
+        println!("Disk:     {disk}");
     }
 
     print_packs(&project, &packs);
@@ -192,10 +248,11 @@ fn grant_line(grant: &store::GrantSummary) -> String {
     )
 }
 
-/// Load and resolve the config of the project in the current directory.
-async fn resolve_config() -> anyhow::Result<ResolvedConfig> {
+/// Load and resolve the config of the project `project_dir`, with the
+/// local project config in `local_dir`.
+async fn resolve_config(project_dir: &Path, local_dir: &Path) -> anyhow::Result<ResolvedConfig> {
     let packs = packs::init()?;
-    config::load()?
+    config::load(project_dir, local_dir)?
         .resolve(&packs, &config::ConfigOverrides::default())
         .await
 }
@@ -272,13 +329,13 @@ fn pack_status(pack: &ConfiguredPack, state: Option<&InstallState>) -> &'static 
     }
 }
 
-/// Open `host_cwd/.airlock/sandbox` without the lock.
+/// Open the sandbox directory `dir` without the lock.
 /// Returns:
-///   `Ok(None)` if the directory does not exist yet (no sandbox started).
-///   `Err` with a short message for all other failures (a symlink, a foreign
-///   owner, ...), so that callers do not treat it as absent.
-fn open_sandbox_dir(host_cwd: &std::path::Path) -> Result<Option<PinnedDir>, String> {
-    match PinnedDir::open(host_cwd, std::path::Path::new(".airlock/sandbox"), false) {
+///   `Ok(None)` if the directory does not exist. `Err` with a short message
+///   for all other failures (a symlink, a foreign owner, ...), so that
+///   callers do not treat it as absent.
+fn open_sandbox_dir(dir: &Path) -> Result<Option<PinnedDir>, String> {
+    match PinnedDir::pin(dir) {
         Ok(dir) => Ok(Some(dir)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.to_string()),
@@ -289,11 +346,11 @@ fn open_sandbox_dir(host_cwd: &std::path::Path) -> Result<Option<PinnedDir>, Str
 /// Returns:
 ///   `None` if there are no records, or if they belong to another disk.
 fn read_install_state(project: &project::Project) -> Option<InstallState> {
-    let dir = match open_sandbox_dir(&project.host_cwd) {
+    let dir = match open_sandbox_dir(&project.sandbox_dir) {
         Ok(Some(dir)) => dir,
         Ok(None) => return None,
         Err(why) => {
-            println!("  (cannot read .airlock/sandbox: {why})");
+            println!("  (cannot read the sandbox directory: {why})");
             return None;
         }
     };
@@ -329,31 +386,170 @@ fn removed_status(status: PackStatus) -> Option<&'static str> {
     }
 }
 
+/// Find the sandbox `id`, or the sandbox of the current directory.
+/// Returns:
+///   The project directory and its sandbox (`None` if the current directory
+///   has none), or error for an id that is not registered.
+async fn find(context: &Context, id: Option<&str>) -> anyhow::Result<(PathBuf, Option<Found>)> {
+    if let Some(id) = id {
+        let found = find_by_id(context, id).await?;
+        return Ok((found.project.clone(), Some(found)));
+    }
+    let cwd = std::env::current_dir()
+        .map_err(|e| anyhow::anyhow!("Cannot determine current directory: {e}"))?;
+    let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    let found = sandboxes::resolve_sandbox(context, &cwd, false)
+        .await
+        .map_err(|e| e.context("Sandbox lookup failed"))?;
+    Ok((cwd, found))
+}
+
+/// Get the registered sandbox `id`.
+/// Returns:
+///   The sandbox, or error if `id` is not registered.
+pub(super) async fn find_by_id(context: &Context, id: &str) -> anyhow::Result<Found> {
+    let project = if registry::is_valid_id(id) {
+        registry::get(&context.db, id).await?
+    } else {
+        None
+    };
+    let Some(project) = project else {
+        anyhow::bail!("No sandbox {id} (see `airlock sandbox list`)");
+    };
+    Ok(Found {
+        location: Location::DataDir { id: id.to_string() },
+        project,
+        dir: context.boxes_dir().join(id),
+    })
+}
+
+/// Details of one sandbox, without its config. The JSON output and the
+/// sandbox list use them.
+#[derive(Debug, Serialize)]
+pub(super) struct Details {
+    /// Registry id. `None` for a sandbox in the project directory.
+    pub(super) id: Option<String>,
+    /// `data-dir` or `project-dir`.
+    location: &'static str,
+    /// Project directory.
+    pub(super) project: PathBuf,
+    /// Sandbox directory.
+    dir: PathBuf,
+    /// `running`, `stopped` or `missing` (no sandbox directory).
+    pub(super) status: &'static str,
+    /// Unix time of the last boot.
+    pub(super) last_run: Option<u64>,
+    /// Working directory in the guest of the last run.
+    guest_cwd: Option<String>,
+    /// Allocated size of the disk image in bytes.
+    pub(super) disk_used: Option<u64>,
+    /// Size of the disk image in bytes.
+    disk_size: Option<u64>,
+    /// Install status of each pack with a record.
+    packs: BTreeMap<String, &'static str>,
+}
+
+impl Details {
+    /// Read the details of the sandbox `found`. Takes no lock and writes
+    /// nothing. Records that cannot be read are left out.
+    pub(super) fn read(found: &Found) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        let dir = &found.dir;
+        let status = if std::fs::symlink_metadata(dir).is_err() {
+            "missing"
+        } else if project::is_running(dir) {
+            "running"
+        } else {
+            "stopped"
+        };
+        let run = read_run_meta(dir);
+        let mut packs = BTreeMap::new();
+        // A symlinked sandbox directory is not read.
+        if let Ok(pinned) = PinnedDir::pin(dir)
+            && let ReadState::Ok(installs) = state::read(&pinned)
+        {
+            for name in installs.packs.keys() {
+                packs.insert(name.clone(), install_status(Some(&installs), name));
+            }
+        }
+        // The disk is a sparse file: `blocks() * 512` gives the allocated
+        // size.
+        let disk = std::fs::metadata(dir.join(disk::DISK_FILE)).ok();
+        Self {
+            id: found.id().map(ToString::to_string),
+            location: match found.location {
+                Location::DataDir { .. } => "data-dir",
+                Location::ProjectDir => "project-dir",
+            },
+            project: found.project.clone(),
+            dir: dir.clone(),
+            status,
+            last_run: run.last_run,
+            guest_cwd: run.guest_cwd,
+            disk_used: disk.as_ref().map(|m| m.blocks() * 512),
+            disk_size: disk.as_ref().map(std::fs::Metadata::len),
+            packs,
+        }
+    }
+
+    /// Format the disk use as `<used> / <size>`.
+    fn disk_text(&self) -> Option<String> {
+        Some(format!(
+            "{} / {}",
+            cli::format_bytes(self.disk_used?),
+            cli::format_bytes(self.disk_size?)
+        ))
+    }
+}
+
+/// Print the details of a sandbox whose project directory is gone. There is
+/// no config to show.
+fn print_sandbox_only(details: &Details) {
+    println!("Path:     {} (missing)", details.project.display());
+    if let Some(id) = &details.id {
+        println!("ID:       {id}");
+    }
+    println!("Status:   {}", details.status);
+    if let Some(last_run) = details.last_run {
+        println!("Last run: {}", project::time_ago(last_run));
+    }
+    println!("Sandbox:  {}", details.dir.display());
+    if let Some(disk) = details.disk_text() {
+        println!("Disk:     {disk}");
+    }
+    if !details.packs.is_empty() {
+        println!("Packs:");
+        for (name, status) in &details.packs {
+            println!("  {name} \u{2014} {status}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    //! Tests for the parts of `airlock show`: the sandbox directory, the
+    //! Tests for the parts of `airlock info`: the sandbox directory, the
     //! pack lines and the sign-in lines.
 
     use super::*;
     use crate::test_cfg::{resolve_project_toml, temp_dir};
 
     /// Test that a symlinked sandbox directory is an error, not a missing
-    /// directory. Thus `show` reports the problem and does not tell the user
+    /// directory. Thus `info` reports the problem and does not tell the user
     /// that no sandbox exists.
-    ///   1. Check that a project without `.airlock/sandbox` gives no directory
-    ///   2. Make `.airlock/sandbox` a symlink to a different directory
+    ///   1. Check that a missing sandbox directory gives no directory
+    ///   2. Make the sandbox directory a symlink to a different directory
     ///   3. Check that the open fails with a message
     #[test]
     fn sandbox_dir_behind_symlink_is_unreadable_not_missing() {
         let project = temp_dir();
         let elsewhere = temp_dir();
-        assert!(matches!(open_sandbox_dir(project.path()), Ok(None)));
+        let sandbox = project.path().join(".airlock/sandbox");
+        assert!(matches!(open_sandbox_dir(&sandbox), Ok(None)));
 
         std::fs::create_dir_all(project.path().join(".airlock")).unwrap();
-        std::os::unix::fs::symlink(elsewhere.path(), project.path().join(".airlock/sandbox"))
-            .unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), &sandbox).unwrap();
 
-        assert!(open_sandbox_dir(project.path()).is_err_and(|why| !why.is_empty()));
+        assert!(open_sandbox_dir(&sandbox).is_err_and(|why| !why.is_empty()));
     }
 
     /// Test that show gives each pack the status from the install records, and

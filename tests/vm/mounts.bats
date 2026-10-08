@@ -93,3 +93,32 @@ EOF
     assert_success
     assert_output_contains "CONTAINED"
 }
+
+# Test that the guest hides .airlock only for a sandbox in the project. A
+# sandbox in the data directory has nothing there, so the guest must not
+# hide the directory or make it in the host project.
+#   1. In a new project, start a sandbox in the data directory and list
+#      .airlock in the sandbox
+#   2. Check that the sandbox sees no .airlock and the host has none
+#   3. In a second project, keep the sandbox in the project and list
+#      .airlock in the sandbox
+#   4. Check that .airlock is empty in the sandbox and has the sandbox on
+#      the host
+@test "airlock dir is masked only for sandbox in project" {
+    mkdir -p boxed
+    printf '[vm]\n' >boxed/airlock.toml
+    cd boxed
+    run_vm sh -c 'ls -A .airlock 2>/dev/null || echo NO-AIRLOCK'
+    assert_success
+    assert_output_contains "NO-AIRLOCK"
+    [[ ! -e .airlock ]]
+
+    mkdir -p ../in-project/.airlock/sandbox
+    printf '[vm]\n' >../in-project/airlock.toml
+    touch ../in-project/.airlock/sandbox/keep-in-project
+    cd ../in-project
+    run_vm sh -c 'echo "[$(ls -A .airlock)]"'
+    assert_success
+    assert_output_contains "[]"
+    [[ -d .airlock/sandbox ]]
+}

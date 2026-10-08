@@ -1,13 +1,18 @@
 //! The `airlock rm` command.
 //!
-//! Deletes the project sandbox and its local state.
+//! Deletes the sandbox of the project in the current directory, in the
+//! airlock data directory or in the project, with the local project config.
+//! For a sandbox in the project, also deletes the local state in the
+//! project.
 
 use std::path::Path;
 
 use clap::Args;
 
 use crate::cli::prompt::yes_no::YesNo;
-use crate::config::files::EXTENSIONS;
+use crate::config::files::{EXTENSIONS, local_config_names};
+use crate::context::Context;
+use crate::sandboxes::{self, Location};
 use crate::{cli, oci, project};
 
 /// CLI arguments for `airlock rm`.
@@ -20,9 +25,12 @@ pub struct RmArgs {
 
 /// Remove the project sandbox after confirmation (unless `--force`).
 ///
-/// Removes the whole project `.airlock/` directory: the sandbox, the local
-/// project config (`.airlock/airlock.<ext>`), `.gitignore`, logs and all other
-/// files in it. If the project is the home directory, `.airlock/` is also the
+/// A sandbox in the data directory goes with its registry entry and its
+/// local project config. The project `.airlock/` directory stays.
+///
+/// For a sandbox in the project, removes the whole project `.airlock/`
+/// directory: the sandbox, the local project config
+/// (`.airlock/airlock.<ext>`), `.gitignore`, logs and all other files in it. If the project is the home directory, `.airlock/` is also the
 /// user airlock directory (user config, vault, service sign-ins, agent homes).
 /// Then only `.airlock/sandbox` is removed. The same applies if `.airlock/`
 /// holds user-level files and the project is not `$HOME` (for example under
@@ -34,7 +42,7 @@ pub struct RmArgs {
 //
 // The sandbox lock stays held until the removal is complete. Thus a parallel
 // `airlock start` cannot take the sandbox during the removal.
-pub fn main(args: &RmArgs) -> i32 {
+pub async fn main(args: &RmArgs, context: &Context) -> i32 {
     let host_cwd = match std::env::current_dir() {
         Ok(cwd) => std::fs::canonicalize(&cwd).unwrap_or(cwd),
         Err(e) => {
@@ -42,13 +50,65 @@ pub fn main(args: &RmArgs) -> i32 {
             return 1;
         }
     };
-    run(args, &host_cwd)
+    run(args, context, &host_cwd).await
 }
 
 /// Body of [`main`], with the project directory as an argument.
 // The argument lets tests run it without a change to the current directory
 // of the process.
-pub(super) fn run(args: &RmArgs, host_cwd: &Path) -> i32 {
+pub(super) async fn run(args: &RmArgs, context: &Context, host_cwd: &Path) -> i32 {
+    match sandboxes::resolve_sandbox(context, host_cwd, false).await {
+        Ok(Some(found)) => {
+            if let Location::DataDir { id } = found.location {
+                return rm_box(args, context, &id).await;
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            cli::error!("Sandbox lookup failed: {e:#}");
+            return 1;
+        }
+    }
+    rm_project_sandbox(args, host_cwd)
+}
+
+/// Remove the sandbox `id` from the data directory (see
+/// [`sandboxes::remove_box`]).
+/// Returns:
+///   Process exit code.
+async fn rm_box(args: &RmArgs, context: &Context, id: &str) -> i32 {
+    // Fail before the question. `remove_box` checks again under the lock.
+    if project::is_running(&context.boxes_dir().join(id)) {
+        cli::error!("Sandbox is running, stop it first");
+        return 1;
+    }
+    // The local project config of the sandbox is in the sandbox directory,
+    // so it goes with the sandbox.
+    let local_config = local_config_name(&context.boxes_dir().join(id));
+    let note = local_config
+        .as_ref()
+        .map(|name| format!("This also deletes the local config {name}."));
+    if !confirm(args, note.as_deref()) {
+        cli::error!("Aborted.");
+        return 0;
+    }
+    if let Err(e) = sandboxes::remove_box(context, id).await {
+        cli::error!("Failed to remove sandbox: {e:#}");
+        return 1;
+    }
+    oci::gc_sweep();
+    match local_config {
+        Some(name) => cli::log!("Sandbox removed (including the local config {name})"),
+        None => cli::log!("Sandbox removed"),
+    }
+    0
+}
+
+/// Remove the sandbox in the project `host_cwd` and the project
+/// `.airlock/` directory (see [`main`]).
+/// Returns:
+///   Process exit code.
+fn rm_project_sandbox(args: &RmArgs, host_cwd: &Path) -> i32 {
     let paths = project::paths(host_cwd);
 
     // `.airlock` can be a symlink. An untrusted repo can commit one that
@@ -276,14 +336,11 @@ fn is_home_dir(cache_dir: &Path, home: &Path) -> bool {
 }
 
 /// Return the file name of the local project config (`airlock.<ext>`) in
-/// `cache_dir`, if it exists.
-// Only the confirmation prompt uses the name. The removal deletes the whole
-// directory in all cases.
-fn local_config_name(cache_dir: &Path) -> Option<String> {
-    EXTENSIONS.iter().find_map(|ext| {
-        let name = format!("airlock.{ext}");
-        cache_dir.join(&name).is_file().then_some(name)
-    })
+/// `dir`, if it exists.
+// Only the confirmation prompt and the report use the name. The removal
+// deletes the whole directory in all cases.
+fn local_config_name(dir: &Path) -> Option<String> {
+    local_config_names(dir).into_iter().next()
 }
 
 /// Files and directories that only a user airlock directory (`~/.airlock`)
