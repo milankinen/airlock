@@ -78,8 +78,8 @@ impl CpuState {
 /// Each core has one row, for example `c0  ████▌···  42%`. The bar uses
 /// half-blocks (`▌`) for half-cell precision. The bar and the percent value
 /// use the same color, which changes with the usage (green, yellow, orange,
-/// red). When the box is tall enough, a load-average row and the mean-usage
-/// histogram show below the core rows.
+/// red). The core rows come first. When the box has rows left, a
+/// load-average row and then the mean-usage histogram show below them.
 pub struct CpuWidget<'a> {
     state: &'a CpuState,
 }
@@ -142,12 +142,18 @@ fn render_body(area: Rect, state: &CpuState, buf: &mut Buffer) {
         height: area.height,
     };
 
-    // Give rows from the top down: core bars, then the load row, then the
-    // histogram. A lower section gets space only if rows remain.
-    let histogram_rows = HISTOGRAM_ROWS.min(content.height.saturating_sub(1));
-    let load_rows: u16 = u16::from(state.load_avg.is_some() && content.height > histogram_rows + 1);
-    let core_rows = content.height.saturating_sub(load_rows + histogram_rows);
-    let visible = (core_rows as usize).min(state.per_core.len());
+    // Give rows in this order: core bars, then the load row, then the
+    // histogram. A later section gets space only if rows remain. The load
+    // row and the histogram stay at the bottom, so extra rows go between
+    // them and the core bars.
+    let cores = u16::try_from(state.per_core.len()).unwrap_or(u16::MAX);
+    let visible_cores = cores.min(content.height);
+    let mut free = content.height - visible_cores;
+    let load_rows = u16::from(state.load_avg.is_some() && free > 0);
+    free -= load_rows;
+    let histogram_rows = HISTOGRAM_ROWS.min(free);
+    let core_rows = content.height - load_rows - histogram_rows;
+    let visible = usize::from(visible_cores);
 
     for (i, &pct) in state.per_core.iter().take(visible).enumerate() {
         let row = Rect {
@@ -264,5 +270,53 @@ fn color_for(pct: u8) -> Color {
         50..=69 => Color::Yellow,
         70..=84 => Color::Rgb(255, 140, 0),
         _ => Color::Red,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests of the CPU panel layout.
+
+    use super::*;
+
+    /// Draw `state` in a body of `height` rows and return the rows as text.
+    fn draw(state: &CpuState, height: u16) -> Vec<String> {
+        let area = Rect::new(0, 0, 40, height);
+        let mut buf = Buffer::empty(area);
+        render_body(area, state, &mut buf);
+        (0..height)
+            .map(|y| (0..40).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect()
+    }
+
+    /// Test that a short CPU box gives its rows to the core bars first, then
+    /// to the load row, then to the histogram. The core bars are the main
+    /// content of the box.
+    ///   1. Set a snapshot with 3 cores and a load average
+    ///   2. Draw in 3 rows and check that all rows are core bars
+    ///   3. Draw in 4 rows and check the 3 core bars and the load row
+    ///   4. Draw in 10 rows and check that the load row and the histogram
+    ///      are at the bottom
+    #[test]
+    fn short_cpu_box_gives_rows_to_core_bars_first() {
+        let mut state = CpuState::new();
+        state.set_snapshot(vec![100, 100, 100], Some((1.0, 2.0, 3.0)));
+
+        let rows = draw(&state, 3);
+        assert!(
+            rows.iter()
+                .zip(["c0", "c1", "c2"])
+                .all(|(r, c)| r.contains(c)),
+            "{rows:#?}"
+        );
+
+        let rows = draw(&state, 4);
+        assert!(rows[2].contains("c2"), "{rows:#?}");
+        assert!(rows[3].contains("load 1.00 2.00 3.00"), "{rows:#?}");
+
+        let rows = draw(&state, 10);
+        assert!(rows[2].contains("c2"), "{rows:#?}");
+        assert!(rows[5].contains("load"), "{rows:#?}");
+        assert!(rows[9].trim() != "", "{rows:#?}");
     }
 }

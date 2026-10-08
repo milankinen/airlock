@@ -63,3 +63,14 @@ wrong positions. In mode 1005 each value (button, column, row, each plus
 more take 2 bytes, so the mode reaches coordinate 2015. The button value
 also goes through UTF-8 encoding, because wheel events with modifiers
 and motion can reach 128 or more.
+
+## CPU box gives rows to the core bars first
+
+The CPU box comment said that rows go to the core bars first, then the
+load row, then the histogram. The code reserved up to 4 histogram rows
+first, so a short box showed only 1 core bar and a histogram. We decided
+that the core bars are the main content. The layout now gives rows to
+the core bars, then the load row, then up to 4 histogram rows. In a
+tall box the result is the same as before: extra rows go between the
+core bars and the load row, so the load row and the histogram stay at
+the bottom. A unit test draws the box at 3, 4 and 10 rows.
