@@ -117,3 +117,27 @@ parameters). `store` writes them back unchanged, and `load` uses the
 cached key only when all inputs in the file match. The parameter test
 now also writes through the same handle and reads the file in a new
 handle.
+
+## One paste prints the clipboard once
+
+A FIFO has no boundary between two pastes. The paste loop opened the
+FIFO for writing, wrote the host clipboard, closed it and opened it
+again at once. When the shim's `cat` had not yet seen end of file, it
+still had the FIFO open. The new open then succeeded at once and wrote
+the clipboard again into the same read. One `wl-paste` printed the
+clipboard 2 to 6 times. Under parallel load the test failed in 71 of
+160 runs.
+
+Of the two options in the leftovers list, polling the write end for
+`POLLHUP` does not work: `cat` reads until end of file, and it gets end
+of file only after the write end closes. A request/response protocol
+needs `mkfifo` or other tools in the image. We chose a third way that
+needs nothing in the image: when a reader has opened the FIFO, the loop
+puts a new FIFO with the same owner at the same path (make it next to
+the path, then rename over it). The reader keeps the old FIFO, but no
+new reader can open it, so the close of the write end always gives it
+end of file. The next paste opens the new FIFO. With the fix, 0 of 160
+parallel runs failed, and the test is no longer ignored.
+
+Two pastes that open the FIFO in the short time between the open and
+the rename still share one stream, as before.

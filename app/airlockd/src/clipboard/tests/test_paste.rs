@@ -19,7 +19,6 @@ fn serve(clipboard: &Clipboard, host: &Rc<HostClipboard>) {
 ///   3. Check that each paste returns the host clipboard
 ///   4. Check that no paste became a copy
 #[test]
-#[ignore = "paste_loop reopens the FIFO before the reader sees EOF, so a paste repeats"]
 fn paste_through_every_tool_name_returns_host_clipboard() {
     run_bridge(async {
         let clipboard = Clipboard::install(true, true);
