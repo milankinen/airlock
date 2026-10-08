@@ -135,32 +135,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn diff_per_core_computes_percent() {
+    fn diff_per_core_is_busy_share_of_elapsed_jiffies() {
         let prev = CpuSample {
-            per_core: vec![(100, 1000), (200, 1000)],
+            per_core: vec![(100, 1000), (200, 1000), (300, 1000)],
         };
         let cur = CpuSample {
-            per_core: vec![(150, 1100), (200, 1100)],
+            per_core: vec![(150, 1100), (200, 1100), (300, 1000)],
         };
-        // core 0: dt=100, di=50, busy=50, => 50%
-        // core 1: dt=100, di=0, busy=100 => 100%
-        assert_eq!(diff_per_core(&prev, &cur), vec![50, 100]);
+        assert_eq!(diff_per_core(&prev, &cur), vec![50, 100, 0]);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn diff_per_core_zero_when_no_change() {
-        let prev = CpuSample {
-            per_core: vec![(100, 1000)],
-        };
-        let cur = prev.clone();
-        assert_eq!(diff_per_core(&prev, &cur), vec![0]);
-    }
+    fn collector_polls_proc_with_zero_cpu_first_then_bounded_usage() {
+        let mut collector = Collector::new();
+        let first = collector.poll();
+        assert!(!first.per_core.is_empty());
+        assert!(first.per_core.iter().all(|&v| v == 0));
+        assert!(first.total_bytes > 0);
+        assert!(first.used_bytes <= first.total_bytes);
 
-    #[test]
-    fn collector_first_call_returns_zeros() {
-        let mut c = Collector::new();
-        let snap = c.poll();
-        // Regardless of core count, first call must be all-zero.
-        assert!(snap.per_core.iter().all(|&v| v == 0));
+        let second = collector.poll();
+        assert_eq!(second.per_core.len(), first.per_core.len());
+        assert!(second.per_core.iter().all(|&v| v <= 100));
     }
 }

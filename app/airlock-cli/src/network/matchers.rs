@@ -64,83 +64,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn star_matches_anything() {
-        assert!(host_matches("anything.example.com", "*"));
-        assert!(host_matches("example.com", "*"));
-        assert!(host_matches("localhost", "*"));
+    fn host_matching_follows_wildcard_and_alias_rules() {
+        for (host, pattern, expected) in [
+            ("anything.example.com", "*", true),
+            ("localhost", "*", true),
+            ("api.example.com", "*.example.com", true),
+            ("x.y.z.example.com", "*.example.com", true),
+            ("example.com", "*.example.com", false),
+            (".example.com", "*.example.com", false),
+            ("api.example.org", "*.example.com", false),
+            ("api.xample.com", "*.example.com", false),
+            ("example.com", "example.com", true),
+            ("api.example.com", "example.com", false),
+            ("foo.com", "*foo.com", false),
+            ("api.foo.com", "*foo.com", false),
+            ("127.0.0.1", "localhost", true),
+            ("localhost", "127.0.0.1", true),
+            ("::1", "localhost", true),
+            ("localhost", "::1", true),
+        ] {
+            assert_eq!(host_matches(host, pattern), expected, "{host} ~ {pattern}");
+        }
     }
 
     #[test]
-    fn wildcard_matches_single_subdomain() {
-        assert!(host_matches("api.example.com", "*.example.com"));
-        assert!(host_matches("www.example.com", "*.example.com"));
-    }
-
-    #[test]
-    fn wildcard_matches_nested_subdomains() {
-        assert!(host_matches("a.b.example.com", "*.example.com"));
-        assert!(host_matches("x.y.z.example.com", "*.example.com"));
-    }
-
-    #[test]
-    fn wildcard_does_not_match_without_subdomain() {
-        assert!(!host_matches("example.com", "*.example.com"));
-    }
-
-    #[test]
-    fn wildcard_requires_leading_label() {
-        // Empty label: ".example.com" has no leading label.
-        assert!(!host_matches(".example.com", "*.example.com"));
-    }
-
-    #[test]
-    fn wildcard_suffix_is_exact() {
-        assert!(!host_matches("api.example.org", "*.example.com"));
-        assert!(!host_matches("api.xample.com", "*.example.com"));
-    }
-
-    #[test]
-    fn matching_is_case_insensitive() {
-        // Regression: DNS is case-insensitive, so an uppercased host must
-        // not evade a lowercase deny rule (nor a lowercase host a rule with
-        // uppercase in it).
-        assert!(host_matches("SECRET.example.com", "secret.example.com"));
-        assert!(host_matches("secret.example.com", "SECRET.EXAMPLE.COM"));
-        assert!(host_matches("API.EXAMPLE.COM", "*.example.com"));
-        assert!(host_matches("api.example.com", "*.EXAMPLE.COM"));
-        assert!(host_matches("LOCALHOST", "localhost"));
-    }
-
-    #[test]
-    fn trailing_dot_is_ignored() {
-        // Regression: `host.` resolves to `host`, so a trailing dot must
-        // not evade a rule written without one.
-        assert!(host_matches("secret.example.com.", "secret.example.com"));
-        assert!(host_matches("api.example.com.", "*.example.com"));
-        // The apex with a trailing dot still must not match a `*.` wildcard.
-        assert!(!host_matches("example.com.", "*.example.com"));
-    }
-
-    #[test]
-    fn exact_literal_match() {
-        assert!(host_matches("example.com", "example.com"));
-        assert!(!host_matches("api.example.com", "example.com"));
-    }
-
-    #[test]
-    fn localhost_aliases_are_equivalent() {
-        assert!(host_matches("127.0.0.1", "localhost"));
-        assert!(host_matches("localhost", "127.0.0.1"));
-        assert!(host_matches("::1", "localhost"));
-        assert!(host_matches("localhost", "::1"));
-    }
-
-    #[test]
-    fn non_wildcard_star_pattern_matches_nothing() {
-        // "*foo.com" is not a supported wildcard form: it starts with `*`
-        // but not `*.`, so it's treated as a literal — and hostnames
-        // never contain `*`, so nothing matches.
-        assert!(!host_matches("foo.com", "*foo.com"));
-        assert!(!host_matches("api.foo.com", "*foo.com"));
+    fn host_case_and_trailing_dot_do_not_evade_pattern() {
+        for (host, pattern, expected) in [
+            ("SECRET.example.com", "secret.example.com", true),
+            ("secret.example.com", "SECRET.EXAMPLE.COM", true),
+            ("API.EXAMPLE.COM", "*.example.com", true),
+            ("api.example.com", "*.EXAMPLE.COM", true),
+            ("LOCALHOST", "localhost", true),
+            ("secret.example.com.", "secret.example.com", true),
+            ("api.example.com.", "*.example.com", true),
+            ("example.com.", "*.example.com", false),
+        ] {
+            assert_eq!(host_matches(host, pattern), expected, "{host} ~ {pattern}");
+        }
     }
 }

@@ -221,75 +221,30 @@ fn surrogate_for(name: &str, value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
-    use crate::vault::{DisabledStorage, VaultStorageType};
-
-    fn vault(host_env: &[(&str, &str)]) -> Vault {
-        Vault::new_with(
-            Box::new(DisabledStorage),
-            host_env
-                .iter()
-                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-                .collect::<HashMap<_, _>>(),
-            VaultStorageType::Disabled,
-        )
-    }
-
-    fn env(entries: &[(&str, &str, bool)]) -> BTreeMap<String, EnvVar> {
-        entries
-            .iter()
-            .map(|(k, v, mask)| {
-                (
-                    (*k).to_string(),
-                    EnvVar {
-                        value: (*v).to_string(),
-                        mask: *mask,
-                    },
-                )
-            })
-            .collect()
-    }
+    use crate::test_cfg::host_env_vault;
 
     #[test]
-    fn surrogate_has_same_byte_length_and_is_alphanumeric() {
-        for real in ["sk-ant-oat01-abcdefghijklmnop", "x", "ääkkönen-token"] {
+    fn surrogate_is_alphanumeric_with_same_byte_length() {
+        for real in ["sk-ant-oat01-abcdefghijklmnop", "x", "", "ääkkönen-token"] {
             let s = surrogate_for("TOKEN", real);
-            assert_eq!(s.len(), real.len(), "for {real}");
-            assert!(s.chars().all(|c| c.is_ascii_alphanumeric()), "got {s}");
+            assert_eq!(s.len(), real.len(), "{real}");
+            assert!(s.chars().all(|c| c.is_ascii_alphanumeric()), "{s}");
         }
     }
 
     #[test]
-    fn surrogate_of_empty_is_empty() {
-        assert_eq!(surrogate_for("TOKEN", ""), "");
-    }
-
-    #[test]
-    fn surrogate_differs_from_real_value() {
-        let real = "sk-ant-oat01-abcdefghijklmnop";
-        // The alphabet excludes `-`, so a collision is impossible here.
-        assert_ne!(surrogate_for("TOKEN", real), real);
-    }
-
-    #[test]
     fn surrogate_depends_only_on_name_and_length() {
-        // Same name and length, different value: same surrogate.
         let a = surrogate_for("OPENAI_API_KEY", "sk-aaaaaaaaaaaaaaaaaaaa");
-        let b = surrogate_for("OPENAI_API_KEY", "sk-bbbbbbbbbbbbbbbbbbbb");
-        assert_eq!(a, b);
-        // Different name or different length: different surrogate.
+        assert_eq!(
+            a,
+            surrogate_for("OPENAI_API_KEY", "sk-bbbbbbbbbbbbbbbbbbbb")
+        );
         assert_ne!(
             a,
             surrogate_for("OPENAI_API_KEX", "sk-aaaaaaaaaaaaaaaaaaaa")
         );
         assert_ne!(a, surrogate_for("OPENAI_API_KEY", "sk-aaaaaaaaaaaaaaaaaaa"));
-    }
-
-    #[test]
-    fn surrogate_name_and_length_do_not_alias() {
-        // Name is length-prefixed, so name/length boundaries cannot shift.
         assert_ne!(surrogate_for("TOKEN1", "ab"), surrogate_for("TOKEN", "ab"));
         assert_ne!(
             surrogate_for("TOKEN1", "abcdefghij"),
@@ -299,8 +254,6 @@ mod tests {
 
     #[test]
     fn surrogate_is_pinned() {
-        // Golden values. A change here invalidates every cached surrogate:
-        // bump `SURROGATE_DOMAIN` or revert.
         assert_eq!(
             surrogate_for(
                 "OPENAI_API_KEY",
@@ -315,126 +268,34 @@ mod tests {
             ),
             "4YIqU4HuWttkzVxUuWLXos9ycGwcCfUKlxnsofMlyjpKd4LBC"
         );
-        // Spans more than one ChaCha block.
-        let long = surrogate_for("LONG", &"x".repeat(100));
-        assert_eq!(long.len(), 100);
         assert_eq!(
-            long,
+            surrogate_for("LONG", &"x".repeat(100)),
             "csNmqNAJNbzpxubyNC7TSRONA5TTH97VhNl5WxXvbhDp23aR20Rwj0LDNCapy0BUKUbTb677RnbzvWeHfazQcvQ57sh8sOX1FBBX"
         );
     }
 
     #[test]
-    fn unmasked_entries_pass_through_substituted() {
-        let v = vault(&[("HOST_TOKEN", "real-value-1234")]);
-        let e = env(&[
-            ("PLAIN", "static", false),
-            ("SUBST", "${HOST_TOKEN}", false),
-        ]);
-        let resolved = SandboxEnv::resolve(&e, &v).unwrap();
-        assert_eq!(resolved.guest_value("PLAIN"), Some("static"));
-        assert_eq!(resolved.guest_value("SUBST"), Some("real-value-1234"));
-        assert_eq!(resolved.masked_count(), 0);
-        assert!(resolved.masked("SUBST").is_none());
+    fn check_injectable_refuses_unmasked_and_undefined_names() {
+        let env = BTreeMap::from([(
+            "PLAIN".to_string(),
+            EnvVar::plain("sk-real-token-0123456789"),
+        )]);
+        let resolved = SandboxEnv::resolve(&env, &host_env_vault(&[])).unwrap();
+        for name in ["PLAIN", "NOPE"] {
+            let err = resolved.check_injectable(name).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                format!("env.{name}: must be defined in [env] with mask = true to be injected")
+            );
+        }
     }
 
     #[test]
-    fn masked_entry_is_substituted_then_masked() {
-        let v = vault(&[("HOST_TOKEN", "real-value-1234")]);
-        let e = env(&[("TOKEN", "${HOST_TOKEN}", true)]);
-        let resolved = SandboxEnv::resolve(&e, &v).unwrap();
-        let secret = resolved.masked("TOKEN").unwrap();
-        assert_eq!(secret.real, "real-value-1234");
-        assert_eq!(secret.surrogate.len(), "real-value-1234".len());
-        assert_ne!(secret.surrogate, secret.real);
-        // The guest sees the surrogate, never the real value.
-        assert_eq!(
-            resolved.guest_value("TOKEN"),
-            Some(secret.surrogate.as_str())
-        );
-        let entries: Vec<_> = resolved.guest_entries().collect();
-        assert_eq!(entries, vec![("TOKEN", secret.surrogate.as_str())]);
-        assert_eq!(resolved.masked_count(), 1);
-        assert_eq!(resolved.len(), 1);
-    }
-
-    #[test]
-    fn missing_host_variable_errors_with_key_prefix() {
-        let v = vault(&[]);
-        let e = env(&[("TOKEN", "${NOPE}", true)]);
-        let Err(err) = SandboxEnv::resolve(&e, &v) else {
-            panic!("expected an error for an undefined host variable");
-        };
-        let err = err.to_string();
-        assert!(err.starts_with("env.TOKEN:"), "got: {err}");
-    }
-
-    #[test]
-    fn check_injectable_accepts_a_normal_masked_secret() {
-        let v = vault(&[]);
-        let e = env(&[("TOKEN", "sk-real-token-0123456789", true)]);
-        let resolved = SandboxEnv::resolve(&e, &v).unwrap();
-        resolved.check_injectable("TOKEN").unwrap();
-    }
-
-    #[test]
-    fn check_injectable_rejects_unmasked_or_missing() {
-        let v = vault(&[]);
-        let e = env(&[("PLAIN", "sk-real-token-0123456789", false)]);
-        let resolved = SandboxEnv::resolve(&e, &v).unwrap();
-        let err = resolved.check_injectable("PLAIN").unwrap_err().to_string();
-        assert!(err.starts_with("env.PLAIN:"), "got: {err}");
-        assert!(err.contains("mask = true"), "got: {err}");
-        let err = resolved.check_injectable("NOPE").unwrap_err().to_string();
-        assert!(err.starts_with("env.NOPE:"), "got: {err}");
-    }
-
-    #[test]
-    fn check_injectable_rejects_short_values() {
-        let v = vault(&[]);
-        let e = env(&[("TOKEN", "short", true)]);
-        let resolved = SandboxEnv::resolve(&e, &v).unwrap();
-        let err = resolved.check_injectable("TOKEN").unwrap_err().to_string();
-        assert!(err.contains("shorter than"), "got: {err}");
-        assert!(!err.contains("short\""), "value leaked: {err}");
-    }
-
-    #[test]
-    fn non_ascii_value_masks_by_byte_length_and_is_injectable() {
-        // The surrogate matches the byte length, so it has more characters
-        // than the real value. Non-ASCII bytes are legal header bytes, so
-        // the value stays injectable.
-        let real = "🔑-secret-token";
-        let v = vault(&[]);
-        let e = env(&[("TOKEN", real, true)]);
-        let resolved = SandboxEnv::resolve(&e, &v).unwrap();
-        let secret = resolved.masked("TOKEN").unwrap();
-        assert_eq!(secret.surrogate.len(), real.len());
-        assert!(secret.surrogate.chars().count() > real.chars().count());
-        assert!(secret.surrogate.is_ascii());
-        resolved.check_injectable("TOKEN").unwrap();
-    }
-
-    #[test]
-    fn check_injectable_rejects_invalid_header_bytes() {
-        let v = vault(&[("T", "sk-real-token-0123456789\n")]);
-        let e = env(&[("TOKEN", "${T}", true)]);
-        let resolved = SandboxEnv::resolve(&e, &v).unwrap();
-        let err = resolved.check_injectable("TOKEN").unwrap_err().to_string();
-        assert!(err.contains("HTTP header"), "got: {err}");
-        assert!(!err.contains("sk-real"), "value leaked: {err}");
-    }
-
-    #[test]
-    fn debug_never_prints_values() {
-        let s = MaskedSecret {
-            name: "TOKEN".into(),
-            real: "real-secret-value".into(),
-            surrogate: "surrogate-value-x".into(),
-        };
-        let dbg = format!("{s:?}");
-        assert!(dbg.contains("TOKEN"));
-        assert!(!dbg.contains("real-secret-value"));
-        assert!(!dbg.contains("surrogate-value-x"));
+    fn masked_secret_debug_never_prints_values() {
+        let secret = MaskedSecret::new("TOKEN", "real-secret-value".into());
+        let debug = format!("{secret:?}");
+        assert!(debug.contains("TOKEN"));
+        assert!(!debug.contains("real-secret-value"));
+        assert!(!debug.contains(&secret.surrogate));
     }
 }

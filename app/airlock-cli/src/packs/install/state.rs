@@ -220,101 +220,63 @@ fn now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
     use super::*;
-    use crate::test_support::TempDir;
+    use crate::test_cfg::temp_dir;
 
     fn fp(c: char) -> String {
         c.to_string().repeat(64)
     }
 
-    fn sample() -> InstallState {
-        let mut packs = BTreeMap::new();
-        for (id, status) in [
-            ("claude", PackStatus::Installed),
-            ("codex", PackStatus::Unconfirmed),
-            ("docker", PackStatus::Kept { confirmed: true }),
-            ("python", PackStatus::Failed),
-        ] {
-            packs.insert(
-                id.to_string(),
-                Record {
-                    status,
-                    fingerprint: fp('a'),
-                    at: 3,
-                },
-            );
+    fn record(status: PackStatus) -> Record {
+        Record {
+            status,
+            fingerprint: fp('a'),
+            at: 3,
         }
-        InstallState {
-            version: STATE_VERSION,
-            disk: Some((1, 2)),
-            image_id: Some("sha256:1".into()),
-            packs,
-            ran_session: true,
-        }
-    }
-
-    fn dir(tmp: &TempDir) -> PinnedDir {
-        PinnedDir::open(tmp.path(), Path::new("sandbox"), true).unwrap()
     }
 
     #[test]
-    fn round_trip_owner_only() {
-        let tmp = TempDir::new("packs-state");
-        let d = dir(&tmp);
-        assert!(matches!(read(&d), ReadState::Absent));
-        write(&d, &sample()).unwrap();
-        match read(&d) {
-            ReadState::Ok(state) => assert_eq!(state, sample()),
-            other => panic!("{other:?}"),
+    fn reading_malformed_tampered_or_newer_state_file_is_refused() {
+        let tmp = temp_dir();
+        let dir = PinnedDir::open(tmp.path(), Path::new("sandbox"), true).unwrap();
+        assert!(matches!(read(&dir), ReadState::Absent));
+        let fingerprint = fp('a');
+        let pack = |id: &str, status: &str, fingerprint: &str| {
+            format!(
+                r#"{{"version": 1, "packs": {{"{id}": {{"status": "{status}", "fingerprint": "{fingerprint}", "at": 1}}}}}}"#
+            )
+        };
+        let corrupt = [
+            "{".to_string(),
+            "{}".to_string(),
+            r#"{"version": 0}"#.to_string(),
+            r#"{"version": 1, "packs": 5}"#.to_string(),
+            pack("x", "weird", &fingerprint),
+            pack("\\u001b[31mx", "installed", &fingerprint),
+            pack("x", "installed", "zz"),
+            r#"{"version": 1, "image_id": "sha\n"}"#.to_string(),
+        ];
+        for json in corrupt {
+            dir.write_atomic(STATE_FILE, json.as_bytes(), 0o600)
+                .unwrap();
+            assert!(matches!(read(&dir), ReadState::Corrupt(_)), "{json}");
         }
-        let path = tmp.path().join("sandbox").join(STATE_FILE);
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
-        // The documented shape.
-        let json: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(json["packs"]["docker"]["status"], "kept");
-        assert_eq!(json["packs"]["docker"]["confirmed"], true);
-        assert_eq!(json["packs"]["claude"]["status"], "installed");
-        assert_eq!(json["disk"], serde_json::json!([1, 2]));
-    }
-
-    fn read_json(tmp: &TempDir, json: &str) -> ReadState {
-        let d = dir(tmp);
-        d.write_atomic(STATE_FILE, json.as_bytes(), 0o600).unwrap();
-        read(&d)
-    }
-
-    #[test]
-    fn corrupt_and_too_new() {
-        let tmp = TempDir::new("packs-state-bad");
-        assert!(matches!(read_json(&tmp, "{"), ReadState::Corrupt(_)));
-        assert!(matches!(read_json(&tmp, "{}"), ReadState::Corrupt(_)));
+        dir.write_atomic(STATE_FILE, br#"{"version": 99}"#, 0o600)
+            .unwrap();
+        assert!(matches!(read(&dir), ReadState::TooNew(99)));
+        dir.write_atomic(
+            STATE_FILE,
+            pack("x", "kept", &fingerprint).as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        assert!(matches!(read(&dir), ReadState::Corrupt(_)));
+        dir.write_atomic(STATE_FILE, br#"{"version": 1}"#, 0o600)
+            .unwrap();
         assert!(matches!(
-            read_json(&tmp, r#"{"version": 0}"#),
-            ReadState::Corrupt(_)
-        ));
-        assert!(matches!(
-            read_json(&tmp, r#"{"version": 99}"#),
-            ReadState::TooNew(99)
-        ));
-        assert!(matches!(
-            read_json(&tmp, r#"{"version": 1, "packs": 5}"#),
-            ReadState::Corrupt(_)
-        ));
-        let bad_status = format!(
-            r#"{{"version": 1, "packs": {{"x": {{"status": "weird", "fingerprint": "{}", "at": 1}}}}}}"#,
-            fp('a')
-        );
-        assert!(matches!(
-            read_json(&tmp, &bad_status),
-            ReadState::Corrupt(_)
-        ));
-        assert!(matches!(
-            read_json(&tmp, r#"{"version": 1}"#),
+            read(&dir),
             ReadState::Ok(InstallState {
                 ran_session: true,
                 ..
@@ -323,59 +285,32 @@ mod tests {
     }
 
     #[test]
-    fn tampered_fields_are_rejected() {
-        let tmp = TempDir::new("packs-state-tamper");
-        let mut s = sample();
-        let r = s.packs.remove("claude").unwrap();
-        s.packs.insert("\u{1b}[31mx".into(), r);
-        let json = serde_json::to_string(&s).unwrap();
-        assert!(matches!(read_json(&tmp, &json), ReadState::Corrupt(_)));
-
-        let mut s = sample();
-        s.packs.get_mut("claude").unwrap().fingerprint = "zz".into();
-        let json = serde_json::to_string(&s).unwrap();
-        assert!(matches!(read_json(&tmp, &json), ReadState::Corrupt(_)));
-
-        let mut s = sample();
-        s.image_id = Some("sha\n".into());
-        let json = serde_json::to_string(&s).unwrap();
-        assert!(matches!(read_json(&tmp, &json), ReadState::Corrupt(_)));
-    }
-
-    #[test]
-    fn apply_and_promote() {
-        let mut s = sample();
+    fn keeping_removed_packs_records_whether_install_was_confirmed() {
+        let mut state = InstallState::default();
+        state
+            .packs
+            .insert("a".into(), record(PackStatus::Installed));
+        state
+            .packs
+            .insert("b".into(), record(PackStatus::Unconfirmed));
         apply(
-            &mut s,
-            &[
-                Transition::Keep("claude".into()),
-                Transition::Keep("codex".into()),
-                Transition::Drop("python".into()),
-            ],
+            &mut state,
+            &[Transition::Keep("a".into()), Transition::Keep("b".into())],
         );
         assert_eq!(
-            s.packs["claude"].status,
+            state.packs["a"].status,
             PackStatus::Kept { confirmed: true }
         );
         assert_eq!(
-            s.packs["codex"].status,
+            state.packs["b"].status,
             PackStatus::Kept { confirmed: false }
         );
-        assert!(!s.packs.contains_key("python"));
-        apply(&mut s, &[Transition::Promote("docker".into())]);
-        assert!(s.is_installed("docker"));
-
-        let mut s = sample();
-        promote(&mut s, &[]);
-        assert_eq!(s.packs["codex"].status, PackStatus::Unconfirmed);
-        promote(&mut s, &["codex".into(), "python".into()]);
-        assert!(s.is_installed("codex"));
-        assert_eq!(s.packs["python"].status, PackStatus::Failed);
-
-        apply(&mut s, &[Transition::Reset]);
-        assert!(s.packs.is_empty());
-        assert_eq!(s.disk, None);
-        assert_eq!(s.image_id, None);
-        assert!(!s.ran_session);
+        apply(&mut state, &[Transition::Promote("a".into())]);
+        assert!(state.is_installed("a"));
+        promote(&mut state, &["b".into()]);
+        assert_eq!(
+            state.packs["b"].status,
+            PackStatus::Kept { confirmed: false }
+        );
     }
 }

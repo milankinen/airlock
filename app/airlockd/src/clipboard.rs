@@ -19,6 +19,7 @@
 //! inline here would wedge the runtime of a process that is PID 1.
 
 use std::io::Write;
+use std::path::PathBuf;
 
 use airlock_common::supervisor_capnp::clipboard;
 use tracing::{debug, info, warn};
@@ -76,10 +77,10 @@ pub fn start(cfg: ClipboardConfig, uid: u32, gid: u32) -> anyhow::Result<()> {
     }
 
     if cfg.copy {
-        tokio::task::spawn_local(copy_loop(sink.clone(), cfg.limit));
+        tokio::task::spawn_local(copy_loop(in_rootfs(COPY_FIFO), sink.clone(), cfg.limit));
     }
     if cfg.paste {
-        tokio::task::spawn_local(paste_loop(sink));
+        tokio::task::spawn_local(paste_loop(in_rootfs(PASTE_FIFO), sink));
     }
 
     info!(
@@ -147,8 +148,7 @@ fn shims(copy: bool, paste: bool) -> Vec<(&'static str, String)> {
 /// the framing: a writer closing the FIFO ends the clipboard operation. The
 /// loop is serial on purpose, so two concurrent `wl-copy` calls queue rather
 /// than interleaving their bytes into one incoherent paste.
-async fn copy_loop(sink: clipboard::Client, limit: u64) {
-    let path = in_rootfs(COPY_FIFO);
+async fn copy_loop(path: PathBuf, sink: clipboard::Client, limit: u64) {
     loop {
         let p = path.clone();
         let read = tokio::task::spawn_blocking(move || read_capped(&p, limit)).await;
@@ -190,8 +190,7 @@ async fn copy_loop(sink: clipboard::Client, limit: u64) {
 /// Opening the write end blocks until a container process opens the read end,
 /// which is the signal to fetch. Fetching only then means the host clipboard
 /// is read on demand rather than polled and cached.
-async fn paste_loop(sink: clipboard::Client) {
-    let path = in_rootfs(PASTE_FIFO);
+async fn paste_loop(path: PathBuf, sink: clipboard::Client) {
     loop {
         let p = path.clone();
         let opened =
@@ -246,78 +245,4 @@ async fn paste_loop(sink: clipboard::Client) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn shim(copy: bool, paste: bool, name: &str) -> String {
-        shims(copy, paste)
-            .into_iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, body)| body)
-            .expect("shim present")
-    }
-
-    /// All four names are always installed — see the note on `shims`.
-    #[test]
-    fn installs_every_known_tool_name() {
-        let names: Vec<_> = shims(true, true).into_iter().map(|(n, _)| n).collect();
-        assert_eq!(names, vec!["wl-copy", "wl-paste", "xclip", "xsel"]);
-    }
-
-    #[test]
-    fn granted_directions_reach_their_fifo() {
-        assert!(shim(true, true, "wl-copy").contains(COPY_FIFO));
-        assert!(shim(true, true, "wl-paste").contains(PASTE_FIFO));
-    }
-
-    /// An ungranted direction must fail fast rather than block on a FIFO
-    /// that nobody serves, or `a || b` fallback chains hang forever.
-    #[test]
-    fn ungranted_copy_exits_nonzero_without_touching_the_fifo() {
-        let s = shim(false, true, "wl-copy");
-        assert!(s.contains("exit 1"), "{s}");
-        assert!(!s.contains(COPY_FIFO), "{s}");
-    }
-
-    #[test]
-    fn ungranted_paste_exits_nonzero_without_touching_the_fifo() {
-        let s = shim(true, false, "wl-paste");
-        assert!(s.contains("exit 1"), "{s}");
-        assert!(!s.contains(PASTE_FIFO), "{s}");
-    }
-
-    /// xclip/xsel serve both directions, so each must route `-o` to paste
-    /// and everything else to copy.
-    #[test]
-    fn dispatch_shims_route_output_flag_to_paste() {
-        for name in ["xclip", "xsel"] {
-            let s = shim(true, true, name);
-            let o = s.find("-o|--output").expect("dispatch arm");
-            let paste = s.find(PASTE_FIFO).expect("paste branch");
-            let copy = s.find(COPY_FIFO).expect("copy branch");
-            assert!(o < paste, "{name}: -o must select the paste branch");
-            assert!(paste < copy, "{name}: copy must be the fallthrough");
-        }
-    }
-
-    #[test]
-    fn every_shim_is_a_sh_script() {
-        for (name, body) in shims(true, true) {
-            assert!(body.starts_with("#!/bin/sh\n"), "{name} lacks a shebang");
-            assert!(body.ends_with('\n'), "{name} lacks a trailing newline");
-        }
-    }
-
-    /// Withholding the sink must disable the bridge even if the flags claim
-    /// a direction — the capability is the grant, not the booleans.
-    #[test]
-    fn missing_sink_is_never_granted() {
-        let cfg = ClipboardConfig {
-            copy: true,
-            paste: true,
-            sink: None,
-            limit: 1024,
-        };
-        assert!(!cfg.granted());
-    }
-}
+mod tests;

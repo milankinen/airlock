@@ -286,73 +286,35 @@ fn open_nofollow(path: &Path) -> io::Result<File> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{SyncDest, sync_file};
+    use crate::test_cfg::temp_dir;
 
-    fn unique_tmp_dir() -> PathBuf {
-        let n = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("airlock-file-sync-test-{n}"));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    /// A directory in the host source path gets swapped with a symlink
-    /// after the sandbox starts. Sync must keep writing into the
-    /// originally pinned parent and never follow the symlink to an
-    /// attacker-chosen location.
     #[test]
-    fn destination_parent_symlink_swap_must_not_redirect_write() {
-        let root = unique_tmp_dir();
-        let project = root.join("project");
-        let safe = project.join("safe");
-        let safe_real = project.join("safe.real");
+    fn sync_after_destination_parent_swapped_for_symlink_writes_to_pinned_parent() {
+        let tmp = temp_dir();
+        let root = tmp.path();
+        let safe = root.join("project/safe");
+        let safe_real = root.join("project/safe.real");
         let outside = root.join("outside");
         let overlay = root.join("overlay");
         fs::create_dir_all(&safe).unwrap();
         fs::create_dir_all(&outside).unwrap();
         fs::create_dir_all(&overlay).unwrap();
-
-        // Destination chosen at startup: parent dir is pinned by FD
-        // *before* anything else has a chance to swap it.
         let source = safe.join(".bashrc");
         fs::write(&source, b"ORIGINAL\n").unwrap();
-        let dest = SyncDest::open(&source).expect("open dest");
-
-        // New content coming from overlay.
+        let dest = SyncDest::open(&source).unwrap();
         let overlay_path = overlay.join("mount_key");
         fs::write(&overlay_path, b"PAYLOAD\n").unwrap();
 
-        // Replace source parent dir with a symlink after startup.
         fs::rename(&safe, &safe_real).unwrap();
         std::os::unix::fs::symlink(&outside, &safe).unwrap();
-
-        // Run sync.
         sync_file(&overlay_path, &dest);
 
-        // outside/.bashrc must not be created — the symlink swap must
-        // not redirect the write.
-        let redirected = outside.join(".bashrc");
-        assert!(
-            !redirected.exists(),
-            "sync followed the planted symlink and wrote outside the pinned parent: {}",
-            redirected.display()
-        );
-
-        // The pinned parent (now reachable at safe.real/) must have
-        // received the new payload — sync should keep working against
-        // the location captured at startup, just not the swapped one.
-        let original = safe_real.join(".bashrc");
+        assert!(!outside.join(".bashrc").exists());
         assert_eq!(
-            fs::read_to_string(&original).unwrap(),
-            "PAYLOAD\n",
-            "sync didn't write to the originally pinned parent"
+            fs::read_to_string(safe_real.join(".bashrc")).unwrap(),
+            "PAYLOAD\n"
         );
-
-        let _ = fs::remove_dir_all(&root);
     }
 }

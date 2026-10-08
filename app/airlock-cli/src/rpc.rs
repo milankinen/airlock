@@ -78,3 +78,6 @@ pub fn set_pty(mut builder: pty_config::Builder<'_>, size: Option<(u16, u16)>) {
         None => builder.set_none(()),
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -259,62 +259,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_plain_char() {
-        assert_eq!(parse_key("q"), Ok((KeyCode::Char('q'), KeyModifiers::NONE)));
-        assert_eq!(parse_key("Q"), Ok((KeyCode::Char('q'), KeyModifiers::NONE)));
+    fn parse_key_reads_names_modifiers_and_any_case() {
+        for (spec, code, mods) in [
+            ("q", KeyCode::Char('q'), KeyModifiers::NONE),
+            ("Q", KeyCode::Char('q'), KeyModifiers::NONE),
+            ("ctrl+d", KeyCode::Char('d'), KeyModifiers::CONTROL),
+            ("shift+a", KeyCode::Char('a'), KeyModifiers::NONE),
+            ("shift+tab", KeyCode::Tab, KeyModifiers::SHIFT),
+            ("enter", KeyCode::Enter, KeyModifiers::NONE),
+            ("f2", KeyCode::F(2), KeyModifiers::NONE),
+            ("PageUp", KeyCode::PageUp, KeyModifiers::NONE),
+        ] {
+            assert_eq!(parse_key(spec), Ok((code, mods)), "{spec}");
+        }
     }
 
     #[test]
-    fn parse_ctrl_d() {
-        assert_eq!(
-            parse_key("ctrl+d"),
-            Ok((KeyCode::Char('d'), KeyModifiers::CONTROL))
-        );
-    }
-
-    #[test]
-    fn parse_named_keys() {
-        assert_eq!(parse_key("enter"), Ok((KeyCode::Enter, KeyModifiers::NONE)));
-        assert_eq!(parse_key("f2"), Ok((KeyCode::F(2), KeyModifiers::NONE)));
-        assert_eq!(
-            parse_key("PageUp"),
-            Ok((KeyCode::PageUp, KeyModifiers::NONE))
-        );
-    }
-
-    #[test]
-    fn parse_shift_tab() {
-        assert_eq!(
-            parse_key("shift+tab"),
-            Ok((KeyCode::Tab, KeyModifiers::SHIFT))
-        );
-    }
-
-    #[test]
-    fn shift_stripped_for_chars() {
-        // Crossterm reports shifted letters as plain uppercase chars
-        // with no SHIFT modifier — make sure binding `shift+a` matches.
-        let (code, mods) = parse_key("shift+a").unwrap();
-        assert_eq!(code, KeyCode::Char('a'));
-        assert_eq!(mods, KeyModifiers::NONE);
-    }
-
-    #[test]
-    fn unknown_modifier_errors() {
-        assert!(parse_key("hyper+x").is_err());
-    }
-
-    #[test]
-    fn unknown_key_errors() {
-        assert!(parse_key("ctrl+nope").is_err());
-    }
-
-    #[test]
-    fn bindings_lookup() {
-        let b = KeyBindings::defaults();
-        let evt = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
-        assert_eq!(b.lookup(&evt), Some(Action::Back));
-        let evt = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
-        assert_eq!(b.lookup(&evt), Some(Action::KillSandbox));
+    fn parse_key_with_unknown_part_is_error() {
+        for spec in ["hyper+x", "ctrl+nope", "f13", "", "ctrl+"] {
+            assert!(parse_key(spec).is_err(), "{spec}");
+        }
     }
 }

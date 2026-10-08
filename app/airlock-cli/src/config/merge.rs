@@ -141,3 +141,46 @@ fn merge_pack_value(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn packs_setting_same_path_differently_conflict_naming_owner() {
+        let docs = [
+            (
+                "a",
+                json!({
+                    "vm": { "image": "x", "cpus": null },
+                    "mounts": { "m": { "source": "s" } },
+                    "rules": { "r": { "allow": ["1"] } },
+                }),
+            ),
+            (
+                "b",
+                json!({
+                    "vm": { "image": "x", "cpus": 2 },
+                    "rules": { "r": { "allow": ["2"] } },
+                }),
+            ),
+            (
+                "c",
+                json!({
+                    "vm": { "cpus": 4 },
+                    "mounts": { "m": { "source": "t", "target": "u" } },
+                }),
+            ),
+        ]
+        .map(|(name, doc)| (name.to_string(), doc));
+        assert_eq!(
+            pack_conflicts(&docs),
+            [
+                "packs a and c both set `mounts.m.source` (\"s\" vs \"t\")",
+                "packs b and c both set `vm.cpus` (2 vs 4)",
+            ]
+        );
+    }
+}

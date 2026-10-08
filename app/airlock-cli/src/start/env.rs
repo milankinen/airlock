@@ -16,40 +16,31 @@ pub fn check_env_early(config: &ConfigValues, vault: &Vault) -> Result<(), Exit>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::resolve_project_toml;
+    use crate::test_cfg::resolve_project_toml;
+    use crate::vault::VaultStorageType;
 
-    fn vault() -> Vault {
-        Vault::new_with(
-            Box::new(crate::vault::DisabledStorage),
-            std::collections::HashMap::new(),
-            crate::vault::VaultStorageType::Disabled,
-        )
-    }
-
-    /// The claude and codex packs need no `[env]` credential (their
-    /// services sign in through the proxy): the check passes. A missing
-    /// variable of the user's own `[env]` still fails, and so does the
-    /// token of the list form, which is plain config.
     #[test]
-    fn early_env_check_fails_only_on_missing_env_entries() {
+    fn early_env_check_fails_only_on_missing_env_variables() {
+        let vault = Vault::for_storage_type(VaultStorageType::Disabled);
         let toml = "[packs]\nclaude = { version = 1 }\ncodex = { version = 1 }\n";
-        let resolved = resolve_project_toml(toml).unwrap();
-        check_env_early(&resolved.values, &vault()).unwrap();
-
-        let toml =
-            "[packs]\nclaude = { version = 1 }\n[env]\nMINE = \"${AIRLOCK_TEST_UNSET_VAR}\"\n";
-        let config = resolve_project_toml(toml).unwrap().values;
-        let Err(e) = crate::project::resolve_env(&config, &vault()) else {
-            panic!("the variable is not set");
-        };
-        assert_eq!(e.name, "MINE");
-
-        let config = resolve_project_toml("presets = [\"claude-code\"]\n")
-            .unwrap()
-            .values;
-        let Err(e) = crate::project::resolve_env(&config, &vault()) else {
-            panic!("the variable is not set");
-        };
-        assert_eq!(e.name, "CLAUDE_CODE_OAUTH_TOKEN");
+        let values = resolve_project_toml(toml).unwrap().values;
+        check_env_early(&values, &vault).unwrap();
+        for (toml, missing) in [
+            (
+                "[packs]\nclaude = { version = 1 }\n[env]\nMINE = \"${AIRLOCK_TEST_UNSET_VAR}\"\n",
+                "MINE",
+            ),
+            ("presets = [\"claude-code\"]\n", "CLAUDE_CODE_OAUTH_TOKEN"),
+        ] {
+            let values = resolve_project_toml(toml).unwrap().values;
+            assert!(matches!(
+                check_env_early(&values, &vault),
+                Err(Exit::Code(2))
+            ));
+            let Err(e) = crate::project::resolve_env(&values, &vault) else {
+                panic!("{missing} resolves");
+            };
+            assert_eq!(e.name, missing);
+        }
     }
 }

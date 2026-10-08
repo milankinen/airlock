@@ -76,6 +76,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 url = { workspace = true }
 
 [dev-dependencies]
+airlock-test-utils = { workspace = true, features = ["http", "rpc", "tls"] }
 axum = { workspace = true }
 rustls-pemfile = { workspace = true }
 tempfile = { workspace = true }

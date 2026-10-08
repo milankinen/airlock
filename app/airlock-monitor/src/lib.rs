@@ -26,7 +26,8 @@ pub use input::{TuiInputEvent, TuiStdin};
 pub use keys::{Action, KeyBindings};
 pub use network_control::{NetworkControl, Policy};
 use pty::{MouseProtocolMode, TuiTerminalSink};
-use ratatui::DefaultTerminal;
+use ratatui::backend::Backend;
+use ratatui::{DefaultTerminal, Terminal};
 pub use settings::TuiSettings;
 pub use ui::TAB_BAR_HEIGHT;
 
@@ -369,15 +370,18 @@ fn run_tui_loop(
 
 /// Process a single TUI event. Returns `Some(exit_code)` if the TUI should exit.
 #[allow(clippy::too_many_arguments)]
-fn handle_event(
+fn handle_event<B: Backend>(
     event: TuiEvent,
     app: &mut App,
     sink: &mut TuiTerminalSink,
     stdin_tx: &tokio::sync::mpsc::Sender<TuiInputEvent>,
     sig_tx: &tokio::sync::mpsc::Sender<i32>,
-    terminal: &mut DefaultTerminal,
+    terminal: &mut Terminal<B>,
     kitty_enabled: bool,
-) -> anyhow::Result<Option<i32>> {
+) -> anyhow::Result<Option<i32>>
+where
+    B::Error: Send + Sync + 'static,
+{
     match event {
         TuiEvent::Output(data) => {
             scan_bracketed_paste_mode(&data, &mut app.guest_bracketed_paste);
@@ -614,13 +618,16 @@ fn guest_owns_mouse(app: &App, sink: &TuiTerminalSink) -> bool {
     app.active_tab == Tab::Sandbox && sink.mouse_protocol_mode() != MouseProtocolMode::None
 }
 
-fn handle_mouse(
+fn handle_mouse<B: Backend>(
     mouse: MouseEvent,
     app: &mut App,
     sink: &mut TuiTerminalSink,
     stdin_tx: &tokio::sync::mpsc::Sender<TuiInputEvent>,
-    terminal: &mut DefaultTerminal,
-) -> anyhow::Result<()> {
+    terminal: &mut Terminal<B>,
+) -> anyhow::Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
     let size = terminal.size()?;
     let size = ratatui::layout::Rect::new(0, 0, size.width, size.height);
 
@@ -783,29 +790,6 @@ fn key_to_bytes(key: KeyEvent, kitty_enabled: bool) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The hint is transient: visible right after a click, gone once the
-    /// window has passed. Checked against the same helper the status line
-    /// uses, so the two cannot drift.
-    #[test]
-    fn select_hint_expires_after_its_window() {
-        let now = std::time::Instant::now();
-        assert!(ui::select_hint_visible(Some(now), now));
-        assert!(ui::select_hint_visible(
-            Some(now),
-            now + Duration::from_millis(1_900)
-        ));
-        assert!(!ui::select_hint_visible(
-            Some(now),
-            now + Duration::from_millis(2_100)
-        ));
-    }
-
-    /// Before the first click there is nothing to advertise.
-    #[test]
-    fn no_hint_before_any_click() {
-        assert!(!ui::select_hint_visible(None, std::time::Instant::now()));
-    }
-}
+mod test_cfg;
+#[cfg(test)]
+mod tests;

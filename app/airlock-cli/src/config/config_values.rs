@@ -1023,3 +1023,31 @@ fn validate_network(config: &ConfigValues) -> anyhow::Result<()> {
         anyhow::bail!("invalid configuration\n{}", problems.join("\n"));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pinned_digest_is_found_only_in_well_formed_references() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        for name in [
+            format!("alpine@{digest}"),
+            format!("alpine:3.20@{digest}"),
+            format!("localhost:5005/alpine:3@{digest}"),
+        ] {
+            assert_eq!(ImageRef::auto(name).pinned_digest(), Some(digest.as_str()));
+        }
+        for name in [
+            "alpine".to_string(),
+            "alpine:3.20".to_string(),
+            "localhost:5005/alpine:3".to_string(),
+            "alpine@sha256".to_string(),
+            "alpine@sha256:abc".to_string(),
+            format!("alpine@sha256:{}", "z".repeat(64)),
+            format!("@{digest}"),
+        ] {
+            assert_eq!(ImageRef::auto(name.clone()).pinned_digest(), None, "{name}");
+        }
+    }
+}

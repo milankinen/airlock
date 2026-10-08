@@ -377,96 +377,64 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     use super::*;
-    use crate::test_support::TempDir;
+    use crate::test_cfg::temp_dir;
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
 
     #[test]
-    fn open_creates_missing_dirs_owner_only() {
-        let tmp = TempDir::new("safe-fs-create");
+    fn pinned_dir_stores_files_owner_only_within_size_cap() {
+        let tmp = temp_dir();
         let dir = PinnedDir::open(tmp.path(), Path::new("a/b"), true).unwrap();
         assert_eq!(
             dir.path(),
             std::fs::canonicalize(tmp.path()).unwrap().join("a/b")
         );
-        let mode = std::fs::metadata(tmp.path().join("a/b"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o700);
+        assert_eq!(mode(&tmp.path().join("a/b")), 0o700);
         assert!(PinnedDir::open(tmp.path(), Path::new("missing"), false).is_err());
-        assert!(PinnedDir::open(tmp.path(), Path::new("../x"), true).is_err());
+
+        dir.write_atomic("state.json", b"1", 0o600).unwrap();
+        dir.write_atomic("state.json", &[b'a'; 10], 0o600).unwrap();
+        assert_eq!(mode(&tmp.path().join("a/b/state.json")), 0o600);
+        let names: Vec<_> = std::fs::read_dir(tmp.path().join("a/b"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["state.json"]);
+        assert_eq!(dir.read("state.json", 10).unwrap().unwrap().len(), 10);
+        assert!(dir.read("state.json", 9).is_err());
+        assert!(dir.read("missing", 9).unwrap().is_none());
+
+        assert!(dir.remove("state.json").unwrap());
+        assert!(!dir.remove("state.json").unwrap());
     }
 
     #[test]
-    fn symlinked_parent_is_refused() {
-        let tmp = TempDir::new("safe-fs-parent");
+    fn pinned_dir_never_leaves_its_directory() {
+        let tmp = temp_dir();
         let outside = tmp.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::create_dir_all(tmp.path().join("home")).unwrap();
         symlink(&outside, tmp.path().join("home/codex")).unwrap();
         let err = PinnedDir::open(tmp.path(), Path::new("home/codex"), true)
             .err()
-            .expect("a symlinked directory must not be opened");
-        // Linux reports ENOTDIR for O_DIRECTORY|O_NOFOLLOW on a symlink,
-        // macOS ELOOP.
+            .unwrap();
         assert!(
             matches!(err.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)),
             "{err}"
         );
-    }
+        assert!(PinnedDir::open(tmp.path(), Path::new("../x"), true).is_err());
 
-    #[test]
-    fn symlinked_file_is_refused_for_read_and_append() {
-        let tmp = TempDir::new("safe-fs-target");
         let dir = PinnedDir::open(tmp.path(), Path::new("d"), true).unwrap();
         let victim = tmp.path().join("victim");
         std::fs::write(&victim, b"host secret").unwrap();
         symlink(&victim, tmp.path().join("d/auth.json")).unwrap();
-
         assert!(dir.read("auth.json", 1024).is_err());
         assert!(dir.open_append("auth.json", 0o600).is_err());
-        assert_eq!(std::fs::read(&victim).unwrap(), b"host secret");
-
-        // An atomic write replaces the link itself, never its target.
+        assert!(dir.read("../victim", 1024).is_err());
         dir.write_atomic("auth.json", b"new", 0o600).unwrap();
         assert_eq!(std::fs::read(&victim).unwrap(), b"host secret");
         assert_eq!(dir.read("auth.json", 1024).unwrap().unwrap(), b"new");
-    }
-
-    #[test]
-    fn read_enforces_the_size_cap() {
-        let tmp = TempDir::new("safe-fs-cap");
-        let dir = PinnedDir::open(tmp.path(), Path::new("d"), true).unwrap();
-        dir.write_atomic("f", &[b'a'; 10], 0o600).unwrap();
-        assert_eq!(dir.read("f", 10).unwrap().unwrap().len(), 10);
-        assert!(dir.read("f", 9).is_err());
-        assert!(dir.read("missing", 9).unwrap().is_none());
-    }
-
-    #[test]
-    fn write_atomic_sets_the_mode_and_leaves_no_temp_files() {
-        let tmp = TempDir::new("safe-fs-atomic");
-        let dir = PinnedDir::open(tmp.path(), Path::new("d"), true).unwrap();
-        dir.write_atomic("state.json", b"1", 0o600).unwrap();
-        dir.write_atomic("state.json", b"2", 0o600).unwrap();
-        let mode = std::fs::metadata(tmp.path().join("d/state.json"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600);
-        let names: Vec<_> = std::fs::read_dir(tmp.path().join("d"))
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert_eq!(names, vec![std::ffi::OsString::from("state.json")]);
-    }
-
-    #[test]
-    fn remove_stays_in_the_directory() {
-        let tmp = TempDir::new("safe-fs-remove");
-        let dir = PinnedDir::open(tmp.path(), Path::new("d"), true).unwrap();
-        dir.write_atomic("b", b"1", 0o600).unwrap();
-        assert!(dir.remove("b").unwrap());
-        assert!(!dir.remove("b").unwrap());
-        assert!(dir.read("../x", 8).is_err());
     }
 }

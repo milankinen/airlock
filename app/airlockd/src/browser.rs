@@ -13,6 +13,8 @@
 //! Both paths live on the per-boot `/run/airlock` tmpfs, so no shim is left
 //! behind in the persisted rootfs for later boots.
 
+use std::path::PathBuf;
+
 use airlock_common::supervisor_capnp::browser;
 use airlock_common::{BROWSER_FIFO, BROWSER_SHIM, BROWSER_URL_MAX};
 use tracing::{debug, info, warn};
@@ -41,7 +43,7 @@ pub fn start(cfg: BrowserConfig, uid: u32, gid: u32) -> anyhow::Result<()> {
 
     make_fifo(BROWSER_FIFO, uid, gid)?;
     install_shim(BROWSER_SHIM, &shim_body(BROWSER_FIFO))?;
-    tokio::task::spawn_local(open_loop(sink));
+    tokio::task::spawn_local(open_loop(in_rootfs(BROWSER_FIFO), sink));
 
     info!("browser: bridge ready");
     Ok(())
@@ -65,8 +67,7 @@ fn shim_body(fifo: &str) -> String {
 /// serial and never exits: every failure is logged and the next cycle
 /// starts, so a hostile writer cannot switch the bridge off for later,
 /// legitimate calls.
-async fn open_loop(sink: browser::Client) {
-    let path = in_rootfs(BROWSER_FIFO);
+async fn open_loop(path: PathBuf, sink: browser::Client) {
     loop {
         let p = path.clone();
         let read = tokio::task::spawn_blocking(move || read_capped(&p, READ_LIMIT)).await;
@@ -126,89 +127,21 @@ fn url_host(url: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    mod test_open_url;
+
     use super::*;
 
     #[test]
-    fn shim_is_a_sh_script_writing_to_the_fifo() {
-        let s = shim_body(BROWSER_FIFO);
-        assert!(s.starts_with("#!/bin/sh\n"), "{s}");
-        assert!(s.ends_with('\n'), "{s}");
-        assert!(
-            s.contains("printf '%s\\n' \"$1\" > /run/airlock/browser.open"),
-            "{s}"
-        );
-    }
-
-    /// Run the real shim body with `sh`, pointed at a plain file instead of
-    /// the FIFO, and return (exit status, what it wrote).
-    fn run_shim(arg: Option<&str>) -> (i32, Option<String>) {
-        static RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let n = RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("airlock-browser-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let out = dir.join("out");
-        let script = dir.join("shim");
-        std::fs::remove_file(&out).ok();
-        std::fs::write(&script, shim_body(out.to_str().unwrap())).unwrap();
-
-        let mut cmd = std::process::Command::new("sh");
-        cmd.arg(&script);
-        if let Some(a) = arg {
-            cmd.arg(a);
-        }
-        let status = cmd.status().unwrap().code().unwrap_or(-1);
-        let written = std::fs::read_to_string(&out).ok();
-        std::fs::remove_dir_all(&dir).ok();
-        (status, written)
-    }
-
-    #[test]
-    fn shim_forwards_http_and_https() {
-        for url in ["https://claude.com/x?a=1&b=2", "http://localhost:1455/y"] {
-            assert_eq!(run_shim(Some(url)), (0, Some(format!("{url}\n"))), "{url}");
-        }
-    }
-
-    #[test]
-    fn shim_rejects_other_schemes_and_no_argument() {
-        for arg in [
-            Some("file:///etc/passwd"),
-            Some("javascript:alert(1)"),
-            Some("-h"),
-            Some(""),
-            None,
+    fn url_host_drops_userinfo_port_path_query_and_fragment() {
+        for (url, host) in [
+            (
+                "https://claude.com/cai/oauth/authorize?state=s",
+                "claude.com",
+            ),
+            ("http://user:pw@localhost:1455/cb#f", "localhost"),
+            ("https://auth.openai.com?x=1", "auth.openai.com"),
         ] {
-            assert_eq!(run_shim(arg), (1, None), "{arg:?}");
+            assert_eq!(url_host(url), host, "{url}");
         }
-    }
-
-    #[test]
-    fn urls_keeps_only_http_lines() {
-        let payload = "https://a.example/x\r\n\nftp://b.example/\nhttp://c.example\n  \n";
-        let got: Vec<_> = urls(payload).collect();
-        assert_eq!(got, vec!["https://a.example/x", "http://c.example"]);
-    }
-
-    #[test]
-    fn urls_drops_oversized_lines() {
-        let long = format!("https://a.example/{}", "x".repeat(BROWSER_URL_MAX));
-        let payload = format!("{long}\nhttps://ok.example/\n");
-        let got: Vec<_> = urls(&payload).collect();
-        assert_eq!(got, vec!["https://ok.example/"]);
-    }
-
-    #[test]
-    fn url_host_strips_everything_but_the_host() {
-        assert_eq!(
-            url_host("https://claude.com/cai/oauth/authorize?state=s"),
-            "claude.com"
-        );
-        assert_eq!(url_host("http://user:pw@localhost:1455/cb#f"), "localhost");
-        assert_eq!(url_host("https://auth.openai.com?x=1"), "auth.openai.com");
-    }
-
-    #[test]
-    fn missing_sink_is_a_noop() {
-        assert!(start(BrowserConfig { sink: None }, 0, 0).is_ok());
     }
 }

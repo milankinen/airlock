@@ -57,3 +57,6 @@ pub fn init_logging(host_cwd: &Path, level: LogLevel) -> Result<(), Exit> {
     info!("airlock version {}", cli::version_string(true));
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

@@ -17,6 +17,9 @@ pub mod server;
 pub mod state;
 pub mod tool_tracker;
 
+#[cfg(test)]
+mod tests;
+
 pub use deny_tracker::DenyTracker;
 pub use server::start;
 pub use state::AdminState;

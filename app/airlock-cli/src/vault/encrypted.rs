@@ -327,50 +327,34 @@ mod tests {
 
     use super::{
         ARGON2_M_KIB, ARGON2_P, ARGON2_T, EncryptedBlob, EncryptedFileStorage, Envelope, KdfParams,
-        MAX_ARGON2_M_KIB, NONCE_BYTES, PassphraseSource, SALT_BYTES, Storage, atomic_write,
+        MAX_ARGON2_M_KIB, NONCE_BYTES, SALT_BYTES, Storage, atomic_write,
     };
+    use crate::test_cfg::temp_dir;
+    use crate::test_cfg::vault::FixedPassphrase;
 
-    struct Fixed(&'static str);
-    impl PassphraseSource for Fixed {
-        fn unlock(&self) -> anyhow::Result<String> {
-            Ok(self.0.to_string())
-        }
-        fn create(&self) -> anyhow::Result<String> {
-            Ok(self.0.to_string())
-        }
+    fn load_envelope(envelope: &Envelope, pass: &'static str) -> anyhow::Result<Option<String>> {
+        let tmp = temp_dir();
+        let path = tmp.path().join("vault.enc.json");
+        atomic_write(
+            &path,
+            serde_json::to_string_pretty(envelope).unwrap().as_bytes(),
+        )
+        .unwrap();
+        EncryptedFileStorage::new(path, Box::new(FixedPassphrase(pass))).load()
     }
 
-    fn tmp(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "airlock-vault-kdf-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(name)
-    }
-
-    /// Hand-write a vault whose KDF params differ from the current constants
-    /// and confirm it still decrypts — i.e. load() derives with the file's
-    /// params, not the compile-time constants.
     #[test]
-    fn load_uses_file_kdf_params_not_constants() {
-        let path = tmp("v.enc.json");
-        let pass = "hunter2";
+    fn vault_file_decrypts_with_kdf_params_stored_in_it() {
         let salt = [7u8; SALT_BYTES];
-        let t = ARGON2_T + 1; // deliberately not the default
-
-        let key = EncryptedFileStorage::derive_key(pass, &salt, ARGON2_M_KIB, t, ARGON2_P).unwrap();
+        let t = ARGON2_T + 1;
+        let key =
+            EncryptedFileStorage::derive_key("hunter2", &salt, ARGON2_M_KIB, t, ARGON2_P).unwrap();
         let mut nonce = [0u8; NONCE_BYTES];
         nonce[0] = 1;
         let plaintext = r#"{"secrets":{},"registries":{}}"#;
         let ct = ChaCha20Poly1305::new(<&Key>::from(&key))
             .encrypt(<&Nonce>::from(&nonce), plaintext.as_bytes())
             .unwrap();
-
         let envelope = Envelope::EncryptedFile(EncryptedBlob {
             kdf: KdfParams {
                 algo: "argon2id".to_string(),
@@ -382,23 +366,15 @@ mod tests {
             nonce: STANDARD_NO_PAD.encode(nonce),
             ciphertext: STANDARD_NO_PAD.encode(&ct),
         });
-        atomic_write(
-            &path,
-            serde_json::to_string_pretty(&envelope).unwrap().as_bytes(),
-        )
-        .unwrap();
 
-        let out = EncryptedFileStorage::new(path, Box::new(Fixed(pass)))
-            .load()
-            .expect("decrypt with file params");
-        assert_eq!(out.as_deref(), Some(plaintext));
+        assert_eq!(
+            load_envelope(&envelope, "hunter2").unwrap().as_deref(),
+            Some(plaintext)
+        );
     }
 
-    /// A vault claiming absurd KDF params must be refused, not attempted
-    /// (a hostile file could otherwise force a huge allocation).
     #[test]
-    fn load_rejects_out_of_bounds_kdf_params() {
-        let path = tmp("v2.enc.json");
+    fn vault_file_with_out_of_bounds_kdf_params_is_refused() {
         let envelope = Envelope::EncryptedFile(EncryptedBlob {
             kdf: KdfParams {
                 algo: "argon2id".to_string(),
@@ -410,15 +386,8 @@ mod tests {
             nonce: STANDARD_NO_PAD.encode([0u8; NONCE_BYTES]),
             ciphertext: STANDARD_NO_PAD.encode([0u8; 32]),
         });
-        atomic_write(
-            &path,
-            serde_json::to_string_pretty(&envelope).unwrap().as_bytes(),
-        )
-        .unwrap();
 
-        let err = EncryptedFileStorage::new(path, Box::new(Fixed("pw")))
-            .load()
-            .unwrap_err();
-        assert!(err.to_string().contains("out of bounds"), "got: {err:#}");
+        let err = load_envelope(&envelope, "pw").unwrap_err();
+        assert!(err.to_string().contains("out of bounds"), "{err:#}");
     }
 }

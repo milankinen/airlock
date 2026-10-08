@@ -34,23 +34,3 @@ impl DenyTracker {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn empty_before_first_report() {
-        let t = DenyTracker::new();
-        assert_eq!(t.last(), None);
-    }
-
-    #[test]
-    fn record_updates_latest() {
-        let t = DenyTracker::new();
-        t.record(1000);
-        assert_eq!(t.last(), Some(1000));
-        t.record(2000);
-        assert_eq!(t.last(), Some(2000));
-    }
-}

@@ -77,29 +77,27 @@ fn rotate_log(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TempDir;
+    use crate::test_cfg::temp_dir;
 
-    /// A second `init` (a second boot in the same process) must not panic,
-    /// and must not create a second log file.
     #[test]
-    fn init_twice_is_a_no_op() {
-        let first = TempDir::new("logging-first");
-        let second = TempDir::new("logging-second");
+    fn init_trims_oversized_log_to_its_tail_and_later_calls_do_nothing() {
+        let first = temp_dir();
+        let second = temp_dir();
+        let path = first.path().join("airlock.log");
+        let mut content = vec![b'a'; 10];
+        content.extend(vec![b'b'; usize::try_from(LOG_MAX_BYTES).unwrap()]);
+        std::fs::write(&path, &content).unwrap();
+
         init(LogLevel::Info, first.path());
         init(LogLevel::Debug, second.path());
-        assert!(!second.path().join("airlock.log").exists());
-    }
 
-    #[test]
-    fn rotate_keeps_the_tail() {
-        let dir = TempDir::new("logging-rotate");
-        let path = dir.path().join("airlock.log");
-        let mut content = vec![b'a'; 10];
-        content.extend(vec![b'b'; LOG_MAX_BYTES as usize]);
-        std::fs::write(&path, &content).unwrap();
-        rotate_log(&path);
         let after = std::fs::read(&path).unwrap();
-        assert_eq!(after.len() as u64, LOG_MAX_BYTES);
-        assert!(after.iter().all(|&b| b == b'b'));
+        assert!(after.len() as u64 >= LOG_MAX_BYTES);
+        assert!(
+            after[..usize::try_from(LOG_MAX_BYTES).unwrap()]
+                .iter()
+                .all(|&b| b == b'b')
+        );
+        assert!(!second.path().join("airlock.log").exists());
     }
 }

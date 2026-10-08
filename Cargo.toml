@@ -1,5 +1,11 @@
 [workspace]
-members = ["app/airlock-cli", "app/airlock-common", "app/airlockd", "app/airlock-monitor"]
+members = [
+    "app/airlock-cli",
+    "app/airlock-common",
+    "app/airlockd",
+    "app/airlock-monitor",
+    "app/airlock-test-utils",
+]
 resolver = "3"
 
 [workspace.package]
@@ -136,6 +142,7 @@ vt100 = "0.16"
 # Internal
 airlock-common = { path = "app/airlock-common" }
 airlock-monitor = { path = "app/airlock-monitor" }
+airlock-test-utils = { path = "app/airlock-test-utils" }
 
 [workspace.lints.clippy]
 pedantic = { level = "deny", priority = -1 }

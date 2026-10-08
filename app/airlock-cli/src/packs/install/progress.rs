@@ -167,7 +167,7 @@ impl InstallProgress {
     /// The spinner message: `<label>: <status>`, with ` [<step>/<steps>]`
     /// when the status is a step, and with `--verbose` the last log lines
     /// under it.
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         let label = &self.label;
         let mut msg = match (&self.status, self.steps.filter(|_| self.step > 0)) {
             (None, _) => label.clone(),
@@ -281,7 +281,7 @@ impl OutputSink for InstallProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TempDir;
+    use crate::test_cfg::temp_dir;
 
     fn progress(log: Option<File>, verbose: bool) -> InstallProgress {
         let mut p = InstallProgress::new(ProgressBar::hidden(), log, verbose);
@@ -290,38 +290,33 @@ mod tests {
     }
 
     #[test]
-    fn status_lines_are_parsed_across_chunks() {
-        let mut p = progress(None, false);
-        p.stdout(b"status down");
-        assert_eq!(p.status(), None);
+    fn status_lines_split_across_chunks_are_sanitized_and_capped() {
+        let mut p = progress(None, true);
+        p.stdout(b"hello\nstatus\nstatus   \nSTATUS x\nstatus down");
+        assert_eq!(p.message(), "Python");
         p.stdout(b"loading\nstat");
-        assert_eq!(p.status(), Some("downloading"));
         assert_eq!(p.message(), "Python: downloading");
         p.stdout(b"us \x1b[31minstalling\x1b[0m\n");
         assert_eq!(p.status(), Some("installing"));
-        // Status text is not log text.
-        assert_eq!(p.tail().count(), 0);
-    }
-
-    #[test]
-    fn non_status_stdout_is_ignored() {
-        let mut p = progress(None, true);
-        p.stdout(b"hello\nstatus\nstatus   \nSTATUS x\n");
-        assert_eq!(p.status(), None);
-        assert_eq!(p.tail().count(), 0);
-        assert_eq!(p.message(), "Python");
-    }
-
-    #[test]
-    fn status_is_capped() {
-        let mut p = progress(None, false);
-        let long = format!("status {}\n", "x".repeat(1000));
-        p.stdout(long.as_bytes());
+        p.stdout(format!("status {}\n", "x".repeat(1000)).as_bytes());
         assert_eq!(p.status().unwrap().chars().count(), MAX_STATUS);
+        assert_eq!(p.tail().count(), 0);
     }
 
     #[test]
-    fn stderr_is_stripped_and_the_tail_is_bounded() {
+    fn declared_steps_number_status_lines_up_to_count() {
+        let mut p = progress(None, false);
+        p.stdout(b"steps 0\nsteps 100\nsteps 2x\nstatus first\n");
+        assert_eq!(p.message(), "Python: first");
+        p.begin("python", "Python");
+        p.stdout(b"steps 2\nsteps 5\nstatus one\n");
+        assert_eq!(p.message(), "Python: one [1/2]");
+        p.stdout(b"status two\nstatus three\n");
+        assert_eq!(p.message(), "Python: three [2/2]");
+    }
+
+    #[test]
+    fn stderr_lines_are_sanitized_and_tail_keeps_last_lines() {
         let mut p = progress(None, false);
         p.stderr(b"\x1b[31mred\x1b[0m\r50%\r100%\n");
         assert_eq!(p.tail().collect::<Vec<_>>(), ["red", "50%", "100%"]);
@@ -334,13 +329,12 @@ mod tests {
         assert_eq!(tail.len(), TAIL_LINES);
         assert_eq!(tail.last(), Some(&"unterminated"));
         assert_eq!(tail[0], "line 61");
-        // The next pack starts with an empty tail.
         p.begin("rust", "Rust");
         assert_eq!(p.tail().count(), 0);
     }
 
     #[test]
-    fn verbose_shows_a_rolling_window() {
+    fn verbose_window_shows_last_lines_cut_to_width() {
         let mut p = progress(None, true);
         for i in 0..8 {
             p.stderr(format!("line {i}\n").as_bytes());
@@ -351,22 +345,19 @@ mod tests {
         assert_eq!(lines[0], "Python");
         assert!(lines[1].contains("line 3"), "{msg}");
         assert!(lines[WINDOW].contains("line 7"), "{msg}");
-        // Long lines are cut.
         p.stderr(format!("{}\n", "y".repeat(500)).as_bytes());
         assert!(p.message().lines().last().unwrap().len() < 200);
-        // Without --verbose, no window.
-        let mut q = progress(None, false);
-        q.stderr(b"one\ntwo\n");
-        assert_eq!(q.message(), "Python");
+        let mut quiet = progress(None, false);
+        quiet.stderr(b"one\ntwo\n");
+        assert_eq!(quiet.message(), "Python");
     }
 
     #[test]
-    fn log_is_prefixed_and_capped() {
-        let tmp = TempDir::new("packs-progress-log");
+    fn log_stops_at_cap_with_truncation_marker() {
+        let tmp = temp_dir();
         let path = tmp.path().join(INSTALLS_LOG);
         let mut p = progress(Some(File::create(&path).unwrap()), false);
         p.stderr(b"first\n");
-        p.stdout(b"status not logged\n");
         p.log_cap = 100;
         for _ in 0..50 {
             p.stderr(b"0123456789\n");
@@ -374,7 +365,6 @@ mod tests {
         p.finish();
         let log = std::fs::read_to_string(&path).unwrap();
         assert!(log.starts_with("[python] first\n"), "{log}");
-        assert!(!log.contains("not logged"));
         assert!(log.len() < 200, "{}", log.len());
         assert!(log.ends_with("[airlock: log truncated]\n"));
     }

@@ -20,3 +20,6 @@ terminput-crossterm = { workspace = true }
 tokio = { workspace = true, features = ["sync", "macros", "time", "rt"] }
 tracing = { workspace = true }
 vt100 = { workspace = true }
+
+[dev-dependencies]
+airlock-test-utils = { workspace = true }

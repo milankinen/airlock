@@ -36,23 +36,3 @@ impl ToolTracker {
         self.starts.remove(tool_use_id).map(|(_, v)| v)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn take_missing_returns_none() {
-        let t = ToolTracker::new();
-        assert_eq!(t.take("missing"), None);
-    }
-
-    #[test]
-    fn record_then_take_yields_start() {
-        let t = ToolTracker::new();
-        t.record("abc", 42);
-        assert_eq!(t.take("abc"), Some(42));
-        // Second take after removal yields None.
-        assert_eq!(t.take("abc"), None);
-    }
-}

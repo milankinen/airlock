@@ -1,0 +1,31 @@
+[package]
+name = "airlock-test-utils"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+http = ["dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower"]
+tls = ["http", "dep:rcgen", "dep:rustls", "dep:rustls-pemfile", "dep:tokio-rustls"]
+rpc = ["dep:capnp", "dep:capnp-rpc", "dep:tokio-util"]
+
+[dependencies]
+futures = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "macros"] }
+
+axum = { workspace = true, optional = true }
+capnp = { workspace = true, optional = true }
+capnp-rpc = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }

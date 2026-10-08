@@ -90,14 +90,14 @@ impl Answers {
 }
 
 /// What the wizard works with.
-struct Input<'a> {
-    host_cwd: &'a Path,
-    packs: &'a PackManager,
+pub(super) struct Input<'a> {
+    pub(super) host_cwd: &'a Path,
+    pub(super) packs: &'a PackManager,
     /// The user files (the project has no config yet), with which the
     /// answers must resolve (see [`check_answers`]).
-    config: &'a LayeredConfig,
+    pub(super) config: &'a LayeredConfig,
     /// The vault that resolves `[env]` (see [`check_answers`]).
-    vault: &'a Vault,
+    pub(super) vault: &'a Vault,
 }
 
 /// Load the project's config files, or (a project without one, see
@@ -243,7 +243,7 @@ async fn run_view(
 /// packs set a value differently, see [`LayeredConfig::resolve`]), and so
 /// does its `[env]` (each host variable that it names is set, see
 /// [`crate::project::resolve_env`]).
-async fn check_answers(input: &Input<'_>, answers: &Answers) -> anyhow::Result<()> {
+pub(super) async fn check_answers(input: &Input<'_>, answers: &Answers) -> anyhow::Result<()> {
     let config = input
         .config
         .clone()
@@ -258,98 +258,18 @@ async fn check_answers(input: &Input<'_>, answers: &Answers) -> anyhow::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packs::ArgValue;
-    use crate::test_support::block_on;
-
-    /// The built-in packs and the test pack `sample@1`, a tool with args.
-    fn sample_packs() -> PackManager {
-        crate::packs::init_with_sample()
-    }
-
-    fn names(packs: &[ConfiguredPack]) -> Vec<String> {
-        packs.iter().map(|c| c.metadata().name.clone()).collect()
-    }
-
-    /// The view starts with the first distro pack and no agent or tool,
-    /// the args at their defaults, and the start option for the local
-    /// file.
-    #[test]
-    fn the_view_starts_with_the_first_distro_pack_only() {
-        let form = Form::new(&sample_packs(), None);
-        let answers = form.answers(Target::Local);
-        assert_eq!(names(&answers.packs), ["alpine"]);
-        assert!(answers.packs[0].non_default_args().is_empty());
-        assert_eq!(form.start().target(), Some(Target::Local));
-    }
-
-    fn text(value: &str) -> ArgValue {
-        ArgValue::Text(value.into())
-    }
-
-    /// The new file: the distro pack first, then the chosen packs, all
-    /// at version "1" with all their args, and no image.
-    #[test]
-    fn answers_render_the_distro_pack_and_the_chosen_packs() {
-        let packs = sample_packs();
-        let answers = |chosen: Vec<ConfiguredPack>| Answers {
-            packs: chosen,
-            image: None,
-            clipboard: Clipboard {
-                copy: true,
-                paste: false,
-            },
-            target: Target::Project,
-        };
-        let configure = |name, args: &[(&str, ArgValue)]| {
-            let args = args
-                .iter()
-                .map(|(key, value)| ((*key).to_string(), value.clone()))
-                .collect();
-            block_on(packs.resolve(name, "1")).unwrap().configure(&args)
-        };
-        let toml = |a: &Answers| a.config(Path::new("/p")).toml;
-        let a = answers(vec![configure("alpine", &[])]);
-        assert_eq!(
-            toml(&a),
-            "[packs]\nalpine = { version = \"1\", args = { package-installs = true } }\n\n\
-             [clipboard]\ncopy = true\npaste = false\n"
-        );
-        let chosen = vec![
-            configure("debian", &[]),
-            configure("claude", &[]),
-            configure(
-                "sample",
-                &[("mode", text("slow")), ("network", ArgValue::Bool(true))],
-            ),
-        ];
-        let a = answers(chosen);
-        let generated = a.config(Path::new("/p"));
-        assert_eq!(generated.path, Path::new("/p/airlock.toml"));
-        assert_eq!(
-            generated.toml,
-            "[packs]\ndebian = { version = \"1\", args = { package-installs = true } }\n\
-             claude = { version = \"1\", args = { acp = false } }\n\
-             sample = { version = \"1\", args = { mode = \"slow\", network = true } }\n\n\
-             [clipboard]\ncopy = true\npaste = false\n"
-        );
-        assert_eq!(
-            toml(&answers(vec![])),
-            "[clipboard]\ncopy = true\npaste = false\n"
-        );
-    }
 
     #[test]
-    fn sandbox_exists_with_a_disk_or_an_install_state() {
-        let tmp = crate::test_support::TempDir::new("wizard-sandbox-exists");
+    fn sandbox_exists_with_disk_or_install_state_only() {
+        let tmp = crate::test_cfg::temp_dir();
         let dir = tmp.path().join(".airlock/sandbox");
         std::fs::create_dir_all(&dir).unwrap();
-        // The lock and the image link alone are no sandbox.
         std::fs::write(dir.join("lock"), "").unwrap();
         assert!(!sandbox_exists(tmp.path()));
-        std::fs::write(dir.join("installs.json"), "{}").unwrap();
+        std::fs::write(dir.join(state::STATE_FILE), "{}").unwrap();
         assert!(sandbox_exists(tmp.path()));
-        std::fs::remove_file(dir.join("installs.json")).unwrap();
-        std::fs::write(dir.join("disk.img"), "").unwrap();
+        std::fs::remove_file(dir.join(state::STATE_FILE)).unwrap();
+        std::fs::write(dir.join(disk::DISK_FILE), "").unwrap();
         assert!(sandbox_exists(tmp.path()));
     }
 }

@@ -9,10 +9,14 @@ use crate::cli;
 use crate::cli::prompt;
 use crate::config::ResolvedConfig;
 use crate::oci::OciImage;
+#[cfg(not(test))]
+use crate::packs::install::setup::install as install_boot;
 use crate::packs::install::state::{self as install_state, InstallState};
 use crate::packs::install::{compose, plan, setup};
 use crate::packs::{ConfiguredPack, InstallerScript};
 use crate::project::{self, Project};
+#[cfg(test)]
+use crate::test_cfg::start::install_boot;
 use crate::util::PinnedDir;
 
 /// What [`install_tools`] installs: decided (and the records saved) by
@@ -130,7 +134,7 @@ async fn run_install(
     options: &SandboxOptions,
 ) -> Result<(), Exit> {
     cli::log!("Installing packs...");
-    let report = match Box::pin(setup::install(
+    let report = match Box::pin(install_boot(
         project,
         image,
         to_install,
@@ -171,58 +175,4 @@ async fn run_install(
         );
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::packs::install::plan::{DecideInput, Wanted};
-
-    /// Only packs whose version has an install are candidates. The
-    /// install record of any other pack counts as removed: "1" → the
-    /// list form, `enabled = false`.
-    #[test]
-    fn a_record_of_a_pack_without_an_install_is_removed() {
-        let candidates = |toml: &str| {
-            let resolved = crate::test_support::resolve_project_toml(toml).unwrap();
-            install_candidates(&resolved.packs)
-        };
-        let mut state = InstallState {
-            disk: Some((1, 2)),
-            ..Default::default()
-        };
-        state.set(
-            "claude",
-            install_state::PackStatus::Installed,
-            &"a".repeat(64),
-        );
-        for toml in [
-            "presets = [\"claude-code\", \"python\"]\n",
-            "[packs]\nclaude = { version = 1, enabled = false }\nalpine = { version = 1 }\n",
-        ] {
-            let candidates = candidates(toml);
-            assert!(candidates.is_empty(), "{toml}");
-            let wanted: Vec<Wanted> = candidates
-                .iter()
-                .map(|t| Wanted {
-                    id: t.pack.clone(),
-                    fingerprint: t.fingerprint.clone(),
-                })
-                .collect();
-            let plan = plan::decide(&DecideInput {
-                state: &state,
-                wanted: &wanted,
-                disk: Some((1, 2)),
-                image_id: None,
-            });
-            assert_eq!(plan.removed, ["claude"], "{toml}");
-        }
-        let names: Vec<String> = candidates(
-            "[packs]\nclaude = { version = 1 }\nalpine = { version = 1 }\nmise = { version = 1 }\n",
-        )
-        .iter()
-        .map(|t| t.pack.clone())
-        .collect();
-        assert_eq!(names, ["claude", "mise"]);
-    }
 }

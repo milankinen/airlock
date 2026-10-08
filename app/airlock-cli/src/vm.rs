@@ -66,35 +66,6 @@ pub fn require_kvm() {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
-mod kvm_tests {
-    use std::os::unix::fs::PermissionsExt;
-
-    use super::*;
-
-    #[test]
-    fn kvm_status_classifies_open_results() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kvm");
-        assert!(matches!(kvm_status_at(&path), KvmStatus::NotFound));
-
-        std::fs::write(&path, b"").unwrap();
-        assert!(matches!(kvm_status_at(&path), KvmStatus::Available));
-
-        if unsafe { libc::geteuid() } != 0 {
-            for mode in [0o400, 0o200] {
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
-                assert!(matches!(kvm_status_at(&path), KvmStatus::NoPermission));
-            }
-        }
-
-        assert!(matches!(
-            kvm_status_at(dir.path()),
-            KvmStatus::Unavailable(_)
-        ));
-    }
-}
-
 use crate::assets::Assets;
 use crate::cli;
 use crate::cli::LogLevel;
@@ -466,3 +437,6 @@ impl VmHandle for cloud_hypervisor::CloudHypervisorBackend {
         Box::pin(async move { cloud_hypervisor::CloudHypervisorBackend::stop(self) })
     }
 }
+
+#[cfg(test)]
+mod tests;

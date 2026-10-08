@@ -297,10 +297,8 @@ fn cleanup_sockets(dir: &Path, vfs_dir: &Path) {
 mod tests {
     use super::*;
 
-    /// The process leads its own process group: the terminal's SIGINT
-    /// misses it.
     #[test]
-    fn tied_processes_lead_their_own_group() {
+    fn process_tied_to_airlock_leads_its_own_process_group() {
         let mut cmd = Command::new("sleep");
         cmd.arg("10");
         tie_to_airlock(&mut cmd);

@@ -60,12 +60,12 @@ mod tests {
     use std::collections::VecDeque;
     use std::rc::Rc;
 
-    use airlock_common::supervisor_capnp::process;
+    use airlock_common::supervisor_capnp::{data_frame, process, process_input};
 
     use super::*;
-    use crate::test_support::block_on_local;
+    use crate::test_cfg::sinks::RecordingSink;
+    use crate::test_cfg::{block_on_local, rpc_loopback};
 
-    /// One scripted answer to `Process.poll`.
     enum Step {
         Stdout(&'static [u8]),
         Stderr(&'static [u8]),
@@ -76,9 +76,9 @@ mod tests {
 
     /// A guest process that answers `poll` from a script, then fails every
     /// further call like a dropped connection.
-    struct StubProcess(RefCell<VecDeque<Step>>);
+    struct ScriptedProcess(RefCell<VecDeque<Step>>);
 
-    impl process::Server for StubProcess {
+    impl process::Server for ScriptedProcess {
         async fn poll(
             self: Rc<Self>,
             _params: process::PollParams,
@@ -101,38 +101,23 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct Recorder {
-        out: Vec<u8>,
-        err: Vec<u8>,
-    }
-
-    impl OutputSink for Recorder {
-        fn stdout(&mut self, bytes: &[u8]) {
-            self.out.extend_from_slice(bytes);
-        }
-
-        fn stderr(&mut self, bytes: &[u8]) {
-            self.err.extend_from_slice(bytes);
-        }
-    }
-
-    fn run(script: Vec<Step>) -> (i32, Recorder) {
-        let mut rec = Recorder::default();
-        let mut code = None;
+    fn drive_script(script: Vec<Step>) -> (i32, RecordingSink) {
         block_on_local(async {
-            let client: process::Client =
-                capnp_rpc::new_client(StubProcess(RefCell::new(script.into())));
-            code = Some(drive(&rpc::Process::new(client), &mut rec).await);
-        });
-        (code.unwrap(), rec)
+            let client: process::Client = rpc_loopback(
+                capnp_rpc::new_client::<process::Client, _>(ScriptedProcess(RefCell::new(
+                    script.into(),
+                )))
+                .client,
+            );
+            let mut sink = RecordingSink::default();
+            let code = drive(&rpc::Process::new(client), &mut sink).await;
+            (code, sink)
+        })
     }
 
-    /// Output is relayed in order and a stream EOF does not end the drive:
-    /// only the exit event does, with the guest's code.
     #[test]
-    fn relays_output_and_skips_eof_until_exit() {
-        let (code, rec) = run(vec![
+    fn driving_process_relays_output_until_exit_or_lost_connection() {
+        let (code, sink) = drive_script(vec![
             Step::Stdout(b"hello "),
             Step::Stderr(b"warn"),
             Step::StdoutEof,
@@ -140,30 +125,24 @@ mod tests {
             Step::StderrEof,
             Step::Exit(3),
         ]);
-        assert_eq!(code, 3);
-        assert_eq!(rec.out, b"hello world");
-        assert_eq!(rec.err, b"warn");
+        assert_eq!(
+            (code, sink.out.as_slice(), sink.err.as_slice()),
+            (3, &b"hello world"[..], &b"warn"[..])
+        );
+
+        let (code, sink) = drive_script(vec![Step::Stdout(b"partial")]);
+        assert_eq!((code, sink.out.as_slice()), (1, &b"partial"[..]));
     }
 
-    /// The first read of a closed stdin is end of file.
     #[test]
-    fn closed_stdin_reads_eof() {
-        use airlock_common::supervisor_capnp::{data_frame, process_input};
+    fn closed_stdin_reads_eof_at_once() {
         block_on_local(async {
-            let stdin = closed_stdin();
-            let response = stdin.read_request().send().promise.await.unwrap();
+            let response = closed_stdin().read_request().send().promise.await.unwrap();
             let input = response.get().unwrap().get_input().unwrap();
             let Ok(process_input::Stdin(frame)) = input.which() else {
                 panic!("expected a stdin frame");
             };
             assert!(matches!(frame.unwrap().which(), Ok(data_frame::Eof(()))));
         });
-    }
-
-    #[test]
-    fn rpc_error_is_exit_code_1() {
-        let (code, rec) = run(vec![Step::Stdout(b"partial")]);
-        assert_eq!(code, 1);
-        assert_eq!(rec.out, b"partial");
     }
 }

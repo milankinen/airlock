@@ -88,8 +88,6 @@ fn tun_bench_upload() {
             sent += n;
         }
         stream.shutdown().await.expect("shutdown");
-        // The mock closes its side after counting all bytes; a clean
-        // EOF here means everything arrived.
         let mut tail = [0u8; 16];
         assert_eq!(stream.read(&mut tail).await.expect("eof"), 0);
     });

@@ -244,29 +244,21 @@ mod tests {
     }
 
     #[test]
-    fn the_browser_grant_points_the_env_at_the_shim() {
-        let got = apply_browser_shim(&env(&["PATH=/usr/bin:/bin", "HOME=/root"]), false);
+    fn browser_shim_goes_first_on_path_and_is_browser_unless_user_set_one() {
         assert_eq!(
-            got,
-            env(&[
+            apply_browser_shim(&env(&["PATH=/usr/bin:/bin", "HOME=/root"]), false),
+            [
                 "HOME=/root",
                 "PATH=/run/airlock/bin:/usr/bin:/bin",
                 "BROWSER=/run/airlock/bin/xdg-open",
-            ])
+            ]
         );
-    }
-
-    #[test]
-    fn a_browser_of_the_user_stays() {
-        let got = apply_browser_shim(&env(&["PATH=/bin", "BROWSER=firefox"]), true);
-        assert_eq!(got, env(&["BROWSER=firefox", "PATH=/run/airlock/bin:/bin"]));
-    }
-
-    #[test]
-    fn no_path_gets_the_default() {
-        let got = apply_browser_shim(&[], false);
         assert_eq!(
-            got[0],
+            apply_browser_shim(&env(&["PATH=/bin", "BROWSER=firefox"]), true),
+            ["BROWSER=firefox", "PATH=/run/airlock/bin:/bin"]
+        );
+        assert_eq!(
+            apply_browser_shim(&[], false)[0],
             format!("PATH=/run/airlock/bin:{}", oci::DEFAULT_PATH)
         );
     }

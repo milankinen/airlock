@@ -388,7 +388,8 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
-    use crate::test_support::block_on_local;
+    use crate::test_cfg::block_on_local;
+    use crate::test_cfg::services::idle_guest;
 
     const PORT: u16 = 1455;
     const CALLBACK: Callback = Callback {
@@ -396,15 +397,12 @@ mod tests {
         pages: &["auth.openai.com", "chatgpt.com"],
     };
 
-    /// A request as the guest's callback server got it.
     #[derive(Clone, Debug)]
     struct Got {
         target: String,
         headers: hyper::HeaderMap,
     }
 
-    /// The guest's callback server: records each request, answers with
-    /// `answer` (status and headers), or `200 ok`.
     async fn fake_guest<S: AsyncRead + AsyncWrite + Unpin + 'static>(
         io: S,
         seen: Arc<Mutex<Vec<Got>>>,
@@ -440,8 +438,6 @@ mod tests {
         }
     }
 
-    /// Send `raw` from the browser's side through `forward` to a guest
-    /// that answers `status` with `answer` headers; read the whole answer.
     async fn exchange_with(
         forward: &CallbackForward,
         raw: &str,
@@ -480,37 +476,43 @@ mod tests {
     }
 
     #[test]
-    fn every_callback_request_gets_a_surrogate_code() {
+    fn every_callback_request_gets_surrogate_code_bound_to_service_and_port() {
         block_on_local(async {
             let got = exchange(&format!(
-                "GET /callback?code=real-1&state=s HTTP/1.1\r\nHost: localhost\r\n\r\n{}",
+                "GET /callback?code=real-1&state=a%20b HTTP/1.1\r\nHost: localhost\r\n\r\n{}",
                 get("/callback?state=t&code=real-2", "")
             ))
             .await;
             assert_eq!(got.answer.matches("200 OK").count(), 2, "{}", got.answer);
             assert_eq!(got.seen.len(), 2, "{:?}", got.seen);
-            let codes: Vec<String> = got
+            let queries: Vec<std::collections::HashMap<String, String>> = got
                 .targets()
                 .iter()
                 .map(|target| {
                     assert!(!target.contains("real-"), "{target}");
                     let query = target.split_once('?').unwrap().1;
                     url::form_urlencoded::parse(query.as_bytes())
-                        .find(|(k, _)| k == "code")
-                        .unwrap()
-                        .1
                         .into_owned()
+                        .collect()
                 })
                 .collect();
-            // Bound to the forward's service and port.
-            let other = Channel::Callback(PORT);
+            assert_eq!(queries[0]["state"], "a b");
+            assert_eq!(queries[1]["state"], "t");
             assert_eq!(
-                got.codes.redeem(&codes[0], ServiceId::Anthropic, other),
+                got.codes.redeem(
+                    &queries[0]["code"],
+                    ServiceId::Anthropic,
+                    Channel::Callback(PORT)
+                ),
                 None
             );
             assert_eq!(
                 got.codes
-                    .redeem(&codes[1], ServiceId::Openai, Channel::Callback(PORT))
+                    .redeem(
+                        &queries[1]["code"],
+                        ServiceId::Openai,
+                        Channel::Callback(PORT)
+                    )
                     .as_deref(),
                 Some("real-2")
             );
@@ -518,7 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn a_request_without_code_passes_unchanged() {
+    fn request_without_code_passes_unchanged() {
         block_on_local(async {
             let got = exchange(&get("/success?id_token=x&a=%2B", "")).await;
             assert_eq!(got.targets(), ["/success?id_token=x&a=%2B"]);
@@ -526,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_request_never_reaches_the_guest() {
+    fn malformed_request_never_reaches_guest() {
         block_on_local(async {
             let got = exchange("GARBAGE /callback?code=real HTTP/9\r\n\x00\r\n\r\n").await;
             assert!(got.seen.is_empty(), "{:?}", got.seen);
@@ -534,10 +536,8 @@ mod tests {
         });
     }
 
-    /// Only `GET` reaches the guest, without the browser's cookies and
-    /// credentials.
     #[test]
-    fn only_get_reaches_the_guest_without_cookies() {
+    fn only_get_reaches_guest_and_without_cookies_or_credentials() {
         block_on_local(async {
             let got = exchange(
                 "POST /callback?code=real HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\
@@ -558,11 +558,8 @@ mod tests {
         });
     }
 
-    /// The guest's answer reaches the browser with only the allowed
-    /// headers (no cookies, CORS or site-data commands) and the sandbox
-    /// CSP.
     #[test]
-    fn answers_keep_only_allowed_headers_and_get_the_sandbox_csp() {
+    fn guest_answer_keeps_only_allowed_headers_and_gets_sandbox_csp() {
         block_on_local(async {
             let got = exchange_with(
                 &forward(),
@@ -590,6 +587,7 @@ mod tests {
                 "clear-site-data",
                 "location",
                 "x-custom",
+                "default-src *",
             ] {
                 assert!(!answer.contains(refused), "{refused}: {answer}");
             }
@@ -600,14 +598,11 @@ mod tests {
                 answer.contains("content-security-policy: sandbox; default-src 'none'"),
                 "{answer}"
             );
-            assert!(!answer.contains("default-src *"), "{answer}");
         });
     }
 
-    /// A redirect leads only to the same loopback origin or to a page of
-    /// the service; others get the host's page.
     #[test]
-    fn redirects_lead_only_to_known_places() {
+    fn guest_redirect_leads_only_to_same_loopback_origin_or_service_page() {
         block_on_local(async {
             for (location, allowed) in [
                 ("/success?id_token=x", true),
@@ -631,41 +626,30 @@ mod tests {
                     302,
                 )
                 .await;
+                let answer = &got.answer;
                 if allowed {
-                    assert!(
-                        got.answer.starts_with("HTTP/1.1 302"),
-                        "{location}: {}",
-                        got.answer
-                    );
-                    assert!(got.answer.contains(location), "{location}: {}", got.answer);
+                    assert!(answer.starts_with("HTTP/1.1 302"), "{location}: {answer}");
+                    assert!(answer.contains(location), "{location}: {answer}");
                 } else {
+                    assert!(answer.starts_with("HTTP/1.1 200"), "{location}: {answer}");
                     assert!(
-                        got.answer.starts_with("HTTP/1.1 200"),
-                        "{location}: {}",
-                        got.answer
+                        answer.contains("Sign-in finished; return to the terminal."),
+                        "{location}: {answer}"
                     );
-                    assert!(
-                        got.answer
-                            .contains("Sign-in finished; return to the terminal."),
-                        "{location}: {}",
-                        got.answer
-                    );
-                    assert!(!got.answer.contains(location), "{location}: {}", got.answer);
+                    assert!(!answer.contains(location), "{location}: {answer}");
                 }
             }
         });
     }
 
-    /// Once a code came, follow-ups reach the guest for [`FOLLOW_UP`] only;
-    /// a reopened forward lets a new sign-in through.
     #[test]
-    fn the_forward_closes_after_the_follow_up_time() {
+    fn forward_closes_after_follow_up_time_until_reopened() {
         block_on_local(async {
             let forward = forward();
             let got = exchange_with(&forward, &get("/callback?code=real", ""), vec![], 200).await;
             assert_eq!(got.seen.len(), 1);
             let got = exchange_with(&forward, &get("/success", ""), vec![], 200).await;
-            assert_eq!(got.seen.len(), 1, "a follow-up in time reaches the guest");
+            assert_eq!(got.seen.len(), 1);
 
             let past = Instant::now().checked_sub(FOLLOW_UP).unwrap();
             forward.0.code_seen.set(Some(past));
@@ -681,10 +665,8 @@ mod tests {
         });
     }
 
-    /// A forward that gets no code closes after [`UNUSED_LIMIT`]; a new
-    /// sign-in on its port before then opens it again.
     #[test]
-    fn an_unused_forward_closes() {
+    fn forward_without_code_closes_after_unused_limit_until_reopened() {
         let forward = forward();
         assert!(forward.is_open());
         let past = Instant::now().checked_sub(UNUSED_LIMIT).unwrap();
@@ -694,13 +676,8 @@ mod tests {
         assert!(forward.is_open());
     }
 
-    /// A supervisor that implements nothing: no connection reaches it.
-    struct NoSupervisor;
-    impl airlock_common::supervisor_capnp::supervisor::Server for NoSupervisor {}
-
-    /// A closed forward frees its port and cannot be reopened.
     #[test]
-    fn a_closed_forward_frees_its_port() {
+    fn closed_forward_frees_its_port_and_cannot_reopen() {
         block_on_local(async {
             let port = std::net::TcpListener::bind("127.0.0.1:0")
                 .unwrap()
@@ -708,12 +685,11 @@ mod tests {
                 .unwrap()
                 .port();
             let bound = reverse_forward::bind_exclusive(port, port).unwrap();
-            let guest = GuestNetwork::new(capnp_rpc::new_client(NoSupervisor));
             let state = CallbackForward::new(port, CALLBACK, PendingCodes::default());
             let past = Instant::now().checked_sub(UNUSED_LIMIT).unwrap();
             state.0.opened.set(past);
             let mut tasks = JoinSet::new();
-            serve_until_closed(bound, &guest, &mut tasks, state.clone());
+            serve_until_closed(bound, &idle_guest(), &mut tasks, state.clone());
             let mut freed = false;
             for _ in 0..50 {
                 tokio::task::yield_now().await;

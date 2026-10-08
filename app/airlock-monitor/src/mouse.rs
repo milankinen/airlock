@@ -197,8 +197,6 @@ fn encode_legacy(report: Report, mods: u8, col: u16, row: u16) -> Option<Vec<u8>
 mod tests {
     use super::*;
 
-    /// Body rect with a non-zero origin, so every test also exercises
-    /// coordinate rebasing rather than an accidental identity mapping.
     const BODY: Rect = Rect {
         x: 2,
         y: 1,
@@ -206,92 +204,97 @@ mod tests {
         height: 20,
     };
 
-    fn ev(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+    fn ev(kind: MouseEventKind, column: u16, row: u16, modifiers: KeyModifiers) -> MouseEvent {
         MouseEvent {
             kind,
             column,
             row,
-            modifiers: KeyModifiers::NONE,
-        }
-    }
-
-    fn with_mods(kind: MouseEventKind, modifiers: KeyModifiers) -> MouseEvent {
-        MouseEvent {
-            kind,
-            column: 2,
-            row: 1,
             modifiers,
         }
     }
 
-    fn sgr(event: MouseEvent, mode: MouseProtocolMode) -> Option<String> {
-        encode(event, mode, MouseProtocolEncoding::Sgr, BODY)
-            .map(|b| String::from_utf8(b).expect("SGR output is ASCII"))
+    fn sgr(kind: MouseEventKind, at: (u16, u16), mode: MouseProtocolMode) -> Option<String> {
+        sgr_with(ev(kind, at.0, at.1, KeyModifiers::NONE), mode)
+    }
+
+    fn sgr_with(event: MouseEvent, mode: MouseProtocolMode) -> Option<String> {
+        encode(event, mode, MouseProtocolEncoding::Sgr, BODY).map(|b| String::from_utf8(b).unwrap())
     }
 
     #[test]
-    fn sgr_press_release_and_drag() {
-        let down = MouseEventKind::Down(MouseButton::Left);
-        let up = MouseEventKind::Up(MouseButton::Left);
-        let drag = MouseEventKind::Drag(MouseButton::Left);
-        // (2,1) is the body origin, so the guest sees its own cell (1,1).
-        assert_eq!(
-            sgr(ev(down, 2, 1), MouseProtocolMode::PressRelease).as_deref(),
-            Some("\x1b[<0;1;1M")
-        );
-        // Release uses the final `m` and keeps the button identity.
-        assert_eq!(
-            sgr(ev(up, 2, 1), MouseProtocolMode::PressRelease).as_deref(),
-            Some("\x1b[<0;1;1m")
-        );
-        // Drag adds the motion bit (32) to the held button.
-        assert_eq!(
-            sgr(ev(drag, 4, 3), MouseProtocolMode::ButtonMotion).as_deref(),
-            Some("\x1b[<32;3;3M")
-        );
-    }
-
-    #[test]
-    fn sgr_middle_right_and_bare_motion() {
-        let middle = MouseEventKind::Down(MouseButton::Middle);
-        let right = MouseEventKind::Down(MouseButton::Right);
-        assert_eq!(
-            sgr(ev(middle, 2, 1), MouseProtocolMode::PressRelease).as_deref(),
-            Some("\x1b[<1;1;1M")
-        );
-        assert_eq!(
-            sgr(ev(right, 2, 1), MouseProtocolMode::PressRelease).as_deref(),
-            Some("\x1b[<2;1;1M")
-        );
-        // Bare motion is "no button" (3) plus the motion bit.
-        assert_eq!(
-            sgr(
-                ev(MouseEventKind::Moved, 2, 1),
-                MouseProtocolMode::AnyMotion
-            )
-            .as_deref(),
-            Some("\x1b[<35;1;1M")
-        );
-    }
-
-    #[test]
-    fn sgr_wheel_both_axes() {
-        for (kind, cb) in [
-            (MouseEventKind::ScrollUp, 64),
-            (MouseEventKind::ScrollDown, 65),
-            (MouseEventKind::ScrollLeft, 66),
-            (MouseEventKind::ScrollRight, 67),
+    fn sgr_encodes_buttons_motion_and_wheel_relative_to_body() {
+        use MouseEventKind::{
+            Down, Drag, Moved, ScrollDown, ScrollLeft, ScrollRight, ScrollUp, Up,
+        };
+        for (kind, at, mode, expected) in [
+            (
+                Down(MouseButton::Left),
+                (2, 1),
+                MouseProtocolMode::PressRelease,
+                "\x1b[<0;1;1M",
+            ),
+            (
+                Up(MouseButton::Left),
+                (2, 1),
+                MouseProtocolMode::PressRelease,
+                "\x1b[<0;1;1m",
+            ),
+            (
+                Down(MouseButton::Middle),
+                (2, 1),
+                MouseProtocolMode::PressRelease,
+                "\x1b[<1;1;1M",
+            ),
+            (
+                Down(MouseButton::Right),
+                (2, 1),
+                MouseProtocolMode::PressRelease,
+                "\x1b[<2;1;1M",
+            ),
+            (
+                Drag(MouseButton::Left),
+                (4, 3),
+                MouseProtocolMode::ButtonMotion,
+                "\x1b[<32;3;3M",
+            ),
+            (Moved, (2, 1), MouseProtocolMode::AnyMotion, "\x1b[<35;1;1M"),
+            (
+                ScrollUp,
+                (2, 1),
+                MouseProtocolMode::PressRelease,
+                "\x1b[<64;1;1M",
+            ),
+            (
+                ScrollDown,
+                (2, 1),
+                MouseProtocolMode::PressRelease,
+                "\x1b[<65;1;1M",
+            ),
+            (
+                ScrollLeft,
+                (2, 1),
+                MouseProtocolMode::PressRelease,
+                "\x1b[<66;1;1M",
+            ),
+            (
+                ScrollRight,
+                (2, 1),
+                MouseProtocolMode::PressRelease,
+                "\x1b[<67;1;1M",
+            ),
+            (
+                Down(MouseButton::Left),
+                (41, 20),
+                MouseProtocolMode::PressRelease,
+                "\x1b[<0;40;20M",
+            ),
         ] {
-            assert_eq!(
-                sgr(ev(kind, 2, 1), MouseProtocolMode::PressRelease).as_deref(),
-                Some(format!("\x1b[<{cb};1;1M").as_str()),
-                "{kind:?}"
-            );
+            assert_eq!(sgr(kind, at, mode).as_deref(), Some(expected), "{kind:?}");
         }
     }
 
     #[test]
-    fn modifier_bits_fold_into_cb() {
+    fn sgr_folds_modifiers_into_button_code() {
         let down = MouseEventKind::Down(MouseButton::Left);
         for (modifiers, cb) in [
             (KeyModifiers::SHIFT, 4),
@@ -304,7 +307,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                sgr(with_mods(down, modifiers), MouseProtocolMode::PressRelease).as_deref(),
+                sgr_with(ev(down, 2, 1, modifiers), MouseProtocolMode::PressRelease).as_deref(),
                 Some(format!("\x1b[<{cb};1;1M").as_str()),
                 "{modifiers:?}"
             );
@@ -312,134 +315,68 @@ mod tests {
     }
 
     #[test]
-    fn legacy_byte_layout() {
-        let down = MouseEventKind::Down(MouseButton::Left);
-        let bytes = encode(
-            ev(down, 4, 3),
-            MouseProtocolMode::PressRelease,
-            MouseProtocolEncoding::Default,
-            BODY,
-        );
-        // Cell (3,3) of the guest grid: 32+0, 32+3, 32+3.
-        assert_eq!(bytes.as_deref(), Some(b"\x1b[M\x20\x23\x23".as_slice()));
-    }
-
-    /// The legacy encoding can't name the released button, so every
-    /// release collapses onto code 3.
-    #[test]
-    fn legacy_release_is_button_three() {
-        let up = MouseEventKind::Up(MouseButton::Right);
-        let bytes = encode(
-            ev(up, 2, 1),
-            MouseProtocolMode::PressRelease,
-            MouseProtocolEncoding::Default,
-            BODY,
-        );
-        assert_eq!(bytes.as_deref(), Some(b"\x1b[M\x23\x21\x21".as_slice()));
-    }
-
-    /// Past column 223 the legacy encoding would silently address the
-    /// wrong cell, so the event is dropped instead. SGR has no such limit.
-    #[test]
-    fn legacy_drops_unrepresentable_coordinates() {
-        let wide = Rect {
-            x: 0,
-            y: 0,
-            width: 300,
-            height: 300,
-        };
-        let down = ev(MouseEventKind::Down(MouseButton::Left), 250, 5);
-        assert_eq!(
+    fn legacy_encoding_offsets_bytes_and_drops_unrepresentable_cells() {
+        let legacy = |kind, column, row, encoding, body| {
             encode(
-                down,
+                ev(kind, column, row, KeyModifiers::NONE),
                 MouseProtocolMode::PressRelease,
-                MouseProtocolEncoding::Default,
-                wide
-            ),
+                encoding,
+                body,
+            )
+        };
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let up = MouseEventKind::Up(MouseButton::Right);
+        let wide = Rect::new(0, 0, 300, 300);
+
+        assert_eq!(
+            legacy(down, 4, 3, MouseProtocolEncoding::Default, BODY).as_deref(),
+            Some(b"\x1b[M\x20\x23\x23".as_slice())
+        );
+        assert_eq!(
+            legacy(up, 2, 1, MouseProtocolEncoding::Default, BODY).as_deref(),
+            Some(b"\x1b[M\x23\x21\x21".as_slice())
+        );
+        assert_eq!(
+            legacy(down, 4, 3, MouseProtocolEncoding::Utf8, BODY),
+            legacy(down, 4, 3, MouseProtocolEncoding::Default, BODY)
+        );
+        assert_eq!(
+            legacy(down, 250, 5, MouseProtocolEncoding::Default, wide),
             None
         );
-        assert!(
-            encode(
-                down,
-                MouseProtocolMode::PressRelease,
-                MouseProtocolEncoding::Sgr,
-                wide
-            )
-            .is_some()
-        );
-    }
-
-    /// UTF-8 mode is treated as the legacy encoding: identical below 224,
-    /// and above it we drop rather than guess.
-    #[test]
-    fn utf8_matches_legacy() {
-        let down = ev(MouseEventKind::Down(MouseButton::Left), 4, 3);
-        assert_eq!(
-            encode(
-                down,
-                MouseProtocolMode::PressRelease,
-                MouseProtocolEncoding::Utf8,
-                BODY
-            ),
-            encode(
-                down,
-                MouseProtocolMode::PressRelease,
-                MouseProtocolEncoding::Default,
-                BODY
-            )
-        );
+        assert!(legacy(down, 250, 5, MouseProtocolEncoding::Sgr, wide).is_some());
     }
 
     #[test]
-    fn mode_filters_event_classes() {
-        let down = ev(MouseEventKind::Down(MouseButton::Left), 2, 1);
-        let up = ev(MouseEventKind::Up(MouseButton::Left), 2, 1);
-        let drag = ev(MouseEventKind::Drag(MouseButton::Left), 2, 1);
-        let moved = ev(MouseEventKind::Moved, 2, 1);
-        let wheel = ev(MouseEventKind::ScrollUp, 2, 1);
-
-        // `None` — the guest never asked; nothing is forwarded.
-        for e in [down, up, drag, moved, wheel] {
-            assert_eq!(sgr(e, MouseProtocolMode::None), None, "{:?}", e.kind);
-        }
-        // `Press` (DEC 9) — presses and wheel only.
-        assert!(sgr(down, MouseProtocolMode::Press).is_some());
-        assert!(sgr(wheel, MouseProtocolMode::Press).is_some());
-        assert_eq!(sgr(up, MouseProtocolMode::Press), None);
-        assert_eq!(sgr(drag, MouseProtocolMode::Press), None);
-        assert_eq!(sgr(moved, MouseProtocolMode::Press), None);
-        // `PressRelease` (DEC 1000) — adds button up.
-        assert!(sgr(up, MouseProtocolMode::PressRelease).is_some());
-        assert_eq!(sgr(drag, MouseProtocolMode::PressRelease), None);
-        assert_eq!(sgr(moved, MouseProtocolMode::PressRelease), None);
-        // `ButtonMotion` (DEC 1002) — adds drag but not bare motion.
-        assert!(sgr(drag, MouseProtocolMode::ButtonMotion).is_some());
-        assert_eq!(sgr(moved, MouseProtocolMode::ButtonMotion), None);
-        // `AnyMotion` (DEC 1003) — everything.
-        assert!(sgr(moved, MouseProtocolMode::AnyMotion).is_some());
-    }
-
-    #[test]
-    fn events_outside_the_body_are_dropped() {
+    fn guest_mouse_mode_selects_forwarded_event_classes() {
+        use MouseProtocolMode::{AnyMotion, ButtonMotion, None, Press, PressRelease};
         let down = MouseEventKind::Down(MouseButton::Left);
-        for (col, row) in [
-            (1, 1),   // left of the body
-            (2, 0),   // above the body
-            (42, 5),  // right of the body (x 2 + width 40)
-            (5, 21),  // below the body (y 1 + height 20)
-            (200, 1), // far right
+        let up = MouseEventKind::Up(MouseButton::Left);
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        let moved = MouseEventKind::Moved;
+        let wheel = MouseEventKind::ScrollUp;
+        for (mode, forwarded) in [
+            (None, [false, false, false, false, false]),
+            (Press, [true, false, false, false, true]),
+            (PressRelease, [true, true, false, false, true]),
+            (ButtonMotion, [true, true, true, false, true]),
+            (AnyMotion, [true, true, true, true, true]),
         ] {
+            for (kind, want) in [down, up, drag, moved, wheel].into_iter().zip(forwarded) {
+                assert_eq!(sgr(kind, (2, 1), mode).is_some(), want, "{mode:?} {kind:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn events_outside_body_are_dropped() {
+        let down = MouseEventKind::Down(MouseButton::Left);
+        for at in [(1, 1), (2, 0), (42, 5), (5, 21), (200, 1)] {
             assert_eq!(
-                sgr(ev(down, col, row), MouseProtocolMode::PressRelease),
+                sgr(down, at, MouseProtocolMode::PressRelease),
                 None,
-                "({col},{row}) is outside the body"
+                "{at:?}"
             );
         }
-        // The far corner of the body is inside, and maps to the guest's
-        // bottom-right cell.
-        assert_eq!(
-            sgr(ev(down, 41, 20), MouseProtocolMode::PressRelease).as_deref(),
-            Some("\x1b[<0;40;20M")
-        );
     }
 }

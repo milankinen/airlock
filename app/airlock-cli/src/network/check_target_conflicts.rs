@@ -150,179 +150,31 @@ mod tests {
         }
     }
 
-    fn labeled(label: &str, spec: &str) -> LabeledTarget {
-        LabeledTarget {
-            label: label.to_string(),
-            target: t(spec),
+    #[test]
+    fn targets_overlap_when_some_host_and_port_match_both() {
+        for (a, b, expected) in [
+            ("a.example.com", "a.example.com", true),
+            ("a.example.com", "b.example.com", false),
+            ("localhost", "127.0.0.1", true),
+            ("127.0.0.1", "::1", true),
+            ("::1", "localhost", true),
+            ("*", "anything.example.com", true),
+            ("*", "*.foo", true),
+            ("*.example.com", "api.example.com", true),
+            ("*.example.com", "a.b.example.com", true),
+            ("*.example.com", "example.com", false),
+            ("*.example.com", "example.org", false),
+            ("*.example.com", "xample.com", false),
+            ("*.example.com", "*.prod.example.com", true),
+            ("*.example.com", "*.example.com", true),
+            ("*.example.com", "*.foo.com", false),
+            ("*.example.com", "*.myexample.com", false),
+            ("example.com", "example.com:443", true),
+            ("example.com:80", "example.com:443", false),
+            ("*.example.com:80", "api.example.com:443", false),
+        ] {
+            assert_eq!(targets_overlap(&t(a), &t(b)), expected, "{a} / {b}");
+            assert_eq!(targets_overlap(&t(b), &t(a)), expected, "{b} / {a}");
         }
-    }
-
-    // ── Overlap unit tests ────────────────────────────────
-
-    #[test]
-    fn exact_literals_overlap_only_when_equal() {
-        assert!(targets_overlap(&t("a.example.com"), &t("a.example.com")));
-        assert!(!targets_overlap(&t("a.example.com"), &t("b.example.com")));
-    }
-
-    #[test]
-    fn localhost_aliases_overlap() {
-        // `::1` has embedded colons, so `parse_target`'s rsplit-on-`:` would
-        // mis-parse it — build the IPv6 target directly.
-        let ipv6 = NetworkTarget {
-            host: "::1".to_string(),
-            port: None,
-        };
-        assert!(targets_overlap(&t("localhost"), &t("127.0.0.1")));
-        assert!(targets_overlap(&t("127.0.0.1"), &ipv6));
-        assert!(targets_overlap(&ipv6, &t("localhost")));
-    }
-
-    #[test]
-    fn wildcard_star_matches_everything() {
-        assert!(targets_overlap(&t("*"), &t("anything.example.com")));
-        assert!(targets_overlap(&t("*"), &t("*.foo")));
-        assert!(targets_overlap(&t("*"), &t("*")));
-    }
-
-    #[test]
-    fn wildcard_subdomain_covers_subdomains_at_any_depth() {
-        assert!(targets_overlap(&t("*.example.com"), &t("api.example.com")));
-        // Multi-label hosts are matched: `*.example.com` matches `a.b.example.com`.
-        assert!(targets_overlap(&t("*.example.com"), &t("a.b.example.com")));
-        // Apex is NOT matched by `*.example.com`.
-        assert!(!targets_overlap(&t("*.example.com"), &t("example.com")));
-    }
-
-    #[test]
-    fn wildcard_subdomain_misses_unrelated_host() {
-        assert!(!targets_overlap(&t("*.example.com"), &t("example.org")));
-        assert!(!targets_overlap(&t("*.example.com"), &t("xample.com")));
-    }
-
-    #[test]
-    fn wildcard_wildcard_overlap() {
-        // Nested suffix overlaps: `a.prod.example.com` matches both.
-        assert!(targets_overlap(
-            &t("*.example.com"),
-            &t("*.prod.example.com")
-        ));
-        // Unrelated suffixes never overlap.
-        assert!(!targets_overlap(&t("*.example.com"), &t("*.foo.com")));
-        // Same suffix overlaps.
-        assert!(targets_overlap(&t("*.example.com"), &t("*.example.com")));
-        // `*` always overlaps.
-        assert!(targets_overlap(&t("*"), &t("*.example.com")));
-    }
-
-    #[test]
-    fn port_any_overlaps_with_specific_port() {
-        assert!(targets_overlap(&t("example.com"), &t("example.com:443")));
-        assert!(targets_overlap(&t("example.com:443"), &t("example.com")));
-    }
-
-    #[test]
-    fn port_mismatch_suppresses_overlap() {
-        assert!(!targets_overlap(
-            &t("example.com:80"),
-            &t("example.com:443")
-        ));
-        assert!(!targets_overlap(
-            &t("*.example.com:80"),
-            &t("api.example.com:443")
-        ));
-    }
-
-    // ── check_passthrough_conflicts integration tests ────
-
-    #[test]
-    fn no_conflict_when_targets_disjoint() {
-        let pt = vec![labeled("rule `pt`", "db.example.com:5432")];
-        let mw = vec![labeled("middleware `api`", "api.example.com")];
-        assert!(check_passthrough_conflicts(&pt, &mw).is_ok());
-    }
-
-    #[test]
-    fn conflict_reports_both_labels() {
-        let pt = vec![labeled(
-            "rule `pt-db` allow=`db.example.com:5432`",
-            "db.example.com:5432",
-        )];
-        let mw = vec![labeled(
-            "middleware `mitm-db` target=`db.example.com:5432`",
-            "db.example.com:5432",
-        )];
-        let err = check_passthrough_conflicts(&pt, &mw)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("pt-db"), "missing rule name: {err}");
-        assert!(err.contains("mitm-db"), "missing mw name: {err}");
-    }
-
-    #[test]
-    fn wildcard_passthrough_catches_literal_middleware() {
-        let pt = vec![labeled("pt-zone", "*.example.com")];
-        let mw = vec![labeled("mitm-api", "api.example.com:443")];
-        assert!(check_passthrough_conflicts(&pt, &mw).is_err());
-    }
-
-    #[test]
-    fn wildcard_middleware_caught_by_literal_passthrough() {
-        let pt = vec![labeled("pt-api", "api.example.com:443")];
-        let mw = vec![labeled("mitm-zone", "*.example.com")];
-        assert!(check_passthrough_conflicts(&pt, &mw).is_err());
-    }
-
-    #[test]
-    fn nested_wildcards_with_suffix_relationship_conflict() {
-        // `a.prod.example.com` matches both `*.example.com` (multi-label)
-        // and `*.prod.example.com`, so these patterns overlap.
-        let pt = vec![labeled("pt", "*.example.com")];
-        let mw = vec![labeled("mitm", "*.prod.example.com")];
-        assert!(check_passthrough_conflicts(&pt, &mw).is_err());
-    }
-
-    #[test]
-    fn disjoint_wildcards_pass() {
-        let pt = vec![labeled("pt", "*.internal")];
-        let mw = vec![labeled("mitm", "*.example.com")];
-        assert!(check_passthrough_conflicts(&pt, &mw).is_ok());
-    }
-
-    #[test]
-    fn port_disjoint_avoids_false_positive() {
-        let pt = vec![labeled("pt", "api.example.com:5432")];
-        let mw = vec![labeled("mitm", "api.example.com:443")];
-        assert!(check_passthrough_conflicts(&pt, &mw).is_ok());
-    }
-
-    // ── check_reverse_forward_conflicts tests ───────────
-
-    fn rf(label: &str, host_port: u16) -> LabeledReverseForward {
-        LabeledReverseForward {
-            label: label.to_string(),
-            host_port,
-        }
-    }
-
-    #[test]
-    fn reverse_forwards_unique_host_ports_pass() {
-        let f = vec![rf("group-a 5000:4000", 5000), rf("group-b 5001:4000", 5001)];
-        assert!(check_reverse_forward_conflicts(&f).is_ok());
-    }
-
-    #[test]
-    fn reverse_forwards_duplicate_host_port_errors() {
-        let f = vec![rf("group-a 5000:4000", 5000), rf("group-b 5000:4001", 5000)];
-        let err = check_reverse_forward_conflicts(&f).unwrap_err().to_string();
-        assert!(err.contains("group-a"), "missing label a: {err}");
-        assert!(err.contains("group-b"), "missing label b: {err}");
-    }
-
-    #[test]
-    fn reverse_forwards_same_guest_port_is_allowed() {
-        // Two host ports fanning into the same guest port is legal.
-        let f = vec![rf("a 5000:4000", 5000), rf("b 5001:4000", 5001)];
-        assert!(check_reverse_forward_conflicts(&f).is_ok());
     }
 }

@@ -242,7 +242,7 @@ impl LayeredConfig {
 
     /// Load the config files of `project_root` with `home` as the home
     /// directory (see [`files::discover_in`]).
-    fn load_from(home: &Path, project_root: &Path) -> anyhow::Result<Self> {
+    pub(crate) fn load_from(home: &Path, project_root: &Path) -> anyhow::Result<Self> {
         let files = files::discover_in(home, project_root)?;
         Ok(Self::new(
             files

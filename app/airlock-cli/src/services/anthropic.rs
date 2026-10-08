@@ -550,37 +550,8 @@ fn sign_in_again() -> Response<ResponseBody> {
 mod tests {
     use super::*;
 
-    fn grant(scopes: &[&str]) -> Grant {
-        let mut grant = Grant::for_tests(vec![]);
-        grant.client_id = "stored-client".into();
-        grant.scopes = scopes.iter().map(ToString::to_string).collect();
-        grant
-    }
-
-    /// A refresh asks for the grant's scopes without
-    /// `org:create_api_key`, with the grant's client id; a grant with no
-    /// other scope asks for none.
     #[test]
-    fn the_refresh_body_is_claude_codes() {
-        let body = PROVIDER.refresh_body(
-            &grant(&["org:create_api_key", "user:inference", "user:profile"]),
-            "real-refresh",
-        );
-        assert_eq!(
-            body,
-            json!({
-                "grant_type": "refresh_token",
-                "refresh_token": "real-refresh",
-                "client_id": "stored-client",
-                "scope": "user:inference user:profile",
-            })
-        );
-        let body = PROVIDER.refresh_body(&grant(&["org:create_api_key"]), "real-refresh");
-        assert!(body.get("scope").is_none(), "{body}");
-    }
-
-    #[test]
-    fn real_tokens_are_told_from_surrogates() {
+    fn token_with_provider_prefix_is_real_unless_airlock_surrogate() {
         for real in ["sk-ant-api03-x", "sk-ant-oat01-x", "sk-ant-ort01-x"] {
             assert!(FORMATS.is_real(real), "{real}");
         }
@@ -595,14 +566,11 @@ mod tests {
         }
     }
 
-    /// Surrogates have their prefix and 48 random bytes (64 base64url
-    /// characters) after it.
     #[test]
-    fn surrogates_have_enough_entropy() {
+    fn minted_surrogate_has_prefix_and_48_random_bytes() {
         for format in FORMATS.0 {
             let s = (format.mint)("sk-ant-oat01-x").unwrap();
             assert!((format.is_surrogate)(&s), "{s}");
-            // 48 random bytes, 64 base64url characters, after the prefix.
             assert!(s.len() >= ID_PREFIX.len() + 64, "{s}");
         }
     }

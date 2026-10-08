@@ -1313,10 +1313,13 @@ async fn revoke_tokens(
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
     use super::*;
 
     #[test]
-    fn paths_are_normalized() {
+    fn path_spellings_normalize_to_one_route() {
         for (raw, want) in [
             ("/v1/oauth/token", "/v1/oauth/token"),
             ("/v1/oauth/token/", "/v1/oauth/token"),
@@ -1333,7 +1336,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_keys_are_refused() {
+    fn json_or_form_with_duplicate_key_is_refused() {
         assert!(serde_json::from_str::<UniqueObject>(r#"{"a":1,"b":2}"#).is_ok());
         assert!(serde_json::from_str::<UniqueObject>(r#"{"a":1,"a":2}"#).is_err());
         assert!(serde_json::from_str::<UniqueObject>("[1]").is_err());
@@ -1342,30 +1345,7 @@ mod tests {
     }
 
     #[test]
-    fn tokens_are_found_anywhere_in_json() {
-        let formats = &super::super::anthropic::FORMATS;
-        for v in [
-            json!({ "access_token": "x" }),
-            json!({ "data": [{ "id_token": 1 }] }),
-            json!({ "key": "sk-ant-api03-abc" }),
-            json!(["sk-ant-oat01-x"]),
-            json!({ "a": { "b": "sk-ant-ort01-y" } }),
-        ] {
-            assert!(carries_token(&v, formats), "{v}");
-        }
-        assert!(!carries_token(
-            &json!({ "user_code": "ABCD", "n": 3, "k": "sk-ant-oat01-airlock-x" }),
-            formats
-        ));
-    }
-
-    /// The device sign-in's identifiers may be JWTs of OpenAI's issuer:
-    /// passed keys keep them; elsewhere such a value is a token, and the
-    /// log names where it was.
-    #[test]
-    fn passed_keys_keep_identifiers_that_look_like_tokens() {
-        use base64::Engine;
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    fn passed_keys_keep_identifiers_that_look_like_tokens_but_not_token_keys() {
         let formats = &super::super::openai::FORMATS;
         let jwt = format!(
             "{}.{}.sig",
@@ -1379,7 +1359,6 @@ mod tests {
             token_field(&answer, formats, &[], "$").as_deref(),
             Some("$.device_auth_id")
         );
-        // An error code is no authorization code; a real token in it is.
         let pending = json!({ "error": { "code": "deviceauth_authorization_pending" } });
         assert_eq!(token_field(&pending, formats, &passed, "$"), None);
         let leak = json!({ "error": { "code": jwt.clone() } });
@@ -1388,37 +1367,10 @@ mod tests {
             Some("$.error.code")
         );
         assert!(carries_token(&json!({ "code": "c" }), formats));
-        // A token key still counts under any passed list.
         let leak = json!({ "device_auth_id": "d", "x": [{ "access_token": "t" }] });
         assert_eq!(
             token_field(&leak, formats, &passed, "$").as_deref(),
             Some("$.x[0].access_token")
-        );
-    }
-
-    #[test]
-    fn bearer_tokens() {
-        assert_eq!(bearer_token("Bearer abc"), Some("abc"));
-        assert_eq!(bearer_token("bearer  abc "), Some("abc"));
-        assert_eq!(bearer_token("abc"), None);
-        assert_eq!(bearer_token("Basic abc"), None);
-    }
-
-    /// An allowed route forwards its own path, never the guest's spelling
-    /// or query.
-    #[test]
-    fn routed_uris_drop_the_guests_spelling() {
-        let h1: hyper::Uri = "/x%2f..%2f/v1/oauth/hello?a=1".parse().unwrap();
-        assert_eq!(
-            routed_uri(&h1, "/v1/oauth/hello").unwrap(),
-            "/v1/oauth/hello"
-        );
-        let h2: hyper::Uri = "https://platform.claude.com/V1//oauth/hello?a"
-            .parse()
-            .unwrap();
-        assert_eq!(
-            routed_uri(&h2, "/v1/oauth/hello").unwrap(),
-            "https://platform.claude.com/v1/oauth/hello"
         );
     }
 }

@@ -42,30 +42,3 @@ impl Storage for KeyringStorage {
 fn keyring_entry() -> anyhow::Result<keyring::Entry> {
     keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).context("construct airlock keyring entry")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cache::HOME_LOCK;
-
-    #[test]
-    fn lock_path_is_under_the_airlock_home() {
-        let _guard = HOME_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let old_home = std::env::var_os("HOME");
-        let home =
-            std::env::temp_dir().join(format!("airlock-keyring-home-{}", std::process::id()));
-        unsafe {
-            std::env::set_var("HOME", &home);
-        }
-        let path = KeyringStorage.lock_path().unwrap();
-        unsafe {
-            match old_home {
-                Some(old) => std::env::set_var("HOME", old),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-        assert_eq!(path, Some(home.join(".airlock/vault.keyring.lock")));
-    }
-}

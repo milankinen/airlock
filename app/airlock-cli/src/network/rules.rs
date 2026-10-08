@@ -217,75 +217,34 @@ pub fn parse_pattern(target: &str) -> anyhow::Result<(&str, Option<u16>)> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::*;
-    use crate::config::config_values::{self, NetworkRule, Policy};
-    use crate::project::MaskedSecret;
 
-    fn rule(allow: &[&str], passthrough: bool) -> NetworkRule {
-        NetworkRule {
-            enabled: true,
-            allow: allow.iter().map(|s| (*s).to_string()).collect(),
-            deny: vec![],
-            passthrough,
-            inject: vec![],
+    #[test]
+    fn parse_pattern_reads_hostnames_ipv4_and_ipv6_literals() {
+        for (pattern, host, port) in [
+            ("api.example.com", "api.example.com", None),
+            ("api.example.com:443", "api.example.com", Some(443)),
+            ("api.example.com:*", "api.example.com", None),
+            ("10.0.0.1:80", "10.0.0.1", Some(80)),
+            ("*", "*", None),
+            ("*:80", "*", Some(80)),
+            ("*:*", "*", None),
+            ("::1", "::1", None),
+            ("2001:db8::1", "2001:db8::1", None),
+            ("[::1]", "::1", None),
+            ("[::1]:443", "::1", Some(443)),
+            ("[2001:db8::1]:8080", "2001:db8::1", Some(8080)),
+        ] {
+            assert_eq!(parse_pattern(pattern).unwrap(), (host, port), "{pattern}");
         }
     }
 
     #[test]
-    fn parse_target_handles_hostnames_and_ipv4() {
-        assert_eq!(parse_target("api.example.com"), ("api.example.com", None));
-        assert_eq!(
-            parse_target("api.example.com:443"),
-            ("api.example.com", Some("443"))
-        );
-        assert_eq!(parse_target("10.0.0.1:80"), ("10.0.0.1", Some("80")));
-    }
-
-    #[test]
-    fn parse_target_handles_ipv6_literals() {
-        // Bare IPv6 → host only, no port (the bug: rsplit would give (":","1")).
-        assert_eq!(parse_target("::1"), ("::1", None));
-        assert_eq!(parse_target("2001:db8::1"), ("2001:db8::1", None));
-        // Bracketed forms carry the port after the closing bracket.
-        assert_eq!(parse_target("[::1]"), ("::1", None));
-        assert_eq!(parse_target("[::1]:"), ("::1", Some("")));
-        assert_eq!(parse_target("[::1]:443"), ("::1", Some("443")));
-        assert_eq!(
-            parse_target("[2001:db8::1]:8080"),
-            ("2001:db8::1", Some("8080"))
-        );
-    }
-
-    #[test]
-    fn parse_pattern_accepts_numeric_and_star_ports() {
-        assert_eq!(
-            parse_pattern("api.example.com").unwrap(),
-            ("api.example.com", None)
-        );
-        assert_eq!(
-            parse_pattern("api.example.com:443").unwrap(),
-            ("api.example.com", Some(443))
-        );
-        assert_eq!(
-            parse_pattern("api.example.com:*").unwrap(),
-            ("api.example.com", None)
-        );
-        assert_eq!(parse_pattern("*:80").unwrap(), ("*", Some(80)));
-        assert_eq!(parse_pattern("*:*").unwrap(), ("*", None));
-        assert_eq!(parse_pattern("*").unwrap(), ("*", None));
-        assert_eq!(parse_pattern("[::1]:443").unwrap(), ("::1", Some(443)));
-        assert_eq!(parse_pattern("2001:db8::1").unwrap(), ("2001:db8::1", None));
-    }
-
-    #[test]
-    fn parse_pattern_rejects_malformed_ports() {
-        // Every one of these used to resolve to "any port".
+    fn parse_pattern_with_malformed_port_fails_instead_of_widening() {
         for bad in [
-            "*:8O80", // letter O
+            "*:8O80",
             "api.example.com:https",
-            "api.example.com:443 ", // trailing space
+            "api.example.com:443 ",
             "api.example.com:",
             "api.example.com:70000",
             "api.example.com:-1",
@@ -297,180 +256,5 @@ mod tests {
             assert!(err.contains(bad), "{bad}: {err}");
             assert!(err.contains("must be a number"), "{bad}: {err}");
         }
-    }
-
-    #[test]
-    fn resolve_rejects_malformed_port_instead_of_widening() {
-        let mut rules = BTreeMap::new();
-        rules.insert("api".to_string(), rule(&["*:8O80"], false));
-        let err = resolve(&net_with_rules(rules)).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("network.rules.api.allow"), "got: {msg}");
-        assert!(msg.contains("`*:8O80`"), "got: {msg}");
-
-        let mut rules = BTreeMap::new();
-        let mut r = rule(&["api.example.com"], false);
-        r.deny = vec!["internal.example.com:https".to_string()];
-        rules.insert("api".to_string(), r);
-        let msg = format!("{:#}", resolve(&net_with_rules(rules)).unwrap_err());
-        assert!(msg.contains("network.rules.api.deny"), "got: {msg}");
-    }
-
-    #[test]
-    fn resolve_treats_star_port_as_any_port() {
-        let mut rules = BTreeMap::new();
-        rules.insert("api".to_string(), rule(&["api.example.com:*"], false));
-        let resolved = resolve(&net_with_rules(rules)).unwrap();
-        assert!(resolved.allow[0].matches("api.example.com", 443));
-        assert!(resolved.allow[0].matches("api.example.com", 8080));
-    }
-
-    #[test]
-    fn resolve_inject_rejects_malformed_port() {
-        let env = SandboxEnv::from_secrets(vec![secret("A", "aaaaaaaaaaaa")]);
-        let net = net_with(vec![(
-            "api",
-            inject_rule(&["api.example.com:443 "], &["A"], false),
-        )]);
-        let msg = format!("{:#}", resolve_inject(&net, &env).unwrap_err());
-        assert!(msg.contains("network.rules.api.allow"), "got: {msg}");
-        assert!(msg.contains("`api.example.com:443 `"), "got: {msg}");
-    }
-
-    fn net_with_rules(rules: BTreeMap<String, NetworkRule>) -> config_values::Network {
-        config_values::Network {
-            policy: Policy::DenyByDefault,
-            rules,
-            middleware: BTreeMap::default(),
-            ports: BTreeMap::default(),
-            sockets: BTreeMap::default(),
-            services: BTreeMap::default(),
-        }
-    }
-
-    #[test]
-    fn passthrough_rule_contributes_to_both_allow_and_passthrough() {
-        let mut rules = BTreeMap::new();
-        rules.insert("pt".to_string(), rule(&["db.example.com:5432"], true));
-        rules.insert("plain".to_string(), rule(&["api.example.com"], false));
-        let net = config_values::Network {
-            policy: Policy::DenyByDefault,
-            rules,
-            middleware: BTreeMap::default(),
-            ports: BTreeMap::default(),
-            sockets: BTreeMap::default(),
-            services: BTreeMap::default(),
-        };
-        let resolved = resolve(&net).unwrap();
-        assert_eq!(resolved.allow.len(), 2);
-        assert_eq!(resolved.passthrough.len(), 1);
-        assert!(resolved.passthrough[0].matches("db.example.com", 5432));
-        assert!(!resolved.passthrough[0].matches("api.example.com", 443));
-    }
-
-    fn secret(name: &str, real: &str) -> MaskedSecret {
-        MaskedSecret {
-            name: name.to_string(),
-            real: real.to_string(),
-            surrogate: "x".repeat(real.chars().count()),
-        }
-    }
-
-    fn net_with(rules: Vec<(&str, NetworkRule)>) -> config_values::Network {
-        config_values::Network {
-            policy: Policy::DenyByDefault,
-            rules: rules.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
-            middleware: BTreeMap::default(),
-            ports: BTreeMap::default(),
-            sockets: BTreeMap::default(),
-            services: BTreeMap::default(),
-        }
-    }
-
-    fn inject_rule(allow: &[&str], inject: &[&str], passthrough: bool) -> NetworkRule {
-        NetworkRule {
-            enabled: true,
-            allow: allow.iter().map(|s| (*s).to_string()).collect(),
-            deny: vec![],
-            passthrough,
-            inject: inject.iter().map(|s| (*s).to_string()).collect(),
-        }
-    }
-
-    #[test]
-    fn resolve_inject_builds_one_target_per_allow_pattern() {
-        let env = SandboxEnv::from_secrets(vec![
-            secret("A", "aaaaaaaaaaaa"),
-            secret("B", "bbbbbbbbbbbb"),
-        ]);
-        let net = net_with(vec![
-            (
-                "api",
-                inject_rule(
-                    &["api.example.com:443", "*.example.org"],
-                    &["A", "B", "A"],
-                    false,
-                ),
-            ),
-            ("plain", inject_rule(&["plain.example.com"], &[], false)),
-        ]);
-        let targets = resolve_inject(&net, &env).unwrap();
-        assert_eq!(targets.len(), 2);
-        assert!(targets[0].matches("api.example.com", 443));
-        assert!(!targets[0].matches("api.example.com", 80));
-        assert!(targets[1].matches("x.example.org", 1234));
-        // Duplicate names collapse; both patterns share the same secrets.
-        assert_eq!(targets[0].secrets.len(), 2);
-        assert!(InjectedSecret::ptr_eq(
-            &targets[0].secrets[0],
-            &targets[1].secrets[0]
-        ));
-    }
-
-    #[test]
-    fn resolve_inject_skips_disabled_rules() {
-        let env = SandboxEnv::from_secrets(vec![secret("A", "aaaaaaaaaaaa")]);
-        let mut rule = inject_rule(&["api.example.com"], &["A"], false);
-        rule.enabled = false;
-        let net = net_with(vec![("api", rule)]);
-        assert!(resolve_inject(&net, &env).unwrap().is_empty());
-    }
-
-    #[test]
-    fn resolve_inject_rejects_unknown_name() {
-        let env = SandboxEnv::from_secrets(vec![]);
-        let net = net_with(vec![(
-            "api",
-            inject_rule(&["api.example.com"], &["A"], false),
-        )]);
-        let err = resolve_inject(&net, &env).unwrap_err().to_string();
-        assert!(err.contains("network.rules.api.inject"), "got: {err}");
-        assert!(err.contains("`A`"), "got: {err}");
-    }
-
-    #[test]
-    fn disabled_passthrough_rule_is_skipped() {
-        let mut rules = BTreeMap::new();
-        rules.insert(
-            "pt".to_string(),
-            NetworkRule {
-                enabled: false,
-                allow: vec!["db.example.com".to_string()],
-                deny: vec![],
-                passthrough: true,
-                inject: vec![],
-            },
-        );
-        let net = config_values::Network {
-            policy: Policy::DenyByDefault,
-            rules,
-            middleware: BTreeMap::default(),
-            ports: BTreeMap::default(),
-            sockets: BTreeMap::default(),
-            services: BTreeMap::default(),
-        };
-        let resolved = resolve(&net).unwrap();
-        assert!(resolved.allow.is_empty());
-        assert!(resolved.passthrough.is_empty());
     }
 }

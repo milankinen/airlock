@@ -115,22 +115,3 @@ pub fn read_from_prompt(label: &str) -> anyhow::Result<String> {
     };
     Ok(texts.swap_remove(0))
 }
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    use super::*;
-    use crate::vault::DisabledStorage;
-
-    #[test]
-    fn ensure_writable_refuses_a_disabled_vault() {
-        let vault = Vault::new_with(
-            Box::new(DisabledStorage),
-            HashMap::new(),
-            VaultStorageType::Disabled,
-        );
-        let err = ensure_writable(&vault, true).unwrap_err();
-        assert!(err.to_string().contains("vault is disabled"), "{err}");
-    }
-}

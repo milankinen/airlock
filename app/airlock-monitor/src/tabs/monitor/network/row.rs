@@ -150,31 +150,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn format_transfer_scales() {
-        assert_eq!(format_transfer(0), "0B");
-        assert_eq!(format_transfer(512), "512B");
-        assert_eq!(format_transfer(1024), "1.0KB");
-        assert_eq!(format_transfer(20 * 1024), "20KB");
-        assert_eq!(format_transfer(6 * 1024 * 1024), "6.0MB");
-        assert_eq!(format_transfer(512 * 1024 * 1024), "512MB");
-    }
-
-    /// One decimal below 10, none at or above it — keeps the column from
-    /// jittering in width as a transfer grows.
-    #[test]
-    fn format_transfer_switches_precision_at_ten() {
+    fn format_transfer_uses_one_decimal_only_below_ten() {
         let gb = 1024 * 1024 * 1024;
-        assert_eq!(format_transfer(gb * 63 / 10), "6.3GB");
-        assert_eq!(format_transfer(gb * 99 / 10), "9.9GB");
-        assert_eq!(format_transfer(gb * 10), "10GB");
+        for (bytes, text) in [
+            (0, "0B"),
+            (512, "512B"),
+            (1024, "1.0KB"),
+            (20 * 1024, "20KB"),
+            (6 * 1024 * 1024, "6.0MB"),
+            (512 * 1024 * 1024, "512MB"),
+            (gb * 63 / 10, "6.3GB"),
+            (gb * 99 / 10, "9.9GB"),
+            (gb * 10, "10GB"),
+        ] {
+            assert_eq!(format_transfer(bytes), text, "{bytes}");
+        }
     }
 
-    /// The widest figure below the petabyte mark is a four-digit one like
-    /// `1023KB` (just under the next unit), so the widest pair the column
-    /// realistically renders is two of those. It has to fit, or the
-    /// timestamp columns beside it would shift.
     #[test]
-    fn format_transfer_pair_fits_column() {
+    fn transfer_pair_fits_column_up_to_petabytes_and_is_truncated_beyond() {
         for bytes in [
             1023,
             1024 * 1023,
@@ -182,25 +176,15 @@ mod tests {
             1024 * 1024 * 1024 * 1023,
         ] {
             let pair = format!("↑ {} ↓ {}", format_transfer(bytes), format_transfer(bytes));
-            assert!(
-                pair.chars().count() <= TRANSFER_COLS,
-                "{pair:?} exceeds {TRANSFER_COLS} cols"
-            );
+            assert!(pair.chars().count() <= TRANSFER_COLS, "{pair:?}");
         }
-    }
-
-    /// Past a petabyte the figure would overflow the column — unreachable
-    /// for a sandbox connection, but the row builder truncates rather than
-    /// pushing the neighbouring columns out of alignment.
-    #[test]
-    fn absurd_transfer_still_holds_column_width() {
-        let pair = format!(
+        let huge = format!(
             "↑ {} ↓ {}",
             format_transfer(u64::MAX),
             format_transfer(u64::MAX)
         );
-        assert!(pair.chars().count() > TRANSFER_COLS);
-        let rendered = pad_right(&truncate_right(&pair, TRANSFER_COLS), TRANSFER_COLS);
+        assert!(huge.chars().count() > TRANSFER_COLS);
+        let rendered = pad_right(&truncate_right(&huge, TRANSFER_COLS), TRANSFER_COLS);
         assert_eq!(rendered.chars().count(), TRANSFER_COLS);
     }
 }

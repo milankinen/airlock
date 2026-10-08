@@ -160,6 +160,30 @@ pub fn for_config(config: &Clipboard) -> Option<ClipboardImpl> {
     })
 }
 
+#[cfg(test)]
+impl ClipboardImpl {
+    /// A clipboard that writes with the argv `write` and reads with `read`.
+    pub(super) fn with_programs(
+        write: &'static [&'static str],
+        read: &'static [&'static str],
+        copy: bool,
+        paste: bool,
+        limit: u64,
+    ) -> Self {
+        Self {
+            tool: HostTool {
+                name: "test",
+                write,
+                read,
+                requires_env: None,
+            },
+            copy,
+            paste,
+            limit,
+        }
+    }
+}
+
 impl clipboard::Server for ClipboardImpl {
     async fn copy(
         self: Rc<Self>,
@@ -221,61 +245,5 @@ impl clipboard::Server for ClipboardImpl {
         );
         results.get().set_data(&data);
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn tool() -> HostTool {
-        HostTool {
-            name: "test",
-            write: &["true"],
-            read: &["true"],
-            requires_env: None,
-        }
-    }
-
-    /// Every candidate must name a program in both directions, so a
-    /// half-filled entry can't slip through and fail at call time.
-    #[test]
-    fn candidates_are_well_formed() {
-        for c in CANDIDATES {
-            assert!(!c.write.is_empty(), "{} has no write argv", c.name);
-            assert!(!c.read.is_empty(), "{} has no read argv", c.name);
-        }
-    }
-
-    #[test]
-    fn write_reports_spawn_failure() {
-        let missing = HostTool {
-            name: "missing",
-            write: &["airlock-definitely-not-a-real-program"],
-            read: &["airlock-definitely-not-a-real-program"],
-            requires_env: None,
-        };
-        assert!(missing.write(b"hi").is_err());
-    }
-
-    /// A failing read is an empty clipboard, not an error — the guest's
-    /// fallback chain handles emptiness but not a broken pipe.
-    #[test]
-    fn read_failure_is_empty_not_error() {
-        let missing = HostTool {
-            name: "missing",
-            write: &["airlock-definitely-not-a-real-program"],
-            read: &["airlock-definitely-not-a-real-program"],
-            requires_env: None,
-        };
-        assert!(missing.read().is_empty());
-    }
-
-    #[test]
-    fn tool_is_copyable_for_blocking_tasks() {
-        // Guards the `spawn_blocking(move || tool.write(..))` calls above,
-        // which require HostTool: Copy + Send + 'static.
-        fn assert_send_static<T: Send + 'static>(_: T) {}
-        assert_send_static(tool());
     }
 }

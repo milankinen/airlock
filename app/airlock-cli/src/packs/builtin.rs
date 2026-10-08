@@ -358,25 +358,37 @@ end
     load(fixture(BUILTIN_PACKS.entries().to_vec(), files))
 }
 
-/// An embedded directory of `root` and `files` (`<folder>/<file>` or
-/// `<file>`).
+/// An embedded directory of `root` and `files` (`<folder>/<file>`,
+/// `<file>`, or deeper paths for nested folders).
 #[cfg(test)]
-fn fixture(
+pub(super) fn fixture(
     mut root: Vec<DirEntry<'static>>,
     files: Vec<(&'static str, String)>,
 ) -> &'static Dir<'static> {
-    let mut folders: BTreeMap<&'static str, Vec<DirEntry<'static>>> = BTreeMap::new();
+    root.extend(fixture_entries("", files));
+    Box::leak(Box::new(Dir::new("", root.leak())))
+}
+
+/// The entries of the folder `prefix` (with a trailing `/`; `""` for the
+/// root) made of `files`.
+#[cfg(test)]
+fn fixture_entries(prefix: &str, files: Vec<(&'static str, String)>) -> Vec<DirEntry<'static>> {
+    let mut entries = Vec::new();
+    let mut folders: BTreeMap<&'static str, Vec<(&'static str, String)>> = BTreeMap::new();
     for (path, text) in files {
-        let entry = DirEntry::File(File::new(path, text.leak().as_bytes()));
-        match path.split_once('/') {
-            Some((folder, _)) => folders.entry(folder).or_default().push(entry),
-            None => root.push(entry),
+        match path[prefix.len()..].split_once('/') {
+            Some((folder, _)) => folders
+                .entry(&path[..prefix.len() + folder.len()])
+                .or_default()
+                .push((path, text)),
+            None => entries.push(DirEntry::File(File::new(path, text.leak().as_bytes()))),
         }
     }
-    for (folder, entries) in folders {
-        root.push(DirEntry::Dir(Dir::new(folder, entries.leak())));
+    for (folder, files) in folders {
+        let children = fixture_entries(&format!("{folder}/"), files);
+        entries.push(DirEntry::Dir(Dir::new(folder, children.leak())));
     }
-    Box::leak(Box::new(Dir::new("", root.leak())))
+    entries
 }
 
 #[cfg(test)]
@@ -397,51 +409,30 @@ default = "a"
 values = ["a", "b"]
 "#;
 
-    /// A valid `packs/` directory: `demo@1`.
-    fn valid_files() -> Vec<(&'static str, String)> {
-        [
-            ("demo@1/pack.toml", PACK),
-            ("demo@1/config.toml", "cpus = 2\n"),
-            ("demo@1/setup.sh", "true\n"),
-        ]
-        .into_iter()
-        .map(|(path, text)| (path, text.to_string()))
-        .collect()
-    }
-
-    /// Load the valid files with `path` set to `text` (`None` removes it).
-    fn load_with(changes: &[(&'static str, Option<&str>)]) -> anyhow::Result<PackManager> {
-        let mut files = valid_files();
-        for &(path, text) in changes {
-            files.retain(|(p, _)| *p != path);
-            if let Some(text) = text {
-                files.push((path, text.to_string()));
-            }
-        }
+    fn load_files(files: &[(&'static str, &str)]) -> anyhow::Result<PackManager> {
+        let files = files
+            .iter()
+            .map(|(path, text)| (*path, (*text).to_string()))
+            .collect();
         load(fixture(vec![], files))
     }
 
-    fn load_error(changes: &[(&'static str, Option<&str>)]) -> String {
-        match load_with(changes) {
-            Ok(_) => panic!("{changes:?} loads"),
-            Err(e) => format!("{e:#}"),
-        }
-    }
-
-    /// `name@version` of every pack version of `packs`.
-    fn versions(packs: &PackManager) -> Vec<String> {
+    fn versions(packs: &[Pack]) -> Vec<String> {
         packs
-            .packs
             .iter()
             .map(|p| format!("{}@{}", p.metadata().name, p.metadata().version))
             .collect()
     }
 
+    fn pack_of_kind(kind: &str) -> String {
+        PACK.replace("kind = \"tool\"", &format!("kind = \"{kind}\""))
+    }
+
     #[test]
     fn builtin_packs_load() {
-        let packs = load(&BUILTIN_PACKS).unwrap();
+        let packs = crate::packs::init().unwrap();
         assert_eq!(
-            versions(&packs),
+            versions(&packs.builtin()),
             [
                 "alpine@1",
                 "debian@1",
@@ -459,88 +450,164 @@ values = ["a", "b"]
     }
 
     #[test]
-    fn a_valid_fixture_loads() {
-        let packs = load_with(&[]).unwrap();
-        assert_eq!(versions(&packs), ["demo@1"]);
+    fn loading_packs_orders_them_by_kind_then_name_and_skips_hidden_files() {
+        let distro = pack_of_kind("distro");
+        let agent = pack_of_kind("agent");
+        let packs = load_files(&[
+            (".DS_Store", "x"),
+            ("zeta@1/pack.toml", PACK),
+            ("demo@2/pack.toml", PACK),
+            ("demo@1/pack.toml", PACK),
+            ("demo@1/.DS_Store", "x"),
+            ("demo@1/config.toml~", "x"),
+            ("bot@1/pack.toml", &agent),
+            ("os@1/pack.toml", &distro),
+        ])
+        .unwrap();
+        assert_eq!(
+            versions(&packs.packs),
+            ["os@1", "bot@1", "demo@1", "demo@2", "zeta@1"]
+        );
+        assert_eq!(
+            versions(&packs.builtin()),
+            ["os@1", "bot@1", "demo@2", "zeta@1"]
+        );
+    }
+
+    #[test]
+    fn loading_pack_folder_reads_metadata_args_config_and_setup() {
+        for (file, text) in [
+            ("demo@1/config.toml", "cpus = 2\n"),
+            ("demo@1/config.json", "{ \"cpus\": 2 }"),
+            ("demo@1/config.yaml", "cpus: 2\n"),
+        ] {
+            let packs = load_files(&[
+                ("demo@1/pack.toml", PACK),
+                (file, text),
+                ("demo@1/setup.sh", "true\n"),
+            ])
+            .unwrap();
+            let demo = &packs.packs[0].0;
+            assert_eq!(demo.metadata.label, "Demo");
+            assert_eq!(demo.metadata.description, "Installs the demo");
+            assert_eq!(demo.metadata.kind, PackKind::Tool);
+            assert!(demo.metadata.has_setup);
+            assert_eq!(demo.setup, Some("true\n"));
+            assert!(
+                matches!(&demo.config, Some(PackConfig::Static(value)) if value["cpus"] == 2),
+                "{file}"
+            );
+            assert_eq!(demo.args[0].key, "mode");
+            assert_eq!(demo.args[0].default, ArgValue::Text("a".into()));
+        }
+        let packs = load_files(&[
+            ("demo@1/pack.toml", PACK),
+            ("demo@1/config.lua", "config.cpus = 2\n"),
+        ])
+        .unwrap();
         let demo = &packs.packs[0].0;
-        assert_eq!(demo.metadata.label, "Demo");
-        assert_eq!(demo.metadata.kind, PackKind::Tool);
-        assert!(demo.metadata.has_setup);
-        assert!(matches!(&demo.config, Some(PackConfig::Static(value)) if value["cpus"] == 2));
-        assert_eq!(demo.args[0].key, "mode");
-        assert_eq!(demo.args[0].default, ArgValue::Text("a".into()));
-        assert_eq!(demo.setup, Some("true\n"));
+        assert!(matches!(
+            demo.config,
+            Some(PackConfig::Lua("config.cpus = 2\n"))
+        ));
+        assert!(!demo.metadata.has_setup && demo.setup.is_none());
     }
 
     #[test]
-    fn a_json_config_loads() {
-        let packs = load_with(&[
-            ("demo@1/config.toml", None),
-            ("demo@1/config.json", Some("{ \"cpus\": 4 }")),
-        ])
-        .unwrap();
-        let config = packs.packs[0].0.config.as_ref().unwrap();
-        assert!(
-            matches!(config, PackConfig::Static(value) if *value == serde_json::json!({ "cpus": 4 }))
-        );
-    }
-
-    #[test]
-    fn hidden_files_and_backups_are_skipped() {
-        load_with(&[
-            (".DS_Store", Some("x")),
-            ("demo@1/.DS_Store", Some("x")),
-            ("demo@1/config.toml~", Some("x")),
-        ])
-        .unwrap();
-    }
-
-    #[test]
-    fn an_unknown_file_is_an_error() {
-        let e = load_error(&[("demo@1/notes.txt", Some("x"))]);
-        assert!(e.contains("packs/demo@1/notes.txt: unknown file"), "{e}");
-        let e = load_error(&[("readme.md", Some("x"))]);
-        assert!(e.contains("packs/readme.md: unknown file"), "{e}");
-        let e = load_error(&[("demo@1/config.yaml", Some("cpus: 2\n"))]);
-        assert!(e.contains("more than one config file"), "{e}");
-        let e = load_error(&[("demo@1/config.lua", Some("config.cpus = 2\n"))]);
-        assert!(e.contains("more than one config file"), "{e}");
-    }
-
-    #[test]
-    fn a_bad_default_is_an_error() {
-        let pack = PACK.replace("default = \"a\"", "default = \"c\"");
-        let e = load_error(&[("demo@1/pack.toml", Some(&pack))]);
-        assert!(
-            e.contains("arg `mode`: default `c` is not valid (one of: a, b)"),
-            "{e}"
-        );
-    }
-
-    #[test]
-    fn the_label_is_the_same_in_all_versions() {
-        let pack = PACK.replace("label = \"Demo\"", "label = \"Other\"");
-        let e = load_error(&[
-            ("demo@2/pack.toml", Some(&pack)),
-            ("demo@2/setup.sh", Some("true\n")),
-        ]);
-        assert!(
-            e.contains("the label \"Other\" differs from \"Demo\""),
-            "{e}"
-        );
-    }
-
-    #[test]
-    fn a_config_cannot_set_packs() {
-        let e = load_error(&[("demo@1/config.toml", Some("packs = [\"python\"]\n"))]);
-        assert!(
-            e.contains("packs/demo@1/config.toml: a pack config cannot set `packs`"),
-            "{e}"
-        );
-    }
-
-    #[test]
-    fn a_bad_folder_name_is_an_error() {
+    fn loading_invalid_pack_folder_fails_naming_problem() {
+        let mut cases: Vec<(&'static str, Option<String>, String)> = vec![
+            (
+                "demo@1/notes.txt",
+                Some("x".into()),
+                "packs/demo@1/notes.txt: unknown file".into(),
+            ),
+            (
+                "readme.md",
+                Some("x".into()),
+                "packs/readme.md: unknown file".into(),
+            ),
+            (
+                "demo@1/sub/config.toml",
+                Some("cpus = 1\n".into()),
+                "packs/demo@1/sub: unknown folder".into(),
+            ),
+            (
+                "demo@1/config.yaml",
+                Some("cpus: 2\n".into()),
+                "more than one config file".into(),
+            ),
+            (
+                "demo@1/config.lua",
+                Some("config.cpus = 2\n".into()),
+                "more than one config file".into(),
+            ),
+            (
+                "demo@1/config.toml",
+                Some("packs = [\"python\"]\n".into()),
+                "packs/demo@1/config.toml: a pack config cannot set `packs`".into(),
+            ),
+            (
+                "demo@2/pack.toml",
+                Some(PACK.replace("label = \"Demo\"", "label = \"Other\"")),
+                "the label \"Other\" differs from \"Demo\"".into(),
+            ),
+            (
+                "demo@2/pack.toml",
+                Some(pack_of_kind("agent")),
+                "the kind differs from the kind of the other versions".into(),
+            ),
+            (
+                "demo@1/pack.toml",
+                None,
+                "packs/demo@1/pack.toml: missing".into(),
+            ),
+        ];
+        let pack_cases = [
+            (
+                PACK.replace("default = \"a\"", "default = \"c\""),
+                "arg `mode`: default `c` is not valid (one of: a, b)",
+            ),
+            (
+                PACK.replace("description = \"Installs the demo\"", "description = \" \""),
+                "packs/demo@1/pack.toml: `description` is empty",
+            ),
+            (
+                format!(
+                    "{PACK}\n[[args]]\nkey = \"mode\"\ndescription = \"Again\"\ntype = \
+                     \"choice\"\nvalues = [\"x\"]\ndefault = \"x\"\n"
+                ),
+                "arg `mode`: the key is used twice",
+            ),
+            (
+                PACK.replace("values = [\"a\", \"b\"]", "values = []"),
+                "arg `mode`: `values` is empty",
+            ),
+            (
+                PACK.replace("values = [\"a\", \"b\"]", "values = [\"a\", \"b\", \"a\"]"),
+                "arg `mode`: the value `a` is in `values` twice",
+            ),
+            (
+                PACK.replace("values = [\"a\", \"b\"]\n", ""),
+                "arg `mode`: a choice needs `values`",
+            ),
+            (
+                PACK.replace("type = \"choice\"", "type = \"bool\""),
+                "arg `mode`: `values` and `other` are only for a choice",
+            ),
+        ];
+        for (pack, expected) in pack_cases {
+            cases.push(("demo@1/pack.toml", Some(pack), expected.into()));
+        }
+        for key in ["enabled", "version", "args", "Mode", "2mode", "mo_de"] {
+            cases.push((
+                "demo@1/pack.toml",
+                Some(PACK.replace("key = \"mode\"", &format!("key = \"{key}\""))),
+                format!(
+                    "arg `{key}`: the key must match [a-z][a-z0-9-]* and not be `version`, \
+                     `enabled` or `args`"
+                ),
+            ));
+        }
         for folder in [
             "demo",
             "Demo@1",
@@ -550,93 +617,26 @@ values = ["a", "b"]
             "demo@v1",
             "demo@legacy",
         ] {
-            let path: &'static str = format!("{folder}/pack.toml").leak();
-            let e = load_error(&[(path, Some(PACK))]);
-            assert!(
-                e.contains(&format!(
-                    "packs/{folder}: the folder name must be <name>@<version>"
-                )),
-                "{folder}: {e}"
-            );
+            cases.push((
+                format!("{folder}/pack.toml").leak(),
+                Some(PACK.into()),
+                format!("packs/{folder}: the folder name must be <name>@<version>"),
+            ));
         }
-    }
 
-    #[test]
-    fn a_missing_file_is_an_error() {
-        let e = load_error(&[("demo@1/pack.toml", None)]);
-        assert!(e.contains("packs/demo@1/pack.toml: missing"), "{e}");
-    }
-
-    #[test]
-    fn a_nested_folder_is_an_error() {
-        let mut files = valid_files();
-        files.retain(|(path, _)| !path.starts_with("demo@1/"));
-        let mut root = fixture(vec![], files).entries().to_vec();
-        let nested = Dir::new(
-            "demo@1/sub",
-            vec![DirEntry::File(File::new(
-                "demo@1/sub/config.toml",
-                b"cpus = 1\n",
-            ))]
-            .leak(),
-        );
-        let demo = vec![
-            DirEntry::File(File::new("demo@1/pack.toml", PACK.as_bytes())),
-            DirEntry::File(File::new("demo@1/config.toml", b"cpus = 2\n")),
-            DirEntry::File(File::new("demo@1/setup.sh", b"true\n")),
-            DirEntry::Dir(nested),
-        ];
-        root.push(DirEntry::Dir(Dir::new("demo@1", demo.leak())));
-        let root: &'static Dir<'static> = Box::leak(Box::new(Dir::new("", root.leak())));
-        let e = format!("{:#}", load(root).err().expect("a nested folder fails"));
-        assert!(e.contains("packs/demo@1/sub: unknown folder"), "{e}");
-    }
-
-    #[test]
-    fn an_empty_description_is_an_error() {
-        let pack = PACK.replace("description = \"Installs the demo\"", "description = \" \"");
-        let e = load_error(&[("demo@1/pack.toml", Some(&pack))]);
-        assert!(
-            e.contains("packs/demo@1/pack.toml: `description` is empty"),
-            "{e}"
-        );
-    }
-
-    #[test]
-    fn a_bad_arg_key_is_an_error() {
-        for key in ["enabled", "version", "args", "Mode", "2mode", "mo_de"] {
-            let pack = PACK.replace("key = \"mode\"", &format!("key = \"{key}\""));
-            let e = load_error(&[("demo@1/pack.toml", Some(&pack))]);
-            assert!(
-                e.contains(&format!(
-                    "arg `{key}`: the key must match [a-z][a-z0-9-]* and not be `version`, \
-                     `enabled` or `args`"
-                )),
-                "{key}: {e}"
-            );
+        for (path, text, expected) in cases {
+            let mut files: Vec<(&'static str, String)> = vec![
+                ("demo@1/pack.toml", PACK.into()),
+                ("demo@1/config.toml", "cpus = 2\n".into()),
+                ("demo@1/setup.sh", "true\n".into()),
+            ];
+            files.retain(|(p, _)| *p != path);
+            files.extend(text.map(|text| (path, text)));
+            let e = match load(fixture(vec![], files)) {
+                Ok(_) => panic!("loads: {expected}"),
+                Err(e) => format!("{e:#}"),
+            };
+            assert!(e.contains(&expected), "{expected}: {e}");
         }
-    }
-
-    const SECOND_ARG: &str = "\n[[args]]\nkey = \"mode\"\ndescription = \"Again\"\n\
-                              type = \"choice\"\nvalues = [\"x\"]\ndefault = \"x\"\n";
-
-    #[test]
-    fn an_arg_key_is_used_once() {
-        let pack = format!("{PACK}{SECOND_ARG}");
-        let e = load_error(&[("demo@1/pack.toml", Some(&pack))]);
-        assert!(e.contains("arg `mode`: the key is used twice"), "{e}");
-    }
-
-    #[test]
-    fn arg_values_are_not_empty_and_unique() {
-        let pack = PACK.replace("values = [\"a\", \"b\"]", "values = []");
-        let e = load_error(&[("demo@1/pack.toml", Some(&pack))]);
-        assert!(e.contains("arg `mode`: `values` is empty"), "{e}");
-        let pack = PACK.replace("values = [\"a\", \"b\"]", "values = [\"a\", \"b\", \"a\"]");
-        let e = load_error(&[("demo@1/pack.toml", Some(&pack))]);
-        assert!(
-            e.contains("arg `mode`: the value `a` is in `values` twice"),
-            "{e}"
-        );
     }
 }

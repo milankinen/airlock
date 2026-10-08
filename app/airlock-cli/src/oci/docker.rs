@@ -225,7 +225,10 @@ fn copy_hashing<R: Read, W: Write>(mut reader: R, mut writer: W) -> std::io::Res
 /// produces a [`DockerSave`] plus pre-staged `.download` files for every
 /// non-cached layer. Separated from the async wrapper so the whole
 /// blocking I/O loop is a single `spawn_blocking` unit.
-fn save_from_stream<R: Read>(stdout: R, layers_root: &Path) -> anyhow::Result<DockerSave> {
+pub(super) fn save_from_stream<R: Read>(
+    stdout: R,
+    layers_root: &Path,
+) -> anyhow::Result<DockerSave> {
     let mut archive = tar::Archive::new(stdout);
 
     let mut manifest_json: Option<Vec<DockerManifestEntry>> = None;
@@ -332,145 +335,4 @@ fn save_from_stream<R: Read>(stdout: R, layers_root: &Path) -> anyhow::Result<Do
     }
 
     result
-}
-
-#[cfg(test)]
-mod tests {
-    use std::io::Cursor;
-
-    use super::*;
-    use crate::cache::HOME_LOCK;
-
-    /// Build a plain tar from in-memory `(path, content)` entries — mirrors
-    /// what `docker image save` emits with the classic driver.
-    fn build_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut buf = Vec::new();
-        {
-            let mut b = tar::Builder::new(&mut buf);
-            for (path, content) in entries {
-                let mut header = tar::Header::new_gnu();
-                header.set_size(content.len() as u64);
-                header.set_mode(0o644);
-                header.set_cksum();
-                b.append_data(&mut header, path, *content).unwrap();
-            }
-            b.finish().unwrap();
-        }
-        buf
-    }
-
-    fn temp_home() -> PathBuf {
-        let base = std::env::temp_dir().join(format!(
-            "airlock-docker-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&base).unwrap();
-        base
-    }
-
-    #[test]
-    fn copy_hashing_matches_known_vectors() {
-        let mut out = Vec::new();
-        assert_eq!(
-            copy_hashing(Cursor::new(b"abc".to_vec()), &mut out).unwrap(),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-        assert_eq!(out, b"abc");
-
-        let mut empty = Vec::new();
-        assert_eq!(
-            copy_hashing(Cursor::new(Vec::new()), &mut empty).unwrap(),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-    }
-
-    #[test]
-    fn blob_hex_recognises_oci_and_docker_archive_layouts() {
-        let hex = "a".repeat(64);
-        assert_eq!(blob_hex(&format!("blobs/sha256/{hex}")), Some(hex.as_str()));
-        assert_eq!(blob_hex(&format!("{hex}.tar")), Some(hex.as_str()));
-        assert_eq!(blob_hex(&format!("{hex}.json")), Some(hex.as_str()));
-        assert_eq!(blob_hex(&format!("{hex}/layer.tar")), None);
-        assert_eq!(blob_hex("index.json"), None);
-    }
-
-    #[test]
-    fn save_from_stream_accepts_podman_docker_archive_layout() {
-        let _guard = HOME_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let home = temp_home();
-        unsafe {
-            std::env::set_var("HOME", &home);
-        }
-        let layers_root = cache::layers_root().unwrap();
-
-        let layer = b"layer bytes";
-        let layer_hex = hex::encode(Sha256::digest(layer));
-        let config = format!(
-            r#"{{"architecture":"amd64","os":"linux","rootfs":{{"type":"layers","diff_ids":["sha256:{layer_hex}"]}}}}"#
-        );
-        let config = config.as_bytes();
-        let config_hex = hex::encode(Sha256::digest(config));
-        let manifest = format!(
-            r#"[{{"Config":"{config_hex}.json","RepoTags":["localhost/x:1"],"Layers":["{layer_hex}.tar"]}}]"#
-        );
-        let tar = build_tar(&[
-            (&format!("{layer_hex}.tar"), layer),
-            (&format!("{config_hex}.json"), config),
-            ("manifest.json", manifest.as_bytes()),
-            ("repositories", b"{}"),
-        ]);
-
-        let save = save_from_stream(Cursor::new(tar), &layers_root).unwrap();
-        assert_eq!(save.layer_digests, vec![format!("sha256:{layer_hex}")]);
-
-        let download = layers_root.join(format!(
-            "{}.download",
-            cache::layer_key(&format!("sha256:{layer_hex}"))
-        ));
-        assert_eq!(std::fs::read(&download).unwrap(), layer);
-        let config_tmp = layers_root.join(format!(
-            "{}.download.tmp",
-            cache::layer_key(&format!("sha256:{config_hex}"))
-        ));
-        assert!(!config_tmp.exists());
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn save_from_stream_rejects_blob_with_mismatched_digest() {
-        let _guard = HOME_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let home = temp_home();
-        unsafe {
-            std::env::set_var("HOME", &home);
-        }
-        let layers_root = cache::layers_root().unwrap();
-
-        // A poisoned blob: named sha256:aaaa... but its content hashes to
-        // something else entirely. This is the cross-source poisoning attempt.
-        let claimed = "a".repeat(64);
-        let tar = build_tar(&[(&format!("blobs/sha256/{claimed}"), b"poison")]);
-
-        let Err(err) = save_from_stream(Cursor::new(tar), &layers_root) else {
-            panic!("mismatched docker blob must be rejected");
-        };
-        assert!(
-            err.to_string().contains("digest mismatch"),
-            "unexpected error: {err}"
-        );
-
-        // The staged tmp file must not be left behind.
-        let tmp = layers_root.join(format!(
-            "{}.download.tmp",
-            cache::layer_key(&format!("sha256:{claimed}"))
-        ));
-        assert!(!tmp.exists(), "staged tmp file leaked after rejection");
-    }
 }

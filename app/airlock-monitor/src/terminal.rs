@@ -62,43 +62,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn iterm_uses_option_from_either_variable() {
-        assert_eq!(modifier_for(Some("iTerm.app"), None, true), OPTION);
-        // Over SSH, TERM_PROGRAM is usually gone but LC_TERMINAL survives.
-        assert_eq!(modifier_for(None, Some("iTerm2"), false), OPTION);
-    }
-
-    #[test]
-    fn terminal_app_uses_fn() {
-        assert_eq!(modifier_for(Some("Apple_Terminal"), None, true), FN);
-    }
-
-    #[test]
-    fn vscode_follows_the_platform() {
-        assert_eq!(modifier_for(Some("vscode"), None, true), OPTION);
-        assert_eq!(modifier_for(Some("vscode"), None, false), SHIFT);
-    }
-
-    /// The fallback carries more weight than the table: most sessions
-    /// identify as nothing in particular, and Shift is right for almost
-    /// every terminal that isn't listed above.
-    #[test]
-    fn anything_unrecognised_falls_back_to_shift() {
-        assert_eq!(modifier_for(None, None, false), SHIFT);
-        assert_eq!(modifier_for(None, None, true), SHIFT);
-        assert_eq!(modifier_for(Some("WezTerm"), None, false), SHIFT);
-        assert_eq!(modifier_for(Some("ghostty"), None, true), SHIFT);
-        assert_eq!(modifier_for(Some(""), Some(""), true), SHIFT);
-    }
-
-    /// LC_TERMINAL wins over a conflicting TERM_PROGRAM: a multiplexer or
-    /// SSH hop can leave a stale TERM_PROGRAM behind, but LC_TERMINAL is
-    /// only set by the terminal that owns the session.
-    #[test]
-    fn lc_terminal_wins_over_a_stale_term_program() {
-        assert_eq!(
-            modifier_for(Some("Apple_Terminal"), Some("iTerm2"), true),
-            OPTION
-        );
+    fn select_modifier_follows_terminal_and_falls_back_to_shift() {
+        for (term_program, lc_terminal, macos, expected) in [
+            (Some("iTerm.app"), None, true, OPTION),
+            (None, Some("iTerm2"), false, OPTION),
+            (Some("Apple_Terminal"), Some("iTerm2"), true, OPTION),
+            (Some("Apple_Terminal"), None, true, FN),
+            (Some("vscode"), None, true, OPTION),
+            (Some("vscode"), None, false, SHIFT),
+            (Some("WezTerm"), None, false, SHIFT),
+            (Some("ghostty"), None, true, SHIFT),
+            (Some(""), Some(""), true, SHIFT),
+            (None, None, true, SHIFT),
+            (None, None, false, SHIFT),
+        ] {
+            assert_eq!(
+                modifier_for(term_program, lc_terminal, macos),
+                expected,
+                "{term_program:?} {lc_terminal:?} macos={macos}"
+            );
+        }
     }
 }

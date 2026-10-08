@@ -143,42 +143,28 @@ mod tests {
     }
 
     #[test]
-    fn merge_env_replaces_existing_and_appends_new_keys() {
-        let base = env(&["PATH=/bin", "HOME=/root", "TERM=xterm"]);
-        let out = merge_env(&base, [("HOME", "/tmp"), ("NEW", "1")], &[]);
-        assert_eq!(out, env(&["PATH=/bin", "TERM=xterm", "HOME=/tmp", "NEW=1"]));
+    fn merging_env_replaces_whole_keys_appends_overrides_and_drops_unset() {
+        let base = env(&["PATH=/bin", "HOME=/root", "FOO=1", "FOOBAR=2", "B=x"]);
+        let out = merge_env(
+            &base,
+            [("HOME", "/tmp"), ("FOO", "3"), ("NEW", "1"), ("D", "4")],
+            &env(&["B", "D", "MISSING"]),
+        );
+        assert_eq!(
+            out,
+            env(&["PATH=/bin", "FOOBAR=2", "HOME=/tmp", "FOO=3", "NEW=1"])
+        );
     }
 
-    /// A key that is a prefix of another key must not remove it.
     #[test]
-    fn merge_env_matches_whole_keys_only() {
-        let base = env(&["FOO=1", "FOOBAR=2"]);
-        let out = merge_env(&base, [("FOO", "3")], &[]);
-        assert_eq!(out, env(&["FOOBAR=2", "FOO=3"]));
-    }
-
-    #[test]
-    fn merge_env_unset_removes_base_and_override_keys() {
-        let base = env(&["A=1", "B=2", "C=3"]);
-        let out = merge_env(&base, [("D", "4")], &env(&["B", "D", "MISSING"]));
-        assert_eq!(out, env(&["A=1", "C=3"]));
-    }
-
-    /// `sh` is on PATH everywhere we run; a nonsense name is not.
-    #[test]
-    fn on_path_finds_real_programs() {
+    fn on_path_finds_executable_files_only() {
         assert!(on_path("sh"));
         assert!(!on_path("airlock-definitely-not-a-real-program"));
-    }
-
-    /// A directory named like the program must not count as a hit.
-    #[test]
-    fn on_path_rejects_directories() {
         assert!(!is_executable(Path::new("/")));
     }
 
     #[test]
-    fn strip_controls_removes_escapes_and_controls() {
+    fn stripping_guest_text_removes_escapes_and_controls() {
         assert_eq!(strip_controls(b"plain\ttext\n"), "plain\ttext\n");
         assert_eq!(strip_controls(b"\x1b[1;31mred\x1b[0m"), "red");
         assert_eq!(
@@ -188,20 +174,6 @@ mod tests {
         assert_eq!(strip_controls(b"50%\r100%\x08\x00"), "50%100%");
         assert_eq!(strip_controls("\u{9b}c1".as_bytes()), "c1");
         assert_eq!(strip_controls(b"bad \xff utf8"), "bad \u{fffd} utf8");
-        // A lone ESC at the end must not panic or swallow earlier text.
         assert_eq!(strip_controls(b"end\x1b"), "end");
-    }
-
-    #[test]
-    fn json_round_trip_through_a_pinned_dir() {
-        let tmp = crate::test_support::TempDir::new("util-json");
-        let dir = PinnedDir::open(tmp.path(), Path::new("d"), true).unwrap();
-        write_json(&dir, "v.json", &vec![1, 2, 3], 0o600).unwrap();
-        let back: Option<Vec<u32>> = read_json(&dir, "v.json", 1024).unwrap();
-        assert_eq!(back, Some(vec![1, 2, 3]));
-        let missing: Option<Vec<u32>> = read_json(&dir, "none.json", 1024).unwrap();
-        assert!(missing.is_none());
-        dir.write_atomic("bad.json", b"{", 0o600).unwrap();
-        assert!(read_json::<Vec<u32>>(&dir, "bad.json", 1024).is_err());
     }
 }

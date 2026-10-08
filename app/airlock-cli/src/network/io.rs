@@ -305,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn poll_write_blocks_until_previous_send_acks_then_wakes() {
+    fn poll_write_with_unacked_send_blocks_until_ack_wakes_it() {
         let (_tx, rx) = mpsc::channel::<Bytes>(1);
         let gate = Arc::new(Notify::new());
         let client_sink: tcp_sink::Client = capnp_rpc::new_client(GatedSink { gate: gate.clone() });
@@ -314,17 +314,10 @@ mod tests {
         let woken = Arc::new(AtomicBool::new(false));
         let waker = Waker::from(Arc::new(FlagWake(woken.clone())));
         let mut cx = Context::from_waker(&waker);
-
-        // The first write completes immediately: nothing is outstanding
-        // yet, so there's nothing to wait for.
         match Pin::new(&mut transport).poll_write(&mut cx, b"first") {
             Poll::Ready(Ok(5)) => {}
             other => panic!("expected first write to complete immediately, got {other:?}"),
         }
-
-        // The gate is still shut, so a second write must block on the
-        // first's ack rather than queuing more data behind an unbounded
-        // backlog.
         match Pin::new(&mut transport).poll_write(&mut cx, b"second") {
             Poll::Pending => {}
             Poll::Ready(other) => {
@@ -335,9 +328,6 @@ mod tests {
             !woken.load(Ordering::SeqCst),
             "should not be woken before the gate opens"
         );
-
-        // Releasing the gate lets `send` return, which must wake the writer
-        // that was waiting on its ack.
         gate.notify_one();
         assert!(
             woken.load(Ordering::SeqCst),

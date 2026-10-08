@@ -1,19 +1,10 @@
 #!/usr/bin/env bats
-# Tests for VM mount functionality: directory and file mounts, rw/ro.
-# Requires KVM (Linux) or Apple Virtualization (macOS) + docker.
 
 load helpers
 
 setup_file() {
-    if [[ ! -x "$AIRLOCK" ]]; then
-        echo "airlock binary not found at $AIRLOCK" >&2
-        echo "run: mise run build:release" >&2
-        return 1
-    fi
-    require_vm_support
     vm_setup_file
 
-    # Create host-side test fixtures
     mkdir -p rw_dir ro_dir
     echo "rw-content" > rw_dir/file.txt
     echo "ro-content" > ro_dir/file.txt
@@ -45,75 +36,35 @@ read_only = true
 EOF
 }
 
-teardown_file() {
-    vm_teardown_file
-}
-
-setup() {
-    cd "$FILE_TEMP_DIR" || return 1
-}
-
-# -- Directory mounts --
-
-@test "rw directory mount contains expected file" {
-    run_vm cat /data/rw/file.txt
+@test "directory mounts share host files and only rw accepts writes" {
+    echo "new-host-content" > rw_dir/host_created.txt
+    run_vm sh -c 'cat /data/rw/file.txt /data/ro/file.txt /data/rw/host_created.txt
+                  echo "written-from-vm" > /data/rw/new_file.txt && echo rw-write-ok
+                  echo "should-fail" 2>/dev/null > /data/ro/new_file.txt || echo ro-write-denied'
     assert_success
     assert_output_contains "rw-content"
-}
-
-@test "ro directory mount contains expected file" {
-    run_vm cat /data/ro/file.txt
-    assert_success
     assert_output_contains "ro-content"
-}
-
-@test "rw directory mount allows writing" {
-    run_vm sh -c 'echo "written-from-vm" > /data/rw/new_file.txt && cat /data/rw/new_file.txt'
-    assert_success
-    assert_output_contains "written-from-vm"
-}
-
-@test "ro directory mount rejects writes" {
-    run_vm sh -c 'echo "should-fail" > /data/ro/new_file.txt 2>&1'
-    assert_failure
-}
-
-@test "rw directory mount reflects host-side changes" {
-    echo "new-host-content" > rw_dir/host_created.txt
-    run_vm cat /data/rw/host_created.txt
-    assert_success
     assert_output_contains "new-host-content"
+    assert_output_contains "rw-write-ok"
+    assert_output_contains "ro-write-denied"
+    [[ "$(cat rw_dir/new_file.txt)" == "written-from-vm" ]]
+    [[ ! -e ro_dir/new_file.txt ]]
 }
 
-# -- File mounts --
-
-@test "rw file mount contains expected content" {
-    run_vm cat /data/rw_file.txt
+@test "file mounts share host changes both ways and only rw accepts writes" {
+    run_vm sh -c 'cat /data/rw_file.txt /data/ro_file.txt'
     assert_success
     assert_output_contains "rw-file-content"
-}
-
-@test "ro file mount contains expected content" {
-    run_vm cat /data/ro_file.txt
-    assert_success
     assert_output_contains "ro-file-content"
-}
 
-@test "rw file mount reflects host-side changes" {
     echo "updated-by-host" > rw_file.txt
-    run_vm cat /data/rw_file.txt
+    run_vm sh -c 'cat /data/rw_file.txt
+                  echo "updated-by-guest" > /data/rw_file.txt && echo rw-write-ok
+                  echo "should-fail" 2>/dev/null > /data/ro_file.txt || echo ro-write-denied'
     assert_success
     assert_output_contains "updated-by-host"
-}
-
-@test "rw file mount reflects guest-side changes" {
-    run_vm sh -c 'echo "updated-by-guest" > /data/rw_file.txt'
-    assert_success
-    content="$(cat rw_file.txt)"
-    [[ "$content" == *"updated-by-guest"* ]]
-}
-
-@test "ro file mount rejects writes" {
-    run_vm sh -c 'echo "should-fail" > /data/ro_file.txt 2>&1'
-    assert_failure
+    assert_output_contains "rw-write-ok"
+    assert_output_contains "ro-write-denied"
+    [[ "$(cat rw_file.txt)" == "updated-by-guest" ]]
+    [[ "$(cat ro_file.txt)" == "ro-file-content" ]]
 }

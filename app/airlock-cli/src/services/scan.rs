@@ -506,13 +506,12 @@ impl Body for ScanBody {
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
     use super::*;
     use crate::services::{anthropic, openai};
-
-    /// A real Anthropic token of a realistic shape.
-    fn real(prefix: &str) -> String {
-        format!("{prefix}-{}", "R".repeat(90))
-    }
+    use crate::test_cfg::services::shaped_token;
 
     fn scanner(formats: &'static Formats, known: &[&str], shapes: bool) -> Scanner {
         Scanner::new(
@@ -522,8 +521,6 @@ mod tests {
         )
     }
 
-    /// Push `chunks`, then finish; the bytes that went out, or `None` on a
-    /// hit.
     fn run(scanner: &mut Scanner, chunks: &[&str]) -> Option<String> {
         let mut out = Vec::new();
         for c in chunks {
@@ -534,12 +531,12 @@ mod tests {
     }
 
     #[test]
-    fn real_shapes_are_found_and_others_pass() {
+    fn real_token_shape_is_found_and_lookalikes_pass() {
         let a = &anthropic::FORMATS;
         for text in [
-            format!(r#"{{"k":"{}"}}"#, real("sk-ant-oat01")),
-            format!("Bearer {}", real("sk-ant-ort01")),
-            real("sk-ant-api03"),
+            format!(r#"{{"k":"{}"}}"#, shaped_token("sk-ant-oat01")),
+            format!("Bearer {}", shaped_token("sk-ant-ort01")),
+            shaped_token("sk-ant-api03"),
         ] {
             assert!(
                 run(&mut scanner(a, &[], true), &[&text]).is_none(),
@@ -549,8 +546,8 @@ mod tests {
         for text in [
             format!(r#"{{"k":"sk-ant-oat01-airlock-{}"}}"#, "s".repeat(64)),
             "sk-ant-api03-short example in a text".to_string(),
-            format!("x{}", real("sk-ant-api03")),
-            format!("assert_{}", real("sk-ant-api03")),
+            format!("x{}", shaped_token("sk-ant-api03")),
+            format!("assert_{}", shaped_token("sk-ant-api03")),
             format!("sk-ant-oat1-{}", "R".repeat(90)),
             "plain text without tokens\n".to_string(),
         ] {
@@ -562,31 +559,9 @@ mod tests {
         }
     }
 
-    /// An event stream gets the exact search only: a token shape in model
-    /// output passes, a known real value does not.
     #[test]
-    fn event_streams_get_the_exact_search_only() {
-        let a = &anthropic::FORMATS;
-        let shaped = format!("data: {}\n\n", real("sk-ant-api03"));
-        assert_eq!(
-            run(&mut scanner(a, &[], false), &[&shaped]).as_deref(),
-            Some(shaped.as_str())
-        );
-        let known = "known-real-value-123";
-        assert!(
-            run(
-                &mut scanner(a, &[known], false),
-                &["data: known-real-", "value-123\n\n"]
-            )
-            .is_none()
-        );
-    }
-
-    /// A token split across chunks is found; the bytes before it went
-    /// out, the token's bytes did not.
-    #[test]
-    fn a_split_token_is_found() {
-        let token = real("sk-ant-oat01");
+    fn token_split_across_chunks_is_found_before_its_bytes_go_out() {
+        let token = shaped_token("sk-ant-oat01");
         let (x, y) = token.split_at(20);
         let mut s = scanner(&anthropic::FORMATS, &[], true);
         assert_eq!(
@@ -596,7 +571,7 @@ mod tests {
         );
         assert!(s.push(y.as_bytes()).unwrap().is_empty());
         assert!(s.push(b"\n\n").is_err());
-        // A surrogate split the same way passes whole.
+
         let surrogate = format!("sk-ant-oat01-airlock-{}", "s".repeat(64));
         let (x, y) = surrogate.split_at(15);
         let mut s = scanner(&anthropic::FORMATS, &[], true);
@@ -606,9 +581,8 @@ mod tests {
         );
     }
 
-    /// Known values are found split, also with characters that end a run.
     #[test]
-    fn known_values_are_found_split() {
+    fn known_value_split_across_chunks_is_found_even_with_run_breaking_characters() {
         for known in ["REAL-opaque-access-token-1234", "pass word!secret"] {
             let (x, y) = known.split_at(7);
             let mut s = scanner(&openai::FORMATS, &[known], true);
@@ -622,9 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_jwts_are_found() {
-        use base64::Engine as _;
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    fn openai_issuer_jwt_is_found_and_fakes_or_other_issuers_pass() {
         let jwt = |claims: &str| {
             format!(
                 "eyJhbGciOiJSUzI1NiJ9.{}.sig",
@@ -638,8 +610,6 @@ mod tests {
         let (x, y) = real.split_at(30);
         assert!(run(&mut scanner(o, &[], true), &["a ", x, y, " b"]).is_none());
         assert!(run(&mut scanner(o, &[], true), &[&format!("{real}.more")]).is_none());
-        // `rt_…` is no shape the scan knows: the exact search finds stored
-        // refresh tokens of any format.
         let short = format!("rt_{}", "a".repeat(40));
         let id = format!("assert_rt_refresh_token_{}", "a".repeat(40));
         for ok in [fake.as_str(), other.as_str(), &short, &id] {
@@ -651,24 +621,20 @@ mod tests {
         }
     }
 
-    /// A long run goes on in parts; a token right after the held part is
-    /// still found.
     #[test]
-    fn a_long_run_is_not_held_whole() {
+    fn long_run_goes_out_in_parts_and_token_after_it_is_found() {
         let mut s = scanner(&anthropic::FORMATS, &[], true);
         let long = "a".repeat(2 * HOLD_MAX + 100);
         assert_eq!(s.push(long.as_bytes()).unwrap().len(), HOLD_MAX + 100);
         let mut s = scanner(&anthropic::FORMATS, &[], true);
         assert!(
-            s.push(format!("x {}\n", real("sk-ant-oat01")).as_bytes())
+            s.push(format!("x {}\n", shaped_token("sk-ant-oat01")).as_bytes())
                 .is_err()
         );
     }
 
-    /// Adversarial runs cost bounded work: 1 MB of candidate starts, in
-    /// small and large chunks, each in well under a second (debug build).
     #[test]
-    fn adversarial_runs_are_scanned_fast() {
+    fn adversarial_runs_are_scanned_in_bounded_time() {
         for (pattern, chunk) in [
             ("-eyJ", 16),
             ("-eyJ", 400 * 1024),
@@ -700,9 +666,9 @@ mod tests {
     }
 
     #[test]
-    fn holds_real_checks_header_values() {
+    fn header_value_with_real_token_or_known_value_holds_real() {
         let s = scanner(&anthropic::FORMATS, &["known-real-value"], false);
-        assert!(s.holds_real(format!("x {}", real("sk-ant-api03")).as_bytes()));
+        assert!(s.holds_real(format!("x {}", shaped_token("sk-ant-api03")).as_bytes()));
         assert!(s.holds_real(b"a=known-real-value; Path=/"));
         assert!(!s.holds_real(b"sk-ant-api03-airlock-abcdefghijklmnopqrstu"));
         assert!(!s.holds_real(b"text/event-stream"));

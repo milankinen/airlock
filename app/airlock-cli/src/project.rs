@@ -548,76 +548,58 @@ fn read_ca(sandbox_dir: &Path) -> anyhow::Result<(String, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
-    fn scratch_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "airlock-lock-test-{}-{}-{}",
-            tag,
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    use super::*;
+    use crate::test_cfg::{host_env_vault, temp_dir, test_context};
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
     #[test]
     fn lock_is_exclusive_and_is_running_tracks_it() {
-        let dir = scratch_dir("excl");
+        let tmp = temp_dir();
+        let dir = tmp.path().join("sandbox");
+        std::fs::create_dir(&dir).unwrap();
         let lock = PinnedDir::pin(&dir).unwrap();
-
-        // No lock file yet → not running.
         assert!(!is_running(&dir));
 
-        let held = acquire_lock(&lock).expect("first acquire succeeds");
-        // Contended → reported as running.
+        let held = acquire_lock(&lock).unwrap();
         assert!(is_running(&dir));
-        // A second acquisition (independent fd) must be refused, even from
-        // the same process — this is the mutual-exclusion the old scheme lost.
         assert!(acquire_lock(&lock).is_err());
 
         drop(held);
-        // Released → not running, and a fresh acquisition succeeds.
         assert!(!is_running(&dir));
-        let held2 = acquire_lock(&lock).expect("re-acquire after release succeeds");
+        let held2 = acquire_lock(&lock).unwrap();
         assert!(matches!(lock_if_idle(&dir), IdleLock::Running));
         drop(held2);
 
-        // An idle lock taken by the probe keeps other instances out until
-        // it drops.
         let IdleLock::Held(probe) = lock_if_idle(&dir) else {
-            panic!("an idle lock is taken");
+            panic!("idle lock is not taken");
         };
         assert!(acquire_lock(&lock).is_err());
         drop(probe);
         assert!(acquire_lock(&lock).is_ok());
 
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
         assert!(matches!(lock_if_idle(&dir), IdleLock::Missing));
     }
 
-    /// `.airlock/.gitignore` and `sandbox/lock` never follow a planted
-    /// symlink, and a symlinked `.airlock` is refused.
     #[test]
     fn cache_dir_and_lock_do_not_follow_symlinks() {
-        use std::os::unix::fs::symlink;
-
-        let dir = scratch_dir("symlinks");
-        let victim = dir.join("victim");
+        let tmp = temp_dir();
+        let dir = tmp.path().join("project");
+        let victim = tmp.path().join("victim");
         std::fs::write(&victim, "host file").unwrap();
         std::fs::create_dir_all(dir.join(".airlock/sandbox")).unwrap();
         symlink(&victim, dir.join(".airlock/.gitignore")).unwrap();
         symlink(&victim, dir.join(".airlock/sandbox/lock")).unwrap();
 
-        // The planted `.gitignore` link is kept, not written through.
         ensure_cache_dir(&dir).unwrap();
         assert!(SandboxLock::acquire(&dir).is_err());
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "host file");
 
-        // A missing `.gitignore` is written.
         std::fs::remove_file(dir.join(".airlock/.gitignore")).unwrap();
         std::fs::remove_file(dir.join(".airlock/sandbox/lock")).unwrap();
         ensure_cache_dir(&dir).unwrap();
@@ -632,7 +614,8 @@ mod tests {
         );
         drop(lock);
 
-        let other = scratch_dir("symlinks-other");
+        let other = tmp.path().join("other");
+        std::fs::create_dir(&other).unwrap();
         std::fs::remove_dir_all(dir.join(".airlock")).unwrap();
         symlink(&other, dir.join(".airlock")).unwrap();
         let err = ensure_cache_dir(&dir).unwrap_err();
@@ -648,68 +631,43 @@ mod tests {
         assert!(SandboxLock::acquire(&dir).is_err());
         assert!(!other.join(".gitignore").exists());
         assert!(!other.join("sandbox").exists());
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&other);
     }
 
-    /// A symlink is refused before the owner is checked; a foreign owner
-    /// of a real directory is refused too; the current user's own
-    /// directory has no problem.
     #[test]
-    fn airlock_dir_problem_flags_symlinks_and_foreign_owners() {
+    fn airlock_dir_owned_by_another_user_is_refused_after_symlink_check() {
         let path = Path::new("/some/.airlock");
         let euid = unsafe { libc::geteuid() };
+        let other = euid.wrapping_add(1);
+        assert_eq!(airlock_dir_problem_for(path, false, euid), None);
         assert_eq!(
-            airlock_dir_problem_for(path, true, euid),
-            Some(
-                "/some/.airlock is a symbolic link; airlock does not follow it. Run `airlock \
-                 rm` to remove just the link (its target is left untouched), or replace it \
-                 with a real directory."
-                    .to_string()
-            )
-        );
-        assert_eq!(
-            airlock_dir_problem_for(path, false, euid),
-            None,
-            "the current user's own directory has no problem"
-        );
-        assert_eq!(
-            airlock_dir_problem_for(path, false, euid.wrapping_add(1)),
+            airlock_dir_problem_for(path, false, other),
             Some("/some/.airlock is owned by another user".to_string())
         );
-        // A symlink owned by someone else is still reported as a symlink.
         assert!(
-            airlock_dir_problem_for(path, true, euid.wrapping_add(1))
+            airlock_dir_problem_for(path, true, other)
                 .unwrap()
                 .contains("is a symbolic link")
         );
     }
 
-    fn empty_config() -> ConfigValues {
-        crate::config::config_values::parse(serde_json::json!({})).unwrap()
-    }
-
-    /// A context in `home` with a disabled vault that substitutes
-    /// `HOST_VAR`.
-    fn test_context(home: &Path) -> Context {
-        crate::test_support::test_context(
-            home,
-            Vault::new_with(
-                Box::new(crate::vault::DisabledStorage),
-                std::collections::HashMap::from([("HOST_VAR".to_string(), "host".to_string())]),
-                crate::vault::VaultStorageType::Disabled,
-            ),
-        )
-    }
-
     #[test]
-    fn the_disk_can_be_reset() {
-        let dir = scratch_dir("disk");
-        let sandbox_lock = SandboxLock::acquire(&dir).unwrap();
-        let project = open(&sandbox_lock, empty_config(), None, test_context(&dir)).unwrap();
+    fn opened_project_has_private_ca_and_resettable_disk() {
+        let tmp = temp_dir();
+        let dir = tmp.path();
+        let sandbox_lock = SandboxLock::acquire(dir).unwrap();
+        let config = crate::config::config_values::parse(serde_json::json!({})).unwrap();
+        let project = open(
+            &sandbox_lock,
+            config,
+            None,
+            test_context(dir, host_env_vault(&[])),
+        )
+        .unwrap();
+        assert_eq!(mode(&project.sandbox_dir), 0o700);
+        assert_eq!(mode(&project.sandbox_dir.join("ca.json")), 0o600);
+        assert!(project.ca_cert.contains("BEGIN CERTIFICATE"));
         let pinned = PinnedDir::pin(&project.sandbox_dir).unwrap();
         project.save_meta();
-        // The guest cwd written by `open` survives the run meta updates.
         assert!(read_run_meta(&project.sandbox_dir).guest_cwd.is_some());
 
         assert!(disk_id(&project.sandbox_dir).is_none());
@@ -718,7 +676,6 @@ mod tests {
         prepare();
         assert!(has_disk(&project.sandbox_dir));
         let id = disk_id(&project.sandbox_dir).unwrap();
-        // Booting again keeps the disk and its identity.
         prepare();
         assert_eq!(disk_id(&project.sandbox_dir), Some(id));
         reset_disk(&pinned).unwrap();
@@ -726,7 +683,6 @@ mod tests {
         assert!(!has_disk(&project.sandbox_dir));
         assert!(!project.sandbox_dir.join(disk::DISK_ID_FILE).exists());
         reset_disk(&pinned).unwrap();
-        // The VM boot creates a missing disk.
         disk::prepare(
             &project.sandbox_dir,
             &project.config.disk,
@@ -736,47 +692,23 @@ mod tests {
         .unwrap();
         assert!(disk_id(&project.sandbox_dir).is_some());
         reset_disk(&pinned).unwrap();
-        // A re-created disk has a new identity, also when it gets the old
-        // inode back.
         prepare();
         let id2 = disk_id(&project.sandbox_dir).unwrap();
         assert_ne!(id2, id);
-        // Deleted by hand, the id file left behind: a new identity too.
         std::fs::remove_file(project.sandbox_dir.join(disk::DISK_FILE)).unwrap();
         assert!(disk_id(&project.sandbox_dir).is_none());
         prepare();
         assert_ne!(disk_id(&project.sandbox_dir), Some(id2));
-        // A disk without an id file (older airlock) gets one.
         std::fs::remove_file(project.sandbox_dir.join(disk::DISK_ID_FILE)).unwrap();
         assert!(disk_id(&project.sandbox_dir).is_none());
         prepare();
         assert!(disk_id(&project.sandbox_dir).is_some());
-        // A symlink at the disk is removed, not followed.
         let victim = dir.join("victim");
         std::fs::write(&victim, "host file").unwrap();
         std::fs::remove_file(project.sandbox_dir.join(disk::DISK_FILE)).unwrap();
-        std::os::unix::fs::symlink(&victim, project.sandbox_dir.join(disk::DISK_FILE)).unwrap();
+        symlink(&victim, project.sandbox_dir.join(disk::DISK_FILE)).unwrap();
         reset_disk(&pinned).unwrap();
         assert!(!has_disk(&project.sandbox_dir));
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "host file");
-        drop(project);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn ca_key_is_written_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = scratch_dir("ca");
-        generate_ca(&dir).expect("generate CA");
-        let mode = std::fs::metadata(dir.join("ca.json"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(
-            mode & 0o777,
-            0o600,
-            "CA private key file must be owner read/write only"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

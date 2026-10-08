@@ -133,142 +133,44 @@ mod tests {
         })
     }
 
-    fn headers(entries: &[(&str, &str)]) -> HeaderMap {
+    fn header(name: &'static str, value: &[u8]) -> HeaderMap {
         let mut h = HeaderMap::new();
-        for (k, v) in entries {
-            h.append(
-                hyper::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
-                HeaderValue::from_str(v).unwrap(),
-            );
-        }
+        h.insert(name, HeaderValue::from_bytes(value).unwrap());
         h
     }
 
-    fn values(h: &HeaderMap, name: &str) -> Vec<String> {
-        h.get_all(name)
-            .iter()
-            .map(|v| v.to_str().unwrap().to_string())
-            .collect()
-    }
-
     #[test]
-    fn replace_bytes_handles_multiple_and_adjacent_matches() {
-        assert_eq!(replace_bytes(b"abcabc", b"abc", b"X"), Some(b"XX".to_vec()));
-        assert_eq!(
-            replace_bytes(b"xx-abc-yy-abc", b"abc", b"LONGER"),
-            Some(b"xx-LONGER-yy-LONGER".to_vec())
-        );
-        assert_eq!(replace_bytes(b"nothing", b"abc", b"X"), None);
-        assert_eq!(replace_bytes(b"", b"abc", b"X"), None);
-    }
-
-    #[test]
-    fn unmask_request_replaces_surrogate_everywhere() {
-        let s = secret("TOKEN", "real-token-value", "SURROGATE1234567");
-        let mut h = headers(&[
-            ("authorization", "Bearer SURROGATE1234567"),
-            ("x-other", "untouched"),
-            ("cookie", "a=SURROGATE1234567; b=SURROGATE1234567"),
-        ]);
-        unmask_request(&mut h, &[s]).unwrap();
-        assert_eq!(values(&h, "authorization"), ["Bearer real-token-value"]);
-        assert_eq!(values(&h, "x-other"), ["untouched"]);
-        assert_eq!(
-            values(&h, "cookie"),
-            ["a=real-token-value; b=real-token-value"]
-        );
-    }
-
-    #[test]
-    fn mask_response_replaces_real_value() {
-        let s = secret("TOKEN", "real-token-value", "SURROGATE1234567");
-        let mut h = headers(&[("x-echo", "got real-token-value back")]);
-        mask_response(&mut h, &[s]).unwrap();
-        assert_eq!(values(&h, "x-echo"), ["got SURROGATE1234567 back"]);
-    }
-
-    #[test]
-    fn repeated_header_names_are_all_rewritten() {
-        let s = secret("TOKEN", "real-token-value", "SURROGATE1234567");
-        let mut h = headers(&[
-            ("x-multi", "SURROGATE1234567"),
-            ("x-multi", "prefix SURROGATE1234567"),
-        ]);
-        unmask_request(&mut h, &[s]).unwrap();
-        assert_eq!(
-            values(&h, "x-multi"),
-            ["real-token-value", "prefix real-token-value"]
-        );
-    }
-
-    #[test]
-    fn multiple_secrets_apply_in_one_pass() {
-        let a = secret("A", "real-a-value-1", "SURR-A-VALUE-1");
-        let b = secret("B", "real-b-value-2", "SURR-B-VALUE-2");
-        let mut h = headers(&[("x-both", "SURR-A-VALUE-1 and SURR-B-VALUE-2")]);
-        unmask_request(&mut h, &[a, b]).unwrap();
-        assert_eq!(values(&h, "x-both"), ["real-a-value-1 and real-b-value-2"]);
-    }
-
-    #[test]
-    fn nested_secrets_mask_the_longer_value_regardless_of_order() {
-        // AUTH's real value contains TOKEN's real value. Listing TOKEN first
-        // must not leave "Bearer " + surrogate(TOKEN) behind for AUTH.
+    fn nested_secrets_mask_longer_value_regardless_of_order() {
         let token = secret("TOKEN", "real-token-value", "SURROGATE1234567");
         let auth = secret("AUTH", "Bearer real-token-value", "SURROGATEabcdefghijklmn");
         for order in [vec![token.clone(), auth.clone()], vec![auth, token]] {
-            let mut h = headers(&[("x-echo", "got Bearer real-token-value back")]);
+            let mut h = header("x-echo", b"got Bearer real-token-value back");
             mask_response(&mut h, &order).unwrap();
-            assert_eq!(values(&h, "x-echo"), ["got SURROGATEabcdefghijklmn back"]);
+            assert_eq!(h["x-echo"], "got SURROGATEabcdefghijklmn back");
         }
     }
 
     #[test]
     fn non_ascii_real_value_round_trips_through_headers() {
-        // Real value is 18 bytes of UTF-8, surrogate is 15 ASCII bytes.
-        // Both directions must rewrite by bytes, and the rebuilt header
-        // must accept the non-ASCII bytes (HTTP allows 128..=255).
         let s = secret("TOKEN", "🔑-secret-token", "SURROGATEabcdef");
-        let mut h = headers(&[("authorization", "Bearer SURROGATEabcdef")]);
+        let mut h = header("authorization", b"Bearer SURROGATEabcdef");
         unmask_request(&mut h, std::slice::from_ref(&s)).unwrap();
         assert_eq!(
-            h.get("authorization").unwrap().as_bytes(),
+            h["authorization"].as_bytes(),
             "Bearer 🔑-secret-token".as_bytes()
         );
 
-        let mut h = HeaderMap::new();
-        h.insert(
-            "x-echo",
-            HeaderValue::from_bytes("got 🔑-secret-token back".as_bytes()).unwrap(),
-        );
+        let mut h = header("x-echo", "got 🔑-secret-token back".as_bytes());
         mask_response(&mut h, &[s]).unwrap();
-        assert_eq!(values(&h, "x-echo"), ["got SURROGATEabcdef back"]);
+        assert_eq!(h["x-echo"], "got SURROGATEabcdef back");
     }
 
     #[test]
-    fn mask_text_replaces_real_values_in_free_text() {
-        let s = secret("TOKEN", "real-token-value", "SURROGATE1234567");
-        let out = mask_text("middleware error: bad auth: Bearer real-token-value", &[s]);
-        assert_eq!(out, "middleware error: bad auth: Bearer SURROGATE1234567");
-        assert_eq!(mask_text("nothing here", &[]), "nothing here");
-    }
-
-    #[test]
-    fn no_secrets_and_empty_needles_are_noops() {
-        let mut h = headers(&[("x", "value")]);
-        unmask_request(&mut h, &[]).unwrap();
-        let empty = secret("E", "", "");
-        unmask_request(&mut h, &[empty]).unwrap();
-        assert_eq!(values(&h, "x"), ["value"]);
-    }
-
-    #[test]
-    fn invalid_rewritten_value_errors_without_leaking() {
-        // A real value containing a CR/LF can't be a header value.
+    fn real_value_invalid_in_header_errors_without_leaking() {
         let s = secret("TOKEN", "bad\r\nvalue-secret", "SURROGATE1234567");
-        let mut h = headers(&[("authorization", "SURROGATE1234567")]);
+        let mut h = header("authorization", b"SURROGATE1234567");
         let err = unmask_request(&mut h, &[s]).unwrap_err().to_string();
-        assert!(err.contains("authorization"), "got: {err}");
-        assert!(!err.contains("value-secret"), "leaked: {err}");
+        assert!(err.contains("authorization"), "{err}");
+        assert!(!err.contains("value-secret"), "{err}");
     }
 }

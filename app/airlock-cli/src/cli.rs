@@ -311,27 +311,4 @@ impl LogLevel {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn log_level_filter_keeps_the_airlock_targets() {
-        assert_eq!(
-            LogLevel::Trace.filter(),
-            "info,airlock=trace,airlockd=trace"
-        );
-        assert_eq!(
-            LogLevel::Debug.filter(),
-            "warn,airlock=debug,airlockd=trace"
-        );
-        assert_eq!(LogLevel::Info.filter(), "warn,airlock=info,airlockd=info");
-        assert_eq!(LogLevel::Warn.filter(), "warn");
-        assert_eq!(LogLevel::Error.filter(), "error");
-        for level in LogLevel::value_variants() {
-            assert!(
-                tracing_subscriber::EnvFilter::try_new(level.filter()).is_ok(),
-                "{level:?}"
-            );
-        }
-    }
-}
+mod tests;

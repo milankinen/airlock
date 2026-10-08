@@ -1,0 +1,190 @@
+use sha2::{Digest, Sha256};
+
+use super::*;
+use crate::test_cfg::home::TempHome;
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn config_json(user: &str, layers: &[&str]) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "architecture": "amd64",
+        "os": "linux",
+        "config": {
+            "User": user,
+            "Entrypoint": ["docker-entrypoint.sh"],
+            "Cmd": ["node"],
+            "Env": ["NODE_VERSION=22.1.0"],
+        },
+        "rootfs": {
+            "type": "layers",
+            "diff_ids": layers.iter().map(|h| format!("sha256:{h}")).collect::<Vec<_>>(),
+        },
+    }))
+    .unwrap()
+}
+
+/// The layers of `save` extracted from their staged tarballs, topmost
+/// first, as `ensure_local_image` does it.
+fn extract_saved_layers(save: &docker::DockerSave) -> Vec<String> {
+    let mut keys: Vec<String> = save
+        .layer_digests
+        .iter()
+        .map(|digest| {
+            layer::ensure_layer_cached(
+                digest,
+                |_| panic!("the docker export already staged {digest}"),
+                None,
+            )
+            .unwrap();
+            cache::layer_key(digest)
+        })
+        .collect();
+    keys.reverse();
+    keys
+}
+
+fn staged(hex: &str) -> std::path::PathBuf {
+    cache::layers_root().unwrap().join(format!(
+        "{}.download",
+        cache::layer_key(&format!("sha256:{hex}"))
+    ))
+}
+
+fn staging_leftovers() -> Vec<String> {
+    std::fs::read_dir(cache::layers_root().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            std::path::Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext == "tmp")
+        })
+        .collect()
+}
+
+#[test]
+fn podman_archive_export_becomes_image_with_named_user() {
+    let _home = TempHome::new();
+    let base = LayerTar::default()
+        .file(
+            "etc/passwd",
+            "root:x:0:0:root:/root:/bin/sh\nnode:x:1000:1000:Node:/home/node:/bin/sh\n",
+        )
+        .file("etc/group", "root:x:0:\nnode:x:1000:\n")
+        .file("etc/os-release", "ID=debian\n")
+        .plain();
+    let top = LayerTar::default()
+        .file("usr/local/bin/node", "#!/bin/sh\n")
+        .plain();
+    let (base_hex, top_hex) = (sha256_hex(&base), sha256_hex(&top));
+    let config = config_json("node", &[&base_hex, &top_hex]);
+    let config_hex = sha256_hex(&config);
+    let manifest = format!(
+        r#"[{{"Config":"{config_hex}.json","RepoTags":["localhost/x:1"],"Layers":["{base_hex}.tar","{top_hex}.tar"]}}]"#
+    );
+    let export = LayerTar::default()
+        .file(&format!("{base_hex}.tar"), &base)
+        .file(&format!("{top_hex}.tar"), &top)
+        .file(&format!("{config_hex}.json"), &config)
+        .file("manifest.json", manifest)
+        .file("repositories", "{}")
+        .plain();
+
+    let save =
+        docker::save_from_stream(std::io::Cursor::new(export), &cache::layers_root().unwrap())
+            .unwrap();
+    assert_eq!(
+        save.layer_digests,
+        [format!("sha256:{base_hex}"), format!("sha256:{top_hex}")]
+    );
+    assert!(staged(&base_hex).is_file());
+
+    let layers = extract_saved_layers(&save);
+    assert!(!staged(&base_hex).exists());
+    assert!(staging_leftovers().is_empty());
+    let image = build_oci_image(
+        "sha256:img".into(),
+        "localhost/x:1".into(),
+        layers.clone(),
+        &save.image_config,
+    )
+    .unwrap();
+    assert_eq!((image.uid, image.gid), (1000, 1000));
+    assert_eq!(image.container_home, "/home/node");
+    assert_eq!(image.cmd, ["docker-entrypoint.sh", "node"]);
+    assert!(image.env.contains(&"HOME=/home/node".to_string()));
+    assert!(image.env.contains(&"NODE_VERSION=22.1.0".to_string()));
+    assert_eq!(os_release(&image).unwrap().id, "debian");
+    assert!(
+        cache::layer_dir(&layers[0])
+            .unwrap()
+            .join("usr/local/bin/node")
+            .is_file()
+    );
+}
+
+#[test]
+fn docker_oci_layout_export_skips_cached_layers_and_legacy_members() {
+    let _home = TempHome::new();
+    let cached = LayerTar::default().file("cached", "1").plain();
+    let fresh = LayerTar::default().file("fresh", "2").plain();
+    let (cached_hex, fresh_hex) = (sha256_hex(&cached), sha256_hex(&fresh));
+    cache_layer(&format!("sha256:{cached_hex}"), &cached);
+    let config = config_json("", &[&cached_hex, &fresh_hex]);
+    let config_hex = sha256_hex(&config);
+    let manifest = format!(
+        r#"[{{"Config":"blobs/sha256/{config_hex}","Layers":["blobs/sha256/{cached_hex}","blobs/sha256/{fresh_hex}"]}}]"#
+    );
+    let export = LayerTar::default()
+        .file(&format!("blobs/sha256/{cached_hex}"), &cached)
+        .file(&format!("blobs/sha256/{fresh_hex}"), &fresh)
+        .file(&format!("blobs/sha256/{config_hex}"), &config)
+        .file(&format!("{}/layer.tar", "f".repeat(64)), &fresh)
+        .file("index.json", "{}")
+        .file("manifest.json", manifest)
+        .plain();
+
+    let save =
+        docker::save_from_stream(std::io::Cursor::new(export), &cache::layers_root().unwrap())
+            .unwrap();
+
+    assert!(!staged(&cached_hex).exists());
+    assert!(staged(&fresh_hex).is_file());
+    let layers = extract_saved_layers(&save);
+    assert!(
+        cache::layer_dir(&layers[0])
+            .unwrap()
+            .join("fresh")
+            .is_file()
+    );
+    assert!(
+        cache::layer_dir(&layers[1])
+            .unwrap()
+            .join("cached")
+            .is_file()
+    );
+    assert!(staging_leftovers().is_empty());
+}
+
+#[test]
+fn docker_blob_whose_content_does_not_match_its_digest_is_rejected() {
+    let _home = TempHome::new();
+    let claimed = "a".repeat(64);
+    let export = LayerTar::default()
+        .file(&format!("blobs/sha256/{claimed}"), "poison")
+        .plain();
+
+    let Err(err) =
+        docker::save_from_stream(std::io::Cursor::new(export), &cache::layers_root().unwrap())
+    else {
+        panic!("mismatched docker blob must be rejected");
+    };
+
+    assert!(err.to_string().contains("digest mismatch"), "{err}");
+    let leftovers: Vec<_> = std::fs::read_dir(cache::layers_root().unwrap())
+        .unwrap()
+        .collect();
+    assert!(leftovers.is_empty());
+}

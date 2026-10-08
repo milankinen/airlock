@@ -482,10 +482,8 @@ mod tests {
         )
     }
 
-    /// Real tokens outside a token field are OpenAI JWTs; airlock's
-    /// surrogates (fake JWTs, `airlock-…`) and other strings are none.
     #[test]
-    fn real_tokens_are_told_from_surrogates() {
+    fn openai_jwt_is_real_and_surrogates_or_other_strings_are_not() {
         let access = jwt(&json!({ "exp": 1, AUTH_CLAIM: { "chatgpt_plan_type": "plus" } }));
         let id_token = jwt(&json!({ "exp": 1, "iss": ISSUER }));
         let fake = tokens::fake_jwt(&access).unwrap().unwrap();
@@ -506,9 +504,8 @@ mod tests {
         }
     }
 
-    /// Which format a token answer's strings get, by key.
     #[test]
-    fn formats_by_key() {
+    fn token_answer_string_gets_format_by_key_and_value() {
         let access = jwt(&json!({ "exp": 1, AUTH_CLAIM: {} }));
         let kind = |k: &str, v: &str| FORMATS.recognize(k, v).map(|f| (f.kind, f.carries_claims));
         assert_eq!(kind("id_token", &access), Some((TokenKind::Id, true)));
@@ -531,21 +528,5 @@ mod tests {
         );
         assert_eq!(kind("id_token", "opaque"), Some((TokenKind::Id, false)));
         assert_eq!(kind("refresh_token", ""), None);
-    }
-
-    /// The refresh upstream holds Codex's own fields and the stored
-    /// client id only.
-    #[test]
-    fn the_refresh_body_is_codexs() {
-        let mut grant = Grant::for_tests(vec![]);
-        grant.client_id = "stored-client".into();
-        assert_eq!(
-            PROVIDER.refresh_body(&grant, "real-refresh"),
-            json!({
-                "client_id": "stored-client",
-                "grant_type": "refresh_token",
-                "refresh_token": "real-refresh",
-            })
-        );
     }
 }

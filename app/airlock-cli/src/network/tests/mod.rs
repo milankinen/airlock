@@ -1,14 +1,17 @@
-mod fake_provider;
-mod helpers;
-mod test_anthropic;
-mod test_http;
-mod test_inject;
-mod test_middleware;
-mod test_openai;
-mod test_services;
-mod test_tcp;
-mod test_tls;
-
-// Re-export for use in test files
-#[allow(unused_imports)]
-pub use helpers::*;
+mod test_alpn_negotiation;
+mod test_answer_scan;
+mod test_anthropic_api;
+mod test_anthropic_refresh_and_revoke;
+mod test_anthropic_sign_in;
+mod test_credential_swap;
+mod test_http1_relay;
+mod test_http_upgrade;
+mod test_middleware_lua;
+mod test_openai_api;
+mod test_openai_sign_in;
+mod test_policy_rules;
+mod test_refresh_racing_sign_out;
+mod test_secret_inject;
+mod test_service_hosts;
+mod test_service_routes;
+mod test_tls_mitm;

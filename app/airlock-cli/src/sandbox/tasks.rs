@@ -65,7 +65,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
-    use crate::test_support::block_on_local;
+    use crate::test_cfg::block_on_local;
 
     /// Sets its flag when dropped, i.e. when the owning task is aborted.
     struct DropFlag(Rc<Cell<bool>>);
@@ -76,13 +76,22 @@ mod tests {
         }
     }
 
-    /// Services stop first while transport keeps running, and a port a
-    /// service held can be bound again as soon as `stop_services` returns.
+    fn spawn_pending(
+        spawn: impl FnOnce(std::pin::Pin<Box<dyn Future<Output = ()>>>),
+    ) -> Rc<Cell<bool>> {
+        let dropped = Rc::new(Cell::new(false));
+        let flag = DropFlag(dropped.clone());
+        spawn(Box::pin(async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+        }));
+        dropped
+    }
+
     #[test]
-    fn services_stop_first_and_free_their_ports() {
+    fn services_stop_before_transport_and_free_their_ports() {
         block_on_local(async {
             let mut tasks = BootTasks::default();
-
             let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
                 .await
                 .unwrap();
@@ -95,21 +104,13 @@ mod tests {
                     let _ = listener.accept().await;
                 }
             });
-
-            let transport_dropped = Rc::new(Cell::new(false));
-            let flag = DropFlag(transport_dropped.clone());
-            tasks.spawn_transport(async move {
-                let _flag = flag;
-                std::future::pending::<()>().await;
-            });
+            let transport_dropped = spawn_pending(|task| tasks.spawn_transport(task));
             tokio::task::yield_now().await;
 
             tasks.stop_services().await;
             assert!(service_dropped.get());
-            assert!(!transport_dropped.get(), "transport must outlive services");
-            TcpListener::bind(addr)
-                .await
-                .expect("the service's port is free after stop_services");
+            assert!(!transport_dropped.get());
+            TcpListener::bind(addr).await.unwrap();
 
             tasks.stop_transport().await;
             assert!(transport_dropped.get());
@@ -117,25 +118,16 @@ mod tests {
     }
 
     #[test]
-    fn drop_aborts_both_groups() {
+    fn dropping_boot_tasks_aborts_both_groups() {
         block_on_local(async {
             let mut tasks = BootTasks::default();
-            let service = Rc::new(Cell::new(false));
-            let transport = Rc::new(Cell::new(false));
-            let flag = DropFlag(service.clone());
-            tasks.spawn_service(async move {
-                let _flag = flag;
-                std::future::pending::<()>().await;
-            });
-            let flag = DropFlag(transport.clone());
-            tasks.spawn_transport(async move {
-                let _flag = flag;
-                std::future::pending::<()>().await;
-            });
+            let service = spawn_pending(|task| tasks.spawn_service(task));
+            let transport = spawn_pending(|task| tasks.spawn_transport(task));
             tokio::task::yield_now().await;
+
             drop(tasks);
-            // Aborted local tasks are dropped on the next scheduler pass.
             tokio::task::yield_now().await;
+
             assert!(service.get() && transport.get());
         });
     }

@@ -142,20 +142,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn format_bytes_scales() {
-        assert_eq!(format_bytes(512), "512 B");
-        assert_eq!(format_bytes(2048), "2 KiB");
-        assert_eq!(format_bytes(2 * 1024 * 1024), "2 MiB");
-        assert_eq!(format_bytes(2 * 1024 * 1024 * 1024), "2.0 GiB");
-    }
-
-    #[test]
-    fn set_usage_pushes_history_and_caps() {
+    fn usage_history_is_capped_to_newest_samples() {
         let mut s = MemoryState::new();
-        for _ in 0..(HISTORY_CAPACITY + 10) {
-            s.set_usage(100, 50);
+        for used in 0..(HISTORY_CAPACITY as u64 + 10) {
+            s.set_usage(1000, used);
         }
         assert_eq!(s.history.len(), HISTORY_CAPACITY);
-        assert!(s.history.iter().all(|&v| v == 50));
+        assert_eq!(s.history.first(), Some(&1));
+        assert_eq!(s.history.last(), Some(&12));
     }
 }

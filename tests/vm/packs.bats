@@ -1,15 +1,4 @@
 #!/usr/bin/env bats
-# Tests for `[packs]`: the install boot of "airlock start" on Alpine and
-# Debian, with every installable built-in pack at version 1, and the list
-# form, which installs nothing. Requires KVM (Linux) or Apple
-# Virtualization (macOS) + docker, and an open network (the install
-# scripts download packages and releases).
-#
-# Installing into an existing sandbox needs a terminal (the "Tools have
-# been added" question); bats has none. So these tests cover the new-disk
-# install, the retry of an unfinished install (no question), and the
-# `--yes` re-create. "Continue with current sandbox" and "Install anyways"
-# are covered by unit tests only.
 
 load helpers
 
@@ -30,39 +19,16 @@ npm --version && python3 --version && cargo --version && rustc --version &&
 docker --version && git --version && mise version && echo ALL-PACKS-OK'
 
 setup_file() {
-    if [[ ! -x "$AIRLOCK" ]]; then
-        echo "airlock binary not found at $AIRLOCK" >&2
-        echo "run: mise run build:release" >&2
-        return 1
-    fi
-    require_vm_support
     vm_setup_file
 
-    # The copilot pack config masks ${COPILOT_GITHUB_TOKEN}: the start
-    # fails when the host has no such variable. A dummy token is enough.
     export COPILOT_GITHUB_TOKEN=airlock-test
 
-    # One project per distro; HOME stays in the parent directory.
     mkdir -p alpine debian
     printf '[vm]\nimage = "alpine:latest"\n\n%s\n' "$PACKS" >alpine/airlock.toml
     printf '[vm]\nimage = "debian:stable-slim"\n\n%s\n' "$PACKS" >debian/airlock.toml
 
-    # A project with the list form only.
     mkdir -p legacy-list
     printf 'presets = ["python"]\n\n[vm]\nimage = "alpine:latest"\n' >legacy-list/airlock.toml
-}
-
-teardown_file() {
-    vm_teardown_file
-}
-
-setup() {
-    cd "$FILE_TEMP_DIR" || return 1
-}
-
-# A user file of the tests: it applies to every project in this file.
-teardown() {
-    rm -f "$FILE_TEMP_DIR/.airlock/config.toml"
 }
 
 # The pack names with lines in the install log of the last install boot.
@@ -144,12 +110,6 @@ check_removed_pack() {
     done
 }
 
-check_exit_code() {
-    cd "$1" || return 1
-    run_airlock start -- sh -c 'exit 7'
-    [[ "$status" -eq 7 ]]
-}
-
 # The list form installs nothing: no install boot, no install records, and
 # no python3 in the sandbox (the Alpine image has none).
 check_legacy_installs_nothing() {
@@ -162,46 +122,38 @@ check_legacy_installs_nothing() {
     [[ ! -e .airlock/sandbox/installs.log ]]
 }
 
-@test "alpine: a new sandbox installs every pack without a question, then runs the command" {
+@test "alpine: new sandbox installs every pack without question then runs command" {
     check_install alpine
 }
 
-@test "alpine: a second start installs nothing" {
+@test "alpine: second start installs nothing" {
     check_second_start alpine
 }
 
-@test "alpine: an unconfirmed install runs every script again" {
+@test "alpine: unconfirmed install runs every script again" {
     check_rerun alpine
 }
 
-@test "alpine: start returns the exit code of the command" {
-    check_exit_code alpine
-}
-
-@test "alpine: a removed pack needs a terminal or --yes, and --yes re-creates the sandbox" {
+@test "alpine: removed pack needs terminal or --yes and --yes re-creates sandbox" {
     check_removed_pack alpine
 }
 
-@test "a legacy list entry installs nothing" {
+@test "list-form preset installs nothing" {
     check_legacy_installs_nothing legacy-list
 }
 
-@test "debian: a new sandbox installs every pack without a question, then runs the command" {
+@test "debian: new sandbox installs every pack without question then runs command" {
     check_install debian
 }
 
-@test "debian: a second start installs nothing" {
+@test "debian: second start installs nothing" {
     check_second_start debian
 }
 
-@test "debian: an unconfirmed install runs every script again" {
+@test "debian: unconfirmed install runs every script again" {
     check_rerun debian
 }
 
-@test "debian: start returns the exit code of the command" {
-    check_exit_code debian
-}
-
-@test "debian: a removed pack needs a terminal or --yes, and --yes re-creates the sandbox" {
+@test "debian: removed pack needs terminal or --yes and --yes re-creates sandbox" {
     check_removed_pack debian
 }

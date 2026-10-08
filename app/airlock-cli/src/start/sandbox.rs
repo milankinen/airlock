@@ -20,12 +20,17 @@ use crate::cli::prompt;
 use crate::cli::prompt::choose::{Choice, Choose};
 use crate::cli::prompt::style::Tone;
 use crate::config::ResolvedConfig;
-use crate::oci::{self, ImageChange, ImageChangeStop, OciImage, OnImageChange};
-use crate::packs::install::facts;
+#[cfg(not(test))]
+use crate::oci::prepare as prepare_image;
+use crate::oci::{ImageChange, ImageChangeStop, OciImage, OnImageChange};
+#[cfg(not(test))]
+use crate::packs::install::facts::check as check_image;
 use crate::packs::install::plan::{self, DecideInput, Pending, Plan, Transition, Wanted, Why};
 use crate::packs::install::state::{self as install_state, InstallState, ReadState};
 use crate::packs::{InstallerScript, PackManager};
 use crate::project::{self, SandboxLock};
+#[cfg(test)]
+use crate::test_cfg::start::{check_image, prepare_image};
 use crate::util::PinnedDir;
 use crate::vault::Vault;
 use crate::{cli, sandbox};
@@ -226,7 +231,7 @@ pub async fn ensure_sandbox(
 
     let values = &resolved.values;
     sandbox::report::print_preparing(sandbox_dir.path(), &values.vm.image.name);
-    let prepared = oci::prepare(
+    let prepared = prepare_image(
         sandbox_dir.path(),
         &values.vm.image,
         vault,
@@ -264,7 +269,7 @@ pub async fn ensure_sandbox(
     // Check the image before the disk of a tool question is gone or
     // anything installs.
     if !candidates.is_empty() && (recreate || !plan.pending.is_empty()) {
-        facts::check(&image).map_err(|e| Exit::error(2, e))?;
+        check_image(&image).map_err(|e| Exit::error(2, e))?;
     }
     if recreate {
         project::reset_disk(&sandbox_dir)?;
@@ -461,17 +466,10 @@ fn read_state(sandbox: &PinnedDir, can_prompt: bool) -> Result<InstallState, Exi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_cfg::packs::{test_installers, test_packs};
 
     const TTY: Answering = Answering {
         can_prompt: true,
-        yes: false,
-    };
-    const YES: Answering = Answering {
-        can_prompt: false,
-        yes: true,
-    };
-    const NOBODY: Answering = Answering {
-        can_prompt: false,
         yes: false,
     };
 
@@ -479,205 +477,19 @@ mod tests {
         Pending { id: id.into(), why }
     }
 
-    fn plan(pending: Vec<Pending>, removed: &[&str]) -> Plan {
+    fn plan(pending: Vec<Pending>, removed: &[&str], changed: &[&str]) -> Plan {
         Plan {
             pending,
-            removed: removed.iter().map(|r| (*r).to_string()).collect(),
+            removed: removed.iter().map(ToString::to_string).collect(),
+            changed: changed.iter().map(ToString::to_string).collect(),
             ..Plan::default()
         }
     }
 
-    /// A plan whose pack `id` changed.
-    fn changed_plan(id: &str) -> Plan {
-        Plan {
-            changed: vec![id.to_string()],
-            ..Plan::default()
-        }
-    }
-
-    #[test]
-    fn a_changed_image_asks_in_a_terminal_and_re_creates_with_yes() {
-        assert_eq!(on_image_change(false, TTY), OnImageChange::Ask);
-        assert_eq!(on_image_change(false, YES), OnImageChange::Recreate);
-        assert_eq!(
-            on_image_change(
-                false,
-                Answering {
-                    can_prompt: true,
-                    yes: true
-                }
-            ),
-            OnImageChange::Recreate
-        );
-        assert_eq!(on_image_change(false, NOBODY), OnImageChange::Refuse);
-    }
-
-    #[test]
-    fn a_new_disk_needs_no_question() {
-        let changed = plan(vec![pending("python", Why::New)], &["mise"]);
-        for answering in [TTY, YES, NOBODY] {
-            assert_eq!(on_image_change(true, answering), OnImageChange::Recreate);
-            assert_eq!(
-                tool_changes(true, &changed, answering),
-                ToolChanges::NoQuestion
-            );
-        }
-    }
-
-    #[test]
-    fn removed_tools_ask_in_a_terminal_and_re_create_with_yes() {
-        let removed = plan(vec![], &["mise"]);
-        assert_eq!(tool_changes(false, &removed, TTY), ToolChanges::Ask);
-        assert_eq!(tool_changes(false, &removed, YES), ToolChanges::Recreate);
-        assert_eq!(
-            tool_changes(false, &removed, NOBODY),
-            ToolChanges::NeedsTerminal
-        );
-        assert_eq!(
-            tools_changed_message(&removed),
-            "Tools changed in the sandbox (removed: mise). Run in a terminal or pass --yes."
-        );
-    }
-
-    #[test]
-    fn added_tools_ask_in_a_terminal_and_re_create_with_yes() {
-        for added in [
-            plan(vec![pending("python", Why::New)], &[]),
-            changed_plan("python"),
-        ] {
-            assert_eq!(tool_changes(false, &added, TTY), ToolChanges::Ask);
-            assert_eq!(tool_changes(false, &added, YES), ToolChanges::Recreate);
-            assert_eq!(
-                tool_changes(false, &added, NOBODY),
-                ToolChanges::NeedsTerminal
-            );
-        }
-        let both = plan(
-            vec![pending("python", Why::New), pending("rust", Why::Retry)],
-            &["mise"],
-        );
-        assert_eq!(
-            tools_changed_message(&both),
-            "Tools changed in the sandbox (added: python; removed: mise). Run in a terminal or \
-             pass --yes."
-        );
-    }
-
-    /// An unfinished install of the same fingerprint installs again
-    /// without a question, also without a terminal.
-    #[test]
-    fn a_retry_needs_no_question() {
-        let retry = plan(vec![pending("python", Why::Retry)], &[]);
-        for answering in [TTY, YES, NOBODY] {
-            assert_eq!(
-                tool_changes(false, &retry, answering),
-                ToolChanges::NoQuestion
-            );
-        }
-        assert_eq!(
-            tool_changes(false, &Plan::default(), NOBODY),
-            ToolChanges::NoQuestion
-        );
-    }
-
-    /// The plan of a pack whose last install failed, on the same disk
-    /// and image; `ran_session`: a session ran since.
-    fn retry_plan(ran_session: bool) -> Plan {
-        let fingerprint = "f".repeat(64);
-        let mut state = InstallState {
-            disk: Some((1, 2)),
-            image_id: Some("sha256:1".into()),
-            ran_session,
-            ..InstallState::default()
-        };
-        state.set("python", install_state::PackStatus::Failed, &fingerprint);
-        plan::decide(&DecideInput {
-            state: &state,
-            wanted: &[Wanted {
-                id: "python".into(),
-                fingerprint,
-            }],
-            disk: Some((1, 2)),
-            image_id: Some("sha256:1"),
-        })
-    }
-
-    /// A retry after a session asks the added-tools question: the disk
-    /// may hold code the session left, and the install boot runs it.
-    #[test]
-    fn a_retry_after_a_session_asks() {
-        let quiet = retry_plan(false);
-        assert_eq!(quiet.pending, [pending("python", Why::Retry)]);
-        for answering in [TTY, YES, NOBODY] {
-            assert_eq!(
-                tool_changes(false, &quiet, answering),
-                ToolChanges::NoQuestion
-            );
-        }
-
-        let mut after_session = retry_plan(true);
-        assert_eq!(tool_changes(false, &after_session, TTY), ToolChanges::Ask);
-        assert_eq!(
-            tool_changes(false, &after_session, YES),
-            ToolChanges::Recreate
-        );
-        assert_eq!(
-            tool_changes(false, &after_session, NOBODY),
-            ToolChanges::NeedsTerminal
-        );
-        assert_eq!(
-            tools_changed_message(&after_session),
-            "Tools changed in the sandbox (added: python). Run in a terminal or pass --yes."
-        );
-        assert_eq!(
-            questions(&mut after_session, &[ToolAnswer::InstallAdded]),
-            (vec![ToolQuestion::Added], false)
-        );
-        assert_eq!(
-            tool_changes(true, &retry_plan(true), NOBODY),
-            ToolChanges::NoQuestion
-        );
-    }
-
-    #[test]
-    fn the_questions_name_the_labels() {
-        let packs = crate::packs::init().unwrap();
-        let resolved = crate::test_support::resolve_project_toml(
-            "[packs]\npython = { version = 1 }\nrust = { version = 1 }\n",
-        )
-        .unwrap();
-        let candidates = install::install_candidates(&resolved.packs);
-        assert_eq!(
-            candidate_labels(["python", "rust", "unknown"], &candidates),
-            ["python", "rust", "unknown"]
-        );
-        assert_eq!(label(&packs, "mise"), "mise");
-    }
-
-    /// Continue with current sandbox records the removed tools as kept.
-    #[test]
-    fn keeping_removed_tools_adds_keep_transitions() {
-        let mut changed = plan(vec![pending("python", Why::New)], &["mise", "rust"]);
-        assert!(!apply_tool_answer(&mut changed, ToolAnswer::KeepRemoved));
-        assert_eq!(
-            changed.transitions,
-            [
-                Transition::Keep("mise".into()),
-                Transition::Keep("rust".into())
-            ]
-        );
-        assert_eq!(changed.pending, [pending("python", Why::New)]);
-        assert!(!apply_tool_answer(&mut changed, ToolAnswer::InstallAdded));
-        assert_eq!(changed.pending, [pending("python", Why::New)]);
-        assert!(apply_tool_answer(&mut changed, ToolAnswer::Recreate));
-    }
-
-    /// The questions of `changed` with the `answers` in turn: the asked
-    /// questions and whether the sandbox is re-created.
-    fn questions(changed: &mut Plan, answers: &[ToolAnswer]) -> (Vec<ToolQuestion>, bool) {
+    fn questions(plan: &mut Plan, answers: &[ToolAnswer]) -> (Vec<ToolQuestion>, bool) {
         let mut asked_questions = Vec::new();
         let mut answers = answers.iter();
-        let recreate = answer_tool_changes(changed, |question, _| {
+        let recreate = answer_tool_changes(plan, |question, _| {
             asked_questions.push(question);
             Ok(*answers.next().expect("an answer"))
         })
@@ -686,52 +498,78 @@ mod tests {
     }
 
     #[test]
-    fn re_creating_at_the_removed_question_skips_the_added_question() {
-        let both = || {
+    fn terminal_asks_about_image_and_tool_changes_but_not_about_retries() {
+        assert_eq!(on_image_change(false, TTY), OnImageChange::Ask);
+        assert_eq!(on_image_change(true, TTY), OnImageChange::Recreate);
+        let yes = Answering {
+            can_prompt: true,
+            yes: true,
+        };
+        assert_eq!(on_image_change(false, yes), OnImageChange::Recreate);
+        for changed in [
+            plan(vec![pending("alpha", Why::New)], &[], &[]),
+            plan(vec![], &["beta"], &[]),
+            plan(vec![], &[], &["gamma"]),
+        ] {
+            assert_eq!(tool_changes(false, &changed, TTY), ToolChanges::Ask);
+            assert_eq!(tool_changes(false, &changed, yes), ToolChanges::Recreate);
+            assert_eq!(tool_changes(true, &changed, TTY), ToolChanges::NoQuestion);
+        }
+        let retry = plan(vec![pending("alpha", Why::Retry)], &[], &[]);
+        assert_eq!(tool_changes(false, &retry, TTY), ToolChanges::NoQuestion);
+    }
+
+    #[test]
+    fn tool_questions_come_in_order_and_re_create_answer_ends_them() {
+        let all = || {
             plan(
-                vec![pending("python", Why::New), pending("rust", Why::Retry)],
-                &["mise"],
+                vec![pending("alpha", Why::New), pending("beta", Why::Retry)],
+                &["gamma"],
+                &["plain"],
             )
         };
-        let mut changed = both();
         assert_eq!(
-            questions(&mut changed, &[ToolAnswer::Recreate]),
+            questions(&mut all(), &[ToolAnswer::Recreate]),
+            (vec![ToolQuestion::Changed], true)
+        );
+
+        let mut kept = plan(
+            vec![pending("alpha", Why::New), pending("beta", Why::Retry)],
+            &["gamma", "plain"],
+            &[],
+        );
+        assert_eq!(
+            questions(&mut kept, &[ToolAnswer::Recreate]),
             (vec![ToolQuestion::Removed], true)
         );
-        let mut changed = both();
         assert_eq!(
             questions(
-                &mut changed,
+                &mut kept,
                 &[ToolAnswer::KeepRemoved, ToolAnswer::InstallAdded]
             ),
             (vec![ToolQuestion::Removed, ToolQuestion::Added], false)
         );
         assert_eq!(
-            changed.pending,
-            [pending("python", Why::New), pending("rust", Why::Retry)]
+            kept.transitions,
+            [
+                Transition::Keep("gamma".into()),
+                Transition::Keep("plain".into())
+            ]
         );
-        assert_eq!(changed.transitions, [Transition::Keep("mise".into())]);
-        // Retries only: no added question.
-        let mut changed = plan(vec![pending("rust", Why::Retry)], &["mise"]);
         assert_eq!(
-            questions(&mut changed, &[ToolAnswer::KeepRemoved]),
+            kept.pending,
+            [pending("alpha", Why::New), pending("beta", Why::Retry)]
+        );
+
+        let mut retries_only = plan(vec![pending("beta", Why::Retry)], &["gamma"], &[]);
+        assert_eq!(
+            questions(&mut retries_only, &[ToolAnswer::KeepRemoved]),
             (vec![ToolQuestion::Removed], false)
-        );
-        let mut changed = Plan {
-            removed: vec!["mise".into()],
-            ..changed_plan("python")
-        };
-        assert_eq!(
-            questions(&mut changed, &[ToolAnswer::Recreate]),
-            (vec![ToolQuestion::Changed], true)
         );
     }
 
-    /// A re-created image resets the disk before the image check (which
-    /// may end the run), and asks no tool question; a tool question's
-    /// re-create waits for the check.
     #[test]
-    fn a_re_created_image_resets_the_disk_before_the_image_check() {
+    fn re_created_image_resets_existing_disk_and_gone_old_image_is_explained() {
         assert!(image_resets_disk(ImageChange::Recreate, false));
         assert!(!image_resets_disk(ImageChange::Recreate, true));
         for change in [
@@ -741,16 +579,10 @@ mod tests {
         ] {
             assert!(!image_resets_disk(change, false));
         }
-    }
-
-    /// A sandbox whose old image is gone continues with the new image: its
-    /// records are stale, so every tool installs again, and the added
-    /// question says why.
-    #[test]
-    fn a_gone_old_image_explains_why_the_tools_install_again() {
-        let notes = added_tools_notes(ImageChange::OldImageGone);
-        assert_eq!(notes.len(), 3);
-        assert_eq!(notes[0], OLD_IMAGE_GONE_NOTE);
+        assert_eq!(
+            added_tools_notes(ImageChange::OldImageGone)[0],
+            OLD_IMAGE_GONE_NOTE
+        );
         for change in [
             ImageChange::Unchanged,
             ImageChange::KeepOld,
@@ -758,46 +590,26 @@ mod tests {
         ] {
             assert!(!added_tools_notes(change).contains(&OLD_IMAGE_GONE_NOTE));
         }
-
-        let state = InstallState {
-            disk: Some((1, 2)),
-            image_id: Some("sha256:old".into()),
-            packs: std::collections::BTreeMap::from([(
-                "python".to_string(),
-                install_state::Record {
-                    status: install_state::PackStatus::Installed,
-                    fingerprint: "f".into(),
-                    at: 1,
-                },
-            )]),
-            ..InstallState::default()
-        };
-        let wanted = [Wanted {
-            id: "python".into(),
-            fingerprint: "f".into(),
-        }];
-        let new_image = plan::decide(&DecideInput {
-            state: &state,
-            wanted: &wanted,
-            disk: Some((1, 2)),
-            image_id: Some("sha256:new"),
-        });
-        assert_eq!(new_image.pending, [pending("python", Why::New)]);
-        assert_eq!(new_image.transitions, [Transition::Reset]);
-        assert_eq!(tool_changes(false, &new_image, TTY), ToolChanges::Ask);
     }
 
     #[test]
-    fn a_changed_image_without_an_answer_is_exit_code_2() {
-        let e = anyhow::Error::from(ImageChangeStop::NeedsTerminal);
-        assert_eq!(
-            e.to_string(),
-            "Sandbox image has been changed. Run in a terminal or pass --yes."
+    fn tool_change_texts_name_packs_without_retries() {
+        let changed = plan(
+            vec![pending("alpha", Why::New), pending("beta", Why::Retry)],
+            &["gamma"],
+            &["plain"],
         );
-        assert!(matches!(image_error(e), Exit::Code(2)));
-        assert!(matches!(
-            image_error(anyhow::anyhow!("pull failed")),
-            Exit::Failed(_)
-        ));
+        assert_eq!(
+            tools_changed_message(&changed),
+            "Tools changed in the sandbox (changed: plain; added: alpha; removed: gamma). Run in \
+             a terminal or pass --yes."
+        );
+        let installers = test_installers("[packs]\nalpha = { version = 1 }\n");
+        assert_eq!(
+            candidate_labels(["alpha", "unknown"], &installers),
+            ["Alpha", "unknown"]
+        );
+        assert_eq!(label(&test_packs(), "beta"), "Beta");
+        assert_eq!(label(&test_packs(), "unknown"), "unknown");
     }
 }

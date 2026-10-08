@@ -18,6 +18,8 @@ mod net;
 mod process;
 mod rpc;
 mod stats;
+#[cfg(test)]
+mod test_cfg;
 mod util;
 mod vsock;
 

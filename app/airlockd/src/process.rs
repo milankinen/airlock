@@ -652,23 +652,12 @@ mod tests {
     use super::parse_stat;
 
     #[test]
-    fn parse_stat_reads_state_and_ppid() {
-        // Simple case: pid 1234, comm "bash", state S, ppid 1.
+    fn parse_stat_reads_ppid_and_state_after_last_paren_of_comm() {
         assert_eq!(parse_stat("1234 (bash) S 1 1234 1234 0 -1"), Some((1, 'S')));
-    }
-
-    #[test]
-    fn parse_stat_handles_comm_with_spaces_and_parens() {
-        // The comm field can contain spaces and parentheses; parsing must key
-        // off the LAST ')'. Here comm is "weird ) proc", state Z, ppid 1.
         assert_eq!(
-            parse_stat("42 (weird ) proc) Z 1 42 42 0 -1 4194560"),
-            Some((1, 'Z'))
+            parse_stat("42 (weird ) proc) Z 7 42 42 0 -1 4194560"),
+            Some((7, 'Z'))
         );
-    }
-
-    #[test]
-    fn parse_stat_rejects_garbage() {
         assert_eq!(parse_stat("not a stat line"), None);
     }
 }

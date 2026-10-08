@@ -66,29 +66,14 @@ fn open_dump(path: &Path) -> Option<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TempDir;
-
-    #[derive(Default)]
-    struct Recorder {
-        out: Vec<u8>,
-        err: Vec<u8>,
-    }
-
-    impl OutputSink for Recorder {
-        fn stdout(&mut self, bytes: &[u8]) {
-            self.out.extend_from_slice(bytes);
-        }
-
-        fn stderr(&mut self, bytes: &[u8]) {
-            self.err.extend_from_slice(bytes);
-        }
-    }
+    use crate::test_cfg::sinks::RecordingSink;
+    use crate::test_cfg::temp_dir;
 
     #[test]
-    fn tees_both_streams_in_order() {
-        let dir = TempDir::new("dump-sink");
+    fn dump_sink_forwards_both_streams_and_tees_them_in_order() {
+        let dir = temp_dir();
         let path = dir.path().join("pty.dump");
-        let mut rec = Recorder::default();
+        let mut rec = RecordingSink::default();
         {
             let mut sink = DumpSink::new(&mut rec, Some(File::create(&path).unwrap()));
             sink.stdout(b"out-1 ");
@@ -98,17 +83,5 @@ mod tests {
         assert_eq!(rec.out, b"out-1 out-2");
         assert_eq!(rec.err, b"err ");
         assert_eq!(std::fs::read(&path).unwrap(), b"out-1 err out-2");
-    }
-
-    #[test]
-    fn without_a_file_only_forwards() {
-        let mut rec = Recorder::default();
-        let mut sink = DumpSink::new(&mut rec, None);
-        sink.stdout(b"x");
-        sink.stderr(b"y");
-        assert_eq!(
-            (rec.out.as_slice(), rec.err.as_slice()),
-            (&b"x"[..], &b"y"[..])
-        );
     }
 }

@@ -19,7 +19,19 @@ pub async fn start(state: Arc<AdminState>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(ADMIN_ADDR).await?;
     info!("admin listening on {}:{}", ADMIN_ADDR.0, ADMIN_ADDR.1);
 
-    let app = Router::new()
+    let app = router(state);
+    tokio::task::spawn_local(async move {
+        if let Err(e) = axum::serve(listener, app).await {
+            warn!("admin server: {e}");
+        }
+    });
+
+    Ok(())
+}
+
+/// The admin routes, without a listener.
+pub(crate) fn router(state: Arc<AdminState>) -> Router {
+    Router::new()
         .route("/", get(routes::root::handle))
         .route(
             "/claude/hooks/pre-tool-use",
@@ -33,13 +45,5 @@ pub async fn start(state: Arc<AdminState>) -> anyhow::Result<()> {
             "/claude/hooks/post-tool-use-failure",
             post(routes::claude_hook_post_tool_use_failure::handle),
         )
-        .with_state(state);
-
-    tokio::task::spawn_local(async move {
-        if let Err(e) = axum::serve(listener, app).await {
-            warn!("admin server: {e}");
-        }
-    });
-
-    Ok(())
+        .with_state(state)
 }

@@ -1,0 +1,65 @@
+use super::*;
+use crate::test_cfg::home::TempHome;
+
+fn os_release_of(layers: Vec<String>) -> Option<OsRelease> {
+    os_release(&image("sha256:img", layers))
+}
+
+#[test]
+fn os_release_comes_from_topmost_layer_that_has_it_safely() {
+    let _home = TempHome::new();
+    let ubuntu = cache_layer(
+        "sha256:ubuntu",
+        &LayerTar::default()
+            .file(
+                "etc/os-release",
+                "NAME=\"Ubuntu\"\nID=ubuntu\nID_LIKE=debian\n",
+            )
+            .gz(),
+    );
+    let escaping = cache_layer(
+        "sha256:escaping",
+        &LayerTar::default()
+            .dir("etc")
+            .symlink("etc/os-release", "/etc/hostname")
+            .gz(),
+    );
+    let emptied = cache_layer(
+        "sha256:emptied",
+        &LayerTar::default().file("etc/os-release", "").gz(),
+    );
+    let unrelated = cache_layer(
+        "sha256:unrelated",
+        &LayerTar::default().file("app/main.js", "").gz(),
+    );
+
+    let release = os_release_of(vec![emptied, escaping, unrelated, ubuntu.clone()]).unwrap();
+    assert_eq!(
+        release,
+        OsRelease {
+            id: "ubuntu".into(),
+            id_like: vec!["debian".into()],
+        }
+    );
+
+    let rocky = cache_layer(
+        "sha256:rocky",
+        &LayerTar::default()
+            .file(
+                "usr/lib/os-release",
+                "ID=\"Rocky\"\nID_LIKE=\"rhel centos fedora\"\n",
+            )
+            .dir("etc")
+            .symlink("etc/os-release", "../usr/lib/os-release")
+            .gz(),
+    );
+    let release = os_release_of(vec![rocky, ubuntu]).unwrap();
+    assert_eq!(release.id, "rocky");
+    assert_eq!(release.id_like, ["rhel", "centos", "fedora"]);
+
+    let nameless = cache_layer(
+        "sha256:nameless",
+        &LayerTar::default().file("etc/os-release", "NAME=x\n").gz(),
+    );
+    assert!(os_release_of(vec![nameless]).is_none());
+}

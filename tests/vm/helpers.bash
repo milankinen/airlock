@@ -18,24 +18,54 @@ require_vm_support() {
 
 # -- File-level setup/teardown for VM tests --
 #
-# Creates a shared temp dir so that the .airlock/ sandbox (disk, image
-# cache link, overlay) persists across all tests in a file. Each test
-# runs "airlock --quiet start -- <cmd>" which boots a fresh VM but
-# reuses the cached sandbox state.
+# Checks the binary and VM support, then creates a shared temp dir so that
+# the .airlock/ sandbox (disk, image cache link, overlay) persists across
+# all tests in a file. Each test runs "airlock --quiet start -- <cmd>",
+# which boots a fresh VM but reuses the cached sandbox state. Call from
+# setup_file, then write the config there.
 
 vm_setup_file() {
+    if [[ ! -x "$AIRLOCK" ]]; then
+        echo "airlock binary not found at $AIRLOCK" >&2
+        echo "run: mise run build:release" >&2
+        return 1
+    fi
+    require_vm_support
     mkdir -p "$TEST_TEMP_ROOT"
     FILE_TEMP_DIR="$(mktemp -d "$TEST_TEMP_ROOT/XXXXXXXX")"
     export FILE_TEMP_DIR
     cd "$FILE_TEMP_DIR" || return 1
 }
 
-vm_teardown_file() {
+teardown_file() {
+    stop_host_http_server
     cd "$REPO_ROOT" || true
     if [[ -n "${FILE_TEMP_DIR:-}" && -d "${FILE_TEMP_DIR:-}" ]]; then
         if [[ "${AIRLOCK_TEST_KEEP:-}" != "1" ]]; then
             rm -rf "$FILE_TEMP_DIR"
         fi
+    fi
+}
+
+setup() {
+    cd "$FILE_TEMP_DIR" || return 1
+}
+
+# Serve $FILE_TEMP_DIR/http_root/index.html ("hello-from-host") on host
+# port $1 until teardown_file.
+start_host_http_server() {
+    mkdir -p http_root
+    echo "hello-from-host" > http_root/index.html
+    python3 -m http.server "$1" --directory http_root \
+        >"$FILE_TEMP_DIR/http_server.log" 2>&1 &
+    HTTP_PID=$!
+    export HTTP_PID
+}
+
+stop_host_http_server() {
+    if [[ -n "${HTTP_PID:-}" ]]; then
+        kill "$HTTP_PID" 2>/dev/null || true
+        wait "$HTTP_PID" 2>/dev/null || true
     fi
 }
 

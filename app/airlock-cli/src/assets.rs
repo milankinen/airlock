@@ -203,37 +203,24 @@ fn resolve_asset(
 #[cfg(all(test, not(feature = "distroless")))]
 mod tests {
     use super::write_atomic;
+    use crate::test_cfg::temp_dir;
 
     #[test]
-    fn write_atomic_replaces_file_and_leaves_no_tmp() {
-        let dir = std::env::temp_dir().join(format!(
-            "airlock-assets-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+    fn asset_write_replaces_file_and_leaves_no_temp_file() {
+        let tmp = temp_dir();
+        let dir = tmp.path();
 
-        write_atomic(&dir, "Image", b"kernel-bytes").unwrap();
-        assert_eq!(std::fs::read(dir.join("Image")).unwrap(), b"kernel-bytes");
+        write_atomic(dir, "Image", b"kernel-bytes").unwrap();
+        write_atomic(dir, "Image", b"newer-and-longer-bytes").unwrap();
 
-        // Overwriting an existing asset is atomic and clean.
-        write_atomic(&dir, "Image", b"newer-and-longer-bytes").unwrap();
         assert_eq!(
             std::fs::read(dir.join("Image")).unwrap(),
             b"newer-and-longer-bytes"
         );
-
-        // No leftover ".tmp" sibling after either write.
-        let leftover: Vec<_> = std::fs::read_dir(&dir)
+        let names: Vec<_> = std::fs::read_dir(dir)
             .unwrap()
-            .filter_map(Result::ok)
-            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .map(|e| e.unwrap().file_name())
             .collect();
-        assert!(leftover.is_empty(), "temp file left behind: {leftover:?}");
-
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(names, ["Image"]);
     }
 }

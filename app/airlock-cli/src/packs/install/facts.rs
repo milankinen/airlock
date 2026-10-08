@@ -45,18 +45,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn families() {
-        assert!(supported(&os("alpine", &[])));
-        assert!(supported(&os("debian", &[])));
-        assert!(supported(&os("ubuntu", &["debian"])));
-        assert!(supported(&os("ubuntu", &[])));
-        assert!(supported(&os("pop", &["ubuntu", "debian"])));
-        assert!(!supported(&os("fedora", &[])));
-        assert!(!supported(&os("rocky", &["rhel", "fedora"])));
-        assert!(!supported(&os("gentoo", &[])));
-    }
-
     fn image(uid: u32) -> OciImage {
         OciImage {
             image_id: "sha256:abc".into(),
@@ -72,10 +60,21 @@ mod tests {
     }
 
     #[test]
-    fn check_refuses_non_root_and_images_without_os_release() {
+    fn alpine_debian_and_ubuntu_families_are_supported_by_id_or_id_like() {
+        assert!(supported(&os("alpine", &[])));
+        assert!(supported(&os("debian", &[])));
+        assert!(supported(&os("ubuntu", &[])));
+        assert!(supported(&os("ubuntu", &["debian"])));
+        assert!(supported(&os("pop", &["ubuntu", "debian"])));
+        assert!(!supported(&os("fedora", &[])));
+        assert!(!supported(&os("rocky", &["rhel", "fedora"])));
+        assert!(!supported(&os("gentoo", &[])));
+    }
+
+    #[test]
+    fn check_refuses_non_root_image_and_image_without_os_release() {
         let err = check(&image(1000)).unwrap_err();
         assert!(err.to_string().contains("uid 1000"), "{err}");
-        // No layers → no os-release.
         let err = check(&image(0)).unwrap_err();
         assert!(err.to_string().contains("os-release"), "{err}");
     }

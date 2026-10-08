@@ -134,12 +134,12 @@ fn spawn_opener(program: &str, url: &str) -> std::io::Result<()> {
 }
 
 /// Opens a checked URL on the host.
-type OpenFn = Box<dyn Fn(&str) -> std::io::Result<()>>;
+pub(super) type OpenFn = Box<dyn Fn(&str) -> std::io::Result<()>>;
 
 /// At most `max_opens` open requests per `window`.
-struct RateLimit {
-    max_opens: usize,
-    window: Duration,
+pub(super) struct RateLimit {
+    pub(super) max_opens: usize,
+    pub(super) window: Duration,
 }
 
 /// The host's side of the browser bridge for one boot. Cheap to clone;
@@ -179,7 +179,7 @@ impl Browser {
     }
 
     /// A browser with an explicit opener (`None`: no browser program).
-    fn with_opener(
+    pub(super) fn with_opener(
         grants: Vec<Rc<dyn BrowserGrant>>,
         opener: Option<OpenFn>,
         limit: RateLimit,
@@ -306,96 +306,5 @@ impl browser::Server for BrowserImpl {
     ) -> Result<(), capnp::Error> {
         let url = params.get()?.get_url()?.to_str()?;
         self.browser.open(url).map_err(capnp::Error::failed)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::cell::Cell;
-
-    use super::*;
-    use crate::test_support::block_on_local;
-
-    /// `auth-claude.md`: the URL claude passes to `$BROWSER`.
-    const CLAUDE_URL: &str = "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A35527%2Fcallback&scope=user%3Ainference&code_challenge=Zm9vYmFyYmF6cXV4&code_challenge_method=S256&state=c3RhdGVzdGF0ZQ";
-
-    /// A grant that allows every URL and counts the calls.
-    struct AllowAll(Rc<Cell<u32>>);
-
-    impl BrowserGrant for AllowAll {
-        fn allow(&self, _url: &Url) -> GrantAnswer {
-            self.0.set(self.0.get() + 1);
-            GrantAnswer::Allow
-        }
-    }
-
-    /// A browser over a grant that allows everything, rate-limited to
-    /// `max_opens` per `window`. Returns the open and grant counters.
-    fn counting_browser(
-        max_opens: usize,
-        window: Duration,
-    ) -> (Browser, Rc<Cell<u32>>, Rc<Cell<u32>>) {
-        let opened = Rc::new(Cell::new(0));
-        let granted = Rc::new(Cell::new(0));
-        let count = opened.clone();
-        let browser = Browser::with_opener(
-            vec![Rc::new(AllowAll(granted.clone()))],
-            Some(Box::new(move |_url: &str| {
-                count.set(count.get() + 1);
-                Ok(())
-            })),
-            RateLimit { max_opens, window },
-        );
-        (browser, opened, granted)
-    }
-
-    #[test]
-    fn the_rate_limit_holds_under_concurrent_opens() {
-        block_on_local(async {
-            let (browser, opened, _) = counting_browser(3, Duration::from_mins(1));
-            let results = futures::future::join_all((0..6).map(|_| {
-                let browser = browser.clone();
-                async move { browser.open(CLAUDE_URL) }
-            }))
-            .await;
-            assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 3);
-            assert_eq!(opened.get(), 3);
-            assert!(
-                browser
-                    .take_notices()
-                    .iter()
-                    .all(|n| n.contains("too many pages"))
-            );
-        });
-    }
-
-    /// The rate limit is a window, not a lifetime budget: once the window
-    /// has passed, opens are accepted again.
-    #[test]
-    fn the_rate_limit_window_passes() {
-        block_on_local(async {
-            let (browser, opened, _) = counting_browser(1, Duration::from_millis(50));
-            browser.open(CLAUDE_URL).unwrap();
-            assert!(browser.open(CLAUDE_URL).is_err());
-            tokio::time::sleep(Duration::from_millis(60)).await;
-            browser.open(CLAUDE_URL).unwrap();
-            assert_eq!(opened.get(), 2);
-        });
-    }
-
-    #[test]
-    fn no_opener_still_grants() {
-        let granted = Rc::new(Cell::new(0));
-        let browser = Browser::with_opener(
-            vec![Rc::new(AllowAll(granted.clone()))],
-            None,
-            RateLimit {
-                max_opens: 3,
-                window: Duration::from_mins(1),
-            },
-        );
-        browser.open(CLAUDE_URL).unwrap();
-        assert_eq!(granted.get(), 1);
-        assert!(browser.take_notices()[0].contains("no browser program"));
     }
 }

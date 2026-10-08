@@ -230,58 +230,37 @@ fn bind_dev_node(dev_root: &str, name: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_cfg::temp_dir;
 
-    /// A fresh temp root per test, removed on drop.
-    struct TempRoot(std::path::PathBuf);
+    #[test]
+    fn bridge_dir_plain_or_missing_is_accepted() {
+        let root = temp_dir();
+        let root = root.path();
+        assert!(refuse_symlinks(root, BRIDGE_REL).is_ok());
+        std::fs::create_dir_all(root.join("run")).unwrap();
+        assert!(refuse_symlinks(root, BRIDGE_REL).is_ok());
+        std::fs::create_dir_all(root.join(BRIDGE_REL)).unwrap();
+        assert!(refuse_symlinks(root, BRIDGE_REL).is_ok());
+    }
 
-    impl TempRoot {
-        fn new(name: &str) -> Self {
-            let dir = std::env::temp_dir()
-                .join(format!("airlock-container-{}-{name}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            Self(dir)
+    #[test]
+    fn bridge_dir_with_symlinked_component_is_refused() {
+        for (link, target) in [
+            ("run", "elsewhere"),
+            (BRIDGE_REL, "../"),
+            (BRIDGE_REL, "/nowhere"),
+        ] {
+            let root = temp_dir();
+            let root = root.path();
+            std::fs::create_dir_all(root.join("elsewhere/airlock")).unwrap();
+            if link == BRIDGE_REL {
+                std::fs::create_dir_all(root.join("run")).unwrap();
+            }
+            std::os::unix::fs::symlink(target, root.join(link)).unwrap();
+            assert!(
+                refuse_symlinks(root, BRIDGE_REL).is_err(),
+                "{link} -> {target}"
+            );
         }
-    }
-
-    impl Drop for TempRoot {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    #[test]
-    fn plain_or_missing_dirs_are_accepted() {
-        let root = TempRoot::new("plain");
-        assert!(refuse_symlinks(&root.0, BRIDGE_REL).is_ok());
-        std::fs::create_dir_all(root.0.join("run")).unwrap();
-        assert!(refuse_symlinks(&root.0, BRIDGE_REL).is_ok());
-        std::fs::create_dir_all(root.0.join(BRIDGE_REL)).unwrap();
-        assert!(refuse_symlinks(&root.0, BRIDGE_REL).is_ok());
-    }
-
-    #[test]
-    fn symlinked_run_is_refused() {
-        let root = TempRoot::new("run-link");
-        std::fs::create_dir_all(root.0.join("elsewhere/airlock")).unwrap();
-        std::os::unix::fs::symlink("elsewhere", root.0.join("run")).unwrap();
-        assert!(refuse_symlinks(&root.0, BRIDGE_REL).is_err());
-    }
-
-    #[test]
-    fn symlinked_run_airlock_is_refused() {
-        let root = TempRoot::new("airlock-link");
-        std::fs::create_dir_all(root.0.join("run")).unwrap();
-        std::os::unix::fs::symlink("../", root.0.join(BRIDGE_REL)).unwrap();
-        assert!(refuse_symlinks(&root.0, BRIDGE_REL).is_err());
-    }
-
-    /// A dangling symlink is still a symlink: the mount would follow it.
-    #[test]
-    fn dangling_symlink_is_refused() {
-        let root = TempRoot::new("dangling");
-        std::fs::create_dir_all(root.0.join("run")).unwrap();
-        std::os::unix::fs::symlink("/nowhere", root.0.join(BRIDGE_REL)).unwrap();
-        assert!(refuse_symlinks(&root.0, BRIDGE_REL).is_err());
     }
 }

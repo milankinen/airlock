@@ -242,18 +242,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn body_area_is_empty_for_tiny_terminal() {
-        // A terminal too short for the tab bar must yield an empty body, so the
-        // resize path can skip it — resizing the vt100 grid to zero underflows.
-        for h in 0..=TAB_BAR_HEIGHT {
-            let b = body_area(Rect::new(0, 0, 80, h));
-            assert!(
-                b.height == 0 || b.width == 0,
-                "terminal height {h} must yield an empty body"
-            );
-        }
-        // One row above the tab bar is the smallest non-empty body.
-        let b = body_area(Rect::new(0, 0, 80, TAB_BAR_HEIGHT + 1));
-        assert!(b.height > 0 && b.width > 0);
+    fn select_hint_after_click_expires_after_two_seconds() {
+        let now = Instant::now();
+        assert!(!select_hint_visible(None, now));
+        assert!(select_hint_visible(Some(now), now));
+        assert!(select_hint_visible(
+            Some(now),
+            now + Duration::from_millis(1_900)
+        ));
+        assert!(!select_hint_visible(
+            Some(now),
+            now + Duration::from_millis(2_100)
+        ));
     }
 }

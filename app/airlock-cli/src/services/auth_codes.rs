@@ -209,26 +209,11 @@ mod tests {
     use super::*;
 
     const CALLBACK: Channel = Channel::Callback(1455);
+    const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 
     #[test]
-    fn a_surrogate_redeems_once() {
-        let codes = PendingCodes::default();
-        let s = codes
-            .issue("real-code", ServiceId::Openai, CALLBACK)
-            .unwrap();
-        assert!(s.starts_with(PREFIX));
-        assert_eq!(codes.redeem("real-code", ServiceId::Openai, CALLBACK), None);
-        assert_eq!(
-            codes.redeem(&s, ServiceId::Openai, CALLBACK).as_deref(),
-            Some("real-code")
-        );
-        assert_eq!(codes.redeem(&s, ServiceId::Openai, CALLBACK), None);
-    }
-
-    /// A code of one service, port or flow is no code of another, and a
-    /// failed try uses it up.
-    #[test]
-    fn a_surrogate_redeems_only_where_it_was_issued() {
+    fn surrogate_redeemed_on_other_service_port_or_flow_fails_and_is_used_up() {
         let codes = PendingCodes::default();
         for (service, channel) in [
             (ServiceId::Anthropic, CALLBACK),
@@ -242,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn the_channel_of_a_redirect() {
+    fn redirect_uri_names_loopback_port_or_device_flow() {
         let device = Some("https://auth.openai.com/deviceauth/callback");
         for (uri, want) in [
             ("http://127.0.0.1:1455/auth/callback", Some(CALLBACK)),
@@ -269,35 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn the_query_gets_a_surrogate_code() {
-        let codes = PendingCodes::default();
-        let q = codes
-            .rewrite_query("code=real-code&state=a%20b", ServiceId::Openai, CALLBACK)
-            .unwrap()
-            .unwrap();
-        assert!(!q.contains("real-code"), "{q}");
-        let pairs: HashMap<String, String> = url::form_urlencoded::parse(q.as_bytes())
-            .into_owned()
-            .collect();
-        assert_eq!(pairs["state"], "a b");
-        assert_eq!(
-            codes
-                .redeem(&pairs["code"], ServiceId::Openai, CALLBACK)
-                .as_deref(),
-            Some("real-code")
-        );
-        assert_eq!(
-            codes
-                .rewrite_query("state=x&error=denied", ServiceId::Openai, CALLBACK)
-                .unwrap(),
-            None
-        );
-    }
-
-    /// Each service keeps its own [`MAX_PENDING`] codes: a flood of one
-    /// drops its own oldest code only.
-    #[test]
-    fn old_codes_are_dropped_per_service() {
+    fn flood_of_codes_drops_oldest_code_of_same_service_only() {
         let codes = PendingCodes::default();
         let first = codes.issue("first", ServiceId::Openai, CALLBACK).unwrap();
         let other = codes
@@ -316,14 +273,8 @@ mod tests {
         );
     }
 
-    /// RFC 7636, appendix B: the S256 challenge of the example verifier.
-    const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-    const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
-
-    /// An opened page binds one manual exchange: its verifier, its
-    /// service, once.
     #[test]
-    fn an_opened_page_redeems_its_verifier_once() {
+    fn opened_page_redeems_its_s256_verifier_once_for_its_service() {
         let codes = PendingCodes::default();
         assert!(!codes.redeem_page(VERIFIER, ServiceId::Anthropic));
         codes.open_page(CHALLENGE, ServiceId::Anthropic);
@@ -335,16 +286,15 @@ mod tests {
     }
 
     #[test]
-    fn an_opened_page_expires() {
+    fn opened_page_expires_after_lifetime() {
         let codes = PendingCodes::default();
         codes.open_page(CHALLENGE, ServiceId::Anthropic);
         codes.pages.lock()[0].opened = Instant::now().checked_sub(LIFETIME).unwrap();
         assert!(!codes.redeem_page(VERIFIER, ServiceId::Anthropic));
     }
 
-    /// Each service keeps its own [`MAX_PENDING`] opened pages.
     #[test]
-    fn old_pages_are_dropped_per_service() {
+    fn flood_of_pages_drops_oldest_page_of_same_service_only() {
         let codes = PendingCodes::default();
         codes.open_page(CHALLENGE, ServiceId::Anthropic);
         codes.open_page(CHALLENGE, ServiceId::Openai);

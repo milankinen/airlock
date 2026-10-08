@@ -47,6 +47,13 @@ pub fn init_with_sample() -> PackManager {
     builtin::load_with_sample()
 }
 
+/// The packs of an in-memory `packs/` directory: `files` are
+/// `(<folder>/<file>, text)` (deeper paths make nested folders).
+#[cfg(test)]
+pub fn load_test_packs(files: Vec<(&'static str, String)>) -> anyhow::Result<PackManager> {
+    builtin::load(builtin::fixture(vec![], files))
+}
+
 /// The known packs. Cheap to clone.
 #[derive(Clone)]
 pub struct PackManager {
@@ -382,114 +389,4 @@ pub struct InstallerScript {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::block_on;
-
-    fn manager() -> PackManager {
-        init().unwrap()
-    }
-
-    #[test]
-    fn builtin_lists_the_newest_version_by_kind_and_name() {
-        let names: Vec<String> = manager()
-            .builtin()
-            .iter()
-            .map(|p| format!("{}@{}", p.metadata().name, p.metadata().version))
-            .collect();
-        assert_eq!(
-            names,
-            [
-                "alpine@1",
-                "debian@1",
-                "claude@1",
-                "codex@1",
-                "copilot@1",
-                "docker@1",
-                "git@1",
-                "mise@1",
-                "nodejs@1",
-                "python@1",
-                "rust@1",
-            ]
-        );
-    }
-
-    #[test]
-    fn resolve_finds_a_name_at_a_version() {
-        let packs = manager();
-        let python = block_on(packs.resolve("python", "1")).unwrap();
-        assert_eq!(python.metadata().kind, PackKind::Tool);
-        assert!(python.metadata().has_setup);
-        assert!(block_on(packs.resolve("python", "2")).is_none());
-        assert!(block_on(packs.resolve("nope", "1")).is_none());
-    }
-
-    fn sample() -> Pack {
-        block_on(init_with_sample().resolve("sample", "1")).unwrap()
-    }
-
-    fn args(values: &[(&str, ArgValue)]) -> BTreeMap<String, ArgValue> {
-        values
-            .iter()
-            .map(|(key, value)| ((*key).to_string(), value.clone()))
-            .collect()
-    }
-
-    fn text(value: &str) -> ArgValue {
-        ArgValue::Text(value.into())
-    }
-
-    #[test]
-    fn configure_keeps_the_given_values() {
-        let configured = sample().configure(&args(&[("mode", text("turbo"))]));
-        assert_eq!(
-            configured.args(),
-            &args(&[("mode", text("turbo")), ("network", ArgValue::Bool(true))])
-        );
-        assert_eq!(configured.non_default_args(), [("mode", &text("turbo"))]);
-    }
-
-    #[test]
-    fn configure_fills_the_defaults() {
-        let python = block_on(manager().resolve("python", "1")).unwrap();
-        let configured = python.configure(&BTreeMap::new());
-        assert_eq!(configured.metadata().name, "python");
-        let installer = configured.setup_installer().unwrap();
-        assert_eq!(installer.pack, "python");
-        assert_eq!(installer.label, "python");
-        assert_eq!(
-            installer.env[..2],
-            [
-                ("AIRLOCK_PACK_API".to_string(), "1".to_string()),
-                ("AIRLOCK_PACK_ID".to_string(), "python".to_string()),
-            ]
-        );
-        let alpine = block_on(manager().resolve("alpine", "1")).unwrap();
-        assert!(
-            alpine
-                .configure(&BTreeMap::new())
-                .setup_installer()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn the_config_values_follow_the_args() {
-        let values = sample()
-            .configure(&BTreeMap::new())
-            .config_values()
-            .unwrap();
-        assert!(values["network"]["rules"].get("sample").is_some());
-        assert_eq!(
-            values["mounts"]["sample-dir"]["source"],
-            "~/.airlock/sample"
-        );
-        let values = sample()
-            .configure(&args(&[("network", ArgValue::Bool(false))]))
-            .config_values()
-            .unwrap();
-        assert!(values.get("network").is_none());
-        assert_eq!(values["env"]["SAMPLE_MODE"], "fast");
-    }
-}
+mod tests;

@@ -322,87 +322,30 @@ fn removed_status(status: PackStatus) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_cfg::{resolve_project_toml, temp_dir};
 
-    fn scratch_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "airlock-cmd-show-test-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    /// A missing `.airlock/sandbox` is `Ok(None)`: no sandbox has started
-    /// yet, not a failure. A symlinked `.airlock/sandbox` is `Err`, not
-    /// silently `Ok(None)`, so [`read_install_state`] can tell the two
-    /// apart instead of hiding the install state behind a symlink or a
-    /// foreign owner.
     #[test]
-    fn open_sandbox_dir_tells_missing_from_unreadable() {
-        let dir = scratch_dir("open-sandbox-dir");
-        assert!(matches!(open_sandbox_dir(&dir), Ok(None)));
+    fn sandbox_dir_behind_symlink_is_unreadable_not_missing() {
+        let project = temp_dir();
+        let elsewhere = temp_dir();
+        assert!(matches!(open_sandbox_dir(project.path()), Ok(None)));
 
-        std::fs::create_dir_all(dir.join(".airlock")).unwrap();
-        let elsewhere = scratch_dir("open-sandbox-dir-elsewhere");
-        std::os::unix::fs::symlink(&elsewhere, dir.join(".airlock/sandbox")).unwrap();
-        match open_sandbox_dir(&dir) {
-            Err(why) => assert!(!why.is_empty()),
-            Ok(_) => panic!("a symlink is not silently absent"),
-        }
+        std::fs::create_dir_all(project.path().join(".airlock")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), project.path().join(".airlock/sandbox"))
+            .unwrap();
 
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&elsewhere);
+        assert!(open_sandbox_dir(project.path()).is_err_and(|why| !why.is_empty()));
     }
 
     #[test]
-    fn statuses() {
-        let mut s = InstallState::default();
-        s.set("a", PackStatus::Installed, &"a".repeat(64));
-        s.set("b", PackStatus::Kept { confirmed: false }, &"a".repeat(64));
-        s.set("c", PackStatus::Failed, &"a".repeat(64));
-        assert_eq!(install_status(Some(&s), "a"), "installed");
-        assert_eq!(install_status(Some(&s), "b"), "install not confirmed");
-        assert_eq!(install_status(Some(&s), "c"), "install failed");
-        assert_eq!(install_status(Some(&s), "d"), "pending");
-        assert_eq!(install_status(None, "a"), "pending");
-        assert_eq!(
-            removed_status(PackStatus::Kept { confirmed: true }),
-            Some("kept, removed from config")
-        );
-        assert_eq!(
-            removed_status(PackStatus::Unconfirmed),
-            Some("installed, removed from config")
-        );
-        assert_eq!(removed_status(PackStatus::Failed), None);
-    }
-
-    /// Only packs whose version installs have an install status.
-    #[test]
-    fn pack_statuses() {
-        use crate::test_support::resolve_project_toml;
-        // The list form is plain config: no pack entries.
-        let resolved = resolve_project_toml("presets = [\"rust\", \"python\"]\n").unwrap();
-        assert!(resolved.packs.is_empty());
-        let mut s = InstallState::default();
-        s.set("rust", PackStatus::Installed, &"a".repeat(64));
-        // The "1" install of rust is on the disk: removed, then kept.
-        assert_eq!(
-            removed_packs(&resolved.packs, &s),
-            [("rust", "installed, removed from config")]
-        );
-        s.set(
-            "rust",
-            PackStatus::Kept { confirmed: true },
-            &"a".repeat(64),
-        );
-        assert_eq!(
-            removed_packs(&resolved.packs, &s),
-            [("rust", "kept, removed from config")]
-        );
+    fn pack_status_reflects_install_records_of_sandbox_disk() {
+        let fp = "a".repeat(64);
+        let mut state = InstallState::default();
+        state.set("rust", PackStatus::Installed, &fp);
+        state.set("sample", PackStatus::Kept { confirmed: false }, &fp);
+        state.set("python", PackStatus::Failed, &fp);
+        state.set("node", PackStatus::Unconfirmed, &fp);
+        state.set("go", PackStatus::Kept { confirmed: true }, &fp);
 
         let resolved = resolve_project_toml(
             "[packs]\nrust = { version = 1 }\n\
@@ -410,35 +353,46 @@ mod tests {
              alpine = { version = 1 }\n",
         )
         .unwrap();
-        let statuses: Vec<(&str, &str)> = resolved
+        let shown: Vec<(String, &str)> = resolved
             .packs
             .iter()
-            .map(|p| (p.metadata().name.as_str(), pack_status(p, Some(&s))))
+            .map(|p| (pack_line(p), pack_status(p, Some(&state))))
             .collect();
         assert_eq!(
-            statuses,
+            shown,
             [
-                ("alpine", "config only"),
-                ("rust", "installed"),
-                ("sample", "pending"),
+                ("alpine 1".to_string(), "config only"),
+                ("rust 1".to_string(), "installed"),
+                (
+                    "sample 1 (mode = slow)".to_string(),
+                    "install not confirmed"
+                ),
             ]
         );
-        let lines: Vec<String> = resolved.packs.iter().map(pack_line).collect();
-        assert_eq!(lines, ["alpine 1", "rust 1", "sample 1 (mode = slow)"]);
-        assert!(removed_packs(&resolved.packs, &s).is_empty());
-    }
-
-    #[test]
-    fn unavailable_lines() {
+        assert_eq!(pack_status(&resolved.packs[1], None), "pending");
         assert_eq!(
-            unavailable_line(services::ServiceId::Openai, "the vault is disabled"),
-            "openai: unavailable (the vault is disabled); its hosts are denied \
-             (`[network.services] openai = false` to sign in without airlock)"
+            removed_packs(&resolved.packs, &state),
+            [
+                ("go", "kept, removed from config"),
+                ("node", "installed, removed from config"),
+            ]
+        );
+
+        let list_form = resolve_project_toml("presets = [\"rust\", \"python\"]\n").unwrap();
+        assert!(list_form.packs.is_empty());
+        assert_eq!(
+            removed_packs(&list_form.packs, &state),
+            [
+                ("go", "kept, removed from config"),
+                ("node", "installed, removed from config"),
+                ("rust", "installed, removed from config"),
+                ("sample", "kept, removed from config"),
+            ]
         );
     }
 
     #[test]
-    fn grant_lines() {
+    fn stored_sign_in_shows_account_scopes_and_age() {
         let grant = |scopes: &[&str]| store::GrantSummary {
             service: "anthropic".into(),
             account: Some("a@example.com".into()),
@@ -452,6 +406,14 @@ mod tests {
         assert_eq!(
             grant_line(&grant(&["a", "b"])),
             "a@example.com (2 scopes), saved 3 days ago"
+        );
+        let anonymous = store::GrantSummary {
+            account: None,
+            ..grant(&[])
+        };
+        assert_eq!(
+            grant_line(&anonymous),
+            "unknown account (no scopes), saved 3 days ago"
         );
     }
 }

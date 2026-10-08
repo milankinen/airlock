@@ -190,7 +190,7 @@ mod tests {
         c.to_string().repeat(64)
     }
 
-    fn state(records: &[(&str, PackStatus, char)]) -> InstallState {
+    fn state(records: &[(&str, PackStatus, char)], ran_session: bool) -> InstallState {
         let packs: BTreeMap<String, Record> = records
             .iter()
             .map(|(id, status, c)| {
@@ -208,6 +208,7 @@ mod tests {
             disk: DISK,
             image_id: Some(IMAGE.into()),
             packs,
+            ran_session,
             ..InstallState::default()
         }
     }
@@ -222,31 +223,43 @@ mod tests {
             .collect()
     }
 
-    fn run(state: &InstallState, wanted: &[Wanted]) -> Plan {
+    fn decide_on(
+        state: &InstallState,
+        wanted: &[Wanted],
+        disk: Option<(u64, u64)>,
+        image_id: Option<&str>,
+    ) -> Plan {
         decide(&DecideInput {
             state,
             wanted,
-            disk: DISK,
-            image_id: Some(IMAGE),
+            disk,
+            image_id,
         })
     }
 
-    fn pending(id: &str, why: Why) -> Pending {
-        Pending { id: id.into(), why }
+    fn new(ids: &[&str]) -> Vec<Pending> {
+        ids.iter()
+            .map(|id| Pending {
+                id: (*id).to_string(),
+                why: Why::New,
+            })
+            .collect()
     }
 
     #[test]
-    fn other_disk_image_or_no_disk_reinstalls_everything() {
-        let s = state(&[
-            ("a", PackStatus::Installed, 'a'),
-            ("gone", PackStatus::Kept { confirmed: true }, 'a'),
-        ]);
+    fn other_disk_or_image_resets_records_and_installs_every_configured_pack() {
+        let s = state(
+            &[
+                ("a", PackStatus::Installed, 'a'),
+                ("gone", PackStatus::Kept { confirmed: true }, 'a'),
+            ],
+            false,
+        );
         let w = wanted(&[("a", 'a'), ("b", 'b')]);
-        let expected = Plan {
-            pending: vec![pending("a", Why::New), pending("b", Why::New)],
-            changed: vec![],
-            removed: vec![],
+        let reinstall = Plan {
+            pending: new(&["a", "b"]),
             transitions: vec![Transition::Reset],
+            ..Plan::default()
         };
         for (disk, image) in [
             (Some((9, 9)), Some(IMAGE)),
@@ -254,137 +267,110 @@ mod tests {
             (DISK, Some("sha256:2")),
             (None, None),
         ] {
-            let plan = decide(&DecideInput {
-                state: &s,
-                wanted: &w,
-                disk,
-                image_id: image,
-            });
-            assert_eq!(plan, expected, "{disk:?} {image:?}");
+            assert_eq!(
+                decide_on(&s, &w, disk, image),
+                reinstall,
+                "{disk:?} {image:?}"
+            );
         }
-        // Without the image (the early check), only the disk counts.
-        let plan = decide(&DecideInput {
-            state: &s,
-            wanted: &w,
-            disk: DISK,
-            image_id: None,
-        });
-        assert_eq!(plan.pending, vec![pending("b", Why::New)]);
-        // No records: nothing to reset.
-        let plan = decide(&DecideInput {
-            state: &InstallState::default(),
-            wanted: &w,
-            disk: None,
-            image_id: None,
-        });
-        assert!(plan.transitions.is_empty());
-        assert_eq!(plan.pending.len(), 2);
-    }
+        assert_eq!(decide_on(&s, &w, DISK, None).pending, new(&["b"]));
 
-    #[test]
-    fn no_record_is_new() {
-        let plan = run(&state(&[]), &wanted(&[("a", 'a')]));
-        assert_eq!(plan.pending, vec![pending("a", Why::New)]);
-    }
+        let empty = decide_on(&InstallState::default(), &w, None, None);
+        assert_eq!(empty.pending, new(&["a", "b"]));
+        assert!(empty.transitions.is_empty());
 
-    #[test]
-    fn installed_same_fingerprint_is_nothing() {
-        let s = state(&[("a", PackStatus::Installed, 'a')]);
-        assert_eq!(run(&s, &wanted(&[("a", 'a')])), Plan::default());
-    }
-
-    #[test]
-    fn installed_other_fingerprint_is_changed() {
-        let s = state(&[("a", PackStatus::Installed, 'a')]);
-        let plan = run(&s, &wanted(&[("a", 'b')]));
-        assert!(plan.pending.is_empty());
+        let s = state(
+            &[
+                ("a", PackStatus::Installed, 'a'),
+                ("b", PackStatus::Failed, 'a'),
+            ],
+            false,
+        );
+        let plan = decide_on(
+            &s,
+            &wanted(&[("a", 'b'), ("b", 'b')]),
+            DISK,
+            Some("sha256:2"),
+        );
         assert_eq!(plan.changed, ["a"]);
+        assert_eq!(plan.pending, new(&["b"]));
+        assert_eq!(plan.transitions, [Transition::Reset]);
     }
 
     #[test]
-    fn unconfirmed_is_retry_with_the_same_fingerprint_else_changed() {
-        let s = state(&[("a", PackStatus::Unconfirmed, 'a')]);
-        let plan = run(&s, &wanted(&[("a", 'a')]));
-        assert_eq!(plan.pending, vec![pending("a", Why::Retry)]);
-        let plan = run(&s, &wanted(&[("a", 'b')]));
-        assert!(plan.pending.is_empty());
-        assert_eq!(plan.changed, ["a"]);
-    }
-
-    #[test]
-    fn failed_is_retry_with_the_same_fingerprint_else_new() {
-        let s = state(&[("a", PackStatus::Failed, 'a')]);
-        let plan = run(&s, &wanted(&[("a", 'a')]));
-        assert_eq!(plan.pending, vec![pending("a", Why::Retry)]);
-        let plan = run(&s, &wanted(&[("a", 'b')]));
-        assert_eq!(plan.pending, vec![pending("a", Why::New)]);
-    }
-
-    /// A session since the unfinished install may have left code on the
-    /// disk: the install is `New` (asked), not a silent `Retry`.
-    #[test]
-    fn a_session_since_the_install_makes_a_retry_new() {
-        for status in [PackStatus::Unconfirmed, PackStatus::Failed] {
-            let s = InstallState {
-                ran_session: true,
-                ..state(&[("a", status, 'a')])
+    fn configured_pack_installs_retries_or_changes_by_its_record() {
+        let retry = Some(Why::Retry);
+        let fresh = Some(Why::New);
+        let unconfirmed_kept = PackStatus::Kept { confirmed: false };
+        let confirmed_kept = PackStatus::Kept { confirmed: true };
+        let rows = [
+            (None, 'a', false, fresh, false),
+            (Some(PackStatus::Installed), 'a', true, None, false),
+            (Some(PackStatus::Installed), 'b', false, None, true),
+            (Some(PackStatus::Unconfirmed), 'a', false, retry, false),
+            (Some(PackStatus::Unconfirmed), 'a', true, fresh, false),
+            (Some(PackStatus::Unconfirmed), 'b', false, None, true),
+            (Some(PackStatus::Failed), 'a', false, retry, false),
+            (Some(PackStatus::Failed), 'a', true, fresh, false),
+            (Some(PackStatus::Failed), 'b', false, fresh, false),
+            (Some(confirmed_kept), 'a', true, None, false),
+            (Some(unconfirmed_kept), 'a', false, fresh, false),
+            (Some(confirmed_kept), 'b', false, None, true),
+            (Some(unconfirmed_kept), 'b', false, None, true),
+            (Some(PackStatus::Installed), 'a', false, None, false),
+        ];
+        for (status, wanted_fp, ran_session, why, changed) in rows {
+            let records: Vec<(&str, PackStatus, char)> =
+                status.map(|s| ("a", s, 'a')).into_iter().collect();
+            let plan = decide_on(
+                &state(&records, ran_session),
+                &wanted(&[("a", wanted_fp)]),
+                DISK,
+                Some(IMAGE),
+            );
+            let row = format!("{status:?} {wanted_fp} session={ran_session}");
+            let pending: Vec<(String, Why)> =
+                why.map(|why| ("a".to_string(), why)).into_iter().collect();
+            assert_eq!(
+                plan.pending
+                    .iter()
+                    .map(|p| (p.id.clone(), p.why))
+                    .collect::<Vec<_>>(),
+                pending,
+                "{row}"
+            );
+            assert_eq!(!plan.changed.is_empty(), changed, "{row}");
+            assert!(plan.removed.is_empty(), "{row}");
+            let promoted = status == Some(confirmed_kept) && wanted_fp == 'a';
+            let expected = if promoted {
+                vec![Transition::Promote("a".into())]
+            } else {
+                vec![]
             };
-            let plan = run(&s, &wanted(&[("a", 'a')]));
-            assert_eq!(plan.pending, vec![pending("a", Why::New)], "{status:?}");
+            assert_eq!(plan.transitions, expected, "{row}");
         }
     }
 
     #[test]
-    fn kept_confirmed_same_fingerprint_is_promoted() {
-        let s = state(&[("a", PackStatus::Kept { confirmed: true }, 'a')]);
-        let plan = run(&s, &wanted(&[("a", 'a')]));
+    fn unconfigured_pack_is_removed_dropped_or_kept_by_its_record() {
+        let s = state(
+            &[
+                ("a", PackStatus::Installed, 'a'),
+                ("b", PackStatus::Unconfirmed, 'a'),
+                ("c", PackStatus::Failed, 'a'),
+                ("d", PackStatus::Kept { confirmed: true }, 'a'),
+                ("e", PackStatus::Kept { confirmed: false }, 'a'),
+            ],
+            true,
+        );
+        let plan = decide_on(&s, &[], DISK, Some(IMAGE));
         assert_eq!(
             plan,
             Plan {
-                transitions: vec![Transition::Promote("a".into())],
+                removed: vec!["a".into(), "b".into()],
+                transitions: vec![Transition::Drop("c".into())],
                 ..Plan::default()
             }
         );
-    }
-
-    #[test]
-    fn kept_unconfirmed_is_new_and_other_fingerprint_is_changed() {
-        let s = state(&[("a", PackStatus::Kept { confirmed: false }, 'a')]);
-        let plan = run(&s, &wanted(&[("a", 'a')]));
-        assert_eq!(plan.pending, vec![pending("a", Why::New)]);
-        assert!(plan.transitions.is_empty());
-
-        let s = state(&[("a", PackStatus::Kept { confirmed: true }, 'a')]);
-        let plan = run(&s, &wanted(&[("a", 'b')]));
-        assert!(plan.pending.is_empty());
-        assert_eq!(plan.changed, ["a"]);
-        assert!(plan.transitions.is_empty());
-    }
-
-    #[test]
-    fn installed_or_unconfirmed_unconfigured_is_removed() {
-        let s = state(&[
-            ("a", PackStatus::Installed, 'a'),
-            ("b", PackStatus::Unconfirmed, 'a'),
-        ]);
-        let plan = run(&s, &[]);
-        assert_eq!(plan.removed, ["a", "b"]);
-        assert!(plan.pending.is_empty() && plan.transitions.is_empty());
-    }
-
-    #[test]
-    fn failed_unconfigured_is_dropped() {
-        let s = state(&[("a", PackStatus::Failed, 'a')]);
-        let plan = run(&s, &[]);
-        assert_eq!(plan.transitions, [Transition::Drop("a".into())]);
-        assert!(plan.removed.is_empty());
-    }
-
-    #[test]
-    fn kept_unconfigured_is_unchanged() {
-        for confirmed in [true, false] {
-            let s = state(&[("a", PackStatus::Kept { confirmed }, 'a')]);
-            assert_eq!(run(&s, &[]), Plan::default());
-        }
     }
 }

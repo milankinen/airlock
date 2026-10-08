@@ -28,10 +28,15 @@ setup_file() {
 # Set AIRLOCK_TEST_KEEP=1 to preserve temp dirs after tests.
 TEST_TEMP_ROOT="$REPO_ROOT/.tmp/tests"
 
-setup() {
+# Create a fresh $TEST_TEMP_DIR (HOME for run_airlock) and cd into it.
+setup_temp_dir() {
     mkdir -p "$TEST_TEMP_ROOT"
     TEST_TEMP_DIR="$(mktemp -d "$TEST_TEMP_ROOT/XXXXXXXX")"
     cd "$TEST_TEMP_DIR" || return 1
+}
+
+setup() {
+    setup_temp_dir
 }
 
 teardown() {
@@ -126,4 +131,31 @@ write_config() {
 
 write_local_config() {
     printf '%s\n' "$1" > airlock.local.toml
+}
+
+# -- Sandbox state helpers --
+
+# An existing sandbox disk in the current project, with disk id [1, 2].
+make_sandbox_disk() {
+    mkdir -p .airlock/sandbox
+    truncate -s 1M .airlock/sandbox/disk.img
+    echo 00000000000000010000000000000002 >.airlock/sandbox/disk.id
+}
+
+# Write .airlock/sandbox/installs.json for disk [1, 2] with one install
+# record per "pack=status" argument.
+write_installs() {
+    local fp packs="" sep="" arg record
+    fp="$(printf 'a%.0s' {1..64})"
+    for arg in "$@"; do
+        record="\"status\": \"${arg#*=}\""
+        if [[ "${arg#*=}" == kept ]]; then
+            record+=", \"confirmed\": true"
+        fi
+        packs+="$sep\"${arg%%=*}\": { $record, \"fingerprint\": \"$fp\", \"at\": 1 }"
+        sep=", "
+    done
+    mkdir -p .airlock/sandbox
+    printf '{ "version": 1, "disk": [1, 2], "image_id": "sha256:1", "packs": { %s } }\n' "$packs" \
+        >.airlock/sandbox/installs.json
 }

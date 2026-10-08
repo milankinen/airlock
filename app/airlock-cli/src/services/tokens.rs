@@ -544,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn token_keys() {
+    fn credential_like_key_is_token_key_and_metadata_key_is_not() {
         for key in [
             "access_token",
             "Refresh_Token",
@@ -581,10 +581,8 @@ mod tests {
         }
     }
 
-    /// Every recognized string is found, wherever it is; unknown strings
-    /// under token-like keys refuse the answer, other strings do not.
     #[test]
-    fn collect_finds_tokens_and_fails_closed() {
+    fn collect_finds_tokens_anywhere_and_refuses_unknown_credentials() {
         let answer = object(&json!({
             "access_token": "real-a",
             "refresh_token": "real-r",
@@ -625,8 +623,6 @@ mod tests {
                 "{bad}"
             );
         }
-        // Identifiers, short values, UUIDs, numbers and booleans are no
-        // credential.
         for ok in [
             json!({ "token_uuid": "opaque-secret-value-0123456789" }),
             json!({ "session": { "id": "opaque-secret-value-0123456789" } }),
@@ -646,10 +642,8 @@ mod tests {
         assert_eq!(got.err(), Some(Refusal::NotAllowed(TokenKind::Id)));
     }
 
-    /// A refresh keeps the main surrogate of an opaque format, re-mints
-    /// one that carries claims, and keeps the replaced access surrogate.
     #[test]
-    fn a_refresh_keeps_or_remints_surrogates() {
+    fn refresh_keeps_opaque_surrogates_and_remints_ones_with_claims() {
         let found = collect(
             &FORMATS,
             &object(
@@ -692,19 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn the_fake_jwt_prefix_is_its_header() {
-        assert_eq!(
-            FAKE_JWT_PREFIX,
-            format!(
-                "{}.",
-                URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#)
-            )
-        );
-    }
-
-    /// A fake JWT keeps the real claims and is unique.
-    #[test]
-    fn fake_jwts_copy_claims_and_are_unique() {
+    fn fake_jwt_copies_real_claims_and_is_unique() {
         let real = format!(
             "eyJhbGciOiJSUzI1NiJ9.{}.sig",
             URL_SAFE_NO_PAD.encode(json!({ "exp": 7, "sub": "u" }).to_string())

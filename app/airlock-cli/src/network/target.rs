@@ -105,12 +105,6 @@ impl InjectedSecret {
     pub fn new(secret: MaskedSecret) -> Self {
         Self(Rc::new(secret))
     }
-
-    /// Whether two handles share the same underlying secret allocation.
-    #[cfg(test)]
-    pub fn ptr_eq(a: &Self, b: &Self) -> bool {
-        Rc::ptr_eq(&a.0, &b.0)
-    }
 }
 
 impl std::ops::Deref for InjectedSecret {
@@ -287,13 +281,5 @@ mod tests {
         ] {
             assert!(is_public_ip(ip.parse().unwrap()), "{ip}");
         }
-    }
-
-    #[test]
-    fn ip_literal_takes_bare_and_bracketed_addresses() {
-        assert_eq!(ip_literal("127.0.0.1"), Some(IpAddr::from([127, 0, 0, 1])));
-        assert_eq!(ip_literal("[::1]"), Some(IpAddr::V6(Ipv6Addr::LOCALHOST)));
-        assert_eq!(ip_literal("::1"), Some(IpAddr::V6(Ipv6Addr::LOCALHOST)));
-        assert_eq!(ip_literal("localhost"), None);
     }
 }

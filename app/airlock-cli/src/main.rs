@@ -23,7 +23,7 @@ pub(crate) mod services;
 mod settings;
 mod start;
 #[cfg(test)]
-mod test_support;
+mod test_cfg;
 mod util;
 mod vault;
 mod vm;

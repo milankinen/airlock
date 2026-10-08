@@ -33,13 +33,17 @@ pub fn in_rootfs(guest_path: &str) -> PathBuf {
 ///
 /// `mkfifo` is subject to umask, so the mode is set explicitly afterwards.
 pub fn make_fifo(guest_path: &str, uid: u32, gid: u32) -> anyhow::Result<()> {
-    let path = in_rootfs(guest_path);
+    make_fifo_at(&in_rootfs(guest_path), uid, gid)
+}
+
+/// [`make_fifo`] at a host path.
+pub(crate) fn make_fifo_at(path: &Path, uid: u32, gid: u32) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     // A stale FIFO from a previous boot would still work, but recreating
     // keeps ownership and mode correct if the container user changed.
-    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path);
 
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
     // Safety: `c_path` is a valid NUL-terminated path for the duration of
@@ -52,7 +56,7 @@ pub fn make_fifo(guest_path: &str, uid: u32, gid: u32) -> anyhow::Result<()> {
             std::io::Error::last_os_error()
         ));
     }
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
 
     // Safety: chown on a path we just created.
     let rc = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
@@ -107,46 +111,4 @@ pub fn read_capped(path: &Path, limit: u64) -> std::io::Result<Result<Vec<u8>, u
     }
 
     Ok(if total > limit { Err(total) } else { Ok(buf) })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `read_capped` reads whatever the writer sends, so a regular file
-    /// exercises the same path a FIFO does once a writer has opened it.
-    fn capped(bytes: &[u8], limit: u64) -> Result<Vec<u8>, u64> {
-        let dir = std::env::temp_dir().join(format!("airlock-clip-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("payload-{}-{limit}", bytes.len()));
-        std::fs::write(&path, bytes).unwrap();
-        let out = read_capped(&path, limit).unwrap();
-        std::fs::remove_file(&path).ok();
-        out
-    }
-
-    #[test]
-    fn reads_payloads_within_the_limit() {
-        assert_eq!(capped(b"hello", 1024), Ok(b"hello".to_vec()));
-    }
-
-    #[test]
-    fn a_payload_exactly_at_the_limit_is_kept() {
-        assert_eq!(capped(b"abcd", 4), Ok(b"abcd".to_vec()));
-    }
-
-    /// One byte over must be rejected, and the reported total must be the
-    /// real size so the warning is not misleading.
-    #[test]
-    fn one_byte_over_the_limit_is_rejected() {
-        assert_eq!(capped(b"abcde", 4), Err(5));
-    }
-
-    /// The guard exists so a hostile `cat /dev/zero > fifo` cannot grow
-    /// PID 1's memory: a payload far over the limit must retain nothing.
-    #[test]
-    fn a_large_payload_retains_nothing() {
-        let big = vec![0u8; 512 * 1024];
-        assert_eq!(capped(&big, 1024), Err(512 * 1024));
-    }
 }

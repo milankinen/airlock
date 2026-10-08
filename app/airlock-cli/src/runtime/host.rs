@@ -103,7 +103,7 @@ mod tests {
     use crate::settings::{KeyList, MonitorBuffers, MonitorSettings, VaultSettings};
 
     #[test]
-    fn new_rejects_bad_monitor_keys() {
+    fn monitor_with_unknown_key_binding_is_refused() {
         let mut settings = Settings {
             vault: VaultSettings::default(),
             monitor: MonitorSettings {
@@ -122,7 +122,6 @@ mod tests {
             e.to_string().starts_with("invalid monitor key bindings:"),
             "{e}"
         );
-        // Without `--monitor` the key bindings are not used, so not checked.
         assert!(matches!(
             HostRuntime::new(false, &settings),
             Ok(HostRuntime::Raw(_))

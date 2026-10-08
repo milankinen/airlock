@@ -129,3 +129,103 @@ async fn drain_to_eof(src: &mut io::BoxRead, buf: &mut [u8]) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::sync::Notify;
+
+    use super::*;
+
+    /// A guest that keeps offering one more byte as long as it is read,
+    /// pinging `drained` for each byte taken.
+    struct AlwaysReady {
+        drained: Arc<Notify>,
+        ready: Cell<bool>,
+    }
+
+    impl AsyncRead for AlwaysReady {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.ready.replace(!self.ready.get()) {
+                buf.put_slice(b"x");
+                self.drained.notify_one();
+                Poll::Ready(Ok(()))
+            } else {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    /// A write half whose shutdown completes only after `drained` fires,
+    /// like an RPC `close` that waits for the peer to keep draining.
+    struct GatedShutdown {
+        drained: Arc<Notify>,
+        waiting: Option<Pin<Box<dyn Future<Output = ()>>>>,
+    }
+
+    impl AsyncWrite for GatedShutdown {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.waiting.is_none() {
+                let drained = self.drained.clone();
+                self.waiting = Some(Box::pin(async move { drained.notified().await }));
+            }
+            self.waiting
+                .as_mut()
+                .unwrap()
+                .as_mut()
+                .poll(cx)
+                .map(|()| Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_shutdown_drains_guest_so_gated_close_completes() {
+        let drained = Arc::new(Notify::new());
+        let container = io::Transport {
+            read: Box::new(AlwaysReady {
+                drained: drained.clone(),
+                ready: Cell::new(false),
+            }),
+            write: Box::new(GatedShutdown {
+                drained,
+                waiting: None,
+            }),
+            h2: false,
+        };
+        let server = io::Transport {
+            read: Box::new(tokio::io::empty()),
+            write: Box::new(tokio::io::sink()),
+            h2: false,
+        };
+        tokio::time::timeout(Duration::from_secs(2), relay(container, server))
+            .await
+            .expect("relay finishes");
+    }
+}

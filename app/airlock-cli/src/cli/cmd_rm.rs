@@ -44,7 +44,7 @@ pub fn main(args: &RmArgs) -> i32 {
 
 /// [`main`]'s body, taking the project directory as an argument so tests
 /// can drive it without touching the process's current directory.
-fn run(args: &RmArgs, host_cwd: &Path) -> i32 {
+pub(super) fn run(args: &RmArgs, host_cwd: &Path) -> i32 {
     let paths = project::paths(host_cwd);
 
     // `.airlock` itself may be a symlink (an untrusted repo can commit one
@@ -307,153 +307,19 @@ fn remove_entry(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TempDir;
+    use crate::test_cfg::temp_dir;
 
     #[test]
-    fn is_home_dir_matches_only_the_home_project() {
-        let tmp = TempDir::new("rm-home");
+    fn home_project_is_found_by_env_home_or_password_database() {
+        let tmp = temp_dir();
         let home = tmp.path();
         std::fs::create_dir_all(home.join("proj/.airlock")).unwrap();
         assert!(is_home_dir(&home.join(".airlock"), home));
         assert!(!is_home_dir(&home.join("proj/.airlock"), home));
-    }
 
-    /// The password database home of the current user counts even when
-    /// `$HOME` points elsewhere (sudo, `HOME=...`).
-    #[test]
-    fn passwd_home_of_the_current_user_counts_as_home() {
-        // SAFETY: getuid cannot fail.
         let uid = unsafe { libc::getuid() };
-        let Some(home) = passwd_home(uid) else {
-            return; // no passwd entry for this uid (minimal container)
-        };
-        assert!(is_user_home_project(&home.join(".airlock")));
-    }
-
-    #[test]
-    fn user_file_marker_finds_user_only_files() {
-        let tmp = TempDir::new("rm-user-marker");
-        let cache_dir = tmp.path().join(".airlock");
-        std::fs::create_dir_all(cache_dir.join("sandbox")).unwrap();
-        std::fs::write(cache_dir.join(".gitignore"), "*\n").unwrap();
-        std::fs::write(cache_dir.join("airlock.toml"), "").unwrap();
-        assert_eq!(user_file_marker(&cache_dir), None);
-
-        std::fs::write(cache_dir.join("settings.yaml"), "").unwrap();
-        assert_eq!(
-            user_file_marker(&cache_dir),
-            Some("settings.yaml".to_string())
-        );
-
-        for name in ["vault.default.json", "vault.default.enc.json"] {
-            let dir = tmp.path().join(name);
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join(name), "{}").unwrap();
-            assert_eq!(user_file_marker(&dir), Some(name.to_string()));
+        if let Some(passwd_home) = passwd_home(uid) {
+            assert!(is_user_home_project(&passwd_home.join(".airlock")));
         }
-        for name in ["claude", "codex", "agents", crate::db::DIR] {
-            let dir = tmp.path().join(format!("{name}-home"));
-            std::fs::create_dir_all(dir.join(name)).unwrap();
-            assert_eq!(user_file_marker(&dir), Some(name.to_string()));
-        }
-        let dir = tmp.path().join("config-home");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("config.json"), "{}").unwrap();
-        assert_eq!(user_file_marker(&dir), Some("config.json".to_string()));
-    }
-
-    #[test]
-    fn local_config_name_finds_the_first_matching_extension() {
-        let tmp = TempDir::new("rm-local-config");
-        let cache_dir = tmp.path().join(".airlock");
-        std::fs::create_dir_all(&cache_dir).unwrap();
-        assert_eq!(local_config_name(&cache_dir), None);
-
-        std::fs::write(cache_dir.join("airlock.toml"), "").unwrap();
-        assert_eq!(
-            local_config_name(&cache_dir),
-            Some("airlock.toml".to_string())
-        );
-    }
-
-    /// A symlinked `.airlock` (an untrusted repo can commit one pointing
-    /// at, say, `~/.airlock`) must not be followed: only the link goes,
-    /// its target — here standing in for a user's real `.airlock`, with
-    /// a user-level file and a sandbox — is left untouched.
-    #[test]
-    fn run_removes_only_the_link_for_a_symlinked_airlock() {
-        use std::os::unix::fs::symlink;
-
-        let tmp = TempDir::new("rm-symlink-airlock");
-        let project = tmp.path().join("proj");
-        std::fs::create_dir_all(&project).unwrap();
-
-        let victim = tmp.path().join("victim-home");
-        std::fs::create_dir_all(victim.join("sandbox")).unwrap();
-        std::fs::write(victim.join("settings.yaml"), "").unwrap();
-        std::fs::write(victim.join("sandbox/disk.img"), b"data").unwrap();
-
-        symlink(&victim, project.join(".airlock")).unwrap();
-
-        let code = run(&RmArgs { force: true }, &project);
-        assert_eq!(code, 0);
-
-        assert!(std::fs::symlink_metadata(project.join(".airlock")).is_err());
-        assert!(victim.join("settings.yaml").is_file());
-        assert!(victim.join("sandbox/disk.img").is_file());
-    }
-
-    /// A symlinked `.airlock/sandbox` in a home-like `.airlock/` (flagged
-    /// by [`user_file_marker`]) must not be followed either: only the
-    /// link goes, its target is left untouched.
-    #[test]
-    fn rm_sandbox_only_does_not_follow_a_symlinked_sandbox() {
-        use std::os::unix::fs::symlink;
-
-        let tmp = TempDir::new("rm-symlink-sandbox");
-        let project = tmp.path().join("proj");
-        let cache_dir = project.join(".airlock");
-        std::fs::create_dir_all(&cache_dir).unwrap();
-        std::fs::write(cache_dir.join("settings.yaml"), "").unwrap();
-
-        let victim = tmp.path().join("victim-sandbox");
-        std::fs::create_dir_all(&victim).unwrap();
-        std::fs::write(victim.join("disk.img"), b"data").unwrap();
-
-        symlink(&victim, cache_dir.join("sandbox")).unwrap();
-
-        let code = run(&RmArgs { force: true }, &project);
-        assert_eq!(code, 0);
-
-        assert!(std::fs::symlink_metadata(cache_dir.join("sandbox")).is_err());
-        assert!(victim.join("disk.img").is_file());
-        assert!(cache_dir.join("settings.yaml").is_file());
-    }
-
-    /// The full-removal path (no user markers, so the whole `.airlock/`
-    /// goes) also must not follow a symlinked `.airlock/sandbox`: the
-    /// `std::fs::remove_dir_all(cache_dir)` it uses unlinks a symlink it
-    /// meets while recursing rather than following it, so the victim
-    /// directory stays intact even though `.airlock` itself disappears.
-    #[test]
-    fn full_removal_does_not_follow_a_symlinked_sandbox() {
-        use std::os::unix::fs::symlink;
-
-        let tmp = TempDir::new("rm-full-symlink-sandbox");
-        let project = tmp.path().join("proj");
-        let cache_dir = project.join(".airlock");
-        std::fs::create_dir_all(&cache_dir).unwrap();
-
-        let victim = tmp.path().join("victim-sandbox");
-        std::fs::create_dir_all(&victim).unwrap();
-        std::fs::write(victim.join("disk.img"), b"data").unwrap();
-
-        symlink(&victim, cache_dir.join("sandbox")).unwrap();
-
-        let code = run(&RmArgs { force: true }, &project);
-        assert_eq!(code, 0);
-
-        assert!(std::fs::symlink_metadata(&cache_dir).is_err());
-        assert!(victim.join("disk.img").is_file());
     }
 }

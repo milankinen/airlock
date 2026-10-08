@@ -44,6 +44,7 @@ version = "0.1.0"
 dependencies = [
  "airlock-common",
  "airlock-monitor",
+ "airlock-test-utils",
  "anyhow",
  "argon2",
  "async-stream",
@@ -123,6 +124,7 @@ name = "airlock-monitor"
 version = "0.1.0"
 dependencies = [
  "airlock-common",
+ "airlock-test-utils",
  "anyhow",
  "capnp",
  "capnp-rpc",
@@ -137,10 +139,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "airlock-test-utils"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "capnp",
+ "capnp-rpc",
+ "futures",
+ "hyper",
+ "hyper-util",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tower",
+]
+
+[[package]]
 name = "airlockd"
 version = "0.1.0"
 dependencies = [
  "airlock-common",
+ "airlock-test-utils",
  "anyhow",
  "axum",
  "bytes",

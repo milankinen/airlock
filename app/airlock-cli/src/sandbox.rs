@@ -51,6 +51,10 @@ pub fn main_argv(args: Vec<String>, login: bool, image: &OciImage) -> Vec<String
 mod tests {
     use super::*;
 
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(ToString::to_string).collect()
+    }
+
     fn image(cmd: &[&str]) -> OciImage {
         OciImage {
             image_id: "sha256:test".into(),
@@ -59,33 +63,26 @@ mod tests {
             container_home: "/root".into(),
             uid: 0,
             gid: 0,
-            cmd: cmd.iter().map(ToString::to_string).collect(),
+            cmd: argv(cmd),
             env: vec![],
             user: None,
         }
     }
 
-    fn argv(args: &[&str]) -> Vec<String> {
-        args.iter().map(ToString::to_string).collect()
-    }
-
     #[test]
-    fn main_argv_prefers_args_over_the_image_command() {
-        let img = image(&["/bin/sh"]);
-        assert_eq!(main_argv(vec![], false, &img), argv(&["/bin/sh"]));
+    fn main_command_is_args_or_image_command_optionally_in_login_shell() {
+        assert_eq!(main_argv(vec![], false, &image(&["/bin/sh"])), ["/bin/sh"]);
         assert_eq!(
-            main_argv(argv(&["cat", "-n"]), false, &img),
-            argv(&["cat", "-n"])
+            main_argv(argv(&["cat", "-n"]), false, &image(&["/bin/sh"])),
+            ["cat", "-n"]
         );
-    }
-
-    #[test]
-    fn main_argv_wraps_in_a_login_shell() {
-        let img = image(&["/bin/bash"]);
-        assert_eq!(main_argv(vec![], true, &img), argv(&["/bin/bash", "-l"]));
         assert_eq!(
-            main_argv(argv(&["claude", "--yolo"]), true, &img),
-            argv(&["bash", "-l", "-c", r#"exec "$0" "$@""#, "claude", "--yolo"])
+            main_argv(vec![], true, &image(&["/bin/bash"])),
+            ["/bin/bash", "-l"]
+        );
+        assert_eq!(
+            main_argv(argv(&["claude", "--yolo"]), true, &image(&["/bin/bash"])),
+            ["bash", "-l", "-c", r#"exec "$0" "$@""#, "claude", "--yolo"]
         );
     }
 }

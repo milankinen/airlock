@@ -177,41 +177,21 @@ fn document(name: &str) -> anyhow::Result<Value> {
 mod tests {
     use super::*;
 
-    /// The released list names (11, plus the later addition `docker`),
-    /// each with its file and, but for the distros without a pack
-    /// (`arch`, `fedora`, `suse`), the name of a built-in pack.
     #[test]
-    fn legacy_names_are_the_released_ones() {
-        let mut names = RELEASED_NAMES.map(|(name, _)| name);
-        names.sort_unstable();
-        assert_eq!(
-            names,
-            [
-                "alpine",
-                "arch",
-                "claude-code",
-                "copilot-cli",
-                "debian",
-                "docker",
-                "fedora",
-                "nodejs",
-                "openai-codex",
-                "python",
-                "rust",
-                "suse",
-            ]
-        );
+    fn released_names_match_documents_and_builtin_packs() {
         let mut files: Vec<String> = DOCUMENTS
             .files()
             .map(|f| f.path().display().to_string())
             .collect();
         files.sort_unstable();
-        let mut expected: Vec<String> = names.iter().map(|n| format!("{n}.toml")).collect();
+        let mut expected: Vec<String> = RELEASED_NAMES
+            .iter()
+            .map(|(name, _)| format!("{name}.toml"))
+            .collect();
         expected.sort_unstable();
         assert_eq!(files, expected);
         let packs = crate::packs::init().unwrap().builtin();
-        for (name, table_name) in RELEASED_NAMES {
-            document(name).unwrap();
+        for (_, table_name) in RELEASED_NAMES {
             assert!(
                 ["arch", "fedora", "suse"].contains(&table_name)
                     || packs.iter().any(|p| p.metadata().name == table_name),

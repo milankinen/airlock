@@ -286,15 +286,13 @@ fn check_redirect(raw: &str, page: &SignInPage) -> Result<u16, String> {
 #[cfg(test)]
 mod tests {
     use airlock_common::BROWSER_URL_MAX;
-    use airlock_common::supervisor_capnp::supervisor;
 
     use super::*;
     use crate::rpc::browser::checked_url;
-    use crate::test_support::block_on_local;
+    use crate::test_cfg::block_on_local;
+    use crate::test_cfg::services::{free_claude_callback_port, idle_guest};
 
-    /// `auth-claude.md`: the URL claude passes to `$BROWSER`.
     const CLAUDE_URL: &str = "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A35527%2Fcallback&scope=user%3Ainference&code_challenge=Zm9vYmFyYmF6cXV4&code_challenge_method=S256&state=c3RhdGVzdGF0ZQ";
-    /// `auth-codex.md`: the shape of the URL `codex login` opens.
     const CODEX_URL: &str = "https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_EMoamEEZ73f0CkXaXp7hrann&redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback&scope=openid%20profile%20email%20offline_access%20api.connectors.read%20api.connectors.invoke&code_challenge=Zm9vYmFy&code_challenge_method=S256&id_token_add_organizations=true&codex_cli_simplified_flow=true&state=c3RhdGU&originator=codex_cli_rs";
 
     fn claude() -> Vec<SignInPage> {
@@ -305,15 +303,6 @@ mod tests {
         crate::services::openai::sign_in_pages()
     }
 
-    /// Both services' pages.
-    fn both() -> Vec<SignInPage> {
-        let mut pages = claude();
-        pages.extend(codex());
-        pages
-    }
-
-    /// The browser's URL check and the page's parameter check, without a
-    /// forward: the callback port, or the refusal.
     fn check_url(raw: &str, pages: &[SignInPage]) -> Result<u16, String> {
         let url = checked_url(raw)?;
         let page = pages
@@ -324,92 +313,71 @@ mod tests {
     }
 
     #[test]
-    fn fixture_urls_pass() {
-        assert_eq!(check_url(CLAUDE_URL, &claude()).unwrap(), 35527);
+    fn agent_sign_in_urls_pass_with_callback_port_of_their_own_page() {
+        let mut both = claude();
+        both.extend(codex());
+        assert_eq!(check_url(CLAUDE_URL, &both).unwrap(), 35527);
         assert_eq!(checked_url(CLAUDE_URL).unwrap().as_str(), CLAUDE_URL);
         let console = CLAUDE_URL.replace("claude.com/cai/oauth", "platform.claude.com/oauth");
-        assert!(check_url(&console, &claude()).is_ok());
-        assert_eq!(check_url(CODEX_URL, &codex()).unwrap(), 1455);
+        assert!(check_url(&console, &both).is_ok());
+        assert_eq!(check_url(CODEX_URL, &both).unwrap(), 1455);
         let alt = CODEX_URL.replace("1455", "1457");
-        assert_eq!(check_url(&alt, &codex()).unwrap(), 1457);
+        assert_eq!(check_url(&alt, &both).unwrap(), 1457);
         let outside = CODEX_URL.replace("1455", "1456");
-        let err = check_url(&outside, &codex()).unwrap_err();
+        let err = check_url(&outside, &both).unwrap_err();
         assert!(err.ends_with("callback port 1456 is not allowed"), "{err}");
         let v4 = CLAUDE_URL.replace("localhost", "127.0.0.1");
-        assert!(check_url(&v4, &claude()).is_ok());
+        assert!(check_url(&v4, &both).is_ok());
         let named = CODEX_URL.replace("127.0.0.1", "localhost");
-        assert!(check_url(&named, &codex()).is_ok());
-    }
-
-    /// `claude /login` with an Anthropic Console account: another OAuth
-    /// client and other scopes on the Console's authorize page.
-    #[test]
-    fn the_console_client_passes() {
-        let console = CLAUDE_URL
-            .replace("claude.com/cai/oauth", "platform.claude.com/oauth")
-            .replace(
-                "client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-                "client_id=41077d10-94b8-4194-be48-d251e9eb21b4",
-            )
-            .replace(
-                "scope=user%3Ainference",
-                "scope=user%3Aprofile+user%3Ainference",
-            );
-        assert_eq!(check_url(&console, &claude()).unwrap(), 35527);
+        assert!(check_url(&named, &both).is_ok());
+        let crossed = CLAUDE_URL.replace("35527%2Fcallback", "1455%2Fauth%2Fcallback");
+        assert!(check_url(&crossed, &both).is_err());
+        let crossed = CODEX_URL.replace("1455%2Fauth%2Fcallback", "35527%2Fcallback");
+        assert!(check_url(&crossed, &both).is_err());
+        assert!(check_url(CLAUDE_URL, &codex()).is_err());
+        assert!(check_url(CODEX_URL, &claude()).is_err());
     }
 
     #[test]
-    fn rejections() {
+    fn url_that_breaks_oauth_parameter_rule_is_refused_without_naming_query() {
         let p = claude();
         let bad = [
-            // wrong host or path
             CLAUDE_URL.replace("claude.com/cai", "claude.com.evil.io/cai"),
             CLAUDE_URL.replace("/cai/oauth/authorize", "/cai/oauth/authorize2"),
             CLAUDE_URL.replace("https://claude.com", "https://evil.com"),
-            // schemes
             CLAUDE_URL.replace("https:", "http:"),
             "file:///etc/passwd".into(),
             "javascript:alert(1)".into(),
-            // userinfo, explicit port, fragment
             CLAUDE_URL.replace("https://claude.com", "https://u:p@claude.com"),
             CLAUDE_URL.replace("https://claude.com", "https://claude.com:8443"),
             format!("{CLAUDE_URL}#x"),
-            // two redirects, none
             format!("{CLAUDE_URL}&redirect_uri=http%3A%2F%2Flocalhost%3A35528%2Fcallback"),
-            CLAUDE_URL.replace("redirect_uri=", "redirect=").clone(),
-            // non-loopback redirect, https redirect, no port
+            CLAUDE_URL.replace("redirect_uri=", "redirect="),
             CLAUDE_URL.replace("localhost%3A35527", "evil.com%3A35527"),
             CLAUDE_URL.replace("localhost%3A35527", "0.0.0.0%3A35527"),
             CLAUDE_URL.replace("http%3A%2F%2Flocalhost", "https%3A%2F%2Flocalhost"),
             CLAUDE_URL.replace("%3A35527", ""),
-            // port outside the set, wrong callback path, redirect query
             CLAUDE_URL.replace("35527", "22"),
             CLAUDE_URL.replace("35527", "61000"),
             CLAUDE_URL.replace("%2Fcallback", "%2Fcallback2"),
             CLAUDE_URL.replace("%2Fcallback", "%2Fcallback%3Fx%3D1"),
-            // metacharacters
             format!("{CLAUDE_URL}&x=$(id)"),
             format!("{CLAUDE_URL}&x=a;b"),
             format!("{CLAUDE_URL}&x=`id`"),
-            // oversize
             format!("{CLAUDE_URL}&pad={}", "a".repeat(BROWSER_URL_MAX)),
-            // an empty client, two clients, no client
             CLAUDE_URL.replace(
                 "client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e",
                 "client_id=",
             ),
             format!("{CLAUDE_URL}&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e"),
-            CLAUDE_URL.replace("client_id=", "client=").clone(),
-            // implicit flow, plain PKCE, no PKCE method
+            CLAUDE_URL.replace("client_id=", "client="),
             CLAUDE_URL.replace("response_type=code", "response_type=token"),
             format!("{CLAUDE_URL}&response_type=code"),
             CLAUDE_URL.replace("code_challenge_method=S256", "code_challenge_method=plain"),
             CLAUDE_URL.replace("&code_challenge_method=S256", ""),
-            // no challenge, an empty one, two
             CLAUDE_URL.replace("&code_challenge=Zm9vYmFyYmF6cXV4", ""),
             CLAUDE_URL.replace("code_challenge=Zm9vYmFyYmF6cXV4", "code_challenge="),
             format!("{CLAUDE_URL}&code_challenge=Zm9vYmFyYmF6cXV4"),
-            // scopes: malformed, empty, missing, twice
             CLAUDE_URL.replace("scope=user%3Ainference", "scope=user%3Ainference%20a%22b"),
             CLAUDE_URL.replace("scope=user%3Ainference", "scope=a%5Cb"),
             CLAUDE_URL.replace("scope=user%3Ainference", "scope=a%20%20b"),
@@ -427,99 +395,52 @@ mod tests {
                 "scope=user%3Ainference",
                 "scope=user%3Ainference+user%3Aprofile+user%3Ainference",
             ),
-            // a response mode, a silent sign-in
             format!("{CLAUDE_URL}&response_mode=form_post"),
             format!("{CLAUDE_URL}&prompt=none"),
             format!("{CLAUDE_URL}&prompt=login%20none"),
         ];
         for url in &bad {
-            let got = check_url(url, &p);
-            assert!(got.is_err(), "accepted {url}");
-            // The message never repeats the query's values.
-            let msg = got.unwrap_err();
+            let msg = check_url(url, &p).expect_err(url);
             assert!(
                 !msg.contains("Zm9vYmFyYmF6cXV4") && !msg.contains("c3RhdGVzdGF0ZQ"),
                 "{url}: {msg}"
             );
         }
-        // A prompt that is not silent, and all of Claude's login scopes.
         assert!(check_url(&format!("{CLAUDE_URL}&prompt=login"), &p).is_ok());
         let all = CLAUDE_URL.replace(
             "scope=user%3Ainference",
             "scope=org%3Acreate_api_key%20user%3Aprofile%20user%3Ainference%20user%3Asessions%3Aclaude_code%20user%3Amcp_servers%20user%3Afile_upload%20user%3Aplugins",
         );
         assert!(check_url(&all, &p).is_ok());
-        // Any scope the agent asks for: the provider decides.
         let new = CLAUDE_URL.replace(
             "scope=user%3Ainference",
             "scope=user%3Ainference+new%3Ascope%21",
         );
         assert!(check_url(&new, &p).is_ok());
-        // The codex pages refuse the claude page and vice versa.
-        assert!(check_url(CLAUDE_URL, &codex()).is_err());
-        assert!(check_url(CODEX_URL, &p).is_err());
     }
 
-    /// With several pages, each page is checked against its own callback
-    /// rule: a codex callback on the claude page is refused, and the
-    /// other way round.
-    #[test]
-    fn several_rules_keep_their_callbacks_apart() {
-        let p = both();
-        assert_eq!(check_url(CLAUDE_URL, &p).unwrap(), 35527);
-        assert_eq!(check_url(CODEX_URL, &p).unwrap(), 1455);
-        let crossed = CLAUDE_URL.replace("35527%2Fcallback", "1455%2Fauth%2Fcallback");
-        assert!(check_url(&crossed, &p).is_err());
-        let crossed = CODEX_URL.replace("1455%2Fauth%2Fcallback", "35527%2Fcallback");
-        assert!(check_url(&crossed, &p).is_err());
-    }
-
-    /// A supervisor that implements nothing: the forward's accept loops
-    /// only call it for a connection.
-    struct NoSupervisor;
-    impl supervisor::Server for NoSupervisor {}
-
-    /// Claude's sign-ins, attached to a guest that is never reached.
     fn claude_sign_in() -> LoopbackSignIn {
         let sign_in = LoopbackSignIn::new(ServiceId::Anthropic, claude(), PendingCodes::default());
-        sign_in.attach(&GuestNetwork::new(capnp_rpc::new_client(NoSupervisor)));
+        sign_in.attach(&idle_guest());
         sign_in
     }
 
-    fn allow(sign_in: &LoopbackSignIn, raw: &str) -> GrantAnswer {
-        sign_in.allow(&Url::parse(raw).unwrap())
+    fn allow(sign_in: &LoopbackSignIn, port: u16) -> GrantAnswer {
+        let raw = CLAUDE_URL.replace("35527", &port.to_string());
+        sign_in.allow(&Url::parse(&raw).unwrap())
     }
 
-    /// A free port inside the claude range.
-    fn free_port() -> u16 {
-        loop {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = l.local_addr().unwrap().port();
-            if (32768..=60999).contains(&port) {
-                return port;
-            }
-        }
-    }
-
-    fn claude_url(port: u16) -> String {
-        CLAUDE_URL.replace("35527", &port.to_string())
-    }
-
-    /// A sign-in with a new callback port replaces the forward of the
-    /// previous one; the same port keeps it. Detaching frees the port.
     #[test]
-    fn a_new_port_replaces_the_forward_and_detach_frees_it() {
+    fn sign_in_on_new_port_replaces_forward_and_detach_frees_port() {
         block_on_local(async {
             let sign_in = claude_sign_in();
-            let first = free_port();
-            assert_eq!(allow(&sign_in, &claude_url(first)), GrantAnswer::Allow);
-            // Held: another exclusive bind fails.
+            let first = free_claude_callback_port();
+            assert_eq!(allow(&sign_in, first), GrantAnswer::Allow);
             assert!(reverse_forward::bind_exclusive(first, first).is_err());
-            assert_eq!(allow(&sign_in, &claude_url(first)), GrantAnswer::Allow);
-            let second = free_port();
-            assert_eq!(allow(&sign_in, &claude_url(second)), GrantAnswer::Allow);
+            assert_eq!(allow(&sign_in, first), GrantAnswer::Allow);
+            let second = free_claude_callback_port();
+            assert_eq!(allow(&sign_in, second), GrantAnswer::Allow);
             assert!(reverse_forward::bind_exclusive(second, second).is_err());
-            // The aborted accept loop lets go of the first port.
             let mut freed = false;
             for _ in 0..50 {
                 if let Ok(l) = reverse_forward::bind_exclusive(first, first) {
@@ -535,37 +456,15 @@ mod tests {
         });
     }
 
-    /// RFC 7636, appendix B: a verifier and its S256 challenge.
-    const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-    const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
-
-    /// A page that opens keeps its PKCE challenge for one manual
-    /// exchange; a refused page keeps none.
     #[test]
-    fn an_opened_page_binds_a_manual_exchange() {
+    fn sign_in_on_busy_port_is_refused_and_keeps_forward() {
         block_on_local(async {
             let sign_in = claude_sign_in();
-            let url = claude_url(free_port()).replace("Zm9vYmFyYmF6cXV4", CHALLENGE);
-            let refused = url.replace("response_type=code", "response_type=token");
-            assert!(matches!(allow(&sign_in, &refused), GrantAnswer::Refuse(_)));
-            assert!(!sign_in.codes.redeem_page(VERIFIER, ServiceId::Anthropic));
-            assert_eq!(allow(&sign_in, &url), GrantAnswer::Allow);
-            assert!(!sign_in.codes.redeem_page(VERIFIER, ServiceId::Openai));
-            assert!(sign_in.codes.redeem_page(VERIFIER, ServiceId::Anthropic));
-            sign_in.detach().await;
-        });
-    }
-
-    /// A busy port is refused and keeps the current forward.
-    #[test]
-    fn a_busy_port_is_not_opened_and_keeps_the_forward() {
-        block_on_local(async {
-            let sign_in = claude_sign_in();
-            let held = free_port();
-            assert_eq!(allow(&sign_in, &claude_url(held)), GrantAnswer::Allow);
-            let port = free_port();
+            let held = free_claude_callback_port();
+            assert_eq!(allow(&sign_in, held), GrantAnswer::Allow);
+            let port = free_claude_callback_port();
             let _busy = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
-            let answer = allow(&sign_in, &claude_url(port));
+            let answer = allow(&sign_in, port);
             assert!(
                 matches!(&answer, GrantAnswer::Refuse(r) if r.contains("in use")),
                 "{answer:?}"

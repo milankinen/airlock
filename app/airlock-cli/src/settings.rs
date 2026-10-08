@@ -150,102 +150,51 @@ fn parse_settings(value: serde_json::Value) -> Result<Settings> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU32, Ordering};
-
     use super::*;
-
-    fn fresh_dir() -> PathBuf {
-        static N: AtomicU32 = AtomicU32::new(0);
-        let id = N.fetch_add(1, Ordering::Relaxed);
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let dir = std::env::temp_dir().join(format!("airlock-settings-test-{ts}-{id}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
+    use crate::test_cfg::temp_dir;
 
     #[test]
-    fn missing_dir_yields_defaults() {
-        let base = fresh_dir();
-        let missing = base.join("nope");
-        let s = Settings::load_from(&missing).unwrap();
+    fn settings_load_from_first_file_by_format_or_defaults() {
+        let dir = temp_dir();
+        let s = Settings::load_from(&dir.path().join("missing")).unwrap();
         assert_eq!(s.vault.storage, VaultStorageType::Keyring);
-    }
+        assert_eq!(s.monitor.buffers.http, 100);
+        assert_eq!(s.monitor.buffers.scrollback, 1000);
 
-    #[test]
-    fn toml_roundtrip() {
-        let dir = fresh_dir();
-        std::fs::write(dir.join("settings.toml"), "vault.storage = \"file\"\n").unwrap();
-        let s = Settings::load_from(&dir).unwrap();
-        assert_eq!(s.vault.storage, VaultStorageType::File);
-    }
-
-    #[test]
-    fn json_roundtrip() {
-        let dir = fresh_dir();
         std::fs::write(
-            dir.join("settings.json"),
+            dir.path().join("settings.yml"),
+            "vault:\n  storage: disabled\n",
+        )
+        .unwrap();
+        let s = Settings::load_from(dir.path()).unwrap();
+        assert_eq!(s.vault.storage, VaultStorageType::Disabled);
+
+        std::fs::write(
+            dir.path().join("settings.json"),
             r#"{"vault": {"storage": "keyring"}}"#,
         )
         .unwrap();
-        let s = Settings::load_from(&dir).unwrap();
+        let s = Settings::load_from(dir.path()).unwrap();
         assert_eq!(s.vault.storage, VaultStorageType::Keyring);
-    }
 
-    #[test]
-    fn yaml_roundtrip() {
-        let dir = fresh_dir();
-        std::fs::write(dir.join("settings.yml"), "vault:\n  storage: disabled\n").unwrap();
-        let s = Settings::load_from(&dir).unwrap();
-        assert_eq!(s.vault.storage, VaultStorageType::Disabled);
-    }
-
-    /// TOML wins when multiple candidates exist — stable ordering
-    /// matters so a stray `settings.json` doesn't shadow the user's
-    /// primary TOML file.
-    #[test]
-    fn toml_wins_over_json() {
-        let dir = fresh_dir();
-        std::fs::write(dir.join("settings.toml"), "vault.storage = \"keyring\"\n").unwrap();
         std::fs::write(
-            dir.join("settings.json"),
-            r#"{"vault": {"storage": "disabled"}}"#,
+            dir.path().join("settings.toml"),
+            "vault.storage = \"file\"\n[monitor.buffers]\nhttp = 5\n",
         )
         .unwrap();
-        let s = Settings::load_from(&dir).unwrap();
-        assert_eq!(s.vault.storage, VaultStorageType::Keyring);
+        let s = Settings::load_from(dir.path()).unwrap();
+        assert_eq!(s.vault.storage, VaultStorageType::File);
+        assert_eq!(s.monitor.buffers.http, 5);
+        assert_eq!(s.monitor.buffers.tcp, 100);
     }
 
     #[test]
-    fn malformed_file_errors() {
-        let dir = fresh_dir();
-        std::fs::write(dir.join("settings.toml"), "not valid = toml =").unwrap();
-        assert!(Settings::load_from(&dir).is_err());
-    }
-
-    /// Unknown enum variants must not silently degrade to the default —
-    /// a typo in `vault.storage = "file"` would otherwise be
-    /// indistinguishable from "user didn't set it".
-    #[test]
-    fn bad_vault_value_errors() {
-        let dir = fresh_dir();
-        std::fs::write(dir.join("settings.toml"), "vault.storage = \"typo\"\n").unwrap();
-        assert!(Settings::load_from(&dir).is_err());
-    }
-
-    /// `mouse_passthrough` was removed once forwarding became
-    /// unconditional. Unknown keys are ignored rather than rejected, so a
-    /// settings file still carrying it must load — upgrading airlock must
-    /// not strand anyone at a startup error over a setting we deleted.
-    #[test]
-    fn a_removed_setting_still_loads() {
-        let dir = fresh_dir();
-        std::fs::write(
-            dir.join("settings.toml"),
-            "[monitor]\nmouse_passthrough = \"all\"\n",
-        )
-        .unwrap();
-        assert!(Settings::load_from(&dir).is_ok());
+    fn malformed_or_invalid_settings_file_fails_load() {
+        for content in ["not valid = toml =", "vault.storage = \"typo\"\n"] {
+            let dir = temp_dir();
+            std::fs::write(dir.path().join("settings.toml"), content).unwrap();
+            let err = format!("{:#}", Settings::load_from(dir.path()).unwrap_err());
+            assert!(err.contains("settings.toml"), "{err}");
+        }
     }
 }

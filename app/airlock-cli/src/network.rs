@@ -13,7 +13,7 @@ pub(crate) mod http;
 pub(crate) mod interceptor;
 pub(crate) mod io;
 mod matchers;
-mod middleware;
+pub(crate) mod middleware;
 pub mod reverse_forward;
 pub(crate) mod rules;
 mod server;
@@ -21,7 +21,7 @@ pub(crate) mod target;
 mod tcp;
 #[cfg(test)]
 mod tests;
-mod tls;
+pub(crate) mod tls;
 mod traffic;
 
 use std::collections::HashMap;
@@ -313,41 +313,41 @@ pub struct Network {
     /// Mutable runtime state. Reads on the hot path use `parking_lot::RwLock`
     /// reads (no contention, no poisoning). The TUI holds a clone of this
     /// `Arc` through [`NetworkControl`] to mutate policy live.
-    state: Arc<RwLock<NetworkState>>,
-    tls_client: Arc<rustls::ClientConfig>,
-    interceptor: Rc<tls::TlsInterceptor>,
+    pub(crate) state: Arc<RwLock<NetworkState>>,
+    pub(crate) tls_client: Arc<rustls::ClientConfig>,
+    pub(crate) interceptor: Rc<tls::TlsInterceptor>,
     /// Allow-rule targets.
-    allow_targets: Vec<NetworkTarget>,
+    pub(crate) allow_targets: Vec<NetworkTarget>,
     /// Deny-rule targets (deny wins unconditionally).
-    deny_targets: Vec<NetworkTarget>,
+    pub(crate) deny_targets: Vec<NetworkTarget>,
     /// Passthrough subset of `allow_targets` — connections matching any of
     /// these skip TLS/HTTP interception entirely and are relayed raw.
-    passthrough_targets: Vec<NetworkTarget>,
+    pub(crate) passthrough_targets: Vec<NetworkTarget>,
     /// Compiled middleware with target patterns.
-    middleware_targets: Vec<MiddlewareTarget>,
+    pub(crate) middleware_targets: Vec<MiddlewareTarget>,
     /// Masked secrets to inject into HTTP headers, with target patterns.
-    inject_targets: Vec<InjectTarget>,
+    pub(crate) inject_targets: Vec<InjectTarget>,
     /// The enabled network services' interceptors; each owns its targets.
-    interceptors: Vec<Rc<dyn Interceptor>>,
+    pub(crate) interceptors: Vec<Rc<dyn Interceptor>>,
     /// The hosts of enabled services that cannot run (no token store):
     /// denied under every policy, so the agents never sign in without
     /// airlock.
-    unavailable_targets: Vec<NetworkTarget>,
+    pub(crate) unavailable_targets: Vec<NetworkTarget>,
     /// Port forward mappings: guest_port → host_port.
-    port_forwards: HashMap<u16, u16>,
+    pub(crate) port_forwards: HashMap<u16, u16>,
     /// Guest socket path → host socket path mapping for Unix socket forwarding.
     pub(crate) socket_map: HashMap<String, PathBuf>,
     /// Network events to subscribe to
     // TODO: this NetworkEvent should be Network event agnostic to any TUI
-    events: broadcast::Sender<airlock_monitor::NetworkEvent>,
+    pub(crate) events: broadcast::Sender<airlock_monitor::NetworkEvent>,
     /// Monotonic counter for connection ids. Used by the TUI to pair
     /// `Disconnect` events with their originating `Connect`.
-    next_id: AtomicU64,
+    pub(crate) next_id: AtomicU64,
     /// Host → guest notifier for every denied connection. Populated once
     /// the supervisor handshake completes; no-op until then.
-    pub(super) deny_reporter: Rc<DenyReporter>,
+    pub(crate) deny_reporter: Rc<DenyReporter>,
     /// Connect to public addresses only ([`Network::public_only`]).
-    public_only: bool,
+    pub(crate) public_only: bool,
 }
 
 impl Network {
@@ -586,182 +586,4 @@ fn is_local_host(host: &str) -> bool {
     name == "localhost"
         || name.ends_with(".localhost")
         || target::ip_literal(host).is_some_and(|ip| !target::is_public_ip(ip))
-}
-
-#[cfg(test)]
-mod labeled_target_tests {
-    use std::collections::BTreeMap;
-
-    use super::*;
-    use crate::config::config_values::{self, MiddlewareRule, NetworkRule};
-
-    fn rule(allow: &[&str], passthrough: bool, enabled: bool) -> NetworkRule {
-        NetworkRule {
-            enabled,
-            allow: allow.iter().map(|s| (*s).to_string()).collect(),
-            deny: vec![],
-            passthrough,
-            inject: vec![],
-        }
-    }
-
-    fn mw(target: &[&str], enabled: bool) -> MiddlewareRule {
-        MiddlewareRule {
-            enabled,
-            target: target.iter().map(|s| (*s).to_string()).collect(),
-            env: BTreeMap::new(),
-            script: "function on_request(req) return req end".to_string(),
-        }
-    }
-
-    fn net(
-        rules: Vec<(&str, NetworkRule)>,
-        middleware: Vec<(&str, MiddlewareRule)>,
-    ) -> config_values::Network {
-        config_values::Network {
-            policy: Policy::DenyByDefault,
-            rules: rules.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
-            middleware: middleware
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect(),
-            ports: BTreeMap::default(),
-            sockets: BTreeMap::default(),
-            services: BTreeMap::default(),
-        }
-    }
-
-    #[test]
-    fn labeled_passthrough_skips_non_passthrough_and_disabled() {
-        let n = net(
-            vec![
-                ("pt-on", rule(&["a:1"], true, true)),
-                ("pt-off", rule(&["b:2"], true, false)),
-                ("plain", rule(&["c:3"], false, true)),
-            ],
-            vec![],
-        );
-        let got: Vec<String> = labeled_passthrough(&n)
-            .unwrap()
-            .into_iter()
-            .map(|lt| lt.label)
-            .collect();
-        assert_eq!(got.len(), 1);
-        assert!(got[0].contains("pt-on"), "got: {got:?}");
-    }
-
-    #[test]
-    fn labeled_inject_lists_allow_patterns_of_injecting_rules() {
-        let mut injecting = rule(&["a:1", "b:2"], false, true);
-        injecting.inject = vec!["TOKEN".to_string()];
-        let mut disabled = rule(&["c:3"], false, false);
-        disabled.inject = vec!["TOKEN".to_string()];
-        let n = net(
-            vec![
-                ("inj", injecting),
-                ("inj-off", disabled),
-                ("plain", rule(&["d:4"], false, true)),
-            ],
-            vec![],
-        );
-        let got: Vec<String> = labeled_inject(&n)
-            .unwrap()
-            .into_iter()
-            .map(|lt| lt.label)
-            .collect();
-        assert_eq!(got.len(), 2, "got: {got:?}");
-        assert!(
-            got.iter()
-                .all(|l| l.contains("inj") && l.contains("inject"))
-        );
-        assert!(
-            got[0].contains("a:1") && got[1].contains("b:2"),
-            "got: {got:?}"
-        );
-    }
-
-    #[test]
-    fn labeled_middleware_skips_disabled() {
-        let n = net(
-            vec![],
-            vec![
-                ("mw-on", mw(&["a:1"], true)),
-                ("mw-off", mw(&["b:2"], false)),
-            ],
-        );
-        let got: Vec<String> = labeled_middleware(&n)
-            .unwrap()
-            .into_iter()
-            .map(|lt| lt.label)
-            .collect();
-        assert_eq!(got.len(), 1);
-        assert!(got[0].contains("mw-on"), "got: {got:?}");
-    }
-}
-
-#[cfg(test)]
-mod public_only_tests {
-    use super::tests::{TestNetworkConfig, build_network};
-    use super::*;
-
-    /// Local, private and metadata destinations, by name and by literal.
-    const LOCAL: [&str; 9] = [
-        "localhost",
-        "LOCALHOST.",
-        "foo.localhost",
-        "127.0.0.1",
-        "::1",
-        "[::1]",
-        "10.0.0.5",
-        "192.168.1.1",
-        "169.254.169.254",
-    ];
-
-    /// The network of the install boot: `allow-always`, everything
-    /// allowed, public destinations only.
-    fn install_network(public_only: bool) -> Network {
-        let (_, _, network) = build_network(TestNetworkConfig::default());
-        network.control().set_policy(Policy::AllowAlways);
-        if public_only {
-            network.public_only()
-        } else {
-            network
-        }
-    }
-
-    #[test]
-    fn public_only_denies_local_destinations_by_name_and_literal() {
-        let network = install_network(true);
-        for host in LOCAL {
-            assert!(!network.resolve_target(host, 80).allowed, "{host}");
-        }
-        let public = network.resolve_target("example.com", 443);
-        assert!(public.allowed && public.public_only);
-    }
-
-    #[test]
-    fn a_normal_network_allows_local_destinations() {
-        let network = install_network(false);
-        for host in LOCAL {
-            let target = network.resolve_target(host, 80);
-            assert!(target.allowed && !target.public_only, "{host}");
-        }
-    }
-
-    /// The resolved addresses decide: `127.1` is no IP literal, but it
-    /// resolves to the loopback.
-    #[tokio::test]
-    async fn public_only_never_dials_a_local_address() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let target = |host: &str, public_only: bool| ResolvedTarget {
-            public_only,
-            ..denied(host, port)
-        };
-        for host in ["127.0.0.1", "127.1", "localhost"] {
-            let e = tcp::dial(&target(host, true)).await.unwrap_err();
-            assert!(e.to_string().contains("blocked"), "{host}: {e}");
-        }
-        assert!(tcp::dial(&target("127.0.0.1", false)).await.is_ok());
-    }
 }
