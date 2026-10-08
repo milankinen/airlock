@@ -228,3 +228,10 @@ request, and checks that the guest gets surrogates in the body. New
 tests cover a value split across streamed chunks (and the forced
 `identity`) and the refusal of a compressed answer. The HTTPS test also
 checks the body.
+
+## Test: upstream close closes the guest connection
+
+`http1_upstream_close_closes_guest_connection_without_502` checked only
+that no 502 came back. A new test connection helper reads until the
+proxy closes the guest connection and fails if it stays open. The test
+uses it, so it now also checks the close.

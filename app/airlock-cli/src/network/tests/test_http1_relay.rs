@@ -121,7 +121,7 @@ fn http1_keepalive_connection_serves_several_requests() {
 /// client that waits for its next request.
 ///   1. Send one keep-alive GET through a no-op middleware
 ///   2. Stop the upstream server
-///   3. Check that the guest gets no 502 on the connection
+///   3. Check that the guest connection closes with no 502
 #[test]
 fn http1_upstream_close_closes_guest_connection_without_502() {
     run_with_config(noop_middleware(), |proxy, _, _| async move {
@@ -135,8 +135,7 @@ fn http1_upstream_close_closes_guest_connection_without_502() {
 
         // The graceful shutdown closes the idle keep-alive connection.
         let _ = shutdown.send(());
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        let resp = conn.recv(1000).await;
+        let resp = conn.recv_until_closed(3000).await;
         assert!(!resp.contains("502"), "{resp}");
     });
 }

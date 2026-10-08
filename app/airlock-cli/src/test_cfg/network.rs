@@ -393,20 +393,42 @@ impl TestConnection {
     /// Returns:
     ///   All data read, as lossy UTF-8.
     pub async fn recv(&mut self, timeout_ms: u64) -> String {
+        self.recv_and_close(timeout_ms).await.0
+    }
+
+    /// Read data until the server closes the connection. Panics if it does
+    /// not close in `timeout_ms`.
+    /// Returns:
+    ///   All data read, as lossy UTF-8.
+    pub async fn recv_until_closed(&mut self, timeout_ms: u64) -> String {
+        let (data, closed) = self.recv_and_close(timeout_ms).await;
+        assert!(
+            closed,
+            "connection still open after {timeout_ms} ms: {data}"
+        );
+        data
+    }
+
+    /// Read data until the server closes the connection or `timeout_ms`
+    /// passes.
+    /// Returns:
+    ///   All data read, as lossy UTF-8, and true if the server closed the
+    ///   connection.
+    async fn recv_and_close(&mut self, timeout_ms: u64) -> (String, bool) {
         let mut buf = bytes::BytesMut::new();
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
-        loop {
+        let closed = loop {
             tokio::select! {
                 data = self.container_rx.recv() => {
                     match data {
                         Some(chunk) => buf.extend_from_slice(&chunk),
-                        None => break,
+                        None => break true,
                     }
                 }
-                () = tokio::time::sleep_until(deadline) => break,
+                () = tokio::time::sleep_until(deadline) => break false,
             }
-        }
-        String::from_utf8_lossy(&buf).into_owned()
+        };
+        (String::from_utf8_lossy(&buf).into_owned(), closed)
     }
 
     /// Change this connection into an `AsyncRead` and `AsyncWrite` stream.
