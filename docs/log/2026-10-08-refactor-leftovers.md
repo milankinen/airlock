@@ -12,3 +12,9 @@ The vault backends told the user to set `settings.vault = "..."`. The
 real key is `vault.storage` in the settings file, as the "vault is
 disabled" message already says. The CA error told the user to run
 `airlock up`, a command that does not exist. It now says `airlock start`.
+
+## Remove a stale dead-code allow
+
+The signal number function had an `allow(dead_code)` for a time when no
+caller existed. The daemon start code calls it now, so the attribute
+only hid future real dead code.

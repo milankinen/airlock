@@ -820,7 +820,6 @@ pub enum Signal {
 impl Signal {
     /// Linux signal number. For these signals, it is the same on all
     /// architectures.
-    #[allow(dead_code)] // TODO: remove the allow. `daemon.rs` uses this now.
     pub fn as_number(self) -> i32 {
         match self {
             Signal::Hup => 1,
