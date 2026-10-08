@@ -52,3 +52,14 @@ click on the gap before the Monitor tab selected it, and a click on its
 last column did nothing. Two constants now give the padding and the gap,
 and both the drawing and the click areas use them. A new TUI test clicks
 the gap column and the last tab column.
+
+## UTF-8 mouse mode sends valid UTF-8
+
+When a guest program enabled UTF-8 mouse mode (`\e[?1005h`), the encoder
+used the default single-byte form. Cells at column or row 96 to 223 gave
+raw bytes 0x80 to 0xFF, which are not valid UTF-8, so the program read
+wrong positions. In mode 1005 each value (button, column, row, each plus
+32) is now one UTF-8 character, as xterm and tmux do. Values of 128 or
+more take 2 bytes, so the mode reaches coordinate 2015. The button value
+also goes through UTF-8 encoding, because wheel events with modifiers
+and motion can reach 128 or more.

@@ -27,6 +27,9 @@ const MOD_CTRL: u8 = 16;
 /// Largest coordinate in the legacy encoding. Each byte holds the value
 /// plus 32, so the maximum is 223 + 32 = 255.
 const LEGACY_MAX_COORD: u16 = 223;
+/// Largest coordinate in the UTF-8 encoding. Each value plus 32 is one
+/// character of 1 or 2 UTF-8 bytes, so the maximum is 2015 + 32 = 2047.
+const UTF8_MAX_COORD: u16 = 2015;
 
 /// Mouse event to report to the guest, independent of the wire format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,12 +85,8 @@ pub fn encode(
     let mods = modifier_bits(event.modifiers);
     match encoding {
         MouseProtocolEncoding::Sgr => Some(encode_sgr(report, mods, col, row)),
-        // UTF-8 mode is different from the default encoding only after
-        // column 223. `encode_legacy` returns `None` at that point anyway,
-        // so the two use the same implementation.
-        MouseProtocolEncoding::Default | MouseProtocolEncoding::Utf8 => {
-            encode_legacy(report, mods, col, row)
-        }
+        MouseProtocolEncoding::Default => encode_legacy(report, mods, col, row, false),
+        MouseProtocolEncoding::Utf8 => encode_legacy(report, mods, col, row, true),
     }
 }
 
@@ -179,14 +178,22 @@ fn encode_sgr(report: Report, mods: u8, col: u16, row: u16) -> Vec<u8> {
     out
 }
 
-/// Encode a report in the legacy format (`\e[?1000h` without an encoding
-/// extension): `CSI M Cb Cx Cy`, with 32 added to each byte.
+/// Encode a report in the legacy format (`\e[?1000h`): `CSI M Cb Cx Cy`,
+/// with 32 added to each value.
 ///
-/// A release does not identify the button. Coordinates above 223 cannot be
-/// encoded. For them the function returns `None`, so that the event does not
-/// go to the wrong cell.
-fn encode_legacy(report: Report, mods: u8, col: u16, row: u16) -> Option<Vec<u8>> {
-    if col > LEGACY_MAX_COORD || row > LEGACY_MAX_COORD {
+/// A release does not identify the button. Without `utf8` (default mode),
+/// each value is one raw byte, so coordinates above 223 cannot be encoded.
+/// With `utf8` (`\e[?1005h`), each value is one UTF-8 character, so values
+/// of 128 or more take 2 bytes and coordinates up to 2015 can be encoded.
+/// For a coordinate that the mode cannot encode, the function returns
+/// `None`, so that the event does not go to the wrong cell.
+fn encode_legacy(report: Report, mods: u8, col: u16, row: u16, utf8: bool) -> Option<Vec<u8>> {
+    let max = if utf8 {
+        UTF8_MAX_COORD
+    } else {
+        LEGACY_MAX_COORD
+    };
+    if col > max || row > max {
         return None;
     }
     let button = match report {
@@ -195,11 +202,19 @@ fn encode_legacy(report: Report, mods: u8, col: u16, row: u16) -> Option<Vec<u8>
         Report::Drag(b) => b + MOTION,
         Report::Motion => BTN_RELEASE + MOTION,
     };
-    let mut out = Vec::with_capacity(6);
+    let mut out = Vec::with_capacity(9);
     out.extend_from_slice(b"\x1b[M");
-    out.push(32 + button + mods);
-    out.push(32 + col as u8);
-    out.push(32 + row as u8);
+    for value in [u16::from(button + mods), col, row] {
+        let value = 32 + value;
+        if utf8 {
+            // The checks above keep the value below 2048, so it is always
+            // a valid character.
+            let c = char::from_u32(value.into())?;
+            out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+        } else {
+            out.push(value as u8);
+        }
+    }
     Some(out)
 }
 
@@ -344,6 +359,7 @@ mod tests {
     ///   1. Encode a press and a release in the legacy format and check the bytes
     ///   2. Check that the UTF-8 encoding gives the same bytes for small cells
     ///   3. Check that a far cell is dropped in the legacy format but not in SGR
+    ///      or UTF-8
     #[test]
     fn legacy_encoding_offsets_bytes_and_drops_unrepresentable_cells() {
         let legacy = |kind, column, row, encoding, body| {
@@ -378,6 +394,38 @@ mod tests {
             None
         );
         assert!(legacy(down, 250, 5, MouseProtocolEncoding::Sgr, wide).is_some());
+        assert!(legacy(down, 250, 5, MouseProtocolEncoding::Utf8, wide).is_some());
+    }
+
+    /// Test that the UTF-8 encoding sends a value of 128 or more as a 2-byte
+    /// UTF-8 character. Raw bytes from 0x80 to 0xFF are not valid UTF-8, and
+    /// a program in this mode cannot decode them.
+    ///   1. Encode a press at column 96 and row 300 in the UTF-8 format
+    ///   2. Check that column 96 (value 128) and row 300 (value 332) each
+    ///      give 2 bytes
+    ///   3. Check that the output is valid UTF-8
+    ///   4. Check that a cell above 2015 is dropped
+    #[test]
+    fn utf8_encoding_sends_large_values_as_utf8_characters() {
+        let wide = Rect::new(0, 0, 3000, 3000);
+        let press = |column, row| {
+            encode(
+                ev(
+                    MouseEventKind::Down(MouseButton::Left),
+                    column,
+                    row,
+                    KeyModifiers::NONE,
+                ),
+                MouseProtocolMode::PressRelease,
+                MouseProtocolEncoding::Utf8,
+                wide,
+            )
+        };
+        // The body starts at 0, so host column 95 is guest column 96.
+        let bytes = press(95, 299).unwrap();
+        assert_eq!(bytes, b"\x1b[M\x20\xc2\x80\xc5\x8c");
+        assert!(String::from_utf8(bytes).is_ok());
+        assert_eq!(press(2015, 0), None);
     }
 
     /// Test that the mouse mode of the guest selects which event kinds go to the
