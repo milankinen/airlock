@@ -242,3 +242,12 @@ uses it, so it now also checks the close.
 from an unknown host gives a 502. The request still goes upstream, which
 is the intended behaviour (the answer scan is the guard). The name now
 says what the test checks: `unknown_endpoint_answer_with_token_is_refused`.
+
+## Test split: credential swap on other hosts
+
+`credential_surrogates_are_swapped_on_every_api_path_only` also checked
+the token host and the ChatGPT host, which the name did not say. Its
+`platform.claude.com` check also read the log of the step before, which
+worked only because that log was empty. The token and ChatGPT host checks
+are now a separate test with their own logs, and both tests share a
+grant helper.

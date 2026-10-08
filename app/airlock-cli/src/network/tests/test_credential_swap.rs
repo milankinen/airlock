@@ -6,8 +6,27 @@ use crate::services::ServiceId;
 use crate::services::tokens::{FAKE_JWT_PREFIX, TokenKind};
 use crate::test_cfg::block_on_local;
 use crate::test_cfg::services::{
-    GotLog, answering, insert_grant, masked, production_services, request,
+    GotLog, ProductionServices, answering, insert_grant, masked, production_services, request,
 };
+
+/// Access token surrogate of [`store_anthropic_grant`].
+const ACCESS: &str = "sk-ant-oat01-airlock-KNOWNACCESS";
+/// API key surrogate of [`store_anthropic_grant`].
+const KEY: &str = "sk-ant-api03-airlock-KNOWNKEY";
+
+/// Store an Anthropic grant with the access token surrogate [`ACCESS`]
+/// and the API key surrogate [`KEY`].
+async fn store_anthropic_grant(services: &ProductionServices) {
+    insert_grant(
+        &services.store,
+        ServiceId::Anthropic,
+        &[
+            (TokenKind::Access, "sk-ant-oat01-REAL", ACCESS),
+            (TokenKind::ApiKey, "sk-ant-api03-REALKEY", KEY),
+        ],
+    )
+    .await;
+}
 
 /// Test that the API host swaps surrogates only in the credential headers,
 /// on every path. A surrogate in other headers or in the body must stay a
@@ -17,36 +36,24 @@ use crate::test_cfg::services::{
 ///      and the body, on normal and odd paths
 ///   3. Check that only `authorization` and `x-api-key` get the real values
 ///   4. Check that a malformed API key gets a local 401
-///   5. Check that a token host and the ChatGPT host do not swap the
-///      Anthropic surrogates
 #[test]
 fn credential_surrogates_are_swapped_on_every_api_path_only() {
     block_on_local(async {
         let services = production_services();
-        let access = "sk-ant-oat01-airlock-KNOWNACCESS";
-        let key = "sk-ant-api03-airlock-KNOWNKEY";
-        insert_grant(
-            &services.store,
-            ServiceId::Anthropic,
-            &[
-                (TokenKind::Access, "sk-ant-oat01-REAL", access),
-                (TokenKind::ApiKey, "sk-ant-api03-REALKEY", key),
-            ],
-        )
-        .await;
+        store_anthropic_grant(&services).await;
         for path in ["/v1/messages", "/api/oauth/claude_cli/roles", "/x/../y?z=1"] {
             let log = GotLog::default();
-            let body = format!(r#"{{"token":"{access}"}}"#);
-            let origin = format!("https://{access}");
-            let bearer = format!("Bearer {access}");
+            let body = format!(r#"{{"token":"{ACCESS}"}}"#);
+            let origin = format!("https://{ACCESS}");
+            let bearer = format!("Bearer {ACCESS}");
             let req = request(
                 "POST",
                 path,
                 &[
                     ("authorization", &bearer),
-                    ("x-api-key", key),
+                    ("x-api-key", KEY),
                     ("origin", &origin),
-                    ("anthropic-beta", access),
+                    ("anthropic-beta", ACCESS),
                 ],
                 &body,
             );
@@ -63,13 +70,13 @@ fn credential_surrogates_are_swapped_on_every_api_path_only() {
             assert!(got.headers.get("authorization").unwrap().is_sensitive());
             assert_eq!(got.header("x-api-key"), Some("sk-ant-api03-REALKEY"));
             assert_eq!(got.header("origin"), Some(origin.as_str()));
-            assert_eq!(got.header("anthropic-beta"), Some(access));
+            assert_eq!(got.header("anthropic-beta"), Some(ACCESS));
             assert_eq!(got.body, body, "{path}");
         }
 
         // A surrogate with more text after it is not a known credential.
         let log = GotLog::default();
-        let with_extra = format!("{key} extra");
+        let with_extra = format!("{KEY} extra");
         let req = request("GET", "/v1/messages", &[("x-api-key", &with_extra)], "");
         let next = answering(&log, "text/plain", "ok");
         let answer = services
@@ -77,19 +84,36 @@ fn credential_surrogates_are_swapped_on_every_api_path_only() {
             .await;
         assert_eq!(answer.status, 401);
         assert!(log.is_empty());
+    });
+}
+
+/// Test that the token host and the hosts of other services do not swap
+/// the Anthropic surrogates. Only the API host of the grant swaps them.
+///   1. Store an Anthropic grant with an access token
+///   2. Send a request with the surrogate to the Anthropic token host and
+///      check that it goes upstream unchanged
+///   3. Send requests with the surrogate to the ChatGPT host, as a
+///      credential and in another header
+///   4. Check the local 401 for the credential and the unchanged header
+#[test]
+fn token_and_other_service_hosts_do_not_swap_anthropic_surrogates() {
+    block_on_local(async {
+        let services = production_services();
+        store_anthropic_grant(&services).await;
 
         // platform.claude.com is the token host. It forwards the request but
         // does not swap.
-        let req = request("GET", "/v1/oauth/hello", &[("x-custom", access)], "");
+        let log = GotLog::default();
+        let req = request("GET", "/v1/oauth/hello", &[("x-custom", ACCESS)], "");
         let next = answering(&log, "text/plain", "ok");
         services
             .send(ServiceId::Anthropic, "platform.claude.com", req, &[], next)
             .await;
-        assert_eq!(log.all()[0].header("x-custom"), Some(access));
+        assert_eq!(log.all()[0].header("x-custom"), Some(ACCESS));
 
         // The OpenAI service does not know the Anthropic surrogate.
         let log = GotLog::default();
-        let bearer = format!("Bearer {access}");
+        let bearer = format!("Bearer {ACCESS}");
         let req = request("GET", "/backend-api/x", &[("authorization", &bearer)], "");
         let next = answering(&log, "text/plain", "ok");
         let answer = services
@@ -97,12 +121,12 @@ fn credential_surrogates_are_swapped_on_every_api_path_only() {
             .await;
         assert_eq!(answer.status, 401);
         assert!(log.is_empty());
-        let req = request("GET", "/backend-api/x", &[("x-custom", access)], "");
+        let req = request("GET", "/backend-api/x", &[("x-custom", ACCESS)], "");
         let next = answering(&log, "text/plain", "ok");
         services
             .send(ServiceId::Openai, "chatgpt.com", req, &[], next)
             .await;
-        assert_eq!(log.all()[0].header("x-custom"), Some(access));
+        assert_eq!(log.all()[0].header("x-custom"), Some(ACCESS));
     });
 }
 
