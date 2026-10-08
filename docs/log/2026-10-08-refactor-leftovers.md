@@ -18,3 +18,13 @@ disabled" message already says. The CA error told the user to run
 The signal number function had an `allow(dead_code)` for a time when no
 caller existed. The daemon start code calls it now, so the attribute
 only hid future real dead code.
+
+## Passthrough conflict check ignores case and a trailing dot
+
+The check that refuses a passthrough target which overlaps a middleware,
+inject or service target compared literal/literal and wildcard/wildcard
+pairs as raw strings. Only the mixed pair went through the run-time host
+matcher, which ignores case and one trailing dot. So `Example.com` or
+`example.com.` gave no conflict with `example.com`, but at run time both
+match the same host. Both patterns now go through the same canonical
+form as the run-time matcher before the compare.

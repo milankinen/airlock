@@ -106,6 +106,11 @@ fn ports_overlap(a: Option<u16>, b: Option<u16>) -> bool {
 }
 
 fn hosts_overlap(a: &str, b: &str) -> bool {
+    // Compare canonical forms, as host_matches does. Else `Example.com` or
+    // `example.com.` would not conflict with `example.com`, but at run time
+    // both match the same host.
+    let (a, b) = (matchers::canonical_host(a), matchers::canonical_host(b));
+    let (a, b) = (a.as_str(), b.as_str());
     if a == "*" || b == "*" {
         return true;
     }
@@ -149,13 +154,18 @@ mod tests {
     /// Test that two target patterns overlap only when some host and port
     /// match both. A false answer hides a passthrough conflict, and a false
     /// overlap refuses a valid config.
-    ///   1. Take pairs of patterns: exact, localhost aliases, wildcards, ports
+    ///   1. Take pairs of patterns: exact, other case or trailing dot,
+    ///      localhost aliases, wildcards, ports
     ///   2. Check the overlap result in both argument orders
     #[test]
     fn targets_overlap_when_some_host_and_port_match_both() {
         for (a, b, expected) in [
             ("a.example.com", "a.example.com", true),
             ("a.example.com", "b.example.com", false),
+            ("Example.com", "example.com", true),
+            ("example.com.", "example.com", true),
+            ("*.Example.com.", "*.example.com", true),
+            ("*.example.com.", "*.prod.Example.com", true),
             ("localhost", "127.0.0.1", true),
             ("127.0.0.1", "::1", true),
             ("::1", "localhost", true),
