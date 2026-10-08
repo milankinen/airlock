@@ -118,7 +118,7 @@ Placement:
 Helpers, fixtures and setup:
 
 * Do not duplicate them. Crate-level helpers live in the crate's
-  `test_cfg` module (`src/test_cfg.rs`), one `.rs` file per logical
+  `test_cfg` module (`src/test_cfg/mod.rs`), one `.rs` file per logical
   part (e.g. `test_cfg/network.rs`).
 * Helpers that more than one crate needs live in the
   `airlock-test-utils` crate (dev-dependency only, helper groups behind
