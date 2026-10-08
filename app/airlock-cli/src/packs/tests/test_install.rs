@@ -273,19 +273,31 @@ fn interrupt_stops_loop_and_synced_shutdown_promotes_only_packs_that_ran() {
 
 /// Test that a pack whose exec did not start keeps its record. Nothing
 /// ran, so nothing changed for that pack.
-///   1. Make the exec of the second pack not start
-///   2. Check that the loop stops as interrupted after the first pack
-///   3. Check that the first pack is installed and the other two have no
-///      record
+///   1. Store a failed record of the second pack from an earlier run
+///   2. Make the exec of the second pack not start
+///   3. Check that the loop stops as interrupted after the first pack
+///   4. Check that the first pack is installed, the second pack has the
+///      same record as before, and the third pack has no record
 #[test]
 fn pack_whose_exec_did_not_start_keeps_its_record() {
     let sandbox = Sandbox::new(CONFIG);
+    let beta = sandbox
+        .installers
+        .iter()
+        .find(|i| i.pack == "beta")
+        .unwrap();
+    let mut earlier = InstallState::default();
+    earlier.set("beta", PackStatus::Failed, &beta.fingerprint);
+    // An old time, so that a new record of the same run differs.
+    earlier.packs.get_mut("beta").unwrap().at = 1;
+    state::write(&sandbox.dir, &earlier).unwrap();
+
     let (outcome, exec) = sandbox.install(HostExec::new().stopping("beta", None), true);
     assert_eq!(exec.ran, ["alpha"]);
     assert!(matches!(outcome.stopped, Some(Ended::Interrupted)));
     let state = sandbox.state();
     assert!(state.is_installed("alpha"));
-    assert_eq!(status(&state, "beta"), None);
+    assert_eq!(state.packs.get("beta"), earlier.packs.get("beta"));
     assert_eq!(status(&state, "gamma"), None);
 }
 

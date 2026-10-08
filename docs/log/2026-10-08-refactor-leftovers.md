@@ -251,3 +251,10 @@ the token host and the ChatGPT host, which the name did not say. Its
 worked only because that log was empty. The token and ChatGPT host checks
 are now a separate test with their own logs, and both tests share a
 grant helper.
+
+## Test: exec that did not start keeps an existing record
+
+`pack_whose_exec_did_not_start_keeps_its_record` ran on a new sandbox,
+so there was no record to keep. It now stores a failed record of the
+pack (with an old time) before the run, and checks that the record is
+the same after it.
