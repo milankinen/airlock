@@ -40,9 +40,11 @@ fn refresh_finishing_after_sign_out_revokes_its_new_tokens_upstream() {
             assert_ne!(resp.status, 200, "{}", resp.body);
             assert!(!resp.body.contains("REAL"), "{}", resp.body);
             assert_eq!(r.fake.refreshes(), 1);
+            // The revoke of the new token can come after the answer to the
+            // guest. The sign-out alone can make more than one revoke, so
+            // wait for this token, not for a count.
             let new_refresh = r.fake.refresh();
-            r.wait_for_revokes(2).await;
-            let revoked: Vec<_> = r.revokes().iter().map(|b| b["token"].clone()).collect();
+            let revoked = r.wait_for_revoke_of(&new_refresh).await;
             assert!(revoked.contains(&json!(new_refresh)), "{revoked:?}");
             assert!(r.grants().await.is_empty());
         });

@@ -798,6 +798,21 @@ impl Running {
         }
     }
 
+    /// Wait until the provider got a revoke of `token`, for at most about
+    /// one second.
+    /// Returns:
+    ///   The `token` values of all revokes that the provider got.
+    pub async fn wait_for_revoke_of(&self, token: &str) -> Vec<Value> {
+        for _ in 0..50 {
+            let revoked: Vec<Value> = self.revokes().iter().map(|b| b["token"].clone()).collect();
+            if revoked.iter().any(|t| t == token) {
+                return revoked;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        self.revokes().iter().map(|b| b["token"].clone()).collect()
+    }
+
     /// The grants in the store.
     pub async fn grants(&self) -> Vec<GrantSummary> {
         list_grants(&self.home.db).await.unwrap()

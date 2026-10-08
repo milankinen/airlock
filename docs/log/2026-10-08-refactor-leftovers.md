@@ -324,3 +324,11 @@ another test in the same binary set up the log first. The setup now has
 an inner function that takes the guard. `init` passes the process guard,
 and the test passes its own. The global subscriber stays process-wide,
 but the test checks only the file trim and the second call.
+
+## Test: wait for the revoke of the new refresh token
+
+`refresh_finishing_after_sign_out_revokes_its_new_tokens_upstream`
+waited for 2 revokes. For OpenAI the sign-out alone makes 2 revokes, so
+the wait did nothing and the test passed only because the revoke came
+early enough. A new provider helper waits until a revoke of a given
+token arrives, and the test waits for the new refresh token.
