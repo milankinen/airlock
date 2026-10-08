@@ -61,6 +61,25 @@ fn ctrl_d_on_monitor_tab_sends_hangup_then_terminate() {
     assert_eq!(tui.signals(), [1, 15]);
 }
 
+/// Test that the click area of a tab is the same as the drawn tab. A wrong
+/// area makes a click on the gap select a tab, or a click on the tab edge
+/// do nothing.
+///   1. Find the drawn Monitor tab, which starts 2 columns before its key
+///   2. Click the gap column before the tab and check that nothing changes
+///   3. Click the last column of the tab and check that the Monitor tab shows
+#[test]
+fn click_on_tab_edge_selects_tab_and_click_on_gap_does_not() {
+    let mut tui = Tui::new();
+    let (x, y) = tui.find("F2 Monitor").unwrap();
+    let (start, width) = (x - 2, u16::try_from("  F2 Monitor  ".len()).unwrap());
+
+    tui.click((start - 1, y));
+    assert!(!tui.screen().contains("airlock sandbox monitor"));
+
+    tui.click((start + width - 1, y));
+    assert!(tui.screen().contains("airlock sandbox monitor"));
+}
+
 /// Test that custom key bindings change the tab bar labels and the tab
 /// changes.
 ///   1. Bind Ctrl+M to the Monitor tab and `b` to back

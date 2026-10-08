@@ -28,6 +28,11 @@ pub fn body_area(size: Rect) -> Rect {
     Rect::new(size.x, size.y, size.width, size.height - TAB_BAR_HEIGHT)
 }
 
+/// Empty columns before the first tab.
+const TAB_BAR_PAD: u16 = 1;
+/// Empty columns between two tabs.
+const TAB_GAP: u16 = 2;
+
 /// One entry in the bottom tab bar, made from the user's key bindings.
 ///
 /// Both `render_tab_bar` and `tab_header_rects` use these entries. Thus
@@ -83,11 +88,11 @@ pub fn tab_header_rects(size: Rect, app: &App) -> Vec<(Tab, Rect)> {
         return rects;
     }
     let y = size.y + size.height - 1;
-    let mut x = size.x + 1; // 1 char left padding
+    let mut x = size.x + TAB_BAR_PAD;
     for entry in tab_entries(app) {
         let w = entry.width();
         rects.push((entry.tab, Rect::new(x, y, w, 1)));
-        x += w + 1;
+        x += w + TAB_GAP;
     }
     rects
 }
@@ -151,10 +156,8 @@ fn render_tab_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
             Tab::Monitor => network_sel,
         };
         let bg = tab_bg(selected);
-        if i > 0 {
-            spans.push(Span::raw(" "));
-        }
-        spans.push(Span::raw(" "));
+        let gap = if i == 0 { TAB_BAR_PAD } else { TAB_GAP };
+        spans.push(Span::raw(" ".repeat(gap.into())));
         spans.push(Span::styled("  ", Style::default().bg(bg)));
         spans.push(Span::styled(entry.shortcut.clone(), hotkey_style(bg)));
         spans.push(Span::styled(

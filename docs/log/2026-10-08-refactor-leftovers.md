@@ -43,3 +43,12 @@ one helper in the layer module. The rename to `<key>.download` stays the
 commit. Because no later pull removes a unique name, the registry pull
 now deletes its temp file itself when the pull or rename fails. The GC
 sweep still removes `.tmp` files that a killed process left.
+
+## Monitor tab click area matches the drawn tab
+
+The tab bar drew 1 padding column before the first tab and 2 columns
+between tabs. The click areas moved only 1 column between tabs. So a
+click on the gap before the Monitor tab selected it, and a click on its
+last column did nothing. Two constants now give the padding and the gap,
+and both the drawing and the click areas use them. A new TUI test clicks
+the gap column and the last tab column.
