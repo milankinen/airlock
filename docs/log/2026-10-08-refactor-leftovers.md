@@ -273,3 +273,9 @@ pack of the same file, then checks that `airlock.toml` wins over both.
 path compare and the password database, not the `$HOME` lookup. It now
 sets `$HOME` to a temp directory (under the crate `HOME` lock) and runs
 the full check on its `.airlock` and on a project below it.
+
+## Test: clipboard grant without capability installs nothing
+
+`grant_without_host_capability_installs_nothing` checked only that the
+start succeeds. It now also checks that no FIFO and no shim exists at
+the container rootfs paths of the bridge.

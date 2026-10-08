@@ -5,7 +5,8 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::rc::Rc;
 
 use super::Clipboard;
-use crate::clipboard::{ClipboardConfig, copy_loop, start};
+use crate::bridge::in_rootfs;
+use crate::clipboard::{BIN_DIR, COPY_FIFO, ClipboardConfig, PASTE_FIFO, copy_loop, start};
 use crate::test_cfg::{HostClipboard, eventually, run_bridge, run_shim};
 
 /// Start the copy loop for `clipboard` with the byte limit `limit`.
@@ -126,6 +127,7 @@ fn copy_shim_without_copy_grant_fails_fast_without_touching_fifo() {
 /// grant with a direction but no route to the host is not a grant.
 ///   1. Make a grant for copy and paste without a host capability
 ///   2. Start the bridge and check that it returns without an error
+///   3. Check that no FIFO and no shim exists in the container rootfs
 #[test]
 fn grant_without_host_capability_installs_nothing() {
     let cfg = ClipboardConfig {
@@ -136,4 +138,11 @@ fn grant_without_host_capability_installs_nothing() {
     };
 
     assert!(start(cfg, 0, 0).is_ok());
+    let shims = ["wl-copy", "wl-paste", "xclip", "xsel"].map(|t| format!("{BIN_DIR}/{t}"));
+    for path in [COPY_FIFO, PASTE_FIFO]
+        .into_iter()
+        .chain(shims.iter().map(String::as_str))
+    {
+        assert!(!in_rootfs(path).exists(), "{path}");
+    }
 }
