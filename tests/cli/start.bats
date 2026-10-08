@@ -151,11 +151,12 @@ python = { version = $version }"
 }
 
 # Test that packs on a new sandbox need no question, so start continues
-# without a terminal.
+# without a terminal. The CLI tests have no VM, so the run stops at the
+# image pull. The VM tests check the install.
 #   1. Write a config with a pack and make no disk
 #   2. Run start
 #   3. Check that there is no question and that the sandbox prepare starts
-@test "start with packs and no sandbox disk installs them without terminal" {
+@test "start with packs and no sandbox disk asks no question without terminal" {
     write_config "$BAD_IMAGE
 
 [packs]
