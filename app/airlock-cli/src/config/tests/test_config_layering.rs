@@ -105,13 +105,14 @@ fn user_local_and_project_files_merge_in_precedence_order() {
     assert_eq!(config.network.policy, Policy::DenyByDefault);
 }
 
-/// Test that a pack in a project file overrides user files, and that the
-/// project file `airlock.toml` overrides a pack in the local file.
+/// Test that a pack in a project file overrides user files, that a file's
+/// own value overrides its own pack, and that the project file
+/// `airlock.toml` overrides a pack in the local file.
 ///   1. Set a user image and an alpine pack in the local file, and check that
 ///      the pack image wins
-///   2. Set an image in `airlock.toml` and check that it wins
-///   3. Also set an image in the local file and check that `airlock.toml`
-///      still wins
+///   2. Also set an image in the local file and check that it wins over the
+///      pack of the same file
+///   3. Set an image in `airlock.toml` and check that it wins
 #[test]
 fn project_pack_overrides_user_files_and_its_own_file_overrides_pack() {
     let dirs = ConfigDirs::new();
@@ -122,13 +123,13 @@ fn project_pack_overrides_user_files_and_its_own_file_overrides_pack() {
         );
     assert_eq!(dirs.values().vm.image.name, "alpine:latest");
 
-    dirs.project_file("airlock.toml", "[vm]\nimage = \"project:1\"\n");
-    assert_eq!(dirs.values().vm.image.name, "project:1");
-
     dirs.project_file(
         ".airlock/airlock.toml",
         "[packs]\nalpine = { version = 1 }\n[vm]\nimage = \"local:1\"\n",
     );
+    assert_eq!(dirs.values().vm.image.name, "local:1");
+
+    dirs.project_file("airlock.toml", "[vm]\nimage = \"project:1\"\n");
     assert_eq!(dirs.values().vm.image.name, "project:1");
 }
 

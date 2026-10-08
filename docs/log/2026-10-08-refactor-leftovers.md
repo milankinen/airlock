@@ -258,3 +258,11 @@ grant helper.
 so there was no record to keep. It now stores a failed record of the
 pack (with an old time) before the run, and checks that the record is
 the same after it.
+
+## Test: a file's own value wins over its own pack
+
+`project_pack_overrides_user_files_and_its_own_file_overrides_pack` never
+checked the second half of its name: when the local file set an image
+next to its pack, `airlock.toml` also set one and hid the result. The
+test now sets the local image first and checks that it wins over the
+pack of the same file, then checks that `airlock.toml` wins over both.
