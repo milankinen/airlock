@@ -31,7 +31,13 @@ static INIT: Once = Once::new();
 /// is already set, logging stays off and nothing fails.
 // The file is first made smaller if necessary (see [`LOG_MAX_BYTES`]).
 pub fn init(log_level: LogLevel, cache_dir: &Path) {
-    INIT.call_once(|| {
+    init_with(&INIT, log_level, cache_dir);
+}
+
+/// Do [`init`] with the guard `once`. Tests use their own guard, so that
+/// the order of the tests in the process has no effect.
+fn init_with(once: &Once, log_level: LogLevel, cache_dir: &Path) {
+    once.call_once(|| {
         let log_path = cache_dir.join("airlock.log");
         rotate_log(&log_path);
         if let Ok(log_file) = std::fs::OpenOptions::new()
@@ -102,10 +108,11 @@ mod tests {
         content.extend(vec![b'b'; usize::try_from(LOG_MAX_BYTES).unwrap()]);
         std::fs::write(&path, &content).unwrap();
 
-        // The setup runs one time for each process. This test fails if a
-        // different test in the same process calls it first.
-        init(LogLevel::Info, first.path());
-        init(LogLevel::Debug, second.path());
+        // A guard of the test, not the guard of the process. Thus another
+        // test that sets up the log first has no effect here.
+        let once = Once::new();
+        init_with(&once, LogLevel::Info, first.path());
+        init_with(&once, LogLevel::Debug, second.path());
 
         let after = std::fs::read(&path).unwrap();
         // The setup can add new log lines after the kept part.

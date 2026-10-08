@@ -315,3 +315,12 @@ and its doc says that the details stay open until the user closes them.
 checked sizes only up to 1023 GB, though the name says petabytes. It now
 also checks 1023 TB and 97 PB (99328 TB, the longest number that still
 fits the 19-column pair).
+
+## Test: log setup with its own guard
+
+`init_trims_oversized_log_to_its_tail_and_later_calls_do_nothing`
+depended on the process-wide `Once` of the log setup. It failed if
+another test in the same binary set up the log first. The setup now has
+an inner function that takes the guard. `init` passes the process guard,
+and the test passes its own. The global subscriber stays process-wide,
+but the test checks only the file trim and the second call.
