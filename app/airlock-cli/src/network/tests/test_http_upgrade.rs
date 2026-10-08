@@ -143,12 +143,16 @@ fn websocket_upgrade_rejected_by_upstream_closes_guest_connection() {
 /// Test that the network stack refuses an upgrade response that a
 /// middleware forged. Without a real upstream switch, a raw relay has
 /// nothing to connect to.
-///   1. Add a middleware that changes the response status to 101
+///   1. Add a middleware that sends the request and changes the status of
+///      the upstream response to 101
 ///   2. Send a handshake that the upstream refuses with 400
 ///   3. Check that the 101 is refused and HTTP 502 is returned
+///   4. Check that the body of the 502 comes from the upgrade check, not
+///      from a script error
 #[test]
 fn websocket_upgrade_forged_by_middleware_is_refused() {
-    run_with_config(middleware("res.status = 101"), |proxy, _, _| async move {
+    let script = "local res = req:send()\nres.status = 101\n";
+    run_with_config(middleware(script), |proxy, _, _| async move {
         let (mut stream, port) = upgrade_stream(&proxy).await;
         stream
             .write_all(websocket_handshake(port, false).as_bytes())
@@ -157,5 +161,9 @@ fn websocket_upgrade_forged_by_middleware_is_refused() {
         let resp = read_until_eof(&mut stream).await;
         assert!(resp.starts_with("HTTP/1.1 502"), "{resp}");
         assert!(resp.to_lowercase().contains("connection: close"), "{resp}");
+        assert!(
+            resp.ends_with("upgrade not accepted by upstream\n"),
+            "{resp}"
+        );
     });
 }

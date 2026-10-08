@@ -151,3 +151,13 @@ port to one of them first (1 failure in 11 full runs). The test only
 needs to see that the service listener closed. It now listens on a Unix
 socket in a private temp directory and checks that a connect is
 refused after the stop. No other test can take that socket.
+
+## Forged upgrade test checks the upgrade check
+
+The test for a 101 that a middleware forged used the script
+`res.status = 101`. Scripts get only `req`, `log` and `env`, so `res`
+was `nil` and the script failed. The test got its 502 from the script
+error, so no test covered the refusal of a forged 101. The script now
+sends the request, changes the upstream status to 101, and the test
+checks that the 502 body is the one of the upgrade check ("upgrade not
+accepted by upstream"). With the old script the new assert fails.
