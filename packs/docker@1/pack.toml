@@ -1,3 +1,9 @@
 label = "docker"
 description = "Docker Engine, CLI, Buildx and Compose"
 kind = "tool"
+
+[[args]]
+key = "allow-pulls"
+type = "bool"
+description = "allow pulls"
+default = true

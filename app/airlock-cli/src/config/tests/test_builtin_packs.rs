@@ -172,6 +172,40 @@ fn docker_preset_runs_unhardened_daemon_and_allows_registries() {
     }
 }
 
+/// Test that the docker pack always starts dockerd without hardening, and
+/// that its `allow-pulls` arg controls the registry rule.
+///   1. Resolve the docker pack with `allow-pulls = true`
+///   2. Check the dockerd daemon settings and the registry rule
+///   3. Resolve the docker pack with `allow-pulls = false`
+///   4. Check that the daemon is there and the registry rule is not
+#[test]
+fn docker_pack_allow_pulls_arg_controls_registry_rule() {
+    let config = |allow: bool| {
+        resolve_project_toml(&format!(
+            "[packs]\ndocker = {{ version = 1, args = {{ allow-pulls = {allow} }} }}\n"
+        ))
+        .unwrap()
+        .values
+    };
+    let with_pulls = config(true);
+    let daemon = &with_pulls.daemons["dockerd"];
+    assert!(!daemon.harden);
+    assert_eq!(daemon.timeout, 10);
+    assert!(daemon.command.last().unwrap().ends_with("exec dockerd"));
+    let allow = &with_pulls.network.rules["docker-registries"].allow;
+    assert!(allow.contains(&"registry-1.docker.io".to_string()));
+    assert!(allow.contains(&"ghcr.io".to_string()));
+
+    let without_pulls = config(false);
+    assert!(without_pulls.daemons.contains_key("dockerd"));
+    assert!(
+        !without_pulls
+            .network
+            .rules
+            .contains_key("docker-registries")
+    );
+}
+
 /// Test that the `acp` arg of the claude and codex packs sets the env
 /// variable that tells the ACP adapter where the agent binary is.
 ///   1. Resolve each pack with `acp = true` and check the binary path

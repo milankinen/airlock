@@ -1,5 +1,5 @@
 -- Node.js: Node.js trusts only its own CA list. Point it at the system
--- bundle, which has the airlock CA. With `npm-installs`, the npm and
+-- bundle, which has the airlock CA. With `allow-npm`, the npm and
 -- Yarn registries.
 
 -- The setup script gives the version to `nvm install`. An option there
@@ -14,7 +14,7 @@ config.env = {
     NODE_EXTRA_CA_CERTS = "/etc/ssl/certs/ca-certificates.crt",
 }
 
-if pack.args["npm-installs"] then
+if pack.args["allow-npm"] then
     config.network = {
         rules = {
             ["nodejs-packages"] = {

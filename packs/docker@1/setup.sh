@@ -1,5 +1,5 @@
 # Docker: the engine, CLI, Buildx and Compose v2 from the distro
-# packages. airlock starts dockerd as a daemon (config.toml) because no
+# packages. airlock starts dockerd as a daemon (config.lua) because no
 # init system runs in the sandbox.
 #
 # Sources:
@@ -17,7 +17,7 @@
 # - https://packages.ubuntu.com/resolute/docker-compose-v2
 # - https://github.com/docker/compose/blob/v1/README.md (v1 is end of life)
 #
-# No args.
+# Args: allow-pulls changes only the network rules (config.lua).
 
 airlock_steps 1
 airlock_status "installing packages"

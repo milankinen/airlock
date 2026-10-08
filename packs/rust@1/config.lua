@@ -1,7 +1,7 @@
 -- Rust: the shared rustup homes of the setup script, the downloads of the
 -- Rust project (rustup installs toolchains and components from
 -- static.rust-lang.org, also for a rust-toolchain.toml), and with
--- `cargo-installs` crates.io.
+-- `allow-cargo` crates.io.
 
 -- The setup script gives the toolchain to rustup. An option there (a
 -- leading `-`) or a character outside a toolchain name is an error.
@@ -26,7 +26,7 @@ local rules = {
         },
     },
 }
-if pack.args["cargo-installs"] then
+if pack.args["allow-cargo"] then
     rules["rust-packages"] = {
         allow = {
             "crates.io",

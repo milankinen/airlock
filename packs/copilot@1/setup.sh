@@ -74,7 +74,7 @@ fetch_release() {
 }
 
 airlock_steps 1
-airlock_status "downloading cli"
+airlock_status "installing cli"
 # bash: the Copilot shell tool (it looks for /bin/bash, /usr/bin/bash,
 # /usr/local/bin/bash). libstdc++/libgcc: the glibc build links them.
 # nodejs: runs the package on musl aarch64 (Alpine has Node.js 22+).

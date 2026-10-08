@@ -3,7 +3,7 @@ description = "Alpine Linux"
 kind = "distro"
 
 [[args]]
-key = "package-installs"
+key = "allow-apk"
 type = "bool"
 description = "allow packages"
 default = true

@@ -1,10 +1,10 @@
--- Debian: the sandbox image, and with `package-installs` the apt package
+-- Debian: the sandbox image, and with `allow-apt` the apt package
 -- mirrors. The rule also has the Ubuntu mirrors, for a `vm.image` of the
 -- Ubuntu family in a config file.
 
 config.vm = { image = "debian:stable-slim" }
 
-if pack.args["package-installs"] then
+if pack.args["allow-apt"] then
     config.network = {
         rules = {
             ["debian-packages"] = {

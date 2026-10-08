@@ -11,7 +11,7 @@ values = ["latest", "3.13", "3.12", "none"]
 other = true
 
 [[args]]
-key = "pypi-installs"
+key = "allow-pypi"
 type = "bool"
 description = "allow pypi"
 default = true

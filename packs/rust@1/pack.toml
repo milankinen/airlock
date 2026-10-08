@@ -11,7 +11,7 @@ values = ["stable", "beta", "nightly", "none"]
 other = true
 
 [[args]]
-key = "cargo-installs"
+key = "allow-cargo"
 type = "bool"
 description = "allow cargo"
 default = true

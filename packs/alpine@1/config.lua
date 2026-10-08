@@ -1,9 +1,9 @@
--- Alpine Linux: the sandbox image, and with `package-installs` the apk
+-- Alpine Linux: the sandbox image, and with `allow-apk` the apk
 -- package mirrors.
 
 config.vm = { image = "alpine:latest" }
 
-if pack.args["package-installs"] then
+if pack.args["allow-apk"] then
     config.network = {
         rules = {
             ["alpine-packages"] = {

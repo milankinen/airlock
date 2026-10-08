@@ -1,11 +1,11 @@
 [packs]
-debian = { version = "1", args = { package-installs = true } }
+debian = { version = "1", args = { allow-apt = true } }
 claude = { version = "1", args = { acp = true } }
 codex = { version = "1", args = { acp = true } }
 docker = { version = "1" }
 git = { version = "1" }
 mise = { version = "1" }
-rust = { version = "1", args = { cargo-installs = true, toolchain = "none" } }
+rust = { version = "1", args = { allow-cargo = true, toolchain = "none" } }
 
 [env]
 # We can always build natively inside vm

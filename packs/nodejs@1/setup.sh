@@ -23,7 +23,7 @@
 # Node.js download against the SHASUMS256.txt of the mirror.
 # Args: node-version (AIRLOCK_PACK_ARG_NODE_VERSION): lts, latest, none,
 # or any version that nvm understands (22, 22.11.0, lts/jod).
-# npm-installs changes only the network rules (config.lua).
+# allow-npm changes only the network rules (config.lua).
 
 NVM_DIR=/usr/local/nvm
 export NVM_DIR

@@ -24,7 +24,7 @@
 #
 # No sha pin: rustup checks the sha256 of each component it downloads.
 # Args: toolchain (AIRLOCK_PACK_ARG_TOOLCHAIN): stable, beta, nightly,
-# none, or any toolchain name of rustup. cargo-installs changes only the
+# none, or any toolchain name of rustup. allow-cargo changes only the
 # network rules (config.lua).
 #
 # The rustup proxies (cargo, rustc, ...) read RUSTUP_HOME on each call.

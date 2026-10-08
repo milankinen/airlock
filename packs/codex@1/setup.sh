@@ -56,7 +56,7 @@ else
     airlock_steps 1
 fi
 
-airlock_status "downloading cli"
+airlock_status "installing cli"
 # curl: the installer. bubblewrap: Codex runs shell commands in a bwrap
 # sandbox and prefers bwrap on PATH to its bundled copy.
 pkg_install ca-certificates curl bubblewrap

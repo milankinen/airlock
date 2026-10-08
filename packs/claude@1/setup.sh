@@ -47,7 +47,7 @@ else
     airlock_steps 1
 fi
 
-airlock_status "downloading cli"
+airlock_status "installing cli"
 # bash and curl: the installer. libgcc and libstdc++: the musl build.
 # ripgrep: the search tool of Claude Code.
 case "$DISTRO" in

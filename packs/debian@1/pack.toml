@@ -3,7 +3,7 @@ description = "Debian stable (slim)"
 kind = "distro"
 
 [[args]]
-key = "package-installs"
+key = "allow-apt"
 type = "bool"
 description = "allow packages"
 default = true

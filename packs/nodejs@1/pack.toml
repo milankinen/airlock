@@ -11,7 +11,7 @@ values = ["lts", "latest", "none"]
 other = true
 
 [[args]]
-key = "npm-installs"
+key = "allow-npm"
 type = "bool"
 description = "allow npm"
 default = true

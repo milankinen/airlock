@@ -2,7 +2,7 @@
 -- airlock CA. python-build-standalone builds (uv, mise) look for
 -- /etc/ssl/cert.pem, which is missing on Debian. uv trusts only its own
 -- CA list without SSL_CERT_FILE. requests and pip have their own CA
--- lists. With `pypi-installs`, PyPI.
+-- lists. With `allow-pypi`, PyPI.
 
 -- The setup script gives the version to `uv python install`. An option
 -- there (a leading `-`) or a character outside a uv Python request is
@@ -20,7 +20,7 @@ config.env = {
     PIP_CERT = bundle,
 }
 
-if pack.args["pypi-installs"] then
+if pack.args["allow-pypi"] then
     config.network = {
         rules = {
             ["python-packages"] = {

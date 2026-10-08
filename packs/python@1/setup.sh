@@ -26,7 +26,7 @@
 # Args: python-version (AIRLOCK_PACK_ARG_PYTHON_VERSION): latest, none,
 # or a uv Python request (3.13, 3.12, 3.12.4, 3.13t, pypy@3.11, ...).
 # "latest" is the request `3`: the newest stable CPython 3 that this uv
-# release knows. pypi-installs changes only the network rules
+# release knows. allow-pypi changes only the network rules
 # (config.lua).
 
 _uv=/usr/local/bin/uv

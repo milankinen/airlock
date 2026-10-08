@@ -138,7 +138,7 @@ fn choosing_packs_and_args_with_keys_saves_shared_config_that_resolves() {
     let text = std::fs::read_to_string(dir.path().join("airlock.toml")).unwrap();
     assert_eq!(
         text,
-        "[packs]\ndebian = { version = \"1\", args = { package-installs = true } }\n\
+        "[packs]\ndebian = { version = \"1\", args = { allow-apt = true } }\n\
          claude = { version = \"1\", args = { acp = false } }\n\
          sample = { version = \"1\", args = { mode = \"turbo\", network = false } }\n\n\
          [clipboard]\ncopy = true\npaste = true\n"
