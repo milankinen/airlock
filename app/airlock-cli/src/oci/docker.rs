@@ -12,7 +12,7 @@ use std::process::{Child, Command, Stdio};
 
 use sha2::{Digest, Sha256};
 
-use super::OciConfig;
+use super::{OciConfig, layer};
 use crate::cache;
 
 /// Get the digest hex of a blob member, or `None` for metadata. Docker 25+
@@ -225,7 +225,7 @@ fn copy_hashing<R: Read, W: Write>(mut reader: R, mut writer: W) -> std::io::Res
 /// separate sync function, so that all blocking I/O runs in one
 /// `spawn_blocking` task.
 ///
-/// Each blob goes to `<key>.download.tmp`, but a blob that is already a
+/// Each blob goes to a process-unique `<key>.download.<pid>.<seq>.tmp`, but a blob that is already a
 /// cached layer dir goes to `sink()`. Thus airlock does not write possibly
 /// gigabytes of extracted base layers to disk only to delete them later.
 /// After the parse of `manifest.json`, the function knows which blob is the
@@ -250,7 +250,7 @@ pub(super) fn save_from_stream<R: Read>(
     let mut archive = tar::Archive::new(stdout);
 
     let mut manifest_json: Option<Vec<DockerManifestEntry>> = None;
-    // Map from hex to `.download.tmp` path, to rename or delete the files
+    // Map from hex to staging path, to rename or delete the files
     // after the manifest parse. A HashMap, because docker save may write the
     // same blob multiple times for different image tags.
     let mut staged: HashMap<String, PathBuf> = HashMap::new();
@@ -286,7 +286,7 @@ pub(super) fn save_from_stream<R: Read>(
                 std::io::copy(&mut entry, &mut std::io::sink())?;
                 continue;
             }
-            let tmp = layers_root.join(format!("{}.download.tmp", cache::layer_key(&digest)));
+            let tmp = layer::download_tmp_path(layers_root, &cache::layer_key(&digest));
             let mut file = File::create(&tmp)?;
             let actual = copy_hashing(&mut entry, &mut file)?;
             // Prevent cross-source cache poisoning. The member name gives the

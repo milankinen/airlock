@@ -1212,11 +1212,10 @@ async fn fetch_and_extract_layer(
 
     // `ensure_layer_cached` does blocking I/O (tar extraction), so it must
     // not run on the async runtime. Thus pull the blob with async code into
-    // `.download.tmp`, then run the extraction in a blocking task.
+    // a temp file, then run the extraction in a blocking task.
     let layers_root = cache::layers_root()?;
     let key = cache::layer_key(&digest);
     let download = layers_root.join(format!("{key}.download"));
-    let download_tmp = layers_root.join(format!("{key}.download.tmp"));
 
     // Same fast path as in `ensure_layer_cached`.
     let layer_dir = cache::layer_dir(&key)?;
@@ -1225,8 +1224,8 @@ async fn fetch_and_extract_layer(
     }
 
     if !download.exists() {
-        let _ = std::fs::remove_file(&download_tmp);
-        registry::pull_layer(
+        let download_tmp = layer::download_tmp_path(&layers_root, &key);
+        let pulled = registry::pull_layer(
             &reference,
             &layer_desc,
             &download_tmp,
@@ -1235,8 +1234,13 @@ async fn fetch_and_extract_layer(
             &auth,
             insecure,
         )
-        .await?;
-        std::fs::rename(&download_tmp, &download)?;
+        .await
+        .and_then(|()| Ok(std::fs::rename(&download_tmp, &download)?));
+        if pulled.is_err() {
+            // The name is unique, so no later pull reuses or removes it.
+            let _ = std::fs::remove_file(&download_tmp);
+        }
+        pulled?;
     }
 
     tokio::task::spawn_blocking(move || {

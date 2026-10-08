@@ -28,3 +28,18 @@ matcher, which ignores case and one trailing dot. So `Example.com` or
 `example.com.` gave no conflict with `example.com`, but at run time both
 match the same host. Both patterns now go through the same canonical
 form as the run-time matcher before the compare.
+
+## Concurrent image pulls use their own layer download files
+
+The registry pull and the `docker save` import downloaded each layer to
+the fixed name `<key>.download.tmp` in the shared layer cache. The
+registry pull also deleted that file before each pull. Two `airlock`
+processes that pulled the same uncached image could write into one file
+(corrupt tarball) or delete the file of the other process. The
+layer-cache path already used a per-process name for this reason.
+
+All three paths now get the name `<key>.download.<pid>.<seq>.tmp` from
+one helper in the layer module. The rename to `<key>.download` stays the
+commit. Because no later pull removes a unique name, the registry pull
+now deletes its temp file itself when the pull or rename fails. The GC
+sweep still removes `.tmp` files that a killed process left.

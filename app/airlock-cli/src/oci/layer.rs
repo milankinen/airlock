@@ -24,6 +24,25 @@ const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
 /// processes out of the staging dirs of the others.
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Get a process-unique temp path for the download of a layer tarball.
+/// Args:
+///  - `layers_root`: Root directory of the layer cache
+///  - `key`: Versioned layer key
+///
+/// Returns:
+///   Path `<key>.download.<pid>.<seq>.tmp` in `layers_root`.
+pub(super) fn download_tmp_path(layers_root: &Path, key: &str) -> PathBuf {
+    // A unique name for each download. Otherwise two `airlock` processes
+    // that pull the same uncached image both write one shared file and
+    // corrupt the tarball. The rename to the shared `<key>.download` name
+    // is the commit.
+    layers_root.join(format!(
+        "{key}.download.{}.{}.tmp",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
+}
+
 /// Make sure that a layer is extracted into the shared cache. Download the
 /// tarball with `fetch` only if it is not already on disk.
 ///
@@ -82,17 +101,9 @@ where
     // If `<key>.download` exists (from a previous run, or from a caller
     // that staged it, like the docker path), skip `fetch` and extract.
     if !download.exists() {
-        // Write to a process-unique temp file. Otherwise two `airlock`
-        // processes that pull the same uncached image both write the one
-        // shared `<key>.download.tmp` and corrupt the tarball. The rename
-        // to the shared `<key>.download` name is the commit. Also remove
-        // an old fixed-name tmp file that an older binary left.
+        // Also remove an old fixed-name tmp file that an older binary left.
         let _ = std::fs::remove_file(parent.join(format!("{dir_name}.download.tmp")));
-        let download_tmp = parent.join(format!(
-            "{dir_name}.download.{}.{}.tmp",
-            std::process::id(),
-            TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
+        let download_tmp = download_tmp_path(parent, &dir_name);
         fetch(&download_tmp)?;
         std::fs::rename(&download_tmp, &download)?;
     }
