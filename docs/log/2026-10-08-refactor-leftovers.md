@@ -340,3 +340,11 @@ stdout sent after a stdout EOF marker still goes out. We decided that
 this is intended: only the exit ends the relay, and output must not get
 lost if a guest sends data after the marker. The process poll comment
 and the test doc now say so. No code change.
+
+## Test split: opened project and disk identity
+
+`opened_project_has_private_ca_and_resettable_disk` covered about 7
+behaviours in one test, so a failure was hard to find. It is now 4 tests
+with a shared open helper: the private CA and run metadata, the disk
+identity until a reset, a new identity for each new disk, and a reset
+that does not follow a symlink.

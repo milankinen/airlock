@@ -709,21 +709,10 @@ mod tests {
         );
     }
 
-    /// Test that an opened project has a private CA and a sandbox disk with
-    /// an identity that changes on each new disk, and that a disk reset
-    /// never follows a symlink.
-    ///   1. Open a project and check the modes of the sandbox directory and
-    ///      the CA file, and the run metadata
-    ///   2. Create the disk twice and check that the identity stays
-    ///   3. Reset the disk and check that the disk and its identity are gone
-    ///   4. Make new disks after a reset and after removal of the disk or
-    ///      identity file, and check that each gets a new identity
-    ///   5. Replace the disk with a symlink to a host file, reset, and check
-    ///      that the host file did not change
-    #[test]
-    fn opened_project_has_private_ca_and_resettable_disk() {
-        let tmp = temp_dir();
-        let dir = tmp.path();
+    /// Open a project with an empty config in `dir`.
+    /// Returns:
+    ///   The project, and the sandbox directory pinned for disk resets.
+    fn open_project(dir: &Path) -> (Project, PinnedDir) {
         let sandbox_lock = SandboxLock::acquire(dir).unwrap();
         let config = crate::config::config_values::parse(serde_json::json!({})).unwrap();
         let project = open(
@@ -733,55 +722,106 @@ mod tests {
             test_context(dir, host_env_vault(&[])),
         )
         .unwrap();
+        let pinned = PinnedDir::pin(&project.sandbox_dir).unwrap();
+        (project, pinned)
+    }
+
+    /// Test that an opened project has a private sandbox directory and CA,
+    /// and records its guest working directory. Other users must not read
+    /// the CA key.
+    ///   1. Open a project
+    ///   2. Check the modes of the sandbox directory and the CA file, and
+    ///      the CA certificate
+    ///   3. Save the run metadata and check the guest working directory
+    #[test]
+    fn opened_project_has_private_ca_and_run_metadata() {
+        let tmp = temp_dir();
+        let (project, _) = open_project(tmp.path());
         assert_eq!(mode(&project.sandbox_dir), 0o700);
         assert_eq!(mode(&project.sandbox_dir.join("ca.json")), 0o600);
         assert!(project.ca_cert.contains("BEGIN CERTIFICATE"));
-        let pinned = PinnedDir::pin(&project.sandbox_dir).unwrap();
         project.save_meta();
         assert!(read_run_meta(&project.sandbox_dir).guest_cwd.is_some());
+    }
 
-        assert!(disk_id(&project.sandbox_dir).is_none());
-        assert!(!has_disk(&project.sandbox_dir));
-        let prepare = || ensure_disk(&project.sandbox_dir, &project.config.disk).unwrap();
-        prepare();
-        assert!(has_disk(&project.sandbox_dir));
-        let id = disk_id(&project.sandbox_dir).unwrap();
-        prepare();
-        assert_eq!(disk_id(&project.sandbox_dir), Some(id));
+    /// Test that the disk identity stays the same while the disk stays, and
+    /// that a reset removes the disk and its identity. The install records
+    /// use the identity to find out if the disk is the same.
+    ///   1. Check that a new project has no disk and no identity
+    ///   2. Create the disk twice and check that the identity stays
+    ///   3. Reset the disk and check that the disk and its identity are gone
+    ///   4. Reset again with no disk and check that it succeeds
+    #[test]
+    fn disk_identity_stays_until_reset() {
+        let tmp = temp_dir();
+        let (project, pinned) = open_project(tmp.path());
+        let dir = &project.sandbox_dir;
+        assert!(disk_id(dir).is_none());
+        assert!(!has_disk(dir));
+
+        ensure_disk(dir, &project.config.disk).unwrap();
+        assert!(has_disk(dir));
+        let id = disk_id(dir).unwrap();
+        ensure_disk(dir, &project.config.disk).unwrap();
+        assert_eq!(disk_id(dir), Some(id));
+
         reset_disk(&pinned).unwrap();
-        assert!(disk_id(&project.sandbox_dir).is_none());
-        assert!(!has_disk(&project.sandbox_dir));
-        assert!(!project.sandbox_dir.join(disk::DISK_ID_FILE).exists());
-        // A reset with no disk must also succeed.
+        assert!(disk_id(dir).is_none());
+        assert!(!has_disk(dir));
+        assert!(!dir.join(disk::DISK_ID_FILE).exists());
         reset_disk(&pinned).unwrap();
-        disk::prepare(
-            &project.sandbox_dir,
-            &project.config.disk,
-            "/root",
-            Path::new("/"),
-        )
-        .unwrap();
-        assert!(disk_id(&project.sandbox_dir).is_some());
+    }
+
+    /// Test that each new disk gets a new identity, and that the identity
+    /// belongs to the disk file. A new disk must not look like the old disk.
+    ///   1. Make a disk with the sandbox prepare, reset it, and make a disk
+    ///      again, and check that the identity changed
+    ///   2. Remove the disk file and check that there is no identity
+    ///   3. Make a disk and check that it has a new identity
+    ///   4. Remove the identity file and check that a new disk gets one
+    #[test]
+    fn each_new_disk_gets_new_identity() {
+        let tmp = temp_dir();
+        let (project, pinned) = open_project(tmp.path());
+        let dir = &project.sandbox_dir;
+        let prepare = || ensure_disk(dir, &project.config.disk).unwrap();
+
+        disk::prepare(dir, &project.config.disk, "/root", Path::new("/")).unwrap();
+        let id = disk_id(dir).unwrap();
         reset_disk(&pinned).unwrap();
         prepare();
-        let id2 = disk_id(&project.sandbox_dir).unwrap();
+        let id2 = disk_id(dir).unwrap();
         assert_ne!(id2, id);
-        // The identity belongs to the disk file. Without the disk file there
-        // is no identity.
-        std::fs::remove_file(project.sandbox_dir.join(disk::DISK_FILE)).unwrap();
-        assert!(disk_id(&project.sandbox_dir).is_none());
+
+        std::fs::remove_file(dir.join(disk::DISK_FILE)).unwrap();
+        assert!(disk_id(dir).is_none());
         prepare();
-        assert_ne!(disk_id(&project.sandbox_dir), Some(id2));
-        std::fs::remove_file(project.sandbox_dir.join(disk::DISK_ID_FILE)).unwrap();
-        assert!(disk_id(&project.sandbox_dir).is_none());
+        assert_ne!(disk_id(dir), Some(id2));
+
+        std::fs::remove_file(dir.join(disk::DISK_ID_FILE)).unwrap();
+        assert!(disk_id(dir).is_none());
         prepare();
-        assert!(disk_id(&project.sandbox_dir).is_some());
-        let victim = dir.join("victim");
+        assert!(disk_id(dir).is_some());
+    }
+
+    /// Test that a disk reset never follows a symlink. A link at the disk
+    /// path must not let a reset change a host file.
+    ///   1. Replace the disk with a symlink to a host file
+    ///   2. Reset the disk
+    ///   3. Check that the link is gone and the host file did not change
+    #[test]
+    fn disk_reset_does_not_follow_symlink() {
+        let tmp = temp_dir();
+        let (project, pinned) = open_project(tmp.path());
+        let dir = &project.sandbox_dir;
+        ensure_disk(dir, &project.config.disk).unwrap();
+
+        let victim = tmp.path().join("victim");
         std::fs::write(&victim, "host file").unwrap();
-        std::fs::remove_file(project.sandbox_dir.join(disk::DISK_FILE)).unwrap();
-        symlink(&victim, project.sandbox_dir.join(disk::DISK_FILE)).unwrap();
+        std::fs::remove_file(dir.join(disk::DISK_FILE)).unwrap();
+        symlink(&victim, dir.join(disk::DISK_FILE)).unwrap();
         reset_disk(&pinned).unwrap();
-        assert!(!has_disk(&project.sandbox_dir));
+        assert!(!has_disk(dir));
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "host file");
     }
 }
