@@ -124,7 +124,9 @@ mod tests {
     }
 
     /// Test that the relay sends stdout and stderr to the sink until the exit,
-    /// and returns 1 when the connection is lost before the exit.
+    /// and returns 1 when the connection is lost before the exit. An EOF
+    /// marker does not stop the relay of its stream. The exit ends the
+    /// relay, so no output gets lost.
     ///   1. Run a script with output on both streams, EOF markers and exit
     ///      code 3
     ///   2. Check the exit code and that each stream has all its output, also

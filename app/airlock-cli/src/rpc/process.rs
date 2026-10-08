@@ -49,6 +49,8 @@ impl Process {
         // A stream `Eof` marks only the end of stdout or stderr, not the
         // process exit. Skip it and poll until the guest sends the real
         // `exit` event. Thus a stdout EOF does not hide the true exit code.
+        // Data after an `Eof` of the same stream still goes out. The guest
+        // never sends such data, and output must not get lost if it does.
         loop {
             let response = self.proc.poll_request().send().promise.await?;
             let next = response.get()?.get_next()?;

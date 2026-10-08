@@ -332,3 +332,11 @@ waited for 2 revokes. For OpenAI the sign-out alone makes 2 revokes, so
 the wait did nothing and the test passed only because the revoke came
 early enough. A new provider helper waits until a revoke of a given
 token arrives, and the test waits for the new refresh token.
+
+## Output after a stream EOF marker is intended
+
+`driving_process_relays_output_until_exit_or_lost_connection` checks that
+stdout sent after a stdout EOF marker still goes out. We decided that
+this is intended: only the exit ends the relay, and output must not get
+lost if a guest sends data after the marker. The process poll comment
+and the test doc now say so. No code change.
