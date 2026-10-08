@@ -308,3 +308,10 @@ as if the details close by themselves when the row leaves the list. They
 do not, and the test closes them with a click. The test is now
 `connection_details_follow_traffic_and_disconnect_after_row_is_evicted`,
 and its doc says that the details stay open until the user closes them.
+
+## Test: transfer pair fits up to petabytes
+
+`transfer_pair_fits_column_up_to_petabytes_and_is_truncated_beyond`
+checked sizes only up to 1023 GB, though the name says petabytes. It now
+also checks 1023 TB and 97 PB (99328 TB, the longest number that still
+fits the 19-column pair).

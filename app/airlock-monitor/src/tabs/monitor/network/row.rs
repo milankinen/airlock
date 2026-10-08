@@ -183,19 +183,23 @@ mod tests {
         }
     }
 
-    /// Test that the up and down transfer pair fits the column up to 1023 TB,
-    /// and that a larger pair is cut to the column width.
-    ///   1. Format pairs of the largest value of each unit up to TB
+    /// Test that the up and down transfer pair fits the column up to 97 PB
+    /// (shown in TB), and that a larger pair is cut to the column width.
+    ///   1. Format pairs of the largest value of each unit, and of 97 PB
     ///   2. Check that each pair fits the column
     ///   3. Format a pair of the maximum value and check that it is cut to the
     ///      column width
     #[test]
     fn transfer_pair_fits_column_up_to_petabytes_and_is_truncated_beyond() {
+        let tb: u64 = 1024 * 1024 * 1024 * 1024;
         for bytes in [
             1023,
             1024 * 1023,
             1024 * 1024 * 1023,
             1024 * 1024 * 1024 * 1023,
+            tb * 1023,
+            // 97 PB is 99328 TB, the longest number that still fits.
+            tb * 1024 * 97,
         ] {
             let pair = format!("↑ {} ↓ {}", format_transfer(bytes), format_transfer(bytes));
             assert!(pair.chars().count() <= TRANSFER_COLS, "{pair:?}");
