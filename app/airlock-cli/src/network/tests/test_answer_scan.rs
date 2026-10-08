@@ -258,3 +258,45 @@ fn api_answers_with_real_tokens_are_refused_and_others_pass_intact() {
         }
     });
 }
+
+/// Test that the scan also checks the answer to a request with a
+/// credential. The proxy puts the real token in that request, so an
+/// upstream that echoes the request can send the real token back.
+///   1. Store a grant with a real access token
+///   2. Send an API request with the access surrogate as the credential
+///   3. Let the upstream stream the real token back, split over two chunks
+///   4. Check that the upstream got the real token and that the answer is
+///      refused without the token
+#[test]
+fn answer_to_request_with_credential_is_scanned() {
+    block_on_local(async {
+        let services = production_services();
+        let real = shaped_token("sk-ant-oat01");
+        let surrogate = "sk-ant-oat01-airlock-A";
+        insert_grant(
+            &services.store,
+            ServiceId::Anthropic,
+            &[(TokenKind::Access, &real, surrogate)],
+        )
+        .await;
+        let got = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let seen = got.clone();
+        let (first, second) = real.split_at(30);
+        let echo = streaming(
+            &[&format!("data: {first}"), &format!("{second}\n\n")],
+            "text/event-stream",
+        );
+        let next: Next = Box::new(move |req| {
+            *seen.borrow_mut() = req.headers()["authorization"].to_str().unwrap().into();
+            echo(req)
+        });
+        let bearer = format!("Bearer {surrogate}");
+        let req = request("GET", "/v1/messages", &[("authorization", &bearer)], "");
+        let answer = services
+            .send(ServiceId::Anthropic, "api.anthropic.com", req, &[], next)
+            .await;
+        assert_eq!(*got.borrow(), format!("Bearer {real}"));
+        assert!(answer.refused(), "{}", answer.body);
+        assert!(!answer.body.contains(&real), "{}", answer.body);
+    });
+}

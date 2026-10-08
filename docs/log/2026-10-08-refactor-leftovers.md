@@ -355,3 +355,12 @@ The HTTP/1.1 relay and WebSocket upgrade tests had a test with and a
 test without middleware. Both go through the same relay, and only a
 no-op middleware differs, so each pair overlapped almost fully. Each
 pair is now one test that runs the same checks in both networks.
+
+## Test: answer scan of a request with a credential
+
+All tests in `test_answer_scan.rs` sent requests with no credential.
+Only end-to-end tests in other files covered the scan of answers to
+credentialed requests. A new test sends an API request with the access
+surrogate, checks that the upstream got the real token, and lets the
+upstream stream the real token back split over two chunks. The answer
+must be refused without the token.
