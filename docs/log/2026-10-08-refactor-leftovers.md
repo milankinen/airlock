@@ -279,3 +279,10 @@ the full check on its `.airlock` and on a project below it.
 `grant_without_host_capability_installs_nothing` checked only that the
 start succeeds. It now also checks that no FIFO and no shim exists at
 the container rootfs paths of the bridge.
+
+## Test: scan finds a token after a long run
+
+`long_run_goes_out_in_parts_and_token_after_it_is_found` checked the
+token with a new scanner, not after the long run. It now pushes the
+token to the same scanner after the run, so the test checks that the
+held-back state of a long run does not hide a later token.

@@ -691,19 +691,19 @@ mod tests {
     }
 
     /// Test that a long run of token characters goes out in parts, so the
-    /// scanner does not hold the full answer, and that the scan finds a token
-    /// after a space.
+    /// scanner does not hold the full answer, and that the scan still finds
+    /// a token after the run.
     ///   1. Push a run longer than twice the hold limit
     ///   2. Check that all but the hold limit goes out
-    ///   3. Push a real token to a new scanner and check that it is found
+    ///   3. Push a real token after a space to the same scanner and check
+    ///      that it is found
     #[test]
     fn long_run_goes_out_in_parts_and_token_after_it_is_found() {
         let mut s = scanner(&anthropic::FORMATS, &[], true);
         let long = "a".repeat(2 * HOLD_MAX + 100);
         assert_eq!(s.push(long.as_bytes()).unwrap().len(), HOLD_MAX + 100);
-        let mut s = scanner(&anthropic::FORMATS, &[], true);
         assert!(
-            s.push(format!("x {}\n", shaped_token("sk-ant-oat01")).as_bytes())
+            s.push(format!(" {}\n", shaped_token("sk-ant-oat01")).as_bytes())
                 .is_err()
         );
     }
