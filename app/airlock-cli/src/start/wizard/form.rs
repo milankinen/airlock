@@ -11,6 +11,7 @@ use crate::cli::prompt::{self, Step};
 use crate::config::UserImage;
 use crate::config::generated::{Clipboard, Target};
 use crate::packs::{ArgKind, ArgValue, Pack, PackKind, PackManager};
+use crate::settings::WizardStart;
 use crate::start::wizard::Answers;
 
 /// The pack kinds of the sections, in pack order. Each kind has one section.
@@ -59,6 +60,15 @@ impl StartChoice {
             StartChoice::Start => Some(Target::Local),
             StartChoice::StartAndShare => Some(Target::Project),
             StartChoice::Cancel => None,
+        }
+    }
+}
+
+impl From<WizardStart> for StartChoice {
+    fn from(start: WizardStart) -> Self {
+        match start {
+            WizardStart::Start => StartChoice::Start,
+            WizardStart::StartAndShare => StartChoice::StartAndShare,
         }
     }
 }
@@ -138,13 +148,14 @@ impl Form {
     /// Args:
     ///  - `packs`: Available packs. The view offers the built-in packs.
     ///  - `custom_image`: The image of the user files, if set
+    ///  - `start`: The first option of the start bar
     ///
     /// Returns:
     ///   The state. The image of the user files is selected, or else the
     ///   first distro pack. No agent or tool is selected, and the args have
-    ///   their defaults. The start bar is on [`StartChoice::Start`]. The focus
-    ///   is on the first row.
-    pub fn new(packs: &PackManager, custom_image: Option<UserImage>) -> Self {
+    ///   their defaults. The start bar is on `start`. The focus is on the
+    ///   first row.
+    pub fn new(packs: &PackManager, custom_image: Option<UserImage>, start: StartChoice) -> Self {
         let offered = packs.builtin();
         let first_distro = offered
             .iter()
@@ -169,7 +180,7 @@ impl Form {
                 copy: true,
                 paste: false,
             },
-            start: StartChoice::Start,
+            start,
             focus: Row::Start,
             return_to: None,
             other: None,

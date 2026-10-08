@@ -12,6 +12,22 @@ On first run, airlock pulls the configured OCI image (Alpine by default),
 generates a per-project CA certificate, and starts the VM. Subsequent runs
 reuse the cached image and existing sandbox state, so startup is near-instant.
 
+## Setup wizard start option
+
+If the project has no config, `airlock start` opens a setup wizard. The
+last row of the wizard has the start options:
+
+- `start` writes a local config to `.airlock/airlock.toml`
+- `start and share` writes a shareable config to `airlock.toml`
+
+The wizard selects `start and share` first. To select `start` first, set
+this value in `~/.airlock/settings.toml`:
+
+```toml
+[wizard_defaults]
+start = "start"  # default: "start-and-share"
+```
+
 ## Configuration basics
 
 Sandbox configuration lives in two files at the project root:

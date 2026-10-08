@@ -113,7 +113,9 @@ mod tests {
     //! Tests for the selection of the host runtime.
 
     use super::*;
-    use crate::settings::{KeyList, MonitorBuffers, MonitorSettings, VaultSettings};
+    use crate::settings::{
+        KeyList, MonitorBuffers, MonitorSettings, VaultSettings, WizardDefaults,
+    };
 
     /// Test that the monitor refuses settings with an unknown key binding
     /// action, so that the user sees the error before the boot starts.
@@ -134,6 +136,7 @@ mod tests {
                 },
                 keys: [("no-such-action".to_string(), KeyList(vec!["q".into()]))].into(),
             },
+            wizard_defaults: WizardDefaults::default(),
         };
         let Err(e) = HostRuntime::new(true, &settings) else {
             panic!("bad keys must be rejected");

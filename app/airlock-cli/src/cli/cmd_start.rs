@@ -94,6 +94,7 @@ async fn run(
         &host_cwd,
         &packs,
         &context.vault,
+        context.settings.wizard_defaults.start,
     ))
     .await?;
     let resolved = config
