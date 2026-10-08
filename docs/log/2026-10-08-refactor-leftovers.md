@@ -266,3 +266,10 @@ checked the second half of its name: when the local file set an image
 next to its pack, `airlock.toml` also set one and hid the result. The
 test now sets the local image first and checks that it wins over the
 pack of the same file, then checks that `airlock.toml` wins over both.
+
+## Test: home project found by `$HOME`
+
+`home_project_is_found_by_env_home_or_password_database` tested only the
+path compare and the password database, not the `$HOME` lookup. It now
+sets `$HOME` to a temp directory (under the crate `HOME` lock) and runs
+the full check on its `.airlock` and on a project below it.

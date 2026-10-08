@@ -335,20 +335,23 @@ mod tests {
     //! Tests for the check that finds a project in the home directory.
 
     use super::*;
-    use crate::test_cfg::temp_dir;
+    use crate::test_cfg::home::TempHome;
 
     /// Test that the home check finds `.airlock` in the home directory and not
     /// in a project below it. In the home, `.airlock` also holds user files.
-    ///   1. Check `.airlock` in a temp home and in a project below it
-    ///   2. If the password database has a home for the user, check that the
+    ///   1. Set `$HOME` to a temp directory with a project below it
+    ///   2. Check that the full check finds `.airlock` in `$HOME` but not in
+    ///      the project
+    ///   3. If the password database has a home for the user, check that the
     ///      full check finds `.airlock` in it
     #[test]
     fn home_project_is_found_by_env_home_or_password_database() {
-        let tmp = temp_dir();
-        let home = tmp.path();
+        let home = TempHome::new();
+        let home = home.path();
+        std::fs::create_dir_all(home.join(".airlock")).unwrap();
         std::fs::create_dir_all(home.join("proj/.airlock")).unwrap();
-        assert!(is_home_dir(&home.join(".airlock"), home));
-        assert!(!is_home_dir(&home.join("proj/.airlock"), home));
+        assert!(is_user_home_project(&home.join(".airlock")));
+        assert!(!is_user_home_project(&home.join("proj/.airlock")));
 
         let uid = unsafe { libc::getuid() };
         if let Some(passwd_home) = passwd_home(uid) {
