@@ -250,8 +250,9 @@ fn connections_show_latest_cumulative_traffic_per_connection() {
     assert!(tui.screen().contains("No HTTP requests observed yet."));
 }
 
-/// Test that open connection details continue to show traffic and the close
-/// of their connection after the row left the list.
+/// Test that open connection details continue to show traffic and the
+/// disconnect of their connection after the row left the list. The details
+/// stay open until the user closes them.
 ///   1. Limit the list to one connection and open the details of a
 ///      connection
 ///   2. Send a second connection, then traffic and a disconnect for the
@@ -259,7 +260,7 @@ fn connections_show_latest_cumulative_traffic_per_connection() {
 ///   3. Check the bytes and the closed state in the details
 ///   4. Close the details and check that the second row has no traffic
 #[test]
-fn connection_details_follow_traffic_and_close_after_row_is_evicted() {
+fn connection_details_follow_traffic_and_disconnect_after_row_is_evicted() {
     let settings = TuiSettings {
         max_tcp_connections: 1,
         ..TuiSettings::default()

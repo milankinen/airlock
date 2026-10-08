@@ -300,3 +300,11 @@ after `Down` passed whether or not the view scrolled: the details fit on
 the screen, so nothing could scroll. The test now makes the terminal
 short, presses `Down`, and checks that the path row of the same request
 moved up by one line.
+
+## Test rename: connection details follow the disconnect
+
+`connection_details_follow_traffic_and_close_after_row_is_evicted` read
+as if the details close by themselves when the row leaves the list. They
+do not, and the test closes them with a click. The test is now
+`connection_details_follow_traffic_and_disconnect_after_row_is_evicted`,
+and its doc says that the details stay open until the user closes them.
