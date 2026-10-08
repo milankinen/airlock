@@ -141,3 +141,13 @@ parallel runs failed, and the test is no longer ignored.
 
 Two pastes that open the FIFO in the short time between the open and
 the rename still share one stream, as before.
+
+## Service stop test uses a Unix socket
+
+The test of the service stop order bound a TCP listener on
+`127.0.0.1:0`, stopped the services and bound the same port again. Many
+parallel tests bind ephemeral ports, and the kernel could give the freed
+port to one of them first (1 failure in 11 full runs). The test only
+needs to see that the service listener closed. It now listens on a Unix
+socket in a private temp directory and checks that a connect is
+refused after the stop. No other test can take that socket.

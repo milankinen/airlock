@@ -65,13 +65,12 @@ mod tests {
     //! Tests for the stop order and the abort of the boot tasks.
 
     use std::cell::Cell;
-    use std::net::{Ipv4Addr, SocketAddr};
     use std::rc::Rc;
 
-    use tokio::net::TcpListener;
+    use tokio::net::{UnixListener, UnixStream};
 
     use super::*;
-    use crate::test_cfg::block_on_local;
+    use crate::test_cfg::{block_on_local, temp_dir};
 
     /// Sets its flag when it drops, which happens when its task stops.
     struct DropFlag(Rc<Cell<bool>>);
@@ -98,19 +97,20 @@ mod tests {
     }
 
     /// Test that the services stop before the transport and that their
-    /// listen ports are free after the stop.
-    ///   1. Spawn a service that listens on a port, and a transport task
+    /// listeners are closed after the stop.
+    ///   1. Spawn a service that listens on a socket, and a transport task
     ///   2. Stop the services and check that only the service stopped
-    ///   3. Check that the port can be bound again
+    ///   3. Check that a connect to the socket is refused
     ///   4. Stop the transport and check that it stopped
     #[test]
-    fn services_stop_before_transport_and_free_their_ports() {
+    fn services_stop_before_transport_and_close_their_listeners() {
+        // A Unix socket in a private directory, not a TCP port. Parallel
+        // tests can take a freed TCP port before this test checks it.
+        let dir = temp_dir();
+        let path = dir.path().join("service.sock");
         block_on_local(async {
             let mut tasks = BootTasks::default();
-            let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
-                .await
-                .unwrap();
-            let addr = listener.local_addr().unwrap();
+            let listener = UnixListener::bind(&path).unwrap();
             let service_dropped = Rc::new(Cell::new(false));
             let flag = DropFlag(service_dropped.clone());
             tasks.spawn_service(async move {
@@ -126,7 +126,8 @@ mod tests {
             tasks.stop_services().await;
             assert!(service_dropped.get());
             assert!(!transport_dropped.get());
-            TcpListener::bind(addr).await.unwrap();
+            let err = UnixStream::connect(&path).await.unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
 
             tasks.stop_transport().await;
             assert!(transport_dropped.get());
