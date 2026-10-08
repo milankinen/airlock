@@ -67,7 +67,9 @@ The container's `/etc/resolv.conf` points at `nameserver 10.0.0.1`,
 which is a minimal UDP DNS server the supervisor runs inside the VM
 on loopback. Instead of forwarding queries to the host, the supervisor
 allocates a **synthetic IP** from `10.2.0.0/16` for each hostname and
-caches the bidirectional mapping.
+caches the bidirectional mapping. When all IPs of the range are in use,
+the next new hostname gets the oldest IP. The DNS answers have a TTL of
+5 minutes, so the guest has most likely forgotten the old hostname.
 
 This matters because the proxy sees an IP, not a name. When the
 container `connect()`s to the synthetic IP, the packet routes via the

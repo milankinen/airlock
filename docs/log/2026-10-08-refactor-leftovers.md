@@ -74,3 +74,17 @@ the core bars, then the load row, then up to 4 histogram rows. In a
 tall box the result is the same as before: extra rows go between the
 core bars and the load row, so the load row and the histogram stay at
 the bottom. A unit test draws the box at 3, 4 and 10 rows.
+
+## Fake DNS IPs stay in their range
+
+The virtual DNS server counted fake IPs up from `10.2.0.1` with no
+limit. After 65,534 hostnames the IPs left `10.2.0.0/16`, which the doc,
+the manual and the VM network setup comments assume. We chose reuse
+over failure: a long sandbox session (for example a crawler) must not
+lose DNS. After `10.2.255.254` the counter starts again at `10.2.0.1`.
+The reused IP is always the oldest one, and the DNS answers have a TTL
+of 5 minutes. So the guest has most likely forgotten its old hostname.
+The old hostname is removed from both maps, and a later query for it
+gets a new IP. A stale IP in the guest can then reach another hostname,
+but the host still applies the network rules of that hostname, so this
+is no policy bypass.
