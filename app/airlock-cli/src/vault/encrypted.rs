@@ -106,8 +106,8 @@ impl Storage for EncryptedFileStorage {
         let blob = match envelope {
             Envelope::EncryptedFile(b) => b,
             Envelope::File(_) => bail!(
-                "{} is a plaintext vault, but settings.vault = \"encrypted-file\". \
-                 Set settings.vault = \"file\" (or delete the file to re-create encrypted).",
+                "{} is a plaintext vault, but vault.storage = \"encrypted-file\" in settings. \
+                 Set vault.storage = \"file\" (or delete the file to re-create encrypted).",
                 self.path.display()
             ),
         };

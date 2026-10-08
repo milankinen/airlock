@@ -569,7 +569,7 @@ fn generate_ca(sandbox_dir: &Path) -> anyhow::Result<()> {
 /// Read the CA cert and key PEM strings from `ca.json`.
 fn read_ca(sandbox_dir: &Path) -> anyhow::Result<(String, String)> {
     let json = std::fs::read_to_string(sandbox_dir.join("ca.json"))
-        .map_err(|_| anyhow::anyhow!("CA not found — run `airlock up` first"))?;
+        .map_err(|_| anyhow::anyhow!("CA not found — run `airlock start` first"))?;
     let ca: CaData = serde_json::from_str(&json)?;
     Ok((ca.cert, ca.key))
 }

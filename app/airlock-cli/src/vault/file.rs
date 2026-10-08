@@ -38,8 +38,8 @@ impl Storage for FileStorage {
                 serde_json::to_string(&data).context("re-serialize vault data")?,
             )),
             Envelope::EncryptedFile(_) => bail!(
-                "{} is an encrypted vault, but settings.vault = \"file\". \
-                 Set settings.vault = \"encrypted-file\" (or delete the file to start fresh).",
+                "{} is an encrypted vault, but vault.storage = \"file\" in settings. \
+                 Set vault.storage = \"encrypted-file\" (or delete the file to start fresh).",
                 self.path.display()
             ),
         }
