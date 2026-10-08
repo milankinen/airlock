@@ -26,12 +26,16 @@ allow = ["example.com:443"]
 EOF
 }
 
-# Test that deny-by-default blocks a host that has no rule.
+# Test that deny-by-default blocks a host that has no rule. The proxy
+# answers a denied HTTP request with its own 403, and never connects to
+# the host. Thus the check does not depend on the host network, and a
+# missing network does not look like a deny.
 #   1. Get a URL of a host with no rule
-#   2. Check that the request fails
+#   2. Check that the request fails with the 403 of the proxy
 @test "host without rule is unreachable" {
-    run_vm sh -c 'wget -q -O- --timeout=5 http://httpbin.org/get 2>&1'
+    run_vm sh -c 'wget -O- --timeout=5 http://no-rule.example.com/ 2>&1'
     assert_failure
+    assert_output_contains "403"
 }
 
 # Test that the sandbox reaches a forwarded host port on localhost, and no
