@@ -32,7 +32,7 @@ fn file_vault_keeps_secrets_in_tagged_plaintext_file() {
 ///   2. Write a secret through the second handle, then through the first
 ///   3. Check that a new handle sees both secrets
 #[test]
-fn file_vault_handles_merge_each_others_writes() {
+fn two_file_vault_handles_keep_writes_of_each_other() {
     let tmp = temp_dir();
     let path = tmp.path().join("vault.json");
     let a = file_vault(&path);

@@ -364,3 +364,9 @@ credentialed requests. A new test sends an API request with the access
 surrogate, checks that the upstream got the real token, and lets the
 upstream stream the real token back split over two chunks. The answer
 must be refused without the token.
+
+## Test rename: two file vault handles keep each other's writes
+
+`file_vault_handles_merge_each_others_writes` read badly. The test is now
+`two_file_vault_handles_keep_writes_of_each_other`, which says what the
+body checks.
