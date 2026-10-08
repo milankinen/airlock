@@ -56,6 +56,29 @@ fn configuring_lua_pack_from_config_text_fills_defaults_and_applies_its_config()
     assert_eq!(resolved.values.env["SAMPLE_MODE"].value, "fast");
 }
 
+/// Test that a new arg with a default value keeps the install fingerprint.
+/// Such an arg is not a breaking change, so existing sandboxes must not
+/// see the pack as changed.
+///   1. Get the fingerprint of the test pack with a non-default arg
+///   2. Add a new bool arg with the default false to the same version
+///   3. Check that the fingerprint stays the same
+#[test]
+fn new_arg_with_default_keeps_install_fingerprint() {
+    let toml = "[packs]\nalpha = { version = 1, args = { mode = \"slow\" } }\n";
+    let before = fingerprint(&test_packs(), toml);
+
+    let mut files = test_pack_files();
+    for (path, text) in &mut files {
+        if *path == "alpha@1/pack.toml" {
+            text.push_str(
+                "\n[[args]]\nkey = \"extra\"\ntype = \"bool\"\n\
+                 description = \"Extra\"\ndefault = false\n",
+            );
+        }
+    }
+    assert_eq!(fingerprint(&load_packs(files), toml), before);
+}
+
 /// Test that the install fingerprint changes with the pack name, version
 /// and args, but not with the setup script text. A changed fingerprint
 /// makes a new sandbox necessary, so it must not change without reason.

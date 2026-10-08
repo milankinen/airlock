@@ -316,7 +316,9 @@ impl ConfiguredPack {
         &self.args
     }
 
-    /// Get the args whose value is not the default, sorted by key.
+    /// Get the args whose value is not the default, sorted by key. The
+    /// install fingerprint uses them (see [`Self::setup_installer`]), so a
+    /// new arg with a default does not change it.
     pub fn non_default_args(&self) -> Vec<(&str, &ArgValue)> {
         self.args
             .iter()
@@ -365,12 +367,14 @@ impl ConfiguredPack {
             (format!("AIRLOCK_PACK_ARG_{name}"), value.to_string())
         }));
 
-        // The fingerprint covers the name, the version and the arg values
-        // (in key order). It does not cover the scripts. A change to what a
-        // script or config does ships as a new version, because versions
-        // copy their files and do not share them. A change to comments only
-        // needs no new version.
-        let input = (&metadata.name, &metadata.version, &self.args);
+        // The fingerprint covers the name, the version and the arg values that
+        // differ from their defaults (in key order). It does not cover the
+        // scripts. So a breaking change must ship as a new version. A breaking
+        // change changes the result of an existing set of arg values. For
+        // example, a new boolean arg whose default (false) keeps the old result
+        // is not breaking. A change of a default value is breaking.
+        let args: BTreeMap<&str, &ArgValue> = self.non_default_args().into_iter().collect();
+        let input = (&metadata.name, &metadata.version, args);
         let json = serde_json::to_vec(&input).expect("fingerprint input serializes");
         let fingerprint = hex::encode(Sha256::digest(json));
 
@@ -399,8 +403,8 @@ pub struct InstallerScript {
     /// is in upper case with `-` changed to `_`. A bool is `true` or
     /// `false`. Args are never secrets.
     pub env: Vec<(String, String)>,
-    /// Identifies the pack definition (name, version, args). If it changes,
-    /// a new sandbox is necessary.
+    /// Identifies the pack definition (name, version, args that differ from
+    /// their defaults). If it changes, a new sandbox is necessary.
     pub fingerprint: String,
 }
 

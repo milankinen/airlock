@@ -161,3 +161,29 @@ error, so no test covered the refusal of a forged 101. The script now
 sends the request, changes the upstream status to 101, and the test
 checks that the 502 body is the one of the upgrade check ("upgrade not
 accepted by upstream"). With the old script the new assert fails.
+
+## Pack fingerprint from the non-default arg values
+
+A pack version must change only for a breaking change: a change of the
+result of an existing set of arg values. The install fingerprint covered
+the name, the version and all arg values, defaults included. A new arg
+added its default to the values, so the fingerprint of every sandbox
+with the pack changed, and airlock reported the pack as changed, also
+when nothing installs differently.
+
+The fingerprint now covers the name, the version and only the arg values
+that differ from their defaults (in key order, as a JSON object as
+before). The setup script and `config.lua` still get all values with
+the defaults. Results:
+
+- An arg set to its default value gives the same fingerprint as no arg
+  (the existing configure test already required this).
+- A new arg with a default does not change the fingerprint. A new test
+  adds a bool arg to a test pack and checks this.
+- A change of a default value changes the result for users who did not
+  set the arg, but not the fingerprint. So it is a breaking change and
+  needs a new version.
+
+No tag contains the packs yet, so the new formula needs no migration.
+Development sandboxes with packs that have args see them as changed
+one time.
