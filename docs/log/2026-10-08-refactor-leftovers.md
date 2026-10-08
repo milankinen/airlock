@@ -235,3 +235,10 @@ checks the body.
 that no 502 came back. A new test connection helper reads until the
 proxy closes the guest connection and fails if it stays open. The test
 uses it, so it now also checks the close.
+
+## Test rename: unknown endpoint answer with token
+
+`unknown_endpoint_fails_closed` checked only that a token in the answer
+from an unknown host gives a 502. The request still goes upstream, which
+is the intended behaviour (the answer scan is the guard). The name now
+says what the test checks: `unknown_endpoint_answer_with_token_is_refused`.

@@ -9,12 +9,13 @@ use crate::test_cfg::block_on_local;
 use crate::test_cfg::services::{GotLog, answering, production_services, request};
 
 /// Test that a service refuses a token answer from a host that it does not
-/// know.
+/// know. The request still goes upstream, but the token must not get to
+/// the sandbox.
 ///   1. Send a request of each service to an unknown host
 ///   2. Let the upstream answer with an access token
 ///   3. Check the local 502 without the token
 #[test]
-fn unknown_endpoint_fails_closed() {
+fn unknown_endpoint_answer_with_token_is_refused() {
     block_on_local(async {
         let services = production_services();
         for service in ServiceId::ALL {
