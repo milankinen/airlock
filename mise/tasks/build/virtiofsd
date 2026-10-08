@@ -16,7 +16,9 @@ VIRTIOFSD_VERSION="v1.13.3"
 mkdir -p target/vm
 OUTPUT="target/vm/virtiofsd"
 
-# Sandbox: airlock intercepts TLS, so the container must trust the VM's CAs
+# Sandbox: airlock intercepts TLS, so the container must trust the VM's CAs.
+# Bash 3.2 (macOS) fails on an empty array with `set -u`, so the expansion
+# below is guarded.
 CA_ARGS=()
 if [[ "${IS_SANDBOX:-}" == 1 ]]; then
   CA_ARGS=(-v /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro)
@@ -26,7 +28,7 @@ fi
 build_virtiofsd() {
   local out="$1" work="$2"; shift 2
   docker run --rm \
-    "${CA_ARGS[@]}" \
+    ${CA_ARGS[@]+"${CA_ARGS[@]}"} \
     -v "$out:/out" \
     -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
     "$@" \

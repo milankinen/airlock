@@ -10,7 +10,9 @@ case "$HOST_ARCH" in
   *)       ARCH=arm64;    CONFIG=config-arm64 ;;
 esac
 
-# Sandbox: airlock intercepts TLS, so the container must trust the VM's CAs
+# Sandbox: airlock intercepts TLS, so the container must trust the VM's CAs.
+# Bash 3.2 (macOS) fails on an empty array with `set -u`, so the expansion
+# below is guarded.
 CA_ARGS=()
 if [[ "${IS_SANDBOX:-}" == 1 ]]; then
   CA_ARGS=(-v /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro)
@@ -20,7 +22,7 @@ fi
 build_kernel() {
   local out="$1"; shift
   docker run --rm \
-    "${CA_ARGS[@]}" \
+    ${CA_ARGS[@]+"${CA_ARGS[@]}"} \
     -e "ARCH=${ARCH}" \
     -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
     -v "$PWD/app/vm-kernel/${CONFIG}:/config:ro" \

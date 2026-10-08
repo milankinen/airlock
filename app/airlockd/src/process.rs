@@ -284,13 +284,13 @@ fn build_pre_exec(
     harden: bool,
     diag_w: i32,
 ) -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
-    // Only Linux uses `harden`. The parameter is always there, so the
-    // signature is the same on all platforms.
-    #[cfg(not(target_os = "linux"))]
-    let _ = harden;
     // Allocate before fork. The hook can only make raw syscalls.
     let rootfs = std::ffi::CString::new(crate::sandbox_ns::ROOTFS).unwrap();
     let ns_fd = crate::sandbox_ns::fd();
+    // Only Linux uses `harden` and `ns_fd`. They are always there, so the
+    // code is the same on all platforms.
+    #[cfg(not(target_os = "linux"))]
+    let _ = (harden, ns_fd);
 
     move || {
         // Save errno first, then write the step tag (write(2) can change it).

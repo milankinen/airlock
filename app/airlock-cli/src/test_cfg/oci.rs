@@ -57,6 +57,7 @@ impl LayerTar {
     /// An empty regular file with the exact name `raw_path`. Use it for
     /// names that a correct builder refuses, for example absolute paths.
     #[must_use]
+    #[cfg(target_os = "linux")]
     pub fn raw_file(mut self, raw_path: &str) -> Self {
         let mut header = tar::Header::new_old();
         header.as_old_mut().name[..raw_path.len()].copy_from_slice(raw_path.as_bytes());
