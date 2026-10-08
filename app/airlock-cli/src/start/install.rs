@@ -105,7 +105,7 @@ pub async fn install_tools(
         }
         let install_project = project
             .with_config(resolved.install_config().map_err(Exit::config)?)
-            .map_err(|e| Exit::error(1, e))?;
+            .map_err(Exit::config)?;
         // Saved with the first record: no session ran after this install.
         state.ran_session = false;
         let mut save = |s: &mut InstallState| save_state(&sandbox, &image.image_id, s);

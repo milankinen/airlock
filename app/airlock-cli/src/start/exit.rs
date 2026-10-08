@@ -7,6 +7,7 @@ use std::fmt;
 
 use crate::cli;
 use crate::cli::prompt::PromptError;
+use crate::project::EnvError;
 
 /// The reason why a step ended the run.
 #[derive(Debug)]
@@ -52,8 +53,13 @@ impl Exit {
     }
 }
 
+/// Convert a failure. An `[env]` problem is a configuration error, also
+/// when it comes from deep inside the project setup.
 impl From<anyhow::Error> for Exit {
     fn from(e: anyhow::Error) -> Self {
+        if e.downcast_ref::<EnvError>().is_some() {
+            return Exit::config(e);
+        }
         Exit::Failed(e)
     }
 }
@@ -66,5 +72,34 @@ impl From<PromptError> for Exit {
             PromptError::NotInteractive => Exit::error(2, e),
             PromptError::Io(_) => Exit::error(1, e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests of the exit codes of failures.
+
+    use anyhow::Context;
+
+    use super::*;
+
+    /// Test that an `[env]` problem gives exit code 2 also when the project
+    /// setup returns it inside a general failure with added context. Other
+    /// failures stay failures (exit code 1).
+    ///   1. Wrap an `[env]` problem in a failure with context
+    ///   2. Check that it converts to exit code 2
+    ///   3. Check that another failure converts to a failure
+    #[test]
+    fn env_error_inside_failure_exits_with_config_error_code() {
+        let env_error = EnvError {
+            name: "TOKEN".into(),
+            reason: "host variable is not set".into(),
+        };
+        let wrapped = Err::<(), _>(env_error).context("open project").unwrap_err();
+        assert!(matches!(Exit::from(wrapped), Exit::Code(2)));
+        assert!(matches!(
+            Exit::from(anyhow::anyhow!("disk full")),
+            Exit::Failed(_)
+        ));
     }
 }

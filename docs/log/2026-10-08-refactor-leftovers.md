@@ -88,3 +88,14 @@ The old hostname is removed from both maps, and a later query for it
 gets a new IP. A stale IP in the guest can then reach another hostname,
 but the host still applies the network rules of that hostname, so this
 is no policy bypass.
+
+## `[env]` errors give exit code 2
+
+The `[env]` error type says that `airlock start` reports it as a config
+error (exit code 2), also when it comes from deep inside the project
+setup. Only the early `[env]` check did that. The install config path
+mapped the error to exit code 1, and the project open wrapped it in a
+general error, which also gave exit code 1. The conversion from a
+general error to an early exit now looks for the `[env]` error type in
+the error chain and reports a config error. The install path maps the
+error directly. We kept the type because the conversion now uses it.
