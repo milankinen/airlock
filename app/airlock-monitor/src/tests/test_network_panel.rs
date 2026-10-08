@@ -102,8 +102,10 @@ fn middleware_deny_for_evicted_request_still_moves_count() {
 ///   1. Send two requests, select the older request and open its details
 ///   2. Check the path, the headers, the missing response and the select hint
 ///   3. Send the response and check its status and headers
-///   4. Close and open the details again and check that the response stays
-///   5. Send a late middleware deny and check that the status is Denied
+///   4. Make the terminal short, press Down and check that the details of
+///      the same request scroll by one line
+///   5. Close and open the details again and check that the response stays
+///   6. Send a late middleware deny and check that the status is Denied
 #[test]
 fn request_details_show_headers_and_follow_late_response() {
     let mut tui = monitor();
@@ -132,9 +134,13 @@ fn request_details_show_headers_and_follow_late_response() {
     assert!(screen.contains("server: nginx"));
 
     // In the details, Down scrolls the body by one line. It does not select
-    // a different request.
+    // a different request. The short terminal makes the body taller than
+    // the panel, so that it can scroll.
+    tui.resize(120, 20);
+    let path_y = y_of(&mut tui, "/v1/models");
     tui.key(KeyCode::Down);
-    assert!(tui.screen().contains("Method"));
+    assert_eq!(y_of(&mut tui, "/v1/models"), path_y - 1);
+    tui.resize(120, 30);
 
     tui.key(KeyCode::Esc);
     let screen = tui.screen();

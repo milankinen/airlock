@@ -292,3 +292,11 @@ held-back state of a long run does not hide a later token.
 `minted_surrogate_has_prefix_and_48_random_bytes` checked the length only
 as a rough lower bound. It now strips the known prefix and checks that
 the rest decodes from base64url to exactly 48 bytes.
+
+## Test: request details scroll on Down
+
+In `request_details_show_headers_and_follow_late_response`, the check
+after `Down` passed whether or not the view scrolled: the details fit on
+the screen, so nothing could scroll. The test now makes the terminal
+short, presses `Down`, and checks that the path row of the same request
+moved up by one line.
