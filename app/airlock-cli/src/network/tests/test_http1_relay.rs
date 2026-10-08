@@ -71,29 +71,21 @@ fn noop_middleware() -> TestNetworkConfig {
     }
 }
 
-/// Test that HTTP/1.1 requests and responses cross the proxy intact when
-/// no middleware applies.
-///   1. Start a network without middleware
-///   2. Send a GET, a POST, a 404 request and a 100 KB response request
+/// Test that HTTP/1.1 requests and responses cross the proxy intact, with
+/// and without a middleware. Both cases use the same relay. A middleware
+/// that does nothing must not change the messages.
+///   1. Start a network without middleware, then one with a no-op
+///      middleware
+///   2. In each network, send a GET, a POST, a 404 request and a 100 KB
+///      response request
 ///   3. Check the status, headers and bodies that the guest gets
 #[test]
-fn http1_requests_without_middleware_arrive_intact() {
-    run_with_config(TestNetworkConfig::default(), |proxy, _, _| async move {
-        assert_http1_relay(&proxy).await;
-    });
-}
-
-/// Test that HTTP/1.1 requests and responses cross the proxy intact when
-/// a middleware applies. A middleware that does nothing must not change
-/// the messages.
-///   1. Start a network with a no-op middleware
-///   2. Send a GET, a POST, a 404 request and a 100 KB response request
-///   3. Check the status, headers and bodies that the guest gets
-#[test]
-fn http1_requests_through_middleware_arrive_intact() {
-    run_with_config(noop_middleware(), |proxy, _, _| async move {
-        assert_http1_relay(&proxy).await;
-    });
+fn http1_requests_arrive_intact_with_and_without_middleware() {
+    for config in [TestNetworkConfig::default(), noop_middleware()] {
+        run_with_config(config, |proxy, _, _| async move {
+            assert_http1_relay(&proxy).await;
+        });
+    }
 }
 
 /// Test that one keep-alive guest connection can send more than one

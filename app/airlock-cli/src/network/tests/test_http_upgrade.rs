@@ -25,41 +25,28 @@ fn middleware(script: &'static str) -> TestNetworkConfig {
     }
 }
 
-/// Test that a WebSocket upgrade without middleware switches to a raw
-/// byte relay in both directions.
-///   1. Send a WebSocket handshake to an upgrade-echo upstream
-///   2. Check the 101 response and its upgrade headers
-///   3. Send bytes in both directions and check that they arrive
-#[test]
-fn websocket_upgrade_without_middleware_relays_raw_bytes() {
-    run_with_config(TestNetworkConfig::default(), |proxy, _, _| async move {
-        let (mut stream, port) = upgrade_stream(&proxy).await;
-        assert_raw_relay(
-            &mut stream,
-            &websocket_handshake(port, true),
-            "HTTP/1.1 101",
-        )
-        .await;
-    });
-}
-
-/// Test that a WebSocket upgrade through a middleware switches to a raw
-/// byte relay. The middleware must not break the switch or lose the bytes
-/// that follow the handshake.
-///   1. Start a network with a no-op middleware
-///   2. Send a WebSocket handshake to an upgrade-echo upstream
+/// Test that a WebSocket upgrade switches to a raw byte relay in both
+/// directions, with and without a middleware. Both cases use the same
+/// relay. A middleware must not break the switch or lose the bytes that
+/// follow the handshake.
+///   1. Start a network without middleware, then one with a no-op
+///      middleware
+///   2. In each network, send a WebSocket handshake to an upgrade-echo
+///      upstream
 ///   3. Check the 101 response and the raw bytes in both directions
 #[test]
-fn websocket_upgrade_through_middleware_relays_raw_bytes() {
-    run_with_config(middleware("-- noop"), |proxy, _, _| async move {
-        let (mut stream, port) = upgrade_stream(&proxy).await;
-        assert_raw_relay(
-            &mut stream,
-            &websocket_handshake(port, true),
-            "HTTP/1.1 101",
-        )
-        .await;
-    });
+fn websocket_upgrade_relays_raw_bytes_with_and_without_middleware() {
+    for config in [TestNetworkConfig::default(), middleware("-- noop")] {
+        run_with_config(config, |proxy, _, _| async move {
+            let (mut stream, port) = upgrade_stream(&proxy).await;
+            assert_raw_relay(
+                &mut stream,
+                &websocket_handshake(port, true),
+                "HTTP/1.1 101",
+            )
+            .await;
+        });
+    }
 }
 
 /// Test that a WebSocket upgrade works over the TLS MITM when the guest

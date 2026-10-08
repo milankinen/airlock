@@ -348,3 +348,10 @@ behaviours in one test, so a failure was hard to find. It is now 4 tests
 with a shared open helper: the private CA and run metadata, the disk
 identity until a reset, a new identity for each new disk, and a reset
 that does not follow a symlink.
+
+## Tests: merge the with/without middleware pairs
+
+The HTTP/1.1 relay and WebSocket upgrade tests had a test with and a
+test without middleware. Both go through the same relay, and only a
+no-op middleware differs, so each pair overlapped almost fully. Each
+pair is now one test that runs the same checks in both networks.
