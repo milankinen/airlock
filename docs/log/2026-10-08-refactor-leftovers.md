@@ -187,3 +187,44 @@ the defaults. Results:
 No tag contains the packs yet, so the new formula needs no migration.
 Development sandboxes with packs that have args see them as changed
 one time.
+
+## Mask injected secrets in response bodies
+
+When an upstream echoed an injected secret in the response body, the
+guest got the real value. Only response headers were masked, and a test
+locked this in. We decided that this is a secret leak to the sandbox.
+
+The response body now goes through a streaming masker after the
+middleware chain:
+
+- The masker holds back `longest - 1` bytes of the pending data. A match
+  that starts before that tail fits completely in the data, so a value
+  split across two chunks is found. At each position the longest real
+  value wins, as in the header swap. A unit test pushes a text with
+  nested secrets split at every byte and compares the result with the
+  full-text masking.
+- The body ends in the same poll as the inner body (`is_end_stream`), so
+  hyper ends the message without one more poll.
+- Trailers go through the header rewrite.
+- A production surrogate has the length of its real value, so
+  `Content-Length` and the size hint stay. If a pair differs in length,
+  the response loses `Content-Length` and the size hint is unknown. The
+  test constants first had a surrogate one byte longer than its real
+  value, which showed this case (hyper cut the body at the old length).
+- The masker cannot see into compressed bodies. When the target has
+  injected secrets, the proxy sets `Accept-Encoding: identity` on the
+  upstream request after middleware, so scripts cannot change it. A
+  compressed body that still comes back gets a local 502, the same
+  fail-closed rule as the API answer scan of the sign-in services.
+- 101 responses and bodies that are already at their end (HEAD, 204,
+  304) pass unchanged.
+
+Known limits, also in the manual: no search for encoded forms (base64,
+JSON escapes, URL encoding), and no check of WebSocket data after an
+upgrade. Scripts still see the real values in `res:body()`.
+
+The echo test now records what the upstream sent to check the unmasked
+request, and checks that the guest gets surrogates in the body. New
+tests cover a value split across streamed chunks (and the forced
+`identity`) and the refusal of a compressed answer. The HTTPS test also
+checks the body.

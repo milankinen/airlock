@@ -170,7 +170,15 @@ carry its secrets, resolved per connection like middleware.
 Per HTTP request the proxy does a byte-level search/replace on header
 values: surrogate → real before the Lua chain, real → surrogate after
 it. The proxy replaces longer values first so nested secrets cannot
-leak. Header names, URI and bodies are untouched.
+leak. It does not change header names, the URI or request bodies.
+
+The response body goes through the same real → surrogate replacement
+while it streams. The proxy holds back the last bytes of each chunk
+(one byte less than the longest real value), so it also finds a value
+that the server splits across two chunks. A surrogate has the same
+length as its real value, so `Content-Length` stays correct. The proxy
+sends `Accept-Encoding: identity` upstream. It answers a compressed
+response body with HTTP 502, because it cannot search compressed data.
 
 ## Localhost port forwarding
 

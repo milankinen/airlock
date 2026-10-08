@@ -202,7 +202,8 @@ pub async fn relay(
             let send = {
                 let (upgrade, method) = (upgrade.clone(), method.clone());
                 let injected = secrets.clone();
-                move |req| async move {
+                move |mut req: Request<ResponseBody>| async move {
+                    inject::request_identity(req.headers_mut(), &injected);
                     let upstream: Next = Box::new(move |req| {
                         Box::pin(async move {
                             let resp =
@@ -227,13 +228,15 @@ pub async fn relay(
             };
             // Unmask before middleware, so scripts see the real request.
             // Mask again after middleware, so nothing that a script adds can
-            // send the real value back into the guest.
+            // send the real value back into the guest. The body is masked
+            // as it streams.
             let result = match inject::unmask_request(req.headers_mut(), &secrets) {
                 Err(e) => Err(e),
                 Ok(()) => middleware::run(req, &middleware, deny_reporter, connect_host, send)
                     .await
                     .and_then(|mut resp| {
-                        inject::mask_response(resp.headers_mut(), &secrets).map(|()| resp)
+                        inject::mask_response(resp.headers_mut(), &secrets)
+                            .map(|()| inject::mask_body(resp, &secrets))
                     }),
             };
 

@@ -169,8 +169,9 @@ request.
 
 airlock unmasks
 [injected](../configuration/network.md#injecting-masked-secrets) secrets
-in request headers before the first script runs and masks them again in
-response headers after the last one returns.
+in request headers before the first script runs. It masks them again in
+the response headers and body after the last script returns. Thus
+`res:body()` shows the real values that the server sent.
 
 ## Examples
 

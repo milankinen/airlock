@@ -107,8 +107,8 @@ on the host port, so airlock suppresses interception automatically.
 
 `inject` lists [masked](env.md#masking) variables. For HTTP traffic to the
 rule's `allow` targets, airlock replaces the surrogate with the real value
-in request headers, and the real value with the surrogate in response
-headers.
+in request headers. It also replaces the real value with the surrogate in
+response headers and response bodies.
 
 ```toml
 [env]
@@ -125,10 +125,18 @@ as it would on the host. airlock inserts the real token at the host boundary.
 - Names must be `[env]` entries with `mask = true`.
 - Values must be at least 8 characters and valid in an HTTP header.
 - Injecting rules cannot be `passthrough`.
-- airlock rewrites only header values — every header, every occurrence.
-  It does not rewrite header names, paths, or bodies.
+- In requests, airlock rewrites only header values — every header, every
+  occurrence. It does not rewrite header names, paths, or request bodies.
+- In responses, airlock rewrites header values and the body. It finds a
+  real value also when the server splits it across two body chunks.
+- airlock asks the server for an uncompressed response
+  (`Accept-Encoding: identity`). If the server still sends a compressed
+  body, airlock replaces the response with HTTP 502. airlock cannot find
+  a real value in compressed data.
+- airlock does not find an encoded real value, for example in base64 or
+  URL encoding. It also does not check WebSocket data after an upgrade.
 - airlock unmasks request headers before [middleware](#middleware) runs
-  and masks response headers after it, so scripts see real values. The
+  and masks the response after it, so scripts see real values. The
   monitor shows surrogates.
 
 ## Middleware

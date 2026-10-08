@@ -1,13 +1,31 @@
-//! Masked secret replacement in HTTP headers.
+//! Masked secret replacement in HTTP messages.
 //!
 //! The guest has only a surrogate for each masked `[env]` variable. For rules
 //! that inject the variable, the proxy replaces the surrogate with the real
 //! value in request headers. It also replaces the real value with the
-//! surrogate in response headers and other text. Thus the real secret never
-//! goes into the VM.
+//! surrogate in response headers, response bodies and other text. Thus the
+//! real secret never goes into the VM.
+//!
+//! Known limits:
+//!
+//! - The body replacement does not see into compressed bodies. Thus the
+//!   proxy asks the upstream for an uncompressed answer, and refuses a
+//!   compressed answer.
+//! - The replacement does not find an encoded form of a real value (a JSON
+//!   `\u` escape, base64, URL encoding).
+//! - The replacement does not check the bytes after a protocol upgrade.
 
-use hyper::header::{HeaderMap, HeaderValue};
+use std::collections::VecDeque;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
+use bytes::Bytes;
+use http_body_util::{BodyExt as _, Either};
+use hyper::body::{Body, Frame};
+use hyper::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, HeaderMap, HeaderValue};
+use hyper::{Response, StatusCode};
+
+use crate::network::http::{BoxError, ResponseBody, text_response};
 use crate::network::target::InjectedSecret;
 
 /// Replace surrogates with real values in all request header values.
@@ -24,6 +42,230 @@ pub fn unmask_request(headers: &mut HeaderMap, secrets: &[InjectedSecret]) -> an
 ///   Error if a changed value is not a valid header value.
 pub fn mask_response(headers: &mut HeaderMap, secrets: &[InjectedSecret]) -> anyhow::Result<()> {
     rewrite_headers(headers, &mask_pairs(secrets))
+}
+
+/// Ask the upstream for an uncompressed answer, so that [`mask_body`] can
+/// see the real values in it. Call it after Lua middleware runs, so that a
+/// script cannot change it.
+pub fn request_identity(headers: &mut HeaderMap, secrets: &[InjectedSecret]) {
+    if !secrets.is_empty() {
+        headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+    }
+}
+
+/// Replace real values with surrogates in the response body, while it
+/// streams. Call it after Lua middleware runs. A real value can be split
+/// across two chunks. The body holds back a short tail of each chunk to
+/// find it. A surrogate of a masked `[env]` value has the same length as its
+/// real value, so the body length usually does not change.
+/// Returns:
+///   The response with the masked body. A local 502 if the body is
+///   compressed, because a compressed real value cannot be found.
+pub fn mask_body(
+    mut resp: Response<ResponseBody>,
+    secrets: &[InjectedSecret],
+) -> Response<ResponseBody> {
+    let masker = Masker::new(secrets);
+    if masker.pairs.is_empty() || resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+        return resp;
+    }
+    if resp.body().is_end_stream() {
+        return resp;
+    }
+    if resp
+        .headers()
+        .get_all(CONTENT_ENCODING)
+        .iter()
+        .any(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"))
+    {
+        return text_response(
+            StatusCode::BAD_GATEWAY,
+            "compressed answer to a request with injected secrets\n",
+        );
+    }
+    if !masker.same_length {
+        // The masked body can have a different length. hyper then sends
+        // the body without a declared length.
+        resp.headers_mut().remove(CONTENT_LENGTH);
+    }
+    resp.map(|inner| {
+        let body = MaskBody {
+            inner,
+            masker,
+            ready: VecDeque::new(),
+            done: false,
+        };
+        Either::Left(Either::Right(body.boxed_unsync()))
+    })
+}
+
+/// Stream replacement of real values with surrogates.
+struct Masker {
+    /// `(real, surrogate)` pairs, longest real value first.
+    pairs: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Length of the longest real value.
+    longest: usize,
+    /// True if each surrogate has the length of its real value.
+    same_length: bool,
+    /// Bytes that are not checked yet.
+    pending: Vec<u8>,
+}
+
+impl Masker {
+    fn new(secrets: &[InjectedSecret]) -> Self {
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = mask_pairs(secrets)
+            .into_iter()
+            .filter(|(from, _)| !from.is_empty())
+            .map(|(from, to)| (from.to_vec(), to.to_vec()))
+            .collect();
+        let longest = pairs.first().map_or(0, |(from, _)| from.len());
+        let same_length = pairs.iter().all(|(from, to)| from.len() == to.len());
+        Self {
+            pairs,
+            longest,
+            same_length,
+            pending: Vec::new(),
+        }
+    }
+
+    /// Add `data` to the stream.
+    /// Returns:
+    ///   The masked bytes that can go on. A tail that can be the start of a
+    ///   real value stays back.
+    fn push(&mut self, data: &[u8]) -> Bytes {
+        self.pending.extend_from_slice(data);
+        self.drain(self.longest - 1)
+    }
+
+    /// End the stream.
+    /// Returns:
+    ///   The masked rest of the stream.
+    fn finish(&mut self) -> Bytes {
+        self.drain(0)
+    }
+
+    /// Mask and remove the pending bytes, except the last `keep` bytes.
+    fn drain(&mut self, keep: usize) -> Bytes {
+        let buf = &self.pending;
+        // A match that starts before `end` fits in `buf` completely, because
+        // `keep` is one less than the longest real value.
+        let end = buf.len().saturating_sub(keep);
+        let mut out = Vec::with_capacity(buf.len());
+        let mut i = 0;
+        'scan: while i < end {
+            // The longest match at a position wins, as in the header swap.
+            for (from, to) in &self.pairs {
+                if buf[i..].starts_with(from) {
+                    out.extend_from_slice(to);
+                    i += from.len();
+                    continue 'scan;
+                }
+            }
+            out.push(buf[i]);
+            i += 1;
+        }
+        self.pending.drain(..i);
+        Bytes::from(out)
+    }
+}
+
+/// A body that passes through a [`Masker`].
+struct MaskBody {
+    inner: ResponseBody,
+    masker: Masker,
+    /// Frames that are ready for the guest.
+    ready: VecDeque<Frame<Bytes>>,
+    /// True if the inner body ended. Its remaining data is in `ready`.
+    done: bool,
+}
+
+impl MaskBody {
+    /// Mask one frame of the inner body, and queue the bytes that can go
+    /// on. `None` is the end of the inner body.
+    fn mask(&mut self, frame: Option<Frame<Bytes>>) -> anyhow::Result<()> {
+        let frame = match frame.map(Frame::into_data) {
+            Some(Ok(data)) => {
+                let out = self.masker.push(&data);
+                if !out.is_empty() {
+                    self.ready.push_back(Frame::data(out));
+                }
+                return Ok(());
+            }
+            Some(Err(frame)) => Some(frame),
+            None => None,
+        };
+        self.done = true;
+        let rest = self.masker.finish();
+        if !rest.is_empty() {
+            self.ready.push_back(Frame::data(rest));
+        }
+        if let Some(frame) = frame {
+            let frame = match frame.into_trailers() {
+                Ok(mut trailers) => {
+                    let pairs: Vec<(&[u8], &[u8])> = self
+                        .masker
+                        .pairs
+                        .iter()
+                        .map(|(from, to)| (from.as_slice(), to.as_slice()))
+                        .collect();
+                    rewrite_headers(&mut trailers, &pairs)?;
+                    Frame::trailers(trailers)
+                }
+                Err(frame) => frame,
+            };
+            self.ready.push_back(frame);
+        }
+        Ok(())
+    }
+}
+
+impl Body for MaskBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let this = &mut *self;
+        loop {
+            if let Some(frame) = this.ready.pop_front() {
+                return Poll::Ready(Some(Ok(frame)));
+            }
+            if this.done {
+                return Poll::Ready(None);
+            }
+            let frame = match Pin::new(&mut this.inner).poll_frame(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => None,
+                Poll::Ready(Some(Ok(frame))) => Some(frame),
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+            };
+            let ended = frame.is_some() && this.inner.is_end_stream();
+            let mut result = this.mask(frame);
+            // End at once after the last frame, as the inner body does. hyper
+            // then ends the message without one more poll.
+            if ended && result.is_ok() && !this.done {
+                result = this.mask(None);
+            }
+            if let Err(e) = result {
+                this.done = true;
+                return Poll::Ready(Some(Err(e.into())));
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.done && self.ready.is_empty()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        if self.masker.same_length {
+            self.inner.size_hint()
+        } else {
+            hyper::body::SizeHint::default()
+        }
+    }
 }
 
 /// Replace each real value in free-form `text` with its surrogate. Use it
@@ -136,7 +378,8 @@ fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Option<V
 
 #[cfg(test)]
 mod tests {
-    //! Tests for the swap of surrogates and real values in headers.
+    //! Tests for the swap of surrogates and real values in headers and
+    //! streamed bodies.
 
     use super::*;
 
@@ -192,6 +435,30 @@ mod tests {
         let mut h = header("x-echo", "got 🔑-secret-token back".as_bytes());
         mask_response(&mut h, &[s]).unwrap();
         assert_eq!(h["x-echo"], "got SURROGATEabcdef back");
+    }
+
+    /// Test that the stream masking gives the same result as the masking of
+    /// the full text, for each split of the text into two chunks. A real
+    /// value can arrive split at any byte.
+    ///   1. Make a token secret and an auth secret that contains the token
+    ///   2. Push a text with both values in two chunks, for each split point
+    ///   3. Check that the output is the same as the full-text masking
+    #[test]
+    fn stream_masking_finds_values_split_at_each_byte() {
+        let secrets = [
+            secret("TOKEN", "real-token-value", "SURROGATE1234567"),
+            secret("AUTH", "Bearer real-token-value", "SURROGATEabcdefghijklmn"),
+        ];
+        let text = "x real-token-value y Bearer real-token-value z real-token-valu";
+        let expected = mask_text(text, &secrets);
+        assert!(!expected.contains("real-token-value"), "{expected}");
+        for cut in 0..=text.len() {
+            let mut masker = Masker::new(&secrets);
+            let mut out = masker.push(&text.as_bytes()[..cut]).to_vec();
+            out.extend_from_slice(&masker.push(&text.as_bytes()[cut..]));
+            out.extend_from_slice(&masker.finish());
+            assert_eq!(String::from_utf8(out).unwrap(), expected, "cut {cut}");
+        }
     }
 
     /// Test that a real value that is not valid in a header gives an error
