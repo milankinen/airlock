@@ -1,3 +1,8 @@
+//! Plain TCP support.
+//!
+//! Connects to the upstream server and relays raw bytes between the sandbox
+//! and the server.
+
 use airlock_common::network_capnp::tcp_sink;
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -8,10 +13,14 @@ use tracing::debug;
 use super::io;
 use super::target::{self, ResolvedTarget};
 
-/// Wrap the RPC channel to the guest in a `Transport` without touching the
-/// real server. Used on both the allow path (paired with `connect_server`)
-/// and the deny path (where we hand the transport to a 403-serving hyper
-/// instance instead).
+/// Wrap the RPC channel to the guest in a [`io::Transport`]. This does not
+/// connect to the real server. The allow path uses it with
+/// [`connect_server`]. The deny path gives the transport to a hyper
+/// instance that sends 403.
+/// Args:
+///  - `first`: Bytes that were already read from the guest
+///  - `rx`: Receiver for more guest bytes
+///  - `client_sink`: RPC sink for bytes to the guest.
 pub fn container_transport(
     first: Bytes,
     rx: mpsc::Receiver<Bytes>,
@@ -26,7 +35,9 @@ pub fn container_transport(
     }
 }
 
-/// Open a plain TCP socket to the real server.
+/// Open a plain TCP connection to the real server, with a timeout.
+/// Returns:
+///   Server transport, or error if the connection fails or times out.
 pub async fn connect_server(target: &ResolvedTarget) -> anyhow::Result<io::Transport> {
     let addr = format!("{}:{}", target.host, target.port);
     debug!("plain tcp: {addr}");
@@ -41,15 +52,19 @@ pub async fn connect_server(target: &ResolvedTarget) -> anyhow::Result<io::Trans
     })
 }
 
-/// Open a TCP stream to `target`. A [`ResolvedTarget::public_only`]
-/// target resolves here, and only its public addresses are dialed: the
-/// check covers the addresses the stream connects to, so neither a name
-/// like `localhost` nor DNS rebinding gets past it.
+/// Open a TCP stream to `target`.
+/// Returns:
+///   The stream, or error if the connection fails. For a
+///   [`ResolvedTarget::public_only`] target, also an error if the host has
+///   no public address.
 pub async fn dial(target: &ResolvedTarget) -> anyhow::Result<TcpStream> {
     let addr = format!("{}:{}", target.host, target.port);
     if !target.public_only {
         return Ok(TcpStream::connect(&addr).await?);
     }
+    // Resolve the name here and connect only to public addresses. The check
+    // applies to the addresses that the stream connects to. Thus a name such
+    // as `localhost` or DNS rebinding cannot get past it.
     let host = target::ip_literal(&target.host).map_or(target.host.clone(), |ip| ip.to_string());
     let public: Vec<_> = tokio::net::lookup_host((host.as_str(), target.port))
         .await?
@@ -59,11 +74,8 @@ pub async fn dial(target: &ResolvedTarget) -> anyhow::Result<TcpStream> {
     Ok(TcpStream::connect(&public[..]).await?)
 }
 
-/// Bidirectional relay between two transports.
-///
-/// When either direction closes, both sides shut down concurrently under a
-/// timeout. An `RpcTransport` shutdown can block on a `close` ack behind
-/// backpressure, so shutdown also drains both read halves to unblock it.
+/// Relay bytes in both directions between two transports, until one
+/// direction closes.
 pub async fn relay(mut container: io::Transport, mut server: io::Transport) {
     let c2s = async {
         let mut buf = vec![0u8; airlock_common::RELAY_CHUNK_SIZE];
@@ -93,7 +105,10 @@ pub async fn relay(mut container: io::Transport, mut server: io::Transport) {
         }
     };
 
-    // When either direction finishes, shut down everything
+    // When one direction finishes, shut down both sides at the same time,
+    // with a timeout. An `RpcTransport` shutdown can block on a `close` ack
+    // behind backpressure. Thus also read both read halves to the end, to
+    // release the block.
     tokio::select! {
         () = c2s => {}
         () = s2c => {}
@@ -111,16 +126,16 @@ pub async fn relay(mut container: io::Transport, mut server: io::Transport) {
     let _ = tokio::time::timeout(crate::constants::RELAY_SHUTDOWN_TIMEOUT, async {
         tokio::select! {
             _ = &mut shutdown => {}
-            // Both sides hit EOF/error before the shutdown did; keep
-            // waiting for it instead of abandoning it.
+            // Both sides got EOF or an error before the shutdown finished.
+            // Continue to wait for the shutdown.
             _ = drain => { let _ = shutdown.await; }
         }
     })
     .await;
 }
 
-/// Reads `src` to EOF or error, discarding the bytes — keeps a peer's own
-/// sends acking while nothing else is draining it.
+/// Read `src` to EOF or error, and discard the bytes. This keeps the acks
+/// of the peer sends going when nothing else reads the stream.
 async fn drain_to_eof(src: &mut io::BoxRead, buf: &mut [u8]) {
     loop {
         match src.read(buf).await {
@@ -132,6 +147,8 @@ async fn drain_to_eof(src: &mut io::BoxRead, buf: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
+    //! Tests for the shutdown of the raw TCP relay.
+
     use std::cell::Cell;
     use std::future::Future;
     use std::pin::Pin;
@@ -144,8 +161,9 @@ mod tests {
 
     use super::*;
 
-    /// A guest that keeps offering one more byte as long as it is read,
-    /// pinging `drained` for each byte taken.
+    /// A guest that never stops sending. Each read gets one byte and
+    /// signals `drained`. Every second poll is pending, so other tasks can
+    /// run.
     struct AlwaysReady {
         drained: Arc<Notify>,
         ready: Cell<bool>,
@@ -168,8 +186,8 @@ mod tests {
         }
     }
 
-    /// A write half whose shutdown completes only after `drained` fires,
-    /// like an RPC `close` that waits for the peer to keep draining.
+    /// A write half whose shutdown completes only after `drained` fires.
+    /// It acts as an RPC `close` that waits until the guest data is read.
     struct GatedShutdown {
         drained: Arc<Notify>,
         waiting: Option<Pin<Box<dyn Future<Output = ()>>>>,
@@ -205,6 +223,13 @@ mod tests {
         }
     }
 
+    /// Test that the relay shutdown reads the guest stream while it waits for
+    /// the guest close. Without this, a close that waits on backpressure
+    /// blocks the relay until the shutdown timeout.
+    ///   1. Make a guest that never stops sending and whose close waits until
+    ///      someone reads its data
+    ///   2. Make a server that closes at once
+    ///   3. Check that the relay finishes in 2 seconds
     #[tokio::test]
     async fn relay_shutdown_drains_guest_so_gated_close_completes() {
         let drained = Arc::new(Notify::new());
@@ -224,6 +249,8 @@ mod tests {
             write: Box::new(tokio::io::sink()),
             h2: false,
         };
+        // The relay shutdown timeout is 30 s, so a pass in 2 s means the
+        // drain released the close.
         tokio::time::timeout(Duration::from_secs(2), relay(container, server))
             .await
             .expect("relay finishes");

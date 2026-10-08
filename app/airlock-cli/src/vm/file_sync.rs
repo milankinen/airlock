@@ -1,12 +1,8 @@
-//! Host-side file-mount sync: watches overlay/files/rw/ with the OS-native
-//! file-change API (FSEvents on macOS, inotify on Linux) and syncs changes
-//! back to the original source paths on the host.
+//! Sync of writable file mounts.
 //!
-//! File mounts are backed by hard links into the project overlay directory.
-//! When the guest writes atomically (temp file + rename), virtiofsd replaces
-//! the directory entry with a new inode, severing the link to the source file.
-//! This module detects such changes and re-establishes the link (or falls back
-//! to a copy) so the host source file stays up-to-date.
+//! Copies the changes that the guest makes in writable file mounts back to
+//! their source files on the host. The sync runs in the background until the
+//! session stops it.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -19,23 +15,25 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::util::PinnedDir;
 
-/// A sync destination, anchored to its parent directory by an FD opened
-/// at sandbox startup. All subsequent writes happen via `*at()` syscalls
-/// relative to that FD instead of resolving the source path again at
-/// every event — so a post-startup symlink swap of any directory
-/// component leading up to the source can't redirect the write.
+/// A sync destination, held by an FD of its parent directory that was opened
+/// at sandbox start.
+///
+/// All later writes use `*at()` syscalls relative to that FD. The source
+/// path is not resolved again on each event. Thus, after the start, a
+/// symlink swap of a directory on the path to the source cannot redirect
+/// the write.
 struct SyncDest {
-    /// Original parent directory, pinned by FD. Operations through it
-    /// target the original inode regardless of what the path may have
-    /// been replaced with on disk in the meantime.
+    /// Original parent directory, pinned by FD. Operations through it use
+    /// the original inode, also if something replaced the path on disk.
     parent: PinnedDir,
-    /// Final path component (file name).
+    /// Last path component (file name).
     basename: OsString,
-    /// Original full path. Logging only — never passed to a syscall.
+    /// Original full path. Only for logs, never given to a syscall.
     display: PathBuf,
 }
 
 impl SyncDest {
+    /// Pin the parent directory of `source` and keep its file name.
     fn open(source: &Path) -> io::Result<Self> {
         let parent = source.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "source has no parent dir")
@@ -51,18 +49,19 @@ impl SyncDest {
         })
     }
 }
-/// Handle to the running file-sync task. Dropping aborts immediately;
-/// call `shutdown()` to drain pending events first.
+
+/// Handle to the running file-sync task. A drop aborts the task
+/// immediately. Call `shutdown()` to handle pending events first.
 pub(super) struct SyncHandle {
     task: Option<tokio::task::JoinHandle<()>>,
-    /// Dropping the watcher closes the event channel, which lets the task
-    /// drain any buffered events and exit naturally.
+    /// A drop of the watcher closes the event channel. The task then
+    /// handles the buffered events and stops normally.
     watcher: Option<RecommendedWatcher>,
 }
 
 impl SyncHandle {
-    /// Gracefully stop the sync task: drop the watcher (stops new events),
-    /// then wait for the task to drain remaining events and finish.
+    /// Stop the sync task cleanly. Drop the watcher (no new events), then
+    /// wait until the task handles the remaining events and stops.
     pub(super) async fn shutdown(mut self) {
         drop(self.watcher.take());
         if let Some(task) = self.task.take() {
@@ -73,26 +72,39 @@ impl SyncHandle {
 
 impl Drop for SyncHandle {
     fn drop(&mut self) {
-        // Fallback for error paths where shutdown() wasn't called.
+        // Fallback for error paths that did not call `shutdown()`.
         if let Some(task) = self.task.take() {
             task.abort();
         }
     }
 }
 
-/// Spawn a background task that watches rw file-mount overlay files and syncs
-/// changes back to their original source paths on the host.
+/// Start a background task that watches the overlay files of writable file
+/// mounts and syncs changes back to their source paths on the host.
 ///
-/// Returns `None` when there are no rw file mounts or the watcher can't be set up.
+/// The task watches `overlay/files/rw/` with the native file-change API of
+/// the OS (FSEvents on macOS, inotify on Linux). File mounts are hardlinks
+/// into this directory. If the guest writes atomically (temp file and
+/// rename), the VirtioFS server replaces the directory entry with a new
+/// inode. That breaks the link to the source file. The task finds such
+/// changes and links the file again (or copies it), so the host source file
+/// stays current.
+/// Args:
+///  - `mounts`: All resolved mounts. Only writable file mounts are synced
+///  - `overlay_dir`: Overlay directory of the sandbox.
+///
+/// Returns:
+///   The task handle, or `None` if there are no writable file mounts or the
+///   watcher setup fails.
 pub(super) fn start(
     mounts: &[super::mount::ResolvedMount],
     overlay_dir: &Path,
 ) -> Option<SyncHandle> {
     let files_rw_dir = overlay_dir.join("files").join("rw");
-    // Open each rw mount's parent dir up front. Mounts whose parent
-    // can't be opened (gone, unreadable, replaced by a non-dir) are
-    // skipped loudly and never sync'd — better than silently writing
-    // to whatever happens to live at that path later.
+    // Open the parent dir of each writable mount now. If a parent cannot be
+    // opened (missing, not readable, not a dir), log a warning and never
+    // sync that mount. That is better than a silent write to whatever is
+    // at that path later.
     let rw_files: Vec<(String, SyncDest)> = mounts
         .iter()
         .filter(|m| matches!(m.mount_type, super::mount::MountType::File { .. }) && !m.read_only)
@@ -142,12 +154,14 @@ pub(super) fn start(
     })
 }
 
+/// Handle watcher events until the watcher is dropped, and sync each
+/// changed file to its destination.
 async fn watch_loop(
     files_rw_dir: PathBuf,
     rw_files: Vec<(String, SyncDest)>,
     mut rx: tokio::sync::mpsc::Receiver<notify::Result<notify::Event>>,
 ) -> anyhow::Result<()> {
-    // (ino, mtime_sec, mtime_nsec) — catches both direct writes (mtime changes)
+    // (ino, mtime_sec, mtime_nsec). Detects direct writes (mtime changes)
     // and atomic renames (new inode).
     type FileState = (u64, i64, i64);
 
@@ -158,13 +172,13 @@ async fn watch_loop(
 
     let file_map: HashMap<String, SyncDest> = rw_files.into_iter().collect();
 
-    // Capture initial state so the first event doesn't trigger a spurious sync.
+    // Record the initial state, so the first event does not cause a false sync.
     let mut states: HashMap<String, FileState> = file_map
         .keys()
         .filter_map(|key| read_state(key).map(|s| (key.clone(), s)))
         .collect();
 
-    // Loop exits naturally when the watcher is dropped (tx closes, recv → None).
+    // The loop stops when the watcher is dropped (tx closes, recv gives None).
     while let Some(res) = rx.recv().await {
         let event = match res {
             Ok(e) => e,
@@ -189,7 +203,7 @@ async fn watch_loop(
                 continue;
             }
             states.insert(filename.to_string(), new_state);
-            // First observation is the boot-time baseline — don't sync yet.
+            // The first state is the boot-time baseline. Do not sync yet.
             let Some(_) = old_state else { continue };
 
             let overlay_path = files_rw_dir.join(filename);
@@ -200,35 +214,32 @@ async fn watch_loop(
     Ok(())
 }
 
-/// Sync `overlay_path` back to `dest` using the cheapest available method.
+/// Sync an overlay file back to its destination with the cheapest
+/// available method.
 ///
-/// Both ends of the sync are anchored:
-///
-/// - The **overlay** is opened **once** with `O_NOFOLLOW` and every
-///   subsequent read targets the resulting FD, so a guest-side symlink
-///   swap of the overlay entry between events can't redirect the read.
-/// - The **destination** is anchored to its parent directory pinned at
-///   sandbox startup (see [`SyncDest`] and [`PinnedDir`]); every write
-///   happens via an `*at()` syscall relative to it, so a host-side
-///   directory swap of any path component leading up to the source
-///   can't redirect the write either.
-///
-/// Steps:
-///
-/// 1. `fstat` the overlay FD; reject non-regular entries (a symlink
-///    would have failed the `O_NOFOLLOW` open with `ELOOP` already).
-/// 2. Same inode at the destination (no-follow) → the hard link is
-///    intact, nothing to do.
-/// 3. Re-establish the hard link atomically ([`PinnedDir::link_from`],
-///    Linux) so future direct writes flow back without needing another
-///    sync event.
-/// 4. Fall back to an FD-based copy ([`PinnedDir::copy_from`]) when
-///    linking is not possible (cross-device, non-Linux).
+/// Both sides of the sync are pinned:
+///  * The **overlay** is opened **one time** with `O_NOFOLLOW`, and all
+///    later reads use that FD. Thus a guest-side symlink swap of the overlay
+///    entry between events cannot redirect the read.
+///  * The **destination** is pinned to its parent directory from sandbox
+///    start (see [`SyncDest`] and [`PinnedDir`]). Each write uses an `*at()`
+///    syscall relative to it. Thus a host-side directory swap on the path to
+///    the source cannot redirect the write.
 fn sync_file(overlay_path: &Path, dest: &SyncDest) {
+    // Steps:
+    //  1. `fstat` the overlay FD. Reject entries that are not regular files
+    //     (a symlink already failed the `O_NOFOLLOW` open with `ELOOP`).
+    //  2. Same inode at the destination (no-follow): the hardlink is
+    //     intact, nothing to do.
+    //  3. Make the hardlink again atomically (`PinnedDir::link_from`,
+    //     Linux), so later direct writes go back without a new sync event.
+    //  4. Use an FD-based copy (`PinnedDir::copy_from`) if a link is not
+    //     possible (cross-device, not Linux).
     let overlay_file = match open_nofollow(overlay_path) {
         Ok(f) => f,
         Err(e) => {
-            // ELOOP here means the guest planted a symlink — skip loudly.
+            // ELOOP here means that the guest put a symlink here. Skip it
+            // with a warning.
             tracing::warn!("file sync open {}: {e}", overlay_path.display());
             return;
         }
@@ -248,8 +259,8 @@ fn sync_file(overlay_path: &Path, dest: &SyncDest) {
         return;
     }
 
-    // Hard-link check against the pinned parent — won't follow a symlink
-    // that was just planted at basename either.
+    // Hardlink check against the pinned parent. It also does not follow a
+    // symlink that something just put at basename.
     if dest.parent.ino(&dest.basename) == Some(overlay_meta.ino()) {
         return;
     }
@@ -273,8 +284,8 @@ fn sync_file(overlay_path: &Path, dest: &SyncDest) {
     }
 }
 
-/// Open `path` with `O_NOFOLLOW` so a symbolic link at `path` aborts the
-/// open with `ELOOP` rather than silently redirecting the read. Subsequent
+/// Open `path` with `O_NOFOLLOW`. If `path` is a symbolic link, the open
+/// fails with `ELOOP` and does not silently redirect the read. Later
 /// operations use the returned FD, never the path.
 fn open_nofollow(path: &Path) -> io::Result<File> {
     std::fs::OpenOptions::new()
@@ -285,11 +296,22 @@ fn open_nofollow(path: &Path) -> io::Result<File> {
 
 #[cfg(test)]
 mod tests {
+    //! Tests for the symlink safety of the file mount sync.
+
     use std::fs;
 
     use super::{SyncDest, sync_file};
     use crate::test_cfg::temp_dir;
 
+    /// Test that a sync writes to the parent directory that was pinned at the
+    /// start, also when the parent path changes to a symlink later. Thus a
+    /// symlink swap cannot redirect the write to another host place.
+    ///   1. Pin the destination of a mounted file in the project
+    ///   2. Rename the parent directory and put a symlink to an outside
+    ///      directory at its old path
+    ///   3. Sync the guest copy of the file
+    ///   4. Check that nothing went to the outside directory and the renamed
+    ///      parent got the new content
     #[test]
     fn sync_after_destination_parent_swapped_for_symlink_writes_to_pinned_parent() {
         let tmp = temp_dir();

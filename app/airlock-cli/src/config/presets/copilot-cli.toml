@@ -4,13 +4,13 @@
 # https://docs.github.com/en/copilot/how-tos/copilot-on-github/customize-copilot/customize-cloud-agent/customize-the-agent-environment
 
 [env]
-# The real token stays on the host: the sandbox sees a same-length random
-# surrogate, and the `inject` rule below swaps the real value into request
-# headers at the host boundary.
+# The real token stays on the host. The sandbox sees a random surrogate
+# of the same length. The `inject` rule below puts the real value into the
+# request headers at the host boundary.
 COPILOT_GITHUB_TOKEN = { value = "${COPILOT_GITHUB_TOKEN}", mask = true }
 
-# Injection covers every host this rule allows (including the telemetry
-# hosts under *.githubcopilot.com) — the token only ever leaves the host in
+# Injection covers each host that this rule allows, also the telemetry
+# hosts under *.githubcopilot.com. The token leaves the host only in
 # requests where Copilot itself put the surrogate.
 [network.rules.copilot-cli]
 inject = ["COPILOT_GITHUB_TOKEN"]

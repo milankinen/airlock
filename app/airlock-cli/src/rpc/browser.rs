@@ -1,26 +1,9 @@
 //! Host-side browser bridge.
 //!
-//! Serves the `Browser` capability: the guest asks the host to open a URL
-//! (a sign-in page) in the user's browser. The VM is untrusted, so
-//! [`Browser`] checks every request before it opens anything:
-//!
-//! - a rate limit on opens;
-//! - URL hygiene: `https` only, no user name, no explicit port, no
-//!   fragment, a length limit, and no whitespace, control or shell
-//!   characters;
-//! - then the [`BrowserGrant`]s decide: a page opens only when a grant
-//!   allows it. The network services are the grants
-//!   ([`crate::services::sign_in::LoopbackSignIn`]); they know their
-//!   sign-in pages and forward the page's callback into the guest.
-//! - the opener gets the URL as its only argument (no shell), detached.
-//!
-//! Messages for the user are queued ([`Browser::take_notices`]) and
-//! printed after the session: printing into a running full-screen tool
-//! would corrupt its screen. Each refusal is also logged (warn) when it
-//! happens. Logs name the host and path only; the query carries OAuth
-//! state.
-//!
-//! This module knows no provider: the grants come from the caller.
+//! Lets the guest ask the host to open a page, for example a sign-in page,
+//! in the user's browser. The VM is untrusted, so the host checks each
+//! request before it opens a page. The caller decides which pages can open,
+//! so this module does not know about specific providers.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -32,46 +15,61 @@ use airlock_common::BROWSER_URL_MAX;
 use airlock_common::supervisor_capnp::browser;
 use url::Url;
 
-/// Notices kept per session; later ones are counted, not stored.
+/// Maximum number of notices kept per session. Later notices are counted,
+/// not stored.
 const MAX_NOTICES: usize = 8;
 
-/// Opens accepted per [`SESSION_OPEN_WINDOW`]: a sign-in opens one page,
-/// a retry another.
+/// Maximum number of open requests per [`SESSION_OPEN_WINDOW`]. The limit
+/// also counts requests that the URL checks or the grants refuse later. A
+/// sign-in opens one page, and a retry opens one more.
 const SESSION_MAX_OPENS: usize = 5;
+/// Time window of the open rate limit.
 const SESSION_OPEN_WINDOW: Duration = Duration::from_mins(1);
 
-/// Characters refused anywhere in a URL handed to the opener, on top of
+/// Characters that a URL for the opener must not contain, in addition to
 /// whitespace and control characters. The opener gets the URL as one
-/// argument without a shell; this is a second line of defense for openers
+/// argument without a shell. This is a second line of defense for openers
 /// that are shell scripts (`xdg-open`).
 const FORBIDDEN: &[char] = &[
     '`', '$', ';', '|', '<', '>', '(', ')', '\\', '"', '\'', '{', '}', '*', '!', '^',
 ];
 
-/// A grant's answer to a URL the guest wants to open.
+/// Answer of a grant to a URL that the guest wants to open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrantAnswer {
-    /// The URL is none of the grant's pages.
+    /// The URL is not a page of this grant.
     NotMine,
     /// Open the URL.
     Allow,
-    /// The URL is the grant's page, but it must not open. The reason is a
-    /// message for the user, shown as it is; it never contains the query.
+    /// The URL is a page of this grant, but it must not open. The reason is
+    /// a message for the user, shown as it is. It never contains the query.
     Refuse(String),
 }
 
-/// Who may open which pages in the host's browser. The browser asks every
-/// grant until one allows the URL.
+/// Permission to open some pages in the host browser. The browser asks
+/// each grant until one allows the URL. The network services are the
+/// grants (see [`crate::services::sign_in::LoopbackSignIn`]). They know
+/// their sign-in pages and forward the callback of the page into the guest.
 pub trait BrowserGrant {
-    /// Answer `url`, which passed the browser's own checks. Allowing may
-    /// prepare the page's use (e.g. forward its callback port).
+    /// Answer a URL that passed the checks of the browser.
+    /// Args:
+    ///  - `url`: Checked URL, see [`checked_url`]
+    ///
+    /// Returns:
+    ///   Answer of the grant. An `Allow` can prepare the use of the page
+    ///   (for example, forward its callback port).
     fn allow(&self, url: &Url) -> GrantAnswer;
 }
 
-/// Check `raw` for any page: `https`, no user name, port or fragment, not
-/// too long, no refused characters. Returns the parsed URL; its string
-/// form is what the opener gets. The error is a message for the user; it
-/// never contains the query.
+/// Check that a URL is safe to open: `https`, no user name, no explicit
+/// port, no fragment, not too long, and no whitespace, control or shell
+/// characters.
+/// Args:
+///  - `raw`: URL from the guest
+///
+/// Returns:
+///   Parsed URL. The opener gets its string form. The error is a message
+///   for the user. It never contains the query.
 pub fn checked_url(raw: &str) -> Result<Url, String> {
     let url = Url::parse(raw).map_err(|_| "not a valid URL".to_string())?;
     if url.scheme() != "https" {
@@ -100,12 +98,13 @@ pub fn checked_url(raw: &str) -> Result<Url, String> {
     Ok(url)
 }
 
-/// Host and path of a URL, for messages and logs.
+/// Host and path of a URL, for messages and logs. Logs never show the
+/// query, because it contains OAuth state.
 fn place_of(url: &Url) -> String {
     format!("{}{}", url.host_str().unwrap_or_default(), url.path())
 }
 
-/// A host program that opens a URL in the default browser.
+/// Find a host program that opens a URL in the default browser.
 fn detect_opener() -> Option<&'static str> {
     if cfg!(target_os = "macos") {
         return crate::util::on_path("open").then_some("open");
@@ -117,7 +116,7 @@ fn detect_opener() -> Option<&'static str> {
 }
 
 /// Start `program url` detached: no stdio, its own process group, and a
-/// thread that reaps it.
+/// thread that reaps it. No shell: the URL is the only argument.
 fn spawn_opener(program: &str, url: &str) -> std::io::Result<()> {
     use std::os::unix::process::CommandExt;
     let mut child = Command::new(program)
@@ -136,28 +135,36 @@ fn spawn_opener(program: &str, url: &str) -> std::io::Result<()> {
 /// Opens a checked URL on the host.
 pub(super) type OpenFn = Box<dyn Fn(&str) -> std::io::Result<()>>;
 
-/// At most `max_opens` open requests per `window`.
+/// Rate limit: a maximum of `max_opens` open requests per `window`.
 pub(super) struct RateLimit {
+    /// Maximum number of open requests in one window.
     pub(super) max_opens: usize,
+    /// Length of the window.
     pub(super) window: Duration,
 }
 
-/// The host's side of the browser bridge for one boot. Cheap to clone;
-/// all clones share the state.
+/// Host side of the browser bridge for one boot. Cheap to clone. All
+/// clones share the state.
+///
+/// Messages for the user wait in a queue ([`Browser::take_notices`]), and
+/// the caller shows them after the session: output into a running
+/// full-screen tool would corrupt its screen. Each refusal is also logged
+/// (warn) when it occurs.
 #[derive(Clone)]
 pub struct Browser(Rc<BrowserInner>);
 
 struct BrowserInner {
     grants: Vec<Rc<dyn BrowserGrant>>,
-    /// `None`: no browser program on this host; the grants still run.
+    /// `None`: no browser program on this host. The grants still run.
     opener: Option<OpenFn>,
     limit: RateLimit,
-    /// When the requests inside the rate window arrived. Runtime state.
+    /// Arrival times of the requests in the rate window. Runtime state.
     recent: RefCell<VecDeque<Instant>>,
     /// Messages for the user after the session. Runtime state.
     notices: RefCell<Notices>,
 }
 
+/// Queue of messages for the user, and the count of dropped messages.
 #[derive(Default)]
 struct Notices {
     items: Vec<String>,
@@ -165,9 +172,14 @@ struct Notices {
 }
 
 impl Browser {
-    /// A browser that opens the pages `grants` allow, with
-    /// [`detect_opener`]. `None` without grants: then the guest gets no
-    /// browser at all.
+    /// Make a browser that opens the pages that the grants allow, with the
+    /// browser program of the host.
+    /// Args:
+    ///  - `grants`: Grants that decide which pages can open
+    ///
+    /// Returns:
+    ///   Browser, or `None` if there are no grants. Then the guest gets no
+    ///   browser.
     pub fn new(grants: Vec<Rc<dyn BrowserGrant>>) -> Option<Self> {
         let opener = detect_opener()
             .map(|program| -> OpenFn { Box::new(move |url: &str| spawn_opener(program, url)) });
@@ -178,7 +190,7 @@ impl Browser {
         (!grants.is_empty()).then(|| Self::with_opener(grants, opener, limit))
     }
 
-    /// A browser with an explicit opener (`None`: no browser program).
+    /// Make a browser with an explicit opener (`None`: no browser program).
     pub(super) fn with_opener(
         grants: Vec<Rc<dyn BrowserGrant>>,
         opener: Option<OpenFn>,
@@ -193,7 +205,8 @@ impl Browser {
         }))
     }
 
-    /// The queued messages for the user, oldest first. Clears the queue.
+    /// Get the queued messages for the user, oldest first. Clears the
+    /// queue.
     pub fn take_notices(&self) -> Vec<String> {
         let Notices { mut items, dropped } = self.0.notices.take();
         if dropped > 0 {
@@ -216,9 +229,17 @@ impl Browser {
     }
 
     /// Handle one open request from the guest: check it, let the grants
-    /// decide, and open it. Synchronous from the rate limit to the grants'
-    /// answers, so concurrent requests cannot race past either.
+    /// decide, and open the page.
+    /// Args:
+    ///  - `raw`: URL from the guest
+    ///
+    /// Returns:
+    ///   Error message if the request is refused or the browser does not
+    ///   start. When the host has no browser program, it queues a notice
+    ///   and returns `Ok`.
     pub fn open(&self, raw: &str) -> Result<(), String> {
+        // No await occurs between the rate limit and the grant answers.
+        // Thus concurrent requests cannot pass either check in parallel.
         let url = self.admit(raw).inspect_err(|msg| {
             self.notice(msg.clone());
         })?;
@@ -243,8 +264,10 @@ impl Browser {
         }
     }
 
-    /// The checks of [`Self::open`]: the rate limit, the URL hygiene, then
-    /// the grants. Returns the URL a grant allowed.
+    /// Do the checks of [`Self::open`]: the rate limit, the URL checks, and
+    /// then the grants.
+    /// Returns:
+    ///   URL that a grant allowed, or a refusal message.
     fn admit(&self, raw: &str) -> Result<Url, String> {
         self.count_open()?;
         let url = checked_url(raw).map_err(|r| format!("refused to open a page: {r}"))?;
@@ -287,12 +310,13 @@ impl Browser {
     }
 }
 
-/// The `Browser` capability handed to the guest.
+/// `Browser` RPC capability that the guest gets.
 pub struct BrowserImpl {
     browser: Browser,
 }
 
 impl BrowserImpl {
+    /// Make the capability for `browser`.
     pub fn new(browser: Browser) -> Self {
         Self { browser }
     }

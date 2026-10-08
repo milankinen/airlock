@@ -1,16 +1,9 @@
-//! Per-port loopback listeners for host-published ports.
+//! Host-published ports in the guest.
 //!
-//! For each port the host requested the guest expose, airlockd owns a
-//! `TcpListener` on `127.0.0.1:<port>`. Connections from guest processes
-//! are accepted and bridged to the host via `NetworkProxy.connect`, with
-//! target set to that same `127.0.0.1:<port>` so the host-side handler
-//! can match it to its forwarding rule.
-//!
-//! Listeners are bound during setup, before any guest process or daemon
-//! starts, so there is no race where a user process binds the port first.
-//!
-//! Outbound traffic to destinations *other* than these loopback ports
-//! flows through the TCP proxy on the TUN (see `net::tcp_proxy`).
+//! Makes each host-published port available to guest processes on
+//! `127.0.0.1:<port>`. The connections go to the host port through the host
+//! network proxy. Traffic to all other destinations goes through the outgoing
+//! TCP proxy.
 
 use airlock_common::network_capnp::network_proxy;
 use bytes::Bytes;
@@ -19,9 +12,17 @@ use tracing::{debug, error, info};
 
 use super::rpc_bridge::{ChannelSink, relay, rpc_connect_tcp};
 
-/// Bind a loopback listener per port and spawn an accept loop for each.
-/// Must run before user processes / daemons start so the supervisor
-/// wins the bind race for every port in the list.
+/// Bind a listener on `127.0.0.1:<port>` for each port and start an accept
+/// loop for each listener.
+///
+/// Must run before user processes and daemons start. Then no user process
+/// can bind one of the ports before the supervisor does.
+/// Args:
+///  - `ports`: Host-published ports
+///  - `network`: Host network proxy client
+///
+/// Returns:
+///   Error if a bind fails.
 pub async fn start(ports: &[u16], network: network_proxy::Client) -> anyhow::Result<()> {
     for &port in ports {
         let listener = TcpListener::bind(("127.0.0.1", port))
@@ -49,8 +50,11 @@ pub async fn start(ports: &[u16], network: network_proxy::Client) -> anyhow::Res
     Ok(())
 }
 
-/// Accept the guest connection, open an RPC connection to the host for
-/// `127.0.0.1:<port>`, and relay bytes both ways.
+/// Relay one accepted guest connection to the host.
+///
+/// Opens an RPC connection to the host with the target `127.0.0.1:<port>`,
+/// then relays bytes in both directions. The target is the same address,
+/// so the host-side handler can match it to its forwarding rule.
 async fn handle(stream: tokio::net::TcpStream, port: u16, network: &network_proxy::Client) {
     debug!("host-port connect 127.0.0.1:{port}");
 

@@ -1,54 +1,9 @@
-//! The `openai` service: Codex's ChatGPT sign-in (`codex login`) and its
-//! use of chatgpt.com.
+//! The `openai` network service.
 //!
-//! On the auth host (`auth.openai.com`) only these routes are served,
-//! matched on the normalized path (see [`oauth::normalize_path`]); every
-//! other route gets a local `403` ([`oauth::route_not_allowed`]):
+//! Supports the ChatGPT sign-in of Codex (`codex login`) and its use of
+//! chatgpt.com.
 //!
-//! - `POST /oauth/token` (parsed strictly, see [`oauth`]):
-//!   - form `authorization_code` (browser and device-code sign-in): the
-//!     `code` must be a surrogate code ([`super::auth_codes`]) issued to
-//!     this service through the channel of the `redirect_uri` (the
-//!     loopback callback port, or the device flow's
-//!     `https://auth.openai.com/deviceauth/callback`); it is swapped for
-//!     the real code and the exchange forwarded. The answer's real
-//!     `id_token`, `access_token` and `refresh_token` are stored as a new
-//!     grant with the exchange's `client_id`. The guest gets fake unpadded
-//!     JWTs with the real tokens' own claims (`exp` included, a random
-//!     nonce, a random signature) and an `airlock-rt-…` refresh
-//!     surrogate; an access token that is no OpenAI JWT gets an
-//!     `airlock-at-…` surrogate. Codex checks no JWT signature.
-//!   - form token exchange (an API key for the ID token): refused locally
-//!     with `unsupported_grant_type`; Codex treats that as non-fatal.
-//!   - JSON `refresh_token`: Codex's own refresh, relayed
-//!     ([`oauth::Grants::relay_refresh`]) as Codex sends it: the grant's
-//!     client id and no `scope`; an unknown refresh surrogate gets `401
-//!     refresh_token_invalidated`. The fake JWTs are re-minted with the
-//!     real tokens' new claims; the access surrogate they replace keeps
-//!     working until its own `exp` (see
-//!     [`super::store::Grant::previous_access`]).
-//!   - other grant types: refused locally (`unsupported_grant_type`).
-//! - `POST /api/accounts/deviceauth/usercode` (device-code sign-in):
-//!   forwarded with that path and no query; its answer passes
-//!   [`oauth::backstop`].
-//! - `POST /api/accounts/deviceauth/token` (device-code sign-in): the
-//!   `authorization_code` of the answer becomes a surrogate code.
-//! - `POST /oauth/revoke`: a refresh or access surrogate deletes its grant
-//!   and revokes both real tokens upstream (refresh, then access); the
-//!   guest gets `200 {}`. `codex login` revokes before every sign-in, so
-//!   a new sign-in signs the earlier grant out (as it does on a host).
-//!
-//! On chatgpt.com, every path (HTTP and the WebSocket upgrade), with
-//! strict credentials and the credential swap of
-//! [`oauth::Grants::swap_headers`] (`Authorization: Bearer` only); a 401
-//! from upstream passes through unchanged (Codex refreshes itself).
-//! Answers stream through [`super::scan::scan_answer`], which ends an
-//! answer with a real access or ID token (a JWT with an OpenAI claim, not
-//! a fake JWT) or a real token of the store (opaque ones, refresh tokens
-//! of any format). Any host the service does not know passes
-//! [`oauth::backstop`].
-//!
-//! Protocol facts: Codex 0.158.0.
+//! The protocol details agree with Codex 0.158.0.
 
 use std::sync::Arc;
 
@@ -71,10 +26,10 @@ const TOKEN_PATH: &str = "/oauth/token";
 const REVOKE_PATH: &str = "/oauth/revoke";
 const DEVICE_USERCODE_PATH: &str = "/api/accounts/deviceauth/usercode";
 const DEVICE_TOKEN_PATH: &str = "/api/accounts/deviceauth/token";
-/// The identifiers of the device-code sign-in that Codex polls with
-/// (`deviceauth/usercode` answers them). They may look like tokens (a JWT
-/// of OpenAI's issuer), but they are worth nothing without the user's
-/// approval, and the code that the poll then gets is swapped.
+/// Identifiers of the device-code sign-in that Codex uses to poll
+/// (`deviceauth/usercode` answers with them). They can look like tokens (a
+/// JWT of OpenAI's issuer). But they have no value without the user's
+/// approval, and the proxy replaces the code that the poll then gets.
 const DEVICE_IDS: &[&str] = &["device_auth_id", "user_code"];
 /// The `redirect_uri` of the device-code sign-in's exchange.
 const DEVICE_REDIRECT: &str = "https://auth.openai.com/deviceauth/callback";
@@ -83,20 +38,24 @@ const REFRESH_PREFIX: &str = "airlock-rt-";
 const ACCESS_PREFIX: &str = "airlock-at-";
 const ID_PREFIX: &str = "airlock-id-";
 
-/// The claim of OpenAI's real access and ID tokens with the ChatGPT
-/// account, and their issuer.
+/// The claim of OpenAI's real access and ID tokens that holds the ChatGPT
+/// account, and the issuer of these tokens.
 const AUTH_CLAIM: &str = "https://api.openai.com/auth";
 const ISSUER: &str = "https://auth.openai.com";
 
-/// The pages a sign-in callback may send the browser to: the authorize
+/// Pages that a sign-in callback can send the browser to: the authorize
 /// host and ChatGPT. Codex's own success page is on the loopback origin.
 const PAGES: &[&str] = &["auth.openai.com", "chatgpt.com"];
 
-/// OpenAI's token formats: access and ID tokens that are JWTs with an
-/// OpenAI claim get fake JWT surrogates; any other value of a token
-/// answer's `access_token`, `refresh_token` or `id_token` gets an opaque
-/// surrogate (the key decides, as the agent reads it: the refresh token's
-/// format is not known).
+/// OpenAI's token formats.
+///
+/// Access and ID tokens that are JWTs with an OpenAI claim get fake JWT
+/// surrogates. The fake JWTs have the claims of the real tokens (also
+/// `exp`), a random nonce and a random signature. Codex checks no JWT
+/// signature. Any other value of the `access_token`, `refresh_token` or
+/// `id_token` of a token answer gets an opaque surrogate (`airlock-at-…`,
+/// `airlock-rt-…`, `airlock-id-…`). The key decides, as the agent reads
+/// it, because the format of the refresh token is not known.
 pub static FORMATS: Formats = Formats(&[
     Format {
         kind: TokenKind::Id,
@@ -146,12 +105,13 @@ pub static FORMATS: Formats = Formats(&[
     },
 ]);
 
+/// Whether `v` is a fake JWT of airlock.
 fn is_fake_jwt(v: &str) -> bool {
     v.starts_with(FAKE_JWT_PREFIX)
 }
 
-/// A JWT with OpenAI's auth claim or issuer that is no fake JWT of
-/// airlock.
+/// Whether `v` is a JWT with OpenAI's auth claim or issuer, and not a fake
+/// JWT of airlock.
 fn is_openai_jwt(v: &str) -> bool {
     !is_fake_jwt(v)
         && tokens::jwt_claims(v).is_some_and(|claims| {
@@ -160,19 +120,21 @@ fn is_openai_jwt(v: &str) -> bool {
         })
 }
 
+/// Make a fake JWT surrogate for the real JWT `real`.
 fn mint_fake_jwt(real: &str) -> anyhow::Result<String> {
     tokens::fake_jwt(real)?.ok_or_else(|| anyhow::anyhow!("the token is no JWT"))
 }
 
-/// Where the service's hosts are.
+/// The hosts of the service.
 pub struct Endpoints {
     /// Sign-in, token endpoint and revoke (`auth.openai.com`).
     pub auth: Endpoint,
-    /// The ChatGPT backend Codex talks to (`chatgpt.com`).
+    /// The ChatGPT backend that Codex uses (`chatgpt.com`).
     pub chatgpt: Endpoint,
 }
 
 impl Endpoints {
+    /// The production hosts.
     pub fn production() -> Self {
         Self {
             auth: Endpoint::new("auth.openai.com", 443),
@@ -180,13 +142,14 @@ impl Endpoints {
         }
     }
 
+    /// The network targets of the hosts.
     pub fn targets(&self) -> Vec<NetworkTarget> {
         crate::network::target::targets_of(&[&self.auth, &self.chatgpt])
     }
 }
 
-/// The sign-in page. Codex listens on 127.0.0.1:1455, or 1457 when that
-/// port is taken.
+/// Get the sign-in page. Codex listens on 127.0.0.1:1455, or on 1457 if
+/// port 1455 is in use.
 pub fn sign_in_pages() -> Vec<SignInPage> {
     vec![SignInPage {
         host: "auth.openai.com",
@@ -219,13 +182,13 @@ impl Provider for OpenaiOauth {
         REVOKE_PATH
     }
 
-    /// Codex needs all three.
+    /// All three tokens, because Codex needs them.
     fn exchange_requires(&self) -> &'static [TokenKind] {
         &[TokenKind::Access, TokenKind::Refresh, TokenKind::Id]
     }
 
-    /// From the ID token's claims: the ChatGPT account (else the subject)
-    /// and the email address.
+    /// Get the ChatGPT account (else the subject) and the email address
+    /// from the claims of the ID token.
     fn account(&self, answer: &Map<String, Value>) -> Account {
         let claims = answer
             .get("id_token")
@@ -238,6 +201,8 @@ impl Provider for OpenaiOauth {
         }
     }
 
+    /// Makes the refresh as Codex sends it: the grant's client id and no
+    /// `scope`.
     fn refresh_body(&self, grant: &Grant, refresh_token: &str) -> Value {
         json!({
             "client_id": grant.client_id,
@@ -246,18 +211,62 @@ impl Provider for OpenaiOauth {
         })
     }
 
-    /// Codex falls back to revoking the access token: the endpoint takes
-    /// both.
+    /// The endpoint accepts both token kinds. Codex revokes the access
+    /// token as a fallback.
     fn revokes_access_tokens(&self) -> bool {
         true
     }
 
-    /// Codex's fallback revoke of the access token names no client.
+    /// Codex's fallback revoke of the access token does not name the
+    /// client.
     fn revoke_names_client(&self, hint: &str) -> bool {
         hint != "access_token"
     }
 }
 
+/// The interceptor of the `openai` service.
+///
+/// On the auth host (`auth.openai.com`), only these routes are served.
+/// They match on the normalized path ([`oauth::normalize_path`]). Every
+/// other route gets a local `403` ([`oauth::route_not_allowed`]).
+///  * `POST /oauth/token` (parsed strictly, see [`TokenRequest`]):
+///    - Form `authorization_code` (browser and device-code sign-in): the
+///      `code` must be a surrogate code ([`super::auth_codes`]) issued to
+///      this service through the channel of the `redirect_uri`. The
+///      channel is the loopback callback port, or the device flow's
+///      `https://auth.openai.com/deviceauth/callback`. The proxy puts the
+///      real code in its place and forwards the exchange. The real
+///      `id_token`, `access_token` and `refresh_token` of the answer are
+///      stored as a new grant with the exchange's `client_id`. The guest
+///      gets surrogates (see [`FORMATS`]).
+///    - Form token exchange (an API key for the ID token): refused locally
+///      with `unsupported_grant_type`. Codex accepts this as not fatal.
+///    - JSON `refresh_token`: Codex's own refresh, relayed
+///      ([`Grants::relay_refresh`]). An unknown refresh surrogate gets
+///      `401 refresh_token_invalidated`. The fake JWTs are made again with
+///      the new claims of the real tokens. The access surrogate that they
+///      replace stays valid until its own `exp` (see
+///      [`super::store::Grant::previous_access`]).
+///    - Other grant types: refused locally (`unsupported_grant_type`).
+///  * `POST /api/accounts/deviceauth/usercode` (device-code sign-in):
+///    forwarded with that path and no query. Its answer goes through
+///    [`oauth::backstop`].
+///  * `POST /api/accounts/deviceauth/token` (device-code sign-in): the
+///    `authorization_code` of the answer becomes a surrogate code.
+///  * `POST /oauth/revoke`: a refresh or access surrogate deletes its
+///    grant and revokes both real tokens upstream (refresh, then access).
+///    The guest gets `200 {}`. `codex login` revokes before every sign-in,
+///    so a new sign-in signs out the earlier grant (as on a host).
+///
+/// On chatgpt.com, every path is served (HTTP and the WebSocket upgrade),
+/// with the credential swap of [`Grants::swap_headers`]. A 401 from
+/// upstream passes through unchanged (Codex refreshes itself). Answers
+/// stream through [`super::scan::scan_answer`]. The scan ends an answer
+/// with a real access or ID token (a JWT with an OpenAI claim, not a fake
+/// JWT) or with a real token of the store (also opaque tokens, and refresh
+/// tokens of any format).
+///
+/// Any other host passes [`oauth::backstop`].
 pub struct Openai {
     endpoints: Endpoints,
     grants: Grants,
@@ -266,6 +275,12 @@ pub struct Openai {
 }
 
 impl Openai {
+    /// Make the interceptor.
+    /// Args:
+    ///  - `endpoints`: The hosts of the service
+    ///  - `store`: The shared token store
+    ///  - `tls`: TLS config for the proxy's own calls to the auth host
+    ///  - `codes`: Surrogate codes, shared with the service's sign-ins.
     pub fn new(
         endpoints: Endpoints,
         store: Arc<TokenStore>,
@@ -315,8 +330,8 @@ impl Openai {
                 .forward_api(to, req, injected, next, sign_in_again)
                 .await;
         }
-        // Fail closed: the auth host serves its routes only; a host the
-        // service does not know passes the backstop.
+        // Fail closed: the auth host serves only its routes. A host that
+        // the service does not know goes through the backstop.
         if *to == self.endpoints.auth {
             return Ok(oauth::route_not_allowed(ServiceId::Openai, to, &req));
         }
@@ -350,7 +365,8 @@ impl Openai {
                 self.grants.exchange(parts, token, next).await
             }
             Some("refresh_token") => self.grants.relay_refresh(token, invalidated).await,
-            // Also the API-key exchange (token exchange): never forwarded.
+            // This includes the API-key exchange (token exchange). It is
+            // never forwarded.
             other => Ok(oauth::token_error(
                 StatusCode::BAD_REQUEST,
                 "unsupported_grant_type",
@@ -359,8 +375,8 @@ impl Openai {
         }
     }
 
-    /// The device-code poll: its `authorization_code` reaches the guest as
-    /// a surrogate code.
+    /// Handle the device-code poll. Its `authorization_code` goes to the
+    /// guest as a surrogate code.
     async fn device_token(
         &self,
         req: Request<ResponseBody>,
@@ -382,8 +398,9 @@ impl Openai {
         };
         let surrogate = self.codes.issue(code, ServiceId::Openai, Channel::Device)?;
         answer.insert("authorization_code".into(), surrogate.into());
-        // The PKCE verifier rides with the surrogate code: without the real
-        // code it is worth nothing. Nothing else may carry a secret.
+        // The PKCE verifier goes with the surrogate code. Without the real
+        // code, it has no value. A token in any other field refuses the
+        // answer.
         let mut rest = answer.clone();
         rest.remove("code_verifier");
         if oauth::carries_token(&Value::Object(rest), &FORMATS) {
@@ -418,7 +435,7 @@ impl Interceptor for Openai {
     }
 }
 
-/// The ChatGPT account of ID-token claims (else the subject).
+/// Get the ChatGPT account from ID-token claims (else the subject).
 fn account_id(claims: &Value) -> Option<String> {
     claims
         .get(AUTH_CLAIM)
@@ -429,7 +446,7 @@ fn account_id(claims: &Value) -> Option<String> {
         .map(String::from)
 }
 
-/// The email address of ID-token claims.
+/// Get the email address from ID-token claims.
 fn email(claims: &Value) -> Option<String> {
     claims
         .get("email")
@@ -442,8 +459,8 @@ fn email(claims: &Value) -> Option<String> {
         .map(String::from)
 }
 
-/// The answer to a refresh whose surrogate airlock does not know (signed
-/// out, never issued, or no refresh token).
+/// Make the answer for a refresh with a surrogate that airlock does not
+/// know (signed out, never issued, or no refresh token).
 fn invalidated() -> Response<ResponseBody> {
     oauth::token_error(
         StatusCode::UNAUTHORIZED,
@@ -452,7 +469,7 @@ fn invalidated() -> Response<ResponseBody> {
     )
 }
 
-/// The answer to an API request whose sign-in is unknown.
+/// Make the answer for an API request with an unknown sign-in.
 fn sign_in_again() -> Response<ResponseBody> {
     tracing::warn!(
         "refused: openai: an API request with a surrogate of no stored sign-in (answered 401)"
@@ -470,11 +487,15 @@ fn sign_in_again() -> Response<ResponseBody> {
 
 #[cfg(test)]
 mod tests {
+    //! OpenAI token formats: real JWTs, surrogates and token kinds of the
+    //! token answer.
+
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
     use super::*;
 
+    /// A JWT-like string with `claims` and a fake signature.
     fn jwt(claims: &Value) -> String {
         format!(
             "eyJhbGciOiJSUzI1NiJ9.{}.sig",
@@ -482,6 +503,12 @@ mod tests {
         )
     }
 
+    /// Test that only an OpenAI JWT counts as a real token. Fake JWT
+    /// surrogates and other strings must not count as real.
+    ///   1. Check that an access token with the auth claim and an ID token
+    ///      from the OpenAI issuer are real
+    ///   2. Check that a fake JWT, a JWT with other claims, surrogates, refresh
+    ///      token shapes and tokens of other providers are not real
     #[test]
     fn openai_jwt_is_real_and_surrogates_or_other_strings_are_not() {
         let access = jwt(&json!({ "exp": 1, AUTH_CLAIM: { "chatgpt_plan_type": "plus" } }));
@@ -504,6 +531,11 @@ mod tests {
         }
     }
 
+    /// Test that a string of a token answer gets its token kind from its key
+    /// and value, and that only OpenAI JWTs carry claims.
+    ///   1. Recognize JWT and opaque values under the token keys
+    ///   2. Check the token kind and the claims flag of each
+    ///   3. Check that an unknown key and an empty refresh token give nothing
     #[test]
     fn token_answer_string_gets_format_by_key_and_value() {
         let access = jwt(&json!({ "exp": 1, AUTH_CLAIM: {} }));

@@ -1,32 +1,40 @@
-//! In-memory store for the latest host-reported deny timestamp.
+//! Latest network deny time.
 //!
-//! The host tells the guest via `Supervisor.report_deny` every time a
-//! network request is blocked. The admin routes consult this to decide
-//! whether a failed tool call was likely caused by a policy deny.
+//! Remembers when the host last reported a network deny. The admin service
+//! uses this time to decide if a policy deny was the likely cause of a failed
+//! tool call.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// `Arc + AtomicU64` so axum's state (which requires `Send + Sync`) and
-/// the RPC handler share the same cell without locks. `0` is the sentinel
-/// for "no deny yet" — saves branching on `Option` and Unix epoch 0 isn't
-/// a realistic value.
+/// Time of the latest network deny that the host reported with
+/// `Supervisor.reportDeny`.
+///
+/// Uses `Arc` and `AtomicU64`, so the axum state (which must be
+/// `Send + Sync`) and the RPC handler share the same value without locks.
 #[derive(Default)]
 pub struct DenyTracker {
+    /// Unix time in milliseconds. `0` means "no deny yet". This removes the
+    /// need for an `Option`, and Unix time 0 is not a realistic value.
     last_epoch: AtomicU64,
 }
 
 impl DenyTracker {
+    /// Create a tracker with no deny recorded.
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
 
-    /// Record a deny notification from the host. Always overwrite with the
-    /// latest — out-of-order reports would only happen on clock skew.
+    /// Record a deny report from the host. `epoch` is Unix time in
+    /// milliseconds.
     pub fn record(&self, epoch: u64) {
+        // Always replace the value with the latest report. Reports come out
+        // of order only on clock skew.
         self.last_epoch.store(epoch, Ordering::Relaxed);
     }
 
+    /// Get the time of the latest deny (Unix time in milliseconds), or
+    /// `None` if the host reported no deny.
     pub fn last(&self) -> Option<u64> {
         match self.last_epoch.load(Ordering::Relaxed) {
             0 => None,

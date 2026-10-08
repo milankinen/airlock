@@ -1,7 +1,7 @@
 # Python through uv: the official uv installer puts uv and uvx in
-# /usr/local/bin; `uv python install` puts a python-build-standalone
+# /usr/local/bin. `uv python install` puts a python-build-standalone
 # CPython in /usr/local/lib/uv/python and links python3.<minor>,
-# python3 and python into /usr/local/bin (on every user's PATH).
+# python3 and python into /usr/local/bin (on the PATH of each user).
 #
 # Sources:
 # - https://docs.astral.sh/uv/getting-started/installation/ (the
@@ -9,16 +9,16 @@
 # - https://docs.astral.sh/uv/reference/installer/ (UV_UNMANAGED_INSTALL:
 #   install dir, no shell profile changes, no `uv self update`)
 # - https://docs.astral.sh/uv/concepts/python-versions/ (request
-#   formats such as `3`, `3.12`, `3.13t`, `pypy@3.11`; uv does not
-#   replace executables that it does not manage)
+#   formats such as `3`, `3.12`, `3.13t`, `pypy@3.11`. uv does not
+#   replace executables that it does not manage.)
 # - https://docs.astral.sh/uv/reference/cli/#uv-python-install
-#   (`--default`: also python3 and python; `--compile-bytecode`)
+#   (`--default` for python3 and python, and `--compile-bytecode`)
 # - https://docs.astral.sh/uv/reference/environment/ (UV_PYTHON_INSTALL_DIR,
 #   UV_PYTHON_BIN_DIR, UV_CACHE_DIR, UV_PYTHON_DOWNLOADS)
-# - https://docs.astral.sh/uv/concepts/preview/ (python-install-default;
-#   an unknown preview feature name only warns)
+# - https://docs.astral.sh/uv/concepts/preview/ (python-install-default.
+#   An unknown preview feature name only gives a warning.)
 # - https://docs.astral.sh/uv/concepts/authentication/certificates/
-#   (uv trusts only SSL_CERT_FILE when it is set; lib.sh exports it)
+#   (uv trusts only SSL_CERT_FILE when it is set. lib.sh exports it.)
 # - https://gregoryszorc.com/docs/python-build-standalone/main/running.html
 #   (dynamically linked musl builds for Alpine)
 #
@@ -37,12 +37,12 @@ case "$_version" in
     -* | *[!0-9A-Za-z.@+_-]*) fail 13 "invalid python-version: $_version" ;;
 esac
 
-# The config env also reaches this script. These variables would move
-# uv out of /usr/local/bin or stop `uv python install`: ignore them here.
+# The config env also reaches this script. These variables can move uv
+# out of /usr/local/bin or stop `uv python install`. Thus ignore them.
 unset UV_INSTALL_DIR CARGO_DIST_FORCE_INSTALL_DIR UV_PYTHON_DOWNLOADS \
     UV_OFFLINE UV_NO_MANAGED_PYTHON UV_PYTHON_PREFERENCE
 
-# Shared, root-owned Python installs; links on the default PATH; no
+# Shared, root-owned Python installs, links on the default PATH and no
 # cache left in /root.
 UV_PYTHON_INSTALL_DIR=$_py_dir
 UV_PYTHON_BIN_DIR=$_bin_dir
@@ -80,7 +80,7 @@ case "$_version" in
         airlock_status "installing python $_version"
         # --default: python3 and python too (python3t and pythont for a
         # free-threaded build, pypy3 and pypy for PyPy). --compile-bytecode:
-        # the directory is root-owned, so other users cannot write .pyc
+        # the directory is root-owned, thus other users cannot write .pyc
         # files. `--`: a request that starts with `-` is not an option.
         run_vendor "uv python install $_request" "$_uv" python install \
             --no-progress --compile-bytecode \
@@ -91,9 +91,10 @@ case "$_version" in
         "$_python" --version </dev/null 3>&- || fail 12 "$_python --version failed"
 
         # uv exits 0 when it does not replace an executable that it does
-        # not manage (it only warns): check the links. From python3.14:
-        # python3.14, python3, python (python3.13t: python3.13t, python3t,
-        # pythont; pypy3.11: pypy3.11, pypy3, pypy).
+        # not manage (it only gives a warning). Thus check the links. From
+        # python3.14: python3.14, python3, python. From python3.13t:
+        # python3.13t, python3t, pythont. From pypy3.11: pypy3.11, pypy3,
+        # pypy.
         _name=${_python##*/}
         _major=$(printf '%s\n' "$_name" | sed 's/^\([a-z]*[0-9]*\)\.[0-9]*/\1/' 3>&-)
         _plain=$(printf '%s\n' "$_major" | sed 's/^\([a-z]*\)[0-9]*/\1/' 3>&-)
@@ -110,8 +111,8 @@ case "$_version" in
         ;;
 esac
 
-# Login shells reset PATH in /etc/profile: add ~/.local/bin, where
-# `uv tool install` and a user's own `uv python install` put commands.
+# Login shells reset PATH in /etc/profile. Add ~/.local/bin, where
+# `uv tool install` and a `uv python install` of the user put commands.
 mkdir -p /etc/profile.d
 cat >/etc/profile.d/airlock-python.sh <<'PROFILE'
 # Managed by airlock: commands from `uv tool install`.

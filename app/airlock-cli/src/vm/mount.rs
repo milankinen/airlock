@@ -1,36 +1,45 @@
-//! Mount resolution: expand paths, classify dir vs file mounts.
+//! Mount resolution.
+//!
+//! Converts the configured mounts to absolute host and guest paths. A mount
+//! shares a directory or a single file from the host with the sandbox.
 
 use std::path::{Path, PathBuf};
 
-/// A mount with host/guest paths fully expanded and validated.
+/// A mount with expanded and validated host and guest paths.
 #[derive(Debug)]
 pub struct ResolvedMount {
-    /// Mount type: file / directory
+    /// Mount type: file or directory.
     pub mount_type: MountType,
-    /// Expanded absolute source path on host.
+    /// Expanded absolute source path on the host.
     pub source: PathBuf,
-    /// Expanded absolute target path in container.
+    /// Expanded absolute target path in the container.
     pub target: String,
+    /// If `true`, the guest cannot write to the mount.
     pub read_only: bool,
 }
 
-/// Whether a mount is a directory (VirtioFS share) or a single file.
+/// Type of a mount: a directory (VirtioFS share) or a single file.
 #[derive(Debug)]
 pub enum MountType {
+    /// A directory mount, shared to the guest as its own VirtioFS share.
     Dir {
+        /// VirtioFS share tag: `project` for the project mount, and
+        /// `dir_0`, `dir_1`, ... for user mounts.
         key: String,
     },
-    /// File mounts are hard-linked (with copy fallback) into the project
-    /// overlay directory under `files/{rw|ro}/{mount_key}`, and exposed via
-    /// `files/rw` / `files/ro` VirtioFS shares. Inside the container, the
-    /// target path becomes a symlink → `/airlock/.files/{rw|ro}/{mount_key}`.
+    /// A file mount. The file is hardlinked (or copied) into the sandbox
+    /// overlay directory under `files/{rw|ro}/{mount_key}`. The `files/rw`
+    /// and `files/ro` VirtioFS shares give these files to the guest. In the
+    /// container, the target path is a symlink to
+    /// `/airlock/.files/{rw|ro}/{mount_key}`.
     File {
+        /// Config key of the mount.
         mount_key: String,
     },
 }
 
 impl ResolvedMount {
-    /// VirtioFS share tag (for Dir mounts) or config key (for File mounts).
+    /// VirtioFS share tag (for dir mounts) or config key (for file mounts).
     pub fn key(&self) -> &str {
         match &self.mount_type {
             MountType::Dir { key } => key.as_str(),
@@ -38,7 +47,7 @@ impl ResolvedMount {
         }
     }
 
-    /// Debug path: where this mount is accessible in the VM environment.
+    /// Path of this mount in the VM, for debug output.
     pub fn vm_path(&self) -> String {
         match &self.mount_type {
             MountType::Dir { key } => format!("/mnt/{key}"),
@@ -50,8 +59,22 @@ impl ResolvedMount {
     }
 }
 
-/// Expand `~` in mount paths, handle missing sources, and classify as
-/// dir or file mounts.
+/// Resolve the configured mounts to absolute paths and mount types.
+///
+/// Expands `~`, makes relative paths absolute, and applies the `missing`
+/// action of each mount if its source does not exist. Can create missing
+/// source directories and files.
+/// Args:
+///  - `mounts`: Enabled mounts as `(config key, mount)` pairs, sorted by key
+///  - `host_home`: Host home for `~` expansion of source paths
+///  - `container_home`: Guest home for `~` expansion of target paths
+///  - `cwd`: Host base directory for relative source paths
+///  - `guest_cwd`: Guest base directory for relative target paths.
+///
+/// Returns:
+///   The resolved mounts, without skipped ones. Error if a source is missing
+///   and its action is `MissingAction::Fail`, if a create mode is not valid,
+///   or if the creation of a source fails.
 pub fn resolve_mounts(
     mounts: &[(&str, crate::config::config_values::Mount)],
     host_home: &Path,
@@ -69,14 +92,14 @@ pub fn resolve_mounts(
     let mut dir_idx: usize = 0;
     for (name, m) in mounts {
         let source = crate::util::expand_tilde(&m.source, host_home);
-        // Resolve relative paths against cwd
+        // Resolve relative paths against cwd.
         let source = if source.is_relative() {
             cwd.join(&source)
         } else {
             source
         };
 
-        // Handle missing source
+        // Handle a missing source.
         if !source.exists() {
             match m.missing {
                 MissingAction::Fail => {
@@ -110,15 +133,16 @@ pub fn resolve_mounts(
 
         let source = std::fs::canonicalize(&source).unwrap_or(source);
         let target = crate::util::expand_tilde(&m.target, &container_home);
-        // Resolve relative target paths against guest_cwd (mirrors source → cwd behavior)
+        // Resolve relative target paths against guest_cwd (the same as
+        // source paths against cwd).
         let target = if target.is_relative() {
             guest_cwd.join(&target)
         } else {
             target
         };
 
-        // Dir mounts get indexed tags (dir_0, dir_1, …) sorted by config key.
-        // File mounts use the config key as their identifier.
+        // Dir mounts get numbered tags (dir_0, dir_1, ...) in config key
+        // order. File mounts use the config key as their identifier.
         let mount_type = if source.is_dir() {
             let key = format!("dir_{dir_idx}");
             dir_idx += 1;
@@ -140,7 +164,8 @@ pub fn resolve_mounts(
     Ok(result)
 }
 
-/// Parse an octal mode string (e.g. "755") into a `u32`, or return the default.
+/// Parse an octal mode string (e.g. "755") into a `u32`. Return `default`
+/// if there is no string.
 fn parse_mode(s: Option<&str>, default: u32) -> anyhow::Result<u32> {
     match s {
         Some(s) => {

@@ -1,17 +1,9 @@
-//! Sidecar daemons — long-running processes declared under `[daemons.<name>]`
-//! that start during the boot, before any process is spawned.
+//! Sidecar daemons.
 //!
-//! Each daemon runs inside its own local task that owns the restart loop,
-//! graceful shutdown, and stdout/stderr file handles. The shared
-//! `states` map lets the supervisor RPC surface a snapshot (`pollDaemons`)
-//! without touching the per-daemon tasks directly. A `oneshot::Sender` per
-//! daemon is the shutdown signal; dropping it is equivalent to sending it
-//! (the task sees the channel close).
-//!
-//! Log paths are pre-chroot (`/mnt/overlay/rootfs/airlock/daemons/<name>/…`)
-//! because the supervisor is not itself chrooted. The inherited stdio FDs
-//! survive the child's chroot — they reference the open file description,
-//! not the path.
+//! Daemons are long-running processes from the `[daemons.<name>]` config.
+//! They start during boot, before the host starts any other process. This
+//! module starts, monitors and stops the daemons, and reports their state to
+//! the host.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -28,24 +20,41 @@ use tracing::{error, info, warn};
 
 use crate::process::spawn_daemon;
 
+/// Root directory of the daemon log files (`<name>/stdout.log`,
+/// `<name>/stderr.log`).
+///
+/// The path is in the VM mount namespace, because the supervisor stays
+/// there. The inherited stdio FDs stay valid after the child enters the
+/// sandbox, because they refer to the open file description, not to the
+/// path.
 const LOG_ROOT: &str = "/mnt/overlay/rootfs/airlock/daemons";
 
-/// Full daemon spec the guest receives via capnp. Mirrors `DaemonSpec` in
-/// the schema, translated into owned Rust types by `from_capnp`.
+/// Daemon spec from the host. Owned Rust version of `DaemonSpec` in the
+/// capnp schema.
 pub struct DaemonSpec {
+    /// Daemon name from `[daemons.<name>]`.
     pub name: String,
+    /// Program and its arguments. The first item is the program.
     pub command: Vec<String>,
+    /// Environment variables as `KEY=VALUE` strings.
     pub env: Vec<String>,
+    /// Working directory inside the container.
     pub cwd: String,
+    /// Signal that asks the daemon to stop.
     pub signal: i32,
+    /// Time to wait after `signal` before SIGKILL. 0 means wait forever.
     pub timeout_ms: u32,
+    /// When to restart the daemon after it exits.
     pub restart: RestartPolicy,
+    /// Maximum number of restarts. 0 means no limit.
     pub max_restarts: u32,
+    /// Apply `PR_SET_NO_NEW_PRIVS` and private mount, IPC and UTS namespaces
+    /// (see [`crate::process::spawn_user`]).
     pub harden: bool,
 }
 
 impl DaemonSpec {
-    /// Translate a wire-format `daemon_spec` reader into an owned spec.
+    /// Convert a wire-format `daemon_spec` reader into an owned spec.
     pub fn from_capnp(d: daemon_spec::Reader) -> Result<Self, capnp::Error> {
         let command = d
             .get_command()?
@@ -75,15 +84,18 @@ impl DaemonSpec {
     }
 }
 
-/// Parse the full `daemons` list from a start-request params reader.
+/// Parse the full `daemons` list from the request params.
 pub fn parse_specs(
     readers: capnp::struct_list::Reader<daemon_spec::Owned>,
 ) -> Result<Vec<DaemonSpec>, capnp::Error> {
     readers.iter().map(DaemonSpec::from_capnp).collect()
 }
 
-/// Serialize a snapshot into a pre-initialized `pollDaemons` response list.
-/// The caller is responsible for sizing the list via `init_states(len)`.
+/// Write a daemon state snapshot into a `pollDaemons` response list.
+/// Args:
+///  - `snapshot`: Daemon names and states, from [`DaemonSet::snapshot`]
+///  - `list`: Response list. The caller must make it the same size as
+///    `snapshot` with `init_states(len)`.
 pub fn write_status_list(
     snapshot: &[(String, DaemonState)],
     mut list: capnp::struct_list::Builder<daemon_status::Owned>,
@@ -99,31 +111,46 @@ pub fn write_status_list(
     }
 }
 
+/// When to restart a daemon after it exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartPolicy {
+    /// Restart after every exit.
     Always,
+    /// Restart only after a non-zero exit code.
     OnFailure,
 }
 
+/// Current state of a daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonState {
+    /// The daemon runs, or waits for a restart.
     Running,
+    /// The daemon exited and does not restart.
     Stopped,
+    /// The daemon did not stop in time after the stop signal and received
+    /// SIGKILL.
     Killed,
 }
 
-/// Collection of running daemons. Lifetime matches the sandbox run: created
-/// once on `Supervisor.boot()`, dropped when the VM shuts down.
+/// Collection of running daemons. Exists for the full sandbox run: created
+/// once on `Supervisor.boot()`, dropped when the VM stops.
 pub struct DaemonSet {
+    /// Shared state map. RPC calls read a snapshot (`pollDaemons`) from it
+    /// without access to the per-daemon tasks.
     states: Rc<RefCell<BTreeMap<String, DaemonState>>>,
+    /// Stop signal for each daemon. A dropped sender has the same effect
+    /// as a sent value: the task sees the channel close.
     stops: RefCell<BTreeMap<String, oneshot::Sender<()>>>,
 }
 
 impl DaemonSet {
-    /// Spawn one local task per daemon and return the set. Construction
-    /// never blocks on the daemons themselves — each task enters its own
-    /// restart loop, so first-start failure becomes a restart attempt
-    /// rather than a top-level error.
+    /// Start all daemons. Each daemon gets its own local task.
+    ///
+    /// Does not wait for the daemons. If a daemon fails to start, its task
+    /// tries a restart. The failure does not become an error here.
+    /// Args:
+    ///  - `specs`: Daemons to start
+    ///  - `uid`, `gid`: Container user and group that run the daemons
     pub fn start_all(specs: Vec<DaemonSpec>, uid: u32, gid: u32) -> Self {
         let states: Rc<RefCell<BTreeMap<String, DaemonState>>> =
             Rc::new(RefCell::new(BTreeMap::new()));
@@ -147,8 +174,8 @@ impl DaemonSet {
         }
     }
 
-    /// Snapshot every declared daemon's current state. Called from the
-    /// `pollDaemons` RPC; order is stable because `BTreeMap` is sorted.
+    /// Get the current state of every daemon, sorted by name. Used by the
+    /// `pollDaemons` RPC.
     pub fn snapshot(&self) -> Vec<(String, DaemonState)> {
         self.states
             .borrow()
@@ -157,9 +184,8 @@ impl DaemonSet {
             .collect()
     }
 
-    /// Ask every still-running daemon to shut down. Drops every stop
-    /// channel, which the per-daemon tasks observe as a signal to start
-    /// `graceful_stop`. Idempotent — a second call sends nothing.
+    /// Tell every running daemon to stop. Each daemon task then does a
+    /// [`graceful_stop`]. A second call does nothing.
     pub fn shutdown_all(&self) {
         let mut stops = self.stops.borrow_mut();
         for (_, tx) in std::mem::take(&mut *stops) {
@@ -168,6 +194,10 @@ impl DaemonSet {
     }
 }
 
+/// Run one daemon with its restart loop until it stops, and keep its entry
+/// in `states` up to date.
+///
+/// Each restart waits one second more than the one before.
 async fn run_daemon(
     spec: DaemonSpec,
     uid: u32,
@@ -275,18 +305,28 @@ async fn run_daemon(
         .insert(spec.name.clone(), DaemonState::Stopped);
 }
 
+/// Reason why [`run_daemon`] stopped waiting for the child.
 enum Exit {
     Code(i32),
     StopRequested,
 }
 
-/// Send the configured shutdown signal, wait up to `timeout_ms`, then
-/// SIGKILL if the child is still alive. Returns `true` iff SIGKILL was
-/// issued (i.e. the daemon ended in `Killed` rather than `Stopped`).
-/// `timeout_ms == 0` means wait forever — the SIGKILL branch is skipped.
+/// Stop a daemon child process.
+///
+/// Sends `signal` and waits up to `timeout_ms`. If the child is still alive
+/// after that, sends SIGKILL.
+/// Args:
+///  - `child`: Daemon process
+///  - `signal`: Stop signal to send first
+///  - `timeout_ms`: Time to wait before SIGKILL. 0 means wait forever and
+///    never send SIGKILL.
+///
+/// Returns:
+///   `true` only if SIGKILL was sent (the daemon state is then `Killed`,
+///   not `Stopped`).
 async fn graceful_stop(mut child: tokio::process::Child, signal: i32, timeout_ms: u32) -> bool {
     let Some(pid) = child.id() else {
-        // Child already exited; nothing to signal.
+        // The child already exited. There is nothing to signal.
         let _ = child.wait().await;
         return false;
     };
@@ -310,9 +350,11 @@ async fn graceful_stop(mut child: tokio::process::Child, signal: i32, timeout_ms
     }
 }
 
-/// Truncate-and-create the per-daemon log files. Opened once per sandbox
-/// lifetime; every restart dup's the same FD so the file offset advances
-/// across restarts (append-on-restart, truncate-on-sandbox-restart).
+/// Create or truncate the stdout and stderr log files of a daemon.
+///
+/// Opened once per sandbox run. Every daemon restart duplicates the same
+/// FD, so the output of a restart goes after the output before it. A new
+/// sandbox run truncates the files.
 fn open_log_files(name: &str) -> anyhow::Result<(std::fs::File, std::fs::File)> {
     let dir = PathBuf::from(LOG_ROOT).join(name);
     std::fs::create_dir_all(&dir)?;

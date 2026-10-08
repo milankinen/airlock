@@ -1,10 +1,7 @@
-//! System keychain / Secret Service backend. Stores the vault blob as
-//! a single secret under `airlock-vault / default`. On macOS first use
-//! triggers the Keychain unlock prompt; on Linux it relies on the
-//! Secret Service being available (GNOME Keyring, KeePassXC, …).
+//! System keychain vault storage.
 //!
-//! The keychain has no compare-and-swap, so writers from different
-//! processes serialize on the lock file `~/.airlock/vault.keyring.lock`.
+//! Used for `settings.vault.storage = "keyring"`. Keeps the vault in the system
+//! keychain or Secret Service.
 
 use std::path::PathBuf;
 
@@ -16,6 +13,11 @@ use crate::settings::Settings;
 const KEYRING_SERVICE: &str = "airlock-vault";
 const KEYRING_ACCOUNT: &str = "default";
 
+/// Storage backend that keeps the vault blob as one secret in the system
+/// keychain, under `airlock-vault / default`.
+///
+/// On macOS, the first use shows the Keychain unlock prompt. On Linux, a
+/// Secret Service must be available (GNOME Keyring, KeePassXC, ...).
 pub struct KeyringStorage;
 
 impl Storage for KeyringStorage {
@@ -34,11 +36,14 @@ impl Storage for KeyringStorage {
     }
 
     fn lock_path(&self) -> anyhow::Result<Option<PathBuf>> {
+        // The keychain has no compare-and-swap, so writers from different
+        // processes serialize on a lock file.
         let dir = Settings::dir().context("find the airlock directory for the vault lock")?;
         Ok(Some(dir.join("vault.keyring.lock")))
     }
 }
 
+/// Open the keychain entry of the vault.
 fn keyring_entry() -> anyhow::Result<keyring::Entry> {
     keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).context("construct airlock keyring entry")
 }

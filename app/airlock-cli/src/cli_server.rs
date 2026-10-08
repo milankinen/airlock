@@ -1,11 +1,7 @@
-/// Unix-socket Cap'n Proto server bridging `airlock exec` clients into the running VM.
-///
-/// `airlock start` runs this server after the VM is up. `airlock exec` connects here
-/// and calls `CliService.exec()`. The exec's `env` list is interpreted as
-/// *overrides* layered on top of the sandbox's resolved base env (image env +
-/// `airlock.toml` env) — so the exec client never has to know what the sandbox
-/// was launched with. The merged env is then forwarded to the supervisor
-/// along with the bridged stdin/process capabilities.
+//! Server for `airlock exec`.
+//!
+//! Runs in `airlock start` while the sandbox is running. It lets `airlock exec`
+//! start more processes in the running sandbox.
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -16,7 +12,7 @@ use tokio::task::JoinSet;
 
 use crate::rpc::{Process, ProcessEvent, Supervisor};
 
-/// RAII guard that removes the Unix socket file when dropped.
+/// Guard that removes the Unix socket file when dropped.
 struct SockGuard(PathBuf);
 
 impl Drop for SockGuard {
@@ -25,15 +21,18 @@ impl Drop for SockGuard {
     }
 }
 
-/// Accept `airlock exec` connections on a Unix socket and bridge each into the
-/// running VM supervisor via Cap'n Proto RPC. `base_env` is the sandbox's
-/// resolved environment (image env + config env, with surrogates for masked
-/// entries) — `exec` clients send overrides which are merged onto this
-/// before each child is spawned.
+/// Accept `airlock exec` connections and relay them to the VM supervisor.
+/// Args:
+///  - `sock_path`: Path of the Unix socket to listen on
+///  - `supervisor`: Supervisor of the running VM
+///  - `base_env`: Resolved sandbox environment (image env and config env, with
+///    surrogates for masked entries). The `env` of each exec request overrides
+///    values in it, so the exec client does not need to know the sandbox env.
 ///
-/// The future owns the socket file and every client connection: dropping
-/// it (the VM shutdown aborts it) closes the connections and
-/// unlinks the socket.
+/// Returns:
+///   Never, unless the bind fails. The future owns the socket file and all
+///   client connections. The sandbox shutdown aborts the future. This
+///   closes the connections and removes the socket file.
 pub async fn serve(sock_path: PathBuf, supervisor: Supervisor, base_env: Vec<String>) {
     let _ = tokio::fs::remove_file(&sock_path).await;
     let listener = match tokio::net::UnixListener::bind(&sock_path) {
@@ -56,25 +55,22 @@ pub async fn serve(sock_path: PathBuf, supervisor: Supervisor, base_env: Vec<Str
                     connections.spawn_local(handle_connection(stream, sup, env));
                 }
                 Err(e) => {
-                    // A failed accept() (transient ECONNABORTED, or fd exhaustion
-                    // such as EMFILE/ENFILE) must never tear down the server: that
-                    // would drop `_guard` and unlink the socket while the VM is
-                    // still running, breaking every later `airlock exec`. There is
-                    // no accept() error that warrants ending `serve` here, so we
-                    // log and keep serving, backing off briefly so a persistent
-                    // error can't hot-spin the loop.
+                    // A failed accept() must never stop the server, for example
+                    // a temporary ECONNABORTED or fd exhaustion (EMFILE/ENFILE).
+                    // A stop drops `_guard` and removes the socket while the VM
+                    // runs. Then all later `airlock exec` calls fail. The short
+                    // sleep prevents a busy loop if the error continues.
                     tracing::warn!("cli server accept error (continuing): {e}");
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             },
-            // Reap finished connections so the set does not grow.
+            // Remove finished connections, so that the set does not grow.
             Some(_) = connections.join_next() => {}
         }
     }
 }
 
-/// Run a Cap'n Proto RPC system for a single `airlock exec` client connection
-/// until the client disconnects.
+/// Serve the Cap'n Proto RPC for one `airlock exec` client until it disconnects.
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     supervisor: Supervisor,
@@ -97,7 +93,7 @@ async fn handle_connection(
     }
 }
 
-/// Implements the `CliService` Cap'n Proto interface exposed to `airlock exec` clients.
+/// The `CliService` Cap'n Proto interface for `airlock exec` clients.
 struct CliServiceImpl {
     supervisor: Supervisor,
     base_env: Rc<Vec<String>>,
@@ -119,7 +115,7 @@ impl cli_service::Server for CliServiceImpl {
             _ => None,
         };
 
-        // Bridge: unix-socket Stdin → vsock Stdin
+        // Relay: unix-socket Stdin to vsock Stdin.
         let unix_stdin = params.get_stdin()?;
         let vsock_stdin: stdin::Client = capnp_rpc::new_client(StdinBridge { inner: unix_stdin });
 
@@ -136,7 +132,7 @@ impl cli_service::Server for CliServiceImpl {
             .map(|e| e.map(|s| s.to_str().unwrap_or("").to_string()))
             .collect::<Result<Vec<_>, _>>()?;
 
-        // Malformed entries (no `=`) are ignored.
+        // Ignore entries without `=`.
         let overrides = overrides.iter().filter_map(|e| e.split_once('='));
         let env = crate::util::merge_env(&self.base_env, overrides, &[]);
 
@@ -146,7 +142,7 @@ impl cli_service::Server for CliServiceImpl {
             .await
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
 
-        // Bridge: vsock Process → unix-socket Process
+        // Relay: vsock Process to unix-socket Process.
         results
             .get()
             .set_proc(capnp_rpc::new_client(ProcessBridge { inner: proc }));
@@ -154,8 +150,8 @@ impl cli_service::Server for CliServiceImpl {
     }
 }
 
-/// Bridges `Stdin.read()` calls from the vsock supervisor to the `airlock exec`
-/// client's unix-socket stdin capability.
+/// Relays `Stdin.read()` calls from the vsock supervisor to the stdin capability
+/// of the `airlock exec` client (on the Unix socket).
 struct StdinBridge {
     inner: stdin::Client,
 }
@@ -191,8 +187,8 @@ impl stdin::Server for StdinBridge {
     }
 }
 
-/// Bridges `Process.poll()`/`signal()` calls from the `airlock exec` client to
-/// the vsock-side process running inside the VM.
+/// Relays `Process` calls (`poll`, `signal`, `kill`) from the `airlock exec`
+/// client to the process in the VM (on vsock).
 struct ProcessBridge {
     inner: Process,
 }

@@ -2,13 +2,12 @@
 
 # Guest-side network egress proxy.
 #
-# Served by the host CLI, called by the in-VM supervisor. Runs over
-# its own vsock port (NETWORK_PORT) so bulk byte transfers can't
-# head-of-line-block the Supervisor RPC (pty, stats, daemons).
+# The host CLI serves it and the in-VM supervisor calls it. It uses its
+# own vsock port (NETWORK_PORT), so bulk byte transfers cannot cause
+# head-of-line blocking on the Supervisor RPC (pty, stats, daemons).
 #
-# The guest receives this interface as the bootstrap capability of
-# the network-side Cap'n Proto connection — it is not passed through
-# `Supervisor.boot` anymore.
+# The guest gets this interface as the bootstrap capability of the
+# network Cap'n Proto connection. `Supervisor.boot` does not pass it.
 interface NetworkProxy {
   connect @0 (target :ConnectTarget, client :TcpSink)
     -> (result :ConnectResult);
@@ -33,10 +32,10 @@ struct ConnectResult {
   }
 }
 
-# Push-style byte sink. One TcpSink per connection direction:
-# `client` in `connect` is pushed bytes by the remote peer (host →
-# guest), the returned `server` is pushed bytes by the guest-side
-# caller (guest → host).
+# Push-style byte sink. Each connection direction has one TcpSink.
+# The `client` sink of `connect` gets the bytes from the remote peer
+# (host → guest). The returned `server` sink gets the bytes from the
+# guest-side caller (guest → host).
 interface TcpSink {
   send @0 (data :Data) -> stream;
   close @1 () -> ();

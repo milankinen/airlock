@@ -1,4 +1,7 @@
-//! `airlock show` — display sandbox details.
+//! The `airlock show` command.
+//!
+//! Prints the details of the project sandbox: status, config, packs and network
+//! services.
 
 use clap::Args;
 
@@ -15,9 +18,12 @@ use crate::{cli, config, packs, project};
 #[derive(Args, Debug)]
 pub struct ShowArgs {}
 
-/// Print sandbox metadata (path, status, image, config) to stdout.
+/// Print sandbox details (path, status, image, config) to stdout.
+/// Returns:
+///   Process exit code: 0 on success, 2 on a config error, 1 on other errors.
 pub async fn main(_args: &ShowArgs, context: Context) -> i32 {
-    // Config errors first, with the config-error exit code (as `start`).
+    // Check config errors first, with the config error exit code (same as
+    // `start`).
     let ResolvedConfig { values, packs, .. } = match resolve_config().await {
         Ok(resolved) => resolved,
         Err(e) => {
@@ -115,8 +121,8 @@ pub async fn main(_args: &ShowArgs, context: Context) -> i32 {
     0
 }
 
-/// The enabled network services, each with its stored sign-ins. Reads
-/// only the plain fields of the token store: no vault key needed.
+/// Print the enabled network services, each with its stored sign-ins.
+// Reads only the plain fields of the token store, so no vault key is needed.
 async fn print_services(project: &project::Project) {
     let ids = services::enabled(&project.config.network.services);
     if ids.is_empty() {
@@ -157,8 +163,8 @@ async fn print_services(project: &project::Project) {
     }
 }
 
-/// An enabled service that cannot run: why, and that its hosts are
-/// denied.
+/// Return the line for an enabled service that cannot run. The line gives
+/// the reason and tells that the service hosts are denied.
 fn unavailable_line(id: services::ServiceId, reason: &str) -> String {
     let name = id.name();
     format!(
@@ -167,9 +173,9 @@ fn unavailable_line(id: services::ServiceId, reason: &str) -> String {
     )
 }
 
-/// One stored sign-in: account, scopes and age. Whether it still works is
-/// the agent's to find out (it refreshes itself); the store does not
-/// track that.
+/// Return the line for one stored sign-in: account, scopes and age.
+// The store does not record if the sign-in still works. The agent knows
+// that, because the agent refreshes the sign-in itself.
 fn grant_line(grant: &store::GrantSummary) -> String {
     let account = grant.account.as_deref().unwrap_or("unknown account");
     let scopes = match grant.scopes.as_slice() {
@@ -186,7 +192,7 @@ fn grant_line(grant: &store::GrantSummary) -> String {
     )
 }
 
-/// The config of the project in the current directory.
+/// Load and resolve the config of the project in the current directory.
 async fn resolve_config() -> anyhow::Result<ResolvedConfig> {
     let packs = packs::init()?;
     config::load()?
@@ -194,8 +200,8 @@ async fn resolve_config() -> anyhow::Result<ResolvedConfig> {
         .await
 }
 
-/// The enabled packs with their status, and the install records of
-/// packs that no longer install.
+/// Print the enabled packs with their status. Also print the install records
+/// of packs that no longer install.
 fn print_packs(project: &project::Project, packs: &[ConfiguredPack]) {
     let state = read_install_state(project);
     let removed = state
@@ -218,9 +224,11 @@ fn print_packs(project: &project::Project, packs: &[ConfiguredPack]) {
     }
 }
 
-/// The install records of packs whose selected entry no longer
-/// installs (removed, disabled, or a version without an install), with
-/// their status.
+/// Return the install records of packs that no longer install, with their
+/// status.
+///
+/// A pack no longer installs if it was removed or disabled, or if its
+/// selected version has no install.
 fn removed_packs<'a>(
     packs: &[ConfiguredPack],
     state: &'a InstallState,
@@ -237,8 +245,8 @@ fn removed_packs<'a>(
         .collect()
 }
 
-/// An enabled pack: `<name> <version>`, then the args that differ from
-/// their default in parentheses.
+/// Return the line for an enabled pack: `<name> <version>`, then the args
+/// that are not default, in parentheses.
 fn pack_line(pack: &ConfiguredPack) -> String {
     let details: Vec<String> = pack
         .non_default_args()
@@ -254,8 +262,8 @@ fn pack_line(pack: &ConfiguredPack) -> String {
     }
 }
 
-/// The status of an enabled pack: `config only` for a version without
-/// a setup script, else the install status.
+/// Return the status of an enabled pack. This is `config only` for a version
+/// without a setup script. Otherwise it is the install status.
 fn pack_status(pack: &ConfiguredPack, state: Option<&InstallState>) -> &'static str {
     if pack.metadata().has_setup {
         install_status(state, &pack.metadata().name)
@@ -264,10 +272,11 @@ fn pack_status(pack: &ConfiguredPack, state: Option<&InstallState>) -> &'static 
     }
 }
 
-/// Open `host_cwd/.airlock/sandbox` without the lock. `Ok(None)` when it
-/// does not exist yet (no sandbox has started); `Err` with a short message
-/// for any other failure (a symlink, a foreign owner, ...), so callers do
-/// not silently treat it as absent.
+/// Open `host_cwd/.airlock/sandbox` without the lock.
+/// Returns:
+///   `Ok(None)` if the directory does not exist yet (no sandbox started).
+///   `Err` with a short message for all other failures (a symlink, a foreign
+///   owner, ...), so that callers do not treat it as absent.
 fn open_sandbox_dir(host_cwd: &std::path::Path) -> Result<Option<PinnedDir>, String> {
     match PinnedDir::open(host_cwd, std::path::Path::new(".airlock/sandbox"), false) {
         Ok(dir) => Ok(Some(dir)),
@@ -276,8 +285,9 @@ fn open_sandbox_dir(host_cwd: &std::path::Path) -> Result<Option<PinnedDir>, Str
     }
 }
 
-/// The install records of the project's current disk, read without the
-/// lock. `None` when there are none, or they belong to another disk.
+/// Read the install records of the current project disk, without the lock.
+/// Returns:
+///   `None` if there are no records, or if they belong to another disk.
 fn read_install_state(project: &project::Project) -> Option<InstallState> {
     let dir = match open_sandbox_dir(&project.host_cwd) {
         Ok(Some(dir)) => dir,
@@ -297,7 +307,7 @@ fn read_install_state(project: &project::Project) -> Option<InstallState> {
     }
 }
 
-/// The install status of the pack `name`.
+/// Return the install status of the pack `name`.
 fn install_status(state: Option<&InstallState>, name: &str) -> &'static str {
     match state.and_then(|s| s.packs.get(name)).map(|r| r.status) {
         Some(PackStatus::Installed | PackStatus::Kept { confirmed: true }) => "installed",
@@ -309,8 +319,8 @@ fn install_status(state: Option<&InstallState>, name: &str) -> &'static str {
     }
 }
 
-/// The status of a pack that no longer installs; `None` when nothing of
-/// it is on the disk.
+/// Return the status of a pack that no longer installs. Return `None` if no
+/// part of it is on the disk.
 fn removed_status(status: PackStatus) -> Option<&'static str> {
     match status {
         PackStatus::Installed | PackStatus::Unconfirmed => Some("installed, removed from config"),
@@ -321,9 +331,18 @@ fn removed_status(status: PackStatus) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    //! Tests for the parts of `airlock show`: the sandbox directory, the
+    //! pack lines and the sign-in lines.
+
     use super::*;
     use crate::test_cfg::{resolve_project_toml, temp_dir};
 
+    /// Test that a symlinked sandbox directory is an error, not a missing
+    /// directory. Thus `show` reports the problem and does not tell the user
+    /// that no sandbox exists.
+    ///   1. Check that a project without `.airlock/sandbox` gives no directory
+    ///   2. Make `.airlock/sandbox` a symlink to a different directory
+    ///   3. Check that the open fails with a message
     #[test]
     fn sandbox_dir_behind_symlink_is_unreadable_not_missing() {
         let project = temp_dir();
@@ -337,6 +356,12 @@ mod tests {
         assert!(open_sandbox_dir(project.path()).is_err_and(|why| !why.is_empty()));
     }
 
+    /// Test that show gives each pack the status from the install records, and
+    /// lists the installed packs that the config no longer has.
+    ///   1. Make install records with different statuses
+    ///   2. Resolve three packs and check their lines and statuses
+    ///   3. Check the status of a pack when there are no records
+    ///   4. Check the removed packs for the pack config and for a presets list
     #[test]
     fn pack_status_reflects_install_records_of_sandbox_disk() {
         let fp = "a".repeat(64);
@@ -353,6 +378,8 @@ mod tests {
              alpine = { version = 1 }\n",
         )
         .unwrap();
+        // alpine has no setup script, so it is config only. sample was
+        // kept but not confirmed.
         let shown: Vec<(String, &str)> = resolved
             .packs
             .iter()
@@ -370,6 +397,8 @@ mod tests {
             ]
         );
         assert_eq!(pack_status(&resolved.packs[1], None), "pending");
+        // Failed records are not shown. Records of packs in the config are
+        // not removed.
         assert_eq!(
             removed_packs(&resolved.packs, &state),
             [
@@ -378,6 +407,7 @@ mod tests {
             ]
         );
 
+        // A presets list makes no packs, so all records count as removed.
         let list_form = resolve_project_toml("presets = [\"rust\", \"python\"]\n").unwrap();
         assert!(list_form.packs.is_empty());
         assert_eq!(
@@ -391,6 +421,10 @@ mod tests {
         );
     }
 
+    /// Test that the line for a stored sign-in shows the account, the scopes
+    /// and the age.
+    ///   1. Check the line for one scope and for two scopes
+    ///   2. Check the line for a sign-in without an account or scopes
     #[test]
     fn stored_sign_in_shows_account_scopes_and_age() {
         let grant = |scopes: &[&str]| store::GrantSummary {

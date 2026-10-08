@@ -2,6 +2,9 @@
 
 load helpers
 
+# Mounts of host files and directories, and the mount namespace of the
+# sandbox.
+
 setup_file() {
     vm_setup_file
 
@@ -36,6 +39,11 @@ read_only = true
 EOF
 }
 
+# Test that directory mounts show the host files and that only the
+# writable mount accepts writes.
+#   1. Make a new file on the host, then read all files in the sandbox
+#   2. Write to the writable and the read-only mount in the sandbox
+#   3. Check that only the write to the writable mount is on the host
 @test "directory mounts share host files and only rw accepts writes" {
     echo "new-host-content" > rw_dir/host_created.txt
     run_vm sh -c 'cat /data/rw/file.txt /data/ro/file.txt /data/rw/host_created.txt
@@ -51,6 +59,13 @@ EOF
     [[ ! -e ro_dir/new_file.txt ]]
 }
 
+# Test that file mounts show host changes, guest writes reach the host,
+# and only the writable file accepts writes.
+#   1. Read both files in the sandbox
+#   2. Change the writable file on the host, then read it and write both
+#      files in a new sandbox
+#   3. Check that the guest write is on the host and the read-only file
+#      did not change
 @test "file mounts share host changes both ways and only rw accepts writes" {
     run_vm sh -c 'cat /data/rw_file.txt /data/ro_file.txt'
     assert_success
@@ -69,6 +84,10 @@ EOF
     [[ "$(cat ro_file.txt)" == "ro-file-content" ]]
 }
 
+# Test that a process that joins the sandbox mount namespace stays in the
+# container root, and does not see the VM root (/mnt/overlay).
+#   1. Enter the mount namespace of the shell with nsenter
+#   2. Check that /mnt/overlay does not exist there
 @test "joining sandbox mount namespace with setns lands in container rootfs" {
     run_vm sh -c 'nsenter --mount=/proc/self/ns/mnt -- sh -c "test -e /mnt/overlay && echo LEAK || echo CONTAINED"'
     assert_success

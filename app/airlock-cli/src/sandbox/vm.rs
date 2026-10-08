@@ -1,5 +1,7 @@
-//! A booted sandbox VM: processes start in it, background services attach
-//! to it until the ordered shutdown.
+//! Booted sandbox VM.
+//!
+//! A running sandbox VM. Processes start in it, and background services
+//! attach to it until the ordered shutdown.
 
 use std::time::Duration;
 
@@ -15,9 +17,10 @@ use crate::runtime::{self, PtySize, SignalStream};
 use crate::vm::VmInstance;
 use crate::{cli_server, daemon, rpc, util};
 
-/// Upper bound on how long we wait for the guest to stop daemons and flush
-/// filesystems during shutdown before forcing the VM down. Generous enough for
-/// a healthy guest's sync, but bounded so a wedged guest can't hang the CLI.
+/// Maximum time for the guest to stop daemons and flush filesystems during
+/// shutdown. After it, the VM stops by force. The time is sufficient for the
+/// sync of a healthy guest. The limit prevents a hung guest from blocking the
+/// CLI.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A process to start in the VM (`Supervisor.spawn`). It runs as the image
@@ -25,40 +28,44 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct ProcessSpec {
     /// Command and arguments (the main process: [`super::main_argv`]).
     pub argv: Vec<String>,
-    /// Working directory; `None` uses the sandbox cwd.
+    /// Working directory. `None` uses the sandbox cwd.
     pub cwd: Option<String>,
-    /// Variables layered over the sandbox env (see [`util::merge_env`]).
+    /// Variables that override the sandbox env (see [`util::merge_env`]).
     pub env: Vec<(String, String)>,
     /// Variables removed from the resulting env.
     pub unset: Vec<String>,
+    /// Stdin of the process.
     pub stdin: stdin::Client,
-    /// Terminal size for PTY mode; `None` runs it with pipes.
+    /// Terminal size for PTY mode. `None` runs the process with pipes.
     pub pty: PtySize,
 }
 
-/// What is left after a shutdown.
+/// Result of a shutdown.
 pub struct Stopped {
     /// The project. The caller still holds the [`crate::project::SandboxLock`]
-    /// it opened the project with; drop that to release the sandbox lock.
+    /// that it used to open the project. Drop that lock to release the
+    /// sandbox.
     pub project: Project,
-    /// The guest confirmed its filesystem sync before the VM stopped.
+    /// `true` if the guest confirmed its filesystem sync before the VM
+    /// stopped.
     pub synced: bool,
 }
 
-/// A booted VM ([`super::boot::boot`]). No process runs in it until the
-/// caller spawns one.
+/// A booted VM (see [`super::boot::boot`]). No process runs in it until the
+/// caller starts one.
 pub struct Vm {
     project: Project,
     instance: VmInstance,
     supervisor: rpc::Supervisor,
     network: NetworkHandle,
-    /// Names of the daemons the boot started, stopped (with a progress
-    /// line each) during shutdown.
+    /// Names of the daemons that the boot started. The shutdown stops them
+    /// and shows one progress line for each.
     daemon_names: Vec<String>,
     tasks: BootTasks,
 }
 
 impl Vm {
+    /// Make a [`Vm`] from the parts of a completed boot.
     pub(super) fn new(
         project: Project,
         instance: VmInstance,
@@ -77,26 +84,32 @@ impl Vm {
         }
     }
 
+    /// Get the project of the VM.
     pub fn project(&self) -> &Project {
         &self.project
     }
 
-    /// Live network control and events, for the runtime.
+    /// Get the live network control and events, for the runtime.
     pub fn network(&self) -> &NetworkHandle {
         &self.network
     }
 
+    /// Get the supervisor RPC client.
     pub fn supervisor(&self) -> &rpc::Supervisor {
         &self.supervisor
     }
 
-    /// The guest's loopback, for services that forward host ports into it.
+    /// Get the guest loopback network, for services that forward host ports
+    /// to it.
     pub fn guest_network(&self) -> GuestNetwork {
         GuestNetwork::new(self.supervisor.client())
     }
 
-    /// Start `spec` in the VM, with the sandbox env plus the spec's
-    /// overrides. The caller drives the returned process.
+    /// Start a process in the VM. It gets the sandbox env with the overrides
+    /// of `spec`.
+    /// Returns:
+    ///   The started process, or error if the command is empty or the spawn
+    ///   fails. The caller drives the process.
     pub async fn spawn(&self, spec: ProcessSpec) -> anyhow::Result<rpc::Process> {
         let ProcessSpec {
             argv,
@@ -116,9 +129,9 @@ impl Vm {
             .await
     }
 
-    /// Serve `airlock exec` on the sandbox's `cli.sock` until shutdown,
-    /// which unlinks the socket. Exec'd processes get the sandbox env with
-    /// the client's overrides layered on top.
+    /// Serve `airlock exec` on the `cli.sock` of the sandbox until shutdown.
+    /// The shutdown removes the socket. The exec processes get the sandbox
+    /// env with the overrides of the client.
     pub fn serve_cli(&mut self) -> anyhow::Result<()> {
         let sock_path = crate::cache::cli_sock_path(&self.project.sandbox_dir)?;
         let base_env = self.instance.env.clone();
@@ -133,25 +146,26 @@ impl Vm {
             .spawn_service(runtime::forward_signals(signals, proc));
     }
 
-    /// Stop everything the boot started, in order:
+    /// Stop all that the boot started, in this order:
     ///
-    /// 1. the services (their ports and `cli.sock` are free afterwards);
-    /// 2. the daemons, then the guest filesystem sync, together bounded by
-    ///    [`SHUTDOWN_TIMEOUT`];
-    /// 3. the VM, which must confirm it stopped;
-    /// 4. the RPC transport.
+    /// 1. The services. Their ports and `cli.sock` are free after this step.
+    /// 2. The daemons, then the guest filesystem sync. The two together have
+    ///    the time limit [`SHUTDOWN_TIMEOUT`].
+    /// 3. The VM, which must confirm that it stopped.
+    /// 4. The RPC transport.
     ///
-    /// Returns the project to the caller, which still holds the
-    /// [`crate::project::SandboxLock`] it opened the project with. An
-    /// unconfirmed VM stop is an error; the rest of the teardown still runs.
+    /// Returns:
+    ///   The project, for the caller that still holds the
+    ///   [`crate::project::SandboxLock`] of the project. Error if the VM stop
+    ///   is not confirmed. All other shutdown steps still run.
     pub async fn shutdown(mut self) -> anyhow::Result<Stopped> {
         self.tasks.stop_services().await;
 
-        // Give the guest a bounded chance to stop its daemons and flush
-        // filesystems, then tear the VM down regardless. A wedged guest must
-        // not hang shutdown forever — that previously left the user resorting
-        // to SIGKILL, which skips the VM's Drop and orphans cloud-hypervisor /
-        // virtiofsd plus a stale lock file.
+        // Give the guest limited time to stop its daemons and flush
+        // filesystems. Then stop the VM in all cases. A hung guest must not
+        // block the shutdown forever. Without the limit, users must send
+        // SIGKILL, which skips the VM's Drop. That leaves orphan
+        // cloud-hypervisor and virtiofsd processes and a stale lock file.
         let supervisor = &self.supervisor;
         let daemon_names = &self.daemon_names;
         let graceful = async {

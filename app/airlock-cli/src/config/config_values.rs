@@ -1,5 +1,8 @@
-//! The config schema: [`ConfigValues`] and the types of its sections,
-//! with parsing and validation of a merged config document.
+//! Config schema.
+//!
+//! Defines all config sections and their values and defaults. Parses a
+//! merged config document and checks it for problems, including problems
+//! that the schema alone cannot express.
 
 use std::cmp::{max, min};
 use std::collections::BTreeMap;
@@ -12,9 +15,8 @@ use crate::config::de::format_error;
 use crate::network::rules::parse_pattern;
 use crate::services::ServiceId;
 
-/// Configuration loaded from hierarchical TOML files and validated
-/// by smart-config. Runtime-only fields (args, terminal) are set
-/// separately after loading.
+/// Configuration from the layered config files, validated by
+/// smart-config.
 #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
 pub struct ConfigValues {
     /// Virtual machine configuration
@@ -29,34 +31,36 @@ pub struct ConfigValues {
     /// Cache volume (VirtIO block device with ext4)
     #[config(nest)]
     pub disk: Disk,
-    /// Environment variables injected into the container.
+    /// Environment variables for the container.
     /// Values support `${VAR}` substitution from the host environment.
-    /// An entry may be a plain string or `{ value = "...", mask = true }`;
-    /// masked entries reach the guest as a stable surrogate of the same
+    /// An entry can be a plain string or `{ value = "...", mask = true }`.
+    /// The guest gets a masked entry as a stable surrogate of the same
     /// length (see [`EnvVar`]).
     #[config(default)]
     pub env: BTreeMap<String, EnvVar>,
-    /// Sidecar processes started during the boot, before any process is spawned.
+    /// Sidecar processes. They start during the boot, before other
+    /// processes.
     #[config(default)]
     pub daemons: BTreeMap<String, Daemon>,
-    /// Subdirectories of the project mount to hide from the sandbox by
-    /// bind-mounting an empty directory over them. Used to keep parts
-    /// of a monorepo invisible to AI agents that operate inside the VM.
+    /// Subdirectories of the project mount to hide from the sandbox. An
+    /// empty directory is bind-mounted over each of them. Use it to hide
+    /// parts of a monorepo from AI agents in the VM.
     #[config(default)]
     pub mask: BTreeMap<String, Mask>,
     /// Clipboard bridge between the sandbox and the host clipboard.
-    /// Both directions are off by default — each one is a deliberate
-    /// hole in the sandbox (see `[clipboard]` in the manual).
+    /// Both directions are off by default, because each one is an
+    /// intentional hole in the sandbox (see `[clipboard]` in the manual).
     #[config(nest)]
     pub clipboard: Clipboard,
 }
 
-/// Default to all available host CPUs.
+/// Default number of CPUs: all available host CPUs.
 pub fn default_cpus() -> u32 {
     std::thread::available_parallelism().map_or(2, |n| n.get() as u32)
 }
 
-/// Default to half of total system RAM, clamped to [512 MB, total].
+/// Default memory size: half of the total system RAM, clamped to
+/// [512 MB, total].
 pub fn default_memory() -> ByteSize {
     use sysinfo::System;
     let sys_bytes = System::new_with_specifics(
@@ -68,12 +72,13 @@ pub fn default_memory() -> ByteSize {
     ByteSize(min(max(min_bytes, half), sys_bytes))
 }
 
+/// Serialize a byte size as text (for example `"4 GB"`).
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde serialize_with requires &T
 pub fn ser_byte_size<S: serde::Serializer>(size: &ByteSize, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&size.to_string())
 }
 
-/// How the OCI image is resolved.
+/// Source of the OCI image.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Resolution {
@@ -94,21 +99,23 @@ impl WellKnown for Resolution {
     const DE: Self::Deserializer = smart_config::de::Serde;
 }
 
-/// When the configured image reference is re-resolved against its source.
+/// When to resolve the configured image reference again against its
+/// source.
 ///
-/// Orthogonal to [`Resolution`]: that picks *where* an image comes from,
-/// this picks *how often* we go ask. Irrelevant for digest-pinned
-/// references (`repo@sha256:…`), which name one immutable image and are
-/// therefore never re-resolved for change detection.
+/// This is independent of [`Resolution`]. [`Resolution`] selects *where*
+/// an image comes from. This policy selects *how often* airlock asks the
+/// source. It has no effect for digest-pinned references
+/// (`repo@sha256:…`). They name one immutable image, thus airlock never
+/// resolves them again to find changes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PullPolicy {
-    /// Use the locally cached image whenever one is present under the
-    /// configured name, without contacting the source (default).
+    /// Use the locally cached image if there is one with the configured
+    /// name. Do not contact the source (default).
     #[default]
     IfNotPresent,
-    /// Re-resolve the reference to a digest on every start and reuse the
-    /// cached image only when that digest still matches.
+    /// Resolve the reference to a digest again at each start. Use the
+    /// cached image only if that digest is still the same.
     IfChanged,
 }
 
@@ -118,15 +125,15 @@ impl WellKnown for PullPolicy {
     const DE: Self::Deserializer = smart_config::de::Serde;
 }
 
-/// OCI image reference — either a plain image name string or a full config object.
+/// OCI image reference: a plain image name string or a full config object.
 ///
 /// String form:  `image = "alpine:latest"`
 /// Object form:  `[vm.image]\nname = "localhost:5005/alpine:3"\ninsecure = true`
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ImageRef {
-    /// Image name (e.g. `alpine:latest`, `localhost:5005/alpine:3`).
-    /// A digest may be pinned with `@sha256:…`, optionally alongside a
-    /// tag (`alpine:3.20@sha256:…`), as Docker tooling accepts.
+    /// Image name (for example `alpine:latest`, `localhost:5005/alpine:3`).
+    /// A digest can be pinned with `@sha256:…`, also together with a tag
+    /// (`alpine:3.20@sha256:…`), the same as Docker tools accept.
     pub name: String,
     /// Resolution strategy: `auto` (default), `docker`, `podman`, or
     /// `registry`.
@@ -135,13 +142,14 @@ pub struct ImageRef {
     /// Allow plain HTTP to the registry (for local or dev registries).
     #[serde(default)]
     pub insecure: bool,
-    /// When to re-resolve the reference: `if-not-present` (default) or
+    /// When to resolve the reference again: `if-not-present` (default) or
     /// `if-changed`.
     #[serde(default, rename = "pull-policy")]
     pub pull_policy: PullPolicy,
 }
 
 impl ImageRef {
+    /// Make a reference to `name` with default settings.
     pub fn auto(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -151,17 +159,17 @@ impl ImageRef {
         }
     }
 
-    /// The digest pinned in the reference, if any (`@sha256:…`).
+    /// Get the digest pinned in the reference (`@sha256:…`), if any.
     ///
-    /// A pinned reference names exactly one immutable image, so callers
-    /// use this both to skip tag→digest change detection and to verify
-    /// that whatever a source hands back is the image that was asked for.
+    /// A pinned reference names exactly one immutable image. Callers use
+    /// the digest to skip the tag→digest change detection. They also use it
+    /// to check that the image from a source is the requested image.
     pub fn pinned_digest(&self) -> Option<&str> {
         let (name, digest) = self.name.rsplit_once('@')?;
-        // Guard against `@` appearing in some other position: a digest is
-        // `<algorithm>:<hex>` and nothing else may follow it. The name
-        // must survive too — stripping the digest has to leave something
-        // to query a source with.
+        // Do not accept `@` in a different position. A digest is
+        // `<algorithm>:<hex>`, and nothing can follow it. The name must also
+        // stay: without the digest, there must be a name to query a source
+        // with.
         let (algorithm, hex) = digest.split_once(':')?;
         let valid = !name.is_empty()
             && !algorithm.is_empty()
@@ -192,9 +200,9 @@ impl<'de> serde::Deserialize<'de> for ImageRef {
                 resolution: Resolution,
                 #[serde(default)]
                 insecure: bool,
-                // The untagged helper ignores keys it doesn't know, so an
-                // unaliased snake_case spelling would silently do nothing
-                // — and every other config section here is snake_case.
+                // The untagged helper ignores unknown keys. Without the
+                // alias, the snake_case spelling would have no effect and no
+                // error. All other config sections here use snake_case.
                 #[serde(default, rename = "pull-policy", alias = "pull_policy")]
                 pull_policy: PullPolicy,
             },
@@ -227,19 +235,19 @@ impl WellKnown for ImageRef {
     const DE: Self::Deserializer = smart_config::de::Serde;
 }
 
-/// One `[env]` entry — either a plain string or a full config object.
+/// One `[env]` entry: a plain string or a full config object.
 ///
 /// String form:  `TOKEN = "${TOKEN}"`
 /// Object form:  `TOKEN = { value = "${TOKEN}", mask = true }`
 ///
-/// With `mask = true` the guest sees a stable alphanumeric surrogate of
-/// the same length (derived from the variable name and the length, never
-/// from the value) instead of the real value. The real value can still
-/// be substituted into outbound HTTP headers on the host through a
-/// network rule's `inject` list.
+/// With `mask = true`, the guest sees a stable alphanumeric surrogate of
+/// the same length instead of the real value. The surrogate comes from the
+/// variable name and the length, never from the value. The host can still
+/// put the real value into outbound HTTP headers through the `inject` list
+/// of a network rule.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct EnvVar {
-    /// Value template; supports `${VAR}` substitution from the host.
+    /// Value template. Supports `${VAR}` substitution from the host.
     pub value: String,
     /// Replace the value with a same-length surrogate inside the guest.
     pub mask: bool,
@@ -259,12 +267,12 @@ impl<'de> serde::Deserialize<'de> for EnvVar {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         use serde::de::Error as _;
 
-        // `deny_unknown_fields` so `{ value = "…", masked = true }` is
-        // an error, not a silent `mask = false` that leaks the real
-        // value into the guest. Dispatching on the raw value (instead of
-        // an untagged enum) keeps that error's own message — which
-        // names the unknown key — instead of serde's generic "did not
-        // match any variant".
+        // `deny_unknown_fields` makes `{ value = "…", masked = true }` an
+        // error. Without it, the entry would silently get `mask = false`
+        // and the real value would go into the guest. The match on the raw
+        // value (not an untagged enum) keeps the error message that names
+        // the unknown key. An untagged enum gives only the generic serde
+        // message "did not match any variant".
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Full {
@@ -297,7 +305,7 @@ impl WellKnown for EnvVar {
     const DE: Self::Deserializer = smart_config::de::Serde;
 }
 
-/// Virtual machine configurations
+/// Virtual machine configuration.
 #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
 pub struct VirtualMachine {
     /// OCI image to use
@@ -325,11 +333,11 @@ pub struct VirtualMachine {
     pub initramfs: Option<String>,
 }
 
-/// Network policy — controls whether connections are allowed or denied
-/// before rules are evaluated.
+/// Network policy. It controls if connections are allowed or denied
+/// before the rules are evaluated.
 ///
-/// Doubles as the value type of `airlock start --network <POLICY>`; the
-/// `clap` value names match the on-disk kebab-case form.
+/// It is also the value type of `airlock start --network <POLICY>`. The
+/// `clap` value names are the same as the kebab-case form in the file.
 #[derive(
     Debug,
     Clone,
@@ -372,7 +380,7 @@ impl WellKnown for Policy {
     const DE: Self::Deserializer = smart_config::de::Serde;
 }
 
-/// Network configuration
+/// Network configuration.
 #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
 pub struct Network {
     /// Network policy: `"allow-always"` (default), `"deny-always"`,
@@ -385,17 +393,17 @@ pub struct Network {
     /// Named HTTP middleware scripts.
     #[config(default)]
     pub middleware: BTreeMap<String, MiddlewareRule>,
-    /// Port forwarding from guest to host.
+    /// Port forwarding between guest and host, in both directions.
     #[config(default)]
     pub ports: BTreeMap<String, PortForward>,
     /// Unix socket forwarding from host to guest.
     #[config(default)]
     pub sockets: BTreeMap<String, SocketForward>,
-    /// Network services by name (`anthropic`, `openai`): `true` lets
-    /// airlock run the agent's sign-in and keep its real tokens on the
-    /// host (see [`crate::services`]). All off by default; left
-    /// out of the serialized config when empty, so configs without
-    /// services serialize as before.
+    /// Network services by name (`anthropic`, `openai`). `true` lets
+    /// airlock run the sign-in of the agent and keep its real tokens on the
+    /// host (see [`crate::services`]). All are off by default. An empty map
+    /// is not serialized, thus configs without services serialize as
+    /// before.
     #[config(default)]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub services: BTreeMap<String, bool>,
@@ -404,7 +412,7 @@ pub struct Network {
 /// Forward a host Unix socket into the guest container.
 ///
 /// The `host` field uses `source:target` syntax (host path : guest path),
-/// or a plain path if the same on both sides.
+/// or a plain path if both sides are the same.
 ///
 /// ```toml
 /// [network.sockets.docker]
@@ -415,8 +423,8 @@ pub struct SocketForward {
     /// Enable/disable this socket forward
     #[config(default_t = true)]
     pub enabled: bool,
-    /// Socket path mapping: `"source:target"` (host:guest) or plain path
-    /// (same on both sides).
+    /// Socket path mapping: `"source:target"` (host:guest) or a plain path
+    /// (the same on both sides).
     pub host: SocketMapping,
 }
 
@@ -427,14 +435,18 @@ impl WellKnown for SocketForward {
 
 /// A socket path mapping: host path to guest path.
 ///
-/// Accepts either a plain path (same on both sides: `"/var/run/docker.sock"`)
-/// or a `"source:target"` string (e.g. `"~/.docker/run/docker.sock:/var/run/docker.sock"`).
+/// Accepts a plain path (the same on both sides: `"/var/run/docker.sock"`)
+/// or a `"source:target"` string (for example
+/// `"~/.docker/run/docker.sock:/var/run/docker.sock"`).
 ///
-/// The delimiter is the **last** colon, so paths with colons in early
-/// components are supported (though uncommon for Unix sockets).
+/// The delimiter is the **last** colon that a path start (`/` or `~`)
+/// follows. Thus paths with colons in earlier components are supported
+/// (but they are not usual for Unix sockets).
 #[derive(Debug, Clone)]
 pub struct SocketMapping {
+    /// Socket path on the host.
     pub source: String,
+    /// Socket path in the guest.
     pub target: String,
 }
 
@@ -451,8 +463,8 @@ impl serde::Serialize for SocketMapping {
 impl<'de> serde::Deserialize<'de> for SocketMapping {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
-        // Split on the last colon that is followed by a `/` or `~` (path start).
-        // This avoids splitting on colons that are part of directory names.
+        // Split at the last colon if a `/` or `~` (path start) follows it.
+        // Thus colons in directory names do not split the path.
         if let Some(pos) = s.rfind(':') {
             let target = &s[pos + 1..];
             if target.starts_with('/') || target.starts_with('~') {
@@ -475,25 +487,23 @@ impl WellKnown for SocketMapping {
     const DE: Self::Deserializer = smart_config::de::Serde;
 }
 
-/// Named port forward group — forwards TCP ports between host and guest
-/// in either direction.
+/// Named port forward group. Forwards TCP ports between host and guest in
+/// one of the two directions.
 #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
 pub struct PortForward {
     /// Enable/disable this port forward group
     #[config(default_t = true)]
     pub enabled: bool,
-    /// Guest → host forwards. Each entry is either a plain port number
-    /// (same port on both sides) or a `"host:guest"` string. A guest
-    /// process connecting to `localhost:<guest_port>` reaches the
-    /// listed host port.
+    /// Guest → host forwards. Each entry is a plain port number (the same
+    /// port on both sides) or a `"host:guest"` string. A guest process that
+    /// connects to `localhost:<guest_port>` reaches the listed host port.
     #[config(default)]
     pub host: Vec<PortMapping>,
-    /// Host → guest forwards. Each entry is either a plain port number
-    /// (same port on both sides) or a `"host:guest"` string. A host
-    /// process connecting to `127.0.0.1:<host_port>` reaches the
-    /// listed guest port. Host-originated traffic bypasses all rules,
-    /// policy, and middleware — the host is trusted. Listeners bind
-    /// on `127.0.0.1` only.
+    /// Host → guest forwards. Each entry is a plain port number (the same
+    /// port on both sides) or a `"host:guest"` string. A host process that
+    /// connects to `127.0.0.1:<host_port>` reaches the listed guest port.
+    /// Traffic from the host skips all rules, policy and middleware,
+    /// because the host is trusted. Listeners bind only on `127.0.0.1`.
     #[config(default)]
     pub guest: Vec<PortMapping>,
 }
@@ -505,23 +515,26 @@ impl WellKnown for PortForward {
 
 /// A port mapping between a host port and a guest port.
 ///
-/// Accepts either a plain integer (same port both sides: `8080`)
-/// or a `"host:guest"` string (e.g. `"9000:8081"`).
+/// Accepts a plain integer (the same port on both sides: `8080`) or a
+/// `"host:guest"` string (for example `"9000:8081"`).
 ///
-/// The left side of the colon is always the host port and the right
-/// side is always the guest port, regardless of which list it appears
-/// in. The direction of the forward is determined by the list:
-/// - `[network.ports.<name>].host` forwards guest → host (the guest
-///   side originates the connection, reaching the host port).
-/// - `[network.ports.<name>].guest` forwards host → guest (the host
-///   side originates the connection, reaching the guest port).
+/// The left side of the colon is always the host port, and the right side
+/// is always the guest port, in both lists. The list sets the direction of
+/// the forward:
+///  - `[network.ports.<name>].host` forwards guest → host (the guest side
+///    opens the connection to the host port).
+///  - `[network.ports.<name>].guest` forwards host → guest (the host side
+///    opens the connection to the guest port).
 #[derive(Debug, Clone, Copy)]
 pub struct PortMapping {
+    /// Port on the host.
     pub host: u16,
+    /// Port in the guest.
     pub guest: u16,
 }
 
 impl PortMapping {
+    /// Make a mapping with the same port on both sides.
     pub fn same(port: u16) -> Self {
         Self {
             host: port,
@@ -584,25 +597,25 @@ impl WellKnown for PortMapping {
     const DE: Self::Deserializer = smart_config::de::Serde;
 }
 
-/// A named network rule — allow/deny patterns for host:port targets.
+/// A named network rule: allow and deny patterns for host:port targets.
 ///
-/// Target syntax: `host[:port]` — omitted port means all ports.
-/// Both host and port support `*` wildcards. A port that is neither a
-/// number nor `*` (`:8O80`, `:https`, a trailing space) is a
-/// configuration error, never a wildcard.
+/// Target syntax: `host[:port]`. Without a port, all ports match. Host and
+/// port both support `*` wildcards. A port that is not a number or `*`
+/// (`:8O80`, `:https`, a trailing space) is a configuration error, never a
+/// wildcard.
 ///
-/// `deny` is checked first and wins unconditionally. If no rule matches,
-/// the connection follows the network `policy`.
+/// `deny` is checked first and always wins. If no rule matches, the
+/// connection follows the network `policy`.
 ///
-/// With `passthrough = true`, `allow` targets skip TLS/HTTP interception
-/// entirely — the connection is a pure TCP relay. Required for protocols
-/// that aren't HTTP and whose first bytes from the client can't be
-/// sniffed (e.g. Postgres, whose 8-byte SSLRequest would deadlock the
-/// HTTP detector). Incompatible with middleware on the same target; a
-/// conflict is reported at startup.
+/// With `passthrough = true`, `allow` targets skip all TLS/HTTP
+/// interception, and the connection is a pure TCP relay. This is necessary
+/// for protocols that are not HTTP and whose first client bytes cannot be
+/// sniffed. For example, the 8-byte SSLRequest of Postgres would deadlock
+/// the HTTP detector. Middleware on the same target is not compatible.
+/// Airlock reports the conflict at startup.
 #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
 pub struct NetworkRule {
-    /// Enable/disable rule
+    /// Enable or disable the rule
     #[config(default_t = true)]
     pub enabled: bool,
     /// Hosts/ports to allow.
@@ -611,15 +624,14 @@ pub struct NetworkRule {
     /// Hosts/ports to deny unconditionally (deny wins over allow).
     #[config(default)]
     pub deny: Vec<String>,
-    /// When true, allowed targets are relayed as plain TCP without any
-    /// TLS or HTTP interception. Middleware on the same target is an
-    /// error.
+    /// If true, allowed targets are relayed as plain TCP without TLS or
+    /// HTTP interception. Middleware on the same target is an error.
     #[config(default)]
     pub passthrough: bool,
-    /// Names of masked `[env]` variables whose real value is substituted
-    /// into HTTP request headers (and masked back in response headers)
-    /// for this rule's allow targets. Each name must be defined in
-    /// `[env]` with `mask = true`. Incompatible with `passthrough`.
+    /// Names of masked `[env]` variables. For the allow targets of this
+    /// rule, their real value goes into HTTP request headers, and is masked
+    /// again in response headers. Each name must be in `[env]` with
+    /// `mask = true`. Not compatible with `passthrough`.
     #[config(default)]
     pub inject: Vec<String>,
 }
@@ -631,21 +643,21 @@ impl WellKnown for NetworkRule {
 
 /// HTTP middleware script with target patterns.
 ///
-/// Middleware is applied to allowed connections whose host:port matches
-/// any entry in `target`. Triggers TLS interception for HTTPS traffic.
+/// Middleware applies to allowed connections whose host:port matches an
+/// entry in `target`. It causes TLS interception for HTTPS traffic.
 #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
 pub struct MiddlewareRule {
-    /// Enable/disable this middleware
+    /// Enable or disable this middleware
     #[config(default_t = true)]
     pub enabled: bool,
-    /// Host:port patterns where this middleware applies (same syntax as
+    /// Host:port patterns where this middleware applies (the same syntax as
     /// rule allow/deny).
     #[config(default)]
     pub target: Vec<String>,
-    /// Variables exposed to the script as the `env` global table.
-    /// Values are subst templates (e.g. `"${HOST_VAR}"`) expanded from
-    /// the host environment. Any template referencing an undefined host
-    /// variable resolves to nil in the script.
+    /// Variables for the script, in the `env` global table. Values are
+    /// subst templates (for example `"${HOST_VAR}"`), expanded from the host
+    /// environment. A template that reads an undefined host variable is nil
+    /// in the script.
     #[config(default)]
     pub env: BTreeMap<String, String>,
     /// Inline Lua script
@@ -660,31 +672,33 @@ impl WellKnown for MiddlewareRule {
 /// Mount point configuration.
 #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
 pub struct Mount {
-    /// Enable/disable mount
+    /// Enable or disable the mount
     #[config(default_t = true)]
     pub enabled: bool,
     /// Source path in the host
     pub source: String,
     /// Target path in the VM container
     pub target: String,
+    /// Mount as read-only
     #[config(default_t = false)]
     pub read_only: bool,
-    /// What to do when the source path doesn't exist.
+    /// What to do if the source path does not exist.
     #[config(default_t = MissingAction::Fail)]
     pub missing: MissingAction,
-    /// Unix permissions for created dirs/files (octal string, e.g. "755").
-    /// Default: "755" for directories, "644" for files.
+    /// Unix permissions for created directories and files (octal string,
+    /// for example "755"). Default: "755" for directories, "644" for files.
     #[config(default)]
     pub create_mode: Option<String>,
-    /// Initial content written when `missing = "create-file"` creates the file.
+    /// Initial content of the file that `missing = "create-file"` creates.
     #[config(default)]
     pub file_content: Option<String>,
 }
 
+/// What to do if the source path of a mount does not exist.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MissingAction {
-    /// Error out if the source doesn't exist (default).
+    /// Stop with an error (default).
     Fail,
     /// Skip the mount with a warning.
     Warn,
@@ -696,10 +710,10 @@ pub enum MissingAction {
     CreateFile,
 }
 
-/// VM disk image configuration — sparse raw disk with ext4
+/// VM disk image configuration: sparse raw disk with ext4.
 #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
 pub struct Disk {
-    /// Disk image size (e.g. "20 GB", "512 MB"). Default 10 GB.
+    /// Disk image size (for example "20 GB", "512 MB"). Default 10 GB.
     #[serde(serialize_with = "ser_byte_size")]
     #[config(default_t = ByteSize(10 * 1024 * 1024 * 1024))]
     pub size: ByteSize,
@@ -708,9 +722,10 @@ pub struct Disk {
     pub cache: BTreeMap<String, CacheMount>,
 }
 
+/// Container paths on the persistent cache volume (`[disk.cache.<name>]`).
 #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
 pub struct CacheMount {
-    /// Enable/disable mount
+    /// Enable or disable the mount
     #[config(default_t = true)]
     pub enabled: bool,
     /// One or more container paths to back with persistent cache storage
@@ -719,26 +734,28 @@ pub struct CacheMount {
 
 /// Clipboard bridge configuration (`[clipboard]`).
 ///
-/// Each direction is granted separately and both default to off. The
-/// host never passes the capability into the guest for a disabled
-/// direction, so a compromised sandbox has nothing to invoke — the
-/// booleans are a capability grant, not a guest-side policy check.
+/// Each direction is granted separately, and both are off by default. For
+/// a disabled direction, the host never gives the capability to the guest.
+/// Thus a compromised sandbox has nothing to call. The booleans grant a
+/// capability. They are not a policy check in the guest.
 #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
 pub struct Clipboard {
-    /// Let the sandbox write to the host clipboard. The risk here is
-    /// content rather than volume: text copied out of the sandbox can
-    /// later be pasted into a shell.
+    /// Let the sandbox write to the host clipboard. The risk is the content,
+    /// not the size: text that is copied from the sandbox can later be
+    /// pasted into a shell.
     #[config(default_t = false)]
     pub copy: bool,
-    /// Largest single guest → host transfer (e.g. "2 MB"). Enforced on
-    /// the host, and again by the guest daemon so an oversized write is
-    /// never buffered. Bounds memory use, not what the content can do.
+    /// Maximum size of one guest → host transfer (for example "2 MB"). The
+    /// host enforces it. The guest daemon also enforces it, thus an
+    /// oversized write is never buffered. It limits memory use, not what the
+    /// content can do.
     #[serde(serialize_with = "ser_byte_size")]
     #[config(default_t = ByteSize(1024 * 1024))]
     pub copy_limit: ByteSize,
-    /// Let the sandbox read the host clipboard. This is a guest-*initiated*
-    /// read with no user interaction, so sandboxed code can take whatever
-    /// was last copied — passwords, tokens. Leave off unless needed.
+    /// Let the sandbox read the host clipboard. The guest *starts* the read
+    /// without user interaction. Thus code in the sandbox can get the last
+    /// copied text, for example passwords or tokens. Enable it only if
+    /// necessary.
     #[config(default_t = false)]
     pub paste: bool,
 }
@@ -763,10 +780,10 @@ impl WellKnown for CacheMount {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RestartPolicy {
-    /// Restart on any exit until `max-restarts` is reached (default).
+    /// Restart on any exit until `max_restarts` is reached (default).
     #[default]
     Always,
-    /// Restart only on non-zero exit; stop the loop on clean exit.
+    /// Restart only on a non-zero exit. Stop the loop on a clean exit.
     OnFailure,
 }
 
@@ -776,26 +793,34 @@ impl WellKnown for RestartPolicy {
     const DE: Self::Deserializer = smart_config::de::Serde;
 }
 
-/// Unix signal used to ask a daemon to shut down gracefully.
+/// Unix signal that asks a daemon to stop gracefully.
 ///
-/// Accepts the canonical name (e.g. `"SIGTERM"`) — unknown names fail
-/// config parse. Numeric signal numbers are not accepted, to avoid
-/// cross-platform portability traps.
+/// Accepts the canonical name (for example `"SIGTERM"`). An unknown name
+/// is a config parse error. Signal numbers are not accepted, because they
+/// are not the same on all platforms.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Signal {
+    /// `SIGTERM` (default).
     #[default]
     Term,
+    /// `SIGINT`.
     Int,
+    /// `SIGHUP`.
     Hup,
+    /// `SIGQUIT`.
     Quit,
+    /// `SIGUSR1`.
     Usr1,
+    /// `SIGUSR2`.
     Usr2,
+    /// `SIGKILL`.
     Kill,
 }
 
 impl Signal {
-    /// Linux signal number (architecture-independent for these signals).
-    #[allow(dead_code)] // used once the host wires daemons into capnp start()
+    /// Linux signal number. For these signals, it is the same on all
+    /// architectures.
+    #[allow(dead_code)] // TODO: remove the allow. `daemon.rs` uses this now.
     pub fn as_number(self) -> i32 {
         match self {
             Signal::Hup => 1,
@@ -857,12 +882,12 @@ impl WellKnown for Signal {
 
 /// Sidecar process declared under `[daemons.<name>]`.
 ///
-/// Daemons start during the boot, before any process is spawned. They are
-/// restarted per `restart`/`max-restarts`, and on sandbox shutdown
-/// are sent `signal`, then SIGKILL'd after `timeout` seconds.
+/// Daemons start during the boot, before other processes. They restart
+/// as `restart` and `max_restarts` specify. At sandbox shutdown, they get
+/// `signal`, then SIGKILL after `timeout` seconds.
 #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
 pub struct Daemon {
-    /// Enable/disable this daemon
+    /// Enable or disable this daemon
     #[config(default_t = true)]
     pub enabled: bool,
     /// Argv for the daemon process
@@ -873,20 +898,20 @@ pub struct Daemon {
     /// Signal used for graceful shutdown (default SIGTERM).
     #[config(default)]
     pub signal: Signal,
-    /// Grace period in seconds after sending `signal` before SIGKILL
-    /// is sent. `0` means wait forever.
+    /// Time in seconds between `signal` and SIGKILL. `0` means wait
+    /// forever.
     #[config(default_t = 10)]
     pub timeout: u32,
     /// Restart policy: `"always"` (default) or `"on-failure"`.
     #[config(default)]
     pub restart: RestartPolicy,
-    /// Maximum number of restarts after the initial launch. `0` means
-    /// no cap.
+    /// Maximum number of restarts after the first start. `0` means no
+    /// limit.
     #[config(default_t = 10)]
     pub max_restarts: u32,
     /// Apply process hardening (namespace isolation, no-new-privileges).
-    /// Defaults to true; can be set to false even when the main shell
-    /// is hardened (e.g. to run `dockerd`).
+    /// True by default. It can be false also if the main shell is hardened
+    /// (for example to run `dockerd`).
     #[config(default_t = true)]
     pub harden: bool,
     /// Environment variables for the daemon process. Values support
@@ -900,21 +925,20 @@ impl WellKnown for Daemon {
     const DE: Self::Deserializer = de::nested();
 }
 
-/// Hide subdirectories of the project mount from the in-VM
-/// sandbox by overlaying an empty directory on top of them.
+/// Hides subdirectories of the project mount from the sandbox in the VM.
+/// An empty directory is put over each of them.
 ///
-/// Each `paths` entry is interpreted relative to the project
-/// root and must be a plain relative path — leading `/` or `~`
-/// are rejected. The masked tree is fully recreated on every
-/// VM start, so the source-of-truth here is the config, not the
-/// guest's prior state.
+/// Each `paths` entry is relative to the project root and must be a plain
+/// relative path. A leading `/` or `~` is an error. The masked tree is
+/// made again at each VM start. Thus the config is the source of truth,
+/// not the earlier state of the guest.
 #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
 pub struct Mask {
-    /// Enable/disable this mask.
+    /// Enable or disable this mask.
     #[config(default_t = true)]
     pub enabled: bool,
-    /// Project-relative paths to mask. Must not start with `/`
-    /// or `~`, must not contain `..`.
+    /// Paths to mask, relative to the project. They must not start with
+    /// `/` or `~`, and must not contain `..`.
     pub paths: Vec<String>,
 }
 
@@ -923,6 +947,12 @@ impl WellKnown for Mask {
     const DE: Self::Deserializer = de::nested();
 }
 
+/// Parse and validate a merged config document.
+/// Args:
+///  - `merged`: Merged config document. It must be a table.
+///
+/// Returns:
+///   The config values, or an error that lists all problems.
 pub(crate) fn parse(merged: serde_json::Value) -> anyhow::Result<ConfigValues> {
     let serde_json::Value::Object(map) = merged else {
         anyhow::bail!("config must be a TOML table");
@@ -947,30 +977,29 @@ pub(crate) fn parse(merged: serde_json::Value) -> anyhow::Result<ConfigValues> {
     Ok(config)
 }
 
-/// Checks on a parsed config that the schema cannot express: the
-/// cross-field `[network]` checks of [`validate_network`].
+/// Check a parsed config for problems that the schema cannot express (see
+/// [`validate_network`]).
 pub(crate) fn validate(config: &ConfigValues) -> anyhow::Result<()> {
     validate_network(config)
 }
 
-/// Cross-field checks on `[network]` that the schema cannot express,
-/// reported in the same shape as smart-config parse errors so the user sees
-/// one consistent "invalid configuration" block.
+/// Do the cross-field checks of `[network]` that the schema cannot
+/// express. The errors have the same form as smart-config parse errors,
+/// thus the user sees one "invalid configuration" block.
 ///
-/// Target patterns: every `allow`/`deny`/middleware `target` entry of an
-/// enabled rule must have a port that is a number or `*` (or none). The
-/// proxy would otherwise have to pick a meaning for `*:8O80`, and the only
-/// safe one is "refuse to start" — treating it as "any port" turns a typo
-/// into a wide-open allow under deny-by-default.
-///
-/// Inject: every name in an enabled rule's `inject` list must be an `[env]`
-/// entry with `mask = true` — injecting an unmasked value would mean the
-/// guest already holds the real secret, and injecting an undefined one is a
-/// typo. An injecting rule also cannot be `passthrough` (injection needs
-/// interception).
-///
-/// Services: every name in `[network.services]` must be a service airlock
-/// knows.
+/// Checks:
+///  - Target patterns: each `allow` and `deny` entry of an enabled rule,
+///    and each `target` entry of an enabled middleware, must have a port
+///    that is a number or `*` (or no port). Otherwise the proxy must
+///    select a meaning for `*:8O80`. The only safe meaning is "do not
+///    start". With "any port", a typo becomes a wide-open allow under
+///    deny-by-default.
+///  - Inject: each name in the `inject` list of an enabled rule must be an
+///    `[env]` entry with `mask = true`. If the value is not masked, the
+///    guest already has the real secret. An undefined name is a typo. A
+///    rule with `inject` also cannot be `passthrough`, because injection
+///    needs interception.
+///  - Services: each name in `[network.services]` must be a known service.
 fn validate_network(config: &ConfigValues) -> anyhow::Result<()> {
     let mut problems: Vec<String> = Vec::new();
     for name in config.network.services.keys() {
@@ -1026,8 +1055,15 @@ fn validate_network(config: &ConfigValues) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    //! Tests for image references.
+
     use super::*;
 
+    /// Test that an image reference gives a pinned digest only if the digest is
+    /// a full sha256 value after a name.
+    ///   1. Check references with a digest, a tag and a registry port
+    ///   2. Check references without a digest, or with a short, bad or nameless
+    ///      digest
     #[test]
     fn pinned_digest_is_found_only_in_well_formed_references() {
         let digest = format!("sha256:{}", "a".repeat(64));

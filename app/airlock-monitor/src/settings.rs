@@ -1,22 +1,25 @@
-//! TUI runtime settings. Sourced from the `[monitor]` section of the
-//! user config; defaults match what the values used to be hard-coded to.
+//! TUI runtime settings from the `[monitor]` section of the user config.
 
 use crate::keys::KeyBindings;
 
+/// TUI runtime settings from the `[monitor]` section of the user config.
 pub struct TuiSettings {
-    /// Max HTTP request entries kept in the Monitor tab buffer. Older
-    /// entries are dropped once this cap is reached.
+    /// Maximum number of HTTP request entries in the Monitor tab buffer.
+    /// When the buffer is full, the oldest entries are removed.
     pub max_http_requests: usize,
-    /// Max TCP connection entries kept in the Monitor tab buffer.
+    /// Maximum number of TCP connection entries in the Monitor tab buffer.
     pub max_tcp_connections: usize,
-    /// Scrollback rows retained by the embedded vt100 terminal that
-    /// drives the sandbox tab.
+    /// Number of scrollback rows that the embedded terminal of the Sandbox
+    /// tab keeps.
     pub scrollback: u16,
-    /// Key → action map consulted on every keystroke. Built once at
-    /// startup from the user's `[monitor.keys]` config (or defaults).
+    /// Map from key to action. The TUI reads it on each keystroke. Airlock
+    /// builds it one time at startup from the user's `[monitor.keys]`
+    /// config, or from the defaults.
     pub keys: KeyBindings,
 }
 
+// The defaults are the same values that the code used before they became
+// configurable.
 impl Default for TuiSettings {
     fn default() -> Self {
         Self {

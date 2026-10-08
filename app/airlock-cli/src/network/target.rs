@@ -1,3 +1,9 @@
+//! Network targets.
+//!
+//! Defines the target patterns from the config, the decision for one
+//! connection, and the host and port of an upstream. Also includes helpers
+//! that classify IP addresses, for example public or private.
+
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::rc::Rc;
 
@@ -6,26 +12,29 @@ use super::interceptor::Interceptor;
 use super::matchers;
 use crate::project::MaskedSecret;
 
-/// A resolved network target — parsed from a rule's `allow` or `deny` list
-/// at startup. Each target represents one `host[:port]` pattern.
+/// One `host[:port]` pattern, parsed at startup from the `allow` or `deny`
+/// list of a rule.
 #[derive(Clone, Debug)]
 pub struct NetworkTarget {
+    /// Host pattern (see [`matchers::host_matches`]).
     pub host: String,
+    /// Port, or `None` for all ports.
     pub port: Option<u16>,
 }
 
 impl NetworkTarget {
-    /// Does this target match the given host:port?
+    /// Return true if this target matches `host:port`.
     pub fn matches(&self, host: &str, port: u16) -> bool {
         matchers::host_matches(host, &self.host) && self.port.is_none_or(|p| p == port)
     }
 }
 
-/// A host and port the proxy talks to. The host is always canonical
-/// ([`matchers::canonical_host`]: lowercase, no trailing dot), so the
-/// services compare endpoints exactly: the guest's DNS keeps the case of
-/// a name, and `AUTH.OPENAI.COM` or `api.anthropic.com.` is the same host
-/// as the endpoint.
+/// Host and port that the proxy connects to.
+///
+/// The host is always canonical ([`matchers::canonical_host`]: lowercase,
+/// no trailing dot). Thus the services can compare endpoints exactly. The
+/// guest DNS keeps the case of a name, and `AUTH.OPENAI.COM` or
+/// `api.anthropic.com.` is the same host as the endpoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Endpoint {
     host: String,
@@ -33,6 +42,7 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
+    /// Make an endpoint. The host becomes canonical.
     pub fn new(host: &str, port: u16) -> Self {
         Self {
             host: matchers::canonical_host(host),
@@ -40,16 +50,18 @@ impl Endpoint {
         }
     }
 
+    /// Get the canonical host.
     pub fn host(&self) -> &str {
         &self.host
     }
 
+    /// Get the port.
     pub fn port(&self) -> u16 {
         self.port
     }
 
-    /// `host`, or `host:port` for a port other than 443: the `Host` and
-    /// `:authority` of a request to the endpoint.
+    /// Get the `Host` and `:authority` value for a request to the endpoint:
+    /// `host` for port 443, `host:port` for other ports.
     pub fn authority(&self) -> String {
         if self.port == 443 {
             self.host.clone()
@@ -58,6 +70,7 @@ impl Endpoint {
         }
     }
 
+    /// Get a target that matches only this endpoint.
     pub fn target(&self) -> NetworkTarget {
         NetworkTarget {
             host: self.host.clone(),
@@ -66,7 +79,7 @@ impl Endpoint {
     }
 }
 
-/// The targets of `endpoints`, without duplicates.
+/// Get the targets of `endpoints`, with no duplicates.
 pub fn targets_of(endpoints: &[&Endpoint]) -> Vec<NetworkTarget> {
     let mut out: Vec<NetworkTarget> = Vec::new();
     for e in endpoints {
@@ -80,28 +93,32 @@ pub fn targets_of(endpoints: &[&Endpoint]) -> Vec<NetworkTarget> {
     out
 }
 
-/// A compiled middleware script with target patterns for matching.
+/// Compiled middleware script with one target pattern.
 #[derive(Clone)]
 pub struct MiddlewareTarget {
+    /// Host pattern (see [`matchers::host_matches`]).
     pub host: String,
+    /// Port, or `None` for all ports.
     pub port: Option<u16>,
+    /// Compiled middleware script.
     pub middleware: CompiledMiddleware,
 }
 
 impl MiddlewareTarget {
-    /// Does this middleware target match the given host:port?
+    /// Return true if this middleware target matches `host:port`.
     pub fn matches(&self, host: &str, port: u16) -> bool {
         matchers::host_matches(host, &self.host) && self.port.is_none_or(|p| p == port)
     }
 }
 
-/// A masked secret as the proxy holds it: shared behind an `Rc` so the
-/// per-connection and per-request copies are pointer bumps, not string
-/// clones. Derefs to the underlying [`MaskedSecret`].
+/// Masked secret as the proxy keeps it. The secret is shared in an `Rc`,
+/// so a copy for each connection and request clones only a pointer, not
+/// strings. Derefs to the [`MaskedSecret`].
 #[derive(Clone, Debug)]
 pub struct InjectedSecret(Rc<MaskedSecret>);
 
 impl InjectedSecret {
+    /// Make a shared handle for `secret`.
     pub fn new(secret: MaskedSecret) -> Self {
         Self(Rc::new(secret))
     }
@@ -115,64 +132,73 @@ impl std::ops::Deref for InjectedSecret {
     }
 }
 
-/// Masked secrets a rule injects into HTTP headers, paired with one of the
-/// rule's allow patterns. One entry per `(rule, allow pattern)`; all entries
-/// of a rule share the same underlying secrets.
+/// Masked secrets that a rule injects into HTTP headers, with one allow
+/// pattern of the rule. There is one entry for each `(rule, allow pattern)`.
+/// All entries of a rule share the same secrets.
 #[derive(Clone, Debug)]
 pub struct InjectTarget {
+    /// Host pattern (see [`matchers::host_matches`]).
     pub host: String,
+    /// Port, or `None` for all ports.
     pub port: Option<u16>,
+    /// Secrets to inject.
     pub secrets: Vec<InjectedSecret>,
 }
 
 impl InjectTarget {
-    /// Does this inject target match the given host:port?
+    /// Return true if this inject target matches `host:port`.
     pub fn matches(&self, host: &str, port: u16) -> bool {
         matchers::host_matches(host, &self.host) && self.port.is_none_or(|p| p == port)
     }
 }
 
+/// Decision for one connection: if it is allowed, and how the proxy
+/// handles it.
 #[derive(Clone)]
 pub struct ResolvedTarget {
+    /// Destination host (after port forward changes).
     pub host: String,
+    /// Destination port (after port forward changes).
     pub port: u16,
     /// Middleware scripts from all matching middleware rules.
     pub middleware: Vec<CompiledMiddleware>,
-    /// Masked secrets to swap in outbound request headers / out of
-    /// response headers, from all matching rules with `inject`. Empty for
-    /// denied and passthrough connections.
-    pub secrets: Vec<InjectedSecret>,
-    /// The interceptor that owns the target; it handles every request on
-    /// the connection around the upstream send. `None` for denied
+    /// Masked secrets to replace in request headers (to the real value) and
+    /// in response headers (to the masked value). They come from all
+    /// matching rules with `inject`. Empty for denied and passthrough
     /// connections.
+    pub secrets: Vec<InjectedSecret>,
+    /// Interceptor that owns the target. It handles each request on the
+    /// connection around the upstream send. `None` for denied connections.
     pub interceptor: Option<Rc<dyn Interceptor>>,
-    /// Whether this connection is permitted.
-    /// False if denied by policy, deny rule, or no allow rule matched.
+    /// True if the connection is allowed. False if the policy or a deny
+    /// rule denies it, or if no allow rule matches.
     pub allowed: bool,
-    /// Skip TLS/HTTP interception and relay the connection as plain TCP.
-    /// Set for targets matching a passthrough rule and for localhost
-    /// port-forwarded destinations (which may carry non-HTTP protocols
-    /// whose first bytes can't be sniffed without deadlocking).
+    /// If true, skip TLS and HTTP interception and relay the connection as
+    /// plain TCP. Set for targets that match a passthrough rule and for
+    /// localhost port-forwarded destinations. These may use non-HTTP
+    /// protocols, and a sniff of their first bytes can cause a deadlock.
     pub passthrough: bool,
-    /// Connect only to public addresses ([`is_public_ip`]): the proxy
-    /// drops every other address the host resolves to, so a name cannot
-    /// reach the host's loopback, the LAN or cloud metadata.
+    /// If true, connect only to public addresses ([`is_public_ip`]). The
+    /// proxy ignores all other addresses that the host resolves to. Thus a
+    /// name cannot reach the host loopback, the LAN or cloud metadata.
     pub public_only: bool,
 }
 
 impl ResolvedTarget {
-    /// True when the allowed connection should skip all interception and
-    /// be relayed as plain TCP. Denied connections never passthrough —
-    /// they still need to reach the 403 code path.
+    /// Return true if the connection is allowed and must skip all
+    /// interception, and the proxy relays it as plain TCP. Denied
+    /// connections never use passthrough. They must get to the 403 code
+    /// path.
     pub fn is_passthrough(&self) -> bool {
         self.allowed && self.passthrough
     }
 }
 
-/// Whether `ip` is a public address: not unspecified, loopback, private
-/// (RFC 1918, ULA), link-local (cloud metadata), shared (CGNAT),
-/// broadcast, multicast or reserved. IPv4-compatible, IPv4-mapped,
-/// NAT64 and 6to4 addresses are judged by their IPv4 address.
+/// Return true if `ip` is a public address. A public address is not
+/// unspecified, loopback, private (RFC 1918, ULA), link-local (cloud
+/// metadata), shared (CGNAT), broadcast, multicast or reserved.
+/// For IPv4-compatible, IPv4-mapped, NAT64 and 6to4 addresses, the
+/// embedded IPv4 address decides.
 pub fn is_public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_public_v4(v4),
@@ -215,7 +241,9 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
         || ip.is_multicast())
 }
 
-/// `host` as an IP address: a literal, bare or in brackets.
+/// Parse `host` as an IP literal, with or without brackets.
+/// Returns:
+///   The IP address, or `None` if `host` is not an IP literal.
 pub fn ip_literal(host: &str) -> Option<IpAddr> {
     host.strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
@@ -226,8 +254,15 @@ pub fn ip_literal(host: &str) -> Option<IpAddr> {
 
 #[cfg(test)]
 mod tests {
+    //! Tests for the public address check of the public-only network.
+
     use super::*;
 
+    /// Test that local, private, metadata and other special addresses are
+    /// not public. A public-only network uses this check, so a miss lets the
+    /// guest reach the host or the LAN.
+    ///   1. Take IPv4 and IPv6 special addresses, also IPv4 in IPv6 forms
+    ///   2. Check that none of them is public
     #[test]
     fn local_private_and_metadata_addresses_are_not_public() {
         for ip in [
@@ -252,6 +287,8 @@ mod tests {
             "fe80::1",
             "fec0::1",
             "ff02::1",
+            // IPv4-mapped, NAT64, IPv4-compatible and 6to4 forms of
+            // loopback, metadata and private IPv4 addresses.
             "::ffff:127.0.0.1",
             "::ffff:169.254.169.254",
             "64:ff9b::a9fe:a9fe",
@@ -265,6 +302,10 @@ mod tests {
         }
     }
 
+    /// Test that internet addresses are public, also near the edge of the
+    /// private ranges and in IPv4 in IPv6 forms.
+    ///   1. Take public IPv4 and IPv6 addresses
+    ///   2. Check that each of them is public
     #[test]
     fn internet_addresses_are_public() {
         for ip in [

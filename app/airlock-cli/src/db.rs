@@ -1,31 +1,8 @@
-//! The airlock database: `~/.airlock/db/`.
+//! The airlock database.
 //!
-//! One LMDB environment (through `heed`) shared by every airlock process
-//! of the user. It hosts named databases for different purposes; this
-//! module knows none of them. [`Db::open`] opens (and creates) the
-//! environment; the process has one [`Db`], opened by
-//! [`crate::context::Context::load`] and cloned from there.
-//!
-//! ## Adding a database
-//!
-//! Name it `<purpose>` or `<purpose>.<name>` (as `services`), get its handle with
-//! [`Db::database`] (created when missing) and use it in the transactions
-//! of [`Db::read`] and [`Db::write`]. Keep the records small: the
-//! map is [`MAP_SIZE`] for all databases together, and the environment
-//! has room for [`MAX_DBS`] databases.
-//!
-//! ## Transactions
-//!
-//! LMDB serializes write transactions across processes with a lock in
-//! `lock.mdb`: a writer waits for the other, so there is no `Busy` error
-//! to retry. A transaction belongs to one thread, and a waiting writer
-//! blocks its thread: [`Db::read`] and [`Db::write`] run the whole
-//! transaction inside [`tokio::task::spawn_blocking`]. Keep transactions
-//! short; never hold one across an `await` or network I/O.
-//!
-//! LMDB allows one environment handle per path in a process: clone the
-//! [`Db`] of the context instead of making another on the same directory
-//! (`heed` refuses the second open).
+//! A key-value store in the airlock home directory. All airlock processes of
+//! the user share it. It contains named databases for different purposes.
+//! This module does not know the contents of any of them.
 
 use std::path::Path;
 
@@ -35,25 +12,43 @@ use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn, WithoutTls};
 /// Directory of the database in the airlock home directory.
 pub const DIR: &str = "db";
 
-/// Upper bound of the environment's size, for all databases together.
-/// LMDB reserves the address space only; the file grows with the data.
+/// Maximum size of the environment, for all databases together. LMDB
+/// reserves only the address space. The file grows with the data.
 const MAP_SIZE: usize = 64 * 1024 * 1024;
 
-/// The most named databases the environment holds.
+/// Maximum number of named databases in the environment.
 const MAX_DBS: u32 = 32;
 
-/// The open database. Cheap to clone; the clones share one environment.
+/// The open database: one LMDB environment (through `heed`).
+///
+/// Clones are cheap and share one environment. The process has one [`Db`].
+/// [`crate::context::Context::load`] opens it, and all users clone it from
+/// there. LMDB allows one environment handle per path in a process, and
+/// `heed` refuses a second open of the same directory.
+///
+/// LMDB serializes write transactions across processes with a lock in
+/// `lock.mdb`. A writer waits for the other, so there is no `Busy` error to
+/// retry. A transaction belongs to one thread, and a waiting writer blocks
+/// its thread. Thus [`Db::read`] and [`Db::write`] run the full transaction
+/// inside [`tokio::task::spawn_blocking`]. Keep transactions short. Never
+/// hold one across an `await` or network I/O.
 #[derive(Clone)]
 pub struct Db(Env<WithoutTls>);
 
 impl Db {
-    /// Open the database in the directory `dir`, created (0700; LMDB's
-    /// files 0600) when absent. Blocks.
+    /// Open the database in the directory `dir`. Creates the directory
+    /// (mode 0700, LMDB files 0600) if it does not exist. Blocks.
     pub fn open(dir: &Path) -> anyhow::Result<Self> {
         open_env(dir).map(Self)
     }
 
-    /// The database `name`, created when missing.
+    /// Get the handle of the database `name`. Creates the database if it
+    /// does not exist.
+    ///
+    /// Name a new database `<purpose>` or `<purpose>.<name>` (as `services`).
+    /// Use the handle in the transactions of [`Db::read`] and [`Db::write`].
+    /// Keep the records small: all databases share [`MAP_SIZE`], and there is
+    /// space for [`MAX_DBS`] databases.
     pub async fn database<K, V>(&self, name: &str) -> anyhow::Result<Database<K, V>>
     where
         K: Send + 'static,
@@ -72,9 +67,11 @@ impl Db {
         .await
     }
 
-    /// Delete every record of the database `name`, if it exists: `heed`
-    /// cannot delete a named database, so a database no longer in use is
-    /// emptied (its name stays). Returns whether it had records.
+    /// Delete all records of the database `name`, if it exists. Use it for a
+    /// database that is no longer in use. The name stays, because `heed`
+    /// cannot delete a named database.
+    /// Returns:
+    ///   `true` if the database had records.
     pub async fn empty_database(&self, name: &str) -> anyhow::Result<bool> {
         let db = self.clone();
         let name = name.to_string();
@@ -96,6 +93,8 @@ impl Db {
     }
 
     /// Run `body` in a read transaction.
+    /// Returns:
+    ///   The result of `body`.
     pub async fn read<T: Send + 'static>(
         &self,
         body: impl FnOnce(&RoTxn<'_, WithoutTls>) -> anyhow::Result<T> + Send + 'static,
@@ -108,8 +107,10 @@ impl Db {
         .await
     }
 
-    /// Run `body` in a write transaction: commit on success, abort on
-    /// error. Waits while another process writes.
+    /// Run `body` in a write transaction. Commits if `body` succeeds, and
+    /// aborts if it fails. Waits while another process writes.
+    /// Returns:
+    ///   The result of `body`.
     pub async fn write<T: Send + 'static>(
         &self,
         body: impl FnOnce(&mut RwTxn<'_>) -> anyhow::Result<T> + Send + 'static,
@@ -146,7 +147,7 @@ impl Db {
     }
 }
 
-/// Run `op` on a blocking thread: LMDB transactions block and belong to
+/// Run `op` on a blocking thread. LMDB transactions block and belong to
 /// their thread.
 async fn blocking<T: Send + 'static>(
     op: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
@@ -156,28 +157,30 @@ async fn blocking<T: Send + 'static>(
         .context("database task")?
 }
 
-/// Open the environment in `dir`, created (0700; LMDB's files 0600) when
-/// absent. Blocks.
+/// Open the environment in `dir`. Creates the directory (mode 0700, LMDB
+/// files 0600) if it does not exist. Blocks.
 fn open_env(dir: &Path) -> anyhow::Result<Env<WithoutTls>> {
     prepare_dir(dir)?;
     let mut options = EnvOpenOptions::new().read_txn_without_tls();
     options.map_size(MAP_SIZE).max_dbs(MAX_DBS);
-    // SAFETY: the memory map is only sound while nothing but LMDB changes
+    // SAFETY: the memory map is sound only while LMDB is the only writer of
     // the files. Only airlock writes them, always through LMDB and this
-    // function; a process opens the environment once (one `Db` in the
-    // context, and `heed` refuses a second open of the same path); the
-    // directory is private to the user and lives in the home directory,
-    // not on a network file system.
+    // function. A process opens the environment once (one `Db` in the
+    // context, and `heed` refuses a second open of the same path). The
+    // directory is private to the user and is in the home directory, not on
+    // a network file system.
     let env = unsafe { options.open(dir) }
         .with_context(|| format!("open the database {}", dir.display()))?;
-    // Reader slots of processes that died mid-read would pin old pages.
+    // Reader slots of processes that died during a read keep old pages
+    // in use. Clear them.
     env.clear_stale_readers()
         .context("clear stale database readers")?;
     Ok(env)
 }
 
-/// Create the environment directory (0700) before LMDB creates its files
-/// (0600) in it; restrict a directory that exists with wider modes.
+/// Create the environment directory (mode 0700) before LMDB creates its
+/// files (0600) in it. If the directory exists with wider modes, restrict it
+/// to 0700.
 fn prepare_dir(dir: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
     std::fs::DirBuilder::new()

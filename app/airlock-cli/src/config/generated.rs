@@ -1,4 +1,8 @@
-//! The new config file of the setup wizard.
+//! New config file of the setup wizard.
+//!
+//! Makes and saves the project config file that the setup wizard creates.
+//! The file contains the selected packs, and optionally an image and
+//! clipboard access.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -6,17 +10,17 @@ use std::path::{Path, PathBuf};
 use crate::packs::ArgValue;
 use crate::project;
 
-/// Where a new project config goes.
+/// Location of a new project config file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
-    /// `airlock.toml`, next to the project files (version-controlled).
+    /// `airlock.toml`, next to the project files (under version control).
     Project,
-    /// `.airlock/airlock.toml` (local; `.airlock/` is git-ignored).
+    /// `.airlock/airlock.toml` (local, because git ignores `.airlock/`).
     Local,
 }
 
 impl Target {
-    /// The file of the target, relative to the project directory.
+    /// Path of the target file, relative to the project directory.
     pub fn file(self) -> &'static str {
         match self {
             Target::Project => "airlock.toml",
@@ -24,45 +28,55 @@ impl Target {
         }
     }
 
+    /// Path of the target file in the project directory `host_cwd`.
     pub fn path(self, host_cwd: &Path) -> PathBuf {
         host_cwd.join(self.file())
     }
 }
 
-/// What the sandbox may do with the host clipboard (`[clipboard]`).
+/// Host clipboard access of the sandbox (`[clipboard]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Clipboard {
-    /// Write to it (`copy`).
+    /// The sandbox can write to the clipboard (`copy`).
     pub copy: bool,
-    /// Read it (`paste`).
+    /// The sandbox can read the clipboard (`paste`).
     pub paste: bool,
 }
 
 /// A pack entry of a new config file.
 pub struct NewEntry<'a> {
+    /// Pack name.
     pub name: &'a str,
+    /// Pack version.
     pub version: &'a str,
-    /// The arg values to write, by key.
+    /// Arg values to write, by key.
     pub args: Vec<(&'a str, &'a ArgValue)>,
 }
 
-/// A new config file, not written yet.
+/// A new config file that is not written yet.
 #[derive(Clone)]
 pub struct GeneratedConfig {
+    /// Location of the file.
     pub target: Target,
-    /// The file of `target` in the project.
+    /// Path of the `target` file in the project.
     pub path: PathBuf,
-    /// The content: the pack entries
-    /// (`[packs] <name> = { version = "1", args = { … } }`, `args` only
-    /// when there are any), `vm.image` and `[clipboard]` when they are
-    /// given. Empty without any of them.
+    /// TOML content of the file:
+    ///  * the pack entries (`[packs] <name> = { version = "1", args = { … } }`,
+    ///    `args` only if there are args)
+    ///  * `vm.image` and `[clipboard]`, if given
+    ///
+    /// Empty if none of them is given.
     pub toml: String,
 }
 
 impl GeneratedConfig {
-    /// The config file of `target` in the project `host_cwd`, with the
-    /// pack `entries`, and `image` (`vm.image`, as a config file has it)
-    /// and `clipboard`, if given.
+    /// Make a new config file.
+    /// Args:
+    ///  - `host_cwd`: Project directory
+    ///  - `target`: Location of the file
+    ///  - `entries`: Pack entries
+    ///  - `image`: `vm.image` as it is in a config file, if any
+    ///  - `clipboard`: Clipboard access, if any
     pub fn new(
         host_cwd: &Path,
         target: Target,
@@ -77,9 +91,9 @@ impl GeneratedConfig {
         }
     }
 
-    /// Write the file as a new file. A file that appeared in the meantime
-    /// is an error, not overwritten. The local file gets
-    /// `.airlock/.gitignore` first.
+    /// Write the file as a new file. If a file appeared in the meantime,
+    /// this is an error and the file is not overwritten. For the local
+    /// file, `.airlock/.gitignore` is created first.
     pub fn save(&self) -> anyhow::Result<()> {
         if self.target == Target::Local {
             let host_cwd = self.path.parent().and_then(Path::parent).ok_or_else(|| {
@@ -97,7 +111,7 @@ impl GeneratedConfig {
     }
 }
 
-/// The content of a new config file (see [`GeneratedConfig::toml`]).
+/// Make the content of a new config file (see [`GeneratedConfig::toml`]).
 fn render(
     entries: &[NewEntry<'_>],
     image: Option<&serde_json::Value>,
@@ -135,14 +149,14 @@ fn render(
     doc.to_string()
 }
 
-/// The `[vm]` table with `image` (as a config file has it).
+/// Make the `[vm]` table with `image` (as it is in a config file).
 fn vm_image(image: &serde_json::Value) -> anyhow::Result<toml_edit::Item> {
     let text = toml::to_string(&serde_json::json!({ "vm": { "image": image } }))?;
     let doc: toml_edit::DocumentMut = text.parse()?;
     Ok(doc["vm"].clone())
 }
 
-/// An arg value as a TOML value.
+/// Convert an arg value to a TOML value.
 fn toml_value(value: &ArgValue) -> toml_edit::Value {
     match value {
         ArgValue::Bool(b) => (*b).into(),
@@ -150,7 +164,7 @@ fn toml_value(value: &ArgValue) -> toml_edit::Value {
     }
 }
 
-/// Create the file `path` with `content`; an existing file is an error.
+/// Create the file `path` with `content`. An existing file is an error.
 fn create_new(path: &Path, content: &str) -> std::io::Result<()> {
     std::fs::OpenOptions::new()
         .write(true)

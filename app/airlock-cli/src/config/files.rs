@@ -1,11 +1,15 @@
 //! Config file discovery and parsing.
+//!
+//! Finds the user and project config files of a project and parses them.
+//! Config files can be TOML, JSON or YAML.
 
 use std::path::{Path, PathBuf};
 
+/// Supported config file extensions, in priority order.
 pub(crate) const EXTENSIONS: &[&str] = &["toml", "json", "yaml", "yml"];
 
-/// The config files found by [`discover_in`], each as its path and parsed
-/// value, lowest precedence first per slot.
+/// Config files that [`discover_in`] found, each as its path and parsed
+/// value. Each slot is in order of precedence, lowest first.
 pub(crate) struct DiscoveredFiles {
     /// `~/.airlock/airlock.<ext>`, `~/.airlock/config.<ext>`, `~/.airlock.<ext>`
     pub user: Vec<(PathBuf, serde_json::Value)>,
@@ -15,10 +19,9 @@ pub(crate) struct DiscoveredFiles {
     pub project: Vec<(PathBuf, serde_json::Value)>,
 }
 
-/// Find and parse the config files of `project_root` with `home` as the
-/// home directory.
+/// Find and parse the config files of a project.
 ///
-/// Files are loaded in order (later overrides former):
+/// Files are loaded in this order (a later file overrides an earlier one):
 /// 1. `~/.airlock/airlock.<ext>`
 /// 2. `~/.airlock/config.<ext>`
 /// 3. `~/.airlock.<ext>`
@@ -26,11 +29,18 @@ pub(crate) struct DiscoveredFiles {
 /// 5. `<project_root>/airlock.<ext>`
 /// 6. `<project_root>/airlock.local.<ext>`
 ///
-/// When the project root is the home directory, `.airlock/airlock.<ext>`
-/// is the local project file only, not also a user file.
+/// If the project root is the home directory, `.airlock/airlock.<ext>` is
+/// only the local project file, not also a user file.
 ///
 /// Supported formats: TOML, JSON, YAML. For each slot, the first matching
 /// extension (`toml` → `json` → `yaml` → `yml`) wins.
+/// Args:
+///  - `home`: Home directory of the user
+///  - `project_root`: Project root directory
+///
+/// Returns:
+///   The parsed files, or an error if a file exists but is not readable or
+///   not valid.
 pub(crate) fn discover_in(home: &Path, project_root: &Path) -> anyhow::Result<DiscoveredFiles> {
     let local_base = project_root.join(".airlock/airlock");
     let home_base = home.join(".airlock/airlock");
@@ -63,16 +73,18 @@ pub(crate) fn discover_in(home: &Path, project_root: &Path) -> anyhow::Result<Di
 }
 
 /// Try each supported extension for `base` and parse the first file found.
+/// Returns:
+///   The path and parsed value, or `None` if no file exists.
 pub(super) fn load_first(base: &Path) -> anyhow::Result<Option<(PathBuf, serde_json::Value)>> {
     for ext in EXTENSIONS {
         let path = PathBuf::from(format!("{}.{ext}", base.display()));
         let content = match std::fs::read_to_string(&path) {
             Ok(content) => content,
-            // Only a genuinely absent file falls through to the next
-            // extension. Any other error (permission, IO, a directory in
-            // the file's place) means the config exists but can't be
-            // read — fail closed so the sandbox never silently drops the
-            // user's policy in favor of permissive defaults.
+            // Only a missing file goes to the next extension. Other errors
+            // (permission, IO, a directory in place of the file) mean that
+            // the config exists but is not readable. Fail closed, so that
+            // the sandbox never drops the user policy without a warning and
+            // uses permissive defaults.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
                 return Err(anyhow::anyhow!("read config file {}: {e}", path.display()));
@@ -84,6 +96,14 @@ pub(super) fn load_first(base: &Path) -> anyhow::Result<Option<(PathBuf, serde_j
     Ok(None)
 }
 
+/// Parse a config file. The file extension selects the format.
+/// Args:
+///  - `path`: File path, for the format and for error messages
+///  - `content`: File contents
+///
+/// Returns:
+///   The parsed value, or an error for a syntax error or an unsupported
+///   extension.
 pub(crate) fn parse_file(path: &Path, content: &str) -> anyhow::Result<serde_json::Value> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("toml") => {

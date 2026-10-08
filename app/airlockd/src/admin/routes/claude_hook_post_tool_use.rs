@@ -1,8 +1,8 @@
-//! `POST /claude/hooks/post-tool-use` — drop the pre-hook's start record
-//! on successful tool completion.
+//! Hook after a successful tool call.
 //!
-//! Nothing to inject back to Claude; the route exists only to release
-//! the `ToolTracker` entry so it doesn't linger until eviction.
+//! Claude Code calls this hook after a tool call succeeds. The hook removes the
+//! start record of the call, so the record does not stay in memory. It sends
+//! nothing back to Claude.
 
 use std::sync::Arc;
 
@@ -14,11 +14,14 @@ use tracing::debug;
 
 use crate::admin::state::AdminState;
 
+/// Hook request body. Only the used fields.
 #[derive(Deserialize)]
 pub struct Payload {
     tool_use_id: Option<String>,
 }
 
+/// Remove the start record of the tool call. Always returns an empty JSON
+/// object.
 pub async fn handle(State(state): State<Arc<AdminState>>, Json(p): Json<Payload>) -> Json<Value> {
     if let Some(id) = p.tool_use_id {
         let found = state.tool_tracker.take(&id).is_some();

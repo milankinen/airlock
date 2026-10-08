@@ -1,10 +1,7 @@
-//! The guest's loopback network, reached from the host.
+//! Host access to the guest loopback network.
 //!
-//! [`GuestNetwork`] wraps the supervisor's `openLocalTcp`: the host opens a
-//! TCP connection to a port on the guest's loopback and gets a byte
-//! stream. Reverse port forwards ([`crate::network::reverse_forward`]) and
-//! the sign-in callback forwards of the network services
-//! ([`crate::services::callback`]) relay into the guest this way.
+//! Lets the host open TCP connections to ports on the guest loopback. Reverse
+//! port forwards and sign-in callbacks use this access.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -16,18 +13,22 @@ use tokio::sync::mpsc;
 
 use crate::network::io::{ChannelSink, RelayError, RpcTransport};
 
-/// The guest's loopback, for connections the host opens. Cheap to clone.
+/// Guest loopback, for connections that the host opens. Wraps the
+/// `openLocalTcp` call of the supervisor. Cheap to clone.
 #[derive(Clone)]
 pub struct GuestNetwork {
     supervisor: supervisor::Client,
 }
 
 impl GuestNetwork {
+    /// Make a guest network handle from a supervisor client.
     pub fn new(supervisor: supervisor::Client) -> Self {
         Self { supervisor }
     }
 
-    /// Open a TCP connection to `port` on the guest's loopback.
+    /// Open a TCP connection to `port` on the guest loopback.
+    /// Returns:
+    ///   Byte stream of the connection.
     pub async fn connect(&self, port: u16) -> anyhow::Result<RpcTransport> {
         let (tx, rx) = mpsc::channel::<Bytes>(1);
         let error: RelayError = Rc::new(RefCell::new(None));

@@ -1,20 +1,24 @@
-//! How a step of `airlock start` ends the run early.
+//! Early end of `airlock start`.
+//!
+//! Lets a step of `airlock start` end the run early, with a reason and an exit
+//! code.
 
 use std::fmt;
 
 use crate::cli;
 use crate::cli::prompt::PromptError;
 
-/// A step that ended the run: the process exit code (the step reported
-/// why), or a failure that the caller reports.
+/// The reason why a step ended the run.
 #[derive(Debug)]
 pub enum Exit {
+    /// Process exit code. The step already reported the reason.
     Code(i32),
+    /// A failure that the caller must report.
     Failed(anyhow::Error),
 }
 
 impl Exit {
-    /// Ctrl+C (128 + SIGINT).
+    /// Exit after Ctrl+C (128 + SIGINT).
     pub const INTERRUPTED: Exit = Exit::Code(130);
 
     /// Report a configuration error (exit code 2).
@@ -29,7 +33,8 @@ impl Exit {
         Exit::Code(code)
     }
 
-    /// The user cancelled a question: exit code 0, or 130 after Ctrl+C.
+    /// Report that the user cancelled a question. Exit code 0, or 130 after
+    /// Ctrl+C.
     pub fn aborted() -> Self {
         if cli::is_interrupted() {
             return Exit::INTERRUPTED;
@@ -38,7 +43,7 @@ impl Exit {
         Exit::Code(0)
     }
 
-    /// The result of the whole run: an exit code, or the failure.
+    /// Convert the result of the whole run to an exit code or the failure.
     pub fn into_result(result: Result<i32, Exit>) -> anyhow::Result<i32> {
         match result {
             Ok(code) | Err(Exit::Code(code)) => Ok(code),
@@ -53,7 +58,7 @@ impl From<anyhow::Error> for Exit {
     }
 }
 
-/// A failed question: reported, except Ctrl+C.
+/// Convert a failed question. Reports the error, except for Ctrl+C.
 impl From<PromptError> for Exit {
     fn from(e: PromptError) -> Self {
         match e {

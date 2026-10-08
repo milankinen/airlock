@@ -1,3 +1,6 @@
+//! Anthropic refreshes and sign-outs through the proxy: what the proxy sends
+//! to the provider, what it refuses locally, and how it deletes grants.
+
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -6,6 +9,7 @@ use crate::services::ServiceId;
 use crate::test_cfg::provider::*;
 use crate::test_cfg::upstream::post;
 
+/// A Claude Code refresh body with the refresh token `surrogate`.
 fn refresh_of(surrogate: &Value) -> Value {
     json!({
         "grant_type": "refresh_token",
@@ -15,6 +19,15 @@ fn refresh_of(surrogate: &Value) -> Value {
     })
 }
 
+/// Test that a relayed refresh sends only the fields that the proxy sets,
+/// and that the guest keeps its refresh surrogate. The guest must not
+/// control the client or the scopes of the real refresh.
+///   1. Sign in with full scopes, or with only `org:create_api_key`
+///   2. Send a refresh with a different client, scopes and an extra field
+///   3. Check that the provider gets the grant's client and scopes without
+///      `org:create_api_key` (no `scope` if none is left)
+///   4. Check that the guest gets the same refresh surrogate and that the new
+///      access surrogate works with the new real token
 #[test]
 fn relayed_refresh_sends_only_providers_fields_and_keeps_surrogate() {
     for (scope, sent_scope) in [
@@ -59,12 +72,21 @@ fn relayed_refresh_sends_only_providers_fields_and_keeps_surrogate() {
     }
 }
 
+/// Test that the token endpoint refuses malformed or unknown requests
+/// locally. Only a valid request with a known surrogate goes upstream.
+///   1. Sign in
+///   2. Send token requests with a query, a duplicate key, a wrong content
+///      type, a JSON array and unsupported grant types
+///   3. Check that each gets a local 400 with the correct error
+///   4. Send refreshes with unknown tokens and check `invalid_grant`
+///   5. Check that no request goes upstream
 #[test]
 fn token_requests_that_do_not_fit_are_refused_locally() {
     Setup::new(ServiceId::Anthropic, Options::default()).run(|r| async move {
         let answer = r.sign_in().await;
         let before = r.upstream_requests();
         let refresh = refresh_of(&answer["refresh_token"]).to_string();
+        // A second `grant_type` key at the start of the JSON object.
         let duplicate = refresh.replacen('{', r#"{"grant_type":"authorization_code","#, 1);
         for (path, content_type, body, error) in [
             (
@@ -112,6 +134,13 @@ fn token_requests_that_do_not_fit_are_refused_locally() {
     });
 }
 
+/// Test that a revoke with the refresh or the access surrogate deletes the
+/// grant and revokes the real refresh token upstream.
+///   1. Sign in
+///   2. Revoke the refresh or the access surrogate
+///   3. Check that the provider gets a revoke of the real refresh token and
+///      that the grant is gone
+///   4. Check that the surrogates now get local refusals
 #[test]
 fn revoke_of_either_surrogate_deletes_grant_and_revokes_real_refresh_token() {
     for field in ["refresh_token", "access_token"] {
@@ -149,6 +178,12 @@ fn revoke_of_either_surrogate_deletes_grant_and_revokes_real_refresh_token() {
     }
 }
 
+/// Test that a revoke of a token that is not a grant's surrogate stays
+/// local. A real token or an API key must not cause an upstream revoke.
+///   1. Sign in and create an API key
+///   2. Revoke an unknown surrogate, the real refresh token, the API key
+///      surrogate and a number
+///   3. Check that each gets 200, nothing goes upstream and the grant stays
 #[test]
 fn revoke_of_unknown_token_or_api_key_stays_local() {
     Setup::new(ServiceId::Anthropic, Options::default()).run(|r| async move {
@@ -170,6 +205,11 @@ fn revoke_of_unknown_token_or_api_key_stays_local() {
     });
 }
 
+/// Test that a sign-out deletes the grant also when the upstream revoke
+/// fails.
+///   1. Make the provider answer revokes with 503
+///   2. Sign in and revoke the refresh surrogate
+///   3. Check that the guest gets 200 and the grant is gone
 #[test]
 fn failed_upstream_revoke_still_deletes_grant() {
     let opts = Options {
@@ -187,6 +227,10 @@ fn failed_upstream_revoke_still_deletes_grant() {
     });
 }
 
+/// Test that a revoke completes also when the guest drops the request.
+///   1. Make the provider answer revokes after 300 ms
+///   2. Sign in, send a revoke and drop it after 100 ms
+///   3. Check that the provider gets the revoke and the grant is gone
 #[test]
 fn revoke_dropped_by_guest_still_completes() {
     let opts = Options {
@@ -199,6 +243,7 @@ fn revoke_dropped_by_guest_still_completes() {
         let dropped =
             tokio::time::timeout(Duration::from_millis(100), r.post_revoke(&revoke)).await;
         assert!(dropped.is_err());
+        // Wait longer than the revoke delay, so that the revoke can complete.
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert_eq!(r.revokes().len(), 1);
         assert!(r.grants().await.is_empty());

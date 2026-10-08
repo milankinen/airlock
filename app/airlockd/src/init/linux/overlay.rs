@@ -1,18 +1,8 @@
-//! Assemble the container rootfs at `/mnt/overlay/rootfs` by composing
-//! the OCI image layers (topmost-first, as `lowerdir`s) with an
-//! upperdir on the project disk (or tmpfs when no disk is present).
+//! Container rootfs.
 //!
-//! Before mounting the overlay this also:
-//! - writes file-mount symlinks into the upperdir (their targets
-//!   resolve through the `/airlock/.files/{rw|ro}/` bind mount
-//!   installed later by `container::setup`),
-//! - stages per-file CA bundles on a tmpfs lowerdir via `ca::prepare_overlay`,
-//! - resets the upperdir when the image digest changes so stale
-//!   upperdir paths from a previous image don't shadow the new one.
-//!
-//! Once overlayfs is up, this also wires dir/cache bind mounts on top
-//! of the composed rootfs and masks `.airlock/` so the container can't
-//! reach back into sandbox internals (CA keys, disk image, lock file).
+//! Makes the container rootfs from the image layers, the project state and the
+//! configured mounts. Hides sandbox internals and the masked paths from the
+//! container.
 
 use std::io::Read;
 use std::os::fd::FromRawFd;
@@ -22,13 +12,28 @@ use tracing::{debug, info};
 
 use crate::init::MountConfig;
 
-/// Assemble the container rootfs from overlayfs layers, file symlinks,
-/// directory bind mounts, and cache bind mounts.
+/// Assemble the container rootfs at `/mnt/overlay/rootfs`.
+///
+/// Steps:
+///  1. Mount overlayfs. The OCI image layers are the lowerdirs (topmost
+///     first). The upperdir is on the project disk, or on tmpfs if there is
+///     no disk. Before the mount:
+///     - Resets the upperdir if the image changed, so old upperdir paths of
+///       a previous image do not hide the new image.
+///     - Writes the file-mount symlinks into the upperdir.
+///     - Adds the CA bundles as a tmpfs lowerdir (see
+///       [`super::ca::prepare_overlay`]).
+///  2. Bind-mount the directory and cache mounts on the rootfs.
+///  3. Hide `.airlock/` and the configured mask paths, so the container
+///     cannot access sandbox internals (CA keys, disk image, lock file).
+///
+/// Args:
+///  - `mounts`: Mount configuration from the host
 pub(super) fn assemble(mounts: &MountConfig) -> anyhow::Result<()> {
     let has_disk = Path::new("/mnt/disk").is_dir();
 
-    // Upper/work must be on a local filesystem (not VirtioFS/FUSE).
-    // Use disk if available (persists), otherwise tmpfs (ephemeral).
+    // Upper/work must be on a local filesystem (not VirtioFS/FUSE). Use the
+    // disk if it exists (persistent), otherwise tmpfs (not persistent).
     let (upper, work) = if has_disk {
         reset_if_image_changed(&mounts.image_id)?;
         std::fs::create_dir_all("/mnt/disk/overlay/upper")?;
@@ -40,11 +45,12 @@ pub(super) fn assemble(mounts: &MountConfig) -> anyhow::Result<()> {
         ("/tmp/overlay_upper", "/tmp/overlay_work")
     };
 
-    // Write file mount symlinks into the upper layer BEFORE mounting overlayfs.
-    // Each symlink at upper/{target_rel} → /airlock/.files/{rw|ro}/{mount_key}
-    // is merged into the container rootfs by overlayfs. The container resolves
-    // the path through /airlock/.files/{rw|ro}/ which is bind-mounted from the
-    // VirtioFS share (set up in setup_container_mounts).
+    // Write the file mount symlinks into the upper layer BEFORE the overlayfs
+    // mount. overlayfs merges each symlink
+    // upper/{target_rel} -> /airlock/.files/{rw|ro}/{mount_key} into the
+    // container rootfs. The container resolves the link through
+    // /airlock/.files/{rw|ro}/, which `container::setup` later bind-mounts
+    // from the VirtioFS share.
     for file in &mounts.files {
         let rw_or_ro = if file.read_only { "ro" } else { "rw" };
         let link_target = format!("/airlock/.files/{rw_or_ro}/{}", file.mount_key);
@@ -53,7 +59,8 @@ pub(super) fn assemble(mounts: &MountConfig) -> anyhow::Result<()> {
         if let Some(parent) = Path::new(&upper_path).parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Overwrite any existing entry at this path (file mount takes precedence).
+        // Replace an existing entry at this path. The file mount has
+        // priority.
         let _ = std::fs::remove_file(&upper_path);
         std::os::unix::fs::symlink(&link_target, &upper_path).map_err(|e| {
             anyhow::anyhow!("failed to create file mount symlink {upper_path} → {link_target}: {e}")
@@ -61,7 +68,8 @@ pub(super) fn assemble(mounts: &MountConfig) -> anyhow::Result<()> {
         debug!("file symlink: {upper_path} → {link_target}");
     }
 
-    // Persist filelinks for debugging (survives overlay resets, shows active file mounts).
+    // Keep a copy of the file links on the disk for debugging. It shows the
+    // active file mounts and stays after overlay resets.
     if has_disk {
         std::fs::create_dir_all("/mnt/disk/filelinks")?;
         let current_keys: std::collections::HashSet<&str> =
@@ -84,15 +92,15 @@ pub(super) fn assemble(mounts: &MountConfig) -> anyhow::Result<()> {
         }
     }
 
-    // overlayfs: per-layer rootfs trees (lowerdirs, topmost-first) +
-    // project state (upperdir). The project CA is staged as an extra tmpfs
-    // lowerdir placed on top of the image layers (see `ca::prepare_overlay`),
-    // so CA writes never land on the persistent upperdir — without that, the
-    // appended CA would accumulate across reboots when the upperdir is kept.
+    // overlayfs: one rootfs tree per layer (lowerdirs, topmost first) and the
+    // project state (upperdir). The project CA is an extra tmpfs lowerdir
+    // above the image layers (see `ca::prepare_overlay`). Thus no CA write
+    // goes to the persistent upperdir. Otherwise the CA would be added again
+    // at each reboot when the upperdir persists.
     //
-    // `userxattr` makes overlayfs honor whiteouts encoded as `user.overlay.*`
-    // xattrs, which is how the host-side extractor preserves whiteouts without
-    // needing CAP_MKNOD. Requires kernel >= 5.11.
+    // `userxattr` makes overlayfs use whiteouts encoded as `user.overlay.*`
+    // xattrs. The host-side extractor keeps whiteouts in this form, because
+    // it does not have CAP_MKNOD. Needs kernel >= 5.11.
     let ca_overlay = super::ca::prepare_overlay(mounts)?;
 
     let layer_dirs: Vec<String> = mounts
@@ -113,16 +121,17 @@ pub(super) fn assemble(mounts: &MountConfig) -> anyhow::Result<()> {
     }
     let lower = lower_dirs.join(":");
     // Force `index=off,xino=off`. With `index=on` (the default for RW
-    // overlays) the kernel records a file-handle-based origin xattr on the
-    // upperdir root pointing into the lower, then re-verifies it on every
-    // remount. virtiofsd assigns fresh inode ids across VM restarts, so the
-    // verification fails on the 2nd mount with ESTALE:
+    // overlays), the kernel writes an origin xattr on the upperdir root. The
+    // xattr is a file handle into the lower, and the kernel checks it again
+    // at each mount. virtiofsd gives new inode IDs after each VM restart, so
+    // the check fails on the 2nd mount with ESTALE:
     //     overlayfs: failed to verify upper root origin
-    // `xino=off` matters for the same reason — with `CONFIG_OVERLAY_FS_XINO_AUTO=y`
-    // the kernel would otherwise encode a layer identity into upper inode
-    // numbers that likewise goes stale after a virtiofsd restart.
-    // We don't need `index` (only used for hardlink consistency across
-    // copy-ups, which we don't rely on).
+    // `xino=off` is necessary for the same reason. With
+    // `CONFIG_OVERLAY_FS_XINO_AUTO=y`, the kernel encodes a layer identity
+    // into upper inode numbers, and this identity also becomes stale after
+    // a virtiofsd restart.
+    // The sandbox does not need `index`. It only keeps hard links consistent
+    // across copy-ups, and the sandbox does not use that.
     let opts =
         format!("lowerdir={lower},upperdir={upper},workdir={work},userxattr,index=off,xino=off");
     info!("overlayfs opts: {opts}");
@@ -158,7 +167,8 @@ pub(super) fn assemble(mounts: &MountConfig) -> anyhow::Result<()> {
         info!("dir: {src} → {}", dst.display());
     }
 
-    // Cache bind mounts (last — override dir mounts).
+    // Cache bind mounts (after the dir mounts, so they have priority over
+    // them).
     if has_disk {
         for cache in mounts.caches.iter().filter(|c| c.enabled) {
             for target in &cache.paths {
@@ -173,10 +183,10 @@ pub(super) fn assemble(mounts: &MountConfig) -> anyhow::Result<()> {
         }
     }
 
-    // Mask .airlock/ and any user-declared `[mask.<name>]` paths.
-    // Per-mask source dirs live under `<mask_root>/project/<name>` so
-    // each block stays isolated from the others. The tree is recreated
-    // fresh on every VM start so the host config is the source of truth.
+    // Hide .airlock/ and all user-defined `[mask.<name>]` paths. Each mask
+    // has its own source directory under `<mask_root>/project/<name>`, so
+    // the blocks stay isolated from each other. The tree is made again at
+    // each VM start, so the host config is the source of truth.
     if let Some(project_mount) = mounts.dirs.iter().find(|d| d.tag == "project") {
         let mask_root = if has_disk {
             "/mnt/disk/mask"
@@ -184,15 +194,15 @@ pub(super) fn assemble(mounts: &MountConfig) -> anyhow::Result<()> {
             "/tmp/airlock-mask"
         };
         let project_mask_root = format!("{mask_root}/project");
-        // Wipe and recreate the per-mask source tree so a re-configured
-        // mask doesn't inherit stale state from a previous boot.
+        // Remove and make again the mask source tree, so a changed mask
+        // gets no old state from a previous boot.
         let _ = std::fs::remove_dir_all(&project_mask_root);
         std::fs::create_dir_all(&project_mask_root)?;
 
         let project_root = crate::util::resolve_in_root(rootfs, &project_mount.target);
 
-        // Built-in: hide the sandbox's own .airlock/ directory so the
-        // container can't read CA keys, disk image, lock file, etc.
+        // Built-in: hide the .airlock/ directory of the sandbox, so the
+        // container cannot read CA keys, disk image, lock file and others.
         {
             let src = format!("{project_mask_root}/.airlock");
             std::fs::create_dir_all(&src)?;
@@ -202,8 +212,8 @@ pub(super) fn assemble(mounts: &MountConfig) -> anyhow::Result<()> {
             info!("masked .airlock at {}", dst.display());
         }
 
-        // User-declared masks: empty per-mask source dir + bind mount
-        // over each declared path inside the project.
+        // User-defined masks: bind-mount the empty source directory of the
+        // mask over each of its paths in the project.
         for mask in &mounts.masks {
             let src = format!("{project_mask_root}/{}", mask.name);
             std::fs::create_dir_all(&src)?;
@@ -219,9 +229,9 @@ pub(super) fn assemble(mounts: &MountConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Drain `/dev/kmsg` non-blocking and return the most recent lines that
-/// mention "overlay". Used to surface the kernel's own error message when
-/// `mount(2)` returns a generic errno like ESTALE.
+/// Read `/dev/kmsg` without blocking and return the last 20 lines that
+/// contain "overlay". Shows the kernel's own error message when `mount(2)`
+/// returns a generic errno such as ESTALE.
 fn recent_kmsg_overlay_lines() -> Vec<String> {
     let fd = unsafe { libc::open(c"/dev/kmsg".as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK) };
     if fd < 0 {
@@ -245,10 +255,12 @@ fn recent_kmsg_overlay_lines() -> Vec<String> {
     lines.split_off(take)
 }
 
-/// Reset the overlay upper layer if the base image changed.
+/// Reset the overlay upper layer if the base image changed. Then writes the
+/// new image ID to `/mnt/disk/overlay/.image_id`.
 fn reset_if_image_changed(image_id: &str) -> anyhow::Result<()> {
     let id_file = "/mnt/disk/overlay/.image_id";
-    // Missing file is normal on first run — treat as empty (needs reset).
+    // On the first run the file does not exist. This is normal. An empty
+    // value causes a reset.
     let current = std::fs::read_to_string(id_file).unwrap_or_default();
     if !current.is_empty() && current.trim() == image_id {
         debug!("overlay image ID matches, keeping existing state");

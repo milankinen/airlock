@@ -1,20 +1,27 @@
-//! Virtual terminal backed by a `vt100::Parser`.
+//! Virtual terminal for the sandbox process output.
 //!
-//! Process output (stdout/stderr) is fed into the parser, and the resulting
-//! screen cells are rendered to the ratatui buffer by the sandbox tab.
+//! Keeps the terminal screen state of the sandbox process. The Sandbox tab
+//! shows this screen.
 
-/// The guest's mouse reporting state, as tracked by the parser. Re-exported
-/// so `crate::mouse` can talk about it without spreading `vt100` imports
-/// across the crate.
+/// Mouse reporting state of the guest, as the parser keeps it. Re-exported
+/// so that other modules can use it without `vt100` imports.
 pub use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
-/// Wraps a `vt100::Parser` to receive PTY output and expose screen state.
+/// Virtual terminal that receives PTY output and gives the screen state.
+///
+/// The Sandbox tab draws the screen cells of this terminal.
 pub struct TuiTerminalSink {
+    // Process output (stdout and stderr) goes into this parser.
     parser: vt100::Parser,
     csi: CsiRewriter,
 }
 
 impl TuiTerminalSink {
+    /// Create a terminal.
+    /// Args:
+    ///  - `rows`: Number of screen rows
+    ///  - `cols`: Number of screen columns
+    ///  - `scrollback`: Number of scrollback rows to keep.
     pub fn new(rows: u16, cols: u16, scrollback: u16) -> Self {
         Self {
             parser: vt100::Parser::new(rows, cols, scrollback as usize),
@@ -22,43 +29,49 @@ impl TuiTerminalSink {
         }
     }
 
+    /// Current screen state.
     pub fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
     }
 
-    /// Which xterm mouse protocol the guest has enabled, if any
-    /// (`\e[?9h`, `\e[?1000h`, `\e[?1002h`, `\e[?1003h`). `None` means the
-    /// guest never asked for mouse reporting, so forwarding events to it
-    /// would land as literal escape bytes at its prompt.
+    /// Xterm mouse protocol that the guest enabled (`\e[?9h`, `\e[?1000h`,
+    /// `\e[?1002h`, `\e[?1003h`). `None` means that the guest did not enable
+    /// mouse reporting. Then forwarded events show as literal escape bytes at
+    /// its prompt.
     pub fn mouse_protocol_mode(&self) -> MouseProtocolMode {
         self.parser.screen().mouse_protocol_mode()
     }
 
-    /// How the guest wants mouse reports encoded — SGR (`\e[?1006h`),
-    /// UTF-8 (`\e[?1005h`), or the default single-byte form.
+    /// Mouse report encoding that the guest wants: SGR (`\e[?1006h`), UTF-8
+    /// (`\e[?1005h`), or the default single-byte form.
     pub fn mouse_protocol_encoding(&self) -> MouseProtocolEncoding {
         self.parser.screen().mouse_protocol_encoding()
     }
 
-    /// How many rows the view is scrolled back from the live screen. Zero
-    /// means on-screen rows line up with the guest's own grid, which is a
-    /// precondition for forwarding mouse coordinates to it.
+    /// Number of rows that the view is scrolled back from the live screen.
+    ///
+    /// Zero means that the rows on the screen are the same as the guest's
+    /// own grid. Mouse coordinates go to the guest only in this state.
     pub fn scrollback(&self) -> usize {
         self.parser.screen().scrollback()
     }
 
+    /// Change the screen size to `rows` x `cols`. Both must be non-zero.
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.parser.screen_mut().set_size(rows, cols);
     }
 
+    /// Process a chunk of PTY output.
     pub fn write(&mut self, data: &[u8]) {
         let rewritten = self.csi.rewrite(data);
         self.parser.process(&rewritten);
     }
 
+    /// Scroll the view back by `rows` rows. No effect on the alternate
+    /// screen.
     pub fn scroll_up(&mut self, rows: usize) {
-        // Alternate screen (vim, htop, etc.) has no scrollback — scrolling
-        // into it would mix alt-screen geometry with normal-screen rows.
+        // The alternate screen (vim, htop, etc.) has no scrollback. A scroll
+        // there mixes the alternate screen layout with normal screen rows.
         if self.parser.screen().alternate_screen() {
             return;
         }
@@ -66,6 +79,8 @@ impl TuiTerminalSink {
         self.parser.screen_mut().set_scrollback(offset);
     }
 
+    /// Scroll the view forward by `rows` rows, toward the live screen. No
+    /// effect on the alternate screen.
     pub fn scroll_down(&mut self, rows: usize) {
         if self.parser.screen().alternate_screen() {
             return;
@@ -74,6 +89,7 @@ impl TuiTerminalSink {
         self.parser.screen_mut().set_scrollback(offset);
     }
 
+    /// Go back to the live screen.
     pub fn scroll_to_bottom(&mut self) {
         self.parser.screen_mut().set_scrollback(0);
     }
@@ -81,13 +97,14 @@ impl TuiTerminalSink {
 
 /// Streaming rewriter that replaces HVP (`CSI ... f`) with CUP (`CSI ... H`).
 ///
-/// Some terminal applications (notably btop) use HVP — functionally equivalent
-/// to CUP per ECMA-48 — but the `vt100` crate only implements CUP and silently
-/// ignores the positioning for HVP, which collapses the rendered output onto
-/// whatever row the cursor happened to be on.
+/// Some terminal applications (for example btop) use HVP. ECMA-48 defines
+/// HVP with the same function as CUP. But the `vt100` crate implements only
+/// CUP, and silently ignores the position in HVP. Then all output shows on
+/// the row where the cursor was.
 ///
-/// Only plain CSI (no private-mode introducers like `?`, `>`, `<`, `=`) with
-/// final byte `f` is rewritten; SGR and other sequences are untouched.
+/// The rewriter changes only plain CSI sequences (no private-mode
+/// introducers such as `?`, `>`, `<`, `=`) with the final byte `f`. SGR and
+/// other sequences stay the same.
 struct CsiRewriter {
     state: CsiState,
 }
@@ -124,23 +141,25 @@ impl CsiRewriter {
                     out.push(b);
                 }
                 CsiState::Csi { ref mut has_intro } => {
-                    // Private-mode introducer immediately after `[`
+                    // Private-mode introducer. It usually comes immediately
+                    // after `[`, but the check accepts it at any position.
                     if matches!(b, b'?' | b'>' | b'<' | b'=') {
                         *has_intro = true;
                         out.push(b);
                     } else if (0x30..=0x3f).contains(&b) {
-                        // Parameter byte (digits, ';', ':')
+                        // Parameter byte (digits, ';', ':').
                         out.push(b);
                     } else if (0x20..=0x2f).contains(&b) {
-                        // Intermediate byte
+                        // Intermediate byte.
                         out.push(b);
                     } else if (0x40..=0x7e).contains(&b) {
-                        // Final byte — rewrite HVP to CUP if no private intro
+                        // Final byte. Change HVP to CUP if there is no
+                        // private-mode introducer.
                         let final_byte = if b == b'f' && !*has_intro { b'H' } else { b };
                         out.push(final_byte);
                         self.state = CsiState::Normal;
                     } else {
-                        // Malformed; reset and pass through
+                        // Malformed sequence. Reset the state and keep the byte.
                         out.push(b);
                         self.state = CsiState::Normal;
                     }

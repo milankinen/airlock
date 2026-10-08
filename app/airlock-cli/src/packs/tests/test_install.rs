@@ -1,3 +1,6 @@
+//! Tests of the install loop: the setup scripts run on the host in place
+//! of the install VM, and the install state on disk follows each outcome.
+
 use std::fs::File;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -13,13 +16,18 @@ use crate::test_cfg::packs::{HostExec, test_installers};
 use crate::test_cfg::{TempDir, block_on_local, temp_dir};
 use crate::util::PinnedDir;
 
+/// Disk identity and image of the fake install boot. Each save writes
+/// them, so that the plan does not ask for a new disk.
 const DISK: Option<(u64, u64)> = Some((1, 2));
 const IMAGE: &str = "sha256:1";
 
+/// Four packs out of name order. `plain` has no setup script, so the
+/// installs are `alpha`, `beta` and `gamma` in name order.
 const CONFIG: &str = "[packs]\ngamma = { version = 1 }\nplain = { version = 1 }\n\
                       alpha = { version = 1, args = { mode = \"slow\", fast-path = true } }\n\
                       beta = { version = 1 }\n";
 
+/// A sandbox directory and the installs of one config.
 struct Sandbox {
     tmp: TempDir,
     dir: PinnedDir,
@@ -27,6 +35,7 @@ struct Sandbox {
 }
 
 impl Sandbox {
+    /// A new empty sandbox directory with the installs of `config`.
     fn new(config: &str) -> Self {
         let tmp = temp_dir();
         let dir = PinnedDir::open(tmp.path(), Path::new("sandbox"), true).unwrap();
@@ -37,10 +46,13 @@ impl Sandbox {
         }
     }
 
+    /// The path of the sandbox directory.
     fn path(&self) -> PathBuf {
         self.tmp.path().join("sandbox")
     }
 
+    /// Run the install loop with `exec`, then update the state as after a
+    /// VM shutdown with (`synced`) or without a confirmed disk sync.
     fn install(&self, exec: HostExec, synced: bool) -> (LoopOutcome, HostExec) {
         let mut exec = exec.recording_state_of(&self.path());
         let mut state = self.state();
@@ -65,6 +77,7 @@ impl Sandbox {
         (outcome, exec)
     }
 
+    /// The install state on disk (default when there is no state file).
     fn state(&self) -> InstallState {
         match state::read(&self.dir) {
             ReadState::Ok(s) => s,
@@ -73,6 +86,8 @@ impl Sandbox {
         }
     }
 
+    /// The packs that the next start installs according to `state`, with
+    /// the reason.
     fn pending(&self, state: &InstallState) -> Vec<(String, Why)> {
         let wanted: Vec<Wanted> = self
             .installers
@@ -95,10 +110,12 @@ impl Sandbox {
     }
 }
 
+/// The status of pack `id` in `state`.
 fn status(state: &InstallState, id: &str) -> Option<PackStatus> {
     state.packs.get(id).map(|r| r.status)
 }
 
+/// Pending packs from string ids.
 fn pending(items: &[(&str, Why)]) -> Vec<(String, Why)> {
     items
         .iter()
@@ -106,6 +123,15 @@ fn pending(items: &[(&str, Why)]) -> Vec<(String, Why)> {
         .collect()
 }
 
+/// Test that the install loop runs each setup script and that a synced
+/// shutdown marks the packs as installed.
+///   1. Install the configured packs with a synced shutdown
+///   2. Check the run order and the progress messages of the status
+///      channel
+///   3. Check that the state file marks all packs as installed, has mode
+///      0600 and leaves nothing pending
+///   4. Check that the install log has the script output and status lines
+///      with a pack prefix, but not the step count line
 #[test]
 fn installing_configured_packs_runs_setup_scripts_and_synced_shutdown_installs_them() {
     let sandbox = Sandbox::new(CONFIG);
@@ -150,9 +176,16 @@ fn installing_configured_packs_runs_setup_scripts_and_synced_shutdown_installs_t
     ] {
         assert!(log.contains(line), "{line}: {log}");
     }
+    // `airlock_steps` writes only to the status channel, not to the log.
     assert!(!log.contains("steps 2"), "{log}");
 }
 
+/// Test that a failed setup script does not stop the next packs, and that
+/// the next start tries the failed pack again.
+///   1. Configure the second pack to exit with code 11
+///   2. Install and check that all three packs ran
+///   3. Check that the failed pack is marked failed and is pending as a
+///      retry, and that the others are installed
 #[test]
 fn failing_pack_does_not_stop_next_and_retries_on_next_start() {
     let sandbox = Sandbox::new(&CONFIG.replace(
@@ -168,10 +201,19 @@ fn failing_pack_does_not_stop_next_and_retries_on_next_start() {
     assert_eq!(sandbox.pending(&state), pending(&[("beta", Why::Retry)]));
 }
 
+/// Test that without a confirmed disk sync, the packs stay unconfirmed and
+/// the next start installs them again. The disk can lose data that the
+/// guest did not sync.
+///   1. Install with an unsynced shutdown
+///   2. Check the state on disk when the third pack started, as after a
+///      crash at that point: the first two are unconfirmed and pending as
+///      retries, the third is new
+///   3. Check that after the shutdown all packs are unconfirmed
 #[test]
 fn unsynced_shutdown_leaves_unconfirmed_records_that_retry() {
     let sandbox = Sandbox::new(CONFIG);
     let (_, exec) = sandbox.install(HostExec::new(), false);
+    // The state on disk when the third exec started.
     let crashed = &exec.on_disk[2];
     assert_eq!(status(crashed, "alpha"), Some(PackStatus::Unconfirmed));
     assert_eq!(status(crashed, "beta"), Some(PackStatus::Unconfirmed));
@@ -190,6 +232,15 @@ fn unsynced_shutdown_leaves_unconfirmed_records_that_retry() {
     }
 }
 
+/// Test that an interrupt stops the loop, and that a synced shutdown
+/// marks as installed only the packs that succeeded in this boot.
+///   1. Interrupt the second pack and check that the loop stops there
+///   2. Check that the first pack is installed, the second failed and
+///      the third pending as new
+///   3. Leave all packs unconfirmed with an unsynced install, then
+///      interrupt the first pack in a synced install
+///   4. Check that the first pack failed and the other two stay
+///      unconfirmed, because they did not run in this boot
 #[test]
 fn interrupt_stops_loop_and_synced_shutdown_promotes_only_packs_that_ran() {
     let sandbox = Sandbox::new(CONFIG);
@@ -220,6 +271,12 @@ fn interrupt_stops_loop_and_synced_shutdown_promotes_only_packs_that_ran() {
     assert_eq!(status(&state, "gamma"), Some(PackStatus::Unconfirmed));
 }
 
+/// Test that a pack whose exec did not start keeps its record. Nothing
+/// ran, so nothing changed for that pack.
+///   1. Make the exec of the second pack not start
+///   2. Check that the loop stops as interrupted after the first pack
+///   3. Check that the first pack is installed and the other two have no
+///      record
 #[test]
 fn pack_whose_exec_did_not_start_keeps_its_record() {
     let sandbox = Sandbox::new(CONFIG);
@@ -232,6 +289,11 @@ fn pack_whose_exec_did_not_start_keeps_its_record() {
     assert_eq!(status(&state, "gamma"), None);
 }
 
+/// Test that a timeout or a failed exec stops the loop with a reason, and
+/// marks the pack as failed.
+///   1. For each of the two endings, end the first pack with it
+///   2. Check that no other pack ran and that the stop has a reason
+///   3. Check that the pack is marked failed
 #[test]
 fn timeout_or_failed_spawn_stops_loop_with_reason() {
     for ended in [Ended::TimedOut, Ended::ExecFailed(anyhow::anyhow!("no"))] {

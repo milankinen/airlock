@@ -1,6 +1,11 @@
+//! Tests for the resolution of the image `USER` to uid, gid and home
+//! through the passwd and group files in the image layers.
+
 use super::*;
 use crate::test_cfg::home::TempHome;
 
+/// Build an image over `layers` (topmost first) with the `USER` value
+/// `user`.
 fn build(layers: &[String], user: &str) -> anyhow::Result<OciImage> {
     build_oci_image(
         "sha256:img".into(),
@@ -15,6 +20,8 @@ fn build(layers: &[String], user: &str) -> anyhow::Result<OciImage> {
     )
 }
 
+/// Build an image as [`build`] does and return the error message. Panics
+/// if the build succeeds.
 fn build_err(layers: &[String], user: &str) -> String {
     match build(layers, user) {
         Ok(_) => panic!("USER {user:?} over {layers:?} must not resolve"),
@@ -22,6 +29,12 @@ fn build_err(layers: &[String], user: &str) -> String {
     }
 }
 
+/// Test that each form of `USER` (name or number, with or without group)
+/// resolves through the passwd and group files of the image.
+///   1. Cache a layer that declares root and the `node` user and group
+///   2. Build an image for each `USER` form of `node`
+///   3. Check the uid, gid, home and stored `USER` of each image
+///   4. Check that an empty `USER` gives root
 #[test]
 fn image_user_resolves_through_image_passwd_and_group() {
     let _home = TempHome::new();
@@ -47,6 +60,11 @@ fn image_user_resolves_through_image_passwd_and_group() {
     );
 }
 
+/// Test that an unknown user or group is an error, not a silent fallback to
+/// root.
+///   1. Cache a layer that declares root and the `node` user
+///   2. Build images with an unknown user or group in each position
+///   3. Check that each error names the unknown value
 #[test]
 fn unknown_image_user_or_group_is_error_not_root() {
     let _home = TempHome::new();
@@ -57,6 +75,15 @@ fn unknown_image_user_or_group_is_error_not_root() {
     }
 }
 
+/// Test that a passwd file or `etc` directory that links out of its layer is
+/// never read, so that an image cannot read host files.
+///   1. Write a passwd file on the host and make an empty host directory
+///   2. Cache layers whose `etc/passwd` or `etc` links to them
+///   3. Check that a lower layer with a real passwd still resolves the user
+///   4. Check that a link layer alone gives an error that says "outside the
+///      layer" and has no host data
+///   5. Check that a link to an empty host directory also says "outside the
+///      layer"
 #[test]
 fn passwd_symlinked_out_of_layer_is_never_read() {
     let home = TempHome::new();
@@ -84,6 +111,7 @@ fn passwd_symlinked_out_of_layer_is_never_read() {
     );
 
     for link in [&file_link, &dir_link] {
+        // The link layer is skipped and the real layer below it is used.
         let image = build(&[link.clone(), real.clone()], "node").unwrap();
         assert_eq!(image.container_home, "/home/node");
 
@@ -108,6 +136,12 @@ fn passwd_symlinked_out_of_layer_is_never_read() {
     assert!(err.contains("outside the layer"), "{err}");
 }
 
+/// Test that a passwd file that is not safe to read is named in the error
+/// with the reason.
+///   1. Cache layers with an oversized passwd file, a passwd directory and
+///      a passwd symlink to a missing file
+///   2. Build an image over each layer
+///   3. Check that each error gives the correct reason
 #[test]
 fn passwd_that_cannot_be_read_safely_is_named_in_error() {
     let _home = TempHome::new();
@@ -139,6 +173,10 @@ fn passwd_that_cannot_be_read_safely_is_named_in_error() {
     }
 }
 
+/// Test that a passwd symlink to a file in the same layer is followed, as
+/// in images with a merged `/usr`.
+///   1. Cache a layer whose `etc/passwd` links to `usr/lib/passwd`
+///   2. Check that uid 1000 resolves to its home directory
 #[test]
 fn passwd_linked_inside_layer_is_followed() {
     let _home = TempHome::new();
@@ -160,6 +198,14 @@ fn passwd_linked_inside_layer_is_followed() {
     );
 }
 
+/// Test that the uid and gid of a cache entry without a `user` field are
+/// checked against the image passwd, so that airlock finds a sandbox that
+/// ran as the wrong user.
+///   1. Make a legacy entry with uid and gid 0
+///   2. Check that an empty `USER` and `root` are verified
+///   3. Check that `node` gives a uid mismatch
+///   4. Fix the uid and check that only the gid differs
+///   5. Fix the gid and check that the entry is verified
 #[test]
 fn legacy_cache_entry_user_is_checked_against_image_passwd() {
     let _home = TempHome::new();

@@ -2,6 +2,12 @@
 
 load helpers
 
+# The show command: packs, install status, network rules and services.
+
+# Test that show fails when the project has no sandbox, also when a config
+# exists.
+#   1. Run show without a config and check the error
+#   2. Write a config, run show again and check the same error
 @test "show without sandbox fails with or without config" {
     run_airlock show
     assert_failure 1
@@ -13,6 +19,12 @@ load helpers
     assert_output_contains "No sandbox for $PWD"
 }
 
+# Test that show lists only the enabled packs of the config. A pack that
+# is not installed yet is pending. A base image pack is config only.
+#   1. Write a config with three packs and one disabled pack
+#   2. Run show
+#   3. Check the status of each pack and that the disabled pack is
+#      not shown
 @test "show lists enabled project packs" {
     mkdir -p .airlock/sandbox
     write_config '[packs]
@@ -29,6 +41,10 @@ alpine = { version = 1 }'
     assert_output_not_contains "docker"
 }
 
+# Test that a list-form preset gives network rules and no packs.
+#   1. Write a config with presets = ["python"]
+#   2. Run show
+#   3. Check that there is no pack list and that the preset rule shows
 @test "show lists list-form presets as network rules not packs" {
     mkdir -p .airlock/sandbox
     write_config 'presets = ["python"]'
@@ -38,6 +54,13 @@ alpine = { version = 1 }'
     assert_output_contains "python-packages: allow 4 deny 0"
 }
 
+# Test that show prints the install status of each pack from the install
+# records of the current disk.
+#   1. Make a sandbox disk with installed, failed, unconfirmed and kept
+#      records
+#   2. Write a config with these packs (but not the kept one) and one
+#      new pack
+#   3. Run show and check the status text of each pack
 @test "show prints install status of each pack on current disk" {
     make_sandbox_disk
     write_installs python=installed rust=failed codex=unconfirmed docker=kept
@@ -55,6 +78,11 @@ nodejs = { version = 1 }'
     assert_output_contains "docker — kept, removed from config"
 }
 
+# Test that show does not use install records that belong to a different
+# disk.
+#   1. Write install records for disk [1, 2] but make no disk
+#   2. Write a config with the same pack
+#   3. Run show and check that the pack is pending
 @test "show ignores install records of another disk" {
     write_installs python=installed
     write_config '[packs]
@@ -64,6 +92,11 @@ python = { version = 1 }'
     assert_output_contains "python 1 — pending"
 }
 
+# Test that an installed pack is shown as removed from config when the
+# config has only the list-form preset of the same name.
+#   1. Make a sandbox disk with an installed python record
+#   2. Write a config with presets = ["python"]
+#   3. Run show and check that python is removed from config, not pending
 @test "show lists install record of list-form preset as removed" {
     make_sandbox_disk
     write_installs python=installed
@@ -74,6 +107,12 @@ python = { version = 1 }'
     assert_output_not_contains "pending"
 }
 
+# Test that show lists the network services and does not print a host
+# token.
+#   1. Write a corrupt auth file and a config that enables two services
+#   2. Run show with a Claude token in the host environment
+#   3. Check that both services are not signed in and that the token is
+#      not in the output
 @test "show lists enabled network services without printing host secrets" {
     mkdir -p .airlock/sandbox
     echo 'not json' >.airlock/sandbox/auth.json

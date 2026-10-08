@@ -1,10 +1,16 @@
+//! Tests for the extraction of layer tarballs into the layer cache:
+//! whiteouts, reuse, interrupted downloads, races and path escapes.
+
 use super::*;
 use crate::test_cfg::home::TempHome;
 
+/// The value of the extended attribute `name` of `path`.
 fn xattr_of(path: &Path, name: &str) -> Option<Vec<u8>> {
     xattr::get(path, name).unwrap()
 }
 
+/// The names of staging entries (`.tmp` and `.download`) in the layer
+/// cache.
 fn staging_entries() -> Vec<String> {
     std::fs::read_dir(cache::layers_root().unwrap())
         .unwrap()
@@ -17,6 +23,13 @@ fn staging_entries() -> Vec<String> {
         .collect()
 }
 
+/// Test that a layer extracts with its whiteouts as overlayfs xattrs, and
+/// that a cached layer is not fetched again.
+///   1. Cache a layer with a file whiteout and an opaque directory marker
+///   2. Check the regular files
+///   3. Check that the whiteout is an empty file with the whiteout xattr
+///   4. Check the opaque xattrs and that no staging entry is left
+///   5. Ask for the layer again and check that no fetch happens
 #[test]
 fn layer_tarball_extracts_with_whiteouts_as_overlay_xattrs_and_is_reused() {
     let _home = TempHome::new();
@@ -40,6 +53,9 @@ fn layer_tarball_extracts_with_whiteouts_as_overlay_xattrs_and_is_reused() {
         xattr_of(&gone, "user.overlay.whiteout").as_deref(),
         Some(&b"y"[..])
     );
+    // A directory with a whiteout gets opaque "x", so overlayfs looks for
+    // whiteouts in it. The `.wh..wh..opq` marker makes a directory fully
+    // opaque with "y".
     assert_eq!(
         xattr_of(&layer.join("etc"), "user.overlay.opaque").as_deref(),
         Some(&b"x"[..])
@@ -59,6 +75,11 @@ fn layer_tarball_extracts_with_whiteouts_as_overlay_xattrs_and_is_reused() {
     assert_eq!(again, layer);
 }
 
+/// Test that a partial download from an earlier run is discarded and the
+/// layer is fetched again.
+///   1. Write a partial download file for the layer
+///   2. Cache the layer
+///   3. Check the layer contents and that no staging entry is left
 #[test]
 fn interrupted_download_is_discarded_and_fetched_again() {
     let _home = TempHome::new();
@@ -77,6 +98,12 @@ fn interrupted_download_is_discarded_and_fetched_again() {
     assert!(staging_entries().is_empty());
 }
 
+/// Test that a layer that another process publishes during the download is
+/// kept, and the own download is discarded.
+///   1. Start to cache a layer with a fetch that also publishes the layer
+///      directory, as a peer process does
+///   2. Check that the peer layer stays and the own content is absent
+///   3. Check that no staging entry is left
 #[test]
 fn layer_published_by_peer_during_download_is_kept() {
     let _home = TempHome::new();
@@ -100,6 +127,12 @@ fn layer_published_by_peer_during_download_is_kept() {
     assert!(staging_entries().is_empty());
 }
 
+/// Test that a whiteout that points out of the layer does not delete host
+/// files, so that a hostile image cannot harm the host.
+///   1. Write files in a host directory out of the layer cache
+///   2. Cache layers with whiteouts through a symlink, an absolute path and
+///      `..` path parts
+///   3. Check that all host files are unchanged
 #[test]
 fn whiteout_aimed_outside_layer_does_not_touch_host_files() {
     let home = TempHome::new();
@@ -113,6 +146,7 @@ fn whiteout_aimed_outside_layer_does_not_touch_host_files() {
         .symlink("esc", &outside)
         .file("esc/.wh.via-symlink", "")
         .gz();
+    // The extraction can fail or succeed. Only the host files matter.
     let _ = layer::ensure_layer_cached(
         "sha256:evil-symlink",
         |dest| Ok(std::fs::write(dest, &through_symlink)?),

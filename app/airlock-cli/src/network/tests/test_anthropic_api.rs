@@ -1,3 +1,6 @@
+//! Anthropic API calls through the proxy: the swap of surrogates for real
+//! credentials, the refusal of unknown credentials, and the scan of answers.
+
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::Request;
@@ -9,6 +12,7 @@ use crate::test_cfg::provider::*;
 use crate::test_cfg::services::masked;
 use crate::test_cfg::upstream::{get_with_bearer, post};
 
+/// A GET request of `path` with `headers` and an empty body.
 fn get_with(path: &str, headers: &[(&str, &str)]) -> Request<Full<Bytes>> {
     let mut req = Request::get(path);
     for (name, value) in headers {
@@ -17,6 +21,14 @@ fn get_with(path: &str, headers: &[(&str, &str)]) -> Request<Full<Bytes>> {
     req.body(Full::new(Bytes::new())).unwrap()
 }
 
+/// Test that an API request gets the real token and goes only to the API
+/// endpoint. A forged `Host` or absolute URI must not send the real token to
+/// a different host.
+///   1. Sign in
+///   2. Send API requests over HTTP/1.1 and HTTP/2, some with an attacker
+///      host in the `Host` header or in the URI
+///   3. Check that the provider gets the real token, its own authority, the
+///      path and at most one `Host` header
 #[test]
 fn api_request_over_h1_and_h2_carries_real_token_to_endpoint_authority() {
     Setup::new(ServiceId::Anthropic, Options::default()).run(|r| async move {
@@ -59,6 +71,12 @@ fn api_request_over_h1_and_h2_carries_real_token_to_endpoint_authority() {
     });
 }
 
+/// Test that the proxy asks for uncompressed API answers and refuses answers
+/// that it cannot scan or that carry a real token.
+///   1. Sign in and send an API request that accepts gzip and brotli
+///   2. Check that the provider gets `Accept-Encoding: identity`
+///   3. Get gzip answers and an answer with the real refresh token
+///   4. Check that each one becomes a local 502 without a real token
 #[test]
 fn api_answers_come_uncompressed_without_real_tokens_or_not_at_all() {
     Setup::new(ServiceId::Anthropic, Options::default()).run(|r| async move {
@@ -81,6 +99,14 @@ fn api_answers_come_uncompressed_without_real_tokens_or_not_at_all() {
     });
 }
 
+/// Test that the proxy swaps surrogates only on the API host. The token host
+/// must not forward API paths, and the API host must not swap a refresh
+/// surrogate in a body.
+///   1. Sign in with the API on its own host and check an API call
+///   2. Send the API call to the token host and check the local 403
+///   3. Send a refresh to the API host
+///   4. Check that the provider gets the refresh surrogate, not the real
+///      token
 #[test]
 fn surrogates_are_swapped_on_api_host_only() {
     let opts = Options {
@@ -111,11 +137,20 @@ fn surrogates_are_swapped_on_api_host_only() {
                 &refresh.to_string(),
             ))
             .await;
+        // The fake provider refuses the surrogate with invalid_grant.
         assert_eq!(resp.status, 400);
         assert!(r.last_seen().body.contains("sk-ant-ort01-airlock-"));
     });
 }
 
+/// Test that the API host refuses unknown credentials locally, with a
+/// message that tells the user what to do.
+///   1. Sign in
+///   2. Send bearer tokens that are an unknown surrogate, the real token and
+///      an unknown token, and check each 401 message
+///   3. Send a real API key, an unknown API key surrogate and Basic auth, and
+///      check each 401
+///   4. Check that no request goes upstream
 #[test]
 fn unknown_credentials_on_api_host_are_refused_locally() {
     Setup::new(ServiceId::Anthropic, Options::default()).run(|r| async move {
@@ -145,6 +180,13 @@ fn unknown_credentials_on_api_host_are_refused_locally() {
     });
 }
 
+/// Test that API keys from `create_api_key` reach the guest as surrogates,
+/// and that a grant can create only a limited number of keys.
+///   1. Sign in and create three API keys
+///   2. Check that each answer has a surrogate key and that the key works
+///      for an API call with the real key
+///   3. Create a fourth key and check the local 429 that does not go
+///      upstream
 #[test]
 fn created_api_keys_reach_guest_as_surrogates_up_to_limit() {
     Setup::new(ServiceId::Anthropic, Options::default()).run(|r| async move {
@@ -172,6 +214,12 @@ fn created_api_keys_reach_guest_as_surrogates_up_to_limit() {
     });
 }
 
+/// Test that masked secrets with inject rules work on the API host without a
+/// sign-in. The user can give their own key or token instead of a sign-in.
+///   1. Configure masked secrets for an API key and an OAuth token
+///   2. Send API calls with the masked values
+///   3. Check that they go upstream with the real values and that no grant
+///      is made
 #[test]
 fn injected_secrets_work_without_sign_in() {
     let s = Setup::new(ServiceId::Anthropic, Options::default());
@@ -197,6 +245,12 @@ fn injected_secrets_work_without_sign_in() {
     });
 }
 
+/// Test that middleware scripts and the monitor see only the surrogate. The
+/// swap happens after them, so that no real token gets into logs or events.
+///   1. Add a middleware script that logs the `authorization` header
+///   2. Sign in and send an API call
+///   3. Check that the provider gets the real token
+///   4. Check that the script log and the monitor events have the surrogate
 #[test]
 fn middleware_and_monitor_see_only_surrogate() {
     let s = Setup::new(ServiceId::Anthropic, Options::default());

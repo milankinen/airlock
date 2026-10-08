@@ -1,9 +1,8 @@
 //! Unix socket forwarding from guest to host.
 //!
-//! For each configured socket pair, a Unix listener is created inside the VM.
-//! When a guest process connects, the connection is relayed to the host via
-//! the `NetworkProxy` RPC interface, which connects to the corresponding
-//! host-side Unix socket (e.g. a Docker socket or SSH agent).
+//! Makes host Unix sockets, for example a Docker socket or an SSH agent,
+//! available in the container. Each connection goes to the host socket through
+//! the host network proxy.
 
 use std::path::Path;
 
@@ -16,10 +15,16 @@ use tracing::{debug, error, info};
 use super::rpc_bridge::ChannelSink;
 use crate::rpc::SocketForwardConfig;
 
-/// Bind all socket listeners synchronously, then spawn the accept loops.
+/// Bind a Unix listener for each socket pair, then start the accept loops.
 ///
-/// Binding is done before returning so all socket files exist in the
-/// container rootfs before the container process starts.
+/// The binds complete before the function returns. Thus all socket files
+/// exist in the container rootfs before the container process starts.
+/// Args:
+///  - `network`: Host network proxy client
+///  - `sockets`: Socket pairs to forward
+///
+/// Returns:
+///   Error if a bind fails.
 pub fn start(
     network: &network_proxy::Client,
     sockets: Vec<SocketForwardConfig>,
@@ -37,22 +42,21 @@ pub fn start(
     Ok(())
 }
 
-/// Bind a UnixListener at the guest path inside the container rootfs.
+/// Bind a `UnixListener` at the guest path inside the container rootfs, with
+/// mode 0777.
 ///
-/// Creates the socket file at the resolved path within `/mnt/overlay/rootfs`
-/// so it lands in the overlayfs upper layer and is visible inside the container.
-///
-/// Path resolution treats absolute symlink targets as relative to the container
-/// root, mirroring chroot semantics. Without this, an absolute symlink like
-/// `/var/run -> /run` would redirect the bind to the VM's `/run/`, not the
-/// container's `/run/`.
+/// The socket file is in `/mnt/overlay/rootfs`, so it goes to the overlayfs
+/// upper layer and the container sees it.
 fn bind(guest_path: &str) -> anyhow::Result<UnixListener> {
+    // Resolve absolute symlink targets relative to the container root, as
+    // in a chroot. Otherwise an absolute symlink such as `/var/run -> /run`
+    // would send the bind to the VM's `/run/`, not to the container's.
     let root = Path::new("/mnt/overlay/rootfs");
     let full_path = crate::util::resolve_in_root(root, guest_path);
     if let Some(parent) = full_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Remove stale socket from previous run
+    // Remove the old socket from a previous run
     let _ = std::fs::remove_file(&full_path);
     let listener = UnixListener::bind(&full_path)
         .map_err(|e| anyhow::anyhow!("bind {}: {e}", full_path.display()))?;
@@ -63,6 +67,7 @@ fn bind(guest_path: &str) -> anyhow::Result<UnixListener> {
     Ok(listener)
 }
 
+/// Accept container connections and relay each one in its own task.
 async fn accept_loop(
     listener: UnixListener,
     _host_path: &str,
@@ -81,6 +86,7 @@ async fn accept_loop(
     }
 }
 
+/// Relay one container connection to the host socket of `guest_path`.
 async fn relay(
     stream: tokio::net::UnixStream,
     guest_path: &str,
@@ -88,12 +94,12 @@ async fn relay(
 ) -> anyhow::Result<()> {
     let (mut local_read, mut local_write) = stream.into_split();
 
-    // Set up RPC channel for server→local data
+    // RPC channel for data from the host to the local peer
     let (server_tx, mut server_rx) = tokio::sync::mpsc::channel::<Bytes>(1);
     let server_sink: tcp_sink::Client = capnp_rpc::new_client(ChannelSink::new(server_tx));
 
-    // Call host NetworkProxy.connect with the guest socket path.
-    // The CLI maps guest → host path (with tilde expansion) on its side.
+    // Call the host NetworkProxy.connect with the guest socket path. The CLI
+    // maps the guest path to the host path (with tilde expansion).
     let mut req = network.connect_request();
     req.get().init_target().set_socket(guest_path);
     req.get().set_client(server_sink);
@@ -109,10 +115,10 @@ async fn relay(
         _ => anyhow::bail!("invalid connect result"),
     };
 
-    // Bidirectional relay: local ↔ RPC, honoring half-close. Each direction
-    // runs to completion independently so a one-way EOF only half-closes that
-    // direction — a `select!` that tore down both on the first EOF truncated
-    // any request→half-close→await-reply protocol.
+    // Relay in both directions (local and RPC), with half-close. Each
+    // direction runs to its end independently, so an EOF in one direction
+    // closes only that direction. A `select!` that closed both on the first
+    // EOF cut each "request, half-close, wait for reply" protocol.
     let local_to_rpc = async {
         let mut buf = vec![0u8; airlock_common::RELAY_CHUNK_SIZE];
         loop {
@@ -127,7 +133,8 @@ async fn relay(
                 }
             }
         }
-        // Local won't send more — signal EOF to the remote, keep draining it.
+        // The local peer sends no more. Send EOF to the remote, and continue
+        // to read from it.
         let _ = client_sink.close_request().send().promise.await;
     };
 
@@ -137,11 +144,11 @@ async fn relay(
                 break;
             }
         }
-        // Remote won't send more — signal EOF to the local peer.
+        // The remote sends no more. Send EOF to the local peer.
         let _ = local_write.shutdown().await;
     };
 
-    // Run both directions to completion so a one-way close only half-closes.
+    // Run both directions to their end, so a one-way close is a half-close.
     tokio::join!(local_to_rpc, rpc_to_local);
     Ok(())
 }

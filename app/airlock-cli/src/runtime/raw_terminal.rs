@@ -1,5 +1,7 @@
-//! Non-monitor `Runtime`: writes guest output straight through to the host's
-//! real stdout/stderr and manages raw mode on the host terminal.
+//! Raw terminal runtime.
+//!
+//! Connects the guest directly to the user's terminal, without the monitor.
+//! Guest output goes directly to the host stdout and stderr.
 
 use std::io::Write;
 
@@ -10,14 +12,15 @@ use crate::network::NetworkHandle;
 use crate::project::Project;
 use crate::rpc;
 
-/// Manages raw mode entry/exit and provides stdin/resize event sources.
+/// Runtime that controls raw mode on the host terminal and gives the stdin
+/// and resize event sources.
 pub struct RawTerminalRuntime {
     is_tty: bool,
     guard: Option<TerminalGuard>,
 }
 
 impl RawTerminalRuntime {
-    /// Detect whether stdin is a TTY and build a handle.
+    /// Make a runtime. Checks if stdin is a TTY.
     pub fn new() -> Self {
         let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
         Self {
@@ -26,28 +29,24 @@ impl RawTerminalRuntime {
         }
     }
 
-    /// Returns true if stdin is a terminal.
+    /// Check if stdin is a terminal.
     #[allow(dead_code)]
     pub fn is_tty(&self) -> bool {
         self.is_tty
     }
 
-    /// Enter raw terminal mode. Call this only when ready for VM interaction
-    /// (after downloads complete) so Ctrl+C works during setup.
-    ///
-    /// Enables xterm `modifyOtherKeys` level 1 so the host terminal encodes
-    /// Shift+Enter as `\e[27;2;13~` (distinct from bare Enter `\r`). Level 1
-    /// leaves keys with well-known behavior alone, so Ctrl+C stays `0x03` for
-    /// PTY line discipline. The guest app sees a distinguishable Shift+Enter
-    /// without needing to negotiate the kitty protocol through the pipe.
-    ///
-    /// Bracketed paste mode is intentionally *not* forced here: the guest
-    /// shell drives it via its own `\e[?2004h` which passes straight through
-    /// to the host terminal. Shells that support bracketed paste (bash, zsh)
-    /// get wrapped pastes; those that don't (BusyBox ash) get raw bytes and
-    /// behave like any normal terminal — forcing it on would feed markers to
-    /// shells that mis-parse them.
+    /// Enter raw terminal mode. Call this only when the VM interaction
+    /// starts (after the downloads), so Ctrl+C works during setup.
     fn enter_raw_mode(&mut self) {
+        // Enable xterm `modifyOtherKeys` level 1. The host terminal then
+        // encodes Shift+Enter as `\e[27;2;13~`, not as Enter `\r`. Level 1
+        // keeps Ctrl+C as `0x03` for the PTY line discipline. The guest app
+        // can identify Shift+Enter without a kitty protocol negotiation.
+        //
+        // Do not force bracketed paste mode. The guest shell enables it with
+        // its own `\e[?2004h`. Shells without support (BusyBox ash) then get
+        // raw bytes, as in a normal terminal, and no markers that they parse
+        // incorrectly.
         if self.is_tty && self.guard.is_none() {
             let raw_mode_enabled = crossterm::terminal::enable_raw_mode().is_ok();
             let modify_other_keys =
@@ -60,14 +59,14 @@ impl RawTerminalRuntime {
     }
 
     /// Enter raw mode (see [`enter_raw_mode`](Self::enter_raw_mode)) and
-    /// turn the runtime into the output sink that owns the terminal until
-    /// it drops.
+    /// change the runtime into the output sink. The sink owns the terminal
+    /// until it drops.
     pub fn into_terminal(mut self) -> RawTerminal {
         self.enter_raw_mode();
         RawTerminal { _guard: self.guard }
     }
 
-    /// Create an RPC stdin server, optionally with resize events if TTY.
+    /// Make an RPC stdin server. On a TTY, it also sends resize events.
     pub fn stdin(&self) -> anyhow::Result<rpc::Stdin> {
         let (pty_size, resizes) = if self.is_tty {
             let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -112,7 +111,8 @@ impl Runtime for RawTerminalRuntime {
     }
 }
 
-/// Output sink: writes guest bytes directly to the host stdout/stderr.
+/// Output sink that writes guest bytes directly to the host stdout and
+/// stderr.
 pub struct RawTerminal {
     /// Kept for its `Drop` impl: restores cooked mode and `modifyOtherKeys`
     /// when the sandbox exits.
@@ -137,7 +137,7 @@ impl Terminal for RawTerminal {
     }
 }
 
-/// RAII guard that restores the terminal to cooked mode on drop.
+/// RAII guard that restores the cooked terminal mode on drop.
 struct TerminalGuard {
     raw_mode_enabled: bool,
     modify_other_keys: bool,

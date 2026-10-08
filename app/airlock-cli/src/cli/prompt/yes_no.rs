@@ -1,11 +1,6 @@
-//! A yes/no question with an inline bar: `<question>  « yes · no »`.
+//! Yes/no prompt.
 //!
-//! The question is bold; the current answer in the bar is green (without
-//! colors: in brackets). The keys (gray) go on the next line. When the
-//! question and the bar do not fit on a line, the question wraps and the
-//! bar goes below it. Keys: ←/→ change the answer, Enter confirms it,
-//! Esc cancels, Ctrl-C interrupts. The question and the answer stay on
-//! the terminal.
+//! Asks a question with an inline `« yes · no »` bar.
 
 use console::measure_text_width;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -14,18 +9,29 @@ use crate::cli::prompt::screen::Frame;
 use crate::cli::prompt::style::{self, Line, Styles, Tone};
 use crate::cli::prompt::{self, PromptError, Step};
 
-/// The keys of the bar.
+/// Key help line of the bar.
 const KEYS: &str = "←→ choose · enter confirm";
 
-/// The question.
+/// A yes/no question with an inline bar: `<question>  « yes · no »`.
+///
+/// The question is bold. The current answer in the bar is green (in brackets
+/// without colors). The key help (gray) is on the next line. If the question
+/// and the bar do not fit on one line, the question wraps and the bar is
+/// below it.
+///
+/// Keys: ←/→ change the answer. Enter confirms it. Esc cancels. Ctrl+C
+/// interrupts. The question and the answer stay on the terminal.
 pub struct YesNo<'a> {
+    /// Question text (bold).
     pub question: &'a str,
-    /// The answer that is current at first.
+    /// The answer that is selected at the start.
     pub default: bool,
 }
 
 impl YesNo<'_> {
-    /// Ask the question: the answer, or `None` on Esc.
+    /// Ask the question.
+    /// Returns:
+    ///   The answer, `None` on Esc, or error.
     pub fn ask(&self) -> Result<Option<bool>, PromptError> {
         let mut yes = self.default;
         let answer = prompt::run(&mut yes, |yes, room| self.frame(*yes, room), key)?;
@@ -35,8 +41,8 @@ impl YesNo<'_> {
         Ok(answer)
     }
 
-    /// The lines of the question with `yes` current, for `room` columns
-    /// of text.
+    /// Return the lines of the question with the current answer `yes`, for
+    /// `room` columns of text.
     fn frame(&self, yes: bool, room: usize) -> Frame {
         let styles = Styles::new();
         let mut bar = Line::default();

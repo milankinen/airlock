@@ -1,3 +1,6 @@
+//! Tests for the resolution of the `[mounts]` config into host sources,
+//! guest targets and mount types, and for missing sources.
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -12,6 +15,8 @@ struct Host {
 }
 
 impl Host {
+    /// A new host in a temporary directory, with empty home and project
+    /// directories.
     fn new() -> Self {
         let dir = temp_dir();
         let root = std::fs::canonicalize(dir.path()).unwrap();
@@ -47,10 +52,12 @@ impl Host {
     }
 }
 
+/// The permission bits of `path`.
 fn mode(path: &Path) -> u32 {
     std::fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
 
+/// Each mount as (key, source, target, read-only, is a directory).
 fn summary(mounts: &[ResolvedMount]) -> Vec<(String, PathBuf, String, bool, bool)> {
     mounts
         .iter()
@@ -66,6 +73,14 @@ fn summary(mounts: &[ResolvedMount]) -> Vec<(String, PathBuf, String, bool, bool
         .collect()
 }
 
+/// Test that config mounts resolve their sources on the host and their
+/// targets in the guest, so that each path form maps to the correct place.
+///   1. Configure mounts with absolute, relative, `./`, `~` and file sources
+///      and with absolute, relative and `~` targets, plus a disabled mount
+///   2. Resolve the mounts
+///   3. Check the source, target, read-only flag and type of each mount
+///   4. Check that directory mounts get numbered tags, the file mount keeps
+///      its config key, and the disabled mount is absent
 #[test]
 fn config_mounts_resolve_host_sources_and_guest_targets() {
     let host = Host::new();
@@ -117,6 +132,8 @@ fn config_mounts_resolve_host_sources_and_guest_targets() {
         ))
         .unwrap();
 
+    // Mounts resolve in key order. Directory mounts get the VirtioFS tags
+    // `dir_0`, `dir_1`, ... and file mounts keep their config key.
     let s = |p: &str| p.to_string();
     assert_eq!(
         summary(&mounts),
@@ -155,6 +172,12 @@ fn config_mounts_resolve_host_sources_and_guest_targets() {
     );
 }
 
+/// Test that a missing mount source is an error by default, and that the
+/// `ignore` and `warn` options skip the mount and create nothing.
+///   1. Resolve a mount with a missing absolute source, then with a missing
+///      `~` source, and check that each gives an error
+///   2. Resolve two missing mounts with `missing = "ignore"` and `"warn"`
+///   3. Check that no mounts resolve and no source directory exists
 #[test]
 fn missing_mount_source_fails_unless_skipped() {
     let host = Host::new();
@@ -187,6 +210,13 @@ fn missing_mount_source_fails_unless_skipped() {
     assert!(!host.home.join(".nope").exists());
 }
 
+/// Test that the `create-dir` and `create-file` options create a missing
+/// source with the correct type, content and mode.
+///   1. Resolve mounts that create nested directories and files, some with
+///      a custom mode and file content
+///   2. Check the mount types, the file contents and the modes (default
+///      0755 for directories and 0644 for files)
+///   3. Resolve a mount with an invalid octal mode and check the error
 #[test]
 fn missing_mount_source_is_created_on_request() {
     let host = Host::new();

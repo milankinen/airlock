@@ -1,5 +1,5 @@
-//! Test packs, setup scripts run on the host, and an install exec that
-//! runs the install scripts on the host in place of the install VM.
+//! Test packs, a host shell for setup scripts, and an install exec that
+//! runs the install scripts on the host instead of in the install VM.
 
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
@@ -18,8 +18,9 @@ use crate::packs::{InstallerScript, PackManager};
 use crate::runtime::OutputSink;
 use crate::util::PinnedDir;
 
-/// The setup script of the test tool packs: two numbered steps, the
-/// args on the log, and `mode = "exit-<n>"` exits with `<n>`.
+/// The setup script of the test tool packs. It reports two numbered steps
+/// and writes the args to the log. With `mode = "exit-<n>"`, it exits with
+/// `<n>`.
 pub const TOOL_SETUP: &str = r#"airlock_steps 2
 airlock_status "preparing $AIRLOCK_PACK_ID"
 echo "mode=$AIRLOCK_PACK_ARG_MODE fast-path=$AIRLOCK_PACK_ARG_FAST_PATH argv0=$0"
@@ -29,6 +30,8 @@ exit-*) exit "${AIRLOCK_PACK_ARG_MODE#exit-}" ;;
 esac
 "#;
 
+/// The `pack.toml` of a test tool pack with the label `label` and the
+/// args `mode` (a choice) and `fast-path` (a bool).
 fn tool_pack(label: &str) -> String {
     format!(
         r#"label = "{label}"
@@ -53,8 +56,8 @@ default = false
 }
 
 /// The files of the test packs: the tools `alpha@1`, `alpha@2`, `beta@1`
-/// and `gamma@1` with [`TOOL_SETUP`], and `plain@1`, a tool with a
-/// static config and no setup script.
+/// and `gamma@1` with [`TOOL_SETUP`], and `plain@1`. `plain@1` is a tool
+/// with a static config and no setup script.
 pub fn test_pack_files() -> Vec<(&'static str, String)> {
     let mut files = Vec::new();
     for (folder, label) in [
@@ -76,34 +79,34 @@ pub fn test_pack_files() -> Vec<(&'static str, String)> {
     files
 }
 
-/// The packs of [`test_pack_files`]. Loaded once per test process.
+/// The packs of [`test_pack_files`]. They load one time per test process.
 pub fn test_packs() -> PackManager {
     static PACKS: LazyLock<PackManager> = LazyLock::new(|| load_packs(test_pack_files()));
     PACKS.clone()
 }
 
-/// The packs of the in-memory `packs/` directory `files`.
+/// Load the packs of an in-memory `packs/` directory with `files`.
 pub fn load_packs(files: Vec<(&'static str, String)>) -> PackManager {
     crate::packs::load_test_packs(files).expect("test packs load")
 }
 
-/// The config of one project file `airlock.toml` with `toml`, resolved
-/// against `packs`.
+/// Resolve one project file `airlock.toml` with the content `toml`, with
+/// the packs `packs`.
 pub fn resolve_with(packs: &PackManager, toml: &str) -> anyhow::Result<ResolvedConfig> {
     let layers =
         LayeredConfig::from_values(vec![], None, vec![("airlock.toml", toml::from_str(toml)?)])?;
     block_on(layers.resolve(packs, &ConfigOverrides::default()))
 }
 
-/// The installs of the configured packs of `toml` (resolved against
-/// [`test_packs`]), in pack order.
+/// The install scripts of the packs that `toml` configures, in pack order.
+/// Uses [`test_packs`].
 pub fn test_installers(toml: &str) -> Vec<InstallerScript> {
     let resolved = resolve_with(&test_packs(), toml).unwrap();
     crate::start::install::install_candidates(&resolved.packs)
 }
 
-/// The shell that runs install scripts on the host: `dash` when there is
-/// one (the strictest POSIX sh at hand), else `/bin/sh`.
+/// The shell that runs install scripts on the host: `dash` if it exists
+/// (the strictest POSIX shell that is usually available), else `/bin/sh`.
 pub fn sh() -> &'static str {
     if Path::new("/usr/bin/dash").exists() {
         "/usr/bin/dash"
@@ -112,24 +115,30 @@ pub fn sh() -> &'static str {
     }
 }
 
-/// The output of a script run by [`HostShell`].
+/// The exit code and output of a script that [`HostShell`] ran.
 pub struct ShellRun {
+    /// The exit code. `None` if a signal stopped the script.
     pub code: Option<i32>,
+    /// The stdout text of the script.
     pub stdout: String,
+    /// The stderr text of the script.
     pub stderr: String,
 }
 
-/// A temp dir where install scripts run on the host: every external
-/// command that `lib.sh` runs is a stub first on `PATH` (each fails with
-/// 99 when fd 3 is open), an `os-release` file of its own, `HOME` and
-/// `TMPDIR` in the temp dir, and no package-manager probe.
+/// A temporary directory where install scripts run on the host. It has:
+///  - a stub for each external command of `lib.sh`, first on `PATH` (each
+///    stub fails with 99 when fd 3 is open)
+///  - its own `os-release` file
+///  - `HOME` and `TMPDIR` in the directory
+///  - no package manager probe
 pub struct HostShell {
     dir: TempDir,
     bin: PathBuf,
 }
 
 impl HostShell {
-    /// A shell whose os-release file has `os_release` (`None`: no file).
+    /// A shell whose os-release file has the content `os_release`. With
+    /// `None`, there is no os-release file.
     pub fn new(os_release: Option<&str>) -> Self {
         let dir = temp_dir();
         let bin = dir.path().join("bin");
@@ -153,7 +162,8 @@ impl HostShell {
         Self { dir, bin }
     }
 
-    /// The command of `argv` in this shell's environment.
+    /// A command that runs `argv` with the shell of [`sh`], in the env of
+    /// this shell. It ignores `argv[0]`.
     pub fn command(&self, argv: &[String]) -> Command {
         let mut command = Command::new(sh());
         command
@@ -167,7 +177,7 @@ impl HostShell {
         command
     }
 
-    /// Run `script` with `sh -c` and the extra `env`.
+    /// Run `script` with `sh -c` and the added env `env`.
     pub fn run(&self, script: &str, env: &[(&str, &str)]) -> ShellRun {
         let argv = ["sh".to_string(), "-c".to_string(), script.to_string()];
         let out = self
@@ -183,8 +193,9 @@ impl HostShell {
     }
 }
 
-/// A stub command `name` in `bin`: fails with 99 when fd 3 is open, else
-/// runs `action`.
+/// Write a stub command `name` in `bin`. The stub fails with 99 when fd 3
+/// is open. Else it runs `action`. Thus a test finds a leaked status
+/// channel.
 fn stub(bin: &Path, name: &str, action: &str) {
     let path = bin.join(name);
     std::fs::write(
@@ -199,19 +210,19 @@ fn stub(bin: &Path, name: &str, action: &str) {
 }
 
 /// An [`Exec`] that runs each install script on the host in a
-/// [`HostShell`] (Alpine os-release) with the install's argv and env, and
-/// feeds its output to the progress.
+/// [`HostShell`] with an Alpine os-release. It uses the argv and env of the
+/// install, and sends the script output to the progress.
 pub struct HostExec {
     shell: HostShell,
-    /// Packs whose exec does not run the script: `None` did not start
-    /// (Ctrl+C came first), `Some` ended so.
+    /// Packs whose exec does not run the script. `None` means that the exec
+    /// did not start (Ctrl+C came first). `Some` gives the end result.
     stops: HashMap<String, Option<Ended>>,
-    /// The sandbox directory whose install state is recorded as it is when
-    /// each exec starts.
+    /// The sandbox directory whose install state is recorded when each exec
+    /// starts.
     state_dir: Option<PathBuf>,
     /// The packs whose exec started, in order.
     pub ran: Vec<String>,
-    /// The progress message after each status-channel line.
+    /// The progress message after each line on the status channel.
     pub messages: Vec<String>,
     /// The install state on disk when each exec started (see
     /// [`Self::recording_state_of`]).
@@ -219,6 +230,7 @@ pub struct HostExec {
 }
 
 impl HostExec {
+    /// An exec that runs all scripts and records nothing on disk.
     pub fn new() -> Self {
         Self {
             shell: HostShell::new(Some("ID=alpine\n")),
@@ -230,8 +242,8 @@ impl HostExec {
         }
     }
 
-    /// The exec of pack `id` ends with `ended` without running the script
-    /// (`None`: it does not start).
+    /// Make the exec of the pack `id` end with `ended` and not run the
+    /// script. With `None`, the exec does not start.
     #[must_use]
     pub fn stopping(mut self, id: &str, ended: Option<Ended>) -> Self {
         self.stops.insert(id.to_string(), ended);

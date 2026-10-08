@@ -1,18 +1,31 @@
+//! Tests of how a project config configures a pack: arg defaults, the
+//! config that the pack adds, and the install fingerprint.
+
 use std::collections::BTreeMap;
 
 use crate::packs::{ArgValue, PackManager};
 use crate::test_cfg::packs::{load_packs, resolve_with, test_pack_files, test_packs};
 use crate::test_cfg::resolve_project_toml;
 
+/// A text arg value.
 fn text(value: &str) -> ArgValue {
     ArgValue::Text(value.into())
 }
 
+/// The install fingerprint of the first configured pack in `toml`.
 fn fingerprint(packs: &PackManager, toml: &str) -> String {
     let resolved = resolve_with(packs, toml).unwrap();
     resolved.packs[0].setup_installer().unwrap().fingerprint
 }
 
+/// Test that a pack with a `config.lua` gets default values for the args
+/// that the config does not set, and that its config follows the args.
+///   1. Configure the sample pack with one arg and check that the other arg
+///      gets its default
+///   2. Check that the env, network rule and mount of the pack are in the
+///      resolved config
+///   3. Turn the network arg off and check that the network rule is not
+///      there and that the mode env has its default value
 #[test]
 fn configuring_lua_pack_from_config_text_fills_defaults_and_applies_its_config() {
     let resolved =
@@ -43,11 +56,24 @@ fn configuring_lua_pack_from_config_text_fills_defaults_and_applies_its_config()
     assert_eq!(resolved.values.env["SAMPLE_MODE"].value, "fast");
 }
 
+/// Test that the install fingerprint changes with the pack name, version
+/// and args, but not with the setup script text. A changed fingerprint
+/// makes a new sandbox necessary, so it must not change without reason.
+///   1. Check that explicit default args give the same fingerprint as no
+///      args
+///   2. Check that a different version, pack or arg value gives a new
+///      fingerprint
+///   3. Check that the order of the args has no effect
+///   4. Change the setup script and check that the fingerprint stays the
+///      same
 #[test]
 fn install_fingerprint_follows_name_version_and_args_but_not_script() {
     let packs = test_packs();
     let base = fingerprint(&packs, "[packs]\nalpha = { version = 1 }\n");
+    // A SHA-256 digest in hex.
     assert_eq!(base.len(), 64);
+    // The version as a string and the default arg values must not change
+    // the fingerprint.
     for same in [
         "[packs]\nalpha = { version = 1, args = { mode = \"fast\" } }\n",
         "[packs]\nalpha = { version = \"1\", args = { fast-path = false, mode = \"fast\" } }\n",

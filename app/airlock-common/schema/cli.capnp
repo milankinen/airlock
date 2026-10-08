@@ -2,10 +2,10 @@
 
 using Supervisor = import "supervisor.capnp";
 
-# CLI server interface — exposed over the unix socket by `airlock start`.
-# `airlock exec` connects here to attach new processes to the running
-# container. Unrelated to the supervisor's vsock RPC; shares process
-# I/O primitives via the import.
+# CLI server interface. `airlock start` serves it on a Unix socket.
+# `airlock exec` connects to it to attach new processes to the running
+# container. It is separate from the supervisor vsock RPC. It uses the
+# process I/O types of the supervisor schema.
 interface CliService {
   exec @0 (
     stdin :Supervisor.Stdin,

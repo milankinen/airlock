@@ -1,7 +1,7 @@
-//! Thin wrappers around `mount(2)` that the rest of guest init builds on.
-//! Each helper takes `&str` paths and reports failures with contextual
-//! `anyhow` errors so callers can chain them without duplicating the
-//! `CString` dance.
+//! Mount helpers for guest init.
+//!
+//! Small helpers that mount host shares, bind mounts and other filesystems,
+//! with clear error messages.
 
 use tracing::debug;
 
@@ -11,7 +11,8 @@ pub(super) fn virtiofs(tag: &str) -> anyhow::Result<()> {
     virtiofs_at(tag, &mount_point)
 }
 
-/// Mount a VirtioFS share by its tag name at an arbitrary path.
+/// Mount a VirtioFS share by its tag name at the given path. Creates the
+/// mount point if necessary.
 pub(super) fn virtiofs_at(tag: &str, mount_point: &str) -> anyhow::Result<()> {
     std::fs::create_dir_all(mount_point)?;
     let tag_cstr = std::ffi::CString::new(tag).unwrap();
@@ -34,7 +35,7 @@ pub(super) fn virtiofs_at(tag: &str, mount_point: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Create a bind mount using the `mount(2)` syscall directly.
+/// Bind-mount `src` at `dst`, optionally read-only.
 pub(super) fn bind(src: &str, dst: &str, read_only: bool) -> anyhow::Result<()> {
     let src_cstr = std::ffi::CString::new(src).unwrap();
     let dst_cstr = std::ffi::CString::new(dst).unwrap();
@@ -59,7 +60,13 @@ pub(super) fn bind(src: &str, dst: &str, read_only: bool) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Mount a filesystem with optional data string.
+/// Mount a filesystem.
+/// Args:
+///  - `source`: Mount source (device or name, for example `proc`)
+///  - `target`: Mount point
+///  - `fstype`: Filesystem type
+///  - `flags`: `MS_*` mount flags
+///  - `data`: Filesystem-specific options. Empty means no options.
 pub(super) fn fs(
     source: &str,
     target: &str,
@@ -70,7 +77,7 @@ pub(super) fn fs(
     let src_cstr = std::ffi::CString::new(source).unwrap();
     let dst_cstr = std::ffi::CString::new(target).unwrap();
     let fs_cstr = std::ffi::CString::new(fstype).unwrap();
-    // Leak the CString to keep the pointer valid across the syscall
+    // Leak the CString to keep the pointer valid during the syscall.
     let data_ptr = if data.is_empty() {
         std::ptr::null()
     } else {

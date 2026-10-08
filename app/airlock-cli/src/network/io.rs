@@ -1,8 +1,8 @@
-//! I/O primitives for bridging RPC byte streams with tokio async I/O.
+//! I/O adapters for the network proxy.
 //!
-//! The network proxy needs to treat both real TCP sockets and Cap'n Proto
-//! RPC channels as `AsyncRead + AsyncWrite`. This module provides the
-//! adapters that make that possible.
+//! Gives the proxy one common type for all connection endpoints: TCP sockets,
+//! streams to and from the guest, and streams with bytes that the proxy has
+//! already read and must put back.
 
 use std::cell::RefCell;
 use std::future::Future;
@@ -21,19 +21,23 @@ pub type BoxRead = Box<dyn AsyncRead + Unpin>;
 /// Boxed write half for type-erased async streams.
 pub type BoxWrite = Box<dyn AsyncWrite + Unpin>;
 
-/// A connection endpoint with boxed read/write streams and h2 flag.
+/// Connection endpoint with boxed read and write streams.
 pub struct Transport {
+    /// Read half.
     pub read: BoxRead,
+    /// Write half.
     pub write: BoxWrite,
+    /// True if the endpoint uses HTTP/2.
     pub h2: bool,
 }
 
 impl Transport {
-    /// A black-hole transport used as the "server" side when policy denies
-    /// the connection: reads return EOF, writes are discarded. Paired with
-    /// [`super::tcp::relay`] it causes the relay to tear the connection
-    /// down immediately; paired with [`super::http::relay`] it short-
-    /// circuits at the `!target.allowed` branch before the sender is used.
+    /// Make an empty transport for the server side of a denied connection.
+    /// Reads return EOF and writes are discarded.
+    ///
+    /// With [`super::tcp::relay`], the relay closes the connection
+    /// immediately. With [`super::http::relay`], the relay stops at the
+    /// `!target.allowed` branch before it uses the sender.
     pub fn null() -> Self {
         Self {
             read: Box::new(tokio::io::empty()),
@@ -43,13 +47,15 @@ impl Transport {
     }
 }
 
-/// Prepend buffered bytes to an `AsyncRead` stream.
+/// `AsyncRead` stream that first returns buffered bytes and then reads from
+/// the inner stream.
 pub struct PrefixedRead {
     prefix: Bytes,
     inner: BoxRead,
 }
 
 impl PrefixedRead {
+    /// Make a stream that returns `prefix` before the data of `inner`.
     pub fn new(prefix: Bytes, inner: BoxRead) -> Self {
         Self { prefix, inner }
     }
@@ -71,29 +77,33 @@ impl AsyncRead for PrefixedRead {
     }
 }
 
-/// Bridges an mpsc channel + RPC sink into `AsyncRead + AsyncWrite`.
-///
-/// `send` on the sink is a capnp `-> stream` method: over a real (two-party)
-/// connection it writes to the wire immediately but only *resolves* once the
-/// per-stream flow-control window has room again (or the stream failed).
-/// `write_ack` holds that promise between polls so the write side honors it
-/// instead of racing ahead.
+/// `AsyncRead + AsyncWrite` adapter for an mpsc channel (read side) and an
+/// RPC sink (write side).
 pub struct RpcTransport {
     prefix: Bytes,
     rx: mpsc::Receiver<Bytes>,
     client_sink: tcp_sink::Client,
     pending: Bytes,
-    /// Ack for the last `send` or `close`; shutdown is terminal, so they
-    /// never overlap.
+    /// Ack for the last `send` or `close`. Shutdown is the last operation,
+    /// so the two never overlap.
+    ///
+    /// `send` on the sink is a capnp `-> stream` method. On a real
+    /// (two-party) connection, it writes to the wire immediately. But it
+    /// *resolves* only when the flow-control window of the stream has space
+    /// again (or the stream failed). This field keeps that promise between
+    /// polls, so the write side waits for it.
     write_ack: Option<Promise<(), capnp::Error>>,
-    /// Set once `close` has been requested, so a repeated `poll_shutdown`
-    /// after the close resolves doesn't resend it.
+    /// True after the `close` request. Thus a new `poll_shutdown` call after
+    /// the close resolves does not send it again.
     close_sent: bool,
 }
 
 impl RpcTransport {
-    /// Create a transport with an optional prefix (pre-read bytes), an mpsc
-    /// receiver for incoming data, and an RPC sink for outgoing data.
+    /// Make an RPC transport.
+    /// Args:
+    ///  - `prefix`: Bytes that were already read. Can be empty.
+    ///  - `rx`: Receiver for incoming data
+    ///  - `client_sink`: RPC sink for outgoing data.
     pub fn new(
         prefix: impl Into<Bytes>,
         rx: mpsc::Receiver<Bytes>,
@@ -109,9 +119,10 @@ impl RpcTransport {
         }
     }
 
-    /// Drive `write_ack` to completion, translating a flow-control failure
-    /// (e.g. the guest sink is gone) into an I/O error. `Ready(Ok(()))`
-    /// means there is nothing outstanding to wait for.
+    /// Poll `write_ack` until it completes.
+    /// Returns:
+    ///   `Ready(Ok(()))` if no ack is pending. An I/O error if flow control
+    ///   failed (for example, the guest sink is gone).
     fn poll_ack(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let Some(promise) = self.write_ack.as_mut() else {
             return Poll::Ready(Ok(()));
@@ -163,7 +174,7 @@ impl AsyncRead for RpcTransport {
 }
 
 impl AsyncWrite for RpcTransport {
-    /// Waits for the previous `send`'s ack before issuing the next one.
+    /// Wait for the ack of the previous `send` before the next `send`.
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -184,8 +195,8 @@ impl AsyncWrite for RpcTransport {
         self.poll_ack(cx)
     }
 
-    /// Flushes the pending `send` ack, then issues `close` once and waits
-    /// for it the same way.
+    /// Wait for the pending `send` ack. Then send `close` one time and wait
+    /// for its ack the same way.
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.as_mut().poll_flush(cx) {
             Poll::Pending => return Poll::Pending,
@@ -194,7 +205,8 @@ impl AsyncWrite for RpcTransport {
         }
         if !self.close_sent {
             self.close_sent = true;
-            // `close` returns a response; drop it to fit `write_ack`.
+            // `close` returns a response. Drop it to fit the type of
+            // `write_ack`.
             let response = self.client_sink.close_request().send().promise;
             self.write_ack = Some(Promise::from_future(async move {
                 response.await?;
@@ -205,17 +217,18 @@ impl AsyncWrite for RpcTransport {
     }
 }
 
-/// Shared error state between relay task and ChannelSink.
+/// Error state that the relay task and [`ChannelSink`] share.
 pub type RelayError = Rc<RefCell<Option<String>>>;
 
-/// RPC interface for the supervisor to push container bytes into the channel.
+/// RPC sink that the supervisor uses to send container bytes into the
+/// channel.
 pub struct ChannelSink {
     tx: RefCell<Option<mpsc::Sender<Bytes>>>,
     error: RelayError,
 }
 
 impl ChannelSink {
-    /// Create a new sink with the given channel and shared error state.
+    /// Make a sink with the given channel and shared error state.
     pub fn new(tx: mpsc::Sender<Bytes>, error: RelayError) -> Self {
         Self {
             tx: RefCell::new(Some(tx)),
@@ -258,6 +271,8 @@ impl tcp_sink::Server for ChannelSink {
 
 #[cfg(test)]
 mod tests {
+    //! Tests for the flow control of the RPC transport.
+
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::{Wake, Waker};
@@ -266,13 +281,10 @@ mod tests {
 
     use super::*;
 
-    /// A `tcp_sink::Server` whose `send` blocks on a shared gate, standing
-    /// in for a guest that has stopped reading. A local (non-networked)
-    /// capability skips the two-party flow-control window, but its
-    /// streaming dispatch is lazy — `send_request().send()` only actually
-    /// calls into `send` the first time the returned promise is polled —
-    /// so holding the gate shut keeps that first poll, and so `write_ack`,
-    /// pending.
+    /// A guest sink whose `send` waits on a shared gate. It acts as a guest
+    /// that does not read. A local capability has no flow-control window.
+    /// But it calls `send` only when the returned promise is first polled.
+    /// Thus a closed gate keeps that poll, and the write ack, pending.
     #[derive(Clone)]
     struct GatedSink {
         gate: Arc<Notify>,
@@ -293,9 +305,8 @@ mod tests {
         }
     }
 
-    /// A `Waker` that records whether it was ever woken, so a test can
-    /// assert a poll's waker was actually invoked rather than merely
-    /// re-polling until something resolves.
+    /// A waker that records if something woke it. A test can then check
+    /// that the waker was called, not only that a new poll completes.
     struct FlagWake(Arc<AtomicBool>);
 
     impl Wake for FlagWake {
@@ -304,6 +315,13 @@ mod tests {
         }
     }
 
+    /// Test that a write waits for the ack of the previous send, and that
+    /// the ack wakes the waiting writer. Without this, a guest that does not
+    /// read makes the proxy buffer data with no limit.
+    ///   1. Write once to a transport whose guest sink does not answer
+    ///   2. Check that a second write is pending and the waker is not called
+    ///   3. Open the gate and check that the waker is called
+    ///   4. Write again and check that the write completes
     #[test]
     fn poll_write_with_unacked_send_blocks_until_ack_wakes_it() {
         let (_tx, rx) = mpsc::channel::<Bytes>(1);
@@ -328,6 +346,8 @@ mod tests {
             !woken.load(Ordering::SeqCst),
             "should not be woken before the gate opens"
         );
+        // No runtime runs here. The gate wakes the promise chain, and the
+        // chain calls the test waker directly.
         gate.notify_one();
         assert!(
             woken.load(Ordering::SeqCst),

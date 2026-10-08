@@ -1,10 +1,13 @@
+//! A builder of OCI layer tarballs for tests.
+
 use std::io::Write;
 use std::path::Path;
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
 
-/// An OCI layer tarball built in memory, entry by entry, in order.
+/// An OCI layer tarball that is built in memory, one entry at a time, in
+/// order.
 pub struct LayerTar(tar::Builder<Vec<u8>>);
 
 impl Default for LayerTar {
@@ -40,7 +43,7 @@ impl LayerTar {
         self
     }
 
-    /// A symlink `path` pointing at `target`.
+    /// A symlink `path` to `target`.
     #[must_use]
     pub fn symlink(mut self, path: &str, target: impl AsRef<Path>) -> Self {
         let mut header = tar::Header::new_gnu();
@@ -51,8 +54,8 @@ impl LayerTar {
         self
     }
 
-    /// An empty regular file whose stored name is `raw_path` byte for
-    /// byte, for names a well-behaved builder refuses (e.g. absolute ones).
+    /// An empty regular file with the exact name `raw_path`. Use it for
+    /// names that a correct builder refuses, for example absolute paths.
     #[must_use]
     pub fn raw_file(mut self, raw_path: &str) -> Self {
         let mut header = tar::Header::new_old();

@@ -1,5 +1,7 @@
-//! Guest process I/O: relay a process's output into a sink until it exits,
-//! and the stdin of processes that read none.
+//! Guest process IO.
+//!
+//! Relays the output of a guest process to the host. Also gives a closed
+//! input for processes that must not read input.
 
 use std::rc::Rc;
 
@@ -8,13 +10,12 @@ use airlock_common::supervisor_capnp::stdin;
 use crate::rpc;
 use crate::runtime::OutputSink;
 
-/// Drive `proc` to completion: relay each stdout and stderr chunk into
-/// `sink` until the guest reports the exit code, and return it. An RPC
-/// error ends the process as exit code 1.
-///
-/// Traces carry byte counts only, never the content: the output of a
-/// sign-in tool can contain a token.
+/// Relay the stdout and stderr of `proc` to `sink` until the process exits.
+/// Returns:
+///   The exit code of the process, or 1 if an RPC error occurs.
 pub async fn drive(proc: &rpc::Process, sink: &mut impl OutputSink) -> i32 {
+    // Traces contain only byte counts, never the content, because the output
+    // of a sign-in tool can contain a token.
     loop {
         match proc.poll().await {
             Ok(rpc::ProcessEvent::Exit(code)) => return code,
@@ -34,13 +35,14 @@ pub async fn drive(proc: &rpc::Process, sink: &mut impl OutputSink) -> i32 {
     }
 }
 
-/// A stdin that is at end of file from the start: the guest closes the
-/// process's stdin on the first read. For processes that must not read
-/// the user's terminal (an installer running in pipe mode).
+/// Make a stdin that is at end of file from the start. The guest closes the
+/// process stdin on the first read. For processes that must not read the
+/// user's terminal (for example an installer in pipe mode).
 pub fn closed_stdin() -> stdin::Client {
     capnp_rpc::new_client(ClosedStdin)
 }
 
+/// Stdin server that always replies with end of file.
 struct ClosedStdin;
 
 impl stdin::Server for ClosedStdin {
@@ -56,6 +58,8 @@ impl stdin::Server for ClosedStdin {
 
 #[cfg(test)]
 mod tests {
+    //! Tests for the relay of guest process output and the closed stdin.
+
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::rc::Rc;
@@ -66,6 +70,7 @@ mod tests {
     use crate::test_cfg::sinks::RecordingSink;
     use crate::test_cfg::{block_on_local, rpc_loopback};
 
+    /// One answer of [`ScriptedProcess`] to a `poll` call.
     enum Step {
         Stdout(&'static [u8]),
         Stderr(&'static [u8]),
@@ -74,8 +79,8 @@ mod tests {
         Exit(i32),
     }
 
-    /// A guest process that answers `poll` from a script, then fails every
-    /// further call like a dropped connection.
+    /// A guest process that answers `poll` from a script. When the script
+    /// ends, each call fails, as with a lost connection.
     struct ScriptedProcess(RefCell<VecDeque<Step>>);
 
     impl process::Server for ScriptedProcess {
@@ -101,6 +106,9 @@ mod tests {
         }
     }
 
+    /// Relay the output of a scripted process to a recording sink.
+    /// Returns:
+    ///   The exit code and the recorded output.
     fn drive_script(script: Vec<Step>) -> (i32, RecordingSink) {
         block_on_local(async {
             let client: process::Client = rpc_loopback(
@@ -115,6 +123,14 @@ mod tests {
         })
     }
 
+    /// Test that the relay sends stdout and stderr to the sink until the exit,
+    /// and returns 1 when the connection is lost before the exit.
+    ///   1. Run a script with output on both streams, EOF markers and exit
+    ///      code 3
+    ///   2. Check the exit code and that each stream has all its output, also
+    ///      the output after an EOF marker
+    ///   3. Run a script that ends without an exit
+    ///   4. Check that the exit code is 1 and the partial output arrived
     #[test]
     fn driving_process_relays_output_until_exit_or_lost_connection() {
         let (code, sink) = drive_script(vec![
@@ -134,6 +150,9 @@ mod tests {
         assert_eq!((code, sink.out.as_slice()), (1, &b"partial"[..]));
     }
 
+    /// Test that the closed stdin answers the first read with end of file.
+    ///   1. Read from the closed stdin
+    ///   2. Check that the answer is a stdin EOF frame
     #[test]
     fn closed_stdin_reads_eof_at_once() {
         block_on_local(async {

@@ -1,3 +1,7 @@
+//! Anthropic sign-ins through the proxy: the code exchange, the manual and
+//! Console sign-ins, and the refusal of exchange answers that the proxy
+//! cannot make safe.
+
 use serde_json::{Value, json};
 
 use crate::rpc::browser::{BrowserGrant as _, GrantAnswer};
@@ -8,6 +12,14 @@ use crate::services::tokens::TokenKind;
 use crate::test_cfg::provider::*;
 use crate::test_cfg::services::{free_claude_callback_port, idle_guest, insert_grant};
 
+/// Test that a code exchange with a surrogate code gives the guest
+/// surrogates and stores the real tokens. The guest must get all other
+/// fields of the answer unchanged, because Claude Code reads them.
+///   1. Sign in with a surrogate code
+///   2. Check the surrogate tokens and the other fields of the answer
+///   3. Check that the provider got the exchange with the real code
+///   4. Check that the store has the real tokens, scopes, client, account
+///      and organization
 #[test]
 fn code_exchange_with_surrogate_code_gives_guest_surrogates_and_stores_real_tokens() {
     Setup::new(ServiceId::Anthropic, Options::default()).run(|r| async move {
@@ -59,6 +71,14 @@ fn code_exchange_with_surrogate_code_gives_guest_surrogates_and_stores_real_toke
     });
 }
 
+/// Test that an exchange without a surrogate code or a client id is refused
+/// locally, and that a surrogate code works only once.
+///   1. Exchange the real code and an unknown surrogate code, and check
+///      `invalid_grant`
+///   2. Exchange a surrogate code without a client id and check
+///      `invalid_request`
+///   3. Exchange a surrogate code two times and check that only the first
+///      one goes upstream
 #[test]
 fn exchange_without_surrogate_code_or_client_id_is_refused_locally() {
     Setup::new(ServiceId::Anthropic, Options::default()).run(|r| async move {
@@ -81,6 +101,16 @@ fn exchange_without_surrogate_code_or_client_id_is_refused_locally() {
     });
 }
 
+/// Test that a manual exchange with the real code goes upstream only if
+/// its PKCE verifier belongs to a sign-in page that the browser bridge
+/// opened for this service. Otherwise the guest can bring any real code.
+///   1. Send a manual exchange before any page opens and check
+///      `invalid_grant`
+///   2. Open a page with a wrong response type, a page of the other service
+///      and a page of a different verifier, and check that the exchange is
+///      still refused
+///   3. Open the page of the correct verifier
+///   4. Check that one exchange succeeds and a second one is refused
 #[test]
 fn manual_exchange_needs_verifier_of_page_opened_for_service() {
     Setup::new(ServiceId::Anthropic, Options::default()).run(|r| async move {
@@ -105,6 +135,7 @@ fn manual_exchange_needs_verifier_of_page_opened_for_service() {
             .replace("response_type=code", "response_type=token");
         let answer = sign_in.allow(&url::Url::parse(&refused).unwrap());
         assert!(matches!(answer, GrantAnswer::Refuse(_)), "{answer:?}");
+        // The correct verifier, but of a page that OpenAI opened.
         r.codes
             .open_page(&challenge_of(VERIFIER), ServiceId::Openai);
         assert_eq!(sign_in.allow(&page("w")), GrantAnswer::Allow);
@@ -121,6 +152,15 @@ fn manual_exchange_needs_verifier_of_page_opened_for_service() {
     });
 }
 
+/// Test that a Console sign-in keeps the Console client id for the
+/// exchange, the refresh and the revoke. The provider binds the tokens to
+/// that client, whatever client id the guest sends later.
+///   1. Open the Console sign-in page and exchange the code
+///   2. Check that the grant has the Console client id
+///   3. Refresh with the Claude client id and check that the provider gets
+///      the Console client id
+///   4. Revoke with a different client id and check the same, and that the
+///      grant is gone
 #[test]
 fn console_client_signs_in_refreshes_and_revokes_with_its_client_id() {
     Setup::new(ServiceId::Anthropic, Options::default()).run(|r| async move {
@@ -176,6 +216,15 @@ fn console_client_signs_in_refreshes_and_revokes_with_its_client_id() {
     });
 }
 
+/// Test that an exchange answer with a credential in an unknown place fails
+/// closed. The proxy cannot swap a credential that it does not find, so it
+/// must refuse the whole answer.
+///   1. Add extra fields to the exchange answer of the provider
+///   2. Sign in
+///   3. Check that answers with an unknown secret under a token-like key,
+///      or with an API key, become a 502 and store no grant
+///   4. Check that the other answers succeed
+///   5. Check that no answer shows a real token to the guest
 #[test]
 fn exchange_answer_with_credential_in_unknown_place_fails_closed() {
     for (extra, refused) in [
@@ -191,6 +240,9 @@ fn exchange_answer_with_credential_in_unknown_place_fails_closed() {
             json!({ "extra": { "key": "sk-ant-api03-REAL-EXTRA" } }),
             true,
         ),
+        // These pass: a new access token format in its usual field, a value
+        // too short for a credential, a number, an access token in an array
+        // (the proxy swaps it), and tokens of the full real length.
         (json!({ "access_token": "opaque-new-format-token" }), false),
         (json!({ "session_token": "short" }), false),
         (json!({ "refresh_token": 42 }), false),
@@ -227,6 +279,11 @@ fn exchange_answer_with_credential_in_unknown_place_fails_closed() {
     }
 }
 
+/// Test that compressed token answers are refused. The proxy cannot read
+/// them to swap the real tokens.
+///   1. Make the provider compress its answers
+///   2. Sign in and check the 502 and that no grant is stored
+///   3. Create an API key with a stored grant and check the 502
 #[test]
 fn compressed_token_answers_are_refused() {
     let opts = Options {
@@ -255,6 +312,12 @@ fn compressed_token_answers_are_refused() {
     });
 }
 
+/// Test that a new sign-in of the same account replaces the older grant and
+/// revokes its real refresh token. Without an account in the answer, the
+/// proxy cannot know the account and keeps both grants.
+///   1. Sign in two times, with or without an account in the answer
+///   2. With an account, check one revoke of the first token and one grant
+///   3. Without an account, check no revoke and two grants
 #[test]
 fn new_sign_in_of_same_account_replaces_and_revokes_older_grant() {
     for account in [true, false] {

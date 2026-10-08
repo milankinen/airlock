@@ -1,10 +1,16 @@
-//! Set the guest system clock from the host-provided wall time. VMs
-//! have no RTC, so until we call this any `time(2)` inside the sandbox
-//! returns kernel boot epoch + seconds — enough to break TLS cert
-//! validation and every `mtime`-driven build tool.
+//! Guest system clock.
+//!
+//! Sets the guest clock to the wall time from the host. The VM has no hardware
+//! clock of its own.
 
 use tracing::{debug, warn};
 
+/// Set `CLOCK_REALTIME` to the given wall time. Does nothing if `epoch` is
+/// 0. A failure only logs a warning.
+///
+/// VMs have no RTC. Until this call, `time(2)` in the sandbox returns the
+/// kernel boot epoch plus uptime. This breaks TLS cert validation and all
+/// build tools that use `mtime`.
 pub(super) fn set(epoch: u64, epoch_nanos: u32) {
     if epoch == 0 {
         return;

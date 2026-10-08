@@ -1,3 +1,6 @@
+//! Tests for the TLS MITM: HTTPS requests cross the proxy over h1 and h2,
+//! and owned hosts refuse bytes that are not HTTP.
+
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -15,6 +18,7 @@ use crate::network::target::{Endpoint, InjectedSecret, NetworkTarget};
 use crate::test_cfg::network::*;
 use crate::test_cfg::upstream::*;
 
+/// A config that trusts the CA of `upstream`.
 fn trusting(upstream: &FakeUpstream) -> TestNetworkConfig {
     TestNetworkConfig {
         trust_cas: vec![upstream.ca_pem()],
@@ -22,10 +26,16 @@ fn trusting(upstream: &FakeUpstream) -> TestNetworkConfig {
     }
 }
 
+/// A GET request to `path` with no body.
 fn get_request(path: &str) -> Request<Full<bytes::Bytes>> {
     Request::get(path).body(Full::default()).unwrap()
 }
 
+/// Test that a middleware header reaches the upstream on an HTTPS request
+/// through the TLS MITM.
+///   1. Add a middleware that sets a header
+///   2. Send an HTTPS GET over HTTP/1.1
+///   3. Check the response and the header that the upstream got
 #[test]
 fn https_request_through_mitm_carries_middleware_header_to_upstream() {
     let upstream = FakeUpstream::bind(&[b"http/1.1"]);
@@ -57,6 +67,12 @@ fn https_request_through_mitm_carries_middleware_header_to_upstream() {
     });
 }
 
+/// Test that a large response crosses the TLS MITM intact over h1 and h2.
+/// The body is larger than the TLS and flow control buffers, so lost or
+/// reordered chunks show.
+///   1. Start a TLS upstream that answers an 8 MB patterned body
+///   2. Send a GET over HTTP/1.1, then over h2
+///   3. Check the length and the content of the body
 #[test]
 fn large_response_through_mitm_arrives_intact_over_h1_and_h2() {
     const SIZE: usize = 8 * 1024 * 1024;
@@ -84,6 +100,12 @@ fn large_response_through_mitm_arrives_intact_over_h1_and_h2() {
     }
 }
 
+/// Test that the proxy bridges an h2 guest request to an upstream that
+/// speaks only HTTP/1.1.
+///   1. Start a TLS upstream that offers only HTTP/1.1
+///   2. Send a GET from the guest over h2
+///   3. Check the response, and the method, path and `Host` that the
+///      upstream got
 #[test]
 fn h2_guest_request_to_h1_only_upstream_is_bridged() {
     let upstream = FakeUpstream::bind(&[b"http/1.1"]);
@@ -111,6 +133,8 @@ fn h2_guest_request_to_h1_only_upstream_is_bridged() {
     });
 }
 
+/// A network service that owns the given targets and panics if it gets a
+/// request.
 struct PanicIfCalled {
     targets: Vec<NetworkTarget>,
 }
@@ -135,6 +159,13 @@ impl Interceptor for PanicIfCalled {
     }
 }
 
+/// Test that the proxy refuses bytes that are not HTTP on a host that a
+/// network service owns. A raw relay would let the guest send anything,
+/// also a real token, past the service.
+///   1. Make a service own a local port that counts connections
+///   2. Open TLS to that port and send a line that is not HTTP
+///   3. Check that the proxy closes the connection with no answer
+///   4. Check that the proxy did not open an upstream connection
 #[test]
 fn non_http_bytes_to_owned_host_are_refused_not_relayed() {
     let upstream = AcceptCounter::bind();
@@ -152,6 +183,7 @@ fn non_http_bytes_to_owned_host_are_refused_not_relayed() {
     run_with_config(cfg, |proxy, _, mitm_ca| async move {
         let accepted = upstream.start();
         let mut tls = guest_tls(&proxy, &mitm_ca, port, &[]).await;
+        // The HTTP detector waits for a line end, so send a full line.
         tls.write_all(b"NOT AN HTTP REQUEST\r\n").await.unwrap();
         let mut resp = Vec::new();
         let _ = tokio::time::timeout(Duration::from_secs(2), tls.read_to_end(&mut resp))

@@ -1,70 +1,12 @@
-//! Secret storage for airlock.
+//! Secret storage.
 //!
-//! Holds two kinds of items:
+//! Stores the secrets that the user adds with `airlock secrets`. Projects
+//! refer to these secrets by name in their config, and airlock puts in the
+//! real values. The vault also stores credentials for image registries.
 //!
-//! - `secrets`: user-managed secrets (`airlock secrets add/list/remove`)
-//!   exposed to projects via `${NAME}` substitution.
-//! - `registries`: image-registry credentials.
-//!
-//! All kinds live inside a **single** `VaultData` blob. Where that blob
-//! lives is chosen by `settings.vault`:
-//!
-//! - `keyring` (default): OS keychain / Secret Service.
-//! - `encrypted-file`: `~/.airlock/vault.default.enc.json`, AEAD-encrypted with a passphrase.
-//! - `file`: `~/.airlock/vault.default.json`, mode 0600, plain JSON.
-//! - `disabled`: no-op; reads return empty, writes are dropped.
-//!
-//! Each backend is an implementation of the `Storage` trait in its own
-//! sibling file under `vault/`. This module owns the facade: the
-//! `Vault` handle, substitution logic, the shared on-disk `Envelope`
-//! format (so a plaintext-vs-encrypted mismatch is rejected before
-//! anything writes), and the shared I/O helpers. Switching the
-//! backend is one line in `settings.toml`; the rest of the pipeline
-//! (`${VAR}` substitution, registry credential lookup, the `secret`
-//! subcommand) is unaware.
-//!
-//! ## On-disk envelope
-//!
-//! ```json
-//! { "type": "file",           "data": { ...VaultData... } }
-//! { "type": "encrypted-file", "data": { "kdf": {...}, "nonce": "...", "ciphertext": "..." } }
-//! ```
-//!
-//! ## Lazy opening
-//!
-//! `Vault::new()` does **not** touch storage. The first call to any
-//! getter or setter opens it. For `encrypted-file` that's the call
-//! that prompts for a passphrase; for `keyring` on Linux it's the call
-//! that may trigger a Secret Service unlock. `Vault::subst` consults
-//! the host-env snapshot first — a template like `${PATH}` resolves
-//! without ever opening the vault, so only references to names that
-//! the host env doesn't define fall through.
-//!
-//! ## Concurrency
-//!
-//! `Vault` guards its in-memory `VaultData` with a `Mutex<Option<_>>`
-//! (`None` = unopened). Reads clone the needed fields out so the lock
-//! is never held across foreign code. One `Vault` per process.
-//!
-//! Every write is a read-modify-write of the whole blob under a
-//! cross-process lock file (`Storage::lock_path`, for every persistent
-//! backend: `vault.default.lock`, `vault.default.enc.lock`,
-//! `vault.keyring.lock`). So a writer never drops what another process
-//! wrote, in any section. The vault lock is held only inside one vault
-//! call, and no other lock is taken while it is held.
-//!
-//! The blob keeps top-level fields that this version does not know, so a
-//! later format change survives a write by this version. One exception:
-//! the `agents` section of an earlier unreleased version holds real agent
-//! credentials that nothing reads any more, so the next write drops it
-//! ([`RETIRED_AGENTS_SECTION`]).
-//!
-//! ## Error model
-//!
-//! "No vault yet" (file absent / no keyring entry) is not an error —
-//! it's the initial state (empty vault). Everything else bubbles up
-//! via `anyhow`. For `encrypted-file`, a wrong passphrase surfaces as
-//! a decrypt error.
+//! The user selects where the vault keeps its data in `settings.vault`: the
+//! system keychain, an encrypted file, a plaintext file, or nothing. The rest
+//! of the program uses the vault in the same way for all storage types.
 
 mod disabled;
 mod encrypted;
@@ -95,14 +37,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::settings::Settings;
 
-// Argon2id parameters — OWASP 2023 "second recommendation": 19 MiB
-// memory, t=2, p=1. These land on the fast side of safe for an
-// interactive unlock on a laptop (~100-300 ms).
+// Argon2id parameters from the OWASP 2023 "second recommendation": 19 MiB
+// memory, t=2, p=1. These values are safe and keep an interactive unlock
+// on a laptop fast (approximately 100-300 ms).
+/// Argon2id memory cost in KiB.
 pub(crate) const ARGON2_M_KIB: u32 = 19_456;
+/// Argon2id time cost (iterations).
 pub(crate) const ARGON2_T: u32 = 2;
+/// Argon2id parallelism.
 pub(crate) const ARGON2_P: u32 = 1;
+/// Length of the derived encryption key in bytes.
 pub(crate) const ARGON2_KEY_BYTES: usize = 32;
+/// Length of the KDF salt in bytes.
 pub(crate) const SALT_BYTES: usize = 16;
+/// Length of the ChaCha20-Poly1305 nonce in bytes.
 pub(crate) const NONCE_BYTES: usize = 12;
 
 /// One user-managed secret.
@@ -120,23 +68,30 @@ struct RegistryEntry {
     saved_at: SystemTime,
 }
 
-/// Metadata returned by `list_secrets`. Values are omitted; `preview`
-/// is a short masked suffix (`****` plus 0/2/4 trailing chars depending
-/// on value length) intended only for disambiguating similarly-named
-/// entries. See `secret_preview`.
+/// Metadata of one secret, returned by [`Vault::list_secrets`]. Does not
+/// contain the secret value.
 #[derive(Clone, Debug)]
 pub struct SecretMeta {
+    /// Secret name.
     pub name: String,
+    /// Time of the last write of the secret.
     pub saved_at: SystemTime,
+    /// Masked preview of the value, see [`secret_preview`]. Use it only to
+    /// tell apart entries with similar names.
     pub preview: String,
 }
 
-/// Masked preview of a secret value, safe to show alongside its name.
-/// Always prefixed with `****` so total length doesn't leak. Reveals
-/// the last 4 chars when the value is ≥16 chars, the last 2 when ≥8,
-/// nothing shorter — below 8 chars even two leaked chars are a
-/// material fraction of the secret's entropy.
+/// Make a masked preview of a secret value. The preview is safe to show
+/// next to the secret name.
+/// Args:
+///  - `value`: Secret value
+///
+/// Returns:
+///   `****` followed by the last 4 chars when the value has 16 or more
+///   chars, the last 2 chars when it has 8 or more, and no chars otherwise.
 pub fn secret_preview(value: &str) -> String {
+    // The fixed `****` prefix hides the total length. Below 8 chars, even
+    // two shown chars are a large part of the secret's entropy.
     let len = value.chars().count();
     let tail = if len >= 16 {
         4
@@ -152,46 +107,53 @@ pub fn secret_preview(value: &str) -> String {
     out
 }
 
-/// Plain registry credentials, decoupled from storage so callers can
-/// construct them without touching internal entry types.
+/// Image-registry credentials for one host. Callers can make them without
+/// access to the internal storage types.
 #[derive(Clone, Debug)]
 pub struct RegistryCreds {
+    /// Registry user name.
     pub username: String,
+    /// Registry password or token.
     pub password: String,
 }
 
 /// Top-level field of the agent credentials of an earlier unreleased
-/// version (`airlock agents`). Dropped on the next write: it holds real
-/// tokens and keys that no command can show or remove.
+/// version (`airlock agents`). The next write drops it, because it holds
+/// real tokens and keys that no command can show or remove.
 const RETIRED_AGENTS_SECTION: &str = "agents";
 
+/// Contents of the vault. All items live in this one blob, which the
+/// [`Storage`] backend stores as JSON.
 #[derive(Default, Serialize, Deserialize)]
 pub(crate) struct VaultData {
     #[serde(default)]
     secrets: BTreeMap<String, SecretEntry>,
     #[serde(default)]
     registries: BTreeMap<String, RegistryEntry>,
-    /// Key of the network services' token store (in `~/.airlock/db/`):
-    /// 32 random bytes, base64. Created once; not a user secret, so
-    /// `airlock secrets` does not list it.
+    /// Key of the token store of the network services (in `~/.airlock/db/`):
+    /// 32 random bytes, base64. Created one time. It is not a user secret,
+    /// so `airlock secrets` does not list it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     service_store_key: Option<String>,
-    /// Top-level fields of a later format, kept through a write.
+    /// Top-level fields that this version does not know. A write keeps
+    /// them, so a later format change survives a write by this version.
+    /// The exception is [`RETIRED_AGENTS_SECTION`], which a write drops.
     #[serde(flatten)]
     unknown: serde_json::Map<String, serde_json::Value>,
 }
 
-/// Which backend `Vault` uses. Matches `settings.vault.storage`.
+/// Storage backend of the [`Vault`]. Matches `settings.vault.storage`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum VaultStorageType {
-    /// Inert backend. Reads empty, writes dropped. `airlock secrets`
-    /// refuses to run.
+    /// No storage. Reads return an empty vault and writes are dropped.
+    /// `airlock secrets` refuses to run.
     Disabled,
     /// Plaintext JSON at `~/.airlock/vault.default.json` (mode 0600).
     File,
-    /// AEAD-encrypted JSON at `~/.airlock/vault.default.enc.json`. Passphrase via
-    /// `AIRLOCK_VAULT_PASSPHRASE` or interactive prompt.
+    /// AEAD-encrypted JSON at `~/.airlock/vault.default.enc.json`. The
+    /// passphrase comes from `AIRLOCK_VAULT_PASSPHRASE` or an interactive
+    /// prompt.
     EncryptedFile,
     /// OS keychain / Secret Service.
     #[default]
@@ -204,8 +166,17 @@ impl smart_config::de::WellKnown for VaultStorageType {
     const DE: Self::Deserializer = smart_config::de::Serde;
 }
 
-/// Process-global vault handle. Cheap to clone (internal `Arc`). One
-/// per process is the expected usage.
+/// Process-global vault handle. Clones share one state, so a clone is
+/// cheap. Use one vault per process.
+///
+/// The vault opens its storage lazily: construction does not touch the
+/// storage, and the first getter or setter call opens it. For
+/// `encrypted-file`, this call asks for the passphrase. For `keyring` on
+/// Linux, this call can cause a Secret Service unlock.
+///
+/// Each write reads, changes and writes the whole blob under a
+/// cross-process lock file (see [`Storage::lock_path`]). Thus a writer
+/// never drops what another process wrote.
 #[derive(Clone)]
 pub struct Vault {
     inner: Arc<VaultInner>,
@@ -213,14 +184,15 @@ pub struct Vault {
 
 struct VaultInner {
     storage: Box<dyn Storage>,
+    /// Cached vault contents. `None` until the vault opens. Reads clone the
+    /// necessary fields, so the lock is never held across foreign code.
     data: Mutex<Option<VaultData>>,
-    /// Host environment snapshot for `${NAME}` substitution. Frozen so
-    /// tests can inject a known env and so substitution stays
-    /// deterministic even if something else mutates `std::env` mid-run.
+    /// Host environment snapshot for `${NAME}` substitution. It is fixed,
+    /// so tests can inject a known env, and substitution gives the same
+    /// result when other code changes `std::env` during the run.
     env: HashMap<String, String>,
-    /// Which backend this vault was constructed with — surfaced so the
-    /// CLI can warn the user when they `secret add` into a plaintext
-    /// file.
+    /// Backend of this vault. The CLI uses it to warn the user when
+    /// `secret add` writes into a plaintext file.
     storage_type: VaultStorageType,
 }
 
@@ -231,8 +203,8 @@ impl Default for Vault {
 }
 
 impl Vault {
-    /// Construct a vault for the given storage backend, reading the
-    /// host environment snapshot now.
+    /// Make a vault for the given storage backend. Takes the host
+    /// environment snapshot now. Does not open the storage.
     pub fn for_storage_type(storage_type: VaultStorageType) -> Self {
         Self::new_with(
             boxed_storage(storage_type),
@@ -241,8 +213,12 @@ impl Vault {
         )
     }
 
-    /// Build a vault against a custom storage backend and a fixed env
-    /// map. Intended for tests; the real CLI uses `Vault::for_storage_type`.
+    /// Make a vault with a custom storage backend and a fixed env map.
+    /// For tests. The CLI uses [`Vault::for_storage_type`].
+    /// Args:
+    ///  - `storage`: Storage backend
+    ///  - `env`: Host environment for `${NAME}` substitution
+    ///  - `storage_type`: Backend type that [`Vault::storage_type`] returns
     pub fn new_with(
         storage: Box<dyn Storage>,
         env: HashMap<String, String>,
@@ -258,8 +234,8 @@ impl Vault {
         }
     }
 
-    /// Which backend this vault uses. Surfaces the active selection so
-    /// subcommands can specialize (e.g. `secret add` warns on `File`).
+    /// Backend of this vault. Subcommands use it to change their behavior
+    /// (for example, `secret add` gives a warning for `File`).
     pub fn storage_type(&self) -> VaultStorageType {
         self.inner.storage_type
     }
@@ -272,7 +248,8 @@ impl Vault {
         Ok(OpenedVault(guard))
     }
 
-    /// Read the current blob from storage (empty when there is none yet).
+    /// Read the current blob from storage. "No vault yet" (no file, no
+    /// keyring entry) is not an error. It gives an empty vault.
     fn load(&self) -> anyhow::Result<VaultData> {
         match self.inner.storage.load()? {
             Some(json) => serde_json::from_str::<VaultData>(&json)
@@ -282,7 +259,7 @@ impl Vault {
     }
 
     /// Take the cross-process vault lock of the backend, if it has one.
-    /// Held until the returned handle drops.
+    /// The lock stays until the returned handle drops.
     fn lock_storage(&self) -> anyhow::Result<Option<File>> {
         self.inner
             .storage
@@ -296,17 +273,17 @@ impl Vault {
         self.inner.storage.store(&json)
     }
 
-    /// Perform a mutation as a locked read-modify-write against the *current*
-    /// on-disk state.
+    /// Change the vault contents under the cross-process lock.
+    /// Args:
+    ///  - `f`: Function that changes the current stored contents
     ///
-    /// The old approach mutated a possibly-stale cached snapshot and flushed
-    /// it wholesale, so a long-running process could erase secrets a
-    /// concurrent `airlock secrets add` had written. Here we take a
-    /// cross-process lock (every persistent backend), reload the latest
-    /// state, apply `f`, write it, and refresh the cache — so concurrent
-    /// changes are merged rather than clobbered. When `f` fails, nothing
-    /// is written.
+    /// Returns:
+    ///   Result of `f`. When `f` fails, nothing is written.
     fn mutate<R>(&self, f: impl FnOnce(&mut VaultData) -> anyhow::Result<R>) -> anyhow::Result<R> {
+        // Read the latest state under the lock. The cached snapshot can be
+        // old, and a write from it can erase secrets that a concurrent
+        // `airlock secrets add` wrote. While this call holds the vault lock,
+        // it takes only the cache lock, for a short time at the end.
         let _lock = self.lock_storage()?;
         let mut data = self.load()?;
         data.unknown.remove(RETIRED_AGENTS_SECTION);
@@ -316,14 +293,19 @@ impl Vault {
         Ok(result)
     }
 
-    /// Lookup a user secret by name. Opens the vault on first use.
+    /// Find a user secret by name. Opens the vault on first use.
+    /// Returns:
+    ///   Secret value, or `None` if the vault has no secret with this name.
     pub fn get_secret(&self, name: &str) -> anyhow::Result<Option<String>> {
         let opened = self.open()?;
         Ok(opened.data().secrets.get(name).map(|e| e.value.clone()))
     }
 
-    /// Store or overwrite a user secret. Rejects empty names/values
-    /// and names that can't be used as env-var identifiers.
+    /// Store or overwrite a user secret.
+    /// Args:
+    ///  - `name`: Secret name. Must be a valid env-var name, see
+    ///    [`validate_secret_name`]
+    ///  - `value`: Secret value. Must not be empty
     pub fn set_secret(&self, name: &str, value: &str) -> anyhow::Result<()> {
         validate_secret_name(name)?;
         if value.is_empty() {
@@ -341,15 +323,16 @@ impl Vault {
         })
     }
 
-    /// Remove a user secret. `Ok(false)` when the name was not present
-    /// — lets the CLI report "nothing to do" without conflating it
-    /// with real storage errors.
+    /// Remove a user secret.
+    /// Returns:
+    ///   `false` if the vault had no secret with this name. Thus the CLI
+    ///   can report "nothing to do" separately from storage errors.
     pub fn remove_secret(&self, name: &str) -> anyhow::Result<bool> {
         self.mutate(|data| Ok(data.secrets.remove(name).is_some()))
     }
 
-    /// Enumerate secrets (names, timestamps, masked previews — no
-    /// full values).
+    /// List the secrets (names, timestamps and masked previews, but not
+    /// the values).
     pub fn list_secrets(&self) -> anyhow::Result<Vec<SecretMeta>> {
         let opened = self.open()?;
         Ok(opened
@@ -364,7 +347,7 @@ impl Vault {
             .collect())
     }
 
-    /// Lookup registry credentials for `host`.
+    /// Find the registry credentials for `host`.
     pub fn get_registry(&self, host: &str) -> anyhow::Result<Option<RegistryCreds>> {
         let opened = self.open()?;
         Ok(opened.data().registries.get(host).map(|e| RegistryCreds {
@@ -391,9 +374,11 @@ impl Vault {
         })
     }
 
-    /// The key of the network services' token store. Created on first use
-    /// under the vault lock, so concurrent first uses agree on one key.
+    /// Get the key of the token store of the network services. Creates the
+    /// key on first use.
     pub fn service_store_key(&self) -> anyhow::Result<[u8; 32]> {
+        // The key is created under the vault lock, so concurrent first uses
+        // get the same key.
         let stored = self.open()?.data().service_store_key.clone();
         if let Some(key) = stored {
             return decode_b64_array(&key, "service store key");
@@ -411,12 +396,19 @@ impl Vault {
         })
     }
 
-    /// Expand `${NAME}` tokens in `template`. Host env is consulted
-    /// first and the vault is the fallback — so common templates like
-    /// `${PATH}` or `${HOME}` never hit the vault.
+    /// Expand the `${NAME}` tokens in a template.
+    /// Args:
+    ///  - `template`: Text with `${NAME}` tokens
+    ///
+    /// Returns:
+    ///   Expanded text, or an error if a name has no value. A name gets
+    ///   its value from the host environment first, then from the vault
+    ///   secrets.
     pub fn subst(&self, template: &str) -> anyhow::Result<String> {
+        // Names that the host env defines (for example `${PATH}`) do not
+        // open the vault. Only the other names open it.
         subst::substitute(template, self).map_err(|e| match self.open() {
-            // The variable is missing because the vault did not open: say
+            // The variable is missing because the vault did not open. Tell
             // why, not only that it is missing.
             Err(open) => open.context(e.to_string()),
             Ok(_) => anyhow!("{e}"),
@@ -424,6 +416,7 @@ impl Vault {
     }
 }
 
+/// Lock guard of an open vault. The data is always `Some`.
 struct OpenedVault<'a>(MutexGuard<'a, Option<VaultData>>);
 
 impl<'a> subst::VariableMap<'a> for Vault {
@@ -442,9 +435,8 @@ impl OpenedVault<'_> {
     }
 }
 
-/// Validate a user-secret name: must parse as a POSIX env-var
-/// identifier (`[A-Z_][A-Z0-9_]*`). Names that can't be referenced
-/// via `${NAME}` would be unreachable anyway.
+/// Make sure that a user-secret name is a POSIX env-var identifier
+/// (`[A-Z_][A-Z0-9_]*`). Other names cannot be used in `${NAME}`.
 pub fn validate_secret_name(name: &str) -> anyhow::Result<()> {
     if name.is_empty() {
         bail!("secret name must not be empty");
@@ -464,22 +456,28 @@ pub fn validate_secret_name(name: &str) -> anyhow::Result<()> {
 
 // ── Storage trait + dispatcher ─────────────────────────────────────────────
 
-/// Backend that persists the vault JSON blob. Vault hands the trait a
-/// plain `VaultData` JSON string and takes the same back on load — any
-/// on-disk envelope or encryption is the backend's concern.
+/// Storage backend for the vault JSON blob. The vault gives a plain
+/// [`VaultData`] JSON string to the backend and gets the same string back.
+/// The backend does the on-disk envelope and encryption, if any.
 pub trait Storage: Send + Sync + 'static {
+    /// Read the stored blob.
+    /// Returns:
+    ///   Blob JSON, or `None` if nothing is stored yet.
     fn load(&self) -> anyhow::Result<Option<String>>;
+    /// Write the blob JSON, and replace the old blob.
     fn store(&self, data: &str) -> anyhow::Result<()>;
 
-    /// Path of a sidecar lock file used to serialize concurrent mutations
-    /// across processes. `None` for backends that don't need it
-    /// (disabled, in-memory test doubles). An error when the backend needs
-    /// a lock but cannot name its path: a write never runs unlocked.
+    /// Path of the lock file that serializes writes across processes.
+    /// Returns:
+    ///   `None` for backends that do not need a lock (disabled, in-memory
+    ///   test doubles). An error when the backend needs a lock but cannot
+    ///   name its path, so a write never runs without the lock.
     fn lock_path(&self) -> anyhow::Result<Option<PathBuf>> {
         Ok(None)
     }
 }
 
+/// Make the storage backend for the given type.
 fn boxed_storage(storage_type: VaultStorageType) -> Box<dyn Storage> {
     match storage_type {
         VaultStorageType::Disabled => Box::new(DisabledStorage),
@@ -500,20 +498,32 @@ fn boxed_storage(storage_type: VaultStorageType) -> Box<dyn Storage> {
 
 // ── Shared on-disk envelope ────────────────────────────────────────────────
 //
-// Both file backends share a tagged envelope so a `settings.vault` flip
-// refuses to reinterpret one kind of file as the other rather than
-// silently zeroing a vault. Defined here (not in `encrypted.rs`) so
-// `file.rs` can match on it without a sibling-module import.
+// It is here (not in `encrypted.rs`), so `file.rs` can use it without an
+// import from a sibling module.
 
+/// Tagged on-disk format of the two file backends:
+///
+/// ```json
+/// { "type": "file",           "data": { ...VaultData... } }
+/// { "type": "encrypted-file", "data": { "kdf": {...}, "nonce": "...", "ciphertext": "..." } }
+/// ```
+///
+/// After a change of `settings.vault`, a backend refuses to read the file
+/// of the other backend. It does not silently start an empty vault, and it
+/// rejects the file before a write.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "kebab-case")]
 pub(crate) enum Envelope {
+    /// Plaintext vault contents.
     File(VaultData),
+    /// Encrypted vault contents.
     EncryptedFile(EncryptedBlob),
 }
 
+/// Encrypted vault contents and the data necessary to decrypt them.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct EncryptedBlob {
+    /// Key derivation parameters.
     pub(crate) kdf: KdfParams,
     /// 12-byte ChaCha20-Poly1305 nonce, base64 (unpadded).
     pub(crate) nonce: String,
@@ -521,8 +531,10 @@ pub(crate) struct EncryptedBlob {
     pub(crate) ciphertext: String,
 }
 
+/// Parameters of the key derivation from the passphrase.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct KdfParams {
+    /// KDF algorithm name.
     pub(crate) algo: String,
     /// 16-byte salt, base64 (unpadded).
     pub(crate) salt: String,
@@ -536,6 +548,9 @@ pub(crate) struct KdfParams {
 
 // ── File I/O helpers ───────────────────────────────────────────────────────
 
+/// Read a vault file.
+/// Returns:
+///   File contents, or `None` if the file does not exist.
 pub(crate) fn read_vault_file(path: &Path) -> anyhow::Result<Option<String>> {
     match std::fs::read_to_string(path) {
         Ok(s) => Ok(Some(s)),
@@ -544,21 +559,16 @@ pub(crate) fn read_vault_file(path: &Path) -> anyhow::Result<Option<String>> {
     }
 }
 
-/// Write `bytes` to `path` atomically and with mode 0600. Goes via a
-/// sibling tempfile + rename so a crash mid-write can't leave the
-/// vault truncated. The parent directory is created if missing.
-/// Acquire an exclusive advisory lock on `path`, held until the returned
-/// handle drops. Blocking (mutations are brief), so concurrent writers queue
-/// rather than fail. Used to serialize vault read-modify-write across
-/// processes so a stale writer can't clobber a concurrent one's changes.
+/// Take an exclusive advisory lock on `path`. The lock stays until the
+/// returned handle drops. Serializes vault writes across processes.
 fn acquire_file_lock(path: &Path) -> anyhow::Result<File> {
     use std::os::unix::io::AsRawFd;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create vault directory {}", parent.display()))?;
     }
-    // `O_NOFOLLOW`: a symlink planted at the lock path is refused, not
-    // followed to create or lock some other file.
+    // `O_NOFOLLOW`: refuse a symlink at the lock path. Do not follow it to
+    // create or lock a different file.
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -568,6 +578,8 @@ fn acquire_file_lock(path: &Path) -> anyhow::Result<File> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .with_context(|| format!("open vault lock {}", path.display()))?;
+    // The lock blocks (writes are short), so concurrent writers wait in a
+    // queue and do not fail.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
     if rc != 0 {
         return Err(anyhow!(
@@ -579,7 +591,11 @@ fn acquire_file_lock(path: &Path) -> anyhow::Result<File> {
     Ok(file)
 }
 
+/// Write `bytes` to `path` atomically, with mode 0600. Creates the parent
+/// directory if it does not exist.
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    // Write to a sibling temp file and rename it, so a crash during the
+    // write cannot leave a truncated vault.
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create vault directory {}", parent.display()))?;
@@ -587,8 +603,8 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let file_name = path
         .file_name()
         .ok_or_else(|| anyhow!("vault path has no file name: {}", path.display()))?;
-    // Per-process unique temp name so two processes writing concurrently can't
-    // rename each other's half-written temp file into place.
+    // The temp name is unique per process. Thus two concurrent writers
+    // cannot rename a half-written temp file of the other process.
     let unique = std::process::id();
     let mut tmp = path.to_path_buf();
     tmp.set_file_name(format!("{}.{unique}.tmp", file_name.to_string_lossy()));
@@ -610,6 +626,14 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Decode an unpadded base64 string into a fixed-size byte array.
+/// Args:
+///  - `s`: Base64 text
+///  - `label`: Name of the value for error messages
+///
+/// Returns:
+///   Decoded bytes, or an error if the text is not base64 or the length
+///   is not `N`.
 pub(crate) fn decode_b64_array<const N: usize>(s: &str, label: &str) -> anyhow::Result<[u8; N]> {
     let bytes = STANDARD_NO_PAD
         .decode(s)

@@ -1,9 +1,11 @@
-//! Inert backend. Reads return empty, writes are dropped. Used when
-//! `settings.vault = "disabled"` so `airlock secrets` can refuse to run
-//! without a separate "is the vault on" check elsewhere.
+//! Disabled vault storage.
+//!
+//! Used for `settings.vault.storage = "disabled"`. Stores nothing.
 
 use super::Storage;
 
+/// Storage backend that stores nothing. Reads return an empty vault and
+/// writes are dropped.
 pub struct DisabledStorage;
 
 impl Storage for DisabledStorage {

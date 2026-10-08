@@ -1,12 +1,6 @@
-//! `airlock secrets` — manage user secrets stored in the configured
-//! vault backend.
+//! The `airlock secrets` command.
 //!
-//! Three subcommands: `list`, `add`, `remove`. Storage goes through
-//! the single `Vault` (one JSON blob); see `crate::vault`.
-//!
-//! `add` never takes the value on the command line — interactive
-//! prompt or `--stdin`. This is a hard rule: argv values leak via
-//! shell history and `ps`.
+//! Lists, adds and removes user secrets in the configured vault.
 
 use anyhow::{Context as _, bail};
 use clap::{Args, Subcommand};
@@ -15,43 +9,44 @@ use crate::cli;
 use crate::context::Context;
 use crate::vault::{Vault, VaultStorageType, ui, validate_secret_name};
 
+/// CLI arguments for `airlock secrets`.
 #[derive(Args, Debug)]
 pub struct SecretArgs {
     #[command(subcommand)]
     cmd: SecretCmd,
 }
 
+/// Subcommands of `airlock secrets`.
 #[derive(Subcommand, Debug)]
 enum SecretCmd {
-    /// List all stored secrets. Shows names, timestamps, and a masked
-    /// `****`-prefixed preview of the last few value chars (for
-    /// disambiguation only — the full value is never printed).
+    /// List secrets: names, save times, masked value previews (never full values)
     #[command(alias = "ls")]
     List,
-    /// Add or overwrite a secret. Prompts interactively for the
-    /// value with echo suppressed. Use `--stdin` to pipe the value.
+    /// Add or replace a secret. Asks for the value without echo
+    // The value never comes from the command line, only from the prompt or
+    // `--stdin`. This is a hard rule: argv values leak through shell history
+    // and `ps`.
     Add {
-        /// Secret name — must match `[A-Z_][A-Z0-9_]*` so it can be
-        /// referenced via `${NAME}` in config.
+        /// Secret name, must match `[A-Z_][A-Z0-9_]*` (use as `${NAME}` in config)
         name: String,
-        /// Read the value from stdin instead of prompting. Reads
-        /// until EOF; trims a single trailing `\n`. Useful for
-        /// piping secrets from scripts.
+        /// Read the value from stdin until EOF (removes one trailing newline)
         #[arg(long)]
         stdin: bool,
-        /// Skip the plaintext-vault confirmation. Has no effect on
-        /// encrypted/keyring vaults.
+        /// Do not ask to confirm a plaintext vault (no effect on other vaults)
         #[arg(short = 'y', long)]
         yes: bool,
     },
     /// Remove a secret.
     #[command(alias = "rm")]
     Remove {
-        /// Secret name.
+        /// Secret name
         name: String,
     },
 }
 
+/// Entry point for `airlock secrets`.
+/// Returns:
+///   Process exit code: 0 on success, 1 on error.
 pub fn main(args: SecretArgs, context: &Context) -> i32 {
     let vault = &context.vault;
     if vault.storage_type() == VaultStorageType::Disabled {

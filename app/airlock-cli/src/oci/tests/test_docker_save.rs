@@ -1,12 +1,18 @@
+//! Tests for the import of local images from a `docker save` or podman
+//! export: layer staging, cached layers and blob digest checks.
+
 use sha2::{Digest, Sha256};
 
 use super::*;
 use crate::test_cfg::home::TempHome;
 
+/// The SHA-256 of `bytes` as lowercase hex.
 fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+/// An image config with the user `user` and the uncompressed layers
+/// `layers` (hex digests, base first).
 fn config_json(user: &str, layers: &[&str]) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "architecture": "amd64",
@@ -25,8 +31,10 @@ fn config_json(user: &str, layers: &[&str]) -> Vec<u8> {
     .unwrap()
 }
 
-/// The layers of `save` extracted from their staged tarballs, topmost
-/// first, as `ensure_local_image` does it.
+/// Extract the staged layer tarballs of `save` into the layer cache, as
+/// `ensure_local_image` does.
+/// Returns:
+///   The layer keys, topmost first.
 fn extract_saved_layers(save: &docker::DockerSave) -> Vec<String> {
     let mut keys: Vec<String> = save
         .layer_digests
@@ -45,6 +53,7 @@ fn extract_saved_layers(save: &docker::DockerSave) -> Vec<String> {
     keys
 }
 
+/// The path of the staged tarball of the layer `hex`.
 fn staged(hex: &str) -> std::path::PathBuf {
     cache::layers_root().unwrap().join(format!(
         "{}.download",
@@ -52,6 +61,7 @@ fn staged(hex: &str) -> std::path::PathBuf {
     ))
 }
 
+/// The names of temporary staging files left in the layer cache.
 fn staging_leftovers() -> Vec<String> {
     std::fs::read_dir(cache::layers_root().unwrap())
         .unwrap()
@@ -64,6 +74,15 @@ fn staging_leftovers() -> Vec<String> {
         .collect()
 }
 
+/// Test that a podman `docker-archive` export becomes an image with the
+/// user, home, command and env of its config, and that its staging files
+/// go away.
+///   1. Make an export with a base layer that declares the `node` user, a
+///      top layer and a config with `User: node`
+///   2. Stage the export and check the layer digests and staged files
+///   3. Extract the layers and check that no staging file is left
+///   4. Build the image and check the user, home, command, env, OS and
+///      layer contents
 #[test]
 fn podman_archive_export_becomes_image_with_named_user() {
     let _home = TempHome::new();
@@ -125,6 +144,14 @@ fn podman_archive_export_becomes_image_with_named_user() {
     );
 }
 
+/// Test that a Docker OCI layout export stages only layers that are not in
+/// the cache, and ignores the legacy `<id>/layer.tar` members.
+///   1. Put one layer in the cache
+///   2. Make an export with the cached layer, a new layer and a legacy
+///      member
+///   3. Stage the export and check that only the new layer is staged
+///   4. Extract the layers and check both layer contents and that no
+///      staging file is left
 #[test]
 fn docker_oci_layout_export_skips_cached_layers_and_legacy_members() {
     let _home = TempHome::new();
@@ -141,6 +168,7 @@ fn docker_oci_layout_export_skips_cached_layers_and_legacy_members() {
         .file(&format!("blobs/sha256/{cached_hex}"), &cached)
         .file(&format!("blobs/sha256/{fresh_hex}"), &fresh)
         .file(&format!("blobs/sha256/{config_hex}"), &config)
+        // The legacy member is not content-addressed. The stage must skip it.
         .file(&format!("{}/layer.tar", "f".repeat(64)), &fresh)
         .file("index.json", "{}")
         .file("manifest.json", manifest)
@@ -168,6 +196,11 @@ fn docker_oci_layout_export_skips_cached_layers_and_legacy_members() {
     assert!(staging_leftovers().is_empty());
 }
 
+/// Test that a blob whose content does not match the digest in its name
+/// is refused, so that a bad export cannot put wrong data in the cache.
+///   1. Make an export with a blob named by a digest of other content
+///   2. Stage the export and check the "digest mismatch" error
+///   3. Check that the layer cache is empty
 #[test]
 fn docker_blob_whose_content_does_not_match_its_digest_is_rejected() {
     let _home = TempHome::new();

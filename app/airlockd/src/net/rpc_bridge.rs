@@ -1,21 +1,9 @@
-//! Shared Cap'n Proto sink/relay/connect plumbing.
+//! Byte streams between guest and host.
 //!
-//! The guest-side networking stack has three distinct users of the
-//! `NetworkProxy.connect` RPC (tcp_proxy, host_port_forward,
-//! host_socket_forward) plus one reverse-direction caller
-//! (`Supervisor.openLocalTcp` for host → guest). They all need the
-//! same three pieces:
-//!
-//! - [`ChannelSink`] — a `TcpSink` server implementation that pushes
-//!   inbound RPC bytes into an mpsc channel, optionally pinging a
-//!   `Notify` so a sync consumer (the smoltcp poll loop) can wake up
-//!   without polling.
-//! - [`rpc_connect_tcp`] — builds + sends a `connect` request, unwraps
-//!   the response, and returns the host-side sink.
-//! - [`relay`] — bidirectional byte pump between a tokio
-//!   `AsyncRead`/`AsyncWrite` pair and an RPC sink/channel pair.
-//! - [`open_local_tcp`] — for the `Supervisor.openLocalTcp` RPC
-//!   handler: connect to an in-guest loopback port and relay.
+//! Common parts of the guest network services. Opens connections through the
+//! host network proxy, and relays bytes in both directions between a local
+//! connection and the host. Also lets the host open connections to guest
+//! loopback ports.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -26,9 +14,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Notify, mpsc};
 use tracing::error;
 
-/// Send a `NetworkProxy.connect` request for a TCP target and return
-/// the host-side sink. Callers decide whether to log errors at `debug`
-/// (expected; e.g. remote denied) or `error` (unexpected).
+/// Open a TCP connection through the host network proxy
+/// (`NetworkProxy.connect`).
+/// Args:
+///  - `network`: Host network proxy client
+///  - `host`, `port`: TCP target
+///  - `server_sink`: Sink that receives the bytes from the target
+///
+/// Returns:
+///   Host-side sink for the bytes to the target. Error if the host denies
+///   the connection or the RPC fails. Callers decide the log level: `debug`
+///   for expected errors (for example a deny), `error` for unexpected ones.
 pub async fn rpc_connect_tcp(
     network: &network_proxy::Client,
     host: &str,
@@ -54,15 +50,19 @@ pub async fn rpc_connect_tcp(
     }
 }
 
-/// Open a local TCP connection inside the guest and bridge it to the
-/// host via two sinks. Used by `Supervisor.openLocalTcp`: the host has
-/// accepted a connection destined for a guest service; we connect to
-/// `127.0.0.1:<port>` here and relay bytes raw in both directions.
+/// Connect to `127.0.0.1:<port>` in the guest and relay the raw bytes in
+/// both directions with the host.
 ///
-/// `client` is the host-side sink (guest → host bytes). The returned
-/// sink is what the host uses to push bytes into the guest's local TCP
-/// connection. A connect failure surfaces as an error the caller turns
-/// into a Cap'n Proto exception.
+/// Used by `Supervisor.openLocalTcp`: the host accepted a connection for a
+/// guest service.
+/// Args:
+///  - `port`: Guest loopback port
+///  - `client`: Host-side sink for the bytes from guest to host
+///
+/// Returns:
+///   Sink that the host uses to send bytes into the guest connection. Error
+///   if the connect fails. The caller converts it into a Cap'n Proto
+///   exception.
 pub async fn open_local_tcp(
     port: u16,
     client: tcp_sink::Client,
@@ -80,15 +80,18 @@ pub async fn open_local_tcp(
     Ok(server_sink)
 }
 
-/// Bidirectional byte relay between a local TCP stream and a remote
-/// RPC sink, honoring half-close.
+/// Relay bytes in both directions between a local stream and a remote RPC
+/// sink, with half-close. Returns when both directions are closed.
 ///
-/// Each direction runs to completion independently: a one-way EOF only
-/// half-closes *that* direction. When the local side stops sending we signal
-/// EOF to the remote (`close`) but keep delivering the remote's response; when
-/// the remote stops sending we shut down the local write half. The previous
-/// implementation tore down both directions on the first EOF, which truncated
-/// any request→half-close→await-reply protocol (redis-style, RPC).
+/// An EOF in one direction closes only *that* direction:
+///  * When the local side stops, the remote gets EOF (`close`), but the
+///    remote response still goes to the local side.
+///  * When the remote stops, the local write half closes.
+///
+/// Args:
+///  - `local_read`, `local_write`: Local stream halves
+///  - `remote_sink`: Sink for the bytes to the remote
+///  - `remote_rx`: Channel with the bytes from the remote
 pub async fn relay(
     local_read: &mut (impl AsyncReadExt + Unpin),
     local_write: &mut (impl AsyncWriteExt + Unpin),
@@ -113,8 +116,8 @@ pub async fn relay(
                 }
             }
         }
-        // Local won't send more — signal EOF to the remote, but let `to_local`
-        // keep draining the response instead of cancelling it.
+        // The local side sends no more. Send EOF to the remote, but let
+        // `to_local` continue to read the response. Do not cancel it.
         let _ = remote_sink.close_request().send().promise.await;
     };
 
@@ -125,25 +128,29 @@ pub async fn relay(
                 break;
             }
         }
-        // Remote won't send more — signal EOF to the local peer.
+        // The remote sends no more. Send EOF to the local peer.
         let _ = local_write.shutdown().await;
     };
 
-    // Run both directions to completion so a one-way close only half-closes.
+    // Run both directions to their end, so a one-way close is a half-close.
+    // A previous version closed both directions on the first EOF. This cut
+    // each "request, half-close, wait for reply" protocol (redis-style, RPC).
     tokio::join!(to_remote, to_local);
 }
 
-/// Bridges RPC `TcpSink.send()` push calls into a tokio mpsc channel.
-///
-/// When a `notify` is attached, every successful `send`/`close` pings
-/// it so a consumer that can't await the channel directly (notably the
-/// sync smoltcp poll loop) can be woken without polling.
+/// `TcpSink` server that puts the data of each RPC `send()` call into a
+/// tokio mpsc channel. `close()` closes the channel.
 pub struct ChannelSink {
+    /// Channel sender. `None` after `close()`.
     tx: RefCell<Option<mpsc::Sender<Bytes>>>,
+    /// Optional wake-up signal. Each successful `send`/`close` (and the drop)
+    /// notifies it. Thus a consumer that cannot await the channel (the sync
+    /// smoltcp poll loop) wakes up without polling.
     notify: Option<Rc<Notify>>,
 }
 
 impl ChannelSink {
+    /// Create a sink that sends the data to `tx`.
     pub fn new(tx: mpsc::Sender<Bytes>) -> Self {
         Self {
             tx: RefCell::new(Some(tx)),
@@ -151,6 +158,8 @@ impl ChannelSink {
         }
     }
 
+    /// Create a sink that sends the data to `tx` and notifies `notify` after
+    /// each change.
     pub fn with_notify(tx: mpsc::Sender<Bytes>, notify: Rc<Notify>) -> Self {
         Self {
             tx: RefCell::new(Some(tx)),
@@ -158,6 +167,7 @@ impl ChannelSink {
         }
     }
 
+    /// Notify the consumer, if there is a `notify`.
     fn wake(&self) {
         if let Some(n) = &self.notify {
             n.notify_one();
@@ -166,10 +176,10 @@ impl ChannelSink {
 }
 
 impl Drop for ChannelSink {
-    /// The host can release this capability without calling `close()`
-    /// — a denied/failed connect, or an error/reset — which drops
-    /// `tx` silently. Wake on drop too, so the poll loop still
-    /// observes the resulting `Disconnected`.
+    /// The host can release this capability without a `close()` call (for
+    /// example after a denied or failed connect, an error or a reset). Then
+    /// `tx` drops without a signal. Thus wake also on drop, so the poll loop
+    /// still sees the `Disconnected` result.
     fn drop(&mut self) {
         self.wake();
     }

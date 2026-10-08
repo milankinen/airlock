@@ -1,5 +1,7 @@
-//! The runtime an interactive sandbox uses on the user's terminal: raw
-//! passthrough, or the TUI monitor with `--monitor`.
+//! Runtime selection for the user's terminal.
+//!
+//! Selects the raw terminal runtime, or the TUI monitor when the user gives
+//! `--monitor`.
 
 use airlock_common::supervisor_capnp::stdin;
 
@@ -13,17 +15,24 @@ use crate::project::Project;
 use crate::rpc;
 use crate::settings::Settings;
 
-/// Either host runtime, chosen once per command. One concrete type keeps
-/// the session code monomorphic.
+/// One of the host runtimes, selected one time per command. One concrete
+/// type keeps the session code monomorphic.
 pub enum HostRuntime {
+    /// Raw terminal passthrough.
     Raw(RawTerminalRuntime),
+    /// TUI monitor.
     Monitor(MonitorRuntime),
 }
 
 impl HostRuntime {
-    /// The monitor runtime when `monitor` is set, else the raw terminal.
-    /// Fails, before anything boots, when the `[monitor.keys]` settings
-    /// are invalid; the error lists each problem.
+    /// Select the runtime.
+    /// Args:
+    ///  - `monitor`: Use the TUI monitor. Otherwise use the raw terminal
+    ///  - `settings`: User settings with the `[monitor.keys]` bindings
+    ///
+    /// Returns:
+    ///   Runtime, or an error that lists each problem in the
+    ///   `[monitor.keys]` settings. Fails before the boot starts.
     pub fn new(monitor: bool, settings: &Settings) -> anyhow::Result<Self> {
         if !monitor {
             return Ok(Self::Raw(RawTerminalRuntime::new()));
@@ -66,9 +75,11 @@ impl Runtime for HostRuntime {
     }
 }
 
-/// The [`Terminal`] of a [`HostRuntime`].
+/// [`Terminal`] of a [`HostRuntime`].
 pub enum HostTerminal {
+    /// Raw terminal passthrough.
     Raw(RawTerminal),
+    /// TUI monitor.
     Monitor(MonitorTerminal),
 }
 
@@ -99,9 +110,18 @@ impl Terminal for HostTerminal {
 
 #[cfg(test)]
 mod tests {
+    //! Tests for the selection of the host runtime.
+
     use super::*;
     use crate::settings::{KeyList, MonitorBuffers, MonitorSettings, VaultSettings};
 
+    /// Test that the monitor refuses settings with an unknown key binding
+    /// action, so that the user sees the error before the boot starts.
+    ///   1. Ask for the monitor with a binding for an unknown action and
+    ///      check the error
+    ///   2. Ask for the raw terminal with the same settings and check that it
+    ///      ignores the bindings
+    ///   3. Remove the bindings and check that the monitor starts
     #[test]
     fn monitor_with_unknown_key_binding_is_refused() {
         let mut settings = Settings {

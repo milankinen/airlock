@@ -1,30 +1,22 @@
-//! Re-encoding host mouse events for the sandboxed program.
+//! Mouse event forwarding to the sandboxed program.
 //!
-//! The TUI owns the host terminal's mouse — `EnableMouseCapture` is what
-//! makes any event arrive at all — so a guest program that asked for mouse
-//! reporting never sees a click or a wheel tick. Merely dropping capture
-//! would hand the mouse to the host terminal emulator, not to the guest;
-//! the guest's own `\e[?1000h` never reaches the host terminal because its
-//! output is parsed by the embedded `vt100` and rendered as cells.
-//!
-//! So this module is the mirror image of `key_to_bytes`: it turns a
-//! crossterm [`MouseEvent`] back into the wire bytes the guest asked for.
-//! Pure and terminal-free, so every byte layout below is unit-testable.
+//! Converts host mouse events into the input that the sandboxed program expects
+//! for its mouse reporting mode.
 
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 use crate::pty::{MouseProtocolEncoding, MouseProtocolMode};
 
-/// Xterm button codes. Wheel ticks are reported as button presses with
-/// bit 6 set; the horizontal wheel continues the same numbering.
+/// Xterm button codes. A wheel tick is a button press with bit 6 set. The
+/// horizontal wheel continues the same numbering.
 const BTN_RELEASE: u8 = 3;
 const BTN_WHEEL_UP: u8 = 64;
 const BTN_WHEEL_DOWN: u8 = 65;
 const BTN_WHEEL_LEFT: u8 = 66;
 const BTN_WHEEL_RIGHT: u8 = 67;
 
-/// Added to the button code to mark a report as motion rather than a
+/// Value to add to the button code to mark a report as motion, not as a
 /// state change.
 const MOTION: u8 = 32;
 
@@ -32,41 +24,53 @@ const MOD_SHIFT: u8 = 4;
 const MOD_ALT: u8 = 8;
 const MOD_CTRL: u8 = 16;
 
-/// Largest coordinate the legacy encoding can express: each byte carries
-/// the value offset by 32, so 223 + 32 = 255 is the ceiling.
+/// Largest coordinate in the legacy encoding. Each byte holds the value
+/// plus 32, so the maximum is 223 + 32 = 255.
 const LEGACY_MAX_COORD: u16 = 223;
 
-/// What the guest is told happened, independent of wire format.
+/// Mouse event to report to the guest, independent of the wire format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Report {
-    /// A button went down, or the wheel turned.
+    /// A button was pressed, or the wheel turned.
     Press(u8),
-    /// A button came up. Carries which one, because SGR can say — the
-    /// legacy encoding can't and reports a bare [`BTN_RELEASE`].
+    /// A button was released. Holds the button, because SGR can report it.
+    /// The legacy encoding cannot, and reports only [`BTN_RELEASE`].
     Release(u8),
-    /// The pointer crossed a cell boundary with a button held.
+    /// The pointer moved to a different cell with a button held.
     Drag(u8),
-    /// The pointer crossed a cell boundary with no button held.
+    /// The pointer moved to a different cell with no button held.
     Motion,
 }
 
-/// Encode a host mouse event for the guest PTY, or return `None` when it
-/// must not be forwarded.
+/// Encode a host mouse event for the guest PTY.
+/// Args:
+///  - `event`: Mouse event from the host terminal
+///  - `mode`: Mouse protocol mode that the guest enabled
+///  - `encoding`: Mouse report encoding that the guest wants
+///  - `body`: Screen rect where the TUI draws the guest's grid. The guest
+///    always gets coordinates in its own 1-based grid, independent of the
+///    body position in the host terminal.
 ///
-/// `None` means one of: the guest has mouse reporting off, the event fell
-/// outside `body`, the guest's protocol mode doesn't want this class of
-/// event, or the position is beyond what the legacy encoding can express.
-/// In every case the caller should fall back to its own handling.
+/// Returns:
+///   The encoded bytes, or `None` if the event must not go to the guest.
+///   `None` means one of these:
+///    * the guest has mouse reporting off
+///    * the event is outside `body`
+///    * the guest's protocol mode does not want this type of event
+///    * the legacy encoding cannot express the position.
 ///
-/// `body` is the on-screen rect the guest's grid is drawn into;
-/// coordinates are rebased onto it so the guest always sees its own
-/// 1-based grid regardless of where the body sits in the host terminal.
+///   For `None`, the caller must handle the event itself.
 pub fn encode(
     event: MouseEvent,
     mode: MouseProtocolMode,
     encoding: MouseProtocolEncoding,
     body: Rect,
 ) -> Option<Vec<u8>> {
+    // The TUI holds the mouse capture of the host terminal. Without the
+    // capture, the mouse goes to the host terminal emulator, not to the
+    // guest. The guest's own `\e[?1000h` never gets to the host terminal,
+    // because the embedded `vt100` parses the guest output. Thus this
+    // function makes the mouse bytes for the guest.
     if mode == MouseProtocolMode::None {
         return None;
     }
@@ -78,17 +82,19 @@ pub fn encode(
     let mods = modifier_bits(event.modifiers);
     match encoding {
         MouseProtocolEncoding::Sgr => Some(encode_sgr(report, mods, col, row)),
-        // UTF-8 mode only diverges from the default encoding past column
-        // 223 — exactly where `encode_legacy` bails out anyway — so the
-        // two share one implementation.
+        // UTF-8 mode is different from the default encoding only after
+        // column 223. `encode_legacy` returns `None` at that point anyway,
+        // so the two use the same implementation.
         MouseProtocolEncoding::Default | MouseProtocolEncoding::Utf8 => {
             encode_legacy(report, mods, col, row)
         }
     }
 }
 
-/// Translate host-terminal coordinates into the guest's 1-based grid,
-/// rejecting anything outside the body rect.
+/// Convert host terminal coordinates into the guest's 1-based grid.
+/// Returns:
+///   The (column, row) in the guest grid, or `None` if the position is
+///   outside `body`.
 fn rebase(column: u16, row: u16, body: Rect) -> Option<(u16, u16)> {
     if column < body.x || row < body.y {
         return None;
@@ -101,6 +107,7 @@ fn rebase(column: u16, row: u16, body: Rect) -> Option<(u16, u16)> {
     Some((col + 1, line + 1))
 }
 
+/// Convert a crossterm event kind into a [`Report`].
 fn classify(kind: MouseEventKind) -> Report {
     match kind {
         MouseEventKind::Down(b) => Report::Press(button_code(b)),
@@ -122,11 +129,11 @@ fn button_code(button: MouseButton) -> u8 {
     }
 }
 
-/// Whether the guest's protocol mode asked for this class of event. A
-/// program that only requested presses must not be handed motion spam.
+/// True if the guest's protocol mode wants this type of event. A program
+/// that enabled only presses must not get many motion events.
 fn wanted(mode: MouseProtocolMode, report: Report) -> bool {
     match report {
-        // `mode == None` is rejected before we get here.
+        // The caller already rejected `mode == None`.
         Report::Press(_) => true,
         Report::Release(_) => matches!(
             mode,
@@ -156,8 +163,9 @@ fn modifier_bits(modifiers: KeyModifiers) -> u8 {
     bits
 }
 
-/// SGR (`\e[?1006h`): `CSI < Cb ; Cx ; Cy M`, with a final `m` for
-/// release. Decimal parameters, so there's no coordinate ceiling.
+/// Encode a report in the SGR format (`\e[?1006h`): `CSI < Cb ; Cx ; Cy M`,
+/// with a final `m` for a release. The parameters are decimal, so there is
+/// no coordinate limit.
 fn encode_sgr(report: Report, mods: u8, col: u16, row: u16) -> Vec<u8> {
     let (button, final_byte) = match report {
         Report::Press(b) => (b, b'M'),
@@ -171,10 +179,12 @@ fn encode_sgr(report: Report, mods: u8, col: u16, row: u16) -> Vec<u8> {
     out
 }
 
-/// Legacy (`\e[?1000h` without an encoding extension): `CSI M Cb Cx Cy`
-/// with every byte offset by 32. Release loses the button identity, and
-/// coordinates past 223 can't be expressed at all — those events are
-/// dropped rather than sent to the wrong cell.
+/// Encode a report in the legacy format (`\e[?1000h` without an encoding
+/// extension): `CSI M Cb Cx Cy`, with 32 added to each byte.
+///
+/// A release does not identify the button. Coordinates above 223 cannot be
+/// encoded. For them the function returns `None`, so that the event does not
+/// go to the wrong cell.
 fn encode_legacy(report: Report, mods: u8, col: u16, row: u16) -> Option<Vec<u8>> {
     if col > LEGACY_MAX_COORD || row > LEGACY_MAX_COORD {
         return None;
@@ -195,8 +205,11 @@ fn encode_legacy(report: Report, mods: u8, col: u16, row: u16) -> Option<Vec<u8>
 
 #[cfg(test)]
 mod tests {
+    //! Tests of the encoder that sends host mouse events to the guest.
+
     use super::*;
 
+    /// Body area of the sandbox terminal. It starts at column 2, row 1.
     const BODY: Rect = Rect {
         x: 2,
         y: 1,
@@ -204,6 +217,7 @@ mod tests {
         height: 20,
     };
 
+    /// Make a mouse event at cell `(column, row)` of the host terminal.
     fn ev(kind: MouseEventKind, column: u16, row: u16, modifiers: KeyModifiers) -> MouseEvent {
         MouseEvent {
             kind,
@@ -213,14 +227,21 @@ mod tests {
         }
     }
 
+    /// Encode an event without modifiers in SGR format, as text.
     fn sgr(kind: MouseEventKind, at: (u16, u16), mode: MouseProtocolMode) -> Option<String> {
         sgr_with(ev(kind, at.0, at.1, KeyModifiers::NONE), mode)
     }
 
+    /// Encode `event` in SGR format relative to [`BODY`], as text.
     fn sgr_with(event: MouseEvent, mode: MouseProtocolMode) -> Option<String> {
         encode(event, mode, MouseProtocolEncoding::Sgr, BODY).map(|b| String::from_utf8(b).unwrap())
     }
 
+    /// Test that the SGR encoder gives the correct button code for each event
+    /// kind and counts cells from 1 at the top-left corner of the body. The
+    /// guest program uses these values to find the button and the cell.
+    ///   1. Encode presses, releases, drags, motion and wheel events
+    ///   2. Check each report, also at the bottom-right cell of the body
     #[test]
     fn sgr_encodes_buttons_motion_and_wheel_relative_to_body() {
         use MouseEventKind::{
@@ -293,6 +314,10 @@ mod tests {
         }
     }
 
+    /// Test that the SGR encoder adds the modifier bits to the button code:
+    /// Shift 4, Alt 8 and Ctrl 16.
+    ///   1. Encode a left press with each modifier set
+    ///   2. Check the button code of each report
     #[test]
     fn sgr_folds_modifiers_into_button_code() {
         let down = MouseEventKind::Down(MouseButton::Left);
@@ -314,6 +339,11 @@ mod tests {
         }
     }
 
+    /// Test that the legacy encoding adds 32 to each value, and drops cells that
+    /// one byte cannot hold. Old programs use this encoding.
+    ///   1. Encode a press and a release in the legacy format and check the bytes
+    ///   2. Check that the UTF-8 encoding gives the same bytes for small cells
+    ///   3. Check that a far cell is dropped in the legacy format but not in SGR
     #[test]
     fn legacy_encoding_offsets_bytes_and_drops_unrepresentable_cells() {
         let legacy = |kind, column, row, encoding, body| {
@@ -328,10 +358,12 @@ mod tests {
         let up = MouseEventKind::Up(MouseButton::Right);
         let wide = Rect::new(0, 0, 300, 300);
 
+        // Button 0 at body cell (3, 3), each value plus 32.
         assert_eq!(
             legacy(down, 4, 3, MouseProtocolEncoding::Default, BODY).as_deref(),
             Some(b"\x1b[M\x20\x23\x23".as_slice())
         );
+        // The legacy format has no button for a release. It sends button 3.
         assert_eq!(
             legacy(up, 2, 1, MouseProtocolEncoding::Default, BODY).as_deref(),
             Some(b"\x1b[M\x23\x21\x21".as_slice())
@@ -340,6 +372,7 @@ mod tests {
             legacy(down, 4, 3, MouseProtocolEncoding::Utf8, BODY),
             legacy(down, 4, 3, MouseProtocolEncoding::Default, BODY)
         );
+        // Column 251 plus 32 does not fit in one byte.
         assert_eq!(
             legacy(down, 250, 5, MouseProtocolEncoding::Default, wide),
             None
@@ -347,6 +380,10 @@ mod tests {
         assert!(legacy(down, 250, 5, MouseProtocolEncoding::Sgr, wide).is_some());
     }
 
+    /// Test that the mouse mode of the guest selects which event kinds go to the
+    /// guest. A program must get only the events that it asked for.
+    ///   1. Encode a press, release, drag, motion and wheel event in each mode
+    ///   2. Check which events give a report
     #[test]
     fn guest_mouse_mode_selects_forwarded_event_classes() {
         use MouseProtocolMode::{AnyMotion, ButtonMotion, None, Press, PressRelease};
@@ -368,6 +405,10 @@ mod tests {
         }
     }
 
+    /// Test that the encoder drops events outside the body. Events on other
+    /// parts of the TUI must not go to the guest.
+    ///   1. Encode presses left of, above, right of and below the body
+    ///   2. Check that no event gives a report
     #[test]
     fn events_outside_body_are_dropped() {
         let down = MouseEventKind::Down(MouseButton::Left);

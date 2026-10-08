@@ -1,9 +1,8 @@
-//! Custom `smart-config` deserializer for nested config structs.
+//! Config parsing helpers.
 //!
-//! `smart-config` doesn't natively support `BTreeMap<String, T>` where `T` is
-//! itself a config struct. This module provides a [`Nested`] deserializer that
-//! re-parses each map value through `smart-config`'s validation pipeline so
-//! defaults and error reporting work correctly for nested structures.
+//! Parses config values that are full config sections themselves, for
+//! example the entries of a named table, with defaults and validation at
+//! each level. Also formats parse errors as readable text.
 
 use std::cell::Cell;
 use std::fmt::{Debug, Write};
@@ -15,20 +14,27 @@ use smart_config::de::{DeserializeContext, DeserializeParam};
 use smart_config::metadata::{BasicTypes, ParamMetadata};
 use smart_config::{DescribeConfig, DeserializeConfig, ErrorWithOrigin};
 
-// Tracks nesting depth for indented error formatting.
+// Nesting depth, for the indent of error messages.
 thread_local! {
     static NEST_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
+/// Indent for the current nesting depth.
 fn indent() -> String {
     let depth = NEST_DEPTH.with(std::cell::Cell::get);
     "  ".repeat(depth)
 }
 
 /// Deserializer that parses a JSON object value as a full `smart-config`
-/// config struct, supporting defaults and validation at any nesting level.
+/// config struct. Defaults and validation work at all nesting levels.
+///
+/// `smart-config` does not support `BTreeMap<String, T>` where `T` is a
+/// config struct. Thus this deserializer parses each value again through
+/// the validation of `smart-config`.
 #[derive(Debug)]
 pub struct Nested<T>(PhantomData<T>);
+
+/// Make a [`Nested`] deserializer for `T`.
 pub const fn nested<T>() -> Nested<T> {
     Nested(PhantomData)
 }
@@ -73,7 +79,10 @@ where
     }
 }
 
-/// Format `smart-config` parse errors into a human-readable string.
+/// Format `smart-config` parse errors as human-readable text.
+/// Args:
+///  - `title`: First line of the message
+///  - `errors`: Parse errors, one line each, indented for the nesting depth
 pub fn format_error(title: impl Into<String>, errors: smart_config::ParseErrors) -> String {
     let ind = indent();
     let mut msg = title.into();

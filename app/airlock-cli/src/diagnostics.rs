@@ -1,33 +1,20 @@
-//! Crash / panic instrumentation for the CLI.
+//! Crash and panic diagnostics for the CLI.
 //!
-//! Installed first in `main.rs` so that any failure after this point
-//! is *visible*:
+//! Makes failures visible:
+//!  * logs panics, also panics in background tasks
+//!  * reports fatal signals, for example crashes in native libraries
 //!
-//! - [`install_panic_hook`] chains a logging hook in front of the
-//!   default Rust panic hook. Every panic — including those in
-//!   `spawn_local` background tasks that tokio would otherwise
-//!   swallow silently — is written to `airlock.log` via `tracing`.
-//! - [`install_fatal_signal_handlers`] catches `SIGSEGV` / `SIGBUS` /
-//!   `SIGILL` (which bypass Rust's panic machinery entirely — the
-//!   prime candidates when an in-process FFI dep, e.g. Apple's
-//!   Virtualization.framework on macOS, crashes). Writes a terse
-//!   marker line to stderr and re-raises the default handler so the
-//!   OS still delivers the original signal (coredump / shell exit
-//!   status intact).
-//!
-//! Neither attempts terminal restoration — `Drop` on the raw-mode
-//! guard handles the unwind case, and signal handlers can't safely
-//! call `tcsetattr`. If the process dies abnormally the user's
-//! terminal may still need `stty sane`, but they'll at least see
-//! *why* in the logs.
+//! The CLI installs these handlers when it starts, so they cover all later
+//! failures.
 
-/// Chain a logging hook in front of the default Rust panic hook.
+/// Add a logging hook in front of the default Rust panic hook.
 ///
-/// The default hook already prints the panic + backtrace to stderr;
-/// we additionally send it through `tracing::error` so it lands in
-/// `airlock.log` (once logging is initialised). Panics in background
-/// `spawn_local` tasks, which tokio otherwise swallows, now show up
-/// in the log with the task's panic message.
+/// The hook writes each panic to `airlock.log` (after logging starts). This
+/// includes panics in background `spawn_local` tasks, which tokio otherwise
+/// hides. The default hook still prints the panic and backtrace to stderr.
+///
+/// The hook does not restore the terminal. The `Drop` of the raw mode guard
+/// does this during unwind.
 pub fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -46,26 +33,35 @@ pub fn install_panic_hook() {
     }));
 }
 
-/// Install a minimal signal handler for the three synchronous "your
-/// program is broken" signals. Writes `"[airlock] fatal signal N\n"`
-/// to stderr (via `write(2)`, the only async-signal-safe stdio
-/// primitive) and re-raises the default disposition so the process
-/// still dies with the correct signal.
+/// Install a minimal handler for the fatal signals `SIGSEGV`, `SIGBUS`,
+/// `SIGILL` and `SIGABRT`.
+///
+/// These signals bypass the Rust panic machinery. They are the most likely
+/// result when an in-process FFI dependency crashes (for example Apple's
+/// Virtualization.framework on macOS). The handler writes
+/// `"[airlock] fatal signal N\n"` to stderr. Then it raises the signal again
+/// with the default disposition, so the process still dies with the correct
+/// signal (core dump and shell exit status stay the same).
+///
+/// The handler does not restore the terminal, because a signal handler cannot
+/// safely call `tcsetattr`. After such an exit, the user's terminal may still
+/// need `stty sane`, but the logs show the cause.
 pub fn install_fatal_signal_handlers() {
     for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGABRT] {
-        // SAFETY: `fatal_signal_handler` is async-signal-safe (only
-        // calls write/signal/raise). Installing a handler once per
-        // signal is safe; we never un-install.
+        // SAFETY: `fatal_signal_handler` is async-signal-safe (it calls only
+        // write/signal/raise). Installing a handler once per signal is safe.
+        // The handler is never removed.
         unsafe {
             libc::signal(sig, fatal_signal_handler as *const () as libc::sighandler_t);
         }
     }
 }
 
+/// Signal handler for [`install_fatal_signal_handlers`].
 extern "C" fn fatal_signal_handler(sig: libc::c_int) {
     const PREFIX: &[u8] = b"[airlock] fatal signal ";
-    // Format the signal number into a 4-byte buffer (digits only, no
-    // NUL). 4 bytes is enough for any Unix signal number.
+    // Format the signal number into a 4-byte buffer (digits only, no NUL).
+    // 4 bytes is sufficient for all Unix signal numbers.
     let (num, len) = {
         let mut tmp = [0u8; 4];
         let mut n = if sig < 0 { 0_u32 } else { sig as u32 };
@@ -79,7 +75,7 @@ extern "C" fn fatal_signal_handler(sig: libc::c_int) {
                 n /= 10;
                 i += 1;
             }
-            // tmp holds digits in reverse; flip in place.
+            // tmp has the digits in reverse order. Reverse them.
             let mut out = [0u8; 4];
             for j in 0..i {
                 out[j] = tmp[i - 1 - j];
@@ -87,9 +83,10 @@ extern "C" fn fatal_signal_handler(sig: libc::c_int) {
             (out, i)
         }
     };
-    // SAFETY: write(2) is async-signal-safe. fd 2 is stderr, always
-    // open in any supported deployment. Ignoring the return value is
-    // fine — we're about to die anyway.
+    // SAFETY: write(2) is async-signal-safe. It is the only stdio primitive
+    // that is async-signal-safe. fd 2 is stderr, which is always
+    // open in all supported deployments. The return value is ignored because
+    // the process dies next.
     unsafe {
         libc::write(2, PREFIX.as_ptr().cast(), PREFIX.len());
         libc::write(2, num.as_ptr().cast(), len);

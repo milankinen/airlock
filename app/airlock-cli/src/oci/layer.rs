@@ -1,18 +1,8 @@
-//! OCI image layer download + extraction, staged through the per-layer cache.
+//! OCI image layer cache.
 //!
-//! A layer moves through three on-disk states under
-//! `~/.cache/airlock/oci/layers/`:
-//!
-//! ```text
-//! <digest>.download.tmp   # in-flight download
-//! <digest>.download       # complete tarball, pending extraction
-//! <digest>.tmp/           # in-flight extraction
-//! <digest>/               # finished layer tree (rename = commit)
-//! ```
-//!
-//! Each transition is an atomic rename, so a crash at any point leaves a
-//! state the next run can either clean up ([`gc::sweep`]) or resume from
-//! ([`ensure_layer_cached`]).
+//! Downloads image layers and extracts each layer into the shared cache. The
+//! guest can then stack the cached layers directly to make the container
+//! root file system.
 
 use std::io::{BufReader, Read};
 use std::path::{Component, Path, PathBuf};
@@ -22,35 +12,46 @@ use indicatif::ProgressBar;
 
 use crate::cache;
 
-/// OCI whiteout marker prefix (AUFS convention, inherited by OCI).
+/// OCI whiteout marker prefix (an AUFS convention that OCI also uses).
 const WHITEOUT_PREFIX: &str = ".wh.";
-/// Opaque-directory whiteout filename — clears all siblings at the same path
+/// Opaque-directory whiteout filename. It hides all entries at the same path
 /// in lower layers.
 const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
 
-/// Monotonic counter that makes staging temp names unique *within* a process,
-/// so two threads extracting different layers never collide on a name either.
-/// Combined with `std::process::id()` it also keeps separate `airlock`
-/// processes off each other's staging dirs.
+/// Monotonic counter that makes staging temp names unique *in* a process.
+/// Thus two threads that extract different layers never use the same name.
+/// Together with `std::process::id()`, it also keeps separate `airlock`
+/// processes out of the staging dirs of the others.
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Ensure a layer is extracted into the shared cache, downloading the
-/// tarball through `fetch` only if it's not already on disk.
+/// Make sure that a layer is extracted into the shared cache. Download the
+/// tarball with `fetch` only if it is not already on disk.
 ///
-/// - Fast path: `<digest>/` exists → return immediately. The directory
-///   only becomes visible via the atomic rename at the end of extraction,
-///   so its presence is itself the commit marker.
-/// - Tarball path: if `<digest>.download` exists (from a previous run or
-///   from a pre-staging caller like the docker path), skip `fetch` and
-///   go straight to extraction.
-/// - Otherwise: call `fetch(&tmp_path)` to write the tarball at
-///   `<digest>.download.tmp`, rename to `<digest>.download`, then extract.
+/// A layer goes through these on-disk states under
+/// `~/.cache/airlock/oci/layers/`:
 ///
-/// After a successful extraction the tarball is removed.
+/// ```text
+/// <key>.download.<pid>.<seq>.tmp   # download in progress
+/// <key>.download                   # complete tarball, extraction not done
+/// <key>.<pid>.<seq>.tmp/           # extraction in progress
+/// <key>/                           # finished layer tree (rename = commit)
+/// ```
 ///
-/// `progress`, when provided, is re-used as the extraction bar: its length
-/// is reset to the tarball size, its position to zero, and its message to
-/// `extracting` before bytes start streaming through.
+/// `<key>` is the versioned layer key of `digest`.
+///
+/// Each change of state is an atomic rename. After a crash at any point,
+/// the next run can remove the leftovers ([`super::gc::sweep`]) or continue
+/// from them (this function). The tarball is removed after a successful
+/// extraction.
+/// Args:
+///  - `digest`: Layer digest (`sha256:<hex>`)
+///  - `fetch`: Writes the tarball to the given path. Called only if no
+///    `<key>.download` exists
+///  - `progress`: Optional bar to show the extraction progress. Its length,
+///    position and message are reset before the extraction.
+///
+/// Returns:
+///   Path of the extracted layer directory.
 pub fn ensure_layer_cached<F>(
     digest: &str,
     fetch: F,
@@ -61,6 +62,8 @@ where
 {
     let key = cache::layer_key(digest);
     let layer_dir = cache::layer_dir(&key)?;
+    // Fast path. The directory appears only with the atomic rename at the
+    // end of the extraction, so if it exists, the layer is complete.
     if layer_dir.is_dir() {
         return Ok(layer_dir);
     }
@@ -76,12 +79,14 @@ where
 
     let download = parent.join(format!("{dir_name}.download"));
 
+    // If `<key>.download` exists (from a previous run, or from a caller
+    // that staged it, like the docker path), skip `fetch` and extract.
     if !download.exists() {
-        // Stage into a process-unique temp file so two `airlock` processes
-        // pulling the same uncached image don't both write the one shared
-        // `<digest>.download.tmp` and corrupt each other's tarball; the rename
-        // to the shared `<digest>.download` name is the commit. A stale
-        // fixed-name tmp left by an older binary is cleaned up here too.
+        // Write to a process-unique temp file. Otherwise two `airlock`
+        // processes that pull the same uncached image both write the one
+        // shared `<key>.download.tmp` and corrupt the tarball. The rename
+        // to the shared `<key>.download` name is the commit. Also remove
+        // an old fixed-name tmp file that an older binary left.
         let _ = std::fs::remove_file(parent.join(format!("{dir_name}.download.tmp")));
         let download_tmp = parent.join(format!(
             "{dir_name}.download.{}.{}.tmp",
@@ -100,18 +105,21 @@ where
     Ok(layer_dir)
 }
 
-/// Extract `tarball` into `<layer_dir>.tmp/` then atomically rename into
-/// `layer_dir/`. The rename is the commit point — readers only see
-/// `layer_dir/` once extraction finished cleanly. Whiteouts are preserved:
+/// Extract a tarball into a layer directory.
 ///
-/// - `.wh.<name>` becomes an empty regular file at `<name>` with a
-///   `user.overlay.whiteout="y"` xattr, and the parent directory gets
-///   `user.overlay.opaque="x"` (the userspace opt-in marker — without it
-///   overlayfs only honors the whiteout on lookup, not during readdir, so
-///   the deleted name reappears in directory listings). The "x" marker is
-///   distinct from "y": the latter hides lowers entirely.
-/// - `.wh..wh..opq` sets `user.overlay.opaque="y"` on the parent directory,
-///   marking it as fully opaque (lowers hidden at that directory).
+/// Extracts into a staging dir, then renames it atomically to `layer_dir`.
+/// The rename is the commit point, so readers see `layer_dir` only after a
+/// complete extraction. Whiteouts become overlayfs xattrs:
+///  * `.wh.<name>` becomes an empty regular file at `<name>` with a
+///    `user.overlay.whiteout="y"` xattr. The parent directory gets
+///    `user.overlay.opaque="x"`.
+///  * `.wh..wh..opq` sets `user.overlay.opaque="y"` on the parent directory.
+///    This makes the directory fully opaque (lower layers are hidden there).
+///
+/// Args:
+///  - `layer_dir`: Final layer directory
+///  - `tarball`: Layer tarball (gzip or plain tar)
+///  - `progress`: Optional bar to show the extraction progress.
 fn extract_tarball_to_cache(
     layer_dir: &Path,
     tarball: &Path,
@@ -125,9 +133,9 @@ fn extract_tarball_to_cache(
         .ok_or_else(|| anyhow::anyhow!("layer dir has no file name"))?
         .to_string_lossy()
         .into_owned();
-    // Stage into a process-unique dir so two `airlock` processes extracting
-    // the same uncached layer never share (and clobber) the one `.tmp` tree.
-    // The final rename below is the cross-process commit point.
+    // Use a process-unique staging dir. Thus two `airlock` processes that
+    // extract the same uncached layer never write into the same `.tmp` tree.
+    // The final rename below is the commit point for all processes.
     let tmp = parent.join(format!(
         "{dir_name}.{}.{}.tmp",
         std::process::id(),
@@ -136,8 +144,9 @@ fn extract_tarball_to_cache(
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
 
-    // Layer blobs may be gzip-compressed (OCI spec, registry pulls) or plain
-    // tar (`docker image save` with the classic driver) — dispatch on magic.
+    // Layer blobs can be gzip-compressed (OCI spec, registry pulls) or plain
+    // tar (`docker image save` with the classic driver). Use the magic bytes
+    // to select the decoder.
     let file = std::fs::File::open(tarball)?;
     let file: Box<dyn Read> = match progress {
         Some(pb) => {
@@ -201,16 +210,12 @@ fn extract_tarball_to_cache(
                         target.display()
                     )
                 })?;
-                // Mark the parent directory as containing xattr whiteouts.
-                // overlayfs only scans entries for xattr-based whiteouts when
-                // the parent carries `user.overlay.opaque="x"` — without it
-                // the lookup path still returns ENOENT (it reads the xattr
-                // directly) but the readdir merge-iteration path treats the
-                // file as a plain 0-byte regular and the "deleted" name
-                // reappears in directory listings. Note: value "x" is the
-                // userspace opt-in marker, distinct from "y" which makes the
-                // whole dir opaque (lowers hidden). Don't overwrite an
-                // existing "y".
+                // Mark the parent as a directory with xattr whiteouts.
+                // Overlayfs readdir examines entries for xattr whiteouts
+                // only if the parent has `user.overlay.opaque="x"`. Without
+                // it, lookup still returns ENOENT, but directory listings
+                // show the "deleted" name as an empty file. Value "y" makes
+                // the full dir opaque. Do not overwrite a "y".
                 let opq = xattr::get(&dir, "user.overlay.opaque").ok().flatten();
                 if opq.as_deref() != Some(b"y") {
                     xattr::set(&dir, "user.overlay.opaque", b"x").map_err(|e| {
@@ -225,19 +230,18 @@ fn extract_tarball_to_cache(
             continue;
         }
 
-        // `unpack_in` resolves the entry path relative to the extraction root
-        // and — critically — rewrites hardlink targets to stay inside it, so
-        // `ln /absolute/host/path /extract/root/foo` never happens.
+        // `unpack_in` resolves the entry path relative to the extraction
+        // root. It also keeps hardlink targets in the root, so a hardlink
+        // to an absolute host path cannot occur.
         entry.unpack_in(&tmp)?;
     }
 
-    // Commit via atomic rename. The fast path in `ensure_layer_cached`
-    // returned early if `<digest>/` already existed, so its presence here
-    // means a concurrent `airlock` won the race and published the same layer:
-    // reuse its tree and drop our staging dir rather than deleting a directory
-    // a peer may still be reading. The winner can also appear between this
-    // check and the rename (which then fails with ENOTEMPTY); treat that the
-    // same way.
+    // Commit with an atomic rename. If `<key>/` exists now, a concurrent
+    // `airlock` published the same layer first. Use its tree and delete
+    // this staging dir. Do not delete the other tree, because the other
+    // process can still read it. The other process can also publish between
+    // this check and the rename. The rename then fails with ENOTEMPTY.
+    // Handle that case the same way.
     if layer_dir.is_dir() {
         let _ = std::fs::remove_dir_all(&tmp);
         return Ok(());
@@ -252,24 +256,29 @@ fn extract_tarball_to_cache(
     }
 }
 
-/// Join `rel` onto the extraction `root` for whiteout handling, refusing any
-/// path that could escape the root.
+/// Join a whiteout path to the extraction root. Refuse a path that can go
+/// outside the root.
 ///
-/// Whiteout entries are handled with our own filesystem calls (rather than
-/// `entry.unpack_in`, which contains normal entries for us), so we must do
-/// the containment ourselves. A malicious layer can order an earlier entry
-/// that plants a symlink (`etc -> ../../../../home/user`) or use an absolute
-/// whiteout path (`/etc/.wh.passwd`); a naive `root.join(parent_rel)` would
-/// then follow the symlink or, for an absolute `parent_rel`, discard `root`
-/// entirely — turning a whiteout into an arbitrary host-file create/delete.
+/// Whiteout entries do not go through `entry.unpack_in`, which keeps normal
+/// entries in the root. Thus this function does the containment check. A
+/// malicious layer can put a symlink in an earlier entry
+/// (`etc -> ../../../../home/user`), or use an absolute whiteout path
+/// (`/etc/.wh.passwd`). A simple `root.join(parent_rel)` then follows the
+/// symlink, or ignores `root` for an absolute `parent_rel`. A whiteout then
+/// creates or deletes any host file.
+/// Args:
+///  - `root`: Extraction root
+///  - `rel`: Parent path of the whiteout entry, relative to `root`.
 ///
-/// We rebuild the path one component at a time from `root`, accept only
-/// `Normal` components (rejecting absolute prefixes and any leftover `..`),
-/// and refuse if any existing component along the way is a symlink. Because
-/// the extraction loop is single-threaded and only this function and
-/// `unpack_in` write under `root`, a component that is a symlink can only
-/// have come from an earlier entry in the same layer.
+/// Returns:
+///   The joined path, or error if the path is not safe.
 fn safe_join(root: &Path, rel: &Path) -> anyhow::Result<PathBuf> {
+    // Make the path again one component at a time from `root`. Accept only
+    // `Normal` components (reject absolute prefixes and any `..`). Refuse
+    // if an existing component on the path is a symlink. The extraction
+    // loop has one thread, and only this function and `unpack_in` write
+    // under `root`. Thus a symlink component can only come from an earlier
+    // entry in the same layer.
     let mut cur = root.to_path_buf();
     for comp in rel.components() {
         match comp {
@@ -295,8 +304,8 @@ fn safe_join(root: &Path, rel: &Path) -> anyhow::Result<PathBuf> {
 }
 
 /// `Read` wrapper that increments a progress bar by the number of bytes
-/// each `read` returns. Used to drive the extraction phase of the same
-/// per-layer bar that tracked the download.
+/// that each `read` returns. Shows the extraction progress on the same
+/// per-layer bar that showed the download.
 struct ProgressReader<R: Read> {
     inner: R,
     bar: ProgressBar,

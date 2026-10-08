@@ -1,11 +1,9 @@
-//! In-VM supervisor process.
+//! In-VM supervisor (`airlockd`).
 //!
-//! Runs as PID 1 inside the guest Linux VM. Accepts two vsock
-//! connections from the host CLI — the supervisor RPC channel and the
-//! network-proxy RPC channel — and bootstraps the guest environment
-//! (mounts, networking, DNS) on the first `boot` call. Boot starts no
-//! process; the main shell and `airlock exec` both run afterwards via
-//! `spawn`.
+//! Runs as the first process (PID 1) in the guest Linux VM. Connects to the
+//! host CLI and serves its requests. The host uses airlockd to set up the
+//! guest environment (mounts, networking, DNS) and to run processes in the
+//! sandbox.
 
 mod admin;
 mod bridge;
@@ -41,24 +39,27 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Single-connection lifecycle: accept the host CLI connections
-/// (supervisor + network), set up the guest on `boot`, then idle — as
-/// PID 1 — until the VM is torn down. Processes (the main shell,
-/// `airlock exec`) run via `spawn`, driven entirely from the host.
+/// Run the supervisor for the lifetime of the VM.
+///
+/// Accepts the host CLI connections (supervisor and network), sets up the
+/// guest on `boot` and then waits until the host stops the VM. The `boot`
+/// call starts no process. The host starts all processes (the main shell,
+/// `airlock exec`) later with `spawn`.
 async fn airlockd() -> anyhow::Result<()> {
-    // As PID 1 we must reap orphaned zombies (e.g. double-forking daemons);
-    // start the reaper before anything spawns processes.
+    // PID 1 must reap orphaned zombies (for example from double-forking
+    // daemons). Start the reaper before any process starts.
     tokio::task::spawn_local(process::run_orphan_reaper());
 
-    // Supervisor channel first — accept blocks until the host connects.
+    // Accept the supervisor channel first. The accept blocks until the host
+    // connects.
     let sup_listen = vsock::listen(airlock_common::SUPERVISOR_PORT)?;
     let sup_conn = vsock::accept(&sup_listen)?;
     drop(sup_listen);
 
-    // Network channel second. The host opens this right after the
-    // supervisor one so bulk transfers on `NetworkProxy.connect` get
-    // their own socket buffers and cannot head-of-line-block pty /
-    // stats / daemon traffic on the supervisor channel.
+    // Accept the network channel second. The host opens it right after the
+    // supervisor channel. Bulk transfers on `NetworkProxy.connect` use
+    // their own socket buffers, so they cannot block pty, stats or daemon
+    // traffic on the supervisor channel (head-of-line blocking).
     let net_listen = vsock::listen(airlock_common::NETWORK_PORT)?;
     let net_conn = vsock::accept(&net_listen)?;
     drop(net_listen);
@@ -77,9 +78,9 @@ async fn airlockd() -> anyhow::Result<()> {
             &cfg.sockets,
             cfg.nested_virt,
         )?;
-        // Periodic resource reclaim back to the host: trim the sparse
-        // disk image and drop the dentry/inode slab so the virtiofs
-        // proxy on the host stops accumulating FDs.
+        // Give resources back to the host at intervals. Trim the sparse
+        // disk image and drop the dentry/inode slab, so that the virtiofs
+        // proxy on the host does not collect more and more FDs.
         init::start_periodic_maintenance();
 
         let dns = Rc::new(net::DnsState::new());
@@ -103,21 +104,26 @@ async fn airlockd() -> anyhow::Result<()> {
     })
     .await?;
 
-    // Keep the supervisor alive until the CLI kills the VM — PID 1 idles
-    // here whether boot succeeded (the main process and `airlock exec`
-    // run via `spawn`, driven from the host) or failed (the host saw the
-    // RPC error and decides whether to tear the VM down).
+    // Keep the supervisor alive until the CLI stops the VM. PID 1 waits
+    // here in both cases:
+    //  * Boot succeeded: the host runs processes with `spawn`.
+    //  * Boot failed: the host received the RPC error and decides if it
+    //    stops the VM.
     std::future::pending::<()>().await;
 
     Ok(())
 }
 
-/// Turn the accepted network-channel fd into a `NetworkProxy` client
-/// capability. The guest is the capnp *client* side here (the host
-/// serves the bootstrap `NetworkProxy`), even though the guest accepted
-/// the vsock connection — vsock direction and capnp side are
-/// independent.
+/// Make a `NetworkProxy` client from the accepted network channel.
+/// Args:
+///  - `conn_fd`: Accepted vsock connection of the network channel
+///
+/// Returns:
+///   `NetworkProxy` client capability, or error if the socket setup fails.
 fn bootstrap_network_client(conn_fd: OwnedFd) -> anyhow::Result<network_proxy::Client> {
+    // The guest is the capnp *client* here, because the host serves the
+    // bootstrap `NetworkProxy`. The guest accepted the vsock connection,
+    // but vsock direction and capnp side are independent.
     let std_stream = unsafe { std::net::TcpStream::from_raw_fd(conn_fd.into_raw_fd()) };
     std_stream.set_nonblocking(true)?;
     let stream = tokio::net::TcpStream::from_std(std_stream)?;

@@ -1,11 +1,12 @@
-//! Cap'n Proto RPC server for the supervisor.
+//! Supervisor RPC server.
 //!
-//! Implements the `Supervisor` interface: the host CLI calls `boot()` once
-//! to bring up the VM (mounts, networking, daemons) and may then call
-//! `spawn()`, any number of times, to run processes inside it (the main
-//! shell and `airlock exec` alike). `spawn()` is refused until `boot()`
-//! has succeeded. The `shutdown()` call syncs filesystems before the VM is
-//! destroyed.
+//! Serves the requests of the host CLI. The host uses the server to:
+//!  * set up the VM one time at boot (mounts, networking, daemons)
+//!  * run processes any number of times, for example the main shell and
+//!    `airlock exec`. Processes can run only after the boot succeeds.
+//!  * get stats and daemon states, sync the clock, report network denies and
+//!    open TCP connections to the guest
+//!  * sync the filesystems before it stops the VM
 
 use std::cell::RefCell;
 use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
@@ -29,47 +30,71 @@ use crate::stats::Collector;
 /// Unix socket forwarding pair: host-side path and guest-side path.
 #[allow(dead_code)]
 pub struct SocketForwardConfig {
+    /// Socket path on the host.
     pub host: String,
+    /// Socket path in the container.
     pub guest: String,
 }
 
-/// All configuration received in the `Supervisor.boot()` RPC call. Passed
-/// to the `boot` closure which bootstraps the container. Carries no
-/// process to run — the main shell and `airlock exec` both start
-/// afterwards via `spawn()`.
+/// All configuration from the `Supervisor.boot()` RPC call. [`serve`] gives
+/// it to the boot callback, which sets up the container.
+///
+/// Contains no process to run. The main shell and `airlock exec` start
+/// later with `spawn()`.
 pub struct BootConfig {
+    /// Host capability that receives the guest log events.
     pub log_sink: log_sink::Client,
+    /// `EnvFilter` directive string for the guest logs.
     pub log_filter: String,
+    /// `NetworkProxy` client of the separate network channel.
     pub network: network_proxy::Client,
+    /// Unix socket forwards (guest to host).
     pub sockets: Vec<SocketForwardConfig>,
+    /// Container user ID.
     pub uid: u32,
+    /// Container group ID.
     pub gid: u32,
+    /// Give the container access to nested virtualization (`/dev/kvm`).
     pub nested_virt: bool,
+    /// Clock and network parameters for guest init.
     pub init_config: InitConfig,
+    /// Mount configuration for guest init.
     pub mount_config: MountConfig,
-    /// Clipboard grant. A withheld capability disables the bridge outright.
+    /// Clipboard grant. If the host gives no capability, the bridge is off.
     pub clipboard: crate::clipboard::ClipboardConfig,
-    /// Browser grant. A withheld capability disables the bridge outright.
+    /// Browser grant. If the host gives no capability, the bridge is off.
     pub browser: crate::browser::BrowserConfig,
     /// Sidecar daemons to start after init. The callback decides when to
-    /// call `DaemonSet::start_all` (typically right after `init::setup`).
+    /// call [`DaemonSet::start_all`] (usually right after
+    /// [`crate::init::setup`]).
     pub daemons: Vec<DaemonSpec>,
-    /// Shared slot the boot callback writes the constructed `DaemonSet`
-    /// into so `pollDaemons`/`shutdownDaemons` can reach it later.
+    /// Shared slot for the [`DaemonSet`]. The boot callback writes the set
+    /// here, so `pollDaemons` and `shutdownDaemons` can use it later.
     pub daemon_set_slot: Rc<RefCell<Option<DaemonSet>>>,
 }
 
-/// Host-side handles for a single process's I/O.
+/// Host-side handles for the I/O of a single process.
 pub struct HostProcess {
+    /// Host capability for the process stdin.
     pub stdin: stdin::Client,
-    /// Oneshot to deliver the `Process` capability back to the host once the
-    /// child is spawned. Taken by the startup code — `None` after consumption.
+    /// Oneshot that sends the `Process` capability back to the host after
+    /// the child starts. The startup code takes it, so it is `None` after
+    /// use.
     pub result: Option<tokio::sync::oneshot::Sender<Result<process::Client, String>>>,
 }
 
-/// Accept the RPC connection and run the boot callback. Returns once the
-/// `boot` call has been answered (success or failure) — the caller keeps
-/// the VM alive afterwards; there is no process here to wait on.
+/// Serve the supervisor RPC interface on the host connection and run the
+/// boot callback when the host calls `boot()`.
+/// Args:
+///  - `conn_fd`: Accepted vsock connection of the supervisor channel
+///  - `deny_tracker`: Store for the deny reports from the host
+///  - `network`: `NetworkProxy` client of the network channel
+///  - `boot`: Callback that sets up the guest with the [`BootConfig`]
+///
+/// Returns:
+///   After the `boot()` call has its answer (success or failure). The RPC
+///   system continues to run in the background. The caller must keep the
+///   VM alive, because there is no process here to wait for.
 pub async fn serve<Boot: AsyncFn(BootConfig) -> anyhow::Result<()>>(
     conn_fd: OwnedFd,
     deny_tracker: Arc<DenyTracker>,
@@ -115,28 +140,29 @@ pub async fn serve<Boot: AsyncFn(BootConfig) -> anyhow::Result<()>>(
     Ok(())
 }
 
-/// What `boot()`'s RPC handler hands to [`serve`]: the parsed config, and a
-/// oneshot to report whether the boot closure succeeded.
+/// What the `boot()` RPC handler gives to [`serve`]: the parsed config, and
+/// a oneshot that reports if the boot callback succeeded.
 type BootPayload = (BootConfig, tokio::sync::oneshot::Sender<Result<(), String>>);
 
 /// Server-side implementation of the `Supervisor` Cap'n Proto interface.
-///
-/// `boot_tx` is consumed by the first `boot()` call and set to `None` —
-/// a second call is refused because the VM only supports one boot sequence.
-/// `spawn_creds` is set once `boot()` succeeds and read by `spawn()` to run
-/// container processes with the same uid/gid/hardening; `spawn()` before
-/// that is refused.
 struct SupervisorImpl {
+    /// Sender to [`serve`]. The first `boot()` call takes it and leaves
+    /// `None`. A second call fails, because the VM supports only one boot.
     boot_tx: RefCell<Option<tokio::sync::oneshot::Sender<BootPayload>>>,
+    /// `(uid, gid, harden)` for `spawn()`. Set only after `boot()` succeeds,
+    /// so all container processes get the same credentials and hardening.
+    /// `spawn()` fails while it is `None`.
     spawn_creds: RefCell<Option<(u32, u32, bool)>>,
+    /// Stats collector for `pollStats`.
     stats: RefCell<Collector>,
+    /// Store for the deny reports from the host.
     deny_tracker: Arc<DenyTracker>,
-    /// Populated by the boot callback once daemons have been started. Held
-    /// by `Rc` so the same handle lives in `BootConfig.daemon_set_slot`.
+    /// The boot callback sets it after it starts the daemons. It is an `Rc`,
+    /// so the same handle is in `BootConfig.daemon_set_slot`.
     daemon_set: Rc<RefCell<Option<DaemonSet>>>,
-    /// Bootstrap capability of the separate network vsock connection,
-    /// threaded into `BootConfig` so downstream net modules can reach
-    /// the host without going through this supervisor channel.
+    /// Bootstrap capability of the separate network vsock connection. Goes
+    /// into `BootConfig`, so the net modules can access the host without
+    /// the supervisor channel.
     network: network_proxy::Client,
 }
 
@@ -211,8 +237,8 @@ impl supervisor::Server for SupervisorImpl {
             })
             .collect::<Result<Vec<_>, capnp::Error>>()?;
 
-        // A host that grants nothing leaves this default-initialised: both
-        // flags false and a null `sink`, which is exactly "no clipboard".
+        // If the host grants nothing, this has default values: both flags
+        // false and a null `sink`. This means "no clipboard".
         let cb = params.get_clipboard()?;
         let clipboard = crate::clipboard::ClipboardConfig {
             copy: cb.get_copy(),
@@ -225,7 +251,7 @@ impl supervisor::Server for SupervisorImpl {
             limit: cb.get_limit(),
         };
 
-        // Likewise a null `sink` is exactly "no browser".
+        // Also, a null `sink` means "no browser".
         let br = params.get_browser()?;
         let browser = crate::browser::BrowserConfig {
             sink: if br.has_sink() {
@@ -284,8 +310,8 @@ impl supervisor::Server for SupervisorImpl {
 
         match result_rx.await {
             Ok(Ok(())) => {
-                // Credentials are recorded only now: a failed boot must
-                // leave spawn() refused.
+                // Record the credentials only now. After a failed boot,
+                // spawn() must continue to fail.
                 *self.spawn_creds.borrow_mut() = Some((uid, gid, harden));
                 Ok(())
             }

@@ -1,4 +1,4 @@
-//! Crate-level test helpers. Re-exports `airlock-test-utils`.
+//! Test helpers of the crate. Also re-exports `airlock-test-utils`.
 
 mod admin;
 mod bridge;

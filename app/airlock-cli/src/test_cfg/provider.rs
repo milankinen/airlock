@@ -1,7 +1,7 @@
-//! A fake OAuth provider behind a network service: the token host and the
-//! API host of Anthropic or OpenAI as local TLS upstreams, the service
-//! built against them, and the guest's side of the sign-in, the token
-//! requests and the API calls through the proxy.
+//! A fake OAuth provider behind a network service. It has the token host
+//! and the API host of Anthropic or OpenAI as local TLS upstreams, and the
+//! service that uses them. It also has the guest side of the sign-in, the
+//! token requests and the API calls through the proxy.
 
 use std::io::Write as _;
 use std::rc::Rc;
@@ -29,27 +29,28 @@ use crate::services::auth_codes::{Channel, PendingCodes};
 use crate::services::store::{GrantSummary, TokenStore, list_grants, now_ms};
 use crate::services::{ServiceId, anthropic, openai};
 
+/// The proxy client of the guest.
 pub type Proxy = network_proxy::Client;
 
-/// The code the fake provider issues: what the browser brings back.
+/// The code that the fake provider issues. The browser brings it back.
 pub const REAL_CODE: &str = "real-code";
-/// The code of OpenAI's device-code sign-in.
+/// The code of the OpenAI device code sign-in.
 pub const REAL_DEVICE_CODE: &str = "real-device-code";
-/// The API key Anthropic's `create_api_key` issues.
+/// The API key that the Anthropic `create_api_key` issues.
 pub const REAL_API_KEY: &str = "sk-ant-api03-REAL-KEY";
-/// Claude Code's OAuth client of the Claude.ai sign-in.
+/// The OAuth client of Claude Code for the Claude.ai sign-in.
 pub const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-/// Claude Code's OAuth client of the Anthropic Console sign-in.
+/// The OAuth client of Claude Code for the Anthropic Console sign-in.
 pub const CONSOLE_CLIENT_ID: &str = "41077d10-94b8-4194-be48-d251e9eb21b4";
-/// Codex's OAuth client.
+/// The OAuth client of Codex.
 pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// The scopes of an Anthropic sign-in.
 pub const CLAUDE_SCOPE: &str = "org:create_api_key user:inference user:profile";
-/// The `redirect_uri` of Claude's manual sign-in.
+/// The `redirect_uri` of the manual Claude sign-in.
 pub const CLAUDE_MANUAL: &str = "https://platform.claude.com/oauth/code/callback";
-/// The `redirect_uri` of Codex's device-code sign-in.
+/// The `redirect_uri` of the Codex device code sign-in.
 pub const CODEX_DEVICE: &str = "https://auth.openai.com/deviceauth/callback";
-/// The PKCE verifier of every exchange the guest sends.
+/// The PKCE verifier of each exchange that the guest sends.
 pub const VERIFIER: &str = "v";
 
 /// The S256 PKCE challenge of `verifier`.
@@ -57,8 +58,8 @@ pub fn challenge_of(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
-/// Claude's authorize page with `client_id` and `scope` (URL-encoded),
-/// its callback on `port`, and the challenge of `verifier`.
+/// The Claude authorize page with `client_id`, `scope` (URL-encoded), the
+/// callback on `port`, and the challenge of `verifier`.
 pub fn claude_sign_in_page(client_id: &str, scope: &str, port: u16, verifier: &str) -> url::Url {
     url::Url::parse(&format!(
         "https://platform.claude.com/oauth/authorize?code=true&client_id={client_id}\
@@ -72,33 +73,34 @@ pub fn claude_sign_in_page(client_id: &str, scope: &str, port: u16, verifier: &s
 /// Where the API host of the fake provider is.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ApiHost {
-    /// On the token host's upstream (Anthropic only).
+    /// On the upstream of the token host (Anthropic only).
     TokenHost,
     /// On an upstream of its own.
     Own,
-    /// On an upstream of its own that is a WebSocket endpoint
-    /// ([`super::upstream::upgrade_echo`]) instead of the provider.
+    /// On its own upstream, which is a WebSocket endpoint
+    /// ([`super::upstream::upgrade_echo`]) and not the provider.
     WebSocket,
 }
 
 /// How the fake provider and its hosts behave.
 #[derive(Clone)]
 pub struct Options {
-    /// Where the API host is; OpenAI's is never the token host's.
+    /// Where the API host is. For OpenAI, the API host always has its own
+    /// upstream.
     pub api: ApiHost,
-    /// The lifetime of the access tokens: `expires_in`, and the `exp` of
-    /// OpenAI's.
+    /// The lifetime of the access tokens, in seconds. It sets
+    /// `expires_in`, and the `exp` of OpenAI access tokens.
     pub expires_in: i64,
-    /// Anthropic's exchange names the account.
+    /// The Anthropic exchange answer has the account.
     pub account: bool,
-    /// Token answers are gzip-compressed.
+    /// The token answers are gzip-compressed.
     pub gzip: bool,
     /// The answer status of a revoke.
     pub revoke_status: u16,
     /// How long a revoke takes.
     pub revoke_delay: Duration,
-    /// Fields the code exchange answer carries besides (or instead of)
-    /// the usual ones.
+    /// Fields that the code exchange answer has in addition to the usual
+    /// fields. A field with a usual name replaces the usual value.
     pub exchange_extra: Option<Value>,
 }
 
@@ -116,34 +118,39 @@ impl Default for Options {
     }
 }
 
-/// The provider's side: the tokens it accepts right now, and every
-/// request it got.
+/// The provider side: the tokens that it accepts now, and all requests
+/// that it got.
 pub struct FakeProvider {
     service: ServiceId,
     opts: Options,
+    /// All requests that the provider got.
     pub seen: SeenLog,
     access: Mutex<String>,
     refresh: Mutex<String>,
     refreshes: AtomicUsize,
-    /// The plan in the ID token an OpenAI refresh issues (none: no ID
-    /// token).
+    /// The plan in the ID token that an OpenAI refresh issues. With `None`,
+    /// the refresh issues no ID token.
     pub refreshed_plan: Mutex<Option<String>>,
-    /// Fields a refresh answer carries besides the tokens.
+    /// Fields that a refresh answer has in addition to the tokens.
     pub refresh_extra: Mutex<Option<Value>>,
-    /// Holds the next refresh until released (none: refreshes answer at
-    /// once).
+    /// Holds the next refresh until its release. With `None`, refreshes
+    /// answer immediately.
     refresh_gate: Mutex<Option<RefreshGate>>,
 }
 
-/// A refresh held by the provider: `arrived` fires when it reaches the
-/// token endpoint, and it is answered once `release` fires.
+/// A refresh that the provider holds. `arrived` fires when the refresh
+/// gets to the token endpoint. The provider answers it after `release`
+/// fires.
 #[derive(Clone, Default)]
 pub struct RefreshGate {
+    /// Fires when the held refresh gets to the token endpoint.
     pub arrived: Arc<tokio::sync::Notify>,
+    /// Fire it to let the provider answer the held refresh.
     pub release: Arc<tokio::sync::Notify>,
 }
 
-/// A JWT with `claims` and a signature that marks it as real.
+/// A JWT with `claims` and a signature that marks it as real. `n` makes
+/// the signature unique.
 fn real_jwt(claims: &Value, n: usize) -> String {
     format!(
         "{}.{}.REALSIG{n}",
@@ -165,8 +172,8 @@ pub fn form_fields(body: &str) -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
-/// A gzip-compressed answer of `content_type`, whatever the request
-/// accepts.
+/// A gzip-compressed answer of the type `content_type`. It ignores what
+/// the request accepts.
 fn gzipped(content_type: &'static str, body: &str) -> Response {
     let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     gz.write_all(body.as_bytes()).unwrap();
@@ -178,6 +185,7 @@ fn gzipped(content_type: &'static str, body: &str) -> Response {
 }
 
 impl FakeProvider {
+    /// A provider that accepts its first tokens.
     fn new(service: ServiceId, opts: Options) -> Arc<Self> {
         let fake = Self {
             service,
@@ -194,7 +202,8 @@ impl FakeProvider {
         Arc::new(fake)
     }
 
-    /// Issue the `n`th access and refresh tokens.
+    /// Issue the access and refresh tokens number `n`. The old tokens stop
+    /// working.
     fn rotate(&self, n: usize) {
         let (access, refresh) = match self.service {
             ServiceId::Anthropic => (
@@ -226,27 +235,29 @@ impl FakeProvider {
         self.refresh.lock().unwrap().clone()
     }
 
+    /// Make the provider accept the access token `token`.
     pub fn set_access(&self, token: &str) {
         *self.access.lock().unwrap() = token.into();
     }
 
+    /// Make the provider accept the refresh token `token`.
     pub fn set_refresh(&self, token: &str) {
         *self.refresh.lock().unwrap() = token.into();
     }
 
-    /// Hold the next refresh until the returned gate is released.
+    /// Hold the next refresh until the release of the returned gate.
     pub fn hold_next_refresh(&self) -> RefreshGate {
         let gate = RefreshGate::default();
         *self.refresh_gate.lock().unwrap() = Some(gate.clone());
         gate
     }
 
-    /// The successful refreshes so far.
+    /// The number of successful refreshes so far.
     pub fn refreshes(&self) -> usize {
         self.refreshes.load(Ordering::SeqCst)
     }
 
-    /// OpenAI's ID token with the plan `plan`.
+    /// An OpenAI ID token with the plan `plan`.
     pub fn id_token(plan: &str) -> String {
         real_jwt(
             &json!({
@@ -262,6 +273,8 @@ impl FakeProvider {
         )
     }
 
+    /// The HTTP app of the provider. It sends all requests to
+    /// [`Self::handle`].
     fn app(self: &Arc<Self>) -> Router {
         let fake = self.clone();
         Router::new().fallback(move |req: axum::extract::Request| {
@@ -270,6 +283,10 @@ impl FakeProvider {
         })
     }
 
+    /// Record and answer one request: token, revoke and device code
+    /// requests, then API requests that need a valid access token or API
+    /// key. Some API paths return gzip bodies or the real tokens, so that
+    /// tests can check the masking of answers.
     async fn handle(&self, req: axum::extract::Request) -> Response {
         let seen = self.seen.record(req).await;
         let post = seen.method == "POST";
@@ -324,7 +341,7 @@ impl FakeProvider {
         }
     }
 
-    /// A JSON answer, gzip-compressed when the options say so.
+    /// A JSON answer. It is gzip-compressed when the options say so.
     fn json(&self, value: Value) -> Response {
         if self.opts.gzip {
             return gzipped("application/json", &value.to_string());
@@ -332,6 +349,10 @@ impl FakeProvider {
         axum::Json(value).into_response()
     }
 
+    /// Answer a token request (JSON or form). A code exchange with a known
+    /// code and a refresh with the current refresh token succeed. A refresh
+    /// rotates the tokens. Other requests get `invalid_grant`, or a
+    /// `refresh_token_invalidated` error from OpenAI.
     fn token(&self, seen: &Seen) -> Response {
         let body: Value = serde_json::from_str(&seen.body)
             .unwrap_or_else(|_| serde_json::to_value(form_fields(&seen.body)).unwrap());
@@ -379,6 +400,8 @@ impl FakeProvider {
         }
     }
 
+    /// The answer to a successful code exchange, in the form of each
+    /// provider.
     fn exchange_answer(&self) -> Value {
         match self.service {
             ServiceId::Anthropic => {
@@ -408,6 +431,7 @@ impl FakeProvider {
     }
 }
 
+/// The path of the token endpoint of `service`.
 fn token_path(service: ServiceId) -> &'static str {
     match service {
         ServiceId::Anthropic => "/v1/oauth/token",
@@ -415,6 +439,7 @@ fn token_path(service: ServiceId) -> &'static str {
     }
 }
 
+/// The path of the revoke endpoint of `service`.
 fn revoke_path(service: ServiceId) -> &'static str {
     match service {
         ServiceId::Anthropic => "/v1/oauth/token/revoke",
@@ -422,7 +447,7 @@ fn revoke_path(service: ServiceId) -> &'static str {
     }
 }
 
-/// The OAuth client a sign-in of `service` uses by default.
+/// The OAuth client that a sign-in of `service` uses by default.
 pub fn client_id(service: ServiceId) -> &'static str {
     match service {
         ServiceId::Anthropic => CLAUDE_CLIENT_ID,
@@ -438,19 +463,26 @@ fn loopback(service: ServiceId) -> (u16, &'static str) {
     }
 }
 
-/// Everything one test needs, built before the runtime starts.
+/// All that one test needs. Make it before the runtime starts.
 pub struct Setup {
     service_id: ServiceId,
+    /// The fake provider.
     pub fake: Arc<FakeProvider>,
     token: FakeUpstream,
     api: Option<FakeUpstream>,
     home: StoreHome,
+    /// The token store of the service.
     pub store: Arc<TokenStore>,
+    /// The pending sign-in codes of the service.
     pub codes: PendingCodes,
+    /// The network service under test.
     pub service: Rc<dyn Interceptor>,
 }
 
 impl Setup {
+    /// Bind the fake upstreams for `service_id` and make the service, its
+    /// store and its pending codes. The API host gets its own upstream
+    /// unless it is on the token host.
     pub fn new(service_id: ServiceId, opts: Options) -> Self {
         let alpn: &[&[u8]] = &[b"h2", b"http/1.1"];
         let token = FakeUpstream::bind(alpn);
@@ -491,12 +523,13 @@ impl Setup {
         }
     }
 
+    /// The port of the token host.
     pub fn token_port(&self) -> u16 {
         self.token.port()
     }
 
-    /// The network config: no allow rule (the service allows its hosts),
-    /// deny-by-default, trusting the fake upstreams.
+    /// The network config: deny by default and no allow rule, because the
+    /// service allows its own hosts. It trusts the fake upstreams.
     pub fn config(&self) -> TestNetworkConfig {
         let mut trust_cas = vec![self.token.ca_pem()];
         trust_cas.extend(self.api.as_ref().map(FakeUpstream::ca_pem));
@@ -508,8 +541,8 @@ impl Setup {
         }
     }
 
-    /// Start the fake upstreams (inside the runtime), for a guest on
-    /// `proxy` that trusts the sandbox CA `mitm`.
+    /// Start the fake upstreams inside the runtime, for a guest on `proxy`
+    /// that trusts the sandbox CA `mitm`.
     pub fn serve(self, proxy: Proxy, mitm: String) -> Running {
         let token_port = self.token.port();
         let api_port = self.api.as_ref().map_or(token_port, FakeUpstream::port);
@@ -558,19 +591,27 @@ impl Setup {
     }
 }
 
-/// A started setup and the guest's side of it.
+/// A started setup and its guest side.
 pub struct Running {
+    /// The service under test.
     pub service: ServiceId,
+    /// The proxy client of the guest.
     pub proxy: Proxy,
+    /// The PEM of the sandbox CA that the guest trusts.
     pub mitm: String,
-    /// The token host (and the API, unless it has its own).
+    /// The port of the token host. The API is also there, unless it has its
+    /// own upstream.
     pub token_port: u16,
+    /// The port of the API host.
     pub api_port: u16,
+    /// The fake provider.
     pub fake: Arc<FakeProvider>,
+    /// The token store of the service.
     pub store: Arc<TokenStore>,
+    /// The pending sign-in codes of the service.
     pub codes: PendingCodes,
     home: StoreHome,
-    /// Every byte the WebSocket endpoint read.
+    /// All bytes that the WebSocket endpoint read.
     pub ws_read: Arc<Mutex<Vec<u8>>>,
 }
 
@@ -616,7 +657,7 @@ impl Running {
         .await
     }
 
-    /// Anthropic's `create_api_key` with the access token `access`.
+    /// Call the Anthropic `create_api_key` with the access token `access`.
     pub async fn create_api_key(&self, access: &str) -> GuestResponse {
         let mut req = post(
             "/api/oauth/claude_cli/create_api_key",
@@ -628,8 +669,8 @@ impl Running {
         self.on_token_host(req).await
     }
 
-    /// The guest's code exchange as the agent sends it: JSON for Claude
-    /// Code, a form for Codex.
+    /// Send the code exchange of the guest as the agent sends it: JSON for
+    /// Claude Code, a form for Codex.
     pub async fn exchange_with(
         &self,
         client_id: &str,
@@ -659,7 +700,7 @@ impl Running {
         self.on_token_host(req).await
     }
 
-    /// The fields of the guest's code exchange.
+    /// The fields of the code exchange of the guest.
     pub fn exchange_body(&self, client_id: &str, code: &str, redirect_uri: &str) -> Value {
         let mut body = json!({
             "grant_type": "authorization_code",
@@ -674,18 +715,20 @@ impl Running {
         body
     }
 
-    /// The code exchange of the default client on the loopback callback.
+    /// Send the code exchange of the default client with the loopback
+    /// callback.
     pub async fn exchange(&self, code: &str) -> GuestResponse {
         self.exchange_with(client_id(self.service), code, self.loopback_redirect())
             .await
     }
 
+    /// The loopback `redirect_uri` of the service.
     pub fn loopback_redirect(&self) -> &'static str {
         loopback(self.service).1
     }
 
-    /// A surrogate code of the service's loopback callback for the real
-    /// code: what the callback forward hands the guest.
+    /// Issue a surrogate code for the real code on the loopback callback of
+    /// the service, as the callback forward gives it to the guest.
     pub fn issue_code(&self) -> String {
         let port = loopback(self.service).0;
         self.codes
@@ -693,8 +736,10 @@ impl Running {
             .unwrap()
     }
 
-    /// A sign-in: the exchange of an issued surrogate code. The answer
-    /// carries no real token.
+    /// Sign in: exchange an issued surrogate code. Checks that the answer
+    /// has no real token.
+    /// Returns:
+    ///   The JSON answer.
     pub async fn sign_in(&self) -> Value {
         let resp = self.exchange(&self.issue_code()).await;
         assert_eq!(resp.status, 200, "{}", resp.body);
@@ -706,22 +751,22 @@ impl Running {
         resp.json()
     }
 
-    /// The requests the provider got.
+    /// The number of requests that the provider got.
     pub fn upstream_requests(&self) -> usize {
         self.fake.seen.all().len()
     }
 
-    /// The last request the provider got.
+    /// The last request that the provider got.
     pub fn last_seen(&self) -> Seen {
         self.fake.seen.last()
     }
 
-    /// The JSON body of the last request the provider got.
+    /// The JSON body of the last request that the provider got.
     pub fn last_body(&self) -> Value {
         serde_json::from_str(&self.last_seen().body).unwrap()
     }
 
-    /// The bodies of the revokes the provider got.
+    /// The bodies of the revokes that the provider got.
     pub fn revokes(&self) -> Vec<Value> {
         self.fake
             .seen
@@ -732,7 +777,7 @@ impl Running {
             .collect()
     }
 
-    /// The requests to the token endpoint the provider got.
+    /// The number of token endpoint requests that the provider got.
     pub fn token_requests(&self) -> usize {
         self.fake
             .seen
@@ -742,7 +787,8 @@ impl Running {
             .count()
     }
 
-    /// Wait (a little) until the provider got `n` revokes.
+    /// Wait until the provider got `n` revokes, for at most about one
+    /// second. It does not fail when the time ends.
     pub async fn wait_for_revokes(&self, n: usize) {
         for _ in 0..50 {
             if self.revokes().len() >= n {

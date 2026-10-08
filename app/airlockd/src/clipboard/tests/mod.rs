@@ -1,3 +1,6 @@
+//! Clipboard bridge between container processes and the host clipboard:
+//! the shims, the FIFOs and the copy and paste loops.
+
 mod test_copy;
 mod test_paste;
 
@@ -6,8 +9,8 @@ use std::path::PathBuf;
 use super::{COPY_FIFO, PASTE_FIFO, shims};
 use crate::test_cfg::BridgeDir;
 
-/// A clipboard bridge laid out in a temp dir: the FIFOs of the granted
-/// directions and all four shims, pointed at them.
+/// A clipboard bridge in a temp directory. It has a FIFO for each granted
+/// direction and all four shims, which point to these FIFOs.
 struct Clipboard {
     dir: BridgeDir,
     copy_fifo: PathBuf,
@@ -15,6 +18,8 @@ struct Clipboard {
 }
 
 impl Clipboard {
+    /// Create the bridge files for the granted directions. The FIFO path of
+    /// a direction that is not granted stays empty.
     fn install(copy: bool, paste: bool) -> Self {
         let dir = BridgeDir::new();
         let copy_fifo = if copy {
@@ -41,6 +46,7 @@ impl Clipboard {
         }
     }
 
+    /// Return the path of the shim with the tool name `name`.
     fn tool(&self, name: &str) -> PathBuf {
         self.dir.path(name)
     }

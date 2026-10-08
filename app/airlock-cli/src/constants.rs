@@ -1,3 +1,5 @@
+//! Shared network timeouts.
+
 use std::time::Duration;
 
 /// Timeout for establishing a TCP connection to the real server.

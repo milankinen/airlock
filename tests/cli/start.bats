@@ -2,13 +2,20 @@
 
 load helpers
 
+# The start command up to the image pull: config checks, pack changes and
+# install state. Most tests use an image that does not exist, so start
+# stops at the image pull and no VM boots.
+
+# A config with an image that does not exist. Start stops at its pull.
 BAD_IMAGE='[vm]
 image = "airlock-test.invalid/no-such-image:1"'
 
+# True if the host can run a VM: not Linux, or Linux with /dev/kvm access.
 has_kvm_or_not_linux() {
     [[ "$(uname)" != "Linux" ]] || [[ -r /dev/kvm ]]
 }
 
+# Skip each test when KVM is not available, except the "without KVM" test.
 setup() {
     setup_temp_dir
     if [[ "$BATS_TEST_DESCRIPTION" != *"without KVM"* ]]; then
@@ -16,6 +23,11 @@ setup() {
     fi
 }
 
+# Test that start without a config and without a terminal fails and does
+# not make a config.
+#   1. Run start in an empty directory
+#   2. Check exit code 2 and the message
+#   3. Check that no config file exists
 @test "start without config fails in non-interactive mode" {
     run_airlock start
     assert_failure 2
@@ -23,6 +35,11 @@ setup() {
     [[ ! -e airlock.toml && ! -e .airlock/airlock.toml ]]
 }
 
+# Test that start refuses to continue when a sandbox exists but its config
+# is gone, so that it does not use a sandbox with the wrong config.
+#   1. Make a sandbox disk, run start and check the error
+#   2. Remove the disk and keep only install records
+#   3. Run start again and check the same error
 @test "start with sandbox state but no config fails" {
     make_sandbox_disk
     run_airlock start
@@ -37,6 +54,12 @@ setup() {
     assert_output_contains "A sandbox exists in $PWD, but there is no config."
 }
 
+# Test that start reports config errors and does not change the config
+# file.
+#   1. Run start with broken TOML, an unknown preset, a bad presets value
+#      and an unknown pack key
+#   2. Check exit code 2 and each error message
+#   3. Check that airlock.toml is not changed
 @test "start with invalid config fails without touching config" {
     assert_config_error start 'not valid toml [' "Config error"
     assert_config_error start 'presets = ["does-not-exist"]' "unknown preset"
@@ -49,6 +72,9 @@ codex = { version = 1, auth = "api-key" }' \
 codex = { version = 1, auth = "api-key" }' ]]
 }
 
+# Test that --quiet removes the log output of start.
+#   1. Run start and check that the log shows
+#   2. Run start --quiet and check that the log does not show
 @test "start --quiet suppresses log output" {
     write_config "$BAD_IMAGE"
     run_airlock start
@@ -59,6 +85,10 @@ codex = { version = 1, auth = "api-key" }' ]]
     assert_output_not_contains "Preparing sandbox"
 }
 
+# Test that start on Linux without /dev/kvm access fails with a clear
+# message.
+#   1. Skip if the host is not Linux or KVM is available
+#   2. Run start and check exit code 1 and the KVM message
 @test "start without KVM on Linux fails" {
     [[ "$(uname)" == "Linux" ]] || skip "Linux only"
     [[ ! -r /dev/kvm ]] || skip "KVM is available"
@@ -68,6 +98,10 @@ codex = { version = 1, auth = "api-key" }' ]]
     assert_output_contains "KVM not available"
 }
 
+# Test that --network replaces the network policy of the config.
+#   1. Write a config with deny-by-default
+#   2. Run start --verbose --network allow-always
+#   3. Check that the rules summary shows allow-always
 @test "start --network overrides config policy in verbose rules summary" {
     write_config '[network]
 policy = "deny-by-default"
@@ -79,6 +113,12 @@ allow = ["example.com:443"]'
     assert_output_contains "(policy: allow-always)"
 }
 
+# Test that a pack added to an existing disk needs a terminal or --yes,
+# and start stops before the image pull.
+#   1. Make a sandbox disk
+#   2. Add a pack with the version as a number, then as a string
+#   3. Run start and check exit code 2, the message and that no install
+#      records exist
 @test "start with pack added to existing disk and no terminal fails before image pull" {
     make_sandbox_disk
     for version in '1' '"1"'; do
@@ -94,6 +134,11 @@ python = { version = $version }"
     done
 }
 
+# Test that a pack removed from the config needs a terminal or --yes, and
+# start keeps the disk.
+#   1. Make a sandbox disk with an installed mise record
+#   2. Write a config without packs and run start
+#   3. Check exit code 2, the message and that the disk still exists
 @test "start with pack removed from existing disk and no terminal fails before image pull" {
     make_sandbox_disk
     write_installs mise=installed
@@ -105,6 +150,11 @@ python = { version = $version }"
     [[ -e .airlock/sandbox/disk.img ]]
 }
 
+# Test that packs on a new sandbox need no question, so start continues
+# without a terminal.
+#   1. Write a config with a pack and make no disk
+#   2. Run start
+#   3. Check that there is no question and that the sandbox prepare starts
 @test "start with packs and no sandbox disk installs them without terminal" {
     write_config "$BAD_IMAGE
 
@@ -117,6 +167,11 @@ python = { version = 1 }"
     [[ ! -e .airlock/sandbox/disk.img ]]
 }
 
+# Test that a list-form preset is not a pack change, so start asks no
+# question on an existing disk.
+#   1. Make a sandbox disk and write a config with presets = ["python"]
+#   2. Run start
+#   3. Check that there is no question and that the sandbox prepare starts
 @test "start with list preset on existing disk installs nothing" {
     make_sandbox_disk
     write_config "presets = [\"python\"]
@@ -128,6 +183,11 @@ $BAD_IMAGE"
     assert_output_contains "Preparing sandbox"
 }
 
+# Test that the claude-code list preset needs its token on the host, and
+# start stops before the image pull without it.
+#   1. Remove the token from the environment and write the preset
+#   2. Run start
+#   3. Check exit code 2 and the config error about the token
 @test "start with claude-code preset and no token fails before image pull" {
     unset CLAUDE_CODE_OAUTH_TOKEN
     write_config "presets = [\"claude-code\"]
@@ -139,6 +199,12 @@ $BAD_IMAGE"
     assert_output_not_contains "Preparing sandbox"
 }
 
+# Test that agent packs need no credentials in the host environment,
+# because the user signs in later through the host.
+#   1. Remove the tokens and write a config with the claude and codex packs
+#   2. Run start
+#   3. Check that there is no config error and no sign-in, and that the
+#      sandbox prepare starts
 @test "start with agent packs and no credentials passes env check" {
     unset CLAUDE_CODE_OAUTH_TOKEN OPENAI_API_KEY
     write_config "$BAD_IMAGE
@@ -153,6 +219,11 @@ codex = { version = 1 }"
     assert_output_contains "Preparing sandbox"
 }
 
+# Test that install records that are not valid stop start when there is
+# no terminal to ask the user.
+#   1. Write a config and an installs.json that is not JSON
+#   2. Run start
+#   3. Check exit code 2 and the message, before the sandbox prepare
 @test "start with corrupt install state and no terminal fails" {
     write_config "$BAD_IMAGE"
     mkdir -p .airlock/sandbox

@@ -1,12 +1,8 @@
-//! The install boot: boot with the install config, spawn one process per
-//! pack, and shut down cleanly.
+//! Pack install boot.
 //!
-//! Packs are independent: a failed pack does not stop the next one. After
-//! each process the state is saved (exit 0 → `unconfirmed`, else `failed`),
-//! so a crash leaves a state that the next start acts on. Whatever ends
-//! the loop (all done, Ctrl+C, idle timeout, a process that cannot start),
-//! the VM shuts down; only when the guest confirmed its disk sync do the
-//! `unconfirmed` records become `installed`.
+//! Boots the sandbox with the install config, runs the install script of
+//! each pack, and shuts the VM down. A failed pack does not stop the other
+//! packs. The install state is saved after each pack.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -24,34 +20,42 @@ use crate::sandbox::vm::{ProcessSpec, Stopped, Vm};
 use crate::sandbox::{self, io};
 use crate::util::PinnedDir;
 
-/// Give up on a pack when it prints nothing for this long.
+/// Stop a pack install if it prints nothing for this long.
 const IDLE_TIMEOUT: Duration = Duration::from_mins(20);
-/// After Ctrl+C: how long the script gets to stop after SIGTERM.
+/// After Ctrl+C or the idle timeout: time that the script gets to stop
+/// after SIGTERM.
 const TERM_GRACE: Duration = Duration::from_secs(10);
-/// After SIGKILL: how long its last output may take to arrive.
+/// After SIGKILL: time to wait for the last output of the script.
 const KILL_DRAIN: Duration = Duration::from_secs(5);
 
-/// Why the install boot did not run.
+/// Reason why the install boot did not run.
 #[derive(Debug, thiserror::Error)]
 pub enum SetupError {
+    /// The user pressed Ctrl+C during the boot.
     #[error("interrupted")]
     Interrupted,
+    /// Another error.
     #[error(transparent)]
     Failed(anyhow::Error),
 }
 
-/// How one pack's process ended.
+/// How the install process of one pack ended.
 #[derive(Debug)]
 pub enum Ended {
+    /// The process exited with this exit code.
     Exited(i32),
+    /// The user pressed Ctrl+C.
     Interrupted,
+    /// The process printed nothing for [`IDLE_TIMEOUT`].
     TimedOut,
     /// The process could not be started.
     ExecFailed(anyhow::Error),
 }
 
 impl Ended {
-    /// Why the loop stopped, for the user; `None` for an exit.
+    /// Explain why the loop stopped, for the user.
+    /// Returns:
+    ///   The reason, or `None` for an exit.
     pub fn reason(&self) -> Option<String> {
         match self {
             Ended::Exited(_) => None,
@@ -65,10 +69,13 @@ impl Ended {
     }
 }
 
-/// Runs one pack's install process, feeding its output to the progress.
-/// The real one is [`VmExec`]; tests use a fake. `None`: the exec did not
-/// start (Ctrl+C came first).
+/// Runs the install process of one pack and sends its output to the
+/// progress. The real implementation is [`VmExec`]. Tests use a fake.
 pub trait Exec {
+    /// Run the install process of `installer`.
+    /// Returns:
+    ///   How the process ended, or `None` if it did not start (Ctrl+C came
+    ///   first).
     async fn run(
         &mut self,
         installer: &InstallerScript,
@@ -76,23 +83,37 @@ pub trait Exec {
     ) -> Option<Ended>;
 }
 
-/// What the install loop did.
+/// Result of the install loop.
 #[derive(Debug, Default)]
 pub struct LoopOutcome {
     /// Packs whose script exited 0 in this boot.
     pub succeeded: Vec<String>,
     /// Packs whose script exited non-zero, with the exit code.
     pub failed: Vec<(String, i32)>,
-    /// What stopped the loop before the last pack, if anything.
+    /// The process end that stopped the loop (Ctrl+C, idle timeout or a
+    /// failed spawn), if any.
     pub stopped: Option<Ended>,
 }
 
-/// Saves the state after each change (sets the disk and image first).
+/// Callback that saves the state after each change. It sets the disk and
+/// the image first.
 pub type Save<'a> = dyn FnMut(&mut InstallState) -> anyhow::Result<()> + 'a;
 
-/// Run `installers` in order through `exec`, saving `state` after each
-/// one. A failed pack does not stop the loop; anything else that ends a
-/// process (Ctrl+C, idle timeout, a failed spawn) does.
+/// Run the installers in order.
+///
+/// Packs are independent: a failed pack does not stop the loop. Other
+/// process ends (Ctrl+C, idle timeout, a failed spawn) stop the loop.
+/// Args:
+///  - `exec`: Runs each install process
+///  - `installers`: Installers to run, in order
+///  - `state`: Install state to update. Exit 0 sets `unconfirmed`, other
+///    ends set `failed`.
+///  - `save`: Saves `state` after each installer. Thus a crash leaves a
+///    state that the next start acts on.
+///  - `progress`: Progress output
+///
+/// Returns:
+///   What the loop did, or an error if a save failed.
 pub async fn install_loop<E: Exec>(
     exec: &mut E,
     installers: &[InstallerScript],
@@ -106,7 +127,7 @@ pub async fn install_loop<E: Exec>(
         let fingerprint = &installer.fingerprint;
         progress.begin(name, &installer.label);
         let Some(ended) = exec.run(installer, progress).await else {
-            // Nothing ran: the pack's record stays as it was.
+            // Nothing ran. The record of the pack stays as it was.
             progress.end(" not started", false);
             outcome.stopped = Some(Ended::Interrupted);
             break;
@@ -140,12 +161,18 @@ pub async fn install_loop<E: Exec>(
     Ok(outcome)
 }
 
-/// After the shutdown: with a confirmed disk sync, the `unconfirmed`
-/// records of the packs that exited 0 in this boot (`succeeded`) become
-/// `installed`, whatever ended the loop. Other `unconfirmed` records (an
-/// earlier boot that did not confirm its sync) stay: those packs did not
-/// run in this boot. Without a sync, nothing is promoted (the next start
-/// runs those packs again).
+/// Update the state after the VM shutdown.
+///
+/// With a confirmed disk sync, the packs that exited 0 in this boot become
+/// `installed`, no matter what ended the loop. Other `unconfirmed` records
+/// (from an earlier boot that did not confirm its sync) stay, because
+/// those packs did not run in this boot. Without a sync, nothing changes,
+/// and the next start runs those packs again.
+/// Args:
+///  - `state`: Install state to update
+///  - `synced`: True if the guest confirmed its disk sync at shutdown
+///  - `succeeded`: Packs whose script exited 0 in this boot
+///  - `save`: Saves `state`
 pub fn finish(
     state: &mut InstallState,
     synced: bool,
@@ -159,18 +186,31 @@ pub fn finish(
     Ok(())
 }
 
-/// What the install boot left.
+/// Result of the install boot.
 pub struct Report {
+    /// Result of the install loop.
     pub outcome: LoopOutcome,
-    /// The guest confirmed its disk sync at shutdown.
+    /// True if the guest confirmed its disk sync at shutdown.
     pub synced: bool,
 }
 
-/// Run the install boot for `project` (configured with
-/// [`phase::install_config`]): boot quietly without the project share,
-/// run `installers` in order, one process each, and shut down. The output
-/// goes to a spinner, [`INSTALLS_LOG`] and, per failed pack, a tail on
-/// stderr.
+/// Run the install boot.
+///
+/// Boots quietly without the project share, runs the installers in order
+/// (one process each) and shuts down. The VM shuts down no matter what
+/// ends the loop. The output goes to a spinner and to [`INSTALLS_LOG`].
+/// For each failed pack, the last log lines go to stderr.
+/// Args:
+///  - `project`: Project, configured with [`phase::install_config`]
+///  - `image`: Prepared image
+///  - `installers`: Installers to run, in order
+///  - `state`: Install state to update
+///  - `save`: Saves `state` after each change
+///  - `log_level`: Log level of the boot
+///  - `verbose`: Show the last log lines under the spinner
+///
+/// Returns:
+///   The report, or an error if the boot was interrupted or failed.
 pub async fn install(
     project: Project,
     image: &OciImage,
@@ -203,9 +243,9 @@ pub async fn install(
     Ok(Report { outcome, synced })
 }
 
-/// Boot the install VM: no network services, browser, clipboard, daemons
-/// or masks (the install config grants none of them), and a network that
-/// reaches public addresses only.
+/// Boot the install VM. It has no network services, browser, clipboard,
+/// daemons or masks, because the install config grants none of them. Its
+/// network reaches only public addresses.
 async fn boot_install_vm(
     project: Project,
     image: &OciImage,
@@ -235,19 +275,19 @@ async fn boot_install_vm(
     .await
 }
 
-/// The install log in `sandbox_dir`.
+/// Path of the install log in the sandbox directory `sandbox_dir`.
 pub fn log_path(sandbox_dir: &Path) -> std::path::PathBuf {
     sandbox_dir.join(INSTALLS_LOG)
 }
 
-/// [`Exec`] over [`Vm::spawn`]: as root (the image user), in `/`, with
-/// pipes and a closed stdin.
+/// [`Exec`] that uses [`Vm::spawn`]. The process runs as root (the image
+/// user), in `/`, with pipes and a closed stdin.
 struct VmExec<'a> {
     vm: &'a Vm,
 }
 
 impl Exec for VmExec<'_> {
-    /// Start the script and drive it to its end: exit, Ctrl+C (SIGTERM,
+    /// Start the script and run it to its end: exit, Ctrl+C (SIGTERM,
     /// then SIGKILL), or no output for [`IDLE_TIMEOUT`].
     async fn run(
         &mut self,
@@ -262,6 +302,7 @@ impl Exec for VmExec<'_> {
 }
 
 impl VmExec<'_> {
+    /// Spawn the script and wait for its end.
     async fn spawn(&self, installer: &InstallerScript, progress: &mut InstallProgress) -> Ended {
         let spec = ProcessSpec {
             argv: compose::argv(installer),
@@ -302,7 +343,7 @@ impl VmExec<'_> {
     }
 }
 
-/// Truncate and open the install log. Logging is best effort.
+/// Remove the old install log and open a new one. Logging is best effort.
 fn open_log(project: &Project) -> Option<std::fs::File> {
     let dir = PinnedDir::open(&project.host_cwd, Path::new(".airlock/sandbox"), false).ok()?;
     dir.remove(INSTALLS_LOG).ok()?;

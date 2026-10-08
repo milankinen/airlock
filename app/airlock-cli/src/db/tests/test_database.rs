@@ -1,3 +1,6 @@
+//! Tests for the airlock database: transactions, shared clones, file
+//! modes and errors when the database cannot open.
+
 use std::os::unix::fs::PermissionsExt as _;
 
 use heed::types::Str;
@@ -5,10 +8,18 @@ use heed::types::Str;
 use crate::db::{DIR, Db};
 use crate::test_cfg::{block_on_local, temp_dir};
 
+/// The permission bits of `path`.
 fn mode(path: &std::path::Path) -> u32 {
     std::fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
 
+/// Test that a write commits only when its body succeeds, that all clones
+/// see the same data, and that the files are private to the user.
+///   1. Open the database in a directory with mode 0755
+///   2. Write one value, then write a second value in a body that fails
+///   3. Read both values through a clone
+///   4. Check that only the first value exists
+///   5. Check that the directory is 0700 and the LMDB files are 0600
 #[test]
 fn database_commits_successful_writes_for_all_clones_in_private_files() {
     let home = temp_dir();
@@ -51,6 +62,11 @@ fn database_commits_successful_writes_for_all_clones_in_private_files() {
     assert_eq!(mode(&dir.join("lock.mdb")), 0o600);
 }
 
+/// Test that the database open fails on a path that is not a directory
+/// and on a second open of the same directory in one process.
+///   1. Open the database on a regular file and check the error
+///   2. Open the database in a directory
+///   3. Open the same directory again and check the error
 #[test]
 fn database_that_cannot_open_is_error() {
     let home = temp_dir();
@@ -59,6 +75,7 @@ fn database_that_cannot_open_is_error() {
     assert!(Db::open(&file).is_err());
 
     let dir = home.path().join(DIR);
+    // `heed` refuses a second environment for the same path in one process.
     let _first = Db::open(&dir).unwrap();
     assert!(Db::open(&dir).is_err());
 }

@@ -1,8 +1,15 @@
+//! Tests for the config sections (`vm`, `clipboard`, `daemons`, `network`):
+//! defaults, parsed values and the config errors for bad values.
+
 use smart_config::ByteSize;
 
 use crate::config::config_values::{PullPolicy, Resolution, RestartPolicy, Signal};
 use crate::test_cfg::{project_toml_error, resolve_project_toml};
 
+/// Test that the defaults give no clipboard access, no KVM, no services and
+/// no daemons. A sandbox gets these only when the config asks for them.
+///   1. Resolve an empty config and a config with an empty `[clipboard]`
+///   2. Check that each access is off and the copy limit is 1 MiB
 #[test]
 fn config_without_sections_grants_no_clipboard_kvm_services_or_daemons() {
     for toml in ["", "[clipboard]\n"] {
@@ -16,6 +23,12 @@ fn config_without_sections_grants_no_clipboard_kvm_services_or_daemons() {
     }
 }
 
+/// Test that the values in each config section resolve correctly.
+///   1. Resolve a project file that sets the VM, image, clipboard, daemon and
+///      network sections
+///   2. Check the VM, image and clipboard values
+///   3. Check the default and the explicit daemon values
+///   4. Check the rules, ports and sockets
 #[test]
 fn project_file_sections_resolve_to_their_values() {
     let digest = format!("sha256:{}", "a".repeat(64));
@@ -112,6 +125,7 @@ fn project_file_sections_resolve_to_their_values() {
     let socket = &config.network.sockets["docker"].host;
     assert_eq!(socket.source, "~/.docker/run/docker.sock");
     assert_eq!(socket.target, "/var/run/docker.sock");
+    // A socket without a target uses the same path in the guest.
     let same = &config.network.sockets["same"].host;
     assert_eq!(
         (same.source.as_str(), same.target.as_str()),
@@ -119,6 +133,11 @@ fn project_file_sections_resolve_to_their_values() {
     );
 }
 
+/// Test that each form of image reference resolves the pull policy and the
+/// resolution.
+///   1. Resolve a plain image string and check the defaults
+///   2. Resolve an image table with a kebab-case pull policy
+///   3. Resolve an image table with a registry resolution
 #[test]
 fn image_reference_forms_resolve_pull_policy_and_resolution() {
     let image = |toml: &str| resolve_project_toml(toml).unwrap().values.vm.image;
@@ -137,6 +156,10 @@ fn image_reference_forms_resolve_pull_policy_and_resolution() {
     assert!(matches!(registry.resolution, Resolution::Registry));
 }
 
+/// Test that a bad value in a section is a config error that names the bad
+/// key or value.
+///   1. Resolve configs that each have one bad value
+///   2. Check that each error is a config error and names the path
 #[test]
 fn invalid_section_values_are_config_errors_naming_their_path() {
     for (toml, path) in [
@@ -168,6 +191,11 @@ fn invalid_section_values_are_config_errors_naming_their_path() {
     }
 }
 
+/// Test that all bad network targets and unknown services show in one error,
+/// in file order. The user can then correct all of them at one time.
+///   1. Resolve a config with an unknown service and bad targets in a rule,
+///      a disabled rule and a middleware
+///   2. Check each error line and the line count
 #[test]
 fn malformed_network_targets_and_unknown_services_are_reported_together() {
     let err = project_toml_error(
@@ -189,6 +217,7 @@ fn malformed_network_targets_and_unknown_services_are_reported_together() {
         script = ""
         "#,
     );
+    // The disabled rule `off` is not checked, so it adds no line.
     let lines: Vec<&str> = err.lines().collect();
     assert_eq!(lines[0], "invalid configuration");
     assert_eq!(
@@ -216,6 +245,11 @@ fn malformed_network_targets_and_unknown_services_are_reported_together() {
     assert_eq!(lines.len(), 6, "{err}");
 }
 
+/// Test that a passthrough rule for the host of an enabled service is an
+/// error. The service must see the traffic, so it cannot pass through.
+///   1. Resolve a passthrough rule for the anthropic hosts with the service on
+///   2. Check that the passthrough check fails and names the conflict
+///   3. Check that it passes with the service off
 #[test]
 fn passthrough_rule_on_enabled_service_host_is_error() {
     let network = |on: bool| {

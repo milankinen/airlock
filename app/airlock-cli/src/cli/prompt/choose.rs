@@ -1,10 +1,6 @@
-//! Pick one option of a vertical radio list.
+//! Single-choice prompt.
 //!
-//! The view: the title (bold), the notes (gray, 2 columns in), the
-//! options one per line (`◉` on the focused one, in green, with its
-//! label in cyan; a [`Tone::Danger`] label in red), an empty line, and
-//! the keys (gray). Keys: ↑/↓ move the focus (around the ends), Enter
-//! picks the focused option, Esc cancels, Ctrl-C interrupts.
+//! Lets the user select one option from a vertical radio list.
 
 use crossterm::event::{KeyCode, KeyEvent};
 
@@ -12,30 +8,45 @@ use crate::cli::prompt::screen::Frame;
 use crate::cli::prompt::style::{self, Line, Styles, Tone};
 use crate::cli::prompt::{self, PromptError, Step};
 
-/// The keys of the list.
+/// Key help line of the list.
 const KEYS: &str = "↑↓ move · enter confirm · esc cancel";
 
-/// An option of the list.
+/// One option of the list.
 pub struct Choice<'a> {
+    /// Option text.
     pub label: &'a str,
+    /// Color of the label. A [`Tone::Danger`] label is red.
     pub tone: Tone,
 }
 
-/// The question.
+/// A prompt that selects one option from a vertical radio list.
+///
+/// The view shows:
+///  * The title (bold)
+///  * The notes (gray, indented by 2 columns)
+///  * One option per line. The focused option has a green `◉` and a cyan
+///    label.
+///  * An empty line and the key help (gray)
+///
+/// Keys: ↑/↓ move the focus (and wrap at the ends). Enter selects the focused
+/// option. Esc cancels. Ctrl+C interrupts.
 pub struct Choose<'a> {
+    /// Question text (bold). Can have many lines.
     pub title: &'a str,
     /// Gray lines between the title and the options.
     pub notes: &'a [&'a str],
+    /// Options of the list.
     pub choices: &'a [Choice<'a>],
-    /// The option that has the focus at first.
+    /// Index of the option that has the focus at the start.
     pub default: usize,
-    /// Whether the title and the picked option stay on the terminal.
+    /// If true, the title and the selected option stay on the terminal.
     pub report: bool,
 }
 
 impl Choose<'_> {
-    /// Ask the question: the index of the picked option, or `None` on
-    /// Esc.
+    /// Ask the question.
+    /// Returns:
+    ///   Index of the selected option, `None` on Esc, or error.
     pub fn ask(&self) -> Result<Option<usize>, PromptError> {
         let mut state = State {
             focus: self.default.min(self.choices.len().saturating_sub(1)),
@@ -54,7 +65,7 @@ impl Choose<'_> {
         Ok(picked)
     }
 
-    /// The lines of the list in `state` for `room` columns of text.
+    /// Return the lines of the list in `state`, for `room` columns of text.
     fn frame(&self, state: &State, room: usize) -> Frame {
         let styles = Styles::new();
         let mut lines: Vec<String> = self
@@ -89,7 +100,7 @@ impl Choose<'_> {
     }
 }
 
-/// The focused option of a list of `len`.
+/// The focused option in a list of `len` options.
 struct State {
     focus: usize,
     len: usize,

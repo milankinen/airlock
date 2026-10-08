@@ -1,4 +1,7 @@
-//! `airlock` — host-side CLI for the airlock VM sandbox.
+//! `airlock` command line tool.
+//!
+//! Host-side CLI for the airlock VM sandbox. Parses the arguments and runs
+//! the selected subcommand.
 
 mod assets;
 mod cache;
@@ -36,14 +39,14 @@ use crate::context::Context;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    // Install panic + fatal-signal instrumentation *before* anything
-    // else — if some later init panics we still want to see it.
+    // Install the panic and fatal signal handlers first. Then a panic in a
+    // later init step is also visible.
     diagnostics::install_panic_hook();
     diagnostics::install_fatal_signal_handlers();
 
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    // Split argv at "--" before clap sees it
+    // Split argv at "--" before clap parses it.
     let raw_args: Vec<String> = std::env::args().collect();
     let (airlock_args, extra_args) = split_at_separator(&raw_args);
 
@@ -54,10 +57,9 @@ async fn main() {
     let parsed = Program::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     cli::initialize(parsed.global.quiet);
 
-    // The process-wide context: settings from `~/.airlock/settings.*`
-    // (absent file → defaults; a malformed file fails loudly so the user
-    // doesn't silently fall back to defaults), the one vault and the
-    // database, threaded into every subcommand.
+    // Process-wide context for all subcommands: settings, vault and database.
+    // A malformed settings file is a fatal error, so the user does not get
+    // defaults without notice.
     let context = match Context::load() {
         Ok(context) => context,
         Err(e) => {
@@ -107,14 +109,14 @@ async fn main() {
         })
         .await;
 
-    // Last trace before exit. Its absence in airlock.log after the
-    // sandbox disappears means the process died abnormally — look
-    // for a panic or "[airlock] fatal signal N" marker above it.
+    // Last trace before exit. If airlock.log does not have it after the
+    // sandbox stops, the process died abnormally. Look for a panic or a
+    // "[airlock] fatal signal N" marker above it.
     tracing::info!("cli exit: code={exit_code}");
     std::process::exit(exit_code);
 }
 
-/// Top-level CLI definition. Clap derives argument parsing from this struct.
+/// Top-level CLI definition. Clap derives the argument parser from it.
 #[derive(Parser)]
 #[command(
     name = "airlock",
@@ -153,7 +155,9 @@ enum Command {
     Secrets(cmd_secret::SecretArgs),
 }
 
-/// Split argv at "--". Returns (args before --, args after --).
+/// Split argv at the first "--".
+/// Returns:
+///   The args before "--" and the args after it.
 fn split_at_separator(args: &[String]) -> (Vec<String>, Vec<String>) {
     if let Some(pos) = args.iter().position(|a| a == "--") {
         (args[..pos].to_vec(), args[pos + 1..].to_vec())

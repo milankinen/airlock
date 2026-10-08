@@ -1,13 +1,10 @@
-//! Minimal virtio-vsock listener.
+//! Host-to-guest connections over vsock.
 //!
-//! The kernel's `AF_VSOCK` socket family is used for host↔guest communication
-//! without requiring network configuration. We use raw syscalls because the
-//! standard library doesn't expose vsock support.
+//! Accepts connections from the host on a vsock port. vsock needs no network
+//! configuration in the guest.
 //!
-//! `AF_VSOCK`, `SOCK_CLOEXEC` and `accept4` are Linux-only, so the
-//! implementation lives in a private Linux-gated module with
-//! compile-time stubs for other targets so `cargo check` works on
-//! macOS — the same arrangement as `net`.
+//! Only Linux has a real implementation. On other targets, stubs let the crate
+//! compile.
 
 #[cfg(target_os = "linux")]
 mod imp {
@@ -31,11 +28,12 @@ mod imp {
 
     /// Create a vsock listener bound to the given port, accepting from any CID.
     pub fn listen(port: u32) -> std::io::Result<OwnedFd> {
+        // Use raw syscalls, because the standard library has no vsock support.
         unsafe {
-            // SOCK_CLOEXEC so the listener fd is not inherited across exec into
-            // container processes — otherwise an untrusted process could walk
-            // /proc/self/fd and speak the host RPC protocol directly, escaping
-            // airlockd's mediation.
+            // SOCK_CLOEXEC: container processes must not inherit the listener
+            // fd across exec. Otherwise an untrusted process could find it in
+            // /proc/self/fd and use the host RPC protocol directly, without
+            // airlockd's control.
             let fd = libc::socket(AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
             if fd < 0 {
                 return Err(std::io::Error::last_os_error());
@@ -72,7 +70,7 @@ mod imp {
     pub fn accept(listen_fd: &OwnedFd) -> std::io::Result<OwnedFd> {
         unsafe {
             // accept4 with SOCK_CLOEXEC: the connected fd carries the live host
-            // RPC channel and must not leak into exec'd container processes.
+            // RPC channel. Container processes must not inherit it across exec.
             let fd = libc::accept4(
                 std::os::unix::io::AsRawFd::as_raw_fd(listen_fd),
                 std::ptr::null_mut(),
@@ -89,21 +87,22 @@ mod imp {
 
 // --- Non-Linux stubs ------------------------------------------------
 //
-// airlockd is only ever executed inside the Linux guest VM. These
-// stubs exist so the crate still type-checks on the host-side
-// developer machine (macOS, etc.) without having to shard the build
-// into per-target binaries.
+// airlockd runs only inside the Linux guest VM. These stubs let the crate
+// type-check on the developer host (macOS and others), without separate
+// builds for each target.
 #[cfg(not(target_os = "linux"))]
 use std::os::unix::io::OwnedFd;
 
 #[cfg(target_os = "linux")]
 pub use imp::{accept, listen};
 
+/// Non-Linux stub. Panics if called.
 #[cfg(not(target_os = "linux"))]
 pub fn listen(_port: u32) -> std::io::Result<OwnedFd> {
     unimplemented!("airlockd only runs inside the Linux VM");
 }
 
+/// Non-Linux stub. Panics if called.
 #[cfg(not(target_os = "linux"))]
 pub fn accept(_listen_fd: &OwnedFd) -> std::io::Result<OwnedFd> {
     unimplemented!("airlockd only runs inside the Linux VM");

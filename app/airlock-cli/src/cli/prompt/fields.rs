@@ -1,15 +1,7 @@
-//! Text inputs, one per row: `<label>: <text>`, with the text cursor
-//! after the text of the focused row.
+//! Text input prompt.
 //!
-//! The view: an optional title (bold) with the rows 2 columns in below
-//! it, the rows (the focused label in cyan; a secret text as one `•`
-//! per character), the error of the last check in red under its row,
-//! and the keys (gray). Keys: characters go to the focused text,
-//! Backspace deletes its last one, Enter goes to the next row and on the
-//! last one checks the texts (the caller's check), Esc cancels, Ctrl-C
-//! interrupts. A failed check keeps the view open, with the focus and
-//! the error on the row that it names; a secret text there is cleared
-//! (it cannot be edited by sight). The view is erased at the end.
+//! Shows a form of `label: value` text inputs. Inputs can be masked, for example
+//! for passwords. A check from the caller validates the values.
 
 use crossterm::event::{KeyCode, KeyEvent};
 
@@ -17,35 +9,57 @@ use crate::cli::prompt::screen::Frame;
 use crate::cli::prompt::style::{self, Line, Styles, Tone};
 use crate::cli::prompt::{self, PromptError, Step};
 
-/// The mask of a character of a secret text.
+/// Mask that replaces each character of a secret text.
 const MASK: &str = "•";
 
-/// A row of the form.
+/// One row of the form.
 pub struct Field<'a> {
+    /// Text before the `: ` and the input.
     pub label: &'a str,
-    /// Whether the text shows masked.
+    /// If true, the text shows as one `•` per character.
     pub secret: bool,
 }
 
-/// The form.
+/// A form of text inputs, one per row: `<label>: <text>`.
+///
+/// The view shows:
+///  * An optional title (bold). Then the rows are indented by 2 columns.
+///  * The rows. The focused label is cyan and has the text cursor after its
+///    text.
+///  * The error of the last check in red, below its row
+///  * The key help (gray)
+///
+/// Keys: characters go to the focused text. Backspace deletes the last
+/// character. Enter moves to the next row. On the last row, Enter runs the
+/// caller's check. Esc cancels. Ctrl+C interrupts.
+///
+/// If the check fails, the view stays open. The focus and the error go to
+/// the row that the error names. A secret text in that row is cleared,
+/// because the user cannot see it to edit it. The view is erased at the end.
 pub struct Fields<'a> {
     /// The bold line above the rows, if any.
     pub title: Option<&'a str>,
+    /// Rows of the form.
     pub rows: &'a [Field<'a>],
-    /// The keys, shown last (gray).
+    /// Key help, shown last (gray).
     pub keys: &'a str,
 }
 
-/// Why the check rejected the texts.
+/// Check failure: the reason why the check rejected the texts.
 pub struct Invalid {
-    /// The row with the error.
+    /// Index of the row with the error.
     pub field: usize,
+    /// Error text to show below the row.
     pub message: String,
 }
 
 impl Fields<'_> {
-    /// Ask for the texts, one per row: they pass `check`, or `None` on
-    /// Esc.
+    /// Ask for the texts, one per row.
+    /// Args:
+    ///  - `check`: Validates the texts. On error, the user can edit them again.
+    ///
+    /// Returns:
+    ///   Texts that passed `check`, `None` on Esc, or error.
     pub fn ask(
         &self,
         mut check: impl FnMut(&[String]) -> Result<(), Invalid>,
@@ -73,7 +87,7 @@ impl Fields<'_> {
         )
     }
 
-    /// The lines of the form in `state` for `room` columns of text.
+    /// Return the lines of the form in `state`, for `room` columns of text.
     fn frame(&self, state: &State, room: usize) -> Frame {
         let styles = Styles::new();
         let mut lines = Vec::new();
@@ -123,8 +137,8 @@ impl Fields<'_> {
     }
 }
 
-/// The texts, the focused row, and the error of the last check (its
-/// row and message) until a text changes.
+/// The texts, the focused row and the error of the last check. The error
+/// (row and message) stays until a text changes.
 struct State {
     texts: Vec<String>,
     focus: usize,
@@ -132,7 +146,7 @@ struct State {
 }
 
 impl State {
-    /// Apply `key`; `Done` asks for the check.
+    /// Apply `key`. `Done` means that the caller must run the check.
     fn key(&mut self, key: KeyEvent) -> Step<()> {
         if prompt::is_interrupt_key(key) {
             return Step::Interrupt;
@@ -152,8 +166,8 @@ impl State {
         Step::Stay
     }
 
-    /// Show `invalid` on its row, which gets the focus; a secret text
-    /// there is cleared.
+    /// Show `invalid` on its row and move the focus there. Clear a secret
+    /// text in that row.
     fn reject(&mut self, invalid: Invalid, fields: &[Field<'_>]) {
         let row = invalid.field.min(self.texts.len().saturating_sub(1));
         if fields.get(row).is_some_and(|field| field.secret)

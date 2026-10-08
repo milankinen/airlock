@@ -1,6 +1,6 @@
-//! Test helpers shared by the airlock crates. Only for tests: the crates
-//! take it as a dev-dependency and turn on the feature of each helper
-//! group they need.
+//! Test helpers that the airlock crates share. Use this crate only for
+//! tests. A crate adds it as a dev-dependency and enables the feature of
+//! each helper group that it needs.
 
 mod fs;
 #[cfg(feature = "http")]

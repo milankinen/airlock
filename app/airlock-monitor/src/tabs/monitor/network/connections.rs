@@ -1,4 +1,6 @@
-//! Connections sub-tab — raw TCP connect events.
+//! Connections sub-tab of the network panel.
+//!
+//! Shows the list of raw TCP connections from the sandbox.
 
 use std::time::SystemTime;
 
@@ -13,24 +15,31 @@ use super::row::{
     format_transfer, pad_right, truncate_right,
 };
 
-/// A single connection log entry.
+/// One TCP connection in the connection list.
 #[derive(Clone)]
 pub struct ConnectionEntry {
+    /// Connection ID, from [`crate::ConnectInfo::id`].
     pub id: u64,
+    /// Time of the connect attempt.
     pub timestamp: SystemTime,
+    /// Target host.
     pub host: String,
+    /// Target port.
     pub port: u16,
+    /// True if the network policy allowed the connection.
     pub allowed: bool,
-    /// Set when a matching `Disconnect` event arrives. `None` means the
+    /// Time of the matching `Disconnect` event. `None` means that the
     /// connection is still open.
     pub disconnected_at: Option<SystemTime>,
-    /// Cumulative bytes guest → server.
+    /// Total bytes from guest to server.
     pub up: u64,
-    /// Cumulative bytes server → guest.
+    /// Total bytes from server to guest.
     pub down: u64,
 }
 
 impl ConnectionEntry {
+    /// Create an open connection entry with zero traffic from a connect
+    /// event.
     pub fn from_info(info: &crate::ConnectInfo) -> Self {
         Self {
             id: info.id,
@@ -45,16 +54,22 @@ impl ConnectionEntry {
     }
 }
 
-/// Below this many cells for `host:port`, the transfer column is dropped
-/// rather than squeezing the target into an ellipsis.
+/// Minimum number of cells for `host:port`. With less space, the widget
+/// removes the transfer column, so that the target is not cut to an
+/// ellipsis.
 const MIN_TARGET_COLS: usize = 24;
 
+/// Widget that draws the connection list, newest first.
 pub struct ConnectionsWidget<'a> {
     entries: &'a [ConnectionEntry],
     selected: Option<usize>,
 }
 
 impl<'a> ConnectionsWidget<'a> {
+    /// Create a connection list widget.
+    /// Args:
+    ///  - `entries`: Connection entries, oldest first
+    ///  - `selected`: Selected display index (0 = newest), if any.
     pub fn new(entries: &'a [ConnectionEntry], selected: Option<usize>) -> Self {
         Self { entries, selected }
     }
@@ -79,16 +94,16 @@ impl Widget for ConnectionsWidget<'_> {
         //   "  " + ⦿(1) + "  " + TARGET(expand) [+ " " + transfer(19)]
         //   + " " + connected(16) + "  " + disconnected(16) + " " +
         //   status(7) + " "
-        // (Two spaces after the bullet — the extra breath visually
-        // separates the status indicator from the white target text;
-        // same reasoning between connected/disconnected.)
+        // (Two spaces after the bullet. The extra space separates the
+        // status indicator from the white target text. The same applies
+        // between connected and disconnected.)
         let width = area.width as usize;
         let base =
             2 + BULLET_COLS + 2 + 1 + TIMESTAMP_COLS + 2 + TIMESTAMP_COLS + 1 + RESULT_COLS + 1;
-        // The transfer column is what gets sacrificed first on a narrow
-        // terminal: at 80 columns keeping it would leave ~11 cells for the
-        // target, too few for even a short `host:port`. Better to drop the
-        // column than to render every row as an ellipsis.
+        // In a narrow terminal, the widget removes the transfer column first.
+        // At 80 columns, the column leaves approximately 11 cells for the
+        // target. That is too few even for a short `host:port`. It is better
+        // to remove the column than to show each row as an ellipsis.
         let show_transfer = width.saturating_sub(base + 1 + TRANSFER_COLS) >= MIN_TARGET_COLS;
         let fixed = if show_transfer {
             base + 1 + TRANSFER_COLS
@@ -201,10 +216,10 @@ fn build_connection_row(
     ];
 
     if show_transfer {
-        // Rendered as one pre-padded string rather than styled arrow/figure
-        // spans so the column lines up regardless of how wide each figure is.
-        // Blank rather than `↑ 0B ↓ 0B` before anything moves — a denied
-        // connection never transfers, and zeros there read as noise.
+        // Draw one padded string, not separate styled spans for arrows and
+        // numbers. Thus the column stays aligned for all number widths.
+        // Show empty space, not `↑ 0B ↓ 0B`, before data moves. A denied
+        // connection never transfers data, and zeros there are only noise.
         let transfer = if e.up == 0 && e.down == 0 {
             " ".repeat(TRANSFER_COLS)
         } else {

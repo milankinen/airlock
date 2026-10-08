@@ -1,4 +1,7 @@
-//! An interactive sandbox on the user's terminal: `airlock start`.
+//! Interactive sandbox.
+//!
+//! Runs the sandbox of `airlock start` on the user's terminal, with raw
+//! terminal passthrough or the monitor TUI.
 
 use tracing::{error, info};
 
@@ -16,17 +19,26 @@ use crate::runtime::{DumpSink, HostRuntime, Runtime, Terminal};
 use crate::services::{self, Services};
 use crate::{daemon, masking};
 
-/// Boot `project` with everything its config grants, run `argv` as the
-/// main process on the user's terminal (raw passthrough or the monitor
-/// TUI, per `runtime`), serve `airlock exec`, then shut down in order.
-/// Returns the exit code for the command: the process's code, the TUI's
-/// override, or 130 when the user interrupts the boot. A VM stop that is
-/// not confirmed after the process exited is shown as an error, and the
-/// process's code is still returned.
+/// Run an interactive sandbox session.
 ///
-/// With network services enabled, the guest may open their sign-in pages
-/// on the host for the whole session (the browser grant); refused
-/// requests are reported after the session.
+/// Boots `project` with all access that its config gives and runs `argv`
+/// as the main process on the user's terminal. Serves `airlock exec` while
+/// the process runs, then stops the sandbox in order. With network services
+/// enabled, the guest can open their sign-in pages on the host for the full
+/// session (browser access). Refused requests are reported after the
+/// session.
+/// Args:
+///  - `project`: The locked project
+///  - `image`: The container image
+///  - `argv`: Command of the main process
+///  - `runtime`: Terminal mode: raw passthrough or the monitor TUI
+///  - `log_level`: Guest log level
+///
+/// Returns:
+///   The exit code for the command: the process exit code, the TUI
+///   override, or 130 if the user interrupts the boot. If the VM stop is not
+///   confirmed after the process exits, the error is shown and the process
+///   exit code is still returned.
 pub async fn run_interactive(
     project: Project,
     image: &OciImage,
@@ -75,8 +87,8 @@ pub async fn run_interactive(
     };
     services.attach(&vm.guest_network());
 
-    // Launch the output sink (enters raw mode for the raw runtime, spawns the
-    // TUI thread for the monitor runtime) before the main process starts.
+    // Start the output sink before the main process starts. The raw runtime
+    // enters raw mode. The monitor runtime starts the TUI thread.
     let launched = (|| {
         let (stdin, pty) = runtime.attach_stdin()?;
         let signals = runtime.signals()?;
@@ -105,14 +117,14 @@ pub async fn run_interactive(
     };
     info!("vm process started");
 
-    // Start the CLI server so `airlock exec` can attach processes to this VM.
+    // Start the CLI server, so `airlock exec` can attach processes to this VM.
     if let Err(e) = vm.serve_cli() {
         return Err(shut_down_after(vm, &services, e).await);
     }
 
     vm.forward_signals(signals, proc.clone());
-    // When AIRLOCK_PTY_DUMP=1, also write all guest output to
-    // <sandbox_dir>/pty.dump for offline replay/diagnosis.
+    // If AIRLOCK_PTY_DUMP=1, also write all guest output to
+    // <sandbox_dir>/pty.dump for offline replay and diagnosis.
     let exit_code = {
         let mut sink = DumpSink::from_env(&mut terminal, &vm.project().sandbox_dir);
         drive(&proc, &mut sink).await
@@ -128,12 +140,13 @@ pub async fn run_interactive(
         }
     }
 
-    // The command has run: its exit code stands also when the VM stop is
-    // not confirmed. That failure is reported, not returned.
+    // The command ran, so its exit code is the result, also if the VM stop
+    // is not confirmed. That failure is reported, not returned.
     match Box::pin(vm.shutdown()).await {
         Ok(Stopped { project, synced }) => {
             info!("all done, exit (guest sync confirmed: {synced})");
-            // Release the sandbox lock only once the VM is gone.
+            // The project holds no lock. The caller holds the sandbox lock
+            // and releases it after this function returns.
             drop(project);
         }
         Err(e) => {
@@ -144,9 +157,10 @@ pub async fn run_interactive(
     Ok(final_code)
 }
 
-/// Detach `services` and shut down `vm` after `error`, and return the
-/// error to report. A failed shutdown is reported instead, since the VM
-/// may still run.
+/// Detach `services` and stop `vm` after `error`.
+/// Returns:
+///   The error to report: `error`, or the shutdown error (with `error` as
+///   context) if the shutdown fails, because the VM may still run.
 async fn shut_down_after(vm: Vm, services: &Services, error: anyhow::Error) -> anyhow::Error {
     services.detach().await;
     match Box::pin(vm.shutdown()).await {

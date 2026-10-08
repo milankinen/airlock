@@ -1,17 +1,17 @@
-# Claude code development preset
+# Claude Code development preset
 
 [env]
-# The real token stays on the host: the sandbox sees a same-length random
-# surrogate, and the `inject` rule below swaps the real value into request
-# headers to the Anthropic API at the host boundary.
+# The real token stays on the host. The sandbox sees a random surrogate
+# of the same length. The `inject` rule below puts the real value into the
+# request headers to the Anthropic API at the host boundary.
 CLAUDE_CODE_OAUTH_TOKEN = { value = "${CLAUDE_CODE_OAUTH_TOKEN}", mask = true }
 
-# Telemetry endpoints are not allowed by netowork rules; disable telemetry entirely
+# The network rules do not allow the telemetry endpoints. Disable telemetry.
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
 
-# Tell that we're inside sandbox
+# Tell Claude Code that it runs in a sandbox.
 IS_SANDBOX = "1"
-# Claude uses Node certs - must add airlock CA to the trusted certs
+# Claude Code uses the Node.js trusted certificates. Add the airlock CA to them.
 NODE_EXTRA_CA_CERTS = "/etc/ssl/certs/ca-certificates.crt"
 
 [network.rules.claude-code]

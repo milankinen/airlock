@@ -13,7 +13,7 @@ config.mounts = {
 
 config.network = {
     -- The openai service owns the ChatGPT sign-in and backend hosts
-    -- (auth.openai.com, chatgpt.com): airlock allows them, keeps the real
+    -- (auth.openai.com, chatgpt.com). airlock allows them, keeps the real
     -- tokens on the host and gives Codex surrogates. `codex login` opens
     -- the sign-in page in the host browser.
     services = {

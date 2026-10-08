@@ -1,3 +1,5 @@
+//! In-memory Cap'n Proto RPC connections for tests.
+
 use capnp::capability::FromClientHook;
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::{RpcSystem, twoparty};

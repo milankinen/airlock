@@ -1,9 +1,13 @@
+//! An output sink that records guest output for tests.
+
 use crate::runtime::OutputSink;
 
-/// An output sink that keeps everything it gets.
+/// An output sink that keeps all stdout and stderr data that it gets.
 #[derive(Default)]
 pub struct RecordingSink {
+    /// All stdout bytes, in order.
     pub out: Vec<u8>,
+    /// All stderr bytes, in order.
     pub err: Vec<u8>,
 }
 

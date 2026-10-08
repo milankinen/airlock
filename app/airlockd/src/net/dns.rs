@@ -1,9 +1,9 @@
-//! Virtual DNS server that assigns deterministic fake IPs to hostnames.
+//! Virtual DNS server.
 //!
-//! The guest has no real DNS resolver. When a process inside the container
-//! resolves a hostname, this server assigns it a unique IP from the `10.2.0.0/16`
-//! range. The transparent proxy later reverse-maps that IP back to the original
-//! hostname before forwarding the connection to the host.
+//! The guest has no real DNS resolver. This server gives each hostname a
+//! unique fake IP. The TCP proxy later maps the IP back to the hostname before
+//! it sends the connection to the host. Thus the host knows the hostname of
+//! each connection.
 
 use std::cell::Cell;
 use std::io::Cursor;
@@ -15,10 +15,13 @@ use simple_dns::{CLASS, Packet, PacketFlag, QTYPE, Question, ResourceRecord, TYP
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
+/// UDP listen address of the server (on loopback).
 const LISTEN_ADDR: &str = "10.0.0.1:53";
+/// First IP to allocate.
 const IP_BASE: u32 = 0x0A020001; // 10.2.0.1
 
-/// Bidirectional hostname ↔ IP mapping, assigning IPs sequentially.
+/// Two-way mapping between hostnames and fake IPs. Gives the IPs in
+/// sequence from the `10.2.0.0/16` range.
 pub struct DnsState {
     host_to_ip: HashMap<String, Ipv4Addr>,
     ip_to_host: HashMap<Ipv4Addr, String>,
@@ -26,7 +29,7 @@ pub struct DnsState {
 }
 
 impl DnsState {
-    /// Create a new empty DNS state starting IP allocation from `10.2.0.1`.
+    /// Create an empty DNS state. The first allocated IP is `10.2.0.1`.
     pub fn new() -> Self {
         Self {
             host_to_ip: HashMap::new(),
@@ -35,13 +38,13 @@ impl DnsState {
         }
     }
 
-    /// Return the IP for `hostname`, allocating a new one if first seen.
+    /// Return the IP for `hostname`. Allocates a new IP for a new hostname.
+    /// `localhost` and `admin.airlock` always get `127.0.0.1`.
     pub fn allocate(&self, hostname: &str) -> Ipv4Addr {
         if hostname == "localhost" || hostname == "admin.airlock" {
             // `admin.airlock` is reserved for the in-VM admin HTTP service.
-            // Loopback bypasses the transparent proxy's iptables redirect
-            // (see `init::linux::setup_networking`), so the request lands
-            // directly on the server bound to `127.0.0.1:80`.
+            // Loopback traffic does not go through the TCP proxy, so the
+            // request goes directly to the server on `127.0.0.1:80`.
             return Ipv4Addr::LOCALHOST;
         }
         if let Some(entry) = self.host_to_ip.get_sync(hostname) {
@@ -55,13 +58,18 @@ impl DnsState {
         ip
     }
 
-    /// Reverse-lookup: map a virtual IP back to its hostname.
+    /// Map a fake IP back to its hostname. Returns `None` for an unknown IP.
     pub fn reverse(&self, ip: Ipv4Addr) -> Option<String> {
         self.ip_to_host.get_sync(&ip).map(|e| e.get().clone())
     }
 }
 
-/// Spawn the DNS UDP server as a local task.
+/// Bind the DNS UDP socket and start the server in a local task.
+/// Args:
+///  - `state`: Shared hostname/IP mapping
+///
+/// Returns:
+///   Error if the bind fails.
 pub async fn start(state: Rc<DnsState>) -> anyhow::Result<()> {
     let socket = UdpSocket::bind(LISTEN_ADDR).await?;
     info!("dns listening on {LISTEN_ADDR}");
@@ -73,6 +81,7 @@ pub async fn start(state: Rc<DnsState>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Answer DNS queries on `socket` until a socket error occurs.
 async fn serve(socket: UdpSocket, state: Rc<DnsState>) -> anyhow::Result<()> {
     let mut buf = [0u8; 512];
     loop {
@@ -84,11 +93,13 @@ async fn serve(socket: UdpSocket, state: Rc<DnsState>) -> anyhow::Result<()> {
     }
 }
 
+/// Make the reply to one DNS query. Only the first question gets an answer,
+/// and only A queries get an IP. Returns `None` for a query that is not
+/// valid.
 fn handle_query(data: &[u8], state: &DnsState) -> Option<Vec<u8>> {
     let query = Packet::parse(data).ok()?;
     let question = query.questions.first()?;
     let hostname = question.qname.to_string();
-    // strip trailing dot if present
     let hostname = hostname.strip_suffix('.').unwrap_or(&hostname);
 
     let mut reply = Packet::new_reply(query.id());
@@ -109,7 +120,7 @@ fn handle_query(data: &[u8], state: &DnsState) -> Option<Vec<u8>> {
             rdata::RData::A(rdata::A::from(ip)),
         ));
     }
-    // AAAA and others: return empty response (no answers)
+    // AAAA and others: return a response with no answers
 
     let mut out = Cursor::new(Vec::with_capacity(512));
     reply.write_compressed_to(&mut out).ok()?;

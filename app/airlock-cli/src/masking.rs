@@ -1,14 +1,16 @@
-//! Host-side helpers for `[mask.<name>]` directory-masking blocks.
+//! Directory masking support on the host.
 //!
-//! Validates that each `paths` entry is a plain project-relative path
-//! (no leading `/` or `~`, no `..` segments), filters out disabled
-//! masks, and converts the config to the wire format the guest
-//! supervisor consumes.
+//! Validates the `[mask.<name>]` config blocks and converts them to the form
+//! that the guest supervisor uses. Also shows a summary of the masks in
+//! verbose mode.
 
 use crate::{cli, project, rpc};
 
-/// Validate config-level mask blocks and translate them into
-/// wire-format `MaskSpec`s. Disabled entries are filtered out.
+/// Validate the enabled mask blocks of the project config and convert them
+/// to the wire format.
+/// Returns:
+///   One [`rpc::MaskSpec`] for each enabled mask, or error if a path is not
+///   a plain project-relative path.
 pub fn build_specs(project: &project::Project) -> anyhow::Result<Vec<rpc::MaskSpec>> {
     project
         .config
@@ -27,6 +29,8 @@ pub fn build_specs(project: &project::Project) -> anyhow::Result<Vec<rpc::MaskSp
         .collect()
 }
 
+/// Make sure that `path` is a plain project-relative path: not empty, no
+/// leading `/` or `~`, and no `..` segments.
 fn validate_path(name: &str, idx: usize, path: &str) -> anyhow::Result<()> {
     if path.is_empty() {
         anyhow::bail!("mask.{name}.paths[{idx}]: empty path");
@@ -51,8 +55,8 @@ fn validate_path(name: &str, idx: usize, path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Verbose-only summary of declared masks. Disabled entries are
-/// filtered out. Mirrors `daemon::print_verbose`.
+/// Print a summary of the enabled masks in verbose mode. Same format as
+/// [`crate::daemon::print_verbose`].
 pub fn print_verbose(project: &project::Project) {
     let enabled: Vec<_> = project
         .config

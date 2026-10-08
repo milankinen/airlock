@@ -1,13 +1,7 @@
-//! `airlock exec` — attach a process to a running VM container.
+//! The `airlock exec` command.
 //!
-//! Walks up from the current working directory looking for
-//! `.airlock/sandbox/cli.sock` and connects there. The command,
-//! the caller's CWD, and any `-e KEY=VAL` overrides are forwarded
-//! to the `airlock start` process, which already holds the
-//! resolved sandbox environment (image env + `airlock.toml` env).
-//! The server merges overrides into that base and asks the
-//! supervisor to spawn the process. `exec` therefore never loads
-//! the project, the vault, or the settings itself.
+//! Runs a process in the container of a running sandbox. The `airlock start`
+//! process of that sandbox does the work.
 
 use std::path::PathBuf;
 
@@ -32,12 +26,19 @@ pub struct ExecArgs {
     /// Environment variables (KEY=VALUE)
     #[arg(short = 'e', long = "env")]
     pub env: Vec<String>,
-    /// Run the command inside a login shell (sources /etc/profile, ~/.profile)
+    /// Run the command in a login shell (reads /etc/profile, ~/.profile)
     #[arg(short = 'l', long)]
     pub login: bool,
 }
 
 /// Entry point for `airlock exec <cmd> [args...]`.
+/// Returns:
+///   Exit code of the process, or error if no sandbox runs.
+// The command, the caller's cwd and the `-e KEY=VAL` overrides go to the
+// `airlock start` process. That process has the resolved sandbox environment
+// (image env and `airlock.toml` env). It merges the overrides into that env
+// and tells the supervisor to start the process. Thus `exec` never loads the
+// project, the vault or the settings.
 pub async fn main(args: ExecArgs) -> anyhow::Result<i32> {
     let ExecArgs {
         cmd,
@@ -119,11 +120,12 @@ pub async fn main(args: ExecArgs) -> anyhow::Result<i32> {
     Ok(sandbox::io::drive(&proc, &mut terminal).await)
 }
 
-/// Walk up from `start` looking for `.airlock/sandbox/`. For each
-/// match resolve the CLI sock path — which is either that directory's
-/// `cli.sock` or a hash-keyed fallback under `~/.cache/airlock/sock/`
-/// when the in-sandbox path would exceed the `AF_UNIX` limit. Returns
-/// the first resolved path that exists on disk.
+/// Find the CLI socket of the nearest sandbox at or above `start`.
+/// Returns:
+///   The first socket path that exists, or `None`.
+// For each `.airlock/sandbox/` directory found, the socket path is that
+// directory's `cli.sock`. If that path is longer than the `AF_UNIX` limit,
+// the path is a hash-keyed fallback under `~/.cache/airlock/sock/`.
 fn find_cli_sock(start: &std::path::Path) -> Option<PathBuf> {
     for dir in start.ancestors() {
         let sandbox_dir = dir.join(".airlock").join("sandbox");

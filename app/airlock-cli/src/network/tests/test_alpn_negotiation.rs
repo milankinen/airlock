@@ -1,3 +1,6 @@
+//! Tests for ALPN negotiation in the TLS MITM: the guest and the upstream
+//! must agree on the same protocol through the proxy.
+
 use axum::Router;
 use axum::routing::get;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10,8 +13,16 @@ const H2: &[u8] = b"h2";
 
 type Alpn = &'static [&'static [u8]];
 
+/// Test that the MITM negotiates ALPN with the guest from what the guest
+/// and the upstream both offer. A wrong protocol makes the guest and the
+/// upstream speak different HTTP versions.
+///   1. Start one TLS upstream for each ALPN case
+///   2. Connect the guest over TLS with its ALPN offer
+///   3. Check the negotiated protocol (none when the upstream offers none)
+///   4. For HTTP/1.1 cases, send a GET and check the response
 #[test]
 fn mitm_negotiates_alpn_from_guest_offer() {
+    // Each case: upstream ALPN, guest ALPN, expected negotiated protocol.
     let cases: [(Alpn, Alpn, Option<&[u8]>); 4] = [
         (&[H1], &[H1], Some(H1)),
         (&[H2, H1], &[H1], Some(H1)),
@@ -37,6 +48,7 @@ fn mitm_negotiates_alpn_from_guest_offer() {
                 expected,
                 "upstream {upstream_alpn:?}, guest {guest_alpn:?}"
             );
+            // The guest sends raw HTTP/1.1 below, so skip the h2 case.
             if expected == Some(H2) {
                 continue;
             }

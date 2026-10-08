@@ -1,5 +1,5 @@
-//! Crate-level test helpers: a TUI driven by real terminal events and
-//! rendered into an in-memory buffer, and network event fixtures.
+//! Test helpers of the crate: a TUI that gets real terminal events and draws
+//! into a buffer in memory, and network events for tests.
 
 mod events;
 mod tui;

@@ -1,8 +1,11 @@
+//! Network events for tests of the monitor.
+
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::{ConnectInfo, DisconnectInfo, NetworkEvent, RequestInfo, ResponseInfo, TrafficInfo};
 
+/// A connection to `host:443` that the policy allowed or denied.
 pub(crate) fn connect(id: u64, host: &str, allowed: bool) -> NetworkEvent {
     NetworkEvent::Connect(Arc::new(ConnectInfo {
         id,
@@ -13,6 +16,7 @@ pub(crate) fn connect(id: u64, host: &str, allowed: bool) -> NetworkEvent {
     }))
 }
 
+/// The end of connection `id`.
 pub(crate) fn disconnect(id: u64) -> NetworkEvent {
     NetworkEvent::Disconnect(Arc::new(DisconnectInfo {
         id,
@@ -20,6 +24,7 @@ pub(crate) fn disconnect(id: u64) -> NetworkEvent {
     }))
 }
 
+/// Bytes sent (`up`) and received (`down`) on connection `id`.
 pub(crate) fn traffic(id: u64, up: u64, down: u64) -> NetworkEvent {
     NetworkEvent::Traffic(Arc::new(TrafficInfo { id, up, down }))
 }
@@ -29,6 +34,7 @@ pub(crate) fn request(id: u64, method: &str, path: &str, host: &str) -> NetworkE
     request_with(id, method, path, host, true, &[])
 }
 
+/// A request to `host:443` with the given policy result and headers.
 pub(crate) fn request_with(
     id: u64,
     method: &str,
@@ -49,10 +55,13 @@ pub(crate) fn request_with(
     }))
 }
 
+/// A response to request `id` without headers.
 pub(crate) fn response(id: u64, status: u16, denied: bool) -> NetworkEvent {
     response_with(id, status, denied, &[])
 }
 
+/// A response to request `id` with headers. `denied` is true if a
+/// middleware script denied the request.
 pub(crate) fn response_with(
     id: u64,
     status: u16,
@@ -67,6 +76,7 @@ pub(crate) fn response_with(
     }))
 }
 
+/// Copy header pairs into owned strings.
 fn owned(headers: &[(&str, &str)]) -> Vec<(String, String)> {
     headers
         .iter()

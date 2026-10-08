@@ -1,8 +1,8 @@
-//! TLS interception (MITM) for HTTP middleware.
+//! TLS interception (MITM).
 //!
-//! When a target has middleware attached, the proxy terminates the container's
-//! TLS, inspects/modifies HTTP traffic, then re-encrypts to the real server.
-//! Per-hostname leaf certificates are generated on demand and cached.
+//! Detects TLS traffic, ends the TLS session from the sandbox, and opens a new
+//! TLS session to the real server. The proxy can then read and change the
+//! plaintext HTTP traffic between them.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -21,10 +21,20 @@ use super::{io, tcp, traffic};
 use crate::network::target::ResolvedTarget;
 
 /// Accept a TLS handshake from the container (MITM) and wrap the decrypted
-/// stream in a `Transport`. The container sees a valid cert for its intended
-/// hostname signed by our CA. Returns the negotiated ALPN so the caller can
-/// either match it when dialing the real server (allow path) or use it to
-/// serve a denial (deny path) without reaching the upstream.
+/// stream in a [`io::Transport`]. The container sees a valid certificate for
+/// its intended host name, signed by the sandbox CA.
+/// Args:
+///  - `host`: Target host. Used if the ClientHello has no SNI.
+///  - `first`: Bytes already read from the container (the ClientHello)
+///  - `rx`: Receiver for more container bytes
+///  - `client_sink`: RPC sink for bytes to the container
+///  - `interceptor`: TLS interceptor that makes the certificates
+///  - `counter`: Optional byte counter for the Monitor tab.
+///
+/// Returns:
+///   The decrypted transport and the negotiated ALPN. On the allow path,
+///   the caller uses the same ALPN to connect to the real server. The deny
+///   path does not use the ALPN.
 pub async fn accept_container(
     host: &str,
     first: Bytes,
@@ -35,14 +45,12 @@ pub async fn accept_container(
 ) -> anyhow::Result<(io::Transport, Option<Bytes>)> {
     let sni_host = extract_sni(&first).unwrap_or_else(|| host.to_string());
     let rpc_io = io::RpcTransport::new(first, rx, client_sink);
-    // Byte counting goes *under* the TLS layer so the Monitor tab reports
-    // wire bytes — encrypted records plus the handshake, matching what a
-    // capture on the guest's interface would show. `first` is re-fed
-    // through this stream, so the ClientHello is counted too.
-    //
-    // Branching on the counter (rather than folding an `Option` into the
-    // wrapper) keeps the unwatched path free of any extra layer; the cost
-    // is one more monomorphization of `handshake`.
+    // Count bytes *below* the TLS layer, so the Monitor tab shows wire
+    // bytes: encrypted records and the handshake. `first` goes through this
+    // stream again, so the count includes the ClientHello.
+    // A branch on the counter (not an `Option` in the wrapper) keeps the
+    // path with no monitor free of extra layers. The cost is one more
+    // monomorphization of `handshake`.
     match counter {
         Some(c) => {
             handshake(
@@ -57,8 +65,16 @@ pub async fn accept_container(
     }
 }
 
-/// Terminate the container's TLS on `stream` and box the decrypted halves
-/// into a `Transport`.
+/// Terminate the container TLS on `stream`, with a timeout.
+/// Args:
+///  - `stream`: Raw container stream
+///  - `sni_host`: Host name for the leaf certificate
+///  - `interceptor`: TLS interceptor that makes the certificates
+///  - `host`: Target host, for logs.
+///
+/// Returns:
+///   The decrypted halves in a boxed [`io::Transport`], and the negotiated
+///   ALPN.
 async fn handshake<S: AsyncRead + AsyncWrite + Unpin + 'static>(
     stream: S,
     sni_host: &str,
@@ -89,8 +105,16 @@ async fn handshake<S: AsyncRead + AsyncWrite + Unpin + 'static>(
     ))
 }
 
-/// Dial the real server over TLS with matching ALPN. Only called on the
-/// allow path.
+/// Connect to the real server with TLS and a matching ALPN. Call it only
+/// on the allow path.
+/// Args:
+///  - `target`: Allowed target
+///  - `alpn`: ALPN that the container negotiated, if any
+///  - `tls_client`: TLS client config for upstream connections.
+///
+/// Returns:
+///   Server transport. Its `h2` flag shows the ALPN that the server
+///   selected.
 pub async fn connect_server(
     target: &ResolvedTarget,
     alpn: Option<&[u8]>,
@@ -99,14 +123,14 @@ pub async fn connect_server(
     let addr = format!("{}:{}", target.host, target.port);
     let server_stream = tcp::dial(target).await?;
     let mut config = (**tls_client).clone();
-    // Offer the container's pick first, but always keep http/1.1 as a
-    // fallback. We advertise h2 to the container long before we know what the
-    // upstream supports, and an upstream that only speaks http/1.1 aborts the
-    // handshake with `no_application_protocol` when h2 is all we offer —
-    // which reaches the guest as a bare FIN mid-TLS ("unexpected eof").
-    // Protocols don't have to match across the proxy: the HTTP relay picks
-    // its upstream client from the *server's* negotiated protocol, so an h2
-    // container talking to an http/1.1 server is a supported bridge.
+    // Offer the protocol of the container first, but always keep http/1.1
+    // as a fallback. The proxy offers h2 to the container before it knows
+    // what the upstream supports. If the proxy offers only h2, an
+    // http/1.1-only upstream stops the handshake with
+    // `no_application_protocol`. The guest then gets a bare FIN in the
+    // middle of TLS ("unexpected eof").
+    // The two sides can use different protocols. The HTTP relay selects its
+    // upstream client from the protocol of the *server*.
     config.alpn_protocols = match alpn {
         Some(proto) if proto != b"http/1.1" => vec![proto.to_vec(), b"http/1.1".to_vec()],
         Some(proto) => vec![proto.to_vec()],
@@ -126,14 +150,18 @@ pub async fn connect_server(
     })
 }
 
-/// TLS interceptor with per-hostname cert caching.
+/// TLS interceptor that makes a leaf certificate for each host name when
+/// necessary, and caches it.
 pub struct TlsInterceptor {
     issuer: Issuer<'static, KeyPair>,
     cache: Cache<String, Arc<ServerConfig>>,
 }
 
 impl TlsInterceptor {
-    /// Create an interceptor from the project CA certificate and private key.
+    /// Make an interceptor from the PEM-encoded project CA certificate and
+    /// private key.
+    /// Returns:
+    ///   The interceptor, or error if the PEM data is not valid.
     pub fn new(ca_cert_pem: &str, ca_key_pem: &str) -> anyhow::Result<Self> {
         let ca_key = KeyPair::from_pem(ca_key_pem)?;
         let issuer = Issuer::from_ca_cert_pem(ca_cert_pem, ca_key)?;
@@ -144,7 +172,10 @@ impl TlsInterceptor {
         })
     }
 
-    /// Perform TLS server-side handshake, returning the negotiated ALPN protocol.
+    /// Do the server-side TLS handshake with a leaf certificate for
+    /// `hostname`.
+    /// Returns:
+    ///   The TLS stream and the negotiated ALPN protocol.
     pub async fn accept<S: AsyncRead + AsyncWrite + Unpin>(
         &self,
         stream: S,
@@ -161,8 +192,8 @@ impl TlsInterceptor {
         Ok((tls_stream, alpn))
     }
 
-    /// Get or generate a TLS server config with a leaf cert for `hostname`,
-    /// signed by the project CA.
+    /// Get or make a TLS server config with a leaf certificate for
+    /// `hostname`, signed by the project CA.
     fn get_or_create_config(&self, hostname: &str) -> anyhow::Result<Arc<ServerConfig>> {
         if let Some(config) = self.cache.get(hostname) {
             return Ok(config);
@@ -183,8 +214,8 @@ impl TlsInterceptor {
         let mut config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![cert_der], key_der)?;
-        // Offer both h2 and h1.1 — we'll match the container's choice when
-        // connecting to the real server.
+        // Offer h2 and h1.1. The connection to the real server uses the
+        // selection of the container.
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let config = Arc::new(config);
 
@@ -193,16 +224,17 @@ impl TlsInterceptor {
     }
 }
 
-/// Read from the channel until we can determine if the stream is TLS.
-///
-/// Returns `(true, buf)` if TLS handshake detected, `(false, buf)` otherwise.
-/// The buffer always contains the consumed bytes for re-feeding as prefix.
+/// Read from the channel until it is known if the stream is TLS.
+/// Returns:
+///   `(true, buf)` if the stream starts with a TLS handshake record,
+///   `(false, buf)` if not. `buf` always contains the bytes that were read,
+///   so the caller can use them again as a prefix.
 pub async fn detect(rx: &mut mpsc::Receiver<Bytes>) -> (bool, Bytes) {
     use tls_parser::{TlsRecordType, parse_tls_record_header};
 
     let mut buf = bytes::BytesMut::new();
 
-    // Read until we have at least 5 bytes (TLS record header)
+    // Read at least 5 bytes (the TLS record header).
     while buf.len() < 5 {
         let Some(data) = rx.recv().await else {
             return (false, buf.freeze());
@@ -210,13 +242,13 @@ pub async fn detect(rx: &mut mpsc::Receiver<Bytes>) -> (bool, Bytes) {
         buf.extend_from_slice(&data);
     }
 
-    // Parse record header — check if it's a handshake record
+    // Parse the record header and make sure that it is a handshake record.
     let hdr = match parse_tls_record_header(&buf) {
         Ok((_, hdr)) if hdr.record_type == TlsRecordType::Handshake => hdr,
         _ => return (false, buf.freeze()),
     };
 
-    // Read until we have the full record (header + payload)
+    // Read the full record (header and payload).
     let record_len = 5 + hdr.len as usize;
     while buf.len() < record_len {
         let Some(data) = rx.recv().await else {
@@ -228,7 +260,9 @@ pub async fn detect(rx: &mut mpsc::Receiver<Bytes>) -> (bool, Bytes) {
     (true, buf.freeze())
 }
 
-/// Extract SNI hostname from a buffered TLS ClientHello.
+/// Get the SNI host name from a buffered TLS ClientHello.
+/// Returns:
+///   The host name, or `None` if the buffer has no ClientHello with SNI.
 pub fn extract_sni(buf: &[u8]) -> Option<String> {
     use tls_parser::{
         TlsExtension, TlsMessage, TlsMessageHandshake, parse_tls_extensions, parse_tls_plaintext,

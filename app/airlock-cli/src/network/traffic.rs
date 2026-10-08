@@ -1,21 +1,7 @@
-//! Per-connection byte accounting for the Monitor tab's up/down column.
+//! Byte counting for each connection.
 //!
-//! Counting attaches to the raw RPC stream carrying the guest's
-//! connection, *underneath* any TLS the proxy terminates. The figures are
-//! therefore wire bytes: encrypted records and handshake included, which
-//! is what a packet capture on the guest's interface would show.
-//!
-//! Two entry points, because the TLS and plain paths reach this at
-//! different points in the stack. [`count_stream`] wraps a duplex stream
-//! before the TLS layer is built on top of it; [`count`] wraps an already
-//! split [`Transport`] on the plain and passthrough paths, where the raw
-//! stream *is* the transport.
-//!
-//! The whole thing is opt-in per connection: [`TrafficCounter::new`]
-//! returns `None` when nothing is subscribed to the event channel, and
-//! both wrappers are then skipped entirely — no per-byte work and no
-//! extra layer in the stack. Non-monitor runs pay one `receiver_count()`
-//! check at connection setup and nothing else.
+//! Counts the bytes that each connection sends and receives, for the up/down
+//! column of the Monitor tab. Counts TLS, plain and passthrough connections.
 
 use std::cell::Cell;
 use std::pin::Pin;
@@ -28,27 +14,37 @@ use tokio::sync::broadcast;
 
 use super::io::{BoxRead, BoxWrite, Transport};
 
-/// Minimum gap between two `Traffic` events for the same connection.
-/// A busy relay moves chunks far faster than the TUI can redraw, so
-/// without this the event channel would be swamped for no visible gain.
+/// Minimum time between two `Traffic` events for the same connection.
+/// A busy relay moves chunks much faster than the TUI can draw. Without this
+/// limit, too many events would fill the event channel, with no visible
+/// benefit.
 const EMIT_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Accumulates byte counts for one connection and emits throttled
-/// `Traffic` events as they change.
+/// Byte counts of one connection. Sends throttled `Traffic` events when
+/// the counts change.
+///
+/// The counter is on the raw RPC stream of the guest connection, *below*
+/// the TLS that the proxy terminates. Thus the counts are wire bytes,
+/// including encrypted records and the handshake. A packet capture on the
+/// guest interface would show the same counts.
 pub struct TrafficCounter {
     id: u64,
     up: Cell<u64>,
     down: Cell<u64>,
-    /// Totals as of the last emitted event — used to skip emitting when
-    /// nothing moved since.
+    /// Totals of the last sent event. Used to send no event when the totals
+    /// did not change.
     sent: Cell<(u64, u64)>,
     last_emit: Cell<Instant>,
     events: broadcast::Sender<airlock_monitor::NetworkEvent>,
 }
 
 impl TrafficCounter {
-    /// Create a counter for connection `id`, or `None` when no one is
-    /// listening — the caller then skips wrapping the transport entirely.
+    /// Make a counter for connection `id`.
+    /// Returns:
+    ///   The counter, or `None` if the event channel has no subscribers.
+    ///   With `None`, the caller does not wrap the transport. Then there is
+    ///   no work for each byte and no extra layer. Runs without the monitor
+    ///   do only one `receiver_count()` check when the connection starts.
     pub fn new(
         id: u64,
         events: &broadcast::Sender<airlock_monitor::NetworkEvent>,
@@ -76,16 +72,16 @@ impl TrafficCounter {
         self.maybe_emit();
     }
 
-    /// Emit if the throttle window has elapsed and the totals moved.
+    /// Send an event if the throttle window is over and the totals changed.
     fn maybe_emit(&self) {
         if self.last_emit.get().elapsed() >= EMIT_INTERVAL {
             self.emit();
         }
     }
 
-    /// Emit the current totals unconditionally, as long as they differ
-    /// from what was last sent. Called on connection close so a short
-    /// transfer that never outlived the throttle window still reports.
+    /// Send the current totals now, if they are different from the last
+    /// sent totals. Call it when the connection closes. Then a short
+    /// transfer that ends before the throttle window also sends a report.
     pub fn flush(&self) {
         self.emit();
     }
@@ -110,9 +106,10 @@ impl TrafficCounter {
     }
 }
 
-/// Wrap a duplex container-side stream so bytes crossing it are counted.
-/// Used on the TLS path, where counting has to sit *below* the TLS layer
-/// and the stream hasn't been split into halves yet.
+/// Wrap a duplex container-side stream to count the bytes that go through
+/// it. Use it on the TLS path, before the TLS layer is added on top. There
+/// the counter must be *below* the TLS layer, and the stream is not yet
+/// split into halves.
 pub fn count_stream<S>(inner: S, counter: &Rc<TrafficCounter>) -> CountingStream<S> {
     CountingStream {
         inner,
@@ -120,8 +117,9 @@ pub fn count_stream<S>(inner: S, counter: &Rc<TrafficCounter>) -> CountingStream
     }
 }
 
-/// Duplex counterpart to [`CountingRead`] / [`CountingWrite`]. Generic
-/// rather than boxed so the TLS handshake keeps its concrete stream type.
+/// Duplex stream that counts bytes. The duplex version of [`CountingRead`]
+/// and [`CountingWrite`]. It is generic, not boxed, so the TLS handshake
+/// keeps its concrete stream type.
 pub struct CountingStream<S> {
     inner: S,
     counter: Rc<TrafficCounter>,
@@ -183,13 +181,19 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<S> {
     }
 }
 
-/// Wrap a container-side transport so bytes crossing it are counted.
-/// Reads from the container are "up" (guest → server); writes to it are
-/// "down" (server → guest). A `None` counter returns `t` unchanged.
+/// Wrap a container-side transport to count the bytes that go through it.
+/// Reads from the container are "up" (guest to server). Writes to the
+/// container are "down" (server to guest).
 ///
-/// Only correct where the transport *is* the raw stream — the plain-HTTP
-/// and passthrough paths. The TLS path uses [`count_stream`] instead, or
-/// it would count decrypted payload rather than wire bytes.
+/// Use it only where the transport *is* the raw stream: the plain HTTP and
+/// passthrough paths. The TLS path uses [`count_stream`]. If not, it counts
+/// decrypted payload, not wire bytes.
+/// Args:
+///  - `t`: Container-side transport
+///  - `counter`: Counter, or `None` for no counting.
+///
+/// Returns:
+///   The wrapped transport, or `t` with no change if `counter` is `None`.
 pub fn count(t: Transport, counter: Option<&Rc<TrafficCounter>>) -> Transport {
     let Some(counter) = counter else {
         return t;
@@ -207,6 +211,7 @@ pub fn count(t: Transport, counter: Option<&Rc<TrafficCounter>>) -> Transport {
     }
 }
 
+/// Read half that counts the bytes read ("up").
 struct CountingRead {
     inner: BoxRead,
     counter: Rc<TrafficCounter>,
@@ -230,6 +235,7 @@ impl AsyncRead for CountingRead {
     }
 }
 
+/// Write half that counts the bytes written ("down").
 struct CountingWrite {
     inner: BoxWrite,
     counter: Rc<TrafficCounter>,
@@ -256,9 +262,9 @@ impl AsyncWrite for CountingWrite {
         Pin::new(&mut *self.inner).poll_shutdown(cx)
     }
 
-    // Forwarded rather than left to the default so a vectored writer
-    // underneath keeps its fast path — the h2 client writes frame
-    // headers and payloads as separate slices.
+    // Forward this call, and do not use the default. Then a vectored writer
+    // below keeps its fast path. The h2 client writes frame headers and
+    // payloads as separate slices.
     fn poll_write_vectored(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,

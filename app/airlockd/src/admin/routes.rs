@@ -1,4 +1,4 @@
-//! HTTP handlers for the admin service.
+//! HTTP endpoints of the admin service.
 
 pub mod claude_hook_post_tool_use;
 pub mod claude_hook_post_tool_use_failure;

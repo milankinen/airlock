@@ -1,10 +1,9 @@
-//! What is installed on the sandbox disk: `.airlock/sandbox/installs.json`.
+//! Pack install state.
 //!
-//! One record per pack. A pack whose script exited 0 is `unconfirmed`
-//! until the install VM confirmed its disk sync at shutdown; only then is
-//! it `installed` ([`promote`]). The file lives next to the disk image,
-//! so `airlock rm` deletes both together. Every read validates the
-//! fields; a file that fails is `Corrupt`.
+//! Records which packs are installed on the sandbox disk, and with which
+//! definition. The record also tells if the install is confirmed on disk.
+//! Pack installation reads this state to decide what to install, and
+//! updates it when an install completes.
 
 use std::collections::BTreeMap;
 
@@ -13,31 +12,36 @@ use serde::{Deserialize, Serialize};
 use super::plan::Transition;
 use crate::util::{self, PinnedDir};
 
-/// File name in the sandbox directory.
+/// File name in the sandbox directory. The file is next to the disk image,
+/// thus `airlock rm` deletes both together.
 pub const STATE_FILE: &str = "installs.json";
 /// Current format version.
 const STATE_VERSION: u32 = 1;
-/// Largest state file read.
+/// Maximum size of the state file to read.
 const STATE_CAP: u64 = 256 * 1024;
 
-/// The install status of one pack.
+/// Install status of one pack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "lowercase")]
 pub enum PackStatus {
-    /// The script exited 0; the disk sync is not confirmed yet.
+    /// The script exited 0, but the disk sync is not confirmed yet. The
+    /// pack stays `unconfirmed` until the install VM confirms its disk sync
+    /// at shutdown (see [`promote`]).
     Unconfirmed,
+    /// The script exited 0 and the disk sync is confirmed.
     Installed,
+    /// The script failed.
     Failed,
-    /// Removed from the config; the user chose to keep it on the disk.
-    /// `confirmed`: the record was `installed` (not `unconfirmed`) then.
-    Kept {
-        confirmed: bool,
-    },
+    /// The pack was removed from the config, and the user chose to keep it
+    /// on the disk. `confirmed` is true if the record was `installed` (not
+    /// `unconfirmed`) at that time.
+    Kept { confirmed: bool },
 }
 
-/// The record of one pack.
+/// Install record of one pack.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
+    /// Install status.
     #[serde(flatten)]
     pub status: PackStatus,
     /// [`crate::packs::InstallerScript::fingerprint`] of the install run.
@@ -46,28 +50,31 @@ pub struct Record {
     pub at: u64,
 }
 
-/// The persisted install state.
+/// Persisted install state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstallState {
+    /// Format version of the file.
     pub version: u32,
-    /// [`crate::project::disk_id`] of the disk the records describe.
+    /// [`crate::project::disk_id`] of the disk that the records describe.
     #[serde(default)]
     pub disk: Option<(u64, u64)>,
-    /// The image the records were installed on.
+    /// Image that the packs were installed on.
     #[serde(default)]
     pub image_id: Option<String>,
+    /// Install records by pack name.
     #[serde(default)]
     pub packs: BTreeMap<String, Record>,
-    /// A normal (non-install) session ran on the disk since the last
-    /// install boot: code it left can run in the next install boot, so a
-    /// retry asks first ([`super::plan::Why::Retry`]). A file without the
-    /// field counts as `true`.
+    /// True if a normal (non-install) session ran on the disk after the
+    /// last install boot. Code that the session left can run in the next
+    /// install boot, thus a retry asks first (see
+    /// [`super::plan::Why::Retry`]). A file without the field counts as
+    /// `true`.
     #[serde(default = "session_unknown")]
     pub ran_session: bool,
 }
 
-/// [`InstallState::ran_session`] of a file without the field: assume a
-/// session ran.
+/// Default of [`InstallState::ran_session`] for a file without the field.
+/// Assume that a session ran.
 fn session_unknown() -> bool {
     true
 }
@@ -85,14 +92,15 @@ impl Default for InstallState {
 }
 
 impl InstallState {
-    /// Whether `id` has an `installed` record.
+    /// Check if the pack `id` has an `installed` record.
     pub fn is_installed(&self, id: &str) -> bool {
         self.packs
             .get(id)
             .is_some_and(|r| r.status == PackStatus::Installed)
     }
 
-    /// Set the record of `id`.
+    /// Set the record of the pack `id`. The record time is the current
+    /// time.
     pub fn set(&mut self, id: &str, status: PackStatus, fingerprint: &str) {
         self.packs.insert(
             id.to_string(),
@@ -105,19 +113,26 @@ impl InstallState {
     }
 }
 
-/// The result of reading the state file.
+/// Result of reading the state file.
 #[derive(Debug)]
 pub enum ReadState {
     /// No state yet.
     Absent,
+    /// Valid state.
     Ok(InstallState),
-    /// Unreadable or invalid; the reason is safe to show.
+    /// The file is not readable or not valid. The reason is safe to show.
     Corrupt(String),
     /// Written by a newer airlock.
     TooNew(u32),
 }
 
-/// Read and validate the state in `dir` (the sandbox directory).
+/// Read and validate the state file.
+/// Args:
+///  - `dir`: The sandbox directory
+///
+/// Returns:
+///   The state, or why it is not available. A file with an invalid field
+///   is `Corrupt`.
 pub fn read(dir: &PinnedDir) -> ReadState {
     let value: serde_json::Value = match util::read_json(dir, STATE_FILE, STATE_CAP) {
         Ok(None) => return ReadState::Absent,
@@ -142,12 +157,13 @@ pub fn read(dir: &PinnedDir) -> ReadState {
     }
 }
 
-/// Write `state` to `dir` (atomic, 0600).
+/// Write `state` to the sandbox directory `dir`. The write is atomic and
+/// the file mode is 0600.
 pub fn write(dir: &PinnedDir, state: &InstallState) -> anyhow::Result<()> {
     util::write_json(dir, STATE_FILE, state, 0o600)
 }
 
-/// Reject fields that are shown on the terminal or compared as ids.
+/// Check the fields that the terminal shows or that are compared as IDs.
 fn validate(state: &InstallState) -> Result<(), String> {
     for (id, record) in &state.packs {
         let well_formed = !id.is_empty()
@@ -172,8 +188,11 @@ fn validate(state: &InstallState) -> Result<(), String> {
     Ok(())
 }
 
-/// Apply `transitions` (from [`super::plan::decide`] and the answers to
-/// the removed-packs prompt) to `state`.
+/// Apply record changes to `state`.
+/// Args:
+///  - `state`: The install state to change
+///  - `transitions`: Changes from [`super::plan::decide`] and from the
+///    answers to the removed-packs prompt
 pub fn apply(state: &mut InstallState, transitions: &[Transition]) {
     for t in transitions {
         match t {
@@ -202,8 +221,10 @@ pub fn apply(state: &mut InstallState, transitions: &[Transition]) {
     }
 }
 
-/// After a synced shutdown: the `unconfirmed` records of `ids` (the packs
-/// that exited 0 in that boot) are `installed`.
+/// Mark `unconfirmed` records as `installed` after a synced shutdown.
+/// Args:
+///  - `state`: The install state to change
+///  - `ids`: The packs whose script exited 0 in that boot
 pub fn promote(state: &mut InstallState, ids: &[String]) {
     for (id, r) in &mut state.packs {
         if r.status == PackStatus::Unconfirmed && ids.contains(id) {
@@ -212,6 +233,7 @@ pub fn promote(state: &mut InstallState, ids: &[String]) {
     }
 }
 
+/// Current Unix time in seconds.
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -220,15 +242,19 @@ fn now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    //! Tests of how the install state file is read and how records change.
+
     use std::path::Path;
 
     use super::*;
     use crate::test_cfg::temp_dir;
 
+    /// A fingerprint of 64 copies of `c`.
     fn fp(c: char) -> String {
         c.to_string().repeat(64)
     }
 
+    /// A record with `status`.
     fn record(status: PackStatus) -> Record {
         Record {
             status,
@@ -237,6 +263,16 @@ mod tests {
         }
     }
 
+    /// Test that the reader refuses a state file that is malformed, was
+    /// changed by hand, or comes from a newer airlock. Bad content must not
+    /// reach the install plan or the terminal.
+    ///   1. Check that a missing file reads as absent
+    ///   2. Write bad JSON, bad fields, control characters in names and
+    ///      a bad fingerprint, and check that each reads as corrupt
+    ///   3. Check that a newer version reads as too new
+    ///   4. Check that a kept record without `confirmed` reads as corrupt
+    ///   5. Check that a file without `ran_session` reads as if a session
+    ///      ran
     #[test]
     fn reading_malformed_tampered_or_newer_state_file_is_refused() {
         let tmp = temp_dir();
@@ -254,6 +290,7 @@ mod tests {
             r#"{"version": 0}"#.to_string(),
             r#"{"version": 1, "packs": 5}"#.to_string(),
             pack("x", "weird", &fingerprint),
+            // A terminal escape sequence in the pack name.
             pack("\\u001b[31mx", "installed", &fingerprint),
             pack("x", "installed", "zz"),
             r#"{"version": 1, "image_id": "sha\n"}"#.to_string(),
@@ -284,6 +321,14 @@ mod tests {
         ));
     }
 
+    /// Test that keeping a removed pack records if its install was
+    /// confirmed, and that only a promote transition changes a kept record.
+    ///   1. Keep one installed and one unconfirmed pack
+    ///   2. Check that the kept records tell which one was confirmed
+    ///   3. Apply a promote transition to the first and check that it is
+    ///      installed
+    ///   4. Promote the second after a synced shutdown and check that it
+    ///      stays kept
     #[test]
     fn keeping_removed_packs_records_whether_install_was_confirmed() {
         let mut state = InstallState::default();

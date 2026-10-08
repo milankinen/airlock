@@ -1,8 +1,17 @@
+//! A refresh that a sign-out overtakes: the proxy must not keep or leak the
+//! new tokens of the provider.
+
 use serde_json::json;
 
 use crate::services::ServiceId;
 use crate::test_cfg::provider::*;
 
+/// Test that a refresh that ends after a sign-out revokes its new tokens
+/// upstream. Otherwise the provider keeps a live grant that no store holds.
+///   1. Sign in, then send a refresh that the provider holds
+///   2. While the provider holds it, sign out and check that the grant is gone
+///   3. Release the refresh and check that the guest gets no tokens
+///   4. Check that the proxy revokes the new real refresh token upstream
 #[test]
 fn refresh_finishing_after_sign_out_revokes_its_new_tokens_upstream() {
     for service in [ServiceId::Anthropic, ServiceId::Openai] {
@@ -15,6 +24,8 @@ fn refresh_finishing_after_sign_out_revokes_its_new_tokens_upstream() {
                 "client_id": client_id(service),
             });
             let refresh = r.post_token(&body);
+            // The sign-out starts only when the refresh is at the provider.
+            // Thus the sign-out always completes in the middle of the refresh.
             let sign_out = async {
                 gate.arrived.notified().await;
                 let resp = r

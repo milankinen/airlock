@@ -1,13 +1,13 @@
-//! Merges multiple Unix signals into a single async stream.
+//! Host signals for the guest.
 //!
-//! The signal numbers emitted are Linux signal numbers (not host numbers),
-//! because they are forwarded to the Linux VM process.
+//! Catches the host signals that airlock forwards to the guest, and gives
+//! them as one stream.
 
 use async_stream::stream;
 use tokio::signal::unix::{SignalKind, signal};
 
-// Linux signal numbers — the target is always the Linux VM,
-// regardless of the host platform.
+// Linux signal numbers, not host numbers: the target is always the Linux VM,
+// on all host platforms.
 const SIGHUP: i32 = 1;
 const SIGINT: i32 = 2;
 const SIGQUIT: i32 = 3;

@@ -1,17 +1,16 @@
-//! Isolated throughput benchmark for the guest-side TUN/smoltcp stack.
+//! Throughput benchmark of the guest half of the TCP tunnel (TUN and
+//! smoltcp), without vsock and the host proxy.
 //!
-//! Runs the real [`tcp_proxy`] poll loop on a private TUN (`bench1`)
-//! against an in-process mock `NetworkProxy` that blasts bytes at the
-//! guest as fast as the fire-and-forget CLI write path does. This
-//! isolates the guest-side half of the tunnel — TUN syscalls, smoltcp,
-//! the poll loop and the RPC channel plumbing — from vsock and the
-//! host-side proxy, so a per-connection throughput ceiling can be
-//! attributed to one side or the other.
+//! The benchmark runs the real [`tcp_proxy`] poll loop on a private TUN
+//! device. A mock `NetworkProxy` in the same process sends bytes to the
+//! guest as fast as the fire-and-forget write path of the CLI does. Thus
+//! the result shows if a speed limit per connection is on the guest side
+//! (TUN syscalls, smoltcp, poll loop, RPC channel) or on the host side.
 //!
-//! Creating TUN devices requires root + CAP_NET_ADMIN, so the benchmark
-//! is double-gated: compile it in with the `tun-bench` feature, then run
-//! it (inside the sandbox VM) with `--ignored`. Serial execution keeps
-//! the (process-global) loop counters per-test:
+//! A TUN device needs root and CAP_NET_ADMIN. Thus two gates apply: compile
+//! with the `tun-bench` feature, then run with `--ignored` in the sandbox VM.
+//! The loop counters are global to the process. Run the tests one at a time,
+//! so that each test gets its own counter values:
 //!
 //! ```sh
 //! cargo test -p airlockd --release --features tun-bench tun_bench -- \
@@ -31,22 +30,29 @@ use super::dns::DnsState;
 use super::tcp_proxy::spawn_poll_loop;
 use super::tun::Tun;
 
+/// Netmask of the TUN address and of the route to the mock server.
 const NETMASK: [u8; 4] = [255, 255, 255, 0];
 
+/// Bytes that each benchmark sends through the tunnel.
 const TOTAL: usize = 64 * 1024 * 1024;
-/// Mimics the CLI's write granularity: one TLS record ≈ 16 KiB.
+/// Write size of the CLI: one TLS record is approximately 16 KiB.
 const CHUNK: usize = 16 * 1024;
 
-/// Per-test network parameters — tests run in parallel threads, so each
-/// gets its own TUN device and subnet.
+/// Network values of one test. Tests can run in parallel threads, so each
+/// test has its own TUN device and subnet.
 struct BenchNet {
     tun_name: &'static str,
     tun_ip: [u8; 4],
-    /// Subnet routed into the TUN; the mock "server" lives here.
+    /// Subnet that is routed into the TUN. The mock server is in it.
     dst_net: [u8; 4],
     dst_ip: [u8; 4],
 }
 
+/// Measure the download speed from the host to a guest TCP client through
+/// the TUN stack.
+///   1. Start the poll loop with a mock proxy that sends 64 MiB to the guest
+///   2. Connect a TCP client through the TUN and read to EOF
+///   3. Check that all bytes arrived and print the speed and loop counters
 #[test]
 #[ignore = "needs root + /dev/net/tun; run inside the sandbox VM"]
 fn tun_bench_download() {
@@ -70,6 +76,12 @@ fn tun_bench_download() {
     });
 }
 
+/// Measure the upload speed from a guest TCP client to the host through the
+/// TUN stack.
+///   1. Start the poll loop with a mock proxy that counts the received bytes
+///   2. Connect a TCP client through the TUN, write 64 MiB and close
+///   3. Check that the proxy got all bytes and that the client gets EOF
+///   4. Print the speed and loop counters
 #[test]
 #[ignore = "needs root + /dev/net/tun; run inside the sandbox VM"]
 fn tun_bench_upload() {
@@ -93,8 +105,8 @@ fn tun_bench_upload() {
     });
 }
 
-/// Shared harness: bring up the TUN, run the poll loop against the mock
-/// proxy, hand a connected `TcpStream` to `body`, and report throughput.
+/// Run one benchmark. Create the TUN and start the poll loop with the mock
+/// proxy. Then give a connected `TcpStream` to `body` and print the speed.
 fn run_bench<F, Fut>(net: &BenchNet, mode: Mode, body: F)
 where
     F: FnOnce(tokio::net::TcpStream) -> Fut,
@@ -124,6 +136,8 @@ where
     rt.block_on(local.run_until(async move {
         let tun = Tun::create(net.tun_name).expect("create TUN (root + CAP_NET_ADMIN required)");
         setup_iface(net);
+        // Turn off the reverse path filter, so that the kernel does not drop
+        // packets that come in on the TUN.
         let _ = std::fs::write(
             format!("/proc/sys/net/ipv4/conf/{}/rp_filter", net.tun_name),
             "0",
@@ -169,20 +183,20 @@ where
     }));
 }
 
-// ── Mock host-side proxy ────────────────────────────────
+// ── Mock proxy of the host ──────────────────────────────
 
-/// Which direction the mock exercises.
+/// The direction that the mock tests.
 #[derive(Clone, Copy)]
 enum Mode {
-    /// Blast `TOTAL` bytes into the guest sink with the same
-    /// fire-and-forget pattern the CLI's `RpcTransport::poll_write`
-    /// uses, then close.
+    /// Send `TOTAL` bytes to the guest sink and then close. The sends do not
+    /// wait for replies, as in `RpcTransport::poll_write` of the CLI.
     Download,
-    /// Discard guest bytes; when the guest closes its side, close ours
-    /// so the benchmark client sees a clean EOF.
+    /// Count and discard the guest bytes. When the guest closes its side,
+    /// close the host side, so that the client gets a clean EOF.
     Upload,
 }
 
+/// Mock `NetworkProxy` of the host for one direction.
 struct MockProxy(Mode);
 
 impl network_proxy::Server for MockProxy {
@@ -203,9 +217,9 @@ impl network_proxy::Server for MockProxy {
                         req.get().set_data(&buf[..n]);
                         drop(req.send());
                         sent += n;
-                        // Let the single-threaded RPC connection drain
-                        // between chunks — the real sender lives in
-                        // another process.
+                        // Let the RPC connection send its queue between
+                        // chunks. It runs on the same thread, but the real
+                        // sender is in a different process.
                         tokio::task::yield_now().await;
                     }
                     let _ = client.close_request().send().promise.await;
@@ -229,7 +243,7 @@ impl network_proxy::Server for MockProxy {
     }
 }
 
-/// Guest → host sink: accept and drop everything.
+/// Sink from the guest to the host that accepts all data and discards it.
 struct DiscardSink;
 
 impl tcp_sink::Server for DiscardSink {
@@ -246,8 +260,9 @@ impl tcp_sink::Server for DiscardSink {
     }
 }
 
-/// Guest → host sink for the upload benchmark: count bytes, and mirror
-/// the guest's close back so the client's final `read` returns EOF.
+/// Sink from the guest to the host for the upload benchmark. It counts the
+/// bytes. When the guest closes, it closes the host side, so that the last
+/// `read` of the client returns EOF.
 struct CountingSink {
     client: tcp_sink::Client,
     received: Cell<u64>,
@@ -271,8 +286,8 @@ impl tcp_sink::Server for CountingSink {
     }
 }
 
-/// Wire a `MockProxy` up over a real two-party RPC connection (tokio
-/// duplex standing in for the vsock), like the CLI does in production.
+/// Connect a `MockProxy` through a real two-party RPC connection, as the CLI
+/// does in production. A tokio duplex stream is used in place of the vsock.
 fn start_mock_proxy(mode: Mode) -> network_proxy::Client {
     let (client_stream, server_stream) = tokio::io::duplex(1024 * 1024);
 
@@ -301,11 +316,11 @@ fn start_mock_proxy(mode: Mode) -> network_proxy::Client {
     proxy
 }
 
-// ── Interface bring-up via ioctl ────────────────────────
+// ── Interface setup with ioctl ──────────────────────────
 //
-// The benchmark environment has no /sbin/ip (production bring-up shells
-// out to it), so address/netmask/UP/route are done with the classic
-// SIOC* ioctls directly.
+// The benchmark environment has no /sbin/ip, which the production setup
+// runs. Thus the address, netmask, UP flag and route are set with the
+// SIOC* ioctls.
 
 const SIOCSIFADDR: libc::Ioctl = 0x8916;
 const SIOCSIFNETMASK: libc::Ioctl = 0x891c;
@@ -313,6 +328,7 @@ const SIOCGIFFLAGS: libc::Ioctl = 0x8913;
 const SIOCSIFFLAGS: libc::Ioctl = 0x8914;
 const SIOCADDRT: libc::Ioctl = 0x890B;
 
+/// `struct ifreq` with an address, for SIOCSIFADDR and SIOCSIFNETMASK.
 #[repr(C)]
 struct IfreqAddr {
     name: [u8; libc::IFNAMSIZ],
@@ -320,6 +336,7 @@ struct IfreqAddr {
     _pad: [u8; 8],
 }
 
+/// `struct ifreq` with flags, for SIOCGIFFLAGS and SIOCSIFFLAGS.
 #[repr(C)]
 struct IfreqFlags {
     name: [u8; libc::IFNAMSIZ],
@@ -327,7 +344,8 @@ struct IfreqFlags {
     _pad: [u8; 22],
 }
 
-// Field names mirror the kernel's `struct rtentry` (net/route.h).
+/// Route entry for SIOCADDRT. The field names are the same as in the kernel
+/// `struct rtentry` (net/route.h).
 #[repr(C)]
 #[allow(clippy::struct_field_names)]
 struct RtEntry {
@@ -346,28 +364,34 @@ struct RtEntry {
     rt_irtt: libc::c_ushort,
 }
 
+/// Make an IPv4 socket address with port 0.
 fn sockaddr_in(ip: [u8; 4]) -> libc::sockaddr_in {
     #[allow(clippy::cast_possible_truncation)]
     let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
     sa.sin_family = libc::AF_INET as libc::sa_family_t;
-    sa.sin_addr.s_addr = u32::from_ne_bytes(ip); // network order == byte order
+    sa.sin_addr.s_addr = u32::from_ne_bytes(ip); // Network order is the byte order of `ip`.
     sa
 }
 
+/// Convert an IPv4 socket address to the generic `sockaddr`.
 fn as_sockaddr(sa: libc::sockaddr_in) -> libc::sockaddr {
     unsafe { std::mem::transmute(sa) }
 }
 
+/// Make the fixed-size interface name for an `ifreq`.
 fn ifname(name: &str) -> [u8; libc::IFNAMSIZ] {
     let mut buf = [0u8; libc::IFNAMSIZ];
     buf[..name.len()].copy_from_slice(name.as_bytes());
     buf
 }
 
+/// Panic with `what` and the OS error if `ret` is negative.
 fn check(what: &str, ret: libc::c_int) {
     assert!(ret >= 0, "{what}: {}", std::io::Error::last_os_error());
 }
 
+/// Set the address and netmask of the TUN, set it UP, and add a route to
+/// the subnet of the mock server.
 fn setup_iface(net: &BenchNet) {
     unsafe {
         let sock = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);

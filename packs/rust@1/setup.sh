@@ -1,18 +1,18 @@
 # Rust: rustup from the official installer script (https://sh.rustup.rs),
-# with the toolchain from the `toolchain` arg (plus clippy and rustfmt;
+# with the toolchain from the `toolchain` arg (plus clippy and rustfmt,
 # `none` installs only rustup), in a shared RUSTUP_HOME and CARGO_HOME
 # under /usr/local (the layout of the official rust Docker images), plus
 # a C toolchain for linking.
 #
 # Sources:
 # - https://rust-lang.github.io/rustup/installation/other.html
-#   (`curl ... https://sh.rustup.rs | sh`; rustup-init.sh downloads the
-#   rustup-init for the platform and passes its arguments on)
+#   (`curl ... https://sh.rustup.rs | sh`. rustup-init.sh downloads the
+#   rustup-init for the platform and gives it its arguments.)
 # - https://rust-lang.github.io/rustup/installation/index.html
 #   (CARGO_HOME and RUSTUP_HOME must always be set and CARGO_HOME/bin
-#   must be on PATH; nightly in two steps: `--default-toolchain none -y`,
+#   must be on PATH. Nightly in two steps: `--default-toolchain none -y`,
 #   then `rustup toolchain install nightly --allow-downgrade
-#   --profile minimal --component clippy`)
+#   --profile minimal --component clippy`.)
 # - https://rust-lang.github.io/rustup/concepts/toolchains.html
 #   (<channel>[-<date>][-<host>]: stable, beta, nightly, 1.99, 1.99.0,
 #   nightly-2026-09-01, ...)
@@ -20,16 +20,16 @@
 # - https://github.com/rust-lang/docker-rust (Dockerfile-alpine.template,
 #   Dockerfile-slim.template: RUSTUP_HOME=/usr/local/rustup,
 #   CARGO_HOME=/usr/local/cargo, -y --no-modify-path --profile minimal
-#   --default-host, then chmod -R a+w; gcc + musl-dev / libc6-dev)
+#   --default-host, then chmod -R a+w, gcc + musl-dev / libc6-dev)
 #
 # No sha pin: rustup checks the sha256 of each component it downloads.
 # Args: toolchain (AIRLOCK_PACK_ARG_TOOLCHAIN): stable, beta, nightly,
 # none, or any toolchain name of rustup. cargo-installs changes only the
 # network rules (config.lua).
 #
-# The rustup proxies (cargo, rustc, ...) read RUSTUP_HOME on every call,
-# so the run env must set RUSTUP_HOME and CARGO_HOME (config.lua `env`);
-# /etc/profile.d sets them for login shells only.
+# The rustup proxies (cargo, rustc, ...) read RUSTUP_HOME on each call.
+# Thus the run env must set RUSTUP_HOME and CARGO_HOME (config.lua `env`).
+# /etc/profile.d sets them only for login shells.
 
 RUSTUP_HOME=/usr/local/rustup
 CARGO_HOME=/usr/local/cargo
@@ -54,10 +54,10 @@ else
 fi
 
 airlock_status "installing rustup"
-# Linking needs a C compiler and the libc headers; many crates also
+# Linking needs a C compiler and the libc headers. Many crates also
 # build C or C++ code. rustup-init.sh picks the musl or glibc build of
-# rustup-init from `ldd --version`: on Alpine, ldd is in musl-utils
-# (part of alpine:latest; installed here for slimmer Alpine images).
+# rustup-init from `ldd --version`. On Alpine, ldd is in musl-utils
+# (part of alpine:latest, installed here for slimmer Alpine images).
 case "$DISTRO" in
     alpine) pkg_install build-base ca-certificates musl-utils ;;
     debian) pkg_install build-essential ca-certificates ;;
@@ -68,31 +68,31 @@ if [ -x "$_bin/rustup" ]; then
 else
     log "downloading rustup"
     fetch https://sh.rustup.rs "$PACK_TMP/rustup-init.sh"
-    # -y: no prompt (stdin is closed). No toolchain here: the next step
-    # installs it, also after an interrupted earlier run. rustup keeps
-    # `minimal` as the profile for toolchains installed later (`rustup
-    # toolchain install`, a rust-toolchain.toml): they get no clippy or
-    # rustfmt unless they ask for them (`-c clippy,rustfmt`, or
+    # -y: no prompt (stdin is closed). No toolchain here, because the next
+    # step installs it, also after an interrupted earlier run. rustup
+    # keeps `minimal` as the profile for toolchains that install later
+    # (`rustup toolchain install`, a rust-toolchain.toml). They get no
+    # clippy or rustfmt unless they ask for them (`-c clippy,rustfmt`, or
     # `components` in rust-toolchain.toml).
     run_vendor "rustup-init" sh "$PACK_TMP/rustup-init.sh" -y --no-modify-path \
         --default-host "$_host" --default-toolchain none --profile minimal
 fi
 
-# Always (idempotent): installs the toolchain, or completes or updates
-# it, and makes it the default. A nightly can lack clippy or rustfmt:
-# rustup then tries older nightlies (up to 21 days back); with
-# --allow-downgrade also older than an already installed nightly. A
-# dated nightly (nightly-YYYY-MM-DD) gets no fallback.
+# Always (idempotent): install the toolchain, or complete or update it,
+# and make it the default. A nightly can lack clippy or rustfmt. Then
+# rustup tries older nightlies (up to 21 days back). With
+# --allow-downgrade, it also tries nightlies older than an installed
+# nightly. A dated nightly (nightly-YYYY-MM-DD) gets no fallback.
 if [ "$_toolchain" != none ]; then
     _downgrade=
     case "$_toolchain" in
         nightly*) _downgrade=--allow-downgrade ;;
     esac
     airlock_status "installing toolchain $_toolchain"
-    # The profile `minimal` plus clippy and rustfmt: the `default`
-    # profile without rust-docs. The components are large downloads;
-    # rustup rolls back a failed install, so try again (up to 3 times)
-    # before giving up.
+    # The profile `minimal` plus clippy and rustfmt is the `default`
+    # profile without rust-docs. The components are large downloads.
+    # rustup rolls back a failed install, thus try again (up to 3 times)
+    # before the script fails.
     _try=1
     until "$_bin/rustup" toolchain install "$_toolchain" --profile minimal \
         --component clippy,rustfmt --no-self-update ${_downgrade:+"$_downgrade"} \
@@ -108,10 +108,10 @@ fi
 # install` and install toolchains (rust-toolchain.toml).
 chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
 
-# Put the rustup proxies on the default PATH, whatever the image's PATH
-# has: symlinks keep the name that rustup dispatches on (argv[0]). Only
-# free names and symlinks into $CARGO_HOME/bin are (re)linked; other
-# files and links are left alone.
+# Put the rustup proxies on the default PATH, for any PATH of the image.
+# Symlinks keep the name that rustup dispatches on (argv[0]). Only free
+# names and symlinks into $CARGO_HOME/bin get a new link. Other files and
+# links stay as they are.
 mkdir -p /usr/local/bin
 for _f in "$_bin"/*; do
     [ -x "$_f" ] || continue

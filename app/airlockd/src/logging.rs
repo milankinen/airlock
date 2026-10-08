@@ -1,9 +1,8 @@
-//! Forwards `tracing` log events from the guest to the host CLI over RPC.
+//! Guest logging.
 //!
-//! The guest has no direct access to stderr or a log file. Instead, a custom
-//! `tracing` layer serialises every event into a `(level, message)` pair and
-//! sends it through the Cap'n Proto `LogSink` interface so the host can
-//! display or filter it.
+//! Sends the log events of the guest to the host CLI. The guest cannot write
+//! to a terminal or to a log file directly, so the host shows the guest logs.
+//! The host also sets the log level.
 
 use std::fmt::Write;
 
@@ -13,7 +12,10 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
-/// Install the global tracing subscriber that forwards events to the host.
+/// Install the global tracing subscriber that sends events to the host.
+/// Args:
+///  - `log_sink`: Host `LogSink` capability that receives the events
+///  - `log_filter`: `EnvFilter` directive string, for example `info`
 pub fn init(log_sink: log_sink::Client, log_filter: &str) {
     let (tx, rx) = mpsc::unbounded_channel::<(u8, String)>();
     let filter = EnvFilter::new(log_filter);
@@ -24,7 +26,7 @@ pub fn init(log_sink: log_sink::Client, log_filter: &str) {
     tokio::task::spawn_local(forward(log_sink, rx));
 }
 
-/// Drain the channel and send each event to the host via RPC streaming.
+/// Read events from the channel and send each event to the host with RPC.
 async fn forward(log_sink: log_sink::Client, mut rx: mpsc::UnboundedReceiver<(u8, String)>) {
     while let Some((level, msg)) = rx.recv().await {
         let mut req = log_sink.log_request();
@@ -34,7 +36,8 @@ async fn forward(log_sink: log_sink::Client, mut rx: mpsc::UnboundedReceiver<(u8
     }
 }
 
-/// Tracing layer that enqueues log events to send over RPC.
+/// Tracing layer that puts each log event as a `(level, message)` pair in a
+/// queue for [`forward`].
 struct RpcLayer {
     tx: mpsc::UnboundedSender<(u8, String)>,
 }

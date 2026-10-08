@@ -1,33 +1,35 @@
-//! Masked-secret substitution in HTTP headers.
+//! Masked secret replacement in HTTP headers.
 //!
-//! The guest only ever holds a surrogate for a masked `[env]` variable. For
-//! rules that `inject` it, the proxy swaps the surrogate for the real value
-//! in outbound request header values (before Lua middleware runs) and swaps
-//! the real value back to the surrogate in response header values (after
-//! Lua middleware has run), so the real secret never crosses into the VM.
-//!
-//! Rewriting is a byte-level search/replace over every header value —
-//! including repeated headers, `cookie`, `host` and friends — and touches
-//! nothing else (names, URI, body).
+//! The guest has only a surrogate for each masked `[env]` variable. For rules
+//! that inject the variable, the proxy replaces the surrogate with the real
+//! value in request headers. It also replaces the real value with the
+//! surrogate in response headers and other text. Thus the real secret never
+//! goes into the VM.
 
 use hyper::header::{HeaderMap, HeaderValue};
 
 use crate::network::target::InjectedSecret;
 
-/// Request direction: surrogate → real.
+/// Replace surrogates with real values in all request header values.
+/// Call it before Lua middleware runs.
+/// Returns:
+///   Error if a changed value is not a valid header value.
 pub fn unmask_request(headers: &mut HeaderMap, secrets: &[InjectedSecret]) -> anyhow::Result<()> {
     rewrite_headers(headers, &unmask_pairs(secrets))
 }
 
-/// Response direction: real → surrogate.
+/// Replace real values with surrogates in all response header values.
+/// Call it after Lua middleware runs.
+/// Returns:
+///   Error if a changed value is not a valid header value.
 pub fn mask_response(headers: &mut HeaderMap, secrets: &[InjectedSecret]) -> anyhow::Result<()> {
     rewrite_headers(headers, &mask_pairs(secrets))
 }
 
-/// Replace every real value in free-form `text` with its surrogate. Used
-/// for anything that is about to cross into the guest but is not a header
-/// — e.g. the body of an error response, which may quote a request header
-/// that was already unmasked.
+/// Replace each real value in free-form `text` with its surrogate. Use it
+/// for text that goes into the guest but is not a header. For example, the
+/// body of an error response can quote a request header that was already
+/// unmasked.
 pub fn mask_text(text: &str, secrets: &[InjectedSecret]) -> String {
     let mut current = text.as_bytes().to_vec();
     for (from, to) in mask_pairs(secrets) {
@@ -57,11 +59,13 @@ fn mask_pairs(secrets: &[InjectedSecret]) -> Vec<(&[u8], &[u8])> {
     )
 }
 
-/// Longest needle first. When one secret's value contains another's
-/// (`AUTH_HEADER = "Bearer ${TOKEN}"` next to `TOKEN`), rewriting the
-/// shorter one first would destroy the longer match and leave the rest of
-/// the longer value in place; replacing the longer one first makes the
-/// result independent of `inject` list order.
+/// Sort the replacement pairs with the longest needle first.
+///
+/// The value of one secret can contain the value of another secret
+/// (`AUTH_HEADER = "Bearer ${TOKEN}"` and `TOKEN`). If the shorter one is
+/// replaced first, the longer match is broken, and the remaining part of
+/// the longer value stays. If the longer one is replaced first, the result
+/// does not depend on the order of the `inject` list.
 fn ordered_pairs<'a>(
     pairs: impl Iterator<Item = (&'a [u8], &'a [u8])>,
 ) -> Vec<(&'a [u8], &'a [u8])> {
@@ -70,16 +74,23 @@ fn ordered_pairs<'a>(
     pairs
 }
 
-/// Replace every occurrence of each `from` with its `to` in every header
-/// value, in the given order. Empty `from` needles are skipped. A header
-/// value is only rebuilt when something actually matched; if the rebuilt
-/// bytes are not a valid header value the error names the header but never
-/// its content.
+/// Replace each `from` with its `to` in all header values, in the given
+/// order. The replacement is a byte-level search and replace on all header
+/// values (also repeated headers, `cookie` and `host`). Header names, the
+/// URI and the body do not change. Empty `from` needles are skipped.
+/// Args:
+///  - `headers`: Headers to change
+///  - `pairs`: `(from, to)` replacement pairs.
+///
+/// Returns:
+///   Error if a changed value is not a valid header value. The error names
+///   the header, but never shows its content.
 pub fn rewrite_headers(headers: &mut HeaderMap, pairs: &[(&[u8], &[u8])]) -> anyhow::Result<()> {
     if pairs.is_empty() {
         return Ok(());
     }
     for (name, value) in headers.iter_mut() {
+        // Make a new header value only if something matched.
         let mut current: Option<Vec<u8>> = None;
         for (from, to) in pairs {
             if from.is_empty() {
@@ -99,7 +110,9 @@ pub fn rewrite_headers(headers: &mut HeaderMap, pairs: &[(&[u8], &[u8])]) -> any
 }
 
 /// Replace all non-overlapping occurrences of `needle` in `haystack`.
-/// Returns `None` when nothing matched so callers can skip re-allocation.
+/// Returns:
+///   The new bytes, or `None` if nothing matched. Then the caller does not
+///   need a new allocation.
 fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Option<Vec<u8>> {
     debug_assert!(!needle.is_empty());
     let mut out: Option<Vec<u8>> = None;
@@ -123,8 +136,11 @@ fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Option<V
 
 #[cfg(test)]
 mod tests {
+    //! Tests for the swap of surrogates and real values in headers.
+
     use super::*;
 
+    /// A secret with the given name, real value and surrogate.
     fn secret(name: &str, real: &str, surrogate: &str) -> InjectedSecret {
         InjectedSecret::new(crate::project::MaskedSecret {
             name: name.into(),
@@ -133,12 +149,19 @@ mod tests {
         })
     }
 
+    /// A header map with one header.
     fn header(name: &'static str, value: &[u8]) -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert(name, HeaderValue::from_bytes(value).unwrap());
         h
     }
 
+    /// Test that masking replaces the longer real value first when one
+    /// secret contains another. Else a part of the longer real value stays
+    /// in the header.
+    ///   1. Make a token secret and an auth secret that contains the token
+    ///   2. Mask a header with the auth value, with both secret orders
+    ///   3. Check that the header has the auth surrogate only
     #[test]
     fn nested_secrets_mask_longer_value_regardless_of_order() {
         let token = secret("TOKEN", "real-token-value", "SURROGATE1234567");
@@ -150,6 +173,12 @@ mod tests {
         }
     }
 
+    /// Test that a real value with non-ASCII bytes goes through the header
+    /// swap in both directions. Header values are bytes, not ASCII text.
+    ///   1. Unmask a request header with the surrogate
+    ///   2. Check that it has the non-ASCII real value
+    ///   3. Mask a response header with the real value
+    ///   4. Check that it has the surrogate
     #[test]
     fn non_ascii_real_value_round_trips_through_headers() {
         let s = secret("TOKEN", "🔑-secret-token", "SURROGATEabcdef");
@@ -165,6 +194,12 @@ mod tests {
         assert_eq!(h["x-echo"], "got SURROGATEabcdef back");
     }
 
+    /// Test that a real value that is not valid in a header gives an error
+    /// that does not show the real value. The error text can go to logs and
+    /// to the guest.
+    ///   1. Make a secret whose real value has a line break
+    ///   2. Unmask a header with the surrogate
+    ///   3. Check that the error names the header but not the real value
     #[test]
     fn real_value_invalid_in_header_errors_without_leaking() {
         let s = secret("TOKEN", "bad\r\nvalue-secret", "SURROGATE1234567");

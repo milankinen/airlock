@@ -1,4 +1,7 @@
-//! Layout and rendering for the TUI.
+//! Layout and drawing of the TUI.
+//!
+//! Draws the full TUI screen. The event handlers also use the layout to resize
+//! the sandbox terminal and to find the target of mouse clicks.
 
 use std::time::{Duration, Instant};
 
@@ -13,10 +16,11 @@ use crate::pty::TuiTerminalSink;
 use crate::tabs::monitor::MonitorWidget;
 use crate::tabs::sandbox::TerminalWidget;
 
-/// Tab bar height: 1 blank gap row + 1 tabs row. Rendered at the bottom.
+/// Height of the tab bar at the bottom: 1 empty row and 1 row of tabs.
 pub const TAB_BAR_HEIGHT: u16 = 2;
 
-/// Calculate the body area (everything above the bottom tab bar).
+/// Body area of the TUI: all of `size` above the bottom tab bar.
+/// Returns an empty rect if the terminal is too small for a body.
 pub fn body_area(size: Rect) -> Rect {
     if size.height < TAB_BAR_HEIGHT + 1 {
         return Rect::default();
@@ -24,9 +28,10 @@ pub fn body_area(size: Rect) -> Rect {
     Rect::new(size.x, size.y, size.width, size.height - TAB_BAR_HEIGHT)
 }
 
-/// One entry in the bottom tab bar. Computed once from the user's
-/// keybindings and reused by both `render_tab_bar` and
-/// `tab_header_rects` so the click hitboxes always match what's drawn.
+/// One entry in the bottom tab bar, made from the user's key bindings.
+///
+/// Both `render_tab_bar` and `tab_header_rects` use these entries. Thus
+/// the click areas are always the same as the drawn tabs.
 struct TabEntry {
     tab: Tab,
     shortcut: String,
@@ -34,10 +39,10 @@ struct TabEntry {
 }
 
 impl TabEntry {
-    /// Total visual width: 2 leading spaces, shortcut, 1 separator,
-    /// name, 2 trailing spaces.
+    /// Total width on the screen: 2 spaces, shortcut, 1 separator, name and
+    /// 2 spaces.
     fn width(&self) -> u16 {
-        // ASCII-only by construction, so .len() == display width.
+        // The text is always ASCII, so .len() is the display width.
         (2 + self.shortcut.len() + 1 + self.name.len() + 2) as u16
     }
 }
@@ -64,8 +69,14 @@ fn tab_entries(app: &App) -> [TabEntry; 2] {
     ]
 }
 
-/// Calculate clickable tab header rectangles for mouse handling. Must match
-/// the layout produced by `render_tab_bar`.
+/// Clickable rectangles of the tab headers, for mouse handling.
+/// Args:
+///  - `size`: Full terminal area
+///  - `app`: Application state (for the key binding labels).
+///
+/// Returns:
+///   Each tab with its header rectangle. The layout must be the same as
+///   the layout of `render_tab_bar`.
 pub fn tab_header_rects(size: Rect, app: &App) -> Vec<(Tab, Rect)> {
     let mut rects = Vec::new();
     if size.height == 0 {
@@ -91,7 +102,6 @@ pub fn render(f: &mut Frame<'_>, app: &App, sink: &TuiTerminalSink) {
     let [body, tab_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(TAB_BAR_HEIGHT)]).areas(size);
 
-    // Body content
     match app.active_tab {
         Tab::Sandbox => {
             TerminalWidget::new(sink).render(body, f.buffer_mut());
@@ -113,8 +123,8 @@ fn render_tab_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
     let sandbox_sel = app.active_tab == Tab::Sandbox;
     let network_sel = app.active_tab == Tab::Monitor;
 
-    // Each tab has its own bg: DarkGray when selected, Black (inherits bar
-    // bg) otherwise. The hotkey stays yellow on whichever bg the tab has.
+    // Each tab has its own bg: DarkGray when selected, else Black (the same
+    // as the bar bg). The hotkey color is the same on both bgs.
     let tab_bg = |selected: bool| -> Color {
         if selected {
             Color::DarkGray
@@ -154,15 +164,15 @@ fn render_tab_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     let line = Line::from(spans);
-    // Paint the bg only on the bottom tabs row (height 1); the row above is
-    // a blank gap at the terminal's default bg.
+    // Paint the bg only on the bottom row of tabs (height 1). The row above
+    // is an empty gap with the default bg of the terminal.
     let tabs_row = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
     let bar_style = Style::default().bg(Color::Black);
     Paragraph::new(line)
         .style(bar_style)
         .render(tabs_row, f.buffer_mut());
 
-    // Right-aligned status indicators on the same row.
+    // Status indicators on the same row, aligned to the right.
     let status = build_status_line(app);
     Paragraph::new(status)
         .style(bar_style)
@@ -170,13 +180,17 @@ fn render_tab_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
         .render(tabs_row, f.buffer_mut());
 }
 
-/// How long the text-selection hint stays up after a click.
+/// Time that the text selection hint stays visible after a click.
 const SELECT_HINT_FOR: Duration = Duration::from_secs(2);
 
-/// Whether the selection hint should be showing at `now`.
+/// True if the selection hint must be visible at `now`.
+/// Args:
+///  - `clicked_at`: Time of the last left click, if there was one
+///  - `now`: Current time.
 ///
-/// Split out so the window can be tested without a terminal, and so the
-/// status line and its test can't disagree about what "visible" means.
+/// It is a separate function so that tests can check the time window
+/// without a terminal. Also, the status line and its test then always use
+/// the same meaning of "visible".
 pub(crate) fn select_hint_visible(clicked_at: Option<Instant>, now: Instant) -> bool {
     clicked_at.is_some_and(|t| now.duration_since(t) < SELECT_HINT_FOR)
 }
@@ -193,8 +207,8 @@ fn build_status_line(app: &App) -> Line<'static> {
     let denied = app.monitor.network.request_denied;
 
     let mut spans = Vec::with_capacity(16);
-    // Mouse capture is held for the whole session, so a plain drag never
-    // selects. Answer the click by naming the modifier that does.
+    // Mouse capture stays on for the whole session, so a plain drag never
+    // selects text. After a click, show the modifier key that does.
     if select_hint_visible(app.select_hint_at, Instant::now()) {
         spans.push(Span::styled(
             format!("Hold {} to select text", crate::terminal::select_modifier()),
@@ -239,8 +253,14 @@ fn format_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    //! Tests of the status line logic.
+
     use super::*;
 
+    /// Test that the text selection hint shows for two seconds after a click.
+    ///   1. Check that the hint is hidden without a click
+    ///   2. Check that it shows at the click and 1.9 seconds later
+    ///   3. Check that it is hidden 2.1 seconds after the click
     #[test]
     fn select_hint_after_click_expires_after_two_seconds() {
         let now = Instant::now();

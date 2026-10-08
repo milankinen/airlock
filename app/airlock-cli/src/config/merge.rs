@@ -1,15 +1,18 @@
-//! Deep merge of config documents ([`merge_json`]), and the check that
-//! the config values of the enabled packs do not conflict
-//! ([`pack_conflicts`]).
+//! Config document merge.
+//!
+//! Merges config documents layer by layer. Prepares `[env]` entries so that
+//! a later layer cannot remove a secret mask by accident. Also finds values
+//! that two enabled packs set differently.
 
-/// Rewrite every plain-string `[env]` entry of one config layer into its
-/// object form `{ "value": "..." }` before layers are merged.
+/// Change each plain-string `[env]` entry of a config layer to its object
+/// form `{ "value": "..." }`. Call this before the layers merge.
 ///
-/// `merge_json` lets a primitive overlay replace an object wholesale, so
-/// without this a `TOKEN = "${TOKEN}"` in `airlock.local.toml` would erase a
-/// base layer's `{ value = "${TOKEN}", mask = true }` — silently un-masking
-/// the secret. With both sides in object form the merge is field-wise: an
-/// overlay string only replaces `value` and inherits the base's `mask`.
+/// [`merge_json`] lets a primitive overlay replace a full object. Without
+/// this step, a `TOKEN = "${TOKEN}"` in `airlock.local.toml` would erase
+/// `{ value = "${TOKEN}", mask = true }` of a base layer. The secret would
+/// then be unmasked without a warning. With both sides in object form, the
+/// merge is field by field. An overlay string replaces only `value` and
+/// keeps the `mask` of the base.
 pub(crate) fn normalize_env(layer: &mut serde_json::Value) {
     let Some(env) = layer
         .get_mut("env")
@@ -25,12 +28,12 @@ pub(crate) fn normalize_env(layer: &mut serde_json::Value) {
     }
 }
 
-/// Merge two JSON values with custom rules:
-/// - Null overlay: base wins (null never overwrites)
-/// - Arrays: concatenate
-/// - Objects: recursive merge
-/// - Primitives: overlay wins
-/// - Type mismatch: overlay wins
+/// Merge two JSON values with these rules:
+///  - Null overlay: base wins (null never overwrites)
+///  - Arrays: concatenate
+///  - Objects: recursive merge
+///  - Primitives: overlay wins
+///  - Different types: overlay wins
 pub(crate) fn merge_json(base: serde_json::Value, overlay: serde_json::Value) -> serde_json::Value {
     use serde_json::Value;
     match (base, overlay) {
@@ -53,18 +56,23 @@ pub(crate) fn merge_json(base: serde_json::Value, overlay: serde_json::Value) ->
     }
 }
 
-/// Find the values that two of the enabled packs set differently: `docs`
-/// are their config values, each `(pack name, value)` in pack order and
-/// env-normalized (see [`normalize_env`]), so env entries compare per
-/// field.
+/// Find the values that two enabled packs set differently.
 ///
 /// The values merge like [`merge_json`]: objects key by key, arrays
 /// concatenate, and a null is no value (it never overwrites, and a later
-/// pack can set the path). A scalar, or a value of another type, at a path
-/// that an earlier pack set is a conflict unless it equals the value
-/// there. Returns one line per conflict (none: the packs merge the same in
-/// any order, but for the order of array items):
-/// ``packs nodejs and python both set `env.FOO.value` ("a" vs "b")``.
+/// pack can set the path). A scalar or a value of a different type at a
+/// path that an earlier pack set is a conflict, unless it is equal to the
+/// value there.
+/// Args:
+///  - `docs`: Config values of the packs as `(pack name, value)`, in pack
+///    order. The env must be normalized (see [`normalize_env`]), thus env
+///    entries compare field by field.
+///
+/// Returns:
+///   One line for each conflict, for example
+///   ``packs nodejs and python both set `env.FOO.value` ("a" vs "b")``.
+///   No lines means that the packs merge the same in all orders, except
+///   for the order of array items.
 pub(crate) fn pack_conflicts(docs: &[(String, serde_json::Value)]) -> Vec<String> {
     let mut owners = Owners::new();
     let mut conflicts = Vec::new();
@@ -82,13 +90,13 @@ pub(crate) fn pack_conflicts(docs: &[(String, serde_json::Value)]) -> Vec<String
     conflicts
 }
 
-/// The pack that put a value at a path (the keys from the top level). A
+/// The pack that set a value at a path (the keys from the top level). A
 /// path inside that value belongs to the same pack, unless a later pack
 /// added it.
 type Owners = std::collections::BTreeMap<Vec<String>, String>;
 
-/// Merge `overlay` of `pack` onto `base` at `path` (see
-/// [`pack_conflicts`]): record the paths that `pack` adds in `owners` and
+/// Merge the `overlay` of `pack` onto `base` at `path` (see
+/// [`pack_conflicts`]). Record the paths that `pack` adds in `owners`, and
 /// the conflicts in `conflicts`.
 fn merge_pack_value(
     base: serde_json::Value,
@@ -121,7 +129,8 @@ fn merge_pack_value(
             base.extend(overlay);
             Value::Array(base)
         }
-        // A null that an earlier pack set is unset, not a value.
+        // A null that an earlier pack set means "not set". It is not a
+        // value.
         (Value::Null, overlay) => {
             owners.insert(path.clone(), pack.to_string());
             overlay
@@ -144,10 +153,17 @@ fn merge_pack_value(
 
 #[cfg(test)]
 mod tests {
+    //! Tests for the conflict check between pack documents.
+
     use serde_json::json;
 
     use super::*;
 
+    /// Test that two packs that set the same path to different values are a
+    /// conflict, and that the error names the pack that set the value first.
+    ///   1. Make three pack documents with equal, null, list and different
+    ///      values
+    ///   2. Check that only the two different values are conflicts
     #[test]
     fn packs_setting_same_path_differently_conflict_naming_owner() {
         let docs = [
@@ -176,6 +192,7 @@ mod tests {
         ]
         .map(|(name, doc)| (name.to_string(), doc));
         assert_eq!(
+            // Equal values, a null and lists are not conflicts.
             pack_conflicts(&docs),
             [
                 "packs a and c both set `mounts.m.source` (\"s\" vs \"t\")",

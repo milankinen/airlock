@@ -1,3 +1,6 @@
+//! The credential swap on the API hosts: which headers get the real token,
+//! and which credentials the services refuse locally.
+
 use crate::network::target::InjectedSecret;
 use crate::services::ServiceId;
 use crate::services::tokens::{FAKE_JWT_PREFIX, TokenKind};
@@ -6,6 +9,16 @@ use crate::test_cfg::services::{
     GotLog, answering, insert_grant, masked, production_services, request,
 };
 
+/// Test that the API host swaps surrogates only in the credential headers,
+/// on every path. A surrogate in other headers or in the body must stay a
+/// surrogate, so that the guest cannot make the proxy echo a real token.
+///   1. Store an Anthropic grant with an access token and an API key
+///   2. Send requests with surrogates in credential headers, other headers
+///      and the body, on normal and odd paths
+///   3. Check that only `authorization` and `x-api-key` get the real values
+///   4. Check that a malformed API key gets a local 401
+///   5. Check that a token host and the ChatGPT host do not swap the
+///      Anthropic surrogates
 #[test]
 fn credential_surrogates_are_swapped_on_every_api_path_only() {
     block_on_local(async {
@@ -54,6 +67,7 @@ fn credential_surrogates_are_swapped_on_every_api_path_only() {
             assert_eq!(got.body, body, "{path}");
         }
 
+        // A surrogate with more text after it is not a known credential.
         let log = GotLog::default();
         let with_extra = format!("{key} extra");
         let req = request("GET", "/v1/messages", &[("x-api-key", &with_extra)], "");
@@ -64,6 +78,8 @@ fn credential_surrogates_are_swapped_on_every_api_path_only() {
         assert_eq!(answer.status, 401);
         assert!(log.is_empty());
 
+        // platform.claude.com is the token host. It forwards the request but
+        // does not swap.
         let req = request("GET", "/v1/oauth/hello", &[("x-custom", access)], "");
         let next = answering(&log, "text/plain", "ok");
         services
@@ -71,6 +87,7 @@ fn credential_surrogates_are_swapped_on_every_api_path_only() {
             .await;
         assert_eq!(log.all()[0].header("x-custom"), Some(access));
 
+        // The OpenAI service does not know the Anthropic surrogate.
         let log = GotLog::default();
         let bearer = format!("Bearer {access}");
         let req = request("GET", "/backend-api/x", &[("authorization", &bearer)], "");
@@ -89,6 +106,13 @@ fn credential_surrogates_are_swapped_on_every_api_path_only() {
     });
 }
 
+/// Test that refresh and ID surrogates do not work as API credentials. Only
+/// access tokens and API keys are credentials of an API request.
+///   1. Store an Anthropic grant with a refresh token and an OpenAI grant
+///      with an ID token
+///   2. Send API requests with these surrogates as credentials
+///   3. Check that each request gets a local 401 with
+///      `airlock_foreign_credential` and does not go upstream
 #[test]
 fn refresh_and_id_surrogates_are_no_api_credentials() {
     block_on_local(async {
@@ -155,11 +179,21 @@ fn refresh_and_id_surrogates_are_no_api_credentials() {
     });
 }
 
+/// Test that the ChatGPT host accepts only surrogates or injected secrets as
+/// credentials. A real token that the guest knows by other means must not
+/// pass.
+///   1. Send a real token without an inject rule and check the local 401
+///   2. Send the same token with a matching injected secret and check that
+///      it goes upstream
+///   3. Send an unknown surrogate with an injected secret and check the
+///      local 401
 #[test]
 fn chatgpt_credentials_must_be_surrogates_or_injected_secrets() {
     block_on_local(async {
         let services = production_services();
         let secret = InjectedSecret::new(masked("CHATGPT_TOKEN", "real-chatgpt-token", "masked"));
+        // The inject rules replace the masked value before the service sees
+        // the request. Thus the service gets the real value of the secret.
         for (token, injected, status) in [
             ("real-chatgpt-token", vec![], 401),
             ("real-chatgpt-token", vec![secret.clone()], 200),

@@ -1,27 +1,15 @@
-//! Packs: config that a project enables in `[packs]`, and for some
-//! packs a setup script that installs into the sandbox.
+//! Packs.
 //!
-//! [`init`] loads the known packs into a [`PackManager`]. Each [`Pack`]
-//! is one version of a pack (`name@version`), a folder
-//! `packs/<name>@<version>/` of the repository ([`builtin`]): its
-//! metadata and args, the config it applies and its setup script.
-//! [`Pack::configure`] fills the defaults of the arg values of a config
-//! and gives a [`ConfiguredPack`]: its config values (a static document,
-//! or what its `config.lua` makes of the args, see [`lua_config`]) and
-//! its install ([`InstallerScript`]).
-//! [`crate::config::pack_entries`] reads the `[packs]` tables of the
-//! config files. The released list form (`presets = ["python"]`) is plain
-//! config ([`crate::config::legacy_presets`]).
+//! A pack is a named, versioned bundle of config that a project enables in
+//! its `[packs]` table. Pack args let the user adjust a pack, for example
+//! to select a tool version. A pack can also install software into the
+//! sandbox with a setup script.
 //!
-//! Versions copy their files rather than share them: a change of a
-//! config or a setup script ships as a new version. So the name, the
-//! version and the arg values define what a pack puts on the sandbox
-//! disk (see [`ConfiguredPack::setup_installer`]).
-//!
-//! `airlock start` installs the configured packs that have a setup
-//! script in an install boot ([`install::setup`]); [`install::state`]
-//! records what is on the sandbox disk and [`install::plan`] decides what
-//! to install.
+//! This module loads the known packs and combines a pack with the user's
+//! arg values into the config and the install script that the pack gives.
+//! Pack authors can compute config with a script. Install scripts get
+//! their args as environment variables and report their progress with a
+//! status line protocol.
 
 mod builtin;
 pub mod install;
@@ -35,13 +23,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-/// Load the known packs: the built-in ones ([`builtin`]).
+/// Load the known packs. At the moment these are only the built-in packs.
 pub fn init() -> anyhow::Result<PackManager> {
     builtin::load(&builtin::BUILTIN_PACKS)
 }
 
-/// [`init`] with the test pack `sample@1` (see
-/// [`builtin::load_with_sample`]).
+/// Load the known packs and the test pack `sample@1`, see [`init`].
 #[cfg(test)]
 pub fn init_with_sample() -> PackManager {
     builtin::load_with_sample()
@@ -54,17 +41,19 @@ pub fn load_test_packs(files: Vec<(&'static str, String)>) -> anyhow::Result<Pac
     builtin::load(builtin::fixture(vec![], files))
 }
 
-/// The known packs. Cheap to clone.
+/// The set of known packs. Cheap to clone.
 #[derive(Clone)]
 pub struct PackManager {
-    /// Every version of every pack: the packs by kind (see [`PackKind`]),
-    /// then by name; the versions of one pack oldest first.
+    /// All versions of all packs. Sorted by kind (see [`PackKind`]), then
+    /// by name. The versions of one pack are sorted oldest first.
     packs: Arc<[Pack]>,
 }
 
 impl PackManager {
-    /// The newest version of each built-in pack, by kind, then by name
-    /// (the order of documents, installs and listings).
+    /// Get the newest version of each built-in pack.
+    /// Returns:
+    ///   Packs sorted by kind, then by name. Documents, installs and
+    ///   listings use this order.
     pub fn builtin(&self) -> Vec<Pack> {
         let mut newest: Vec<Pack> = Vec::new();
         for pack in self.packs.iter() {
@@ -78,7 +67,13 @@ impl PackManager {
         newest
     }
 
-    /// The pack `name` at `version`, if there is one.
+    /// Find a pack version.
+    /// Args:
+    ///  - `name`: Pack name
+    ///  - `version`: Pack version, for example `"1"`
+    ///
+    /// Returns:
+    ///   The pack version, or `None` if it does not exist.
     #[allow(
         clippy::unused_async,
         reason = "remote packs resolve over the network later"
@@ -91,12 +86,12 @@ impl PackManager {
     }
 }
 
-/// One version of a pack (`name@version`), with everything it needs.
+/// One version of a pack (`name@version`) with all its data.
 /// Cheap to clone.
 #[derive(Clone)]
 pub struct Pack(Arc<PackVersionData>);
 
-/// What names and describes a pack version.
+/// Name and description of a pack version.
 pub struct PackMetadata {
     /// Key in the `[packs]` table.
     pub name: String,
@@ -104,14 +99,15 @@ pub struct PackMetadata {
     pub version: String,
     /// Human-readable name.
     pub label: String,
-    /// What the version does, in one line; the setup wizard shows it.
+    /// One-line description of the version. The setup wizard shows it.
     pub description: String,
+    /// What the pack is for.
     pub kind: PackKind,
     /// Whether the version has a setup script (`setup.sh`).
     pub has_setup: bool,
 }
 
-/// What a pack is for. The packs are ordered by kind, in this order.
+/// What a pack is for. Packs are sorted by kind in the order of the variants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PackKind {
@@ -126,12 +122,13 @@ pub enum PackKind {
 /// The data of one pack version.
 struct PackVersionData {
     metadata: PackMetadata,
-    /// In `pack.toml` order.
+    /// Args in `pack.toml` order.
     args: Vec<PackArg>,
+    /// Config that the pack applies, if any.
     config: Option<PackConfig>,
-    /// `setup.sh`: POSIX sh, run after `lib.sh` (see
-    /// [`install::compose`]). Idempotent; reads its args from the
-    /// environment only.
+    /// `setup.sh`: POSIX sh script that runs after `lib.sh` (see
+    /// [`install::compose`]). It is idempotent. It reads its args only from
+    /// the environment.
     setup: Option<&'static str>,
 }
 
@@ -139,25 +136,30 @@ struct PackVersionData {
 enum PackConfig {
     /// `config.{toml,json,yaml,yml}`: the same values for every entry.
     Static(Value),
-    /// The source of `config.lua`: it makes the values of an entry from
-    /// its args (see [`lua_config`]).
+    /// Source of `config.lua`. The script makes the config values of an
+    /// entry from its args (see [`lua_config`]).
     Lua(&'static str),
 }
 
 impl Pack {
+    /// Name and description of the version.
     pub fn metadata(&self) -> &PackMetadata {
         &self.0.metadata
     }
 
-    /// The args of the version, in `pack.toml` order.
+    /// Args of the version, in `pack.toml` order.
     pub fn args(&self) -> &[PackArg] {
         &self.0.args
     }
 
-    /// The version with the arg values `args` and the defaults of the
-    /// others. Each value must be a value of its arg (see
-    /// [`ArgKind::parse`]): the config checks them
-    /// ([`crate::config::pack_entries`]).
+    /// Apply arg values to the version.
+    /// Args:
+    ///  - `args`: Arg values by key. Each value must be valid for its arg
+    ///    (see [`ArgKind::parse`]). [`crate::config::pack_entries`] checks
+    ///    the values before this call.
+    ///
+    /// Returns:
+    ///   The configured pack. Args not in `args` get their default value.
     pub fn configure(&self, args: &BTreeMap<String, ArgValue>) -> ConfiguredPack {
         debug_assert!(
             args.iter().all(|(key, value)| self
@@ -181,7 +183,7 @@ impl Pack {
         }
     }
 
-    /// The keys of the args, for error messages.
+    /// List the arg keys as text for error messages.
     pub fn known_args(&self) -> String {
         if self.args().is_empty() {
             return "it has no args".to_string();
@@ -191,17 +193,18 @@ impl Pack {
     }
 }
 
-/// One arg of a pack version: a value that a `[packs]` entry sets in
+/// One arg of a pack version. A `[packs]` entry sets its value in
 /// `args = { <key> = <value> }`.
 #[derive(Clone, Debug)]
 pub struct PackArg {
     /// `[a-z][a-z0-9-]*`, not `version`, `enabled` or `args`.
     pub key: String,
-    /// What the arg does; the setup wizard shows it as the label of the
-    /// arg's row.
+    /// What the arg does. The setup wizard shows it as the label of the
+    /// arg row.
     pub description: String,
+    /// Type of the arg value.
     pub kind: ArgKind,
-    /// The value when no config file sets the arg.
+    /// Value to use when no config file sets the arg.
     pub default: ArgValue,
 }
 
@@ -210,13 +213,18 @@ pub struct PackArg {
 pub enum ArgKind {
     /// `true` or `false`.
     Bool,
-    /// One of `values`; with `other`, any non-empty string.
+    /// One of `values`. If `other` is true, also any non-empty string.
     Choice { values: Vec<String>, other: bool },
 }
 
 impl ArgKind {
-    /// The arg value of the config value `raw`; the error text follows
-    /// the arg's path.
+    /// Parse and check an arg value.
+    /// Args:
+    ///  - `raw`: Value from the config file
+    ///
+    /// Returns:
+    ///   The arg value, or an error text. The caller writes the error text
+    ///   after the arg path.
     pub fn parse(&self, raw: &Value) -> Result<ArgValue, String> {
         let value = match raw {
             Value::Bool(b) => ArgValue::Bool(*b),
@@ -245,7 +253,7 @@ impl ArgKind {
         }
     }
 
-    /// The error for a value of another type.
+    /// Error text for a value of the wrong type.
     fn wrong_type(&self) -> String {
         match self {
             ArgKind::Bool => "must be true or false".to_string(),
@@ -256,7 +264,7 @@ impl ArgKind {
     }
 }
 
-/// What the value of a choice arg must be, for error messages.
+/// Describe the valid values of a choice arg, for error messages.
 fn expected_choice(values: &[String], other: bool) -> String {
     if other {
         format!(
@@ -288,27 +296,27 @@ impl fmt::Display for ArgValue {
     }
 }
 
-/// A pack version with its arg values, defaults filled (see
-/// [`Pack::configure`]; the config checks the values).
-/// Cheap to clone.
+/// A pack version with its arg values, made by [`Pack::configure`].
+/// All args have a value. Cheap to clone.
 #[derive(Clone)]
 pub struct ConfiguredPack {
     pack: Pack,
-    /// One value per arg of the version (defaults filled), by key.
+    /// One value for each arg of the version (defaults included), by key.
     args: BTreeMap<String, ArgValue>,
 }
 
 impl ConfiguredPack {
+    /// Name and description of the version.
     pub fn metadata(&self) -> &PackMetadata {
         self.pack.metadata()
     }
 
-    /// The value of every arg (defaults filled), by key.
+    /// Values of all args (defaults included), by key.
     pub fn args(&self) -> &BTreeMap<String, ArgValue> {
         &self.args
     }
 
-    /// The args whose value is not the version's default, by key.
+    /// Get the args whose value is not the default, sorted by key.
     pub fn non_default_args(&self) -> Vec<(&str, &ArgValue)> {
         self.args
             .iter()
@@ -322,17 +330,19 @@ impl ConfiguredPack {
             .collect()
     }
 
-    /// The config that the pack applies: its static document, or what
-    /// its `config.lua` makes of the args (see [`lua_config::evaluate`]);
-    /// an empty object without a config. Before a `config.lua` runs, the
-    /// pack's directory ([`crate::cache::pack_mounts_dir`]) is created. A
-    /// failing `config.lua` or directory is an error `pack <name>: …`.
+    /// Get the config values that the pack applies.
+    /// Returns:
+    ///   The static config document, or the result of `config.lua` for the
+    ///   arg values (see [`lua_config::evaluate`]). An empty object if the
+    ///   pack has no config. An error `pack <name>: …` if `config.lua` or
+    ///   the pack directory fails.
     pub fn config_values(&self) -> anyhow::Result<Value> {
         match &self.pack.0.config {
             None => Ok(Value::Object(Map::new())),
             Some(PackConfig::Static(value)) => Ok(value.clone()),
             Some(PackConfig::Lua(source)) => {
                 let metadata = self.metadata();
+                // Create the pack directory before `config.lua` runs.
                 let directory = crate::cache::pack_mounts_dir(&metadata.name)
                     .map_err(|e| anyhow::anyhow!("pack {}: {e:#}", metadata.name))?;
                 lua_config::evaluate(metadata, source, &self.args, &directory)
@@ -340,7 +350,9 @@ impl ConfiguredPack {
         }
     }
 
-    /// The install of the version, if it has a setup script.
+    /// Make the installer of the version.
+    /// Returns:
+    ///   The installer, or `None` if the version has no setup script.
     pub fn setup_installer(&self) -> Option<InstallerScript> {
         let setup = self.pack.0.setup?;
         let metadata = self.metadata();
@@ -353,9 +365,11 @@ impl ConfiguredPack {
             (format!("AIRLOCK_PACK_ARG_{name}"), value.to_string())
         }));
 
-        // The definition of the pack: name, version and arg values (in
-        // key order). The scripts do not count: a change of them ships as
-        // a new version.
+        // The fingerprint covers the name, the version and the arg values
+        // (in key order). It does not cover the scripts. A change to what a
+        // script or config does ships as a new version, because versions
+        // copy their files and do not share them. A change to comments only
+        // needs no new version.
         let input = (&metadata.name, &metadata.version, &self.args);
         let json = serde_json::to_vec(&input).expect("fingerprint input serializes");
         let fingerprint = hex::encode(Sha256::digest(json));
@@ -370,21 +384,23 @@ impl ConfiguredPack {
     }
 }
 
-/// The install of a configured pack.
+/// Installer of a configured pack.
 #[derive(Clone, Debug)]
 pub struct InstallerScript {
-    /// The pack name: the key in `installs.json`.
+    /// Pack name. It is also the key in `installs.json`.
     pub pack: String,
+    /// Human-readable pack name.
     pub label: String,
-    /// The whole script: wrapper, `lib.sh`, the pack's `setup.sh` (see
+    /// Full script: wrapper, `lib.sh` and the `setup.sh` of the pack (see
     /// [`install::compose::script`]).
     pub script: String,
-    /// `AIRLOCK_PACK_API`, `AIRLOCK_PACK_ID`, and per arg
-    /// `AIRLOCK_PACK_ARG_<KEY>` (key in upper case, `-` as `_`; a bool
-    /// is `true` or `false`; args are never secrets).
+    /// Environment variables for the script: `AIRLOCK_PACK_API`,
+    /// `AIRLOCK_PACK_ID`, and `AIRLOCK_PACK_ARG_<KEY>` for each arg. The key
+    /// is in upper case with `-` changed to `_`. A bool is `true` or
+    /// `false`. Args are never secrets.
     pub env: Vec<(String, String)>,
-    /// Identifies the definition of the pack (name, version, args): a
-    /// change needs a new sandbox.
+    /// Identifies the pack definition (name, version, args). If it changes,
+    /// a new sandbox is necessary.
     pub fingerprint: String,
 }
 

@@ -1,3 +1,6 @@
+//! Helpers that make a process context, a database and a token store in a
+//! temporary home.
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -9,8 +12,9 @@ use crate::services::store::TokenStore;
 use crate::settings::Settings;
 use crate::vault::Vault;
 
-/// The process context of a test: default settings, `vault`, and the
-/// database in `home` (a temp dir the caller keeps).
+/// The process context of a test: the settings in `home` (defaults if
+/// there is no file), `vault`, and the database in `home`. The caller
+/// keeps the `home` directory.
 pub fn test_context(home: &Path, vault: Vault) -> Context {
     Context {
         settings: Settings::load_from(home).unwrap(),
@@ -19,21 +23,23 @@ pub fn test_context(home: &Path, vault: Vault) -> Context {
     }
 }
 
-/// A database in a fresh temp home (kept alive by the returned guard).
+/// A database in a new temporary home. The database stays while the
+/// returned directory exists.
 pub fn test_db() -> (TempDir, Db) {
     let dir = temp_dir();
     let db = Db::open(&dir.path().join(crate::db::DIR)).unwrap();
     (dir, db)
 }
 
-/// The temp home of a [`test_store`] and its database.
+/// The temporary home of a [`test_store`] and its database.
 pub struct StoreHome {
     _dir: TempDir,
+    /// The database of the token store.
     pub db: Db,
 }
 
-/// A token store in the database of a test context in a fresh temp home
-/// (kept alive by the returned [`StoreHome`]).
+/// A token store in a database in a new temporary home, with a fixed key.
+/// The store stays while the returned [`StoreHome`] exists.
 pub fn test_store() -> (StoreHome, Arc<TokenStore>) {
     let (dir, db) = test_db();
     let store = TokenStore::new(db.clone(), &[42; 32]);

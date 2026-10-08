@@ -1,4 +1,15 @@
-//! Host-side Cap'n Proto RPC types for communicating with the in-VM supervisor.
+//! Communication between the host and the VM.
+//!
+//! Lets the host control the supervisor that runs in the VM: boot the
+//! sandbox, start processes and read their output. Also serves the host
+//! services that the VM can use:
+//!  * terminal input
+//!  * log forwarding
+//!  * the sandbox network
+//!  * the host clipboard
+//!  * opening pages in the user's browser
+//!
+//! The host can also open connections to ports inside the VM.
 
 pub(crate) mod browser;
 pub(crate) mod clipboard;
@@ -21,20 +32,22 @@ pub use process::*;
 pub use stdin::Stdin;
 pub use supervisor::{BootRequest, DaemonSpec, DaemonState, MaskSpec, Supervisor};
 
-/// A Cap'n Proto RPC system bound to one vsock connection. It serves the
-/// connection until the peer goes away. The caller owns it and decides how
-/// long it runs: the sandbox session spawns it as a transport task and stops
-/// it only after the VM has stopped.
+/// A Cap'n Proto RPC system on one vsock connection. It serves the
+/// connection until the peer disconnects. The caller owns it and decides
+/// how long it runs: the sandbox session starts it as a transport task and
+/// stops it only after the VM stops.
 pub type Driver = Pin<Box<dyn Future<Output = ()>>>;
 
 /// Wrap a connected vsock fd as a two-party Cap'n Proto transport.
-///
-/// On macOS, Virtualization.framework hands out a socket that behaves like a
-/// TCP stream; on Linux, cloud-hypervisor's vsock is a Unix stream.
+/// Args:
+///  - `vsock_fd`: Connected vsock socket
+///  - `side`: RPC side of this end (client or server)
 fn vsock_transport(
     vsock_fd: OwnedFd,
     side: rpc_twoparty_capnp::Side,
 ) -> anyhow::Result<Box<dyn capnp_rpc::VatNetwork<twoparty::VatId>>> {
+    // On macOS, Virtualization.framework gives a socket that behaves like a
+    // TCP stream. On Linux, the cloud-hypervisor vsock is a Unix stream.
     #[cfg(target_os = "macos")]
     let stream = {
         let std_stream = unsafe { std::net::TcpStream::from_raw_fd(vsock_fd.into_raw_fd()) };
@@ -57,7 +70,8 @@ fn vsock_transport(
     )))
 }
 
-/// Turn a running RPC system into a [`Driver`] that logs how it ended.
+/// Make a [`Driver`] from an RPC system. The driver logs how the system
+/// ended.
 fn driver(rpc: capnp_rpc::RpcSystem<twoparty::VatId>, name: &'static str) -> Driver {
     Box::pin(async move {
         if let Err(e) = rpc.await {
@@ -66,8 +80,12 @@ fn driver(rpc: capnp_rpc::RpcSystem<twoparty::VatId>, name: &'static str) -> Dri
     })
 }
 
-/// Fill a `PtyConfig`: a terminal size selects PTY mode, `None` selects
-/// pipe mode. Shared by `Supervisor.spawn` and the `airlock exec` client.
+/// Fill a `PtyConfig`. `Supervisor.spawn` and the `airlock exec` client
+/// use it.
+/// Args:
+///  - `builder`: `PtyConfig` builder to fill
+///  - `size`: Terminal size `(rows, cols)` for PTY mode, or `None` for
+///    pipe mode
 pub fn set_pty(mut builder: pty_config::Builder<'_>, size: Option<(u16, u16)>) {
     match size {
         Some((rows, cols)) => {

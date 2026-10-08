@@ -1,9 +1,7 @@
-//! Channel-based stdin replacement for TUI mode.
+//! Keyboard input from the TUI to the sandbox.
 //!
-//! Instead of reading from `tokio::io::stdin()`, the TUI event loop sends
-//! keystrokes and resize events through an mpsc channel. This struct
-//! implements the Cap'n Proto `Stdin` RPC interface so it can be passed
-//! to the supervisor in place of the real terminal stdin.
+//! In monitor mode, the sandbox process does not read the real terminal. The
+//! TUI sends the keystrokes and terminal size changes to the sandbox instead.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -20,14 +18,19 @@ pub enum TuiInputEvent {
     Resize(u16, u16),
 }
 
-/// Implements the Cap'n Proto `Stdin` interface by reading from a channel
-/// fed by the TUI event loop.
+/// Cap'n Proto `Stdin` server that reads keystrokes and resize events from
+/// the TUI event loop instead of from `tokio::io::stdin()`.
 pub struct TuiStdin {
     rx: RefCell<mpsc::Receiver<TuiInputEvent>>,
     pty_size: Option<(u16, u16)>,
 }
 
 impl TuiStdin {
+    /// Create a stdin server.
+    /// Args:
+    ///  - `rx`: Channel that receives input events from the TUI event loop
+    ///  - `pty_size`: Initial PTY size as (rows, cols), or `None` if the
+    ///    process does not use a PTY.
     pub fn new(rx: mpsc::Receiver<TuiInputEvent>, pty_size: Option<(u16, u16)>) -> Self {
         Self {
             rx: RefCell::new(rx),
@@ -35,6 +38,7 @@ impl TuiStdin {
         }
     }
 
+    /// Initial PTY size as (rows, cols), or `None` if there is no PTY.
     pub fn pty_size(&self) -> Option<(u16, u16)> {
         self.pty_size
     }

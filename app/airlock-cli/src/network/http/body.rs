@@ -1,18 +1,17 @@
-//! Lua `Body` userdata for HTTP middleware scripts.
+//! HTTP bodies for middleware scripts.
 //!
-//! Provides `text()`, `json()`, and `len()` accessors on HTTP bodies.
-//! Also implements `FromLua` so scripts can pass strings, tables, or
-//! Body objects wherever a body is expected.
+//! Lets middleware scripts read HTTP bodies as text or JSON. Scripts can also
+//! use strings, tables or `nil` where a body is expected.
 
 use bytes::Bytes;
 use mlua::{FromLua, Lua, LuaSerdeExt, UserData, UserDataMethods, Value};
 
-/// HTTP body userdata — wraps raw bytes with text/json accessors.
+/// HTTP body userdata: raw bytes with text and JSON accessors.
 #[derive(Clone)]
 pub struct Body(pub Bytes);
 
 impl Body {
-    /// Create an empty body.
+    /// Make an empty body.
     pub fn empty() -> Self {
         Self(Bytes::new())
     }
@@ -20,36 +19,36 @@ impl Body {
 
 impl UserData for Body {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        // text() — return raw bytes as a Lua string
+        // text(): return the raw bytes as a Lua string.
         methods.add_method("text", |_, this, ()| {
             Ok(mlua::BString::from(this.0.to_vec()))
         });
 
-        // json() — parse bytes as JSON, return Lua table
+        // json(): parse the bytes as JSON and return a Lua table.
         methods.add_method("json", |lua, this, ()| {
             let json: serde_json::Value = serde_json::from_slice(&this.0)
                 .map_err(|e| mlua::Error::runtime(format!("invalid JSON: {e}")))?;
             lua.to_value(&json)
         });
 
-        // len() — byte length
+        // len(): return the length in bytes.
         methods.add_method("len", |_, this, ()| Ok(this.0.len()));
 
-        // tostring metamethod
+        // `tostring` metamethod.
         methods.add_meta_method(mlua::MetaMethod::ToString, |_, this, ()| {
             Ok(format!("Body({} bytes)", this.0.len()))
         });
 
-        // len metamethod (#body)
+        // `len` metamethod (#body).
         methods.add_meta_method(mlua::MetaMethod::Len, |_, this, ()| Ok(this.0.len()));
     }
 }
 
-/// Coerce Lua values to Body:
-/// - String → raw bytes
-/// - Table → JSON encoded
-/// - Body userdata → clone
-/// - nil → empty
+/// Convert Lua values to `Body`:
+/// - String: raw bytes
+/// - Table: JSON-encoded bytes
+/// - Body userdata: a clone
+/// - nil: empty body
 impl FromLua for Body {
     fn from_lua(value: Value, lua: &Lua) -> mlua::Result<Self> {
         match value {

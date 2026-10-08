@@ -1,5 +1,7 @@
-//! TUI monitor `Runtime`: channel-backed stdin, ratatui thread, and the
-//! network-event / stats-poll forwarders.
+//! TUI monitor runtime.
+//!
+//! Shows the guest in the TUI monitor control panel, together with network
+//! events and guest stats.
 
 use airlock_common::supervisor_capnp::stdin;
 use futures::StreamExt;
@@ -11,21 +13,24 @@ use crate::network::NetworkHandle;
 use crate::project::Project;
 use crate::rpc;
 
-/// Build a TUI-backed runtime. `attach_stdin` must be called before `launch`
-/// so the supervisor gets its channel-backed stdin client.
+/// Runtime with the TUI monitor. Call `attach_stdin` before `launch`, so
+/// the supervisor gets its channel-backed stdin client.
 pub struct MonitorRuntime {
+    /// Sender of the channel-backed guest stdin. Set in `attach_stdin`.
     stdin_tx: Option<mpsc::Sender<airlock_monitor::TuiInputEvent>>,
-    /// Sender given to the TUI so it can request signals (e.g. SIGINT when
-    /// the user presses `q`). Taken in `launch`.
+    /// Sender for the TUI to request signals (for example SIGHUP and
+    /// SIGTERM when the user stops the sandbox from the TUI). Taken in
+    /// `launch`.
     sig_tx: Option<mpsc::Sender<i32>>,
-    /// Receiver drained by `signals()` and merged into the signal stream.
+    /// Receiver that `signals()` reads and merges into the signal stream.
     sig_rx: Option<mpsc::Receiver<i32>>,
-    /// Buffer caps and scrollback for the TUI. Built from the user's
-    /// `[monitor]` config section by the CLI before construction.
+    /// Buffer limits, scrollback and key bindings for the TUI. The CLI
+    /// makes them from the `[monitor]` section of the user settings.
     settings: airlock_monitor::TuiSettings,
 }
 
 impl MonitorRuntime {
+    /// Make a monitor runtime with the given TUI settings.
     pub fn new(settings: airlock_monitor::TuiSettings) -> Self {
         let (sig_tx, sig_rx) = mpsc::channel(8);
         Self {
@@ -42,9 +47,9 @@ impl Runtime for MonitorRuntime {
 
     fn attach_stdin(&mut self) -> anyhow::Result<(stdin::Client, PtySize)> {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        // The tab bar occupies rows at the bottom; the guest PTY only gets
-        // the body area. Advertising the full terminal size would let the
-        // guest draw past vt100's grid and collapse onto the last row.
+        // The tab bar uses rows at the bottom, so the guest PTY gets only
+        // the body area. With the full terminal size, the guest draws past
+        // the vt100 grid, and the extra lines overwrite the last row.
         let body_rows = rows.saturating_sub(airlock_monitor::TAB_BAR_HEIGHT);
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let tui_stdin = airlock_monitor::TuiStdin::new(rx, Some((body_rows, cols)));
@@ -97,7 +102,8 @@ impl Runtime for MonitorRuntime {
 
         let mut tasks = JoinSet::new();
 
-        // Forward network events from the broadcast channel to the TUI thread.
+        // Forward network events from the broadcast channel to the TUI
+        // thread.
         let net_tx = tui.tx.clone();
         let mut events = network.events();
         tasks.spawn_local(async move {
@@ -110,7 +116,8 @@ impl Runtime for MonitorRuntime {
             }
         });
 
-        // Poll guest CPU/memory stats once per second and forward to the TUI.
+        // Poll the guest CPU and memory stats one time per second and send
+        // them to the TUI.
         let stats_tx = tui.tx.clone();
         tasks.spawn_local(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -139,10 +146,11 @@ impl Runtime for MonitorRuntime {
     }
 }
 
+/// Output sink that sends guest output to the TUI monitor.
 pub struct MonitorTerminal {
     tui: Option<airlock_monitor::TuiHandle>,
-    /// The network-event and stats forwarders. Dropping the terminal (after
-    /// `exit`) aborts them.
+    /// Forwarders of network events and stats. They stop when the terminal
+    /// drops (after `exit`).
     _tasks: JoinSet<()>,
 }
 

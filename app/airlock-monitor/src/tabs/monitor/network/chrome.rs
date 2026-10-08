@@ -1,5 +1,7 @@
-//! Outer chrome for the network panel: rounded border with a title + mode
-//! indicator, and the sub-tab header row with a separator.
+//! Frame parts of the network panel.
+//!
+//! Draws the panel border with the title and the current network policy, the
+//! policy dropdown and the sub-tab header row.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
@@ -10,19 +12,27 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget};
 use super::NetworkSubTab;
 use crate::Policy;
 
-/// Draw the rounded border + left title + right-aligned "policy: …" anchor.
-/// Returns the inner content rect plus the anchor rect (for click detection).
+/// Draw the panel border, the title on the left, and the "policy: …" title
+/// on the right.
+/// Args:
+///  - `area`: Area of the full panel
+///  - `policy`: Current network policy
+///  - `buf`: Buffer to draw into.
+///
+/// Returns:
+///   The inner content rect, and the rect of the policy title (for click
+///   detection).
 pub fn render_frame(area: Rect, policy: Policy, buf: &mut Buffer) -> (Rect, Rect) {
     let title = Line::from(Span::styled(
         " network ",
         Style::default().add_modifier(Modifier::BOLD),
     ));
     let label = policy.title();
-    // Fixed-width anchor so the label's left edge doesn't dance as the
-    // policy changes. " p" — "p" is the keyboard shortcut, lifted to
-    // white + bold so it reads as a hint. "olicy:" and " ▾ " fade into
-    // the title bar. For shorter labels, the gap before " ▾ " is filled
-    // with `─` so the anchor's total width stays constant.
+    // The policy title has a fixed width, so the left edge of the label does
+    // not move when the policy changes. In " p", "p" is the keyboard
+    // shortcut. It has a highlight style, so it shows as a hint. "olicy:"
+    // and " ▾ " are dim, as the title bar. For shorter labels, `─` fills the
+    // gap before " ▾ ", so the total width stays the same.
     let leading = " ";
     let shortcut = "p";
     let rest = "olicy: ";
@@ -40,8 +50,8 @@ pub fn render_frame(area: Rect, policy: Policy, buf: &mut Buffer) -> (Rect, Rect
         + max_label_w
         + suffix.chars().count()) as u16;
     let dim_style = Style::default().fg(Color::DarkGray);
-    // Cyan matches the `R`/`C` accelerator tint on the sub-tab labels so
-    // the keyboard hints read as a unified vocabulary.
+    // Cyan is the same color as the `R`/`C` shortcut letters on the sub-tab
+    // labels. Thus all keyboard hints look the same.
     let shortcut_style = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
@@ -67,8 +77,8 @@ pub fn render_frame(area: Rect, policy: Policy, buf: &mut Buffer) -> (Rect, Rect
     let inner = block.inner(area);
     block.render(area, buf);
 
-    // Anchor sits on the top border row, right-aligned with a 1-column gap
-    // before the rounded corner.
+    // The policy title is on the top border row, aligned to the right. It
+    // ends at the column before the rounded corner.
     let anchor_x = area
         .x
         .saturating_add(area.width)
@@ -77,16 +87,24 @@ pub fn render_frame(area: Rect, policy: Policy, buf: &mut Buffer) -> (Rect, Rect
     (inner, anchor)
 }
 
-/// Render the policy dropdown overlay anchored under the title label. Returns
-/// the per-row click rects (one entry per `Policy::ALL` variant).
+/// Draw the policy dropdown below the policy title.
+/// Args:
+///  - `panel`: Area of the full panel. The dropdown stays in this area.
+///  - `anchor`: Rect of the policy title, from [`render_frame`]
+///  - `highlighted`: Policy to highlight
+///  - `buf`: Buffer to draw into.
+///
+/// Returns:
+///   The click rect of each row, in [`Policy::ALL`] order. Empty if the
+///   panel is too small for the dropdown.
 pub fn render_policy_dropdown(
     panel: Rect,
     anchor: Rect,
     highlighted: Policy,
     buf: &mut Buffer,
 ) -> Vec<(Policy, Rect)> {
-    // Width: fit the longest label plus 1 space of padding between the
-    // text and each border; cap at panel width.
+    // Width: the longest label, plus 1 space between the text and each
+    // border. Not wider than the panel.
     let label_w = Policy::ALL
         .iter()
         .map(|p| p.title().chars().count() as u16)
@@ -99,10 +117,10 @@ pub fn render_policy_dropdown(
     }
 
     // Align the item text with the policy label in the title bar. The title
-    // reads " policy: <label> ▾ "; `<label>` starts 9 cols into the anchor
-    // (1 leading space + "policy: "). Inside the dropdown, the label starts
-    // 2 cols into the box (1 border + 1 padding). So `anchor.x + 9 = x + 2`
-    // ⇒ `x = anchor.x + 7`. Nudge left if the panel can't hold that.
+    // is " policy: <label> ▾ ". `<label>` starts 9 cols into the title
+    // (1 space + "policy: "). In the dropdown, the label starts 2 cols into
+    // the box (1 border + 1 padding). So `anchor.x + 9 = x + 2`, thus
+    // `x = anchor.x + 7`. Move the box left if the panel is too narrow.
     let desired_x = anchor.x.saturating_add(7);
     let max_x = panel.x + panel.width.saturating_sub(width);
     let x = desired_x.min(max_x).max(panel.x);
@@ -138,19 +156,33 @@ pub fn render_policy_dropdown(
     rects
 }
 
-/// Rects produced by `render_sub_tabs`, for mouse hit-testing.
+/// Rects from [`render_sub_tabs`], for mouse hit tests.
 pub struct SubTabRects {
+    /// Rect of the Requests label.
     pub requests: Rect,
+    /// Rect of the Connections label.
     pub connections: Rect,
-    /// `Some` only when the details tab is currently visible.
+    /// Rect of the details label. `Some` only when the details tab is
+    /// visible.
     pub details: Option<Rect>,
-    /// Click rect for the `×` close glyph at the end of the details label.
+    /// Click rect of the `×` close glyph at the end of the details label.
     pub details_close: Option<Rect>,
 }
 
-/// Render the sub-tab labels with a blank top-margin row and a bottom
-/// separator. `details_label` is `Some(text)` (e.g. "Request details") only
-/// while the details sub-tab is visible.
+/// Draw the sub-tab labels, with an empty top margin row and a separator
+/// row below.
+/// Args:
+///  - `area`: Area of the sub-tab header
+///  - `active`: Active sub-tab
+///  - `details_label`: Text of the details label (for example "Request
+///    details"). `Some` only when the details sub-tab is visible.
+///  - `highlight_requests_letter`: True to highlight the "R" shortcut letter
+///  - `highlight_connections_letter`: True to highlight the "C" shortcut
+///    letter
+///  - `buf`: Buffer to draw into.
+///
+/// Returns:
+///   The label rects, for mouse hit tests.
 pub fn render_sub_tabs(
     area: Rect,
     active: NetworkSubTab,
@@ -168,7 +200,7 @@ pub fn render_sub_tabs(
         };
     }
 
-    // Layout: top-margin row (blank) | labels row | separator row.
+    // Layout: top margin row (empty), labels row, separator row.
     let labels_y = area.y + area.height.min(2).saturating_sub(1);
     let sep_y = area.y + area.height.saturating_sub(1);
 
@@ -198,10 +230,10 @@ pub fn render_sub_tabs(
     );
 
     let (details_rect, details_close_rect) = if let Some(text) = details_label {
-        // Details label + trailing " × ". Shortcut-letter styling doesn't
-        // apply (no single-letter accelerator) so render it as a plain word.
+        // Details label and " × " after it. The label has no shortcut
+        // letter, so it shows as a plain word.
         let word_len = text.chars().count() as u16;
-        // " " + word + " × " (space-×-space as close button).
+        // " " + word + " × " (space, ×, space is the close button).
         let label_w = word_len + 4;
         let close_w: u16 = 3;
         let label_x = area.x + left_pad + req_w + gap + conn_w + gap;
@@ -231,9 +263,10 @@ pub fn render_sub_tabs(
     }
 }
 
-/// Render the third sub-tab label (details). Active highlighting mirrors
-/// `render_label`; the trailing ` × ` is always dim so it reads as a
-/// clickable close hint.
+/// Draw the third sub-tab label (details).
+///
+/// The active style is the same as in `render_label`. The ` × ` at the end
+/// is always dim, so it shows as a close button.
 fn render_details_label(rect: Rect, text: &str, active: bool, buf: &mut Buffer) {
     let word_style = if active {
         Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
@@ -251,12 +284,11 @@ fn render_details_label(rect: Rect, text: &str, active: bool, buf: &mut Buffer) 
     Paragraph::new(line).render(rect, buf);
 }
 
-/// Render one sub-tab label with a leading/trailing space and an
-/// underline under the word (but not the surrounding padding spaces)
-/// when active. The first letter is tinted cyan only when
-/// `highlight_letter` is true — the caller passes `false` if the user
-/// has rebound the action to something other than that letter, so the
-/// hint doesn't lie.
+/// Draw one sub-tab label with a space before and after the word.
+///
+/// When active, the word is underlined, but not the spaces. The first letter
+/// is cyan only when `highlight_letter` is true. The caller gives `false` if
+/// the user bound the action to a different key, so the hint is not wrong.
 fn render_label(rect: Rect, text: &str, active: bool, highlight_letter: bool, buf: &mut Buffer) {
     let pad_style = Style::default();
     let word_style = if active {

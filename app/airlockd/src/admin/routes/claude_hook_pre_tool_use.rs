@@ -1,10 +1,8 @@
-//! `POST /claude/hooks/pre-tool-use` — record the tool call's start time.
+//! Hook before a tool call.
 //!
-//! Claude Code fires this hook before it invokes a tool. We store
-//! `tool_use_id → now` so the matching post-tool-use-failure route can
-//! compare against the `DenyTracker` and decide whether a failure was
-//! caused by a policy deny. Always responds with an empty object so the
-//! hook passes through without modifying tool behavior.
+//! Claude Code calls this hook before it runs a tool. The hook records the
+//! start time of the tool call. The failure hook uses this time to decide if a
+//! network deny caused a failure.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,11 +15,14 @@ use tracing::debug;
 
 use crate::admin::state::AdminState;
 
+/// Hook request body. Only the used fields.
 #[derive(Deserialize)]
 pub struct Payload {
     tool_use_id: Option<String>,
 }
 
+/// Record the current time as the start of the tool call. Always returns an
+/// empty JSON object, so the hook does not change the tool behavior.
 pub async fn handle(State(state): State<Arc<AdminState>>, Json(p): Json<Payload>) -> Json<Value> {
     if let Some(id) = p.tool_use_id {
         let now = SystemTime::now()

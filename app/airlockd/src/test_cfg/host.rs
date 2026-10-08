@@ -1,21 +1,24 @@
+//! Fake host services (clipboard and browser) for the guest bridges.
+
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use airlock_common::supervisor_capnp::{browser, clipboard};
 use airlock_test_utils::rpc_loopback;
 
-/// The host clipboard, served to the guest over a real RPC connection.
-/// Call [`HostClipboard::client`] inside a `LocalSet`.
+/// A fake host clipboard that the guest uses through a real RPC connection.
+/// Call [`HostClipboard::client`] in a `LocalSet`.
 #[derive(Default)]
 pub(crate) struct HostClipboard {
-    /// Copies the host accepted, in order.
+    /// Copies that the host accepted, in order.
     pub copies: RefCell<Vec<Vec<u8>>>,
-    /// What a paste returns; `None` refuses the paste.
+    /// The data that a paste returns. `None` refuses the paste.
     pub contents: RefCell<Option<Vec<u8>>>,
-    /// How many upcoming copies the host refuses.
+    /// The number of next copies that the host refuses.
     pub refuse_copies: Cell<usize>,
 }
 
+/// RPC server of [`HostClipboard`].
 struct ClipboardServer(Rc<HostClipboard>);
 
 impl clipboard::Server for ClipboardServer {
@@ -47,11 +50,13 @@ impl clipboard::Server for ClipboardServer {
 }
 
 impl HostClipboard {
+    /// Return an RPC client for this clipboard.
     pub fn client(self: &Rc<Self>) -> clipboard::Client {
         let server: clipboard::Client = capnp_rpc::new_client(ClipboardServer(self.clone()));
         rpc_loopback(server.client)
     }
 
+    /// Return the accepted copies as text.
     pub fn copied(&self) -> Vec<String> {
         self.copies
             .borrow()
@@ -61,16 +66,17 @@ impl HostClipboard {
     }
 }
 
-/// The host browser, served to the guest over a real RPC connection.
-/// Call [`HostBrowser::client`] inside a `LocalSet`.
+/// A fake host browser that the guest uses through a real RPC connection.
+/// Call [`HostBrowser::client`] in a `LocalSet`.
 #[derive(Default)]
 pub(crate) struct HostBrowser {
-    /// URLs the host opened, in order.
+    /// URLs that the host opened, in order.
     pub opened: RefCell<Vec<String>>,
-    /// How many upcoming opens the host refuses.
+    /// The number of next opens that the host refuses.
     pub refuse_opens: Cell<usize>,
 }
 
+/// RPC server of [`HostBrowser`].
 struct BrowserServer(Rc<HostBrowser>);
 
 impl browser::Server for BrowserServer {
@@ -91,6 +97,7 @@ impl browser::Server for BrowserServer {
 }
 
 impl HostBrowser {
+    /// Return an RPC client for this browser.
     pub fn client(self: &Rc<Self>) -> browser::Client {
         let server: browser::Client = capnp_rpc::new_client(BrowserServer(self.clone()));
         rpc_loopback(server.client)

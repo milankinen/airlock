@@ -1,7 +1,7 @@
-//! Shared row-rendering helpers for the network panel. Both Requests and
-//! Connections rows share the same column vocabulary (timestamp widths,
-//! status widths, truncation, selection highlight); this module hosts
-//! those utilities.
+//! Row layout for the network panel lists.
+//!
+//! Sets the columns, text format and selection highlight of the rows in the
+//! Requests and Connections sub-tabs.
 
 use std::time::SystemTime;
 
@@ -10,22 +10,22 @@ use ratatui::text::Line;
 
 /// Width of the leading `⦿` bullet (1 char, no padding).
 pub const BULLET_COLS: usize = 1;
-/// Width of a fixed-width timestamp column, sized for `"Mon DD, HH:MM:SS"`.
+/// Width of a timestamp column. The size is for `"Mon DD, HH:MM:SS"`.
 pub const TIMESTAMP_COLS: usize = 16;
 /// Width of the trailing `Allowed` / `Denied` column.
 pub const RESULT_COLS: usize = 7;
-/// Width of the `↑ 1.2MB ↓ 340KB` transfer column. Sized for the widest
-/// realistic pair — five glyphs per figure plus arrows and spacing.
+/// Width of the `↑ 1.2MB ↓ 340KB` transfer column. The widest realistic
+/// pair (six glyphs for each number, plus arrows and spaces) uses 17 cells.
+/// The column has 2 more cells.
 pub const TRANSFER_COLS: usize = 19;
 
-/// Human-readable byte count in the short, approximate style used by
-/// `curl`/`wget` progress output — `6.3GB`, `12MB`, `840KB`, `19B`.
-///
-/// Powers of 1024, but labelled with the shorter SI-style suffixes: the
-/// column is far too narrow for `GiB`, and at one decimal place the
-/// distinction is noise for the "how much did this move" question the
-/// column answers. One decimal only below 10 so the width stays put.
+/// Format a byte count in the short, approximate style of the `curl` and
+/// `wget` progress output, for example `6.3GB`, `12MB`, `840KB`, `19B`.
 pub fn format_transfer(bytes: u64) -> String {
+    // Use powers of 1024, but with the shorter SI-style suffixes. The column
+    // is too narrow for `GiB`. Also, with one decimal place, the difference
+    // is not important for the column's purpose (how much data moved).
+    // Use one decimal only below 10, so that the width stays the same.
     const UNITS: [(u64, &str); 4] = [
         (1024 * 1024 * 1024 * 1024, "TB"),
         (1024 * 1024 * 1024, "GB"),
@@ -45,6 +45,8 @@ pub fn format_transfer(bytes: u64) -> String {
     format!("{bytes}B")
 }
 
+/// Cut `s` to at most `width` chars. If the text is too long, the end is
+/// replaced with `…`.
 pub fn truncate_right(s: &str, width: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= width {
@@ -61,6 +63,8 @@ pub fn truncate_right(s: &str, width: usize) -> String {
     out
 }
 
+/// Cut `s` to at most `width` chars. If the text is too long, the start is
+/// replaced with `…`.
 pub fn truncate_left(s: &str, width: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= width {
@@ -79,6 +83,8 @@ pub fn truncate_left(s: &str, width: usize) -> String {
     out
 }
 
+/// Add spaces after `s` until it is `width` chars wide. Longer text stays
+/// the same.
 pub fn pad_right(s: &str, width: usize) -> String {
     let n = s.chars().count();
     if n >= width {
@@ -89,6 +95,8 @@ pub fn pad_right(s: &str, width: usize) -> String {
     out
 }
 
+/// Add spaces before `s` until it is `width` chars wide. Longer text stays
+/// the same.
 pub fn pad_left(s: &str, width: usize) -> String {
     let n = s.chars().count();
     if n >= width {
@@ -104,12 +112,13 @@ const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
-/// Format a `SystemTime` as local "Mon DD, HH:MM:SS" using libc's `localtime_r`.
+/// Format a `SystemTime` as local time in the format "Mon DD, HH:MM:SS".
 pub fn format_timestamp(t: SystemTime) -> String {
     let secs = t
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let tt = secs as libc::time_t;
+    // Convert to local time with `localtime_r` from libc.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let ok = unsafe { !libc::localtime_r(&raw const tt, &raw mut tm).is_null() };
     if !ok {
@@ -125,11 +134,12 @@ pub fn format_timestamp(t: SystemTime) -> String {
     )
 }
 
-/// Paint every span on the line with a dark-gray background to mark it as
-/// selected. Also promotes normal (unset) fg to white and `DarkGray` to a
-/// slightly lighter gray so the row reads clearly against the highlight
-/// background without losing the dimmed/primary distinction. Other explicit
-/// colors (bullet, status green/red) are preserved.
+/// Mark the line as selected with a dark gray background on all spans.
+///
+/// Also changes the normal (unset) fg to white, and `DarkGray` to a lighter
+/// gray. Thus the row is easy to read on the highlight background, and dim
+/// text stays different from primary text. Other explicit colors (bullet,
+/// green or red status) stay the same.
 pub fn apply_row_highlight(line: &mut Line<'_>) {
     for span in &mut line.spans {
         let fg = match span.style.fg {
@@ -147,8 +157,14 @@ pub fn apply_row_highlight(line: &mut Line<'_>) {
 
 #[cfg(test)]
 mod tests {
+    //! Tests of the transfer column of the network rows.
+
     use super::*;
 
+    /// Test that transfer sizes have one decimal only below 10 of a unit. The
+    /// column stays short and easy to read.
+    ///   1. Format sizes from 0 B to 10 GB
+    ///   2. Check the text of each size
     #[test]
     fn format_transfer_uses_one_decimal_only_below_ten() {
         let gb = 1024 * 1024 * 1024;
@@ -167,6 +183,12 @@ mod tests {
         }
     }
 
+    /// Test that the up and down transfer pair fits the column up to 1023 TB,
+    /// and that a larger pair is cut to the column width.
+    ///   1. Format pairs of the largest value of each unit up to TB
+    ///   2. Check that each pair fits the column
+    ///   3. Format a pair of the maximum value and check that it is cut to the
+    ///      column width
     #[test]
     fn transfer_pair_fits_column_up_to_petabytes_and_is_truncated_beyond() {
         for bytes in [

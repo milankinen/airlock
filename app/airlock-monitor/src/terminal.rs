@@ -1,15 +1,7 @@
-//! Which modifier key suspends mouse reporting in the host terminal.
+//! Host terminal detection for text selection.
 //!
-//! The TUI holds the terminal's mouse capture for the whole session, so a
-//! plain drag never reaches the terminal's own text selection. Every
-//! mainstream terminal has an escape hatch — hold a modifier and reporting
-//! is bypassed for that drag — but *which* modifier differs, and a user
-//! told the wrong one is worse off than a user told nothing.
-//!
-//! Detection is best-effort by nature. Over SSH, inside a multiplexer, or
-//! under a terminal that advertises nothing, `TERM_PROGRAM` may be absent
-//! or belong to some other program entirely — so the fallback matters more
-//! than the table does.
+//! Finds the modifier key that lets the user select text in the host terminal
+//! when the sandboxed program uses the mouse.
 
 use std::sync::OnceLock;
 
@@ -18,13 +10,23 @@ use std::sync::OnceLock;
 const SHIFT: &str = "Shift";
 /// macOS terminals that bind selection-bypass to the Option key.
 const OPTION: &str = "Option";
-/// Terminal.app is the odd one out.
+/// Terminal.app on macOS uses the Fn key.
 const FN: &str = "Fn";
 
-/// Modifier to hold for text selection in the current terminal.
+/// Modifier key to hold for text selection in the current terminal.
 ///
-/// Cached — the environment cannot change mid-session.
+/// The TUI holds the terminal's mouse capture for the whole session. Thus a
+/// plain drag never gets to the terminal's own text selection. All common
+/// terminals bypass mouse reporting for a drag when the user holds a
+/// modifier key. But the key is different in different terminals. A wrong
+/// hint is worse than no hint.
+///
+/// The detection cannot be fully reliable. Over SSH, in a multiplexer, or
+/// in a terminal that sets no variables, `TERM_PROGRAM` may be missing or
+/// may belong to a different program. Thus the fallback is more important
+/// than the table.
 pub fn select_modifier() -> &'static str {
+    // Cached, because the environment cannot change during the session.
     static CACHED: OnceLock<&'static str> = OnceLock::new();
     CACHED.get_or_init(|| {
         modifier_for(
@@ -35,23 +37,25 @@ pub fn select_modifier() -> &'static str {
     })
 }
 
-/// Pure form of [`select_modifier`], split out so the table can be tested
-/// without touching process environment — which is racy under a parallel
-/// test runner and `unsafe` besides.
+/// Pure form of [`select_modifier`].
+///
+/// It is a separate function so that tests can check the table without
+/// changes to the process environment. Such changes are racy when tests run
+/// in parallel, and they are also `unsafe`.
 fn modifier_for(
     term_program: Option<&str>,
     lc_terminal: Option<&str>,
     macos: bool,
 ) -> &'static str {
-    // iTerm2 sets LC_TERMINAL as well, and forwards it over SSH where
-    // TERM_PROGRAM is typically lost — so check it either way round.
+    // iTerm2 also sets LC_TERMINAL and sends it over SSH, where
+    // TERM_PROGRAM is usually lost. Thus check LC_TERMINAL first.
     if lc_terminal == Some("iTerm2") {
         return OPTION;
     }
     match term_program {
         Some("iTerm.app") => OPTION,
         Some("Apple_Terminal") => FN,
-        // VS Code follows the platform's convention rather than its own.
+        // VS Code uses the convention of the platform.
         Some("vscode") if macos => OPTION,
         _ => SHIFT,
     }
@@ -59,13 +63,22 @@ fn modifier_for(
 
 #[cfg(test)]
 mod tests {
+    //! Tests of the selection modifier for each host terminal.
+
     use super::*;
 
+    /// Test that the text selection modifier agrees with the host terminal and
+    /// is Shift for unknown terminals. The hint must name the correct key.
+    ///   1. Get the modifier for known and unknown terminals on macOS and on
+    ///      other systems
+    ///   2. Check the modifier of each case
     #[test]
     fn select_modifier_follows_terminal_and_falls_back_to_shift() {
         for (term_program, lc_terminal, macos, expected) in [
             (Some("iTerm.app"), None, true, OPTION),
             (None, Some("iTerm2"), false, OPTION),
+            // LC_TERMINAL comes first, because SSH keeps it but often loses
+            // TERM_PROGRAM.
             (Some("Apple_Terminal"), Some("iTerm2"), true, OPTION),
             (Some("Apple_Terminal"), None, true, FN),
             (Some("vscode"), None, true, OPTION),

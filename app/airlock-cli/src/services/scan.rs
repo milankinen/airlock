@@ -1,48 +1,16 @@
-//! The streaming scan of API answers: no real token of the provider
-//! reaches the sandbox in an API answer, whatever its size or framing.
+//! The scan of API answers.
 //!
-//! [`scan_answer`] checks every answer of a service's API hosts:
-//!
-//! - A compressed answer is refused (local `502`): it cannot be scanned,
-//!   and the proxy asked for none (`Accept-Encoding: identity`).
-//! - A response header that holds a real token refuses the answer. That
-//!   covers `Set-Cookie` too: a cookie that holds a JWT with an OpenAI
-//!   claim makes the answer a `502`.
-//! - The body and its trailers stream through a [`Scanner`]. The primary
-//!   check is an exact search for the real values the proxy knows: every
-//!   real token of the service's store and the real values of the masked
-//!   secrets injected into this request (opaque tokens too). The second
-//!   check searches for the provider's token shapes
-//!   ([`super::tokens::Format::starts`] and [`super::tokens::Format::shape`]:
-//!   `sk-ant-oat01-…` with 80 or more characters, JWTs with an OpenAI
-//!   claim; surrogates excluded), at the start of a
-//!   run of token characters only. An event stream (model output) gets the
-//!   exact search only: model text can hold token-shaped strings.
-//! - A JSON answer is held until [`HOLD_JSON`] bytes are scanned: a hit
-//!   there is a local `502`. Other answers go on at once (the status
-//!   included); a hit ends the stream with an error, so the chunk with the
-//!   token never reaches the guest.
-//! - A switch of protocols (`101`, the WebSocket upgrade) passes.
-//!
-//! Split tokens: a token is a run of token characters
-//! ([`is_token_char`]). The scanner holds back the run at the end of a
-//! chunk until it ends (at most [`HOLD_MAX`] bytes; a longer run goes on
-//! in parts), and an end of the chunk that is the start of a known value.
-//! A token
-//! split across chunks is found whole. Everything before goes on at once:
-//! an event stream, whose events end in a newline, is not delayed.
-//!
-//! Bounded work: each byte is checked once for the start of a candidate
-//! token, a candidate is at most [`MAX_TOKEN_LEN`] bytes, and held bytes
-//! are not searched again on the next chunk.
+//! Makes sure that no real token of the provider gets to the sandbox in an
+//! API answer. The scan works on the stream, for answers of all sizes and
+//! framings.
 //!
 //! Known limits:
 //!
-//! - WebSocket frames after a `101` are not scanned.
-//! - An encoded form of a token (a JSON `\u` escape, base64,
-//!   URL-encoding) is not found. The sandbox can make the proxy send a
-//!   real token upstream only in the swapped credential headers, so an
-//!   upstream that echoes a request cannot be steered to encode one.
+//! - The scan does not check WebSocket frames after a protocol upgrade.
+//! - The scan does not find an encoded form of a token (a JSON `\u`
+//!   escape, base64, URL encoding). The sandbox can make the proxy send a
+//!   real token upstream only in the swapped credential headers. Thus the
+//!   sandbox cannot make an upstream that echoes a request encode a token.
 
 use std::collections::VecDeque;
 use std::pin::Pin;
@@ -60,38 +28,45 @@ use super::tokens::Formats;
 use crate::network::http::{BoxError, ResponseBody};
 use crate::network::target::InjectedSecret;
 
-/// The longest token the shape search decides on: longer runs are cut
-/// there (a JWT of the providers is a few KiB).
+/// Maximum length of a token for the shape search. The search cuts longer
+/// runs at this length (a JWT of the providers is a few KiB).
 pub const MAX_TOKEN_LEN: usize = 8 * 1024;
 
-/// How much of a long run of token characters the scanner holds back
-/// (at least [`MAX_TOKEN_LEN`]). A run up to twice this goes on whole.
+/// How much of a long run of token characters the scanner holds back (at
+/// least [`MAX_TOKEN_LEN`]). A run of up to twice this length is held
+/// back fully.
 pub const HOLD_MAX: usize = 32 * 1024;
 
-/// How much of a JSON answer the scan reads before the answer goes on: a
-/// JSON answer up to this size with a real token is a local `502`, not a
-/// cut stream.
+/// How much of a JSON answer the scan reads before the answer goes to the
+/// guest. A JSON answer of up to this size with a real token becomes a
+/// local `502`, not a cut stream.
 pub const HOLD_JSON: usize = 64 * 1024;
 
-/// Store tokens shorter than this are not searched for: too likely to
-/// match by chance.
+/// The scan does not search for store tokens shorter than this. A short
+/// token can match by chance too easily.
 const MIN_KNOWN_LEN: usize = 8;
 
-/// Injected masked secrets shorter than this are not searched for: a user
-/// secret can be short and common (masked secrets have 8 or more
-/// characters), and a chance match would cut an answer.
+/// The scan does not search for injected masked secrets shorter than
+/// this. A user secret can be short and common (masked secrets have 8 or
+/// more characters), and a chance match would cut an answer.
 pub const MIN_INJECTED_LEN: usize = 16;
 
-/// A character of a token run: base64url, dots and `~`. The providers'
-/// token shapes use no other; `=`, `/` and `+` end a run, so a token
-/// after `name=` (a cookie) or in a URL path starts a run of its own.
+/// Whether `c` is a character of a token run: base64url, dots and `~`.
+///
+/// The providers' token shapes use no other characters. `=`, `/` and `+`
+/// end a run, so a token after `name=` (a cookie) or in a URL path starts
+/// its own run.
 pub fn is_token_char(c: u8) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.' | b'~')
 }
 
-/// The real values an API answer must not carry: the real tokens of the
-/// service's store and the real values of the masked secrets injected
-/// into the request.
+/// Collect the real values that an API answer must not contain: the real
+/// tokens of the service's store, and the real values of the masked
+/// secrets injected into the request.
+/// Args:
+///  - `snapshot`: The service's grants
+///  - `injected`: Masked secrets that the inject rules put into the
+///    request.
 pub fn known_reals(snapshot: &Snapshot, injected: &[InjectedSecret]) -> Vec<String> {
     snapshot
         .reals()
@@ -106,7 +81,7 @@ pub fn known_reals(snapshot: &Snapshot, injected: &[InjectedSecret]) -> Vec<Stri
         .collect()
 }
 
-/// A real token was found.
+/// Error: the scan found a real token.
 #[derive(Debug)]
 pub struct Found;
 
@@ -118,21 +93,21 @@ impl std::fmt::Display for Found {
 
 impl std::error::Error for Found {}
 
-/// What the scanner looks for, and where it left off.
+/// What the scanner searches for, and where the last search stopped.
 struct State {
     formats: &'static Formats,
     known: Vec<Vec<u8>>,
-    /// Search the token shapes (not in event streams).
+    /// Search for the token shapes (not in event streams).
     shapes: bool,
-    /// The byte before the held bytes (the last byte that went on).
+    /// The byte before the held bytes (the last byte sent to the guest).
     before: Option<u8>,
-    /// Offset in the held bytes from which candidate starts are not yet
-    /// decided.
+    /// Offset in the held bytes from which the candidate starts are not
+    /// decided yet.
     shapes_from: usize,
-    /// The undecided candidate at `shapes_from`, and how far its run is
-    /// known to reach.
+    /// End of the known part of the run of the undecided candidate at
+    /// `shapes_from`.
     open_end: Option<usize>,
-    /// Offset in the held bytes from which known values may still start.
+    /// Offset in the held bytes from which known values can still start.
     known_from: usize,
     /// The length of the run of token characters at the end of the held
     /// bytes.
@@ -157,8 +132,9 @@ impl State {
         self.known.iter().map(Vec::len).max().unwrap_or(0)
     }
 
-    /// The longest end of `buf` that is the start of a known value (and
-    /// not the whole value): those bytes must wait for the next chunk.
+    /// Get the length of the longest end of `buf` that is the start of a
+    /// known value (but not the full value). These bytes must wait for the
+    /// next chunk.
     fn known_prefix_at_end(&self, buf: &[u8]) -> usize {
         let Some(&last) = buf.last() else {
             return 0;
@@ -173,8 +149,17 @@ impl State {
             .unwrap_or(0)
     }
 
-    /// Search `buf` (the held bytes) from where the last search left off.
-    /// `last`: no more data follows.
+    /// Search `buf` (the held bytes) from where the last search stopped.
+    ///
+    /// Bounded work: each byte is checked once for the start of a
+    /// candidate token, and a candidate is at most [`MAX_TOKEN_LEN`] bytes.
+    /// The next search does not search held bytes again.
+    /// Args:
+    ///  - `buf`: The held bytes
+    ///  - `last`: True if no more data follows.
+    ///
+    /// Returns:
+    ///   [`Found`] if `buf` contains a known value or a real token shape.
     fn check(&mut self, buf: &[u8], last: bool) -> Result<(), Found> {
         for real in &self.known {
             if find_from(buf, real, self.known_from) {
@@ -203,7 +188,9 @@ impl State {
                 i += 1;
                 continue;
             }
-            // A run starts at `i`: the candidate, at most MAX_TOKEN_LEN.
+            // A run starts at `i`. It is the candidate, at most
+            // MAX_TOKEN_LEN bytes. The shape search looks only at the start
+            // of a run.
             let cap = buf.len().min(i + MAX_TOKEN_LEN);
             let from = match self.open_end {
                 Some(end) if i == self.shapes_from => end.min(cap),
@@ -237,7 +224,7 @@ impl State {
                 .any(|f| f.starts.iter().any(|p| candidate.starts_with(p)) && (f.shape)(candidate))
     }
 
-    /// The held bytes lost their first `n` bytes (they went on).
+    /// Update the offsets after the first `n` held bytes went to the guest.
     fn shift(&mut self, n: usize, last_sent: Option<u8>) {
         if n == 0 {
             return;
@@ -250,15 +237,32 @@ impl State {
 }
 
 /// The scan state of one body.
+///
+/// The primary check is an exact search for the real values that the
+/// proxy knows (opaque tokens too). The second check searches for the
+/// provider's token shapes ([`super::tokens::Format::starts`] and
+/// [`super::tokens::Format::shape`]), but not surrogates.
+///
+/// A token split across chunks is found as a full token. The scanner holds
+/// back the run of token characters ([`is_token_char`]) at the end of a
+/// chunk until it ends. It holds back a run of up to twice [`HOLD_MAX`]
+/// bytes fully. Of a longer run, it holds back only the last [`HOLD_MAX`]
+/// bytes, and the run goes on in parts. It also holds back an end of the
+/// chunk that is the start of a known value. All bytes before go on
+/// immediately, so an event stream, whose events end in a newline, has no
+/// delay.
 pub struct Scanner {
     state: State,
-    /// Bytes held back: scanned, but they may be the start of a token.
+    /// Bytes held back: scanned, but they can be the start of a token.
     held: Vec<u8>,
 }
 
 impl Scanner {
-    /// A scanner for the real values `known`; `shapes`: also search the
-    /// provider's token shapes.
+    /// Make a scanner.
+    /// Args:
+    ///  - `formats`: Token formats of the provider
+    ///  - `known`: Real values to search for
+    ///  - `shapes`: Also search for the provider's token shapes.
     pub fn new(formats: &'static Formats, known: Vec<String>, shapes: bool) -> Self {
         Self {
             state: State::new(formats, known, shapes),
@@ -266,8 +270,10 @@ impl Scanner {
         }
     }
 
-    /// Scan the next chunk. Returns the bytes that may go to the guest
-    /// now (possibly none).
+    /// Scan the next chunk.
+    /// Returns:
+    ///   The bytes that can go to the guest now (possibly none), or
+    ///   [`Found`].
     pub fn push(&mut self, chunk: &[u8]) -> Result<Bytes, Found> {
         self.held.extend_from_slice(chunk);
         let tail = chunk
@@ -290,14 +296,17 @@ impl Scanner {
         Ok(Bytes::from(out))
     }
 
-    /// The end of the body: the held bytes, scanned as complete.
+    /// Scan the held bytes as complete at the end of the body.
+    /// Returns:
+    ///   The held bytes, or [`Found`].
     pub fn finish(&mut self) -> Result<Bytes, Found> {
         self.state.check(&self.held, true)?;
         Ok(Bytes::from(std::mem::take(&mut self.held)))
     }
 
-    /// Whether a complete value (a header or trailer value) holds a real
-    /// value or, whatever the content type, a token shape.
+    /// Whether a complete value (a header or trailer value) contains a real
+    /// value or a token shape. The shape search applies for all content
+    /// types.
     pub fn holds_real(&self, value: &[u8]) -> bool {
         let known = self
             .state
@@ -325,7 +334,8 @@ fn find_from(haystack: &[u8], needle: &[u8], from: usize) -> bool {
         .any(|i| haystack[i..].starts_with(needle))
 }
 
-/// The media type of the `Content-Type`, lowercase, without parameters.
+/// Get the media type of the `Content-Type`, lowercase, without
+/// parameters.
 fn mime_type(headers: &HeaderMap) -> Option<String> {
     headers
         .get(CONTENT_TYPE)
@@ -334,8 +344,32 @@ fn mime_type(headers: &HeaderMap) -> Option<String> {
         .map(|mime| mime.trim().to_ascii_lowercase())
 }
 
-/// Check an answer of an API host (see the module docs). `known`: the
-/// real values the answer must not carry ([`known_reals`]).
+/// Check an answer of an API host for real tokens.
+///
+/// The checks:
+///  * A switch of protocols (`101`, the WebSocket upgrade) passes.
+///  * A compressed answer is refused (local `502`). The scan cannot read
+///    it, and the proxy asked for no compression (`Accept-Encoding:
+///    identity`).
+///  * A response header that contains a real token refuses the answer.
+///    This includes `Set-Cookie`: a cookie with a JWT with an OpenAI claim
+///    makes the answer a `502`.
+///  * The body and its trailers stream through a [`Scanner`]. An event
+///    stream (model output) gets only the exact search, because model text
+///    can contain strings with a token shape.
+///  * A JSON answer is held until [`HOLD_JSON`] bytes are scanned. A hit
+///    there gives a local `502`. Other answers go on immediately (also the
+///    status). A hit then ends the stream with an error, so the chunk with
+///    the token never gets to the guest.
+///
+/// Args:
+///  - `resp`: The answer of the API host
+///  - `formats`: Token formats of the provider
+///  - `known`: Real values that the answer must not contain
+///    ([`known_reals`]).
+///
+/// Returns:
+///   The scanned answer, or a local `502`.
 pub async fn scan_answer(
     resp: Response<ResponseBody>,
     formats: &'static Formats,
@@ -419,6 +453,7 @@ pub async fn scan_answer(
     ))
 }
 
+/// Make the local `502` answer for an answer with a real token.
 fn refused() -> Response<ResponseBody> {
     server_error("an API answer that carries a real token")
 }
@@ -427,16 +462,17 @@ fn refused() -> Response<ResponseBody> {
 struct ScanBody {
     inner: ResponseBody,
     scanner: Scanner,
-    /// Frames ready for the guest.
+    /// Frames that are ready for the guest.
     ready: VecDeque<Frame<Bytes>>,
-    /// The inner body ended (its rest is in `ready`).
+    /// True if the inner body ended. Its remaining data is in `ready`.
     done: bool,
-    /// A token was found: the stream ended with an error.
+    /// True if the scan found a token. The stream ended with an error.
     failed: bool,
 }
 
 impl ScanBody {
-    /// Scan one frame of the inner body; queue what may go on.
+    /// Scan one frame of the inner body, and queue the bytes that can go
+    /// on.
     fn scan(&mut self, frame: Option<Frame<Bytes>>) -> Result<(), Found> {
         let Some(frame) = frame else {
             self.done = true;
@@ -506,6 +542,9 @@ impl Body for ScanBody {
 
 #[cfg(test)]
 mod tests {
+    //! The stream scan of API answers: real token shapes, known values,
+    //! tokens split across chunks, long runs and scan time.
+
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -513,6 +552,8 @@ mod tests {
     use crate::services::{anthropic, openai};
     use crate::test_cfg::services::shaped_token;
 
+    /// A scanner for `formats` and the `known` real values. `shapes` turns
+    /// on the search for token shapes.
     fn scanner(formats: &'static Formats, known: &[&str], shapes: bool) -> Scanner {
         Scanner::new(
             formats,
@@ -521,6 +562,9 @@ mod tests {
         )
     }
 
+    /// Push `chunks` through `scanner` and finish it.
+    /// Returns:
+    ///   The output text, or `None` if the scanner found a real value.
     fn run(scanner: &mut Scanner, chunks: &[&str]) -> Option<String> {
         let mut out = Vec::new();
         for c in chunks {
@@ -530,6 +574,13 @@ mod tests {
         Some(String::from_utf8(out).unwrap())
     }
 
+    /// Test that the scan finds real Anthropic token shapes, but lets
+    /// surrogates and strings that only look like tokens pass unchanged.
+    ///   1. Scan a JSON value, a bearer header and a bare API key with real
+    ///      token shapes and check that each is found
+    ///   2. Scan a surrogate, a short key, a key inside a longer word, a wrong
+    ///      prefix and plain text
+    ///   3. Check that each of them passes unchanged
     #[test]
     fn real_token_shape_is_found_and_lookalikes_pass() {
         let a = &anthropic::FORMATS;
@@ -559,6 +610,13 @@ mod tests {
         }
     }
 
+    /// Test that a token split across chunks is found before any of its bytes
+    /// go out, and that a split surrogate passes.
+    ///   1. Push text and the first part of a real token, and check that only
+    ///      the text before the token goes out
+    ///   2. Push the second part and check that nothing goes out
+    ///   3. Push the end of the run and check that the scan fails
+    ///   4. Scan a surrogate split in two and check that it passes unchanged
     #[test]
     fn token_split_across_chunks_is_found_before_its_bytes_go_out() {
         let token = shaped_token("sk-ant-oat01");
@@ -581,6 +639,11 @@ mod tests {
         );
     }
 
+    /// Test that a known real value split across chunks is found, also when it
+    /// contains characters that end a token run.
+    ///   1. Scan a split opaque token and a split value with a space and a `!`
+    ///   2. Check that each is found
+    ///   3. Check that a value with only a common start passes
     #[test]
     fn known_value_split_across_chunks_is_found_even_with_run_breaking_characters() {
         for known in ["REAL-opaque-access-token-1234", "pass word!secret"] {
@@ -595,6 +658,12 @@ mod tests {
         assert!(run(&mut s, &["{\"t\":\"REAL-opaque-other\"}"]).is_some());
     }
 
+    /// Test that the scan finds an OpenAI JWT, also split or with text after
+    /// it, but lets fake JWTs, other issuers and refresh-like strings pass.
+    ///   1. Scan a split real JWT and a real JWT with more text after a dot
+    ///   2. Check that both are found
+    ///   3. Scan a fake JWT, a JWT of another issuer and two strings that look
+    ///      like refresh tokens, and check that they pass unchanged
     #[test]
     fn openai_issuer_jwt_is_found_and_fakes_or_other_issuers_pass() {
         let jwt = |claims: &str| {
@@ -621,6 +690,12 @@ mod tests {
         }
     }
 
+    /// Test that a long run of token characters goes out in parts, so the
+    /// scanner does not hold the full answer, and that the scan finds a token
+    /// after a space.
+    ///   1. Push a run longer than twice the hold limit
+    ///   2. Check that all but the hold limit goes out
+    ///   3. Push a real token to a new scanner and check that it is found
     #[test]
     fn long_run_goes_out_in_parts_and_token_after_it_is_found() {
         let mut s = scanner(&anthropic::FORMATS, &[], true);
@@ -633,6 +708,13 @@ mod tests {
         );
     }
 
+    /// Test that answers made to slow the scan down are scanned in bounded
+    /// time. A malicious upstream must not stall the proxy.
+    ///   1. Make 1 MiB answers of repeated token starts, and a 64 KiB answer
+    ///      of `a` in one-byte chunks
+    ///   2. Push each in small and large chunks
+    ///   3. Check that all bytes go out and that each scan takes less than
+    ///      one second
     #[test]
     fn adversarial_runs_are_scanned_in_bounded_time() {
         for (pattern, chunk) in [
@@ -645,6 +727,7 @@ mod tests {
         ] {
             let started = std::time::Instant::now();
             let body = pattern.repeat(1024 * 1024 / pattern.len());
+            // One-byte chunks are slow, so the `a` case scans less data.
             let size = if pattern == "a" {
                 64 * 1024
             } else {
@@ -665,6 +748,10 @@ mod tests {
         }
     }
 
+    /// Test that a header value holds a real value if it contains a real token
+    /// shape or a known value, but not a surrogate or a normal value.
+    ///   1. Check a header with a real API key and a cookie with a known value
+    ///   2. Check a surrogate and a content type
     #[test]
     fn header_value_with_real_token_or_known_value_holds_real() {
         let s = scanner(&anthropic::FORMATS, &["known-real-value"], false);

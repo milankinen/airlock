@@ -1,22 +1,12 @@
-//! Guest side of the clipboard bridge.
+//! Clipboard bridge.
 //!
-//! The host hands us a `Clipboard` capability when the project grants a
-//! direction. We expose it to container processes as ordinary clipboard
-//! programs — `wl-copy`, `wl-paste`, `xclip`, `xsel` — because that is what
-//! software actually reaches for; nothing in the sandbox needs to know a
-//! bridge exists.
+//! Gives container processes access to the host clipboard through the usual
+//! clipboard programs `wl-copy`, `wl-paste`, `xclip` and `xsel`. Thus no
+//! program in the sandbox must know about the bridge. The host decides if
+//! copy, paste or both are available.
 //!
-//! **Transport is a FIFO pair, not a unix socket.** A shell shim cannot open
-//! a unix socket without `nc`/`socat`, which minimal images do not ship,
-//! whereas `cat > fifo` and `cat fifo` need nothing at all.
-//!
-//! Framing falls out of FIFO semantics: one open-to-EOF cycle is exactly one
-//! clipboard operation, so consecutive `wl-copy` invocations cannot run
-//! together into one blob.
-//!
-//! Opening a FIFO blocks — the read end waits for a writer and the write end
-//! waits for a reader — so every open happens on the blocking pool. Blocking
-//! inline here would wedge the runtime of a process that is PID 1.
+//! Each call of a clipboard program is one clipboard operation. The data of
+//! two concurrent copies does not mix.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -26,38 +16,49 @@ use tracing::{debug, info, warn};
 
 use crate::bridge::{in_rootfs, install_shim, make_fifo, read_capped};
 
-/// Guest-visible paths. `/usr/local/bin` is first on the container `PATH`
-/// (see the base env in the host's `oci.rs`), so the shims win over anything
-/// the image ships under the same names.
+// Paths as the container sees them. In the default container `PATH`,
+// `/usr/local/bin` comes before `/usr/bin` and `/bin` (see `DEFAULT_PATH` in
+// the host's `oci.rs`). Thus the shims have priority over programs with the
+// same names in these image directories. An image can set its own `PATH`.
+
+/// FIFO for copies (guest to host).
 const COPY_FIFO: &str = "/run/airlock/clipboard.copy";
+/// FIFO for pastes (host to guest).
 const PASTE_FIFO: &str = "/run/airlock/clipboard.paste";
+/// Directory of the shim scripts.
 const BIN_DIR: &str = "/usr/local/bin";
 
 /// Clipboard grant received in `Supervisor.boot()`.
 pub struct ClipboardConfig {
+    /// Copy (guest to host) is granted.
     pub copy: bool,
+    /// Paste (host to guest) is granted.
     pub paste: bool,
-    /// `None` when the host granted neither direction. Without it there is
-    /// no route to the host clipboard at all.
+    /// Host clipboard capability. `None` when the host granted neither
+    /// direction. Without it, there is no route to the host clipboard.
     pub sink: Option<clipboard::Client>,
-    /// Max bytes per copy. The host is the real check; this bound stops a
-    /// hostile writer growing our buffer without limit.
+    /// Maximum bytes per copy. The host does the real check. This limit
+    /// stops a hostile writer that tries to grow the guest buffer without
+    /// limit.
     pub limit: u64,
 }
 
 impl ClipboardConfig {
-    /// Nothing to do when the host withheld the capability. Guards against a
-    /// grant that claims a direction but carries no sink to serve it.
+    /// Return `true` if the bridge has something to serve. A grant with a
+    /// direction but no sink is not a grant.
     fn granted(&self) -> bool {
         self.sink.is_some() && (self.copy || self.paste)
     }
 }
 
-/// Create the FIFOs and shims, then spawn the serve loops.
+/// Start the clipboard bridge: create the FIFOs and shims, then start the
+/// serve loops.
 ///
-/// A no-op when nothing was granted: no FIFOs, no shims, so a program
-/// probing for a clipboard tool finds exactly what it would in an ordinary
-/// sandbox — nothing.
+/// Does nothing if the host granted nothing. Then there are no FIFOs and no
+/// shims, and a program that looks for a clipboard tool finds none.
+/// Args:
+///  - `cfg`: Clipboard grant from the host
+///  - `uid`, `gid`: Container user and group that own the FIFOs
 pub fn start(cfg: ClipboardConfig, uid: u32, gid: u32) -> anyhow::Result<()> {
     if !cfg.granted() {
         debug!("clipboard: not granted, no shims installed");
@@ -92,14 +93,14 @@ pub fn start(cfg: ClipboardConfig, uid: u32, gid: u32) -> anyhow::Result<()> {
 
 /// Shim scripts to install, as `(filename, contents)`.
 ///
-/// All four names are installed whenever either direction is granted,
-/// because real software disagrees about which to reach for — and even one
-/// program can disagree with itself: Claude Code's copy prefers `wl-copy`
-/// while its paste tries `xclip` first and falls back to `wl-paste`.
+/// Installs all four names if one or both directions are granted. Different
+/// programs use different tools, and one program can use more than one. For
+/// example, Claude Code copies with `wl-copy`, but for paste it tries
+/// `xclip` first and then `wl-paste`.
 ///
-/// A shim for an ungranted direction exits non-zero rather than hanging, so
-/// the `cmd-a || cmd-b` chains callers typically use move on to the next
-/// candidate instead of blocking forever on a FIFO nobody will serve.
+/// A shim for a direction that is not granted exits with a non-zero code. It
+/// does not wait. Thus a `cmd-a || cmd-b` chain tries the next program and
+/// does not block forever on a FIFO that nobody serves.
 fn shims(copy: bool, paste: bool) -> Vec<(&'static str, String)> {
     let copy_branch = if copy {
         format!("exec cat > {COPY_FIFO}")
@@ -112,9 +113,9 @@ fn shims(copy: bool, paste: bool) -> Vec<(&'static str, String)> {
         "echo 'airlock: clipboard paste is not enabled' >&2; exit 1".to_string()
     };
 
-    // `-o`/`--output` selects paste for both xclip and xsel; everything else
-    // is a copy. Good enough for the flag sets these are called with, and it
-    // fails safe: an unrecognised invocation copies rather than leaking.
+    // `-o`/`--output` selects paste for both xclip and xsel. All other calls
+    // are a copy. This is sufficient for the flags that programs use. It is
+    // also safe: an unknown call copies, and does not leak clipboard data.
     let dispatch = |name: &str| {
         format!(
             "#!/bin/sh\n\
@@ -142,13 +143,13 @@ fn shims(copy: bool, paste: bool) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// Serve guest → host copies.
+/// Serve copies (guest to host).
 ///
-/// Each iteration is one `open → read to EOF → forward` cycle, which is also
-/// the framing: a writer closing the FIFO ends the clipboard operation. The
-/// loop is serial on purpose, so two concurrent `wl-copy` calls queue rather
-/// than interleaving their bytes into one incoherent paste.
+/// Each iteration is one cycle: open, read to EOF, send to host. When the
+/// writer closes the FIFO, the clipboard operation ends.
 async fn copy_loop(path: PathBuf, sink: clipboard::Client, limit: u64) {
+    // The loop is serial on purpose. Two concurrent `wl-copy` calls wait in
+    // a queue, so their bytes do not mix into one paste.
     loop {
         let p = path.clone();
         let read = tokio::task::spawn_blocking(move || read_capped(&p, limit)).await;
@@ -174,8 +175,8 @@ async fn copy_loop(path: PathBuf, sink: clipboard::Client, limit: u64) {
             continue;
         }
 
-        // The host enforces the size cap and re-checks the grant; a rejection
-        // arrives as a capnp error and must not kill the loop.
+        // The host applies the size limit and checks the grant again. A
+        // rejection comes as a capnp error and must not stop the loop.
         let mut req = sink.copy_request();
         req.get().set_data(&data);
         match req.send().promise.await {
@@ -185,11 +186,11 @@ async fn copy_loop(path: PathBuf, sink: clipboard::Client, limit: u64) {
     }
 }
 
-/// Serve host → guest pastes.
+/// Serve pastes (host to guest).
 ///
-/// Opening the write end blocks until a container process opens the read end,
-/// which is the signal to fetch. Fetching only then means the host clipboard
-/// is read on demand rather than polled and cached.
+/// The open of the write end blocks until a container process opens the
+/// read end. Only then the loop gets the host clipboard. Thus the host
+/// clipboard is read on demand, not polled and cached.
 async fn paste_loop(path: PathBuf, sink: clipboard::Client) {
     loop {
         let p = path.clone();
@@ -226,10 +227,10 @@ async fn paste_loop(path: PathBuf, sink: clipboard::Client) {
             }
         };
 
-        // Closing without writing still yields a clean EOF, so a refused
-        // paste surfaces to the caller as an empty clipboard rather than a
-        // hang. A reader that walks away mid-write gives us EPIPE, which is
-        // expected rather than exceptional.
+        // A close without a write still gives a clean EOF. Thus the caller
+        // sees a refused paste as an empty clipboard and does not hang. If
+        // the reader closes the FIFO during the write, the write gets EPIPE.
+        // This is expected, not an error.
         let n = data.len();
         let write = tokio::task::spawn_blocking(move || {
             let mut file = file;

@@ -1,5 +1,7 @@
-//! Trait abstraction over hyper's HTTP/1.1 and HTTP/2 client senders so
-//! the middleware layer doesn't need to know which protocol is in use.
+//! Upstream HTTP request senders.
+//!
+//! Gives one interface to send requests over HTTP/1.1 and HTTP/2. Thus the
+//! middleware layer does not need to know which protocol the upstream uses.
 
 use std::cell::RefCell;
 use std::pin::Pin;
@@ -10,15 +12,18 @@ use hyper::{Method, Request, Response, Uri};
 
 use crate::network::http::ResponseBody;
 
-/// Send an HTTP request over either h1 or h2.
+/// Sends an HTTP request on h1 or h2.
 pub trait RequestSender {
+    /// Send `req` to the upstream.
+    /// Returns:
+    ///   Future that gives the upstream response.
     fn send(
         &self,
         req: Request<ResponseBody>,
     ) -> Pin<Box<dyn Future<Output = Result<Response<Incoming>, hyper::Error>>>>;
 }
 
-/// HTTP/1.1 sender wrapper. Uses `RefCell` because h1 `SendRequest` requires `&mut`.
+/// HTTP/1.1 sender. Uses `RefCell` because h1 `SendRequest` needs `&mut`.
 pub struct H1Sender(pub RefCell<hyper::client::conn::http1::SendRequest<ResponseBody>>);
 impl RequestSender for H1Sender {
     fn send(
@@ -30,21 +35,21 @@ impl RequestSender for H1Sender {
     }
 }
 
-/// Rewrite an absolute-form request into the origin-form + `Host` pair that
-/// HTTP/1.1 origin servers expect.
+/// Change an absolute-form request into the origin form and `Host` header
+/// that HTTP/1.1 origin servers expect.
 ///
-/// A request that reached us over h2 carries its authority in the URI (built
-/// from `:authority`) and has no `Host` header at all, since h2 has none.
-/// Forwarded verbatim that becomes `GET https://host/path HTTP/1.1` with no
-/// `Host`, which strict servers — nginx among them — answer with 400. This
-/// happens whenever the two hops disagree on protocol: an h2 container
-/// talking to an http/1.1 upstream, or h2-with-prior-knowledge over
-/// cleartext (where the upstream is never h2).
+/// A request that came on h2 has its authority in the URI (from
+/// `:authority`) and has no `Host` header, because h2 has no `Host`. With
+/// no change, it becomes `GET https://host/path HTTP/1.1` with no `Host`.
+/// Strict servers (for example nginx) send 400 for it. This occurs when the
+/// two sides use different protocols: an h2 container with an http/1.1
+/// upstream, or h2 with prior knowledge on cleartext (where the upstream is
+/// never h2).
 ///
-/// Requests that arrived over h1 are already in origin form and carry their
-/// own `Host`, so this is a no-op for them.
+/// Requests that came on h1 are already in origin form and have their own
+/// `Host`. For them, this function changes nothing.
 fn to_origin_form(req: &mut Request<ResponseBody>) {
-    // `CONNECT host:port` is authority-form by definition.
+    // `CONNECT host:port` is always in authority form.
     if req.method() == Method::CONNECT {
         return;
     }
@@ -65,7 +70,8 @@ fn to_origin_form(req: &mut Request<ResponseBody>) {
     }
 }
 
-/// HTTP/2 sender wrapper. h2 `SendRequest` is clone-friendly, no `RefCell` needed.
+/// HTTP/2 sender. h2 `SendRequest` is cheap to clone, so no `RefCell` is
+/// necessary.
 pub struct H2Sender(pub hyper::client::conn::http2::SendRequest<ResponseBody>);
 impl RequestSender for H2Sender {
     fn send(

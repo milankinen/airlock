@@ -1,5 +1,8 @@
-//! OCI registry client: resolve image manifests, pull layers, and verify
-//! downloads.
+//! OCI registry client.
+//!
+//! Finds the Linux image for the host CPU architecture in a remote registry
+//! and downloads its layers. Each downloaded layer is verified against the image
+//! manifest.
 
 use std::path::Path;
 use std::pin::Pin;
@@ -15,22 +18,25 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use super::OciConfig;
 
-/// A fully resolved registry image with manifest and config.
+/// A resolved registry image with manifest and config.
 pub struct RegistryImage {
+    /// Parsed image reference.
     pub reference: Reference,
-    /// Digest of the platform-specific manifest actually selected.
+    /// Digest of the selected platform-specific manifest.
     pub digest: String,
-    /// Digest of the multi-platform index the manifest was selected from,
-    /// when the reference resolved to one. A user pinning `@sha256:…` will
-    /// normally have copied the index digest (that is what a registry
-    /// advertises for a tag), so digest-pin checks must accept either.
+    /// Digest of the multi-platform index that contains the manifest, if
+    /// the reference resolved to an index. A user who pins `@sha256:…`
+    /// usually copied the index digest (a registry shows that digest for a
+    /// tag). Thus digest-pin checks must accept both digests.
     pub list_digest: Option<String>,
+    /// Manifest of the selected platform.
     pub manifest: OciImageManifest,
+    /// Parsed image config.
     pub image_config: OciConfig,
 }
 
-/// Create an OCI registry client. Uses plain HTTP when `insecure` is true,
-/// HTTPS otherwise.
+/// Create an OCI registry client. Uses plain HTTP if `insecure` is true,
+/// and HTTPS if it is false.
 fn make_client(insecure: bool) -> Client {
     let protocol = if insecure {
         ClientProtocol::Http
@@ -61,7 +67,7 @@ fn linux_platform_resolver(manifests: &[oci_client::manifest::ImageIndexEntry]) 
     })
 }
 
-/// Returns true if `e` is an OCI registry authentication failure.
+/// Return `true` if `e` is an OCI registry authentication failure.
 pub fn is_auth_error(e: &anyhow::Error) -> bool {
     use oci_client::errors::OciDistributionError;
     e.downcast_ref::<OciDistributionError>().is_some_and(|err| {
@@ -73,7 +79,15 @@ pub fn is_auth_error(e: &anyhow::Error) -> bool {
     })
 }
 
-/// Resolve an image reference to a manifest, digest, and config.
+/// Resolve an image reference to a manifest, digest and config.
+/// Args:
+///  - `image_ref`: Image reference (e.g. `alpine:3.20`)
+///  - `auth`: Registry auth
+///  - `insecure`: Use plain HTTP instead of HTTPS.
+///
+/// Returns:
+///   The resolved image, or error (for example an auth error, see
+///   [`is_auth_error`]).
 pub async fn resolve(
     image_ref: &str,
     auth: &RegistryAuth,
@@ -97,19 +111,22 @@ pub async fn resolve(
     })
 }
 
-/// Download a single layer blob to `dest` with optional progress reporting.
+/// Download a single layer blob to a file and verify its size and digest.
 ///
-/// The caller is responsible for placing `dest` at the appropriate staging
-/// path (`<digest>.download.tmp`) and for atomically renaming into place
-/// after return. Both the per-layer and overall progress bars, when
-/// provided, are incremented by the same number of bytes as data is
-/// written.
+/// The caller must give a staging path for `dest`
+/// (`<key>.download.tmp`), and rename it atomically after the return.
+/// Args:
+///  - `reference`: Image reference in the registry
+///  - `layer`: Descriptor of the layer from the manifest
+///  - `dest`: File to write the blob to
+///  - `per_layer`: Optional progress bar of the layer
+///  - `overall`: Optional progress bar of all layers
+///  - `auth`: Registry auth
+///  - `insecure`: Use plain HTTP instead of HTTPS.
 ///
-/// The blob is hashed with SHA-256 while streaming and compared against the
-/// digest from the manifest before return; on mismatch the staged file is
-/// removed and an error is surfaced. Size is also checked. This protects
-/// against a compromised or MITM'd registry serving a same-size, different
-/// blob, and does not depend on transitive checks inside `oci-client`.
+/// Returns:
+///   `Ok` if the blob has the size and digest from the manifest. Otherwise
+///   error. A failed download or a size or digest mismatch removes `dest`.
 pub async fn pull_layer(
     reference: &Reference,
     layer: &oci_client::manifest::OciDescriptor,
@@ -125,6 +142,7 @@ pub async fn pull_layer(
     client.store_auth_if_needed(registry, auth).await;
 
     let file = tokio::fs::File::create(dest).await?;
+    // Both progress bars get the same number of bytes as the writes.
     let bars: Vec<ProgressBar> = per_layer.into_iter().chain(overall).cloned().collect();
     let mut writer = HashingWriter {
         inner: ProgressWriter { inner: file, bars },
@@ -140,6 +158,9 @@ pub async fn pull_layer(
     }
     flush_result?;
 
+    // Check size and SHA-256 digest against the manifest. This protects
+    // against a compromised or MITM registry that sends a different blob of
+    // the same size. It does not depend on checks inside `oci-client`.
     let metadata = tokio::fs::metadata(dest).await?;
     let expected_size = layer.size as u64;
     if metadata.len() != expected_size {
@@ -161,9 +182,8 @@ pub async fn pull_layer(
     Ok(())
 }
 
-/// Wraps an `AsyncWrite` and increments every attached progress bar on each
-/// write. Used to drive the per-layer bar and the overall-total bar from the
-/// same byte stream.
+/// File writer that increments all its progress bars on each write. Thus
+/// the per-layer bar and the overall bar get the same byte stream.
 struct ProgressWriter {
     inner: tokio::fs::File,
     bars: Vec<ProgressBar>,
@@ -196,9 +216,9 @@ impl AsyncWrite for ProgressWriter {
     }
 }
 
-/// Feeds the byte stream through a SHA-256 hasher on the way to the inner
-/// writer. Only the bytes actually accepted by the inner writer are hashed
-/// so partial-write short counts stay consistent with on-disk content.
+/// Writer that calculates the SHA-256 hash of the bytes it writes to the
+/// inner writer. It hashes only the bytes that the inner writer accepted,
+/// so after a partial write the hash still matches the content on disk.
 struct HashingWriter {
     inner: ProgressWriter,
     hasher: Sha256,

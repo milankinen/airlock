@@ -1,14 +1,7 @@
 //! Host-side clipboard bridge.
 //!
-//! Serves the `Clipboard` capability the guest calls to reach the host
-//! clipboard. The guest has no other route: withholding this object denies
-//! access outright, and every call re-checks the per-direction grant and the
-//! size cap here rather than trusting anything inside the sandbox.
-//!
-//! Clipboard programs are spawned with `std::process::Command` on
-//! `spawn_blocking`, matching how the rest of the CLI shells out
-//! (`crate::oci::docker`), so a wedged clipboard tool cannot stall the
-//! single-threaded RPC runtime.
+//! Gives the guest access to the host clipboard, when the project config
+//! allows it. The guest has no other access to the host clipboard.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -19,25 +12,24 @@ use airlock_common::supervisor_capnp::*;
 use crate::config::config_values::Clipboard;
 
 /// A pair of host programs that write and read the system clipboard.
-///
-/// `write`/`read` are full argv slices — element 0 is the program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostTool {
-    /// Name used in diagnostics.
+    /// Name for diagnostics.
     pub name: &'static str,
+    /// Full argv of the write program. Element 0 is the program.
     write: &'static [&'static str],
+    /// Full argv of the read program. Element 0 is the program.
     read: &'static [&'static str],
-    /// Environment variable that must be set for this tool to reach a
-    /// display server. `None` for tools that talk to the OS directly.
+    /// Environment variable that must be set, so this tool can connect to a
+    /// display server. `None` for tools that use the OS directly.
     ///
-    /// This is the *host* side, where a display genuinely may or may not
-    /// exist — unlike the guest, where airlock deliberately declines to
-    /// invent one.
+    /// This is the *host* side, where a display can exist or not. In the
+    /// guest, airlock intentionally does not make a display.
     requires_env: Option<&'static str>,
 }
 
-/// Candidates in preference order. macOS first (its tools are unconditional),
-/// then Wayland, then the two X11 options.
+/// Candidates in order of preference: macOS first (its tools need no
+/// display variable), then Wayland, then the two X11 options.
 const CANDIDATES: &[HostTool] = &[
     HostTool {
         name: "pbcopy",
@@ -65,8 +57,8 @@ const CANDIDATES: &[HostTool] = &[
     },
 ];
 
-/// First candidate whose programs are both on `PATH` and whose display
-/// requirement (if any) is satisfied. `None` when the host has no usable
+/// Find the first candidate that has both programs on `PATH` and its
+/// display variable (if any) set. `None` when the host has no usable
 /// clipboard.
 fn detect() -> Option<HostTool> {
     CANDIDATES.iter().copied().find(|t| {
@@ -78,7 +70,8 @@ fn detect() -> Option<HostTool> {
 }
 
 impl HostTool {
-    /// Write `data` to the host clipboard. Blocking — call on a blocking pool.
+    /// Write `data` to the host clipboard. Blocks, so call it on a blocking
+    /// pool.
     fn write(&self, data: &[u8]) -> anyhow::Result<()> {
         let mut child = Command::new(self.write[0])
             .args(&self.write[1..])
@@ -86,8 +79,8 @@ impl HostTool {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;
-        // Scoped so stdin is dropped (and the pipe closed) before `wait`,
-        // which would otherwise deadlock against a tool waiting for EOF.
+        // Drop stdin (and close the pipe) in this scope, before `wait`.
+        // Otherwise `wait` deadlocks with a tool that waits for EOF.
         {
             let mut stdin = child.stdin.take().expect("piped stdin");
             stdin.write_all(data)?;
@@ -99,13 +92,14 @@ impl HostTool {
         Ok(())
     }
 
-    /// Read the host clipboard. Blocking — call on a blocking pool.
-    ///
-    /// A failing read is reported as an empty clipboard rather than an
-    /// error: `wl-paste` exits non-zero when the clipboard is empty, and
-    /// the guest program is invariably a `||` fallback chain that copes
-    /// with emptiness far better than with a broken pipe.
+    /// Read the host clipboard. Blocks, so call it on a blocking pool.
+    /// Returns:
+    ///   Clipboard contents. Empty if the read fails.
     fn read(&self) -> Vec<u8> {
+        // A failed read gives an empty clipboard, not an error. `wl-paste`
+        // exits non-zero when the clipboard is empty. Guest programs usually
+        // use a `||` fallback chain, which handles an empty value better
+        // than an error.
         match Command::new(self.read[0])
             .args(&self.read[1..])
             .stdin(Stdio::null())
@@ -129,18 +123,29 @@ impl HostTool {
     }
 }
 
-/// Cap'n Proto `Clipboard` server bridging the guest to the host clipboard.
+/// Cap'n Proto `Clipboard` server that connects the guest to the host
+/// clipboard.
+///
+/// Each call checks the grant of its direction and the size limit again
+/// here. It does not trust anything in the sandbox.
 pub struct ClipboardImpl {
     tool: HostTool,
+    /// Guest → host copy is granted.
     pub(super) copy: bool,
+    /// Host → guest paste is granted.
     pub(super) paste: bool,
     /// Largest accepted guest → host transfer, in bytes.
     pub(super) limit: u64,
 }
 
-/// The clipboard grant of `config`: `None` when it grants no direction,
-/// so an ungranted sandbox has nothing to call. A host with no clipboard
-/// program downgrades to ungranted with a warning — never a failed start.
+/// Make the clipboard capability for the `[clipboard]` config.
+/// Args:
+///  - `config`: Clipboard config of the project
+///
+/// Returns:
+///   Capability, or `None` if the config grants no direction. Then the
+///   sandbox has nothing to call. A host without a clipboard program also
+///   gives `None`, with a warning. It never causes a failed start.
 pub fn for_config(config: &Clipboard) -> Option<ClipboardImpl> {
     if !config.copy && !config.paste {
         return None;
@@ -190,9 +195,9 @@ impl clipboard::Server for ClipboardImpl {
         params: clipboard::CopyParams,
         _results: clipboard::CopyResults,
     ) -> Result<(), capnp::Error> {
-        // Belt and braces: the capability is not handed over at all when
-        // copy is ungranted, so reaching this arm means the guest got hold
-        // of an object it should not have.
+        // Defense in depth: the guest gets no capability when copy is not
+        // granted. Thus, if the code gets here, the guest has an object
+        // that it must not have.
         if !self.copy {
             return Err(capnp::Error::failed("clipboard copy is not granted".into()));
         }
@@ -212,6 +217,9 @@ impl clipboard::Server for ClipboardImpl {
 
         let tool = self.tool;
         let len = data.len();
+        // Run the clipboard program on `spawn_blocking`, as the rest of the
+        // CLI does (`crate::oci::docker`). Thus a stuck clipboard tool cannot
+        // stop the single-threaded RPC runtime.
         tokio::task::spawn_blocking(move || tool.write(&data))
             .await
             .map_err(|e| capnp::Error::failed(format!("clipboard copy task: {e}")))?

@@ -1,17 +1,12 @@
-//! Guest side of the browser bridge.
+//! Browser bridge.
 //!
-//! The host hands us a `Browser` capability only for boots that may need to
-//! open a page on the host (an in-VM sign-in). We expose it to container
-//! processes as a shim at [`BROWSER_SHIM`]; the host points `$BROWSER` at
-//! it, which both Node's `execFile($BROWSER, [url])` and Rust's `webbrowser`
-//! crate honour.
+//! Lets container processes open web pages in the host browser, for example
+//! for a sign-in in the sandbox. Tools that open links through `$BROWSER` use
+//! the bridge. The host gives browser access only to the boots that can need
+//! it.
 //!
-//! The shim writes one URL line to a FIFO; a serve loop forwards each http(s)
-//! line to the host. The guest filter is only hygiene: the host re-checks
-//! every URL against its own policy, because the VM is untrusted.
-//!
-//! Both paths live on the per-boot `/run/airlock` tmpfs, so no shim is left
-//! behind in the persisted rootfs for later boots.
+//! The bridge exists only for the current boot. No part of it stays on the
+//! sandbox disk for later boots.
 
 use std::path::PathBuf;
 
@@ -21,8 +16,9 @@ use tracing::{debug, info, warn};
 
 use crate::bridge::{in_rootfs, install_shim, make_fifo, read_capped};
 
-/// Max bytes read per FIFO open-to-EOF cycle. Concurrent shim calls can share
-/// one cycle, so allow a few URLs' worth; anything past this is dropped.
+/// Maximum bytes read per FIFO open-to-EOF cycle. Concurrent shim calls can
+/// share one cycle, so the limit is the size of a few URLs. The loop drops
+/// payloads larger than this.
 const READ_LIMIT: u64 = 4 * (BROWSER_URL_MAX as u64 + 1);
 
 /// Browser grant received in `Supervisor.boot()`.
@@ -31,10 +27,15 @@ pub struct BrowserConfig {
     pub sink: Option<browser::Client>,
 }
 
-/// Create the FIFO and shim, then spawn the serve loop.
+/// Start the browser bridge: create the FIFO and shim, then start the serve
+/// loop.
 ///
-/// A no-op when not granted: no FIFO, no shim, so `$BROWSER` (if set at all)
-/// points at nothing and tools fall back to printing the link.
+/// Does nothing if the host did not grant browser access. Then there is no
+/// FIFO and no shim. `$BROWSER` (if set) points to nothing, and tools show
+/// the link instead.
+/// Args:
+///  - `cfg`: Browser grant from the host
+///  - `uid`, `gid`: Container user and group that own the FIFO
 pub fn start(cfg: BrowserConfig, uid: u32, gid: u32) -> anyhow::Result<()> {
     let Some(sink) = cfg.sink else {
         debug!("browser: not granted, no shim installed");
@@ -49,8 +50,10 @@ pub fn start(cfg: BrowserConfig, uid: u32, gid: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The shim script. Non-http(s) arguments exit non-zero so callers fall back
-/// to showing the link themselves instead of waiting on a page that never
+/// Make the shim script that writes one URL line to `fifo`.
+///
+/// For a non-http(s) argument, the shim exits with a non-zero code. Then
+/// callers show the link themselves and do not wait for a page that never
 /// opens.
 fn shim_body(fifo: &str) -> String {
     format!(
@@ -61,12 +64,12 @@ fn shim_body(fifo: &str) -> String {
     )
 }
 
-/// Serve guest → host open requests.
+/// Serve open requests (guest to host).
 ///
-/// Each iteration is one `open → read to EOF → forward` cycle. The loop is
-/// serial and never exits: every failure is logged and the next cycle
-/// starts, so a hostile writer cannot switch the bridge off for later,
-/// legitimate calls.
+/// Each iteration is one cycle: open, read to EOF, send each http(s) line to
+/// the host. The loop is serial and never stops. It logs each failure and
+/// starts the next cycle. Thus a hostile writer cannot stop the bridge for
+/// later, legitimate calls.
 async fn open_loop(path: PathBuf, sink: browser::Client) {
     loop {
         let p = path.clone();
@@ -93,8 +96,10 @@ async fn open_loop(path: PathBuf, sink: browser::Client) {
             continue;
         };
 
+        // The guest URL filter is only hygiene. The VM is untrusted, so the
+        // host checks every URL again against its own policy.
         for url in urls(text) {
-            // Log the host only: the full URL carries OAuth state and the
+            // Log only the host. The full URL contains OAuth state and the
             // PKCE challenge.
             let host = url_host(url);
             let mut req = sink.open_request();
@@ -107,17 +112,17 @@ async fn open_loop(path: PathBuf, sink: browser::Client) {
     }
 }
 
-/// Split a FIFO payload into URL lines, keeping only non-empty http(s) lines
-/// of at most [`BROWSER_URL_MAX`] bytes. Surrounding whitespace (a `\r` from
-/// a CRLF writer, say) is trimmed.
+/// Split a FIFO payload into URL lines. Keeps only non-empty http(s) lines
+/// of at most [`BROWSER_URL_MAX`] bytes. Removes the whitespace around each
+/// line (for example a `\r` from a CRLF writer).
 fn urls(payload: &str) -> impl Iterator<Item = &str> {
     payload.lines().map(str::trim).filter(|l| {
         l.len() <= BROWSER_URL_MAX && (l.starts_with("http://") || l.starts_with("https://"))
     })
 }
 
-/// The host part of an http(s) URL, for logging. Userinfo, port, path, query
-/// and fragment are dropped.
+/// Get the host part of an http(s) URL, for logs. Removes userinfo, port,
+/// path, query and fragment.
 fn url_host(url: &str) -> &str {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
@@ -127,10 +132,16 @@ fn url_host(url: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    //! Tests of the browser bridge.
+
     mod test_open_url;
 
     use super::*;
 
+    /// Test that the log host of a URL has no userinfo, port, path, query or
+    /// fragment. Logs must not show OAuth state or credentials.
+    ///   1. Get the host of URLs with these parts
+    ///   2. Check that only the host name stays
     #[test]
     fn url_host_drops_userinfo_port_path_query_and_fragment() {
         for (url, host) in [

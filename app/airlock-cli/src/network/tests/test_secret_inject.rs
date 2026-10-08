@@ -1,3 +1,6 @@
+//! Tests for secret injection: the proxy swaps surrogates for real values
+//! on the way out and masks real values on the way back to the guest.
+
 use std::fmt::Write;
 
 use axum::Router;
@@ -15,6 +18,7 @@ const SURROGATE: &str = "SURROGATEabcdef0123456789";
 const OTHER_REAL: &str = "sk-other-0123456789";
 const OTHER_SURROGATE: &str = "OTHERSURROGATE01234";
 
+/// A masked secret with the given name, real value and surrogate.
 fn secret(name: &str, real: &str, surrogate: &str) -> MaskedSecret {
     MaskedSecret {
         name: name.into(),
@@ -23,6 +27,8 @@ fn secret(name: &str, real: &str, surrogate: &str) -> MaskedSecret {
     }
 }
 
+/// A config that injects two secrets on all allowed hosts, with the given
+/// middleware scripts.
 fn injecting(scripts: Vec<(&'static str, &'static str)>) -> TestNetworkConfig {
     TestNetworkConfig {
         inject: vec![
@@ -34,6 +40,9 @@ fn injecting(scripts: Vec<(&'static str, &'static str)>) -> TestNetworkConfig {
     }
 }
 
+/// An upstream that echoes the `authorization`, `x-multi` and `cookie`
+/// headers it got in the body. It also copies `authorization` into the
+/// `x-echo` response header.
 fn echo_app() -> Router {
     Router::new().route(
         "/",
@@ -52,6 +61,8 @@ fn echo_app() -> Router {
     )
 }
 
+/// A GET with the surrogate as a Bearer token, plus the `extra` header
+/// lines.
 fn get_with_auth(port: u16, extra: &str) -> String {
     format!(
         "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {SURROGATE}\r\n\
@@ -59,6 +70,12 @@ fn get_with_auth(port: u16, extra: &str) -> String {
     )
 }
 
+/// Test that the proxy swaps surrogates for real values in request headers
+/// and masks real values in response headers. The guest must never see a
+/// real value, and the upstream must get it.
+///   1. Send headers with surrogates: repeated, with a prefix, in cookies
+///   2. Check that the upstream got the real values in each header
+///   3. Check that the echoed response header shows the surrogate
 #[test]
 fn surrogates_in_request_headers_are_swapped_and_real_values_masked_in_response() {
     run_with_config(injecting(vec![]), |proxy, _, _| async move {
@@ -71,6 +88,8 @@ fn surrogates_in_request_headers_are_swapped_and_real_values_masked_in_response(
             .await
             .roundtrip(&get_with_auth(port, &extra))
             .await;
+        // The body shows what the upstream got. Response bodies are not
+        // masked, only headers.
         let (head, body) = resp.split_once("\r\n\r\n").unwrap();
         assert_eq!(
             body,
@@ -87,6 +106,13 @@ fn surrogates_in_request_headers_are_swapped_and_real_values_masked_in_response(
     });
 }
 
+/// Test that a middleware sees the real value, and that the proxy masks a
+/// real value that the middleware puts in a response header.
+///   1. Add a middleware that logs the auth header and copies it into a
+///      response header
+///   2. Send a request with the surrogate
+///   3. Check that the log has the real value
+///   4. Check that the response header shows the surrogate
 #[test]
 fn middleware_sees_real_value_and_its_response_header_is_masked() {
     let cfg = injecting(vec![(
@@ -114,6 +140,11 @@ fn middleware_sees_real_value_and_its_response_header_is_masked() {
     });
 }
 
+/// Test that the proxy masks a real value in a middleware error message.
+/// The error text goes to the guest in the 502 body.
+///   1. Add a middleware that fails with the auth header in its message
+///   2. Send a request with the surrogate
+///   3. Check the 502 with the surrogate and no real value
 #[test]
 fn middleware_error_text_with_real_value_is_masked() {
     let cfg = injecting(vec![(
@@ -135,6 +166,12 @@ fn middleware_error_text_with_real_value_is_masked() {
     });
 }
 
+/// Test that a host that only a rule without inject allows gets the
+/// surrogate, not the real value.
+///   1. Inject the secrets on another host only
+///   2. Allow 127.0.0.1 with a rule that does not inject
+///   3. Send a request with the surrogate
+///   4. Check that the upstream got the surrogate
 #[test]
 fn host_allowed_without_inject_rule_keeps_surrogate() {
     let cfg = TestNetworkConfig {
@@ -153,6 +190,11 @@ fn host_allowed_without_inject_rule_keeps_surrogate() {
     });
 }
 
+/// Test that the proxy masks a real value in an HTTPS response header
+/// through the TLS MITM.
+///   1. Start a TLS upstream that sends the real value in a header
+///   2. Send a GET over TLS through the proxy
+///   3. Check that the header shows the surrogate and no real value
 #[test]
 fn https_response_header_with_real_value_is_masked() {
     let upstream = FakeUpstream::bind(&[b"http/1.1"]);

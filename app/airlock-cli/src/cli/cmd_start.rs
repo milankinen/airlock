@@ -1,11 +1,7 @@
-//! `airlock start` — boot the VM and run the container.
+//! The `airlock start` command.
 //!
-//! The steps are in [`crate::start`]: the system check, the setup wizard
-//! for a project without config, the config, the stored sandbox (image,
-//! disk, the tool decisions) and the tools' install (an install boot, see
-//! [`crate::packs::install::setup`]). Then the sandbox session
-//! ([`crate::start::run::run_sandbox`]): network rules → boot VM → start
-//! supervisor RPC → relay I/O → ordered shutdown.
+//! Reads the command-line options and starts the sandbox VM with the container
+//! in it. The steps of the command are in the `start` module.
 
 use clap::Args;
 
@@ -22,28 +18,28 @@ pub struct StartArgs {
     /// Log level
     #[arg(long, env = "AIRLOCK_LOG_LEVEL", default_value = "info")]
     pub log_level: LogLevel,
-    /// Working directory inside the container (defaults to the host cwd)
+    /// Working directory in the container (default: the host cwd)
     #[arg(long)]
     pub sandbox_cwd: Option<String>,
-    /// Run the container command inside a login shell (sources /etc/profile, ~/.profile)
+    /// Run the container command in a login shell (reads /etc/profile, ~/.profile)
     #[arg(short = 'l', long)]
     pub login: bool,
     /// Show detailed output (mounts, network rules, sockets, port forwards)
     #[arg(short = 'v', long)]
     pub verbose: bool,
-    /// Open TUI monitoring control panel (tabbed sandbox + network view)
+    /// Open the TUI monitor (sandbox and network tabs)
     #[arg(short = 'm', long)]
     pub monitor: bool,
-    /// Override the `[network] policy` from the config for this run only
+    /// Use this network policy instead of `[network] policy`, for this run only
     #[arg(long, value_name = "POLICY")]
     pub network: Option<Policy>,
-    /// Answer every sandbox question with its default (re-create the sandbox)
+    /// Use the default answer for every sandbox question (re-create the sandbox)
     #[arg(short = 'y', long)]
     pub yes: bool,
 }
 
 impl StartArgs {
-    /// The options of the sandbox and install steps.
+    /// Return the options for the sandbox and install steps.
     fn sandbox_options(&self) -> start::SandboxOptions {
         start::SandboxOptions {
             yes: self.yes,
@@ -52,7 +48,8 @@ impl StartArgs {
         }
     }
 
-    /// The config overrides of `--network`, for [`config::LayeredConfig::resolve`].
+    /// Return the config overrides from `--network`, for
+    /// [`config::LayeredConfig::resolve`].
     fn config_overrides(&self) -> config::ConfigOverrides {
         config::ConfigOverrides {
             network_policy: self.network,
@@ -61,6 +58,17 @@ impl StartArgs {
 }
 
 /// Entry point for `airlock start [--log-level <level>] [-- extra-args...]`.
+/// Args:
+///  - `args`: Parsed command-line arguments
+///  - `extra_args`: Arguments after `--`, for the container command
+///  - `context`: Shared CLI context (settings, vault and database)
+///
+/// Returns:
+///   Exit code of the sandbox session, or error.
+// The steps: system check, setup wizard (for a project without config),
+// config, stored sandbox (image, disk, tool decisions) and tool installation
+// (an install boot, see [`crate::packs::install::setup`]). Then the sandbox
+// session runs ([`crate::start::run::run_sandbox`]).
 pub async fn main(
     args: StartArgs,
     extra_args: Vec<String>,
@@ -80,8 +88,8 @@ async fn run(
     start::init_logging(&host_cwd, args.log_level)?;
 
     let packs = packs::init().map_err(start::Exit::config)?;
-    // A project without config gets the setup wizard; its generated file
-    // is saved once the sandbox is stored.
+    // A project without config gets the setup wizard. The generated file is
+    // saved after the sandbox is stored.
     let config = Box::pin(start::wizard::load_or_generate_config(
         &host_cwd,
         &packs,
@@ -92,7 +100,7 @@ async fn run(
         .resolve(&packs, &args.config_overrides())
         .await
         .map_err(start::Exit::config)?;
-    // The terminal runtime (bad `[monitor.keys]` fail here).
+    // The terminal runtime. Bad `[monitor.keys]` values fail here.
     let runtime =
         HostRuntime::new(args.monitor, &context.settings).map_err(|e| start::Exit::error(2, e))?;
 

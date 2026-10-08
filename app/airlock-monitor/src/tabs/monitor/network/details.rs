@@ -1,4 +1,6 @@
-//! Details sub-tab body — shows a snapshot of one request or connection.
+//! Details sub-tab of the network panel.
+//!
+//! Shows the details of one HTTP request or TCP connection.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -10,22 +12,31 @@ use super::connections::ConnectionEntry;
 use super::requests::RequestEntry;
 use super::row::{format_timestamp, format_transfer};
 
-/// Which entry the details view is showing.
+/// Copy of the entry that the details view shows.
 #[derive(Clone)]
 pub enum DetailView {
+    /// Details of an HTTP request.
     Request(RequestEntry),
+    /// Details of a TCP connection.
     Connection(ConnectionEntry),
 }
 
+/// Widget that draws the details body of one entry.
 pub struct DetailsWidget<'a> {
     view: &'a DetailView,
     scroll: u16,
-    /// Called with the largest useful scroll offset for this render, so
-    /// the owning tab can clamp its key handling to the real content.
+    /// Callback that gets the largest useful scroll offset for this render.
+    /// The owner tab uses it to limit the scroll keys to the real content.
     report_max_scroll: &'a dyn Fn(u16),
 }
 
 impl<'a> DetailsWidget<'a> {
+    /// Create a details widget.
+    /// Args:
+    ///  - `view`: Entry to show
+    ///  - `scroll`: Scroll offset, as the first visible wrapped line
+    ///  - `report_max_scroll`: Callback that gets the maximum scroll offset
+    ///    on each render.
     pub fn new(view: &'a DetailView, scroll: u16, report_max_scroll: &'a dyn Fn(u16)) -> Self {
         Self {
             view,
@@ -46,15 +57,15 @@ impl Widget for DetailsWidget<'_> {
         };
         let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
 
-        // `line_count` measures *after* wrapping, so a single long header
-        // that folds into four rows costs four lines of scroll — which is
-        // what the user actually sees.
+        // `line_count` counts the lines *after* the wrap. Thus a long header
+        // that wraps into four rows uses four lines of scroll. That is what
+        // the user sees.
         let content = u16::try_from(paragraph.line_count(area.width)).unwrap_or(u16::MAX);
         let max_scroll = content.saturating_sub(area.height);
         (self.report_max_scroll)(max_scroll);
 
-        // Clamp here too: the offset was chosen against the *previous*
-        // render's width, and a resize can shrink the content under it.
+        // Limit the offset here too. The offset came from the width of the
+        // *previous* render, and a resize can make the content shorter.
         let scroll = self.scroll.min(max_scroll);
         paragraph.scroll((scroll, 0)).render(area, buf);
     }
@@ -106,8 +117,8 @@ fn request_lines(r: &RequestEntry) -> Vec<Line<'static>> {
         out.push(section("Response headers"));
         push_headers(&mut out, &r.response_headers);
     } else {
-        // Either still in flight, or the connection died before a reply
-        // came back — the monitor can't tell those apart after the fact.
+        // The request is in progress, or the connection stopped before a
+        // reply. The monitor cannot tell which one is true.
         out.push(Line::from(Span::styled(
             "    (no response yet)",
             Style::default().fg(Color::DarkGray),
@@ -116,8 +127,8 @@ fn request_lines(r: &RequestEntry) -> Vec<Line<'static>> {
     out
 }
 
-/// Status line as `404 Not Found`, falling back to the bare number for
-/// codes with no canonical reason phrase.
+/// Status label such as `404 Not Found`. Only the number for codes without
+/// a known reason phrase.
 fn status_code_label(status: u16) -> String {
     match http_reason(status) {
         Some(reason) => format!("{status} {reason}"),
@@ -136,8 +147,8 @@ fn status_code_color(status: u16) -> Color {
     }
 }
 
-/// Reason phrases for the codes a sandboxed workload realistically sees.
-/// Deliberately not exhaustive — unknown codes render bare.
+/// Reason phrase for the codes that a sandboxed workload usually gets.
+/// The list is not complete on purpose. Unknown codes show only the number.
 fn http_reason(status: u16) -> Option<&'static str> {
     Some(match status {
         200 => "OK",

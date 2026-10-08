@@ -1,10 +1,9 @@
-//! Lua-based HTTP middleware: compile scripts, then run them in a chain
-//! around each proxied HTTP request.
+//! HTTP middleware scripts.
 //!
-//! Each script receives a `req` userdata with fields like `method`, `path`,
-//! `headers` and methods like `body()`, `setBody()`, `send()`, `deny()`.
-//! Scripts can inspect and modify the request before forwarding, or
-//! inspect/modify the response after.
+//! Compiles the configured middleware scripts and runs them as a chain around
+//! each proxied HTTP request. Scripts can read and change the request before
+//! the proxy forwards it, and the response after. Scripts can also deny a
+//! request.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -27,7 +26,7 @@ type RequestBody = ResponseBody;
 type MiddlewareNext = Box<dyn FnOnce(hyper::http::request::Parts, RequestBody) -> NextFuture>;
 type NextFuture = Pin<Box<dyn Future<Output = mlua::Result<hyper::Response<ResponseBody>>>>>;
 
-/// A compiled Lua middleware script, ready to be invoked per-request.
+/// Compiled Lua middleware script, ready to run for each request.
 #[derive(Clone)]
 pub struct CompiledMiddleware(Rc<Inner>);
 
@@ -36,14 +35,17 @@ struct Inner {
     func: Function,
 }
 
-/// Compile a Lua middleware script. The script is wrapped in a closure so
-/// `req` is a local parameter rather than a global, preventing races.
+/// Compile and validate the given Lua middleware script.
+/// Args:
+///  - `script`: User's Lua script from `network.middleware.<name>.script`
+///  - `env_vars`: User-defined environment variable mapping from
+///    `network.middleware.<name>.env`
+///  - `vault`: Vault instance for resolving environment variables
+///  - `log`: Logger callback for in-script `log` function.
 ///
-/// `env_vars` maps variable names to their descriptions; values are resolved
-/// through `Vault::subst` (host env first, vault as fallback) and exposed
-/// to the script as the `env` global table. A template that references an
-/// undefined name fails compilation — matches `[env]` behaviour in
-/// `project::resolve_env` so middleware never runs with silently-missing inputs.
+/// Returns:
+///   Compiled middleware, or error if the script does not compile or an
+///   environment variable does not resolve.
 pub fn compile(
     script: &str,
     env_vars: &BTreeMap<String, String>,
@@ -59,11 +61,12 @@ pub fn compile(
     })?;
     lua.globals().set("log", log_fn)?;
 
-    // Expose declared env vars as the `env` global table. Unresolved
-    // templates fail compilation rather than becoming nil — a missing
-    // `${VAR}` in a security-sensitive middleware script (e.g. the token
-    // used to authenticate an outbound request) must not silently pass
-    // through as an empty check.
+    // Give the declared env vars to the script as the `env` global table.
+    // `Vault::subst` resolves the values (host env first, then the vault).
+    // An undefined name fails the compile and does not become nil. Thus a
+    // missing `${VAR}` in a security-sensitive script (for example a token
+    // for an outbound request) cannot silently become an empty check.
+    // `[env]` in `project::resolve_env` does the same.
     let env_table = lua.create_table()?;
     for (key, template) in env_vars {
         let value = vault
@@ -73,9 +76,9 @@ pub fn compile(
     }
     lua.globals().set("env", env_table)?;
 
-    // Wrap the script in a function(req) so `req` is a local parameter,
-    // not a global. This prevents races when concurrent requests share
-    // the same Lua instance.
+    // Wrap the script in a function(req), so `req` is a local parameter,
+    // not a global. This prevents races when concurrent requests share the
+    // same Lua instance.
     let wrapped = format!("return function(req)\n{script}\nend");
     let func: Function = lua
         .load(&wrapped)
@@ -86,14 +89,15 @@ pub fn compile(
     Ok(CompiledMiddleware(Rc::new(Inner { lua, func })))
 }
 
-/// Raised by `req:deny()`. Also tags, as a response extension, the 403 that
-/// [`run`] answers a denial with, so the caller can tell it apart from an
+/// Error from `req:deny()`. Also a response extension on the 403 that
+/// [`run`] sends for a denial. Thus the caller can tell it apart from an
 /// upstream 403.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
 #[error("denied by network rules")]
 pub struct Denied;
 
-/// Check if an mlua error (possibly nested in CallbackError) contains Denied.
+/// Return true if an mlua error (possibly in a `CallbackError`) contains
+/// [`Denied`].
 fn is_denied(e: &mlua::Error) -> bool {
     match e {
         mlua::Error::ExternalError(e) => e.downcast_ref::<Denied>().is_some(),
@@ -102,16 +106,23 @@ fn is_denied(e: &mlua::Error) -> bool {
     }
 }
 
-/// Run all HTTP middleware layers around the send function. `send` is the
-/// rest of the relay (a network service, then the upstream), so its
-/// response body may be one the proxy built.
+/// Run all HTTP middleware layers around the send function.
 ///
-/// Default behaviour is to forward the request. Scripts can call
-/// `req:deny()` to block with 403, tagged with the [`Denied`] extension.
-/// If a script calls neither `req:send()` nor `req:deny()`, the request is
-/// forwarded implicitly (allow-by-default).
+/// A script can call `req:deny()` to block the request with a 403 that has
+/// the [`Denied`] extension. If a script calls neither `req:send()` nor
+/// `req:deny()`, the chain forwards the request (allow by default).
+/// Args:
+///  - `req`: Request from the guest
+///  - `middleware`: Middleware scripts. If empty, the request goes directly
+///    to `send`.
+///  - `deny_reporter`: Notifier for denied requests
+///  - `connect_host`: Host that the connection was authorized for. Scripts
+///    see it as `req.host`.
+///  - `send`: Remaining part of the relay (a network service, then the
+///    upstream). Its response body can be one that the proxy made.
 ///
-/// Empty middleware list forwards directly.
+/// Returns:
+///   Response for the guest, or error if a script fails.
 pub async fn run<F, Fut>(
     req: hyper::Request<Incoming>,
     middleware: &[CompiledMiddleware],
@@ -127,7 +138,7 @@ where
         return send(req.map(streamed)).await;
     }
 
-    // Innermost: the actual hyper send
+    // Innermost layer: `send` (the network service, then the upstream).
     let mut next: MiddlewareNext = Box::new(move |parts, body| -> NextFuture {
         Box::pin(async move {
             let req = hyper::Request::from_parts(parts, body);
@@ -154,7 +165,7 @@ where
 
                 trace!("running http middleware '{:?}'", m.func);
                 let thread = m.lua.create_thread(m.func.clone())?;
-                // Pass state as the function argument (not a global)
+                // Give the state as the function argument (not a global).
                 let result = thread.into_async::<()>(state.clone())?.await;
 
                 match result {
@@ -167,14 +178,15 @@ where
                     }
                 }
 
-                // If script called send()/allow(), response is stored in RespState
+                // If the script called send(), the response is in RespState.
                 if let Some(resp_ref) = state.resp.borrow_mut().take()
                     && let Some(resp) = resp_ref.borrow_mut().take()
                 {
                     return Ok(resp);
                 }
 
-                // Script didn't call send()/deny() — forward implicitly
+                // The script did not call send() or deny(). Forward the
+                // request.
                 trace!("middleware did not call send(), forwarding implicitly");
                 let next = state
                     .next
@@ -191,7 +203,7 @@ where
         });
     }
 
-    // Kick off the chain
+    // Start the chain.
     let (parts, body) = req.into_parts();
     let result = next(parts, streamed(body)).await;
     match result {
@@ -212,15 +224,17 @@ where
 
 type ResponseRef = Rc<RefCell<Option<hyper::Response<ResponseBody>>>>;
 
-/// Shared state between the middleware runner and the Lua UserData methods.
+/// State that the middleware runner and the Lua `req` userdata methods
+/// share.
 #[derive(Clone)]
 struct State {
     req: Rc<RefCell<Option<(hyper::http::request::Parts, RequestBody)>>>,
     next: Rc<RefCell<Option<MiddlewareNext>>>,
     resp: Rc<RefCell<Option<ResponseRef>>>,
-    /// The authenticated destination host this connection was authorized for
-    /// (fixed at connect time). Used by `req.host` / `req:hostMatches`, which
-    /// must NOT trust the guest-controlled request URI / `Host` header.
+    /// Authenticated destination host that the connection was authorized
+    /// for (set at connect time). Used by `req.host` and `req:hostMatches`.
+    /// These must NOT trust the request URI or the `Host` header, which the
+    /// guest controls.
     connect_host: Rc<str>,
 }
 
@@ -292,10 +306,10 @@ impl UserData for State {
             })
         });
         fields.add_field_method_get("host", |_, this| {
-            // The authenticated connect target, not the guest-controlled URI /
-            // Host header — the latter can be spoofed to dodge host-based
-            // middleware rules. Scripts wanting the raw header can still read
-            // `req:header("host")`.
+            // Use the authenticated connect target, not the URI or `Host`
+            // header that the guest controls. The guest can spoof these to
+            // avoid host-based middleware rules. Scripts that need the raw
+            // header can read `req:header("host")`.
             Ok(this.connect_host.to_string())
         });
     }
@@ -339,8 +353,8 @@ impl UserData for State {
             },
         );
         methods.add_method("hostMatches", |_, this, pattern: String| {
-            // Match against the authenticated connect target, not the
-            // spoofable request URI / Host header.
+            // Match the authenticated connect target, not the request URI
+            // or `Host` header, which the guest can spoof.
             Ok(matchers::host_matches(&this.connect_host, &pattern))
         });
 
@@ -348,9 +362,10 @@ impl UserData for State {
             Err(mlua::Error::external(Denied))
         });
 
-        // body() — collect the streaming body, returns Body userdata
+        // body(): read the full streaming body and return Body userdata.
         methods.add_async_method("body", |_, this, ()| async move {
-            // Take body out of RefCell before awaiting (can't hold borrow across await)
+            // Take the body out of the RefCell before the await. A borrow
+            // cannot stay across an await.
             let body = {
                 let mut req = this.req.borrow_mut();
                 let (_, body) = req
@@ -365,15 +380,15 @@ impl UserData for State {
                 .await
                 .map_err(|e| mlua::Error::runtime(format!("read body: {e}")))?
                 .to_bytes();
-            // Put the buffered body back
+            // Put the buffered body back.
             if let Some((_, body)) = this.req.borrow_mut().as_mut() {
                 *body = Either::Right(Full::new(collected.clone()));
             }
             Ok(super::body::Body(collected))
         });
 
-        // setBody(val) — set body from string, table (→ JSON), or Body
-        // Also updates Content-Length header.
+        // setBody(val): set the body from a string, a table (as JSON) or a
+        // Body. Also updates the Content-Length header.
         methods.add_method("setBody", |_, this, val: super::body::Body| {
             this.with_req_mut(|parts, body| {
                 let len = val.0.len();
@@ -385,7 +400,8 @@ impl UserData for State {
             })
         });
 
-        // send() — forward through the middleware chain, returns response userdata
+        // send(): forward the request through the middleware chain and
+        // return the response userdata.
         methods.add_async_method("send", |_, this, ()| async move {
             let next = this
                 .next
@@ -401,7 +417,8 @@ impl UserData for State {
             let resp_state = RespState {
                 inner: Rc::new(RefCell::new(Some(resp))),
             };
-            // Link the response state so we can retrieve it after script ends
+            // Keep a link to the response state, so the runner can get it
+            // after the script ends.
             *this.resp.borrow_mut() = Some(resp_state.inner.clone());
             Ok(resp_state)
         });
@@ -410,7 +427,7 @@ impl UserData for State {
 
 type HttpResponse = hyper::Response<ResponseBody>;
 
-/// Response userdata — wraps the hyper response parts directly.
+/// Response userdata for scripts. Contains the hyper response.
 #[derive(Clone)]
 struct RespState {
     inner: Rc<RefCell<Option<HttpResponse>>>,
@@ -492,7 +509,7 @@ impl UserData for RespState {
             })
         });
 
-        // body() — collect the response body, returns Body userdata
+        // body(): read the full response body and return Body userdata.
         methods.add_async_method("body", |_, this, ()| async move {
             let body = {
                 let mut resp = this.inner.borrow_mut();
@@ -514,8 +531,8 @@ impl UserData for RespState {
             Ok(super::body::Body(collected))
         });
 
-        // setBody(val) — set body from string, table (→ JSON), or Body
-        // Also updates Content-Length header.
+        // setBody(val): set the body from a string, a table (as JSON) or a
+        // Body. Also updates the Content-Length header.
         methods.add_method("setBody", |_, this, val: super::body::Body| {
             this.with_resp_mut(|r| {
                 let len = val.0.len();

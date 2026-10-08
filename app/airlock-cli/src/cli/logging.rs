@@ -1,8 +1,7 @@
-//! Host log file: `.airlock/airlock.log` under the project.
+//! Host log file.
 //!
-//! [`init`] installs the global `tracing` subscriber once per process. A
-//! command that boots several sandboxes in one run may call it again; later
-//! calls are no-ops, so the first level and file stay in effect.
+//! Writes the diagnostic logs of airlock to a log file in the project, and not
+//! to the terminal.
 
 use std::path::Path;
 use std::sync::Once;
@@ -11,19 +10,26 @@ use tracing_subscriber::EnvFilter;
 
 use super::LogLevel;
 
-/// Hard cap on `airlock.log` at startup. If the existing file is
-/// larger than this, we trim the beginning so each run appends to a
-/// bounded tail rather than nuking the file (crash logs from the
-/// previous run survive long enough to be useful).
+/// Maximum size of `airlock.log` at startup.
+///
+/// If the file is larger, the start of the file is removed. Each run thus
+/// appends to a limited tail, and the file is not deleted. This keeps crash
+/// logs from the previous run available.
 const LOG_MAX_BYTES: u64 = 1024 * 1024;
 
-/// Guards [`init`]: the subscriber can be set once per process.
+/// Guard for [`init`]. The subscriber can be set only once per process.
 static INIT: Once = Once::new();
 
-/// Send `tracing` output at `log_level` to `<cache_dir>/airlock.log`,
-/// trimming the file first (see [`LOG_MAX_BYTES`]). Only the first call in
-/// a process has an effect. Best-effort: when the file cannot be opened,
-/// or a subscriber is already set, logging stays off and nothing fails.
+/// Send `tracing` output to `<cache_dir>/airlock.log`.
+/// Args:
+///  - `log_level`: Log level for the file
+///  - `cache_dir`: Project `.airlock/` directory
+///
+/// Only the first call in a process has an effect. Later calls do nothing, so
+/// the first level and file stay in use. A command that boots many sandboxes
+/// in one run can call it again. If the file does not open, or a subscriber
+/// is already set, logging stays off and nothing fails.
+// The file is first made smaller if necessary (see [`LOG_MAX_BYTES`]).
 pub fn init(log_level: LogLevel, cache_dir: &Path) {
     INIT.call_once(|| {
         let log_path = cache_dir.join("airlock.log");
@@ -42,10 +48,10 @@ pub fn init(log_level: LogLevel, cache_dir: &Path) {
     });
 }
 
-/// If `airlock.log` exceeds [`LOG_MAX_BYTES`], rewrite the file with
-/// just its last N bytes so the new run starts with ≤1 MB of history.
-/// Best-effort; failure is silent (logging still works, just wasn't
-/// trimmed).
+/// Keep only the last [`LOG_MAX_BYTES`] of the log file at `path`.
+///
+/// The new run thus starts with 1 MB of history or less. Errors are ignored.
+/// Logging still works, but the file stays large.
 fn rotate_log(path: &Path) {
     use std::io::{Read, Seek, SeekFrom, Write};
     let Ok(meta) = std::fs::metadata(path) else {
@@ -76,9 +82,17 @@ fn rotate_log(path: &Path) {
 
 #[cfg(test)]
 mod tests {
+    //! Tests for the log file setup.
+
     use super::*;
     use crate::test_cfg::temp_dir;
 
+    /// Test that the log setup cuts an oversized log file to its last part, and
+    /// that only the first setup call has an effect.
+    ///   1. Write a log that is 10 bytes longer than the limit
+    ///   2. Set up the log in one directory, then in a second directory
+    ///   3. Check that the log starts with the last bytes of the old content
+    ///   4. Check that the second directory has no log file
     #[test]
     fn init_trims_oversized_log_to_its_tail_and_later_calls_do_nothing() {
         let first = temp_dir();
@@ -88,10 +102,13 @@ mod tests {
         content.extend(vec![b'b'; usize::try_from(LOG_MAX_BYTES).unwrap()]);
         std::fs::write(&path, &content).unwrap();
 
+        // The setup runs one time for each process. This test fails if a
+        // different test in the same process calls it first.
         init(LogLevel::Info, first.path());
         init(LogLevel::Debug, second.path());
 
         let after = std::fs::read(&path).unwrap();
+        // The setup can add new log lines after the kept part.
         assert!(after.len() as u64 >= LOG_MAX_BYTES);
         assert!(
             after[..usize::try_from(LOG_MAX_BYTES).unwrap()]

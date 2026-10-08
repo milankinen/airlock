@@ -1,23 +1,6 @@
-//! The lines that show the setup wizard's view ([`frame`]) of a
-//! [`Form`].
+//! Setup wizard view.
 //!
-//! An empty line, the logo and an empty line, a section per pack kind
-//! (its title and its rows), an empty line, the keys that work on the
-//! focused row (gray, see [`keys`]), and the start bar last. A pack
-//! row has its radio mark (distro) or checkbox and its label; its arg
-//! rows go below it, further in, as `<label>: <value>` with the value
-//! in gray (a bool's value is `yes` or `no`). The start bar shows its
-//! current option. The focused row has its label in cyan; a focused
-//! pack row has its description in gray: ` - description` after the
-//! label, or on the next lines when it does not fit. A focused arg row
-//! lists all its values, and the start bar all its options: the current
-//! one in green, the others in gray. A choice arg with `other` ends its
-//! values with [`OTHER_CHOICE`] or, while the other slot is current,
-//! its text in green with the text cursor after it. Without colors
-//! (`NO_COLOR`, `CLICOLOR=0`, a terminal without them), `❯` before the
-//! focused row's mark or label shows the focus, and brackets the
-//! current value (`[lts]`). The error of the other slot shows in red
-//! under its row; the error of the last check under the start bar.
+//! Makes the lines that the wizard shows from the current wizard state.
 
 use console::measure_text_width;
 
@@ -38,13 +21,42 @@ const LOGO: [&str; 4] = [
 /// The description of [`Row::Custom`].
 const CUSTOM_DESCRIPTION: &str = "User defined image";
 
-/// The item of the other slot of a choice arg while it is not current.
+/// The item of the "other" slot of a choice arg, when it is not current.
 const OTHER_CHOICE: &str = "other…";
 
-/// The lines of the view of `form` for a terminal with `room` columns
-/// for text. The focus covers the focused row with its description and
-/// errors; on the first row of a section, the section title too (on the
-/// first section, the logo; on the start bar, the keys).
+/// Make the lines of the wizard view.
+///
+/// The view shows, from top to bottom:
+///  * An empty line, the logo and an empty line
+///  * One section per pack kind: its title and its rows
+///  * The "Capabilities" section: the clipboard rows
+///  * An empty line, and the keys for the focused row (gray, see [`keys`])
+///  * The start bar
+///
+/// A pack row has a radio mark (distro) or a checkbox, and a label. Its arg
+/// rows are below it, with more indent, as `<label>: <value>`. The value is
+/// gray (`yes` or `no` for a bool). The start bar shows its current option.
+///
+/// The focused row has a cyan label. A focused pack row has its description
+/// in gray: ` - description` after the label, or on the next lines if it does
+/// not fit. A focused arg row shows all its values, and the focused start bar
+/// shows all its options. The current one is green and the others are gray.
+/// A choice arg with `other` shows [`OTHER_CHOICE`] as its last value. When
+/// the "other" slot is current, its text shows in green with the text cursor
+/// after it. The error of the "other" slot shows in red below its row. The
+/// error of the last check shows below the start bar.
+///
+/// Without colors (`NO_COLOR`, `CLICOLOR=0`, or a terminal without colors), a
+/// `❯` before the mark or label of the focused row shows the focus. Brackets
+/// show the current value (`[lts]`).
+/// Args:
+///  - `form`: Wizard state
+///  - `room`: Number of text columns of the terminal
+///
+/// Returns:
+///   The frame. The focus covers the focused row with its description and
+///   errors. On the first row of a section, it also covers the section title
+///   (the logo for the first section, the keys for the start bar).
 pub fn frame(form: &Form, room: usize) -> Frame {
     let styles = Styles::new();
     let mut lines = vec![String::new()];
@@ -71,7 +83,7 @@ pub fn frame(form: &Form, room: usize) -> Frame {
         if let Some(title) = title {
             lines.push(styles.bold.apply_to(title).to_string());
         } else {
-            // The start bar: an empty line and the keys before it.
+            // The start bar has an empty line and the keys before it.
             lines.push(String::new());
             lines.push(styles.dim.apply_to(keys(form)).to_string());
         }
@@ -93,7 +105,7 @@ pub fn frame(form: &Form, room: usize) -> Frame {
     }
 }
 
-/// The title of the section of the packs of `kind`.
+/// Return the section title for the packs of `kind`.
 fn section_title(kind: PackKind) -> &'static str {
     match kind {
         PackKind::Distro => "Base image",
@@ -102,7 +114,7 @@ fn section_title(kind: PackKind) -> &'static str {
     }
 }
 
-/// The keys that work on the focused row of `form`.
+/// Return the key help for the focused row of `form`.
 fn keys(form: &Form) -> &'static str {
     match (form.focus(), form.other()) {
         (Row::Start, _) => "←→ choose · enter confirm",
@@ -116,7 +128,7 @@ fn keys(form: &Form) -> &'static str {
     }
 }
 
-/// The label of a start bar option.
+/// Return the label of a start bar option.
 fn start_label(choice: StartChoice) -> &'static str {
     match choice {
         StartChoice::Start => "start",
@@ -125,7 +137,7 @@ fn start_label(choice: StartChoice) -> &'static str {
     }
 }
 
-/// How an arg value shows: a bool as `yes` or `no`.
+/// Return the display text of an arg value. A bool shows as `yes` or `no`.
 fn value_text(value: &ArgValue) -> &str {
     match value {
         ArgValue::Bool(true) => "yes",
@@ -134,8 +146,10 @@ fn value_text(value: &ArgValue) -> &str {
     }
 }
 
-/// The lines of `row`: the row (focused: with its description, on the
-/// next lines when it does not fit in `room`), then its errors.
+/// Return the lines of `row`: the row, then its errors.
+///
+/// A focused row also shows its description. If the description does not
+/// fit in `room`, it goes on the next lines.
 fn row_lines(form: &Form, row: Row, room: usize, styles: &Styles) -> Shown {
     let focused = row == form.focus();
     let line = row_line(form, row, focused, styles);
@@ -174,7 +188,7 @@ fn row_lines(form: &Form, row: Row, room: usize, styles: &Styles) -> Shown {
     Shown { lines, cursor }
 }
 
-/// The line of `row` (without description and errors).
+/// Return the line of `row`, without description and errors.
 fn row_line(form: &Form, row: Row, focused: bool, styles: &Styles) -> Line {
     let mut line = Line::default();
     let label = styles.label(focused, Tone::Plain);

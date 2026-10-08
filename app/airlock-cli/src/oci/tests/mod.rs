@@ -1,3 +1,6 @@
+//! Tests for the OCI image cache: layer extraction, local image import,
+//! image users, `os-release` and the garbage collector.
+
 mod test_docker_save;
 mod test_image_cache;
 mod test_image_user;
@@ -15,8 +18,10 @@ fn cache_layer(digest: &str, tar: &[u8]) -> String {
     cache::layer_key(digest)
 }
 
-/// A layer whose `/etc/passwd` and `/etc/group` declare root and one
-/// unprivileged user, as `node`, `python` and `debian` derived images do.
+/// Cache a layer whose `/etc/passwd` and `/etc/group` declare root and one
+/// normal user (`node`, uid 1000), as images such as `node` have.
+/// Returns:
+///   The layer key.
 fn passwd_layer(digest: &str) -> String {
     cache_layer(
         digest,
@@ -30,7 +35,8 @@ fn passwd_layer(digest: &str) -> String {
     )
 }
 
-/// An image config as the registry or `docker save` hands it over.
+/// Parse `json` as an image config, in the form that a registry or
+/// `docker save` gives.
 fn image_config(json: serde_json::Value) -> OciConfig {
     serde_json::from_value(json).unwrap()
 }

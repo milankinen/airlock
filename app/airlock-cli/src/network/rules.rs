@@ -1,3 +1,9 @@
+//! Network rule resolution.
+//!
+//! Converts the `network` config section into target lists: allow, deny and
+//! passthrough targets, middleware targets, inject targets and port forwards.
+//! Also parses `host[:port]` target patterns.
+
 use anyhow::Context;
 
 use super::http;
@@ -7,27 +13,31 @@ use crate::config::config_values::Network;
 use crate::project::SandboxEnv;
 use crate::vault::Vault;
 
-/// Rule targets extracted from enabled rules.
-///
-/// `passthrough` is a subset of `allow`: entries from rules with
-/// `passthrough = true`. They're kept separate so the connect path can decide
-/// whether to short-circuit interception without re-scanning rule metadata.
+/// Rule targets from the enabled rules.
 #[derive(Debug)]
 pub struct RuleTargets {
+    /// Targets from `allow` lists.
     pub allow: Vec<NetworkTarget>,
+    /// Targets from `deny` lists.
     pub deny: Vec<NetworkTarget>,
+    /// Subset of `allow`: the targets of rules with `passthrough = true`.
+    /// This is a separate list, so the connect path can skip interception
+    /// without a new scan of the rule metadata.
     pub passthrough: Vec<NetworkTarget>,
 }
 
-/// Resolve config rules into allow/deny/passthrough target lists.
-/// Disabled rules are skipped. Errors on a malformed pattern (see
-/// [`parse_pattern`]); config loading reports the same problems earlier
-/// with the offending rule named, so this is the fail-closed backstop.
+/// Convert the enabled config rules into allow, deny and passthrough
+/// target lists.
+/// Returns:
+///   The target lists, or error if a pattern is not valid
+///   (see [`parse_pattern`]).
 pub fn resolve(network: &Network) -> anyhow::Result<RuleTargets> {
     let mut allow = Vec::new();
     let mut deny = Vec::new();
     let mut passthrough = Vec::new();
 
+    // Config loading reports pattern errors earlier, with the rule name.
+    // The errors here are the fail-closed backstop.
     for (rule_name, rule) in &network.rules {
         if !rule.enabled {
             continue;
@@ -63,8 +73,16 @@ pub fn resolve(network: &Network) -> anyhow::Result<RuleTargets> {
     })
 }
 
-/// Compile middleware from the `network.middleware` config section.
-/// Each enabled middleware rule is compiled and paired with its target patterns.
+/// Compile the enabled middleware from the `network.middleware` config
+/// section.
+/// Args:
+///  - `network`: Network config
+///  - `vault`: Vault for resolving middleware environment variables
+///  - `log`: Logger callback for the in-script `log` function.
+///
+/// Returns:
+///   One middleware target for each target pattern of each middleware, or
+///   error if a script does not compile or a pattern is not valid.
 pub fn resolve_middleware(
     network: &Network,
     vault: &Vault,
@@ -93,11 +111,15 @@ pub fn resolve_middleware(
     Ok(targets)
 }
 
-/// Resolve `inject` lists from enabled rules into targets carrying the
-/// masked secrets. Config loading guarantees every name is a masked `[env]`
-/// entry and that no injecting rule is `passthrough`; `project::open` /
-/// [`crate::project::Project::with_config`] check the values are
-/// injectable. This still errors (rather than panics) on a missing entry.
+/// Convert the `inject` lists of the enabled rules into targets with the
+/// masked secrets.
+/// Args:
+///  - `network`: Network config
+///  - `env`: Sandbox environment with the masked secrets.
+///
+/// Returns:
+///   One inject target for each allow pattern of each injecting rule, or
+///   error if a secret is missing or a pattern is not valid.
 pub fn resolve_inject(network: &Network, env: &SandboxEnv) -> anyhow::Result<Vec<InjectTarget>> {
     let mut targets = Vec::new();
 
@@ -108,6 +130,11 @@ pub fn resolve_inject(network: &Network, env: &SandboxEnv) -> anyhow::Result<Vec
 
         let mut secrets: Vec<InjectedSecret> = Vec::with_capacity(rule.inject.len());
         for name in &rule.inject {
+            // Config loading makes sure that each name is a masked `[env]`
+            // entry and that no injecting rule is `passthrough`.
+            // `project::open` and `Project::with_config` make sure that the
+            // values are injectable. A missing entry still gives an error,
+            // not a panic.
             let Some(secret) = env.masked(name) else {
                 anyhow::bail!(
                     "network.rules.{rule_name}.inject: `{name}` must be defined in [env] with mask = true"
@@ -132,8 +159,9 @@ pub fn resolve_inject(network: &Network, env: &SandboxEnv) -> anyhow::Result<Vec
     Ok(targets)
 }
 
-/// Derive guest → host port forward mappings from config.
-/// Returns `(guest_port, host_port)` pairs from all enabled port forward groups.
+/// Get the guest-to-host port forwards from the config.
+/// Returns:
+///   `(guest_port, host_port)` pairs from all enabled port forward groups.
 pub fn port_forwards_from_config(network: &Network) -> Vec<(u16, u16)> {
     let mut forwards = Vec::new();
     for pf in network.ports.values() {
@@ -150,10 +178,11 @@ pub fn port_forwards_from_config(network: &Network) -> Vec<(u16, u16)> {
     forwards
 }
 
-/// Derive host → guest port forward mappings from config.
-/// Returns `(host_port, guest_port)` pairs from all enabled port forward
-/// groups — the host binds `127.0.0.1:<host_port>` and each connection
-/// is bridged into the guest on `127.0.0.1:<guest_port>`.
+/// Get the host-to-guest port forwards from the config.
+/// The host listens on `127.0.0.1:<host_port>`. Each connection goes to
+/// `127.0.0.1:<guest_port>` in the guest.
+/// Returns:
+///   `(host_port, guest_port)` pairs from all enabled port forward groups.
 pub fn reverse_port_forwards_from_config(network: &Network) -> Vec<(u16, u16)> {
     let mut forwards = Vec::new();
     for pf in network.ports.values() {
@@ -170,24 +199,28 @@ pub fn reverse_port_forwards_from_config(network: &Network) -> Vec<(u16, u16)> {
     forwards
 }
 
-/// Parse a target pattern `host[:port]` into (host, port_str).
+/// Split a `host[:port]` target pattern into host and port string.
 ///
-/// Handles IPv6 literals, which a naive `rsplit_once(':')` mangles (`::1`
-/// would parse to host `":"`, port `"1"`, matching nothing):
-/// - `[::1]` / `[::1]:443` — bracketed form, port after `]`.
-/// - `2001:db8::1` — a bare IPv6 literal (more than one colon) has no
-///   unbracketed `:port` form, so the whole string is the host.
-/// - everything else — a hostname or IPv4 with an optional `:port`.
+/// Supported forms:
+/// - `[::1]` and `[::1]:443`: IPv6 in brackets. The port follows `]`.
+/// - `2001:db8::1`: IPv6 with no brackets (more than one colon). This form
+///   has no `:port`, so the full string is the host.
+/// - All other forms: a hostname or IPv4 with an optional `:port`.
+///
+/// Returns:
+///   `(host, port)`. The port is `None` if the pattern has no port.
 pub(super) fn parse_target(target: &str) -> (&str, Option<&str>) {
+    // A simple `rsplit_once(':')` breaks IPv6 literals. For example `::1`
+    // would give host `":"` and port `"1"`, which matches nothing.
     if let Some(rest) = target.strip_prefix('[') {
-        // Bracketed IPv6 literal.
+        // IPv6 literal in brackets.
         return match rest.split_once(']') {
             Some((host, after)) => (host, after.strip_prefix(':')),
-            None => (target, None), // malformed; treat whole as host
+            None => (target, None), // Not valid: use the full string as host.
         };
     }
     if target.matches(':').count() > 1 {
-        // Bare IPv6 literal — no port.
+        // IPv6 literal with no brackets has no port.
         return (target, None);
     }
     match target.rsplit_once(':') {
@@ -196,16 +229,17 @@ pub(super) fn parse_target(target: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Parse a `host[:port]` pattern into its matcher parts, with the port
-/// validated. `None` means "any port" and is produced only by an absent
-/// port or a literal `*`; every other port string is an error.
-///
-/// This must never fall back to the wildcard: under deny-by-default, a
-/// silently widened `allow = ["*:8O80"]` (letter O) or `["api.example.com:https"]`
-/// would grant every port instead of none, and a typo'd inject target would
-/// inject the secret into every port on that host.
+/// Parse a `host[:port]` pattern into host and validated port.
+/// Returns:
+///   `(host, port)`. The port is `None` ("any port") only if the pattern has
+///   no port or the port is `*`. All other port strings that are not valid
+///   numbers give an error.
 pub fn parse_pattern(target: &str) -> anyhow::Result<(&str, Option<u16>)> {
     let (host, port) = parse_target(target);
+    // Never use the wildcard as a fallback. With a fallback, a typo such as
+    // `allow = ["*:8O80"]` (letter O) or `["api.example.com:https"]` would
+    // allow all ports instead of none. An inject target with a typo would
+    // inject the secret into all ports of that host.
     let port = match port {
         None | Some("*") => None,
         Some(p) => Some(p.parse::<u16>().map_err(|_| {
@@ -217,8 +251,15 @@ pub fn parse_pattern(target: &str) -> anyhow::Result<(&str, Option<u16>)> {
 
 #[cfg(test)]
 mod tests {
+    //! Tests for the parser of `host:port` target patterns.
+
     use super::*;
 
+    /// Test that the pattern parser reads host names, IPv4 and IPv6
+    /// literals, with and without a port. A bare IPv6 address has colons, so
+    /// it must not be read as a host and a port.
+    ///   1. Parse patterns with names, wildcards, IPv4 and IPv6 literals
+    ///   2. Check the host and the port (none for no port or `*`)
     #[test]
     fn parse_pattern_reads_hostnames_ipv4_and_ipv6_literals() {
         for (pattern, host, port) in [
@@ -239,9 +280,14 @@ mod tests {
         }
     }
 
+    /// Test that a pattern with a bad port fails. If the parser ignored the
+    /// port, the rule would match all ports.
+    ///   1. Parse patterns with ports that are not valid numbers
+    ///   2. Check that each fails with an error that names the pattern
     #[test]
     fn parse_pattern_with_malformed_port_fails_instead_of_widening() {
         for bad in [
+            // The letter O, not the digit 0.
             "*:8O80",
             "api.example.com:https",
             "api.example.com:443 ",

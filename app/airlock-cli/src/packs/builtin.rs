@@ -1,12 +1,7 @@
-//! The built-in packs: the folders `packs/<name>@<version>/` at the
-//! repository root, embedded in the binary, and their loader.
+//! Built-in packs.
 //!
-//! A folder holds `pack.toml` (label, description, kind and args), at
-//! most one config file `config.{toml,json,yaml,yml,lua}` and the setup
-//! script `setup.sh`; only `pack.toml` is required. The packs are ordered
-//! by kind (distro, agent, tool), then by name. Names that start with `.`
-//! or end with `~` (`.DS_Store`, editor backups) are skipped; any other
-//! file is an error.
+//! Embeds the packs of the repository in the binary. Loads them and checks
+//! that each pack version is valid.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -22,14 +17,15 @@ use crate::packs::{
     ArgKind, Pack, PackArg, PackConfig, PackKind, PackManager, PackMetadata, PackVersionData,
 };
 
-/// The `packs/` directory of the repository.
+/// The `packs/` directory of the repository, embedded in the binary.
+/// Each folder `<name>@<version>/` is one pack version.
 pub static BUILTIN_PACKS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../packs");
 
 const PACK_FILE: &str = "pack.toml";
 const LUA_CONFIG_FILE: &str = "config.lua";
 const SETUP_FILE: &str = "setup.sh";
 
-/// The keys of a `[packs]` entry, which no arg can have.
+/// Keys of a `[packs]` entry. No arg can use them.
 const RESERVED_ARG_KEYS: [&str; 3] = ["version", "enabled", "args"];
 
 /// `pack.toml` of a version folder.
@@ -37,8 +33,8 @@ const RESERVED_ARG_KEYS: [&str; 3] = ["version", "enabled", "args"];
 #[serde(deny_unknown_fields)]
 struct PackFile {
     label: String,
-    /// What the version does, in one line (see
-    /// [`PackMetadata::description`]); the loader checks that it is not
+    /// One-line description of the version (see
+    /// [`PackMetadata::description`]). The loader checks that it is not
     /// empty.
     description: String,
     kind: PackKind,
@@ -54,12 +50,13 @@ struct ArgEntry {
     r#type: ArgType,
     description: String,
     default: Value,
-    /// A choice arg: its values.
+    /// Valid values of a choice arg.
     values: Option<Vec<String>>,
-    /// A choice arg: whether any non-empty string is a value too.
+    /// For a choice arg: if true, any non-empty string is also valid.
     other: Option<bool>,
 }
 
+/// The `type` field of an `[[args]]` entry.
 #[derive(Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum ArgType {
@@ -67,7 +64,21 @@ enum ArgType {
     Choice,
 }
 
-/// Load and validate the packs of `root` (a `packs/` directory).
+/// Load and validate the packs of a `packs/` directory.
+///
+/// A version folder `<name>@<version>/` contains:
+///  * `pack.toml` (label, description, kind and args). Required.
+///  * At most one config file `config.{toml,json,yaml,yml,lua}`.
+///  * The setup script `setup.sh`.
+///
+/// Any other file is an error. Hidden files and editor backups are
+/// ignored.
+/// Args:
+///  - `root`: The `packs/` directory, for example [`BUILTIN_PACKS`]
+///
+/// Returns:
+///   The packs, sorted by kind (distro, agent, tool), then by name. An
+///   error if a pack is not valid.
 pub fn load(root: &'static Dir<'static>) -> anyhow::Result<PackManager> {
     // The versions of each pack, by name.
     let mut by_name: BTreeMap<&'static str, Vec<(u64, PackVersionData)>> = BTreeMap::new();
@@ -95,7 +106,6 @@ pub fn load(root: &'static Dir<'static>) -> anyhow::Result<PackManager> {
 
     let mut groups: Vec<Vec<PackVersionData>> = Vec::new();
     for (name, mut versions) in by_name {
-        // The numbers in ascending order.
         versions.sort_by_key(|(number, _)| *number);
         let first = &versions[0].1.metadata;
         for (_, data) in &versions[1..] {
@@ -113,7 +123,7 @@ pub fn load(root: &'static Dir<'static>) -> anyhow::Result<PackManager> {
         }
         groups.push(versions.into_iter().map(|(_, data)| data).collect());
     }
-    // Stable: the names stay in order within a kind.
+    // The sort is stable, thus the names stay in order within a kind.
     groups.sort_by_key(|versions| versions[0].metadata.kind);
     Ok(PackManager {
         packs: groups
@@ -124,7 +134,7 @@ pub fn load(root: &'static Dir<'static>) -> anyhow::Result<PackManager> {
     })
 }
 
-/// Load the folder `folder` of the pack `name` at version `version`.
+/// Load and validate the folder of one pack version.
 fn load_version(
     name: &str,
     version: &str,
@@ -211,8 +221,15 @@ fn load_version(
     })
 }
 
-/// Check the `[[args]]` of the file `at`: unique keys, the fields of
-/// their type, and a default of that type.
+/// Check the `[[args]]` entries of a `pack.toml` and convert them.
+/// Args:
+///  - `at`: Path of the file, for error messages
+///  - `entries`: The `[[args]]` entries
+///
+/// Returns:
+///   The args, or an error if a key is not valid or not unique, a field
+///   does not fit the arg type, `values` is empty or has a duplicate, or
+///   the default is not valid.
 fn load_args(at: &str, entries: Vec<ArgEntry>) -> anyhow::Result<Vec<PackArg>> {
     let mut args: Vec<PackArg> = Vec::new();
     for entry in entries {
@@ -258,8 +275,8 @@ fn load_args(at: &str, entries: Vec<ArgEntry>) -> anyhow::Result<Vec<PackArg>> {
     Ok(args)
 }
 
-/// A static config file of a version folder: a table that does not set
-/// `packs` or `presets`.
+/// Parse a static config file of a version folder. The file must be a
+/// table that does not set `packs` or `presets`.
 fn document(file: &'static File<'static>) -> anyhow::Result<Value> {
     let path = Path::new("packs").join(file.path());
     let value = parse_file(&path, utf8(file)?)?;
@@ -276,40 +293,44 @@ fn document(file: &'static File<'static>) -> anyhow::Result<Value> {
     Ok(value)
 }
 
+/// The file name of `path` as UTF-8.
 fn file_name(path: &'static Path) -> anyhow::Result<&'static str> {
     path.file_name()
         .and_then(|name| name.to_str())
         .with_context(|| format!("packs/{}: the name is not UTF-8", path.display()))
 }
 
+/// The contents of `file` as UTF-8.
 fn utf8(file: &'static File<'static>) -> anyhow::Result<&'static str> {
     file.contents_utf8()
         .with_context(|| format!("packs/{}: not UTF-8", file.path().display()))
 }
 
-/// Hidden files and editor backups (`.DS_Store`, `config.toml~`).
+/// Check if the file is hidden or an editor backup (`.DS_Store`,
+/// `config.toml~`). The loader ignores these files.
 fn is_skipped(file_name: &str) -> bool {
     file_name.starts_with('.') || file_name.ends_with('~')
 }
 
-/// `text` matches `^[a-z][a-z0-9-]*$`.
+/// Check if `text` matches `^[a-z][a-z0-9-]*$`.
 fn is_identifier(text: &str) -> bool {
     let mut chars = text.chars();
     chars.next().is_some_and(|c| c.is_ascii_lowercase())
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// A whole number from 1 without leading zeros.
+/// Check if `text` is a whole number from 1 without leading zeros.
 fn is_version(text: &str) -> bool {
     text.bytes().all(|b| b.is_ascii_digit())
         && !text.starts_with('0')
         && text.parse::<u64>().is_ok()
 }
 
-/// The built-in packs and the test pack `sample@1` (a tool): a choice
-/// arg `mode` (`fast` or `slow`, or any other value; `broken` fails), a
-/// bool arg `network`, a `config.lua` and a setup script. Loaded once
-/// per test process: each load leaks its embedded files.
+/// The built-in packs and the test pack `sample@1` (a tool). The sample
+/// pack has a choice arg `mode` (`fast`, `slow` or any other value, but
+/// `broken` fails), a bool arg `network`, a `config.lua` and a setup
+/// script. The packs load once per test process because each load leaks
+/// its embedded files.
 #[cfg(test)]
 pub fn load_with_sample() -> PackManager {
     static SAMPLE: std::sync::LazyLock<PackManager> =
@@ -317,6 +338,8 @@ pub fn load_with_sample() -> PackManager {
     SAMPLE.clone()
 }
 
+/// Load the built-in packs and the test pack `sample@1`, see
+/// [`load_with_sample`].
 #[cfg(test)]
 fn load_sample() -> anyhow::Result<PackManager> {
     const PACK: &str = r#"
@@ -369,8 +392,8 @@ pub(super) fn fixture(
     Box::leak(Box::new(Dir::new("", root.leak())))
 }
 
-/// The entries of the folder `prefix` (with a trailing `/`; `""` for the
-/// root) made of `files`.
+/// The entries of the folder `prefix` (with a trailing `/`, or `""` for
+/// the root) made of `files`.
 #[cfg(test)]
 fn fixture_entries(prefix: &str, files: Vec<(&'static str, String)>) -> Vec<DirEntry<'static>> {
     let mut entries = Vec::new();
@@ -393,9 +416,12 @@ fn fixture_entries(prefix: &str, files: Vec<(&'static str, String)>) -> Vec<DirE
 
 #[cfg(test)]
 mod tests {
+    //! Tests of how the pack loader reads and checks a `packs/` directory.
+
     use super::*;
     use crate::packs::ArgValue;
 
+    /// A `pack.toml` of a tool pack with one choice arg `mode`.
     const PACK: &str = r#"
 label = "Demo"
 description = "Installs the demo"
@@ -409,6 +435,7 @@ default = "a"
 values = ["a", "b"]
 "#;
 
+    /// Load the packs of an in-memory `packs/` directory of `files`.
     fn load_files(files: &[(&'static str, &str)]) -> anyhow::Result<PackManager> {
         let files = files
             .iter()
@@ -417,6 +444,7 @@ values = ["a", "b"]
         load(fixture(vec![], files))
     }
 
+    /// The `<name>@<version>` of each pack, in order.
     fn versions(packs: &[Pack]) -> Vec<String> {
         packs
             .iter()
@@ -424,10 +452,15 @@ values = ["a", "b"]
             .collect()
     }
 
+    /// [`PACK`] with the kind `kind`.
     fn pack_of_kind(kind: &str) -> String {
         PACK.replace("kind = \"tool\"", &format!("kind = \"{kind}\""))
     }
 
+    /// Test that the built-in packs load and that the newest versions come
+    /// in kind order, then name order.
+    ///   1. Load the built-in packs
+    ///   2. Check the list of newest versions
     #[test]
     fn builtin_packs_load() {
         let packs = crate::packs::init().unwrap();
@@ -449,6 +482,13 @@ values = ["a", "b"]
         );
     }
 
+    /// Test that the loader sorts packs by kind, then name, then version,
+    /// and skips hidden and backup files.
+    ///   1. Load packs of three kinds, two versions of one pack, and hidden
+    ///      and backup files
+    ///   2. Check the order of all versions
+    ///   3. Check that the built-in list has only the newest version of
+    ///      each pack
     #[test]
     fn loading_packs_orders_them_by_kind_then_name_and_skips_hidden_files() {
         let distro = pack_of_kind("distro");
@@ -474,6 +514,13 @@ values = ["a", "b"]
         );
     }
 
+    /// Test that the loader reads the metadata, args, config and setup
+    /// script of a pack folder.
+    ///   1. Load a pack with a TOML, JSON or YAML config and a setup script
+    ///   2. Check the metadata, the setup script, the static config and the
+    ///      args
+    ///   3. Load a pack with a Lua config and no setup script
+    ///   4. Check that the config is Lua and that there is no setup
     #[test]
     fn loading_pack_folder_reads_metadata_args_config_and_setup() {
         for (file, text) in [
@@ -513,6 +560,13 @@ values = ["a", "b"]
         assert!(!demo.metadata.has_setup && demo.setup.is_none());
     }
 
+    /// Test that the loader refuses a pack directory that is not valid, and
+    /// that the error names the problem.
+    ///   1. Make a list of cases: unknown files and folders, two configs,
+    ///      a config that sets packs, versions that do not agree, a missing
+    ///      `pack.toml`, bad args and bad folder names
+    ///   2. For each case, change one file of a valid pack folder
+    ///   3. Check that the load fails with the expected error text
     #[test]
     fn loading_invalid_pack_folder_fails_naming_problem() {
         let mut cases: Vec<(&'static str, Option<String>, String)> = vec![
@@ -624,6 +678,8 @@ values = ["a", "b"]
             ));
         }
 
+        // Each case adds, replaces or (`None`) removes one file of a valid
+        // pack folder.
         for (path, text, expected) in cases {
             let mut files: Vec<(&'static str, String)> = vec![
                 ("demo@1/pack.toml", PACK.into()),

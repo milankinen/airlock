@@ -1,31 +1,8 @@
-//! The setup wizard of `airlock start`, for a project without config.
+//! The setup wizard of `airlock start`.
 //!
-//! It runs only when the project has no sandbox and there is a terminal.
-//! It is one view (its state: [`form`]; its lines: [`view`]; drawn on
-//! the [`screen`](crate::cli::prompt::screen)) with the packs by their kind
-//! ([`PackKind`](crate::packs::PackKind)): the distro pack (or the
-//! user's own image), the agents and the tools, the args of each
-//! selected pack, the clipboard capabilities (copy, paste), and the
-//! start bar: `start` (the config is local, `.airlock/airlock.toml`),
-//! `start and share` (it is shareable, `airlock.toml`) or `cancel`. It
-//! returns the new file ([`crate::config::generated`]) with the chosen
-//! packs at their newest version and all their args, and `[clipboard]`;
-//! the distro pack sets the image, or the new file repeats the user's
-//! own image (`vm.image` as the user file has it). The rest
-//! of `airlock start` then runs with that config as with any other; the
-//! file is saved ([`save_config`]) once the sandbox is stored. The wizard
-//! writes nothing and takes no lock.
-//!
-//! No pack is pre-selected from the user files (`[packs]` belongs in the
-//! project files). When the user files set an image, the distro group
-//! starts with it (`custom (<image>)`, no distro pack) and it is
-//! selected; else the first distro pack is. No agent or tool is selected,
-//! and the args have their defaults. On a start option the answers must
-//! resolve with the user files, `[env]` too (see [`check_answers`]); if
-//! they do not, the error shows in the view, which stays open. Esc or
-//! `cancel` ends the run
-//! without a config (exit code 0, or 2 after a failed check: the error
-//! stands); Ctrl-C ends it with exit code 130.
+//! Runs when the project has no config. Asks the user for packs and settings,
+//! and makes a new project config from the answers. The config is saved only
+//! after the sandbox is ready.
 
 pub mod form;
 pub mod view;
@@ -45,20 +22,23 @@ use crate::start::wizard::form::Form;
 use crate::vault::Vault;
 use crate::vm::disk;
 
-/// Everything the wizard asks.
+/// All answers of the wizard.
 pub struct Answers {
-    /// The chosen packs at their newest version, with the answered args,
-    /// in pack order: the distro pack, the agents, the tools.
+    /// The selected packs at their newest version, with the answered args.
+    /// In pack order: the distro pack, the agents, the tools.
     pub packs: Vec<ConfiguredPack>,
-    /// The image of the user files, when it is chosen instead of a
+    /// The image of the user files, if the user selected it instead of a
     /// distro pack (`vm.image` as the file has it).
     pub image: Option<serde_json::Value>,
+    /// The clipboard capabilities (copy, paste).
     pub clipboard: Clipboard,
+    /// Where the new config file goes (local or shareable).
     pub target: Target,
 }
 
 impl Answers {
-    /// The entries of the new file: the chosen packs with all their args.
+    /// Return the entries of the new file: the selected packs with all their
+    /// args.
     fn entries(&self) -> Vec<NewEntry<'_>> {
         self.packs
             .iter()
@@ -77,7 +57,7 @@ impl Answers {
             .collect()
     }
 
-    /// The new config file of the answers in the project `host_cwd`.
+    /// Return the new config file of the answers for the project `host_cwd`.
     pub fn config(&self, host_cwd: &Path) -> GeneratedConfig {
         GeneratedConfig::new(
             host_cwd,
@@ -89,23 +69,30 @@ impl Answers {
     }
 }
 
-/// What the wizard works with.
+/// Inputs of the wizard.
 pub(super) struct Input<'a> {
+    /// Project directory on the host.
     pub(super) host_cwd: &'a Path,
+    /// Available packs.
     pub(super) packs: &'a PackManager,
-    /// The user files (the project has no config yet), with which the
-    /// answers must resolve (see [`check_answers`]).
+    /// The user files (the project has no config yet). The answers must
+    /// resolve with them (see [`check_answers`]).
     pub(super) config: &'a LayeredConfig,
     /// The vault that resolves `[env]` (see [`check_answers`]).
     pub(super) vault: &'a Vault,
 }
 
-/// Load the project's config files, or (a project without one, see
-/// [`LayeredConfig::has_project_config`]) run the setup wizard and carry
-/// its answer as the generated project config
-/// ([`LayeredConfig::with_generated_project`]). The caller saves it once
-/// the sandbox is stored (see [`save_config`]). `vault` resolves the
-/// `[env]` of the answers (see [`check_answers`]).
+/// Load the config files of the project, or run the setup wizard if the
+/// project has none (see [`LayeredConfig::has_project_config`]).
+/// Args:
+///  - `host_cwd`: Project directory on the host
+///  - `packs`: Available packs
+///  - `vault`: Vault that resolves the `[env]` of the answers
+///
+/// Returns:
+///   The loaded config. After the wizard, the config contains the answers as
+///   the generated project config ([`LayeredConfig::with_generated_project`]).
+///   The caller saves it after the sandbox is stored (see [`save_config`]).
 pub async fn load_or_generate_config(
     host_cwd: &Path,
     packs: &PackManager,
@@ -121,11 +108,42 @@ pub async fn load_or_generate_config(
         .map_err(Exit::config)
 }
 
-/// The setup wizard for the project at `host_cwd` without config
-/// (`config` has the user files only). A sandbox without config and a
-/// missing terminal are errors (exit code 2). `vault` resolves the
-/// `[env]` of the answers (see [`check_answers`]). Returns the new config
-/// (not saved yet); see the module docs for how the view ends.
+/// Run the setup wizard for a project without config.
+///
+/// The wizard is one view with the packs grouped by kind
+/// ([`PackKind`](crate::packs::PackKind)):
+///  * The distro pack, or the image of the user files
+///  * The agents and the tools
+///  * The args of each selected pack
+///  * The clipboard capabilities (copy, paste)
+///  * The start bar: `start` (local config, `.airlock/airlock.toml`),
+///    `start and share` (shareable config, `airlock.toml`) or `cancel`
+///
+/// The user files do not select packs, because `[packs]` belongs in the
+/// project files. If the user files set an image, the distro group starts
+/// with it (`custom (<image>)`, no distro pack) and it is selected. Otherwise
+/// the first distro pack is selected. No agent or tool is selected, and the
+/// args have their defaults.
+///
+/// On a start option, the answers must resolve with the user files, also
+/// `[env]` (see [`check_answers`]). If they do not, the error shows in the
+/// view, and the view stays open. The wizard writes nothing and takes no
+/// lock.
+/// Args:
+///  - `host_cwd`: Project directory on the host
+///  - `packs`: Available packs
+///  - `config`: The user config files only
+///  - `vault`: Vault that resolves the `[env]` of the answers
+///
+/// Returns:
+///   The new config file (not saved yet, see [`crate::config::generated`]).
+///   It has the selected packs at their newest version with all their args,
+///   and `[clipboard]`. The distro pack sets the image, or the file repeats
+///   the user image. Errors:
+///    * A sandbox without config, or no terminal: exit code 2
+///    * Esc or `cancel`: exit code 0, or 2 after a failed check (the error
+///      stays valid)
+///    * Ctrl+C: exit code 130
 pub async fn run_wizard(
     host_cwd: &Path,
     packs: &PackManager,
@@ -156,9 +174,9 @@ pub async fn run_wizard(
     Box::pin(ask_config(&input)).await
 }
 
-/// Save the config of the wizard (after the sandbox is stored). Only a
-/// shareable file (`airlock.toml`) is reported: the local one is not for
-/// the user to edit or commit.
+/// Save the config of the wizard. Call this after the sandbox is stored.
+// Report only a shareable file (`airlock.toml`). The user must not edit or
+// commit the local file.
 pub fn save_config(generated: &GeneratedConfig) -> Result<(), Exit> {
     generated.save().map_err(|e| Exit::error(1, e))?;
     if generated.target == Target::Project {
@@ -167,8 +185,8 @@ pub fn save_config(generated: &GeneratedConfig) -> Result<(), Exit> {
     Ok(())
 }
 
-/// Whether the project at `host_cwd` has a sandbox: a disk or an install
-/// state in `.airlock/sandbox`.
+/// Return true if the project at `host_cwd` has a sandbox: a disk or an
+/// install state in `.airlock/sandbox`.
 fn sandbox_exists(host_cwd: &Path) -> bool {
     let dir = host_cwd.join(".airlock/sandbox");
     dir.join(disk::DISK_FILE).exists() || dir.join(state::STATE_FILE).exists()
@@ -178,11 +196,13 @@ fn sandbox_exists(host_cwd: &Path) -> bool {
 enum End {
     /// A start option, with answers that passed [`check_answers`].
     Done(Answers),
+    /// Esc or `cancel`.
     Cancelled,
+    /// Ctrl+C or an interrupt signal.
     Interrupted,
 }
 
-/// Show the view until it ends (see the module docs) and return the new
+/// Show the view until it ends (see [`run_wizard`]) and return the new
 /// config. Messages print after the terminal is restored.
 async fn ask_config(input: &Input<'_>) -> Result<GeneratedConfig, Exit> {
     let mut form = Form::new(input.packs, input.config.user_image());
@@ -223,8 +243,8 @@ async fn run_view(
             Step::Interrupt => return Ok(End::Interrupted),
             Step::Done(target) => {
                 let answers = form.answers(target);
-                // Out of raw mode and without the view: what the check
-                // prints (a vault passphrase prompt) shows as usual.
+                // Leave raw mode and remove the view. Then the output of the
+                // check (a vault passphrase prompt) shows as usual.
                 screen.suspend()?;
                 match check_answers(input, &answers).await {
                     Ok(()) => return Ok(End::Done(answers)),
@@ -238,11 +258,13 @@ async fn run_view(
     }
 }
 
-/// Check the config of `answers` as the rest of `airlock start` uses it:
-/// with the user files, it resolves (each pack's `config.lua`, and no two
-/// packs set a value differently, see [`LayeredConfig::resolve`]), and so
-/// does its `[env]` (each host variable that it names is set, see
-/// [`crate::project::resolve_env`]).
+/// Check the config of `answers` as the rest of `airlock start` uses it.
+///
+/// With the user files, the config must resolve (see
+/// [`LayeredConfig::resolve`]). Each pack `config.lua` must run, and no two
+/// packs can set a value differently. The `[env]` of the config must also
+/// resolve (see [`crate::project::resolve_env`]): each host variable that it
+/// names must be set.
 pub(super) async fn check_answers(input: &Input<'_>, answers: &Answers) -> anyhow::Result<()> {
     let config = input
         .config
@@ -257,8 +279,16 @@ pub(super) async fn check_answers(input: &Input<'_>, answers: &Answers) -> anyho
 
 #[cfg(test)]
 mod tests {
+    //! Tests of the sandbox check before the setup wizard.
+
     use super::*;
 
+    /// Test that only a disk or an install state counts as a sandbox. The
+    /// wizard refuses to run over a sandbox that lost its config.
+    ///   1. Make a sandbox directory with only a lock file and check that
+    ///      it does not count
+    ///   2. Add an install state and check that it counts
+    ///   3. Replace the install state with a disk and check that it counts
     #[test]
     fn sandbox_exists_with_disk_or_install_state_only() {
         let tmp = crate::test_cfg::temp_dir();

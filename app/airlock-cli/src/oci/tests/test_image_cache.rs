@@ -1,14 +1,25 @@
+//! Tests for the cached image entries, the sandbox image links and the
+//! garbage collector of the OCI cache.
+
 use super::*;
 use crate::test_cfg::home::TempHome;
 
+/// Cache a small layer as `digest` and return its layer key.
 fn small_layer(digest: &str) -> String {
     cache_layer(digest, &LayerTar::default().file("marker", "x").gz())
 }
 
+/// Whether the layer `key` exists in the layer cache.
 fn layer_exists(key: &str) -> bool {
     cache::layer_dir(key).unwrap().exists()
 }
 
+/// Test that a cached image is ready only while all its layers exist, so
+/// that a sweep that removed a layer makes airlock resolve the image again.
+///   1. Write a cached image with one layer and check that it is ready
+///   2. Remove the layer and check that the entry reads but is not ready
+///   3. Cache the layer again and check that the image is ready
+///   4. Check that an image with no layers is never ready
 #[test]
 fn cached_image_is_ready_only_while_all_its_layers_exist() {
     let _home = TempHome::new();
@@ -29,6 +40,13 @@ fn cached_image_is_ready_only_while_all_its_layers_exist() {
     assert!(read_ready_image(&empty).is_none());
 }
 
+/// Test that the GC sweep keeps only the images that a sandbox links to and
+/// their layers, and removes all staging leftovers.
+///   1. Cache a live image (linked by a sandbox) and an orphan image that
+///      share one layer
+///   2. Add staging leftovers to the layer cache
+///   3. Sweep and check that only the live image and its layers stay
+///   4. Remove the sandbox, sweep again and check that all is gone
 #[test]
 fn gc_sweep_keeps_only_images_linked_by_sandboxes_and_their_layers() {
     let home = TempHome::new();
@@ -42,6 +60,7 @@ fn gc_sweep_keeps_only_images_linked_by_sandboxes_and_their_layers() {
     write_cached_image(&orphan_path, &orphan).unwrap();
     let sandbox = home.path().join("project/.airlock/sandbox");
     std::fs::create_dir_all(&sandbox).unwrap();
+    // The second call must see the existing link and do nothing.
     ensure_image_hardlink(&sandbox.join("image"), &live_path, &live).unwrap();
     ensure_image_hardlink(&sandbox.join("image"), &live_path, &live).unwrap();
     let layers = cache::layers_root().unwrap();
@@ -71,6 +90,11 @@ fn gc_sweep_keeps_only_images_linked_by_sandboxes_and_their_layers() {
     assert!(!layer_exists(&own) && !layer_exists(&shared));
 }
 
+/// Test that the sandbox image link is made again when the cache entry is
+/// gone, so that the GC does not remove the image of a live sandbox.
+///   1. Link a sandbox to a cached image
+///   2. Remove the cache entry and link again
+///   3. Sweep and check that the image entry exists and is ready
 #[test]
 fn sandbox_image_link_is_restored_when_cache_entry_was_wiped() {
     let home = TempHome::new();
@@ -89,6 +113,11 @@ fn sandbox_image_link_is_restored_when_cache_entry_was_wiped() {
     );
 }
 
+/// Test that a cache entry from before the `user` field loads with no user,
+/// so that airlock knows to resolve the user again.
+///   1. Write a cache entry without the `user` field
+///   2. Check that it loads with no user
+///   3. Write a current entry and check that it has a user
 #[test]
 fn cache_file_from_before_user_field_loads_as_legacy() {
     let _home = TempHome::new();

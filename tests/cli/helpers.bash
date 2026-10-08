@@ -1,4 +1,4 @@
-# Load shared helpers from parent directory, then add CLI test helpers.
+# Helpers for the CLI tests. These tests do not start a VM.
 source "$(dirname "${BASH_SOURCE[0]}")/../helpers.bash"
 
 # Write $2 as airlock.toml, run "airlock $1", and expect a config error

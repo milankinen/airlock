@@ -1,4 +1,7 @@
-//! Optional raw copy of guest output for offline replay and diagnosis.
+//! Optional raw copy of guest output.
+//!
+//! Writes a copy of the guest output to a file, so that a developer can
+//! replay and examine the session later.
 
 use std::fs::File;
 use std::io::Write;
@@ -7,21 +10,24 @@ use std::path::Path;
 use super::OutputSink;
 use crate::cli;
 
-/// Forwards guest output to `inner` and, when a dump file is open, also
-/// appends every stdout and stderr chunk to it, unchanged.
+/// Output sink that forwards guest output to `inner`. When a dump file is
+/// open, it also appends each stdout and stderr chunk to the file,
+/// unchanged.
 pub struct DumpSink<'a, S: OutputSink> {
     inner: &'a mut S,
     file: Option<File>,
 }
 
 impl<'a, S: OutputSink> DumpSink<'a, S> {
-    /// Tee into `file`, or only forward when it is `None`.
+    /// Make a sink that copies the output into `file`. When `file` is
+    /// `None`, it only forwards the output.
     pub fn new(inner: &'a mut S, file: Option<File>) -> Self {
         Self { inner, file }
     }
 
-    /// Tee into `<sandbox_dir>/pty.dump` when `AIRLOCK_PTY_DUMP=1`. The file
-    /// is truncated; failing to open it is reported and dumping is skipped.
+    /// Make a sink that copies the output into `<sandbox_dir>/pty.dump`
+    /// when `AIRLOCK_PTY_DUMP=1`. Truncates the file. If the file does not
+    /// open, reports the error and makes no copy.
     pub fn from_env(inner: &'a mut S, sandbox_dir: &Path) -> Self {
         let file = if std::env::var("AIRLOCK_PTY_DUMP").as_deref() == Ok("1") {
             open_dump(&sandbox_dir.join("pty.dump"))
@@ -50,6 +56,7 @@ impl<S: OutputSink> OutputSink for DumpSink<'_, S> {
     }
 }
 
+/// Create the dump file. Reports the result to the user.
 fn open_dump(path: &Path) -> Option<File> {
     match File::create(path) {
         Ok(f) => {
@@ -65,10 +72,17 @@ fn open_dump(path: &Path) -> Option<File> {
 
 #[cfg(test)]
 mod tests {
+    //! Tests for the raw copy of guest output to a dump file.
+
     use super::*;
     use crate::test_cfg::sinks::RecordingSink;
     use crate::test_cfg::temp_dir;
 
+    /// Test that the dump sink forwards stdout and stderr to the inner sink
+    /// and writes both to the dump file in the order they came.
+    ///   1. Send stdout, stderr and stdout chunks through a dump sink
+    ///   2. Check that the inner sink got each stream
+    ///   3. Check that the dump file has all chunks in order
     #[test]
     fn dump_sink_forwards_both_streams_and_tees_them_in_order() {
         let dir = temp_dir();

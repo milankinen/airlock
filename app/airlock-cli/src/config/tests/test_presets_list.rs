@@ -1,3 +1,6 @@
+//! Tests for the `presets` list of released versions: a golden file keeps
+//! the resolved config of each released form, and errors for bad lists.
+
 use serde_json::{Map, Value, json};
 
 use crate::test_cfg::{ConfigDirs, project_toml_error};
@@ -8,7 +11,8 @@ const GOLDEN_PATH: &str = concat!(
     "/src/config/tests/golden/legacy-presets.json"
 );
 
-/// The released preset names (11, plus the later addition `docker`), frozen.
+/// The released preset names: the 11 first names and the later `docker`.
+/// Do not change this list.
 const NAMES: [&str; 12] = [
     "alpine",
     "arch",
@@ -24,8 +28,7 @@ const NAMES: [&str; 12] = [
     "suse",
 ];
 
-/// [`NAMES`] without the later addition `docker`: the 11 names released on
-/// `main`.
+/// [`NAMES`] without the later `docker`: the 11 names released on `main`.
 const NAMES_NO_DOCKER: [&str; 11] = [
     "alpine",
     "arch",
@@ -40,13 +43,15 @@ const NAMES_NO_DOCKER: [&str; 11] = [
     "suse",
 ];
 
-/// One golden case: config files, each `(in home, relative path, text)`.
+/// One golden case: a name and config files, each as
+/// `(in home, relative path, text)`.
 struct Case {
     name: String,
     files: Vec<(bool, String, String)>,
 }
 
 impl Case {
+    /// Make a case with no files.
     fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -54,41 +59,47 @@ impl Case {
         }
     }
 
+    /// Add a JSON file, in the home if `home` is true, else in the project.
     fn json_file(mut self, home: bool, rel: &str, value: &Value) -> Self {
         self.files
             .push((home, rel.to_string(), serde_json::to_string(value).unwrap()));
         self
     }
 
+    /// Add the user file `~/.airlock/config.json`.
     fn user(self, value: &Value) -> Self {
         self.json_file(true, ".airlock/config.json", value)
     }
 
+    /// Add the user file at `rel` in the home.
     fn user_at(self, rel: &str, value: &Value) -> Self {
         self.json_file(true, rel, value)
     }
 
+    /// Add the local file `.airlock/airlock.json`.
     fn local(self, value: &Value) -> Self {
         self.json_file(false, ".airlock/airlock.json", value)
     }
 
+    /// Add the project file `airlock.json`.
     fn project(self, value: &Value) -> Self {
         self.json_file(false, "airlock.json", value)
     }
 
+    /// Add the project-local file `airlock.local.json`.
     fn project_local(self, value: &Value) -> Self {
         self.json_file(false, "airlock.local.json", value)
     }
 
-    /// The project file `rel` with `text`.
+    /// Add the project file `rel` with `text`.
     fn file(mut self, rel: &str, text: &str) -> Self {
         self.files.push((false, rel.to_string(), text.to_string()));
         self
     }
 
-    /// Write the files, resolve them, and record the config or the error
-    /// text. `~/.airlock/airlock.json` pins `vm.cpus` and `vm.memory`,
-    /// whose defaults depend on the host.
+    /// Write the files, resolve them, and return the config or the error
+    /// text. `~/.airlock/airlock.json` sets `vm.cpus` and `vm.memory`,
+    /// because their defaults change with the host.
     fn record(&self) -> Value {
         let dirs = ConfigDirs::new();
         dirs.user_file(
@@ -109,10 +120,13 @@ impl Case {
     }
 }
 
+/// Return a config body with the `presets` list `names`.
 fn presets(names: &[&str]) -> Value {
     json!({ "presets": names })
 }
 
+/// Return all golden cases: each name alone, each pair, all names in
+/// different orders and layers, and the text, split and overlap cases.
 fn cases() -> Vec<Case> {
     let mut cases = vec![];
 
@@ -152,8 +166,8 @@ fn cases() -> Vec<Case> {
     cases
 }
 
-/// Configs from the docs, the examples, and the bats tests, as TOML text,
-/// and the same configs converted to JSON and YAML text.
+/// Return the configs from the docs, the examples and the bats tests as
+/// TOML text, and the same configs as JSON and YAML text.
 fn text_cases() -> Vec<Case> {
     const TEXTS: &[(&str, &str)] = &[
         (
@@ -286,8 +300,8 @@ image = "airlock-test.invalid/no-such-image:1"
     cases
 }
 
-/// Lists split over user, local, and project files, and the same name in
-/// two layers.
+/// Return lists split across the user, local and project files, the same
+/// name in more than one layer, and empty lists.
 fn split_cases() -> Vec<Case> {
     vec![
         Case::new("split/user-project")
@@ -323,7 +337,7 @@ fn split_cases() -> Vec<Case> {
     ]
 }
 
-/// Layer bodies that overlap keys of the preset documents.
+/// Return files that set keys that the preset documents also set.
 fn overlap_cases() -> Vec<Case> {
     vec![
         Case::new("overlap/plain-token-over-masked-local")
@@ -376,6 +390,7 @@ fn overlap_cases() -> Vec<Case> {
     ]
 }
 
+/// Resolve all cases and return the results by case name.
 fn record_all() -> Map<String, Value> {
     let mut results = Map::new();
     for case in cases() {
@@ -389,7 +404,8 @@ fn record_all() -> Map<String, Value> {
     results
 }
 
-/// One case per line, sorted by name, so a diff shows the changed cases.
+/// Return the results as JSON text with one case on each line, sorted by
+/// name, so that a diff shows only the changed cases.
 fn render(results: &Map<String, Value>) -> String {
     let mut names: Vec<_> = results.keys().collect();
     names.sort();
@@ -400,6 +416,12 @@ fn render(results: &Map<String, Value>) -> String {
     format!("{{\n{}\n}}\n", lines.join(",\n"))
 }
 
+/// Test that each released form of the `presets` list resolves to the same
+/// config as in the golden file. Old configs must work the same after an
+/// upgrade.
+///   1. Check that the golden file has no error results
+///   2. Resolve all cases and check that there are at least 218
+///   3. Compare each case with the golden file in both directions
 #[test]
 fn released_presets_lists_resolve_as_golden_file() {
     let golden: Map<String, Value> = serde_json::from_str(GOLDEN).unwrap();
@@ -436,12 +458,23 @@ fn released_presets_lists_resolve_as_golden_file() {
     );
 }
 
+/// Write the golden file again from the current results. This is not a
+/// real test. Run it by hand only after a planned change to a preset
+/// document.
+///   1. Resolve all cases
+///   2. Write the results to the golden file
 #[test]
 #[ignore = "rewrites the golden file; run only for a deliberate preset document edit"]
 fn regenerate_legacy_presets_golden() {
     std::fs::write(GOLDEN_PATH, render(&record_all())).unwrap();
 }
 
+/// Test that preset names add only plain config, and that a name in more
+/// than one list applies only one time.
+///   1. Set python twice in the user file and again in the project file,
+///      with three agent presets
+///   2. Check that there are no packs and that each agent rule exists
+///   3. Check that the python allow list has the hosts of one python preset
 #[test]
 fn presets_list_names_are_plain_config_applied_once() {
     let dirs = ConfigDirs::new();
@@ -461,6 +494,11 @@ fn presets_list_names_are_plain_config_applied_once() {
     );
 }
 
+/// Test that the python preset and the python pack entry both apply. They
+/// are different config sources, so their allow lists concatenate.
+///   1. Set python in the user presets list and as a project pack
+///   2. Check that there is one pack, and the allow list has the hosts of
+///      both
 #[test]
 fn presets_list_and_pack_entry_of_same_pack_both_apply() {
     let dirs = ConfigDirs::new();
@@ -474,6 +512,10 @@ fn presets_list_and_pack_entry_of_same_pack_both_apply() {
     );
 }
 
+/// Test that an unknown preset name is an error that lists the known names.
+/// For a newer pack name, the error tells the user to use `[packs]`.
+///   1. Check the full error for `claude` and the hint for `mise`
+///   2. Check that a name that is not a pack gets no `[packs]` hint
 #[test]
 fn unknown_presets_list_names_are_errors_with_hints() {
     assert_eq!(
@@ -495,6 +537,10 @@ fn unknown_presets_list_names_are_errors_with_hints() {
     assert!(err.ends_with("fedora, suse)"), "{err}");
 }
 
+/// Test that a `presets` value that is not a list of names stops the load
+/// with an error that names the file. An empty value is accepted.
+///   1. Load each bad `presets` value and check the full error
+///   2. Load an empty `presets` key and check that the other values apply
 #[test]
 fn presets_value_that_is_not_list_of_names_fails_load() {
     for (yaml, text) in [

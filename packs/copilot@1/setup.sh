@@ -7,24 +7,25 @@
 #   (npm with Node.js 22+, Homebrew, the install script, and "Download
 #   from GitHub.com": download the executable, unpack it, run it)
 # - https://gh.io/copilot-install -> https://raw.githubusercontent.com/github/copilot-cli/refs/heads/main/install.sh
-#   (bash; always takes copilot-linux-<x64|arm64>.tar.gz, also on musl,
-#   and its `sha256sum -c --ignore-missing` fails under BusyBox; this
-#   script does the same download and check, with the musl build on musl)
+#   (bash. It always takes copilot-linux-<x64|arm64>.tar.gz, also on
+#   musl, and its `sha256sum -c --ignore-missing` fails under BusyBox.
+#   This script does the same download and check, with the musl build on
+#   musl.)
 # - https://github.com/github/copilot-cli/releases (copilot-<linux|linuxmusl>-<x64|arm64>.tar.gz
-#   with one file `copilot` owned by uid 1001; github-copilot-<ver>-<plat>-<arch>.tgz
-#   packages; SHA256SUMS.txt)
+#   with one file `copilot` owned by uid 1001, github-copilot-<ver>-<plat>-<arch>.tgz
+#   packages, SHA256SUMS.txt)
 # - https://github.com/github/copilot-cli/blob/main/changelog.md (1.0.49:
-#   Alpine/musl support; 0.0.397: `--acp`)
+#   Alpine/musl support, 0.0.397: `--acp`)
 # - https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server
 #
 # musl + aarch64: the standalone linuxmusl-arm64 executable (checked:
 # 1.0.64, 1.0.86, 1.0.91) cannot load its native addons on Alpine
-# ("Node-API symbol ... has not been loaded"); only `--version` works.
-# There, the same release's linuxmusl-arm64 package runs on Alpine's
-# Node.js instead.
+# ("Node-API symbol ... has not been loaded"). Only `--version` works.
+# Thus on that platform the linuxmusl-arm64 package of the same release
+# runs on the Node.js of Alpine.
 #
-# No sha pin: each download is checked against the release's
-# SHA256SUMS.txt, as the install script does.
+# No sha pin: the script checks each download against the SHA256SUMS.txt
+# of the release, as the install script does.
 # No args.
 
 _bin=/usr/local/bin/copilot
@@ -46,8 +47,8 @@ if [ "$_plat" = linuxmusl ] && [ "$_arch" = arm64 ]; then
 fi
 
 # `copilot --help` loads the native runtime addon (`--version` does
-# not). Root's run unpacks the package (about 180 MB) into a cache: keep
-# that and any state in the scratch directory. No auto-update.
+# not). The run as root unpacks the package (about 180 MB) into a cache.
+# Keep that cache and all state in the scratch directory. No auto-update.
 copilot_works() {
     mkdir -p "$PACK_TMP/home"
     HOME="$PACK_TMP/home" XDG_CACHE_HOME="$PACK_TMP/cache" COPILOT_AUTO_UPDATE=false \
@@ -55,7 +56,8 @@ copilot_works() {
 }
 
 # fetch_release <tag> <asset>: download a release asset to $PACK_TMP and
-# check it against the release's SHA256SUMS.txt (what install.sh does).
+# check it against the SHA256SUMS.txt of the release (as install.sh
+# does).
 fetch_release() {
     fetch "https://github.com/$_repo/releases/download/$1/$2" "$PACK_TMP/$2"
     if [ ! -f "$PACK_TMP/SHA256SUMS.txt" ]; then
@@ -122,8 +124,8 @@ WRAPPER
         log "downloading Copilot CLI $TAG"
         fetch_release "$TAG" "$_asset"
         log "installing Copilot CLI $TAG"
-        # One member, `copilot`, owned by uid 1001 in the archive (tar as
-        # root keeps that owner): write a new root-owned file instead.
+        # The archive has one member, `copilot`, owned by uid 1001. tar as
+        # root keeps that owner. Thus write a new root-owned file.
         if ! tar -xzOf "$PACK_TMP/$_asset" copilot >"$_bin.new" 3>&-; then
             rm -f "$_bin.new"
             fail 12 "could not unpack $_asset"

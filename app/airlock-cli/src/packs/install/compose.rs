@@ -1,27 +1,30 @@
-//! The install script of one pack: a wrapper, `lib.sh`, then the pack's
-//! `setup.sh`, run with `/bin/sh -c` in the install boot.
+//! Pack install script.
 //!
-//! Protocol v1 (`AIRLOCK_PACK_API=1`): the wrapper moves the exec's stdout
-//! to fd 3 and sends everything else to stderr (`exec 3>&1 1>&2`). So the
-//! exec's stdout carries only status lines (`steps <n>` and
-//! `status <text>`, written by `airlock_steps` and `airlock_status`; see
-//! [`super::progress`]), and its stderr is the install log.
+//! Makes the full install script of a pack from its setup script and the
+//! shared shell helpers, and the command that runs it. Also explains the
+//! known exit codes of the scripts in failure messages.
 
 use crate::packs::InstallerScript;
 
-/// The shared helpers of every install script.
+/// Shared helpers of all install scripts.
 const LIB: &str = include_str!("lib.sh");
 
 /// Moves stdout to fd 3 (the status channel) and fd 1 to stderr.
+///
+/// Protocol v1 (`AIRLOCK_PACK_API=1`): after the wrapper, the stdout of the
+/// exec carries only status lines (`steps <n>` and `status <text>`, written
+/// by `airlock_steps` and `airlock_status`, see [`super::progress`]). The
+/// stderr of the exec is the install log.
 const WRAPPER: &str = "exec 3>&1 1>&2\n";
 
-/// The whole install script of the setup script `setup`: wrapper,
-/// `lib.sh`, `setup`.
+/// Make the full install script: wrapper, `lib.sh`, then `setup`.
+/// Args:
+///  - `setup`: The `setup.sh` of the pack
 pub(in crate::packs) fn script(setup: &str) -> String {
     format!("{WRAPPER}{LIB}\n{setup}")
 }
 
-/// The argv of the install exec of `installer`.
+/// Make the argv that runs the install script with `/bin/sh -c`.
 pub fn argv(installer: &InstallerScript) -> Vec<String> {
     vec![
         "/bin/sh".into(),
@@ -31,7 +34,9 @@ pub fn argv(installer: &InstallerScript) -> Vec<String> {
     ]
 }
 
-/// What an install script exit code means, for the failure message.
+/// Explain an install script exit code, for the failure message.
+/// Returns:
+///   A hint, or `None` for an exit code without a known meaning.
 pub fn exit_hint(code: i32) -> Option<&'static str> {
     match code {
         10 => Some("the image is not Alpine- or Debian-based, or the CPU is not supported"),

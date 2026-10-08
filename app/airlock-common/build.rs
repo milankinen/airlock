@@ -1,3 +1,7 @@
+//! Build script for the shared RPC crate.
+//!
+//! Generates the Rust code of the RPC protocols from their schemas.
+
 fn main() {
     capnpc::CompilerCommand::new()
         .file("schema/network.capnp")

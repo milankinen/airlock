@@ -1,44 +1,10 @@
-//! Loopback sign-ins: the browser grant of a network service.
+//! Loopback sign-ins of the network services.
 //!
-//! The agent signs in inside the sandbox; its sign-in page opens in the
-//! host's browser through the browser bridge ([`crate::rpc::browser`]),
-//! and the agent listens for the OAuth callback on a loopback port of the
-//! guest. [`LoopbackSignIn`] is the service's
-//! [`crate::rpc::browser::BrowserGrant`]: it decides which pages the guest
-//! may open and forwards their callback port from host loopback into the
-//! guest ([`super::callback`]).
-//!
-//! The VM is untrusted, so a page opens only when it is one of the
-//! service's [`SignInPage`]s and its OAuth parameters match the page:
-//!
-//! - one non-empty `client_id` (any: an agent can have several OAuth
-//!   clients, and the code exchange stores the one it used),
-//!   `response_type=code`, one `code_challenge` with
-//!   `code_challenge_method=S256`, and one `scope` with at least one
-//!   scope, each a well-formed scope token (RFC 6749, section 3.3) and
-//!   named once (any scope: the provider decides what it grants); no
-//!   `response_mode`, no `prompt=none`;
-//! - exactly one loopback `redirect_uri` on a port and path of the page
-//!   (no arbitrary host ports).
-//!
-//! The browser checks the URL itself (`https`, no user name, port or
-//! fragment, length, characters) before it asks the grants.
-//!
-//! The `code_challenge` of every page that opens is kept
-//! ([`PendingCodes::open_page`]): Claude's manual sign-in exchange, whose
-//! real code the user pastes, works only with the verifier of a page
-//! opened here.
-//!
-//! The callback port is bound exclusively, so the guest never receives
-//! traffic meant for a host program. One forward runs at a time: a
-//! sign-in that names a new callback port replaces the previous forward
-//! (Claude Code listens on a new ephemeral port per sign-in); a new
-//! sign-in on the same port opens the forward again. Forwards need the
-//! booted VM: they run between [`LoopbackSignIn::attach`] and
-//! [`LoopbackSignIn::detach`]. A forward frees its port once it closes
-//! ([`super::callback`]: no code in time, or the follow-ups after the
-//! code are over). Refusals name the host and path only,
-//! never the query: it carries OAuth state.
+//! The agent signs in inside the sandbox. Its sign-in page opens in the
+//! host's browser through the browser bridge, and the agent waits for the
+//! OAuth callback on a loopback port of the guest. This module decides
+//! which sign-in pages the guest can open and which callbacks they can
+//! use. It then forwards the callback port from the host into the guest.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -54,24 +20,26 @@ use crate::network::reverse_forward;
 use crate::rpc::browser::{BrowserGrant, GrantAnswer};
 use crate::rpc::guest_network::GuestNetwork;
 
-/// A sign-in page the guest may open, with the callback it may name.
+/// A sign-in page that the guest can open, with the callback that it can
+/// name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignInPage {
-    /// Exact host of the authorize page (https, default port).
+    /// Exact host of the authorize page (`https`, default port).
     pub host: &'static str,
     /// Exact path of the authorize page.
     pub path: &'static str,
-    /// Allowed ports of the `redirect_uri`: the loopback ports the sign-in
-    /// tool may listen on for its callback.
+    /// Allowed ports of the `redirect_uri`: the loopback ports where the
+    /// sign-in tool can listen for its callback.
     pub callback_ports: &'static [RangeInclusive<u16>],
     /// Required path of the `redirect_uri`.
     pub callback_path: &'static str,
-    /// Hosts of the service's pages the callback may redirect the browser
+    /// Hosts of the service's pages that the callback can send the browser
     /// to (`https`): the authorize hosts and their success pages.
     pub pages: &'static [&'static str],
 }
 
 impl SignInPage {
+    /// Whether `url` has the host and path of this page.
     fn is_page_of(&self, url: &Url) -> bool {
         url.host_str() == Some(self.host) && url.path() == self.path
     }
@@ -79,16 +47,36 @@ impl SignInPage {
 
 /// The sign-ins of one service: its pages, and the callback forward of
 /// the current sign-in.
+///
+/// The VM is untrusted, so a page opens only if it is one of the
+/// service's [`SignInPage`]s and its OAuth parameters match the page (see
+/// [`check_params`]). The browser bridge checks the URL itself (`https`,
+/// no user name, port or fragment, length, characters) before it asks the
+/// grants.
+///
+/// The `code_challenge` of every page that opens is recorded
+/// ([`PendingCodes::open_page`]). Claude's manual sign-in exchange, whose
+/// real code the user pastes, works only with the verifier of a page
+/// opened here.
+///
+/// The callback port is bound exclusively, so the guest never receives
+/// traffic for a host program. Only one forward runs at a time. A forward
+/// needs the booted VM: it runs between [`Self::attach`] and
+/// [`Self::detach`]. A forward frees its port when it closes (see
+/// [`CallbackForward`]).
+///
+/// Refusals name only the host and path, never the query, because the
+/// query contains OAuth state.
 pub struct LoopbackSignIn {
     service: ServiceId,
     pages: Vec<SignInPage>,
-    /// Where the callback forwards keep the codes they swapped, and the
-    /// grant keeps the challenges of the pages it opened.
+    /// Store for the surrogate codes of the callback forwards, and for the
+    /// challenges of the pages that the grant opened.
     codes: PendingCodes,
-    /// The guest from [`Self::attach`] until [`Self::detach`]. Runtime
+    /// The guest, from [`Self::attach`] until [`Self::detach`]. Runtime
     /// state: the grant exists before the VM boots, the guest only after.
     guest: RefCell<Option<GuestNetwork>>,
-    /// The current callback forward. Runtime state: each sign-in may
+    /// The current callback forward. Runtime state: each sign-in can
     /// replace it.
     forward: RefCell<Option<Forward>>,
 }
@@ -96,14 +84,18 @@ pub struct LoopbackSignIn {
 /// A callback port forwarded into the guest.
 struct Forward {
     port: u16,
-    /// The accept loops; dropping the set aborts them.
+    /// The accept loops. A drop of the set stops them.
     tasks: JoinSet<()>,
     state: CallbackForward,
 }
 
 impl LoopbackSignIn {
-    /// The sign-ins of `service` on `pages`; their callback forwards swap
-    /// codes into `codes`.
+    /// Make the sign-ins of `service`.
+    /// Args:
+    ///  - `service`: The service
+    ///  - `pages`: The sign-in pages that the guest can open
+    ///  - `codes`: Store for the surrogate codes and opened pages, shared
+    ///    with the service's token exchange.
     pub fn new(service: ServiceId, pages: Vec<SignInPage>, codes: PendingCodes) -> Self {
         Self {
             service,
@@ -119,8 +111,8 @@ impl LoopbackSignIn {
         self.guest.replace(Some(guest.clone()));
     }
 
-    /// Stop forwarding: the callback port is free once this returns, and
-    /// later sign-ins are refused.
+    /// Stop the forwards. The callback port is free when this returns, and
+    /// the grant refuses later sign-ins.
     pub async fn detach(&self) {
         self.guest.replace(None);
         let forward = self.forward.take();
@@ -130,10 +122,15 @@ impl LoopbackSignIn {
         }
     }
 
-    /// Forward `port` for a sign-in of `callback`. A new port, or the port
-    /// of a forward that has closed, replaces the current forward only
-    /// once its bind succeeded. Synchronous from the check to the bind, so
-    /// concurrent sign-ins cannot race past it.
+    /// Forward `port` for a sign-in of `callback`.
+    ///
+    /// A sign-in on the port of the current open forward opens it again. A
+    /// new port, or the port of a closed forward, replaces the current
+    /// forward, but only after the bind succeeds. (Claude Code listens on a
+    /// new ephemeral port for each sign-in.) The function is synchronous
+    /// from the check to the bind, so concurrent sign-ins cannot race.
+    /// Returns:
+    ///   An error message for the user if the forward cannot start.
     fn forward(&self, port: u16, callback: Callback) -> Result<(), String> {
         let guest = self.guest.borrow();
         let Some(guest) = guest.as_ref() else {
@@ -150,7 +147,7 @@ impl LoopbackSignIn {
             Ok(bound) => {
                 let mut tasks = JoinSet::new();
                 let state = callback::serve(bound, guest, &mut tasks, &self.codes, callback);
-                // The old forward's accept loops end with its set.
+                // The accept loops of the old forward stop with its set.
                 *current = Some(Forward { port, tasks, state });
                 tracing::debug!("sign-in: forwarding callback port {port}");
                 Ok(())
@@ -190,7 +187,7 @@ impl BrowserGrant for LoopbackSignIn {
     }
 }
 
-/// What [`check_params`] found in an authorize URL.
+/// The values that [`check_params`] found in an authorize URL.
 #[derive(Debug)]
 struct Checked {
     /// The port of the loopback `redirect_uri`.
@@ -199,8 +196,23 @@ struct Checked {
     challenge: String,
 }
 
-/// The OAuth parameters of an authorize URL against its page. The error
-/// never contains the query.
+/// Check the OAuth parameters of an authorize URL against its page.
+///
+/// The URL must have:
+///  * One non-empty `client_id`. Any client is accepted: an agent can have
+///    several OAuth clients, and the code exchange stores the one it used.
+///  * `response_type=code`.
+///  * One `code_challenge` with `code_challenge_method=S256`.
+///  * One `scope` with at least one scope. Each scope must be a valid
+///    scope token (RFC 6749, section 3.3) and occur only once. Any scope
+///    is accepted, because the provider decides what it grants.
+///  * No `response_mode` and no `prompt=none`.
+///  * Exactly one loopback `redirect_uri` on a port and path of the page
+///    (see [`check_redirect`]). Thus no arbitrary host port is forwarded.
+///
+/// Returns:
+///   The callback port and the PKCE challenge, or an error message. The
+///   error never contains the query.
 fn check_params(url: &Url, page: &SignInPage) -> Result<Checked, String> {
     let one = |name: &str| -> Result<String, String> {
         let values: Vec<String> = url
@@ -246,16 +258,19 @@ fn check_params(url: &Url, page: &SignInPage) -> Result<Checked, String> {
     Ok(Checked { port, challenge })
 }
 
-/// A scope token of RFC 6749, section 3.3: one or more of `%x21 /
-/// %x23-5B / %x5D-7E` (visible ASCII without `"` and `\`).
+/// Whether `s` is a scope token of RFC 6749, section 3.3: one or more of
+/// `%x21 / %x23-5B / %x5D-7E` (visible ASCII without `"` and `\`).
 fn is_scope_token(s: &str) -> bool {
     !s.is_empty()
         && s.bytes()
             .all(|c| matches!(c, 0x21 | 0x23..=0x5B | 0x5D..=0x7E))
 }
 
-/// The redirect must be `http://localhost|127.0.0.1:<port><callback_path>`
-/// with the port in the page's set. Returns the port.
+/// Check that the redirect is
+/// `http://localhost|127.0.0.1:<port><callback_path>`, with the port in
+/// the set of the page.
+/// Returns:
+///   The port, or an error message.
 fn check_redirect(raw: &str, page: &SignInPage) -> Result<u16, String> {
     let url = Url::parse(raw).map_err(|_| "the redirect_uri is not a URL".to_string())?;
     let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1"));
@@ -285,6 +300,9 @@ fn check_redirect(raw: &str, page: &SignInPage) -> Result<u16, String> {
 
 #[cfg(test)]
 mod tests {
+    //! Loopback sign-ins: the check of sign-in page URLs and the callback
+    //! forwards that an allowed sign-in opens.
+
     use airlock_common::BROWSER_URL_MAX;
 
     use super::*;
@@ -292,17 +310,23 @@ mod tests {
     use crate::test_cfg::block_on_local;
     use crate::test_cfg::services::{free_claude_callback_port, idle_guest};
 
+    // Sign-in URLs in the form that Claude Code and Codex open.
     const CLAUDE_URL: &str = "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A35527%2Fcallback&scope=user%3Ainference&code_challenge=Zm9vYmFyYmF6cXV4&code_challenge_method=S256&state=c3RhdGVzdGF0ZQ";
     const CODEX_URL: &str = "https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_EMoamEEZ73f0CkXaXp7hrann&redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback&scope=openid%20profile%20email%20offline_access%20api.connectors.read%20api.connectors.invoke&code_challenge=Zm9vYmFy&code_challenge_method=S256&id_token_add_organizations=true&codex_cli_simplified_flow=true&state=c3RhdGU&originator=codex_cli_rs";
 
+    /// The sign-in pages of Claude Code.
     fn claude() -> Vec<SignInPage> {
         crate::services::anthropic::sign_in_pages()
     }
 
+    /// The sign-in pages of Codex.
     fn codex() -> Vec<SignInPage> {
         crate::services::openai::sign_in_pages()
     }
 
+    /// Check `raw` against the sign-in `pages` like the browser bridge does.
+    /// Returns:
+    ///   The callback port, or the refusal message.
     fn check_url(raw: &str, pages: &[SignInPage]) -> Result<u16, String> {
         let url = checked_url(raw)?;
         let page = pages
@@ -312,6 +336,13 @@ mod tests {
         check_params(&url, page).map(|c| c.port)
     }
 
+    /// Test that real agent sign-in URLs pass with the callback port of their
+    /// own page, and that a callback of another page or a wrong port fails.
+    ///   1. Check the Claude Code, Console and Codex URLs and their ports
+    ///   2. Check an allowed and a refused alternative Codex port
+    ///   3. Check that both loopback host names work
+    ///   4. Check that a callback of the other agent and a URL of a page that
+    ///      is not in the list fail
     #[test]
     fn agent_sign_in_urls_pass_with_callback_port_of_their_own_page() {
         let mut both = claude();
@@ -338,6 +369,14 @@ mod tests {
         assert!(check_url(CODEX_URL, &claude()).is_err());
     }
 
+    /// Test that a URL that breaks a rule of the page, the callback or the
+    /// OAuth parameters is refused, and that the message does not show the
+    /// PKCE challenge or the state. The guest must not open other pages or
+    /// change the sign-in.
+    ///   1. Check each bad URL and check that the message has no secret query
+    ///      values
+    ///   2. Check that `prompt=login`, the full scope list and a new scope
+    ///      pass
     #[test]
     fn url_that_breaks_oauth_parameter_rule_is_refused_without_naming_query() {
         let p = claude();
@@ -419,17 +458,26 @@ mod tests {
         assert!(check_url(&new, &p).is_ok());
     }
 
+    /// A Claude Code sign-in attached to a guest that no connection reaches.
     fn claude_sign_in() -> LoopbackSignIn {
         let sign_in = LoopbackSignIn::new(ServiceId::Anthropic, claude(), PendingCodes::default());
         sign_in.attach(&idle_guest());
         sign_in
     }
 
+    /// Ask `sign_in` to allow the Claude Code URL with callback `port`.
     fn allow(sign_in: &LoopbackSignIn, port: u16) -> GrantAnswer {
         let raw = CLAUDE_URL.replace("35527", &port.to_string());
         sign_in.allow(&Url::parse(&raw).unwrap())
     }
 
+    /// Test that a sign-in on a new port replaces the old forward and frees its
+    /// port, and that a detach frees the last port.
+    ///   1. Allow a sign-in on a first port and check that the port is held
+    ///   2. Allow it again on the same port
+    ///   3. Allow a sign-in on a second port and wait until the first port is
+    ///      free
+    ///   4. Detach and check that the second port is free
     #[test]
     fn sign_in_on_new_port_replaces_forward_and_detach_frees_port() {
         block_on_local(async {
@@ -441,6 +489,8 @@ mod tests {
             let second = free_claude_callback_port();
             assert_eq!(allow(&sign_in, second), GrantAnswer::Allow);
             assert!(reverse_forward::bind_exclusive(second, second).is_err());
+            // The old forward closes in a task on this thread. Yield to
+            // let it free the port.
             let mut freed = false;
             for _ in 0..50 {
                 if let Ok(l) = reverse_forward::bind_exclusive(first, first) {
@@ -456,6 +506,11 @@ mod tests {
         });
     }
 
+    /// Test that a sign-in on a port that is in use is refused and that the
+    /// current forward stays.
+    ///   1. Allow a sign-in on one port
+    ///   2. Hold a second port and ask for a sign-in on it
+    ///   3. Check the refusal and that the first port is still held
     #[test]
     fn sign_in_on_busy_port_is_refused_and_keeps_forward() {
         block_on_local(async {

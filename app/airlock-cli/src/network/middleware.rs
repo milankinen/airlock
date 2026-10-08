@@ -1,17 +1,22 @@
 //! Lua sandbox for HTTP middleware scripts.
+//!
+//! Restricts what middleware scripts can do, so that user scripts cannot
+//! access the host or run forever. Also sends script log messages to the
+//! airlock log.
 
 use mlua::{Lua, Value};
 
-/// Log sink for middleware scripts. Production uses tracing, tests can collect.
+/// Log callback for middleware scripts. Production code uses tracing.
+/// Tests can collect the messages.
 pub type LogFn = std::rc::Rc<dyn Fn(&str)>;
 
-/// Creates the default log sink that writes to tracing.
+/// Make the default log callback, which writes to tracing.
 pub fn tracing_log() -> LogFn {
     std::rc::Rc::new(|msg| tracing::debug!(target: "airlock::script", "{msg}"))
 }
 
-/// Strip dangerous globals and set an instruction-count limit so user
-/// scripts can't escape the sandbox or run forever.
+/// Remove dangerous globals and set an instruction count limit. Then user
+/// scripts cannot escape the sandbox or run forever.
 pub(super) fn sandbox(lua: &Lua) -> mlua::Result<()> {
     let globals = lua.globals();
     for name in ["os", "io", "debug", "loadfile", "dofile", "load", "require"] {

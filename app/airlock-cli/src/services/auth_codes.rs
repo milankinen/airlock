@@ -1,34 +1,11 @@
-//! Surrogate authorization codes: the real OAuth authorization code of a
-//! sign-in never reaches the sandbox.
+//! Surrogate authorization codes.
 //!
-//! The code comes to the host in two ways, and both swap it for a
-//! surrogate (`airlock-code-` and random characters) before the sandbox
-//! gets it:
+//! Makes sure that the real OAuth authorization code of a sign-in never
+//! gets to the sandbox. The sandbox gets a surrogate code, and the host
+//! changes it back to the real code when the agent redeems it. Also
+//! records which sign-in pages the sandbox opened.
 //!
-//! - the browser's redirect to the loopback callback, which the
-//!   service's sign-in forwards into the sandbox ([`super::callback`]
-//!   rewrites the `code` of each request's query);
-//! - the answer of Codex's device-code poll (`authorization_code`, see
-//!   [`super::openai`]).
-//!
-//! The token exchange then must carry a surrogate this process issued:
-//! the service swaps in the real code, and refuses an unknown code
-//! locally. A surrogate is bound to where it was issued: its service and
-//! its [`Channel`] (the callback port, or the device poll). An exchange
-//! redeems it only for the same service and with a `redirect_uri` of the
-//! same channel, so a code of one sign-in cannot be spent by another
-//! service or flow. A surrogate works once and for [`LIFETIME`]. The codes
-//! live in the memory of this process only; each service has its own
-//! [`PendingCodes`] and keeps at most [`MAX_PENDING`], so a flood of one
-//! service's codes cannot push out another's.
-//!
-//! Claude's manual sign-in is the exception: the user pastes the real
-//! code into the sandbox, so there is no surrogate to redeem. Its
-//! exchange is bound to a sign-in page the browser bridge opened instead
-//! ([`PendingCodes::open_page`]): the exchange's PKCE `code_verifier` must
-//! hash (S256) to the `code_challenge` of a page this process opened for
-//! the service. An opened page works for one exchange and for
-//! [`LIFETIME`]; the service keeps at most [`MAX_PENDING`].
+//! The codes are only in the memory of this process.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,29 +20,42 @@ use url::Url;
 use super::ServiceId;
 use super::store::random_bytes;
 
-/// What a surrogate code starts with.
+/// Start of every surrogate code.
 pub const PREFIX: &str = "airlock-code-";
 
-/// How long a surrogate code, and an opened sign-in page, works.
+/// How long a surrogate code or an opened sign-in page is valid.
 const LIFETIME: Duration = Duration::from_mins(10);
 
-/// The most codes (and opened pages) kept per service; a new one drops
-/// the service's oldest. A sign-in issues one.
+/// Maximum number of codes (and of opened pages) per service. A new one
+/// removes the oldest one of the service. A sign-in issues one code.
+/// Because the limit is per service, a flood of codes of one service
+/// cannot remove the codes of another service.
 const MAX_PENDING: usize = 32;
 
-/// Where a real code came to the host.
+/// The place where a real code came to the host.
+///
+/// A surrogate is bound to its channel. Thus another flow cannot use the
+/// code of one sign-in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Channel {
-    /// The browser's redirect to the loopback callback on this port.
+    /// The browser's redirect to the loopback callback on this port. The
+    /// callback forward ([`super::callback`]) replaces the `code` of each
+    /// request's query.
     Callback(u16),
-    /// The answer of a device-code poll.
+    /// The answer of a device-code poll (`authorization_code` of Codex's
+    /// poll, see [`super::openai`]).
     Device,
 }
 
 impl Channel {
-    /// The channel of an exchange's `redirect_uri`: an `http` loopback URL
-    /// names its port; `device_redirect` (the provider's device-flow
-    /// redirect) is the device channel. `None` for anything else.
+    /// Get the channel of an exchange's `redirect_uri`.
+    /// Args:
+    ///  - `redirect_uri`: The `redirect_uri` of the exchange
+    ///  - `device_redirect`: The provider's device-flow redirect, if any.
+    ///
+    /// Returns:
+    ///   [`Self::Device`] for `device_redirect`, [`Self::Callback`] with
+    ///   the port for an `http` loopback URL, or `None` for anything else.
     pub fn of_redirect(redirect_uri: &str, device_redirect: Option<&str>) -> Option<Self> {
         if device_redirect.is_some_and(|d| d == redirect_uri) {
             return Some(Self::Device);
@@ -78,15 +68,28 @@ impl Channel {
     }
 }
 
-/// The surrogate codes issued and not yet used, and the sign-in pages
-/// opened and not yet used by a manual exchange. Cheap to clone; clones
+/// The issued surrogate codes that are not used yet, and the opened
+/// sign-in pages that no manual exchange used yet. Cheap to clone. Clones
 /// share both.
+///
+/// The token exchange must contain a surrogate that this process issued.
+/// The service puts the real code in its place, and refuses an unknown
+/// code locally. A surrogate works once, for [`LIFETIME`], and only for
+/// the same service and a `redirect_uri` of the same [`Channel`].
+///
+/// Claude's manual sign-in is the exception. The user pastes the real code
+/// into the sandbox, so there is no surrogate to redeem. Its exchange is
+/// bound to a sign-in page that the browser bridge opened
+/// ([`Self::open_page`]): the exchange's PKCE `code_verifier` must hash
+/// (S256) to the `code_challenge` of such a page. An opened page works for
+/// one exchange and for [`LIFETIME`].
 #[derive(Clone, Default)]
 pub struct PendingCodes {
     codes: Arc<Mutex<HashMap<String, Pending>>>,
     pages: Arc<Mutex<Vec<OpenedPage>>>,
 }
 
+/// An issued surrogate code.
 struct Pending {
     real: String,
     service: ServiceId,
@@ -103,7 +106,7 @@ struct OpenedPage {
 }
 
 impl PendingCodes {
-    /// A surrogate for the real code `real` that came to `service`
+    /// Issue a surrogate for the real code `real` that came to `service`
     /// through `channel`.
     pub fn issue(
         &self,
@@ -135,9 +138,11 @@ impl PendingCodes {
         Ok(surrogate)
     }
 
-    /// The real code of `surrogate`, once, when it was issued to `service`
-    /// through `channel`: the surrogate is used up either way. `None` for
-    /// an unknown, used, expired or foreign surrogate.
+    /// Redeem `surrogate` once, if it was issued to `service` through
+    /// `channel`. The surrogate is used in all cases.
+    /// Returns:
+    ///   The real code, or `None` for an unknown, used, expired or foreign
+    ///   surrogate.
     pub fn redeem(&self, surrogate: &str, service: ServiceId, channel: Channel) -> Option<String> {
         let pending = self.codes.lock().remove(surrogate)?;
         (pending.issued.elapsed() < LIFETIME
@@ -146,7 +151,7 @@ impl PendingCodes {
             .then_some(pending.real)
     }
 
-    /// Remember that the browser bridge opened a sign-in page of `service`
+    /// Record that the browser bridge opened a sign-in page of `service`
     /// with the PKCE `code_challenge` `challenge`.
     pub fn open_page(&self, challenge: &str, service: ServiceId) {
         let mut pages = self.pages.lock();
@@ -166,8 +171,8 @@ impl PendingCodes {
     }
 
     /// Whether `verifier` is the PKCE verifier of a page opened for
-    /// `service` within [`LIFETIME`] ([`Self::open_page`]): its S256
-    /// challenge matches. A match uses the page up.
+    /// `service` in the last [`LIFETIME`] ([`Self::open_page`]): its S256
+    /// challenge matches. A match uses the page.
     pub fn redeem_page(&self, verifier: &str, service: ServiceId) -> bool {
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         let mut pages = self.pages.lock();
@@ -177,9 +182,11 @@ impl PendingCodes {
         found.map(|i| pages.remove(i)).is_some()
     }
 
-    /// `query` with the value of every `code` parameter swapped for a
-    /// surrogate issued to `service` through `channel`. `None` when the
-    /// query has no `code`: then it stays as it is, byte for byte.
+    /// Replace the value of every `code` parameter of `query` with a
+    /// surrogate issued to `service` through `channel`.
+    /// Returns:
+    ///   The changed query, or `None` if the query has no `code`. Then the
+    ///   query stays unchanged, byte for byte.
     pub fn rewrite_query(
         &self,
         query: &str,
@@ -206,12 +213,22 @@ impl PendingCodes {
 
 #[cfg(test)]
 mod tests {
+    //! Surrogate authorization codes and opened sign-in pages: binding to a
+    //! service and channel, single use, expiry and flood limits.
+
     use super::*;
 
     const CALLBACK: Channel = Channel::Callback(1455);
+    // The PKCE verifier and S256 challenge example from RFC 7636.
     const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
     const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 
+    /// Test that a surrogate code redeems only on its own service and channel,
+    /// and that a wrong redeem uses it up. Another flow must not get the real
+    /// code of a sign-in.
+    ///   1. Issue a code for one service and callback port
+    ///   2. Redeem it on another service, port or flow and check that it fails
+    ///   3. Redeem it on its own service and channel and check that it fails
     #[test]
     fn surrogate_redeemed_on_other_service_port_or_flow_fails_and_is_used_up() {
         let codes = PendingCodes::default();
@@ -226,6 +243,13 @@ mod tests {
         }
     }
 
+    /// Test that a redirect URI gives the loopback callback port or the device
+    /// flow, and that other URIs give no channel.
+    ///   1. Get the channel of loopback, device, HTTPS, remote and bad URIs
+    ///   2. Check that only `http` loopback URIs with a port and the device
+    ///      redirect give a channel
+    ///   3. Check that the device URI gives no channel when the provider has
+    ///      no device flow
     #[test]
     fn redirect_uri_names_loopback_port_or_device_flow() {
         let device = Some("https://auth.openai.com/deviceauth/callback");
@@ -253,6 +277,12 @@ mod tests {
         );
     }
 
+    /// Test that a flood of codes removes the oldest code of the same service
+    /// only. A flood on one service must not break a sign-in on another.
+    ///   1. Issue a code for each service
+    ///   2. Issue the maximum number of codes for the first service
+    ///   3. Check that the oldest code of the first service is removed
+    ///   4. Check that the code of the other service still redeems
     #[test]
     fn flood_of_codes_drops_oldest_code_of_same_service_only() {
         let codes = PendingCodes::default();
@@ -273,6 +303,13 @@ mod tests {
         );
     }
 
+    /// Test that an opened sign-in page redeems only with its PKCE verifier,
+    /// only for its service, and only once.
+    ///   1. Check that a verifier fails before the page is opened
+    ///   2. Open the page with the S256 challenge
+    ///   3. Check that a wrong verifier, the wrong service and the challenge
+    ///      itself fail
+    ///   4. Check that the correct verifier works once only
     #[test]
     fn opened_page_redeems_its_s256_verifier_once_for_its_service() {
         let codes = PendingCodes::default();
@@ -285,6 +322,9 @@ mod tests {
         assert!(!codes.redeem_page(VERIFIER, ServiceId::Anthropic));
     }
 
+    /// Test that an opened sign-in page expires after its lifetime.
+    ///   1. Open a page and set its open time back by the lifetime
+    ///   2. Check that its verifier does not redeem
     #[test]
     fn opened_page_expires_after_lifetime() {
         let codes = PendingCodes::default();
@@ -293,6 +333,11 @@ mod tests {
         assert!(!codes.redeem_page(VERIFIER, ServiceId::Anthropic));
     }
 
+    /// Test that a flood of opened pages removes the oldest page of the same
+    /// service only.
+    ///   1. Open the same page for both services
+    ///   2. Open the maximum number of pages for the first service
+    ///   3. Check that the first service lost its page and the other kept it
     #[test]
     fn flood_of_pages_drops_oldest_page_of_same_service_only() {
         let codes = PendingCodes::default();

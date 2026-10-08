@@ -1,5 +1,7 @@
-//! Host-side stdin RPC server that reads from the real terminal and delivers
-//! data (or resize events) to the guest supervisor on demand.
+//! Terminal input for the guest.
+//!
+//! Sends terminal input and terminal size changes to the supervisor in the
+//! VM when it asks for them.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -8,9 +10,8 @@ use airlock_common::supervisor_capnp::*;
 use tokio::io::AsyncReadExt;
 use tokio::signal::unix::Signal;
 
-/// Implements the Cap'n Proto `Stdin` interface by reading from the host
-/// terminal. When the terminal is a TTY, it also watches for `SIGWINCH`
-/// to deliver resize events.
+/// Cap'n Proto `Stdin` server that reads from the host terminal. When the
+/// terminal is a TTY, it also sends resize events (`SIGWINCH`).
 pub struct Stdin {
     reader: RefCell<tokio::io::Stdin>,
     resizes: RefCell<Option<Signal>>,
@@ -18,7 +19,13 @@ pub struct Stdin {
 }
 
 impl Stdin {
-    /// Create a new stdin server.
+    /// Make a stdin server.
+    /// Args:
+    ///  - `reader`: Host stdin
+    ///  - `pty_size`: Initial terminal size `(rows, cols)` in PTY mode, or
+    ///    `None` in pipe mode
+    ///  - `resizes`: `SIGWINCH` signal stream, or `None` to send no resize
+    ///    events
     pub fn new(
         reader: tokio::io::Stdin,
         pty_size: Option<(u16, u16)>,
@@ -31,14 +38,14 @@ impl Stdin {
         }
     }
 
-    /// Initial terminal size, if running in interactive (PTY) mode.
+    /// Initial terminal size in interactive (PTY) mode.
     pub fn pty_size(&self) -> Option<(u16, u16)> {
         self.pty_size
     }
 }
 
 impl stdin::Server for Stdin {
-    // Single-threaded runtime; RefCell is appropriate here.
+    // Single-threaded runtime, so RefCell is correct here.
     #[allow(clippy::await_holding_refcell_ref)]
     async fn read(
         self: Rc<Self>,
@@ -66,7 +73,8 @@ impl stdin::Server for Stdin {
                         results.get().init_input().init_stdin().set_eof(());
                     }
                     Ok(n) => {
-                        // Byte count only: stdin may carry secrets (a pasted token).
+                        // Log the byte count only: stdin can contain secrets (a
+                        // pasted token).
                         tracing::trace!("host stdin: {n} bytes");
                         results.get().init_input().init_stdin().set_data(&buf[..n]);
                     }

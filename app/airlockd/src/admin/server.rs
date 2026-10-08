@@ -1,7 +1,6 @@
-//! Axum bootstrap for the admin HTTP service.
+//! HTTP server of the admin service.
 //!
-//! Binds `127.0.0.1:80` so loopback traffic from the container bypasses
-//! the transparent proxy's iptables redirect and lands here directly.
+//! Starts the server with all admin endpoints.
 
 use std::sync::Arc;
 
@@ -13,8 +12,17 @@ use tracing::{info, warn};
 use super::routes;
 use super::state::AdminState;
 
+/// Listen address. Loopback traffic does not go through the TCP proxy, so
+/// container requests come here directly.
 const ADMIN_ADDR: (&str, u16) = ("127.0.0.1", 80);
 
+/// Bind the admin listen address and serve the admin routes in a background
+/// task.
+/// Args:
+///  - `state`: Shared state for the route handlers
+///
+/// Returns:
+///   Error if the bind fails.
 pub async fn start(state: Arc<AdminState>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(ADMIN_ADDR).await?;
     info!("admin listening on {}:{}", ADMIN_ADDR.0, ADMIN_ADDR.1);

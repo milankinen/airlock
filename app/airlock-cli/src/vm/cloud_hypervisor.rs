@@ -1,8 +1,7 @@
-//! Cloud Hypervisor + virtiofsd backend (Linux).
+//! Cloud Hypervisor VM backend (Linux).
 //!
-//! Spawns a virtiofsd instance per VirtioFS share, then launches
-//! cloud-hypervisor with vsock support. Vsock connections use a
-//! `CONNECT <port>` handshake over the unix socket.
+//! Starts and stops the sandbox VM and its file sharing on Linux, and opens
+//! connections from the host to the guest.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::io::OwnedFd;
@@ -14,7 +13,7 @@ use tracing::{debug, error};
 
 use super::config::VmConfig;
 
-/// Linux VM backend using cloud-hypervisor and virtiofsd.
+/// Linux VM backend that uses cloud-hypervisor and virtiofsd.
 pub struct CloudHypervisorBackend {
     ch_child: Option<Child>,
     virtiofsd_children: Vec<Child>,
@@ -23,20 +22,20 @@ pub struct CloudHypervisorBackend {
 }
 
 impl CloudHypervisorBackend {
-    /// Launch virtiofsd instances and cloud-hypervisor, then wait for sockets.
+    /// Start one virtiofsd process for each VirtioFS share, then start
+    /// cloud-hypervisor with vsock support.
     pub fn start(config: &VmConfig) -> anyhow::Result<Self> {
         let runtime_dir = &config.runtime_dir;
         let vfs_dir = runtime_dir.join("vfs");
         std::fs::create_dir_all(&vfs_dir)?;
         let vsock_socket_path = runtime_dir.join("vsock.sock");
 
-        // Clean up leftover sockets
         cleanup_sockets(runtime_dir, &vfs_dir);
 
         let host_uid = unsafe { libc::getuid() };
         let host_gid = unsafe { libc::getgid() };
 
-        // Start a virtiofsd process for each VirtioFS share
+        // Start a virtiofsd process for each VirtioFS share.
         let mut virtiofsd_children = Vec::new();
         let mut fs_args: Vec<String> = Vec::new();
 
@@ -67,10 +66,7 @@ impl CloudHypervisorBackend {
                 .spawn()
                 .map_err(|e| anyhow::anyhow!("failed to start virtiofsd for {}: {e}", share.tag))?;
 
-            // Drain stderr in background
             spawn_stderr_drain(&share.tag, &mut child);
-
-            // Wait for the socket to appear
             wait_for_socket(&sock_path, &share.tag)?;
 
             virtiofsd_children.push(child);
@@ -82,7 +78,7 @@ impl CloudHypervisorBackend {
             ));
         }
 
-        // Build cloud-hypervisor command
+        // Make the cloud-hypervisor command.
         let ram_mib = config.memory_bytes / (1024 * 1024);
 
         let mut cmd = Command::new(&config.cloud_hypervisor);
@@ -105,7 +101,7 @@ impl CloudHypervisorBackend {
             .arg(format!("cid=3,socket={}", vsock_socket_path.display()));
         cmd.arg("--api-socket").arg(runtime_dir.join("ch-api.sock"));
 
-        // VirtioFS shares (each pointing to a virtiofsd socket)
+        // VirtioFS shares (each uses a virtiofsd socket).
         if !fs_args.is_empty() {
             cmd.arg("--fs");
             for fs in &fs_args {
@@ -113,7 +109,7 @@ impl CloudHypervisorBackend {
             }
         }
 
-        // Block device for cache disk
+        // Block device for the cache disk.
         if let Some(cache_disk) = &config.cache_disk {
             cmd.arg("--disk")
                 .arg(format!("path={},image_type=raw", cache_disk.display()));
@@ -142,18 +138,19 @@ impl CloudHypervisorBackend {
         })
     }
 
-    /// Open a vsock connection to the given guest port via the
-    /// cloud-hypervisor vsock socket. Performs the `CONNECT <port>`
-    /// handshake that cloud-hypervisor expects.
+    /// Open a vsock connection to the given guest port through the
+    /// cloud-hypervisor vsock socket.
+    /// Returns:
+    ///   The connected socket, or error if the `CONNECT` handshake fails.
     pub fn vsock_connect(&self, port: u32) -> anyhow::Result<OwnedFd> {
         let mut stream = UnixStream::connect(&self.vsock_socket_path).map_err(|e| {
             anyhow::anyhow!("vsock connect to {}: {e}", self.vsock_socket_path.display())
         })?;
 
-        // Cloud Hypervisor vsock requires CONNECT handshake
+        // Cloud Hypervisor vsock needs a `CONNECT <port>` handshake.
         writeln!(stream, "CONNECT {port}")?;
 
-        // Read response line (OK <port>)
+        // Read the response line (`OK <port>`).
         let mut reader = BufReader::new(&stream);
         let mut response = String::new();
         reader.read_line(&mut response)?;
@@ -166,10 +163,11 @@ impl CloudHypervisorBackend {
 }
 
 impl CloudHypervisorBackend {
-    /// Kill cloud-hypervisor and every virtiofsd, and reap each one. `Ok`
-    /// confirms that cloud-hypervisor exited and was reaped; the first
-    /// failure is returned after every process has been handled. A second
-    /// call finds nothing left to stop.
+    /// Kill cloud-hypervisor and all virtiofsd processes, and reap each one.
+    /// A second call has nothing to stop.
+    /// Returns:
+    ///   `Ok` if all processes were reaped. Otherwise the first failure,
+    ///   after all processes were handled.
     pub fn stop(&mut self) -> anyhow::Result<()> {
         let mut result = Ok(());
         if let Some(child) = self.ch_child.take() {
@@ -194,9 +192,10 @@ impl Drop for CloudHypervisorBackend {
     }
 }
 
-/// Send SIGKILL to `child` and wait for it. A kill error is only logged (the
-/// process may have exited already); a failed wait means the exit is not
-/// confirmed.
+/// Send SIGKILL to `child` and wait for it. A kill error is only logged
+/// (the process may have exited already).
+/// Returns:
+///   Error if the wait fails, because then the exit is not confirmed.
 fn kill_and_reap(mut child: Child, name: &str) -> anyhow::Result<()> {
     if let Err(e) = child.kill() {
         error!("{name} kill: {e}");
@@ -208,16 +207,15 @@ fn kill_and_reap(mut child: Child, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Start `cmd` in its own process group and tie its life to airlock's.
-///
-/// - The terminal's SIGINT (Ctrl+C in cooked mode, e.g. during the boot)
-///   reaches only airlock, which then stops the VM in order (the guest
-///   sync first) instead of losing it at once.
-/// - `PR_SET_PDEATHSIG` kills the process when airlock dies without
-///   stopping it (SIGKILL, crash). The signal fires when the *thread* that
-///   spawned the process exits: the VM is started on the main thread (the
-///   current-thread runtime). The `getppid` check covers airlock dying
-///   before the `prctl`.
+/// Start `cmd` in its own process group, and stop it when airlock stops.
+///  * The SIGINT of the terminal (Ctrl+C in cooked mode, e.g. during the
+///    boot) goes only to airlock, not to the process. Airlock then stops the
+///    VM in the correct order (the guest sync first).
+///  * `PR_SET_PDEATHSIG` kills the process if airlock dies without a stop
+///    (SIGKILL, crash). The signal fires when the *thread* that started the
+///    process exits. The VM starts on the main thread (the current-thread
+///    runtime). The `getppid` check covers the case where airlock dies
+///    before the `prctl`.
 fn tie_to_airlock(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
     let parent = libc::pid_t::try_from(std::process::id()).expect("pid fits pid_t");
@@ -236,12 +234,14 @@ fn tie_to_airlock(cmd: &mut Command) {
     }
 }
 
+/// Path of the per-port vsock socket (`<base>_<port>`).
 fn vsock_port_path(base: &Path, port: u32) -> PathBuf {
     let mut path = base.as_os_str().to_owned();
     path.push(format!("_{port}"));
     PathBuf::from(path)
 }
 
+/// Wait up to 5 s until the virtiofsd socket at `path` exists.
 fn wait_for_socket(path: &Path, tag: &str) -> anyhow::Result<()> {
     for _ in 0..100 {
         if path.exists() {
@@ -253,6 +253,7 @@ fn wait_for_socket(path: &Path, tag: &str) -> anyhow::Result<()> {
     anyhow::bail!("virtiofsd socket not ready after 5s: {tag}")
 }
 
+/// Start a thread that reads the stderr of `child` and logs each line.
 fn spawn_stderr_drain(tag: &str, child: &mut Child) {
     if let Some(stderr) = child.stderr.take() {
         let tag = tag.to_string();
@@ -271,17 +272,18 @@ fn spawn_stderr_drain(tag: &str, child: &mut Child) {
     }
 }
 
+/// Remove the cloud-hypervisor, vsock and virtiofsd sockets.
 fn cleanup_sockets(dir: &Path, vfs_dir: &Path) {
     let patterns = ["vsock.sock", "ch-api.sock"];
     for pat in &patterns {
         let _ = std::fs::remove_file(dir.join(pat));
     }
-    // Clean vsock_<port> files
+    // Remove the `vsock.sock_<port>` file of the supervisor port.
     let _ = std::fs::remove_file(vsock_port_path(
         &dir.join("vsock.sock"),
         airlock_common::SUPERVISOR_PORT,
     ));
-    // Clean virtiofsd sockets
+    // Remove the virtiofsd sockets.
     if let Ok(entries) = std::fs::read_dir(vfs_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -295,8 +297,16 @@ fn cleanup_sockets(dir: &Path, vfs_dir: &Path) {
 
 #[cfg(test)]
 mod tests {
+    //! Tests for the start of VM helper processes.
+
     use super::*;
 
+    /// Test that a process tied to airlock leads its own process group, so
+    /// that a Ctrl+C of the terminal goes only to airlock.
+    ///   1. Start a process tied to airlock
+    ///   2. Read its process group and stop the process
+    ///   3. Check that the group ID is the process ID and differs from the
+    ///      group of the test
     #[test]
     fn process_tied_to_airlock_leads_its_own_process_group() {
         let mut cmd = Command::new("sleep");

@@ -1,11 +1,16 @@
-//! Whether the setup scripts can run in an image, checked on the host
-//! from the image layers before the install boot.
+//! Image checks for pack installs.
+//!
+//! Checks on the host, before the install boot, that the setup scripts can
+//! run in the sandbox image.
 
 use crate::oci::{self, OciImage};
 
-/// Check that `image` runs as root (the scripts use the package manager,
-/// and every process in the sandbox runs as the image user) and is
-/// Alpine- or Debian-based (see [`supported`]).
+/// Check that the setup scripts can run in `image`.
+///
+/// The image must run as root, because the scripts use the package manager
+/// and all processes in the sandbox run as the image user. The image must
+/// also be Alpine- or Debian-based (see [`supported`]). The check reads the
+/// image layers.
 pub fn check(image: &OciImage) -> anyhow::Result<()> {
     if image.uid != 0 {
         anyhow::bail!(
@@ -25,9 +30,9 @@ pub fn check(image: &OciImage) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Whether `lib.sh` supports the distribution `os`: one of its `ID` and
-/// `ID_LIKE` values is `alpine`, or `debian` or `ubuntu` (as `lib.sh`
-/// detects it).
+/// Check if `lib.sh` supports the distribution `os`. One of its `ID` and
+/// `ID_LIKE` values must be `alpine`, `debian` or `ubuntu`. This is the
+/// same detection as in `lib.sh`.
 fn supported(os: &oci::OsRelease) -> bool {
     std::iter::once(&os.id)
         .chain(&os.id_like)
@@ -36,8 +41,11 @@ fn supported(os: &oci::OsRelease) -> bool {
 
 #[cfg(test)]
 mod tests {
+    //! Tests of the image checks before a pack install.
+
     use super::*;
 
+    /// An os-release with `ID` `id` and `ID_LIKE` `like`.
     fn os(id: &str, like: &[&str]) -> oci::OsRelease {
         oci::OsRelease {
             id: id.into(),
@@ -45,6 +53,7 @@ mod tests {
         }
     }
 
+    /// An image that runs as `uid` and has no layers (thus no os-release).
     fn image(uid: u32) -> OciImage {
         OciImage {
             image_id: "sha256:abc".into(),
@@ -59,6 +68,11 @@ mod tests {
         }
     }
 
+    /// Test that the check accepts the Alpine and Debian families by `ID`
+    /// or `ID_LIKE`, and refuses other distros. It must agree with the
+    /// detection in `lib.sh`.
+    ///   1. Check that Alpine, Debian, Ubuntu and their derivatives pass
+    ///   2. Check that Fedora, Rocky and Gentoo fail
     #[test]
     fn alpine_debian_and_ubuntu_families_are_supported_by_id_or_id_like() {
         assert!(supported(&os("alpine", &[])));
@@ -71,6 +85,10 @@ mod tests {
         assert!(!supported(&os("gentoo", &[])));
     }
 
+    /// Test that the check refuses an image that does not run as root, and
+    /// an image without os-release.
+    ///   1. Check an image that runs as uid 1000 and check the error
+    ///   2. Check a root image with no layers and check the error
     #[test]
     fn check_refuses_non_root_image_and_image_without_os_release() {
         let err = check(&image(1000)).unwrap_err();

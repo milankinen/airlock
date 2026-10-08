@@ -1,35 +1,13 @@
-//! The sign-in callback forward of a network service.
+//! The sign-in callback forward.
 //!
-//! A sign-in tool in the guest listens for the OAuth callback on a
-//! loopback port. [`super::sign_in::LoopbackSignIn`] binds that port on the
-//! host and serves it here, so the browser's redirect to
-//! `http://localhost:<port>/…` reaches the tool. The forward is no raw
-//! relay: it parses each HTTP request and swaps the `code` of its query
-//! for a surrogate code ([`super::auth_codes`]), bound to the sign-in's
-//! service and callback port, so the real authorization code of a sign-in
-//! never reaches the guest. The guest is untrusted, and the browser holds
-//! the user's sessions, so the forward also:
+//! A sign-in tool in the guest waits for the OAuth callback on a loopback
+//! port. The callback forward receives the browser's redirect to that port
+//! on the host and sends it to the tool in the guest.
 //!
-//! - forwards `GET` only (anything else gets `405` from the host), and
-//!   strips `Cookie` and `Authorization` from the browser's requests;
-//! - passes only the guest's answer headers of [`ANSWER_HEADERS`] (and a
-//!   checked `Location`), so no `Set-Cookie`, `Refresh`, CORS or
-//!   `Clear-Site-Data` reaches the browser, and adds
-//!   `Content-Security-Policy: sandbox; default-src 'none'`;
-//! - lets a redirect (`3xx` with `Location`) of the guest lead only to the
-//!   same loopback origin (host and port) or to an `https` page of the
-//!   service ([`Callback::pages`]); any other redirect is replaced by a
-//!   host page that says the sign-in finished;
-//! - closes after [`FOLLOW_UP`]: once a request carried a `code`, the
-//!   browser's follow-ups (a success page) reach the guest for that long.
-//!   A forward that gets no `code` closes after [`UNUSED_LIMIT`], so the
-//!   sandbox cannot hold a host port forever. A closed forward drops later
-//!   connections, answers later requests with the host page, and frees its
-//!   port. A new sign-in on the same port opens a forward that has not
-//!   closed yet again ([`CallbackForward::reopen`]).
-//!
-//! A request that does not parse as HTTP/1 gets an error from the host
-//! and never reaches the guest.
+//! The forward is not a raw relay. It replaces the authorization code with
+//! a surrogate code, so the real code never gets to the guest. It also
+//! protects the browser, which holds the user's sessions, from the
+//! untrusted guest.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -55,49 +33,58 @@ use super::auth_codes::{Channel, PendingCodes};
 use crate::network::reverse_forward::{self, BoundForward};
 use crate::rpc::guest_network::GuestNetwork;
 
-/// How long the browser's follow-ups reach the guest after the first
-/// request with a `code`.
+/// How long the browser's follow-up requests (for example, a success page)
+/// get to the guest after the first request with a `code`.
 const FOLLOW_UP: Duration = Duration::from_mins(1);
 
-/// How long a forward waits for its first request with a `code`.
+/// How long a forward waits for its first request with a `code`. Thus the
+/// sandbox cannot hold a host port forever.
 const UNUSED_LIMIT: Duration = Duration::from_mins(10);
 
-/// The headers of the guest's answers that reach the browser. A
-/// `Location` reaches it too, on a redirect that [`to_browser`] allows.
+/// Headers of the guest's answers that get to the browser. A `Location`
+/// also gets to it, on a redirect that [`to_browser`] allows. Thus no
+/// `Set-Cookie`, `Refresh`, CORS or `Clear-Site-Data` header gets to the
+/// browser.
 const ANSWER_HEADERS: [HeaderName; 3] = [CONTENT_TYPE, CONTENT_LENGTH, CACHE_CONTROL];
 
-/// The policy of the callback answers the guest sends to the browser.
+/// Content security policy of the callback answers to the browser.
 const CSP: &str = "sandbox; default-src 'none'";
 
-/// The page the host shows instead of a guest answer it refuses.
+/// Page that the host shows in place of a guest answer that it refuses.
 const FINISHED_PAGE: &str = "<!doctype html><meta charset=utf-8><title>airlock</title>\
     <p>Sign-in finished; return to the terminal.</p>\n";
 
-/// The sign-in a callback forward serves.
+/// The sign-in that a callback forward serves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Callback {
     /// The service whose sign-in page named the callback.
     pub service: ServiceId,
-    /// The hosts of the service's pages a redirect may lead to (`https`).
+    /// Hosts of the service's pages that a redirect can go to (`https`).
     pub pages: &'static [&'static str],
 }
 
 /// The state of one callback forward, shared by its listeners and
 /// connections. Cheap to clone.
+///
+/// A forward closes [`FOLLOW_UP`] after the first request with a `code`,
+/// or [`UNUSED_LIMIT`] after it opened if no `code` came. A closed forward
+/// drops new connections, answers new requests with the host page, and
+/// frees its port.
 #[derive(Clone)]
 pub struct CallbackForward(Rc<ForwardState>);
 
-/// Runtime state of a forward: a new sign-in on the same port reopens it
-/// with its own callback, and the first code starts the follow-up time.
+/// Runtime state of a forward. A new sign-in on the same port opens it
+/// again with its own callback. The first code starts the follow-up time.
 struct ForwardState {
     port: u16,
     codes: PendingCodes,
     callback: Cell<Callback>,
-    /// When the forward opened, or a new sign-in reopened it.
+    /// When the forward opened, or when a new sign-in opened it again.
     opened: Cell<Instant>,
     /// When the first request with a `code` came.
     code_seen: Cell<Option<Instant>>,
-    /// The forward has closed for good: its port is (being) freed.
+    /// True if the forward closed permanently. Its port is free, or
+    /// becomes free.
     ended: Cell<bool>,
 }
 
@@ -113,8 +100,10 @@ impl CallbackForward {
         }))
     }
 
-    /// Open the forward again for a new sign-in of `callback`. `false`
-    /// when it has closed for good: the sign-in needs a new forward.
+    /// Open the forward again for a new sign-in of `callback`.
+    /// Returns:
+    ///   `false` if the forward closed permanently. Then the sign-in needs
+    ///   a new forward.
     pub fn reopen(&self, callback: Callback) -> bool {
         if self.0.ended.get() {
             return false;
@@ -125,8 +114,8 @@ impl CallbackForward {
         true
     }
 
-    /// When the forward closes: [`FOLLOW_UP`] after the first code, else
-    /// [`UNUSED_LIMIT`] after it opened.
+    /// Get the time when the forward closes: [`FOLLOW_UP`] after the first
+    /// code, else [`UNUSED_LIMIT`] after it opened.
     fn deadline(&self) -> Instant {
         match self.0.code_seen.get() {
             Some(seen) => seen + FOLLOW_UP,
@@ -134,12 +123,12 @@ impl CallbackForward {
         }
     }
 
-    /// Whether requests still reach the guest.
+    /// Whether requests still get to the guest.
     fn is_open(&self) -> bool {
         !self.0.ended.get() && Instant::now() < self.deadline()
     }
 
-    /// Wait until the forward closes, and mark it closed for good.
+    /// Wait until the forward closes, and mark it as closed permanently.
     async fn closed(&self) {
         while self.is_open() {
             tokio::time::sleep_until(self.deadline().into()).await;
@@ -147,9 +136,9 @@ impl CallbackForward {
         self.0.ended.set(true);
     }
 
-    /// The origin the browser reached the forward at, from `Host`: a
-    /// loopback name with the forward's port. Else `127.0.0.1` and the
-    /// port.
+    /// Get the origin that the browser used for the forward, from `Host`.
+    /// The origin is a loopback name with the forward's port. If `Host`
+    /// is not valid, the origin is `127.0.0.1` with the port.
     fn origin(&self, req: &Request<Incoming>) -> Url {
         let port = self.0.port;
         req.headers()
@@ -166,11 +155,20 @@ impl CallbackForward {
     }
 }
 
-/// Serve the bound callback port `forward` for a sign-in of `callback`
-/// (see the module docs): a task in `tasks` that runs the accept loops
-/// until the forward closes and then frees the port, each connection
-/// relayed to the same port on `guest`, every request's `code` swapped for
-/// a surrogate kept in `codes`. Returns the forward's state.
+/// Forward the bound callback port into the guest for a sign-in.
+///
+/// Relays each connection to the same port on `guest`, and replaces the
+/// `code` of each request with a surrogate code. A task in `tasks` runs
+/// the accept loops until the forward closes, and then frees the port.
+/// Args:
+///  - `forward`: The bound callback port
+///  - `guest`: The guest network
+///  - `tasks`: Task set that gets the forward task
+///  - `codes`: Store for the surrogate codes
+///  - `callback`: The sign-in that the forward serves.
+///
+/// Returns:
+///   The state of the forward.
 pub fn serve(
     forward: BoundForward,
     guest: &GuestNetwork,
@@ -183,8 +181,8 @@ pub fn serve(
     state
 }
 
-/// Serve `forward` for `state` in a task of `tasks` until `state` closes;
-/// then the port is freed.
+/// Serve `forward` for `state` in a task of `tasks` until `state` closes.
+/// Then free the port.
 fn serve_until_closed(
     forward: BoundForward,
     guest: &GuestNetwork,
@@ -215,8 +213,13 @@ fn serve_until_closed(
 
 type CallbackBody = Either<Incoming, Full<Bytes>>;
 
-/// Serve the browser's HTTP/1 requests on `browser` and send each to the
-/// guest over `guest`, hardened as the module docs say.
+/// Serve the browser's HTTP/1 requests on `browser`, and send each request
+/// to the guest over `guest`.
+///
+/// Only `GET` requests get to the guest. Other methods get `405` from the
+/// host. A request that does not parse as HTTP/1 gets an error from the
+/// host and never gets to the guest. See [`to_guest`] and [`to_browser`]
+/// for the changes to requests and answers.
 async fn relay_callback<B, G>(browser: B, guest: G, forward: CallbackForward) -> anyhow::Result<()>
 where
     B: AsyncRead + AsyncWrite + Unpin + 'static,
@@ -250,7 +253,7 @@ where
                     return Ok(status_only(StatusCode::BAD_REQUEST));
                 }
             };
-            // The borrow ends before the send is awaited.
+            // The borrow ends before the code awaits the send.
             let sent = sender.borrow_mut().send_request(req);
             match sent.await {
                 Ok(resp) => Ok::<_, hyper::Error>(to_browser(resp, &origin, callback.pages)),
@@ -266,8 +269,8 @@ where
     });
     let browser =
         hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(browser), service);
-    // The guest may close first (`Connection: close`): the browser still
-    // gets the answer hyper has already received.
+    // The guest can close first (`Connection: close`). The browser still
+    // gets the answer that hyper already received.
     let mut browser = std::pin::pin!(browser);
     tokio::select! {
         served = browser.as_mut() => return served.context("sign-in callback"),
@@ -280,10 +283,12 @@ where
     browser.await.context("sign-in callback")
 }
 
-/// The browser's request as the guest gets it: no `Cookie` and no
-/// `Authorization`, and every `code` of its query swapped for a surrogate
-/// code of the forward's sign-in. The first request with a `code` starts
-/// the [`FOLLOW_UP`] time.
+/// Change the browser's request for the guest.
+///
+/// Removes `Cookie` and `Authorization`. Replaces every `code` of the
+/// query with a surrogate code, bound to the service and callback port of
+/// the forward's sign-in. The first request with a `code` starts the
+/// [`FOLLOW_UP`] time.
 fn to_guest(
     mut req: Request<Incoming>,
     forward: &CallbackForward,
@@ -309,10 +314,16 @@ fn to_guest(
     Ok(req)
 }
 
-/// The guest's answer as the browser gets it: only the headers of
-/// [`ANSWER_HEADERS`], the sandbox CSP, and a redirect only to `origin` or
-/// an `https` page on one of `pages`; any other redirect becomes the
-/// host's [`finished_page`].
+/// Change the guest's answer for the browser.
+///
+/// Keeps only the headers of [`ANSWER_HEADERS`] and adds the sandbox
+/// [`CSP`]. A redirect (`3xx` with `Location`) can go only to the same
+/// loopback origin (host and port) or to an `https` page on one of
+/// `pages`. Any other redirect becomes the host's [`finished_page`].
+/// Args:
+///  - `resp`: The guest's answer
+///  - `origin`: The loopback origin that the browser used
+///  - `pages`: Hosts of the service's pages.
 fn to_browser(resp: Response<Incoming>, origin: &Url, pages: &[&str]) -> Response<CallbackBody> {
     let redirect = resp.status().is_redirection() && resp.headers().contains_key(LOCATION);
     if redirect {
@@ -343,7 +354,7 @@ fn to_browser(resp: Response<Incoming>, origin: &Url, pages: &[&str]) -> Respons
     Response::from_parts(parts, Either::Left(body))
 }
 
-/// A redirect target the guest may send the browser to.
+/// Whether the guest can send the browser to the redirect target `to`.
 fn redirect_allowed(to: &Url, origin: &Url, pages: &[&str]) -> bool {
     if !to.username().is_empty() || to.password().is_some() {
         return false;
@@ -358,7 +369,7 @@ fn redirect_allowed(to: &Url, origin: &Url, pages: &[&str]) -> bool {
     }
 }
 
-/// The host's own answer: the sign-in is over.
+/// Make the host's own answer: the sign-in is finished.
 fn finished_page() -> Response<CallbackBody> {
     let mut resp = Response::new(Either::Right(Full::new(Bytes::from_static(
         FINISHED_PAGE.as_bytes(),
@@ -373,6 +384,7 @@ fn finished_page() -> Response<CallbackBody> {
     resp
 }
 
+/// Make an empty answer with `status` and the sandbox CSP.
 fn status_only(status: StatusCode) -> Response<CallbackBody> {
     let mut resp = Response::new(Either::Right(Full::new(Bytes::new())));
     *resp.status_mut() = status;
@@ -383,6 +395,9 @@ fn status_only(status: StatusCode) -> Response<CallbackBody> {
 
 #[cfg(test)]
 mod tests {
+    //! The sign-in callback forward: code replacement, what gets to the
+    //! guest and to the browser, and when the forward closes.
+
     use std::sync::{Arc, Mutex};
 
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -397,12 +412,16 @@ mod tests {
         pages: &["auth.openai.com", "chatgpt.com"],
     };
 
+    /// One request that the fake guest received.
     #[derive(Clone, Debug)]
     struct Got {
         target: String,
         headers: hyper::HeaderMap,
     }
 
+    /// Serve HTTP/1 on `io` like the sign-in tool in the guest. Record each
+    /// request in `seen` and answer with `status`, the headers in `answer`
+    /// and the body "ok".
     async fn fake_guest<S: AsyncRead + AsyncWrite + Unpin + 'static>(
         io: S,
         seen: Arc<Mutex<Vec<Got>>>,
@@ -426,6 +445,7 @@ mod tests {
             .await;
     }
 
+    /// The result of one browser exchange through the forward.
     struct Exchanged {
         answer: String,
         seen: Vec<Got>,
@@ -433,11 +453,15 @@ mod tests {
     }
 
     impl Exchanged {
+        /// The request targets that the guest received.
         fn targets(&self) -> Vec<String> {
             self.seen.iter().map(|g| g.target.clone()).collect()
         }
     }
 
+    /// Send the raw browser bytes `raw` through `forward` to a fake guest
+    /// that answers with `answer` headers and `status`. Return the browser's
+    /// answer, the guest's requests and the pending codes.
     async fn exchange_with(
         forward: &CallbackForward,
         raw: &str,
@@ -461,23 +485,37 @@ mod tests {
         }
     }
 
+    /// A new forward for the OpenAI callback on the test port.
     fn forward() -> CallbackForward {
         CallbackForward::new(PORT, CALLBACK, PendingCodes::default())
     }
 
+    /// Send `raw` through a new forward to a guest that answers 200.
     async fn exchange(raw: &str) -> Exchanged {
         exchange_with(&forward(), raw, vec![], 200).await
     }
 
+    /// A browser GET of `target` with the `extra` header lines that closes
+    /// the connection.
     fn get(target: &str, extra: &str) -> String {
         format!(
             "GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\n{extra}Connection: close\r\n\r\n"
         )
     }
 
+    /// Test that each callback request on a connection gets a surrogate code
+    /// that redeems only for its service and port. The real code must never
+    /// get to the guest.
+    ///   1. Send two callback requests with real codes on one connection
+    ///   2. Check that the guest gets both, with no real code and with the
+    ///      other query values unchanged
+    ///   3. Check that a surrogate does not redeem for a different service
+    ///   4. Check that a surrogate redeems to its real code for its service
     #[test]
     fn every_callback_request_gets_surrogate_code_bound_to_service_and_port() {
         block_on_local(async {
+            // The first request keeps the connection open, so both requests
+            // use one connection.
             let got = exchange(&format!(
                 "GET /callback?code=real-1&state=a%20b HTTP/1.1\r\nHost: localhost\r\n\r\n{}",
                 get("/callback?state=t&code=real-2", "")
@@ -519,6 +557,9 @@ mod tests {
         });
     }
 
+    /// Test that a request with no code gets to the guest unchanged.
+    ///   1. Send a request to the success page with no code
+    ///   2. Check that the guest gets the same target
     #[test]
     fn request_without_code_passes_unchanged() {
         block_on_local(async {
@@ -527,6 +568,10 @@ mod tests {
         });
     }
 
+    /// Test that a malformed request does not get to the guest and that the
+    /// answer does not show the code.
+    ///   1. Send bytes that are not a valid HTTP request
+    ///   2. Check that the guest gets nothing and the answer has no code
     #[test]
     fn malformed_request_never_reaches_guest() {
         block_on_local(async {
@@ -536,6 +581,12 @@ mod tests {
         });
     }
 
+    /// Test that only GET requests get to the guest, with no cookies or
+    /// credentials. The browser must not leak user sessions to the guest.
+    ///   1. Send a POST and check that the guest gets nothing and the browser
+    ///      gets HTTP 405
+    ///   2. Send a GET with a cookie and an authorization header
+    ///   3. Check that the guest gets neither header
     #[test]
     fn only_get_reaches_guest_and_without_cookies_or_credentials() {
         block_on_local(async {
@@ -558,6 +609,12 @@ mod tests {
         });
     }
 
+    /// Test that the guest answer keeps only the allowed headers and gets the
+    /// sandbox content security policy. The guest must not set cookies, cause
+    /// redirects or change browser state.
+    ///   1. Let the guest answer with dangerous and safe headers
+    ///   2. Check that the browser gets only the safe headers and the body
+    ///   3. Check that the guest policy is replaced with the sandbox policy
     #[test]
     fn guest_answer_keeps_only_allowed_headers_and_gets_sandbox_csp() {
         block_on_local(async {
@@ -601,6 +658,14 @@ mod tests {
         });
     }
 
+    /// Test that a guest redirect gets to the browser only if it goes to the
+    /// same loopback origin or to an HTTPS page of the service. Otherwise the
+    /// browser gets the host page. The guest must not send the browser to an
+    /// attacker page.
+    ///   1. Let the guest answer with a redirect to each location
+    ///   2. Check that an allowed location gets to the browser as a redirect
+    ///   3. Check that a refused location gives the host page with no
+    ///      location
     #[test]
     fn guest_redirect_leads_only_to_same_loopback_origin_or_service_page() {
         block_on_local(async {
@@ -642,6 +707,13 @@ mod tests {
         });
     }
 
+    /// Test that the forward closes when the follow-up time after the first
+    /// code ends, and that a new sign-in opens it again.
+    ///   1. Send a callback with a code and a follow-up request and check that
+    ///      both get to the guest
+    ///   2. Move the time of the code back by the follow-up time
+    ///   3. Check that the forward is closed and answers with the host page
+    ///   4. Open it again and check that a callback gets to the guest
     #[test]
     fn forward_closes_after_follow_up_time_until_reopened() {
         block_on_local(async {
@@ -665,6 +737,12 @@ mod tests {
         });
     }
 
+    /// Test that a forward that gets no code closes after the unused limit,
+    /// and that a new sign-in opens it again. The sandbox must not hold a host
+    /// port forever.
+    ///   1. Move the open time of the forward back by the unused limit
+    ///   2. Check that the forward is closed
+    ///   3. Open it again and check that it is open
     #[test]
     fn forward_without_code_closes_after_unused_limit_until_reopened() {
         let forward = forward();
@@ -676,6 +754,10 @@ mod tests {
         assert!(forward.is_open());
     }
 
+    /// Test that a closed forward frees its host port and cannot open again.
+    ///   1. Bind a free port and serve a forward that is past its unused limit
+    ///   2. Wait until the port can be bound again
+    ///   3. Check that the forward cannot open again
     #[test]
     fn closed_forward_frees_its_port_and_cannot_reopen() {
         block_on_local(async {
@@ -690,6 +772,8 @@ mod tests {
             state.0.opened.set(past);
             let mut tasks = JoinSet::new();
             serve_until_closed(bound, &idle_guest(), &mut tasks, state.clone());
+            // The serve task runs on this thread. Yield to let it close the
+            // forward and drop the listener.
             let mut freed = false;
             for _ in 0..50 {
                 tokio::task::yield_now().await;

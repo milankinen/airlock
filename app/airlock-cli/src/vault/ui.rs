@@ -1,6 +1,8 @@
-//! Terminal interaction for storing secrets with `airlock secrets add`:
-//! the disabled-vault message, the plaintext-vault confirmation and
-//! reading a value from a prompt or stdin.
+//! Terminal interaction for `airlock secrets add`.
+//!
+//! Tells the user when the vault is disabled, asks for confirmation before
+//! airlock stores a secret without encryption, and reads the secret value
+//! from a prompt or stdin.
 
 use std::io::Read;
 
@@ -12,8 +14,8 @@ use crate::cli::prompt::fields::{Field, Fields};
 use crate::cli::prompt::yes_no::YesNo;
 use crate::settings::Settings;
 
-/// The error for commands that must store a secret while the vault is
-/// disabled: how to enable it.
+/// Error message for commands that must store a secret while the vault is
+/// disabled. Tells how to enable the vault.
 pub fn disabled_message() -> String {
     format!(
         "the airlock vault is disabled. Enable it to store user \
@@ -26,8 +28,14 @@ pub fn disabled_message() -> String {
     )
 }
 
-/// Check that a secret can be stored: the vault is not disabled, and a
-/// plaintext (`file`) vault is confirmed by the user unless `assume_yes`.
+/// Make sure that the vault can store a secret.
+/// Args:
+///  - `vault`: Vault to check
+///  - `assume_yes`: Do not ask the user to confirm a plaintext vault
+///
+/// Returns:
+///   Error if the vault is disabled, or if the vault is plaintext (`file`)
+///   and the user does not confirm it.
 pub fn ensure_writable(vault: &Vault, assume_yes: bool) -> anyhow::Result<()> {
     match vault.storage_type() {
         VaultStorageType::Disabled => bail!("{}", disabled_message()),
@@ -36,11 +44,11 @@ pub fn ensure_writable(vault: &Vault, assume_yes: bool) -> anyhow::Result<()> {
     }
 }
 
-/// Warn the user — once per `secret add` — that the `file` backend
-/// stores secrets as cleartext JSON, and ask whether to proceed. Point
-/// at the two better options so the warning carries actionable advice
-/// instead of just friction. A non-interactive shell fails closed; the
-/// caller can pass `--yes` when scripting.
+/// Warn the user that the `file` backend stores secrets as cleartext JSON,
+/// and ask if they want to continue. Shows one time per `secret add`.
+///
+/// The warning shows the two better backends, so the user knows what to
+/// do. A non-interactive shell fails. Scripts can use `--yes`.
 fn confirm_plaintext_vault() -> anyhow::Result<()> {
     let msg = "\
 Your vault backend is \"file\" — secrets will be written as plaintext
@@ -71,9 +79,10 @@ vault.storage = \"encrypted-file\"
     Ok(())
 }
 
-/// Read value from stdin. Errors if stdin is a TTY (prevents users
-/// from running `airlock secrets add FOO --stdin` and then typing into
-/// their terminal, which would echo the secret).
+/// Read a secret value from stdin.
+/// Returns:
+///   Value without one trailing newline. Error if stdin is a TTY: then
+///   the user would type the secret into the terminal, which shows it.
 pub fn read_from_stdin() -> anyhow::Result<String> {
     // SAFETY: `libc::isatty` on fd 0 is side-effect-free.
     let is_tty = unsafe { libc::isatty(0) } == 1;
@@ -84,7 +93,8 @@ pub fn read_from_stdin() -> anyhow::Result<String> {
     std::io::stdin()
         .read_to_string(&mut buf)
         .context("read secret from stdin")?;
-    // Trim exactly one trailing newline so `echo $FOO | ...` round-trips.
+    // Remove exactly one trailing newline, so `echo $FOO | ...` gives the
+    // original value.
     if buf.ends_with('\n') {
         buf.pop();
         if buf.ends_with('\r') {
@@ -94,9 +104,13 @@ pub fn read_from_stdin() -> anyhow::Result<String> {
     Ok(buf)
 }
 
-/// Prompt once for a value (the row `label`), masked; accept whatever the
-/// user types. Abort with an error if the TTY isn't interactive, and on
-/// Esc.
+/// Ask the user one time for a secret value. The input is masked.
+/// Args:
+///  - `label`: Label of the input row
+///
+/// Returns:
+///   Text that the user typed. Error if the terminal is not interactive
+///   or the user pushes Esc.
 pub fn read_from_prompt(label: &str) -> anyhow::Result<String> {
     if !cli::is_interactive() {
         bail!("no TTY available — use `--stdin` to pipe the value in");

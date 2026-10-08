@@ -2,18 +2,18 @@
 
 using Network = import "network.capnp";
 
-# In-VM supervisor RPC. Runs over the primary vsock port
-# (SUPERVISOR_PORT). The `NetworkProxy` capability is NOT passed
-# through `boot` anymore — it is the bootstrap capability of the
-# separate network vsock (NETWORK_PORT). Splitting the flows gives
-# bulk network transfers independent buffers so they cannot stall
-# pty / stats / daemon traffic on this channel.
+# In-VM supervisor RPC. It uses the primary vsock port
+# (SUPERVISOR_PORT). `boot` does not pass the `NetworkProxy`
+# capability. It is the bootstrap capability of the separate network
+# vsock (NETWORK_PORT). The two channels give bulk network transfers
+# their own buffers, so they cannot stall the pty, stats and daemon
+# traffic on this channel.
 interface Supervisor {
-  # Boot the VM: mount the rootfs, bring up networking, and start the
-  # daemons. Carries only VM/boot configuration — no process to run.
-  # Processes (the main shell, `airlock exec`) start afterwards via
-  # `spawn`, which is refused until `boot` has succeeded. The guest
-  # accepts this once per VM; a second call is refused.
+  # Boot the VM: mount the rootfs, start networking, and start the
+  # daemons. The call carries only VM and boot configuration. It has no
+  # process to run. Processes (the main shell, `airlock exec`) start
+  # later with `spawn`. The guest refuses `spawn` until `boot` succeeds.
+  # The guest accepts `boot` one time per VM and refuses a second call.
   boot @0 (
     logs       :LogSink,
     logFilter  :Text,
@@ -25,39 +25,40 @@ interface Supervisor {
     gid        :UInt32,
     nestedVirt :Bool,
     harden     :Bool,
-    # Mount configuration (replaces mounts.json)
+    # Mount configuration.
     imageId     :Text,
     imageLayers :List(Text),
     dirs        :List(DirMount),
     files       :List(FileMount),
     caches      :List(CacheMount),
-    # Project CA cert in PEM form. Appended to the image's CA bundles by
-    # guest init after the overlayfs rootfs is mounted. Empty when the
-    # project has no CA (vault disabled / TLS interception off).
+    # Project CA cert in PEM form. Guest init appends it to the image's CA
+    # bundles in an extra overlayfs lower layer when it mounts the rootfs.
+    # Empty when the project has no CA. The guest then does not change the
+    # CA bundles.
     caCert      :Data,
-    # Sidecar processes, started during the boot (before any `spawn`).
-    # The supervisor owns their lifecycle (restart loop, graceful
+    # Sidecar processes. The boot starts them before any `spawn`. The
+    # supervisor controls their lifecycle (restart loop, graceful
     # shutdown).
     daemons     :List(DaemonSpec),
-    # Subdirectories of the project mount that get bind-mounted with an
-    # empty directory by guest init, hiding their contents from the
-    # sandbox. Used to cordon off parts of a monorepo from AI agents.
+    # Subdirectories of the project mount to hide from the sandbox. Guest
+    # init bind-mounts an empty directory on each of them. Use it to
+    # isolate parts of a monorepo from AI agents.
     masks       :List(MaskSpec),
-    # Clipboard bridge grant. Default-initialised (both flags false, null
-    # `sink`) is exactly the ungranted state, so a host that never sets
-    # this hands the guest nothing to call.
+    # Clipboard bridge grant. The default value (both flags false, null
+    # `sink`) is the ungranted state. Thus a host that does not set this
+    # field gives the guest nothing to call.
     clipboard   :ClipboardConfig,
-    # Host browser grant. Default-initialised (null `sink`) is exactly the
-    # ungranted state, so a host that never sets this hands the guest
-    # nothing to call.
+    # Host browser grant. The default value (null `sink`) is the
+    # ungranted state. Thus a host that does not set this field gives the
+    # guest nothing to call.
     browser     :BrowserConfig,
   ) -> ();
 
   shutdown @1 () -> ();
 
-  # Start a process inside the booted container, with the uid/gid/harden
-  # settings `boot` recorded. Used for the main shell and `airlock exec`
-  # alike. Refused before `boot` has succeeded.
+  # Start a process inside the booted container, with the uid, gid and
+  # harden settings from `boot`. The main shell and `airlock exec` both
+  # use it. The guest refuses it until `boot` succeeds.
   spawn @2 (
     stdin :Stdin,
     pty   :PtyConfig,
@@ -67,55 +68,55 @@ interface Supervisor {
     env   :List(Text),
   ) -> (proc :Process);
 
-  # Sample guest CPU and memory stats for the host monitor UI. The
-  # implementation diffs /proc/stat across consecutive calls to compute
-  # per-core %; the first call returns zeroed per-core values.
+  # Sample guest CPU and memory stats for the host monitor UI. The guest
+  # compares /proc/stat between two calls to get the per-core %. Thus the
+  # first call returns zero per-core values.
   pollStats @3 () -> (snapshot :StatsSnapshot);
 
-  # Host-to-guest notification that a network request was just denied.
-  # `epoch` is Unix-epoch milliseconds. The guest caches the timestamp
-  # so the admin HTTP service at `http://admin.airlock/` can correlate
-  # it with Claude Code tool failures reported via hook endpoints.
+  # Tell the guest that the host denied a network request. `epoch` is
+  # Unix-epoch milliseconds. The guest keeps the timestamp, so the admin
+  # HTTP service at `http://admin.airlock/` can match it with Claude Code
+  # tool failures that hook endpoints report.
   reportDeny @4 (epoch :UInt64) -> ();
 
-  # Host → guest TCP port forward. The host has accepted a local TCP
-  # connection from some host process destined for a guest service;
-  # this opens TCP to 127.0.0.1:<port> inside the VM and bridges bytes
-  # via the sink pair. Raw relay — no rules, no interception. Failures
-  # to connect inside the guest surface as Cap'n Proto exceptions so
-  # the host closes the accepted socket.
+  # Host → guest TCP port forward. The host accepted a local TCP
+  # connection from a host process to a guest service. This call opens
+  # TCP to 127.0.0.1:<port> inside the VM and relays bytes through the
+  # sink pair. It is a raw relay with no rules and no interception. A
+  # failed connect inside the guest gives a Cap'n Proto exception, and
+  # the host then closes the accepted socket.
   openLocalTcp @5 (port :UInt16, client :Network.TcpSink) -> (server :Network.TcpSink);
 
-  # Snapshot of every declared daemon's current state. Called repeatedly
-  # (e.g. every 100ms) by the host during shutdown UI to drive per-daemon
-  # spinners. Daemons are identified by name across polls.
+  # Snapshot of the current state of each declared daemon. The host
+  # calls it repeatedly (e.g. every 100ms) during shutdown to update the
+  # per-daemon spinners. The name identifies a daemon across polls.
   pollDaemons @6 () -> (states :List(DaemonStatus));
 
-  # Fire-and-forget: ask the supervisor to start graceful shutdown for
-  # every still-running daemon. Host follows up with `pollDaemons` until
-  # all daemons reach a terminal state (`stopped` or `killed`).
+  # Fire-and-forget: tell the supervisor to start graceful shutdown of
+  # each running daemon. The host then calls `pollDaemons` until all
+  # daemons are in a terminal state (`stopped` or `killed`).
   shutdownDaemons @7 () -> ();
 
-  # Reapply the host wall-clock to the guest. VMs have no RTC; the
-  # initial clock is set in `start @0`, but long host sleeps (laptop
-  # lid closed) cause the guest time to drift. The host polls this
-  # every few seconds to keep them within wake-up-jitter of each other.
+  # Set the guest clock to the host wall-clock again. VMs have no RTC.
+  # `boot @0` sets the initial clock, but long host sleeps (laptop lid
+  # closed) cause the guest time to drift. The host calls this every
+  # minute to keep the two clocks close.
   syncClock @8 (epoch :UInt64, epochNanos :UInt32) -> ();
 }
 
-# Host clipboard access, handed to the guest as a capability. The guest can
-# only reach the host clipboard through this object, so withholding it (a
-# null `ClipboardConfig.sink`) denies access no matter what runs inside the
-# sandbox — there is no guest-side flag to subvert.
+# Host clipboard access that the host gives to the guest as a capability.
+# This object is the only path from the guest to the host clipboard. Thus
+# a null `ClipboardConfig.sink` denies access, whatever runs inside the
+# sandbox. No guest-side flag exists that the sandbox can change.
 #
-# The host re-checks the per-direction grant and the size cap on every call;
-# the flags on `ClipboardConfig` exist so the guest knows which shims are
-# worth creating, not to police access.
+# The host checks the per-direction grant and the size limit again on each
+# call. The flags on `ClipboardConfig` only tell the guest which shims to
+# create. They do not control access.
 interface Clipboard {
-  # Guest → host. Rejected when copy is not granted, or when `data` exceeds
-  # the configured limit.
+  # Guest → host. The host rejects it when copy is not granted, or when
+  # `data` is larger than the configured limit.
   copy  @0 (data :Data) -> ();
-  # Host → guest. Rejected when paste is not granted.
+  # Host → guest. The host rejects it when paste is not granted.
   paste @1 () -> (data :Data);
 }
 
@@ -124,22 +125,23 @@ struct ClipboardConfig {
   paste @1 :Bool;
   # Null unless at least one direction is granted.
   sink  @2 :Clipboard;
-  # Max bytes per guest → host copy. The host enforces this as the real
-  # check; the guest gets told so it can stop reading rather than buffer an
-  # unbounded write. Without it `cat /dev/zero > fifo` would grow the guest
-  # daemon — which is PID 1 — until the VM dies.
+  # Max bytes per guest → host copy. The host does the real check. The
+  # guest gets the value so it can stop the read instead of buffering an
+  # unbounded write. Without it, `cat /dev/zero > fifo` makes the guest
+  # daemon (PID 1) grow until the VM dies.
   limit @3 :UInt64;
 }
 
-# Host browser access, handed to the guest as a capability. The guest can
-# only ask the host to open a URL through this object, so withholding it (a
-# null `BrowserConfig.sink`) denies access no matter what runs inside the
-# sandbox — there is no guest-side flag to subvert.
+# Host browser access that the host gives to the guest as a capability.
+# This object is the only path for the guest to tell the host to open a
+# URL. Thus a null `BrowserConfig.sink` denies access, whatever runs
+# inside the sandbox. No guest-side flag exists that the sandbox can
+# change.
 #
-# The host re-checks every URL against its own policy; the guest filters
-# to http(s) only so obvious junk never crosses the channel.
+# The host checks each URL again against its own policy. The guest sends
+# only http(s) URLs, so obvious junk does not cross the channel.
 interface Browser {
-  # Guest → host. Rejected when the URL fails the host policy.
+  # Guest → host. The host rejects URLs that fail the host policy.
   open @0 (url :Text) -> ();
 }
 
@@ -150,8 +152,8 @@ struct BrowserConfig {
 
 struct MaskSpec {
   # Mask block name from the user's config (e.g. "secret-monorepo").
-  # Used by the supervisor to derive the per-mask source-dir path
-  # under /mnt/disk/mask/project/<name>.
+  # The supervisor uses it to make the per-mask source directory path
+  # /mnt/disk/mask/project/<name>.
   name             @0 :Text;
   # Project-relative paths to mask. Already validated by the host:
   # no leading `/` or `~`, no `..` segments.
@@ -162,7 +164,7 @@ struct DaemonSpec {
   name        @0 :Text;
   # argv[0] plus arguments.
   command     @1 :List(Text);
-  # "KEY=VALUE" pairs. Image env is already layered in by the host.
+  # "KEY=VALUE" pairs. The host already merged the image env into them.
   env         @2 :List(Text);
   cwd         @3 :Text;
   # Signal sent on graceful shutdown (numeric, Linux signal number).
@@ -171,7 +173,7 @@ struct DaemonSpec {
   # SIGKILL. `0` means wait forever.
   timeoutMs   @5 :UInt32;
   restart     @6 :RestartPolicy;
-  # Max restart attempts after the initial launch. `0` = no cap.
+  # Max restart attempts after the first start. `0` means no limit.
   maxRestarts @7 :UInt32;
   # Per-daemon hardening override. Independent of the main-shell toggle.
   harden      @8 :Bool;
@@ -185,8 +187,8 @@ enum RestartPolicy {
 enum DaemonState {
   # Currently alive, or between restarts inside the restart loop.
   running @0;
-  # Terminated cleanly (shutdown, max-restarts reached, or on-failure
-  # clean exit). Terminal.
+  # Ended cleanly (shutdown, max restarts reached, or clean exit with
+  # the on-failure policy). Terminal.
   stopped @1;
   # SIGKILL'd after the graceful-shutdown timeout elapsed. Terminal.
   killed  @2;

@@ -1,9 +1,6 @@
-//! Thread-safe handle for live network-state edits from the TUI.
+//! Live network state control.
 //!
-//! `Network` lives on the tokio current-thread runtime (it holds `Rc`s). The
-//! TUI runs on its own OS thread, so it mutates shared state through this
-//! `Arc<RwLock<_>>` wrapper. Exposes just the methods the TUI needs — the
-//! wider `Network` API stays private to the network module.
+//! Lets the TUI read and change the network policy while the sandbox runs.
 
 use std::sync::Arc;
 
@@ -12,25 +9,32 @@ use parking_lot::RwLock;
 use super::NetworkState;
 use crate::config::config_values::Policy;
 
-/// Clonable, `Send + Sync` handle the TUI uses to read and mutate runtime
-/// network state. All methods hide the lock.
+/// Cloneable, `Send + Sync` handle to read and change the runtime network
+/// state. All methods hide the lock.
+///
+/// `Network` runs on the tokio current-thread runtime (it holds `Rc`s).
+/// The TUI runs on its own OS thread. Thus the TUI changes the shared state
+/// through this `Arc<RwLock<_>>` wrapper. The handle exposes only the
+/// methods that the TUI needs. The full `Network` API stays private to the
+/// network module.
 #[derive(Clone)]
 pub struct NetworkControl {
     state: Arc<RwLock<NetworkState>>,
 }
 
 impl NetworkControl {
+    /// Make a handle for the given shared state.
     pub(super) fn new(state: Arc<RwLock<NetworkState>>) -> Self {
         Self { state }
     }
 
-    /// Current top-level policy.
+    /// Get the current top-level policy.
     pub fn policy(&self) -> Policy {
         self.state.read().policy
     }
 
-    /// Replace the top-level policy. Takes effect on the next connection the
-    /// network task processes.
+    /// Replace the top-level policy. The change applies from the next
+    /// connection that the network task processes.
     pub fn set_policy(&self, policy: Policy) {
         self.state.write().policy = policy;
     }

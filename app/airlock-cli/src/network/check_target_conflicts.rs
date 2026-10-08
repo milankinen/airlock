@@ -1,35 +1,26 @@
-//! Startup-time validation of network targets.
+//! Startup checks for network target conflicts.
 //!
-//! Two checks live here:
-//!
-//! 1. Overlap between passthrough rule targets and middleware targets —
-//!    the two are semantically incompatible (passthrough skips
-//!    interception; middleware requires it), so any overlap is a
-//!    config error. Both sides use the same `host[:port]` pattern
-//!    syntax, which is narrow enough that intersection can be decided
-//!    by a small case analysis (see [`targets_overlap`]) rather than
-//!    a generic regex-intersection engine.
-//!
-//! 2. Duplicate host-side ports across `.guest` reverse port forwards
-//!    ([`check_reverse_forward_conflicts`]). Two `.guest` entries
-//!    can't both bind the same `127.0.0.1:<port>`.
+//! Finds config errors before the sandbox starts:
+//!  * passthrough targets that overlap intercepted targets
+//!  * reverse port forwards that use the same host port
 
 use super::matchers;
 use super::target::NetworkTarget;
 
-/// A labeled reverse port forward, used for error messages when two
-/// `.guest` entries collide on the same host port.
+/// Reverse port forward with a label for error messages.
 pub struct LabeledReverseForward {
+    /// Text that identifies the config entry in error messages.
     pub label: String,
+    /// Host port that the forward listens on.
     pub host_port: u16,
 }
 
-/// Reject configs where two `.guest` reverse port forwards share a
-/// host port — only one listener can bind `127.0.0.1:<port>`. Same
-/// guest port on the other side is fine (two host ports forwarding
-/// into the same guest service is legal).
-///
-/// Error messages name every offending pair by label.
+/// Make sure that no two `.guest` reverse port forwards use the same host
+/// port. Only one listener can bind `127.0.0.1:<port>`. Two forwards can
+/// use the same guest port: two host ports can forward to the same guest
+/// service.
+/// Returns:
+///   Error that names each conflicting pair by label, if conflicts exist.
 pub fn check_reverse_forward_conflicts(forwards: &[LabeledReverseForward]) -> anyhow::Result<()> {
     let mut conflicts: Vec<String> = Vec::new();
     for (i, a) in forwards.iter().enumerate() {
@@ -50,20 +41,25 @@ pub fn check_reverse_forward_conflicts(forwards: &[LabeledReverseForward]) -> an
     }
 }
 
-/// A parsed target tagged with a human-readable label, used for error
-/// messages when a conflict is reported.
+/// Parsed target with a human-readable label for error messages.
 pub struct LabeledTarget {
+    /// Text that identifies the config entry in error messages.
     pub label: String,
+    /// Parsed target pattern.
     pub target: NetworkTarget,
 }
 
-/// Reject configs where any passthrough target overlaps any middleware
-/// target. Passthrough means "no interception," middleware needs
-/// interception — they can't both apply to the same destination without
-/// one silently winning.
+/// Make sure that no passthrough target overlaps an intercepted target.
+/// Passthrough means "no interception". Middleware and inject need
+/// interception. If both apply to the same destination, one of them wins
+/// silently.
+/// Args:
+///  - `passthrough`: Passthrough targets
+///  - `middleware`: Intercepted targets (middleware, inject and services).
 ///
-/// Error messages name every offending (passthrough, middleware) pair so
-/// the user can fix the config directly.
+/// Returns:
+///   Error that names each conflicting pair, if conflicts exist. The user
+///   can then fix the config.
 pub fn check_passthrough_conflicts(
     passthrough: &[LabeledTarget],
     middleware: &[LabeledTarget],
@@ -87,21 +83,17 @@ pub fn check_passthrough_conflicts(
     }
 }
 
-/// True iff there exists at least one concrete `(host, port)` that both
-/// targets would match, using the same wildcard semantics as
+/// Return true if at least one concrete `(host, port)` matches both
+/// targets. The wildcard rules are the same as in
 /// [`super::matchers::host_matches`]:
 ///
-/// - `*` matches any host.
-/// - `*.<suffix>` matches any subdomain of `<suffix>` at any depth —
-///   `*.example.com` matches both `api.example.com` and `a.b.example.com`.
-/// - anything else is an exact literal (with localhost aliases).
+/// - `*` matches all hosts.
+/// - `*.<suffix>` matches all subdomains of `<suffix>` at all depths.
+///   `*.example.com` matches `api.example.com` and `a.b.example.com`.
+/// - All other patterns are exact literals (with localhost aliases).
 ///
-/// Two `*.suffix` wildcards overlap when their suffixes are equal, or when
-/// one suffix is a dot-separated sub-suffix of the other (e.g.
-/// `*.example.com` and `*.prod.example.com` overlap because any host
-/// matching the narrower pattern also matches the broader one). Wildcard ×
-/// literal reduces to "does the literal match the wildcard." `*` vs
-/// anything always overlaps.
+/// The pattern syntax is narrow. Thus a small case analysis is sufficient,
+/// and no generic regex intersection is necessary.
 fn targets_overlap(a: &NetworkTarget, b: &NetworkTarget) -> bool {
     ports_overlap(a.port, b.port) && hosts_overlap(&a.host, &b.host)
 }
@@ -118,16 +110,17 @@ fn hosts_overlap(a: &str, b: &str) -> bool {
         return true;
     }
     match (a.strip_prefix("*."), b.strip_prefix("*.")) {
-        // Both wildcards: *.A and *.B overlap iff A==B, or one suffix contains
-        // the other as a dot-separated sub-suffix (e.g. "example.com" and
-        // "prod.example.com"), because a multi-label host like `x.prod.example.com`
-        // would match both `*.example.com` and `*.prod.example.com` at runtime.
+        // Two wildcards: *.A and *.B overlap only if A == B, or if one suffix
+        // is a dot-separated sub-suffix of the other (for example
+        // "example.com" and "prod.example.com"). A host such as
+        // `x.prod.example.com` matches both `*.example.com` and
+        // `*.prod.example.com`.
         (Some(sa), Some(sb)) => {
             sa == sb
                 || sa.strip_suffix(sb).is_some_and(|p| p.ends_with('.'))
                 || sb.strip_suffix(sa).is_some_and(|p| p.ends_with('.'))
         }
-        // Wildcard × literal: delegate to host_matches so semantics stay in sync.
+        // Wildcard and literal: use host_matches, so the rules stay the same.
         (Some(_sa), None) => matchers::host_matches(b, a),
         (None, Some(_sb)) => matchers::host_matches(a, b),
         (None, None) => a == b || (is_localhost(a) && is_localhost(b)),
@@ -140,8 +133,11 @@ fn is_localhost(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    //! Tests for the overlap check of target patterns.
+
     use super::*;
 
+    /// Parse the target pattern `s`, for example `*.example.com:443`.
     fn t(s: &str) -> NetworkTarget {
         let (host, port) = super::super::rules::parse_pattern(s).unwrap();
         NetworkTarget {
@@ -150,6 +146,11 @@ mod tests {
         }
     }
 
+    /// Test that two target patterns overlap only when some host and port
+    /// match both. A false answer hides a passthrough conflict, and a false
+    /// overlap refuses a valid config.
+    ///   1. Take pairs of patterns: exact, localhost aliases, wildcards, ports
+    ///   2. Check the overlap result in both argument orders
     #[test]
     fn targets_overlap_when_some_host_and_port_match_both() {
         for (a, b, expected) in [

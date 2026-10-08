@@ -1,5 +1,9 @@
-//! `GET /` — plain-text liveness probe for `admin.airlock`.
+//! Liveness check of the admin service.
+//!
+//! Answers with plain text, so tools can check that `admin.airlock` is
+//! available.
 
+/// Response body (ASCII art logo). The first newline is not sent.
 const MESSAGE: &str = r"
        _      _            _
   __ _(_)_ __| | ___   ___| | __
@@ -9,6 +13,7 @@ const MESSAGE: &str = r"
 
 ";
 
+/// Return the [`MESSAGE`] text.
 pub async fn handle() -> &'static str {
     &MESSAGE[1..]
 }

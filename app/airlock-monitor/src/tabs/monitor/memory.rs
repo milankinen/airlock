@@ -1,4 +1,6 @@
-//! Memory widget — total/used text + used% sparkline histogram.
+//! Memory panel of the Monitor tab.
+//!
+//! Shows the total and used memory, and a history of the used percent.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -6,23 +8,29 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 
-/// Maximum samples retained in the used% history ring buffer.
+/// Maximum number of samples in the used-percent history.
 const HISTORY_CAPACITY: usize = 120;
 
-/// State holding the most recent memory snapshot plus a usage ring buffer.
+/// State of the memory panel: the latest memory snapshot and a usage history.
 #[derive(Default)]
 pub struct MemoryState {
+    /// Total guest memory in bytes. Zero until the first snapshot.
     pub total_bytes: u64,
+    /// Used guest memory in bytes.
     pub used_bytes: u64,
+    /// Used-percent samples, oldest first. At most [`HISTORY_CAPACITY`]
+    /// samples.
     pub history: Vec<u8>,
 }
 
 impl MemoryState {
+    /// Create an empty state.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Replace total/used and append the latest used% to the history ring.
+    /// Set the total and used memory, and add the used percent to the
+    /// history. When the history is full, the oldest sample is removed.
     pub fn set_usage(&mut self, total_bytes: u64, used_bytes: u64) {
         self.total_bytes = total_bytes;
         self.used_bytes = used_bytes;
@@ -32,7 +40,7 @@ impl MemoryState {
         self.history.push(self.used_percent());
     }
 
-    /// Used percentage 0..100.
+    /// Used memory in percent (0..=100). Zero if the total is not known.
     pub fn used_percent(&self) -> u8 {
         (self.used_bytes * 100)
             .checked_div(self.total_bytes)
@@ -41,11 +49,13 @@ impl MemoryState {
     }
 }
 
+/// Widget that draws the memory panel.
 pub struct MemoryWidget<'a> {
     state: &'a MemoryState,
 }
 
 impl<'a> MemoryWidget<'a> {
+    /// Create a widget that draws `state`.
     pub fn new(state: &'a MemoryState) -> Self {
         Self { state }
     }
@@ -82,7 +92,7 @@ impl Widget for MemoryWidget<'_> {
 }
 
 fn render_body(area: Rect, state: &MemoryState, buf: &mut Buffer) {
-    // Two text rows at the top, sparkline fills the rest.
+    // Two text rows at the top. The histogram uses the remaining rows.
     let text_rows = area.height.min(2);
     let spark_rows = area.height.saturating_sub(text_rows);
     let [text_area, spark_area] = Layout::vertical([
@@ -139,14 +149,22 @@ fn format_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    //! Tests of the memory panel state.
+
     use super::*;
 
+    /// Test that the usage history keeps only the newest samples, so that memory
+    /// use stays bounded.
+    ///   1. Add 10 more samples than the history can hold
+    ///   2. Check the length and the first and last samples
     #[test]
     fn usage_history_is_capped_to_newest_samples() {
         let mut s = MemoryState::new();
         for used in 0..(HISTORY_CAPACITY as u64 + 10) {
             s.set_usage(1000, used);
         }
+        // The history holds percents of the 1000 byte total. The oldest
+        // kept sample is 10 bytes (1%), the last is 129 bytes (12%).
         assert_eq!(s.history.len(), HISTORY_CAPACITY);
         assert_eq!(s.history.first(), Some(&1));
         assert_eq!(s.history.last(), Some(&12));

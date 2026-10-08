@@ -1,8 +1,8 @@
--- Node.js: Node.js trusts only its own CA list; point it at the system
+-- Node.js: Node.js trusts only its own CA list. Point it at the system
 -- bundle, which has the airlock CA. With `npm-installs`, the npm and
 -- Yarn registries.
 
--- The setup script gives the version to `nvm install`: an option there
+-- The setup script gives the version to `nvm install`. An option there
 -- (a leading `-`) or a character outside a version spec is an error.
 local version = pack.args["node-version"]
 if version:sub(1, 1) == "-" or version:find("[^%w./*_-]") then

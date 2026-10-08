@@ -1,4 +1,6 @@
-//! Sandbox tab — renders the embedded terminal from the vt100 screen.
+//! Sandbox tab.
+//!
+//! Shows the terminal of the sandbox process, with its cursor.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -7,13 +9,18 @@ use ratatui::widgets::Widget;
 
 use crate::pty::TuiTerminalSink;
 
-/// Position (x, y) within the sandbox area where the native terminal cursor
-/// should be placed, or `None` if the cursor should stay hidden.
+/// Position of the native terminal cursor in the sandbox area.
+/// Args:
+///  - `sink`: Virtual terminal of the sandbox process
+///  - `area`: Screen area of the Sandbox tab body.
+///
+/// Returns:
+///   The (x, y) position, or `None` if the cursor must stay hidden.
 pub fn cursor_position(sink: &TuiTerminalSink, area: Rect) -> Option<(u16, u16)> {
     let screen = sink.screen();
-    // Hide the cursor when viewing scrollback — the vt100 cursor position
-    // refers to the live screen, not the scrolled-back view, so showing it
-    // would place the real cursor at an unrelated cell.
+    // Hide the cursor in the scrollback view. The vt100 cursor position is
+    // for the live screen, not for the scrolled-back view. Thus the real
+    // cursor would be at an unrelated cell.
     if screen.hide_cursor() || screen.scrollback() > 0 {
         return None;
     }
@@ -27,12 +34,13 @@ pub fn cursor_position(sink: &TuiTerminalSink, area: Rect) -> Option<(u16, u16)>
     }
 }
 
-/// Widget that renders the vt100 screen into a ratatui buffer.
+/// Widget that draws the vt100 screen into a ratatui buffer.
 pub struct TerminalWidget<'a> {
     sink: &'a TuiTerminalSink,
 }
 
 impl<'a> TerminalWidget<'a> {
+    /// Create a widget that draws the screen of `sink`.
     pub fn new(sink: &'a TuiTerminalSink) -> Self {
         Self { sink }
     }
@@ -58,9 +66,9 @@ impl Widget for TerminalWidget<'_> {
                     continue;
                 };
 
-                // Skip wide-char continuation cells — the preceding wide base
-                // cell already occupies both columns in ratatui; writing here
-                // corrupts ratatui's diff renderer.
+                // Skip continuation cells of wide chars. In ratatui, the wide
+                // base cell before it already uses both columns. A write here
+                // corrupts the ratatui diff renderer.
                 if cell.is_wide_continuation() {
                     col += 1;
                     continue;

@@ -1,4 +1,8 @@
-//! Sparse disk image management for the project's persistent overlay and cache.
+//! Sandbox disk.
+//!
+//! Creates and resizes the persistent disk of a sandbox, and identifies each
+//! disk. The disk keeps all changes that the sandbox makes to the container
+//! file system, and the contents of the named caches.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,22 +13,21 @@ use crate::cli::prompt::choose::{Choice, Choose};
 use crate::cli::prompt::style::Tone;
 use crate::config::config_values::Disk;
 
-/// Default disk size (10 GB) — used for overlay upper + cache dirs.
+/// Default disk size (10 GB) for the overlay upper layer and cache dirs.
 const DEFAULT_DISK_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 /// The disk image file in the sandbox directory.
 pub const DISK_FILE: &str = "disk.img";
-/// The identity of the disk image, next to it: a random id, written anew
-/// with every new image ([`read_id`]).
+/// The identity file of the disk image, next to the image. Contains a random
+/// id that changes with each new image ([`read_id`]).
 pub const DISK_ID_FILE: &str = "disk.id";
 
 /// Named cache entry: `(name, enabled, expanded_container_paths)`.
 pub type CacheEntry = (String, bool, Vec<String>);
 
-/// Make the project disk image in `cache_dir` match the configured size:
-/// create it, grow it, or (on confirmation) recreate it smaller. The disk
-/// backs both the rootfs overlay upper layer and any configured cache
-/// mounts. Prints a line for each change.
+/// Make the disk image in `cache_dir` match the configured size. Creates
+/// the image, grows it, or (if the user confirms) makes it again smaller.
+/// Prints a line for each change.
 pub fn ensure(cache_dir: &Path, config: &Disk) -> anyhow::Result<()> {
     let image_path = cache_dir.join(DISK_FILE);
 
@@ -38,11 +41,11 @@ pub fn ensure(cache_dir: &Path, config: &Disk) -> anyhow::Result<()> {
     if image_path.exists() {
         let current_size = fs::metadata(&image_path)?.len();
         if current_size > bytes {
-            // The disk backs the overlay upper layer (all in-sandbox writes)
-            // and the named caches, so shrinking it destroys that data. Only
-            // do it on explicit confirmation, then recreate the image from
-            // scratch at the smaller size — so the user never has to delete
-            // the file by hand. Declining (or no TTY) keeps the larger disk.
+            // The disk holds the overlay upper layer (all sandbox writes) and
+            // the named caches. A smaller disk destroys this data, so do it
+            // only if the user confirms. Then make a new, empty image at the
+            // smaller size. If the user declines or there is no TTY, keep the
+            // larger disk.
             if prompt_shrink_disk(current_size, bytes)? {
                 fs::remove_file(&image_path)?;
                 create_sparse(&image_path, bytes)?;
@@ -67,7 +70,7 @@ pub fn ensure(cache_dir: &Path, config: &Disk) -> anyhow::Result<()> {
                 cli::dim(&format_size(bytes))
             );
         }
-        // A disk from before identity files.
+        // A disk from before identity files existed.
         if read_id(cache_dir).is_none() {
             write_id(cache_dir)?;
         }
@@ -82,9 +85,17 @@ pub fn ensure(cache_dir: &Path, config: &Disk) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The disk image for a VM boot, and the cache entries. The disk image
-/// is created when it is missing; `airlock start` sizes it earlier, when
-/// it prepares the sandbox ([`ensure`]).
+/// Get the disk image and the cache entries for a VM boot. Creates the disk
+/// image if it is missing. `airlock start` sets its size earlier, when it
+/// prepares the sandbox ([`ensure`]).
+/// Args:
+///  - `cache_dir`: Sandbox directory that contains the disk image
+///  - `config`: Disk config
+///  - `container_home`: Guest home for `~` expansion of cache paths
+///  - `cwd`: Base directory for relative cache paths.
+///
+/// Returns:
+///   The disk image path and all cache entries (enabled and disabled).
 pub fn prepare(
     cache_dir: &Path,
     config: &Disk,
@@ -97,9 +108,9 @@ pub fn prepare(
     }
 
     let container_home = PathBuf::from(container_home);
-    // Include all entries (enabled and disabled) so the supervisor
-    // knows every declared name — it will clean up disk dirs for any
-    // name not present in this list, and skip mounting disabled ones.
+    // Include all entries (enabled and disabled), so the supervisor knows
+    // all declared names. It removes the disk dirs of names that are not in
+    // this list, and does not mount disabled entries.
     let cache_entries: Vec<(String, bool, Vec<String>)> = config
         .cache
         .iter()
@@ -124,6 +135,7 @@ pub fn prepare(
     Ok((image_path, cache_entries))
 }
 
+/// Format a byte count as whole GB or MB.
 fn format_size(bytes: u64) -> String {
     if bytes >= 1024 * 1024 * 1024 {
         format!("{} GB", bytes / (1024 * 1024 * 1024))
@@ -132,11 +144,14 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-/// Ask whether to erase and recreate the disk at a smaller size. Returns
-/// `true` only on explicit confirmation. Without a TTY we can't ask, so we
-/// return `false` (keep the larger disk) rather than destroy data silently.
-/// The default selection is the non-destructive one, so an accidental Enter
-/// never wipes the disk; Esc keeps it too.
+/// Ask the user if airlock erases the disk and makes it again at a smaller
+/// size.
+/// Returns:
+///   `true` only if the user confirms. Without a TTY, `false` (keep the
+///   larger disk), so no data is destroyed silently.
+///
+/// The default selection keeps the disk, so an accidental Enter never erases
+/// it. Esc also keeps it.
 fn prompt_shrink_disk(current: u64, target: u64) -> anyhow::Result<bool> {
     if !cli::is_interactive() {
         return Ok(false);
@@ -170,8 +185,9 @@ fn prompt_shrink_disk(current: u64, target: u64) -> anyhow::Result<bool> {
     }
 }
 
-/// Create a new disk image and give it a new identity. The old identity
-/// goes first, so no crash leaves the new image with the old one.
+/// Create a new disk image and give it a new identity. The old identity is
+/// removed first, so a crash never leaves the new image with the old
+/// identity.
 fn create_sparse(path: &Path, size: u64) -> anyhow::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     remove_id(dir)?;
@@ -180,11 +196,13 @@ fn create_sparse(path: &Path, size: u64) -> anyhow::Result<()> {
     write_id(dir)
 }
 
-/// The identity of the disk image in `dir`, or `None` when there is no
-/// image or no valid identity file. Every new image (first boot, `airlock
-/// rm`, reset, recreated at a smaller size, deleted by hand) gets a new
-/// random identity, so a re-created disk never looks like the old one,
-/// even with the same inode.
+/// Read the identity of the disk image in `dir`.
+///
+/// Each new image (first boot, `airlock rm`, reset, smaller size, manual
+/// delete) gets a new random identity. Thus a new disk never looks like the
+/// old one, also if it has the same inode.
+/// Returns:
+///   The identity, or `None` if there is no image or no valid identity file.
 pub fn read_id(dir: &Path) -> Option<(u64, u64)> {
     if !dir.join(DISK_FILE).is_file() {
         return None;
@@ -193,6 +211,7 @@ pub fn read_id(dir: &Path) -> Option<(u64, u64)> {
     parse_id(text.trim())
 }
 
+/// Parse a 32-digit hex identity into two `u64` halves.
 fn parse_id(text: &str) -> Option<(u64, u64)> {
     if text.len() != 32 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;

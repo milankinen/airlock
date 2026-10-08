@@ -1,11 +1,8 @@
-//! The `packs` value of the config files.
+//! `[packs]` tables of the config files.
 //!
-//! Each file's `[packs]` table is read on its own ([`read_layer_packs`]):
-//! an entry is `<name> = { version = "1", enabled = false, args = { … } }`,
-//! each key optional. The list form (`presets = ["python"]`) is plain
-//! config ([`crate::config::legacy_presets`]). The entries of all files
-//! then merge per pack ([`merge_pack_entries`]) and configure the version
-//! they end up with ([`configure_packs`]).
+//! Reads the `[packs]` table of each config file, combines the entries for
+//! the same pack from all files, and makes the configured packs from them.
+//! The legacy `presets` list is a different feature.
 
 use std::collections::BTreeMap;
 
@@ -14,27 +11,37 @@ use serde_json::{Map, Value};
 use crate::config::legacy_presets;
 use crate::packs::{ConfiguredPack, Pack, PackManager};
 
-/// The keys of an entry.
+/// Keys of an entry, for error messages.
 const ENTRY_KEYS: &str = "version, enabled, args";
 
-/// One file's entry for one pack.
+/// The entry of one file for one pack:
+/// `<name> = { version = "1", enabled = false, args = { … } }`. All keys
+/// are optional.
 #[derive(Clone, Debug)]
 pub struct PackEntry {
-    /// The pack name (the key in the `[packs]` table).
+    /// Pack name (the key in the `[packs]` table).
     pub name: String,
-    /// The file that holds the entry.
+    /// The file that contains the entry.
     pub file: String,
+    /// The `enabled` value, if set.
     pub enabled: Option<bool>,
-    /// Normalized to a string (`1` → `"1"`).
+    /// The `version` value as a string (`1` → `"1"`), if set.
     pub version: Option<String>,
-    /// The `args` table as written; checked after the merge, against the
-    /// final version.
+    /// The `args` table as written. It is checked after the merge, against
+    /// the final version.
     pub args: Map<String, Value>,
 }
 
-/// Remove the `[packs]` table from the file `origin`'s `value` and read
-/// its entries; `known` are the packs that an entry can name. Problems
-/// with single entries go to `problems`.
+/// Remove the `[packs]` table from the value of a file and read its entries.
+/// Args:
+///  - `origin`: The config file, for error messages
+///  - `value`: Config value of the file
+///  - `known`: Packs that an entry can name
+///  - `problems`: Receives the problems with entries, one line each
+///
+/// Returns:
+///   The entries of known packs that are tables. A field with a value
+///   that is not valid is left unset.
 pub fn read_layer_packs(
     origin: &str,
     value: &mut Value,
@@ -126,8 +133,8 @@ fn read_table(
     entries
 }
 
-/// A `version` value as a string: a string as it is, a whole number ≥ 1
-/// as its decimal text.
+/// Convert a `version` value to a string. A string stays as it is. A whole
+/// number ≥ 1 becomes its decimal text.
 fn normalize_version(value: &Value) -> Result<String, String> {
     match value {
         Value::String(s) => Ok(s.clone()),
@@ -142,13 +149,14 @@ fn normalize_version(value: &Value) -> Result<String, String> {
 
 /// The entries of one pack from all files, lowest precedence first.
 pub struct MergedEntry {
+    /// Pack name.
     pub name: String,
-    /// The entries in file order (each file contributes one at most).
+    /// The entries in file order (at most one from each file).
     pub contributors: Vec<PackEntry>,
 }
 
 impl MergedEntry {
-    /// `enabled` of the highest file that sets it; true by default.
+    /// Get `enabled` from the highest file that sets it. True by default.
     pub fn enabled(&self) -> bool {
         self.contributors
             .iter()
@@ -157,19 +165,24 @@ impl MergedEntry {
             .unwrap_or(true)
     }
 
-    /// The highest file's entry that sets `version`.
+    /// The entry of the highest file that sets `version`.
     fn version_source(&self) -> Option<&PackEntry> {
         self.contributors.iter().rev().find(|c| c.version.is_some())
     }
 
-    /// The contributing files, for error messages.
+    /// List the files of the entries, for error messages.
     fn files(&self) -> String {
         let files: Vec<&str> = self.contributors.iter().map(|c| c.file.as_str()).collect();
         files.join(", ")
     }
 }
 
-/// Group the entries of all files (in file order) by pack.
+/// Group the entries of all files by pack.
+/// Args:
+///  - `entries`: Entries of all files, in file order
+///
+/// Returns:
+///   One merged entry for each pack, in order of the first entry.
 pub fn merge_pack_entries(entries: Vec<PackEntry>) -> Vec<MergedEntry> {
     let mut merged: Vec<MergedEntry> = Vec::new();
     for entry in entries {
@@ -184,9 +197,16 @@ pub fn merge_pack_entries(entries: Vec<PackEntry>) -> Vec<MergedEntry> {
     merged
 }
 
-/// Merge the entries of all files and configure the enabled ones at their
-/// version. `known` are the packs of `packs` that an entry can name; the
-/// configured packs are in their order. Problems go to `problems`.
+/// Merge the entries of all files and configure the enabled packs at their
+/// version.
+/// Args:
+///  - `entries`: Entries of all files, in file order
+///  - `packs`: Known packs
+///  - `known`: Newest version of each pack that an entry can name
+///  - `problems`: Receives the problems, one line each
+///
+/// Returns:
+///   The configured packs, in the order of `known`.
 pub async fn configure_packs(
     entries: Vec<PackEntry>,
     packs: &PackManager,
@@ -210,10 +230,19 @@ pub async fn configure_packs(
     configured
 }
 
-/// Configure a merged entry of `newest` (the newest version of the pack):
-/// its version, and the args of the files whose entry has that version or
-/// none. Per arg the highest of these files wins; each file's value must
-/// fit the arg. Args written for another version are dropped.
+/// Configure a merged entry at its version.
+///
+/// Uses the args of the files whose entry has that version or no version.
+/// For each arg, the highest of these files wins. The value of each file
+/// must be valid for the arg. Args written for a different version are
+/// dropped.
+/// Args:
+///  - `entry`: Merged entry of the pack
+///  - `packs`: Known packs
+///  - `newest`: Newest version of the pack
+///
+/// Returns:
+///   The configured pack, or the problems, one line each.
 async fn configure_entry(
     entry: &MergedEntry,
     packs: &PackManager,
@@ -251,7 +280,7 @@ async fn configure_entry(
         )]);
     };
 
-    // Per arg key: each file that sets it, with its value, lowest first.
+    // For each arg key: each file that sets it, with its value, lowest first.
     let mut set_by: BTreeMap<&str, Vec<(&str, &Value)>> = BTreeMap::new();
     for c in &entry.contributors {
         if let Some(other) = c.version.as_ref().filter(|v| **v != version) {
@@ -299,7 +328,7 @@ async fn configure_entry(
     Ok(pack.configure(&args))
 }
 
-/// The versions of the pack of `newest` that `packs` has, newest first.
+/// List the available versions of the pack of `newest`, newest first.
 /// Versions are the whole numbers from 1.
 async fn supported_versions(packs: &PackManager, newest: &Pack) -> Vec<String> {
     let metadata = newest.metadata();

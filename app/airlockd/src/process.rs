@@ -1,8 +1,11 @@
-//! Child process management inside the guest VM.
+//! Processes in the guest VM.
 //!
-//! Handles both PTY-based (interactive) and pipe-based (non-interactive)
-//! processes. Each spawned process is later attached to a [`HostProcess`]
-//! which bridges its I/O back to the host CLI via RPC.
+//! Starts the processes of the sandbox:
+//!  * user processes in the container, with a terminal (interactive) or
+//!    without. Their input and output go to the host CLI.
+//!  * sidecar daemons, with their output in log files
+//!
+//! Also removes orphan processes after they exit.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -19,33 +22,33 @@ use tracing::{error, trace};
 
 use crate::rpc::HostProcess;
 
-/// PIDs of processes airlockd spawned via tokio and reaps itself. The orphan
-/// reaper consults this set so it never steals a status that a `Child::wait`
-/// is waiting for.
+/// PIDs of processes that airlockd started with tokio and reaps itself. The
+/// orphan reaper skips these PIDs, so it never takes an exit status that a
+/// `Child::wait` waits for.
 fn own_children() -> &'static Mutex<HashSet<i32>> {
     static R: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-/// Record a PID airlockd spawned itself, so the orphan reaper leaves it alone.
+/// Record a PID that airlockd started itself, so the orphan reaper skips it.
 pub(crate) fn register_own_child(pid: u32) {
     own_children().lock().unwrap().insert(pid as i32);
 }
 
-/// Reap orphaned zombie processes reparented to this init.
+/// Reap orphaned zombie processes that the kernel gives to this init
+/// process. Runs forever, with a check every 2 seconds.
 ///
-/// airlockd runs as PID 1, so any process whose parent exits — e.g. a
-/// double-forking daemon started by the workload — is reparented here. tokio
-/// only reaps the children it spawned, so without this those orphans pile up
-/// as `<defunct>` zombies until PID space is exhausted and the VM can no
-/// longer fork.
-///
-/// We periodically scan `/proc` for zombie children of this process and reap
-/// them, skipping any PID airlockd spawned itself (tracked in
-/// [`own_children`]) so tokio's `Child::wait` still observes those exits. The
-/// scan enumerates via `/proc` rather than `waitpid(-1)` precisely so it can
-/// exclude our own children instead of blindly consuming the first zombie.
+/// airlockd runs as PID 1. Thus each process whose parent exits (for
+/// example a double-forking daemon of the workload) gets airlockd as its
+/// new parent. tokio reaps only the children that it started. Without this
+/// reaper, the orphans stay as `<defunct>` zombies until no PIDs are left
+/// and the VM cannot fork.
 pub async fn run_orphan_reaper() {
+    // Scan `/proc` for zombie children of this process and reap them. Skip
+    // the PIDs that airlockd started itself (see `own_children`), so tokio's
+    // `Child::wait` still sees their exits. The scan uses `/proc`, not
+    // `waitpid(-1)`, because `waitpid(-1)` takes the first zombie, also a
+    // child that airlockd started itself.
     let me = std::process::id() as i32;
     let mut ticker = tokio::time::interval(Duration::from_secs(2));
     loop {
@@ -54,6 +57,7 @@ pub async fn run_orphan_reaper() {
     }
 }
 
+/// Do one scan of `/proc` and reap the orphan zombie children of `me`.
 fn reap_orphans_once(me: i32) {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return;
@@ -76,12 +80,13 @@ fn reap_orphans_once(me: i32) {
             continue;
         };
         if ppid == me && state == 'Z' && !own_children().lock().unwrap().contains(&pid) {
-            // An orphan zombie we did not spawn — reap it.
+            // An orphan zombie that airlockd did not start. Reap it.
             unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
         }
     }
-    // Drop registry entries whose process is gone (tokio reaped it), keeping
-    // the set bounded and letting a reused PID re-register cleanly on spawn.
+    // Remove the entries of processes that do not exist now (tokio reaped
+    // them). This keeps the set small, and a reused PID can register again
+    // cleanly at spawn.
     own_children()
         .lock()
         .unwrap()
@@ -90,9 +95,9 @@ fn reap_orphans_once(me: i32) {
 
 /// Parse the parent PID and state character from a `/proc/<pid>/stat` line.
 ///
-/// The `comm` field (field 2) is wrapped in parentheses and may itself
-/// contain spaces and parentheses, so we split *after* the last `)`; the
-/// state is then the first following field and PPID the second.
+/// The `comm` field (field 2) is in parentheses, and it can contain spaces
+/// and parentheses itself. Thus the parser splits *after* the last `)`. The
+/// state is the first field after it, and the PPID is the second.
 fn parse_stat(stat: &str) -> Option<(i32, char)> {
     let after_comm = stat[stat.rfind(')')? + 1..].trim_start();
     let mut fields = after_comm.split_whitespace();
@@ -101,15 +106,15 @@ fn parse_stat(stat: &str) -> Option<(i32, char)> {
     Some((ppid, state))
 }
 
-/// A child process that has been spawned but not yet wired to host I/O.
+/// A child process that runs, but has no connection to the host I/O yet.
 pub struct SpawnedProcess {
     child: tokio::process::Child,
     pty: Option<pty_process::Pty>,
 }
 
 impl SpawnedProcess {
-    /// Wire this process's I/O to the host and block until it exits. The
-    /// exit code reaches the host as the last frame.
+    /// Connect the process I/O to the host and wait until the process exits.
+    /// The host gets the exit code as the last frame.
     pub async fn attach(self, host: HostProcess) {
         match self.pty {
             Some(pty) => attach_pty(self.child, pty, host).await,
@@ -118,13 +123,21 @@ impl SpawnedProcess {
     }
 }
 
-/// Spawn a process inside the container rootfs via chroot + setuid/setgid.
+/// Start a user process inside the container rootfs, as the container user.
+/// Args:
+///  - `cmd`: Program to run
+///  - `args`: Program arguments
+///  - `env`: Full environment as `KEY=VALUE` strings. Nothing is inherited.
+///  - `cwd`: Working directory in the container. If it does not exist, the
+///    process starts in `/`.
+///  - `uid`, `gid`: Container user and group
+///  - `harden`: Apply `PR_SET_NO_NEW_PRIVS` and private mount, IPC and UTS
+///    namespaces
+///  - `pty_size`: `(rows, cols)` to run the process in a PTY. `None` runs it
+///    with pipes.
 ///
-/// Builds a pre-exec hook (chroot → chdir → setgid → setuid, optionally with
-/// namespace/privilege hardening) and delegates to [`spawn`].
-///
-/// Uses a diagnostic pipe to capture which syscall failed inside the pre_exec,
-/// since error strings cannot cross the fork/exec boundary — only the errno does.
+/// Returns:
+///   The started process, or an error that tells which setup step failed.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_user(
     cmd: &str,
@@ -137,6 +150,8 @@ pub fn spawn_user(
     pty_size: Option<(u16, u16)>,
 ) -> Result<SpawnedProcess, anyhow::Error> {
     let env_pairs = env_string_pairs(env);
+    // The diagnostic pipe tells which syscall failed in the pre-exec hook.
+    // Error strings cannot cross the fork/exec boundary. Only the errno can.
     let (diag_r, diag_w) = open_diag_pipe();
     let pre_exec = build_pre_exec(cwd.to_string(), uid, gid, harden, diag_w);
 
@@ -144,15 +159,20 @@ pub fn spawn_user(
     finish_diag_pipe(diag_r, diag_w, result)
 }
 
-/// Spawn a sidecar daemon process with file-backed stdout/stderr. Same
-/// chroot + setuid/setgid + optional hardening as [`spawn_user`], but:
+/// Start a sidecar daemon process, with stdout and stderr in files.
 ///
-/// - stdin is `/dev/null` (no host stream to wire in),
-/// - stdout and stderr are dup'd from caller-owned `File`s so each restart
-///   appends to the same open file description (offset preserved).
+/// Same container setup as [`spawn_user`], but stdin is `/dev/null` (there
+/// is no host stream).
+/// Args:
+///  - `cmd`, `args`, `env`, `cwd`, `uid`, `gid`, `harden`: Same as in
+///    [`spawn_user`]
+///  - `stdout_file`, `stderr_file`: Log files. The child gets duplicates of
+///    these FDs, so each restart writes after the output of the previous run
+///    (the file offset is shared).
 ///
-/// Returns the `tokio::process::Child` directly — there is no host
-/// `HostProcess` to attach, and the daemon's restart loop owns the child.
+/// Returns:
+///   The child process. There is no [`HostProcess`] to attach, and the
+///   restart loop of the daemon owns the child.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_daemon(
     cmd: &str,
@@ -182,7 +202,8 @@ pub fn spawn_daemon(
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_dup))
         .stderr(Stdio::from(stderr_dup));
-    // Safety: pre_exec runs post-fork in child; only async-signal-safe calls.
+    // Safety: pre_exec runs in the child after fork. It uses only
+    // async-signal-safe calls.
     unsafe { command.pre_exec(pre_exec) };
     let result = command.spawn().map_err(anyhow::Error::from);
     let result = finish_diag_pipe(diag_r, diag_w, result);
@@ -194,6 +215,8 @@ pub fn spawn_daemon(
     result
 }
 
+/// Split `KEY=VALUE` strings into pairs. A string without `=` gets an empty
+/// value.
 fn env_string_pairs(env: &[String]) -> Vec<(String, String)> {
     env.iter()
         .filter_map(|e| {
@@ -205,9 +228,12 @@ fn env_string_pairs(env: &[String]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Open the diagnostic pipe used by the pre-exec hook to report which step
-/// failed. `O_CLOEXEC` closes the write end automatically on a successful
-/// exec, giving the parent a clean EOF. Returns `(-1, -1)` off-Linux.
+/// Open the diagnostic pipe. The pre-exec hook uses it to report the step
+/// that failed. Returns `(read_fd, write_fd)`, or `(-1, -1)` on other
+/// targets than Linux.
+///
+/// `O_CLOEXEC` closes the write end when exec succeeds, so the parent gets
+/// a clean EOF.
 fn open_diag_pipe() -> (i32, i32) {
     #[cfg(target_os = "linux")]
     {
@@ -221,8 +247,8 @@ fn open_diag_pipe() -> (i32, i32) {
     }
 }
 
-/// Close the pipe FDs and, on spawn failure, read any tag the pre-exec
-/// child wrote and attach it to the error as context.
+/// Close the pipe FDs. If the spawn failed, read the step tag that the
+/// pre-exec hook wrote and add it to the error as context.
 fn finish_diag_pipe<T>(diag_r: i32, diag_w: i32, result: anyhow::Result<T>) -> anyhow::Result<T> {
     if diag_w >= 0 {
         unsafe { libc::close(diag_w) };
@@ -245,9 +271,12 @@ fn finish_diag_pipe<T>(diag_r: i32, diag_w: i32, result: anyhow::Result<T>) -> a
     result
 }
 
-/// Build the post-fork/pre-exec hook: setns (or chroot) → harden → chdir →
-/// setgid → setuid. On any hard failure it writes a short step tag to `diag_w`
-/// so the parent can attach it as context.
+/// Make the pre-exec hook that runs in the child after fork.
+///
+/// Steps: enter the container rootfs (join the sandbox mount namespace, or
+/// chroot if init could not make it), harden, chdir, setgroups, setgid,
+/// setuid. On a hard failure, the hook writes a short step tag to `diag_w`,
+/// so the parent can add it to the error as context.
 fn build_pre_exec(
     cwd: String,
     uid: u32,
@@ -255,16 +284,16 @@ fn build_pre_exec(
     harden: bool,
     diag_w: i32,
 ) -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
-    // harden is only consumed on Linux; keep the parameter unconditional
-    // so the signature stays stable across platforms.
+    // Only Linux uses `harden`. The parameter is always there, so the
+    // signature is the same on all platforms.
     #[cfg(not(target_os = "linux"))]
     let _ = harden;
-    // Allocate before fork: the hook itself may only make raw syscalls.
+    // Allocate before fork. The hook can only make raw syscalls.
     let rootfs = std::ffi::CString::new(crate::sandbox_ns::ROOTFS).unwrap();
     let ns_fd = crate::sandbox_ns::fd();
 
     move || {
-        // Save errno first, then write the step tag (write(2) might change it).
+        // Save errno first, then write the step tag (write(2) can change it).
         macro_rules! fail {
             ($tag:expr) => {{
                 let err = std::io::Error::last_os_error();
@@ -276,11 +305,12 @@ fn build_pre_exec(
             }};
         }
 
-        // Enter the container rootfs: join the shared sandbox mount namespace
-        // (its root *is* the rootfs, see `crate::sandbox_ns`), or chroot when
-        // init could not build it. setns must come before the hardening
-        // unshare below, which then takes a private copy of this namespace.
-        // setns also moves the cwd to the new root; the chdir below fixes it.
+        // Enter the container rootfs. Join the shared sandbox mount namespace
+        // (its root is the rootfs, see `crate::sandbox_ns`), or use chroot if
+        // init could not make it. setns must come before the hardening
+        // unshare below. The unshare then makes a private copy of this
+        // namespace. setns also moves the cwd to the new root. The chdir
+        // below sets the correct cwd.
         #[cfg(target_os = "linux")]
         let entered = match ns_fd {
             Some(fd) => {
@@ -296,14 +326,15 @@ fn build_pre_exec(
 
         #[cfg(target_os = "linux")]
         if harden {
-            // Prevent privilege escalation via setuid/setcap binaries.
+            // Prevent privilege escalation through setuid/setcap binaries.
             if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
                 fail!(b"prctl(PR_SET_NO_NEW_PRIVS)");
             }
-            // Best-effort namespace isolation: private mount, IPC, and UTS
-            // namespaces. Network namespace is intentionally shared so the
-            // container has network access. Failures are ignored — the primary
-            // security (NO_NEW_PRIVS + chroot + setuid) remains in effect.
+            // Best-effort namespace isolation: private mount, IPC and UTS
+            // namespaces. The network namespace is shared on purpose, so the
+            // container has network access. Failures are ignored, because
+            // the primary security (NO_NEW_PRIVS, the rootfs root, setuid)
+            // stays.
             unsafe { libc::unshare(libc::CLONE_NEWNS) };
             unsafe { libc::unshare(libc::CLONE_NEWIPC) };
             unsafe { libc::unshare(libc::CLONE_NEWUTS) };
@@ -312,22 +343,21 @@ fn build_pre_exec(
         if !entered && unsafe { libc::chroot(rootfs.as_ptr()) } != 0 {
             fail!(b"chroot(/mnt/overlay/rootfs)");
         }
-        // chdir to the container working directory (fall back to / if missing)
         let cwd_cstr = std::ffi::CString::new(cwd.as_str()).unwrap();
         if unsafe { libc::chdir(cwd_cstr.as_ptr()) } != 0 {
             let root = std::ffi::CString::new("/").unwrap();
             unsafe { libc::chdir(root.as_ptr()) };
         }
-        // Drop root's supplementary groups before dropping privileges.
-        // Without this the container process, though running as an
-        // unprivileged uid, would keep airlockd's (root's) supplementary
-        // group list — typically including GID 0 — and could reach
-        // group-owned files it shouldn't. Must happen while still root and
-        // before setuid. `setgroups` is async-signal-safe (a bare syscall).
+        // Remove the supplementary groups before the privilege drop.
+        // Otherwise the process keeps the groups of airlockd (root), which
+        // usually include GID 0, also with an unprivileged uid. Must run as
+        // root, before setuid. `setgroups` is async-signal-safe (a bare
+        // syscall).
         if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
             fail!(b"setgroups");
         }
-        // setgid must come before setuid (can't change gid after dropping root)
+        // setgid must run before setuid. After setuid drops root, the
+        // process cannot change its gid.
         if unsafe { libc::setgid(gid) } != 0 {
             fail!(b"setgid");
         }
@@ -338,12 +368,14 @@ fn build_pre_exec(
     }
 }
 
-/// Core spawn primitive. Handles PTY/pipe dispatch, env setup, and an optional
-/// pre-exec hook. All callers go through here.
-///
-/// - `env`: the whole environment of the child (nothing is inherited).
-/// - `pre_exec`: runs in the child after fork, before exec. Must only use
-///   async-signal-safe operations.
+/// Start a child process with a PTY or with pipes. All spawn functions
+/// except [`spawn_daemon`] use it.
+/// Args:
+///  - `cmd`, `args`: Program and its arguments
+///  - `env`: Full environment of the child. Nothing is inherited.
+///  - `pre_exec`: Hook that runs in the child after fork, before exec. Must
+///    use only async-signal-safe operations.
+///  - `pty_size`: `(rows, cols)` for a PTY. `None` uses pipes.
 fn spawn<A, F>(
     cmd: &str,
     args: &[A],
@@ -361,12 +393,13 @@ where
         if let Err(e) = pty.resize(pty_process::Size::new(rows, cols)) {
             tracing::warn!("initial pty resize failed: {e}");
         }
-        // pty_process::Command is a consuming builder — chain all calls.
+        // pty_process::Command is a consuming builder. Chain all calls.
         let builder = pty_process::Command::new(cmd)
             .args(args)
             .env_clear()
             .envs(env);
-        // Safety: pre_exec runs post-fork in child; only async-signal-safe calls.
+        // Safety: pre_exec runs in the child after fork. It uses only
+        // async-signal-safe calls.
         let child = unsafe { builder.pre_exec(pre_exec) }.spawn(pts)?;
         if let Some(pid) = child.id() {
             register_own_child(pid);
@@ -382,12 +415,13 @@ where
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            // Its own process group, as a PTY child has its own session:
-            // host signals reach the children of a shell too (see
+            // Its own process group, as a PTY child has its own session.
+            // Thus host signals also reach the children of a shell (see
             // `signal_group`).
             .process_group(0);
         command.env_clear().envs(env);
-        // Safety: pre_exec runs post-fork in child; only async-signal-safe calls.
+        // Safety: pre_exec runs in the child after fork. It uses only
+        // async-signal-safe calls.
         unsafe { command.pre_exec(pre_exec) };
         let child = command.spawn()?;
         if let Some(pid) = child.id() {
@@ -399,9 +433,8 @@ where
 
 /// Relay I/O between a PTY-backed child and the host RPC connection.
 ///
-/// Signals are translated: SIGINT/SIGQUIT are written as control characters
-/// to the PTY (as a real terminal would), while other signals are forwarded
-/// via `kill(2)`.
+/// SIGINT and SIGQUIT go to the PTY as control characters, as from a real
+/// terminal. Other signals go to the child with `kill(2)`.
 async fn attach_pty(
     mut child: tokio::process::Child,
     pty: pty_process::Pty,
@@ -411,7 +444,8 @@ async fn attach_pty(
     let pty_fd = pty.as_raw_fd();
     let (mut pty_reader, pty_writer) = pty.into_split();
 
-    // Initial size is set before spawn. This handles size changes during attach.
+    // The initial size is set before spawn. `relay_stdin_pty` handles the
+    // size changes during attach.
 
     let stdin = host.stdin;
     tokio::task::spawn_local(async move {
@@ -464,7 +498,7 @@ async fn attach_pty(
 }
 
 /// Relay I/O between a pipe-backed child and the host RPC connection.
-/// Stdout and stderr are forwarded as separate frame types.
+/// Stdout and stderr go to the host as different frame types.
 async fn attach_pipe(mut child: tokio::process::Child, mut host: HostProcess) {
     let child_stdin = child.stdin.take();
     let mut child_stdout = child.stdout.take();
@@ -530,9 +564,10 @@ async fn attach_pipe(mut child: tokio::process::Child, mut host: HostProcess) {
     log_error(frames_tx.send(Frame::Exit(exit_code)).await);
 }
 
-/// Send `signum` to the process group of a pipe-mode child (it leads its
-/// own group, see [`spawn`]), so that the processes it started get it
-/// too. The group outlives its leader until the last member exits.
+/// Send `signum` to the process group of a pipe-mode child (the child leads
+/// its own group, see [`spawn`]). Thus the processes that it started also
+/// get the signal. The group exists until its last member exits, also after
+/// the leader exits.
 fn signal_group(child: &tokio::process::Child, signum: i32) {
     if let Some(pid) = child.id() {
         trace!("signal ({signum}), process group: {pid}");
@@ -540,6 +575,8 @@ fn signal_group(child: &tokio::process::Child, signum: i32) {
     }
 }
 
+/// Wait for the child to exit and return its exit code. Returns -1 if the
+/// child has no exit code (for example, a signal stopped it) or on error.
 async fn wait_child(child: &mut tokio::process::Child) -> i32 {
     match child.wait().await {
         Ok(exit) => exit.code().unwrap_or(-1),
@@ -550,13 +587,15 @@ async fn wait_child(child: &mut tokio::process::Child) -> i32 {
     }
 }
 
+/// Log the error of `res`, if any.
 fn log_error<Ok, Err: Display>(res: Result<Ok, Err>) {
     if let Err(e) = res {
         error!("{e}");
     }
 }
 
-/// Read host stdin frames and write them to the PTY, handling resize events.
+/// Read host stdin frames and write them to the PTY. Also applies the
+/// resize events.
 async fn relay_stdin_pty(
     stdin: stdin::Client,
     mut writer: pty_process::OwnedWritePty,
@@ -567,7 +606,8 @@ async fn relay_stdin_pty(
         match input.which()? {
             process_input::Stdin(frame) => {
                 if let Ok(data_frame::Data(Ok(data))) = frame?.which() {
-                    // Byte count only: stdin may carry secrets (a pasted token).
+                    // Log only the byte count. stdin can contain secrets (for
+                    // example a pasted token).
                     tracing::trace!("guest stdin pty: {} bytes", data.len());
                     writer.write_all(data).await?;
                 } else {
@@ -604,22 +644,30 @@ async fn relay_stdin_pipe(
 
 /// Server-side implementation of the Cap'n Proto `Process` interface.
 ///
-/// The host polls for output frames and can send signals or kill the process.
+/// The host polls for output frames, and can send signals or kill the
+/// process.
 struct ProcessImpl {
+    /// Output frames from the relay loop.
     frames: RefCell<tokio::sync::mpsc::Receiver<Frame>>,
+    /// Signal requests to the relay loop.
     signals: RefCell<tokio::sync::mpsc::Sender<Signal>>,
 }
 
-/// An output frame from a child process, sent to the host via polling.
+/// An output frame from a child process. The host gets it when it polls.
 enum Frame {
+    /// Data from stdout (or from the PTY).
     Stdout(Bytes),
+    /// Data from stderr (pipe mode only).
     Stderr(Bytes),
+    /// Exit code. The last frame.
     Exit(i32),
 }
 
 /// A signal request from the host to the child process.
 enum Signal {
+    /// Send this signal number.
     Num(i32),
+    /// Kill the process and stop the relay.
     Kill,
 }
 
@@ -668,8 +716,14 @@ impl process::Server for ProcessImpl {
 
 #[cfg(test)]
 mod tests {
+    //! Tests of the `/proc/<pid>/stat` parser.
+
     use super::parse_stat;
 
+    /// Test that the parser reads the PPID and state after the last `)` of
+    /// the command name. A command name can contain spaces and parentheses.
+    ///   1. Parse a normal line and a line with `)` in the command name
+    ///   2. Check the PPID and state, and check that a bad line gives `None`
     #[test]
     fn parse_stat_reads_ppid_and_state_after_last_paren_of_comm() {
         assert_eq!(parse_stat("1234 (bash) S 1 1234 1234 0 -1"), Some((1, 'S')));

@@ -1,11 +1,9 @@
-//! Embedded VM assets (kernel, initramfs, hypervisor binaries).
+//! VM boot assets.
 //!
-//! These files are compiled into the `airlock` binary via `include_bytes!`. On
-//! first run (or after a build changes the checksum), they are extracted to
-//! `~/.cache/airlock/vm/` so the hypervisor can memory-map them.
-//!
-//! Custom kernel/initramfs paths can be set in `[vm]` config; when present
-//! they override the bundled files.
+//! The `airlock` binary contains the files that boot the sandbox VM: the
+//! kernel, the initramfs and, on Linux, the hypervisor. This module extracts
+//! them to the cache on the host when they change. The `[vm]` config can
+//! replace the bundled kernel and initramfs with custom files.
 
 use std::path::PathBuf;
 
@@ -13,20 +11,28 @@ use crate::project::Project;
 
 /// Paths to the extracted VM boot assets.
 pub struct Assets {
+    /// Kernel image.
     pub kernel: PathBuf,
+    /// Initramfs archive.
     pub initramfs: PathBuf,
+    /// `cloud-hypervisor` executable.
     #[cfg(target_os = "linux")]
     pub cloud_hypervisor: PathBuf,
+    /// `virtiofsd` executable.
     #[cfg(target_os = "linux")]
     pub virtiofsd: PathBuf,
 }
 
 impl Assets {
-    /// Extract embedded assets to the cache directory if the checksum changed,
-    /// then apply any custom kernel/initramfs paths from the project config.
+    /// Get the VM asset paths for the project.
     ///
-    /// With the `distroless` feature, kernel and initramfs are not bundled —
-    /// `vm.kernel` and `vm.initramfs` must be set in the project config.
+    /// Extracts the embedded assets to the cache directory if their checksum
+    /// changed. The custom kernel and initramfs paths of the project config
+    /// replace the bundled files. With the `distroless` feature, the binary
+    /// does not contain a kernel and initramfs, so the project config must
+    /// set `vm.kernel` and `vm.initramfs`.
+    /// Returns:
+    ///   The asset paths, or error if extraction fails or an asset is missing.
     #[cfg(not(test))]
     pub fn init(project: &Project) -> anyhow::Result<Assets> {
         const CHECKSUM: &str = env!("AIRLOCK_ASSETS_CHECKSUM");
@@ -34,11 +40,12 @@ impl Assets {
         let dir = crate::cache::cache_dir()?.join("vm");
         std::fs::create_dir_all(&dir)?;
 
-        // Serialize the checksum-check-and-extract across processes: take a
-        // blocking exclusive lock before reading the checksum so two concurrent
-        // first-runs (e.g. right after an upgrade) can't both rewrite the boot
-        // assets, and so a booting hypervisor never memory-maps a file another
-        // process is mid-rewrite on. Released when `_lock` drops.
+        // Serialize the checksum check and extraction across processes. Take
+        // a blocking exclusive lock before the checksum read. Then two
+        // concurrent first runs (for example after an upgrade) cannot both
+        // write the boot assets. Also, the hypervisor never memory-maps a
+        // file while another process writes it. The lock releases when
+        // `_lock` drops.
         let _lock = acquire_extract_lock(&dir.join("lock"))?;
 
         let checksum_file = dir.join("checksum");
@@ -46,8 +53,8 @@ impl Assets {
         if cached_checksum.trim() != CHECKSUM {
             #[cfg(not(feature = "distroless"))]
             {
-                // Write via temp file + rename so a reader (or a second process)
-                // never observes Image/initramfs truncated mid-write.
+                // Write through a temp file and rename, so a reader (or a second
+                // process) never sees a partly written Image or initramfs.
                 write_atomic(&dir, "Image", include_bytes!("../../../target/vm/Image"))?;
                 write_atomic(
                     &dir,
@@ -58,8 +65,8 @@ impl Assets {
 
             #[cfg(target_os = "linux")]
             {
-                // Write to temp files first, then rename — avoids ETXTBSY if a
-                // previous virtiofsd/cloud-hypervisor process is still running.
+                // Write to temp files first, then rename. This prevents ETXTBSY
+                // if a previous virtiofsd/cloud-hypervisor process still runs.
                 write_executable(
                     &dir,
                     "cloud-hypervisor",
@@ -108,13 +115,15 @@ impl Assets {
         })
     }
 
+    /// Test stub. Tests do not extract the VM assets, so this always fails.
     #[cfg(test)]
     pub fn init(_project: &Project) -> anyhow::Result<Assets> {
         anyhow::bail!("Assets::init not supported in tests")
     }
 }
 
-/// Write an executable to `dir/name` via a temp file + rename to avoid ETXTBSY.
+/// Write an executable to `dir/name` through a temp file and rename. This
+/// prevents ETXTBSY if the old executable still runs.
 #[cfg(all(target_os = "linux", not(test)))]
 fn write_executable(dir: &std::path::Path, name: &str, data: &[u8]) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -126,26 +135,29 @@ fn write_executable(dir: &std::path::Path, name: &str, data: &[u8]) -> anyhow::R
     Ok(())
 }
 
-/// Write `data` to `dir/name` via a sibling temp file + rename, so a reader
-/// never observes the destination truncated mid-write and a concurrent process
-/// can't boot from a half-written file. Cross-platform (unlike
-/// [`write_executable`], no executable bit is set — used for `Image` /
-/// `initramfs.gz`). The temp name carries the pid so a stray temp left by
-/// another process can never be renamed into place.
+/// Write `data` to `dir/name` through a sibling temp file and rename. A
+/// reader never sees a partly written file, and a concurrent process cannot
+/// boot from it. Used for `Image` and `initramfs.gz`. Unlike
+/// `write_executable`, it works on all platforms and does not set the
+/// executable bit.
 #[cfg(not(feature = "distroless"))]
 fn write_atomic(dir: &std::path::Path, name: &str, data: &[u8]) -> anyhow::Result<()> {
+    // The temp name contains the pid, so a stray temp file of another
+    // process never goes into place.
     let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
     std::fs::write(&tmp, data)?;
     std::fs::rename(&tmp, dir.join(name))?;
     Ok(())
 }
 
-/// Acquire a blocking exclusive advisory lock on `path`, held until the
-/// returned handle drops. Serializes the checksum-check-and-extract in
-/// [`Assets::init`] across processes. Blocking (not fail-fast) because
-/// extraction is brief: a second process simply waits, then observes the
-/// freshly written checksum and skips re-extracting. Mirrors the `flock`
-/// pattern in `project::acquire_lock` / `vault::acquire_file_lock`.
+/// Get a blocking exclusive advisory lock on `path`. The lock stays until the
+/// returned handle drops. It serializes the checksum check and extraction in
+/// [`Assets::init`] across processes.
+///
+/// The lock blocks (and does not fail fast) because extraction is short. A
+/// second process waits, then reads the new checksum and does not extract
+/// again. Same `flock` pattern as `project::acquire_lock` and
+/// `vault::acquire_file_lock`.
 #[cfg(not(test))]
 fn acquire_extract_lock(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
     use std::os::unix::io::AsRawFd;
@@ -167,10 +179,18 @@ fn acquire_extract_lock(path: &std::path::Path) -> anyhow::Result<std::fs::File>
     Ok(file)
 }
 
-/// Resolve an asset path: use `custom` if provided (with tilde expansion and
-/// existence check), otherwise fall back to `bundled`.
+/// Resolve the path of one VM asset.
+/// Args:
+///  - `custom`: Custom path from the project config, if set. Expands `~` and
+///    resolves relative paths from the project directory.
+///  - `project`: Project for path expansion
+///  - `bundled`: Path of the extracted bundled asset. `None` for
+///    `distroless` builds, which then require `custom`.
+///  - `name`: Asset name for error messages
 ///
-/// `bundled` is `None` for `distroless` builds — `custom` is then required.
+/// Returns:
+///   `custom` if set, else `bundled`. Error if the custom file does not
+///   exist or no path is available.
 #[cfg(not(test))]
 fn resolve_asset(
     custom: Option<&str>,
@@ -202,9 +222,16 @@ fn resolve_asset(
 
 #[cfg(all(test, not(feature = "distroless")))]
 mod tests {
+    //! Tests for the atomic write of the bundled VM assets.
+
     use super::write_atomic;
     use crate::test_cfg::temp_dir;
 
+    /// Test that an asset write replaces the old file and leaves no temporary
+    /// file, so that a reader never sees a partial asset.
+    ///   1. Write an asset, then write it again with longer content
+    ///   2. Check that the file has the new content
+    ///   3. Check that the directory has only the asset file
     #[test]
     fn asset_write_replaces_file_and_leaves_no_temp_file() {
         let tmp = temp_dir();

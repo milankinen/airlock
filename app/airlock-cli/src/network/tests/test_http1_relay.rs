@@ -1,3 +1,6 @@
+//! Tests for the plain HTTP/1.1 relay: requests and responses cross the
+//! proxy intact, with and without middleware.
+
 use airlock_common::network_capnp::network_proxy;
 use axum::Router;
 use axum::extract::Path;
@@ -7,6 +10,8 @@ use axum::routing::{any, get};
 use crate::test_cfg::network::*;
 use crate::test_cfg::*;
 
+/// An upstream that answers with the method, path and body it got. It also
+/// has a large-body route and a 404 route with a custom header.
 fn reflect_app() -> Router {
     Router::new()
         .route("/big", get(|| async { "x".repeat(100_000) }))
@@ -24,6 +29,8 @@ fn reflect_app() -> Router {
         )
 }
 
+/// Send a GET, a POST, a 404 request and a large-body request through
+/// `proxy`, and check that each response arrives intact.
 async fn assert_http1_relay(proxy: &network_proxy::Client) {
     let port = serve(reflect_app()).await.port();
 
@@ -55,6 +62,8 @@ async fn assert_http1_relay(proxy: &network_proxy::Client) {
     assert_eq!(body.len(), 100_000);
 }
 
+/// A config with one Lua middleware that does nothing. Each request and
+/// response then goes through the middleware chain.
 fn noop_middleware() -> TestNetworkConfig {
     TestNetworkConfig {
         middleware_scripts: vec![("noop", "-- noop")],
@@ -62,6 +71,11 @@ fn noop_middleware() -> TestNetworkConfig {
     }
 }
 
+/// Test that HTTP/1.1 requests and responses cross the proxy intact when
+/// no middleware applies.
+///   1. Start a network without middleware
+///   2. Send a GET, a POST, a 404 request and a 100 KB response request
+///   3. Check the status, headers and bodies that the guest gets
 #[test]
 fn http1_requests_without_middleware_arrive_intact() {
     run_with_config(TestNetworkConfig::default(), |proxy, _, _| async move {
@@ -69,6 +83,12 @@ fn http1_requests_without_middleware_arrive_intact() {
     });
 }
 
+/// Test that HTTP/1.1 requests and responses cross the proxy intact when
+/// a middleware applies. A middleware that does nothing must not change
+/// the messages.
+///   1. Start a network with a no-op middleware
+///   2. Send a GET, a POST, a 404 request and a 100 KB response request
+///   3. Check the status, headers and bodies that the guest gets
 #[test]
 fn http1_requests_through_middleware_arrive_intact() {
     run_with_config(noop_middleware(), |proxy, _, _| async move {
@@ -76,6 +96,11 @@ fn http1_requests_through_middleware_arrive_intact() {
     });
 }
 
+/// Test that one keep-alive guest connection can send more than one
+/// request through the middleware path.
+///   1. Open one guest connection through a no-op middleware
+///   2. Send two keep-alive GET requests one after the other
+///   3. Check that each request gets its own correct response
 #[test]
 fn http1_keepalive_connection_serves_several_requests() {
     run_with_config(noop_middleware(), |proxy, _, _| async move {
@@ -91,6 +116,12 @@ fn http1_keepalive_connection_serves_several_requests() {
     });
 }
 
+/// Test that the proxy does not send a 502 to the guest when the upstream
+/// closes an idle keep-alive connection. A false 502 can break a guest
+/// client that waits for its next request.
+///   1. Send one keep-alive GET through a no-op middleware
+///   2. Stop the upstream server
+///   3. Check that the guest gets no 502 on the connection
 #[test]
 fn http1_upstream_close_closes_guest_connection_without_502() {
     run_with_config(noop_middleware(), |proxy, _, _| async move {
@@ -102,6 +133,7 @@ fn http1_upstream_close_closes_guest_connection_without_502() {
         let resp = conn.recv(500).await;
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
 
+        // The graceful shutdown closes the idle keep-alive connection.
         let _ = shutdown.send(());
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         let resp = conn.recv(1000).await;

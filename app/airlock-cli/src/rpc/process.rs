@@ -1,11 +1,17 @@
-//! Host-side wrapper around a guest `Process` RPC capability.
+//! Host-side handle to a guest process.
+//!
+//! Lets the host control a process that runs in the VM and receive its
+//! output and exit status.
 
 use airlock_common::supervisor_capnp::*;
 
-/// A decoded output event from a guest process.
+/// Decoded output event of a guest process.
 pub enum ProcessEvent {
+    /// Chunk of stdout data.
     Stdout(Vec<u8>),
+    /// Chunk of stderr data.
     Stderr(Vec<u8>),
+    /// Process exit with its exit code.
     Exit(i32),
 }
 
@@ -35,14 +41,14 @@ impl Process {
         Ok(())
     }
 
-    /// Poll for the next output event (stdout chunk, stderr chunk, or exit).
-    ///
-    /// A stream `Eof` only marks the end of a stdout/stderr stream, not the
-    /// process exit, so it is skipped: we keep polling until the guest delivers
-    /// the real `exit` event. This is what stops a stdout EOF from masking the
-    /// true exit code. Malformed or unknown frames are logged and surfaced as
-    /// an error instead of being silently reported as `Exit(1)`.
+    /// Wait for the next output event (stdout chunk, stderr chunk or exit).
+    /// Returns:
+    ///   Next event, or an error for a malformed or unknown frame. Such a
+    ///   frame is logged, and not silently reported as `Exit(1)`.
     pub async fn poll(&self) -> anyhow::Result<ProcessEvent> {
+        // A stream `Eof` marks only the end of stdout or stderr, not the
+        // process exit. Skip it and poll until the guest sends the real
+        // `exit` event. Thus a stdout EOF does not hide the true exit code.
         loop {
             let response = self.proc.poll_request().send().promise.await?;
             let next = response.get()?.get_next()?;

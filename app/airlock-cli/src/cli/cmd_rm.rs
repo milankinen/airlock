@@ -1,4 +1,6 @@
-//! `airlock rm` — delete a sandbox's cached state.
+//! The `airlock rm` command.
+//!
+//! Deletes the project sandbox and its local state.
 
 use std::path::Path;
 
@@ -11,26 +13,27 @@ use crate::{cli, oci, project};
 /// CLI arguments for `airlock rm`.
 #[derive(Args, Debug)]
 pub struct RmArgs {
-    /// Skip confirmation prompt
+    /// Do not ask for confirmation
     #[arg(short = 'f', long)]
     pub force: bool,
 }
 
-/// Remove the sandbox directory after confirmation (unless `--force`).
+/// Remove the project sandbox after confirmation (unless `--force`).
 ///
 /// Removes the whole project `.airlock/` directory: the sandbox, the local
-/// project config (`.airlock/airlock.<ext>`), `.gitignore`, logs — everything
-/// under it. When the project is the home directory, `.airlock/` is also the
-/// user's airlock directory (user config, vault, service sign-ins, agent
-/// homes): only `.airlock/sandbox` goes then. The same applies when
-/// `.airlock/` holds user-level files although the project is not `$HOME`
-/// (for example under `sudo`, or with a wrong `$HOME`).
-///
-/// The config is not loaded: `rm` needs only the sandbox paths, and a
-/// broken config is a common reason to start over.
-///
-/// The sandbox lock is held until the removal finishes, so a concurrent
-/// `airlock start` cannot take the sandbox while it is being removed.
+/// project config (`.airlock/airlock.<ext>`), `.gitignore`, logs and all other
+/// files in it. If the project is the home directory, `.airlock/` is also the
+/// user airlock directory (user config, vault, service sign-ins, agent homes).
+/// Then only `.airlock/sandbox` is removed. The same applies if `.airlock/`
+/// holds user-level files and the project is not `$HOME` (for example under
+/// `sudo`, or with a wrong `$HOME`).
+/// Returns:
+///   Process exit code: 0 on success or abort, 1 on error.
+// The config is not loaded. `rm` needs only the sandbox paths, and a broken
+// config is a common reason to start again.
+//
+// The sandbox lock stays held until the removal is complete. Thus a parallel
+// `airlock start` cannot take the sandbox during the removal.
 pub fn main(args: &RmArgs) -> i32 {
     let host_cwd = match std::env::current_dir() {
         Ok(cwd) => std::fs::canonicalize(&cwd).unwrap_or(cwd),
@@ -42,17 +45,17 @@ pub fn main(args: &RmArgs) -> i32 {
     run(args, &host_cwd)
 }
 
-/// [`main`]'s body, taking the project directory as an argument so tests
-/// can drive it without touching the process's current directory.
+/// Body of [`main`], with the project directory as an argument.
+// The argument lets tests run it without a change to the current directory
+// of the process.
 pub(super) fn run(args: &RmArgs, host_cwd: &Path) -> i32 {
     let paths = project::paths(host_cwd);
 
-    // `.airlock` itself may be a symlink (an untrusted repo can commit one
-    // pointing at, say, `~/.airlock`): `start` refuses it (see
-    // `project::airlock_dir_problem_for`), and everything below this point
-    // builds paths by joining onto `cache_dir`, so following it here would
-    // let `rm` reach — and delete — whatever the link points at. Handle it
-    // on its own, without ever resolving through it.
+    // `.airlock` can be a symlink. An untrusted repo can commit one that
+    // points to, for example, `~/.airlock`. `start` refuses it (see
+    // `project::airlock_dir_problem_for`). All code below builds paths from
+    // `cache_dir`. If `rm` followed the link, it could delete the link
+    // target. Thus handle the link separately and never resolve through it.
     let Ok(cache_meta) = std::fs::symlink_metadata(&paths.cache_dir) else {
         return 0;
     };
@@ -98,8 +101,8 @@ pub(super) fn run(args: &RmArgs, host_cwd: &Path) -> i32 {
         return 1;
     }
 
-    // The sandbox's image hardlink went away with its cache dir — sweep any
-    // image/layers that no longer have live refs.
+    // The image hardlink of the sandbox was in its cache dir. Remove the
+    // images and layers that no longer have live references.
     oci::gc_sweep();
 
     match local_config {
@@ -110,10 +113,18 @@ pub(super) fn run(args: &RmArgs, host_cwd: &Path) -> i32 {
 }
 
 /// Remove only `.airlock/sandbox`, for an `.airlock/` that is also a user
-/// airlock directory (user config, vault, service sign-ins, agent homes):
-/// the project is
-/// the home directory, or [`user_file_marker`] found a user-level file.
-/// `kept_note` says what stays and why.
+/// airlock directory (user config, vault, service sign-ins, agent homes).
+///
+/// This applies if the project is the home directory, or if
+/// [`user_file_marker`] found a user-level file.
+/// Args:
+///  - `args`: Command arguments
+///  - `cache_dir`: Project `.airlock/` directory
+///  - `sandbox_dir`: The `.airlock/sandbox` directory to remove
+///  - `kept_note`: Message that tells what stays and why
+///
+/// Returns:
+///   Process exit code.
 fn rm_sandbox_only(args: &RmArgs, cache_dir: &Path, sandbox_dir: &Path, kept_note: &str) -> i32 {
     if std::fs::symlink_metadata(sandbox_dir).is_err() {
         cli::log!("No sandbox to remove (kept {kept_note})");
@@ -125,11 +136,11 @@ fn rm_sandbox_only(args: &RmArgs, cache_dir: &Path, sandbox_dir: &Path, kept_not
         return 0;
     }
 
-    // `sandbox_dir` is `cache_dir.join("sandbox")`: re-check that `.airlock`
-    // is still a real directory right before the removal, in case it was
-    // swapped for a symlink while the confirmation prompt above was
-    // waiting. Without this, the path built from it would resolve through
-    // the swapped-in link and the removal below would reach its target.
+    // `sandbox_dir` is `cache_dir.join("sandbox")`. Check again, immediately
+    // before the removal, that `.airlock` is still a real directory. It can
+    // change to a symlink while the confirmation prompt waits. Without this
+    // check, the path resolves through the new link and the removal below
+    // reaches the link target.
     match std::fs::symlink_metadata(cache_dir) {
         Ok(meta) if !meta.file_type().is_symlink() => {}
         _ => {
@@ -148,10 +159,14 @@ fn rm_sandbox_only(args: &RmArgs, cache_dir: &Path, sandbox_dir: &Path, kept_not
     0
 }
 
-/// Remove a symlinked `.airlock` (see [`run`]): only the link goes, after
-/// the normal confirmation (skipped with `--force`); its target, which may
-/// be another project's or a user's real `.airlock`, is never touched or
-/// even followed to look inside.
+/// Remove a symlinked `.airlock` (see [`run`]).
+///
+/// Removes only the link, after the normal confirmation (no confirmation with
+/// `--force`). The target can be the real `.airlock` of another project or of
+/// a user. The function never changes the target and never follows the link
+/// to look inside.
+/// Returns:
+///   Process exit code.
 fn rm_symlinked_airlock(args: &RmArgs, cache_dir: &Path) -> i32 {
     let target =
         std::fs::read_link(cache_dir).map_or_else(|_| "?".to_string(), |p| p.display().to_string());
@@ -176,9 +191,14 @@ fn rm_symlinked_airlock(args: &RmArgs, cache_dir: &Path) -> i32 {
     0
 }
 
-/// [`confirm_prompt`] with the standard "Remove sandbox?" prompt. `note`,
-/// when given, is appended to flag extra fallout of the removal, such as
-/// the local project config going with it.
+/// Ask for confirmation with the standard "Remove sandbox?" prompt.
+/// Args:
+///  - `args`: Command arguments
+///  - `note`: Optional text after the prompt about other effects of the
+///    removal, for example that the local project config is also removed
+///
+/// Returns:
+///   True if the user confirmed (see [`confirm_prompt`]).
 fn confirm(args: &RmArgs, note: Option<&str>) -> bool {
     let prompt = match note {
         Some(note) => format!("Remove sandbox? {note}"),
@@ -187,10 +207,11 @@ fn confirm(args: &RmArgs, note: Option<&str>) -> bool {
     confirm_prompt(args, &prompt)
 }
 
-/// Ask `prompt` to confirm removal (skipped with `--force`). Esc, no
-/// terminal or a failed prompt is "no". Used directly by removals that
-/// are not "the sandbox" (e.g. a symlinked `.airlock`), and through
-/// [`confirm`] otherwise.
+/// Ask `prompt` to confirm a removal. With `--force`, do not ask.
+/// Returns:
+///   True if confirmed. Esc, no terminal or a failed prompt is "no".
+// Removals that are not "the sandbox" (for example a symlinked `.airlock`)
+// call this directly. Other removals call it through [`confirm`].
 fn confirm_prompt(args: &RmArgs, prompt: &str) -> bool {
     if args.force {
         return true;
@@ -202,12 +223,12 @@ fn confirm_prompt(args: &RmArgs, prompt: &str) -> bool {
     matches!(question.ask(), Ok(Some(true)))
 }
 
-/// Whether `cache_dir` (`<project>/.airlock`) is `<home>/.airlock`.
-/// Whether the project of `cache_dir` is a user's home directory, so
-/// `cache_dir` is that user's `~/.airlock`. `$HOME` alone is not trusted
-/// (`sudo` or an overridden `HOME` point it elsewhere): the homes of the
-/// current user and of the owner of `cache_dir`, from the password
-/// database, count too.
+/// Return true if the project of `cache_dir` (`<project>/.airlock`) is the
+/// home directory of a user. Then `cache_dir` is the `~/.airlock` of that
+/// user.
+// `$HOME` alone is not trusted, because `sudo` or a changed `HOME` can point
+// it to a different directory. Thus the homes of the current user and of the
+// owner of `cache_dir`, from the password database, also count.
 fn is_user_home_project(cache_dir: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     // SAFETY: getuid cannot fail.
@@ -220,15 +241,15 @@ fn is_user_home_project(cache_dir: &Path) -> bool {
         .any(|home| is_home_dir(cache_dir, &home))
 }
 
-/// The home directory of `uid` in the password database.
+/// Return the home directory of `uid` from the password database.
 fn passwd_home(uid: libc::uid_t) -> Option<std::path::PathBuf> {
     use std::os::unix::ffi::OsStrExt;
     let mut buf = vec![0 as libc::c_char; 16 * 1024];
     // SAFETY: an all-zero passwd is a valid value for getpwuid_r to fill.
     let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
     let mut found: *mut libc::passwd = std::ptr::null_mut();
-    // SAFETY: every pointer is valid for the call; `buf` outlives the
-    // strings in `entry`, which are only read below.
+    // SAFETY: every pointer is valid for the call. `buf` lives longer than
+    // the strings in `entry`, and the code reads them only below.
     let rc = unsafe {
         libc::getpwuid_r(
             uid,
@@ -246,6 +267,7 @@ fn passwd_home(uid: libc::uid_t) -> Option<std::path::PathBuf> {
     Some(std::ffi::OsStr::from_bytes(dir.to_bytes()).into())
 }
 
+/// Return true if the parent of `cache_dir` is `home` (canonical paths).
 fn is_home_dir(cache_dir: &Path, home: &Path) -> bool {
     let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     cache_dir
@@ -253,9 +275,10 @@ fn is_home_dir(cache_dir: &Path, home: &Path) -> bool {
         .is_some_and(|project| canonical(project) == canonical(home))
 }
 
-/// The local project config's file name (`airlock.<ext>`) in `cache_dir`,
-/// if one exists. Used only to mention it in the confirmation prompt:
-/// removal takes the whole directory regardless.
+/// Return the file name of the local project config (`airlock.<ext>`) in
+/// `cache_dir`, if it exists.
+// Only the confirmation prompt uses the name. The removal deletes the whole
+// directory in all cases.
 fn local_config_name(cache_dir: &Path) -> Option<String> {
     EXTENSIONS.iter().find_map(|ext| {
         let name = format!("airlock.{ext}");
@@ -264,10 +287,13 @@ fn local_config_name(cache_dir: &Path) -> Option<String> {
 }
 
 /// Files and directories that only a user airlock directory (`~/.airlock`)
-/// holds, never a project `.airlock/`: the file vaults, the airlock
-/// database (with the token store of the network services), and the homes that the agent packs mount
-/// (`claude`, `codex` of the list form, `agents/codex` of `codex@1`).
-/// `airlock.<ext>` is not a marker: a project has one too.
+/// holds, never a project `.airlock/`.
+///
+/// These are the file vaults, the airlock database (with the token store of
+/// the network services) and the homes that the agent presets of the list
+/// form mount (`claude`, `codex`). No current pack uses `agents`. The agent
+/// packs keep their homes in the pack mount directories, not here.
+/// `airlock.<ext>` is not a marker, because a project also has one.
 const USER_DIR_FILES: [&str; 6] = [
     "vault.default.json",
     "vault.default.enc.json",
@@ -281,8 +307,8 @@ const USER_DIR_FILES: [&str; 6] = [
 /// (`settings.<ext>`) and the user config (`config.<ext>`).
 const USER_DIR_FILE_STEMS: [&str; 2] = ["settings", "config"];
 
-/// The first user-level airlock file found in `cache_dir` (see
-/// [`USER_DIR_FILES`] and [`USER_DIR_FILE_STEMS`]), or `None` when it looks
+/// Return the first user-level airlock file in `cache_dir` (see
+/// [`USER_DIR_FILES`] and [`USER_DIR_FILE_STEMS`]). Return `None` if it looks
 /// like a project `.airlock/`.
 fn user_file_marker(cache_dir: &Path) -> Option<String> {
     let stems = USER_DIR_FILE_STEMS
@@ -306,9 +332,16 @@ fn remove_entry(path: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    //! Tests for the check that finds a project in the home directory.
+
     use super::*;
     use crate::test_cfg::temp_dir;
 
+    /// Test that the home check finds `.airlock` in the home directory and not
+    /// in a project below it. In the home, `.airlock` also holds user files.
+    ///   1. Check `.airlock` in a temp home and in a project below it
+    ///   2. If the password database has a home for the user, check that the
+    ///      full check finds `.airlock` in it
     #[test]
     fn home_project_is_found_by_env_home_or_password_database() {
         let tmp = temp_dir();

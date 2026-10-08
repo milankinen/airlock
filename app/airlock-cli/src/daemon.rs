@@ -1,14 +1,12 @@
-//! Host-side helpers for `[daemons.<name>]` sidecars.
+//! Daemon support on the host.
 //!
-//! Two responsibilities:
-//!   1. Translate the config-level `Daemon` map into wire-format `DaemonSpec`s
-//!      (env expansion through the project vault, image env merge, filtering
-//!      out disabled entries).
-//!   2. Drive the post-main-shell shutdown UI: ask the supervisor to stop all
-//!      daemons, then poll until each reports a terminal state.
+//! Prepares the `[daemons.<name>]` sidecars for the sandbox:
+//!  * converts the daemon config to the form that the guest supervisor uses
+//!  * shows a summary of the daemons in verbose mode
+//!  * shows the shutdown progress of each daemon after the main process exits
 //!
-//! Neither helper owns any state — the sandbox session calls them at the
-//! specific lifecycle points they apply to.
+//! The module keeps no state. The sandbox session uses it at the applicable
+//! points of its lifecycle.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -18,8 +16,16 @@ use indicatif::{ProgressBar, ProgressStyle};
 use crate::config::config_values::RestartPolicy;
 use crate::{cli, project, rpc};
 
-/// Expand `${VAR}` templates in each daemon's env map and layer them on
-/// top of the image env. Disabled daemons are filtered out.
+/// Convert the enabled daemons of the project config to the wire format.
+/// Args:
+///  - `project`: Project with the daemon config and the vault
+///  - `image_env`: Sandbox env (see [`crate::sandbox::boot::guest_env`]),
+///    as `KEY=VALUE` items
+///
+/// Returns:
+///   One [`rpc::DaemonSpec`] for each enabled daemon, or error if a
+///   `${VAR}` template in a daemon env does not resolve. Daemon env values
+///   override the sandbox env.
 pub fn build_specs(
     project: &project::Project,
     image_env: &[String],
@@ -58,7 +64,7 @@ pub fn build_specs(
         .collect()
 }
 
-/// Verbose-only summary of declared daemons. Disabled daemons are filtered out.
+/// Print a summary of the enabled daemons in verbose mode.
 pub fn print_verbose(project: &project::Project) {
     let enabled: Vec<_> = project
         .config
@@ -88,11 +94,13 @@ pub fn print_verbose(project: &project::Project) {
     }
 }
 
-/// Ask the supervisor to stop every daemon, then drive one spinner per
-/// daemon until all report a terminal state. Each spinner finishes with
-/// either "shut down" or "killed" (for SIGKILL'd daemons). Ctrl+C
-/// shortcircuits — the caller's `vm.shutdown()` will tear the VM down
-/// and with it any still-running daemons.
+/// Stop all daemons and show one spinner per daemon until each daemon is in
+/// a terminal state. Each spinner ends with "shut down", or "killed" if the
+/// daemon got SIGKILL. Ctrl+C stops the wait. The caller's `vm.shutdown()`
+/// then stops the VM and all daemons that still run.
+/// Args:
+///  - `supervisor`: Supervisor RPC client of the running VM
+///  - `names`: Names of the daemons to wait for
 pub async fn run_shutdown(supervisor: &rpc::Supervisor, names: &[String]) {
     supervisor.shutdown_daemons().await;
 

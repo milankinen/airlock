@@ -1,8 +1,13 @@
-//! OCI image resolution, download, and extraction.
+//! OCI image support.
 //!
-//! Handles both Docker-daemon images and remote registry pulls, caches
-//! layers locally, and returns an `OciImage` with all the metadata
-//! needed by the VM to start the container.
+//! Gets the container image of a sandbox ready for the VM. The image can come
+//! from a local Docker or Podman engine or from a remote registry. The host
+//! keeps downloaded images and layers in a shared cache.
+//!
+//! Also supports:
+//!  * reading files from an image, for example the OS release information
+//!  * running the user's command in a login shell
+//!  * removing cached images and layers that no sandbox uses
 
 mod credentials;
 mod docker;
@@ -29,111 +34,122 @@ use crate::{cache, cli};
 /// The `PATH` of a container whose image sets none.
 pub const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
-/// Largest `etc/passwd` / `etc/group` accepted from a layer. Real files are
-/// a few KB; anything bigger is treated as having no records rather than
-/// read whole, so an image cannot dictate how much memory `prepare` uses.
+/// Largest file that the host reads from a layer (for example `etc/passwd`,
+/// `etc/group` or `etc/os-release`). Real files are a few KB. A larger file
+/// counts as "no records" and is not read, so an image cannot control how
+/// much memory these reads use.
 const MAX_LAYER_RECORD_FILE: u64 = 1024 * 1024;
 
-/// Everything needed to configure the container process (returned by `prepare`).
-/// Mount resolution, disk setup, and env overrides happen in `vm::start` (env
-/// via the resolved `SandboxEnv`); command overrides in `sandbox::main_argv`.
+/// Image metadata that configures the container process. [`prepare`]
+/// returns it.
 ///
-/// Serialized to disk at `images/<digest>` wrapped in [`CachedImage`]; the
-/// same file is hardlinked to `<sandbox>/image` as the GC liveness signal.
+/// This type has no mounts, disk setup, `[env]` overrides or command
+/// overrides. `vm::start` adds mounts, disks and env (from the resolved
+/// `SandboxEnv`). `sandbox::main_argv` adds command overrides.
+///
+/// Stored on disk at `images/<digest>`, wrapped in [`CachedImage`]. The same
+/// file is hardlinked to `<sandbox>/image` to tell GC that the image is in use.
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct OciImage {
-    /// OCI image digest, used by supervisor to detect image changes.
+    /// OCI image digest. The supervisor uses it to detect image changes.
     pub image_id: String,
-    /// Image reference the user asked for (e.g. `alpine:3.20`). Stored so the
-    /// fast path can confirm the cached entry still matches the project's
-    /// configured image name without re-resolving the tag.
+    /// Image reference that the user configured (e.g. `alpine:3.20`). The
+    /// fast path uses it to check that the cached entry still matches the
+    /// configured image name, without a new tag resolution.
     pub name: String,
-    /// Ordered layer keys — topmost-first. Each entry is a versioned layer
-    /// name ([`cache::layer_key`]), matching both the on-disk directory name
-    /// under `~/.cache/airlock/oci/layers/<key>` and the guest mount path
+    /// Layer keys, topmost first. Each key is a versioned layer name
+    /// ([`cache::layer_key`]). It is the directory name under
+    /// `~/.cache/airlock/oci/layers/<key>` and the guest mount path
     /// `/mnt/layers/<key>`.
     pub image_layers: Vec<String>,
-    /// Container home directory derived from the image's user record
-    /// (e.g. `/root`). For guest-path `~` expansion the
-    /// [`effective_container_home`] helper should be preferred — the
-    /// user can override `HOME` from `[env]`, in which case tilde
-    /// expansion needs to track the override or we'd resolve to a
-    /// path that doesn't match what `$HOME` actually points to inside
-    /// the sandbox.
+    /// Container home directory from the image's user record (e.g. `/root`).
+    /// For `~` expansion of guest paths, use [`effective_container_home`].
+    /// The user can override `HOME` in `[env]`, and `~` must then expand to
+    /// the same path as `$HOME` in the sandbox.
     pub container_home: String,
     /// Container uid (from image config).
     pub uid: u32,
     /// Container gid (from image config).
     pub gid: u32,
-    /// Raw image entrypoint+cmd merged, `/bin/sh` fallback if empty.
-    /// No command overrides (those go in `sandbox::main_argv`).
+    /// Image entrypoint and cmd merged. `/bin/sh` if both are empty.
+    /// Has no command overrides (`sandbox::main_argv` adds them).
     pub cmd: Vec<String>,
-    /// Base defaults (PATH/TERM/HOME) + image env.
-    /// No `[env]` overrides (those are layered in `vm::start` from `SandboxEnv`).
+    /// Base defaults (`PATH`, `TERM`, `HOME`) and the image env.
+    /// Has no `[env]` overrides (`vm::start` adds them from `SandboxEnv`).
     pub env: Vec<String>,
-    /// The raw `USER` string from the image config (`""` when the image
-    /// declares none). `None` marks a file written before named users were
-    /// resolved through the image's `/etc/passwd`
-    /// (<https://github.com/milankinen/airlock/pull/12>): such a file may
-    /// carry root `uid`/`gid` for an image that asked for a non-root user, so
-    /// [`prepare`] re-verifies it against a fresh resolution before use.
+    /// The raw `USER` string from the image config (`""` if the image sets
+    /// none). `None` marks a file written before airlock resolved named users
+    /// through the image's `/etc/passwd`
+    /// (<https://github.com/milankinen/airlock/pull/12>). Such a file can
+    /// contain root `uid`/`gid` for an image that asked for a non-root user,
+    /// so [`prepare`] checks it again against a new resolution before use.
     #[serde(default)]
     pub user: Option<String>,
 }
 
 /// What [`prepare`] does when the configured image resolves to a digest
-/// other than the one the sandbox was created with.
+/// that is different from the digest the sandbox was created with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnImageChange {
-    /// Ask the user: re-create the sandbox, continue with the current one,
+    /// Ask the user to re-create the sandbox, continue with the current one,
     /// or cancel.
     Ask,
-    /// Re-create the sandbox without asking (`--yes`).
+    /// Re-create the sandbox without a question (`--yes`).
     Recreate,
-    /// Stop with [`ImageChangeStop::NeedsTerminal`]: nobody can answer.
+    /// Stop with [`ImageChangeStop::NeedsTerminal`] because nobody can answer.
     Refuse,
 }
 
-/// What [`prepare`] did about the image of the sandbox.
+/// What [`prepare`] did with the image of the sandbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageChange {
     /// The image is the one the sandbox was created with (or the sandbox
-    /// had none yet).
+    /// had no image yet).
     Unchanged,
-    /// The image changed and the sandbox must be re-created: the caller
+    /// The image changed and the sandbox must be re-created. The caller
     /// deletes the sandbox disk and the install records.
     Recreate,
     /// The image changed, and the sandbox continues with its old image.
     KeepOld,
     /// The image changed and the sandbox was to continue with its old
-    /// image, but that is not available any more (not complete in the
-    /// cache): the sandbox continues with the new image.
+    /// image, but the old image is not complete in the cache any more.
+    /// The sandbox continues with the new image.
     OldImageGone,
 }
 
-/// Why [`prepare`] stopped early (a typed error inside the
-/// `anyhow::Error`).
+/// Why [`prepare`] stopped early. A typed error inside the `anyhow::Error`.
 #[derive(Debug, thiserror::Error)]
 pub enum ImageChangeStop {
-    /// No terminal to ask on, and no `--yes`.
+    /// There is no terminal for the question, and no `--yes`.
     #[error("Sandbox image has been changed. Run in a terminal or pass --yes.")]
     NeedsTerminal,
     /// The user chose Cancel (or pressed Esc).
     #[error("cancelled by user")]
     Cancelled,
-    /// Ctrl+C while the question was open or the image downloaded.
+    /// Ctrl+C during the question or the image download.
     #[error("interrupted")]
     Interrupted,
 }
 
 /// The prepared image of a sandbox, and what happened to the old one.
 pub struct PreparedImage {
+    /// The image that the sandbox uses.
     pub image: OciImage,
+    /// What [`prepare`] did with the image of the sandbox.
     pub change: ImageChange,
 }
 
-/// Resolve, download, and prepare the OCI image `image_cfg` for the sandbox
-/// at `sandbox_dir`. `vault` holds the registry credentials.
+/// Resolve, download and prepare the OCI image for a sandbox.
+/// Args:
+///  - `sandbox_dir`: Directory of the sandbox
+///  - `image_cfg`: Configured image reference and pull settings
+///  - `vault`: Vault that holds the registry credentials
+///  - `on_change`: What to do if the image digest changed since the sandbox
+///    was created.
+///
+/// Returns:
+///   The prepared image and what happened to the old image, or error.
+///   Stops with [`ImageChangeStop`] if the user cancels or nobody can answer.
 pub async fn prepare(
     sandbox_dir: &Path,
     image_cfg: &ImageRef,
@@ -147,22 +163,22 @@ pub async fn prepare(
         change: ImageChange::Unchanged,
     };
 
-    // The cached image this sandbox is currently running, if it is both
-    // complete on disk and still the image the config asks for by name.
+    // The cached image of this sandbox. Set only if it is complete on disk
+    // and its name is still the configured image name.
     let cached = read_ready_image(&sandbox_image).filter(|img| img.name == *image_name);
 
-    // A file without `user` predates named-USER resolution and may carry a
-    // wrong uid/gid — it has to be re-verified below, so it never takes the
-    // fast path and never serves as a digest-keyed cache hit.
+    // A file without `user` is older than named-USER resolution and can
+    // contain a wrong uid/gid. The code below must check it again, so it
+    // never takes the fast path and is never a digest-keyed cache hit.
     let legacy = cached.as_ref().is_some_and(|img| img.user.is_none());
 
-    // Fast path: reuse the cached image and skip the network round-trip that
-    // resolves tag → digest.
+    // Fast path: use the cached image and skip the network request that
+    // resolves the tag to a digest.
     //
-    // `if-changed` gives up that shortcut on purpose — spending the
-    // round-trip is the whole point of the policy. A digest-pinned reference
-    // is exempt either way: it names one immutable image, so a matching name
-    // already implies a matching digest and there is nothing to detect.
+    // `if-changed` does not use this shortcut on purpose. The network request
+    // is the purpose of that policy. A digest-pinned reference always takes
+    // the fast path: it names one immutable image, so a matching name means
+    // a matching digest and there is nothing to detect.
     if let Some(img) = cached.clone()
         && !legacy
         && (image_cfg.pull_policy == PullPolicy::IfNotPresent
@@ -172,10 +188,9 @@ pub async fn prepare(
         return use_cached_image(sandbox_dir, &sandbox_image, img).map(unchanged);
     }
 
-    // Fall-through: read just the stored digest (if any) for change detection.
+    // Read only the stored digest (if any) for change detection.
     let stored_digest = read_cached_image(&sandbox_image).map(|i| i.image_id);
 
-    // Set up registry auth: use stored credentials, fall back to anonymous.
     let registry_host: String = image_name
         .parse::<oci_client::Reference>()
         .map_or_else(|_| image_name.clone(), |r| r.resolve_registry().to_string());
@@ -183,10 +198,10 @@ pub async fn prepare(
     let (mut image, auth) = match resolve_with_auth(vault, image_cfg, &registry_host).await {
         Ok(resolved) => resolved,
         Err(e) => {
-            // Under `if-changed` the source was contacted only to ask whether
-            // a newer digest exists. A registry that is down, unreachable, or
-            // mid-outage shouldn't strand a sandbox whose image is already
-            // sitting complete on disk — offer to carry on with it.
+            // With `if-changed`, airlock contacted the source only to ask if
+            // a newer digest exists. If the registry is down or unreachable,
+            // the sandbox must not stop when its image is already complete
+            // on disk. Offer to continue with the cached image.
             let Some(img) = cached.filter(|_| !cli::is_interrupted()) else {
                 return Err(e);
             };
@@ -197,10 +212,9 @@ pub async fn prepare(
         }
     };
 
-    // Same digest, but the cached metadata was baked by the old `USER`
-    // resolution: re-derive uid/gid from the fresh config and either stamp
-    // the file as verified or, if the sandbox has been running as the wrong
-    // user, refuse to start it.
+    // Same digest, but the old `USER` resolution made the cached metadata.
+    // Find uid/gid again from the new config. Mark the file as verified, or
+    // refuse to start the sandbox if it ran as the wrong user.
     if let Some(img) = cached
         .as_ref()
         .filter(|i| i.user.is_none() && i.image_id == image.digest)
@@ -208,7 +222,7 @@ pub async fn prepare(
         verify_legacy_user(img, &image)?;
     }
 
-    // Check if image changed before downloading.
+    // Check for an image change before the download.
     let digest_changed = stored_digest
         .as_deref()
         .is_none_or(|s| s.trim() != image.digest);
@@ -223,26 +237,18 @@ pub async fn prepare(
             OnImageChange::Refuse => return Err(ImageChangeStop::NeedsTerminal.into()),
         };
         if change == ImageChange::KeepOld {
-            // "Still intact" has to mean *ready*, not merely present: the
-            // JSON can outlive its layer trees, which a sweep collects
-            // independently. Checking only for the file and then handing
-            // the old digest to `ensure_image` would miss that, fall
-            // through to the pull path, and persist the **new** image's
-            // layers and config under the **old** digest — poisoning that
-            // cache entry for every sandbox that shares it, and reporting
-            // an `image_id` the supervisor uses for change detection that
-            // describes neither image.
-            //
-            // Returning here instead of rewriting `image.digest` keeps
-            // that mismatch unrepresentable rather than merely unlikely:
-            // no digest can reach `ensure_image` unless it came from the
-            // same resolution as the source beside it.
+            // The old image must be *ready*, not only present. A sweep can
+            // remove the layer trees and keep the JSON. With the old digest,
+            // `ensure_image` then pulls the **new** image into the **old**
+            // digest entry. This corrupts the entry for all sandboxes that
+            // share it, and the `image_id` describes neither image.
+            // A return here makes this mismatch impossible. A digest gets to
+            // `ensure_image` only from the same resolution as its source.
             let old_image_path = crate::cache::image_path(old_digest.trim())?;
             if let Some(mut old) = read_ready_image(&old_image_path) {
-                // Stamp the configured name onto the kept image so the
-                // name-keyed fast path recognizes it on the next start —
-                // otherwise every subsequent run re-resolves and asks this
-                // same question again.
+                // Write the configured name into the kept image, so the
+                // name-keyed fast path finds it on the next start. Otherwise
+                // each later run resolves again and asks the same question.
                 if old.name != *image_name {
                     old.name.clone_from(image_name);
                     write_cached_image(&old_image_path, &old)?;
@@ -260,27 +266,25 @@ pub async fn prepare(
                 cli::bullet()
             );
         } else {
-            // Remove image ref hard link — drops this sandbox's liveness signal
-            // for the old image, so the sweep below may collect it.
+            // Remove the image hardlink. This sandbox then no longer marks
+            // the old image as in use, so the sweep below can collect it.
             let _ = std::fs::remove_file(&sandbox_image);
             cli::log!("  {} old environment erased", cli::check());
-            // GC: remove images with no remaining sandbox refs, plus any
-            // layers they uniquely owned.
+            // GC: remove images that no sandbox uses, and the layers that
+            // only those images used.
             gc::sweep();
         }
     }
 
-    // Download/ensure image (auth already resolved above).
     let oci_image = tokio::select! {
         res = ensure_image(&mut image, image_name, &auth, image_cfg.insecure) => res?,
         () = cli::interrupted() => return Err(ImageChangeStop::Interrupted.into()),
     };
-    // Hard-link the cached image file into the sandbox directory. nlink > 1
-    // on `images/<digest>` is the GC guard — without it, a sibling sandbox
-    // creating a new image could trigger a sweep that wrongly deletes this
-    // one. Enforce unconditionally: even when the digest hasn't changed, a
-    // previous run may have left the sandbox with a standalone copy instead
-    // of a hardlink.
+    // Hardlink the cached image file into the sandbox directory. nlink > 1
+    // on `images/<digest>` protects it from GC. Without it, a sibling sandbox
+    // that creates a new image can start a sweep that deletes this one.
+    // Always do this: also when the digest did not change, a previous run
+    // can have left a standalone copy instead of a hardlink.
     let image_path = crate::cache::image_path(&oci_image.image_id)?;
     ensure_image_hardlink(&sandbox_image, &image_path, &oci_image)?;
 
@@ -294,21 +298,21 @@ pub async fn prepare(
     })
 }
 
-/// Finish `prepare` with an image already cached on disk: re-establish the GC
-/// hardlink, make sure the overlay dir exists, and report it as ready.
+/// Finish [`prepare`] with an image that is already cached on disk. Creates
+/// the GC hardlink again, makes sure that the overlay dir exists, and reports
+/// the image as ready.
 ///
-/// Shared by the fast path and the resolution-failure fallback so both leave
-/// the sandbox in exactly the same state as a freshly pulled image would.
+/// The fast path and the resolution-failure fallback both use this, so both
+/// leave the sandbox in the same state as a newly pulled image.
 fn use_cached_image(
     sandbox_dir: &Path,
     sandbox_image: &Path,
     image: OciImage,
 ) -> anyhow::Result<OciImage> {
     // Invariant: `sandbox/image` must be a hardlink to the canonical cache
-    // file so sweep GC sees the sandbox as a live reference. Heal it on every
-    // prepare — the link may have been severed by a cache wipe, a cache-path
-    // migration, or a prior run that pre-dated this invariant, leaving our
-    // entry as a sweep target.
+    // file, so the GC sweep sees that the sandbox uses it. Repair it on each
+    // prepare. A cache wipe, a cache-path migration, or an older run can
+    // break the link. Then the sweep can delete the image.
     let image_path = crate::cache::image_path(&image.image_id)?;
     ensure_image_hardlink(sandbox_image, &image_path, &image)?;
     cli::log!(
@@ -322,16 +326,23 @@ fn use_cached_image(
     Ok(image)
 }
 
-/// Resolve the configured reference to a digest, negotiating registry auth.
+/// Resolve the configured image reference to a digest and find working
+/// registry auth.
+/// Args:
+///  - `vault`: Vault that stores the registry credentials
+///  - `image_cfg`: Configured image reference
+///  - `registry_host`: Registry host for the credential lookup.
 ///
-/// Starts anonymous, falls back to vault-stored credentials, and finally
-/// prompts — retrying until resolution succeeds or the user interrupts.
-/// Returns the auth that worked so the caller can reuse it for the pull.
+/// Returns:
+///   The resolved image and the auth that worked, so the caller can use the
+///   same auth for the pull.
 async fn resolve_with_auth(
     vault: &Vault,
     image_cfg: &ImageRef,
     registry_host: &str,
 ) -> anyhow::Result<(ResolvedImage, RegistryAuth)> {
+    // Try anonymous first, then the credentials in the vault, then ask the
+    // user. Try again until resolution succeeds or the user interrupts.
     let mut auth = RegistryAuth::Anonymous;
     let mut updated_creds = None;
     loop {
@@ -362,11 +373,11 @@ async fn resolve_with_auth(
     }
 }
 
-/// On-disk wrapper for a cached [`OciImage`]. Internally tagged so the JSON
-/// carries `"schema":"v2"` alongside the image fields. The schema version
-/// is bumped in lockstep with [`crate::cache::LAYER_FORMAT`] so a layer
-/// format change makes every old image JSON fail to deserialize and force
-/// a clean re-pull.
+/// On-disk wrapper for a cached [`OciImage`]. Internally tagged, so the JSON
+/// has `"schema":"v2"` next to the image fields. The schema version changes
+/// together with [`crate::cache::LAYER_FORMAT`]. Thus after a layer format
+/// change, all old image JSON files fail to deserialize, which causes a
+/// clean pull.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(tag = "schema")]
 enum CachedImage {
@@ -374,9 +385,10 @@ enum CachedImage {
     V2(OciImage),
 }
 
-/// Read a cached image JSON file and unwrap it into an [`OciImage`]. Returns
-/// `None` when the file is absent, unreadable, or written by an
-/// unrecognized schema version — callers treat any of those as a cache miss.
+/// Read a cached image JSON file and unwrap it into an [`OciImage`].
+/// Returns:
+///   The image, or `None` if the file is missing, cannot be read, or has an
+///   unknown schema version. Callers treat `None` as a cache miss.
 fn read_cached_image(path: &Path) -> Option<OciImage> {
     let data = std::fs::read(path).ok()?;
     let wrapped: CachedImage = serde_json::from_slice(&data).ok()?;
@@ -384,9 +396,11 @@ fn read_cached_image(path: &Path) -> Option<OciImage> {
     Some(image)
 }
 
-/// Like [`read_cached_image`], but also requires every referenced layer to
-/// still exist on disk. Returns `None` for both "no such file" and "file
-/// there but some layer was swept" — both mean the caller must re-resolve.
+/// Like [`read_cached_image`], but all layers of the image must also exist
+/// on disk.
+/// Returns:
+///   The image, or `None` if the file is missing or a sweep removed a layer.
+///   In both cases the caller must resolve the image again.
 fn read_ready_image(path: &Path) -> Option<OciImage> {
     let image = read_cached_image(path)?;
     if image.image_layers.is_empty() {
@@ -399,20 +413,22 @@ fn read_ready_image(path: &Path) -> Option<OciImage> {
         .then_some(image)
 }
 
-/// Ensure `sandbox_image` is a hardlink to `images/<digest>` — the GC
-/// liveness signal. No-op when the inodes already match; otherwise severs
-/// the old `sandbox_image` and links it fresh. If the canonical cache file
-/// is missing (cache wipe, path migration), the sandbox copy is written
-/// back out first so we have something to link to.
+/// Make sure that `sandbox_image` is a hardlink to `images/<digest>`. The
+/// hardlink tells GC that the sandbox uses the image.
+/// Args:
+///  - `sandbox_image`: The `image` file in the sandbox directory
+///  - `image_path`: The canonical cache file `images/<digest>`
+///  - `image`: Image to write if the cache file is missing.
 ///
-/// Fails hard on link error because the only plausible cause is a
-/// cross-filesystem config problem (both paths are under `$HOME`), and
-/// silently falling through would leave the sandbox un-GC-protected.
+/// Returns:
+///   Error if the hardlink fails.
 fn ensure_image_hardlink(
     sandbox_image: &Path,
     image_path: &Path,
     image: &OciImage,
 ) -> anyhow::Result<()> {
+    // Do nothing if the inodes already match. Otherwise remove the old
+    // `sandbox_image` and link it again.
     use std::os::unix::fs::MetadataExt;
     let linked = match (
         std::fs::metadata(sandbox_image),
@@ -424,10 +440,15 @@ fn ensure_image_hardlink(
     if linked {
         return Ok(());
     }
+    // A cache wipe or a path migration can remove the canonical cache file.
+    // Write the sandbox copy back first, so there is a file to link to.
     if !image_path.exists() {
         write_cached_image(image_path, image)?;
     }
     let _ = std::fs::remove_file(sandbox_image);
+    // Fail on a link error. Both paths are under `$HOME`, so the only
+    // probable cause is a cross-filesystem config problem. Without the link,
+    // GC does not protect the sandbox image.
     std::fs::hard_link(image_path, sandbox_image).map_err(|e| {
         anyhow::anyhow!(
             "failed to hardlink image ref {} → {}: {e} \
@@ -439,12 +460,13 @@ fn ensure_image_hardlink(
     Ok(())
 }
 
-/// Write a cached image atomically: serialize, write to `<path>.tmp`, rename.
-/// Rename is the commit point, same idiom as the layer cache.
+/// Write a cached image file atomically.
 fn write_cached_image(path: &Path, image: &OciImage) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // Write to `<path>.tmp`, then rename. The rename is the commit point,
+    // the same as in the layer cache.
     let tmp = path.with_extension("tmp");
     let bytes = serde_json::to_vec_pretty(&CachedImage::V2(image.clone()))?;
     std::fs::write(&tmp, &bytes)?;
@@ -452,9 +474,17 @@ fn write_cached_image(path: &Path, image: &OciImage) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Bake the parsed OCI image config plus the ordered layer list into an
-/// `OciImage`: extracts uid/gid, merges entrypoint+cmd, applies env defaults,
-/// and resolves `$HOME` from the per-layer `/etc/passwd`.
+/// Make an [`OciImage`] from the parsed OCI image config and the layer list.
+/// Args:
+///  - `image_id`: Image digest
+///  - `name`: Configured image reference
+///  - `ordered_layers`: Layer keys, topmost first
+///  - `image_config`: Parsed OCI image config.
+///
+/// Returns:
+///   The image with uid/gid, command, env and home directory, or error if
+///   the image has no layers, or its user or home directory cannot be
+///   resolved.
 fn build_oci_image(
     image_id: String,
     name: String,
@@ -470,7 +500,7 @@ fn build_oci_image(
     let (uid, gid) = resolve_user(&ordered_layers, user)?;
     let container_home = lookup_home_dir(&ordered_layers, uid)?;
 
-    // Resolve container command: entrypoint + cmd merged
+    // Container command: entrypoint and cmd merged.
     let cmd: Vec<String> = {
         let mut a = Vec::new();
         if let Some(ep) = cfg.and_then(|c| c.entrypoint.as_ref()) {
@@ -485,7 +515,7 @@ fn build_oci_image(
         a
     };
 
-    // Resolve environment: base defaults → image env (no sandbox overrides here)
+    // Environment: base defaults, then image env. No sandbox overrides here.
     let host_term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
     let mut env: Vec<String> = vec![
         format!("PATH={DEFAULT_PATH}"),
@@ -513,30 +543,34 @@ fn build_oci_image(
     })
 }
 
-/// Resolve the home directory that `~` should expand to for paths the
-/// sandbox sees. Falls back to the OCI image's user record when the
-/// project doesn't set `HOME` in `[env]`; otherwise honours the user's
-/// override as the guest will see it (already `${VAR}`-substituted by
-/// [`crate::project::SandboxEnv::resolve`] in `project::open` /
-/// [`crate::project::Project::with_config`]).
+/// Resolve the home directory that `~` expands to in guest paths.
+/// Args:
+///  - `project`: Project with the resolved `[env]`
+///  - `image`: The prepared image.
 ///
-/// Without this, a `target = "~/foo"` mount with `[env].HOME = "/x"`
-/// would expand the `~` against the image's home (`/root`) but the
-/// sandbox shell would resolve `$HOME` as `/x` — paths land in the
-/// wrong place and tools that re-tilde a result of the mount mismatch
-/// what's actually mounted.
+/// Returns:
+///   The `HOME` value from `[env]` as the guest sees it, or the home
+///   directory from the image's user record if `[env]` does not set `HOME`.
 pub fn effective_container_home(project: &Project, image: &OciImage) -> String {
+    // `~` must expand to the same path as `$HOME` in the sandbox. Example:
+    // a `target = "~/foo"` mount with `[env].HOME = "/x"`. If `~` expands
+    // to the image home (`/root`), the shell sees `$HOME` as `/x`. Paths
+    // then go to the wrong place, and tools that convert a mount path back
+    // to `~` form do not match the real mount.
+    //
+    // `SandboxEnv::resolve` already did the `${VAR}` substitution (in
+    // `project::open` or `Project::with_config`).
     project
         .env
         .guest_value("HOME")
         .map_or_else(|| image.container_home.clone(), str::to_string)
 }
 
-/// Wrap a command vector for execution inside a login shell.
+/// Wrap a command so that it runs in a login shell.
 ///
-/// Lone shell binaries (`sh`, `bash`, etc.) get `-l` appended directly.
-/// All other commands are wrapped as `sh -l -c 'exec "$0" "$@"' cmd args...`
-/// which passes arguments without quoting.
+/// A lone shell binary (`sh`, `bash`, etc.) gets `-l` at the end. Other
+/// commands become `bash -l -c 'exec "$0" "$@"' cmd args...`, which passes
+/// the arguments without quoting.
 pub(crate) fn apply_login_shell(cmd: Vec<String>) -> Vec<String> {
     let is_lone_shell = cmd.len() == 1 && {
         let name = std::path::Path::new(&cmd[0])
@@ -561,26 +595,32 @@ pub(crate) fn apply_login_shell(cmd: Vec<String>) -> Vec<String> {
     }
 }
 
-/// Resolve an image `USER` string into numeric uid/gid.
+/// Resolve an image `USER` string to a numeric uid and gid.
 ///
 /// The OCI image spec allows `user`, `uid`, `user:group`, `uid:gid`,
 /// `uid:group` and `user:gid`. Names are looked up in the image's own
-/// `/etc/passwd` and `/etc/group` (via [`lookup_layer_record`]), matching
-/// what Docker does; a bare user with no group part takes that user's
-/// primary gid from `passwd`. An empty string means root, as it does for
-/// an image that never sets `USER`.
+/// `/etc/passwd` and `/etc/group` (with [`lookup_layer_record`]), the same
+/// as Docker does. A user without a group part gets the primary gid of
+/// that user from `passwd`. An empty string means root, the same as for an
+/// image that does not set `USER`.
 ///
-/// A name that no layer declares is an error rather than a fallback to
-/// root: silently promoting an image that asked for an unprivileged user
-/// is exactly the outcome the image author wrote `USER` to prevent.
+/// A name that no layer declares is an error, not a fallback to root. The
+/// image author wrote `USER` to prevent root access for an unprivileged
+/// user, so a silent change to root is not acceptable.
+/// Args:
+///  - `layer_keys`: Layer keys, topmost first
+///  - `user`: The `USER` string from the image config.
+///
+/// Returns:
+///   The `(uid, gid)` pair, or error if a name is not found.
 fn resolve_user(layer_keys: &[String], user: &str) -> anyhow::Result<(u32, u32)> {
     let (user_part, group_part) = match user.split_once(':') {
         Some((u, g)) => (u, Some(g)),
         None => (user, None),
     };
 
-    // Each passwd record is `name:pw:uid:gid:gecos:home:shell`; a match
-    // yields `(uid, primary gid)`.
+    // Each passwd record is `name:pw:uid:gid:gecos:home:shell`. A match
+    // gives `(uid, primary gid)`.
     let passwd_record = |matches: &dyn Fn(&[&str]) -> bool| {
         lookup_layer_record(layer_keys, "etc/passwd", |f| {
             if f.len() >= 4 && matches(f) {
@@ -610,8 +650,8 @@ fn resolve_user(layer_keys: &[String], user: &str) -> anyhow::Result<(u32, u32)>
     Ok((uid, gid))
 }
 
-/// Resolve the group half of a `USER` string: a numeric gid is used as-is,
-/// a name is looked up in the image's `/etc/group`.
+/// Resolve the group part of a `USER` string. A numeric gid is used as it
+/// is. A name is looked up in the image's `/etc/group`.
 fn resolve_group(layer_keys: &[String], group: &str) -> anyhow::Result<u32> {
     if let Ok(gid) = group.parse::<u32>() {
         return Ok(gid);
@@ -627,8 +667,8 @@ fn resolve_group(layer_keys: &[String], group: &str) -> anyhow::Result<u32> {
     .ok_or_else(|| format!("no group {group} found in any layer /etc/group"))
 }
 
-/// Ask what to do about the changed image of an existing sandbox. Esc and
-/// Cancel stop with [`ImageChangeStop::Cancelled`].
+/// Ask the user what to do with the changed image of an existing sandbox.
+/// Esc and Cancel stop with [`ImageChangeStop::Cancelled`].
 fn ask_image_changed() -> anyhow::Result<ImageChange> {
     let question = Choose {
         title: "Sandbox image has been changed",
@@ -662,13 +702,13 @@ fn ask_image_changed() -> anyhow::Result<ImageChange> {
     }
 }
 
-/// Ask whether to fall back to the cached image after resolution failed.
-/// Returns `true` to continue with the cache, `false` to abort (the
-/// default, Esc, or no terminal).
-///
-/// Non-interactive runs abort: a resolution failure is a genuine error, and
-/// silently substituting a possibly stale image in CI would hide it.
+/// Ask the user if airlock uses the cached image after a resolution failure.
+/// Returns:
+///   `true` to continue with the cached image. `false` to stop (the
+///   default, Esc, or no terminal).
 fn prompt_resolution_failed(err: &anyhow::Error) -> anyhow::Result<bool> {
+    // Non-interactive runs stop. A resolution failure is a real error, and a
+    // silent change to a possibly old image in CI would hide it.
     if !cli::is_interactive() {
         return Ok(false);
     }
@@ -696,23 +736,23 @@ fn prompt_resolution_failed(err: &anyhow::Error) -> anyhow::Result<bool> {
     }
 }
 
-/// Outcome of re-checking a legacy cache file's uid/gid against a fresh
+/// Result of a new check of the uid/gid of a legacy cache file against a new
 /// resolution of the image's `USER`.
 #[derive(Debug, PartialEq, Eq)]
 enum LegacyUser {
-    /// The stored uid/gid are what the fixed resolution produces.
+    /// The stored uid/gid are the same as the fixed resolution gives.
     Verified,
     /// Same uid, different primary group (`USER 1000` used to get gid 0).
-    /// Existing files still belong to the same owner, so the cache entry is
-    /// repaired in place instead of throwing the sandbox away.
+    /// Existing files still have the same owner, so airlock repairs the
+    /// cache entry and keeps the sandbox.
     GidOnly { gid: u32 },
-    /// The sandbox has been running as the wrong user — typically root for
-    /// `USER node` — and its disk holds state owned by that user.
+    /// The sandbox ran as the wrong user (usually root for `USER node`), and
+    /// its disk contains state that this user owns.
     UidMismatch { uid: u32, gid: u32 },
 }
 
-/// Re-derive uid/gid for a legacy cache file (one without `user`) from the
-/// current `USER` string, using the layers the file already references.
+/// Find uid/gid again for a legacy cache file (one without `user`). Uses
+/// the current `USER` string and the layers that the file refers to.
 fn check_legacy_user(stored: &OciImage, user: &str) -> anyhow::Result<LegacyUser> {
     let (uid, gid) = resolve_user(&stored.image_layers, user)?;
     Ok(if uid != stored.uid {
@@ -724,9 +764,9 @@ fn check_legacy_user(stored: &OciImage, user: &str) -> anyhow::Result<LegacyUser
     })
 }
 
-/// The `USER` string of a freshly resolved image. Registry resolution
-/// already carries the config; local resolution defers it to the export,
-/// so ask the engine directly.
+/// Get the `USER` string of a newly resolved image. Registry resolution
+/// already has the config. Local resolution gets the config only at the
+/// export, so ask the engine directly.
 fn resolved_user(resolved: &ResolvedImage) -> anyhow::Result<String> {
     match &resolved.source {
         ImageSource::Registry(_) => Ok(resolved
@@ -739,12 +779,16 @@ fn resolved_user(resolved: &ResolvedImage) -> anyhow::Result<String> {
     }
 }
 
-/// `stored` is this sandbox's cached image, written before named `USER`
-/// resolution existed and still naming the digest `resolved` just produced.
-/// Stamp it verified (or repair its gid) when the fixed resolution agrees;
-/// otherwise fail with an explanation and point at `airlock rm` — after the
-/// removal the next start finds no sandbox image, and `ensure_image` rebuilds
-/// the shared entry rather than reusing the legacy one.
+/// Check the uid/gid of a legacy cached image against the fixed `USER`
+/// resolution.
+/// Args:
+///  - `stored`: Cached image of this sandbox, written before named `USER`
+///    resolution existed. It has the same digest as `resolved`
+///  - `resolved`: The newly resolved image.
+///
+/// Returns:
+///   `Ok` after it marks the file as verified or repairs its gid. Error that
+///   tells the user to run `airlock rm` if the uid is wrong.
 fn verify_legacy_user(stored: &OciImage, resolved: &ResolvedImage) -> anyhow::Result<()> {
     let user = resolved_user(resolved)?;
     let mut fixed = stored.clone();
@@ -760,6 +804,9 @@ fn verify_legacy_user(stored: &OciImage, resolved: &ResolvedImage) -> anyhow::Re
             fixed.gid = gid;
         }
         LegacyUser::UidMismatch { uid, gid } => {
+            // After `airlock rm`, the next start finds no sandbox image, and
+            // `ensure_image` makes the shared entry again instead of using
+            // the legacy one.
             anyhow::bail!(
                 "This sandbox was created by an airlock version that resolved the \
                  image's `USER {user}` to uid {}, gid {} instead of uid {uid}, gid {gid}, \
@@ -772,12 +819,13 @@ fn verify_legacy_user(stored: &OciImage, resolved: &ResolvedImage) -> anyhow::Re
             );
         }
     }
-    // Rewrite the shared cache entry; `prepare` re-links the sandbox copy to
-    // the new file via `ensure_image_hardlink`.
+    // Write the shared cache entry again. `prepare` links the sandbox copy
+    // to the new file with `ensure_image_hardlink`.
     write_cached_image(&crate::cache::image_path(&stored.image_id)?, &fixed)
 }
 
-/// Full image resolution (with config).
+/// Resolve the configured image to a digest and config. Tries the local
+/// engines first (as `resolution` allows), then the registry.
 async fn resolve_image(
     image_cfg: &crate::config::config_values::ImageRef,
     auth: &RegistryAuth,
@@ -800,9 +848,9 @@ async fn resolve_image(
     for engine in engines {
         match resolve_local(engine, image_ref, pinned) {
             Ok(Some(resolved)) => return Ok(resolved),
-            // Present locally but unusable. With a single engine there is
-            // nowhere else to look, so surface why rather than the generic
-            // not-found.
+            // The image is local but not usable. With a single engine there
+            // is no other source, so show the reason, not a generic
+            // "not found".
             Err(reason) if local_only => anyhow::bail!("{reason}"),
             Err(reason) => cli::log!("  {} {reason} — trying next", cli::bullet()),
             Ok(None) => {}
@@ -813,8 +861,8 @@ async fn resolve_image(
     }
 
     let reg = registry::resolve(image_ref, auth, image_cfg.insecure).await?;
-    // A pin can name either the multi-platform index or the platform manifest
-    // selected from it; both are legitimate things to copy out of a registry.
+    // A pin can name the multi-platform index or the platform manifest from
+    // it. Users can correctly copy both from a registry.
     if let Some(want) = pinned
         && reg.digest != want
         && reg.list_digest.as_deref() != Some(want)
@@ -836,18 +884,23 @@ async fn resolve_image(
     })
 }
 
-/// Try to satisfy the reference from the local `engine` (docker or podman).
+/// Try to resolve the image from a local engine.
+/// Args:
+///  - `engine`: `docker` or `podman`
+///  - `image_ref`: Configured image reference
+///  - `pinned`: Pinned digest of the reference, if any.
 ///
-/// `Ok(None)` means the image simply isn't there (or the engine isn't
-/// installed); `Err(reason)` means it is, but can't be used — the caller
-/// decides whether that is fatal or just a reason to try the next source.
+/// Returns:
+///   The resolved image. `Ok(None)` if the image is not there (or the engine
+///   is not installed). `Err(reason)` if the image is there but not usable.
+///   The caller decides if that is fatal or a reason to try the next source.
 fn resolve_local(
     engine: &'static str,
     image_ref: &str,
     pinned: Option<&str>,
 ) -> Result<Option<ResolvedImage>, String> {
-    // `docker images` matches on repo:tag and knows nothing about the
-    // `@sha256:…` suffix, so query without it and verify the pin separately.
+    // `docker images` matches on repo:tag and does not know the `@sha256:…`
+    // suffix. Query without it and check the pin separately.
     let query_ref = match pinned {
         Some(_) => image_ref
             .rsplit_once('@')
@@ -858,9 +911,9 @@ fn resolve_local(
         return Ok(None);
     };
 
-    // A local tag can point somewhere else entirely than the same tag in the
-    // registry, so a pinned digest must be checked against what the engine
-    // recorded when it pulled the image — not assumed from the name.
+    // A local tag can point to a different image than the same tag in the
+    // registry. Check a pinned digest against the digests that the engine
+    // recorded at pull time. Do not trust the name.
     if let Some(want) = pinned
         && !docker::repo_digests(engine, &image_id)
             .iter()
@@ -896,18 +949,19 @@ fn resolve_local(
     }))
 }
 
-/// An image resolved to a concrete digest, ready to be downloaded.
+/// An image resolved to a concrete digest, ready for download.
 ///
-/// Invariant: `digest` names the image that `source` will produce. Both come
-/// from a single [`resolve_image`] call and must not be recombined — swapping
-/// in some other digest makes [`ensure_image`] write one image's content to
-/// another image's cache entry.
+/// Invariant: `digest` names the image that `source` gives. Both come from
+/// a single [`resolve_image`] call. Do not combine them with other values.
+/// With a different digest, [`ensure_image`] writes the content of one
+/// image to the cache entry of a different image.
 struct ResolvedImage {
     digest: String,
     config: OciConfig,
     source: ImageSource,
 }
 
+/// Where the content of a resolved image comes from.
 enum ImageSource {
     Local {
         engine: &'static str,
@@ -916,14 +970,20 @@ enum ImageSource {
     Registry(Box<registry::RegistryImage>),
 }
 
-/// Ensure every layer is cached under `~/.cache/airlock/oci/layers/`, bake
-/// the image metadata into an [`OciImage`], and persist it as a single
-/// schema-tagged JSON file at `images/<digest>`.
+/// Make sure that all layers of the image are in the layer cache, and store
+/// the image metadata at `images/<digest>`.
 ///
-/// There is no merged rootfs on the host — the guest composes overlayfs
-/// straight from the per-layer cache. Both registry and docker paths
-/// converge on the same per-layer staging pipeline (see
-/// [`layer::ensure_layer_cached`]).
+/// The host has no merged rootfs. The guest makes the overlayfs directly
+/// from the per-layer cache. Registry and docker images both use
+/// [`layer::ensure_layer_cached`].
+/// Args:
+///  - `resolved`: The resolved image. Local resolution sets its config here
+///  - `image_name`: Configured image reference
+///  - `auth`: Registry auth
+///  - `insecure`: Allow plain-HTTP registry access.
+///
+/// Returns:
+///   The cached image metadata, or error.
 async fn ensure_image(
     resolved: &mut ResolvedImage,
     image_name: &str,
@@ -932,10 +992,10 @@ async fn ensure_image(
 ) -> anyhow::Result<OciImage> {
     let image_path = crate::cache::image_path(&resolved.digest)?;
 
-    // Digest-keyed cache hit: a sibling project already pulled this exact
-    // image and all its layers are still on disk. Skip the source-specific
-    // pull entirely. We refresh the stored name so the per-sandbox fast
-    // path in `prepare()` (which matches on name) sees the current tag.
+    // Digest-keyed cache hit: a sibling project already pulled this image
+    // and all its layers are still on disk. Skip the pull. Write the current
+    // name, so the per-sandbox fast path in `prepare()` (which matches on
+    // name) sees the current tag.
     if let Some(mut cached) = read_ready_image(&image_path).filter(|c| c.user.is_some()) {
         if cached.name != image_name {
             cached.name = image_name.to_string();
@@ -963,14 +1023,14 @@ async fn ensure_image(
     Ok(image)
 }
 
-/// Stream `docker image save` and extract each referenced layer through the
-/// shared per-layer cache. Returns the parsed image config plus layer
-/// digests in topmost-first order.
+/// Export an image from a local engine and extract its layers into the
+/// shared per-layer cache. Ctrl+C stops the export.
+/// Args:
+///  - `engine`: `docker` or `podman`
+///  - `image_ref`: Image reference without a digest pin.
 ///
-/// The whole pipeline (save + per-layer extract) races against
-/// [`cli::interrupted`]; on Ctrl+C the docker child is killed via the
-/// save-side drop guard and the extract loop stops at the current layer.
-/// Any partial `.tmp/` extraction is left behind for the next sweep GC.
+/// Returns:
+///   The parsed image config and the layer keys, topmost first.
 async fn ensure_local_image(
     engine: &'static str,
     image_ref: &str,
@@ -999,6 +1059,10 @@ async fn ensure_local_image(
         Ok::<_, anyhow::Error>(save)
     };
 
+    // The full pipeline (save and per-layer extract) runs against
+    // `cli::interrupted`. On Ctrl+C, the drop guard of the save side kills
+    // the docker child, and the extract loop stops at the current layer.
+    // The next GC sweep removes any partial `.tmp/` extraction.
     let save = tokio::select! {
         res = pipeline => res?,
         () = cli::interrupted() => {
@@ -1010,7 +1074,8 @@ async fn ensure_local_image(
     sp.finish_and_clear();
     cli::log!("  {} exported from {engine}", cli::check());
 
-    // Docker save manifests are bottom-up; overlayfs wants topmost first.
+    // Docker save manifests list layers bottom first. Overlayfs needs
+    // topmost first.
     let mut ordered: Vec<String> = save
         .layer_digests
         .iter()
@@ -1020,10 +1085,15 @@ async fn ensure_local_image(
     Ok((save.image_config, ordered))
 }
 
-/// Pull-and-extract for registry-sourced images. Layer downloads run
-/// concurrently (bounded); each layer is streamed to its
-/// `<digest>.download.tmp` path and extracted through the shared per-layer
-/// cache. Returns layer digests in topmost-first order.
+/// Pull the layers of a registry image and extract them into the shared
+/// per-layer cache. Ctrl+C stops the pull.
+/// Args:
+///  - `reg`: The resolved registry image
+///  - `auth`: Registry auth
+///  - `insecure`: Allow plain-HTTP registry access.
+///
+/// Returns:
+///   The layer keys, topmost first.
 async fn ensure_registry_image(
     reg: &registry::RegistryImage,
     auth: &RegistryAuth,
@@ -1055,8 +1125,8 @@ async fn ensure_registry_image(
         let mp = cli::multi_progress();
         let reference = &reg.reference;
 
-        // Bar per layer — cached layers get pre-filled so the display shows
-        // progress for the whole image, not just the slice we're downloading.
+        // One bar for each layer. Cached layers start full, so the display
+        // shows progress for the full image, not only for the downloads.
         let fetch_set: std::collections::HashSet<usize> = to_fetch.iter().copied().collect();
         let bars: Vec<indicatif::ProgressBar> = layers
             .iter()
@@ -1073,6 +1143,7 @@ async fn ensure_registry_image(
         let _spacer = cli::progress_spacer(&mp);
         let bars_ref = &bars;
 
+        // Download at most 3 layers at the same time.
         let fetch = async {
             let mut stream = stream::iter(to_fetch.iter().copied())
                 .map(|i| async move {
@@ -1109,16 +1180,23 @@ async fn ensure_registry_image(
         );
     }
 
-    // OCI manifests list layers bottom→top; overlayfs wants topmost first.
+    // OCI manifests list layers bottom first. Overlayfs needs topmost first.
     let mut ordered: Vec<String> = layers.iter().map(|l| cache::layer_key(&l.digest)).collect();
     ordered.reverse();
     Ok(ordered)
 }
 
-/// Download one layer blob into `<digest>.download.tmp` and extract it
-/// through the shared per-layer cache. `ensure_layer_cached` is a no-op
-/// when the layer dir already exists, so the `to_fetch` filter in the
-/// caller is a latency optimization, not a correctness requirement.
+/// Download one layer blob and extract it into the shared per-layer cache.
+///
+/// [`layer::ensure_layer_cached`] does nothing if the layer dir already
+/// exists. Thus the `to_fetch` filter in the caller only makes it faster.
+/// Correct operation does not need it.
+/// Args:
+///  - `reference`: Image reference in the registry
+///  - `layer_desc`: Descriptor of the layer
+///  - `per_layer`: Progress bar of the layer
+///  - `auth`: Registry auth
+///  - `insecure`: Allow plain-HTTP registry access.
 async fn fetch_and_extract_layer(
     reference: &oci_client::Reference,
     layer_desc: &oci_client::manifest::OciDescriptor,
@@ -1132,18 +1210,15 @@ async fn fetch_and_extract_layer(
     let per_layer = per_layer.clone();
     let auth = auth.clone();
 
-    // `ensure_layer_cached` does blocking I/O (tar extraction); keep it off
-    // the async runtime. The fetch closure runs async code via a oneshot
-    // channel trick — but simpler here: do the download on the blocking
-    // thread by blocking on a oneshot from an async task. Instead, invert:
-    // pull the blob async → write to .download.tmp → spawn blocking
-    // extraction.
+    // `ensure_layer_cached` does blocking I/O (tar extraction), so it must
+    // not run on the async runtime. Thus pull the blob with async code into
+    // `.download.tmp`, then run the extraction in a blocking task.
     let layers_root = cache::layers_root()?;
     let key = cache::layer_key(&digest);
     let download = layers_root.join(format!("{key}.download"));
     let download_tmp = layers_root.join(format!("{key}.download.tmp"));
 
-    // Short-circuit fast path identical to ensure_layer_cached.
+    // Same fast path as in `ensure_layer_cached`.
     let layer_dir = cache::layer_dir(&key)?;
     if layer_dir.is_dir() {
         return Ok(());
@@ -1168,8 +1243,8 @@ async fn fetch_and_extract_layer(
         layer::ensure_layer_cached(
             &digest,
             |_tmp| {
-                // .download already exists from the async pull above, so the
-                // fetch closure is not called. If somehow it is, fail loudly.
+                // The async pull above made `.download`, so this fetch
+                // closure does not run. If it runs, fail with an error.
                 anyhow::bail!("unreachable: layer tarball missing after pull")
             },
             Some(&per_layer),
@@ -1179,6 +1254,7 @@ async fn fetch_and_extract_layer(
     Ok(())
 }
 
+/// Format a byte count for humans (`B`, `KB` or `MB`).
 fn format_size(bytes: i64) -> String {
     if bytes < 1024 {
         format!("{bytes}B")
@@ -1189,20 +1265,26 @@ fn format_size(bytes: i64) -> String {
     }
 }
 
-/// Walk `rel_path` (e.g. `etc/passwd`) through the per-layer cache, topmost
-/// first, splitting each line on `:` and returning the first record for
-/// which `pick` yields a value — together with every layer copy that was
-/// refused rather than read, and why.
+/// Find the first `:`-separated record in a file of the image layers.
 ///
-/// Reads from individual layer trees under `~/.cache/airlock/oci/layers/` —
-/// the host has no merged rootfs to consult for this lookup. Whiteouts
-/// manifest as empty files (which parse to zero matches and fall through
-/// to the next layer); this is coarser than real overlayfs semantics but
-/// is a safe superset for the common case of images that never delete
-/// `/etc/passwd` in an upper layer. The same coarseness means a record an
-/// upper layer *removed* from its copy of the file is still found in a
-/// lower layer's copy — the walk keeps going past a file that exists but
-/// has no match, where a merged rootfs would have stopped at it.
+/// Reads the individual layer trees under `~/.cache/airlock/oci/layers/`,
+/// because the host has no merged rootfs. This is less exact than real
+/// overlayfs:
+///  * A whiteout is an empty file. It has no matches, so the search
+///    continues in the next layer. This is safe for the usual images that
+///    never delete `/etc/passwd` in an upper layer.
+///  * If an upper layer *removed* a record from its copy of the file, the
+///    search still finds the record in a lower layer. The search continues
+///    past a file that exists but has no match. A merged rootfs stops there.
+///
+/// Args:
+///  - `layer_keys`: Layer keys, topmost first
+///  - `rel_path`: File path in the layer (e.g. `etc/passwd`)
+///  - `pick`: Gets the fields of a line, and returns a value on a match.
+///
+/// Returns:
+///   The first match, and all layer copies of the file that were refused
+///   instead of read, with the reason.
 fn lookup_layer_record<T>(
     layer_keys: &[String],
     rel_path: &str,
@@ -1239,10 +1321,10 @@ fn lookup_layer_record<T>(
     })
 }
 
-/// Outcome of [`lookup_layer_record`]: the first match, plus the layer
-/// copies that were refused instead of read. The refusals only matter when
-/// nothing matched — then they are the difference between "this image is
-/// broken" and "this image was rejected", so they go into the error.
+/// Result of [`lookup_layer_record`]: the first match, and the layer copies
+/// that were refused instead of read. The refusals are important only if
+/// nothing matched. Then they show the difference between "this image is
+/// broken" and "airlock rejected this image", so they go into the error.
 struct Lookup<T> {
     value: Option<T>,
     ignored: Vec<String>,
@@ -1250,7 +1332,7 @@ struct Lookup<T> {
 
 impl<T> Lookup<T> {
     /// Like `Option::ok_or_else`, but the error also lists the refused
-    /// layer files so the user learns *why* nothing resolved.
+    /// layer files, so the user knows *why* nothing resolved.
     fn ok_or_else(self, not_found: impl FnOnce() -> String) -> anyhow::Result<T> {
         if let Some(value) = self.value {
             return Ok(value);
@@ -1264,30 +1346,34 @@ impl<T> Lookup<T> {
     }
 }
 
-/// Read `rel_path` from one layer tree, refusing anything that would take
-/// the read outside that tree.
+/// Read a file from one layer tree. Refuse a read that goes outside that
+/// tree.
 ///
-/// Tar extraction keeps a layer's symlinks verbatim because they are meant
-/// to resolve inside the *guest* — but here they resolve on the host. An
-/// image can therefore ship `etc/passwd -> /etc/passwd` (read the host's
-/// users), `-> /dev/zero` (read until OOM) or `etc -> /` (both). Symlinks
-/// that stay within the layer (`etc/passwd -> ../usr/lib/passwd`) are
-/// legitimate and still resolve. Anything refused reads as "no records in
-/// this layer", so the walk falls through to the next layer the same way it
-/// does for a whiteout — but unlike a whiteout the refusal is returned as
-/// `Err`, so it can be reported if nothing else resolves. `Ok(None)` means
-/// the layer simply has no such file.
+/// Tar extraction keeps the symlinks of a layer as they are, because they
+/// must resolve inside the *guest*. But here they resolve on the host. Thus
+/// an image can contain `etc/passwd -> /etc/passwd` (read the host users),
+/// `-> /dev/zero` (read until OOM) or `etc -> /` (both). Symlinks that stay
+/// in the layer (`etc/passwd -> ../usr/lib/passwd`) are correct and still
+/// resolve.
+/// Args:
+///  - `layer_dir`: Root directory of the layer tree
+///  - `rel_path`: File path in the layer.
+///
+/// Returns:
+///   The file content. `Ok(None)` if the layer has no such file. `Err` if
+///   the read was refused. Callers treat a refusal as "no records in this
+///   layer" and continue to the next layer, the same as for a whiteout. But
+///   they can report the refusal if nothing else resolves.
 fn read_layer_file(layer_dir: &Path, rel_path: &str) -> Result<Option<String>, Refused> {
     use std::io::Read;
 
     let root = std::fs::canonicalize(layer_dir)
         .map_err(|e| Refused::suspicious(format!("cannot resolve layer dir: {e}")))?;
 
-    // Walk one component at a time. `lstat` refuses to follow only the
-    // *last* component, so checking `etc/passwd` in one go would traverse
-    // `etc -> /` and, if the host happens to lack `/passwd`, report the
-    // layer as merely not having the file. Every symlink on the way gets
-    // the same stay-inside test as the final one.
+    // Examine one component at a time. `lstat` does not follow the last
+    // component, but it follows symlinks in the parent components. Thus a
+    // single check of `etc/passwd` follows `etc -> /` to the host. Each
+    // symlink on the path gets the same stay-inside check.
     let mut path = layer_dir.to_path_buf();
     for component in rel_path.split('/') {
         path.push(component);
@@ -1328,17 +1414,20 @@ fn read_layer_file(layer_dir: &Path, rel_path: &str) -> Result<Option<String>, R
     Ok(Some(content))
 }
 
-/// Why a layer file was not read. `suspicious` separates what an honest
-/// image never does (a symlink escaping the layer, a directory or device
-/// where a file should be, an oversized file) from a symlink whose target
-/// lives in another layer, which is a limit of reading per-layer trees and
-/// not worth a warning every prepare.
+/// Why a layer file was not read.
+///
+/// `suspicious` is `true` for things that an honest image never does: a
+/// symlink out of the layer, a directory or device instead of a file, or a
+/// file that is too large. It is `false` for a symlink whose target is in a
+/// different layer. That is a limit of per-layer reads, and a warning on
+/// each prepare is not useful.
 struct Refused {
     why: String,
     suspicious: bool,
 }
 
 impl Refused {
+    /// A refusal that an honest image never causes.
     fn suspicious(why: String) -> Self {
         Self {
             why,
@@ -1346,6 +1435,7 @@ impl Refused {
         }
     }
 
+    /// A symlink whose target cannot be resolved in this layer.
     fn unresolved(why: String) -> Self {
         Self {
             why,
@@ -1354,11 +1444,18 @@ impl Refused {
     }
 }
 
-/// Read `rel_path` (e.g. `etc/os-release`) from the image's layers,
-/// topmost layer first, with the same containment rules as the user
-/// lookup ([`read_layer_file`]): a symlink out of its layer or an oversized
-/// file is skipped. An empty file (how a whiteout looks in the layer
-/// cache) falls through to the next layer. `None` when no layer has it.
+/// Read a file from the image layers, topmost layer first.
+///
+/// Uses the same containment rules as the user lookup
+/// ([`read_layer_file`]). It skips a symlink out of its layer and a file
+/// that is too large. An empty file (a whiteout in the layer cache) also
+/// continues to the next layer.
+/// Args:
+///  - `layer_keys`: Layer keys, topmost first
+///  - `rel_path`: File path in the image (e.g. `etc/os-release`).
+///
+/// Returns:
+///   The file content, or `None` if no layer has the file.
 pub fn read_image_file(layer_keys: &[String], rel_path: &str) -> Option<String> {
     let dirs: Vec<_> = layer_keys
         .iter()
@@ -1390,8 +1487,11 @@ pub struct OsRelease {
     pub id_like: Vec<String>,
 }
 
-/// Read `etc/os-release` (or `usr/lib/os-release`, which it usually links
-/// to) from the image layers. `None` when neither exists or has no `ID`.
+/// Read `etc/os-release` (or `usr/lib/os-release`, its usual link target)
+/// from the image layers.
+/// Returns:
+///   The distribution identity, or `None` if neither file exists or has no
+///   `ID`.
 pub fn os_release(image: &OciImage) -> Option<OsRelease> {
     ["etc/os-release", "usr/lib/os-release"]
         .iter()
@@ -1400,7 +1500,7 @@ pub fn os_release(image: &OciImage) -> Option<OsRelease> {
 }
 
 /// Parse the `ID` and `ID_LIKE` keys of an os-release file (shell-style
-/// `KEY=value`, optionally quoted).
+/// `KEY=value`, quotes optional).
 fn parse_os_release(content: &str) -> Option<OsRelease> {
     let mut id = None;
     let mut id_like = Vec::new();

@@ -1,9 +1,11 @@
+//! Stream reads with a time limit for tests.
+
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-/// Read from `stream` until the collected text contains `needle`. Panics,
-/// showing what did arrive, after two seconds.
+/// Read from `stream` until the collected text contains `needle`.
+/// After two seconds, panic and show the text that arrived.
 pub async fn read_until_contains<S: AsyncRead + Unpin>(stream: &mut S, needle: &str) -> String {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -25,8 +27,8 @@ pub async fn read_until_contains<S: AsyncRead + Unpin>(stream: &mut S, needle: &
     }
 }
 
-/// Read from `stream` until EOF. Panics, showing what did arrive, after
-/// two seconds.
+/// Read from `stream` until EOF.
+/// After two seconds, panic and show the text that arrived.
 pub async fn read_until_eof<S: AsyncRead + Unpin>(stream: &mut S) -> String {
     let mut buf = Vec::new();
     tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut buf))

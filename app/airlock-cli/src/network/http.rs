@@ -1,10 +1,14 @@
-//! HTTP request interception via hyper.
+//! HTTP request support.
 //!
-//! When the first bytes from the container look like HTTP, we hand off
-//! to a hyper HTTP server (h1 or h2, by the sniffed preface) and h1/h2
-//! client. HTTP/1.1 upgrades are handled in [`upgrade`].
-//! For each request, Lua scripts run and the (possibly modified) request
-//! is forwarded via hyper client. Bodies are streamed, not buffered.
+//! Detects HTTP traffic and relays requests from the sandbox to the upstream
+//! server. The configured HTTP middlewares run for each request and response.
+//! Also handles:
+//!  * HTTP 1.1/2 conversion when the sandbox and the server use different
+//!    versions
+//!  * HTTP 1.1 upgrades, for example websockets
+//!  * secret injection into requests
+//!
+//! Expects plaintext (TLS decrypted) traffic from both sides.
 
 pub mod body;
 mod executor;
@@ -37,11 +41,13 @@ use crate::network::{DenyReporter, io, tcp};
 
 const MAX_DETECT_SIZE: usize = 4096;
 
-/// Peek at the first bytes to detect HTTP.
+/// Read the first bytes of a stream to detect HTTP.
 ///
-/// Reads up to 4KB or until the first `\r\n`, then checks if the line
-/// matches `METHOD path HTTP/x.y\r\n`. Returns `Ok(buf)` if HTTP,
-/// `Err(buf)` if not.
+/// Reads up to 4KB or until the first `\r\n`. Then checks if the line
+/// matches `METHOD path HTTP/x.y\r\n` or the HTTP/2 preface.
+/// Returns:
+///   `Ok(buf)` if the stream is HTTP, `Err(buf)` if not. `buf` contains the
+///   bytes that were read.
 pub async fn detect(reader: &mut (impl AsyncRead + Unpin)) -> Result<Bytes, Bytes> {
     let mut buf = bytes::BytesMut::zeroed(MAX_DETECT_SIZE);
     let mut len = 0;
@@ -78,37 +84,45 @@ pub async fn detect(reader: &mut (impl AsyncRead + Unpin)) -> Result<Bytes, Byte
     }
 }
 
-/// Request and response bodies on the relay's send path: streamed from
-/// the peer, or built by the proxy.
+/// Request and response body on the send path of the relay. The body
+/// streams from the peer, or the proxy makes it.
 pub type ResponseBody = Either<StreamBody, Full<Bytes>>;
 
-/// A streamed body: the peer's own, or a peer's body that an interceptor
+/// Streamed body: the body of the peer, or a peer body that an interceptor
 /// wraps (the token scan of [`crate::services::scan`]).
 pub type StreamBody = Either<Incoming, UnsyncBoxBody<Bytes, BoxError>>;
 
-/// The error of a wrapped body.
+/// Error of a wrapped body.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// A body streamed from the peer, as a [`ResponseBody`].
+/// Convert a body that streams from the peer into a [`ResponseBody`].
 pub fn streamed(body: Incoming) -> ResponseBody {
     Either::Left(Either::Left(body))
 }
 
-/// hyper IO over a boxed read/write pair — both guest and upstream sides.
+/// hyper IO on a boxed read/write pair. Used for the guest side and the
+/// upstream side.
 type HyperIo = TokioIo<tokio::io::Join<io::BoxRead, io::BoxWrite>>;
 type H1UpstreamConn = hyper::client::conn::http1::Connection<HyperIo, ResponseBody>;
 
-/// The upstream connection task's output: the h1 connection object when
-/// the upstream speaks h1 (so it can be taken apart after an upgrade),
-/// `None` for h2.
+/// Output of the upstream connection task. For an h1 upstream, it is the h1
+/// connection object, so the relay can take it apart after an upgrade.
+/// For h2, it is `None`.
 type UpstreamDone = Option<H1UpstreamConn>;
 
-/// Run hyper HTTP proxy with middleware interception.
+/// Relay HTTP requests from the container to the server, with middleware.
+/// Bodies stream and are not buffered.
+/// Args:
+///  - `container`: Plaintext container transport
+///  - `server`: Plaintext server transport. [`io::Transport::null`] if the
+///    target is denied.
+///  - `target`: Resolved target with the decision, middleware, secrets and
+///    interceptor
+///  - `events`: Sender for monitor events
+///  - `deny_reporter`: Notifier for denied requests.
 ///
-/// When `target.allowed` is false, `server` is a [`io::Transport::null`]
-/// black hole. We still run a hyper server against the container so the
-/// request headers are parsed and surfaced in the Requests sub-tab, but we
-/// short-circuit with a 403 before touching the server transport.
+/// Returns:
+///   Ok when the connection ends, or error if the HTTP connection fails.
 pub async fn relay(
     container: io::Transport,
     server: io::Transport,
@@ -118,6 +132,9 @@ pub async fn relay(
 ) -> anyhow::Result<()> {
     let client_io = hyper_util::rt::TokioIo::new(tokio::io::join(container.read, container.write));
 
+    // For a denied target, still run a hyper server on the container side.
+    // Then the request headers are parsed and show in the Requests sub-tab.
+    // Each request gets a 403, and the server transport is not used.
     if !target.allowed {
         let target_host = target.host.clone();
         let target_port = target.port;
@@ -153,7 +170,7 @@ pub async fn relay(
     let middleware = target.middleware;
     let secrets = target.secrets;
     let interceptor = target.interceptor;
-    // The interceptor's view of where the guest connected.
+    // Where the guest connected, as the interceptor sees it.
     let endpoint = Rc::new(Endpoint::new(&target.host, target.port));
     let target_host = target.host.clone();
     let target_port = target.port;
@@ -170,8 +187,8 @@ pub async fn relay(
         let deny_reporter = deny_reporter.clone();
         let upgrade = upgrade_shared.clone();
         async move {
-            // The monitor sees the request as the guest sent it (surrogates
-            // intact): the event is emitted before any secret is unmasked.
+            // The monitor sees the request as the guest sent it (with the
+            // surrogates). The event goes out before any secret is unmasked.
             let id = emit_request_event(&events, &req, &target_host, target_port, allowed);
             let wants_upgrade = upgradable && Upgrade::wants(&req);
             if wants_upgrade {
@@ -179,9 +196,9 @@ pub async fn relay(
             }
             let method = req.method().clone();
             let connect_host: std::rc::Rc<str> = std::rc::Rc::from(target_host.as_str());
-            // The innermost step: an interceptor that owns the host (after
-            // middleware, so scripts and the monitor see its surrogates
-            // only), then the upstream.
+            // The innermost step: the interceptor that owns the host, then
+            // the upstream. The interceptor runs after middleware, so
+            // scripts and the monitor see only its surrogates.
             let send = {
                 let (upgrade, method) = (upgrade.clone(), method.clone());
                 let injected = secrets.clone();
@@ -208,9 +225,9 @@ pub async fn relay(
                     Ok(resp)
                 }
             };
-            // Unmask before middleware so scripts observe the real request;
-            // re-mask after middleware so nothing a script adds can carry the
-            // real value back into the guest.
+            // Unmask before middleware, so scripts see the real request.
+            // Mask again after middleware, so nothing that a script adds can
+            // send the real value back into the guest.
             let result = match inject::unmask_request(req.headers_mut(), &secrets) {
                 Err(e) => Err(e),
                 Ok(()) => middleware::run(req, &middleware, deny_reporter, connect_host, send)
@@ -223,8 +240,8 @@ pub async fn relay(
             let mut resp = match result {
                 Ok(resp) => resp,
                 Err(e) => {
-                    // The request was unmasked before middleware ran, so a
-                    // script error that quotes a header may carry the real
+                    // The request was unmasked before middleware ran. Thus a
+                    // script error that quotes a header may contain the real
                     // secret. Mask the text before it is logged or sent.
                     let msg = inject::mask_text(&e.to_string(), &secrets);
                     debug!("middleware error: {msg}");
@@ -258,9 +275,10 @@ pub async fn relay(
     if !upgrade.in_flight() {
         return Ok(());
     }
-    // hyper ends a connection that carried an upgrade request with
-    // `Dispatched::Upgrade`, switch or not, and leaves its socket open for
-    // us — plus whatever bytes it already read past the last message.
+    // hyper ends a connection that had an upgrade request with
+    // `Dispatched::Upgrade`, also if the protocol did not switch. It leaves
+    // the socket open, with the bytes that it already read after the last
+    // message.
     let guest = guest.into_parts();
     let guest_buffered = guest.read_buf.len();
     let mut guest = upgrade::transport(guest.io, guest.read_buf);
@@ -274,16 +292,23 @@ pub async fn relay(
             tcp::relay(guest, upgrade::transport(upstream.io, upstream.read_buf)).await;
         }
         _ => {
-            // The reply carried `Connection: close`; make the close real.
+            // The reply had `Connection: close`. Close the connection.
             let _ = guest.write.shutdown().await;
         }
     }
     Ok(())
 }
 
-/// Handshake a hyper client on the upstream transport and drive it on its
-/// own task. The h1 task hands the connection object back when it ends:
-/// after an upgrade the socket is still open and the relay needs it.
+/// Do the hyper client handshake on the upstream transport and run the
+/// connection on its own task.
+/// Args:
+///  - `server_io`: Upstream transport
+///  - `h2`: True if the upstream uses HTTP/2.
+///
+/// Returns:
+///   Request sender and the connection task. The h1 task returns the
+///   connection object when it ends. After an upgrade, the socket is still
+///   open and the relay needs it.
 async fn connect_upstream(
     server_io: HyperIo,
     h2: bool,
@@ -313,17 +338,16 @@ async fn connect_upstream(
 }
 
 /// Serve the guest connection until it ends.
+/// Args:
+///  - `guest`: Guest connection future
+///  - `upstream`: Upstream connection task
+///  - `upgrade`: Upgrade state of the connection
+///  - `shutdown`: Function that starts a graceful shutdown of `guest`.
 ///
-/// Mirrors an upstream close with a graceful shutdown, so the guest sees a
-/// clean close and reconnects instead of getting 502s from a stale sender.
-/// Not while an upgrade is in flight: the upstream h1 connection ends the
-/// moment it parses the 101, and a shutdown then makes hyper rewrite the
-/// 101's `Connection: upgrade` into `Connection: close`. The guest
-/// connection ends on its own in that case (see [`Upgrade::reply`]).
-///
-/// Returns the upstream task's output once the upstream is known to be
-/// done: it ended first, or the guest ended on a switch (the upstream
-/// stops on the same reply).
+/// Returns:
+///   The output of the upstream task, if the upstream is known to be done:
+///   it ended first, or the guest ended on a protocol switch (the upstream
+///   stops on the same reply). `None` if not.
 async fn drive_guest<C>(
     mut guest: Pin<&mut C>,
     mut upstream: JoinHandle<UpstreamDone>,
@@ -339,6 +363,14 @@ where
             None
         }
         done = &mut upstream => {
+            // When the upstream closes, do a graceful shutdown of the guest
+            // connection. Then the guest sees a clean close and connects
+            // again, and gets no 502s from an old sender.
+            // Skip the shutdown while an upgrade is in progress. The
+            // upstream h1 connection ends when it parses the 101. A shutdown then makes
+            // hyper change `Connection: upgrade` of the 101 into
+            // `Connection: close`. The guest connection then ends by itself
+            // (see [`Upgrade::reply`]).
             if !upgrade.in_flight() {
                 debug!("upstream connection closed, shutting down guest connection");
                 shutdown(guest.as_mut());
@@ -360,12 +392,10 @@ fn text_response(status: StatusCode, body: &str) -> Response<ResponseBody> {
         .unwrap()
 }
 
-/// Broadcast a `NetworkEvent::Request` describing this HTTP request. Silently
-/// drops the event when there are no subscribers — and short-circuits *before*
-/// cloning any request fields in that common case (non-monitor runs).
-///
-/// Returns the id assigned to the request, for pairing with a later
-/// [`emit_response_event`]; `None` when nothing was emitted.
+/// Send a `NetworkEvent::Request` for this HTTP request to the subscribers.
+/// Returns:
+///   The id of the request, to pair it with a later [`emit_response_event`].
+///   `None` if no event was sent (no subscribers).
 fn emit_request_event(
     events: &tokio::sync::broadcast::Sender<airlock_monitor::NetworkEvent>,
     req: &Request<Incoming>,
@@ -373,6 +403,8 @@ fn emit_request_event(
     target_port: u16,
     allowed: bool,
 ) -> Option<u64> {
+    // Usually there are no subscribers (runs without the monitor). Return
+    // before the request fields are cloned in that case.
     if events.receiver_count() == 0 {
         return None;
     }
@@ -408,14 +440,14 @@ fn emit_request_event(
     Some(id)
 }
 
-/// Broadcast the response paired to a prior [`emit_request_event`]. A
-/// `None` id means the request was never reported (no subscribers), so
-/// there's nothing to pair with.
+/// Send the response event for an earlier [`emit_request_event`].
+/// A `None` id means that no request event was sent (no subscribers). Then
+/// this function sends nothing.
 ///
-/// Middleware runs after the request event went out, and only for requests
-/// that event reported allowed. A 403 tagged [`middleware::Denied`] is a
-/// script's `req:deny()`: the response event sets `denied` to overturn the
-/// request event's verdict.
+/// Middleware runs after the request event, and only for requests that the
+/// event shows as allowed. A 403 with the [`middleware::Denied`] tag comes
+/// from `req:deny()` in a script. The response event then sets `denied`,
+/// which overrides the decision of the request event.
 fn emit_response_event<B>(
     events: &tokio::sync::broadcast::Sender<airlock_monitor::NetworkEvent>,
     id: Option<u64>,
@@ -448,15 +480,16 @@ fn emit_response_event<B>(
     ));
 }
 
-/// Monotonic request ids, used only to pair a response back to its
-/// request in the Monitor tab.
+/// Get a new monotonic request id. The Monitor tab uses the ids only to
+/// pair each response with its request.
 fn next_request_id() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Check if a line matches an HTTP request line or h2 connection preface.
+/// Return true if a line is an HTTP request line or the h2 connection
+/// preface.
 fn is_http_request_line(line: &[u8]) -> bool {
     use std::sync::LazyLock;
 
@@ -468,8 +501,8 @@ fn is_http_request_line(line: &[u8]) -> bool {
     is_h2_preface(line) || H1_REQUEST.is_match(line)
 }
 
-/// True when the sniffed first line is the HTTP/2 connection preface, i.e.
-/// the guest speaks h2 (by ALPN or prior knowledge) rather than h1.
+/// Return true if the sniffed first line is the HTTP/2 connection preface.
+/// This means that the guest uses h2 (by ALPN or prior knowledge), not h1.
 pub fn is_h2_preface(line: &[u8]) -> bool {
     line.starts_with(b"PRI * HTTP/2.0")
 }

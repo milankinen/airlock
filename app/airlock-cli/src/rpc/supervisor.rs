@@ -1,8 +1,7 @@
-//! Host-side RPC client for the in-VM supervisor.
+//! Host-side control of the supervisor in the VM.
 //!
-//! [`Supervisor`] connects over virtio-vsock and exposes typed methods for
-//! booting the VM, spawning processes inside it, and a shutdown call for
-//! filesystem sync.
+//! Lets the host boot the sandbox, start processes in it, read resource
+//! statistics, control background daemons and shut the VM down.
 
 use std::future::Future;
 use std::os::unix::io::OwnedFd;
@@ -24,39 +23,49 @@ use crate::vm::VmInstance;
 /// Snapshot of guest resource usage returned by [`Supervisor::poll_stats`].
 #[derive(Debug, Clone, Default)]
 pub struct StatsSnapshot {
+    /// CPU utilization of each core, 0..100.
     pub per_core: Vec<u8>,
+    /// Total guest memory in bytes.
     pub total_bytes: u64,
+    /// Used guest memory in bytes.
     pub used_bytes: u64,
+    /// Load average over 1, 5 and 15 minutes.
     pub load_avg: (f32, f32, f32),
 }
 
-/// Host-side daemon specification, serialized into the `boot` RPC. Built
-/// from the TOML config after env templates have been expanded.
+/// Host-side daemon specification for the `boot` RPC. Made from the TOML
+/// config after the env templates are expanded.
 #[derive(Debug, Clone)]
 pub struct DaemonSpec {
+    /// Daemon name.
     pub name: String,
+    /// `argv[0]` and the arguments.
     pub command: Vec<String>,
-    /// `KEY=VALUE` strings, image env already merged in by the builder.
+    /// `KEY=VALUE` strings. The builder already merged the image env.
     pub env: Vec<String>,
+    /// Working directory in the guest.
     pub cwd: String,
     /// Linux signal number for graceful shutdown.
     pub signal: i32,
-    /// Milliseconds to wait after sending `signal` before SIGKILL. `0` =
-    /// wait forever.
+    /// Milliseconds to wait after `signal` before SIGKILL. `0` = wait
+    /// forever.
     pub timeout_ms: u32,
+    /// When the guest restarts the daemon.
     pub restart: RestartPolicy,
-    /// Max restart attempts after the initial launch. `0` = no cap.
+    /// Maximum number of restarts after the first start. `0` = no limit.
     pub max_restarts: u32,
+    /// Hardening of this daemon. Independent of the main-shell setting.
     pub harden: bool,
 }
 
-/// Host-side directory mask spec, serialised into the boot RPC and
-/// applied by guest init. Matches `MaskSpec` in supervisor.capnp.
+/// Host-side directory mask specification for the boot RPC. Guest init
+/// applies it. Matches `MaskSpec` in supervisor.capnp.
 #[derive(Debug, Clone)]
 pub struct MaskSpec {
+    /// Mask name.
     pub name: String,
     /// Project-relative paths to mask. Already validated to be plain
-    /// relative paths (no leading `/` / `~`, no `..` segments).
+    /// relative paths (no leading `/` or `~`, no `..` segments).
     pub paths: Vec<String>,
 }
 
@@ -64,45 +73,59 @@ pub struct MaskSpec {
 /// [`Supervisor::poll_daemons`]. `Stopped` and `Killed` are terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonState {
+    /// Alive, or between restarts.
     Running,
+    /// Terminated cleanly (shutdown, max restarts, or clean exit with the
+    /// on-failure policy).
     Stopped,
+    /// Killed with SIGKILL after the graceful-shutdown timeout.
     Killed,
 }
 
 impl DaemonState {
+    /// Check if the state is terminal (`Stopped` or `Killed`).
     pub fn is_terminal(self) -> bool {
         matches!(self, DaemonState::Stopped | DaemonState::Killed)
     }
 }
 
-/// The `Supervisor.boot` inputs: VM/mount configuration built from the
-/// project config. Carries no process to run — the main process and
-/// `airlock exec` both start afterwards via [`Supervisor::spawn`].
+/// Inputs of `Supervisor.boot`: VM and mount configuration from the
+/// project config. It has no process to run. The main process and
+/// `airlock exec` both start later with [`Supervisor::spawn`].
 pub struct BootRequest<'a> {
+    /// Project to boot.
     pub project: &'a Project,
+    /// Prepared VM instance (image, mounts, caches, user ids).
     pub vm: &'a VmInstance,
-    /// `tracing` filter directive for the guest (see [`crate::cli::LogLevel::filter`]).
+    /// `tracing` filter directive for the guest (see
+    /// [`crate::cli::LogLevel::filter`]).
     pub log_filter: &'a str,
     /// `(host path, guest path)` socket forwards.
     pub socket_fwds: &'a [(String, String)],
+    /// Daemons that the guest starts.
     pub daemons: &'a [DaemonSpec],
+    /// Directory masks that guest init applies.
     pub masks: &'a [MaskSpec],
-    /// The browser bridge; `None` grants no browser.
+    /// Browser bridge. `None` grants no browser.
     pub browser: Option<Browser>,
-    /// The clipboard bridge; `None` grants no clipboard.
+    /// Clipboard bridge. `None` grants no clipboard.
     pub clipboard: Option<ClipboardImpl>,
 }
 
-/// Host-side handle to the in-VM supervisor, wrapping the Cap'n Proto client.
+/// Host-side handle to the in-VM supervisor. Wraps the Cap'n Proto client.
 #[derive(Clone)]
 pub struct Supervisor {
     supervisor: supervisor::Client,
 }
 
 impl Supervisor {
-    /// Establish an RPC connection to the supervisor over the given vsock fd.
-    /// The returned [`Driver`] runs the connection; the handle works only
-    /// while the driver is polled.
+    /// Connect to the supervisor over a vsock socket.
+    /// Args:
+    ///  - `vsock_fd`: Connected vsock socket of the supervisor channel
+    ///
+    /// Returns:
+    ///   Handle and the [`Driver`] that runs the connection. The handle
+    ///   works only while the driver is polled.
     pub fn connect(vsock_fd: OwnedFd) -> anyhow::Result<(Self, Driver)> {
         let transport = vsock_transport(vsock_fd, rpc_twoparty_capnp::Side::Client)?;
         let mut rpc = capnp_rpc::RpcSystem::new(transport, None);
@@ -110,27 +133,27 @@ impl Supervisor {
         Ok((Self { supervisor: client }, driver(rpc, "supervisor")))
     }
 
-    /// Clone of the underlying capnp client. Used to hand a late-bound
-    /// reference to components like the deny reporter and
-    /// [`crate::rpc::guest_network::GuestNetwork`] that need to fire
-    /// specific RPCs after the handshake.
+    /// Get a clone of the capnp client. Components that send specific RPCs
+    /// after the handshake use it, for example the deny reporter and
+    /// [`crate::rpc::guest_network::GuestNetwork`].
     pub fn client(&self) -> supervisor::Client {
         self.supervisor.clone()
     }
 
-    /// A task that pushes the host wall-clock into the guest every
-    /// `interval`, forever. VMs have no RTC, so long host sleeps
-    /// (laptop lid closed, suspend) cause the guest clock to drift —
-    /// breaking TLS validation and every `mtime`-driven build tool.
-    /// The RPC is cheap (one UInt64 + UInt32 round-trip) and idempotent;
-    /// we just keep re-setting the guest clock to the current host
-    /// value.
+    /// Make a task that sets the guest clock to the host wall-clock every
+    /// `interval`, forever.
+    ///
+    /// VMs have no RTC. Thus long host sleeps (laptop lid closed, suspend)
+    /// cause the guest clock to drift. This breaks TLS validation and all
+    /// `mtime`-driven build tools.
     pub fn clock_sync(&self, interval: std::time::Duration) -> impl Future<Output = ()> + 'static {
+        // The RPC is cheap (one UInt64 + UInt32 round trip) and idempotent,
+        // so the task sets the guest clock again on each tick.
         let supervisor = self.supervisor.clone();
         async move {
             let mut ticker = tokio::time::interval(interval);
-            // Skip the immediate first tick — the guest's clock was
-            // just set by `Supervisor.boot`.
+            // Skip the immediate first tick: `Supervisor.boot` just set the
+            // guest clock.
             ticker.tick().await;
             loop {
                 ticker.tick().await;
@@ -145,10 +168,10 @@ impl Supervisor {
         }
     }
 
-    /// Send the `Supervisor.boot()` RPC to bring up the VM: mounts,
-    /// networking, daemons. Carries no process to run; the main process
-    /// and `airlock exec` both start afterwards via [`Self::spawn`]. The
-    /// guest accepts this once per VM.
+    /// Send the `Supervisor.boot()` RPC to start the VM: mounts, network,
+    /// daemons. It has no process to run. The main process and
+    /// `airlock exec` both start later with [`Self::spawn`]. The guest
+    /// accepts this call one time per VM.
     pub async fn boot(&self, boot: BootRequest<'_>) -> anyhow::Result<()> {
         let BootRequest {
             project,
@@ -268,9 +291,9 @@ impl Supervisor {
             }
         }
 
-        // Clipboard grant. The capability is only ever built when a
-        // direction is granted, so an ungranted sandbox holds a null `sink`
-        // and has nothing to call.
+        // Clipboard grant. The capability exists only when a direction is
+        // granted. Otherwise the sandbox has a null `sink` and nothing to
+        // call.
         if let Some(grant) = clipboard {
             let mut b = req.get().init_clipboard();
             b.set_copy(grant.copy);
@@ -290,9 +313,21 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Start a process inside the booted container — the main process and
-    /// `airlock exec` both go through here. Refused before [`Self::boot`]
-    /// has succeeded.
+    /// Start a process in the booted container. The main process and
+    /// `airlock exec` both use it. The guest refuses it before a successful
+    /// [`Self::boot`].
+    /// Args:
+    ///  - `stdin`: Stdin capability of the process (see
+    ///    [`Stdin`](crate::rpc::Stdin))
+    ///  - `pty_size`: Terminal size `(rows, cols)` for PTY mode, or `None`
+    ///    for pipe mode
+    ///  - `cmd`: Program to run
+    ///  - `args`: Program arguments
+    ///  - `cwd`: Working directory in the guest
+    ///  - `env`: `KEY=VALUE` environment strings
+    ///
+    /// Returns:
+    ///   Handle of the started process.
     pub async fn spawn(
         &self,
         stdin: stdin::Client,
@@ -319,7 +354,7 @@ impl Supervisor {
         Ok(Process::new(response.get()?.get_proc()?))
     }
 
-    /// Sample guest CPU/memory/load for the monitor UI.
+    /// Read the guest CPU, memory and load for the monitor UI.
     pub async fn poll_stats(&self) -> anyhow::Result<StatsSnapshot> {
         let req = self.supervisor.poll_stats_request();
         let response = req.send().promise.await?;
@@ -342,17 +377,17 @@ impl Supervisor {
         })
     }
 
-    /// Request the supervisor to sync filesystems before the VM is destroyed.
-    /// `Ok` means the guest confirmed the sync.
+    /// Ask the supervisor to sync the filesystems before the VM stops.
+    /// `Ok` means that the guest confirmed the sync.
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         let req = self.supervisor.shutdown_request();
         req.send().promise.await?;
         Ok(())
     }
 
-    /// Snapshot of every declared daemon's current state. The guest holds
-    /// authoritative state; the host polls during shutdown to drive UI
-    /// until all daemons reach a terminal state.
+    /// Get the current state of each declared daemon. The guest has the
+    /// authoritative state. During shutdown, the host polls it to update
+    /// the UI until all daemons are in a terminal state.
     pub async fn poll_daemons(&self) -> anyhow::Result<Vec<(String, DaemonState)>> {
         let req = self.supervisor.poll_daemons_request();
         let response = req.send().promise.await?;
@@ -370,9 +405,9 @@ impl Supervisor {
         Ok(out)
     }
 
-    /// Fire-and-forget: ask the supervisor to start graceful shutdown for
-    /// every still-running daemon. Follow up with [`Self::poll_daemons`]
-    /// until all daemons reach a terminal state.
+    /// Ask the supervisor to start a graceful shutdown of each running
+    /// daemon. Does not wait for the result. After this call, use
+    /// [`Self::poll_daemons`] until all daemons are in a terminal state.
     pub async fn shutdown_daemons(&self) {
         let req = self.supervisor.shutdown_daemons_request();
         if let Err(e) = req.send().promise.await {

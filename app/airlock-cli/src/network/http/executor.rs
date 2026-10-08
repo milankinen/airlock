@@ -1,4 +1,6 @@
-/// Executor that spawns futures on the current LocalSet.
+//! Task runner for HTTP connections on the current thread.
+
+/// hyper executor that starts futures on the current `LocalSet`.
 #[derive(Clone)]
 pub struct LocalExecutor;
 

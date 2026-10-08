@@ -1,64 +1,10 @@
-//! The `anthropic` service: Claude Code's sign-ins (`claude /login` with
-//! a Claude.ai subscription or an Anthropic Console account, `claude
-//! setup-token`) and its API use.
+//! The `anthropic` network service.
 //!
-//! On the token host (`platform.claude.com`) only these routes are served,
-//! matched on the normalized path (see [`oauth::normalize_path`]); every
-//! other route gets a local `403` ([`oauth::route_not_allowed`]):
+//! Supports the sign-ins of Claude Code and its API use. The sign-ins are
+//! `claude /login` with a Claude.ai subscription or an Anthropic Console
+//! account, and `claude setup-token`.
 //!
-//! - `POST /v1/oauth/token` (parsed strictly, see [`oauth`]):
-//!   - `authorization_code`: the `code` must be a surrogate code
-//!     ([`super::auth_codes`]) issued to this service through the
-//!     loopback callback on the port of the `redirect_uri`; it is swapped
-//!     for the real code and the exchange forwarded with the guest's
-//!     `client_id` (Claude Code has several OAuth clients). The answer's
-//!     real tokens are stored as a new grant with that client id and the
-//!     guest gets surrogates (access `sk-ant-oat01-airlock-…`, refresh
-//!     `sk-ant-ort01-airlock-…`) with the upstream's own `expires_in`.
-//!   - `refresh_token`: Claude Code's own refresh, relayed
-//!     ([`oauth::Grants::relay_refresh`]) as a refresh of the grant's
-//!     scopes without `org:create_api_key`, with the grant's client id; an
-//!     unknown refresh surrogate gets `invalid_grant`.
-//!   - other grant types: refused locally (`unsupported_grant_type`).
-//! - `POST /v1/oauth/token/revoke` (Claude's `/logout`): a refresh or
-//!   access surrogate deletes its grant and revokes the real refresh
-//!   token upstream (the access token when there is none; Claude Code
-//!   never revokes access tokens); the guest gets `200 {}`.
-//! - `GET /v1/oauth/hello`: Claude Code's connection check before a
-//!   sign-in; forwarded with that path and no query, its answer passes
-//!   [`oauth::backstop`].
-//!
-//! On the API host (`api.anthropic.com`), every path, with strict
-//! credentials and the credential swap of [`oauth::Grants::swap_headers`]
-//! (`Authorization: Bearer` and `x-api-key` only); a 401 from upstream
-//! passes through unchanged (Claude Code refreshes itself). Answers
-//! stream through [`super::scan::scan_answer`]. `POST
-//! /api/oauth/claude_cli/create_api_key`: every `sk-ant-api…` string of
-//! the answer is replaced by a surrogate stored with the grant; a grant
-//! creates at most three keys an hour, then the guest gets a local `429`.
-//!
-//! Any other host (the service owns none) passes [`oauth::backstop`].
-//!
-//! The access and refresh surrogates stay the same for the life of a
-//! grant: they are opaque, so a refresh only changes the real tokens
-//! behind them.
-//!
-//! Known limits:
-//!
-//! - The manual sign-in (Claude prints a page, the user pastes the code
-//!   from `https://platform.claude.com/oauth/code/callback`) brings the
-//!   real authorization code into the sandbox through the clipboard;
-//!   airlock cannot swap it. Its exchange (exactly that `redirect_uri`) is
-//!   forwarded with the real code only when its PKCE verifier belongs to
-//!   a sign-in page the browser bridge opened in this process (Claude
-//!   uses one verifier for both of its pages), once, within ten minutes
-//!   (see [`super::auth_codes`]); else `invalid_grant`. Without the
-//!   browser bridge, the manual sign-in does not work.
-//! - Claude Code also talks to `mcp-proxy.anthropic.com` at run time. It is
-//!   not verified which credential it sends there; the service does not
-//!   own that host, so a surrogate sent there stays a surrogate.
-//!
-//! Protocol facts: Claude Code 2.1.288.
+//! The protocol details agree with Claude Code 2.1.288.
 
 use std::sync::Arc;
 
@@ -90,24 +36,25 @@ const REFRESH_PREFIX: &str = "sk-ant-ort01-airlock-";
 const API_KEY_PREFIX: &str = "sk-ant-api03-airlock-";
 const ID_PREFIX: &str = "airlock-id-";
 
-/// The scope a refresh never asks for: Claude Code refreshes without it.
+/// The scope that a refresh never asks for. Claude Code refreshes without
+/// it.
 const NOT_REFRESHED_SCOPE: &str = "org:create_api_key";
 
 /// Claude Code listens for the callback on an ephemeral port of the guest
 /// (Linux: 32768–60999).
 const CALLBACK_PORTS: &[std::ops::RangeInclusive<u16>] = &[32768..=60999];
 
-/// The pages a sign-in callback may send the browser to: the authorize
-/// hosts and the success pages (`platform.claude.com/oauth/code/success`,
+/// Pages that a sign-in callback can send the browser to: the authorize
+/// hosts, the success pages (`platform.claude.com/oauth/code/success`,
 /// the Console's `buy_credits`), and the Claude.ai origin.
 const PAGES: &[&str] = &["platform.claude.com", "claude.com", "claude.ai"];
 
-/// The shortest random part of a real Anthropic token in the scan of
-/// API answers.
+/// Minimum length of the random part of a real Anthropic token in the
+/// scan of API answers.
 const REAL_SHAPE_MIN: usize = 80;
 
-/// A real token's shape: `sk-ant-<kind><two digits>-` and at least
-/// [`REAL_SHAPE_MIN`] base64url characters.
+/// Whether `run` has the shape of a real token: `sk-ant-<kind><two
+/// digits>-` and at least [`REAL_SHAPE_MIN`] base64url characters.
 fn is_real_shape(run: &str) -> bool {
     let b = run.as_bytes();
     b.len() > 13
@@ -121,10 +68,15 @@ fn is_real_shape(run: &str) -> bool {
             >= REAL_SHAPE_MIN
 }
 
-/// Anthropic's token formats: OAuth access and refresh tokens and API
-/// keys, each by its prefix; then, by key, any other value of a token
-/// answer's `access_token`, `refresh_token` or `id_token` (the surrogate
-/// keeps the prefix Claude Code checks).
+/// Anthropic's token formats.
+///
+/// First the OAuth access and refresh tokens and the API keys, each by its
+/// prefix. Then, by key, any other value of the `access_token`,
+/// `refresh_token` or `id_token` of a token answer. The surrogate keeps
+/// the prefix that Claude Code checks.
+///
+/// The access and refresh surrogates stay the same for the life of a
+/// grant. They are opaque, so a refresh changes only the real tokens.
 pub static FORMATS: Formats = Formats(&[
     Format {
         kind: TokenKind::Access,
@@ -183,7 +135,7 @@ pub static FORMATS: Formats = Formats(&[
     },
 ]);
 
-/// Where the service's hosts are.
+/// The hosts of the service.
 pub struct Endpoints {
     /// Token exchange, refresh and revoke (`platform.claude.com`).
     pub token: Endpoint,
@@ -192,6 +144,7 @@ pub struct Endpoints {
 }
 
 impl Endpoints {
+    /// The production hosts.
     pub fn production() -> Self {
         Self {
             token: Endpoint::new("platform.claude.com", 443),
@@ -199,12 +152,14 @@ impl Endpoints {
         }
     }
 
+    /// The network targets of the hosts.
     pub fn targets(&self) -> Vec<NetworkTarget> {
         crate::network::target::targets_of(&[&self.token, &self.api])
     }
 }
 
-/// The sign-in pages: the Console and the Claude.ai subscription login.
+/// Get the sign-in pages: the Console and the Claude.ai subscription
+/// login.
 pub fn sign_in_pages() -> Vec<SignInPage> {
     vec![
         SignInPage {
@@ -246,7 +201,8 @@ impl Provider for AnthropicOauth {
         REVOKE_PATH
     }
 
-    /// `setup-token` issues no refresh token.
+    /// Only the access token, because `setup-token` issues no refresh
+    /// token.
     fn exchange_requires(&self) -> &'static [TokenKind] {
         &[TokenKind::Access]
     }
@@ -266,8 +222,8 @@ impl Provider for AnthropicOauth {
         }
     }
 
-    /// The grant's scopes without [`NOT_REFRESHED_SCOPE`] (no `scope` when
-    /// none is left), with the grant's client id.
+    /// Asks for the grant's scopes without [`NOT_REFRESHED_SCOPE`] (no
+    /// `scope` if no scope is left), with the grant's client id.
     fn refresh_body(&self, grant: &Grant, refresh_token: &str) -> Value {
         let mut body = json!({
             "grant_type": "refresh_token",
@@ -286,13 +242,62 @@ impl Provider for AnthropicOauth {
         body
     }
 
-    /// Claude Code revokes its refresh token only; an access-token revoke
-    /// is not known to work.
+    /// Claude Code revokes only its refresh token. It is not known if an
+    /// access-token revoke works.
     fn revokes_access_tokens(&self) -> bool {
         false
     }
 }
 
+/// The interceptor of the `anthropic` service.
+///
+/// On the token host (`platform.claude.com`), only these routes are
+/// served. They match on the normalized path ([`oauth::normalize_path`]).
+/// Every other route gets a local `403` ([`oauth::route_not_allowed`]).
+///  * `POST /v1/oauth/token` (parsed strictly, see [`TokenRequest`]):
+///    - `authorization_code`: the `code` must be a surrogate code
+///      ([`super::auth_codes`]) issued to this service through the
+///      loopback callback on the port of the `redirect_uri`. The proxy
+///      puts the real code in its place and forwards the exchange with the
+///      guest's `client_id` (Claude Code has several OAuth clients). The
+///      real tokens of the answer are stored as a new grant with that
+///      client id. The guest gets surrogates (access
+///      `sk-ant-oat01-airlock-…`, refresh `sk-ant-ort01-airlock-…`) with
+///      the upstream's own `expires_in`.
+///    - `refresh_token`: Claude Code's own refresh, relayed
+///      ([`Grants::relay_refresh`]). An unknown refresh surrogate gets
+///      `invalid_grant`.
+///    - Other grant types: refused locally (`unsupported_grant_type`).
+///  * `POST /v1/oauth/token/revoke` (Claude's `/logout`): a refresh or
+///    access surrogate deletes its grant and revokes the real refresh
+///    token upstream (the access token if there is no refresh token). The
+///    guest gets `200 {}`.
+///  * `GET /v1/oauth/hello`: Claude Code's connection check before a
+///    sign-in. Forwarded with that path and no query. Its answer goes
+///    through [`oauth::backstop`].
+///
+/// On the API host (`api.anthropic.com`), every path is served, with the
+/// credential swap of [`Grants::swap_headers`]. Answers stream through
+/// [`scan::scan_answer`]. A 401 from upstream passes through unchanged
+/// (Claude Code refreshes itself). For `create_api_key`, see
+/// [`Self::create_api_key`].
+///
+/// Any other host passes [`oauth::backstop`].
+///
+/// Known limits:
+///  * The manual sign-in brings the real authorization code into the
+///    sandbox through the clipboard: Claude shows a page, and the user
+///    pastes the code from `https://platform.claude.com/oauth/code/callback`.
+///    Airlock cannot replace that code. The proxy forwards its exchange
+///    (exactly that `redirect_uri`) with the real code only if its PKCE
+///    verifier belongs to a sign-in page that the browser bridge opened in
+///    this process. This works once, in ten minutes (see
+///    [`super::auth_codes`]). Claude uses one verifier for both of its
+///    pages. Otherwise the exchange gets `invalid_grant`. Without the
+///    browser bridge, the manual sign-in does not work.
+///  * Claude Code also connects to `mcp-proxy.anthropic.com` at run time.
+///    It is not verified which credential it sends there. The service
+///    does not own that host, so a surrogate sent there stays a surrogate.
 pub struct Anthropic {
     endpoints: Endpoints,
     grants: Grants,
@@ -301,6 +306,12 @@ pub struct Anthropic {
 }
 
 impl Anthropic {
+    /// Make the interceptor.
+    /// Args:
+    ///  - `endpoints`: The hosts of the service
+    ///  - `store`: The shared token store
+    ///  - `tls`: TLS config for the proxy's own calls to the token host
+    ///  - `codes`: Surrogate codes, shared with the service's sign-ins.
     pub fn new(
         endpoints: Endpoints,
         store: Arc<TokenStore>,
@@ -358,8 +369,8 @@ impl Anthropic {
                 .forward_api(to, req, injected, next, sign_in_again)
                 .await;
         }
-        // Fail closed: the token host serves its routes only; a host the
-        // service does not know passes the backstop.
+        // Fail closed: the token host serves only its routes. A host that
+        // the service does not know goes through the backstop.
         if *to == self.endpoints.token {
             return Ok(oauth::route_not_allowed(ServiceId::Anthropic, to, &req));
         }
@@ -401,9 +412,13 @@ impl Anthropic {
         }
     }
 
-    /// `POST create_api_key` with a grant's token: the created key reaches
-    /// the guest as a surrogate. At most [`store::API_KEY_CREATIONS`] keys
-    /// per grant in [`store::API_KEY_WINDOW_MS`]; beyond, a local 429.
+    /// Handle `POST /api/oauth/claude_cli/create_api_key` with a grant's
+    /// token.
+    ///
+    /// Every `sk-ant-api…` string of the answer is replaced with a
+    /// surrogate stored with the grant. A grant can create at most
+    /// [`store::API_KEY_CREATIONS`] keys in [`store::API_KEY_WINDOW_MS`].
+    /// More requests get a local `429`.
     async fn create_api_key(
         &self,
         to: &Endpoint,
@@ -421,8 +436,8 @@ impl Anthropic {
         };
         let known = self.grants.known_reals(&swapped, injected).await?;
         let Credential::Grant(grant_id) = swapped.credential else {
-            // An injected token's key is the user's own: the answer still
-            // passes the scan, which refuses a real key.
+            // The key of an injected token belongs to the user. The answer
+            // still goes through the scan, which refuses a real key.
             let (parts, bytes) = oauth::forward_buffered(req, next).await?;
             return scan::scan_answer(oauth::rebuilt(parts, bytes), &FORMATS, known).await;
         };
@@ -442,8 +457,8 @@ impl Anthropic {
                 "anthropic: a create_api_key answer that is no uncompressed JSON object",
             ));
         };
-        // The answer's other fields are not known: only the key formats
-        // count, and an OAuth token in it refuses it.
+        // The other fields of the answer are not known. Only the key
+        // formats count. An OAuth token in the answer refuses the answer.
         let found = match tokens::collect(&FORMATS, &answer, &[TokenKind::ApiKey], false) {
             Ok(found) if !found.is_empty() => found,
             Ok(_) => {
@@ -497,7 +512,7 @@ impl Interceptor for Anthropic {
     }
 }
 
-/// The answer to a `create_api_key` beyond the limit of the grant.
+/// Make the answer for a `create_api_key` above the limit of the grant.
 fn too_many_api_keys() -> Response<ResponseBody> {
     tracing::warn!(
         "refused: anthropic: a create_api_key beyond {} keys an hour for the sign-in (answered \
@@ -519,8 +534,8 @@ fn too_many_api_keys() -> Response<ResponseBody> {
     )
 }
 
-/// The answer to a refresh whose surrogate airlock does not know (signed
-/// out, never issued, or no refresh token).
+/// Make the answer for a refresh with a surrogate that airlock does not
+/// know (signed out, never issued, or no refresh token).
 fn invalid_grant() -> Response<ResponseBody> {
     oauth::token_error(
         StatusCode::BAD_REQUEST,
@@ -529,7 +544,7 @@ fn invalid_grant() -> Response<ResponseBody> {
     )
 }
 
-/// The answer to an API request whose sign-in is unknown.
+/// Make the answer for an API request with an unknown sign-in.
 fn sign_in_again() -> Response<ResponseBody> {
     tracing::warn!(
         "refused: anthropic: an API request with a surrogate of no stored sign-in (answered 401)"
@@ -548,8 +563,15 @@ fn sign_in_again() -> Response<ResponseBody> {
 
 #[cfg(test)]
 mod tests {
+    //! Anthropic token formats: real tokens and minted surrogates.
+
     use super::*;
 
+    /// Test that a token with an Anthropic prefix counts as real, but an
+    /// airlock surrogate with the same prefix does not.
+    ///   1. Check that API keys, access tokens and refresh tokens are real
+    ///   2. Check that surrogates, a token of a different provider and a short
+    ///      string are not real
     #[test]
     fn token_with_provider_prefix_is_real_unless_airlock_surrogate() {
         for real in ["sk-ant-api03-x", "sk-ant-oat01-x", "sk-ant-ort01-x"] {
@@ -566,6 +588,10 @@ mod tests {
         }
     }
 
+    /// Test that each format mints a surrogate that it recognizes and that
+    /// has enough random data (48 bytes are 64 base64 characters).
+    ///   1. Mint a surrogate with each format
+    ///   2. Check that the format recognizes it and that it is long enough
     #[test]
     fn minted_surrogate_has_prefix_and_48_random_bytes() {
         for format in FORMATS.0 {

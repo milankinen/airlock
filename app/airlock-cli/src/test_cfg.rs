@@ -1,5 +1,5 @@
-//! Crate-level test helpers. The helpers shared with the other crates come
-//! from `airlock-test-utils` and are re-exported here.
+//! Test helpers of the crate. This module also re-exports the helpers of
+//! `airlock-test-utils`, which other crates use too.
 
 pub mod config;
 pub mod context;

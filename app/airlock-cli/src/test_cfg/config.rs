@@ -1,3 +1,6 @@
+//! Helpers that load and resolve config files for tests, and a vault with
+//! only a host env.
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -8,8 +11,8 @@ use crate::config::{ConfigOverrides, LayeredConfig, ResolvedConfig};
 use crate::packs::{ArgKind, ArgValue, ConfiguredPack, Pack};
 use crate::vault::{DisabledStorage, Vault, VaultStorageType};
 
-/// The config of one project file `airlock.toml` with `toml`, resolved
-/// against the built-in packs and the test pack `sample@1` (see
+/// Resolve one project file `airlock.toml` with the content `toml`. Uses
+/// the built-in packs and the test pack `sample@1` (see
 /// [`crate::packs::init_with_sample`]).
 pub fn resolve_project_toml(toml: &str) -> anyhow::Result<ResolvedConfig> {
     let layers =
@@ -17,7 +20,7 @@ pub fn resolve_project_toml(toml: &str) -> anyhow::Result<ResolvedConfig> {
     resolve_layers(&layers, ConfigOverrides::default())
 }
 
-/// The error text (`{:#}`) of [`resolve_project_toml`]; panics if `toml`
+/// The error text (`{:#}`) of [`resolve_project_toml`]. Panics if `toml`
 /// resolves.
 pub fn project_toml_error(toml: &str) -> String {
     match resolve_project_toml(toml) {
@@ -26,8 +29,8 @@ pub fn project_toml_error(toml: &str) -> String {
     }
 }
 
-/// `layers` resolved against the built-in packs and the test pack
-/// `sample@1`, with `overrides`.
+/// Resolve `layers` with `overrides`. Uses the built-in packs and the test
+/// pack `sample@1`.
 pub fn resolve_layers(
     layers: &LayeredConfig,
     overrides: ConfigOverrides,
@@ -35,13 +38,14 @@ pub fn resolve_layers(
     block_on(layers.resolve(&crate::packs::init_with_sample(), &overrides))
 }
 
-/// A temp home directory and a project directory with real config files,
-/// loaded and resolved the way the CLI does it.
+/// A temporary home directory and project directory with real config
+/// files. It loads and resolves them as the CLI does.
 pub struct ConfigDirs {
     dir: TempDir,
 }
 
 impl ConfigDirs {
+    /// Make empty home and project directories.
     pub fn new() -> Self {
         let dir = temp_dir();
         std::fs::create_dir(dir.path().join("home")).unwrap();
@@ -49,10 +53,12 @@ impl ConfigDirs {
         Self { dir }
     }
 
+    /// The home directory.
     pub fn home(&self) -> PathBuf {
         self.dir.path().join("home")
     }
 
+    /// The project directory.
     pub fn project(&self) -> PathBuf {
         self.dir.path().join("project")
     }
@@ -75,7 +81,7 @@ impl ConfigDirs {
         self.project().join(rel).display().to_string()
     }
 
-    /// Discover and parse the config files.
+    /// Find and parse the config files.
     pub fn load(&self) -> anyhow::Result<LayeredConfig> {
         LayeredConfig::load_from(&self.home(), &self.project())
     }
@@ -85,12 +91,12 @@ impl ConfigDirs {
         resolve_layers(&self.load()?, ConfigOverrides::default())
     }
 
-    /// The resolved config values; panics on a config error.
+    /// The resolved config values. Panics on a config error.
     pub fn values(&self) -> ConfigValues {
         self.resolve().unwrap().values
     }
 
-    /// The error text (`{:#}`) of [`Self::resolve`]; panics if it resolves.
+    /// The error text (`{:#}`) of [`Self::resolve`]. Panics if it resolves.
     pub fn error(&self) -> String {
         match self.resolve() {
             Ok(_) => panic!("config resolves"),
@@ -105,12 +111,13 @@ impl Default for ConfigDirs {
     }
 }
 
+/// Write `content` to `path` and create its parent directories.
 fn write_file(path: &Path, content: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, content).unwrap();
 }
 
-/// A vault without secret storage whose host environment is `host_env`.
+/// A vault with no secret storage and with the host env `host_env`.
 pub fn host_env_vault(host_env: &[(&str, &str)]) -> Vault {
     Vault::new_with(
         Box::new(DisabledStorage),
@@ -122,8 +129,8 @@ pub fn host_env_vault(host_env: &[(&str, &str)]) -> Vault {
     )
 }
 
-/// `pack` configured with every combination of its arg values (both
-/// values of a bool arg, each listed value of a choice arg).
+/// Configure `pack` with each combination of its arg values: both values
+/// of a bool arg and each listed value of a choice arg.
 pub fn configured_variants(pack: &Pack) -> Vec<ConfiguredPack> {
     let mut variants = vec![BTreeMap::<String, ArgValue>::new()];
     for arg in pack.args() {

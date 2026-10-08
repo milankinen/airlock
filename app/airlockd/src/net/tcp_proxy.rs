@@ -1,44 +1,8 @@
-//! TCP proxy on a TUN device.
+//! Outgoing TCP proxy.
 //!
-//! Opens a TUN device, runs smoltcp's userspace TCP/IP stack on it, and
-//! intercepts TCP connections to any destination IP + any port by
-//! snooping incoming SYN packets and creating a matching listener
-//! on-the-fly. smoltcp's built-in listener requires a specific
-//! address+port up front, so we peek at each rx frame, detect SYNs, and
-//! add a socket bound to the observed (dst_ip, dst_port) *before*
-//! smoltcp processes the SYN.
-//!
-//! Accepted connections are bridged to the host via the existing
-//! `NetworkProxy.connect` RPC: bytes read from the smoltcp socket are
-//! forwarded to the host through a per-connection relay task, and bytes
-//! the host sends back are pushed into the smoltcp socket's tx buffer.
-//! Unlike the iptables REDIRECT path that this replaced, the TUN catches
-//! traffic from container network namespaces too, because it sits at
-//! the VM's default route rather than the netfilter OUTPUT chain.
-//!
-//! # Poll loop shape
-//!
-//! smoltcp is sync/poll-driven. We drive it from tokio like this:
-//!
-//! 1. `drain_rx`: non-blocking drain of the TUN fd; for each packet,
-//!    parse headers and, if it's a fresh SYN for an unknown (src,dst)
-//!    pair, add a new listener socket bound to (dst_ip, dst_port) to
-//!    the socket set. Push the packet into the Device's rx queue.
-//! 2. `poll_ingress_single` one packet at a time. Whenever it reports
-//!    `SocketStateChanged`, run the FSM so accepted sockets see their
-//!    new state before the next ingress step.
-//! 3. `poll_egress` turns socket-buffered data + FINs into wire packets
-//!    pushed into the Device's tx queue. One call emits at most one
-//!    packet per socket, so it runs in a loop until it reports no
-//!    progress.
-//! 4. `poll_maintenance` advances timers (retransmits, TIME-WAIT).
-//! 5. Drain the Device's tx queue to the TUN fd.
-//! 6. Sleep until any of: TUN readable, a `wake` notify (host→guest
-//!    bytes arriving, or the relay agent freeing a `to_host` slot
-//!    after draining one), smoltcp's next timer, or 100ms safety-net.
-//!
-//! All in one task, single-threaded. No locks — the Device, Interface,
-//! SocketSet and connection tracker live on the task's stack.
+//! Catches all outgoing TCP connections in the VM, including connections from
+//! containers, and relays them to the host. The host then decides how to
+//! handle each connection.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
@@ -67,23 +31,25 @@ use super::dns::DnsState;
 use super::rpc_bridge::{ChannelSink, rpc_connect_tcp};
 use super::tun::Tun;
 
-/// TUN MTU. We advertise 1500 to smoltcp to match what most Linux
-/// stacks negotiate; the actual frame size is whatever the kernel hands
-/// us on `read`.
+/// TUN MTU. smoltcp gets 1500, the value that most Linux stacks negotiate.
+/// The real frame size is what the kernel gives on `read`.
 const MTU: usize = 1500;
 
+/// Receive buffer size of each smoltcp socket.
 const RX_BUF: usize = 16 * 1024;
+/// Send buffer size of each smoltcp socket.
 const TX_BUF: usize = 16 * 1024;
 
-/// Cap on concurrent intercepted connections. Once hit, new SYNs are
+/// Maximum number of concurrent connections. At the limit, new SYNs are
 /// dropped until existing sockets close.
 const MAX_CONNS: usize = 256;
 
-/// Per-direction channel capacity. Small enough to exert backpressure
-/// quickly (smoltcp's send window shrinks naturally) but large enough
-/// that single-byte interactive typing doesn't stall on a full queue.
+/// Channel capacity for each direction. Small, so backpressure starts
+/// quickly (the smoltcp send window becomes smaller). Large enough, so that
+/// single-byte interactive typing does not stop on a full queue.
 const CHAN_CAP: usize = 8;
 
+/// Connection key: `(src, dst)` addresses.
 type ConnKey = (SocketAddrV4, SocketAddrV4);
 
 #[cfg(feature = "tun-bench")]
@@ -97,56 +63,73 @@ macro_rules! bench_count {
     ($counter:ident, $n:expr) => {};
 }
 
-/// Per-connection state held in the poll loop.
+/// State of one connection in the poll loop.
 struct Conn {
+    /// smoltcp socket of the connection.
     handle: SocketHandle,
-    /// Bytes from guest → host. `None` once the guest half-closed and
-    /// we've drained the recv buffer — dropping the sender signals the
-    /// relay agent that no more data is coming. Bounded by `CHAN_CAP`.
+    /// Bytes from guest to host. Capacity is `CHAN_CAP`. Becomes `None`
+    /// after the guest half-closed and the recv buffer is empty. The
+    /// dropped sender tells the relay agent that no more data comes.
     to_host: Option<mpsc::Sender<Bytes>>,
-    /// Bytes from host → guest. The relay agent closes its half when
-    /// the host side ends, which surfaces here as `Disconnected`.
+    /// Bytes from host to guest. The relay agent closes its half when the
+    /// host side ends. The poll loop then sees `Disconnected`.
     from_host_rx: mpsc::Receiver<Bytes>,
-    /// True once the relay agent has been spawned (first ESTABLISHED).
+    /// `true` after the relay agent started (at the first ESTABLISHED).
     agent_spawned: bool,
-    /// Leftover bytes from a previous `send_slice` that didn't fully
-    /// fit into smoltcp's tx buffer; retried next iteration.
+    /// Bytes from a previous `send_slice` that did not fit fully into the
+    /// smoltcp tx buffer. The next iteration tries them again.
     pending_tx: Option<Bytes>,
-    /// Set when the host side (relay agent) has closed — either because
-    /// the RPC connect was denied/errored or the remote host FIN'd.
+    /// Set when the host side (relay agent) closed. The cause is a denied
+    /// or failed RPC connect, or a FIN from the remote host.
     host_closed: bool,
-    /// Set when the relay agent is gone but the guest hasn't half-closed
-    /// yet: nobody can accept more guest bytes, so drain and drop them
-    /// instead of stalling the window.
+    /// Set when the relay agent is gone but the guest did not half-close
+    /// yet. Nobody can accept more guest bytes, so read and drop them. This
+    /// prevents a stalled window.
     discard_rx: bool,
 }
 
-/// Launch the proxy as a local task. Creates `airlock0`, brings it up,
-/// addresses it, installs a test route, and enters the poll loop.
+/// Start the TCP proxy in a local task.
+///
+/// Creates the TUN device `airlock0`, enables it, gives it its address,
+/// makes it the default route of the VM and starts the poll loop.
+/// Args:
+///  - `network`: Host network proxy client
+///  - `dns`: Virtual DNS state, to map the fake IPs back to hostnames
+///
+/// Returns:
+///   Error if the TUN device or interface setup fails.
 pub fn start(network: network_proxy::Client, dns: Rc<DnsState>) -> anyhow::Result<()> {
     let tun = Tun::create("airlock0")?;
     let name = tun.name().to_string();
 
-    // Interface bring-up + test route — shells out to /sbin/ip to match
-    // the rest of the networking setup (see init/linux/net.rs).
+    // Interface bring-up and route. Uses /sbin/ip, as the rest of the
+    // network setup does (see init/linux/net.rs).
     run_ip(&["link", "set", &name, "up"])?;
     run_ip(&["addr", "add", "192.168.77.1/24", "dev", &name])?;
-    // airlock0 becomes the default route for the VM: every outbound TCP
-    // that isn't loopback-local ends up in the smoltcp stack and, from
-    // there, is relayed to the host via `NetworkProxy.connect`.
+    // airlock0 becomes the default route of the VM. All outgoing TCP that
+    // is not loopback-local goes into the smoltcp stack. From there, it goes
+    // to the host through `NetworkProxy.connect`.
     run_ip(&["route", "add", "default", "dev", &name])?;
-    // Loose reverse-path filter on airlock0 — smoltcp replies come back
-    // with src=10.77.0.x which isn't owned by this interface, so strict
-    // RPF would drop them.
+    // Loose reverse-path filter on airlock0. smoltcp replies come back with
+    // the original destination as src (any IP, for example a virtual DNS IP
+    // from 10.2.0.0/16), not with the 192.168.77.1 address of this
+    // interface. Strict RPF would drop them.
     let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{name}/rp_filter"), "0");
 
     spawn_poll_loop(tun, Ipv4Addr::new(192, 168, 77, 1), 24, network, dns)
 }
 
-/// Build the smoltcp interface on an already-configured TUN and spawn the
-/// poll loop. Split from [`start`] so the benchmark in
-/// `tcp_proxy_bench` can run the identical loop on a private TUN whose
-/// bring-up is done with ioctls instead of `/sbin/ip`.
+/// Make the smoltcp interface on a configured TUN device and start the poll
+/// loop in a local task.
+///
+/// Separate from [`start`], so the benchmark in `tcp_proxy_bench` can run
+/// the same loop on a private TUN that it configures with ioctls, not with
+/// `/sbin/ip`.
+/// Args:
+///  - `tun`: TUN device that is up and has its address
+///  - `ip`, `prefix`: Interface address and prefix length
+///  - `network`: Host network proxy client
+///  - `dns`: Virtual DNS state, to map the fake IPs back to hostnames
 pub(crate) fn spawn_poll_loop(
     tun: Tun,
     ip: Ipv4Addr,
@@ -171,10 +154,10 @@ pub(crate) fn spawn_poll_loop(
         let _ = addrs.push(iface_ip);
     });
     iface.set_any_ip(true);
-    // set_any_ip only accepts packets whose destination lies within a
-    // route whose gateway is one of the interface's own addresses.
-    // With a `0.0.0.0/0` gateway route we accept connections to *any*
-    // destination IP — the kernel delivers every egress packet here.
+    // set_any_ip accepts only packets to a destination in a route whose
+    // gateway is an address of the interface. With a `0.0.0.0/0` gateway
+    // route, the interface accepts connections to *any* destination IP. The
+    // kernel sends every outgoing packet here.
     iface.routes_mut().update(|routes| {
         let _ = routes.push(Route {
             cidr: IpCidr::new(IpAddress::v4(0, 0, 0, 0), 0),
@@ -189,22 +172,36 @@ pub(crate) fn spawn_poll_loop(
 
     info!("tcp proxy up on tun '{name}' addr={iface_ip}; intercepting all egress");
 
-    // Shared wake-up signal: the TUN fd makes us readable via AsyncFd
-    // when packets arrive, but the mpsc channels have no fd of their
-    // own. ChannelSink pings this on host→guest bytes, close, or drop;
-    // relay_agent pings it after taking a chunk off `to_host` and on
-    // exit.
+    // Shared wake-up signal. AsyncFd wakes the loop when packets arrive on the
+    // TUN fd, but the mpsc channels have no fd. ChannelSink notifies this on
+    // host-to-guest bytes, close or drop. relay_agent notifies it after it
+    // takes a chunk from `to_host`, and when it exits.
     let wake = Rc::new(Notify::new());
 
+    // Poll loop. smoltcp is sync and poll-driven. A tokio task drives it:
+    //  1. `poll_ingress_single`, one packet at a time. On
+    //     `SocketStateChanged`, run the FSM, so accepted sockets see their
+    //     new state before the next ingress step.
+    //  2. `poll_egress` makes wire packets from socket-buffered data and
+    //     FINs, into the device tx queue.
+    //  3. `poll_maintenance` advances the timers (retransmits, TIME-WAIT).
+    //  4. Write the device tx queue to the TUN fd.
+    //  5. Sleep until one of: TUN readable, a `wake` notify (host-to-guest
+    //     bytes, or the relay agent freed a `to_host` slot), the next
+    //     smoltcp timer, or the 100ms safety net. When the TUN is readable,
+    //     `drain_rx` reads all packets into the device rx queue.
+    //
+    // All in one single-threaded task. No locks: the device, interface,
+    // socket set and connection tracker are on the task's stack.
     tokio::task::spawn_local(async move {
         let start = StdInstant::now();
         loop {
             bench_count!(ITERS, 1);
             let now = Instant::from_millis(start.elapsed().as_millis() as i64);
 
-            // Ingress: process packets one at a time. Run the FSM
-            // whenever a packet caused a state change so accepted
-            // sockets see their new state before the next ingress step.
+            // Ingress: process packets one at a time. Run the FSM when a
+            // packet caused a state change, so accepted sockets see their
+            // new state before the next ingress step.
             loop {
                 match iface.poll_ingress_single(now, &mut device, &mut sockets) {
                     PollIngressSingleResult::None => break,
@@ -214,23 +211,23 @@ pub(crate) fn spawn_poll_loop(
                     }
                 }
             }
-            // One more FSM pass for timer-driven state changes + any
-            // channel progress the wake-up signal reported.
+            // One more FSM pass for timer-driven state changes and for the
+            // channel progress that the wake-up signal reported.
             run_fsm(&mut sockets, &mut tracker, &network, &dns, &wake);
 
-            // Egress: turn socket-buffered data into device tx packets.
-            // `poll_egress` is bounded work — it emits at most ONE packet
-            // per socket per call — so it must be driven until it reports
-            // no progress, like smoltcp's own `poll()` does. Calling it
-            // once per wakeup caps every connection at one MSS per loop
-            // iteration (~2.5 MiB/s at the observed wakeup rate).
+            // Egress: make device tx packets from socket-buffered data.
+            // `poll_egress` sends at most ONE packet per socket per call.
+            // Thus call it until it reports no progress, as smoltcp's own
+            // `poll()` does. One call per wake-up limits each connection to
+            // one MSS per loop iteration (~2.5 MiB/s at the observed wake-up
+            // rate).
             while iface.poll_egress(now, &mut device, &mut sockets)
                 == PollResult::SocketStateChanged
             {}
             // Maintenance: retransmit timers, TIME-WAIT aging.
             iface.poll_maintenance(now);
 
-            // Flush pending tx to the TUN.
+            // Write the pending tx packets to the TUN.
             while let Some(pkt) = device.tx_queue.pop_front() {
                 match device.tun.write(&pkt) {
                     Ok(_) => {
@@ -247,8 +244,8 @@ pub(crate) fn spawn_poll_loop(
                 }
             }
 
-            // Sleep until *any* of: TUN fd readable, a `wake` notify,
-            // smoltcp's next timer, or the 100ms safety net.
+            // Sleep until *one* of: TUN fd readable, a `wake` notify, the
+            // next smoltcp timer, or the 100ms safety net.
             let timer_wait = iface
                 .poll_delay(now, &sockets)
                 .map_or(Duration::from_millis(100), |d| {
@@ -282,16 +279,16 @@ pub(crate) fn spawn_poll_loop(
     Ok(())
 }
 
-/// Per-connection state machine:
-///  * On first ESTABLISHED, spawn the RPC relay agent.
-///  * Drain smoltcp's recv buffer into the `to_host` channel. If the
-///    agent is gone, discard further guest bytes instead (`discard_rx`).
-///  * Pump `from_host_rx` into smoltcp's tx buffer (with leftover
-///    bytes parked in `pending_tx` on partial writes).
-///  * Half-close: once the guest FIN'd and recv is drained, drop
-///    `to_host` to signal the agent. Once the agent closed and all
-///    pending writes flushed, call `sock.close()` to FIN back.
-///  * Reap fully-closed sockets out of the tracker and socket set.
+/// Run the state machine of each connection:
+///  * At the first ESTABLISHED, start the RPC relay agent.
+///  * Move the data of the smoltcp recv buffer into the `to_host` channel.
+///    If the agent is gone, discard the guest bytes (`discard_rx`).
+///  * Move the data of `from_host_rx` into the smoltcp tx buffer. After a
+///    partial write, keep the remaining bytes in `pending_tx`.
+///  * Half-close: after the guest FIN and an empty recv buffer, drop
+///    `to_host` to tell the agent. After the agent closed and all pending
+///    writes are sent, call `sock.close()` to send a FIN back.
+///  * Remove fully closed sockets from the tracker and the socket set.
 fn run_fsm(
     sockets: &mut SocketSet<'static>,
     tracker: &mut HashMap<ConnKey, Conn>,
@@ -303,7 +300,7 @@ fn run_fsm(
     for (&key, conn) in tracker.iter_mut() {
         let sock = sockets.get_mut::<tcp::Socket>(conn.handle);
 
-        // Spawn the relay agent the first time this socket is live.
+        // Start the relay agent the first time this socket is live.
         if !conn.agent_spawned && sock.may_send() {
             let (to_host_tx, to_host_rx) = mpsc::channel::<Bytes>(CHAN_CAP);
             let (from_host_tx, from_host_rx) = mpsc::channel::<Bytes>(CHAN_CAP);
@@ -321,19 +318,18 @@ fn run_fsm(
             ));
         }
 
-        // Guest → Host: drain smoltcp recv into to_host channel while
-        // we have both data and channel capacity.
+        // Guest to host: move smoltcp recv data into the to_host channel
+        // while there is data and channel capacity.
         if let Some(tx) = conn.to_host.clone() {
             while sock.can_recv() {
                 let permit = match tx.try_reserve() {
                     Ok(permit) => permit,
                     Err(mpsc::error::TrySendError::Full(())) => break,
-                    // Reachable only if the RPC connect failed or a
-                    // host-side send errored — the agent's normal exit
-                    // only drops `to_host_rx` after `to_host` is
-                    // already None. Nobody will drain this channel
-                    // again; discard further bytes so the window
-                    // doesn't stay closed.
+                    // Occurs only if the RPC connect failed or a host-side
+                    // send failed. A normal agent exit drops `to_host_rx`
+                    // only after `to_host` is already None. Nobody reads
+                    // this channel again, so discard the next bytes. Then
+                    // the window does not stay closed.
                     Err(mpsc::error::TrySendError::Closed(())) => {
                         conn.to_host = None;
                         conn.discard_rx = true;
@@ -348,21 +344,21 @@ fn run_fsm(
             }
         }
 
-        // Relay agent gone but no FIN from the guest yet: drop further
-        // guest bytes instead of leaving the window closed.
+        // The relay agent is gone, but there is no FIN from the guest yet.
+        // Drop the guest bytes, so the window does not stay closed.
         if conn.discard_rx {
             while sock.can_recv() && sock.recv(|b| (b.len(), ())).is_ok() {}
         }
 
-        // If the guest half-closed (FIN received and recv buffer
-        // drained), stop feeding the agent.
+        // If the guest half-closed (FIN received and recv buffer empty),
+        // send no more data to the agent.
         if conn.to_host.is_some() && !sock.may_recv() && !sock.can_recv() {
             conn.to_host = None;
         }
 
-        // Host → Guest: only pump once the agent exists. Before that
-        // the placeholder channel's sender has already been dropped,
-        // so a try_recv would falsely report the host side closed.
+        // Host to guest: only after the agent exists. Before that, the
+        // sender of the placeholder channel is already dropped, so a
+        // try_recv would incorrectly report that the host side closed.
         if conn.agent_spawned {
             if let Some(pending) = conn.pending_tx.take()
                 && let Some(remaining) = push_to_socket(sock, pending)
@@ -386,7 +382,8 @@ fn run_fsm(
             }
         }
 
-        // FIN to guest once host side is done and tx buffer drained.
+        // Send FIN to the guest after the host side is done and the tx
+        // buffer is empty.
         if conn.host_closed
             && conn.pending_tx.is_none()
             && sock.send_queue() == 0
@@ -407,10 +404,11 @@ fn run_fsm(
     }
 }
 
-/// Try to push `data` into the socket's tx buffer. Returns `Some(rest)`
-/// if the socket only accepted a prefix and the remainder must be
-/// retried later; `None` if everything was queued (or the socket
-/// rejected the write, which we treat as "give up on this chunk").
+/// Try to put `data` into the tx buffer of the socket.
+/// Returns:
+///   `Some(rest)` if the socket accepted only a prefix. The caller must try
+///   the rest again later. `None` if all data is in the queue, or if the
+///   socket rejected the write (then the chunk is dropped).
 fn push_to_socket(sock: &mut tcp::Socket, data: Bytes) -> Option<Bytes> {
     match sock.send_slice(&data) {
         Ok(n) if n == data.len() => None,
@@ -420,11 +418,23 @@ fn push_to_socket(sock: &mut tcp::Socket, data: Bytes) -> Option<Bytes> {
     }
 }
 
-/// Per-connection relay task. Opens a `NetworkProxy.connect` RPC to
-/// the host and shuttles bytes: `to_host_rx` → `client_sink.send`, and
-/// the host-side `server_sink.send` → `from_host_tx` (via the
-/// `ChannelSink` that owns `from_host_tx`). Exits when either direction
-/// closes; dropping the tx end signals the poll loop.
+/// Relay task of one connection.
+///
+/// Opens a connection to the host with `NetworkProxy.connect` and moves the
+/// bytes:
+///  * `to_host_rx` to `client_sink.send`.
+///  * Host-side `server_sink.send` to `from_host_tx` (through the
+///    `ChannelSink` that owns `from_host_tx`).
+///
+/// Exits when one of the directions closes. The dropped tx end tells the
+/// poll loop.
+/// Args:
+///  - `network`: Host network proxy client
+///  - `dns`: Virtual DNS state, to map `dst` back to a hostname
+///  - `dst`: Destination address from the guest
+///  - `to_host_rx`: Bytes from guest to host
+///  - `from_host_tx`: Bytes from host to guest
+///  - `wake`: Wake-up signal of the poll loop
 async fn relay_agent(
     network: network_proxy::Client,
     dns: Rc<DnsState>,
@@ -442,16 +452,16 @@ async fn relay_agent(
         Ok(sink) => sink,
         Err(e) => {
             debug!("tcp-proxy rpc {hostname}:{}: {e}", dst.port());
-            // `to_host_rx` drops here with no agent left to drain it;
-            // wake the poll loop so run_fsm notices `to_host` closed.
+            // `to_host_rx` drops here, and no agent reads it. Wake the poll
+            // loop, so run_fsm sees that `to_host` is closed.
             wake.notify_one();
             return;
         }
     };
 
     while let Some(data) = to_host_rx.recv().await {
-        // Wake the poll loop now that a `to_host` slot is free, so it
-        // can refill it while we await the RPC send below.
+        // A `to_host` slot is free now. Wake the poll loop, so it can fill
+        // the slot while this task waits for the RPC send below.
         wake.notify_one();
         let mut req = client_sink.send_request();
         req.get().set_data(&data);
@@ -460,12 +470,17 @@ async fn relay_agent(
         }
     }
     let _ = client_sink.close_request().send().promise.await;
-    // Same as above: wake so run_fsm notices `to_host` closed.
+    // Same as above: wake, so run_fsm sees that `to_host` is closed.
     wake.notify_one();
 }
 
-/// Drain every packet from the TUN, SYN-snoop to register listeners,
-/// and push into the Device's rx queue for smoltcp to consume.
+/// Read all packets from the TUN (non-blocking) into the device rx queue
+/// for smoltcp.
+///
+/// The built-in smoltcp listener needs a specific address and port before
+/// the connection starts. Thus this function looks at each packet first.
+/// For a new SYN of an unknown `(src, dst)` pair, it adds a listener socket
+/// bound to `(dst_ip, dst_port)`, *before* smoltcp processes the SYN.
 fn drain_rx(
     device: &mut TunDevice,
     sockets: &mut SocketSet<'static>,
@@ -482,12 +497,12 @@ fn drain_rx(
                     && let Some(handle) = make_listener(sockets, dst)
                 {
                     debug!("tcp-proxy listener: {src} → {dst}");
-                    // Placeholder channel — replaced when the agent is
-                    // spawned at the first ESTABLISHED tick. Using a
-                    // channel here (rather than Option<Receiver>) means
-                    // `run_fsm` can unconditionally call try_recv even
-                    // before the agent exists: the buffer is empty so
-                    // nothing happens.
+                    // Placeholder channel. Replaced when the agent starts at
+                    // the first ESTABLISHED tick. With a channel here (not
+                    // Option<Receiver>), the field needs no Option. The
+                    // sender drops at once, so a try_recv would report
+                    // `Disconnected`. Thus `run_fsm` calls try_recv only
+                    // after the agent starts.
                     let (_placeholder_tx, placeholder_rx) = mpsc::channel::<Bytes>(1);
                     tracker.insert(
                         (src, dst),
@@ -514,8 +529,8 @@ fn drain_rx(
     }
 }
 
-/// Parse an incoming IP packet and return (src, dst) if it is a fresh
-/// TCP SYN (SYN set, ACK clear). Anything else returns None.
+/// Parse an incoming IP packet. Returns `(src, dst)` if it is a new TCP SYN
+/// (SYN set, ACK clear). Returns `None` for all other packets.
 fn classify_tcp_syn(pkt: &[u8]) -> Option<(SocketAddrV4, SocketAddrV4)> {
     let ip = Ipv4Packet::new_checked(pkt).ok()?;
     if ip.next_header() != IpProtocol::Tcp {
@@ -530,8 +545,8 @@ fn classify_tcp_syn(pkt: &[u8]) -> Option<(SocketAddrV4, SocketAddrV4)> {
     Some((src, dst))
 }
 
-/// Create a fresh TCP listener bound to the exact (dst_ip, dst_port)
-/// and add it to the socket set. Returns the handle or None on error.
+/// Create a new TCP listener bound to the exact `(dst_ip, dst_port)` and add
+/// it to the socket set. Returns the handle, or `None` on error.
 fn make_listener(sockets: &mut SocketSet<'static>, dst: SocketAddrV4) -> Option<SocketHandle> {
     let rx = tcp::SocketBuffer::new(vec![0; RX_BUF]);
     let tx = tcp::SocketBuffer::new(vec![0; TX_BUF]);
@@ -547,6 +562,8 @@ fn make_listener(sockets: &mut SocketSet<'static>, dst: SocketAddrV4) -> Option<
     Some(sockets.add(sock))
 }
 
+/// smoltcp device on the TUN. Packets go through in-memory queues, so the
+/// poll loop controls all TUN reads and writes.
 struct TunDevice {
     tun: Tun,
     rx_queue: VecDeque<Vec<u8>>,
@@ -580,6 +597,7 @@ impl Device for TunDevice {
     }
 }
 
+/// smoltcp receive token: one packet from the rx queue.
 struct TunRx(Vec<u8>);
 
 impl RxToken for TunRx {
@@ -591,6 +609,7 @@ impl RxToken for TunRx {
     }
 }
 
+/// smoltcp transmit token: adds one packet to the tx queue.
 struct TunTx<'a>(&'a mut VecDeque<Vec<u8>>);
 
 impl TxToken for TunTx<'_> {
@@ -605,6 +624,7 @@ impl TxToken for TunTx<'_> {
     }
 }
 
+/// Run `/sbin/ip` with `args`. Returns an error with stderr if it fails.
 fn run_ip(args: &[&str]) -> anyhow::Result<()> {
     let out = std::process::Command::new("/sbin/ip").args(args).output()?;
     if !out.status.success() {
@@ -617,17 +637,25 @@ fn run_ip(args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Poll-loop counters for the benchmark in `tcp_proxy_bench` — attribute a
-/// throughput ceiling to iteration rate vs. per-iteration work.
+/// Poll loop counters for the benchmark in `tcp_proxy_bench`. They show if
+/// a throughput limit comes from the iteration rate or from the work per
+/// iteration.
 #[cfg(feature = "tun-bench")]
 pub(crate) mod stats {
     use std::sync::atomic::AtomicU64;
 
+    /// Poll loop iterations.
     pub static ITERS: AtomicU64 = AtomicU64::new(0);
+    /// Wake-ups because the TUN fd is readable.
     pub static WAKE_FD: AtomicU64 = AtomicU64::new(0);
+    /// Wake-ups from the `wake` notify.
     pub static WAKE_NOTIFY: AtomicU64 = AtomicU64::new(0);
+    /// Wake-ups from the timer.
     pub static WAKE_TIMER: AtomicU64 = AtomicU64::new(0);
+    /// Packets written to the TUN.
     pub static TX_PKTS: AtomicU64 = AtomicU64::new(0);
+    /// Packets read from the TUN.
     pub static RX_PKTS: AtomicU64 = AtomicU64::new(0);
+    /// Bytes from the host that the FSM moved into smoltcp sockets.
     pub static FSM_BYTES_IN: AtomicU64 = AtomicU64::new(0);
 }

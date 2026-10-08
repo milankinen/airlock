@@ -1,12 +1,6 @@
-//! Sweep-based garbage collector for the OCI cache.
+//! Garbage collector for the OCI cache.
 //!
-//! An image is considered live when some sandbox holds a hardlink to its
-//! `images/<digest>` file (link count > 1). A layer is live when at least
-//! one live image lists its digest. Everything else is deleted.
-//!
-//! Run this only after user-initiated removals (`Recreate`, `airlock rm`).
-//! Running it on every `prepare()` would race with sibling sandboxes in
-//! the middle of starting up — their hardlinks may not exist yet.
+//! Removes the cached images and layers that no sandbox uses.
 
 use std::collections::HashSet;
 use std::os::unix::fs::MetadataExt;
@@ -14,24 +8,33 @@ use std::path::Path;
 
 use crate::cache;
 
-/// Minimal shape for parsing just the layer list from a cached image file —
-/// avoids pulling in the full `OciImage` deserialization path here.
+/// Minimal shape to parse only the layer list of a cached image file. Thus
+/// this module does not need the full `OciImage` deserialization.
 #[derive(serde::Deserialize)]
 struct CachedLayers {
     #[serde(default)]
     image_layers: Vec<String>,
 }
 
-/// Remove every cached image file whose link count is 1 (no sandbox
-/// references), then every layer dir not referenced by a surviving image.
-/// Stray staging entries (`.download`, `.download.tmp`, `.tmp`) are always
-/// removed — they're only meaningful mid-pull.
+/// Remove the cached images and layers that no sandbox uses.
+///
+/// An image is in use if a sandbox has a hardlink to its `images/<digest>`
+/// file (link count > 1). A layer is in use if at least one image in use
+/// lists it. The sweep deletes all other images and layers. It also always
+/// removes stray staging entries (`.download`, `.download.tmp`, `.tmp`),
+/// because they are useful only during a pull.
+///
+/// Run this only after removals that the user started (`Recreate`,
+/// `airlock rm`). If it runs on each `prepare()`, it races with sibling
+/// sandboxes that are starting. Their hardlinks may not exist yet.
 pub fn sweep() {
     sweep_images();
     let live = collect_live_layers();
     sweep_layers(&live);
 }
 
+/// Remove the cached image files that have link count 1 (no sandbox uses
+/// them).
 fn sweep_images() {
     let Ok(images_root) = cache::images_root() else {
         return;
@@ -45,8 +48,8 @@ fn sweep_images() {
             continue;
         };
         if !meta.is_file() {
-            // Ignore leftover directories from the old layout (harmless) and
-            // whatever else shows up; only files are real cache entries.
+            // Ignore directories left from the old layout (they do no harm)
+            // and other entries. Only files are real cache entries.
             continue;
         }
         if meta.nlink() <= 1 {
@@ -55,6 +58,7 @@ fn sweep_images() {
     }
 }
 
+/// Collect the layer keys of all remaining cached images.
 fn collect_live_layers() -> HashSet<String> {
     let mut live = HashSet::new();
     let Ok(images_root) = cache::images_root() else {
@@ -70,13 +74,15 @@ fn collect_live_layers() -> HashSet<String> {
         let Ok(parsed) = serde_json::from_slice::<CachedLayers>(&data) else {
             continue;
         };
-        // `image_layers` holds versioned layer keys (e.g. `2.<hex>`) that
-        // match the on-disk dir name 1:1 — no normalization needed.
+        // `image_layers` contains versioned layer keys (e.g. `2.<hex>`).
+        // They are the same as the on-disk dir names, so no conversion is
+        // necessary.
         live.extend(parsed.image_layers);
     }
     live
 }
 
+/// Remove staging entries and the layer dirs that are not in `live`.
 fn sweep_layers(live: &HashSet<String>) {
     let Ok(layers_root) = cache::layers_root() else {
         return;
@@ -97,11 +103,13 @@ fn sweep_layers(live: &HashSet<String>) {
     }
 }
 
+/// Return `true` if `name` is a staging entry of an unfinished pull.
 #[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn is_staging_name(name: &str) -> bool {
     name.ends_with(".download.tmp") || name.ends_with(".download") || name.ends_with(".tmp")
 }
 
+/// Remove a file or a directory tree.
 fn remove_any(path: &Path) -> std::io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(m) if m.is_dir() => std::fs::remove_dir_all(path),

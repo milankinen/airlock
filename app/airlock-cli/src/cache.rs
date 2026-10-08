@@ -1,53 +1,58 @@
-//! Paths into the `~/.cache/airlock/` global cache directory.
+//! Global cache locations.
 //!
-//! The global cache holds VM boot assets (under `vm/`) and an `oci/` subtree
-//! with extracted OCI image rootfs trees and individual OCI layer trees.
-//! Under `packs/mounts/<name>/`, each pack with a `config.lua` has a
-//! directory of its own for the host side of its mounts (see
-//! [`pack_mounts_dir`]).
-//! Per-sandbox state (CA, disk image, overlay, etc.) lives in
-//! `<project>/.airlock/sandbox/` — see `sandbox.rs`.
+//! Gives the locations in the user's global airlock cache. All sandboxes share
+//! this cache. It contains the VM boot assets, the OCI images and layers, the
+//! host side of the pack mounts, and fallback CLI sockets.
+//!
+//! The state of each sandbox is not in the global cache. It is in the project
+//! directory.
 
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-/// On-disk format version for the per-layer cache. Bumped whenever the
-/// on-disk contract changes (e.g. the extractor now sets
-/// `user.overlay.opaque="x"` on parent dirs of xattr whiteouts; layers
-/// produced without that mark can't be reused). Every layer dir and
-/// staging file is prefixed with `{LAYER_FORMAT}.`, and the image JSON
-/// schema is bumped in lockstep so stale caches are ignored instead of
-/// silently poisoning fresh runs.
+/// On-disk format version of the per-layer cache.
+///
+/// Increase it when the on-disk contract changes. For example, the
+/// extractor sets `user.overlay.opaque="x"` on parent dirs of xattr
+/// whiteouts. Layers without that mark are not usable. Each layer dir and staging file
+/// has the prefix `{LAYER_FORMAT}.`. Increase the image JSON schema version
+/// at the same time. Then new runs ignore stale caches and do not use bad
+/// data from them.
 pub const LAYER_FORMAT: u32 = 2;
 
-/// Shared lock for tests that mutate the process-wide `HOME` env var.
-/// Any test that calls `std::env::set_var("HOME", …)` to redirect the
-/// cache must hold this lock so concurrent tests don't see each other's
-/// value.
+/// Lock for tests that change the process-wide `HOME` env var. Each test
+/// that sets `HOME` to move the cache must hold this lock. Thus tests that
+/// run at the same time do not see the `HOME` of another test.
 #[cfg(test)]
 pub(crate) static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Strip a leading `<algo>:` from a digest, returning just the hash portion.
-/// `sha256:abc123…` → `abc123…`. Used as the input to [`layer_key`]; not
-/// used directly as an on-disk name (the layer cache is versioned — see
+/// Remove a leading `<algo>:` from a digest.
+/// Returns:
+///   The hash part of the digest: `sha256:abc123…` gives `abc123…`.
+///
+/// It is the input of [`layer_key`]. Do not use it directly as a layer
+/// directory name, because the layer cache is versioned (see
 /// [`LAYER_FORMAT`]).
 pub fn digest_name(digest: &str) -> &str {
     digest.split(':').next_back().unwrap_or(digest)
 }
 
-/// Normalize an OCI digest into the versioned layer key used as both the
-/// on-disk directory name and the identifier passed to the guest (so guest
-/// mount paths match host paths). Embedding [`LAYER_FORMAT`] into every
-/// layer name means a format bump automatically invalidates the old cache
-/// without needing to locate and wipe it — old dirs stay around until
-/// [`crate::oci::gc_sweep`] reaps them, but they're ignored by anything
-/// that consults the cache.
+/// Convert an OCI digest to the versioned layer key.
+/// Returns:
+///   The layer key. It is the on-disk directory name and also the
+///   identifier for the guest, so guest mount paths are the same as host
+///   paths.
+///
+/// The key contains [`LAYER_FORMAT`]. Thus a format change makes the old
+/// cache invalid without a search and delete. Old dirs stay until
+/// [`crate::oci::gc_sweep`] removes them, but cache readers ignore them.
 pub fn layer_key(digest: &str) -> String {
     format!("{LAYER_FORMAT}.{}", digest_name(digest))
 }
 
-/// Root cache directory (`~/.cache/airlock/`), created if absent.
+/// Get the root cache directory (`~/.cache/airlock/`). Creates it if it
+/// does not exist.
 pub fn cache_dir() -> anyhow::Result<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
     let dir = home.join(".cache").join("airlock");
@@ -55,11 +60,12 @@ pub fn cache_dir() -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-/// The directory of the pack `name` (`~/.cache/airlock/packs/mounts/<name>/`),
-/// created if absent. The pack's `config.lua` gets it as `pack.directory`
-/// and keeps the host side of its mounts there (for example the agents'
-/// settings and credential files), shared by all sandboxes that use the
-/// pack.
+/// Get the mount directory of the pack `name`
+/// (`~/.cache/airlock/packs/mounts/<name>/`). Creates it if it does not exist.
+///
+/// The pack's `config.lua` gets it as `pack.directory`. The pack keeps the
+/// host side of its mounts there (for example the agent settings and
+/// credential files). All sandboxes that use the pack share it.
 pub fn pack_mounts_dir(name: &str) -> anyhow::Result<PathBuf> {
     let dir = cache_dir()?.join("packs").join("mounts").join(name);
     std::fs::create_dir_all(&dir)
@@ -67,18 +73,15 @@ pub fn pack_mounts_dir(name: &str) -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Where the CLI RPC Unix socket lives for the sandbox at `sandbox_dir`.
-///
-/// Default is `<sandbox_dir>/cli.sock`. `AF_UNIX` has a hard 104-byte
-/// `sun_path` limit on macOS (108 on Linux); deeply nested project
-/// paths overflow that, so we fall back to
-/// `~/.cache/airlock/sock/<hash>.sock` — a short, stable location
-/// derived from the sandbox dir so `airlock start` and `airlock exec`
-/// both compute the same path without any pointer file.
-///
-/// The parent directory is created on demand.
+/// Get the path of the CLI RPC Unix socket for the sandbox at `sandbox_dir`.
+/// Creates the parent directory if necessary.
+/// Returns:
+///   `<sandbox_dir>/cli.sock`, or `~/.cache/airlock/sock/<hash>.sock` if
+///   the default path is too long for a Unix socket.
 pub fn cli_sock_path(sandbox_dir: &Path) -> anyhow::Result<PathBuf> {
-    // 103 = min(sun_path) across linux/macos, minus trailing NUL.
+    // `AF_UNIX` has a hard `sun_path` limit of 104 bytes on macOS (108 on
+    // Linux). Deeply nested project paths can be longer. 103 is the smaller
+    // limit minus the trailing NUL.
     const SUN_PATH_SAFE: usize = 103;
 
     let default = sandbox_dir.join(airlock_common::CLI_SOCK_FILENAME);
@@ -86,6 +89,9 @@ pub fn cli_sock_path(sandbox_dir: &Path) -> anyhow::Result<PathBuf> {
         return Ok(default);
     }
 
+    // Fallback: a short, stable path from a hash of the sandbox dir. Thus
+    // `airlock start` and `airlock exec` get the same path without a pointer
+    // file.
     let mut hasher = Sha256::new();
     hasher.update(sandbox_dir.as_os_str().as_encoded_bytes());
     let hash = hex::encode(&hasher.finalize()[..8]);
@@ -94,44 +100,49 @@ pub fn cli_sock_path(sandbox_dir: &Path) -> anyhow::Result<PathBuf> {
     Ok(dir.join(format!("{hash}.sock")))
 }
 
-/// Root of the OCI cache (`~/.cache/airlock/oci/`), created if absent.
-/// Holds the `images/` and `layers/` subtrees — kept under a dedicated
-/// namespace so other cache kinds (VM assets, …) don't collide.
+/// Get the root of the OCI cache (`~/.cache/airlock/oci/`). Creates it if it
+/// does not exist. It contains the `images/` and `layers/` subtrees. They
+/// have their own namespace, so they do not collide with other cache kinds
+/// (VM assets and others).
 fn oci_root() -> anyhow::Result<PathBuf> {
     let dir = cache_dir()?.join("oci");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
-/// Root of the image cache (`~/.cache/airlock/oci/images/`), created if
-/// absent. Each entry is a single `<image-digest>` JSON file holding the
-/// fully-baked `OciImage` (schema-tagged via `crate::oci::CachedImage`).
+/// Get the root of the image cache (`~/.cache/airlock/oci/images/`). Creates
+/// it if it does not exist. Each entry is one `<image-digest>` JSON file with
+/// the complete `OciImage` (with a schema tag from `crate::oci::CachedImage`).
 pub fn images_root() -> anyhow::Result<PathBuf> {
     let dir = oci_root()?.join("images");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
-/// Path to a cached OCI image file, keyed by its digest hash. The path may
-/// or may not exist on disk — callers check.
+/// Get the path of a cached OCI image file for the image `digest`. The file
+/// possibly does not exist. The caller must check.
 pub fn image_path(digest: &str) -> anyhow::Result<PathBuf> {
     Ok(images_root()?.join(digest_name(digest)))
 }
 
-/// Root of the per-layer cache (`~/.cache/airlock/oci/layers/`), created if
-/// absent. Each entry is `<layer-digest>/` with the layer contents extracted
-/// directly at the root; the directory's presence is itself the completion
-/// marker (it only appears via the atomic rename from `<layer-digest>.tmp/`).
+/// Get the root of the per-layer cache (`~/.cache/airlock/oci/layers/`).
+/// Creates it if it does not exist.
+///
+/// Each entry is a `<layer-key>/` directory (see [`layer_key`]) with the
+/// layer contents at its root. If the directory exists, the layer is
+/// complete, because the directory appears only through the atomic rename
+/// from a `<layer-key>.<...>.tmp/` staging directory.
 pub fn layers_root() -> anyhow::Result<PathBuf> {
     let dir = oci_root()?.join("layers");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
-/// Directory for a single cached OCI layer, keyed by the versioned
-/// [`layer_key`]. Callers holding a raw OCI digest must convert via
-/// `layer_key` first; callers that read a key back from `image_layers`
-/// (stored in the image JSON) pass it through unchanged.
+/// Get the directory of one cached OCI layer.
+/// Args:
+///  - `key`: Versioned layer key. Convert a raw OCI digest with
+///    [`layer_key`] first. A key from `image_layers` (in the image JSON) is
+///    already a layer key.
 pub fn layer_dir(key: &str) -> anyhow::Result<PathBuf> {
     Ok(layers_root()?.join(key))
 }

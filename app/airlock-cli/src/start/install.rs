@@ -1,8 +1,8 @@
-//! The install step of `airlock start`: run the install boot
-//! ([`setup::install`]) for the tools that [`super::sandbox::ensure_sandbox`]
-//! decided to install, and save their records. No questions: a failed
-//! install ends the run (exit code 1), and the next start installs it
-//! again.
+//! The install step of `airlock start`.
+//!
+//! Installs the tools that the sandbox step selected. The step asks no
+//! questions. A failed install ends the run, and the next start tries the
+//! install again.
 
 use super::{Exit, SandboxOptions};
 use crate::cli;
@@ -19,20 +19,31 @@ use crate::project::{self, Project};
 use crate::test_cfg::start::install_boot;
 use crate::util::PinnedDir;
 
-/// What [`install_tools`] installs: decided (and the records saved) by
-/// [`super::sandbox::ensure_sandbox`].
+/// The tools that [`install_tools`] installs.
+///
+/// [`super::sandbox::ensure_sandbox`] makes this decision and saves the
+/// records.
 pub struct InstallDecision {
     /// `.airlock/sandbox/`.
     sandbox: PinnedDir,
-    /// The records, as saved.
+    /// The install records, as saved.
     state: InstallState,
     /// The installs to run now, in pack order.
     to_install: Vec<InstallerScript>,
 }
 
 impl InstallDecision {
-    /// Apply `transitions` to `state`, save it when it changed or
-    /// something installs, and install `to_install`.
+    /// Make the install decision.
+    /// Args:
+    ///  - `sandbox`: The `.airlock/sandbox/` directory
+    ///  - `state`: Current install records
+    ///  - `transitions`: Record changes to apply to `state`
+    ///  - `to_install`: Installs to run, in pack order
+    ///  - `image`: Container image of the sandbox
+    ///
+    /// Returns:
+    ///   The decision, or error if the save fails. The records are saved if
+    ///   they changed or if something installs.
     pub(super) fn save(
         sandbox: PinnedDir,
         mut state: InstallState,
@@ -53,7 +64,7 @@ impl InstallDecision {
     }
 }
 
-/// The installs of the packs whose version has a setup script.
+/// Return the installs of the packs whose version has a setup script.
 pub fn install_candidates(configured: &[ConfiguredPack]) -> Vec<InstallerScript> {
     configured
         .iter()
@@ -61,11 +72,20 @@ pub fn install_candidates(configured: &[ConfiguredPack]) -> Vec<InstallerScript>
         .collect()
 }
 
-/// Run the install boot for the decided tools (its own project, with
-/// [`ResolvedConfig::install_config`]; `project`'s run config is
-/// untouched), and save the records. A pack that still has no
-/// `installed` record after this ends the run (exit code 1); config is
-/// the source of truth for tools, so there is no starting without one.
+/// Install the selected tools in an install boot, and save the records.
+/// Args:
+///  - `project`: The open project
+///  - `resolved`: Resolved config, for [`ResolvedConfig::install_config`]
+///  - `image`: Container image of the sandbox
+///  - `decision`: The tools to install
+///  - `options`: Command-line options
+///
+/// Returns:
+///   Exit code 1 if a pack still has no `installed` record after the
+///   install. The config is the source of truth for tools, so the sandbox
+///   cannot start without the pack.
+// The install boot uses its own project with the install config. The run
+// config of `project` does not change.
 pub async fn install_tools(
     project: &Project,
     resolved: &ResolvedConfig,
@@ -86,7 +106,7 @@ pub async fn install_tools(
         let install_project = project
             .with_config(resolved.install_config().map_err(Exit::config)?)
             .map_err(|e| Exit::error(1, e))?;
-        // Saved with the first record: no session ran since this install.
+        // Saved with the first record: no session ran after this install.
         state.ran_session = false;
         let mut save = |s: &mut InstallState| save_state(&sandbox, &image.image_id, s);
         let run = run_install(
@@ -108,7 +128,7 @@ pub async fn install_tools(
     if install {
         prompt::flush_input();
     }
-    // The session runs next; a later retry asks first (see
+    // The session runs next. A later retry asks first (see
     // [`InstallState::ran_session`]).
     if !state.ran_session && !state.packs.is_empty() {
         state.ran_session = true;
@@ -124,7 +144,7 @@ fn save_state(sandbox: &PinnedDir, image_id: &str, state: &mut InstallState) -> 
     install_state::write(sandbox, state)
 }
 
-/// Run the install boot for `to_install`, and report what failed.
+/// Run the install boot for `to_install`, and report the failures.
 async fn run_install(
     project: Project,
     image: &OciImage,

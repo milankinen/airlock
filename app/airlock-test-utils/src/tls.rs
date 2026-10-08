@@ -1,3 +1,5 @@
+//! Test certificates and local TLS servers.
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -5,11 +7,14 @@ use axum::Router;
 
 /// A self-signed CA for a test, in PEM, with its key.
 pub struct TestCa {
+    /// The CA certificate in PEM.
     pub cert_pem: String,
+    /// The CA private key in PEM.
     pub key_pem: String,
 }
 
 impl TestCa {
+    /// Make a new self-signed CA with a fresh key.
     pub fn generate() -> Self {
         let key = rcgen::KeyPair::generate().unwrap();
         let cert = rcgen::CertificateParams::new(vec![])

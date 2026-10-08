@@ -1,3 +1,5 @@
+//! Temporary directories for tests.
+
 pub use tempfile::TempDir;
 
 /// A fresh empty directory under the system temp dir, removed on drop.

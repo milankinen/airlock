@@ -1,7 +1,11 @@
-//! VM lifecycle: configure, boot, and connect to the in-VM supervisor.
+//! VM lifecycle support.
 //!
-//! On macOS, uses the Apple Virtualization.framework. On Linux, uses
-//! cloud-hypervisor + virtiofsd.
+//! Configures, boots and controls the sandbox VM, and connects to the
+//! supervisor in the VM. Also resolves the configured mounts and manages the
+//! persistent sandbox disk. On Linux, it checks that the user can use KVM.
+//!
+//! On macOS, the VM uses the Apple Virtualization framework. On Linux, it
+//! uses Cloud Hypervisor and virtiofsd.
 
 #[cfg(target_os = "macos")]
 mod apple;
@@ -15,22 +19,30 @@ pub mod mount;
 use std::os::unix::io::OwnedFd;
 use std::path::{Path, PathBuf};
 
+/// Result of the KVM access check.
 #[cfg(target_os = "linux")]
 pub enum KvmStatus {
+    /// `/dev/kvm` can be opened for read and write.
     Available,
+    /// `/dev/kvm` does not exist.
     NotFound,
+    /// The user has no permission to open `/dev/kvm`.
     NoPermission,
+    /// `/dev/kvm` cannot be opened for a different reason.
     Unavailable(std::io::Error),
 }
 
+/// Check if the current user can use `/dev/kvm`.
 #[cfg(target_os = "linux")]
 pub fn kvm_status() -> KvmStatus {
     kvm_status_at(Path::new("/dev/kvm"))
 }
 
+/// Check if the current user can open the KVM device at `path`.
 #[cfg(target_os = "linux")]
 fn kvm_status_at(path: &Path) -> KvmStatus {
-    // Opening instead of inspecting mode bits lets the kernel apply ACLs.
+    // Open the file instead of reading the mode bits, so the kernel also
+    // applies ACLs.
     match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -45,6 +57,8 @@ fn kvm_status_at(path: &Path) -> KvmStatus {
     }
 }
 
+/// Make sure that KVM is available. If not, show the reason and exit the
+/// process.
 #[cfg(target_os = "linux")]
 pub fn require_kvm() {
     match kvm_status() {
@@ -74,30 +88,42 @@ use crate::project::Project;
 use crate::sandbox::boot::BootOptions;
 use crate::vm::config::VmShare;
 
-/// A running VM instance. Dropping this kills the VM and stops file sync.
+/// A running VM instance. When dropped, it kills the VM and stops the file
+/// sync.
 #[allow(dead_code)]
 pub struct VmInstance {
-    /// Private — dropping kills the VM via the existing backend impls.
+    /// Backend handle. When dropped, the backend kills the VM.
     vm_handle: Box<dyn VmHandle>,
-    /// File-sync handle — gracefully drained by `shutdown()`, aborted on drop.
+    /// File-sync handle. `shutdown()` stops it cleanly. A drop aborts it.
     sync_handle: Option<file_sync::SyncHandle>,
+    /// OCI image digest.
     pub image_id: String,
+    /// Image layer keys, topmost first.
     pub image_layers: Vec<String>,
+    /// Resolved mounts, including the project mount if it is shared.
     pub mounts: Vec<mount::ResolvedMount>,
+    /// Path of the sandbox disk image.
     pub disk_image: PathBuf,
+    /// Cache directories on the sandbox disk.
     pub caches: Vec<disk::CacheEntry>,
+    /// Resolved guest home directory.
     pub container_home: String,
     /// The sandbox env (see [`crate::sandbox::boot::guest_env`]).
     pub env: Vec<String>,
+    /// Working directory in the guest.
     pub cwd: String,
+    /// Container uid.
     pub uid: u32,
+    /// Container gid.
     pub gid: u32,
 }
 
 impl VmInstance {
-    /// Gracefully shut down file sync (drains pending events), then stop the
-    /// VM and wait until the backend confirms it stopped. An error means the
-    /// stop was not confirmed; the VM is still killed when `self` drops.
+    /// Stop the file sync cleanly (it handles pending events), then stop the
+    /// VM and wait until the backend confirms the stop.
+    /// Returns:
+    ///   Error if the stop was not confirmed. The VM is still killed when
+    ///   `self` is dropped.
     pub async fn shutdown(mut self) -> anyhow::Result<()> {
         if let Some(handle) = self.sync_handle.take() {
             handle.shutdown().await;
@@ -105,11 +131,14 @@ impl VmInstance {
         self.vm_handle.stop().await
     }
 
-    /// Open a vsock connection to the given guest port. Retries every
-    /// 200ms for up to ~12 s because the guest may still be booting
-    /// (first call) or may have just started listening on a new port
-    /// after the initial handshake (subsequent calls).
+    /// Open a vsock connection to the given guest port. Tries again every
+    /// 200 ms for up to approximately 12 s.
+    /// Returns:
+    ///   The connected socket, or error if all attempts fail.
     pub async fn vsock_connect(&self, port: u32) -> anyhow::Result<OwnedFd> {
+        // Retries are necessary because the guest can still be in boot
+        // (first call), or can have only just started to listen on a new
+        // port after the initial handshake (later calls).
         const MAX_ATTEMPTS: u32 = 60;
         const DELAY: std::time::Duration = std::time::Duration::from_millis(200);
         let mut last_err = None;
@@ -129,16 +158,20 @@ impl VmInstance {
     }
 }
 
-/// Boot the VM with the given config and image. Returns a `VmInstance` (for
-/// cleanup on drop) and the vsock fd connected to the in-VM supervisor.
+/// Boot the sandbox VM and connect to the in-VM supervisor.
+/// Args:
+///  - `project`: The project with its config
+///  - `image`: The prepared OCI image
+///  - `container_home`: Resolved guest home, see
+///    [`crate::oci::effective_container_home`]. Used for `~/...` expansion
+///    of mount, cache and socket-forward paths
+///  - `env`: The sandbox env ([`crate::sandbox::boot::guest_env`])
+///  - `opts`: Boot options. If `project_share` is false, there is no project
+///    mount and the guest runs in `/`. `quiet` skips the VM resources summary.
 ///
-/// `opts.project_share` false leaves out the project mount and runs the
-/// guest in `/`; `opts.quiet` skips the VM resources summary.
-///
-/// `container_home` is the resolved guest home — `[env].HOME` if the
-/// user overrode it, otherwise the image's user-record home. Used for
-/// `~/...` expansion of mount, cache, and socket-forward paths. `env` is
-/// the sandbox env ([`crate::sandbox::boot::guest_env`]).
+/// Returns:
+///   The [`VmInstance`] (it cleans up on drop) and the vsock fd that is
+///   connected to the in-VM supervisor.
 pub async fn start(
     project: &Project,
     image: &OciImage,
@@ -208,13 +241,13 @@ pub async fn start(
         uid: image.uid,
         gid: image.gid,
     };
-    // Wait for the in-VM supervisor to start listening. Reuses the
-    // same retry loop as every other vsock we open later.
+    // Wait until the in-VM supervisor listens. All later vsock connections
+    // use the same retry loop.
     let vsock_fd = vm.vsock_connect(airlock_common::SUPERVISOR_PORT).await?;
     Ok((vm, vsock_fd))
 }
 
-/// Build the project dir mount (when `project_share`) and resolve all
+/// Make the project dir mount (if `project_share` is true) and resolve all
 /// enabled user mounts.
 fn assemble_mounts(
     project: &Project,
@@ -251,18 +284,19 @@ fn assemble_mounts(
     Ok(mounts)
 }
 
-/// Build the VirtioFS share list from static shares + dir mounts + file mounts.
+/// Make the VirtioFS share list from the static shares, the dir mounts and
+/// the file mounts.
 ///
-/// File mounts are hard-linked (copy fallback on EXDEV) into
-/// `overlay/files/{rw,ro}/{key}` and exposed as two consolidated shares.
+/// File mounts are hardlinked (copied on EXDEV) into
+/// `overlay/files/{rw,ro}/{key}`. Two shares give them to the guest.
 fn prepare_shares(
     _image: &OciImage,
     mounts: &[mount::ResolvedMount],
     sandbox_dir: &Path,
 ) -> anyhow::Result<Vec<VmShare>> {
-    // The guest composes the image rootfs via overlayfs from `/mnt/layers/<d>`.
-    // Share the shared per-layer cache root once; the guest reads only the
-    // digests listed in `imageLayers` for this image.
+    // The guest makes the image rootfs with overlayfs from
+    // `/mnt/layers/<d>`. Share the per-layer cache root one time. The guest
+    // reads only the layers that `imageLayers` lists for this image.
     let mut shares = vec![VmShare {
         tag: "layers".to_string(),
         host_path: crate::cache::layers_root()?,
@@ -287,8 +321,8 @@ fn prepare_shares(
         });
     }
 
-    // Hard-link file mounts into overlay/files/{rw|ro}/{key}. Rebuild from
-    // scratch each boot so stale entries are removed.
+    // Hardlink file mounts into overlay/files/{rw|ro}/{key}. Make the dirs
+    // again on each boot, so old entries are removed.
     let files_rw_dir = sandbox_dir.join("overlay").join("files").join("rw");
     let files_ro_dir = sandbox_dir.join("overlay").join("files").join("ro");
     let _ = std::fs::remove_dir_all(&files_rw_dir);
@@ -377,9 +411,8 @@ fn log_config(project: &Project) {
     );
 }
 
-/// Start the platform-specific VM backend. Waiting for a particular
-/// vsock port to be ready is caller responsibility — see
-/// [`VmInstance::vsock_connect`].
+/// Start the platform-specific VM backend. The caller must wait until a
+/// vsock port is ready, see [`VmInstance::vsock_connect`].
 #[cfg_attr(not(target_os = "macos"), allow(clippy::unused_async))]
 async fn boot_backend(vm_config: &config::VmConfig) -> anyhow::Result<Box<dyn VmHandle>> {
     #[cfg(target_os = "macos")]
@@ -407,12 +440,13 @@ type HandleFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T>
 
 /// Trait for VM backends. Dropping the handle kills the VM.
 trait VmHandle {
-    /// Open a fresh vsock connection to the given guest port. Used to
-    /// open the network-proxy channel after the supervisor one is up.
+    /// Open a new vsock connection to the given guest port. Used for the
+    /// supervisor channel and for later channels, for example the network
+    /// proxy.
     fn vsock_connect(&self, port: u32) -> HandleFuture<'_, anyhow::Result<OwnedFd>>;
 
-    /// Stop the VM and wait until the backend confirms it stopped. Dropping
-    /// the handle afterwards does not stop it again.
+    /// Stop the VM and wait until the backend confirms the stop. A drop of
+    /// the handle after this does not stop the VM again.
     fn stop(&mut self) -> HandleFuture<'_, anyhow::Result<()>>;
 }
 

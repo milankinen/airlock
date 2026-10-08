@@ -1,13 +1,8 @@
-//! The interceptor seam between the network proxy and the services behind
-//! it ([`crate::services`]).
+//! Interface between the network proxy and the network services.
 //!
-//! An [`Interceptor`] is one provider's proxy over the hosts it owns: the
-//! network layer resolves a connection's target, matches it against the
-//! interceptors' [`targets`](Interceptor::targets), and on a match hands
-//! every request on the connection to [`send`](Interceptor::send) around
-//! the upstream send, instead of forwarding it as is. The network knows
-//! nothing about what an interceptor does with a request (token swaps,
-//! sign-in, backstops) — that is the services' concern.
+//! A service uses this interface to handle the requests to the hosts that it
+//! owns. The network does not know what a service does with a request (token
+//! swaps, sign-in, backstops). That is the concern of the services.
 
 use futures::future::LocalBoxFuture;
 use hyper::{Request, Response};
@@ -15,29 +10,45 @@ use hyper::{Request, Response};
 use super::http::ResponseBody;
 use super::target::{Endpoint, InjectedSecret, NetworkTarget};
 
-/// The upstream send of one request: the rest of the relay.
+/// Function that sends one request upstream: the remaining part of the
+/// relay.
 pub type Next = Box<
     dyn FnOnce(
         Request<ResponseBody>,
     ) -> LocalBoxFuture<'static, anyhow::Result<Response<ResponseBody>>>,
 >;
 
-/// One provider's proxy over the hosts it owns.
+/// Proxy of one provider for the hosts that it owns.
+///
+/// The network layer matches the target of each connection against the
+/// [`targets`](Interceptor::targets) of all interceptors. On a match, it
+/// gives each request on a TLS connection to [`send`](Interceptor::send),
+/// instead of forwarding the request with no change.
 pub trait Interceptor {
     /// Display name for logging and diagnostics.
     fn name(&self) -> &str;
 
-    /// The hosts this interceptor owns: allowed (unless `deny-always` or a
-    /// deny rule), always intercepted, never passthrough.
+    /// Get the hosts that this interceptor owns. The network allows them
+    /// (except under `deny-always` or a deny rule), intercepts their TLS
+    /// connections, and never uses passthrough for them.
     fn targets(&self) -> &[NetworkTarget];
 
-    /// Handle one request to an owned host `to` (the host and port the
-    /// guest connected to), after Lua middleware: pin the request's
-    /// authority to `to`, swap surrogates for the real tokens and call
-    /// `next` (the upstream), or answer locally. `injected` are the masked
-    /// secrets the inject rules put into the request (already unmasked):
-    /// the only credentials besides surrogates that an API request may
-    /// carry. Responses reach the guest with surrogates only.
+    /// Handle one request to an owned host, after Lua middleware.
+    ///
+    /// The implementation must set the request authority to `to`, replace
+    /// surrogates with the real tokens and call `next`. Or it can send a
+    /// local response. Responses must get to the guest with surrogates
+    /// only.
+    /// Args:
+    ///  - `to`: Host and port that the guest connected to
+    ///  - `req`: Request from the guest
+    ///  - `injected`: Masked secrets that the inject rules put into the
+    ///    request (already unmasked). These are the only credentials other
+    ///    than surrogates that an API request can contain.
+    ///  - `next`: Function that sends the request upstream.
+    ///
+    /// Returns:
+    ///   Response for the guest, or error.
     fn send<'a>(
         &'a self,
         to: &'a Endpoint,

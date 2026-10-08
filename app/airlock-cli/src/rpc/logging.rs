@@ -1,11 +1,13 @@
-//! Receives log events from the in-VM supervisor and re-emits them through
-//! the host's `tracing` subscriber under the `airlock::airlockd` target.
+//! Guest log forwarding.
+//!
+//! Receives log events from the supervisor in the VM and writes them to the
+//! host log.
 
 use std::rc::Rc;
 
 use airlock_common::supervisor_capnp::log_sink;
 
-/// Cap'n Proto `LogSink` server that bridges guest log events into the host
+/// Cap'n Proto `LogSink` server that sends guest log events to the host
 /// tracing system.
 pub struct LogSinkImpl;
 

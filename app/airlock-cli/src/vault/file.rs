@@ -1,7 +1,7 @@
-//! Plaintext JSON backend. Writes a tagged envelope so a later
-//! `settings.vault = "encrypted-file"` flip can refuse to reinterpret
-//! a plaintext file as encrypted (and vice versa in `encrypted.rs`),
-//! rather than silently zeroing a vault.
+//! Plaintext file vault storage.
+//!
+//! Used for `settings.vault.storage = "file"`. Keeps the vault in a file without
+//! encryption.
 
 use std::path::PathBuf;
 
@@ -9,11 +9,18 @@ use anyhow::{Context, bail};
 
 use super::{Envelope, Storage, VaultData, atomic_write, read_vault_file};
 
+/// Storage backend that keeps the vault as plaintext JSON in one file.
+///
+/// The file has the tagged [`Envelope`] format. Thus, after a change to
+/// `settings.vault.storage = "encrypted-file"`, the encrypted backend refuses to
+/// read this file as encrypted, and the reverse. It does not silently
+/// start an empty vault.
 pub struct FileStorage {
     path: PathBuf,
 }
 
 impl FileStorage {
+    /// Make a backend for the vault file at `path`.
     pub fn new(path: PathBuf) -> Self {
         Self { path }
     }

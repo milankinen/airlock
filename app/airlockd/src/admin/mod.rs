@@ -1,15 +1,10 @@
-//! Guest-side admin HTTP service served at `http://admin.airlock/`.
+//! Admin service for sandbox tools.
 //!
-//! The service is reachable only from inside the VM. It exposes endpoints
-//! that tools running in the sandbox — most notably Claude Code's HTTP
-//! hooks — use to coordinate with the host's network policy engine.
-//!
-//! Wire-up:
-//! - The name `admin.airlock` resolves to `127.0.0.1` via a reserved
-//!   mapping in the guest DNS server (see `net::dns`).
-//! - The server binds on `127.0.0.1:80`; loopback traffic bypasses the
-//!   transparent proxy's iptables redirect, so the HTTP request lands
-//!   here directly.
+//! Runs an HTTP service at `http://admin.airlock/`. Only processes inside the
+//! VM can access it. Sandbox tools use it to work with the network policy of
+//! the host. The most important users are the HTTP hooks of Claude Code. The
+//! hooks tell Claude when a network deny is the probable cause of a failed
+//! tool call.
 
 pub mod deny_tracker;
 pub mod routes;

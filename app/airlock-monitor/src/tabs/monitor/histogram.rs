@@ -1,10 +1,6 @@
-//! Shared per-column vertical histogram renderer used by the CPU and
-//! memory widgets.
+//! Vertical histogram for the CPU and memory panels.
 //!
-//! Each history sample (0..=100) becomes one column. Fill height is
-//! rounded to 1/8-block precision so short bars look smooth. A thin
-//! baseline (`▁`) is always drawn for non-empty histories so the widget
-//! stays visible even at 0%.
+//! Shows a history of percent values as bars.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -12,13 +8,24 @@ use ratatui::style::{Color, Style};
 
 const BLOCKS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
+/// Draw a vertical histogram with one column for each history sample.
+/// Args:
+///  - `area`: Area to draw in
+///  - `history`: Samples in percent (0..=100), oldest first. If there are
+///    more samples than columns, only the newest samples show.
+///  - `color`: Color of the bars
+///  - `buf`: Buffer to draw into.
+///
+/// The bar height has a precision of 1/8 of a cell, so short bars look
+/// smooth. A non-empty history always shows a thin baseline (`▁`), so the
+/// widget is visible also at 0%.
 pub fn render(area: Rect, history: &[u8], color: Color, buf: &mut Buffer) {
     let cols = area.width as usize;
     if cols == 0 || area.height == 0 || history.is_empty() {
         return;
     }
-    // Show the most recent `cols` samples, right-aligned so fresh data
-    // appears on the right edge.
+    // Show the newest `cols` samples. Align them to the right, so new data
+    // shows at the right edge.
     let start = history.len().saturating_sub(cols);
     let visible = &history[start..];
     let offset = cols - visible.len();
@@ -29,7 +36,7 @@ pub fn render(area: Rect, history: &[u8], color: Color, buf: &mut Buffer) {
     for (i, &pct) in visible.iter().enumerate() {
         let x = area.x + (offset + i) as u16;
         let mut fill = (u32::from(pct) * height_eighths + 50) / 100;
-        // Always show at least the lowest sub-cell so 0% remains visible.
+        // Always show at least the lowest sub-cell, so 0% stays visible.
         if fill == 0 {
             fill = 1;
         }

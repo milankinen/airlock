@@ -1,10 +1,9 @@
-//! Application-wide user settings loaded from `~/.airlock/settings.*`.
+//! Application-wide user settings.
 //!
-//! Resolved once at `main` into the [`crate::context::Context`]. Shares the
-//! smart-config pipeline with the project-level `airlock.toml` loader
-//! (`crate::config::files`): same TOML/JSON/YAML auto-detect,
-//! same parse-error formatting. Missing file → defaults, which keeps
-//! `airlock` usable with zero configuration.
+//! Loads the user's settings from the airlock home directory. The settings
+//! file can be TOML, JSON or YAML. The CLI loads it once when it starts. If
+//! the file does not exist, the defaults apply, so `airlock` works without
+//! configuration.
 
 pub(crate) mod keys;
 
@@ -19,18 +18,18 @@ use crate::config::de::format_error;
 use crate::config::files::{EXTENSIONS, parse_file};
 use crate::vault::VaultStorageType;
 
-/// All user-tunable settings. Add fields here; the default for each
-/// field must keep `airlock` usable without a settings file.
+/// All user settings. Add new fields here. The default of each field must
+/// keep `airlock` usable without a settings file.
 #[derive(Clone, Debug, DescribeConfig, DeserializeConfig)]
 pub struct Settings {
-    /// Vault configuration. Nested under `[vault]` so future vault-related
-    /// knobs (passphrase caching policy, custom storage path, ...) fit
-    /// alongside `storage` without polluting the top-level namespace.
+    /// Vault configuration. It is in the `[vault]` table, so future vault
+    /// settings (passphrase cache policy, custom storage path, ...) can go
+    /// next to `storage`, not in the top-level namespace.
     #[config(nest)]
     pub vault: VaultSettings,
-    /// Monitor TUI tuning (buffer caps, terminal scrollback, key
-    /// bindings). Personal preferences kept out of the per-project
-    /// `airlock.toml`.
+    /// Monitor TUI settings (buffer limits, terminal scrollback, key
+    /// bindings). These are personal preferences, so they are not in the
+    /// per-project `airlock.toml`.
     #[config(nest)]
     pub monitor: MonitorSettings,
 }
@@ -38,11 +37,12 @@ pub struct Settings {
 /// Settings under the `[vault]` table.
 #[derive(Clone, Debug, Default, DescribeConfig, DeserializeConfig)]
 pub struct VaultSettings {
-    /// Which backend stores user secrets and registry credentials.
-    /// Defaults to `keyring` — the OS keychain (macOS Keychain /
-    /// Linux Secret Service). Switch to `encrypted-file` for a
-    /// passphrase-encrypted JSON file, `file` for mode-0600 plaintext,
-    /// or `disabled` to turn the vault off entirely.
+    /// Backend that stores user secrets and registry credentials:
+    ///  * `keyring` (default): the OS keychain (macOS Keychain or Linux
+    ///    Secret Service)
+    ///  * `encrypted-file`: a JSON file encrypted with a passphrase
+    ///  * `file`: a plaintext file with mode 0600
+    ///  * `disabled`: no vault.
     #[config(default)]
     pub storage: VaultStorageType,
 }
@@ -50,21 +50,23 @@ pub struct VaultSettings {
 /// Settings under the `[monitor]` table.
 #[derive(Clone, Debug, DescribeConfig, DeserializeConfig)]
 pub struct MonitorSettings {
-    /// Buffer caps and scrollback for the TUI.
+    /// Buffer limits and scrollback for the TUI.
     #[config(nest)]
     pub buffers: MonitorBuffers,
-    /// Per-action key bindings. Action names match the canonical
-    /// kebab-case list (see `airlock_monitor::keys::SPEC`); each value
-    /// is either a single key string (`back = "q"`) or an array
-    /// (`cancel = ["esc", "x"]`). Unset actions keep their defaults.
+    /// Key bindings for each action. Action names are the kebab-case names
+    /// in `airlock_monitor::keys::SPEC`. Each value is one key string
+    /// (`back = "q"`) or an array (`cancel = ["esc", "x"]`). Actions that
+    /// are not set keep their defaults.
     #[config(default)]
     pub keys: BTreeMap<String, KeyList>,
 }
 
 impl MonitorSettings {
-    /// Build the TUI settings: buffer caps, scrollback, and the key
-    /// bindings resolved over the defaults. Invalid key bindings are an
-    /// error listing every problem, one per line.
+    /// Build the TUI settings: buffer limits, scrollback, and the key
+    /// bindings over the defaults.
+    /// Returns:
+    ///   The TUI settings, or error if a key binding is not valid. The error
+    ///   lists all problems, one on each line.
     pub fn tui_settings(&self) -> Result<airlock_monitor::TuiSettings, String> {
         Ok(airlock_monitor::TuiSettings {
             max_http_requests: self.buffers.http,
@@ -75,45 +77,47 @@ impl MonitorSettings {
     }
 }
 
-/// Settings under the `[monitor.buffers]` table. Defaults match the
-/// values previously hard-coded in `airlock-monitor`.
+/// Settings under the `[monitor.buffers]` table. The defaults are the values
+/// that were hard-coded in `airlock-monitor` before.
 #[derive(Clone, Debug, DescribeConfig, DeserializeConfig)]
 pub struct MonitorBuffers {
-    /// Maximum HTTP request entries kept in the monitor buffer.
-    /// Once the cap is hit, the oldest entries are dropped.
+    /// Maximum number of HTTP request entries in the monitor buffer. At the
+    /// limit, the oldest entries are dropped.
     #[config(default_t = 100)]
     pub http: usize,
-    /// Maximum TCP connection entries kept in the monitor buffer.
-    /// Once the cap is hit, the oldest entries are dropped.
+    /// Maximum number of TCP connection entries in the monitor buffer. At
+    /// the limit, the oldest entries are dropped.
     #[config(default_t = 100)]
     pub tcp: usize,
-    /// Scrollback rows retained by the embedded vt100 terminal that
-    /// drives the sandbox tab. Trades memory for how far back the
-    /// user can scroll into the sandbox session.
+    /// Number of scrollback rows in the embedded vt100 terminal of the
+    /// sandbox tab. More rows use more memory and let the user scroll back
+    /// farther in the sandbox session.
     #[config(default_t = 1000)]
     pub scrollback: u16,
 }
 
 impl Settings {
+    /// Get the airlock directory of the user (`~/.airlock`).
     pub fn dir() -> Result<PathBuf> {
         let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory missing"))?;
         Ok(home.join(".airlock"))
     }
 
-    /// Human-readable path where the TOML settings file should live.
-    /// Used in error messages that ask the user to create/edit it.
+    /// Get the display path of the TOML settings file. For error messages
+    /// that tell the user to create or edit the file.
     pub fn expected_path() -> PathBuf {
         PathBuf::from("~/.airlock/settings.toml")
     }
 
-    /// Load settings from the first matching `settings.*` file in the
-    /// airlock directory `dir` (`~/.airlock`, see [`Self::dir`]). Missing
-    /// file → defaults. Parse errors bubble up so the user notices a
-    /// malformed file instead of silently getting defaults.
+    /// Load the settings from the first `settings.*` file in the airlock
+    /// directory `dir` (`~/.airlock`, see [`Self::dir`]).
+    /// Returns:
+    ///   The settings, or the defaults if no file exists. Error if the file
+    ///   is malformed, so the user does not get defaults without notice.
     pub fn load_from(dir: &Path) -> Result<Self> {
-        // Same extension ordering (TOML → JSON → YAML) as the project
-        // config loader. TOML wins if multiple files exist, so a stray
-        // `settings.json` can't shadow the user's primary `settings.toml`.
+        // Same extension order (TOML, JSON, YAML) as the project config
+        // loader. If there are multiple files, TOML wins. Thus a stray
+        // `settings.json` cannot hide the user's primary `settings.toml`.
         for ext in EXTENSIONS {
             let path = dir.join(format!("settings.{ext}"));
             if !path.exists() {
@@ -125,16 +129,17 @@ impl Settings {
             return parse_settings(value)
                 .with_context(|| format!("load settings file {}", path.display()));
         }
-        // No file → still go through smart-config with an empty
-        // source so per-field `default_t` annotations apply (notably
-        // the `keys` defaults, which would be empty under derive(Default)).
+        // No file: still parse an empty source with smart-config, so the
+        // per-field `default_t` annotations apply. This is important for the
+        // `[monitor.buffers]` defaults, which `derive(Default)` would make 0.
         parse_settings(serde_json::Value::Object(serde_json::Map::new()))
     }
 }
 
-/// Feed the parsed file (as a JSON object) through smart-config using
-/// the same pipeline as the project config loader. Unknown fields and
-/// type mismatches surface here as structured parse errors.
+/// Parse the settings from the parsed file (as a JSON object) with
+/// smart-config. Uses the same pipeline as the project config loader.
+/// Returns:
+///   The settings, or a structured parse error for type mismatches.
 fn parse_settings(value: serde_json::Value) -> Result<Settings> {
     let serde_json::Value::Object(map) = value else {
         bail!("settings must be a table");
@@ -150,9 +155,18 @@ fn parse_settings(value: serde_json::Value) -> Result<Settings> {
 
 #[cfg(test)]
 mod tests {
+    //! Tests for the load of the user settings file.
+
     use super::*;
     use crate::test_cfg::temp_dir;
 
+    /// Test that the settings come from the first file in the order TOML,
+    /// JSON, YAML, and that the defaults apply when there is no file.
+    ///   1. Load from a missing directory and check the defaults
+    ///   2. Add a YAML file and check that it loads
+    ///   3. Add a JSON file and check that it wins over the YAML file
+    ///   4. Add a TOML file and check that it wins, and that the fields it
+    ///      does not set keep their defaults
     #[test]
     fn settings_load_from_first_file_by_format_or_defaults() {
         let dir = temp_dir();
@@ -188,6 +202,10 @@ mod tests {
         assert_eq!(s.monitor.buffers.tcp, 100);
     }
 
+    /// Test that a settings file with bad syntax or a bad value fails the
+    /// load, so that the user does not get the defaults without notice.
+    ///   1. Write a file with bad TOML, then a file with an unknown value
+    ///   2. Check that each load fails with the file name in the error
     #[test]
     fn malformed_or_invalid_settings_file_fails_load() {
         for content in ["not valid = toml =", "vault.storage = \"typo\"\n"] {

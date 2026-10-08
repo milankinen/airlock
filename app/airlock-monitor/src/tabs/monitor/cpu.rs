@@ -1,10 +1,7 @@
-//! CPU widget — btop-style per-core utilization bars + load average.
+//! CPU panel of the Monitor tab.
 //!
-//! Each core gets one row: `c0 ▮▮▮▮░░  42%`. The bar uses `▮` / `░`
-//! glyphs and half-block `▌` for sub-cell precision. The bar fill and
-//! percentage tail share a utilization-driven color ramp (green →
-//! yellow → orange → red). A load-avg footer sits on the last row
-//! when the box is tall enough.
+//! Shows usage bars for each CPU core (as in btop), the load average and a
+//! history of the mean usage.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
@@ -12,28 +9,36 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
 
-/// Maximum samples retained in the mean-usage history ring buffer.
+/// Maximum number of samples in the mean-usage history.
 const HISTORY_CAPACITY: usize = 120;
 
-/// Rows reserved for the total-usage histogram below the per-core bars.
+/// Number of rows for the total-usage histogram below the core bars.
 const HISTOGRAM_ROWS: u16 = 4;
 
-/// State holding the most recent CPU snapshot plus a short history of
-/// the mean across cores for the footer histogram.
+/// State of the CPU panel: the latest CPU snapshot and a short history of
+/// the mean usage of all cores, for the histogram.
 #[derive(Default)]
 pub struct CpuState {
+    /// Usage of each core in percent. Empty until the first snapshot.
     pub per_core: Vec<u8>,
+    /// Load average for 1, 5 and 15 minutes, if known.
     pub load_avg: Option<(f32, f32, f32)>,
+    /// Mean-usage samples, oldest first. At most [`HISTORY_CAPACITY`]
+    /// samples.
     pub history: Vec<u8>,
 }
 
 impl CpuState {
+    /// Create an empty state.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Replace `per_core`/`load_avg` and record the current mean into the
-    /// history ring. Called once per `pollStats` snapshot.
+    /// Set the core usage and load average, and add the current mean usage
+    /// to the history. Called one time for each `pollStats` snapshot.
+    /// Args:
+    ///  - `per_core`: Usage of each core in percent
+    ///  - `load_avg`: Load average for 1, 5 and 15 minutes, if known.
     pub fn set_snapshot(&mut self, per_core: Vec<u8>, load_avg: Option<(f32, f32, f32)>) {
         self.per_core = per_core;
         self.load_avg = load_avg;
@@ -43,7 +48,8 @@ impl CpuState {
         self.history.push(self.mean());
     }
 
-    /// Mean utilization across all cores, 0..100.
+    /// Mean usage of all cores in percent (0..=100). Zero if there is no
+    /// data.
     pub fn mean(&self) -> u8 {
         if self.per_core.is_empty() {
             0
@@ -53,11 +59,13 @@ impl CpuState {
         }
     }
 
-    /// Number of rows the CPU box needs given current content: two
-    /// border rows + one row per core + one load-avg row + the fixed
-    /// histogram strip. Callers cap the box height to this so it
-    /// doesn't stretch to fill the terminal.
+    /// Number of rows that the CPU box needs for its current content.
+    ///
+    /// The callers limit the box height to this value, so that the box does
+    /// not expand to fill the terminal.
     pub fn desired_height(&self) -> u16 {
+        // Two border rows, one row for each core, one load-average row and
+        // the fixed histogram rows.
         let cores = u16::try_from(self.per_core.len()).unwrap_or(0);
         let load = u16::from(self.load_avg.is_some());
         let content = cores + load + HISTOGRAM_ROWS;
@@ -65,11 +73,19 @@ impl CpuState {
     }
 }
 
+/// Widget that draws the CPU panel.
+///
+/// Each core has one row, for example `c0  ████▌···  42%`. The bar uses
+/// half-blocks (`▌`) for half-cell precision. The bar and the percent value
+/// use the same color, which changes with the usage (green, yellow, orange,
+/// red). When the box is tall enough, a load-average row and the mean-usage
+/// histogram show below the core rows.
 pub struct CpuWidget<'a> {
     state: &'a CpuState,
 }
 
 impl<'a> CpuWidget<'a> {
+    /// Create a widget that draws `state`.
     pub fn new(state: &'a CpuState) -> Self {
         Self { state }
     }
@@ -115,7 +131,7 @@ fn render_body(area: Rect, state: &CpuState, buf: &mut Buffer) {
         return;
     }
 
-    // One char of breathing room on either side of every row.
+    // One char of empty space on each side of each row.
     if area.width < 4 {
         return;
     }
@@ -126,8 +142,8 @@ fn render_body(area: Rect, state: &CpuState, buf: &mut Buffer) {
         height: area.height,
     };
 
-    // Budget rows top-down: per-core bars → load line → histogram strip.
-    // Each lower section only gets space if rows remain.
+    // Give rows from the top down: core bars, then the load row, then the
+    // histogram. A lower section gets space only if rows remain.
     let histogram_rows = HISTOGRAM_ROWS.min(content.height.saturating_sub(1));
     let load_rows: u16 = u16::from(state.load_avg.is_some() && content.height > histogram_rows + 1);
     let core_rows = content.height.saturating_sub(load_rows + histogram_rows);
@@ -171,7 +187,7 @@ fn render_body(area: Rect, state: &CpuState, buf: &mut Buffer) {
 }
 
 fn render_core_row(row: Rect, idx: usize, pct: u8, buf: &mut Buffer) {
-    // Layout: "cNN " (4) + bar (fills) + " PPP%" (5)
+    // Layout: "cNN " (4), then the bar (fills the space), then " PPP%" (5).
     let label = format!("c{idx:<2} ");
     let tail = format!(" {pct:>3}%");
 
@@ -215,8 +231,9 @@ fn render_core_row(row: Rect, idx: usize, pct: u8, buf: &mut Buffer) {
     .render(tail_rect, buf);
 }
 
-/// Render a horizontal bar filled to `pct` percent into `area`. Fill color
-/// matches the percentage tail so each row reads as one visual unit.
+/// Draw a horizontal bar filled to `pct` percent into `area`. The fill color
+/// is the same as the color of the percent value, so each row looks like one
+/// unit.
 fn render_bar(area: Rect, pct: u8, buf: &mut Buffer) {
     let cells = u32::from(area.width);
     if cells == 0 {
@@ -240,7 +257,7 @@ fn render_bar(area: Rect, pct: u8, buf: &mut Buffer) {
     }
 }
 
-/// Usage color ramp: green → yellow → orange → red.
+/// Color for a usage percent: green, yellow, orange or red.
 fn color_for(pct: u8) -> Color {
     match pct {
         0..=49 => Color::Green,

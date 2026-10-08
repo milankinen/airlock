@@ -1,6 +1,6 @@
-//! Helpers for the network services: grants put in a store without a
-//! sign-in, a guest for the sign-in forwards, and a direct dispatch of
-//! the production services where `next` stands for the upstream.
+//! Helpers for the network services: grants in a store without a sign-in,
+//! a guest for the sign-in forwards, and a direct call of the production
+//! services where `next` is the upstream.
 
 use std::cell::RefCell;
 use std::ops::RangeInclusive;
@@ -24,8 +24,8 @@ use crate::services::store::{NewGrant, TokenStore};
 use crate::services::tokens::{Token, TokenKind};
 use crate::services::{ServiceId, anthropic, openai};
 
-/// A grant of `service` made without the proxy: account `acct`, client
-/// `client`, and `tokens` as `(kind, real, surrogate)`.
+/// A grant made without the proxy, with the account `acct`, the client
+/// `client` and `tokens` as `(kind, real, surrogate)`.
 pub fn new_grant(tokens: &[(TokenKind, &str, &str)]) -> NewGrant {
     NewGrant {
         account_id: "acct".into(),
@@ -45,9 +45,10 @@ pub fn new_grant(tokens: &[(TokenKind, &str, &str)]) -> NewGrant {
     }
 }
 
-/// The grant of a sign-in of `account`: its access token `access` and
-/// refresh token `<access>-refresh` (surrogates: `<real>-surrogate`),
-/// valid for a minute, with client `client-1` and two scopes.
+/// The grant of a sign-in of `account`, with the client `client-1` and two
+/// scopes. It has the access token `access` and the refresh token
+/// `<access>-refresh`. Each surrogate is `<real>-surrogate`, and each token
+/// is valid for one minute.
 pub fn signed_in_grant(access: &str, account: &str) -> NewGrant {
     let token = |kind, real: String| Token {
         kind,
@@ -68,7 +69,7 @@ pub fn signed_in_grant(access: &str, account: &str) -> NewGrant {
     }
 }
 
-/// Store a [`new_grant`] of `service`.
+/// Store a [`new_grant`] with `tokens` for `service`.
 pub async fn insert_grant(
     store: &TokenStore,
     service: ServiceId,
@@ -89,7 +90,8 @@ pub fn masked(name: &str, real: &str, surrogate: &str) -> MaskedSecret {
     }
 }
 
-/// A real token of a realistic shape: `prefix`, a dash and 90 characters.
+/// A real token with a realistic shape: `prefix`, a dash and 90
+/// characters.
 pub fn shaped_token(prefix: &str) -> String {
     format!("{prefix}-{}", "R".repeat(90))
 }
@@ -98,8 +100,8 @@ pub fn shaped_token(prefix: &str) -> String {
 struct NoSupervisor;
 impl supervisor::Server for NoSupervisor {}
 
-/// A guest that no connection reaches: the sign-in forwards' accept loops
-/// only call it for a connection.
+/// A guest that no connection reaches. The accept loops of the sign-in
+/// forwards call the guest only for a connection.
 pub fn idle_guest() -> GuestNetwork {
     GuestNetwork::new(capnp_rpc::new_client(NoSupervisor))
 }
@@ -115,45 +117,52 @@ pub fn free_port_in(range: RangeInclusive<u16>) -> u16 {
     }
 }
 
-/// A free loopback port in Claude Code's callback range.
+/// A free loopback port in the callback port range of Claude Code.
 pub fn free_claude_callback_port() -> u16 {
     free_port_in(32768..=60999)
 }
 
-/// One request as `next` got it.
+/// One request as `next` received it.
 #[derive(Clone, Debug)]
 pub struct Got {
+    /// The request URI.
     pub uri: String,
+    /// The request headers.
     pub headers: HeaderMap,
+    /// The request body as text.
     pub body: String,
 }
 
 impl Got {
+    /// The value of the header `name`, if it is valid text.
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(name).and_then(|v| v.to_str().ok())
     }
 }
 
-/// Every request a `next` of [`answering`] got.
+/// All requests that a `next` of [`answering`] received.
 #[derive(Clone, Default)]
 pub struct GotLog(Rc<RefCell<Vec<Got>>>);
 
 impl GotLog {
+    /// All requests, in order.
     pub fn all(&self) -> Vec<Got> {
         self.0.borrow().clone()
     }
 
+    /// The number of requests.
     pub fn len(&self) -> usize {
         self.0.borrow().len()
     }
 
+    /// Whether there are no requests.
     pub fn is_empty(&self) -> bool {
         self.0.borrow().is_empty()
     }
 }
 
-/// An upstream that records each request in `log` and answers `200` with
-/// `body` of `content_type` (and its length).
+/// An upstream that records each request in `log`. It answers `200` with
+/// `body` of the type `content_type` and a content length.
 pub fn answering(log: &GotLog, content_type: &'static str, body: &str) -> Next {
     let (log, body) = (log.clone(), body.to_string());
     Box::new(move |req: Request<ResponseBody>| {
@@ -175,8 +184,8 @@ pub fn answering(log: &GotLog, content_type: &'static str, body: &str) -> Next {
     })
 }
 
-/// An upstream that answers `200` with `frames` of `content_type`,
-/// streamed without a length.
+/// An upstream that answers `200` with `frames` of the type
+/// `content_type`. It streams them with no content length.
 pub fn streaming_frames(
     frames: Vec<hyper::body::Frame<Bytes>>,
     content_type: &'static str,
@@ -193,7 +202,7 @@ pub fn streaming_frames(
     })
 }
 
-/// [`streaming_frames`] of data `chunks`.
+/// [`streaming_frames`] with one data frame for each of `chunks`.
 pub fn streaming(chunks: &[&str], content_type: &'static str) -> Next {
     let frames = chunks
         .iter()
@@ -202,7 +211,7 @@ pub fn streaming(chunks: &[&str], content_type: &'static str) -> Next {
     streaming_frames(frames, content_type)
 }
 
-/// A request as the relay hands it to a service.
+/// A request in the form that the relay gives to a service.
 pub fn request(
     method: &str,
     uri: &str,
@@ -217,21 +226,25 @@ pub fn request(
         .unwrap()
 }
 
-/// An answer as the guest reads it: until its end or an error.
+/// An answer as the guest reads it, up to its end or an error.
 #[derive(Debug)]
 pub struct Answer {
+    /// The response status.
     pub status: StatusCode,
+    /// The body text that arrived before the end or the error.
     pub body: String,
     /// The body ended with an error.
     pub failed: bool,
 }
 
 impl Answer {
-    /// Refused: a local `502`, or a stream that ended with an error.
+    /// Whether the answer is a refusal: a local `502`, or a stream that
+    /// ended with an error.
     pub fn refused(&self) -> bool {
         self.status == StatusCode::BAD_GATEWAY || self.failed
     }
 
+    /// The body as JSON. Panics if the body is not JSON.
     pub fn json(&self) -> serde_json::Value {
         serde_json::from_str(&self.body).unwrap_or_else(|e| panic!("not JSON ({e}): {}", self.body))
     }
@@ -257,16 +270,17 @@ pub async fn read_answer(resp: Response<ResponseBody>) -> Answer {
     }
 }
 
-/// The production services on their production endpoints, with a store
-/// in a temp home. Their requests go to `next` only.
+/// The production services with their production endpoints and a store
+/// in a temporary home. Their requests go only to `next`.
 pub struct ProductionServices {
     _home: StoreHome,
+    /// The token store of the services.
     pub store: Arc<TokenStore>,
     anthropic: Rc<dyn Interceptor>,
     openai: Rc<dyn Interceptor>,
 }
 
-/// See [`ProductionServices`].
+/// Make the [`ProductionServices`].
 pub fn production_services() -> ProductionServices {
     let (home, store) = test_store();
     let tls = Arc::new(tls_trusting(""));
@@ -292,7 +306,10 @@ pub fn production_services() -> ProductionServices {
 }
 
 impl ProductionServices {
-    /// `service` handles `req` to `host:443`, with `injected` secrets.
+    /// Let `service` handle `req` to `host:443` with the `injected`
+    /// secrets.
+    /// Returns:
+    ///   The answer as the guest reads it.
     pub async fn send(
         &self,
         service: ServiceId,

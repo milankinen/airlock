@@ -1,26 +1,26 @@
 # Node.js through nvm: nvm in /usr/local/nvm (one copy for all users),
-# the chosen Node.js version as nvm's default, its commands on the default
+# the chosen Node.js version as the nvm default, its commands on the default
 # PATH through /usr/local/bin, and nvm itself in login shells (profile.d).
 #
 # Sources:
 # - https://github.com/nvm-sh/nvm#install--update-script (the install
-#   script of a release: https://raw.githubusercontent.com/nvm-sh/nvm/<tag>/install.sh;
-#   NVM_DIR, PROFILE=/dev/null; `nvm install 'lts/*'`, `nvm install
-#   node`; "Platforms without official binaries": NVM_NODEJS_ORG_MIRROR,
-#   NVM_NO_SOURCE_FALLBACK; "Environment variables": install locks under
-#   $NVM_DIR/.cache/locks)
+#   script of a release: https://raw.githubusercontent.com/nvm-sh/nvm/<tag>/install.sh,
+#   NVM_DIR, PROFILE=/dev/null, `nvm install 'lts/*'`, `nvm install
+#   node`. "Platforms without official binaries": NVM_NODEJS_ORG_MIRROR,
+#   NVM_NO_SOURCE_FALLBACK. "Environment variables": install locks under
+#   $NVM_DIR/.cache/locks.)
 # - https://github.com/nvm-sh/nvm/blob/master/install.sh (METHOD=script:
-#   nvm.sh, nvm-exec, bash_completion, no git; a non-default NVM_DIR must
-#   exist; NODE_VERSION makes it install Node.js)
+#   nvm.sh, nvm-exec, bash_completion, no git. A non-default NVM_DIR must
+#   exist. NODE_VERSION makes it install Node.js.)
 # - https://github.com/nvm-sh/nvm/blob/master/.github/workflows/tests-alpine.yml
 #   (Alpine binary install: packages, mirror, `nvm install -b`)
 # - https://github.com/nodejs/unofficial-builds#readme (linux-x64-musl,
-#   linux-arm64-musl; `apk add libstdc++`)
+#   linux-arm64-musl, `apk add libstdc++`)
 # - https://github.com/nodejs/node/blob/main/BUILDING.md (official Linux
-#   binaries: glibc; Node.js 25 and later need the libatomic runtime)
+#   binaries: glibc. Node.js 25 and later need the libatomic runtime.)
 #
-# No sha pin: the latest nvm release; nvm checks each Node.js download
-# against the mirror's SHASUMS256.txt.
+# No sha pin: the script uses the latest nvm release. nvm checks each
+# Node.js download against the SHASUMS256.txt of the mirror.
 # Args: node-version (AIRLOCK_PACK_ARG_NODE_VERSION): lts, latest, none,
 # or any version that nvm understands (22, 22.11.0, lts/jod).
 # npm-installs changes only the network rules (config.lua).
@@ -47,8 +47,8 @@ fi
 airlock_status "installing nvm"
 case "$DISTRO" in
     alpine)
-        # nvm asks for linux-<arch>-musl builds on Alpine; nodejs.org has
-        # only some x64 ones, unofficial-builds has x64 and arm64.
+        # On Alpine, nvm asks for linux-<arch>-musl builds. nodejs.org has
+        # only some x64 builds. unofficial-builds has x64 and arm64.
         NVM_NODEJS_ORG_MIRROR=https://unofficial-builds.nodejs.org/download/release
         export NVM_NODEJS_ORG_MIRROR
         pkg_install bash ca-certificates curl tar xz gzip grep sed coreutils \
@@ -59,8 +59,9 @@ case "$DISTRO" in
         ;;
 esac
 
-# nvm: install.sh is a bash script. Empty NODE_VERSION and NVM_SOURCE:
-# an image ENV (node images set NODE_VERSION) must not change what it does.
+# nvm: install.sh is a bash script. Empty NODE_VERSION and NVM_SOURCE,
+# because an image ENV (node images set NODE_VERSION) must not change
+# what it does.
 if bash -c '. "$NVM_DIR/nvm.sh" --no-use && nvm --version' \
     </dev/null >/dev/null 2>&1 3>&-; then
     log "nvm is already installed"
@@ -76,10 +77,10 @@ else
     [ -s "$NVM_DIR/nvm.sh" ] || fail 12 "the nvm installer did not create $NVM_DIR/nvm.sh"
 fi
 
-# Login shells: the nvm command, and the default version's bin directory
-# (with the commands from `npm install -g`) on PATH. nvm.sh reads its
-# arguments (--no-use, --install); source it from a function so that the
-# arguments of the login shell's command do not get to it.
+# Login shells: the nvm command, and the bin directory of the default
+# version (with the commands from `npm install -g`) on PATH. nvm.sh reads
+# its arguments (--no-use, --install). Thus source it from a function, so
+# that the arguments of the login shell command do not get to it.
 mkdir -p /etc/profile.d
 {
     printf '# Managed by airlock: nvm and its default Node.js for login shells.\n'
@@ -105,8 +106,9 @@ if [ -z "$_node" ]; then
 else
     # -b: a missing binary is an error, not a long compile from source.
     # `nvm install` does nothing for an installed version. A killed
-    # earlier run can leave an install lock, and nvm then waits 600 s and
-    # fails; nothing else runs nvm during the install, so drop the locks.
+    # earlier run can leave an install lock. Then nvm waits 600 s and
+    # fails. Nothing else runs nvm during the install, thus remove the
+    # locks.
     rm -rf "$NVM_DIR/.cache/locks"
     airlock_status "installing node $_arg"
     run_vendor "nvm install $_node" bash -c '
@@ -123,8 +125,8 @@ else
     [ -x "$_node_bin" ] || fail 12 "nvm did not install Node.js ($_arg)"
 
     # node, npm, npx (corepack up to Node.js 24) on the default PATH of
-    # every shell and user. Only links into $NVM_DIR and free names are
-    # changed; other files are left alone.
+    # each shell and user. Only links into $NVM_DIR and free names
+    # change. Other files stay as they are.
     _bin_dir=${_node_bin%/node}
     mkdir -p /usr/local/bin
     for _link in /usr/local/bin/*; do

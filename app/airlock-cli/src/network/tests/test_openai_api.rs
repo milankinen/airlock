@@ -1,3 +1,6 @@
+//! ChatGPT API calls through the proxy: the swap of surrogates on every path
+//! and on WebSocket upgrades, and the scan of answers.
+
 use std::sync::Arc;
 
 use crate::services::ServiceId;
@@ -6,6 +9,12 @@ use crate::test_cfg::provider::*;
 use crate::test_cfg::tls_trusting;
 use crate::test_cfg::upstream::{assert_raw_relay, get_with_bearer, websocket_handshake};
 
+/// Test that the ChatGPT host swaps the surrogate on every path, and that
+/// the token host does not serve API paths.
+///   1. Sign in
+///   2. Send API calls over HTTP/1.1 and HTTP/2 on normal and odd paths
+///   3. Check that the provider gets the real token for each one
+///   4. Send an API call to the token host and check the local 403
 #[test]
 fn chatgpt_requests_on_any_path_carry_real_token_over_h1_and_h2() {
     Setup::new(ServiceId::Openai, Options::default()).run(|r| async move {
@@ -40,6 +49,12 @@ fn chatgpt_requests_on_any_path_carry_real_token_over_h1_and_h2() {
     });
 }
 
+/// Test that a WebSocket upgrade request gets the real token. Codex can
+/// connect to its responses endpoint with a WebSocket.
+///   1. Sign in, with a WebSocket endpoint as the ChatGPT host
+///   2. Send an upgrade request with the surrogate over TLS
+///   3. Check that the upgrade succeeds
+///   4. Check that the endpoint read the real token and not the surrogate
 #[test]
 fn websocket_upgrade_carries_real_token() {
     let opts = Options {
@@ -59,6 +74,7 @@ fn websocket_upgrade_carries_real_token() {
             )
             .await
             .unwrap();
+        // Put the Codex path and the surrogate into a normal handshake.
         let handshake = websocket_handshake(r.api_port, true)
             .replacen("GET /ws ", "GET /backend-api/codex/responses ", 1)
             .replacen(
@@ -75,6 +91,14 @@ fn websocket_upgrade_carries_real_token() {
     });
 }
 
+/// Test that ChatGPT answers with a real token are refused, and that answers
+/// with only token-like values pass.
+///   1. Sign in
+///   2. Get answers with the real access token, the real refresh token, and
+///      short token-like identifiers
+///   3. Check that the first two become a local 502 and the last passes
+///   4. Check that no answer has a real token and the provider got
+///      `Accept-Encoding: identity`
 #[test]
 fn chatgpt_answers_with_real_token_are_refused() {
     Setup::new(ServiceId::Openai, Options::default()).run(|r| async move {

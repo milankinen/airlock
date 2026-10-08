@@ -1,10 +1,12 @@
 //! TUI monitoring control panel for `airlock start --monitor`.
 //!
-//! Runs the terminal UI on a dedicated `std::thread`, fully decoupled from
-//! the async RPC event loop. Communication happens via channels:
+//! The TUI shows the sandbox terminal and a Monitor tab with resource usage and
+//! network activity. The user can also change the network policy from the TUI.
 //!
-//! - **To TUI:** process output, network events, exit code (`std::sync::mpsc`)
-//! - **From TUI:** keystrokes and resize events (`tokio::sync::mpsc`)
+//! The TUI runs on its own thread, separately from the host event loop. The
+//! host sends process output, network events, resource statistics and the exit
+//! code to the TUI. The TUI sends keystrokes, terminal size changes and process
+//! signals to the sandbox.
 
 mod app;
 pub mod input;
@@ -34,88 +36,117 @@ pub use ui::TAB_BAR_HEIGHT;
 /// Snapshot of guest resource usage, displayed on the Monitor tab.
 #[derive(Debug, Clone, Default)]
 pub struct StatsSnapshot {
+    /// CPU usage of each core, in percent.
     pub per_core: Vec<u8>,
+    /// Total guest memory in bytes.
     pub total_bytes: u64,
+    /// Used guest memory in bytes.
     pub used_bytes: u64,
+    /// Guest load average for 1, 5 and 15 minutes.
     pub load_avg: (f32, f32, f32),
 }
 
-/// A network event emitted by the host-side proxy for the Monitor tab.
+/// Network event from the host-side proxy for the Monitor tab.
 #[derive(Debug, Clone)]
 pub enum NetworkEvent {
-    /// Raw TCP connect decision (allow/deny at connection time).
+    /// TCP connect decision (allow or deny when the connection opens).
     Connect(Arc<ConnectInfo>),
-    /// Previously-connected TCP connection closed. The `id` matches the
-    /// `ConnectInfo::id` of the `Connect` event that opened it.
+    /// A connected TCP connection closed. The `id` is the same as the
+    /// [`ConnectInfo::id`] of the `Connect` event that opened it.
     Disconnect(Arc<DisconnectInfo>),
-    /// Updated byte counters for a live connection. The `id` matches the
-    /// `ConnectInfo::id` of the `Connect` event that opened it.
+    /// New byte counters for a live connection. The `id` is the same as the
+    /// [`ConnectInfo::id`] of the `Connect` event that opened it.
     Traffic(Arc<TrafficInfo>),
-    /// HTTP request observed by the middleware.
+    /// HTTP request that the middleware saw.
     Request(Arc<RequestInfo>),
-    /// The response to a previously-reported request. The `id` matches
-    /// the `RequestInfo::id` it answers.
+    /// Response to a request from an earlier `Request` event. The `id` is
+    /// the same as the [`RequestInfo::id`] of that request.
     Response(Arc<ResponseInfo>),
 }
 
-/// TCP-level connect event payload. Wrapped in `Arc` so the broadcast
-/// channel only bumps a refcount on recv rather than cloning fields.
+/// Payload of a TCP connect event.
+///
+/// The payload is in an `Arc`, so a receive from the broadcast channel only
+/// increments a reference count and does not clone the fields.
 #[derive(Debug)]
 pub struct ConnectInfo {
-    /// Monotonic per-process connection id — used to link a later
-    /// `DisconnectInfo` back to its `ConnectInfo`.
+    /// Connection ID. It increases monotonically in the process. A later
+    /// [`DisconnectInfo`] uses it to refer to this connection.
     pub id: u64,
+    /// Time of the connect attempt.
     pub timestamp: SystemTime,
+    /// Target host.
     pub host: String,
+    /// Target port.
     pub port: u16,
+    /// True if the network policy allowed the connection.
     pub allowed: bool,
 }
 
-/// Event payload for a TCP connection closing.
+/// Payload of a TCP disconnect event.
 #[derive(Debug)]
 pub struct DisconnectInfo {
+    /// ID of the closed connection, from [`ConnectInfo::id`].
     pub id: u64,
+    /// Time when the connection closed.
     pub timestamp: SystemTime,
 }
 
-/// Cumulative (not delta) byte counters for one connection, sampled on
-/// the raw stream beneath any TLS the proxy terminates — so these are
-/// wire bytes, encrypted records and handshake included.
+/// Cumulative byte counters for one connection. The values are totals, not
+/// deltas.
+///
+/// The proxy counts the bytes on the raw stream, below the TLS layer that it
+/// terminates. Thus the counts are wire bytes, which include encrypted
+/// records and the handshake.
 #[derive(Debug)]
 pub struct TrafficInfo {
+    /// Connection ID, from [`ConnectInfo::id`].
     pub id: u64,
-    /// Guest → server, cumulative.
+    /// Total bytes from guest to server.
     pub up: u64,
-    /// Server → guest, cumulative.
+    /// Total bytes from server to guest.
     pub down: u64,
 }
 
-/// HTTP request event payload. Wrapped in `Arc` on the wire.
+/// Payload of an HTTP request event. The sender wraps it in an `Arc`.
 #[derive(Debug)]
 pub struct RequestInfo {
-    /// Monotonic per-process request id — used to attach the matching
-    /// [`ResponseInfo`] once the upstream reply arrives.
+    /// Request ID. It increases monotonically in the process. The matching
+    /// [`ResponseInfo`] uses it to refer to this request.
     pub id: u64,
+    /// Time of the request.
     pub timestamp: SystemTime,
+    /// HTTP method.
     pub method: String,
+    /// Request path.
     pub path: String,
+    /// Target host.
     pub host: String,
+    /// Target port.
     pub port: u16,
+    /// True if the network policy allowed the request.
     pub allowed: bool,
+    /// Request headers as (name, value) pairs.
     pub headers: Vec<(String, String)>,
 }
 
-/// HTTP response event payload, paired to a [`RequestInfo`] by `id`.
+/// Payload of an HTTP response event. The `id` field links it to a
+/// [`RequestInfo`].
 #[derive(Debug)]
 pub struct ResponseInfo {
+    /// Request ID, from [`RequestInfo::id`].
     pub id: u64,
+    /// HTTP status code.
     pub status: u16,
+    /// Response headers as (name, value) pairs.
     pub headers: Vec<(String, String)>,
-    /// A middleware script denied the request (`req:deny()`), and this is
-    /// the proxy's 403 rather than an upstream reply. Middleware runs after
-    /// the [`RequestInfo`] goes out, so that event said `allowed`; this
-    /// overturns it. Always `false` for a request the policy denied: its
-    /// `RequestInfo` already said so.
+    /// True if a middleware script denied the request (`req:deny()`). Then
+    /// the response is the 403 from the proxy, not a reply from upstream.
+    ///
+    /// The middleware runs after the proxy sends the [`RequestInfo`]. Thus
+    /// that event said `allowed`, and this field overrides it. Always
+    /// `false` for a request that the policy denied, because its
+    /// `RequestInfo` already shows the denial.
     pub denied: bool,
 }
 
@@ -123,9 +154,9 @@ pub struct ResponseInfo {
 enum TuiEvent {
     /// Process stdout/stderr output bytes.
     Output(Vec<u8>),
-    /// Network connection event for the monitor tab.
+    /// Network event for the Monitor tab.
     Network(NetworkEvent),
-    /// Guest resource snapshot for the monitor tab's CPU/memory widgets.
+    /// Guest resource snapshot for the CPU and memory widgets.
     Stats(StatsSnapshot),
     /// Process exited with the given code.
     Exit(i32),
@@ -133,9 +164,9 @@ enum TuiEvent {
     Terminal(Event),
 }
 
-/// Sender for feeding events to the TUI thread.
+/// Sender of events to the TUI thread.
 ///
-/// All methods are non-blocking (unbounded channel).
+/// All methods are non-blocking, because the channel is unbounded.
 #[derive(Clone)]
 pub struct TuiSender {
     tx: std_mpsc::Sender<TuiEvent>,
@@ -147,17 +178,17 @@ impl TuiSender {
         let _ = self.tx.send(TuiEvent::Output(data));
     }
 
-    /// Send a network event to the TUI network tab.
+    /// Send a network event to the Monitor tab.
     pub fn send_network(&self, ev: NetworkEvent) {
         let _ = self.tx.send(TuiEvent::Network(ev));
     }
 
-    /// Send a guest stats snapshot to the TUI monitor tab.
+    /// Send a guest stats snapshot to the Monitor tab.
     pub fn send_stats(&self, snapshot: StatsSnapshot) {
         let _ = self.tx.send(TuiEvent::Stats(snapshot));
     }
 
-    /// Notify the TUI that the sandbox process has exited.
+    /// Tell the TUI that the sandbox process exited with `code`.
     pub fn send_exit(&self, code: i32) {
         let _ = self.tx.send(TuiEvent::Exit(code));
     }
@@ -165,13 +196,16 @@ impl TuiSender {
 
 /// Handle to a running TUI thread.
 pub struct TuiHandle {
-    /// Sender for pushing events to the TUI.
+    /// Sender of events to the TUI.
     pub tx: TuiSender,
     join: Option<std::thread::JoinHandle<anyhow::Result<i32>>>,
 }
 
 impl TuiHandle {
-    /// Block until the TUI thread finishes and return its exit code.
+    /// Block until the TUI thread stops.
+    /// Returns:
+    ///   Exit code of the sandbox process, or 1 if the TUI stopped for a
+    ///   different reason.
     pub fn join(mut self) -> anyhow::Result<i32> {
         match self.join.take() {
             Some(h) => h.join().unwrap_or(Ok(1)),
@@ -182,19 +216,26 @@ impl TuiHandle {
 
 impl Drop for TuiHandle {
     fn drop(&mut self) {
-        // If join() was never called, at least wait for the thread.
+        // If nobody called join(), wait for the thread here.
         if let Some(h) = self.join.take() {
             let _ = h.join();
         }
     }
 }
 
-/// Spawn the TUI on a dedicated thread and return a handle for communication.
+/// Start the TUI on its own thread.
+/// Args:
+///  - `stdin_tx`: Channel for keystrokes and resize events to the RPC stdin
+///    server
+///  - `sig_tx`: Channel for signals that the TUI sends to the sandbox
+///    process (for example when the user presses Ctrl+D on the Monitor tab)
+///  - `network`: Handle to the live host network state
+///  - `project_path`: Project path to show on the Monitor tab
+///  - `version`: Airlock version to show on the Monitor tab
+///  - `settings`: Runtime settings from the user config.
 ///
-/// - `stdin_tx`: channel for sending keystrokes/resize to the RPC stdin server
-/// - `sig_tx`: channel for TUI-initiated signals (e.g. SIGINT when the user
-///   presses `q` or Ctrl+D on the monitor tab)
-/// - `network`: live handle into host network state (policy + future toggles)
+/// Returns:
+///   Handle to send events to the TUI and to wait for it to stop.
 pub fn spawn(
     stdin_tx: tokio::sync::mpsc::Sender<TuiInputEvent>,
     sig_tx: tokio::sync::mpsc::Sender<i32>,
@@ -225,7 +266,8 @@ pub fn spawn(
     }
 }
 
-/// TUI thread entry point — runs synchronously, never touches the async runtime.
+/// Entry point of the TUI thread. Runs synchronously and does not use the
+/// async runtime.
 #[allow(clippy::needless_pass_by_value)] // owned values required by thread::spawn move
 #[allow(clippy::too_many_arguments)]
 fn tui_main(
@@ -238,7 +280,8 @@ fn tui_main(
     version: String,
     settings: TuiSettings,
 ) -> anyhow::Result<i32> {
-    // Enter alternate screen, raw mode, mouse capture, and kitty keyboard protocol
+    // Enable the alternate screen, raw mode, mouse capture and the kitty
+    // keyboard protocol.
     let mut terminal = ratatui::init();
     let kitty_enabled = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
     if kitty_enabled {
@@ -250,15 +293,16 @@ fn tui_main(
         )?;
     }
     crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
-    // Bracketed paste: crossterm reports paste as `Event::Paste(String)`
-    // instead of dozens of individual key events (which would include the
-    // Enter between lines and execute pasted code immediately).
+    // With bracketed paste, crossterm reports a paste as one
+    // `Event::Paste(String)`. Without it, a paste becomes many key events.
+    // These include the Enter between lines, which runs the pasted code
+    // immediately.
     crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
 
-    // Ensure terminal is restored on all exit paths. Explicit `Show` after
-    // `ratatui::restore()` is required because ratatui may have issued `Hide`
-    // in its last frame (when the network tab was active and no cursor was
-    // set) — without this, the host terminal cursor stays hidden after exit.
+    // Restore the terminal on all exit paths. The explicit `Show` after
+    // `ratatui::restore()` is necessary. Ratatui may have sent `Hide` in its
+    // last frame (when the Monitor tab was active and no cursor was set).
+    // Without `Show`, the host terminal cursor stays hidden after exit.
     let result = run_tui_loop(
         &mut terminal,
         &rx,
@@ -306,11 +350,11 @@ fn run_tui_loop(
     let mut sink = TuiTerminalSink::new(80, 24, settings.scrollback);
     let mut app = App::new(network, project_path, version, settings);
 
-    // Resize vt100 parser to match terminal body area. Skip a degenerate
-    // (zero-sized) body — a terminal shorter than the tab bar yields a 0x0
-    // body, and resizing the vt100 grid to zero rows underflows (panic in
-    // debug, corruption in release). The sink keeps its default size until
-    // the terminal is large enough.
+    // Make the vt100 parser the same size as the terminal body area. Skip a
+    // zero-sized body. A terminal that is not taller than the tab bar gives
+    // a 0x0 body. A vt100 grid with zero rows causes an underflow (panic in
+    // debug builds, corrupt data in release builds). The sink keeps its
+    // default size until the terminal is large enough.
     let size = terminal.size()?;
     let size = ratatui::layout::Rect::new(0, 0, size.width, size.height);
     let body = ui::body_area(size);
@@ -318,7 +362,8 @@ fn run_tui_loop(
         sink.resize(body.height, body.width);
     }
 
-    // Crossterm reader thread — sends terminal events into the unified channel
+    // Crossterm reader thread. It sends terminal events into the same channel
+    // as all other TUI events.
     std::thread::spawn(move || {
         while let Ok(ev) = crossterm::event::read() {
             if crossterm_tx.send(TuiEvent::Terminal(ev)).is_err() {
@@ -328,17 +373,17 @@ fn run_tui_loop(
     });
 
     loop {
-        // Render frame
         terminal.draw(|f| ui::render(f, &app, &sink))?;
 
-        // Wait for next event (blocks up to 16ms for ~60fps rendering)
+        // Wait for the next event. Block for 16ms at most, to render at
+        // approximately 60 fps.
         let event = match rx.recv_timeout(Duration::from_millis(16)) {
             Ok(ev) => Some(ev),
             Err(std_mpsc::RecvTimeoutError::Timeout) => None,
             Err(std_mpsc::RecvTimeoutError::Disconnected) => return Ok(1),
         };
 
-        // Process the event (if any) plus any queued events
+        // Process the event (if there is one) and all queued events.
         if let Some(ev) = event
             && let Some(code) = handle_event(
                 ev,
@@ -368,7 +413,9 @@ fn run_tui_loop(
     }
 }
 
-/// Process a single TUI event. Returns `Some(exit_code)` if the TUI should exit.
+/// Process one TUI event.
+/// Returns:
+///   `Some(exit_code)` if the TUI must stop, else `None`.
 #[allow(clippy::too_many_arguments)]
 fn handle_event<B: Backend>(
     event: TuiEvent,
@@ -407,19 +454,20 @@ where
         TuiEvent::Terminal(Event::Resize(cols, rows)) => {
             let size = ratatui::layout::Rect::new(0, 0, cols, rows);
             let body = ui::body_area(size);
-            // Ignore a degenerate body: a terminal shrunk to <=2 rows yields a
-            // 0x0 body, and resizing the vt100 grid (or the guest PTY) to zero
-            // panics/underflows. Keep the last valid size and let render clip.
+            // Ignore a zero-sized body. A terminal with 2 rows or fewer gives a
+            // 0x0 body. A vt100 grid (or guest PTY) with zero size causes a
+            // panic or underflow. Keep the last valid size and let the render
+            // clip the output.
             if body.height > 0 && body.width > 0 {
                 sink.resize(body.height, body.width);
                 let _ = stdin_tx.blocking_send(TuiInputEvent::Resize(body.height, body.width));
             }
         }
         TuiEvent::Terminal(Event::Paste(text)) => {
-            // Only forward paste while the sandbox tab is active. Wrap in
-            // bracketed paste markers only when the guest shell asked for
-            // them (`\e[?2004h`); shells without support (BusyBox ash, dash)
-            // mis-parse the markers and silently eat surrounding bytes.
+            // Forward a paste only when the Sandbox tab is active. Add the
+            // bracketed paste markers only when the guest shell enabled them
+            // (`\e[?2004h`). Shells without support (BusyBox ash, dash) parse
+            // the markers incorrectly and silently discard the bytes near them.
             if app.active_tab == Tab::Sandbox {
                 let bytes = if app.guest_bracketed_paste {
                     let mut b = Vec::with_capacity(text.len() + 12);
@@ -438,15 +486,20 @@ where
     Ok(None)
 }
 
-/// Scan guest PTY output for the DEC private mode toggles that enable or
-/// disable bracketed paste (`\e[?2004h` / `\e[?2004l`). Used to decide
-/// whether to wrap host pastes in `\e[200~...\e[201~` before forwarding —
-/// shells that don't support it (BusyBox ash) mis-parse the markers and
-/// eat surrounding bytes.
+/// Update the guest bracketed paste state from guest PTY output.
 ///
-/// Doesn't try to handle the sequence being split across chunks: the guest
-/// re-emits on every prompt redraw, so a single miss resolves itself.
+/// Looks for the DEC private mode sequences that enable or disable bracketed
+/// paste (`\e[?2004h` / `\e[?2004l`). The state tells if host pastes get the
+/// `\e[200~...\e[201~` markers. Shells without support (BusyBox ash) parse
+/// the markers incorrectly and discard the bytes near them.
+/// Args:
+///  - `data`: Chunk of guest PTY output
+///  - `enabled`: Current state. The function changes it when the chunk
+///    contains one of the sequences.
 fn scan_bracketed_paste_mode(data: &[u8], enabled: &mut bool) {
+    // A sequence that is split across two chunks is not found. This is
+    // acceptable: the guest sends the sequence again on each prompt redraw,
+    // so one miss corrects itself.
     const ENABLE: &[u8] = b"\x1b[?2004h";
     const DISABLE: &[u8] = b"\x1b[?2004l";
     for window in data.windows(ENABLE.len()) {
@@ -458,10 +511,9 @@ fn scan_bracketed_paste_mode(data: &[u8], enabled: &mut bool) {
     }
 }
 
-/// Handle a key event. Returns `Some(code)` if the TUI should exit.
-///
-/// Infallible since capture became unconditional — nothing here writes an
-/// escape sequence to the terminal any more.
+/// Handle a key event.
+/// Returns:
+///   `Some(code)` if the TUI must stop, else `None`.
 fn handle_key(
     key: KeyEvent,
     app: &mut App,
@@ -470,6 +522,8 @@ fn handle_key(
     sig_tx: &tokio::sync::mpsc::Sender<i32>,
     kitty_enabled: bool,
 ) -> Option<i32> {
+    // Mouse capture is always on, so no key here writes an escape sequence
+    // to the terminal. Thus this function has no I/O error to return.
     let action = app.settings.keys.lookup(&key);
 
     // Global shortcuts.
@@ -487,10 +541,11 @@ fn handle_key(
 
     match app.active_tab {
         Tab::Sandbox => {
-            // Sandbox is passthrough — nothing the user can rebind here.
-            // Forward the raw keystroke to the guest PTY.
+            // The Sandbox tab forwards all keys except the global shortcuts,
+            // so the user cannot rebind other keys here. Send the raw
+            // keystroke to the guest PTY.
             if let Some(bytes) = key_to_bytes(key, kitty_enabled) {
-                // Any key input jumps back to the live view.
+                // A key press always goes back to the live view.
                 sink.scroll_to_bottom();
                 let _ = stdin_tx.blocking_send(TuiInputEvent::Data(bytes));
             }
@@ -503,9 +558,10 @@ fn handle_key(
     None
 }
 
-/// Apply a resolved [`Action`] in the Monitor-tab context. Sub-state
-/// (dropdown / details / list) decides what each action means; keys
-/// without an action binding are ignored.
+/// Apply an [`Action`] on the Monitor tab.
+///
+/// The open view (dropdown, details or list) sets the meaning of each
+/// action. A key without an action binding (`None`) has no effect.
 fn handle_monitor_action(
     action: Option<Action>,
     app: &mut App,
@@ -535,18 +591,18 @@ fn handle_monitor_action(
 
     if app.monitor.network.details_open() {
         match action {
-            // In the details pane the selection keys scroll the body —
-            // there's no row to move between, and long header sets don't
-            // fit on one screen.
+            // In the details pane, the selection keys scroll the body. There
+            // are no rows to select, and long header lists do not fit on one
+            // screen.
             Action::SelectUp => app.monitor.network.scroll_details(-1),
             Action::SelectDown => app.monitor.network.scroll_details(1),
             Action::SelectPageUp => app.monitor.network.scroll_details(-20),
             Action::SelectPageDown => app.monitor.network.scroll_details(20),
             Action::SelectNewest => app.monitor.network.scroll_details_to_top(),
             Action::SelectOldest => app.monitor.network.scroll_details_to_bottom(),
-            // `Back` and `Cancel` both close the details pane first,
-            // staying on the Monitor tab. A second `Back` from the list
-            // view then goes back to Sandbox (below).
+            // `Back` and `Cancel` both close the details pane first, and the
+            // Monitor tab stays open. A second `Back` from the list view then
+            // opens the Sandbox tab (below).
             Action::Cancel | Action::Back => app.monitor.network.close_details(),
             Action::ToggleSubTab => app.monitor.network.toggle_sub_tab(),
             Action::SelectRequests => app.monitor.network.select_sub_tab(NetworkSubTab::Requests),
@@ -587,14 +643,14 @@ fn handle_monitor_action(
             .monitor
             .network
             .open_policy_dropdown(app.network.policy()),
-        // Ctrl+D from the monitor tab asks the sandbox process to exit.
-        // SIGHUP first — it's the canonical "controlling terminal went
-        // away" signal and interactive shells like bash exit on it
-        // (SIGINT/SIGTERM get ignored at an idle prompt). SIGTERM
-        // follows as a fallback for anything that doesn't handle HUP.
-        // The TUI itself shuts down when the process's exit event
-        // arrives on the main channel, so we don't return early.
         Action::Back => app.active_tab = Tab::Sandbox,
+        // Ctrl+D on the Monitor tab tells the sandbox process to exit.
+        // Send SIGHUP first. It is the standard "controlling terminal is
+        // gone" signal, and interactive shells such as bash exit on it.
+        // (They ignore SIGINT and SIGTERM at an idle prompt.) Then send
+        // SIGTERM for processes that do not handle SIGHUP. The TUI stops
+        // when the exit event of the process comes on the main channel, so
+        // do not return early.
         Action::KillSandbox => {
             let _ = sig_tx.blocking_send(1);
             let _ = sig_tx.blocking_send(15);
@@ -603,21 +659,19 @@ fn handle_monitor_action(
     }
 }
 
-/// Whether mouse events on the Sandbox tab currently belong to the
-/// sandboxed program rather than to the TUI.
-///
-/// Derived fresh from the active tab and parser state, so there is
-/// nothing on `App` to keep in sync.
-///
-/// The guest's own mouse mode is part of the answer on purpose: that is
-/// what makes unconditional forwarding safe. A program that never asked
-/// for mouse reporting would otherwise receive `\e[<64;10;5M` as literal
-/// keystrokes at its prompt, and the TUI's scrollback would become
-/// unreachable at a plain shell.
+/// True if mouse events go to the sandboxed program and not to the TUI.
 fn guest_owns_mouse(app: &App, sink: &TuiTerminalSink) -> bool {
+    // The value comes from the active tab and the parser state each time.
+    // Thus there is no field on `App` to keep in sync.
+    //
+    // The guest's mouse mode is part of the check on purpose. It makes the
+    // forwarding safe. Without it, a program that did not enable mouse
+    // reporting gets `\e[<64;10;5M` as literal keystrokes at its prompt.
+    // Also, the user cannot get to the TUI scrollback in a plain shell.
     app.active_tab == Tab::Sandbox && sink.mouse_protocol_mode() != MouseProtocolMode::None
 }
 
+/// Handle a mouse event. Forwards it to the guest, or applies it to the TUI.
 fn handle_mouse<B: Backend>(
     mouse: MouseEvent,
     app: &mut App,
@@ -631,10 +685,10 @@ where
     let size = terminal.size()?;
     let size = ratatui::layout::Rect::new(0, 0, size.width, size.height);
 
-    // A left click is the gesture someone makes when they mean to select
-    // text, so it's the moment to say how. Recorded before the forwarding
-    // branch below — that branch is the common case, and a hint that only
-    // appeared when the click *didn't* reach the guest would be backwards.
+    // A left click often means that the user wants to select text. Thus
+    // this is the time to show the selection hint. Record the click before
+    // the forwarding branch below. That branch is the usual case. A hint
+    // that shows only when the click does *not* go to the guest is wrong.
     if matches!(
         mouse.kind,
         MouseEventKind::Down(crossterm::event::MouseButton::Left)
@@ -642,14 +696,14 @@ where
         app.select_hint_at = Some(std::time::Instant::now());
     }
 
-    // Mouse routed to the sandboxed program: re-encode the event into its
-    // PTY instead of acting on it here. `encode` declines anything outside
-    // the body rect, so the tab bar keeps switching tabs.
+    // The mouse belongs to the sandboxed program. Encode the event again
+    // and send it to its PTY. Do not apply it here. `encode` returns `None`
+    // for events outside the body rect, so the tab bar still switches tabs.
     //
-    // Scrolled-back views are excluded: on-screen rows no longer line up
-    // with guest rows there, so coordinates would be a lie. Falling
-    // through lets the wheel walk the view back down to the live screen,
-    // at which point forwarding resumes.
+    // Do not forward in a scrolled-back view. There, the rows on the screen
+    // are not the same as the guest rows, so the coordinates are wrong. The
+    // code below lets the wheel scroll the view down to the live screen.
+    // Then forwarding starts again.
     if guest_owns_mouse(app, sink)
         && sink.scrollback() == 0
         && let Some(bytes) = mouse::encode(
@@ -667,8 +721,8 @@ where
 
     match mouse.kind {
         MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-            // While the policy dropdown is open, it consumes clicks: pick a
-            // row or close on any other click.
+            // When the policy dropdown is open, it gets all clicks. A click
+            // on a row selects it. All clicks close the dropdown.
             if app.active_tab == Tab::Monitor && app.monitor.network.dropdown_open() {
                 if let Some(p) = app.monitor.network.dropdown_row_at(mouse.column, mouse.row) {
                     app.network.set_policy(p);
@@ -686,7 +740,7 @@ where
                     return Ok(());
                 }
             }
-            // Policy title anchor click opens the dropdown.
+            // A click on the policy title opens the dropdown.
             if app.active_tab == Tab::Monitor
                 && app
                     .monitor
@@ -698,9 +752,10 @@ where
                     .open_policy_dropdown(app.network.policy());
                 return Ok(());
             }
-            // Details sub-tab close button (×). Check before the generic
-            // sub-tab hit test so the × inside the details label rect takes
-            // precedence over re-selecting the already-active details tab.
+            // Close button (×) of the details sub-tab. Check it before the
+            // general sub-tab hit test. The × is inside the details label
+            // rect, and the close must have priority over a new selection
+            // of the active details tab.
             if app.active_tab == Tab::Monitor
                 && app
                     .monitor
@@ -710,7 +765,7 @@ where
                 app.monitor.network.close_details();
                 return Ok(());
             }
-            // Sub-tab click inside the monitor tab.
+            // Click on a sub-tab of the Monitor tab.
             if app.active_tab == Tab::Monitor
                 && let Some(sub) = app.monitor.network.sub_tab_at(mouse.column, mouse.row)
             {
@@ -721,13 +776,13 @@ where
                 }
                 return Ok(());
             }
-            // A click in either body area is not a TUI target — it's
-            // someone reaching for text. Capture stays on (the terminal's
-            // own modifier handles the drag); the hint recorded above is
-            // the whole response.
+            // A click in a body area is not for the TUI. The user probably
+            // wants to select text. Mouse capture stays on, and the
+            // terminal's own modifier key controls the drag. The only
+            // response is the hint that the code recorded above.
         }
-        // In the details pane the wheel scrolls the body; in the list
-        // views it moves the selection.
+        // In the details pane, the wheel scrolls the body. In the list
+        // views, it moves the selection.
         MouseEventKind::ScrollUp => match app.active_tab {
             Tab::Monitor if app.monitor.network.details_open() => {
                 app.monitor.network.scroll_details(-3);
@@ -757,15 +812,20 @@ where
 }
 
 /// Convert a crossterm key event into escape sequence bytes for the PTY.
+/// Args:
+///  - `key`: Key event from crossterm
+///  - `kitty_enabled`: True if the host terminal supports the kitty
+///    keyboard protocol.
 ///
-/// Uses legacy Xterm encoding by default for maximum guest compatibility.
-/// Switches to Kitty CSI-u encoding only for modified special keys (e.g.
-/// Shift+Enter) where Xterm encoding would lose the modifier information.
+/// Returns:
+///   Encoded bytes, or `None` if the key has no encoding.
 fn key_to_bytes(key: KeyEvent, kitty_enabled: bool) -> Option<Vec<u8>> {
-    // Use Kitty encoding only for keys where Xterm would discard modifiers.
-    // Xterm can't encode SHIFT on Enter, Backspace, Escape, or Space — they
-    // all produce the same byte regardless of Shift. Everything else (Ctrl+key,
-    // Alt+key, modified arrows/function keys) encodes fine with Xterm.
+    // Use the legacy Xterm encoding by default, because most guests support
+    // it. Use the Kitty CSI-u encoding only for keys where Xterm loses the
+    // modifier. Xterm cannot encode SHIFT on Enter, Backspace, Escape or
+    // Space: they give the same byte with or without Shift. All other keys
+    // (Ctrl+key, Alt+key, arrows and function keys with modifiers) have a
+    // correct Xterm encoding.
     let use_kitty = kitty_enabled
         && key.modifiers.intersects(KeyModifiers::SHIFT)
         && matches!(

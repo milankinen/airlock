@@ -1,24 +1,9 @@
-//! The `config.lua` of a pack: Lua code that makes the pack's config
-//! values from its args, or from the host (for example
-//! `io.popen("git config get user.name")`). It runs on the host each time
-//! the config resolves, so every `airlock start` and `airlock show` reads
-//! the host again.
+//! Pack `config.lua` support.
 //!
-//! Pack code is trusted (it ships with airlock): the Lua state has the
-//! standard library and no limits, unlike the sandboxed state of network
-//! middleware (`network/middleware.rs`). Its globals:
-//!
-//! - `config`: an empty table that the code fills (or replaces) with the
-//!   config values, as a config file holds them;
-//! - `pack`: the pack and its entry:
-//!   - `pack.name`, `pack.version`: strings;
-//!   - `pack.args`: the arg values of the entry, defaults filled (a bool
-//!     arg is a boolean, a choice arg a string);
-//!   - `pack.directory`: the absolute host path of the pack's own
-//!     directory ([`crate::cache::pack_mounts_dir`]), which exists. The
-//!     pack decides what goes there; the agent packs keep the host side
-//!     of their mounts in it;
-//! - `fail(message)`: stop with the config error `pack <name>: <message>`.
+//! Some packs make their config values with a Lua script instead of a static
+//! config file. The script runs on the host and can read the pack args and
+//! the host, for example the git user name. Pack scripts get a small Lua
+//! API.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -27,16 +12,42 @@ use mlua::{Lua, LuaSerdeExt};
 
 use crate::packs::{ArgValue, PackMetadata};
 
-/// The error that `fail(message)` raises.
+/// Error that the Lua function `fail(message)` raises.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 struct Fail(String);
 
-/// Run the `config.lua` `source` of `pack` with `args` and the pack's
-/// `directory`, and return its
-/// `config`: an object (an empty table is `{}`). A `fail` call, a Lua
-/// error and a `config` that is not a table are errors
-/// `pack <name>: …`; so is a `config` that sets `packs` or `presets`.
+/// Run the `config.lua` script of a pack.
+///
+/// The script runs on the host each time the config resolves. Thus each
+/// `airlock start` and `airlock show` reads the host again.
+///
+/// The script has the full Lua standard library, thus it can read the
+/// host (for example `io.popen("git config get user.name")`).
+///
+/// The script gets these globals:
+///  - `config`: Empty table. The script fills or replaces it with config
+///    values, in the same form as a config file.
+///  - `pack.name`, `pack.version`: Strings.
+///  - `pack.args`: Arg values of the entry, defaults included. A bool arg
+///    is a boolean, a choice arg is a string.
+///  - `pack.directory`: Absolute host path of the pack directory. The
+///    pack decides what to keep there. The agent packs keep the host side
+///    of their mounts in it.
+///  - `fail(message)`: Stops with the config error
+///    `pack <name>: <message>`.
+///
+/// Args:
+///  - `pack`: Pack that owns the script
+///  - `source`: Source of `config.lua`
+///  - `args`: Arg values of the pack entry, defaults included
+///  - `directory`: Host directory of the pack (see
+///    [`crate::cache::pack_mounts_dir`]). It must exist.
+///
+/// Returns:
+///   The `config` table as a JSON object (an empty table is `{}`). An error
+///   `pack <name>: …` for a `fail` call, a Lua error, a `config` that is
+///   not a table, or a `config` that sets `packs` or `presets`.
 pub fn evaluate(
     pack: &PackMetadata,
     source: &str,
@@ -59,13 +70,17 @@ pub fn evaluate(
     Ok(value)
 }
 
-/// Set the globals, run `source` and convert `config`.
+/// Set the globals (see [`evaluate`]), run `source` and convert `config`
+/// to JSON.
 fn run(
     pack: &PackMetadata,
     source: &str,
     args: &BTreeMap<String, ArgValue>,
     directory: &Path,
 ) -> mlua::Result<serde_json::Value> {
+    // Pack code is trusted because it ships with airlock. Thus the state
+    // has the full standard library and no limits, unlike the sandboxed
+    // state of network middleware (`network/middleware.rs`).
     let lua = Lua::new();
     let globals = lua.globals();
     globals.set("config", lua.create_table()?)?;

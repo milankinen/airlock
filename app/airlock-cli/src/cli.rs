@@ -1,8 +1,10 @@
-//! CLI argument parsing, console output, and interruption handling.
+//! Command-line interface.
 //!
-//! Use `cli::log!("message")` for status messages,
-//! `cli::layer_progress_bar()` / `cli::spinner()` for progress,
-//! and `cli::interrupted()` for Ctrl+C cancellation.
+//! Contains the airlock CLI commands and the console output that they share:
+//!  * status, verbose and error messages
+//!  * progress bars and spinners
+//!  * text styles and colors
+//!  * Ctrl+C and SIGTERM handling, so that long steps can stop cleanly
 
 pub mod cmd_exec;
 pub mod cmd_rm;
@@ -21,6 +23,7 @@ use tokio::sync::watch;
 
 // -- CLI argument parsing --
 
+/// Return a "Status" section with the KVM access state for help output.
 #[cfg(target_os = "linux")]
 pub fn platform_status() -> String {
     use crate::vm::{KvmStatus, kvm_status};
@@ -33,12 +36,13 @@ pub fn platform_status() -> String {
     format!("{}:\n  {kvm_line}\n", console::style("Status").underlined())
 }
 
+/// Return an empty status section. Other platforms have no status to show.
 #[cfg(not(target_os = "linux"))]
 pub fn platform_status() -> String {
     String::new()
 }
 
-/// Supervisor log verbosity level, mapped to `tracing` filter strings.
+/// Log verbosity level. See [`LogLevel::filter`] for the `tracing` filter.
 #[derive(ValueEnum, Debug, Clone, Copy)]
 pub enum LogLevel {
     Trace,
@@ -62,7 +66,7 @@ pub fn check() -> String {
     console::style("\u{2714}").green().to_string()
 }
 
-/// Dim bullet for detail lines.
+/// Bullet for detail lines.
 pub fn bullet() -> String {
     "\u{2022}".to_string()
 }
@@ -77,16 +81,18 @@ pub fn red(s: &str) -> String {
     console::style(s).red().to_string()
 }
 
-/// Format a value as yellow text (for warnings)
+/// Format a value as yellow text (for warnings).
 pub fn yellow(s: &str) -> String {
     console::style(s).yellow().to_string()
 }
 
-/// Build the version string shown by `-V`.
+/// Build the version string that `-V` shows.
+/// Args:
+///  - `include_hash`: Add the git commit hash to the end of the string
 ///
-/// In release builds the release action patches `AIRLOCK_VERSION_SLOT` in
-/// the binary with the version bytes; we read them here. Falls back to the
-/// Cargo package version in dev builds.
+/// Returns:
+///   The release version from [`AIRLOCK_VERSION_SLOT`], or the Cargo package
+///   version in dev builds. Distroless builds add a `[distroless]` tag.
 pub fn version_string(include_hash: bool) -> String {
     let git_hash = env!("GIT_HASH");
     let distroless = cfg!(feature = "distroless");
@@ -103,11 +109,14 @@ pub fn version_string(include_hash: bool) -> String {
     }
 }
 
-// 16-byte sentinel + 64-byte version slot. The release action locates the
-// sentinel and overwrites the slot bytes before code signing. Bytes live
-// inside the binary's rodata, so the signature stays valid under
-// `codesign --strict`. `#[no_mangle]` + `#[used]` force external linkage so
-// the linker's dead-strip pass cannot remove the static.
+/// Version slot that the release action patches in the binary.
+///
+/// Layout: a 16-byte sentinel, then a 64-byte version slot. The release action
+/// finds the sentinel and writes the version into the slot before code signing.
+/// The bytes are in the binary's rodata, so the signature stays valid under
+/// `codesign --strict`.
+// `#[no_mangle]` and `#[used]` force external linkage. Thus the linker's
+// dead-strip pass cannot remove the static.
 #[used]
 #[unsafe(no_mangle)]
 pub static AIRLOCK_VERSION_SLOT: [u8; 80] = {
@@ -123,8 +132,8 @@ pub static AIRLOCK_VERSION_SLOT: [u8; 80] = {
 
 fn release_version() -> Option<String> {
     const SENTINEL_LEN: usize = 16;
-    // `read_volatile` prevents LTO from folding the slot's compile-time
-    // initializer into the call site.
+    // `read_volatile` prevents LTO from putting the compile-time initializer
+    // of the slot into the call site.
     let bytes = unsafe { std::ptr::read_volatile(&raw const AIRLOCK_VERSION_SLOT) };
     let tail = &bytes[SENTINEL_LEN..];
     let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
@@ -132,7 +141,9 @@ fn release_version() -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
 }
 
-/// Initialize the console; call at the very beginning of the program.
+/// Initialize the console. Call this at the start of the program.
+/// Args:
+///  - `quiet`: Do not print status messages and progress
 pub fn initialize(quiet: bool) {
     let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
     SILENT.store(quiet, Ordering::Relaxed);
@@ -152,17 +163,17 @@ pub fn initialize(quiet: bool) {
     });
 }
 
-/// Returns true if `--quiet` was passed.
+/// Return true if the user gave `--quiet`.
 pub fn is_silent() -> bool {
     SILENT.load(Ordering::Relaxed)
 }
 
-/// Returns true if `--verbose` was passed.
+/// Return true if the user gave `--verbose`.
 pub fn is_verbose() -> bool {
     VERBOSE.load(Ordering::Relaxed)
 }
 
-/// Enable verbose output for the current command.
+/// Enable or disable verbose output for the current command.
 pub fn set_verbose(value: bool) {
     VERBOSE.store(value, Ordering::Relaxed);
 }
@@ -178,10 +189,10 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Format a `SystemTime` as local `YYYY-MM-DD HH:MM:SS` via
-/// `libc::localtime_r`. Matches the style used in the TUI's network
-/// log — but kept inline here so the CLI doesn't pull in the TUI crate
-/// for one helper.
+/// Format a `SystemTime` as local time in `YYYY-MM-DD HH:MM:SS` format.
+// The TUI network log uses the same `localtime_r` conversion, but a different
+// format. The helper is a copy, so the CLI does not need the TUI crate for one
+// function.
 pub fn format_local_time(t: std::time::SystemTime) -> String {
     let secs = t
         .duration_since(std::time::UNIX_EPOCH)
@@ -203,24 +214,24 @@ pub fn format_local_time(t: std::time::SystemTime) -> String {
     )
 }
 
-/// Returns true if the user has pressed Ctrl+C / SIGTERM.
+/// Return true if the user pressed Ctrl+C or the process got SIGTERM.
 pub fn is_interrupted() -> bool {
     *INTERRUPTED.1.borrow()
 }
 
-/// Returns a future that resolves when the user interrupts.
+/// Return a future that completes when the user interrupts the program.
 pub async fn interrupted() {
     let mut rx = INTERRUPTED.1.clone();
     let _ = rx.wait_for(|&v| v).await;
 }
 
-/// Return true if cli has started in interactive mode.
+/// Return true if the CLI started in interactive mode (stdin is a TTY).
 pub fn is_interactive() -> bool {
     IS_TTY.load(Ordering::Relaxed)
 }
 
-/// Print a status message to stderr (unless silent).
-/// Uses `\r\n` so it works correctly in raw terminal mode.
+/// Print a status message to stderr, unless silent.
+// `\r\n` makes the output correct in raw terminal mode.
 macro_rules! _log {
     ($($arg:tt)*) => {
         if !$crate::cli::is_silent() {
@@ -229,12 +240,14 @@ macro_rules! _log {
     };
 }
 
+/// Print an error message in red to stderr. Silent mode does not apply.
 macro_rules! _error {
     ($($arg:tt)*) => {
         eprint!("{}\r\n", $crate::cli::red(&format!("{}", format_args!($($arg)*))))
     };
 }
 
+/// Print a status message to stderr in verbose mode, unless silent.
 macro_rules! _verbose {
     ($($arg:tt)*) => {
         if $crate::cli::is_verbose() && !$crate::cli::is_silent() {
@@ -247,8 +260,8 @@ pub(crate) use _error as error;
 pub(crate) use _log as log;
 pub(crate) use _verbose as verbose;
 
-/// Create a `MultiProgress` container for composing several bars in parallel.
-/// Hidden in silent mode so nothing renders.
+/// Create a `MultiProgress` container that shows many bars at the same time.
+/// In silent mode, the container is hidden.
 pub fn multi_progress() -> MultiProgress {
     let mp = MultiProgress::new();
     if is_silent() {
@@ -257,12 +270,15 @@ pub fn multi_progress() -> MultiProgress {
     mp
 }
 
-/// Create a per-layer progress bar registered inside a `MultiProgress`.
+/// Create a progress bar for one image layer inside `mp`.
+/// Args:
+///  - `mp`: Container that shows the bar
+///  - `total`: Total size of the layer in bytes
 ///
-/// The leading `{msg}` doubles as a phase label — callers set it to
-/// `downloading`, `extracting`, `ready`, or `cached` as the layer moves
-/// through the pipeline. The same bar is reused across phases so each image
-/// layer occupies exactly one line.
+/// Returns:
+///   A progress bar. Its message is the phase label: `downloading`,
+///   `extracting`, `ready` or `cached`. Callers use the same bar for all
+///   phases, so each layer uses exactly one line.
 pub fn layer_progress_bar(mp: &MultiProgress, total: u64) -> ProgressBar {
     let pb = mp.add(ProgressBar::new(total));
     pb.set_style(
@@ -274,17 +290,19 @@ pub fn layer_progress_bar(mp: &MultiProgress, total: u64) -> ProgressBar {
     pb
 }
 
-/// Append a zero-height spacer as the last line of a `MultiProgress` so
-/// there's a blank line between the bars and whatever the terminal prints
-/// next. Returned bar lives as long as the `MultiProgress` and is cleared
-/// by the same `mp.clear()` that removes the real bars.
+/// Add an empty spacer line as the last line of `mp`.
+///
+/// The spacer puts a blank line between the bars and the next terminal output.
+/// The returned bar lives as long as `mp`. The `mp.clear()` call that removes
+/// the other bars also removes the spacer.
 pub fn progress_spacer(mp: &MultiProgress) -> ProgressBar {
     let pb = mp.add(ProgressBar::new(1));
     pb.set_style(ProgressStyle::with_template("").unwrap());
     pb
 }
 
-/// Create a spinner for indeterminate progress (unless silent).
+/// Create a spinner for progress of unknown length. In silent mode, the
+/// spinner is hidden.
 pub fn spinner(msg: &str) -> ProgressBar {
     if is_silent() {
         return ProgressBar::hidden();
@@ -297,8 +315,8 @@ pub fn spinner(msg: &str) -> ProgressBar {
 }
 
 impl LogLevel {
-    /// Map the user-facing log level to a `tracing` filter directive, used
-    /// for both the host log file and the guest supervisor.
+    /// Return the `tracing` filter directive for this log level. The host log
+    /// file and the guest supervisor both use it.
     pub fn filter(self) -> &'static str {
         match self {
             LogLevel::Trace => "info,airlock=trace,airlockd=trace",

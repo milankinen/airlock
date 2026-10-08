@@ -1,32 +1,7 @@
-//! The state of the setup wizard's view and what the keys do to it (the
-//! lines that show it: [`crate::start::wizard::view`]).
+//! Setup wizard state.
 //!
-//! The view has a section per pack kind ([`KINDS`]): the distro packs
-//! are a radio group, with a first row for the image of the user files
-//! when they set one ([`Row::Custom`]: no distro pack); the agents and the tools are checkboxes. A
-//! selected pack has its args as rows below it; an unselected one has
-//! none. An arg row lists its values ([`listed_values`]: `yes` and `no`
-//! for a bool); a choice arg with `other` has the other slot after them,
-//! where the user types a value. Below the sections: the start bar
-//! ([`Row::Start`]) with its options ([`START_CHOICES`]).
-//!
-//! After the packs, the capabilities: checkboxes for the clipboard
-//! ([`Row::ClipboardCopy`], [`Row::ClipboardPaste`]).
-//!
-//! Keys: ↑/↓ move the focus (around the ends); space toggles a checkbox
-//! or a bool, or selects a radio row; ←/→ go to the previous or next
-//! value of an arg row or option of the start bar (no
-//! wrap). Enter moves the focus to the start bar; there, it ends the
-//! view with the focused option. Esc on the start bar that Enter moved
-//! to goes back to the row before; else it cancels. Ctrl-C interrupts.
-//!
-//! The other slot: → from the last value makes it the current item, with
-//! an empty text (an arg row with a custom value has it there when it
-//! gets the focus). Characters go to the text, Backspace deletes the
-//! last one; ← goes back to the last value and clears the text. ↑/↓ and
-//! Enter leave the row only with a text that the pack's config accepts
-//! (then the arg has it); an empty text keeps the focus, another one
-//! keeps it with the error of the pack's config.
+//! Keeps the answers and the focus of the wizard view, and changes them when
+//! the user presses keys.
 
 use std::collections::BTreeMap;
 
@@ -38,7 +13,7 @@ use crate::config::generated::{Clipboard, Target};
 use crate::packs::{ArgKind, ArgValue, Pack, PackKind, PackManager};
 use crate::start::wizard::Answers;
 
-/// The pack kinds of the sections, in pack order.
+/// The pack kinds of the sections, in pack order. Each kind has one section.
 pub const KINDS: [PackKind; 3] = [PackKind::Distro, PackKind::Agent, PackKind::Tool];
 
 /// The options of the start bar, in order.
@@ -53,10 +28,10 @@ pub const START_CHOICES: [StartChoice; 3] = [
 pub enum Row {
     /// The pack of `entries[i]`.
     Pack(usize),
-    /// The first row of the distro group when the user files set an
-    /// image: that image, no distro pack.
+    /// The image of the user files, with no distro pack. It is the first row
+    /// of the distro group, if the user files set an image.
     Custom,
-    /// Arg `a` of the pack of `entries[i]` (only while it is selected).
+    /// Arg `a` of the pack of `entries[i]` (only when the pack is selected).
     Arg(usize, usize),
     /// The sandbox may write to the host clipboard.
     ClipboardCopy,
@@ -78,7 +53,7 @@ pub enum StartChoice {
 }
 
 impl StartChoice {
-    /// Where the config goes; none on cancel.
+    /// Return where the config goes, or `None` on cancel.
     pub fn target(self) -> Option<Target> {
         match self {
             StartChoice::Start => Some(Target::Local),
@@ -88,41 +63,59 @@ impl StartChoice {
     }
 }
 
-/// A pack of the view.
+/// A pack in the view.
 pub struct Entry {
+    /// The pack (newest version).
     pub pack: Pack,
+    /// True if the user selected the pack.
     pub selected: bool,
-    /// The value of every arg of the pack, by key (the defaults at first).
+    /// The value of every arg of the pack, by key (the defaults at the start).
     pub values: BTreeMap<String, ArgValue>,
 }
 
 impl Entry {
+    /// Return true if the pack is a distro pack.
     pub fn is_distro(&self) -> bool {
         self.pack.metadata().kind == PackKind::Distro
     }
 }
 
-/// The other slot of the focused choice arg, while it is the current
-/// item. The arg keeps its value until the focus leaves the row with the
-/// text (see the module docs).
+/// The "other" slot of the focused choice arg, when it is the current item.
+///
+/// The user types a custom value in the slot. The arg keeps its old value
+/// until the focus leaves the row with the text (see [`Form::key`]).
 #[derive(Default)]
 pub struct OtherSlot {
+    /// The typed text.
     pub text: String,
-    /// Why the pack's config did not accept the text (until it
-    /// changes).
+    /// The reason why the pack config did not accept the text. Stays until
+    /// the text changes.
     pub error: Option<String>,
 }
 
 impl OtherSlot {
-    /// Whether the text has no value (it is blank).
+    /// Return true if the text is blank.
     pub fn is_empty(&self) -> bool {
         self.text.trim().is_empty()
     }
 }
 
-/// The state of the view.
+/// The state of the setup wizard view.
+///
+/// The view has one section per pack kind ([`KINDS`]):
+///  * The distro packs are a radio group. If the user files set an image,
+///    the first row is that image ([`Row::Custom`], no distro pack).
+///  * The agents and the tools are checkboxes.
+///
+/// A selected pack has its args as rows below it. An unselected pack has no
+/// arg rows. An arg row shows its values ([`listed_values`]). A choice arg
+/// with `other` has an "other" slot after the values, where the user types a
+/// value ([`OtherSlot`]). After the packs are the capabilities: checkboxes
+/// for the clipboard ([`Row::ClipboardCopy`], [`Row::ClipboardPaste`]). The
+/// last row is the start bar ([`Row::Start`]) with its options
+/// ([`START_CHOICES`]).
 pub struct Form {
-    /// Every pack offered (the newest version of each), in pack order.
+    /// All offered packs (the newest version of each), in pack order.
     entries: Vec<Entry>,
     /// The image that the user files set ([`Row::Custom`]).
     custom_image: Option<UserImage>,
@@ -130,20 +123,27 @@ pub struct Form {
     /// The current option of the start bar.
     start: StartChoice,
     focus: Row,
-    /// The row that Enter moved the focus to the start bar from (Esc
-    /// goes back there).
+    /// The row from which Enter moved the focus to the start bar. Esc goes
+    /// back to this row.
     return_to: Option<Row>,
-    /// The other slot of the focused arg row, while it is current.
+    /// The "other" slot of the focused arg row, when it is current.
     other: Option<OtherSlot>,
-    /// Why the last answers did not pass the check (see
+    /// The reason why the last answers did not pass the check (see
     /// [`Form::check_failed`]).
     check_error: Option<String>,
 }
 
 impl Form {
-    /// The view of `packs`: the image of the user files (`custom_image`)
-    /// is selected, else the first distro pack; no agent or tool; the args have their defaults; the start bar is on
-    /// [`StartChoice::Start`]. The focus is on the first row.
+    /// Create the start state of the view.
+    /// Args:
+    ///  - `packs`: Available packs. The view offers the built-in packs.
+    ///  - `custom_image`: The image of the user files, if set
+    ///
+    /// Returns:
+    ///   The state. The image of the user files is selected, or else the
+    ///   first distro pack. No agent or tool is selected, and the args have
+    ///   their defaults. The start bar is on [`StartChoice::Start`]. The focus
+    ///   is on the first row.
     pub fn new(packs: &PackManager, custom_image: Option<UserImage>) -> Self {
         let offered = packs.builtin();
         let first_distro = offered
@@ -179,7 +179,7 @@ impl Form {
         form
     }
 
-    /// The answers: the selected packs with their arg values, in pack
+    /// Return the answers: the selected packs with their arg values, in pack
     /// order, and `target`, where the config goes.
     pub fn answers(&self, target: Target) -> Answers {
         Answers {
@@ -199,52 +199,54 @@ impl Form {
         }
     }
 
-    /// The answers did not pass the check: `error` shows under the start
-    /// bar (which has the focus) until the next check.
+    /// Record that the answers did not pass the check. `error` shows below
+    /// the start bar (which has the focus) until the next check.
     pub fn check_failed(&mut self, error: String) {
         self.check_error = Some(error);
     }
 
-    /// Why the last answers did not pass the check, if they did not.
+    /// Return the reason why the last answers did not pass the check, if any.
     pub fn check_error(&self) -> Option<&str> {
         self.check_error.as_deref()
     }
 
-    /// Every pack offered, in pack order ([`Row::Pack`] and [`Row::Arg`]
-    /// index it).
+    /// Return all offered packs, in pack order. [`Row::Pack`] and [`Row::Arg`]
+    /// are indexes into this list.
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
 
+    /// Return the focused row.
     pub fn focus(&self) -> Row {
         self.focus
     }
 
-    /// The other slot of the focused arg row, while it is current.
+    /// Return the "other" slot of the focused arg row, when it is current.
     pub fn other(&self) -> Option<&OtherSlot> {
         self.other.as_ref()
     }
 
-    /// The clipboard capabilities ([`Row::ClipboardCopy`],
+    /// Return the clipboard capabilities ([`Row::ClipboardCopy`],
     /// [`Row::ClipboardPaste`]).
     pub fn clipboard(&self) -> Clipboard {
         self.clipboard
     }
 
-    /// The image that the user files set ([`Row::Custom`]).
+    /// Return the image that the user files set ([`Row::Custom`]).
     pub fn custom_image(&self) -> Option<&UserImage> {
         self.custom_image.as_ref()
     }
 
-    /// The current option of the start bar.
+    /// Return the current option of the start bar.
     pub fn start(&self) -> StartChoice {
         self.start
     }
 
-    /// The rows of the packs of `kind`: each pack, with its args while
-    /// it is selected; the distro group starts with [`Row::Custom`] when
-    /// the user files set an image.
-    /// None without packs of `kind`.
+    /// Return the rows of the packs of `kind`.
+    ///
+    /// Each pack has a row, followed by its arg rows if it is selected. If
+    /// the user files set an image, the distro group starts with
+    /// [`Row::Custom`]. Empty if there are no packs of `kind`.
     pub fn section_rows(&self, kind: PackKind) -> Vec<Row> {
         let mut rows = Vec::new();
         for (i, entry) in self.entries.iter().enumerate() {
@@ -262,7 +264,29 @@ impl Form {
         rows
     }
 
-    /// Apply `key` (see the module docs).
+    /// Apply a key press to the state.
+    ///
+    /// Keys:
+    ///  * ↑/↓: Move the focus (wraps at the ends).
+    ///  * Space: Toggle a checkbox or a bool, or select a radio row.
+    ///  * ←/→: Go to the previous or next value of an arg row, or option of
+    ///    the start bar (no wrap).
+    ///  * Enter: Move the focus to the start bar. On the start bar, end the
+    ///    view with the focused option.
+    ///  * Esc: On the start bar after Enter, go back to the earlier row.
+    ///    Otherwise cancel.
+    ///  * Ctrl+C: Interrupt.
+    ///
+    /// The "other" slot: → from the last value makes it the current item,
+    /// with an empty text. An arg row with a custom value has the value in
+    /// the slot when it gets the focus. Characters go to the text and
+    /// Backspace deletes the last character. ← goes back to the last value
+    /// and clears the text. ↑/↓ and Enter leave the row only if the pack
+    /// config accepts the text. Then the arg gets the text. An empty text
+    /// keeps the focus. A text that the pack config does not accept keeps the
+    /// focus and shows the error.
+    /// Returns:
+    ///   The next [`Step`]. `Done` contains the target of the config.
     pub fn key(&mut self, key: KeyEvent) -> Step<Target> {
         if prompt::is_interrupt_key(key) {
             return Step::Interrupt;
@@ -299,7 +323,7 @@ impl Form {
         Step::Stay
     }
 
-    /// The rows, top to bottom.
+    /// Return all rows, top to bottom.
     fn rows(&self) -> Vec<Row> {
         KINDS
             .iter()
@@ -308,8 +332,8 @@ impl Form {
             .collect()
     }
 
-    /// Select the distro pack of `entries[chosen]`, or none, and no
-    /// other.
+    /// Select the distro pack of `entries[chosen]`, or no distro pack. Clear
+    /// all other distro selections.
     fn select_distro(&mut self, chosen: Option<usize>) {
         for (i, entry) in self.entries.iter_mut().enumerate() {
             if entry.is_distro() {
@@ -318,7 +342,7 @@ impl Form {
         }
     }
 
-    /// Move the focus to the next (`forward`) or previous row, around the
+    /// Move the focus to the next (`forward`) or previous row. Wraps at the
     /// ends (see [`Form::go_to`]).
     fn move_focus(&mut self, forward: bool) {
         self.return_to = None;
@@ -332,9 +356,9 @@ impl Form {
         self.go_to(rows[next]);
     }
 
-    /// Move the focus to `row`, if the focused row lets it go (see
-    /// [`Form::commit_other`]). An arg row with a custom value gets it in
-    /// its other slot.
+    /// Move the focus to `row`, if the focused row allows it (see
+    /// [`Form::commit_other`]). An arg row with a custom value gets the value
+    /// in its "other" slot.
     fn go_to(&mut self, row: Row) {
         if !self.commit_other() {
             return;
@@ -346,10 +370,11 @@ impl Form {
         });
     }
 
-    /// Give the text of the other slot to its arg and close the slot.
-    /// False (the slot stays) when the text is empty or the pack's config
-    /// does not accept it (the slot has the error then); true without a
-    /// slot.
+    /// Give the text of the "other" slot to its arg and close the slot.
+    /// Returns:
+    ///   False if the text is empty or the pack config does not accept it.
+    ///   Then the slot stays open, with the error in the second case. True if
+    ///   the commit succeeded or there is no slot.
     fn commit_other(&mut self) -> bool {
         let (Some(other), Row::Arg(i, a)) = (self.other.as_mut(), self.focus) else {
             return true;
@@ -376,8 +401,8 @@ impl Form {
         }
     }
 
-    /// The value of the arg of `row` if it is a custom value: a text that
-    /// is not one of the arg's values.
+    /// Return the value of the arg of `row` if it is a custom value: a text
+    /// that is not one of the listed values of the arg.
     fn custom_value(&self, row: Row) -> Option<&str> {
         let Row::Arg(i, a) = row else {
             return None;
@@ -412,9 +437,11 @@ impl Form {
         }
     }
 
-    /// ←/→: the previous or next (`forward`) value of the focused arg
-    /// (after the last one, the other slot; from the other slot, back to
-    /// the last one), or option of the start bar. Nothing at the ends.
+    /// ←/→: Go to the previous or next (`forward`) value of the focused arg,
+    /// or option of the start bar. Do nothing at the ends.
+    ///
+    /// After the last value of a choice arg with `other`, → goes to the
+    /// "other" slot. From the slot, ← goes back to the last value.
     fn change(&mut self, forward: bool) {
         match self.focus {
             Row::Arg(i, a) => {
@@ -455,9 +482,10 @@ impl Form {
     }
 }
 
-/// The values that the row of an arg of `kind` lists, in order: true
-/// and false (`yes`, `no`) for a bool, the values of a choice (with
-/// `other`, the other slot follows them).
+/// Return the values that the row of an arg of `kind` shows, in order.
+///
+/// For a bool: true and false (`yes`, `no`). For a choice: its values. With
+/// `other`, the "other" slot comes after them.
 pub fn listed_values(kind: &ArgKind) -> Vec<ArgValue> {
     match kind {
         ArgKind::Bool => vec![ArgValue::Bool(true), ArgValue::Bool(false)],
@@ -465,8 +493,8 @@ pub fn listed_values(kind: &ArgKind) -> Vec<ArgValue> {
     }
 }
 
-/// The index after (`forward`) or before `at` of `len` items, if there
-/// is one (no wrap).
+/// Return the index after (`forward`) or before `at` in `len` items, if it
+/// exists (no wrap).
 fn neighbor(at: usize, len: usize, forward: bool) -> Option<usize> {
     if forward {
         (at + 1 < len).then_some(at + 1)

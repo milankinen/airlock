@@ -1,3 +1,9 @@
+//! Build script for the airlock CLI.
+//!
+//! Makes the checksum of the bundled VM assets and the git commit hash
+//! available to the CLI at compile time. Rebuilds the CLI when the VM assets
+//! or the built-in packs change.
+
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 
@@ -24,17 +30,17 @@ fn main() {
         println!("cargo:rerun-if-changed=../../target/vm/virtiofsd");
     }
 
-    // The built-in packs (`include_dir!` in `src/packs/builtin.rs`):
-    // cargo scans the directory, so new files rebuild too.
+    // Built-in packs (`include_dir!` in `src/packs/builtin.rs`). Cargo scans
+    // the directory, so new files also cause a rebuild.
     println!("cargo:rerun-if-changed=../../packs");
-    // The released list-form presets (`include_dir!` in
+    // Released list-form presets (`include_dir!` in
     // `src/config/legacy_presets.rs`).
     println!("cargo:rerun-if-changed=src/config/presets");
 
     let checksum = format!("{:016x}", hasher.finish());
     println!("cargo:rustc-env=AIRLOCK_ASSETS_CHECKSUM={checksum}");
 
-    // Embed git commit hash for version string
+    // Embed the git commit hash for the version string.
     let hash = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()

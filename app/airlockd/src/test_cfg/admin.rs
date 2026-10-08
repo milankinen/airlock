@@ -1,3 +1,5 @@
+//! Helpers for tests of the admin service.
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -14,8 +16,8 @@ pub(crate) async fn serve_admin(state: Arc<AdminState>) -> SocketAddr {
     serve(router(state)).await
 }
 
-/// POST a JSON hook payload, as Claude Code's HTTP hooks do, and return
-/// the JSON response body.
+/// Send a JSON hook payload with POST, as the HTTP hooks of Claude Code do.
+/// Check that the status is 200 and return the JSON response body.
 pub(crate) async fn post_hook(addr: SocketAddr, path: &str, body: &Value) -> Value {
     let body = body.to_string();
     let request = format!(

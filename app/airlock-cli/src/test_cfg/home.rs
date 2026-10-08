@@ -1,3 +1,5 @@
+//! A temporary `HOME` for tests that use the global airlock cache.
+
 use std::ffi::OsString;
 use std::path::Path;
 use std::sync::MutexGuard;
@@ -6,9 +8,9 @@ use airlock_test_utils::{TempDir, temp_dir};
 
 use crate::cache::HOME_LOCK;
 
-/// `HOME` pointed at a fresh temp dir (so the global cache under
-/// `~/.cache/airlock` is the test's own) while the value lives. Holds the
-/// crate-wide `HOME` lock and restores the old `HOME` on drop.
+/// Sets `HOME` to a new temporary directory while the value exists. Thus
+/// the global cache under `~/.cache/airlock` belongs to the test. Holds the
+/// crate-wide `HOME` lock, and sets the old `HOME` again on drop.
 pub struct TempHome {
     dir: TempDir,
     old: Option<OsString>,
@@ -16,13 +18,14 @@ pub struct TempHome {
 }
 
 impl TempHome {
+    /// Take the `HOME` lock and set `HOME` to a new temporary directory.
     pub fn new() -> Self {
         let lock = HOME_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = temp_dir();
         let old = std::env::var_os("HOME");
-        // SAFETY: every test that reads or writes `HOME` holds `HOME_LOCK`.
+        // SAFETY: each test that reads or writes `HOME` holds `HOME_LOCK`.
         unsafe { std::env::set_var("HOME", dir.path()) };
         Self {
             dir,
@@ -31,6 +34,7 @@ impl TempHome {
         }
     }
 
+    /// The temporary home directory.
     pub fn path(&self) -> &Path {
         self.dir.path()
     }

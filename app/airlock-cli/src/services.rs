@@ -1,110 +1,15 @@
-//! Network services: airlock-managed sign-ins of AI agents.
+//! Network services: sign-ins of AI agents that airlock manages.
 //!
-//! A service (`[network.services] anthropic = true`) owns the hosts of one
-//! provider's sign-in and API. The agent signs in inside the sandbox as
-//! usual (`claude /login`, `codex login`); the browser opens on the host
-//! through the browser bridge ([`crate::rpc::browser`]). The proxy keeps
-//! the real tokens on the host and the sandbox only ever sees
-//! *surrogates*: random strings in the provider's token format. The
-//! sandbox is untrusted: it never holds a real credential (not even the
-//! authorization code of a sign-in, see [`auth_codes`]), and it cannot
-//! make the proxy use one for other requests than the provider's API.
+//! A network service (`[network.services] anthropic = true`) controls the
+//! sign-in and API hosts of one provider. The agent signs in inside the
+//! sandbox as usual, and the sign-in page opens in the host's browser.
+//! The real tokens stay on the host. The sandbox gets only *surrogates*:
+//! random strings in the token format of the provider.
 //!
-//! ## Shared sign-ins
-//!
-//! The sign-ins (*grants*) are the user's, not a sandbox's: every airlock
-//! process uses the same token store. The packs keep the agents'
-//! credential files (with the surrogates) on shared mounts in their pack
-//! directories (`~/.cache/airlock/packs/mounts/claude/claude` →
-//! `~/.claude/.credentials.json`, `~/.cache/airlock/packs/mounts/codex/codex`
-//! → `~/.codex/auth.json`, see [`crate::cache::pack_mounts_dir`]), so the
-//! sandboxes act the same as several instances of an agent on one host:
-//! they read the same surrogates, a sign-in or refresh rewrites the file
-//! for all, and a sign-out (`claude /logout`, and `codex login`, which
-//! signs out before it signs in) deletes the grant and revokes it upstream
-//! for all. A new sign-in replaces the older grant of the same account
-//! and scopes. With the mounts changed to per-project directories each
-//! project has its own credential file; the grants are still in the one
-//! store.
-//!
-//! Hooks into the proxy:
-//!
-//! - [`crate::network::Network::resolve_target`]: an owned host is allowed
-//!   (unless `deny-always` or a deny rule), always intercepted, never
-//!   passthrough. The resolved target carries the service's
-//!   [`crate::network::interceptor::Interceptor`]. Host names match
-//!   without regard to case or a trailing dot, and the service's
-//!   endpoints are canonical ([`crate::network::target::Endpoint`]).
-//! - [`crate::network::http`]: the relay hands each request on an owned
-//!   host to [`crate::network::interceptor::Interceptor::send`] around the
-//!   upstream send, after the monitor event and the Lua middleware, so
-//!   both see surrogates only. The interceptor first pins the request's
-//!   authority to the endpoint ([`oauth::pin_authority`]), handles the
-//!   token hosts' routes itself (code exchange, refresh, revoke; other
-//!   routes there get a local `403`), swaps a known surrogate for its real
-//!   value in the credential headers (`Authorization: Bearer`,
-//!   `x-api-key`) on the API hosts (any path; never another header, never
-//!   a body, never another host), scans every API answer for real tokens
-//!   as it streams ([`scan`]), and puts surrogates in place of the real
-//!   tokens in token answers ([`tokens`]). Only TLS connections get
-//!   the interceptor: on plain HTTP a surrogate goes out as it is.
-//! - The browser bridge ([`crate::rpc::browser`]): each service's
-//!   [`sign_in::LoopbackSignIn`] is a browser grant for its sign-in
-//!   pages, and `airlock start` points `$BROWSER` of the sandbox at the
-//!   guest's browser shim. Once the VM is booted ([`Services::attach`]),
-//!   the grant forwards the page's callback port into the guest
-//!   ([`callback`]), which swaps the authorization code for a surrogate
-//!   code ([`auth_codes`]), and keeps the page's PKCE challenge for
-//!   Claude's manual sign-in exchange. The check of a page takes any
-//!   OAuth client and any well-formed scopes ([`sign_in`]): the exchange
-//!   stores the client it used, and refresh and revoke use that one.
-//!
-//! ## Fail closed
-//!
-//! - Dispatch: a token host serves only the routes the agents call there
-//!   (token, revoke, and the few sign-in calls of each agent); any other
-//!   route gets a local `403`. An API host takes every path, with the
-//!   credential swap and the answer scan. A host the service does not know passes the backstop of
-//!   [`oauth`]; nothing goes out as a raw forward.
-//! - Unknown token formats: a token answer with a string under a
-//!   token-like key that is in no format the provider's table knows is
-//!   refused whole (local `502`, nothing stored), so a new token format
-//!   never reaches the sandbox ([`tokens`]).
-//! - Strict credentials: on the API branch, an `Authorization` or
-//!   `x-api-key` value must be a surrogate of the service or the real
-//!   value of a masked secret the inject rules put in (the `injected` of
-//!   [`crate::network::interceptor::Interceptor::send`]); anything else
-//!   gets a local `401` that names the two ways. One sandbox so cannot
-//!   plant its own token in the shared credential files and have the
-//!   others' requests use it.
-//! - No token store: an enabled service without its store key (vault
-//!   `disabled`, or a key that fails) is unavailable, and its hosts
-//!   are denied under every policy ([`build_enabled`]), so the agent cannot sign
-//!   in natively and keep real tokens in the sandbox. `airlock show` says
-//!   so; `[network.services] <name> = false` is the opt-out.
-//!
-//! The agent owns the token lifecycle, as it would on a host: it
-//! refreshes its own real access token, and the proxy only relays that
-//! call and stores the answer (see [`oauth::Grants::relay_refresh`]). An
-//! API request past its real expiry gets whatever the provider answers
-//! (a 401 included); the proxy never refreshes on its own. Real tokens
-//! live encrypted in a database shared by all airlock processes
-//! ([`store`]); its key is in the vault. A sign-out or refresh in one
-//! process is seen by the others on their next lookup. A sign-out revokes both real
-//! tokens where the provider allows it, a replaced grant is revoked too,
-//! and the tokens of a refresh that ends after a sign-out are revoked
-//! again (see [`oauth::Grants`]).
-//!
-//! Providers: [`anthropic`] (Claude Code), [`openai`] (Codex). Shared
-//! OAuth 2 logic is in [`oauth`], the surrogate engine in [`tokens`].
-//!
-//! What stays per provider (and why): the hosts and token-host routes
-//! (the allowlist is the point), the token formats (fail closed needs to
-//! know a real token), the callback ports and paths of the loopback
-//! sign-in (no arbitrary host ports), the device flow and manual sign-in
-//! redirects, the shape of the refresh request (Claude Code's drops
-//! `org:create_api_key`), and the secret-minting `create_api_key`
-//! endpoint (rate limit).
+//! The sandbox is untrusted. It never holds a real credential. It cannot
+//! make the proxy use a real credential for requests other than the
+//! requests to the provider's API. When a service gets an unknown request
+//! or answer, it refuses it (it fails closed).
 
 pub mod anthropic;
 pub mod auth_codes;
@@ -133,17 +38,20 @@ use crate::services::auth_codes::PendingCodes;
 use crate::services::sign_in::LoopbackSignIn;
 use crate::vault::VaultStorageType;
 
-/// The services airlock knows.
+/// A network service that airlock knows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ServiceId {
+    /// Claude Code sign-ins and the Anthropic API.
     Anthropic,
+    /// Codex sign-ins and the ChatGPT backend.
     Openai,
 }
 
 impl ServiceId {
+    /// All known services, in a fixed order.
     pub const ALL: [ServiceId; 2] = [ServiceId::Anthropic, ServiceId::Openai];
 
-    /// The name in `[network.services]` and in the token store.
+    /// Name of the service in `[network.services]` and in the token store.
     pub fn name(self) -> &'static str {
         match self {
             ServiceId::Anthropic => "anthropic",
@@ -151,11 +59,12 @@ impl ServiceId {
         }
     }
 
+    /// Find the service with the given `[network.services]` name.
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|s| s.name() == name)
     }
 
-    /// The hosts the service owns in production.
+    /// Hosts that the service owns in production.
     pub fn targets(self) -> Vec<NetworkTarget> {
         match self {
             ServiceId::Anthropic => anthropic::Endpoints::production().targets(),
@@ -164,31 +73,56 @@ impl ServiceId {
     }
 }
 
-/// One provider's sign-in, as the sandbox runs it.
+/// Sign-in and API access of one provider, as a sandbox runs it.
+///
+/// Sign-ins (*grants*) belong to the user, not to one sandbox. All airlock
+/// processes use the same token store. The packs keep the agents'
+/// credential files (with the surrogates) on shared mounts (see
+/// [`crate::cache::pack_mounts_dir`]). Thus sandboxes act the same as
+/// several instances of an agent on one host:
+///  * They read the same surrogates.
+///  * A sign-in or refresh writes the file again for all of them.
+///  * A sign-out deletes the grant and revokes it upstream for all of them.
+///    (`codex login` signs out before it signs in.)
+///
+/// A new sign-in replaces the older grant of the same account and scopes.
+/// If the mounts are per project, each project has its own credential
+/// file, but the grants are still in the one store.
 pub trait Service {
+    /// The service identity.
     fn id(&self) -> ServiceId;
 
-    /// The service's interceptors over the hosts it owns — each provider
-    /// exposes its proxy as a [`crate::network::interceptor::Interceptor`].
+    /// The interceptors of the hosts that the service owns.
+    ///
+    /// The network resolves an owned host as allowed (unless a deny rule
+    /// or `deny-always` applies) and always intercepted, never as a
+    /// passthrough. Host names match without regard to case or a trailing
+    /// dot. The HTTP relay calls the interceptor after the monitor
+    /// event and the Lua middleware, so both see only surrogates. Only TLS
+    /// connections get the interceptor: on plain HTTP, a surrogate goes
+    /// upstream unchanged.
     fn interceptors(&self) -> Vec<Rc<dyn Interceptor>>;
 
-    /// The sign-in pages the guest may open on the host.
+    /// The browser grants of the sign-in pages that the guest can open on
+    /// the host.
     fn browser_grants(&self) -> Vec<Rc<dyn BrowserGrant>>;
 
-    /// Reach the booted VM: from now on the sign-ins forward their
-    /// callbacks into `guest`.
+    /// Connect the sign-ins to the booted VM. After this call, the
+    /// sign-ins forward their callbacks into `guest`.
     fn attach(&self, guest: &GuestNetwork);
 
-    /// Let go of the VM: the callback ports are free once the future
-    /// ends.
+    /// Disconnect the sign-ins from the VM. The callback ports are free
+    /// when the future completes.
     fn detach(&self) -> LocalBoxFuture<'_, ()>;
 }
 
-/// A provider's [`Service`]: its proxy (an [`Interceptor`]) plus identity
-/// and sign-ins. The provider's struct implements only [`Interceptor`]
-/// (the actual request handling); this wraps it so [`build_enabled`] can
-/// hand out `Rc<dyn Service>` while [`Interceptor`] stays unaware of
-/// service identity or sign-in pages.
+/// [`Service`] of one provider: its [`Interceptor`], identity and
+/// sign-ins.
+///
+/// The provider struct implements only [`Interceptor`] (the request
+/// handling). This adapter wraps it, so that [`build_enabled`] can return
+/// `Rc<dyn Service>` and [`Interceptor`] does not know about service
+/// identity or sign-in pages.
 struct ServiceAdapter<T> {
     id: ServiceId,
     interceptor: Rc<T>,
@@ -217,8 +151,8 @@ impl<T: Interceptor + 'static> Service for ServiceAdapter<T> {
     }
 }
 
-/// The services enabled in `config` (`[network.services]`), in a fixed
-/// order. Names were validated with the config.
+/// Get the services that `config` (`[network.services]`) enables, in a
+/// fixed order. The config validation already checked the names.
 pub fn enabled(config: &BTreeMap<String, bool>) -> Vec<ServiceId> {
     ServiceId::ALL
         .into_iter()
@@ -226,23 +160,23 @@ pub fn enabled(config: &BTreeMap<String, bool>) -> Vec<ServiceId> {
         .collect()
 }
 
-/// The enabled services of a sandbox: those that run, and those that
-/// cannot (their hosts are denied).
+/// Enabled services of a sandbox: the services that run, and the services
+/// that cannot run (their hosts are denied).
 #[derive(Default)]
 pub struct Services {
     running: Vec<Rc<dyn Service>>,
-    /// Enabled services without their token store, with the reason.
+    /// Enabled services that have no token store, with the reason.
     unavailable: Vec<(ServiceId, String)>,
 }
 
 impl Services {
-    /// The interceptors of the running services, for the network.
+    /// Interceptors of the running services, for the network.
     pub fn interceptors(&self) -> Vec<Rc<dyn Interceptor>> {
         self.running.iter().flat_map(|s| s.interceptors()).collect()
     }
 
-    /// The hosts the network denies under every policy: those of the
-    /// services that cannot run, so the agents never sign in without
+    /// Hosts that the network denies under every policy: the hosts of the
+    /// services that cannot run. Thus the agents never sign in without
     /// airlock.
     pub fn denied_targets(&self) -> Vec<NetworkTarget> {
         self.unavailable
@@ -251,7 +185,7 @@ impl Services {
             .collect()
     }
 
-    /// The browser grants of the running services.
+    /// Browser grants of the running services.
     pub fn browser_grants(&self) -> Vec<Rc<dyn BrowserGrant>> {
         self.running
             .iter()
@@ -267,7 +201,7 @@ impl Services {
         }
     }
 
-    /// Detach every running service; their ports are free afterwards.
+    /// Detach every running service. Their ports are free after this call.
     pub async fn detach(&self) {
         for service in &self.running {
             service.detach().await;
@@ -275,15 +209,22 @@ impl Services {
     }
 }
 
-/// Build the services enabled in `config`; each has its own surrogate
-/// codes (and opened sign-in pages), shared by its token exchange and its
-/// sign-ins. Needs the
-/// token-store key from the vault of `context` and its database (open
-/// since [`Context::load`]). Fails closed: with the vault `disabled`, or a
-/// key that fails, the services are unavailable and their hosts are
-/// denied (one warning per process names them, the reason and the
-/// opt-out), so an agent never signs in natively and keeps real tokens in
-/// the sandbox. The vault opens only when a service is enabled.
+/// Build the services that `config` enables.
+/// Args:
+///  - `config`: The `[network.services]` table
+///  - `context`: Context with the vault (for the token-store key) and the
+///    database (open since [`Context::load`])
+///  - `tls_client`: TLS config for the proxy's own calls to token
+///    endpoints.
+///
+/// Returns:
+///   The running services, or, if the token store is not available, the
+///   unavailable services. Their hosts are then denied.
+///
+/// If the vault is `disabled` or the key fails, the services are
+/// unavailable (fail closed). Thus an agent never signs in natively and
+/// keeps real tokens in the sandbox. `[network.services] <name> = false`
+/// is the opt-out. The vault opens only when a service is enabled.
 pub fn build_enabled(
     config: &BTreeMap<String, bool>,
     context: &Context,
@@ -291,6 +232,8 @@ pub fn build_enabled(
 ) -> Services {
     static WARNED: AtomicBool = AtomicBool::new(false);
 
+    // One warning per process names the services, the reason and the
+    // opt-out.
     let ids = enabled(config);
     if ids.is_empty() {
         return Services::default();
@@ -309,6 +252,8 @@ pub fn build_enabled(
     let running = ids
         .into_iter()
         .map(|id| -> Rc<dyn Service> {
+            // Each service has its own surrogate codes (and opened sign-in
+            // pages). Its token exchange and its sign-ins share them.
             let codes = PendingCodes::default();
             match id {
                 ServiceId::Anthropic => Rc::new(ServiceAdapter {
@@ -340,7 +285,7 @@ pub fn build_enabled(
     }
 }
 
-/// The warning about enabled services that cannot run.
+/// Make the warning about enabled services that cannot run.
 fn unavailable_warning(ids: &[ServiceId], reason: &str) -> String {
     let names: Vec<&str> = ids.iter().map(|id| id.name()).collect();
     let opt_out: Vec<String> = ids
@@ -360,8 +305,9 @@ fn unavailable_warning(ids: &[ServiceId], reason: &str) -> String {
     )
 }
 
-/// Print `msg` as a warning, the first time only. Returns whether it was
-/// printed.
+/// Print `msg` as a warning, only the first time.
+/// Returns:
+///   `true` if this call printed the warning.
 fn warn_once(warned: &AtomicBool, msg: &str) -> bool {
     if warned.swap(true, Ordering::Relaxed) {
         return false;
@@ -370,8 +316,8 @@ fn warn_once(warned: &AtomicBool, msg: &str) -> bool {
     true
 }
 
-/// The token store in the database of `context`, with the key from its
-/// vault (created there on first use).
+/// Open the token store in the database of `context`, with the key from
+/// its vault. The vault creates the key on first use.
 fn open_store(context: &Context) -> anyhow::Result<store::TokenStore> {
     if context.vault.storage_type() == VaultStorageType::Disabled {
         anyhow::bail!("the vault is disabled");

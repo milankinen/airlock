@@ -1,15 +1,7 @@
-//! Host → guest deny notification.
+//! Deny notifications to the guest.
 //!
-//! Every denied TCP/HTTP/socket connection fires a one-way
-//! `Supervisor.report_deny(epoch)` RPC at the in-VM supervisor. The
-//! supervisor caches the latest timestamp and exposes it on an in-guest
-//! HTTP endpoint so tools inside the sandbox can detect when they've hit
-//! a policy block without a host round-trip.
-//!
-//! Reports are sent by a task that the session owns (see
-//! [`DenyReporter::attach`]). Before it is attached, `report()` is a
-//! silent no-op, which keeps tests (no supervisor) and the pre-boot
-//! window honest.
+//! Tells the guest about denied connections. Tools in the sandbox can then see
+//! a policy block with no round trip to the host.
 
 use std::future::Future;
 use std::rc::Rc;
@@ -17,24 +9,33 @@ use std::rc::Rc;
 use airlock_common::supervisor_capnp::supervisor;
 use tokio::sync::watch;
 
-/// Late-bound deny notifier. `report()` records the latest deny time; the
-/// task returned by [`attach`](Self::attach) sends it to the guest. The
-/// guest keeps only the latest timestamp, so reports that arrive while an
-/// RPC is in flight are coalesced into one.
+/// Deny notifier that connects to the guest late.
+///
+/// [`report`](Self::report) records the latest deny time. The task from
+/// [`attach`](Self::attach) sends it to the guest with a one-way
+/// `Supervisor.report_deny(epoch)` RPC. The supervisor keeps the latest
+/// timestamp and shows it on an HTTP endpoint in the guest.
+///
+/// The guest keeps only the latest timestamp. Thus reports that arrive
+/// while an RPC is in progress become one report.
+///
+/// Before the task is attached, `report()` does nothing. This is correct
+/// for tests (no supervisor) and for the time before boot.
 pub struct DenyReporter {
     latest: watch::Sender<u64>,
 }
 
 impl DenyReporter {
+    /// Make a notifier that is not attached.
     pub fn new() -> Rc<Self> {
         Rc::new(Self {
             latest: watch::channel(0).0,
         })
     }
 
-    /// Return the task that forwards deny reports to `client`. The caller
-    /// owns the task; it ends when the network is dropped. Reports made
-    /// before this call are not sent.
+    /// Get the task that sends deny reports to `client`.
+    /// The caller owns the task. The task stops when the network is
+    /// dropped. Reports from before this call are not sent.
     pub fn attach(&self, client: supervisor::Client) -> impl Future<Output = ()> + 'static {
         let mut latest = self.latest.subscribe();
         async move {
@@ -49,9 +50,9 @@ impl DenyReporter {
         }
     }
 
-    /// Record a deny now. Never blocks or fails: a deny notification that
-    /// doesn't reach the guest is a visibility issue, not a correctness
-    /// issue, and shouldn't block or fail the original deny path.
+    /// Record a deny now. This never blocks or fails. A deny notification
+    /// that does not get to the guest is a visibility problem, not a
+    /// correctness problem. It must not block or stop the deny path.
     pub fn report(&self) {
         let epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -1,11 +1,9 @@
-//! The released list form of `presets` (`presets = ["python", "rust"]`).
+//! Legacy `presets` list support (`presets = ["python", "rust"]`).
 //!
-//! The 11 released names are the files `src/config/presets/<name>.toml`,
-//! byte for byte as released (`docker` is a later addition). A file's
-//! list is taken out of its value when the file loads, and its names are
-//! checked when the config resolves (see [`crate::config::LayeredConfig`]).
-//! The documents of the lists of all files merge into one value
-//! ([`expand`]) that applies beneath every config file, as released.
+//! Older config files enable presets with a list of names. This module
+//! keeps these files working as released. It checks the names, applies the
+//! released preset documents below all config files, and maps the old
+//! names to the `[packs]` table names for hints.
 
 use std::collections::HashSet;
 
@@ -15,12 +13,15 @@ use serde_json::{Map, Value};
 use crate::config::merge::{merge_json, normalize_env};
 use crate::packs::Pack;
 
-/// The released documents (`build.rs` reruns when they change).
+/// The released documents. The 11 released names are the files
+/// `src/config/presets/<name>.toml`, with the same settings as released
+/// (`docker` is a later addition). Their comments can change, their
+/// settings cannot. `build.rs` runs again when they change.
 static DOCUMENTS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/src/config/presets");
 
-/// Each released name and the `[packs]` table name of its pack (`arch`,
-/// `fedora` and `suse` have no pack any more), in the order that error
-/// messages list them.
+/// Each released name and the `[packs]` table name of its pack, in the
+/// order that error messages list them. `arch`, `fedora` and `suse` have no
+/// pack any more.
 const RELEASED_NAMES: [(&str, &str); 12] = [
     ("claude-code", "claude"),
     ("openai-codex", "codex"),
@@ -36,13 +37,16 @@ const RELEASED_NAMES: [(&str, &str); 12] = [
     ("suse", "suse"),
 ];
 
-/// The version that a `[packs]` table entry can not have: the list form
+/// Version that a `[packs]` table entry cannot have, because the list form
 /// replaces it.
 pub(crate) const LEGACY_VERSION: &str = "legacy";
 
-/// Check the names of the list in the file `origin`: each must be a
-/// released name. The error for the name of a pack of `known` (the
-/// built-in packs) shows its `[packs]` table entry.
+/// Check that each name of a `presets` list is a released name.
+/// Args:
+///  - `origin`: The config file, for error messages
+///  - `names`: Names of the list
+///  - `known`: Built-in packs. For the name of a known pack, the error
+///    shows its `[packs]` table entry.
 pub(crate) fn validate_names(origin: &str, names: &[String], known: &[Pack]) -> anyhow::Result<()> {
     let released: Vec<&str> = RELEASED_NAMES.iter().map(|(name, _)| *name).collect();
     let Some(name) = names.iter().find(|name| !released.contains(&name.as_str())) else {
@@ -63,11 +67,17 @@ pub(crate) fn validate_names(origin: &str, names: &[String], known: &[Pack]) -> 
     )
 }
 
-/// Remove `presets` from `value` and check that it is a list of strings:
-/// the only form it accepts now. A table is an error that hints to use a
-/// `[packs]` table instead. `null` (for example a YAML `presets:` with no
-/// value) is treated as absent, as [`merge_json`] treats nulls elsewhere.
-/// `origin` starts the error messages.
+/// Remove `presets` from a config value and check that it is a list of
+/// strings. A list is the only form that is accepted now.
+/// Args:
+///  - `value`: Config value of a file
+///  - `origin`: The config file, at the start of error messages
+///
+/// Returns:
+///   The names, or `None` if there is no `presets` key. `null` (for example
+///   a YAML `presets:` with no value) counts as no key, the same as
+///   [`merge_json`] does for nulls. A table is an error with a hint to use a
+///   `[packs]` table.
 pub(crate) fn take_presets_key(
     value: &mut Value,
     origin: &str,
@@ -98,12 +108,14 @@ pub(crate) fn take_presets_key(
     }
 }
 
-/// Whether `name` is a released name.
+/// Check if `name` is a released name.
 pub(crate) fn is_released_name(name: &str) -> bool {
     RELEASED_NAMES.iter().any(|(released, _)| *released == name)
 }
 
-/// The first released name of the `[packs]` table name `table_name`.
+/// Get the first released name for a `[packs]` table name.
+/// Returns:
+///   The released name, or `None` if there is none.
 pub(crate) fn released_name(table_name: &str) -> Option<&'static str> {
     RELEASED_NAMES
         .iter()
@@ -111,10 +123,14 @@ pub(crate) fn released_name(table_name: &str) -> Option<&'static str> {
         .map(|(released, _)| *released)
 }
 
-/// Merge the documents of `names` (validated, all lists in file order)
-/// into one value, as released: each name once, the names of a
-/// document's own `presets` list before the document, every document
-/// env-normalized.
+/// Merge the preset documents into one value, as released.
+/// Args:
+///  - `names`: Validated names of all lists, in file order
+///
+/// Returns:
+///   The merged value. Each name applies once. The names of the `presets`
+///   list of a document apply before the document. The env of each
+///   document is normalized.
 pub(crate) fn expand<'a>(names: impl IntoIterator<Item = &'a str>) -> anyhow::Result<Value> {
     let mut base = Value::Object(Map::new());
     let mut applied = HashSet::new();
@@ -125,7 +141,8 @@ pub(crate) fn expand<'a>(names: impl IntoIterator<Item = &'a str>) -> anyhow::Re
 }
 
 /// Apply the document `name` onto `base`, its nested names first.
-/// `chain` holds the documents being applied, `applied` the done ones.
+/// `chain` contains the documents that are in progress, `applied` the
+/// documents that are done.
 fn apply(
     mut base: Value,
     name: &str,
@@ -162,7 +179,7 @@ fn apply(
     Ok(merge_json(base, document))
 }
 
-/// The parsed document of the released name `name`.
+/// Parse the document of the released name `name`.
 fn document(name: &str) -> anyhow::Result<Value> {
     let file = DOCUMENTS
         .get_file(format!("{name}.toml"))
@@ -175,8 +192,15 @@ fn document(name: &str) -> anyhow::Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    //! Tests for the list of released preset names.
+
     use super::*;
 
+    /// Test that each released preset name has a document, that each document
+    /// has a name, and that each name maps to a built-in pack.
+    ///   1. Compare the document files with the released names
+    ///   2. Check that each table name is a built-in pack, or a distro without a
+    ///      pack
     #[test]
     fn released_names_match_documents_and_builtin_packs() {
         let mut files: Vec<String> = DOCUMENTS

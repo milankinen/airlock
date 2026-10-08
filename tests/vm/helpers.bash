@@ -1,9 +1,10 @@
-# Load shared helpers from parent directory, then add VM test helpers.
+# Helpers for the VM tests. These tests boot real sandboxes.
 source "$(dirname "${BASH_SOURCE[0]}")/../helpers.bash"
 
 # -- Prerequisites --
 
-# Skip the entire test if VM support is not available.
+# Skip the test (or the file) if the host cannot run a VM: no KVM on Linux,
+# or no docker daemon.
 require_vm_support() {
     if [[ "$(uname)" == "Linux" && ! -r /dev/kvm ]]; then
         skip "no KVM access (Linux)"
@@ -16,13 +17,12 @@ require_vm_support() {
     fi
 }
 
-# -- File-level setup/teardown for VM tests --
-#
-# Checks the binary and VM support, then creates a shared temp dir so that
-# the .airlock/ sandbox (disk, image cache link, overlay) persists across
-# all tests in a file. Each test runs "airlock --quiet start -- <cmd>",
-# which boots a fresh VM but reuses the cached sandbox state. Call from
-# setup_file, then write the config there.
+# -- File-level setup and teardown for VM tests --
+
+# Check the binary and VM support. Then make one temp directory for all
+# tests of the file, so that the .airlock/ sandbox (disk, image cache link,
+# overlay) stays between tests. Each test boots a new VM but uses the same
+# sandbox state again. Call this from setup_file, then write the config.
 
 vm_setup_file() {
     if [[ ! -x "$AIRLOCK" ]]; then
@@ -37,6 +37,8 @@ vm_setup_file() {
     cd "$FILE_TEMP_DIR" || return 1
 }
 
+# Stop the host HTTP server and remove the shared temp directory, unless
+# AIRLOCK_TEST_KEEP=1.
 teardown_file() {
     stop_host_http_server
     cd "$REPO_ROOT" || true
@@ -47,12 +49,13 @@ teardown_file() {
     fi
 }
 
+# Start each test in the shared temp directory of the file.
 setup() {
     cd "$FILE_TEMP_DIR" || return 1
 }
 
-# Serve $FILE_TEMP_DIR/http_root/index.html ("hello-from-host") on host
-# port $1 until teardown_file.
+# Serve http_root/index.html ("hello-from-host") on host port $1 until
+# teardown_file. Call from setup_file in $FILE_TEMP_DIR.
 start_host_http_server() {
     mkdir -p http_root
     echo "hello-from-host" > http_root/index.html
@@ -62,6 +65,7 @@ start_host_http_server() {
     export HTTP_PID
 }
 
+# Stop the server of start_host_http_server, if it runs.
 stop_host_http_server() {
     if [[ -n "${HTTP_PID:-}" ]]; then
         kill "$HTTP_PID" 2>/dev/null || true
@@ -69,11 +73,11 @@ stop_host_http_server() {
     fi
 }
 
-# -- Convenience wrapper --
+# -- Run a command in a VM --
 
-# Run a command inside a fresh VM. Uses --quiet to suppress setup logs
-# so $output contains only the command's stdout/stderr.
-# Sets $status, $output, $lines (same convention as run_airlock).
+# Run a command in a new VM. --quiet removes the setup logs, so $output
+# contains only the output of the command. Sets $status, $output and
+# $lines, as run_airlock does.
 run_vm() {
     run_airlock --quiet start -- "$@"
 }

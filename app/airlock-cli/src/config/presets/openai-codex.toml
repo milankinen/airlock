@@ -1,9 +1,9 @@
-# OpenAI codex development preset
+# OpenAI Codex development preset
 
 [env]
-# The real API key stays on the host: the sandbox sees a same-length random
-# surrogate, and the `inject` rule below swaps the real value into request
-# headers at the host boundary.
+# The real API key stays on the host. The sandbox sees a random surrogate
+# of the same length. The `inject` rule below puts the real value into the
+# request headers at the host boundary.
 OPENAI_API_KEY = { value = "${OPENAI_API_KEY}", mask = true }
 
 [network.rules.codex]

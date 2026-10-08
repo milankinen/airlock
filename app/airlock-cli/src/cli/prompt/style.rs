@@ -1,37 +1,43 @@
-//! The look that every prompt shares: the styles ([`Styles`]), the marks
-//! ([`radio`], [`checkbox`]), a line builder ([`Line`]) and word wrap
-//! ([`wrap`], [`indented`]).
+//! Shared look of the prompts.
 //!
-//! Titles are bold, notes and hints gray, the focused label cyan, a
-//! current mark or option green, errors and destructive options red
-//! ([`Tone::Danger`]). Without colors (`NO_COLOR`, `CLICOLOR=0`, a
-//! terminal without them), `❯` before the focused row shows the focus
-//! ([`Line::lead`]), and brackets the current option (`[yes]`).
+//! Titles are bold. Notes and hints are gray. The focused label is cyan. A
+//! current mark or option is green. Errors and destructive options are red.
+//! Without colors (`NO_COLOR`, `CLICOLOR=0`, or a terminal without colors), a
+//! `❯` before the focused row shows the focus. Brackets show the current option
+//! (`[yes]`). Also wraps long text to the terminal width.
 
 use console::{Style, measure_text_width};
 
-/// What an option does, for its color.
+/// Kind of an option. Sets the color of the option.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone {
+    /// A normal option.
     Plain,
-    /// It destroys data or ends the run: red.
+    /// The option destroys data or ends the run. Shows in red.
     Danger,
 }
 
-/// The styles of a prompt, for stderr (no colors when it does not
-/// support them).
+/// The styles of a prompt on stderr. No colors if stderr does not support
+/// them.
 pub struct Styles {
-    /// Whether stderr shows colors (else the styles are plain).
+    /// True if stderr shows colors. If false, all styles are plain.
     pub colors: bool,
+    /// No style.
     pub plain: Style,
+    /// Bold text, for titles.
     pub bold: Style,
+    /// Gray text, for notes and hints.
     pub dim: Style,
+    /// Cyan text, for the focused label.
     pub cyan: Style,
+    /// Green text, for the current mark or option.
     pub green: Style,
+    /// Red text, for errors and destructive options.
     pub red: Style,
 }
 
 impl Styles {
+    /// Create the styles for stderr.
     pub fn new() -> Self {
         let style = || Style::new().for_stderr();
         Self {
@@ -45,12 +51,12 @@ impl Styles {
         }
     }
 
-    /// The style of a checkbox or radio mark.
+    /// Return the style of a checkbox or radio mark.
     pub fn mark(&self, selected: bool) -> &Style {
         if selected { &self.green } else { &self.plain }
     }
 
-    /// The style of a row's label: cyan when `focused`, red for
+    /// Return the style of a row label: cyan when `focused`, red for
     /// [`Tone::Danger`].
     pub fn label(&self, focused: bool, tone: Tone) -> &Style {
         match tone {
@@ -61,16 +67,25 @@ impl Styles {
     }
 }
 
+/// Return the radio mark for the `selected` state.
 pub fn radio(selected: bool) -> &'static str {
     if selected { "◉" } else { "○" }
 }
 
+/// Return the checkbox mark for the `selected` state.
 pub fn checkbox(selected: bool) -> &'static str {
     if selected { "■" } else { "□" }
 }
 
-/// `text` wrapped into lines of `room` columns, each `indent` columns in
-/// and in `style`.
+/// Wrap `text` into styled and indented lines.
+/// Args:
+///  - `text`: Text to wrap
+///  - `indent`: Indent of each line, in columns
+///  - `room`: Total line width in columns, including the indent
+///  - `style`: Style of the text
+///
+/// Returns:
+///   The lines.
 pub fn indented(text: &str, indent: usize, room: usize, style: &Style) -> Vec<String> {
     wrap(text, room.saturating_sub(indent))
         .into_iter()
@@ -78,8 +93,10 @@ pub fn indented(text: &str, indent: usize, room: usize, style: &Style) -> Vec<St
         .collect()
 }
 
-/// `text` in lines of at most `width` columns, broken between words (a
-/// longer word is broken anywhere).
+/// Wrap `text` into lines of at most `width` columns.
+///
+/// Lines break between words. A word longer than `width` breaks at any
+/// character.
 pub fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = Vec::new();
@@ -108,27 +125,32 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// A line of a view while it is built: the styled text and its width.
+/// Builder for one line of a view.
 #[derive(Default)]
 pub struct Line {
+    /// Styled text of the line.
     pub text: String,
+    /// Visible width of the text in columns.
     pub width: usize,
-    /// The column of the label, where the description and error lines
-    /// start when they go below the row.
+    /// The column of the label. Description and error lines below the row
+    /// start at this column.
     pub indent: usize,
     /// The column of the text cursor, if it shows on this line.
     pub cursor: Option<usize>,
 }
 
 impl Line {
+    /// Add `text` in `style` to the end of the line.
     pub fn push(&mut self, text: &str, style: &Style) {
         self.text.push_str(&style.apply_to(text).to_string());
         self.width += measure_text_width(text);
     }
 
-    /// The blank start of a row whose mark or label starts `width`
-    /// columns in. Without colors, its last two columns are `❯ ` on the
-    /// focused row (else the focus does not show).
+    /// Add the blank start of a row, `width` columns wide.
+    ///
+    /// The mark or label of the row starts after it. Without colors, the
+    /// last two columns are `❯ ` on the focused row. Otherwise the focus does
+    /// not show.
     pub fn lead(&mut self, width: usize, focused: bool, styles: &Styles) {
         if styles.colors {
             self.push(&" ".repeat(width), &styles.plain);
@@ -138,19 +160,22 @@ impl Line {
         }
     }
 
-    /// The label starts here (see [`Line::indent`]).
+    /// Mark the current end of the line as the label start (see
+    /// [`Line::indent`]).
     pub fn mark_indent(&mut self) {
         self.indent = self.width;
     }
 
-    /// The text cursor shows here (see [`Line::cursor`]).
+    /// Mark the current end of the line as the text cursor position (see
+    /// [`Line::cursor`]).
     pub fn mark_cursor(&mut self) {
         self.cursor = Some(self.width);
     }
 
-    /// An option of a bar (`« a · b »`): the `current` one in green (or
-    /// red for [`Tone::Danger`]; without colors: in brackets), another
-    /// one plain.
+    /// Add an option of a bar (`« a · b »`).
+    ///
+    /// The `current` option is green, or red for [`Tone::Danger`]. Without
+    /// colors, it is in brackets. Other options are plain.
     pub fn push_option(&mut self, text: &str, current: bool, tone: Tone, styles: &Styles) {
         if !current {
             self.push(text, &styles.plain);
@@ -163,9 +188,10 @@ impl Line {
         }
     }
 
-    /// An item of a focused row's values or options: the `current` one
-    /// in green (without colors: in brackets), with the text cursor
-    /// after it if `cursor`; another one in gray.
+    /// Add an item of the values or options of a focused row.
+    ///
+    /// The `current` item is green (in brackets without colors). If `cursor`
+    /// is true, the text cursor goes after it. Other items are gray.
     pub fn push_item(&mut self, text: &str, current: bool, cursor: bool, styles: &Styles) {
         if !current {
             self.push(text, &styles.dim);

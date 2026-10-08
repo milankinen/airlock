@@ -1,18 +1,10 @@
-//! Symlink-safe host file access, for directories the sandbox can write to.
+//! Symlink-safe host file access.
 //!
-//! Some host directories are mounted read-write into the guest
-//! (the agent packs' `~/.cache/airlock/packs/mounts/codex/codex`,
-//! `~/.cache/airlock/packs/mounts/claude/claude`), and the guest can
-//! plant symlinks in them. Code that later reads or writes files there on
-//! the host must not follow such a link to a path of the guest's choosing.
-//!
-//! A [`PinnedDir`] holds an open descriptor of one directory. Every
-//! operation is an `*at()` syscall relative to that descriptor with
-//! `O_NOFOLLOW`, so neither a symlink at the file name nor a later swap of
-//! a directory on the way can redirect it. Files that are read or written
-//! must be regular files owned by the current user. Writes go through an
-//! `O_EXCL` temp file and `renameat`, or truncate the file in place when
-//! its inode must be kept (a hard-linked file mount).
+//! Some host directories are mounted read-write into the guest, for example
+//! the mounts of the agent packs. The guest can put symlinks in them. Host
+//! code that reads or writes files there must not follow such a link to a
+//! path that the guest selects. This module gives file access that prevents
+//! this.
 
 use std::ffi::{CString, OsStr};
 use std::fs::File;
@@ -23,18 +15,27 @@ use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// An open directory; all file operations resolve relative to it and
-/// never follow a symlink at the final component.
+/// An open directory. All file operations resolve relative to it and never
+/// follow a symlink at the final component. A later swap of a directory on
+/// the path cannot redirect them.
+///
+/// Files that are read or appended to must be regular files that the
+/// current user owns. Atomic writes and copies replace the entry at the
+/// name.
 pub struct PinnedDir {
+    // Each operation is an `*at()` syscall relative to this descriptor with
+    // `O_NOFOLLOW`. Thus a symlink at the file name cannot redirect it, and
+    // a swap of a directory on the path cannot redirect it either. Atomic
+    // writes and copies use an `O_EXCL` temp file and `renameat`.
     fd: OwnedFd,
-    /// The path the directory was opened at. Messages only; never passed
-    /// to a syscall.
+    /// The path of the directory when it was opened. Only for messages.
+    /// Never give it to a syscall.
     display: PathBuf,
 }
 
 impl PinnedDir {
-    /// Pin the directory at `path`. Only the last component is checked
-    /// for a symlink; the components before it are resolved normally.
+    /// Pin the directory at `path`. Only the last component must not be a
+    /// symlink. The components before it resolve normally.
     pub fn pin(path: &Path) -> io::Result<Self> {
         let c = CString::new(path.as_os_str().as_bytes())?;
         let fd = open_raw(
@@ -49,11 +50,17 @@ impl PinnedDir {
         })
     }
 
-    /// Open `root/rel`. `root` is trusted and resolved normally (it may
-    /// contain symlinks, e.g. `/tmp` on macOS). Each component of `rel` is
-    /// opened with `O_NOFOLLOW` and must be a directory owned by the
-    /// current user. With `create`, missing components are created with
-    /// mode 0700; without it, a missing component is `NotFound`.
+    /// Open the directory `root/rel`.
+    /// Args:
+    ///  - `root`: Trusted base directory. It resolves normally and can
+    ///    contain symlinks (for example `/tmp` on macOS).
+    ///  - `rel`: Plain relative path. Each component opens with
+    ///    `O_NOFOLLOW` and must be a directory that the current user owns.
+    ///  - `create`: If `true`, create missing components with mode 0700.
+    ///
+    /// Returns:
+    ///   The pinned directory. Error `NotFound` if a component is missing
+    ///   and `create` is `false`.
     pub fn open(root: &Path, rel: &Path, create: bool) -> io::Result<Self> {
         let mut dir = Self::pin(&std::fs::canonicalize(root)?)?;
         for component in rel.components() {
@@ -68,8 +75,8 @@ impl PinnedDir {
         Ok(dir)
     }
 
-    /// Open the child directory `name`, creating it (0700) when `create`
-    /// is set and it does not exist.
+    /// Open the child directory `name`. If `create` is `true` and the
+    /// directory does not exist, create it with mode 0700.
     fn subdir(&self, name: &OsStr, create: bool) -> io::Result<Self> {
         let c = file_name(name)?;
         let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW;
@@ -94,18 +101,24 @@ impl PinnedDir {
         })
     }
 
-    /// The path this directory was opened at, for messages.
+    /// Get the path of the directory when it was opened, for messages.
     pub fn path(&self) -> &Path {
         &self.display
     }
 
-    /// Read the regular file `name`, at most `cap` bytes. `Ok(None)` when
-    /// it does not exist; a symlink, a non-regular file, a foreign owner
-    /// or a file larger than `cap` is an error.
+    /// Read the regular file `name`.
+    /// Args:
+    ///  - `name`: File name
+    ///  - `cap`: Maximum file size in bytes
+    ///
+    /// Returns:
+    ///   The file content, or `Ok(None)` if the file does not exist. Error
+    ///   for a symlink, a file that is not regular, a file of a different
+    ///   owner, or a file larger than `cap`.
     pub fn read(&self, name: impl AsRef<OsStr>, cap: u64) -> io::Result<Option<Vec<u8>>> {
         let name = name.as_ref();
         let c = file_name(name)?;
-        // O_NONBLOCK: opening a planted FIFO must not block; the type
+        // O_NONBLOCK: the open of a planted FIFO must not block. The type
         // check below refuses it.
         let fd = match open_raw(
             self.fd.as_raw_fd(),
@@ -143,15 +156,17 @@ impl PinnedDir {
         Ok(Some(buf))
     }
 
-    /// Replace `name` atomically: write a fresh `O_EXCL` temp file with
-    /// `mode`, sync it, and `renameat` it over `name`. A symlink at `name`
-    /// is replaced, not followed.
+    /// Replace the file `name` atomically with `bytes`. The file gets the
+    /// permission bits `mode`. A symlink at `name` is replaced, not followed.
     pub fn write_atomic(&self, name: impl AsRef<OsStr>, bytes: &[u8], mode: u32) -> io::Result<()> {
         let name = name.as_ref();
+        // Write a new `O_EXCL` temp file, sync it, and `renameat` it over
+        // `name`.
         self.replace_with(name, mode, |out| out.write_all(bytes))
     }
 
-    /// Open `name` for appending, creating it with `mode` when absent.
+    /// Open the file `name` to append to it. If the file does not exist,
+    /// create it with the permission bits `mode`.
     pub fn open_append(&self, name: impl AsRef<OsStr>, mode: u32) -> io::Result<File> {
         let name = name.as_ref();
         let c = file_name(name)?;
@@ -167,8 +182,9 @@ impl PinnedDir {
         Ok(file)
     }
 
-    /// Unlink `name` (a file or a symlink, never followed). `Ok(false)`
-    /// when it did not exist.
+    /// Remove `name` (a file or a symlink, never followed).
+    /// Returns:
+    ///   `Ok(true)` if it was removed, `Ok(false)` if it did not exist.
     pub fn remove(&self, name: impl AsRef<OsStr>) -> io::Result<bool> {
         let c = file_name(name.as_ref())?;
         let rc = unsafe { libc::unlinkat(self.fd.as_raw_fd(), c.as_ptr(), 0) };
@@ -182,8 +198,9 @@ impl PinnedDir {
         Ok(true)
     }
 
-    /// The inode of `name`, without following a symlink. `None` when it
-    /// does not exist or cannot be examined.
+    /// Get the inode of `name`. Does not follow a symlink.
+    /// Returns:
+    ///   The inode, or `None` if `name` does not exist or `fstatat` fails.
     pub fn ino(&self, name: impl AsRef<OsStr>) -> Option<u64> {
         let c = file_name(name.as_ref()).ok()?;
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -198,13 +215,13 @@ impl PinnedDir {
         (rc == 0).then_some(st.st_ino as u64)
     }
 
-    /// Make `name` a hard link to the open file `src`, atomically (link
-    /// to a temp name, then rename). Linux only: it links through
-    /// `/proc/self/fd`, so the link targets exactly the inode `src` has
-    /// open. Elsewhere this is `Unsupported`.
+    /// Make `name` a hard link to the open file `src`, atomically. Only on
+    /// Linux. On other platforms, the result is an `Unsupported` error.
     #[cfg(target_os = "linux")]
     pub fn link_from(&self, src: &File, name: impl AsRef<OsStr>) -> io::Result<()> {
         let name = name.as_ref();
+        // Link to a temp name, then rename. The link goes through
+        // `/proc/self/fd`, so it targets exactly the inode that `src` has open.
         let tmp = temp_name(name);
         let src_path = CString::new(format!("/proc/self/fd/{}", src.as_raw_fd()))?;
         let rc = unsafe {
@@ -222,10 +239,12 @@ impl PinnedDir {
         self.commit_temp(&tmp, name)
     }
 
-    /// macOS has no `/proc/self/fd` and no `linkat(AT_EMPTY_PATH)`, so a
-    /// hard link cannot be made from an open file.
+    /// Make `name` a hard link to the open file `src`. Not available on this
+    /// platform: always returns an `Unsupported` error. macOS has no
+    /// `/proc/self/fd` and no `linkat(AT_EMPTY_PATH)`, so a hard link cannot
+    /// be made from an open file.
     #[cfg(not(target_os = "linux"))]
-    #[allow(clippy::unused_self)] // the same signature as on Linux
+    #[allow(clippy::unused_self)] // Same signature as on Linux.
     pub fn link_from(&self, _src: &File, _name: impl AsRef<OsStr>) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -233,8 +252,9 @@ impl PinnedDir {
         ))
     }
 
-    /// Replace `name` atomically with the current content of the open
-    /// file `src` (copied from the descriptor, not a path).
+    /// Replace the file `name` atomically with the current content of the
+    /// open file `src`. The copy reads from the descriptor, not from a path.
+    /// The file gets the permission bits `mode`.
     pub fn copy_from(&self, src: &File, name: impl AsRef<OsStr>, mode: u32) -> io::Result<()> {
         let mut src = src;
         self.replace_with(name.as_ref(), mode, |out| {
@@ -242,8 +262,8 @@ impl PinnedDir {
         })
     }
 
-    /// Write a temp file with `fill`, sync it and rename it over `name`.
-    /// The temp file is removed on any failure.
+    /// Write a temp file with `fill`, sync it and rename it over `name`. If a
+    /// step fails, the temp file is removed.
     fn replace_with(
         &self,
         name: &OsStr,
@@ -270,7 +290,8 @@ impl PinnedDir {
         }
     }
 
-    /// Rename the temp file `tmp` over `name`; remove it when that fails.
+    /// Rename the temp file `tmp` over `name`. If the rename fails, remove
+    /// the temp file.
     fn commit_temp(&self, tmp: &CString, name: &OsStr) -> io::Result<()> {
         let target = file_name(name)?;
         let rc = unsafe {
@@ -289,6 +310,7 @@ impl PinnedDir {
         Ok(())
     }
 
+    /// Make sure that `name` is a regular file that the current user owns.
     fn check_regular(&self, name: &OsStr, meta: &std::fs::Metadata) -> io::Result<()> {
         let path = self.display.join(name);
         if !meta.file_type().is_file() {
@@ -300,6 +322,8 @@ impl PinnedDir {
         check_owner(meta, &path)
     }
 
+    /// Add the path of `name` to the error `e`. A symlink error (`ELOOP`)
+    /// gets a clear message.
     fn context(&self, name: &OsStr, e: &io::Error) -> io::Error {
         let path = self.display.join(name);
         if e.raw_os_error() == Some(libc::ELOOP) {
@@ -312,7 +336,9 @@ impl PinnedDir {
     }
 }
 
-/// `openat` with `O_CLOEXEC`, returning an owned descriptor.
+/// Call `openat` with `O_CLOEXEC`.
+/// Returns:
+///   The new owned descriptor.
 fn open_raw(
     dirfd: libc::c_int,
     name: &CString,
@@ -334,7 +360,9 @@ fn open_raw(
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
-/// A single path component as a C string: no `/`, not empty, `.` or `..`.
+/// Convert one path component to a C string.
+/// Returns:
+///   The C string, or error if `name` is empty, `.`, `..` or contains `/`.
 fn file_name(name: &OsStr) -> io::Result<CString> {
     let bytes = name.as_bytes();
     if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
@@ -346,7 +374,7 @@ fn file_name(name: &OsStr) -> io::Result<CString> {
     Ok(CString::new(bytes)?)
 }
 
-/// A per-process unique temp name next to `name`.
+/// Make a temp file name for `name`, unique in the process.
 fn temp_name(name: &OsStr) -> CString {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -356,7 +384,7 @@ fn temp_name(name: &OsStr) -> CString {
     CString::new(bytes).expect("file names have no NUL bytes")
 }
 
-/// Files and directories must belong to the user airlock runs as.
+/// Make sure that the user who runs airlock owns the file or directory.
 fn check_owner(meta: &std::fs::Metadata, path: &Path) -> io::Result<()> {
     let euid = unsafe { libc::geteuid() };
     if meta.uid() != euid {
@@ -374,15 +402,27 @@ fn check_owner(meta: &std::fs::Metadata, path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    //! Tests for the pinned directory: private files, size limits and
+    //! symlink safety.
+
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     use super::*;
     use crate::test_cfg::temp_dir;
 
+    /// The permission bits of `path`.
     fn mode(path: &Path) -> u32 {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
+    /// Test that a pinned directory makes private directories and files,
+    /// writes atomically and refuses reads over the size limit.
+    ///   1. Open a nested directory with create and check its path and mode
+    ///   2. Check that a missing directory without create fails
+    ///   3. Write a file two times and check its mode and that no temporary
+    ///      file is left
+    ///   4. Read the file at and over the size limit, and read a missing file
+    ///   5. Remove the file two times and check the results
     #[test]
     fn pinned_dir_stores_files_owner_only_within_size_cap() {
         let tmp = temp_dir();
@@ -410,6 +450,15 @@ mod tests {
         assert!(!dir.remove("state.json").unwrap());
     }
 
+    /// Test that a pinned directory never follows a symlink or `..` out of
+    /// itself, so that a guest-controlled path cannot reach host files.
+    ///   1. Open a directory through a symlinked path part and check the
+    ///      error, then open a `..` path and check the error
+    ///   2. Put a symlink to a host file in the directory
+    ///   3. Check that a read and an append through the symlink fail, and
+    ///      that a `..` read fails
+    ///   4. Write the file name and check that the write replaces the
+    ///      symlink and the host file did not change
     #[test]
     fn pinned_dir_never_leaves_its_directory() {
         let tmp = temp_dir();

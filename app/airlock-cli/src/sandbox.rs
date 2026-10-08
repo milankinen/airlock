@@ -1,21 +1,14 @@
-//! Sandbox API: boot a VM for a locked project with every capability the
-//! guest gets, start processes in it, and shut everything down in order.
+//! Sandbox lifecycle.
 //!
-//! ```text
-//! oci::prepare ─► boot::boot(BootSpec) ─► Vm ─► Vm::spawn(..) … ─► Vm::shutdown
-//! ```
+//! Runs a sandbox VM for a locked project:
+//!  * boots a VM with all the access that the configuration gives the guest
+//!  * starts processes in the VM and relays their input and output
+//!  * shows the progress of the preparation and boot
+//!  * runs the interactive sandbox of `airlock start`
+//!  * stops the VM in the correct order
 //!
-//! The caller builds everything the guest gets before the boot (network,
-//! browser, clipboard, daemons, masks, env; see [`boot::BootSpec`]); the
-//! boot only wires it and starts no process. Processes — the main process
-//! of `airlock start`, the installers of the install boot, `airlock exec`
-//! — start afterwards with [`vm::Vm::spawn`].
-//!
-//! Each step tears down what it built when it fails, so a caller only has
-//! to shut down the value it holds. Every background task of a boot is
-//! owned by that boot (see [`tasks::BootTasks`]) and stops before the next
-//! boot in the same process can start. `airlock start` is
-//! [`interactive::run_interactive`] over this API.
+//! If a step fails, it removes what it built. Thus a caller must stop only
+//! what it holds.
 
 pub mod boot;
 pub mod interactive;
@@ -26,14 +19,20 @@ pub mod vm;
 
 use crate::oci::{self, OciImage};
 
-/// A boot step saw the user's Ctrl+C / SIGTERM and stopped. What it had
-/// built is already torn down; commands map this to exit code 130.
+/// Error: a boot step got the user's Ctrl+C or SIGTERM and stopped. The step
+/// already removed what it built. Commands map this error to exit code 130.
 #[derive(Debug, thiserror::Error)]
 #[error("interrupted")]
 pub struct Interrupted;
 
-/// The main process argv: `args` (the command after `--`) or the image's
-/// command when empty, wrapped in a login shell when `login` is set.
+/// Get the argv of the main process.
+/// Args:
+///  - `args`: The command after `--`. If empty, the image command is used.
+///  - `login`: If `true`, run the command in a login shell
+///  - `image`: Image with the default command
+///
+/// Returns:
+///   The argv of the main process.
 pub fn main_argv(args: Vec<String>, login: bool, image: &OciImage) -> Vec<String> {
     let cmd = if args.is_empty() {
         image.cmd.clone()
@@ -49,12 +48,16 @@ pub fn main_argv(args: Vec<String>, login: bool, image: &OciImage) -> Vec<String
 
 #[cfg(test)]
 mod tests {
+    //! Tests for the command of the main guest process.
+
     use super::*;
 
+    /// The `args` as owned strings.
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(ToString::to_string).collect()
     }
 
+    /// An image whose default command is `cmd`.
     fn image(cmd: &[&str]) -> OciImage {
         OciImage {
             image_id: "sha256:test".into(),
@@ -69,6 +72,14 @@ mod tests {
         }
     }
 
+    /// Test that the main command is the user command or else the image
+    /// command, and that a login shell wraps it when asked.
+    ///   1. Check that no args give the image command
+    ///   2. Check that args replace the image command
+    ///   3. Check that a login shell with no args runs the image shell with
+    ///      `-l`
+    ///   4. Check that a login shell with args runs them through `exec` in
+    ///      `bash -l -c`, with each arg kept as one word
     #[test]
     fn main_command_is_args_or_image_command_optionally_in_login_shell() {
         assert_eq!(main_argv(vec![], false, &image(&["/bin/sh"])), ["/bin/sh"]);

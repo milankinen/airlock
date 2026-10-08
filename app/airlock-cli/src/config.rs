@@ -1,12 +1,11 @@
-//! Hierarchical TOML configuration with pack support.
+//! Layered airlock configuration with pack support.
 //!
-//! [`load`] reads up to six config files (three user files, the local
-//! project file, the project files; see [`files::discover_in`]) into a
-//! [`LayeredConfig`]. Only the project-level files (the local project file
-//! and the project files) may enable packs: a `[packs]` table in a user
-//! file is an error. [`LayeredConfig::resolve`] merges the files with
-//! deep-merge semantics, each over the config values of the packs whose
-//! highest entry it holds, and validates the result with `smart-config`.
+//! Reads the user and project config files and merges them into one
+//! validated config. The config of the enabled packs merges in with the
+//! files. The rest of the program uses only the resolved config.
+//!
+//! Also handles the `[packs]` tables, the legacy `presets` lists and the
+//! new config file that the setup wizard creates.
 
 pub(crate) mod config_values;
 pub(crate) mod de;
@@ -25,8 +24,8 @@ use crate::config::generated::GeneratedConfig;
 use crate::config::merge::{merge_json, normalize_env, pack_conflicts};
 use crate::packs::{ConfiguredPack, Pack, PackManager};
 
-/// Load the config files of the project in the current directory, with
-/// the user's home directory for the user files.
+/// Load the config files of the project in the current directory. The user
+/// files come from the home directory of the user.
 pub fn load() -> anyhow::Result<LayeredConfig> {
     let cwd = std::env::current_dir()
         .map_err(|e| anyhow::anyhow!("cannot determine the current directory: {e}"))?;
@@ -36,24 +35,29 @@ pub fn load() -> anyhow::Result<LayeredConfig> {
 }
 
 /// One config file (or in-memory document) before merging.
-///
-/// `value` is already env-normalized (see [`normalize_env`]), so layers
-/// merge field-wise no matter where they came from. A `presets` list (the
-/// released list form) is taken out of `value`; a `[packs]` table stays.
 #[derive(Clone)]
 struct Layer {
-    /// Where the layer came from (a file path), for logs and errors.
+    /// Source of the layer (a file path), for logs and errors.
     origin: String,
+    /// Config values of the file. The env is already normalized (see
+    /// [`normalize_env`]), thus layers merge field by field no matter where
+    /// they came from. A `presets` list (the released list form) is removed
+    /// from the value. A `[packs]` table stays.
     value: serde_json::Value,
-    /// The names of the file's `presets` list, if it has one.
+    /// Names in the `presets` list of the file, if it has one.
     legacy_presets: Option<Vec<String>>,
 }
 
 impl Layer {
-    /// The layer of `value` from `origin`. A `presets` value that is not
-    /// a list of names is an error (see
-    /// [`legacy_presets::take_presets_key`]); the names of a list are
-    /// checked in [`LayeredConfig::resolve`].
+    /// Make a layer.
+    /// Args:
+    ///  - `origin`: Source of the layer, for logs and errors
+    ///  - `value`: Config values of the file
+    ///
+    /// Returns:
+    ///   The layer, or an error if `presets` is not a list of names (see
+    ///   [`legacy_presets::take_presets_key`]). [`LayeredConfig::resolve`]
+    ///   checks the names later.
     fn new(origin: impl Into<String>, mut value: serde_json::Value) -> anyhow::Result<Self> {
         let origin = origin.into();
         normalize_env(&mut value);
@@ -65,7 +69,7 @@ impl Layer {
         })
     }
 
-    /// The layer of a discovered config file, logged as loaded.
+    /// Make the layer of a discovered config file and log it.
     fn from_file((path, value): (PathBuf, serde_json::Value)) -> anyhow::Result<Self> {
         let layer = Self::new(path.display().to_string(), value)?;
         tracing::debug!("config: loaded {}", layer.origin);
@@ -73,8 +77,9 @@ impl Layer {
         Ok(layer)
     }
 
-    /// The layer of a discovered user file (see [`Self::from_file`]). A
-    /// `packs` key is an error: packs belong in the project-level files.
+    /// Make the layer of a discovered user file (see [`Self::from_file`]).
+    /// A `packs` key is an error, because only project-level files can
+    /// enable packs.
     fn from_user_file(file: (PathBuf, serde_json::Value)) -> anyhow::Result<Self> {
         let layer = Self::from_file(file)?;
         anyhow::ensure!(
@@ -87,7 +92,7 @@ impl Layer {
     }
 }
 
-/// What `--network` overrides in [`LayeredConfig::resolve`].
+/// Command line overrides for [`LayeredConfig::resolve`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ConfigOverrides {
     /// `airlock start --network <POLICY>`.
@@ -98,15 +103,16 @@ pub struct ConfigOverrides {
 /// user files < local project file < project files.
 #[derive(Clone)]
 pub struct LayeredConfig {
-    /// `~/.airlock/airlock.<ext>`, `~/.airlock/config.<ext>`, `~/.airlock.<ext>`;
-    /// without `[packs]` when loaded (see [`Layer::from_user_file`]).
+    /// `~/.airlock/airlock.<ext>`, `~/.airlock/config.<ext>`,
+    /// `~/.airlock.<ext>`. They have no `[packs]` (see
+    /// [`Layer::from_user_file`]).
     user: Vec<Layer>,
     /// `<project_root>/.airlock/airlock.<ext>`
     local: Option<Layer>,
     /// `<project_root>/airlock.<ext>`, `<project_root>/airlock.local.<ext>`
     project: Vec<Layer>,
-    /// The project config the setup wizard generated (see
-    /// [`Self::with_generated_project`]), not written to disk yet.
+    /// Project config that the setup wizard generated (see
+    /// [`Self::with_generated_project`]). It is not written to disk yet.
     generated: Option<GeneratedConfig>,
 }
 
@@ -117,9 +123,14 @@ impl LayeredConfig {
         !self.project.is_empty() || self.local.is_some()
     }
 
-    /// Add `generated` (the config the setup wizard produced, not written
-    /// to disk yet) as the project config. Only for a project without
-    /// config (see [`Self::has_project_config`]).
+    /// Use a generated config as the project config.
+    /// Args:
+    ///  - `generated`: Config that the setup wizard made. It is not written
+    ///    to disk yet.
+    ///
+    /// Returns:
+    ///   The config, or an error if the project already has a config (see
+    ///   [`Self::has_project_config`]) or `generated` is not valid TOML.
     pub fn with_generated_project(mut self, generated: GeneratedConfig) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !self.has_project_config(),
@@ -133,8 +144,8 @@ impl LayeredConfig {
         Ok(self)
     }
 
-    /// The image that the user files set (`vm.image`), if any: the
-    /// highest user file with one wins.
+    /// Get the image that the user files set in `vm.image`, if any. The
+    /// highest user file with an image wins.
     pub fn user_image(&self) -> Option<UserImage> {
         self.user.iter().rev().find_map(|layer| {
             // `image = "<ref>"`, or `[vm.image]` with its `name`.
@@ -147,38 +158,47 @@ impl LayeredConfig {
         })
     }
 
-    /// The project config the setup wizard generated, if
-    /// [`Self::with_generated_project`] added one; it still needs saving
-    /// (see [`crate::start::wizard::save_config`]).
+    /// Get the project config that [`Self::with_generated_project`] added,
+    /// if any. It is not saved yet (see
+    /// [`crate::start::wizard::save_config`]).
     pub fn generated_project(&self) -> Option<&GeneratedConfig> {
         self.generated.as_ref()
     }
 
-    /// Merge all layers in precedence order, each over the config values
-    /// of its packs, apply `overrides`, and parse and validate the result.
+    /// Merge all layers and their packs into the final config.
     ///
-    /// The names of the `presets` lists must be released names (see
-    /// [`legacy_presets::validate_names`]). Each layer's `[packs]` table
-    /// is read on its own and the entries merge per pack (see
-    /// [`pack_entries`]). The config values of the enabled packs (a
-    /// `config.lua` runs here, on every resolve) must not conflict, across
-    /// all layers (see [`pack_conflicts`]). The documents of the `presets`
-    /// lists apply first, then each layer (see [`merge_config`]): the
-    /// config values of the packs whose highest entry is in that layer,
-    /// then the layer's own values (without `packs` or `presets`). So a
-    /// pack overrides the layers below its highest entry (a project pack
-    /// overrides the user files), and the layer of that entry overrides
+    /// The merge order is:
+    ///  1. The documents of the `presets` lists.
+    ///  2. For each layer, lowest precedence first: the config values of the
+    ///     packs whose highest entry is in that layer, then the values of
+    ///     the layer.
+    ///
+    /// Thus a pack overrides the layers below its highest entry (a project
+    /// pack overrides the user files). The layer of that entry overrides
     /// the pack.
+    /// Args:
+    ///  - `packs`: Known packs
+    ///  - `overrides`: Command line overrides
+    ///
+    /// Returns:
+    ///   The validated config and the enabled packs. An error lists all
+    ///   problems, for example an unknown preset name, an invalid
+    ///   `[packs]` entry, a failed `config.lua`, or two packs that set a
+    ///   value differently.
     pub async fn resolve(
         &self,
         packs: &PackManager,
         overrides: &ConfigOverrides,
     ) -> anyhow::Result<ResolvedConfig> {
         let known = packs.builtin();
+        // The names of the `presets` lists must be released names (see
+        // `legacy_presets::validate_names`).
         let legacy_base = self.legacy_base(&known)?;
         let mut problems = Vec::new();
         let mut entries = Vec::new();
         let mut plain_layers = Vec::new();
+        // Read the `[packs]` table of each layer separately. The entries
+        // merge for each pack (see `pack_entries`).
         for layer in self.layers() {
             tracing::trace!("config: reading {}", layer.origin);
             let mut value = layer.value.clone();
@@ -192,6 +212,8 @@ impl LayeredConfig {
         if !problems.is_empty() {
             anyhow::bail!("invalid configuration\n{}", problems.join("\n"));
         }
+        // A `config.lua` runs here, on each resolve. The values of the
+        // enabled packs must not conflict across all layers.
         let pack_values = pack_configs(&configured).map_err(|problems| {
             anyhow::anyhow!("invalid configuration\n{}", problems.join("\n"))
         })?;
@@ -206,15 +228,20 @@ impl LayeredConfig {
         })
     }
 
-    /// The layers, lowest precedence first.
+    /// Iterate the layers, lowest precedence first.
     fn layers(&self) -> impl Iterator<Item = &Layer> {
         self.user.iter().chain(&self.local).chain(&self.project)
     }
 
-    /// The documents of the `presets` lists of all layers, merged (see
-    /// [`legacy_presets::expand`]); they apply beneath every layer and its
-    /// packs. A name that is not a released one is an error; `known` (the
-    /// built-in packs) gives its hint.
+    /// Merge the documents of the `presets` lists of all layers (see
+    /// [`legacy_presets::expand`]). The result applies below all layers and
+    /// their packs.
+    /// Args:
+    ///  - `known`: Built-in packs, for the hint of an unknown name
+    ///
+    /// Returns:
+    ///   The merged documents, or an error for a name that is not a
+    ///   released one.
     fn legacy_base(&self, known: &[Pack]) -> anyhow::Result<serde_json::Value> {
         for layer in self.layers() {
             if let Some(names) = &layer.legacy_presets {
@@ -229,8 +256,8 @@ impl LayeredConfig {
         legacy_presets::expand(names)
     }
 
-    /// The config of `user`, `local` and `project` (each lowest precedence
-    /// first), with no generated project config yet.
+    /// Make the config from its layers, each lowest precedence first. There
+    /// is no generated project config yet.
     fn new(user: Vec<Layer>, local: Option<Layer>, project: Vec<Layer>) -> Self {
         Self {
             user,
@@ -240,7 +267,7 @@ impl LayeredConfig {
         }
     }
 
-    /// Load the config files of `project_root` with `home` as the home
+    /// Load the config files of `project_root`, with `home` as the home
     /// directory (see [`files::discover_in`]).
     pub(crate) fn load_from(home: &Path, project_root: &Path) -> anyhow::Result<Self> {
         let files = files::discover_in(home, project_root)?;
@@ -283,35 +310,41 @@ impl LayeredConfig {
     }
 }
 
-/// The image of the user files (see [`LayeredConfig::user_image`]).
+/// Image that the user files set (see [`LayeredConfig::user_image`]).
 #[derive(Clone)]
 pub struct UserImage {
-    /// The image reference (`image`, or the `name` of `[vm.image]`).
+    /// Image reference (`image`, or the `name` of `[vm.image]`).
     pub name: String,
-    /// `vm.image` as the file has it.
+    /// `vm.image` as it is in the file.
     pub value: serde_json::Value,
 }
 
 /// A resolved config and the enabled packs.
 pub struct ResolvedConfig {
-    /// Everything applied (the `--network` policy too, when it is set).
+    /// Final config values, with all overrides (also the `--network`
+    /// policy, if set).
     pub values: ConfigValues,
-    /// Every enabled `[packs]` entry, in pack order.
+    /// All enabled `[packs]` entries, in pack order.
     pub packs: Vec<ConfiguredPack>,
 }
 
 impl ResolvedConfig {
-    /// The config of the install boot (see
+    /// Make the config of the install boot (see
     /// [`crate::packs::install::phase::install_config`]).
     pub(crate) fn install_config(&self) -> anyhow::Result<ConfigValues> {
         crate::packs::install::phase::install_config(self.values.clone())
     }
 }
 
-/// The config values of `packs` (in their order), each env-normalized
-/// (see [`normalize_env`]). A pack whose config fails (its `config.lua`)
-/// and a value that two packs set differently (see [`pack_conflicts`])
-/// are problems, one line each.
+/// Get the config values of the packs.
+/// Args:
+///  - `packs`: Configured packs
+///
+/// Returns:
+///   The config values in pack order, with normalized env (see
+///   [`normalize_env`]). Or the problems, one line each: a pack whose
+///   `config.lua` fails, or a value that two packs set differently (see
+///   [`pack_conflicts`]).
 fn pack_configs(packs: &[ConfiguredPack]) -> Result<Vec<serde_json::Value>, Vec<String>> {
     let mut docs = Vec::new();
     let mut problems = Vec::new();
@@ -343,26 +376,34 @@ fn pack_configs(packs: &[ConfiguredPack]) -> Result<Vec<serde_json::Value>, Vec<
     Ok(docs.into_iter().map(|(_, value)| value).collect())
 }
 
-/// One layer's part of [`merge_config`]: its own values (without `packs`
-/// and `presets`), and the names of the packs that its `[packs]` table
-/// has entries for.
+/// One layer as input to [`merge_config`].
 struct PlainLayer {
+    /// Values of the layer, without `packs` and `presets`.
     value: serde_json::Value,
+    /// Names of the packs that the `[packs]` table of the layer has entries
+    /// for.
     pack_names: Vec<String>,
 }
 
-/// Merge `legacy_base` (the documents of the `presets` lists), then each
-/// of `layers` (lowest precedence first): the config values of the packs
-/// whose highest entry is in that layer, then the layer's own values.
-/// `pack_values` are the config values of `packs`, in the same order.
-/// Parse and validate the result.
+/// Merge the presets, layers and packs, then parse and validate the result.
+/// Args:
+///  - `legacy_base`: Merged documents of the `presets` lists. It applies
+///    first.
+///  - `layers`: Layers, lowest precedence first. For each layer, the config
+///    values of the packs whose highest entry is in that layer apply first,
+///    then the values of the layer.
+///  - `packs`: Configured packs
+///  - `pack_values`: Config values of `packs`, in the same order
+///
+/// Returns:
+///   The validated config values.
 fn merge_config(
     legacy_base: serde_json::Value,
     layers: Vec<PlainLayer>,
     packs: &[ConfiguredPack],
     pack_values: Vec<serde_json::Value>,
 ) -> anyhow::Result<ConfigValues> {
-    // Every configured pack has an entry, so it has a layer.
+    // Each configured pack has an entry, thus it has a layer.
     let mut layer_packs = vec![Vec::new(); layers.len()];
     for (pack, value) in packs.iter().zip(pack_values) {
         let name = &pack.metadata().name;

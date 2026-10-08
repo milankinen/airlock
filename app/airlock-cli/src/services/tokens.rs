@@ -1,35 +1,13 @@
-//! Surrogate tokens: the shared engine that finds the real tokens in a
-//! provider's answer and puts surrogates in their place.
+//! Surrogate tokens.
 //!
-//! Each provider has a table of [`Format`]s ([`Formats`]): how to tell a
-//! real token of the format, of which [`TokenKind`] it is, how to mint its
-//! surrogate, and how to tell a surrogate of the format (its fixed
-//! prefix). The engine knows no provider: an agent update that adds a
-//! field to a token answer needs no change here, and a new token format
-//! is one more row in the provider's table.
+//! Finds the real tokens in a token answer of a provider and puts
+//! surrogates in their place, for new sign-ins and for refreshes. The
+//! engine refuses an answer that can contain a secret in an unknown
+//! format.
 //!
-//! On a token answer ([`collect`]):
-//!
-//! - every string a format recognizes, anywhere in the answer, is a real
-//!   token: it is stored with the grant and the guest gets a surrogate
-//!   ([`mint_all`] for a new grant, [`apply_refresh`] for a refresh;
-//!   [`substitute`] puts the surrogates in). The standard token fields
-//!   (`access_token`, `refresh_token`, `id_token`) are decided by their
-//!   key, as the agent reads them: each provider table ends with a format
-//!   per field that takes any value, after the formats of known shapes
-//!   (whose minters keep claims or prefixes). A real refresh token of an
-//!   unexpected format still gets a surrogate.
-//! - fail closed: a string under another token-like key ([`is_token_key`],
-//!   also deeper inside such a key) that no format recognizes, that is no
-//!   surrogate of airlock, and that can be a credential (not an
-//!   identifier key, not a UUID, number or boolean, at least
-//!   [`MIN_CREDENTIAL_LEN`] characters) refuses the whole answer. The guest
-//!   then gets a local `502` and nothing is stored: an unknown secret
-//!   never reaches the sandbox.
-//!
-//! Surrogates have at least [`SURROGATE_BYTES`] random bytes from the
-//! CSPRNG after their fixed prefix ([`surrogate`]); a fake JWT has them in
-//! its nonce claim and again in its signature ([`fake_jwt`]).
+//! Each provider gives a table of its token formats. The engine itself
+//! knows no provider. A new field in a token answer needs no change, and a
+//! new token format is one more row in the table of the provider.
 
 use std::collections::{HashMap, HashSet};
 
@@ -41,19 +19,19 @@ use serde_json::{Map, Value};
 use super::auth_codes;
 use super::store::{Grant, now_ms, random_bytes};
 
-/// The random bytes of a surrogate after its prefix.
+/// Number of random bytes from the CSPRNG in a surrogate, after its fixed
+/// prefix.
 pub const SURROGATE_BYTES: usize = 48;
 
-/// What every fake JWT starts with: its fixed header
-/// `{"alg":"none","typ":"JWT"}` (base64url) and the dot. Real tokens never
-/// use `alg` `none`.
+/// Start of every fake JWT: its fixed header `{"alg":"none","typ":"JWT"}`
+/// (base64url) and the dot. Real tokens never use `alg` `none`.
 pub const FAKE_JWT_PREFIX: &str = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.";
 
-/// How long a replaced access surrogate stays valid when its real token
-/// had no known expiry.
+/// How long a replaced access surrogate stays valid if the expiry of its
+/// real token is not known.
 const DEFAULT_PREVIOUS_LIFETIME_MS: i64 = 60 * 60 * 1000;
 
-/// What a key that names a secret contains.
+/// Parts of a key name that make the key name a secret.
 const SECRET_PARTS: &[&str] = &[
     "token",
     "secret",
@@ -68,7 +46,7 @@ const SECRET_PARTS: &[&str] = &[
     "assertion",
 ];
 
-/// Keys with "token" in their name whose values are no secret.
+/// Keys with "token" in their name whose values are not secret.
 const METADATA_KEYS: &[&str] = &[
     "token_type",
     "token_type_hint",
@@ -77,21 +55,23 @@ const METADATA_KEYS: &[&str] = &[
     "subject_token_type",
 ];
 
-/// What a token is for.
+/// The purpose of a token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TokenKind {
+    /// An OAuth access token.
     Access,
+    /// An OAuth refresh token.
     Refresh,
-    /// An OpenID Connect ID token: no credential, but it carries the
-    /// account.
+    /// An OpenID Connect ID token. It is not a credential, but it contains
+    /// the account.
     Id,
+    /// An API key that a grant created.
     ApiKey,
 }
 
 impl TokenKind {
-    /// The key of an OAuth token answer that holds the token of this
-    /// kind.
+    /// Key of an OAuth token answer that holds the token of this kind.
     fn answer_key(self) -> Option<&'static str> {
         match self {
             TokenKind::Access => Some("access_token"),
@@ -105,8 +85,11 @@ impl TokenKind {
 /// One real token of a grant and its surrogate.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Token {
+    /// The token kind.
     pub kind: TokenKind,
+    /// The real token from the provider.
     pub real: String,
+    /// The surrogate that the sandbox gets.
     pub surrogate: String,
     /// When the real token expires (Unix ms), if known.
     #[serde(default)]
@@ -114,38 +97,46 @@ pub struct Token {
 }
 
 /// One token format of a provider.
+///
+/// A provider table lists the formats of known shapes first. Their
+/// minters keep claims or prefixes. The table ends with one format per
+/// standard token field (`access_token`, `refresh_token`, `id_token`)
+/// that accepts any value: the key decides, as the agent reads it. Thus a
+/// real refresh token of an unexpected format still gets a surrogate.
 pub struct Format {
+    /// The kind of the tokens of this format.
     pub kind: TokenKind,
-    /// Whether `value`, found under the JSON key `key` (`""` when no key
-    /// is known), is a real token of this format. Never called with a
+    /// Whether `value`, found under the JSON key `key` (`""` if the key is
+    /// not known), is a real token of this format. Never called with a
     /// surrogate of the provider.
     pub recognize: fn(key: &str, value: &str) -> bool,
-    /// Whether `value` is a surrogate of this format (its fixed prefix).
+    /// Whether `value` is a surrogate of this format (by its fixed
+    /// prefix).
     pub is_surrogate: fn(value: &str) -> bool,
-    /// A new surrogate for the real token `real`.
+    /// Make a new surrogate for the real token `real`.
     pub mint: fn(real: &str) -> anyhow::Result<String>,
-    /// What every real token of the format starts with, for the scan of
-    /// API answers ([`super::scan`]); empty: the format has no fixed start
-    /// (only the store's own copies of such tokens are found there).
+    /// Start of every real token of the format, for the scan of API
+    /// answers ([`super::scan`]). Empty if the format has no fixed start.
+    /// Then the scan finds only the tokens that the store holds.
     pub starts: &'static [&'static str],
-    /// Whether a run of token characters that begins with one of
+    /// Whether a run of token characters that starts with one of
     /// [`Self::starts`] (at most [`super::scan::MAX_TOKEN_LEN`] bytes) is
     /// a real token of a realistic shape, for the scan of API answers. Not
-    /// called with a surrogate. Stricter than [`Self::recognize`]: the
-    /// scan sees text that is no token answer.
+    /// called with a surrogate. Stricter than [`Self::recognize`], because
+    /// the scan sees text that is not a token answer.
     pub shape: fn(run: &str) -> bool,
-    /// The surrogate carries facts of its real token (a fake JWT carries
-    /// its claims and `exp`): a new real token gets a new surrogate. Other
-    /// surrogates stay for the life of the grant.
+    /// Whether the surrogate contains facts of its real token (a fake JWT
+    /// contains its claims and `exp`). If true, a new real token gets a new
+    /// surrogate. Other surrogates stay for the life of the grant.
     pub carries_claims: bool,
 }
 
-/// The token formats of one provider.
+/// The token formats of one provider, in match order.
 pub struct Formats(pub &'static [Format]);
 
 impl Formats {
-    /// The format that recognizes `value` under `key`; `None` for
-    /// surrogates and strings of no format.
+    /// Find the format that recognizes `value` under `key`. Returns `None`
+    /// for surrogates and for strings of no format.
     pub fn recognize(&self, key: &str, value: &str) -> Option<&'static Format> {
         if self.is_surrogate(value) {
             return None;
@@ -153,27 +144,31 @@ impl Formats {
         self.0.iter().find(|f| (f.recognize)(key, value))
     }
 
-    /// Whether `value` is shaped as a surrogate of the provider (known to
-    /// the store or not).
+    /// Whether `value` has the shape of a surrogate of the provider (known
+    /// to the store or not).
     pub fn is_surrogate(&self, value: &str) -> bool {
         self.0.iter().any(|f| (f.is_surrogate)(value))
     }
 
-    /// Whether `value` is a real token of the provider wherever it is:
-    /// what an API answer must not carry.
+    /// Whether `value` is a real token of the provider, without regard to
+    /// its key. An API answer must not contain such a value.
     pub fn is_real(&self, value: &str) -> bool {
         self.recognize("", value).is_some()
     }
 }
 
-/// Whether a JSON key names a secret (case-insensitive): it contains one
-/// of [`SECRET_PARTS`], it is `code` or `authorization_code`, or it has
-/// the word `auth` (`x_auth`, `authValue`; not `authorization_endpoint`).
-/// Known metadata keys (`token_type`, …) and identifiers
-/// ([`is_id_key`]) do not count. Broader than
-/// `oauth::CODE_KEYS` and its token keys, which refuse any answer of an
-/// allowed route that has such a field: here a recognized token under the
-/// key is fine (it gets a surrogate), so the net can be wider.
+/// Whether a JSON key names a secret (case-insensitive).
+///
+/// A key names a secret if it contains one of [`SECRET_PARTS`], if it is
+/// `code` or `authorization_code`, or if it has the word `auth`
+/// (`x_auth`, `authValue`, but not `authorization_endpoint`). Known
+/// metadata keys (`token_type`, …) and identifiers ([`is_id_key`]) do not
+/// count.
+///
+/// This set is broader than the token and code keys of
+/// [`super::oauth::backstop`], which refuses any answer with such a field.
+/// Here a recognized token under the key is accepted (it gets a
+/// surrogate), so the set can be wider.
 pub fn is_token_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     if METADATA_KEYS.contains(&lower.as_str()) || is_id_key(key) {
@@ -185,18 +180,19 @@ pub fn is_token_key(key: &str) -> bool {
         || words(key).any(|w| w == "auth")
 }
 
-/// Whether a key names an identifier, no secret: `id`, `uuid`, or a key
-/// ending in `_id` or `_uuid` (`token_uuid`, `client_id`).
+/// Whether a key names an identifier, not a secret: `id`, `uuid`, or a key
+/// that ends in `_id` or `_uuid` (`token_uuid`, `client_id`).
 fn is_id_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     key == "id" || key == "uuid" || key.ends_with("_id") || key.ends_with("_uuid")
 }
 
-/// The shortest string the fail-closed rule takes for a credential.
+/// Minimum length of a string that the fail-closed rule of [`collect`]
+/// treats as a possible credential.
 const MIN_CREDENTIAL_LEN: usize = 16;
 
-/// Whether a string can be a credential: not shorter than
-/// [`MIN_CREDENTIAL_LEN`], not a number, a boolean or a UUID.
+/// Whether a string can be a credential: at least [`MIN_CREDENTIAL_LEN`]
+/// long, and not a number, a boolean or a UUID.
 fn can_be_credential(s: &str) -> bool {
     let uuid = s.len() == 36
         && s.char_indices().all(|(i, c)| match i {
@@ -211,8 +207,9 @@ fn can_be_credential(s: &str) -> bool {
         && !matches!(s, "true" | "false")
 }
 
-/// The words of a key: split at non-alphanumeric characters and before an
-/// uppercase letter that follows a lowercase one, lowercased.
+/// Split a key into lowercase words. A word ends at a non-alphanumeric
+/// character and before an uppercase letter that follows a lowercase
+/// letter.
 fn words(key: &str) -> impl Iterator<Item = String> + '_ {
     let mut words = Vec::new();
     let mut word = String::new();
@@ -235,22 +232,26 @@ fn words(key: &str) -> impl Iterator<Item = String> + '_ {
 
 /// A real token found in an answer.
 pub struct Found {
+    /// The token kind.
     pub kind: TokenKind,
+    /// The real token.
     pub real: String,
+    /// The format that recognized the token.
     pub format: &'static Format,
-    /// The token is the answer's own field of its kind (`access_token`,
-    /// `refresh_token`, `id_token` at the top): the grant's main token of
-    /// the kind.
+    /// True if the token is the answer's own field of its kind
+    /// (`access_token`, `refresh_token` or `id_token` at the top level).
+    /// Then it is the grant's main token of that kind.
     pub primary: bool,
+    /// When the real token expires (Unix ms), if known.
     pub expires_at: Option<i64>,
 }
 
-/// Why an answer is refused.
+/// The reason why an answer is refused.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Refusal {
     /// A string under this token-like key is in no known format.
     Unknown(String),
-    /// A real token of a kind this answer must not carry.
+    /// A real token of a kind that this answer must not contain.
     NotAllowed(TokenKind),
 }
 
@@ -263,10 +264,28 @@ impl std::fmt::Display for Refusal {
     }
 }
 
-/// Find the real tokens of `answer` (see the module docs). `allowed`: the
-/// kinds the answer may carry. `strict`: refuse an unknown string under a
-/// token-like key (token answers); off for answers whose other fields are
-/// not known (a created API key), where only known formats count.
+/// Find the real tokens of a provider answer.
+///
+/// Every string that a format recognizes, anywhere in the answer, is a
+/// real token. The caller stores it with the grant and gives the guest a
+/// surrogate.
+///
+/// In strict mode, the answer fails closed: a string that can be a
+/// credential under a token-like key ([`is_token_key`], also deeper below
+/// such a key) refuses the whole answer, if no format recognizes it and
+/// it is not a surrogate of airlock. An identifier key, a UUID, a number,
+/// a boolean or a string shorter than [`MIN_CREDENTIAL_LEN`] is not a
+/// credential. Thus an unknown secret never gets to the sandbox.
+/// Args:
+///  - `formats`: Token formats of the provider
+///  - `answer`: The JSON answer
+///  - `allowed`: Token kinds that the answer can contain
+///  - `strict`: Refuse an unknown string under a token-like key. Use it
+///    for token answers. Do not use it for answers whose other fields are
+///    not known (a created API key), where only known formats count.
+///
+/// Returns:
+///   The real tokens found, or the reason to refuse the answer.
 pub fn collect(
     formats: &Formats,
     answer: &Map<String, Value>,
@@ -292,9 +311,10 @@ pub fn collect(
     Ok(found)
 }
 
-/// One value of an answer under `key`; `top`: directly in the answer
-/// object; `secret`: under a token-like key (here or above) of a
-/// `strict` walk.
+/// Walk one value of an answer under `key` for [`collect`].
+///
+/// `top` is true for a value directly in the answer object. `secret` is
+/// true below a token-like key (here or above) in a `strict` walk.
 fn walk(
     formats: &Formats,
     key: &str,
@@ -339,8 +359,8 @@ fn walk(
     Ok(())
 }
 
-/// The surrogates of the tokens of a new grant: one per distinct real
-/// token, each kind's main token first.
+/// Make the surrogates of the tokens of a new grant: one per distinct real
+/// token, with the main token of each kind first.
 pub fn mint_all(found: &[Found]) -> anyhow::Result<Vec<Token>> {
     let mut tokens: Vec<Token> = Vec::new();
     for f in ordered(found) {
@@ -357,20 +377,23 @@ pub fn mint_all(found: &[Found]) -> anyhow::Result<Vec<Token>> {
     Ok(tokens)
 }
 
-/// `found` with each kind's main token first.
+/// Sort `found` so that the main token of each kind comes first.
 fn ordered(found: &[Found]) -> Vec<&Found> {
     let mut out: Vec<&Found> = found.iter().filter(|f| f.primary).collect();
     out.extend(found.iter().filter(|f| !f.primary));
     out
 }
 
-/// Apply the tokens of a refresh answer to `grant` in place. Each kind the
-/// answer carries replaces the grant's tokens of that kind; kinds the
-/// answer leaves out stay. The main token keeps its surrogate unless the
-/// surrogate carries claims ([`Format::carries_claims`]); a replaced access
-/// surrogate stays valid until the expiry of its own real token
-/// ([`Grant::keep_previous_access`]). Returns real token → surrogate, for
-/// [`substitute`].
+/// Apply the tokens of a refresh answer to `grant` in place.
+///
+/// Each kind in the answer replaces the grant's tokens of that kind. Kinds
+/// that the answer does not contain stay. The main token keeps its
+/// surrogate, unless the surrogate contains claims
+/// ([`Format::carries_claims`]). A replaced access surrogate stays valid
+/// until the expiry of its own real token
+/// ([`Grant::keep_previous_access`]).
+/// Returns:
+///   A map from real token to surrogate, for [`substitute`].
 pub fn apply_refresh(
     grant: &mut Grant,
     found: &[Found],
@@ -423,7 +446,8 @@ pub fn apply_refresh(
     Ok(map)
 }
 
-/// Replace every string of `value` that is a key of `map` by its value.
+/// Replace every string of `value` that is a key of `map` with the map
+/// value.
 pub fn substitute(value: &mut Value, map: &HashMap<String, String>) {
     match value {
         Value::String(s) => {
@@ -437,8 +461,8 @@ pub fn substitute(value: &mut Value, map: &HashMap<String, String>) {
     }
 }
 
-/// A random surrogate: `prefix` and [`SURROGATE_BYTES`] bytes from the
-/// CSPRNG, base64url.
+/// Make a random surrogate: `prefix` and [`SURROGATE_BYTES`] bytes from
+/// the CSPRNG, base64url.
 pub fn surrogate(prefix: &str) -> anyhow::Result<String> {
     Ok(format!(
         "{prefix}{}",
@@ -446,9 +470,12 @@ pub fn surrogate(prefix: &str) -> anyhow::Result<String> {
     ))
 }
 
-/// A fake unpadded JWT with the claims of the JWT `real` (its own `exp`
-/// included), a random nonce claim and a random signature. `None` when
-/// `real` is not a JWT with a claims object.
+/// Make a fake unpadded JWT from the JWT `real`.
+///
+/// The fake JWT has the claims of `real` (also its `exp`), a random nonce
+/// claim and a random signature.
+/// Returns:
+///   The fake JWT, or `None` if `real` is not a JWT with a claims object.
 pub fn fake_jwt(real: &str) -> anyhow::Result<Option<String>> {
     let Some(Value::Object(mut claims)) = jwt_claims(real) else {
         return Ok(None);
@@ -462,7 +489,7 @@ pub fn fake_jwt(real: &str) -> anyhow::Result<Option<String>> {
     Ok(Some(format!("{FAKE_JWT_PREFIX}{payload}.{signature}")))
 }
 
-/// The claims of a JWT (unverified): the decoded middle part.
+/// Get the claims of a JWT (not verified): the decoded middle part.
 pub fn jwt_claims(token: &str) -> Option<Value> {
     let mut parts = token.split('.');
     let (Some(_), Some(payload), Some(_), None) =
@@ -474,8 +501,8 @@ pub fn jwt_claims(token: &str) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// The JWT at the start of a run of token characters: its first three
-/// dot-separated parts. `None` with fewer parts.
+/// Get the JWT at the start of a run of token characters: its first three
+/// dot-separated parts. Returns `None` if there are fewer parts.
 pub fn jwt_at_start(run: &str) -> Option<&str> {
     match run.match_indices('.').nth(2) {
         Some((end, _)) => Some(&run[..end]),
@@ -483,30 +510,41 @@ pub fn jwt_at_start(run: &str) -> Option<&str> {
     }
 }
 
-/// The `exp` claim of a JWT (Unix seconds).
+/// Get the `exp` claim of a JWT (Unix seconds).
 fn jwt_exp(token: &str) -> Option<i64> {
     jwt_claims(token)?.get("exp")?.as_i64()
 }
 
 #[cfg(test)]
 mod tests {
+    //! Tokens in provider answers: token keys, the collection of tokens,
+    //! refresh of surrogates and fake JWTs.
+
     use serde_json::json;
 
     use super::*;
 
+    // A test provider: real tokens start with `real-`, surrogates with
+    // `ours-`, and ID tokens with `jwt-` carry claims.
+
+    /// True for a real token of the test provider.
     fn is_real(_key: &str, v: &str) -> bool {
         v.starts_with("real-")
     }
+    /// True for a surrogate of the test provider.
     fn is_ours(v: &str) -> bool {
         v.starts_with("ours-")
     }
+    /// Mint a surrogate of the test provider.
     fn mint(_real: &str) -> anyhow::Result<String> {
         surrogate("ours-")
     }
+    /// True for an ID token of the test provider.
     fn is_claimed(key: &str, v: &str) -> bool {
         key == "id_token" && v.starts_with("jwt-")
     }
 
+    /// Token formats of the test provider.
     static FORMATS: Formats = Formats(&[
         Format {
             kind: TokenKind::Access,
@@ -537,12 +575,19 @@ mod tests {
         },
     ]);
 
+    /// All token kinds.
     const ALL: &[TokenKind] = &[TokenKind::Access, TokenKind::Refresh, TokenKind::Id];
 
+    /// The JSON object of `v`.
     fn object(v: &Value) -> Map<String, Value> {
         v.as_object().unwrap().clone()
     }
 
+    /// Test that a key that names a credential is a token key and that a
+    /// metadata key is not.
+    ///   1. Check that credential keys in different cases and styles are token
+    ///      keys
+    ///   2. Check that metadata and identifier keys are not token keys
     #[test]
     fn credential_like_key_is_token_key_and_metadata_key_is_not() {
         for key in [
@@ -581,6 +626,16 @@ mod tests {
         }
     }
 
+    /// Test that the collection finds real tokens at all depths and refuses an
+    /// unknown credential in strict mode. An unknown secret must never get to
+    /// the sandbox.
+    ///   1. Collect from an answer with top-level and nested tokens, a
+    ///      surrogate code and a surrogate
+    ///   2. Check the found tokens, which ones are main tokens, and the expiry
+    ///   3. Check that unknown values under token keys are refused only in
+    ///      strict mode
+    ///   4. Check that identifiers, short values, numbers and flags pass
+    ///   5. Check that a token kind that is not allowed is refused
     #[test]
     fn collect_finds_tokens_anywhere_and_refuses_unknown_credentials() {
         let answer = object(&json!({
@@ -642,6 +697,14 @@ mod tests {
         assert_eq!(got.err(), Some(Refusal::NotAllowed(TokenKind::Id)));
     }
 
+    /// Test that a refresh keeps the surrogates of opaque tokens and mints new
+    /// surrogates for tokens with claims. A surrogate with claims must show
+    /// the new claims.
+    ///   1. Make a grant from an answer with access, refresh and ID tokens
+    ///   2. Apply a refresh answer with a new access token and a new ID token
+    ///   3. Check that the access surrogate stays, the refresh token stays and
+    ///      the ID surrogate changes
+    ///   4. Replace the real tokens in the answer and check the surrogates
     #[test]
     fn refresh_keeps_opaque_surrogates_and_remints_ones_with_claims() {
         let found = collect(
@@ -685,6 +748,11 @@ mod tests {
         assert_eq!(answer["id_token"], token(TokenKind::Id).surrogate);
     }
 
+    /// Test that a fake JWT copies the claims of the real JWT and is different
+    /// each time.
+    ///   1. Make two fake JWTs of one real JWT
+    ///   2. Check that they differ, have the prefix and contain the claims
+    ///   3. Check that an opaque token gives no fake JWT
     #[test]
     fn fake_jwt_copies_real_claims_and_is_unique() {
         let real = format!(

@@ -1,24 +1,15 @@
-//! Interactive prompts on stderr, drawn in place in raw mode.
+//! Interactive terminal prompts.
 //!
-//! The parts know nothing about airlock: the caller gives the titles,
-//! notes, options and checks.
-//! - [`screen`]: the terminal (raw mode, the view drawn in place, keys);
-//! - [`style`]: the look that the prompts share (styles, marks, lines);
-//! - [`choose`]: one option of a vertical radio list;
-//! - [`yes_no`]: a question with an inline `« yes · no »` bar;
-//! - [`fields`]: `label: value` text inputs, some masked.
+//! The prompts know nothing about airlock. The caller gives the titles, notes,
+//! options and checks. The available prompts are a single choice from a list, a
+//! yes/no question and a form of text inputs. Callers can also make custom
+//! prompts.
 //!
-//! A prompt is a state that keys change ([`Step`]) and the lines that
-//! show it ([`screen::Frame`]); [`run`] draws it until it ends. Every
-//! prompt:
-//! - refuses to run unless stdin **and** stderr are terminals (it reads
-//!   keys from the terminal and draws on stderr);
-//! - returns `Ok(None)` when the user presses Esc, so callers can tell
-//!   "cancel" from an error;
-//! - reports Ctrl+C (a key in raw mode) and a latched interrupt (the
-//!   signal handler in [`crate::cli::initialize`]) as
-//!   [`PromptError::Interrupted`];
-//! - erases its view and restores the terminal on every path.
+//! Every prompt:
+//!  * fails unless stdin and stderr are terminals
+//!  * lets the caller tell a cancel (Esc) from an error
+//!  * stops on Ctrl+C or on an earlier interrupt signal
+//!  * erases its view and restores the terminal on every path
 
 pub mod choose;
 pub mod fields;
@@ -33,7 +24,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::cli;
 use crate::cli::prompt::screen::{Frame, Input, Screen};
 
-/// Why a prompt produced no answer (Esc is `Ok(None)`, not an error).
+/// Reason why a prompt gave no answer. Esc is `Ok(None)`, not an error.
 #[derive(Debug, thiserror::Error)]
 pub enum PromptError {
     /// stdin or stderr is not a terminal.
@@ -42,43 +33,49 @@ pub enum PromptError {
     /// Ctrl+C or SIGTERM while the prompt was open.
     #[error("interrupted")]
     Interrupted,
+    /// Terminal I/O error.
     #[error("prompt failed: {0}")]
     Io(std::io::Error),
 }
 
-/// What a key did to a prompt.
+/// Result of one key press on a prompt.
 pub enum Step<T> {
     /// The prompt stays open.
     Stay,
     /// The prompt ends with the answer.
     Done(T),
-    /// Esc (or a cancel option).
+    /// The user pressed Esc or selected a cancel option.
     Cancel,
-    /// Ctrl-C.
+    /// The user pressed Ctrl+C.
     Interrupt,
 }
 
-/// Whether prompts can run: stdin and stderr are both terminals.
+/// Return true if prompts can run (stdin and stderr are both terminals).
 pub fn can_prompt() -> bool {
     cli::is_interactive() && std::io::stderr().is_terminal()
 }
 
-/// Drop typed-ahead input that nobody read yet (keys pressed while a VM
-/// booted), so it does not answer the next prompt. No-op without a TTY.
+/// Discard unread typed input, for example keys pressed while a VM booted.
+/// Thus the input does not answer the next prompt. Does nothing without a TTY.
 pub fn flush_input() {
     if std::io::stdin().is_terminal() {
         unsafe { libc::tcflush(0, libc::TCIFLUSH) };
     }
 }
 
-/// Whether `key` is Ctrl-C.
+/// Return true if `key` is Ctrl+C.
 pub fn is_interrupt_key(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c')
 }
 
-/// Apply a text editing `key` to `text`: a typed character goes to its
-/// end, Backspace deletes its last one. Returns whether `key` was one of
-/// them.
+/// Apply a text editing key to `text`.
+/// Args:
+///  - `text`: Text to edit
+///  - `key`: A typed character is added to the end. Backspace deletes the
+///    last character.
+///
+/// Returns:
+///   True if `key` was an editing key.
 pub fn edit_text(text: &mut String, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Backspace => {
@@ -97,9 +94,15 @@ pub fn edit_text(text: &mut String, key: KeyEvent) -> bool {
     }
 }
 
-/// Show the prompt of `state` (its lines: `frame`, for the columns of
-/// text that the terminal has) and apply each key with `key` until it
-/// ends. Returns the answer, or `None` on Esc. The view is erased.
+/// Show a prompt and handle keys until the prompt ends.
+/// Args:
+///  - `state`: Prompt state
+///  - `frame`: Makes the lines of the view from the state and the terminal
+///    width in columns
+///  - `key`: Applies a key press to the state and returns the next [`Step`]
+///
+/// Returns:
+///   The answer, `None` on Esc, or error. The view is erased at the end.
 pub fn run<S, T>(
     state: &mut S,
     frame: impl Fn(&S, usize) -> Frame,
@@ -135,7 +138,7 @@ pub fn run<S, T>(
     Ok(answer)
 }
 
-/// Leave `title` and its `answer` on stderr in place of a closed prompt.
+/// Print `title` and its `answer` on stderr in place of a closed prompt.
 fn report(title: &str, answer: &str) {
     let styles = style::Styles::new();
     eprintln!(

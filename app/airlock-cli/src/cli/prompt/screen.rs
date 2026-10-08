@@ -1,16 +1,7 @@
-//! The terminal of a prompt: raw mode, and the prompt's view drawn in
-//! place on stderr below the output before it (no alternate screen).
+//! Terminal control for the prompts.
 //!
-//! [`Screen::draw`] replaces the last drawn [`Frame`] with the next one.
-//! Every line is narrower than the terminal, so none wraps and the
-//! screen knows how many rows it drew. A frame taller than the terminal
-//! shows the part of its lines with the focused row ([`scroll`]). After a
-//! resize that made the terminal narrower than a drawn line (the terminal wrapped or
-//! cut it, so its rows are unknown), the next frame starts over at the
-//! top of a cleared screen. [`Screen`] restores the terminal when it is
-//! dropped, also on a panic. Logs go to the log file, not to the
-//! terminal ([`crate::cli::logging`]), so nothing writes between the
-//! frames.
+//! Draws a prompt view in place on stderr, below the earlier output. It does not
+//! use an alternate screen. Also reads the key presses of the user.
 
 use std::io::Write;
 use std::ops::Range;
@@ -23,39 +14,44 @@ use crossterm::{cursor, queue, terminal};
 use crate::cli;
 use crate::cli::prompt::PromptError;
 
-/// How often [`next_input`] and [`read_input`] look for a key or an
+/// Interval at which [`next_input`] and [`read_input`] check for a key or an
 /// interrupt.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-/// What the view shows.
+/// Content of the prompt view.
 pub struct Frame {
-    /// The lines, each fitting in the columns that the frame was made
-    /// for (longer ones are cut).
+    /// The lines. Each line must fit in the columns that the frame was made
+    /// for. Longer lines are cut.
     pub lines: Vec<String>,
     /// The lines of the focused row, which stay on the screen.
     pub focus: Range<usize>,
-    /// Where the text cursor shows (line, column), if it shows.
+    /// Position of the text cursor (line, column), if it shows.
     pub cursor: Option<(usize, usize)>,
 }
 
-/// What came from the terminal.
+/// Input from the terminal.
 pub enum Input {
+    /// A key press.
     Key(KeyEvent),
     /// The terminal changed its size.
     Resized,
-    /// Ctrl+C or SIGTERM from outside (a signal, not a key).
+    /// Ctrl+C or SIGTERM from outside (a signal, not a key press).
     Interrupted,
 }
 
 /// The terminal in raw mode, with the last drawn frame.
+///
+/// [`Screen`] restores the terminal when dropped, also on a panic. Logs go to
+/// the log file and not to the terminal (see [`crate::cli::logging`]). Thus
+/// no other output comes between the frames.
 pub struct Screen {
     /// Whether the terminal is in raw mode (see [`Screen::suspend`]).
     raw: bool,
-    /// The rows from the top of the drawn frame to the cursor.
+    /// Number of rows from the top of the drawn frame to the cursor.
     cursor_row: usize,
     /// The width of the widest drawn line.
     drawn_width: usize,
-    /// The first line of the frame that shows.
+    /// Index of the first frame line that shows.
     scroll: usize,
 }
 
@@ -72,11 +68,19 @@ impl Screen {
         Ok(screen)
     }
 
-    /// Replace the drawn frame with the frame that `make` makes for the
-    /// columns of text that the terminal has (one less than its width,
-    /// so that no line wraps).
+    /// Replace the drawn frame with a new frame.
+    /// Args:
+    ///  - `make`: Makes the frame for the given number of text columns
+    ///
+    /// The number of text columns is one less than the terminal width, so
+    /// that no line wraps. Thus the screen knows how many rows it drew. If the
+    /// frame is taller than the terminal, only the part with the focused row
+    /// shows (see [`scroll`]).
+    // If a resize made the terminal narrower than a drawn line, the terminal
+    // wrapped or cut that line. Then the drawn row count is unknown, so the
+    // next frame starts at the top of a cleared screen.
     pub fn draw(&mut self, make: impl FnOnce(usize) -> Frame) -> Result<(), PromptError> {
-        // Some ptys report 0x0: draw for a common size then.
+        // Some ptys report 0x0. Then use a common size.
         let (columns, rows) = terminal::size()
             .ok()
             .filter(|&(columns, rows)| columns > 0 && rows > 0)
@@ -135,9 +139,10 @@ impl Screen {
         write_stderr(&out)
     }
 
-    /// Erase the drawn frame and leave raw mode, for output in the
-    /// normal mode (it goes where the frame was), until
-    /// [`Screen::resume`].
+    /// Erase the drawn frame and leave raw mode, until [`Screen::resume`].
+    ///
+    /// Use this to write output in normal mode. The output goes where the
+    /// frame was.
     pub fn suspend(&mut self) -> Result<(), PromptError> {
         if !self.raw {
             return Ok(());
@@ -145,16 +150,16 @@ impl Screen {
         let mut out = Vec::new();
         self.queue_erase(&mut out)?;
         queue!(out, cursor::Show).map_err(PromptError::Io)?;
-        // Leave raw mode even when the erase cannot be written: a tty left
-        // in raw mode is worse than a stale frame.
+        // Leave raw mode even if the erase fails. A tty left in raw mode is
+        // worse than an old frame on the screen.
         let written = write_stderr(&out);
         self.raw = false;
         let restored = terminal::disable_raw_mode().map_err(PromptError::Io);
         written.and(restored)
     }
 
-    /// Back to raw mode after [`Screen::suspend`]; the next frame goes
-    /// below the output in between.
+    /// Go back to raw mode after [`Screen::suspend`]. The next frame goes
+    /// below the output that came after the suspend.
     pub fn resume(&mut self) -> Result<(), PromptError> {
         terminal::enable_raw_mode().map_err(PromptError::Io)?;
         self.raw = true;
@@ -170,8 +175,8 @@ impl Screen {
         self.suspend()
     }
 
-    /// Go to the top of the drawn frame and erase it to the end of the
-    /// screen.
+    /// Queue commands that move to the top of the drawn frame and erase to the
+    /// end of the screen.
     fn queue_erase(&self, out: &mut Vec<u8>) -> Result<(), PromptError> {
         queue!(out, cursor::MoveToColumn(0)).map_err(PromptError::Io)?;
         if self.cursor_row > 0 {
@@ -181,9 +186,11 @@ impl Screen {
     }
 }
 
-/// Restore the terminal: erase the frame, or after a panic (its message
-/// is on the screen already) go below it; show the cursor; leave raw
-/// mode.
+/// Restore the terminal.
+///
+/// Erase the frame, show the cursor and leave raw mode. After a panic, do not
+/// erase. Move below the frame instead, because the panic message is already
+/// on the screen.
 impl Drop for Screen {
     fn drop(&mut self) {
         if !self.raw {
@@ -201,9 +208,9 @@ impl Drop for Screen {
     }
 }
 
-/// The next key or resize, or an interrupt. Waits on the runtime between
-/// the looks, so that the signal handler of [`crate::cli::initialize`]
-/// runs.
+/// Wait for the next key press, resize or interrupt.
+// Waits on the runtime between the checks, so that the signal handler of
+// [`crate::cli::initialize`] can run.
 pub async fn next_input() -> Result<Input, PromptError> {
     loop {
         if cli::is_interrupted() {
@@ -219,10 +226,11 @@ pub async fn next_input() -> Result<Input, PromptError> {
     }
 }
 
-/// The next key or resize, or an interrupt, for a caller that cannot
-/// wait on the runtime: it blocks the thread, so the signal handler of
-/// [`crate::cli::initialize`] latches a signal only after the prompt
-/// (Ctrl+C is a key in raw mode).
+/// Wait for the next key press, resize or interrupt, and block the thread.
+///
+/// For callers that cannot wait on the runtime. Because the thread blocks,
+/// the signal handler of [`crate::cli::initialize`] records a signal only
+/// after the prompt. In raw mode, Ctrl+C is a key press.
 pub fn read_input() -> Result<Input, PromptError> {
     loop {
         if cli::is_interrupted() {
@@ -236,8 +244,8 @@ pub fn read_input() -> Result<Input, PromptError> {
     }
 }
 
-/// The waiting event as an input, if it is one (a key press or a
-/// resize).
+/// Read the waiting event. Return it as an input if it is a key press or a
+/// resize.
 fn read_event() -> Result<Option<Input>, PromptError> {
     Ok(match event::read().map_err(PromptError::Io)? {
         Event::Key(key) if key.kind != KeyEventKind::Release => Some(Input::Key(key)),
@@ -246,16 +254,23 @@ fn read_event() -> Result<Option<Input>, PromptError> {
     })
 }
 
-/// The first line to show of `lines` lines on a terminal `height` rows
-/// high, from the last one (`scroll`): the least change that shows the
-/// lines of `focus` (their start, if they do not fit).
+/// Return the first line to show.
+/// Args:
+///  - `scroll`: First line that the last drawn frame showed
+///  - `focus`: Lines of the focused row
+///  - `lines`: Total number of lines
+///  - `height`: Terminal height in rows
+///
+/// Returns:
+///   The first line after the smallest change that shows the `focus` lines.
+///   If they do not fit, the start of `focus` shows.
 fn scroll(scroll: usize, focus: &Range<usize>, lines: usize, height: usize) -> usize {
     let scroll = scroll.min(lines.saturating_sub(height));
     let scroll = scroll.max(focus.end.saturating_sub(height));
     scroll.min(focus.start)
 }
 
-/// `n` as a cursor move count.
+/// Convert `n` to a cursor move count.
 fn count(n: usize) -> u16 {
     u16::try_from(n).unwrap_or(u16::MAX)
 }

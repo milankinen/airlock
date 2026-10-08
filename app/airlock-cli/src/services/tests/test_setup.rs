@@ -1,3 +1,6 @@
+//! Setup of the enabled network services: what runs when the vault works,
+//! and which hosts are denied when it does not.
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
@@ -5,6 +8,7 @@ use crate::services::{ServiceId, build_enabled, unavailable_warning};
 use crate::test_cfg::{temp_dir, test_context};
 use crate::vault::{Storage, Vault, VaultStorageType};
 
+/// Vault storage in memory that always works.
 #[derive(Default)]
 struct MemoryStorage(parking_lot::Mutex<Option<String>>);
 
@@ -18,6 +22,7 @@ impl Storage for MemoryStorage {
     }
 }
 
+/// Vault storage that always fails, like a locked keyring.
 struct BrokenStorage;
 
 impl Storage for BrokenStorage {
@@ -29,14 +34,18 @@ impl Storage for BrokenStorage {
     }
 }
 
+/// A file-type vault on `storage`.
 fn vault(storage: impl Storage) -> Vault {
     Vault::new_with(Box::new(storage), HashMap::new(), VaultStorageType::File)
 }
 
+/// Service settings that enable Anthropic and OpenAI.
 fn both() -> BTreeMap<String, bool> {
     BTreeMap::from([("anthropic".into(), true), ("openai".into(), true)])
 }
 
+/// A TLS client configuration with no trusted roots. The tests make no
+/// connections.
 fn tls() -> Arc<rustls::ClientConfig> {
     Arc::new(
         rustls::ClientConfig::builder()
@@ -45,6 +54,11 @@ fn tls() -> Arc<rustls::ClientConfig> {
     )
 }
 
+/// Test that enabled services run with their sign-in forwards when the
+/// vault works.
+///   1. Build both services with a working vault
+///   2. Check that each service has an interceptor and a browser grant
+///      and that no host is denied
 #[test]
 fn enabled_services_with_working_vault_run_with_their_sign_ins() {
     let home = temp_dir();
@@ -55,6 +69,11 @@ fn enabled_services_with_working_vault_run_with_their_sign_ins() {
     assert!(services.denied_targets().is_empty());
 }
 
+/// Test that the setup does not open the vault when no service is
+/// enabled. A broken keyring must not affect users who do not use the
+/// services.
+///   1. Build the services with all services off and a broken vault
+///   2. Check that no interceptor runs and no host is denied
 #[test]
 fn no_enabled_service_never_opens_vault() {
     let home = temp_dir();
@@ -65,6 +84,13 @@ fn no_enabled_service_never_opens_vault() {
     assert!(services.denied_targets().is_empty());
 }
 
+/// Test that enabled services become unavailable when the vault is
+/// disabled or broken, and that their hosts are denied. Without this, the
+/// agent could sign in directly and expose real tokens to the sandbox.
+///   1. Build both services with a disabled vault and with a broken vault
+///   2. Check that no interceptor or browser grant runs
+///   3. Check that each service is unavailable with the vault error
+///   4. Check that the hosts of both services are denied
 #[test]
 fn enabled_services_without_vault_are_unavailable_and_their_hosts_denied() {
     for (vault, reason) in [
@@ -98,6 +124,10 @@ fn enabled_services_without_vault_are_unavailable_and_their_hosts_denied() {
     }
 }
 
+/// Test that the warning for unavailable services names the services, the
+/// reason and the setting that turns them off, in plural and singular.
+///   1. Make the warning for both services and check the text
+///   2. Make the warning for one service and check the text
 #[test]
 fn unavailable_warning_names_services_reason_and_opt_out() {
     assert_eq!(

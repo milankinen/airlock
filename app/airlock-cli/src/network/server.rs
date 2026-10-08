@@ -1,5 +1,7 @@
-//! `NetworkProxy` RPC server implementation — the main entry point for all
-//! outbound connections from the guest VM.
+//! Network proxy server for the guest.
+//!
+//! This is the entry point for all outgoing connections from the guest VM:
+//! TCP connections and Unix socket connections.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -29,12 +31,12 @@ impl network_proxy::Server for Network {
                 let host = tcp.get_host()?.to_str()?.to_string();
                 let port = tcp.get_port();
 
-                // Deferred deny: we accept the guest's TCP connect even when
-                // policy denies, so that an HTTP request on top of it still
-                // reaches the relay layer and can be surfaced in the Requests
-                // sub-tab with full method/path/header detail. The relay then
-                // answers with 403 instead of forwarding upstream. Plain
-                // non-HTTP denies close the connection after detection.
+                // Deferred deny: accept the TCP connect of the guest also
+                // when the policy denies it. Then an HTTP request on the
+                // connection still gets to the relay layer, and the Requests
+                // sub-tab can show its method, path and headers. The relay
+                // then sends 403 and does not forward upstream. A denied
+                // non-HTTP connection closes after detection.
                 let net_target = self.resolve_target(&host, port);
                 debug!(
                     "connect {host}:{port} ({})",
@@ -92,8 +94,11 @@ impl network_proxy::Server for Network {
     }
 }
 
-/// Spawn a background task for a TCP connection: detect TLS, optionally
-/// intercept, apply middleware, and relay bytes bidirectionally.
+/// Start a background task for a TCP connection. The task detects TLS,
+/// intercepts if necessary, applies middleware, and relays bytes in both
+/// directions.
+/// Returns:
+///   RPC sink that receives the container bytes of the connection.
 fn spawn_tcp_connection(
     id: u64,
     target: ResolvedTarget,
@@ -109,8 +114,8 @@ fn spawn_tcp_connection(
 
     tokio::task::spawn_local(async move {
         let addr = format!("{}:{}", target.host, target.port);
-        // `None` on non-monitor runs, which keeps the relay transports
-        // unwrapped and the byte accounting out of the hot path.
+        // `None` on runs without the monitor. Then the relay transports have
+        // no wrapper, and the hot path does no byte counting.
         let counter = traffic::TrafficCounter::new(id, &events);
         let result = Box::pin(handle_connection(
             target,
@@ -129,14 +134,15 @@ fn spawn_tcp_connection(
             *task_error.borrow_mut() = Some(format!("{e}"));
         }
 
-        // Final totals before the row goes gray. A transfer shorter than
-        // the throttle window would otherwise never report at all.
+        // Send the final totals before the row becomes gray. If not, a
+        // transfer shorter than the throttle window never sends a report.
         if let Some(counter) = counter.as_ref() {
             counter.flush();
         }
 
-        // Matching `Disconnect` — lets the TUI flip the row's indicator
-        // from green (open) to gray (closed) and record the close time.
+        // Send the matching `Disconnect`. The TUI then changes the row
+        // indicator from green (open) to gray (closed) and records the
+        // close time.
         if events.receiver_count() > 0 {
             let info = airlock_monitor::DisconnectInfo {
                 id,
@@ -149,8 +155,10 @@ fn spawn_tcp_connection(
     capnp_rpc::new_client(io::ChannelSink::new(tx, error))
 }
 
-/// Spawn a background task for a Unix socket connection: connect to the
-/// host-side socket and relay bytes bidirectionally.
+/// Start a background task for a Unix socket connection. The task connects
+/// to the host socket at `path` and relays bytes in both directions.
+/// Returns:
+///   RPC sink that receives the container bytes of the connection.
 fn spawn_socket_connection(path: &str, client_sink: tcp_sink::Client) -> tcp_sink::Client {
     let (tx, rx) = mpsc::channel::<Bytes>(1);
     let error: io::RelayError = Rc::new(RefCell::new(None));
@@ -193,22 +201,10 @@ fn spawn_socket_connection(path: &str, client_sink: tcp_sink::Client) -> tcp_sin
     capnp_rpc::new_client(io::ChannelSink::new(tx, error))
 }
 
-/// Main connection handler: detect TLS, intercept (MITM) if so, detect HTTP,
-/// and route to the appropriate relay.
-///
-/// When the policy denies the target we still accept TLS and peek for HTTP —
-/// that's the whole point of deferring the deny decision to this phase, so
-/// denied HTTP requests surface in the Requests sub-tab with full detail
-/// instead of vanishing behind an early TCP reset.
-///
-/// Passthrough targets bypass all detection: the connection is opened to the
-/// real server immediately and relayed as raw bytes. This is required for
-/// non-HTTP protocols whose first bytes from the client can't be sniffed
-/// (Postgres' 8-byte `SSLRequest` deadlocks the HTTP detector waiting for
-/// `\r\n`).
-// Every argument here is a distinct collaborator handed down from
-// `spawn_tcp_connection`; bundling them into a struct would just move the
-// same list one level up.
+/// Handle one TCP connection. Detect TLS and intercept it (MITM), detect
+/// HTTP, and send the connection to the correct relay.
+// Each argument is a different collaborator from `spawn_tcp_connection`.
+// A struct for them would only move the same list one level up.
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut target: ResolvedTarget,
@@ -222,6 +218,11 @@ async fn handle_connection(
 ) -> anyhow::Result<()> {
     let addr = format!("{}:{}", target.host, target.port);
 
+    // Passthrough targets skip all detection. The proxy connects to the real
+    // server immediately and relays raw bytes. Non-HTTP protocols need this
+    // when their first client bytes cannot be sniffed. For example, the
+    // 8-byte `SSLRequest` of Postgres blocks the HTTP detector, which waits
+    // for `\r\n`.
     if target.is_passthrough() {
         debug!("passthrough: {addr}");
         let container = tcp::container_transport(Bytes::new(), rx, client_sink);
@@ -231,17 +232,20 @@ async fn handle_connection(
         return Ok(());
     }
 
+    // Accept TLS and detect HTTP also when the policy denies the target.
+    // This is why the deny decision waits until this phase: a denied HTTP
+    // request shows in the Requests sub-tab with all details, and does not
+    // disappear behind an early TCP reset.
     let (is_tls, first) = tls::detect(&mut rx).await;
 
-    // Container-side transport first — same for allow and deny.
+    // Make the container-side transport first. It is the same for allow and
+    // deny.
     //
-    // Byte counting attaches to the raw RPC stream on both branches, so
-    // the Monitor tab reports wire bytes. On the TLS branch that has to
-    // happen inside `accept_container`, below the layer it terminates;
-    // here the transport already *is* the raw stream. `detect_http`
-    // re-wraps the read half below to replay the sniffed prefix, but
-    // those bytes were counted on the way in, so they aren't counted
-    // twice.
+    // Count bytes on the raw RPC stream on both branches, so the Monitor tab
+    // shows wire bytes. On the TLS branch, `accept_container` counts below
+    // the TLS layer that it terminates. On the plain branch, the transport
+    // *is* the raw stream. `detect_http` replays the sniffed prefix outside
+    // the counter, so it does not count those bytes two times.
     let (container, alpn) = if is_tls {
         tls::accept_container(&target.host, first, rx, client_sink, interceptor, counter).await?
     } else {
@@ -251,19 +255,18 @@ async fn handle_connection(
         )
     };
 
-    // A network service only handles TLS connections: on plain HTTP the
-    // guest's surrogates go out as they are.
+    // A network service handles only TLS connections. On plain HTTP, the
+    // surrogates of the guest go out with no change.
     if !is_tls {
         target.interceptor = None;
     }
     let (container, is_http) = detect_http(container).await;
 
-    // An owned host's fail-closed handling (token swaps, backstops) lives
-    // entirely in the HTTP relay's interceptor call. Bytes that don't parse
-    // as HTTP never reach it — relaying them raw to the real upstream would
-    // let a guest smuggle anything (including a real token it captured
-    // some other way) straight past the service. Refuse instead of
-    // connecting upstream at all.
+    // All fail-closed handling of an owned host (token swaps, backstops) is
+    // in the interceptor call of the HTTP relay. Bytes that are not HTTP
+    // never get there. If the proxy relayed them raw to the real upstream,
+    // a guest could send anything past the service (also a real token that
+    // it got in some other way). Thus refuse, and do not connect upstream.
     if target.interceptor.is_some() && !is_http {
         debug!("denied: {addr} (owned host sent non-HTTP bytes)");
         deny_reporter.report();
@@ -293,12 +296,15 @@ async fn handle_connection(
     Ok(())
 }
 
-/// Peek at the container stream to detect HTTP.
+/// Read the start of the container stream to detect HTTP.
+/// Returns:
+///   The container transport, with the read bytes put back in front, and
+///   true if the stream is HTTP.
 async fn detect_http(mut container: io::Transport) -> (io::Transport, bool) {
     match http::detect(&mut container.read).await {
         Ok(prefix) => {
-            // What the guest actually speaks decides the server-side hyper
-            // flavour (an h2 ALPN pick without the preface is still h1).
+            // The protocol that the guest really uses sets the server-side
+            // hyper mode. An h2 ALPN selection with no h2 preface is h1.
             container.h2 = http::is_h2_preface(&prefix);
             container.read = Box::new(io::PrefixedRead::new(prefix, container.read));
             (container, true)

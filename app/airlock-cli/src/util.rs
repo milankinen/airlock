@@ -1,4 +1,8 @@
-//! Small host-side helpers shared across modules.
+//! Shared host-side helpers.
+//!
+//! Small helpers for paths, environment variables, executables,
+//! terminal-safe text and JSON files. Also gives file access that does not
+//! follow symlinks.
 
 pub(crate) mod safe_fs;
 
@@ -7,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 pub(crate) use safe_fs::PinnedDir;
 
-/// Expand `~` prefix in a path string.
+/// Expand a `~` prefix in a path string to `home`.
 pub(crate) fn expand_tilde(path: &str, home: &Path) -> PathBuf {
     if path == "~" {
         home.to_path_buf()
@@ -18,14 +22,19 @@ pub(crate) fn expand_tilde(path: &str, home: &Path) -> PathBuf {
     }
 }
 
-/// Layer `(key, value)` overrides over a `KEY=VALUE` environment, then
-/// drop every key named in `unset`.
+/// Apply overrides to a `KEY=VALUE` environment and remove keys.
 ///
-/// An override replaces any prior entry with the same key and is appended
-/// at the end, so the result keeps the base order for untouched keys. This
-/// is the one precedence rule for every guest environment: `[env]` over
-/// the image env, daemon env over the sandbox env, and `airlock exec -e`
-/// over the sandbox env.
+/// This is the single precedence rule for all guest environments: `[env]`
+/// over the image env, daemon env over the sandbox env, and
+/// `airlock exec -e` over the sandbox env.
+/// Args:
+///  - `base`: Base environment as `KEY=VALUE` items
+///  - `overrides`: `(key, value)` pairs that replace the same keys in `base`
+///  - `unset`: Keys to remove from the result
+///
+/// Returns:
+///   The merged environment. Keys without an override keep their base
+///   order. Each override replaces the old entry and goes to the end.
 pub(crate) fn merge_env<K, V>(
     base: &[String],
     overrides: impl IntoIterator<Item = (K, V)>,
@@ -45,14 +54,14 @@ where
     out
 }
 
-/// Whether the `KEY=VALUE` entry `entry` sets `key`.
+/// Return `true` if the `KEY=VALUE` entry `entry` sets `key`.
 fn has_key(entry: &str, key: &str) -> bool {
     entry
         .strip_prefix(key)
         .is_some_and(|rest| rest.starts_with('='))
 }
 
-/// Whether `program` resolves to an executable file on `PATH`.
+/// Return `true` if `program` is an executable file on `PATH`.
 pub(crate) fn on_path(program: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
@@ -60,15 +69,17 @@ pub(crate) fn on_path(program: &str) -> bool {
     std::env::split_paths(&path).any(|dir| is_executable(&dir.join(program)))
 }
 
-/// Whether `path` is a regular file with an execute bit set.
+/// Return `true` if `path` is a regular file with an execute bit set.
 pub(crate) fn is_executable(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-/// Guest text made safe to print on the host terminal: lossy UTF-8 with
-/// escape sequences (CSI, OSC, other `ESC x` pairs) and control characters
-/// removed, except tab and newline. Guest output is untrusted and must not
-/// move the cursor, retitle the window or hide text.
+/// Make guest text safe to print on the host terminal. Guest output is
+/// untrusted and must not move the cursor, change the window title or hide
+/// text.
+/// Returns:
+///   `bytes` as lossy UTF-8 without escape sequences (CSI, OSC, other
+///   `ESC x` pairs) and control characters, except tab and newline.
 pub(crate) fn strip_controls(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
     let mut out = String::with_capacity(text.len());
@@ -106,8 +117,15 @@ pub(crate) fn strip_controls(bytes: &[u8]) -> String {
     out
 }
 
-/// Read and parse the JSON file `name` in `dir` (at most `cap` bytes).
-/// `Ok(None)` when it does not exist.
+/// Read and parse the JSON file `name` in `dir`.
+/// Args:
+///  - `dir`: Directory of the file
+///  - `name`: File name
+///  - `cap`: Maximum file size in bytes
+///
+/// Returns:
+///   The parsed value, `Ok(None)` if the file does not exist, or error if
+///   the read or parse fails.
 pub(crate) fn read_json<T: serde::de::DeserializeOwned>(
     dir: &PinnedDir,
     name: &str,
@@ -121,7 +139,8 @@ pub(crate) fn read_json<T: serde::de::DeserializeOwned>(
     Ok(Some(value))
 }
 
-/// Write `value` as pretty JSON to `name` in `dir`, atomically with `mode`.
+/// Write `value` as pretty JSON to the file `name` in `dir`. The write is
+/// atomic and the file gets the permission bits `mode`.
 pub(crate) fn write_json<T: serde::Serialize>(
     dir: &PinnedDir,
     name: &str,
@@ -136,12 +155,22 @@ pub(crate) fn write_json<T: serde::Serialize>(
 
 #[cfg(test)]
 mod tests {
+    //! Tests for the env merge, the `PATH` lookup and the cleanup of guest
+    //! text.
+
     use super::*;
 
+    /// The `entries` as owned strings.
     fn env(entries: &[&str]) -> Vec<String> {
         entries.iter().map(ToString::to_string).collect()
     }
 
+    /// Test the precedence rule of all guest environments: an override
+    /// replaces the whole key and goes to the end, and unset keys go away.
+    ///   1. Merge a base env with overrides and keys to unset
+    ///   2. Check that `FOOBAR` stays (a key prefix does not match), the
+    ///      overrides are last in their order, and the unset keys are gone,
+    ///      also an override that is also unset
     #[test]
     fn merging_env_replaces_whole_keys_appends_overrides_and_drops_unset() {
         let base = env(&["PATH=/bin", "HOME=/root", "FOO=1", "FOOBAR=2", "B=x"]);
@@ -156,6 +185,9 @@ mod tests {
         );
     }
 
+    /// Test that the `PATH` lookup finds only executable files.
+    ///   1. Check that `sh` is found and a missing program is not
+    ///   2. Check that a directory is not executable
     #[test]
     fn on_path_finds_executable_files_only() {
         assert!(on_path("sh"));
@@ -163,6 +195,13 @@ mod tests {
         assert!(!is_executable(Path::new("/")));
     }
 
+    /// Test that guest text loses all terminal escapes and control
+    /// characters except tab and newline, so that the guest cannot change
+    /// the host terminal.
+    ///   1. Strip CSI color codes, OSC title and link sequences, carriage
+    ///      returns, backspaces, NUL and a C1 control
+    ///   2. Check that bad UTF-8 becomes a replacement character
+    ///   3. Check that a lone ESC at the end goes away
     #[test]
     fn stripping_guest_text_removes_escapes_and_controls() {
         assert_eq!(strip_controls(b"plain\ttext\n"), "plain\ttext\n");

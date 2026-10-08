@@ -2,21 +2,25 @@
 
 use std::path::{Path, PathBuf};
 
-/// Resolve `guest_path` within `root` using chroot-aware symlink semantics.
+/// Resolve a container path inside a container root, with chroot symlink
+/// semantics.
 ///
-/// Standard path resolution follows absolute symlinks from the process root
-/// (`/`). Inside a chroot/container, absolute symlinks are meant to be
-/// interpreted relative to the container root, not the host root.
+/// Absolute symlink targets resolve relative to `root`, not to the host `/`.
+/// Relative symlink targets resolve normally.
 ///
-/// This function walks `guest_path` component by component: when it encounters
-/// a symlink whose target is absolute, the target is joined to `root` rather
-/// than to `/`. Relative symlink targets are resolved normally.
+/// Example: `root = /mnt/overlay/rootfs`, `guest_path = /var/run/docker.sock`
+/// and `var/run` is a symlink to `/run`. The result is
+/// `/mnt/overlay/rootfs/run/docker.sock`, not `/run/docker.sock`.
+/// Args:
+///  - `root`: Container root directory on the guest
+///  - `guest_path`: Path as the container sees it
 ///
-/// Example: with `root = /mnt/overlay/rootfs` and `guest_path = /var/run/docker.sock`,
-/// if `var/run` is a symlink to `/run`, this returns
-/// `/mnt/overlay/rootfs/run/docker.sock` rather than `/run/docker.sock`.
+/// Returns:
+///   Resolved path on the guest. The path does not have to exist.
 #[allow(dead_code)]
 pub fn resolve_in_root(root: &Path, guest_path: &str) -> PathBuf {
+    // Walk `guest_path` one component at a time and resolve the symlinks
+    // at each component.
     let mut path = root.to_path_buf();
     for component in Path::new(guest_path).components() {
         match component {
@@ -26,7 +30,7 @@ pub fn resolve_in_root(root: &Path, guest_path: &str) -> PathBuf {
                 for _ in 0..40 {
                     match std::fs::read_link(&path) {
                         Ok(target) if target.is_absolute() => {
-                            // Absolute target: treat as relative to container root.
+                            // Absolute target: relative to the container root.
                             let stripped = target.strip_prefix("/").unwrap_or(&target);
                             path = root.join(stripped);
                         }

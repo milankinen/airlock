@@ -1,14 +1,8 @@
-//! AEAD-encrypted JSON backend. Envelope format lives in the parent
-//! module (so `file.rs` can peek at the `type` tag and refuse to open
-//! the wrong kind of vault); this file holds the crypto and the
-//! passphrase UX.
+//! Encrypted file vault storage.
 //!
-//! Argon2id (OWASP 2023 second recommendation: 19 MiB memory, t=2,
-//! p=1) derives a 32-byte key from the user's passphrase and a
-//! per-vault salt. ChaCha20-Poly1305 AEAD encrypts the JSON blob under
-//! a fresh 12-byte nonce on each write. Salt + key are cached in
-//! memory after the first successful unlock so the user is only
-//! prompted once per process.
+//! Used for `settings.vault.storage = "encrypted-file"`. Keeps the vault in a file
+//! that a passphrase encrypts. Gets the passphrase from an environment
+//! variable, or asks the user for it.
 
 use std::path::PathBuf;
 
@@ -28,32 +22,39 @@ use super::{
 };
 use crate::cli::prompt::fields::{Field, Fields, Invalid};
 
-/// Env var used to supply the encrypted-vault passphrase non-interactively
+/// Env var that gives the encrypted-vault passphrase without a prompt
 /// (CI, scripts, and headless shells without a TTY).
 const PASSPHRASE_ENV: &str = "AIRLOCK_VAULT_PASSPHRASE";
 
-/// Supplies the passphrase for an `EncryptedFileStorage`. Abstracted so
-/// tests can inject a fixed value without a TTY or env-var round-trip.
+/// Source of the passphrase for an [`EncryptedFileStorage`]. Tests use it
+/// to inject a fixed value without a TTY or env var.
 pub trait PassphraseSource: Send + Sync + 'static {
     /// Ask for the passphrase of an existing vault.
     fn unlock(&self) -> anyhow::Result<String>;
-    /// Ask for a new passphrase when the vault is being created.
+    /// Ask for a new passphrase for a new vault.
     fn create(&self) -> anyhow::Result<String>;
 }
 
+/// Storage backend that keeps the vault as encrypted JSON in one file. The
+/// key comes from the passphrase and a per-vault salt. The user gives the
+/// passphrase one time per process.
 pub struct EncryptedFileStorage {
     path: PathBuf,
     passphrase: Box<dyn PassphraseSource>,
-    /// Cached key, derived on first unlock/create and reused on
-    /// subsequent operations so the user only prompts once per process.
+    /// Cached key. Derived on the first unlock or create, and used again
+    /// after that, so the user gets only one prompt per process.
     key: Mutex<Option<[u8; ARGON2_KEY_BYTES]>>,
-    /// Cached salt for an existing vault — reused so the derived key
-    /// stays stable across reads in one process. `None` until the
-    /// first successful load, or until a fresh vault is created.
+    /// Cached salt of the vault. Used again, so the derived key stays the
+    /// same across reads in one process. `None` until the first successful
+    /// load, or until a new vault is created.
     salt: Mutex<Option<[u8; SALT_BYTES]>>,
 }
 
 impl EncryptedFileStorage {
+    /// Make a backend for the encrypted vault file.
+    /// Args:
+    ///  - `path`: Path of the vault file
+    ///  - `passphrase`: Source of the passphrase
     pub fn new(path: PathBuf, passphrase: Box<dyn PassphraseSource>) -> Self {
         Self {
             path,
@@ -63,6 +64,12 @@ impl EncryptedFileStorage {
         }
     }
 
+    /// Derive the encryption key from a passphrase with Argon2id.
+    /// Args:
+    ///  - `passphrase`: User passphrase
+    ///  - `salt`: Per-vault salt
+    ///  - `m_kib`, `t`, `p`: Argon2 memory cost (KiB), time cost and
+    ///    parallelism
     fn derive_key(
         passphrase: &str,
         salt: &[u8],
@@ -81,9 +88,10 @@ impl EncryptedFileStorage {
     }
 }
 
-/// Upper bounds on the Argon2 parameters accepted from a vault file, so a
-/// hostile or corrupt file can't force a huge memory allocation (DoS). These
-/// are far above the values we write (19 MiB / t=2 / p=1) yet still sane.
+/// Upper limits of the Argon2 parameters that a vault file can have. They
+/// prevent a hostile or corrupt file from causing a very large memory
+/// allocation (DoS). The limits are much higher than the values that this
+/// version writes (19 MiB / t=2 / p=1), but still sane.
 const MAX_ARGON2_M_KIB: u32 = 1 << 20; // 1 GiB
 const MAX_ARGON2_T: u32 = 16;
 const MAX_ARGON2_P: u32 = 16;
@@ -107,13 +115,9 @@ impl Storage for EncryptedFileStorage {
         if blob.kdf.algo != "argon2id" {
             bail!("unsupported vault KDF algo: {}", blob.kdf.algo);
         }
-        // Derive with the parameters recorded in the file, not the current
-        // compile-time constants. Otherwise a vault written with different
-        // Argon2 parameters (a future release that bumps them, or another tool
-        // honoring this self-describing envelope) could never be opened even
-        // with the correct passphrase — the file stores m/t/p precisely so
-        // they may vary. Bound them to keep a hostile file from forcing a huge
-        // allocation.
+        // Derive the key with the m/t/p values in the file, not with the
+        // constants. A later release or another tool can write other values.
+        // The limits stop a hostile file from causing a very large allocation.
         if blob.kdf.m > MAX_ARGON2_M_KIB || blob.kdf.t > MAX_ARGON2_T || blob.kdf.p > MAX_ARGON2_P {
             bail!(
                 "vault KDF parameters out of bounds (m={} t={} p={})",
@@ -128,9 +132,9 @@ impl Storage for EncryptedFileStorage {
             .decode(&blob.ciphertext)
             .context("decode vault ciphertext")?;
 
-        // Reuse the in-memory key if this vault was already unlocked in this
-        // process and the on-disk salt still matches — so a re-read during a
-        // mutation (lock → reload → merge → store) doesn't prompt again.
+        // Use the cached key again if this process already unlocked the
+        // vault and the salt in the file did not change. Thus a read during
+        // a write (lock → reload → merge → store) does not ask again.
         let cached_key = {
             let key = self.key.lock();
             let cached_salt = self.salt.lock();
@@ -159,9 +163,9 @@ impl Storage for EncryptedFileStorage {
     }
 
     fn store(&self, data: &str) -> anyhow::Result<()> {
-        // Reuse the salt (and therefore the derived key) across saves
-        // in the same process. On a brand-new vault there is no cached
-        // salt yet — mint one and prompt for a new passphrase.
+        // Use the same salt (and thus the same key) for all writes in one
+        // process. A new vault has no cached salt. Then make a salt and ask
+        // for a new passphrase.
         let (salt, key) = {
             let mut salt_slot = self.salt.lock();
             let mut key_slot = self.key.lock();
@@ -180,6 +184,8 @@ impl Storage for EncryptedFileStorage {
             }
         };
 
+        // Each write uses a new random nonce. ChaCha20-Poly1305 is not safe
+        // when one key and nonce encrypt two messages.
         let mut nonce = [0u8; NONCE_BYTES];
         SysRng
             .try_fill_bytes(&mut nonce)
@@ -210,12 +216,13 @@ impl Storage for EncryptedFileStorage {
     }
 }
 
-/// Production passphrase source: checks `AIRLOCK_VAULT_PASSPHRASE`
-/// first (covers CI / non-interactive runs), then falls back to a
-/// suppressed-echo terminal prompt. On successful input the prompt
-/// line is erased so the terminal stays clean.
+/// Passphrase source of the CLI. Uses `AIRLOCK_VAULT_PASSPHRASE` first
+/// (for CI and non-interactive runs). If it is not set, shows a terminal
+/// prompt that does not echo the input. After input, the prompt line is
+/// erased.
 pub struct InteractivePassphrase;
 
+/// Make the passphrase source of the CLI, see [`InteractivePassphrase`].
 pub(super) fn interactive_passphrase() -> Box<dyn PassphraseSource> {
     Box::new(InteractivePassphrase)
 }
@@ -239,8 +246,10 @@ impl PassphraseSource for InteractivePassphrase {
     }
 }
 
-/// Ask for the passphrase (the row `label`) of an existing vault; the
-/// line is erased afterwards.
+/// Ask for the passphrase of an existing vault. Erases the line after
+/// input.
+/// Args:
+///  - `label`: Label of the input row
 fn prompt_once(label: &str) -> anyhow::Result<String> {
     if !crate::cli::is_interactive() {
         bail!(
@@ -265,8 +274,8 @@ fn prompt_once(label: &str) -> anyhow::Result<String> {
     Ok(texts.swap_remove(0))
 }
 
-/// Ask for the passphrase of a new vault, twice; the lines are erased
-/// afterwards.
+/// Ask two times for the passphrase of a new vault. Erases the lines after
+/// input.
 fn prompt_create() -> anyhow::Result<String> {
     if !crate::cli::is_interactive() {
         bail!(
@@ -306,7 +315,7 @@ fn prompt_create() -> anyhow::Result<String> {
     Ok(texts.swap_remove(0))
 }
 
-/// The check of a passphrase form: the passphrase of row `field` is not
+/// Validate a passphrase form: the passphrase in row `field` must not be
 /// empty.
 fn required(texts: &[String], field: usize) -> Result<(), Invalid> {
     if texts[field].is_empty() {
@@ -320,6 +329,8 @@ fn required(texts: &[String], field: usize) -> Result<(), Invalid> {
 
 #[cfg(test)]
 mod tests {
+    //! Tests for the key derivation parameters in the encrypted vault file.
+
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD_NO_PAD;
     use chacha20poly1305::aead::{Aead, KeyInit};
@@ -332,6 +343,8 @@ mod tests {
     use crate::test_cfg::temp_dir;
     use crate::test_cfg::vault::FixedPassphrase;
 
+    /// Write `envelope` to a vault file and load it with the passphrase
+    /// `pass`.
     fn load_envelope(envelope: &Envelope, pass: &'static str) -> anyhow::Result<Option<String>> {
         let tmp = temp_dir();
         let path = tmp.path().join("vault.enc.json");
@@ -343,6 +356,12 @@ mod tests {
         EncryptedFileStorage::new(path, Box::new(FixedPassphrase(pass))).load()
     }
 
+    /// Test that the vault decrypts with the KDF parameters in the file, not
+    /// with the current constants, so that a vault from another version
+    /// still opens.
+    ///   1. Encrypt a blob with a key made with a different `t` value
+    ///   2. Write the blob and its KDF parameters to a vault file
+    ///   3. Load the file and check the plaintext
     #[test]
     fn vault_file_decrypts_with_kdf_params_stored_in_it() {
         let salt = [7u8; SALT_BYTES];
@@ -373,6 +392,10 @@ mod tests {
         );
     }
 
+    /// Test that the vault refuses KDF parameters above the limits, so that a
+    /// hostile file cannot cause a very large memory allocation.
+    ///   1. Write a vault file with a memory cost above the limit
+    ///   2. Load the file and check the "out of bounds" error
     #[test]
     fn vault_file_with_out_of_bounds_kdf_params_is_refused() {
         let envelope = Envelope::EncryptedFile(EncryptedBlob {

@@ -1,3 +1,6 @@
+//! OpenAI (Codex) sign-ins, refreshes and sign-outs through the proxy: the
+//! fake JWTs for the guest, the device-code sign-in, and the local refusals.
+
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
@@ -8,6 +11,7 @@ use crate::services::tokens::{FAKE_JWT_PREFIX, TokenKind};
 use crate::test_cfg::provider::*;
 use crate::test_cfg::upstream::post;
 
+/// Provider options with access tokens that expire after 60 seconds.
 fn short_lived() -> Options {
     Options {
         expires_in: 60,
@@ -15,10 +19,19 @@ fn short_lived() -> Options {
     }
 }
 
+/// A Codex refresh body with the refresh token `surrogate`.
 fn refresh_of(surrogate: &Value) -> Value {
     json!({ "grant_type": "refresh_token", "refresh_token": surrogate })
 }
 
+/// Test that a code exchange with a surrogate code gives the guest fake JWTs
+/// and stores the real tokens. Codex reads claims from the JWTs, so the fake
+/// JWTs must carry the claims of the real ones.
+///   1. Sign in with a surrogate code
+///   2. Check that the ID and access tokens are unsigned JWTs with the real
+///      claims and a nonce
+///   3. Check that the provider got the exchange with the real code
+///   4. Check that the store has the real tokens, the client and the account
 #[test]
 fn code_exchange_with_surrogate_code_gives_guest_fake_jwts_and_stores_real_tokens() {
     Setup::new(ServiceId::Openai, Options::default()).run(|r| async move {
@@ -81,6 +94,10 @@ fn code_exchange_with_surrogate_code_gives_guest_fake_jwts_and_stores_real_token
     });
 }
 
+/// Test that an exchange is refused locally without a surrogate code of this
+/// service.
+///   1. Exchange the real code and a surrogate code of Anthropic
+///   2. Check that each gets `invalid_grant` and nothing goes upstream
 #[test]
 fn exchange_without_surrogate_code_of_service_is_refused_locally() {
     Setup::new(ServiceId::Openai, Options::default()).run(|r| async move {
@@ -97,6 +114,13 @@ fn exchange_without_surrogate_code_of_service_is_refused_locally() {
     });
 }
 
+/// Test that the device-code poll gives the guest a surrogate code that
+/// works only in the device flow.
+///   1. Poll for the device code and check that the guest gets a surrogate
+///   2. Exchange it on the loopback callback and check `invalid_grant`
+///   3. Exchange it on the device callback and check that it is used up
+///   4. Exchange a fresh device surrogate code and check that the provider
+///      gets the real device code
 #[test]
 fn device_code_reaches_guest_as_surrogate_bound_to_device_flow() {
     Setup::new(ServiceId::Openai, Options::default()).run(|r| async move {
@@ -117,6 +141,7 @@ fn device_code_reaches_guest_as_surrogate_bound_to_device_flow() {
             .to_string();
         assert!(code.starts_with("airlock-code-"), "{code}");
 
+        // The wrong channel uses up the code too.
         let resp = r.exchange(&code).await;
         assert_eq!(resp.status, 400, "{}", resp.body);
         assert_eq!(resp.json()["error"], "invalid_grant");
@@ -134,6 +159,12 @@ fn device_code_reaches_guest_as_surrogate_bound_to_device_flow() {
     });
 }
 
+/// Test that tokens that are not JWTs get opaque surrogates that work for
+/// API calls, refreshes and revokes.
+///   1. Make the provider issue opaque tokens and sign in
+///   2. Check the opaque surrogates and that an API call gets the real token
+///   3. Refresh and check that the provider gets the real refresh token
+///   4. Revoke and check that the provider gets the new real refresh token
 #[test]
 fn opaque_tokens_get_opaque_surrogates_that_work_upstream() {
     Setup::new(ServiceId::Openai, short_lived()).run(|r| async move {
@@ -164,6 +195,15 @@ fn opaque_tokens_get_opaque_surrogates_that_work_upstream() {
     });
 }
 
+/// Test that a relayed refresh sends only the fields that the proxy sets,
+/// and that the guest gets the new claims. Codex reads the plan from the
+/// new ID token.
+///   1. Sign in and make the provider issue an ID token with a new plan
+///   2. Refresh with a different client, a scope and an extra field
+///   3. Check that the provider gets only the grant's client and the real
+///      refresh token
+///   4. Check that the guest keeps its refresh surrogate and gets the new
+///      plan
 #[test]
 fn relayed_refresh_sends_only_providers_fields_and_carries_new_claims() {
     Setup::new(ServiceId::Openai, short_lived()).run(|r| async move {
@@ -200,6 +240,13 @@ fn relayed_refresh_sends_only_providers_fields_and_carries_new_claims() {
     });
 }
 
+/// Test that a refresh answer is swapped completely or refused completely.
+/// A refused answer must not change the stored tokens.
+///   1. Sign in and add a real JWT to the refresh answer
+///   2. Refresh and check that the guest gets a fake JWT for it
+///   3. Add an unknown secret to the refresh answer and refresh
+///   4. Check the 502 and that the store keeps the real refresh token of
+///      the last good refresh
 #[test]
 fn refresh_answer_is_swapped_or_refused_whole() {
     Setup::new(ServiceId::Openai, short_lived()).run(|r| async move {
@@ -232,6 +279,15 @@ fn refresh_answer_is_swapped_or_refused_whole() {
     });
 }
 
+/// Test that a token exchange grant and an unknown refresh token are
+/// refused locally. A token exchange gets an API key for the ID token. The
+/// proxy never forwards it, and Codex accepts the refusal.
+///   1. Sign in
+///   2. Send a token exchange for an API key and check
+///      `unsupported_grant_type`
+///   3. Refresh with an unknown surrogate and check the 401
+///      `refresh_token_invalidated`
+///   4. Check that nothing goes upstream
 #[test]
 fn token_exchange_grant_and_unknown_refresh_are_refused_locally() {
     Setup::new(ServiceId::Openai, Options::default()).run(|r| async move {
@@ -267,6 +323,12 @@ fn token_exchange_grant_and_unknown_refresh_are_refused_locally() {
     });
 }
 
+/// Test that a sign-out deletes the grant and revokes both real tokens
+/// upstream.
+///   1. Sign in and revoke the refresh surrogate
+///   2. Check that the provider gets revokes of the real refresh and access
+///      tokens and that the grant is gone
+///   3. Revoke again and check that nothing goes upstream
 #[test]
 fn revoke_deletes_grant_and_revokes_both_real_tokens() {
     Setup::new(ServiceId::Openai, Options::default()).run(|r| async move {

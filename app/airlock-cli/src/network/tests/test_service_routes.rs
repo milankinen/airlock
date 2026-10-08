@@ -1,3 +1,6 @@
+//! The routes of the service hosts: which paths the token hosts forward,
+//! how the proxy rewrites them, and the last check of their answers.
+
 use hyper::Version;
 use serde_json::json;
 
@@ -5,6 +8,11 @@ use crate::services::ServiceId;
 use crate::test_cfg::block_on_local;
 use crate::test_cfg::services::{GotLog, answering, production_services, request};
 
+/// Test that a service refuses a token answer from a host that it does not
+/// know.
+///   1. Send a request of each service to an unknown host
+///   2. Let the upstream answer with an access token
+///   3. Check the local 502 without the token
 #[test]
 fn unknown_endpoint_fails_closed() {
     block_on_local(async {
@@ -30,10 +38,19 @@ fn unknown_endpoint_fails_closed() {
     });
 }
 
+/// Test that answers of the forwarded token host routes pass the last check
+/// unless they carry a token or a code.
+///   1. Send requests to the forwarded routes of both token hosts
+///   2. Let the upstream answer with token fields, codes or a verifier, and
+///      check the local 502
+///   3. Let the upstream answer with surrogate codes, other fields, HTML or
+///      large JSON, and check that they pass
 #[test]
 fn token_host_routes_pass_backstop_unless_answer_carries_token() {
     block_on_local(async {
         let services = production_services();
+        // The check reads only JSON answers up to a size limit. A larger
+        // answer with a known length passes unchanged.
         let big = json!({ "access_token": "x", "pad": "a".repeat(70 * 1024) }).to_string();
         for (content_type, answer, refused) in [
             (
@@ -99,6 +116,12 @@ fn token_host_routes_pass_backstop_unless_answer_carries_token() {
     });
 }
 
+/// Test that an allowed route goes upstream with its own normal path only.
+/// The guest must not send a different path or a query through an allowed
+/// route.
+///   1. Send requests with odd case, dot segments, encoded characters,
+///      queries and parameters, over HTTP/1.1 and HTTP/2
+///   2. Check that the upstream gets only the normal path of the route
 #[test]
 fn allowed_routes_forward_their_own_path_only() {
     block_on_local(async {
@@ -149,6 +172,12 @@ fn allowed_routes_forward_their_own_path_only() {
     });
 }
 
+/// Test that the token hosts refuse every other route, and that the API
+/// hosts take every path.
+///   1. Send requests with wrong methods or other paths to both token hosts
+///   2. Check the local 403 `airlock_route_not_allowed` and that nothing
+///      goes upstream
+///   3. Send a request of any path to both API hosts and check the 200
 #[test]
 fn other_token_host_routes_are_forbidden_and_api_hosts_take_every_path() {
     block_on_local(async {

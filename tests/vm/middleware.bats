@@ -2,6 +2,8 @@
 
 load helpers
 
+# A Lua network middleware that denies some HTTPS requests.
+
 setup_file() {
     vm_setup_file
 
@@ -24,6 +26,10 @@ end
 EOF
 }
 
+# Test that a middleware can deny a request by its path inside HTTPS, and
+# other paths of the same host still work.
+#   1. Get the root path of the allowed host and check that it works
+#   2. Get the /forbidden path and check that it is denied
 @test "middleware denies forbidden https path and allows others" {
     run_vm sh -c 'wget -q -O- --timeout=10 https://example.org/ >/dev/null 2>&1 && echo root-allowed
                   wget -q -O- --timeout=10 https://example.org/forbidden >/dev/null 2>&1 || echo forbidden-denied'

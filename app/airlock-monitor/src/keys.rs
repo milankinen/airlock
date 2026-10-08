@@ -1,57 +1,67 @@
-//! Key-to-action lookup for the monitor TUI.
+//! Key bindings for the monitor TUI.
 //!
-//! Each user gesture is modelled as an [`Action`]. The CLI builds a
-//! [`KeyBindings`] map (action → set of keys) from the user's
-//! `[monitor.keys]` config and hands it to the TUI; the dispatcher then
-//! resolves a [`crossterm::event::KeyEvent`] into an `Action` (or `None`
-//! for keys that should pass through to the sandbox PTY).
-//!
-//! Actions are intentionally context-agnostic: `Confirm` means
-//! "confirm whatever the user is looking at" — open details from the
-//! list view, apply a policy from the dropdown. The dispatcher in
-//! `lib.rs` decides what each action does given the current state.
+//! Defines the actions that the user can bind to keys, and the default key for
+//! each action. The user can change the bindings in the `[monitor.keys]`
+//! config section. Also reads and shows keys in a text form.
 
 use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-/// User-bindable actions.
+/// User-bindable action.
+///
+/// Actions do not depend on the context on purpose. For example, `Confirm`
+/// means "confirm the item that the user sees": open the details from the
+/// list view, or apply a policy from the dropdown. The dispatcher in
+/// `lib.rs` sets the effect of each action from the current state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Action {
-    /// Force-switch to the Sandbox tab.
+    /// Go to the Sandbox tab from any state.
     SwitchSandbox,
-    /// Force-switch to the Monitor tab.
+    /// Go to the Monitor tab from any state.
     SwitchMonitor,
-    /// Step back: in list view, return to Sandbox tab; in details
-    /// or dropdown, close the modal.
+    /// Go back one step. In the list view, go to the Sandbox tab. In the
+    /// details or the dropdown, close it.
     Back,
-    /// Dismiss the topmost modal (dropdown / details). No-op in list view.
+    /// Close the topmost modal (dropdown or details). No effect in the
+    /// list view.
     Cancel,
-    /// Confirm: open details on the selected list entry, or apply the
+    /// Open the details of the selected list entry, or apply the
     /// highlighted policy in the dropdown.
     Confirm,
-    /// Send SIGHUP+SIGTERM to the sandbox process (Ctrl+D by default).
+    /// Send SIGHUP and SIGTERM to the sandbox process (Ctrl+D by default).
     KillSandbox,
+    /// Move the selection up one row.
     SelectUp,
+    /// Move the selection down one row.
     SelectDown,
+    /// Move the selection up one page.
     SelectPageUp,
+    /// Move the selection down one page.
     SelectPageDown,
+    /// Select the newest entry.
     SelectNewest,
+    /// Select the oldest entry.
     SelectOldest,
-    /// Toggle between Requests and Connections sub-tabs.
+    /// Change between the Requests and Connections sub-tabs.
     ToggleSubTab,
+    /// Open the Requests sub-tab.
     SelectRequests,
+    /// Open the Connections sub-tab.
     SelectConnections,
+    /// Open the network policy dropdown.
     OpenPolicy,
 }
 
-/// Map from a (KeyCode, KeyModifiers) tuple to an Action. Built once at
-/// startup from the user's config (or from defaults) and consulted on
-/// every key event.
+/// Map from a (KeyCode, KeyModifiers) tuple to an [`Action`].
 ///
-/// Also tracks a per-action *primary* key — the first key the action
-/// was bound to. Used by the UI to render shortcut hints (tab labels,
-/// etc.) deterministically when an action has multiple bindings.
+/// Airlock builds it one time at startup from the user's config, or from
+/// the defaults. The TUI reads it on each key event.
+///
+/// It also keeps a *primary* key for each action: the first key bound to
+/// the action. The UI uses it to show shortcut hints (for example in tab
+/// labels). Thus the hint is always the same key when an action has many
+/// bindings.
 #[derive(Debug, Clone, Default)]
 pub struct KeyBindings {
     map: HashMap<(KeyCode, KeyModifiers), Action>,
@@ -59,22 +69,26 @@ pub struct KeyBindings {
 }
 
 impl KeyBindings {
-    /// Look up the action bound to a specific key event, if any.
+    /// Action bound to the key event, or `None` if the key has no binding.
     pub fn lookup(&self, key: &KeyEvent) -> Option<Action> {
         self.map.get(&(key.code, key.modifiers)).copied()
     }
 
-    /// The "display" key for an action — the first key it was bound
-    /// to. `None` when the action has no binding.
+    /// Key to show for `action` in the UI: the first key bound to it.
+    /// `None` if the action has no binding.
     pub fn primary(&self, action: Action) -> Option<(KeyCode, KeyModifiers)> {
         self.primary.get(&action).copied()
     }
 
-    /// Bind every parsed key in `keys` to `action`. Subsequent calls
-    /// for the same key overwrite earlier bindings — last write wins.
-    /// The first parsed key in the iterator becomes the action's
-    /// primary key (used for UI display); a later `bind()` for the
-    /// same action *replaces* the primary.
+    /// Bind keys to an action.
+    /// Args:
+    ///  - `action`: Action to bind
+    ///  - `keys`: Key specs in the [`parse_key`] format. Invalid specs are
+    ///    ignored.
+    ///
+    /// A later binding of the same key replaces the earlier one. The first
+    /// valid key in `keys` becomes the primary key of the action. A later
+    /// `bind()` for the same action *replaces* the primary key.
     pub fn bind<I, S>(&mut self, action: Action, keys: I)
     where
         I: IntoIterator<Item = S>,
@@ -94,10 +108,11 @@ impl KeyBindings {
 }
 
 impl KeyBindings {
-    /// Default bindings — mirrors what the TUI shipped with before the
-    /// `[monitor.keys]` setting existed. Reads straight from [`SPEC`]
-    /// so defaults can't drift from the action-name lookup.
+    /// Default bindings. They are the same as the bindings before the
+    /// `[monitor.keys]` setting existed.
     pub fn defaults() -> Self {
+        // Read from SPEC, so the defaults always agree with the action-name
+        // lookup.
         let mut b = Self::default();
         for (_, action, keys) in SPEC {
             b.bind(*action, keys.iter().copied());
@@ -106,10 +121,12 @@ impl KeyBindings {
     }
 }
 
-/// Canonical (kebab-case-name, action, default-keys) table. The single
-/// source of truth used to: build the default bindings, look up an
-/// action from a string in the user's settings, and report a human
-/// name for an action in error messages.
+/// Table of (kebab-case name, action, default keys) for all actions.
+///
+/// It is the single source of truth for:
+///  * the default bindings
+///  * the action lookup by name from the user's settings
+///  * the action name in error messages.
 pub const SPEC: &[(&str, Action, &[&str])] = &[
     ("switch-sandbox", Action::SwitchSandbox, &["f1"]),
     ("switch-monitor", Action::SwitchMonitor, &["f2"]),
@@ -133,21 +150,27 @@ pub const SPEC: &[(&str, Action, &[&str])] = &[
     ("open-policy", Action::OpenPolicy, &["p"]),
 ];
 
-/// Look up an action by its kebab-case name. Returns `None` for
-/// unknown names; callers (the settings parser) report the typo.
+/// Find an action by its kebab-case name.
+/// Returns:
+///   The action, or `None` for an unknown name. The caller (the settings
+///   parser) reports the error.
 pub fn action_for(name: &str) -> Option<Action> {
     SPEC.iter().find_map(|(n, a, _)| (*n == name).then_some(*a))
 }
 
 /// Parse a key spec string into a (KeyCode, KeyModifiers) tuple.
+/// Args:
+///  - `spec`: Key spec in the format `[<modifier>+]*<key>`.
+///    Modifier names: `ctrl`, `alt`, `shift`, `super`.
+///    Key names (case-insensitive): one ASCII char (`q`, `1`, `+`, `?`,
+///    ...), `enter`, `esc`/`escape`, `tab`, `backspace`, `delete`, `space`,
+///    `up`, `down`, `left`, `right`, `home`, `end`, `pageup`, `pagedown`,
+///    `f1`..`f12`.
+///    Examples: `q`, `ctrl+d`, `shift+tab`, `f2`, `alt+enter`.
 ///
-/// Format: `[<modifier>+]*<key>`. Modifier names: `ctrl`, `alt`,
-/// `shift`, `super`. Key names (case-insensitive): single ASCII char
-/// (`q`, `1`, `+`, `?`, ...), `enter`, `esc`/`escape`, `tab`,
-/// `backspace`, `delete`, `space`, `up`, `down`, `left`, `right`,
-/// `home`, `end`, `pageup`, `pagedown`, `f1`..`f12`.
-///
-/// Examples: `q`, `ctrl+d`, `shift+tab`, `f2`, `alt+enter`.
+/// Returns:
+///   The key code and modifiers, or an error message if the spec is not
+///   valid.
 pub fn parse_key(spec: &str) -> Result<(KeyCode, KeyModifiers), String> {
     let parts: Vec<&str> = spec.split('+').map(str::trim).collect();
     if parts.is_empty() || parts.iter().any(|p| p.is_empty()) {
@@ -170,9 +193,9 @@ pub fn parse_key(spec: &str) -> Result<(KeyCode, KeyModifiers), String> {
     let code = parse_code(key_part)
         .ok_or_else(|| format!("unknown key `{key_part}` in key spec `{spec}`"))?;
 
-    // Single printable chars carry no shift modifier — `Shift+a` would be
-    // confusing because crossterm reports plain `A` for shifted keys.
-    // Strip SHIFT for char codes so user configs match what crossterm emits.
+    // Printable chars have no SHIFT modifier. Crossterm reports a plain `A`
+    // for a shifted key, so `Shift+a` is confusing. Remove SHIFT from char
+    // codes, so that user configs match the events from crossterm.
     let mods = if matches!(code, KeyCode::Char(_)) {
         mods - KeyModifiers::SHIFT
     } else {
@@ -182,13 +205,14 @@ pub fn parse_key(spec: &str) -> Result<(KeyCode, KeyModifiers), String> {
     Ok((code, mods))
 }
 
-/// Render a `(KeyCode, KeyModifiers)` pair as the canonical display
-/// string the UI shows to users. Roughly the inverse of [`parse_key`],
-/// using title-case modifier names and `F<n>` / `PageUp` etc. for named
-/// keys. Single chars come back uppercase to read naturally as a label.
+/// Format a `(KeyCode, KeyModifiers)` pair as the label that the UI shows.
+///
+/// Approximately the inverse of [`parse_key`]. Modifier names are in title
+/// case. Named keys use forms such as `F<n>` and `PageUp`. Single chars are
+/// in uppercase, because that is easier to read as a label.
 pub fn format_key((code, mods): (KeyCode, KeyModifiers)) -> String {
     let mut out = String::new();
-    // Order matches what most users write: Ctrl, Alt, Shift, Super.
+    // Use the order that most users write: Ctrl, Alt, Shift, Super.
     if mods.contains(KeyModifiers::CONTROL) {
         out.push_str("Ctrl+");
     }
@@ -247,7 +271,7 @@ fn parse_code(s: &str) -> Option<KeyCode> {
         }
         s if s.chars().count() == 1 => {
             let c = s.chars().next().expect("len 1");
-            // Always lowercase: see comment in parse_key about SHIFT.
+            // Always lowercase. See the SHIFT comment in parse_key.
             Some(KeyCode::Char(c.to_ascii_lowercase()))
         }
         _ => None,
@@ -256,14 +280,22 @@ fn parse_code(s: &str) -> Option<KeyCode> {
 
 #[cfg(test)]
 mod tests {
+    //! Tests of the key spec parser for user key bindings.
+
     use super::*;
 
+    /// Test that the parser reads key names and modifiers in any letter case.
+    /// User configs must match the key events from crossterm.
+    ///   1. Parse char keys, named keys, function keys and modifier specs
+    ///   2. Check the key code and modifiers of each spec
     #[test]
     fn parse_key_reads_names_modifiers_and_any_case() {
         for (spec, code, mods) in [
             ("q", KeyCode::Char('q'), KeyModifiers::NONE),
             ("Q", KeyCode::Char('q'), KeyModifiers::NONE),
             ("ctrl+d", KeyCode::Char('d'), KeyModifiers::CONTROL),
+            // Crossterm reports no SHIFT for char keys, so the parser
+            // removes it.
             ("shift+a", KeyCode::Char('a'), KeyModifiers::NONE),
             ("shift+tab", KeyCode::Tab, KeyModifiers::SHIFT),
             ("enter", KeyCode::Enter, KeyModifiers::NONE),
@@ -274,6 +306,10 @@ mod tests {
         }
     }
 
+    /// Test that a spec with an unknown modifier, an unknown key or a missing
+    /// key is an error. The settings parser shows this error to the user.
+    ///   1. Parse each bad spec
+    ///   2. Check that each one gives an error
     #[test]
     fn parse_key_with_unknown_part_is_error() {
         for spec in ["hyper+x", "ctrl+nope", "f13", "", "ctrl+"] {

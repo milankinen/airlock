@@ -1,26 +1,37 @@
-//! The setup boots' configs: the resolved config, narrowed.
+//! Config and boot options of the setup boots.
 //!
-//! The install boot runs code the user did not write (vendor installers)
-//! and code already on the persistent disk, with an open network: the
-//! policy is `allow-always`, every rule is disabled, and one
-//! [`INSTALL_RULE`] passes every target through without TLS interception.
-//! The open network is the public internet only: the install boot's
-//! network is [`crate::network::Network::public_only`], so the host's
-//! loopback, the LAN and cloud metadata stay out of reach.
-//! It gets nothing else the config grants: no secrets (no masked or
-//! `${…}` env, no inject), no mounts and no project share, and no ports,
-//! sockets, daemons, masks, middleware or clipboard.
+//! Narrows the project config for the install boot. The install boot gets
+//! open access to the public internet, but no secrets, mounts or other
+//! grants of the config.
 
 use crate::cli::LogLevel;
 use crate::config::config_values::{self, ConfigValues, NetworkRule, Policy};
 use crate::sandbox::boot::BootOptions;
 
-/// The network rule of the install boot: every target, passthrough.
+/// Name of the install boot network rule. The rule allows all targets
+/// in passthrough mode.
 const INSTALL_RULE: &str = "airlock-install";
 
-/// Narrow the resolved `config` for the install boot (see the module
-/// docs) and validate the result.
+/// Narrow the resolved config for the install boot and validate it.
+///
+/// The install boot runs code that the user did not write (vendor
+/// installers) and code that is already on the persistent disk. It gets
+/// open access to the public internet without TLS interception. The host
+/// loopback, the LAN and cloud metadata stay out of reach.
+///
+/// The install boot gets nothing else that the config grants: no secrets
+/// (no masked env, no `${…}` env except `HOME`, no inject), no mounts, no
+/// project share, and no ports, sockets, daemons, masks, middleware or
+/// clipboard.
+/// Args:
+///  - `config`: The resolved config
+///
+/// Returns:
+///   The narrowed config, or an error if it is not valid.
 pub fn install_config(mut config: ConfigValues) -> anyhow::Result<ConfigValues> {
+    // Open network: allow all, disable the user rules and add one
+    // passthrough rule for all targets. The install boot uses
+    // `Network::public_only`, thus the rule reaches only the public internet.
     let net = &mut config.network;
     net.policy = Policy::AllowAlways;
     for rule in net.rules.values_mut() {
@@ -42,8 +53,8 @@ pub fn install_config(mut config: ConfigValues) -> anyhow::Result<ConfigValues> 
     Ok(config)
 }
 
-/// The boot options of the setup boots: quiet (they print their own
-/// progress) and without the project share.
+/// Get the boot options of the setup boots. The boots are quiet because
+/// they print their own progress. They have no project share.
 pub fn boot_options(log_level: LogLevel) -> BootOptions {
     BootOptions {
         log_level,
@@ -52,9 +63,9 @@ pub fn boot_options(log_level: LogLevel) -> BootOptions {
     }
 }
 
-/// What the setup boots never get: middleware, network services, ports,
-/// sockets, secrets and host env (except a `HOME` that is not masked),
-/// mounts, daemons, masks, clipboard.
+/// Remove what the setup boots never get: middleware, network services,
+/// ports, sockets, secrets and host env (except a `HOME` that is not
+/// masked), mounts, daemons, masks and clipboard.
 fn isolate(config: &mut ConfigValues) {
     let net = &mut config.network;
     net.services.clear();
@@ -67,9 +78,9 @@ fn isolate(config: &mut ConfigValues) {
     for socket in net.sockets.values_mut() {
         socket.enabled = false;
     }
-    // `HOME` stays even when it reads host variables: tools install into
-    // it (`~/.cargo`, `~/.local/bin`), and the run boot must find them in
-    // the same place. The run config resolves it the same way.
+    // Keep `HOME` even if it reads host variables. Tools install into it
+    // (`~/.cargo`, `~/.local/bin`), and the run boot must find them in the
+    // same place. The run config resolves `HOME` the same way.
     config
         .env
         .retain(|name, var| !var.mask && (name == "HOME" || !references_vars(&var.value)));
@@ -86,10 +97,11 @@ fn isolate(config: &mut ConfigValues) {
     config.clipboard.paste = false;
 }
 
-/// Whether the `[env]` template `value` reads a variable (`$X`, `${X}`,
-/// `${X:default}`). Uses the substitution parser itself; a template it
-/// cannot parse counts as reading one.
+/// Check if the `[env]` template `value` reads a variable (`$X`, `${X}`,
+/// `${X:default}`).
 fn references_vars(value: &str) -> bool {
+    // Use the substitution parser itself to find variable reads. A
+    // template that it cannot parse counts as one that reads a variable.
     struct Recorder(std::cell::Cell<bool>);
     impl<'a> subst::VariableMap<'a> for Recorder {
         type Value = &'static str;
@@ -107,8 +119,15 @@ fn references_vars(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    //! Tests of the env narrowing of the setup boots.
+
     use super::*;
 
+    /// Test that the variable check follows the substitution syntax. Env
+    /// that reads host variables must not reach the install boot.
+    ///   1. Check that `$X`, `${X}`, `${X:default}` and a template that does
+    ///      not parse count as variable reads
+    ///   2. Check that plain text, an escaped `$` and empty text do not
     #[test]
     fn references_vars_follows_substitution_syntax() {
         assert!(references_vars("${X}"));

@@ -1,11 +1,12 @@
 # Docker engine inside the VM
 #
 # Starts `dockerd` as a daemon and allows image pulls from Docker Hub and
-# GitHub Container Registry. The image must ship the engine, e.g.
+# GitHub Container Registry. The image must contain the engine, for example
 # `apk add docker docker-compose` on Alpine.
 #
-# Registries accept pushes as well as pulls: a sandboxed process can log
-# in to any account and `docker push` data out through these hosts.
+# Registries accept pushes as well as pulls. A process in the sandbox can
+# sign in to any account and use `docker push` to send data out through
+# these hosts.
 
 [network.rules.docker-registries]
 allow = [
@@ -20,12 +21,12 @@ allow = [
     "pkg-containers.githubusercontent.com",
 ]
 
-# Docker's overlayfs storage driver cannot run on top of the VM's overlayfs
-# root, so /var/lib/docker is bind-mounted from the ext4 disk at
+# The overlayfs storage driver of Docker cannot run on top of the overlayfs
+# root of the VM. So /var/lib/docker is a bind mount from the ext4 disk at
 # /airlock/disk. This also keeps images and build cache across sandbox
-# restarts. The bind mount is skipped when a daemon restart finds it
-# already in place. `harden = false` because dockerd must create
-# namespaces and manage cgroups, which hardening blocks.
+# restarts. A daemon restart skips the bind mount if it is already in place.
+# `harden = false`, because dockerd must make namespaces and manage cgroups,
+# and hardening blocks that.
 [daemons.dockerd]
 command = [
     "sh", "-c",

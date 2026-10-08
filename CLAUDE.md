@@ -41,6 +41,57 @@ mkdir -p .tmp/test-foo && cd .tmp/test-foo
 mise airlock -- start -- echo hello
 ```
 
+## Code comments
+
+Write all comments (`//!`, `///`, `//`, `#` in shell and bats) in
+simple ASD-STE100 language (`/asd-ste100` skill, STE-flavored mode):
+short sentences, active voice, simple tenses, no semicolons, no phrasal
+verbs, no marketing words. Keep comments compact. Keep each comment
+true to the code: when you change code, update its comments.
+
+Module docs (`//!`): describe at high level the purpose of the module
+and its capabilities and concepts. Do not name types or functions, and
+do not describe the implementation (no library names, file paths, data
+layouts or algorithm steps):
+
+```rust
+//! HTTP request support.
+//!
+//! Detects HTTP traffic and relays requests from the sandbox to the
+//! upstream server. The configured HTTP middlewares run for each request
+//! and response. Also handles:
+//!  * HTTP 1.1/2 conversion when the sandbox and the server use different
+//!    versions
+//!  * HTTP 1.1 upgrades, for example websockets
+//!
+//! Expects plaintext (TLS decrypted) traffic from both sides.
+```
+
+Item docs (`///`): give each exported item (`pub`, `pub(crate)`,
+`pub(super)`) a rustdoc. Say what the item does and what its arguments
+and return value mean, not how it works. Use `Args:` / `Returns:` for
+functions whose arguments or return value are not obvious. Put a blank
+`///` line before `Returns:` when it follows a list item (clippy
+`doc_lazy_continuation`):
+
+```rust
+/// Compile and validate the given Lua middleware script.
+/// Args:
+///  - `script`: User's Lua script from `network.middleware.<name>.script`
+///  - `env_vars`: User-defined environment variables from
+///    `network.middleware.<name>.env`
+///  - `vault`: Vault for resolving the environment variables
+///  - `log`: Logger callback for the in-script `log` function
+///
+/// Returns:
+///   Compiled middleware, or error if compilation fails.
+```
+
+Inline comments (`//`): put implementation notes here, at the line
+they explain. Write them for the "why": reasons, invariants, safety,
+ordering, and things that are not obvious. Do not restate the code.
+Keep tags like `SAFETY:` and `TODO`.
+
 ## Tests
 
 Run Rust tests with `mise run test`, bats tests with `mise run bats`.
@@ -77,7 +128,20 @@ Names: `doing_something_with_some_condition_has_some_effect`, e.g.
 `websocket_upgrade_forged_by_middleware_is_refused`. Use simple words
 and drop "a"/"the" unless needed.
 
-Comments: do not write comments on tests or in test bodies.
+Comments: give each test a rustdoc comment (bats: a `#` comment above
+`@test`) in simple ASD-STE100 language. State the purpose and the reason,
+then the flow as a short numbered list:
+
+```rust
+/// Test that the network stack refuses upgrade responses that a
+/// middleware forged.
+///   1. Add a middleware that changes the response code to 101
+///   2. Send a request to a normal HTTP server
+///   3. Check that the 101 is refused and HTTP 502 is returned
+```
+
+Add inline comments in test bodies only for parts that are not trivial,
+not obvious, or tricky.
 
 ## User manual
 

@@ -1,13 +1,8 @@
-//! Project CA injection. Builds a tmpfs lowerdir (`/mnt/ca-overlay`)
-//! containing per-bundle copies of every CA bundle the image ships,
-//! each with the project CA appended. `overlay.rs` splices the tmpfs
-//! on top of the image layers in the overlayfs `lowerdir` stack —
-//! writes never land on the persistent upperdir, so the appended CA
-//! doesn't accumulate across reboots.
+//! Project CA in the container.
 //!
-//! Also drops the raw CA at every well-known anchor path so distro
-//! trust-update tools (`update-ca-certificates`, `update-ca-trust`,
-//! `trust extract-compat`) regenerate bundles that still include it.
+//! Makes TLS clients in the container trust the project CA. The CA bundles of
+//! the container include the project CA, also after a trust update tool makes
+//! the bundles again.
 
 use std::path::Path;
 
@@ -15,11 +10,12 @@ use tracing::debug;
 
 use crate::init::MountConfig;
 
-/// CA bundle paths known across common distros. Each path is relative to the
-/// rootfs. Guest init merges the project CA into each existing bundle (read
-/// from the image's lower layers) and falls back to writing the Debian/Ubuntu
-/// path when none are present, so `SSL_CERT_FILE` can point at a predictable
-/// location in minimal images.
+/// CA bundle paths of common distros, relative to the rootfs.
+///
+/// Guest init adds the project CA to each bundle that the image layers have.
+/// If the image has none, guest init writes the Debian/Ubuntu path (the
+/// first item). Thus `SSL_CERT_FILE` can point to a known location also in
+/// minimal images.
 const BUNDLE_PATHS: &[&str] = &[
     "etc/ssl/certs/ca-certificates.crt", // Debian/Ubuntu/Alpine
     "etc/ssl/cert.pem",                  // Alpine/LibreSSL
@@ -28,36 +24,41 @@ const BUNDLE_PATHS: &[&str] = &[
     "etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", // RHEL/Fedora
 ];
 
-/// Drop-in anchor locations for distro trust-update tools. When the user or
-/// a package postinst runs `update-ca-certificates` / `update-ca-trust` /
-/// `trust extract-compat` it rebuilds the bundles from these directories —
-/// so shipping the project CA as a plain file here makes it survive any
-/// future rebuild of `etc/ssl/certs/ca-certificates.crt` on the upperdir.
+/// Anchor file locations for distro trust-update tools.
+///
+/// The user or a package postinst script can run `update-ca-certificates`,
+/// `update-ca-trust` or `trust extract-compat`. These tools make the
+/// bundles again from these directories. With the project CA as a plain
+/// file here, the CA stays in all bundles that these tools make again on
+/// the upperdir (for example `etc/ssl/certs/ca-certificates.crt`).
 const ANCHOR_PATHS: &[&str] = &[
-    "usr/local/share/ca-certificates/airlock.crt", // Debian/Ubuntu/Alpine — update-ca-certificates
-    "etc/pki/ca-trust/source/anchors/airlock.crt", // RHEL/Fedora/CentOS — update-ca-trust
-    "etc/pki/trust/anchors/airlock.crt",           // openSUSE/SLES — update-ca-certificates
-    "etc/ca-certificates/trust-source/anchors/airlock.crt", // Arch — trust extract-compat
+    "usr/local/share/ca-certificates/airlock.crt", // Debian/Ubuntu/Alpine: update-ca-certificates
+    "etc/pki/ca-trust/source/anchors/airlock.crt", // RHEL/Fedora/CentOS: update-ca-trust
+    "etc/pki/trust/anchors/airlock.crt",           // openSUSE/SLES: update-ca-certificates
+    "etc/ca-certificates/trust-source/anchors/airlock.crt", // Arch: trust extract-compat
 ];
 
-/// tmpfs lowerdir holding pre-merged CA bundles. Placed above the image
-/// layers in the overlayfs stack so the project CA is visible without any
-/// write ever landing on the persistent upperdir.
+/// tmpfs lowerdir with the merged CA bundles. It is above the image layers
+/// in the overlayfs stack. Thus the container sees the project CA, and no
+/// CA write goes to the persistent upperdir.
 const OVERLAY_DIR: &str = "/mnt/ca-overlay";
 
-/// Build a tmpfs lowerdir containing per-bundle copies of every CA bundle the
-/// image ships, each with the project CA appended. Returns the tmpfs path
-/// when anything was written (so the caller can splice it into `lowerdir`),
-/// or `None` when there's no project CA to inject.
+/// Make a tmpfs lowerdir with a copy of each CA bundle of the image, with
+/// the project CA added to each copy. Also writes the project CA to each
+/// anchor path in [`ANCHOR_PATHS`].
 ///
-/// This runs **before** overlayfs is mounted: for each well-known bundle path
-/// we walk `image_layers` topmost-first, take the first layer that ships a
-/// non-empty copy of that file, append the project CA, and drop the result
-/// into the tmpfs at the same relative path. Doing the merge against the
-/// pristine layer content — not the already-merged overlayfs view — is what
-/// prevents the CA from accumulating across reboots when the upperdir is
-/// persisted on the project disk.
+/// Must run **before** overlayfs is mounted.
+/// Args:
+///  - `mounts`: Mount configuration with the project CA and image layers
+///
+/// Returns:
+///   The tmpfs path, which the caller adds to `lowerdir`. `None` if there is
+///   no project CA.
 pub(super) fn prepare_overlay(mounts: &MountConfig) -> anyhow::Result<Option<&'static str>> {
+    // For each bundle path, use the topmost layer that has a non-empty copy
+    // of the file. Merge with this original layer content, not with the
+    // merged overlayfs view. Otherwise the CA would be added again at each
+    // reboot when the upperdir persists on the project disk.
     if mounts.ca_cert.is_empty() {
         return Ok(None);
     }
@@ -87,9 +88,9 @@ pub(super) fn prepare_overlay(mounts: &MountConfig) -> anyhow::Result<Option<&'s
         );
     }
 
-    // Drop the raw CA into every well-known anchor directory so trust-update
-    // tools regenerate bundles that still include it. Cheap and harmless when
-    // the tool isn't installed — the file just sits there unread.
+    // Write the raw CA into each anchor directory, so trust-update tools
+    // make bundles that include it. If a tool is not installed, the file is
+    // not used and causes no problem.
     for rel in ANCHOR_PATHS {
         write_bundle(rel, &[], &mounts.ca_cert)?;
         debug!("ca: dropped anchor /{rel}");
@@ -97,11 +98,18 @@ pub(super) fn prepare_overlay(mounts: &MountConfig) -> anyhow::Result<Option<&'s
     Ok(Some(OVERLAY_DIR))
 }
 
-/// Find the first layer that ships `rel` (topmost-first) and return its
-/// contents. An empty file in a layer is treated as "masked here" — either an
-/// overlayfs whiteout placeholder from our extractor or a deliberately empty
-/// bundle — and stops the walk so we don't resurrect content the image meant
-/// to hide. `None` means no layer had the path at all.
+/// Find the topmost layer that has the file `rel` and return its contents.
+/// Args:
+///  - `layers`: Layer digests, topmost first
+///  - `rel`: File path relative to the rootfs
+///
+/// Returns:
+///   File contents, or `None` if no layer has a usable file at `rel`.
+///
+/// An empty file (or other non-file entry) means "hidden here". It can be
+/// an overlayfs whiteout placeholder from the layer extractor, or an empty
+/// bundle on purpose. The search stops there, so content that the image
+/// hides does not come back.
 fn find_bundle_in_layers(layers: &[String], rel: &str) -> anyhow::Result<Option<Vec<u8>>> {
     for digest in layers {
         let path = Path::new("/mnt/layers").join(digest).join(rel);
@@ -117,6 +125,7 @@ fn find_bundle_in_layers(layers: &[String], rel: &str) -> anyhow::Result<Option<
     Ok(None)
 }
 
+/// Write `base` with `ca_cert` added to the end, at `rel` in the CA tmpfs.
 fn write_bundle(rel: &str, base: &[u8], ca_cert: &[u8]) -> anyhow::Result<()> {
     let target = Path::new(OVERLAY_DIR).join(rel);
     if let Some(parent) = target.parent() {

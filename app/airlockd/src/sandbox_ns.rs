@@ -1,57 +1,53 @@
 //! The shared sandbox mount namespace.
 //!
-//! Every container process (main process, `airlock exec`, daemons) enters the
-//! assembled rootfs by joining this namespace with `setns`, not by `chroot`.
+//! Gives all container processes (the main process, `airlock exec` and
+//! daemons) one mount namespace with the container rootfs as its root. Tools
+//! that enter a namespace from inside the sandbox, for example `docker exec`,
+//! Docker health checks and `nsenter -m`, then also get the container and not
+//! the VM.
 //!
-//! **Why not `chroot`.** `chroot` only changes one process's root; the mount
-//! namespace root stays the VM's initramfs, with every VM mount hanging off
-//! it. Anything that later enters the namespace by `setns` — `docker exec`,
-//! Docker healthchecks, `nsenter -m` — is put at the *namespace* root by the
-//! kernel, and so lands in the VM instead of the container.
-//!
-//! **How the namespace is built.** A short-lived helper unshares a mount
-//! namespace and `pivot_root`s into the rootfs, as OCI runtimes do, then
-//! detaches the old root so no VM mount is left in the namespace. airlockd
-//! keeps a descriptor to the namespace and the helper exits.
-//!
-//! `pivot_root` cannot be called from the VM root directly: that is the
-//! initramfs `rootfs`, which has no parent mount, and `pivot_root` refuses to
-//! move such a root (`EINVAL`). The helper first stacks a recursive bind of the
-//! VM root on `/` and chroots into it; that bind has a parent, so it can be
-//! pivoted away. The rootfs then takes its place on top of `/`. `setns`
-//! resolves the namespace root with `LOOKUP_DOWN`, which follows mounts
-//! stacked on `/`, so a process joining the namespace gets the container
-//! rootfs as its root.
-//!
-//! Mounts made inside the sandbox after this point (e.g. dockerd bind-mounting
-//! `/var/lib/docker`) stay in the sandbox namespace. VM-side paths under
-//! [`ROOTFS`] keep working for airlockd, which stays in the VM namespace: new
-//! *files* are shared through the same filesystems, only *mounts* are not.
+//! Mounts made inside the sandbox stay in the sandbox. airlockd itself stays
+//! in the VM and can still see all new files in the rootfs.
 
 use std::sync::OnceLock;
 
-/// Where init assembles the container rootfs, as seen from the VM namespace.
+/// Path of the container rootfs in the VM mount namespace.
+// airlockd stays in the VM namespace and uses this path. New files are shared
+// with the sandbox namespace through the same filesystems. Only mounts are
+// not shared.
 pub const ROOTFS: &str = "/mnt/overlay/rootfs";
 
-/// Empty VM directory the helper bind-mounts the VM root onto before it moves
-/// that bind onto `/`. Only used inside the helper's namespace.
+/// Empty VM directory. The helper bind-mounts the VM root here, then moves
+/// that bind mount onto `/`. Used only inside the namespace of the helper.
 #[cfg(target_os = "linux")]
 const STAGE: &str = "/mnt/.sandbox-stage";
 
 /// Descriptor of the sandbox mount namespace (`O_CLOEXEC`), once created.
 static NS_FD: OnceLock<i32> = OnceLock::new();
 
-/// The sandbox namespace descriptor, or `None` if it was never created (init
-/// failed to create it, or not on Linux). Spawns then fall back to `chroot`.
+/// Get the sandbox namespace descriptor.
+///
+/// Returns:
+///   The descriptor, or `None` if init did not make the namespace (it failed,
+///   or the OS is not Linux). Spawns then use `chroot`.
 pub fn fd() -> Option<i32> {
     NS_FD.get().copied()
 }
 
-/// Create the sandbox namespace from the fully assembled rootfs.
+/// Make the sandbox namespace from the assembled rootfs.
 ///
-/// Must run after every init mount under [`ROOTFS`] is in place: the
-/// namespace gets a private copy of the mount tree at this moment, and later
-/// VM-side mounts do not propagate into it.
+/// Call it after all init mounts under [`ROOTFS`] are in place. The
+/// namespace gets a private copy of the mount tree at this time. Later
+/// mounts in the VM do not go into it.
+///
+/// Container processes join this namespace with `setns`, not `chroot`.
+/// `chroot` changes the root of one process only. The root of its mount
+/// namespace stays the VM initramfs, with all VM mounts under it. The kernel
+/// puts a process that enters with `setns` at the namespace root, so it gets
+/// the VM and not the container.
+///
+/// Returns:
+///   Error if the namespace cannot be made, or if it already exists.
 #[cfg(target_os = "linux")]
 pub fn create() -> anyhow::Result<()> {
     let fd = create_ns(ROOTFS)?;
@@ -62,8 +58,25 @@ pub fn create() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Fork a helper that builds the namespace, grab `/proc/<pid>/ns/mnt`, then
-/// let the helper exit. Returns the namespace descriptor.
+/// Make the namespace in a helper process and open it.
+///
+/// The helper unshares a mount namespace and moves its root into `rootfs`
+/// with `pivot_root`, as OCI runtimes do. Then it detaches the old root, so
+/// no VM mount stays in the namespace. The parent opens
+/// `/proc/<pid>/ns/mnt`, and then the helper exits.
+///
+/// `pivot_root` cannot move the VM root directly. The VM root is the
+/// initramfs `rootfs`, which has no parent mount, and `pivot_root` refuses
+/// such a root (`EINVAL`). So the helper first puts a recursive bind of the
+/// VM root on `/` and does a chroot into it. That bind has a parent, so
+/// `pivot_root` can move it. The rootfs then sits on top of `/`. `setns`
+/// finds the namespace root with `LOOKUP_DOWN`, which follows mounts on `/`.
+/// Thus a process that joins the namespace gets the container rootfs as
+/// its root.
+///
+/// Returns:
+///   The namespace descriptor (`O_CLOEXEC`), or the error of the step that
+///   failed.
 #[cfg(target_os = "linux")]
 fn create_ns(rootfs: &str) -> anyhow::Result<i32> {
     use anyhow::Context as _;
@@ -74,9 +87,10 @@ fn create_ns(rootfs: &str) -> anyhow::Result<i32> {
     let dot = c".";
     let slash = c"/";
 
-    // ready: helper → parent, a status byte (0 = ok, else the failed step)
-    // followed by the step's errno.
-    // release: parent → helper, closed once the descriptor is open.
+    // `ready`: helper to parent. A status byte (0 = ok, else the number of
+    // the failed step), then the errno of that step.
+    // `release`: parent to helper. The parent closes it when the descriptor
+    // is open.
     let ready = pipe().context("pipe")?;
     let release = match pipe() {
         Ok(p) => p,
@@ -109,8 +123,8 @@ fn create_ns(rootfs: &str) -> anyhow::Result<i32> {
             ) != 0
             {
                 2
-            // Stack a copy of the VM root (rootfs and all) on `/` and enter
-            // it, so the root that pivot_root moves away has a parent.
+            // Put a copy of the VM root (with all its mounts) on `/` and
+            // enter it. Thus the root that pivot_root moves has a parent.
             } else if libc::mount(
                 slash.as_ptr(),
                 stage_c.as_ptr(),
@@ -134,8 +148,8 @@ fn create_ns(rootfs: &str) -> anyhow::Result<i32> {
                 5
             } else if libc::chdir(rootfs_c.as_ptr()) != 0 {
                 6
-            // pivot_root(".", ".") stacks the old root on top of the new one;
-            // the umount detaches it, and every VM mount with it.
+            // pivot_root(".", ".") puts the old root on top of the new one.
+            // The umount detaches it, and all VM mounts with it.
             } else if libc::syscall(libc::SYS_pivot_root, dot.as_ptr(), dot.as_ptr()) != 0 {
                 7
             } else if libc::umount2(dot.as_ptr(), libc::MNT_DETACH) != 0 {
@@ -151,7 +165,7 @@ fn create_ns(rootfs: &str) -> anyhow::Result<i32> {
                 msg[1..].copy_from_slice(&(*libc::__errno_location()).to_ne_bytes());
             }
             libc::write(ready.1, msg.as_ptr().cast(), msg.len());
-            // Block until the parent has opened the namespace (or died).
+            // Wait until the parent opened the namespace (or stopped).
             let mut b = 0u8;
             libc::read(release.0, (&raw mut b).cast(), 1);
             libc::_exit(i32::from(step));
@@ -208,6 +222,10 @@ fn create_ns(rootfs: &str) -> anyhow::Result<i32> {
     result
 }
 
+/// Make a pipe with `O_CLOEXEC` on both ends.
+///
+/// Returns:
+///   The read and write descriptors.
 #[cfg(target_os = "linux")]
 fn pipe() -> std::io::Result<(i32, i32)> {
     let mut fds = [-1i32; 2];
@@ -217,6 +235,7 @@ fn pipe() -> std::io::Result<(i32, i32)> {
     Ok((fds[0], fds[1]))
 }
 
+/// Close both ends of a pipe.
 #[cfg(target_os = "linux")]
 fn close_pair((r, w): (i32, i32)) {
     unsafe {

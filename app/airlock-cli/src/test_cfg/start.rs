@@ -1,8 +1,7 @@
-//! `airlock start` with its edges faked: the image registry
-//! ([`prepare_image`]), the image check ([`check_image`]) and the install
-//! VM ([`install_boot`], which runs the install scripts on the host with
-//! [`HostExec`]). The start steps use these in tests. What the fakes do
-//! and saw is per thread ([`fake_host`]).
+//! `airlock start` with fakes at its edges: the image registry, the image
+//! check and the install VM. The fake install VM runs the install scripts
+//! on the host. The start steps call these fakes in tests. Each thread has
+//! its own fake state.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -29,18 +28,19 @@ use crate::start::{Exit, SandboxOptions};
 use crate::util::PinnedDir;
 use crate::vault::{Vault, VaultStorageType};
 
-/// What the faked edges of `airlock start` do, and what they saw.
+/// What the fakes at the edges of `airlock start` do, and what they
+/// recorded.
 #[derive(Default)]
 pub struct FakeHost {
     /// Calls of [`prepare_image`].
     pub prepared: usize,
     /// Packs whose install script ran, in order, over all install boots.
     pub ran: Vec<String>,
-    /// Packs whose install exits with the code without running.
+    /// Packs whose install exits with the given code and does not run.
     pub failing: HashMap<String, i32>,
     /// The install VM does not confirm its disk sync.
     pub unsynced: bool,
-    /// The fakes are on (else the real edges run).
+    /// The fakes are on. Else the real edges run.
     pub enabled: bool,
 }
 
@@ -53,8 +53,8 @@ pub fn fake_host<R>(f: impl FnOnce(&mut FakeHost) -> R) -> R {
     FAKE_HOST.with_borrow_mut(f)
 }
 
-/// The image of the reference `name`: root, no layers, an id derived from
-/// the name.
+/// A fake image for the reference `name`: user root, no layers, and an ID
+/// made from the name.
 pub fn fake_image(name: &str) -> OciImage {
     OciImage {
         image_id: format!("sha256:{}", hex::encode(Sha256::digest(name))),
@@ -69,9 +69,10 @@ pub fn fake_image(name: &str) -> OciImage {
     }
 }
 
-/// `oci::prepare` for tests: with the fakes on, the image is [`fake_image`] of the
-/// configured name. A sandbox that had another image re-creates with
-/// [`OnImageChange::Recreate`] and stops with [`OnImageChange::Refuse`].
+/// `oci::prepare` for tests. With the fakes on, the image is the
+/// [`fake_image`] of the configured name. If the sandbox had another image,
+/// [`OnImageChange::Recreate`] makes it again and [`OnImageChange::Refuse`]
+/// stops.
 pub async fn prepare_image(
     sandbox_dir: &Path,
     image_cfg: &ImageRef,
@@ -99,7 +100,7 @@ pub async fn prepare_image(
     })
 }
 
-/// `facts::check` for tests: with the fakes on, every image can take packs.
+/// `facts::check` for tests. With the fakes on, each image can take packs.
 pub fn check_image(image: &OciImage) -> anyhow::Result<()> {
     if !fake_host(|host| host.enabled) {
         return crate::packs::install::facts::check(image);
@@ -107,9 +108,10 @@ pub fn check_image(image: &OciImage) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `setup::install` for tests: with the fakes on, the install loop over [`HostExec`] instead
-/// of an install VM, logged to the install log, and a shutdown that
-/// confirms the disk sync unless [`FakeHost::unsynced`].
+/// `setup::install` for tests. With the fakes on, it runs the install loop
+/// with [`HostExec`] instead of an install VM and writes the install log.
+/// The fake shutdown confirms the disk sync unless [`FakeHost::unsynced`]
+/// is set.
 pub async fn install_boot(
     project: Project,
     image: &OciImage,
@@ -138,8 +140,8 @@ pub async fn install_boot(
     Ok(Report { outcome, synced })
 }
 
-/// A project directory (and a home for its context) that `airlock start`
-/// runs in, with the faked edges.
+/// A project directory and a home directory for `airlock start` with the
+/// fakes on.
 pub struct StartProject {
     dir: TempDir,
     home: TempDir,
@@ -147,8 +149,8 @@ pub struct StartProject {
 }
 
 impl StartProject {
-    /// A project without a sandbox, configured against `packs`. Resets
-    /// the [`FakeHost`] of this thread.
+    /// A project with no sandbox that uses the packs `packs`. Resets the
+    /// [`FakeHost`] of this thread and turns the fakes on.
     pub fn new(packs: PackManager) -> Self {
         fake_host(|host| {
             *host = FakeHost {
@@ -163,16 +165,18 @@ impl StartProject {
         }
     }
 
+    /// The sandbox directory of the project.
     pub fn sandbox_dir(&self) -> PathBuf {
         self.dir.path().join(".airlock/sandbox")
     }
 
-    /// The sandbox and install steps of `airlock start` with the project
-    /// file `toml`, without a terminal; `yes`: `--yes`. The sandbox lock
-    /// of the previous start can stay held for a moment after it is
-    /// dropped: a process that a parallel test spawns has a copy of its
-    /// descriptor until it execs. A start that finds the lock held tries
-    /// again.
+    /// Run the sandbox and install steps of `airlock start` with the
+    /// project file `toml` and no terminal. `yes` is the `--yes` flag.
+    ///
+    /// The sandbox lock of the previous start can stay held for a short
+    /// time after it drops. The cause is a process that a parallel test
+    /// starts: it has a copy of the lock descriptor until it execs. Thus a
+    /// start that finds the lock held tries again.
     pub fn start(&self, toml: &str, yes: bool) -> Result<(), Exit> {
         let resolved = resolve_with(&self.packs, toml).map_err(Exit::config)?;
         let options = SandboxOptions {
@@ -191,6 +195,7 @@ impl StartProject {
         panic!("the sandbox lock stays held");
     }
 
+    /// One try of [`Self::start`].
     fn start_once(&self, resolved: &ResolvedConfig, options: &SandboxOptions) -> Result<(), Exit> {
         let vault = Vault::for_storage_type(VaultStorageType::Disabled);
         block_on_local(async {
@@ -215,7 +220,7 @@ impl StartProject {
         })
     }
 
-    /// The install state of the sandbox (empty when there is none).
+    /// The install state of the sandbox. Empty when there is no state.
     pub fn state(&self) -> InstallState {
         let dir = PinnedDir::open(self.dir.path(), Path::new(".airlock/sandbox"), true).unwrap();
         match state::read(&dir) {

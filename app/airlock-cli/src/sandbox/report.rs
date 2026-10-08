@@ -1,12 +1,17 @@
-//! Terminal reports printed while a sandbox is prepared and booted.
+//! Sandbox preparation and boot reports.
+//!
+//! Shows the terminal output while a sandbox is prepared and booted.
 
 use std::path::Path;
 
 use crate::{cli, daemon, masking, project};
 
-/// Print the "Preparing sandbox" header with the image name, and whether
-/// the sandbox at `sandbox_dir` gets a new CA certificate (it has none
-/// yet; [`project::open`] generates it).
+/// Print the "Preparing sandbox" header.
+/// Args:
+///  - `sandbox_dir`: Sandbox directory. If it has no CA certificate yet,
+///    the output tells that a new one is generated ([`project::open`]
+///    generates it).
+///  - `image_name`: Image name to show
 pub fn print_preparing(sandbox_dir: &Path, image_name: &str) {
     cli::log!("Preparing sandbox...");
     cli::log!(
@@ -19,8 +24,8 @@ pub fn print_preparing(sandbox_dir: &Path, image_name: &str) {
     }
 }
 
-/// Verbose-only: list enabled mounts, network rules, socket forwards,
-/// and TCP port forwards grouped by kind.
+/// Print the enabled env, mounts, network rules, socket forwards, TCP port
+/// forwards, daemons and masks in verbose mode, grouped by kind.
 pub(super) fn print_mounts_and_rules(project: &project::Project) {
     if !project.env.is_empty() {
         cli::verbose!(

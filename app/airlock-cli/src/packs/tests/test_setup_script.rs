@@ -1,8 +1,12 @@
+//! Tests of the setup scripts and the shared `lib.sh` helpers. The
+//! scripts run in a host shell with stub commands.
+
 use std::process::Command;
 
 use crate::packs::install::compose::script;
 use crate::test_cfg::packs::{HostShell, ShellRun, sh};
 
+/// The name and setup script of each built-in pack that has one.
 fn builtin_setups() -> Vec<(String, &'static str)> {
     crate::packs::init()
         .unwrap()
@@ -12,16 +16,26 @@ fn builtin_setups() -> Vec<(String, &'static str)> {
         .collect()
 }
 
+/// Run `body` as a full install script in a new host shell.
 fn run(os_release: Option<&str>, body: &str, env: &[(&str, &str)]) -> ShellRun {
     HostShell::new(os_release).run(&script(body), env)
 }
 
+/// The exit code and the detected distro family of a host shell with
+/// `os_release` (`None`: no os-release file).
 fn distro(os_release: Option<&str>) -> (Option<i32>, String) {
+    // The wrapper sends stdout to stderr, so the echo is the last line of
+    // stderr.
     let run = run(os_release, "echo \"$DISTRO\"", &[]);
     let last = run.stderr.lines().last().unwrap_or_default().to_string();
     (run.code, last)
 }
 
+/// Test that each built-in setup script is valid POSIX sh, and that only
+/// the mise pack uses mise.
+///   1. Check that the shared helpers do not mention mise
+///   2. Check each built-in setup script with `sh -n`
+///   3. Check that no setup script other than the mise pack mentions mise
 #[test]
 fn builtin_setup_scripts_pass_sh_syntax_check_and_only_mise_pack_uses_mise() {
     assert!(!script("").contains("mise"));
@@ -43,6 +57,12 @@ fn builtin_setup_scripts_pass_sh_syntax_check_and_only_mise_pack_uses_mise() {
     }
 }
 
+/// Test that the distro detection reads `ID` and `ID_LIKE` from
+/// os-release, and fails with exit code 10 for other distros.
+///   1. Check that Alpine, Debian and Debian-like os-release files give
+///      the correct family
+///   2. Check that an unknown distro, a missing file and a file that
+///      does not parse give exit code 10
 #[test]
 fn distro_detection_follows_os_release_id_and_id_like() {
     assert_eq!(distro(Some("ID=alpine\n")), (Some(0), "alpine".into()));
@@ -60,6 +80,12 @@ fn distro_detection_follows_os_release_id_and_id_like() {
     assert_eq!(distro(Some("ID=\"unterminated\n")).0, Some(10));
 }
 
+/// Test that status lines go to stdout only when the script runs under
+/// the pack API. All other output goes to the log on stderr.
+///   1. Run a script with `AIRLOCK_PACK_API=1` that prints a line and a
+///      status
+///   2. Check that stdout has only the status line and stderr has both
+///   3. Run the script without the pack API and check that stdout is empty
 #[test]
 fn status_lines_reach_stdout_only_under_pack_api() {
     let api = run(
@@ -77,11 +103,21 @@ fn status_lines_reach_stdout_only_under_pack_api() {
     assert!(plain.stderr.contains("airlock-pack: quiet"));
 }
 
+/// Test that the helpers close fd 3 for the external commands they run.
+/// Thus a package manager or vendor installer cannot write status lines.
+///   1. Run each helper on Alpine or Debian with stubs that fail when fd 3
+///      is open
+///   2. Check that each run succeeds
+///   3. Check that the Alpine package install calls `apk add`
+///   4. Run a stub directly and check that it fails, which shows that the
+///      stubs detect an open fd 3
 #[test]
 fn lib_helpers_close_fd_3_for_external_commands() {
     let cases = [
         ("alpine", "pkg_install pkg-a pkg-b"),
         ("alpine", "pkg_is_installed pkg-a || :"),
+        // `_apt_ready=1` skips the apt setup, which writes to `/usr/sbin`
+        // on the host.
         ("debian", "_apt_ready=1\npkg_install pkg-a"),
         ("debian", "_apt_ready=1\npkg_available pkg-a || :"),
         ("debian", "pkg_is_installed pkg-a || :"),

@@ -1,26 +1,9 @@
-//! Host-side listener for reverse (host → guest) port forwards.
+//! Reverse (host-to-guest) port forwards.
 //!
-//! For each `(host_port, guest_port)` pair derived from
-//! `[network.ports.<name>].guest`, bind listeners on both
-//! `127.0.0.1:<host_port>` AND `[::1]:<host_port>` and bridge every
-//! accepted connection into the guest via the supervisor's
-//! `openLocalTcp` RPC. Raw TCP relay — no rules, no policy, no
-//! interception (the host is trusted).
-//!
-//! Binding is split from accept-loop wiring so that `bind()` failures
-//! (typically `EADDRINUSE`) surface before the VM boots — there's no
-//! point starting a sandbox whose reverse forwards won't work.
-//!
-//! Why two listeners: a single `TcpListener::bind(("127.0.0.1", port))`
-//! only covers IPv4 loopback, and on some OS/socket combinations
-//! (Python's `http.server` binding `::` with `IPV6_V6ONLY=1`, macOS with
-//! split v4/v6 slots) an existing IPv6 listener on the same port does
-//! NOT cause the IPv4 bind to fail. Explicitly binding `[::1]` as well
-//! guarantees conflict detection on either family.
-//!
-//! The sign-in callback forwards of the network services
-//! ([`crate::services::callback`]) bind with [`bind_exclusive`] and accept
-//! with [`serve_with`], but handle each connection themselves.
+//! Listens on host loopback ports and relays the accepted connections into the
+//! guest. The config section `[network.ports.<name>].guest` sets the forwarded
+//! ports. The sign-in callbacks of the network services also use these
+//! forwards, with their own connection handler.
 
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -33,25 +16,35 @@ use tracing::{debug, warn};
 use super::{io, tcp};
 use crate::rpc::guest_network::GuestNetwork;
 
-/// A pre-bound reverse-forward listener pair (IPv4 loopback, optional IPv6
-/// loopback) waiting to be attached to the supervisor. Carries the
-/// guest-side port so the accept loops know where to bridge to.
+/// Bound reverse forward listeners (IPv4 loopback, optional IPv6 loopback)
+/// that are not yet attached to the supervisor. It also contains the guest
+/// port, so the accept loops know the destination.
 pub struct BoundForward {
     v4: TcpListener,
     v6: Option<TcpListener>,
     guest_port: u16,
 }
 
-/// Bind every reverse-forward listener on BOTH `127.0.0.1:<host_port>`
-/// and `[::1]:<host_port>`. Fails fast on any `EADDRINUSE` from either
-/// family — called before the VM is booted so the user sees the failure
-/// without boot noise in the way.
+/// Bind the listeners of all reverse forwards on `127.0.0.1:<host_port>`
+/// and on `[::1]:<host_port>`.
 ///
-/// An IPv6 bind failure that isn't `EADDRINUSE` (e.g. IPv6 disabled on
-/// the host) is logged but tolerated — we proceed with just the IPv4
-/// listener.
+/// Call this before the VM boots. Then a bind failure (usually
+/// `EADDRINUSE`) shows before the boot output, and no sandbox starts with
+/// reverse forwards that do not work.
+/// Args:
+///  - `forwards`: `(host_port, guest_port)` pairs.
+///
+/// Returns:
+///   The bound forwards, or error on the first IPv4 bind error or IPv6
+///   `EADDRINUSE`. Other IPv6 bind errors (for example IPv6 disabled on the host)
+///   only cause a warning, and the forward uses only the IPv4 listener.
 pub async fn bind(forwards: Vec<(u16, u16)>) -> anyhow::Result<Vec<BoundForward>> {
     let mut out = Vec::with_capacity(forwards.len());
+    // Bind both families. A bind of `127.0.0.1` covers only IPv4 loopback.
+    // On some OS and socket combinations, an IPv6 listener on the same port
+    // does NOT make the IPv4 bind fail (for example Python's `http.server`
+    // on `::` with `IPV6_V6ONLY=1`, or macOS with split v4/v6 slots).
+    // The second bind on `[::1]` shows conflicts on both families.
     for (host_port, guest_port) in forwards {
         let v4 = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), host_port))
             .await
@@ -77,26 +70,30 @@ pub async fn bind(forwards: Vec<(u16, u16)>) -> anyhow::Result<Vec<BoundForward>
 }
 
 /// Bind one forward from host `127.0.0.1:<host_port>` and `[::1]:<host_port>`
-/// to guest `guest_port`, failing when any other socket holds the port on
-/// either family. For ports the guest asks for at run time (a sign-in
-/// callback), where sharing a port with a host program would hand that
-/// program's traffic to the guest.
+/// to guest `guest_port`. Use it for ports that the guest requests at run
+/// time (a sign-in callback). If such a port is shared with a host program,
+/// the guest gets the traffic of that program.
+/// Args:
+///  - `host_port`: Host loopback port to listen on
+///  - `guest_port`: Guest loopback port to forward to.
 ///
-/// macOS allows a specific-address bind next to a wildcard listener when
-/// `SO_REUSEADDR` is set, so it is left off there. Linux never shares a
-/// listening port that way, and there `SO_REUSEADDR` only lets a port with
-/// connections in `TIME_WAIT` (an earlier sign-in) be bound again.
-///
-/// A host without IPv6 loopback (`EADDRNOTAVAIL` / `EAFNOSUPPORT` on
-/// `::1`) gets the IPv4 listener only. Synchronous: nothing awaits between
-/// the check and the bind.
+/// Returns:
+///   The bound forward, or error if another socket holds the port on IPv4
+///   or IPv6. A host with no IPv6 loopback gets only the IPv4 listener.
 pub fn bind_exclusive(host_port: u16, guest_port: u16) -> std::io::Result<BoundForward> {
+    // This function is synchronous. Thus no other task can take the port
+    // between the IPv4 bind and the IPv6 bind.
     let listen = |addr: SocketAddr| -> std::io::Result<TcpListener> {
         let socket = if addr.is_ipv4() {
             TcpSocket::new_v4()?
         } else {
             TcpSocket::new_v6()?
         };
+        // With `SO_REUSEADDR`, macOS allows a specific-address bind next to
+        // a wildcard listener. Thus do not set it on macOS. Linux never
+        // shares a listening port that way. On Linux, `SO_REUSEADDR` only
+        // allows a new bind of a port with connections in `TIME_WAIT` (from
+        // an earlier sign-in).
         #[cfg(not(target_os = "macos"))]
         socket.set_reuseaddr(true)?;
         socket.bind(addr)?;
@@ -105,6 +102,7 @@ pub fn bind_exclusive(host_port: u16, guest_port: u16) -> std::io::Result<BoundF
     let v4 = listen(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), host_port))?;
     let v6 = match listen(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), host_port)) {
         Ok(l) => Some(l),
+        // No IPv6 loopback on the host.
         Err(e)
             if matches!(
                 e.raw_os_error(),
@@ -120,16 +118,20 @@ pub fn bind_exclusive(host_port: u16, guest_port: u16) -> std::io::Result<BoundF
 }
 
 impl BoundForward {
-    /// The guest port the listeners forward to.
+    /// Get the guest port that the listeners forward to.
     pub fn guest_port(&self) -> u16 {
         self.guest_port
     }
 }
 
-/// Attach the pre-bound listeners to the guest: one accept loop per
-/// listener, spawned into `tasks`, relaying each connection raw. Each loop
-/// owns its listener and its connections, so stopping the task unbinds the
-/// port and closes every relayed connection.
+/// Attach the bound listeners to the guest and relay the raw bytes of each
+/// connection.
+/// Args:
+///  - `forwards`: Bound forwards from [`bind`] or [`bind_exclusive`]
+///  - `guest`: Guest network RPC client
+///  - `tasks`: Task set that gets one accept loop for each listener. Each
+///    loop owns its listener and its connections. Thus when the task stops,
+///    the port is released and all relayed connections close.
 pub fn serve(forwards: Vec<BoundForward>, guest: &GuestNetwork, tasks: &mut JoinSet<()>) {
     for forward in forwards {
         let guest = guest.clone();
@@ -140,8 +142,12 @@ pub fn serve(forwards: Vec<BoundForward>, guest: &GuestNetwork, tasks: &mut Join
     }
 }
 
-/// Like [`serve`], with `handle` run for every accepted connection
+/// Same as [`serve`], but run `handle` for each accepted connection
 /// instead of the raw relay.
+/// Args:
+///  - `forward`: Bound forward from [`bind`] or [`bind_exclusive`]
+///  - `tasks`: Task set that gets one accept loop for each listener
+///  - `handle`: Connection handler.
 pub fn serve_with<F, Fut>(forward: BoundForward, tasks: &mut JoinSet<()>, handle: F)
 where
     F: Fn(TcpStream) -> Fut + Clone + 'static,
@@ -179,7 +185,10 @@ where
     }
 }
 
-/// Relay `stream` raw to `guest_port` on the guest's loopback.
+/// Relay the raw bytes of `stream` to `guest_port` on the guest loopback.
+/// The relay applies no rules, no policy and no interception, because the
+/// host is trusted. The connection goes through the `openLocalTcp` RPC of
+/// the supervisor.
 async fn relay_raw(stream: TcpStream, guest_port: u16, guest: GuestNetwork) -> anyhow::Result<()> {
     let rpc_io = guest.connect(guest_port).await?;
     let (read, write) = stream.into_split();

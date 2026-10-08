@@ -1,3 +1,5 @@
+//! Tests for the cross-process vault lock that makes vault writes safe.
+
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
@@ -5,9 +7,9 @@ use super::*;
 use crate::test_cfg::temp_dir;
 use crate::test_cfg::vault::{MemoryStorage, vault_with};
 
-/// A locked backend whose first write tells `in_store` it holds the vault
-/// lock and then stalls, so a writer that skips the lock would read the
-/// old blob meanwhile.
+/// A locked backend that stops for a time in its first write. It first
+/// tells `in_store` that it holds the vault lock. A writer that does not
+/// take the lock reads the old blob in this time.
 struct StallingStorage {
     inner: MemoryStorage,
     in_store: parking_lot::Mutex<Option<Sender<()>>>,
@@ -29,6 +31,7 @@ impl Storage for StallingStorage {
     }
 }
 
+/// A backend that fails to give its lock path, as with no home directory.
 struct NoLockPath(MemoryStorage);
 
 impl Storage for NoLockPath {
@@ -43,6 +46,12 @@ impl Storage for NoLockPath {
     }
 }
 
+/// Test that two concurrent writers both keep their secret, because each
+/// write holds the vault lock and reads the latest blob in it.
+///   1. Start a write in a thread that stops while it holds the lock
+///   2. Write a second secret through another handle
+///   3. Wait for the first write to finish
+///   4. Check that a new handle sees both secrets
 #[test]
 fn concurrent_writers_holding_vault_lock_both_survive() {
     let tmp = temp_dir();
@@ -58,6 +67,8 @@ fn concurrent_writers_holding_vault_lock_both_survive() {
     let b = vault_with(storage.clone(), &[]);
 
     let writer_a = std::thread::spawn(move || a.set_secret("A", "1"));
+    // Writer A holds the lock now. Writer B must wait for it and then read
+    // the blob that A wrote.
     stalled.recv().unwrap();
     b.set_secret("B", "2").unwrap();
     writer_a.join().unwrap().unwrap();
@@ -67,6 +78,11 @@ fn concurrent_writers_holding_vault_lock_both_survive() {
     assert_eq!(fresh.get_secret("B").unwrap().as_deref(), Some("2"));
 }
 
+/// Test that the vault lock does not follow a symlink, so that an attacker
+/// cannot make airlock create or open a file at another path.
+///   1. Make the lock path a symlink to a missing file
+///   2. Write a secret and check the lock error
+///   3. Check that the symlink target does not exist and nothing was written
 #[test]
 fn vault_lock_never_follows_symlink() {
     let tmp = temp_dir();
@@ -82,6 +98,11 @@ fn vault_lock_never_follows_symlink() {
     assert!(vault.get_secret("A").unwrap().is_none());
 }
 
+/// Test that a write fails when the backend cannot give its lock path,
+/// instead of a write without the lock.
+///   1. Use a backend whose lock path fails
+///   2. Write a secret and check the error
+///   3. Check that the storage got no write
 #[test]
 fn backend_without_lock_path_does_not_write_unlocked() {
     let storage = MemoryStorage::default();

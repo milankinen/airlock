@@ -1,25 +1,27 @@
-//! Thread-safe handle the TUI uses to read and mutate live network state.
+//! Network control interface for the TUI.
 //!
-//! The host side (`airlock::network::NetworkControl`) implements this trait;
-//! the TUI holds an `Arc<dyn NetworkControl>` and calls through it when the
-//! user flips policy or toggles rules. Keeping the contract here — rather
-//! than importing the airlock crate — lets the TUI crate stay a leaf.
+//! Lets the TUI read and change the live network policy of the sandbox. The
+//! host implements this interface.
 
 use ratatui::style::Color;
 
-/// Top-level network policy, mirrors `airlock::config::Policy` for TUI use.
+/// Top-level network policy. Copy of `airlock::config::config_values::Policy` for the TUI.
 ///
-/// The display order is the order rendered in the policy dropdown.
+/// The variant order is the order in the policy dropdown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Policy {
+    /// Allow all connections. Rules have no effect.
     AllowAlways,
+    /// Allow connections that no rule denies.
     AllowByDefault,
+    /// Deny connections that no rule allows.
     DenyByDefault,
+    /// Deny all connections. Rules have no effect.
     DenyAlways,
 }
 
 impl Policy {
-    /// Entries in drop-down order.
+    /// All policies in dropdown order.
     pub const ALL: [Policy; 4] = [
         Policy::AllowAlways,
         Policy::AllowByDefault,
@@ -27,7 +29,7 @@ impl Policy {
         Policy::DenyAlways,
     ];
 
-    /// Kebab-case label — matches the on-disk config form.
+    /// Kebab-case label. It is the same as the value in the config file.
     pub fn label(self) -> &'static str {
         match self {
             Policy::AllowAlways => "allow-always",
@@ -47,9 +49,10 @@ impl Policy {
         }
     }
 
-    /// Accent color used in the policy title. `always` variants flag the
-    /// extremes (green / red); the `by-default` variants share cyan as the
-    /// neutral middle.
+    /// Accent color for the policy title.
+    ///
+    /// The `always` variants are the extremes and use green or red. The
+    /// `by-default` variants are the neutral middle and both use cyan.
     pub fn color(self) -> Color {
         match self {
             Policy::AllowAlways => Color::Green,
@@ -59,9 +62,15 @@ impl Policy {
     }
 }
 
-/// Host-side control surface used by the TUI. All methods are cheap and
-/// lock-protected on the host side.
+/// Host-side network control that the TUI uses. All methods are cheap.
+/// The host side protects them with a lock.
+///
+/// The host side (`airlock::network::NetworkControl`) implements the trait.
+/// The trait is in this crate, so this crate does not depend on the
+/// airlock crate.
 pub trait NetworkControl: Send + Sync {
+    /// Current network policy.
     fn policy(&self) -> Policy;
+    /// Change the network policy to `policy`.
     fn set_policy(&self, policy: Policy);
 }

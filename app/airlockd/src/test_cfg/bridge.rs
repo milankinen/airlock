@@ -1,3 +1,5 @@
+//! Helpers for tests of the FIFO bridges (clipboard and browser).
+
 use std::cell::RefCell;
 use std::future::Future;
 use std::os::unix::fs::OpenOptionsExt;
@@ -11,9 +13,9 @@ use tokio::task::LocalSet;
 
 use crate::bridge::make_fifo_at;
 
-/// Run `fut` like airlockd does: on a current-thread runtime inside a
-/// `LocalSet`. Shuts the runtime down without waiting for the blocking
-/// FIFO opens of bridge loops that are still running.
+/// Run `fut` as airlockd does: on a current-thread runtime in a `LocalSet`.
+/// Stop the runtime without a wait for the blocking FIFO opens of bridge
+/// loops that still run.
 pub(crate) fn run_bridge<F: Future>(fut: F) -> F::Output {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -24,14 +26,15 @@ pub(crate) fn run_bridge<F: Future>(fut: F) -> F::Output {
     out
 }
 
-/// A temp directory standing in for the container rootfs of a bridge.
-/// On drop, opens each FIFO once so no blocked bridge thread is left.
+/// A temp directory in place of the container rootfs of a bridge. On drop,
+/// it opens each FIFO one time, so that no bridge thread stays blocked.
 pub(crate) struct BridgeDir {
     dir: TempDir,
     fifos: RefCell<Vec<PathBuf>>,
 }
 
 impl BridgeDir {
+    /// Create an empty bridge directory.
     pub fn new() -> Self {
         Self {
             dir: temp_dir(),
@@ -39,11 +42,13 @@ impl BridgeDir {
         }
     }
 
+    /// Return the path of file `name` in the directory.
     pub fn path(&self, name: &str) -> PathBuf {
         self.dir.path().join(name)
     }
 
-    /// Create FIFO `name` with the production helper, owned by us.
+    /// Create FIFO `name` with the production helper. The current user owns
+    /// it.
     pub fn fifo(&self, name: &str) -> PathBuf {
         let path = self.path(name);
         // SAFETY: getuid/getgid cannot fail.
@@ -53,8 +58,8 @@ impl BridgeDir {
         path
     }
 
-    /// Write shim `name` with `body`, its guest paths swapped for local
-    /// ones.
+    /// Write shim `name` with `body`. Replace each guest path in `paths`
+    /// with its local path.
     pub fn shim(&self, name: &str, body: &str, paths: &[(&str, &Path)]) -> PathBuf {
         let body = paths.iter().fold(body.to_string(), |b, (guest, local)| {
             b.replace(guest, local.to_str().unwrap())
@@ -80,12 +85,16 @@ impl Drop for BridgeDir {
 /// Exit code and output of one shim run.
 #[derive(Debug)]
 pub(crate) struct ShimRun {
+    /// Exit code. -1 if a signal stopped the shim.
     pub code: i32,
+    /// Standard output as text.
     pub stdout: String,
+    /// Standard error as text.
     pub stderr: String,
 }
 
-/// Run `shim` with `sh`, feeding it `stdin`, as a container process would.
+/// Run `shim` with `sh` and write `stdin` to it, as a container process
+/// does. Panics if the shim runs for more than five seconds.
 pub(crate) async fn run_shim(shim: &Path, args: &[&str], stdin: &[u8]) -> ShimRun {
     let mut child = tokio::process::Command::new("sh")
         .arg(shim)
@@ -112,7 +121,8 @@ pub(crate) async fn run_shim(shim: &Path, args: &[&str], stdin: &[u8]) -> ShimRu
     }
 }
 
-/// Write `data` to `fifo` in one open-to-close cycle, like a raw writer.
+/// Write `data` to `fifo` in one open-to-close cycle, as a raw writer does.
+/// Panics if no reader opens the FIFO in five seconds.
 pub(crate) async fn write_fifo(fifo: &Path, data: Vec<u8>) {
     let fifo = fifo.to_path_buf();
     tokio::time::timeout(
@@ -125,7 +135,7 @@ pub(crate) async fn write_fifo(fifo: &Path, data: Vec<u8>) {
     .unwrap();
 }
 
-/// Wait until `cond` holds. Panics with `what` after five seconds.
+/// Wait until `cond` is true. Panics with `what` after five seconds.
 pub(crate) async fn eventually(what: &str, cond: impl Fn() -> bool) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while !cond() {

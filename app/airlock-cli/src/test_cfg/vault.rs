@@ -1,3 +1,5 @@
+//! Vault backends, vaults and passphrase sources for tests.
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -6,8 +8,8 @@ use parking_lot::Mutex;
 
 use crate::vault::{PassphraseSource, Storage, Vault, VaultStorageType};
 
-/// A vault backend in memory. Clones share one blob, like two processes
-/// on one backend.
+/// A vault backend in memory. Clones share one blob, as two processes on
+/// one backend do. The default backend has no vault lock.
 #[derive(Clone, Default)]
 pub struct MemoryStorage {
     blob: Arc<Mutex<Option<String>>>,
@@ -42,7 +44,7 @@ impl Storage for MemoryStorage {
     }
 }
 
-/// A vault over `storage` whose host environment is `env`.
+/// A vault over `storage` with the host env `env`.
 pub fn vault_with(storage: impl Storage, env: &[(&str, &str)]) -> Vault {
     Vault::new_with(
         Box::new(storage),
@@ -53,7 +55,7 @@ pub fn vault_with(storage: impl Storage, env: &[(&str, &str)]) -> Vault {
     )
 }
 
-/// A passphrase prompt that always answers with the same passphrase.
+/// A passphrase source that always gives the same passphrase.
 pub struct FixedPassphrase(pub &'static str);
 
 impl PassphraseSource for FixedPassphrase {

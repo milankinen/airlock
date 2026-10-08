@@ -1,10 +1,10 @@
 -- Python: point the TLS stacks at the system bundle, which has the
 -- airlock CA. python-build-standalone builds (uv, mise) look for
--- /etc/ssl/cert.pem, which is missing on Debian, uv trusts only its own
--- CA list without SSL_CERT_FILE, and requests and pip ship their own CA
+-- /etc/ssl/cert.pem, which is missing on Debian. uv trusts only its own
+-- CA list without SSL_CERT_FILE. requests and pip have their own CA
 -- lists. With `pypi-installs`, PyPI.
 
--- The setup script gives the version to `uv python install`: an option
+-- The setup script gives the version to `uv python install`. An option
 -- there (a leading `-`) or a character outside a uv Python request is
 -- an error.
 local version = pack.args["python-version"]

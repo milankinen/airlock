@@ -1,63 +1,13 @@
-//! The token store of the network services: the database `services` of
-//! the airlock database `~/.airlock/db/` ([`crate::db`]), shared by every
-//! airlock process of the user. It holds the sign-ins (*grants*): the
-//! real tokens a provider issued, the surrogates the sandbox got for
-//! them, and the OAuth client and scopes of each sign-in.
+//! The token store of the network services.
 //!
-//! ## Layout
+//! Keeps the sign-ins (*grants*) encrypted in the airlock database. All
+//! airlock processes of the user share the store. A grant holds the real
+//! tokens that a provider issued, the surrogates that the sandbox got for
+//! them, and the OAuth client and scopes of the sign-in.
 //!
-//! Three keys per service:
-//!
-//! - `<service>.secrets`: all grants of the service in one JSON document
-//!   ([`Secrets`]), sealed with ChaCha20-Poly1305 under a key from the
-//!   vault. The AAD is the key name and the format version, so a sealed
-//!   value cannot move to another key. A copied database is useless
-//!   without the vault.
-//! - `<service>.meta`: plain JSON for `airlock show` ([`list_grants`]):
-//!   per grant id the account's email address, organization, scopes,
-//!   client id, times and whether it has a refresh token. No token, no
-//!   surrogate.
-//! - `<service>.generation`: a `u64` (big-endian) that every write
-//!   transaction increments.
-//!
-//! A write is one read-modify-write transaction that writes all three
-//! keys ([`TokenStore::update`]). A reader reads the generation and
-//! decrypts the secrets (and rebuilds its in-memory index surrogate →
-//! grant and token, [`Snapshot`]) only when the generation changed since
-//! its last read: a sign-out or refresh in another process is seen on the
-//! next lookup, without a time-to-live. The files never map a surrogate
-//! to a grant in plain text, and there is no HMAC lookup table.
-//!
-//! The databases `services.grants` and `services.lookups` of an earlier
-//! layout are emptied when a process first uses the store: `heed` cannot
-//! delete a named database, so their names stay, without records.
-//!
-//! ## Concurrency
-//!
-//! Every transaction runs whole on a blocking thread through
-//! [`crate::db::Db`]: LMDB serializes the writers across processes, and a
-//! transaction is short and never spans an `await` or network I/O.
-//!
-//! The agent refreshes its own tokens (see [`super::oauth`]); the proxy
-//! only relays that refresh and stores its answer on the grant's
-//! *current* record (re-read inside the write transaction, never the
-//! value the caller last saw). Two refreshes of the same grant racing (two
-//! sandboxes, or an agent that retries) each run their own upstream call
-//! and then their own write; LMDB serializes the writes, so neither
-//! corrupts the other's, but the one that commits second overwrites the
-//! first (as two agents racing a refresh on a host would).
-//!
-//! ## Limits
-//!
-//! - A grant keeps at most [`MAX_API_KEYS`] created API keys; a new one
-//!   drops the oldest (its surrogate stops working).
-//! - At most [`API_KEY_CREATIONS`] API keys are created per grant in
-//!   [`API_KEY_WINDOW_MS`] ([`TokenStore::take_api_key_slot`]); the times
-//!   are in the store, so the limit holds across processes.
-//! - An access surrogate a refresh re-mints keeps working until the expiry
-//!   of its own real token, capped at [`MAX_PREVIOUS_ACCESS`]
-//!   ([`Grant::previous_access`]): an agent (or another sandbox sharing the
-//!   grant) that cached the old surrogate is not cut off right away.
+//! The store also lists the grants for `airlock show`, and limits how many
+//! API keys and replaced surrogates a grant can have. A copied database is
+//! useless without the vault.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -79,65 +29,79 @@ use super::ServiceId;
 use super::tokens::{Token, TokenKind};
 use crate::db::Db;
 
-/// The database of the store.
+/// Name of the database of the store.
 pub const DATABASE: &str = "services";
 
-/// The databases of the earlier layout, emptied on first use.
+/// Databases of an earlier layout. The store empties them on first use.
+/// `heed` cannot delete a named database, so their names stay, without
+/// records.
 pub const OLD_DATABASES: &[&str] = &["services.grants", "services.lookups"];
 
-/// The version of the sealed format, in the AAD and the first byte.
+/// Version of the sealed format, in the AAD and in the first byte.
 const FORMAT_VERSION: u8 = 1;
 
-/// The most API keys a grant keeps.
+/// Maximum number of API keys that a grant keeps. A new key removes the
+/// oldest key, and the surrogate of that key stops working.
 pub const MAX_API_KEYS: usize = 8;
 
-/// The most API keys created with one grant in [`API_KEY_WINDOW_MS`].
+/// Maximum number of API keys that one grant can create in
+/// [`API_KEY_WINDOW_MS`]. The creation times are in the store, so the
+/// limit applies across processes.
 pub const API_KEY_CREATIONS: usize = 3;
 
-/// The window of [`API_KEY_CREATIONS`].
+/// Time window of [`API_KEY_CREATIONS`], in ms.
 pub const API_KEY_WINDOW_MS: i64 = 60 * 60 * 1000;
 
-/// The most earlier access surrogates [`Grant::previous_access`] keeps.
+/// Maximum number of replaced access surrogates in
+/// [`Grant::previous_access`].
 pub const MAX_PREVIOUS_ACCESS: usize = 4;
 
-/// One sign-in, decrypted. No `Debug` with fields: it holds real tokens.
+/// One sign-in, decrypted. Its `Debug` shows no fields, because it holds
+/// real tokens.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Grant {
     /// The key in [`Secrets::grants`].
     #[serde(skip)]
     pub id: String,
-    /// The provider's id of the account: a new sign-in of the same
-    /// account, client and scopes replaces this grant.
+    /// The provider's account id. A new sign-in of the same account,
+    /// client and scopes replaces this grant.
     pub account_id: String,
     /// The account's email address, for `airlock show`.
     #[serde(default)]
     pub account: Option<String>,
+    /// The organization name, if the provider named one.
     #[serde(default)]
     pub organization: Option<String>,
-    /// The OAuth client of the code exchange: refresh and revoke use it,
-    /// never the one of the guest's request.
+    /// The OAuth client of the code exchange. Refresh and revoke use it,
+    /// never the client of the guest's request.
     pub client_id: String,
     /// The scopes the provider granted.
     #[serde(default)]
     pub scopes: Vec<String>,
-    /// The real tokens and their surrogates; the first of each kind is the
-    /// grant's main token of that kind.
+    /// The real tokens and their surrogates. The first token of each kind
+    /// is the grant's main token of that kind.
     pub tokens: Vec<Token>,
-    /// Access surrogates a refresh replaced, valid until their expiry: they
-    /// stand for the current access token.
+    /// Access surrogates that a refresh replaced. Until its expiry, each
+    /// one stands for the current access token. Thus an agent (or another
+    /// sandbox that shares the grant) with the old surrogate in its cache
+    /// can continue to work. The expiry is that of the old real token, or
+    /// one hour after the refresh if that expiry is not known.
     #[serde(default)]
     pub previous_access: Vec<PreviousAccess>,
-    /// API keys created with the grant, each with its surrogate.
+    /// API keys that the grant created, each with its surrogate.
     #[serde(default)]
     pub api_keys: Vec<ApiKey>,
-    /// Unix ms of the API keys created in the last [`API_KEY_WINDOW_MS`].
+    /// Creation times (Unix ms) of the API keys created in the last
+    /// [`API_KEY_WINDOW_MS`].
     #[serde(default)]
     pub api_key_creations: Vec<i64>,
+    /// Time of the sign-in (Unix ms).
     pub created_at: i64,
+    /// Time of the last change (Unix ms).
     pub updated_at: i64,
 }
 
-/// Names the grant, never its secrets.
+/// Shows the grant id, never its secrets.
 impl std::fmt::Debug for Grant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Grant")
@@ -147,19 +111,21 @@ impl std::fmt::Debug for Grant {
 }
 
 impl Grant {
-    /// The main token of `kind`.
+    /// Get the main token of `kind`.
     pub fn token(&self, kind: TokenKind) -> Option<&Token> {
         self.tokens.iter().find(|t| t.kind == kind)
     }
 
-    /// The real main token of `kind`.
+    /// Get the real value of the main token of `kind`.
     pub fn real(&self, kind: TokenKind) -> Option<&str> {
         self.token(kind).map(|t| t.real.as_str())
     }
 
-    /// Keep `surrogate` (replaced by a new one) valid until `expires_at`:
-    /// drop entries past their expiry, then the oldest when
-    /// [`MAX_PREVIOUS_ACCESS`] is full.
+    /// Keep the replaced access surrogate `surrogate` valid until
+    /// `expires_at`.
+    ///
+    /// First removes the expired entries. Then removes the oldest entry if
+    /// there are [`MAX_PREVIOUS_ACCESS`] entries.
     pub fn keep_previous_access(&mut self, surrogate: String, expires_at: i64) {
         let now = now_ms();
         self.previous_access.retain(|p| p.expires_at > now);
@@ -172,7 +138,8 @@ impl Grant {
         });
     }
 
-    /// What a new sign-in replaces: same account, client and scopes.
+    /// Whether a new sign-in `other` replaces this grant: same account,
+    /// client and scopes.
     fn same_sign_in(&self, other: &Grant) -> bool {
         let sorted = |g: &Grant| {
             let mut s = g.scopes.clone();
@@ -184,6 +151,7 @@ impl Grant {
             && sorted(self) == sorted(other)
     }
 
+    /// A grant with `tokens`, account `acct` and client `client`.
     #[cfg(test)]
     pub fn for_tests(tokens: Vec<Token>) -> Self {
         Self {
@@ -203,38 +171,65 @@ impl Grant {
     }
 }
 
-/// One access surrogate a refresh replaced. See
+/// One access surrogate that a refresh replaced. See
 /// [`Grant::previous_access`].
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PreviousAccess {
+    /// The replaced surrogate.
     pub surrogate: String,
-    /// Unix ms.
+    /// When the surrogate stops working (Unix ms).
     pub expires_at: i64,
 }
 
+/// An API key that a grant created.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ApiKey {
+    /// The real key.
     pub real: String,
+    /// The surrogate that the sandbox gets.
     pub surrogate: String,
 }
 
-/// A new grant from a code exchange; the store gives it its id and times.
+/// A new grant from a code exchange. The store gives it its id and times.
+/// See [`Grant`] for the fields.
 pub struct NewGrant {
+    /// The provider's account id.
     pub account_id: String,
+    /// The account's email address.
     pub account: Option<String>,
+    /// The organization name.
     pub organization: Option<String>,
+    /// The OAuth client of the code exchange.
     pub client_id: String,
+    /// The scopes that the provider granted.
     pub scopes: Vec<String>,
+    /// The real tokens and their surrogates.
     pub tokens: Vec<Token>,
 }
 
-/// The sealed document of `<service>.secrets`.
+/// The sealed document of the `<service>.secrets` key: all grants of the
+/// service.
+///
+/// Each service has three keys in the database:
+///  * `<service>.secrets`: this document, sealed with ChaCha20-Poly1305
+///    under a key from the vault. The AAD is the key name and the format
+///    version, so a sealed value cannot move to another key.
+///  * `<service>.meta`: plain JSON for `airlock show` ([`list_grants`]).
+///    No token, no surrogate.
+///  * `<service>.generation`: a `u64` (big-endian) that every write
+///    transaction increments.
+///
+/// The files never map a surrogate to a grant in plain text, and there is
+/// no HMAC lookup table.
 #[derive(Default, Serialize, Deserialize)]
 pub struct Secrets {
+    /// The grants, by grant id.
     pub grants: BTreeMap<String, Grant>,
 }
 
-/// What `<service>.meta` holds of a grant: no secrets.
+/// The data of a grant in `<service>.meta`: no secrets. Per grant id: the
+/// account's email address, organization, scopes, client id, times and
+/// whether the grant has a refresh token.
 #[derive(Serialize, Deserialize)]
 struct GrantMeta {
     account: Option<String>,
@@ -260,39 +255,44 @@ impl GrantMeta {
     }
 }
 
-/// What `airlock show` lists of a grant: no secrets.
+/// The data of a grant that `airlock show` lists: no secrets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantSummary {
+    /// The service name.
     pub service: String,
+    /// The account's email address.
     pub account: Option<String>,
+    /// The scopes that the provider granted.
     pub scopes: Vec<String>,
     /// Unix ms of the sign-in.
     pub created_at: i64,
 }
 
-/// What a surrogate stands for.
+/// The token that a surrogate stands for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Slot {
     /// `tokens[i]`.
     Token(usize),
-    /// `previous_access[i]`: the current access token, until its expiry.
+    /// `previous_access[i]`: stands for the current access token, until
+    /// its expiry.
     PreviousAccess(usize),
     /// `api_keys[i]`.
     ApiKey(usize),
 }
 
-/// A surrogate the store knows.
+/// A surrogate that the store knows, and its real value.
 #[derive(Clone)]
 pub struct Resolved {
+    /// The id of the grant of the surrogate.
     pub grant_id: String,
-    /// The kind of token it stands for.
+    /// The kind of token that the surrogate stands for.
     pub kind: TokenKind,
-    /// The real value to send in its place.
+    /// The real value to send in place of the surrogate.
     pub real: String,
 }
 
-/// The grants of one service as of one generation, with the index of
-/// their surrogates.
+/// The grants of one service at one generation, with an in-memory index
+/// from surrogate to grant and token.
 pub struct Snapshot {
     generation: u64,
     grants: HashMap<String, Grant>,
@@ -325,9 +325,10 @@ impl Snapshot {
         }
     }
 
-    /// The token `surrogate` stands for. A previous access surrogate
-    /// stands for the current access token until its own expiry; after
-    /// that it is unknown.
+    /// Find the token that `surrogate` stands for.
+    ///
+    /// A replaced access surrogate stands for the current access token
+    /// until its own expiry. After that, it is unknown.
     pub fn resolve(&self, surrogate: &str) -> Option<Resolved> {
         let (id, slot) = self.index.get(surrogate)?;
         let grant = self.grants.get(id)?;
@@ -354,7 +355,7 @@ impl Snapshot {
         })
     }
 
-    /// Every real token and API key of the service.
+    /// Get every real token and API key of the service.
     pub fn reals(&self) -> impl Iterator<Item = &str> {
         self.grants.values().flat_map(|g| {
             g.tokens
@@ -364,7 +365,8 @@ impl Snapshot {
         })
     }
 
-    /// The grant of the surrogate `surrogate` of one of `kinds`.
+    /// Find the grant of `surrogate`, if the surrogate is of one of
+    /// `kinds`.
     pub fn grant_of(&self, surrogate: &str, kinds: &[TokenKind]) -> Option<&Grant> {
         let resolved = self.resolve(surrogate)?;
         kinds
@@ -374,7 +376,7 @@ impl Snapshot {
     }
 }
 
-/// The store key from the vault, as the encryption key.
+/// The encryption key, derived from the store key of the vault.
 #[derive(Clone)]
 struct Keys {
     encryption: [u8; 32],
@@ -387,7 +389,9 @@ impl Keys {
         }
     }
 
-    /// `[version] nonce ciphertext` of `plain` under the key name `key`.
+    /// Seal `plain` for the database key `key`.
+    /// Returns:
+    ///   `[version] nonce ciphertext`.
     fn seal(&self, key: &str, plain: &[u8]) -> anyhow::Result<Vec<u8>> {
         let nonce = random_bytes::<12>()?;
         let ciphertext = ChaCha20Poly1305::new(<&Key>::from(&self.encryption))
@@ -429,7 +433,7 @@ impl Keys {
     }
 }
 
-/// The AAD of the sealed value of the key `key`.
+/// Make the AAD of the sealed value of the database key `key`.
 fn aad(key: &str) -> Vec<u8> {
     format!("airlock-services\0{key}\0v{FORMAT_VERSION}").into_bytes()
 }
@@ -443,7 +447,7 @@ fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     mac.finalize().into_bytes().into()
 }
 
-/// `N` bytes from the operating system's CSPRNG.
+/// Get `N` bytes from the CSPRNG of the operating system.
 pub fn random_bytes<const N: usize>() -> anyhow::Result<[u8; N]> {
     let mut bytes = [0u8; N];
     SysRng
@@ -452,14 +456,14 @@ pub fn random_bytes<const N: usize>() -> anyhow::Result<[u8; N]> {
     Ok(bytes)
 }
 
-/// Unix time in ms.
+/// Get the current Unix time in ms.
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64)
 }
 
-/// The name of the key `part` of `service`.
+/// Make the database key name of `part` of `service`.
 fn key_name(service: ServiceId, part: &str) -> String {
     format!("{}.{part}", service.name())
 }
@@ -488,7 +492,7 @@ fn read_secrets(
     serde_json::from_slice(&plain).with_context(|| format!("parse {key}"))
 }
 
-/// Write all three keys of `service`; returns the new generation.
+/// Write all three keys of `service`. Returns the new generation.
 fn write_all(
     table: Table,
     txn: &mut RwTxn,
@@ -513,17 +517,27 @@ fn write_all(
 
 /// The token store of one process (one per sandbox session) in the
 /// airlock database. Opens its database on first use.
+///
+/// A write is one read-modify-write transaction that writes all three
+/// keys of a service ([`Self::update`]). A reader reads the generation.
+/// It decrypts the secrets and makes its [`Snapshot`] again only if the
+/// generation changed since its last read. Thus a sign-out or refresh in
+/// another process is visible at the next lookup, without a time to live.
+///
+/// Every transaction runs fully on a blocking thread through
+/// [`crate::db::Db`]. LMDB serializes the writers across processes. A
+/// transaction is short and never includes an `await` or network I/O.
 pub struct TokenStore {
     db: Db,
     keys: Keys,
     table: OnceCell<Table>,
-    /// The last snapshot this process read of each service.
+    /// The last snapshot of each service that this process read.
     cache: parking_lot::Mutex<HashMap<ServiceId, Arc<Snapshot>>>,
 }
 
 impl TokenStore {
-    /// A store in the database `db` with the vault's store key. Touches
-    /// nothing yet.
+    /// Make a store in the database `db` with the store key `master_key`
+    /// of the vault. Does not access the database yet.
     pub fn new(db: Db, master_key: &[u8; 32]) -> Self {
         Self {
             db,
@@ -533,7 +547,8 @@ impl TokenStore {
         }
     }
 
-    /// The database (created on first use; the old databases emptied).
+    /// Get the database. On first use, creates it and empties the old
+    /// databases.
     async fn table(&self) -> anyhow::Result<Table> {
         self.table
             .get_or_try_init(|| async {
@@ -548,8 +563,8 @@ impl TokenStore {
             .copied()
     }
 
-    /// The grants of `service` as they are now: the cached snapshot when
-    /// the generation did not change, else decrypted again.
+    /// Get the current grants of `service`. Returns the cached snapshot if
+    /// the generation did not change, else decrypts the grants again.
     pub async fn snapshot(&self, service: ServiceId) -> anyhow::Result<Arc<Snapshot>> {
         let table = self.table().await?;
         let cached = self.cache.lock().get(&service).cloned();
@@ -588,9 +603,23 @@ impl TokenStore {
         snapshot
     }
 
-    /// Change the grants of `service` in one write transaction: `change`
-    /// gets them as they stand now (never a cached copy), and all three
-    /// keys are written with the next generation.
+    /// Change the grants of `service` in one write transaction.
+    ///
+    /// `change` gets the current grants, read again in the transaction
+    /// (never a cached copy). Then all three keys are written with the next
+    /// generation.
+    ///
+    /// Two refreshes of the same grant that race (two sandboxes, or an
+    /// agent that tries again) each do their own upstream call and their
+    /// own write. LMDB serializes the writes, so neither write corrupts the
+    /// other. But the second commit overwrites the first, as with two
+    /// agents that race a refresh on a host.
+    /// Args:
+    ///  - `service`: The service of the grants
+    ///  - `change`: Changes the grants and returns a value.
+    ///
+    /// Returns:
+    ///   The value from `change`.
     pub async fn update<T, F>(&self, service: ServiceId, change: F) -> anyhow::Result<T>
     where
         T: Send + 'static,
@@ -615,8 +644,8 @@ impl TokenStore {
         Ok(value)
     }
 
-    /// The token `surrogate` of `service` stands for, if the store knows
-    /// it.
+    /// Find the token that `surrogate` of `service` stands for, if the
+    /// store knows it.
     #[cfg(test)]
     pub async fn resolve(
         &self,
@@ -626,8 +655,8 @@ impl TokenStore {
         Ok(self.snapshot(service).await?.resolve(surrogate))
     }
 
-    /// The grant of the surrogate `surrogate` of one of `kinds`, as it is
-    /// now.
+    /// Find the current grant of `surrogate`, if the surrogate is of one
+    /// of `kinds`.
     pub async fn grant_of(
         &self,
         service: ServiceId,
@@ -641,10 +670,12 @@ impl TokenStore {
             .cloned())
     }
 
-    /// Store a new grant. Older grants of the same account, client and
-    /// scopes are deleted in the same transaction: the new sign-in
-    /// replaces them. Returns the new grant and the replaced ones (to
-    /// revoke upstream).
+    /// Store a new grant.
+    ///
+    /// Deletes the older grants of the same account, client and scopes in
+    /// the same transaction, because the new sign-in replaces them.
+    /// Returns:
+    ///   The new grant, and the replaced grants (to revoke upstream).
     pub async fn insert_grant(
         &self,
         service: ServiceId,
@@ -690,8 +721,11 @@ impl TokenStore {
         Ok((grant, replaced))
     }
 
-    /// Change the grant `id` of `service` as it stands now. `Ok(None)`:
-    /// the grant is gone (a sign-out meanwhile); nothing is changed.
+    /// Change the current grant `id` of `service` with `change`.
+    /// Returns:
+    ///   The changed grant and the value from `change`. `Ok(None)` if the
+    ///   grant does not exist (for example, after a sign-out). Then
+    ///   nothing changes.
     pub async fn update_grant<T, F>(
         &self,
         service: ServiceId,
@@ -715,8 +749,8 @@ impl TokenStore {
         .await
     }
 
-    /// Record API keys created with the grant (and their surrogates). The
-    /// oldest keys go beyond [`MAX_API_KEYS`].
+    /// Record API keys (and their surrogates) that the grant created.
+    /// Removes the oldest keys above [`MAX_API_KEYS`].
     pub async fn add_api_keys(
         &self,
         service: ServiceId,
@@ -737,10 +771,11 @@ impl TokenStore {
         Ok(())
     }
 
-    /// Count one API key creation with grant `grant_id`: `false` (and
-    /// nothing counted) when the grant already created
-    /// [`API_KEY_CREATIONS`] keys in the last [`API_KEY_WINDOW_MS`], or is
-    /// gone.
+    /// Count one API key creation for the grant `grant_id`.
+    /// Returns:
+    ///   `false` (and counts nothing) if the grant already created
+    ///   [`API_KEY_CREATIONS`] keys in the last [`API_KEY_WINDOW_MS`], or
+    ///   if the grant does not exist.
     pub async fn take_api_key_slot(
         &self,
         service: ServiceId,
@@ -762,8 +797,8 @@ impl TokenStore {
         Ok(taken.is_some_and(|(_, taken)| taken))
     }
 
-    /// Delete the grant `grant_id` (a sign-out). Deleting a grant that is
-    /// gone is no error.
+    /// Delete the grant `grant_id` (a sign-out). If the grant does not
+    /// exist, this is not an error.
     pub async fn delete_grant(&self, service: ServiceId, grant_id: &str) -> anyhow::Result<()> {
         let id = grant_id.to_string();
         self.update(service, move |secrets| {
@@ -774,8 +809,8 @@ impl TokenStore {
     }
 }
 
-/// The grants stored in `db`, without the key: for `airlock show`. Reads
-/// only `<service>.meta`.
+/// List the grants stored in `db`, for `airlock show`. Reads only the
+/// `<service>.meta` keys, so it does not need the store key.
 pub async fn list_grants(db: &Db) -> anyhow::Result<Vec<GrantSummary>> {
     let table: Table = db.database(DATABASE).await?;
     db.read(move |txn| {

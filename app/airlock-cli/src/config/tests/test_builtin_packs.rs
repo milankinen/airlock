@@ -1,10 +1,13 @@
+//! Tests for the built-in packs: their metadata, the config they make with
+//! all arg values, and the effects of some packs.
+
 use std::collections::{BTreeMap, HashSet};
 
 use crate::config::config_values;
 use crate::test_cfg::{configured_variants, resolve_project_toml};
 
-/// The config values of every built-in pack with every combination of
-/// its arg values: `(pack name, label, value)`.
+/// Return the config values of each built-in pack for all combinations of
+/// its arg values, as `(pack name, label, value)`.
 fn builtin_values() -> Vec<(String, String, serde_json::Value)> {
     let mut values = Vec::new();
     for pack in crate::packs::init().unwrap().builtin() {
@@ -25,7 +28,8 @@ fn builtin_values() -> Vec<(String, String, serde_json::Value)> {
     values
 }
 
-/// The leaf paths of a document (`/a/b/c`), with arrays as leaves.
+/// Add the leaf paths of a document (`/a/b/c`) and their values to `out`.
+/// An array is a leaf.
 fn leaves(prefix: &str, value: &serde_json::Value, out: &mut BTreeMap<String, serde_json::Value>) {
     match value {
         serde_json::Value::Object(map) => {
@@ -39,6 +43,11 @@ fn leaves(prefix: &str, value: &serde_json::Value, out: &mut BTreeMap<String, se
     }
 }
 
+/// Test that each built-in pack has a unique name, a label, a version of 1
+/// or higher, and valid arg keys. Config files use these names and keys.
+///   1. Check each pack name is new and its label is not empty
+///   2. Check its version is a whole number of 1 or higher
+///   3. Check each arg key is lowercase kebab case and not a reserved key
 #[test]
 fn builtin_packs_have_unique_names_versions_and_valid_arg_keys() {
     let mut seen = HashSet::new();
@@ -70,6 +79,9 @@ fn builtin_packs_have_unique_names_versions_and_valid_arg_keys() {
     }
 }
 
+/// Test that each built-in pack makes valid config with all arg values.
+///   1. Make the config of each pack for each combination of arg values
+///   2. Parse each config and check that it passes
 #[test]
 fn every_builtin_pack_variant_is_valid_config() {
     for (_, label, value) in builtin_values() {
@@ -77,6 +89,13 @@ fn every_builtin_pack_variant_is_valid_config() {
     }
 }
 
+/// Test that the configs of two different built-in packs do not overlap, so
+/// the merge result does not depend on pack order. Two distro packs can
+/// overlap, because only one can be in a config.
+///   1. Get the leaf paths of each pack config for all arg values
+///   2. For each pair of different packs, check that a path set by both has
+///      the same value and is not an array
+///   3. Check that no pack sets a path inside a leaf of the other pack
 #[test]
 fn builtin_pack_documents_merge_same_in_any_order() {
     let distros: Vec<String> = crate::packs::init()
@@ -100,6 +119,8 @@ fn builtin_pack_documents_merge_same_in_any_order() {
                 continue;
             }
             for (path, a_value) in a_paths {
+                // Arrays concatenate in the merge, so their order changes the
+                // result.
                 if let Some(b_value) = b_paths.get(path) {
                     assert!(
                         !a_value.is_array() && a_value == b_value,
@@ -123,6 +144,11 @@ fn builtin_pack_documents_merge_same_in_any_order() {
     }
 }
 
+/// Test that the docker preset starts dockerd without hardening and allows
+/// the registry hosts. Docker needs both to pull images.
+///   1. Resolve a config with the docker preset
+///   2. Check the dockerd daemon settings
+///   3. Check that the registry rule allows each registry host
 #[test]
 fn docker_preset_runs_unhardened_daemon_and_allows_registries() {
     let config = resolve_project_toml("presets = [\"docker\"]\n")
@@ -146,6 +172,11 @@ fn docker_preset_runs_unhardened_daemon_and_allows_registries() {
     }
 }
 
+/// Test that the `acp` arg of the claude and codex packs sets the env
+/// variable that tells the ACP adapter where the agent binary is.
+///   1. Resolve each pack with `acp = true` and check the binary path
+///   2. Resolve each pack with `acp = false` and check that the variable
+///      is not set
 #[test]
 fn acp_arg_points_adapter_at_agent_binary() {
     let env = |pack: &str, acp: bool| {
@@ -168,6 +199,13 @@ fn acp_arg_points_adapter_at_agent_binary() {
     assert!(!env("codex", false).contains_key("CODEX_PATH"));
 }
 
+/// Test that the claude and codex packs enable their sign-in service and
+/// allow their hosts, and that the project can disable the service.
+///   1. Resolve the claude pack and check the service, the rule and the
+///      passthrough check
+///   2. Resolve the codex pack and check the same
+///   3. Resolve the claude pack with the service set to false and check that
+///      no service is enabled
 #[test]
 fn agent_packs_enable_their_service_unless_project_turns_it_off() {
     let claude = resolve_project_toml("[packs]\nclaude = { version = 1 }\n").unwrap();

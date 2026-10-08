@@ -1,3 +1,5 @@
+//! Local HTTP servers and a hyper executor for tests.
+
 use std::future::Future;
 use std::net::SocketAddr;
 

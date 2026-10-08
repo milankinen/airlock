@@ -1,13 +1,20 @@
+//! Tests for network policy and rules from config: allow, deny,
+//! passthrough and inject decisions, config conflicts and the public-only
+//! network.
+
 use std::sync::atomic::Ordering;
 
 use crate::config::config_values::Policy;
 use crate::network::Network;
 use crate::test_cfg::network::*;
 
+/// The network of a project with `toml` as its `airlock.toml`.
 fn network(toml: &str) -> Network {
     network_from_toml(toml).unwrap().network
 }
 
+/// The full error text when the network refuses `toml`. Panics if the
+/// network accepts it.
 fn config_error(toml: &str) -> String {
     match network_from_toml(toml) {
         Ok(_) => panic!("config accepted:\n{toml}"),
@@ -15,6 +22,8 @@ fn config_error(toml: &str) -> String {
     }
 }
 
+/// Rules with ports, wildcards, a deny, an IPv6 literal, a passthrough
+/// rule and disabled rules.
 const RULES: &str = r#"
 [network]
 policy = "deny-by-default"
@@ -37,6 +46,12 @@ allow = ["offdb.example.com"]
 passthrough = true
 "#;
 
+/// Test that the deny-by-default rules from config give the correct allow
+/// and passthrough decision for each target. Hosts and ports that no
+/// enabled rule allows must stay denied.
+///   1. Build the network from rules with ports, wildcards and a deny
+///   2. Resolve each host and port
+///   3. Check the allowed and passthrough flags
 #[test]
 fn deny_by_default_rules_from_config_decide_each_target() {
     let network = network(RULES);
@@ -47,9 +62,11 @@ fn deny_by_default_rules_from_config_decide_each_target() {
         ("a.b.example.org", 443, true, false),
         ("example.org", 443, false, false),
         ("secret.example.org", 443, false, false),
+        // Case and a trailing dot must not evade the deny.
         ("SECRET.Example.org.", 443, false, false),
         ("svc.example.net", 1234, true, false),
         ("::1", 8443, true, false),
+        // The localhost aliases match each other, so `[::1]` allows it.
         ("localhost", 8443, true, false),
         ("::1", 443, false, false),
         ("db.example.com", 5432, true, true),
@@ -67,6 +84,13 @@ fn deny_by_default_rules_from_config_decide_each_target() {
     }
 }
 
+/// Test that the policy decides targets that no rule covers. Only
+/// allow-always overrides a deny rule, and deny-always also denies targets
+/// that a rule allows.
+///   1. Build the network from the rules
+///   2. Set each policy in turn
+///   3. Check a target outside the rules and a denied target
+///   4. Check that deny-always denies a target that a rule allows
 #[test]
 fn policy_decides_targets_outside_rules_and_allow_always_overrides_deny() {
     let network = network(RULES);
@@ -88,9 +112,16 @@ fn policy_decides_targets_outside_rules_and_allow_always_overrides_deny() {
             "{policy:?}"
         );
     }
+    // The last policy in the loop is deny-always.
     assert!(!network.resolve_target("api.example.com", 443).allowed);
 }
 
+/// Test that the proxy answers HTTP 403 to a request that no allow rule
+/// covers, also when the config has no allow rules.
+///   1. Start a network that allows only `example.com`, then one with no
+///      allow rules
+///   2. Send a GET to 127.0.0.1
+///   3. Check that the guest gets 403
 #[test]
 fn connection_outside_allow_rules_is_answered_403() {
     for allowed_hosts in [vec!["example.com".to_string()], vec![]] {
@@ -108,6 +139,13 @@ fn connection_outside_allow_rules_is_answered_403() {
     }
 }
 
+/// Test that inject rules from config attach masked secrets only to the
+/// targets of their rule. A secret on a wrong target leaks the real value.
+///   1. Build the network from rules that inject secrets, with a duplicate
+///      name and two rules for the same host
+///   2. Resolve each host and port
+///   3. Check the secret names of each target, with no duplicates
+///   4. Check that the target holds the real value, not the surrogate
 #[test]
 fn inject_rules_from_config_attach_secrets_only_to_their_targets() {
     let built = network_from_toml(
@@ -150,6 +188,7 @@ fn inject_rules_from_config_attach_secrets_only_to_their_targets() {
     assert_eq!(target.secrets[0].real, token.real);
 }
 
+/// A config with an enabled and a disabled passthrough rule, plus `other`.
 fn passthrough_with(other: &str) -> String {
     format!(
         r#"
@@ -170,6 +209,13 @@ fn passthrough_with(other: &str) -> String {
     )
 }
 
+/// Test that the network refuses a passthrough target that overlaps a
+/// middleware or inject target. A passthrough connection is never
+/// intercepted, so the middleware or the secret would silently not apply.
+///   1. Add each middleware or inject rule next to the passthrough rules
+///   2. For an overlap, check that the error names both sides
+///   3. Check that the disabled passthrough rule is not in the error
+///   4. For no overlap or a disabled rule, check that the config is valid
 #[test]
 fn passthrough_overlapping_intercepted_target_is_rejected() {
     for (other, conflict) in [
@@ -218,8 +264,14 @@ fn passthrough_overlapping_intercepted_target_is_rejected() {
     }
 }
 
+/// Test that the network refuses two reverse forwards on the same host
+/// port. Only one listener can bind a host port.
+///   1. Add two forwards on host port 5000 and a disabled one
+///   2. Check that the error names the two enabled forwards only
+///   3. Check that different host ports with the same guest port are valid
 #[test]
 fn reverse_forwards_sharing_host_port_are_rejected() {
+    // Format is `<host>:<guest>`.
     let ports = |b: &str| {
         format!(
             "[network.ports.a]\nguest = [\"5000:4000\"]\n\
@@ -234,6 +286,8 @@ fn reverse_forwards_sharing_host_port_are_rejected() {
     network_from_toml(&ports("5001:4000")).unwrap();
 }
 
+/// Local destinations: loopback names and literals, private and
+/// link-local addresses (cloud metadata).
 const LOCAL: [&str; 9] = [
     "localhost",
     "LOCALHOST.",
@@ -246,6 +300,12 @@ const LOCAL: [&str; 9] = [
     "169.254.169.254",
 ];
 
+/// Test that a public-only network denies local destinations, by name and
+/// by IP literal, also under allow-always. A normal network allows them.
+///   1. Build a normal and a public-only network with allow-always
+///   2. Check that the normal network allows each local destination
+///   3. Check that the public-only network denies each of them
+///   4. Check that a public host is allowed and marked public-only
 #[test]
 fn public_only_network_denies_local_destinations_by_name_and_literal() {
     let toml = "[network]\npolicy = \"allow-always\"";
@@ -260,6 +320,13 @@ fn public_only_network_denies_local_destinations_by_name_and_literal() {
     assert!(public.allowed && public.public_only);
 }
 
+/// Test that a public-only network never opens a connection to a local
+/// address. A denied answer is not enough if the dial already happened.
+///   1. Start a local server that counts accepted connections
+///   2. Send a GET to it by three loopback names through each network
+///   3. Check the 204 answers on the normal network only
+///   4. Check that the server accepted no connection from the public-only
+///      network
 #[test]
 fn public_only_network_never_dials_local_address() {
     let toml = "[network]\npolicy = \"allow-always\"";
@@ -268,6 +335,7 @@ fn public_only_network_never_dials_local_address() {
         let port = upstream.port();
         run_network(network, |proxy| async move {
             let accepted = upstream.start();
+            // `127.1` is a short form of `127.0.0.1`.
             for host in ["127.0.0.1", "127.1", "localhost"] {
                 let resp = TestConnection::connect(&proxy, host, port)
                     .await

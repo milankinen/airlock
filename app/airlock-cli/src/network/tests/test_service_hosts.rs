@@ -1,3 +1,6 @@
+//! How the network treats the hosts of a service: the policy rules, the
+//! hosts of a service that cannot run, plain HTTP, and host spellings.
+
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -12,6 +15,13 @@ use crate::test_cfg::provider::{Options, Setup};
 use crate::test_cfg::services::{GotLog, answering, insert_grant, production_services, request};
 use crate::test_cfg::{block_on_local, read_until_contains, test_store, tls_trusting};
 
+/// Test that a service host is allowed and intercepted without an allow
+/// rule. A passthrough rule does not stop the interception, but a deny rule
+/// wins over the service.
+///   1. Check that the service host is allowed and intercepted, and that
+///      another port is denied
+///   2. Add a passthrough rule and check that the service still intercepts
+///   3. Add a deny rule and check that the host is denied
 #[test]
 fn service_host_is_allowed_and_intercepted_unless_denied() {
     let s = Setup::new(ServiceId::Anthropic, Options::default());
@@ -37,6 +47,12 @@ fn service_host_is_allowed_and_intercepted_unless_denied() {
     assert!(!t.allowed && t.interceptor.is_none());
 }
 
+/// Test that the hosts of a service that cannot run are denied, also under
+/// an allow-all rule. Otherwise the agent signs in without airlock and gets
+/// real tokens.
+///   1. Allow all hosts and mark the Anthropic hosts as unavailable
+///   2. Check that these hosts are denied on port 443, in any spelling
+///   3. Check that port 80 and other hosts are still allowed
 #[test]
 fn hosts_of_unavailable_service_are_denied_under_allow_all_rule() {
     let cfg = TestNetworkConfig {
@@ -53,6 +69,11 @@ fn hosts_of_unavailable_service_are_denied_under_allow_all_rule() {
     assert!(network.resolve_target("example.com", 443).allowed);
 }
 
+/// Test that plain HTTP to a service host gets no swap. A real token must
+/// never go over an unencrypted connection.
+///   1. Store a grant and start a plain TCP upstream on the service host
+///   2. Send a plain HTTP request with the surrogate
+///   3. Check that the upstream gets the surrogate and no real token
 #[test]
 fn plain_http_to_owned_host_gets_no_swap() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -108,6 +129,15 @@ fn plain_http_to_owned_host_gets_no_swap() {
     });
 }
 
+/// Test that other spellings of a service host (case, trailing dot) get
+/// the same handling as the usual spelling. Otherwise a different spelling
+/// can bypass the service.
+///   1. Poll for a device code on spellings of the OpenAI token host and
+///      check that the guest gets a surrogate code
+///   2. Exchange a real code on a spelling of the Anthropic token host and
+///      check the local `invalid_grant`
+///   3. Send a real token to a spelling of the Anthropic API host and check
+///      the local 401
 #[test]
 fn host_spellings_get_owned_hosts_handling() {
     block_on_local(async {

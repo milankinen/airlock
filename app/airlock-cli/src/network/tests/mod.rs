@@ -1,3 +1,6 @@
+//! End-to-end tests of the network proxy, one file for each flow. The
+//! tests send guest traffic through the proxy to fake upstreams.
+
 mod test_alpn_negotiation;
 mod test_answer_scan;
 mod test_anthropic_api;

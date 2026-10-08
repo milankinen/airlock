@@ -1,23 +1,15 @@
-//! Guest-side networking.
+//! Guest networking.
 //!
-//! Everything here runs inside the Linux VM and shells out to
-//! Linux-only syscalls (ioctl on `/dev/net/tun`, `/sbin/ip`, raw
-//! AF_UNIX / AF_INET sockets). The entire implementation lives in
-//! private Linux-gated submodules; this file re-exports a flat
-//! public API and provides compile-time stubs for other targets so
-//! `cargo check` works on macOS.
+//! Starts the network services of the guest:
+//!  * a TCP proxy that sends all outgoing TCP traffic of the VM to the host
+//!  * a virtual DNS server that gives each hostname a fake IP
+//!  * forwarding of host-published ports (guest to host)
+//!  * forwarding of Unix sockets (guest to host)
 //!
-//! Submodule layout (all private):
+//! Also opens TCP connections from the host to guest ports.
 //!
-//! - `tcp_proxy` — smoltcp on a TUN device intercepting all TCP egress
-//!   from the VM (including container netns) and relaying each flow to
-//!   the host via the `NetworkProxy.connect` RPC.
-//! - `host_port_forward` — per-port loopback listeners for
-//!   host-published ports (guest → host).
-//! - `host_socket_forward` — unix socket forwarding (guest → host).
-//! - `dns` — virtual DNS server that maps hostnames to synthetic IPs.
-//! - `rpc_bridge` — shared Cap'n Proto sink/relay/connect plumbing.
-//! - `tun` — minimal `/dev/net/tun` wrapper.
+//! Only Linux has a real implementation. On other targets, stubs let the crate
+//! compile.
 
 #[cfg(target_os = "linux")]
 mod dns;
@@ -37,10 +29,9 @@ mod tcp_proxy_bench;
 
 // --- Non-Linux stubs ------------------------------------------------
 //
-// airlockd is only ever executed inside the Linux guest VM. These
-// stubs exist so the crate still type-checks on the host-side
-// developer machine (macOS, etc.) without having to shard the build
-// into per-target binaries.
+// airlockd runs only inside the Linux guest VM. These stubs let the crate
+// type-check on the developer host (macOS and others), without separate
+// builds for each target.
 #[cfg(not(target_os = "linux"))]
 use std::rc::Rc;
 
@@ -59,22 +50,26 @@ pub use rpc_bridge::open_local_tcp;
 #[cfg(target_os = "linux")]
 pub use tcp_proxy::start as start_tcp_proxy;
 
+/// Non-Linux stub of the DNS server state.
 #[cfg(not(target_os = "linux"))]
 pub struct DnsState;
 
 #[cfg(not(target_os = "linux"))]
 impl DnsState {
+    /// Non-Linux stub.
     pub fn new() -> Self {
         Self
     }
 }
 
+/// Non-Linux stub. Panics if called.
 #[cfg(not(target_os = "linux"))]
 #[allow(clippy::unused_async)]
 pub async fn start_dns(_state: Rc<DnsState>) -> anyhow::Result<()> {
     unimplemented!("airlockd only runs inside the Linux VM");
 }
 
+/// Non-Linux stub. Panics if called.
 #[cfg(not(target_os = "linux"))]
 pub fn start_host_socket_forward(
     _network: &network_proxy::Client,
@@ -83,6 +78,7 @@ pub fn start_host_socket_forward(
     unimplemented!("airlockd only runs inside the Linux VM");
 }
 
+/// Non-Linux stub. Panics if called.
 #[cfg(not(target_os = "linux"))]
 #[allow(clippy::unused_async)]
 pub async fn start_host_port_forward(
@@ -92,11 +88,13 @@ pub async fn start_host_port_forward(
     unimplemented!("airlockd only runs inside the Linux VM");
 }
 
+/// Non-Linux stub. Panics if called.
 #[cfg(not(target_os = "linux"))]
 pub fn start_tcp_proxy(_network: network_proxy::Client, _dns: Rc<DnsState>) -> anyhow::Result<()> {
     unimplemented!("airlockd only runs inside the Linux VM");
 }
 
+/// Non-Linux stub. Panics if called.
 #[cfg(not(target_os = "linux"))]
 #[allow(clippy::unused_async)]
 pub async fn open_local_tcp(

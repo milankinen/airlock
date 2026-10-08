@@ -1,11 +1,17 @@
-//! Replay a dumped byte stream (from AIRLOCK_PTY_DUMP=1, which writes to
-//! `<sandbox_dir>/pty.dump`) through vt100 and print the resulting grid,
-//! so we can diagnose terminal rendering issues offline.
+//! Offline replay tool for terminal output dumps.
 //!
-//! Usage: cargo run --example vt100_replay -- <dump-path> [rows] [cols]
+//! Replays a dump of the sandbox terminal output through the TUI terminal
+//! emulator and prints the resulting screen. Use it to examine terminal
+//! rendering problems without a running sandbox.
 
 use std::io::Write;
 
+/// Replays a PTY dump and prints the resulting screen grid.
+///
+/// To make a dump, set `AIRLOCK_PTY_DUMP=1`. Airlock then writes the guest
+/// output stream to `<sandbox_dir>/pty.dump`.
+///
+/// Usage: cargo run --example vt100_replay -- <dump-path> [rows] [cols]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let path = args

@@ -1,8 +1,7 @@
-//! Apple Virtualization.framework backend (macOS).
+//! Apple Virtualization framework VM backend (macOS).
 //!
-//! Uses `VZVirtualMachine` on a serial dispatch queue. All VM method calls
-//! are dispatched to this queue, with oneshot channels bridging back to the
-//! async world.
+//! Creates, starts and stops the sandbox VM on macOS, and opens connections
+//! from the host to the guest.
 
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::panic::{AssertUnwindSafe, UnwindSafe};
@@ -19,19 +18,20 @@ use tracing::{debug, error, info};
 
 use super::config::VmConfig;
 
+/// Read and write ends of a Unix pipe.
 struct PipeEnds {
     read: OwnedFd,
     write: OwnedFd,
 }
 
-/// Run `f` inside `objc2::exception::catch`, converting any thrown
-/// Obj-C exception into an error string.
+/// Run `f` inside `objc2::exception::catch`, and convert a thrown Obj-C
+/// exception into an error string.
 ///
-/// Without this wrapper, an `NSException` thrown by the Virtualization
-/// framework would unwind through a Rust frame and trigger
-/// "Rust cannot catch foreign exceptions" → `abort()` → SIGABRT.
-/// That's the suspected cause of the silent-exit bug; catching the
-/// exception here turns it into a cleanly-reportable error instead.
+/// Without this wrapper, an `NSException` from the Virtualization framework
+/// unwinds through a Rust frame. That causes "Rust cannot catch foreign
+/// exceptions", then `abort()` and SIGABRT. This is the suspected cause of
+/// the silent-exit bug. This wrapper changes the exception into an error
+/// that can be reported.
 fn catch_obj<R, F: FnOnce() -> R + UnwindSafe>(f: F) -> std::result::Result<R, String> {
     objc2::exception::catch(f).map_err(|exc| match exc {
         Some(e) => format!("ObjC exception: {e:?}"),
@@ -39,9 +39,9 @@ fn catch_obj<R, F: FnOnce() -> R + UnwindSafe>(f: F) -> std::result::Result<R, S
     })
 }
 
-/// Report an Obj-C exception (or any other error string) back to an
-/// awaiting oneshot. Used from the outer error-recovery path of every
-/// dispatch-queue callback.
+/// Send an Obj-C exception (or a different error string) to the waiting
+/// oneshot. The outer error-recovery path of each dispatch-queue callback
+/// uses this.
 fn deliver_err<T>(
     tx: &Mutex<Option<tokio::sync::oneshot::Sender<std::result::Result<T, String>>>>,
     msg: String,
@@ -63,43 +63,45 @@ fn create_pipe() -> anyhow::Result<PipeEnds> {
     })
 }
 
-/// macOS VM backend using the Apple Virtualization.framework.
+/// macOS VM backend that uses the Apple Virtualization.framework.
+///
+/// The `VZVirtualMachine` runs on a serial dispatch queue. All VM method
+/// calls go to this queue, and oneshot channels send the results back to
+/// async code.
 #[allow(dead_code, clippy::used_underscore_binding)]
 pub struct AppleVmBackend {
-    /// Live pointer to the VM object, nulled by `Drop` before `_vm`
-    /// releases the underlying retain. Every dispatch-queue callback
-    /// loads this atomically and bails on null — so a callback that
-    /// was queued before Drop but runs after never dereferences
-    /// freed memory. Using `AtomicPtr` (not `usize`) makes the
-    /// happens-before relationship between Drop's `swap` and the
-    /// callback's `load` explicit.
+    /// Pointer to the VM object. `Drop` sets it to null before `_vm`
+    /// releases the retain. Each dispatch-queue callback loads it
+    /// atomically and stops on null. Thus a callback that was queued
+    /// before `Drop` but runs after it never reads freed memory. `AtomicPtr`
+    /// (not `usize`) makes the happens-before relation between the `swap`
+    /// in `Drop` and the `load` in the callback explicit.
     vm: std::sync::Arc<AtomicPtr<VZVirtualMachine>>,
-    /// Holds the +1 retain count of the VM object. `Option` so Drop
-    /// can `take()` it after nulling `vm` and stopping the VM, so
-    /// the object is freed strictly *after* any concurrent callback
-    /// has observed the null.
+    /// Holds the +1 retain count of the VM object. It is an `Option`, so
+    /// `Drop` can `take()` it after it sets `vm` to null and stops the VM.
+    /// Thus the object is freed only *after* all concurrent callbacks saw
+    /// the null.
     _vm: Option<Retained<VZVirtualMachine>>,
     vm_queue: dispatch2::DispatchRetained<DispatchQueue>,
     host_to_guest_write: OwnedFd,
     guest_to_host_read: OwnedFd,
 }
 
-// Safety: the struct is only moved between tokio tasks on the same
-// thread (current_thread runtime). All VM method calls are dispatched
-// to the serial VM queue, which synchronises access. The `AtomicPtr`
-// check in every callback means a dispatched callback cannot observe
-// a freed VM.
+// Safety: the struct moves only between tokio tasks on the same thread
+// (current_thread runtime). All VM method calls go to the serial VM queue,
+// which synchronizes access. Because of the `AtomicPtr` check in each
+// callback, a dispatched callback cannot see a freed VM.
 unsafe impl Send for AppleVmBackend {}
 
 impl AppleVmBackend {
-    /// Create a new VM (not yet started) with the given configuration.
+    /// Create a new VM (not started) with the given configuration.
     pub fn new(config: &VmConfig) -> anyhow::Result<Self> {
         let host_to_guest = create_pipe()?;
         let guest_to_host = create_pipe()?;
 
-        // Wrap VZ framework calls in `catch_obj` so an NSException thrown
-        // during config construction / validation / VM init becomes a
-        // Rust error instead of aborting the process.
+        // Wrap VZ framework calls in `catch_obj`. Thus an NSException from
+        // config creation, validation or VM init becomes a Rust error and
+        // does not abort the process.
         let vm_config = catch_obj(AssertUnwindSafe(|| unsafe {
             Self::create_vm_config(config, &host_to_guest, &guest_to_host)
         }))
@@ -127,8 +129,8 @@ impl AppleVmBackend {
         let vm_raw = (&raw const *vm).cast_mut();
 
         // Drop the guest-side pipe ends on the host. The VM has its own
-        // dup'd copies via NSFileHandle. When the VM shuts down and closes
-        // them, read() on guest_to_host_read will get EOF.
+        // duplicated copies through NSFileHandle. When the VM stops and
+        // closes them, read() on guest_to_host_read gets EOF.
         drop(host_to_guest.read);
         drop(guest_to_host.write);
 
@@ -141,6 +143,8 @@ impl AppleVmBackend {
         })
     }
 
+    /// Make the Virtualization.framework configuration from `config`, with
+    /// the pipes as the serial console.
     unsafe fn create_vm_config(
         config: &VmConfig,
         host_to_guest: &PipeEnds,
@@ -182,10 +186,10 @@ impl AppleVmBackend {
             }
             vm_config.setPlatform(&platform.into_super());
 
-            // Serial port (console) via pipes.
-            // Dup the fds for NSFileHandle with closeOnDealloc:true so the VM
-            // owns its copies. When the VM shuts down, these close, giving the
-            // host relay EOF.
+            // Serial port (console) through pipes.
+            // Duplicate the fds for NSFileHandle with closeOnDealloc:true, so
+            // the VM owns its copies. When the VM stops, these close, and the
+            // host relay gets EOF.
             let guest_read_fd = libc::dup(host_to_guest.read.as_raw_fd());
             let guest_write_fd = libc::dup(guest_to_host.write.as_raw_fd());
             let read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
@@ -225,13 +229,13 @@ impl AppleVmBackend {
             let balloons = NSArray::from_retained_slice(&[balloon_config]);
             vm_config.setMemoryBalloonDevices(&balloons);
 
-            // Vsock device (for host↔guest communication)
+            // Vsock device (for host-guest communication)
             let vsock = VZVirtioSocketDeviceConfiguration::new();
             let vsock_config: Retained<VZSocketDeviceConfiguration> = vsock.into_super();
             let vsock_devices = NSArray::from_retained_slice(&[vsock_config]);
             vm_config.setSocketDevices(&vsock_devices);
 
-            // VirtioFS shares (bundle + mounts)
+            // VirtioFS shares (image layers and mounts)
             if !config.shares.is_empty() {
                 let mut fs_devices_vec = Vec::new();
                 for share in &config.shares {
@@ -289,20 +293,20 @@ impl AppleVmBackend {
 
 impl Drop for AppleVmBackend {
     fn drop(&mut self) {
-        // Take the pointer out of the atomic *before* doing anything
-        // else. Any callback queued earlier that hasn't run yet will
-        // see null on its `load()` and bail. `_vm` still holds the
-        // retain so the object is alive during this Drop body.
+        // Take the pointer out of the atomic *before* all other steps. A
+        // callback that was queued earlier and did not run yet sees null on
+        // its `load()` and stops. `_vm` still holds the retain, so the
+        // object is alive during this `Drop` body.
         //
-        // The exec_sync closure is required to be `Send`; raw pointers
-        // are `!Send` so we move the value in as a `usize` and cast
-        // back inside the queue callback (same trick as start/stop).
+        // The exec_sync closure must be `Send`. Raw pointers are `!Send`,
+        // so move the value in as a `usize` and cast it back inside the
+        // queue callback.
         let vm_raw = self.vm.swap(std::ptr::null_mut(), Ordering::AcqRel);
         if !vm_raw.is_null() {
             let vm_addr = vm_raw as usize;
             self.vm_queue.exec_sync(move || {
-                // Swallow any ObjC exception in Drop — we're tearing
-                // down and there's nowhere to report it to.
+                // Ignore an ObjC exception in `Drop`. This is the teardown,
+                // and there is no place to report it.
                 let res = catch_obj(AssertUnwindSafe(|| unsafe {
                     let vm = &*(vm_addr as *const VZVirtualMachine);
                     if vm.canStop() {
@@ -314,14 +318,14 @@ impl Drop for AppleVmBackend {
                 }
             });
         }
-        // Drop the retain *after* exec_sync — which, because the queue
-        // is serial, guarantees no other callback is running on it.
+        // Drop the retain *after* exec_sync. The queue is serial, so no
+        // other callback runs on it at this point.
         let _ = self._vm.take();
     }
 }
 
 impl AppleVmBackend {
-    /// Boot the VM asynchronously via the dispatch queue.
+    /// Boot the VM asynchronously through the dispatch queue.
     pub async fn start(&mut self) -> anyhow::Result<()> {
         info!("starting VM...");
 
@@ -371,11 +375,12 @@ impl AppleVmBackend {
         Ok(())
     }
 
-    /// Stop the VM and wait for Virtualization.framework to confirm it. A VM
-    /// that is already stopped (the guest powered off, or it stopped on an
-    /// error) counts as confirmed. Called by `VmInstance::shutdown`; `Drop`
-    /// then finds nothing left to stop (`canStop` is false). The macOS test
-    /// build sees no caller, so it reports this method as dead code.
+    /// Stop the VM and wait until Virtualization.framework confirms the stop.
+    /// A VM that is already stopped (the guest powered off, or it stopped on
+    /// an error) counts as confirmed. `VmInstance::shutdown` calls this.
+    /// After it, `Drop` has nothing to stop (`canStop` is false).
+    // The macOS test build has no caller, so it reports this method as dead
+    // code.
     #[cfg_attr(test, allow(dead_code))]
     pub async fn stop(&mut self) -> anyhow::Result<()> {
         let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<(), String>>();
@@ -433,7 +438,9 @@ impl AppleVmBackend {
         Ok(())
     }
 
-    /// Connect to a vsock port inside the VM, returning an owned fd.
+    /// Connect to a vsock port inside the VM.
+    /// Returns:
+    ///   The owned fd of the connection.
     #[allow(dead_code)]
     pub async fn vsock_connect(&self, port: u32) -> anyhow::Result<OwnedFd> {
         let (tx, rx) = tokio::sync::oneshot::channel::<std::result::Result<i32, String>>();
@@ -456,8 +463,9 @@ impl AppleVmBackend {
                         deliver_err(&tx_body, "no vsock device".into());
                         return;
                     };
-                    // Downcast VZSocketDevice → VZVirtioSocketDevice
-                    // Safety: we configured exactly one VZVirtioSocketDeviceConfiguration
+                    // Downcast VZSocketDevice to VZVirtioSocketDevice.
+                    // Safety: `create_vm_config` adds exactly one
+                    // VZVirtioSocketDeviceConfiguration.
                     let device_ptr =
                         std::ptr::from_ref::<VZSocketDevice>(device).cast::<VZVirtioSocketDevice>();
                     let device = &*device_ptr;
@@ -468,7 +476,8 @@ impl AppleVmBackend {
                             let caught = catch_obj(AssertUnwindSafe(|| {
                                 if err_ptr.is_null() && !conn_ptr.is_null() {
                                     let conn = &*conn_ptr;
-                                    // Dup the fd so it outlives the connection.
+                                    // Duplicate the fd, so it stays open after
+                                    // the connection is closed.
                                     let fd = libc::dup(conn.fileDescriptor());
                                     if fd < 0 {
                                         Err("failed to dup vsock fd".into())

@@ -1,7 +1,11 @@
+//! Tests for `[packs]` entries: their order and merge across files, and the
+//! config errors for bad entries.
+
 use crate::config::ResolvedConfig;
 use crate::packs::ArgValue;
 use crate::test_cfg::{ConfigDirs, project_toml_error, resolve_project_toml};
 
+/// Return the name and version of each resolved pack, in order.
 fn versions(resolved: &ResolvedConfig) -> Vec<(&str, &str)> {
     resolved
         .packs
@@ -10,6 +14,7 @@ fn versions(resolved: &ResolvedConfig) -> Vec<(&str, &str)> {
         .collect()
 }
 
+/// Return the value of the arg `key` of the pack `name`, if it is set.
 fn arg<'a>(resolved: &'a ResolvedConfig, name: &str, key: &str) -> Option<&'a ArgValue> {
     resolved
         .packs
@@ -19,6 +24,11 @@ fn arg<'a>(resolved: &'a ResolvedConfig, name: &str, key: &str) -> Option<&'a Ar
         .get(key)
 }
 
+/// Test that pack entries resolve in catalog order, not file order, and that
+/// the file that holds them overrides their values.
+///   1. Resolve five packs and an env value in one file
+///   2. Check that the packs are in catalog order
+///   3. Check the pack rules and env values, and that the file value wins
 #[test]
 fn pack_entries_apply_in_pack_order_below_their_file() {
     let resolved = resolve_project_toml(
@@ -58,6 +68,13 @@ fn pack_entries_apply_in_pack_order_below_their_file() {
     assert_eq!(config.env["SSL_CERT_FILE"].value, "/x.pem");
 }
 
+/// Test that the version, args and `enabled` of a pack entry merge across
+/// the project files.
+///   1. Set pack entries in the local, project and project-local files
+///   2. Check that only the enabled packs with a version resolve
+///   3. Check the merged and default args of the sample pack
+///   4. Check that the python preset applies, and the disabled codex pack
+///      does not
 #[test]
 fn pack_entries_merge_version_args_and_enabled_across_files() {
     let dirs = ConfigDirs::new();
@@ -84,6 +101,7 @@ fn pack_entries_merge_version_args_and_enabled_across_files() {
     )
     .project_file(
         "airlock.local.toml",
+        // The codex arg is bad, but codex is disabled, so it is not checked.
         "[packs]\nrust = { version = 1, enabled = true }\n\
          codex = { enabled = false, args = { acp = \"broken\" } }\n",
     );
@@ -111,6 +129,11 @@ fn pack_entries_merge_version_args_and_enabled_across_files() {
     assert!(!resolved.values.env.contains_key("OPENAI_API_KEY"));
 }
 
+/// Test that the error for a pack without a version names each file that
+/// sets the entry. The user can then find where to add the version.
+///   1. Check the error for one file
+///   2. Check that the error names both files when two files set the entry
+///   3. Check that a presets list does not count as a file that sets it
 #[test]
 fn missing_version_names_every_contributing_file() {
     assert!(
@@ -144,6 +167,11 @@ fn missing_version_names_every_contributing_file() {
     );
 }
 
+/// Test that all bad pack entries show in one config error, each with a
+/// hint. The user can then correct all of them at one time.
+///   1. Resolve a `[packs]` table with many different bad entries
+///   2. Check that the error has a line for each bad entry
+///   3. Check the error for a `packs` value that is not a table
 #[test]
 fn invalid_pack_entries_are_reported_together() {
     let err = project_toml_error(
@@ -203,6 +231,10 @@ fn invalid_pack_entries_are_reported_together() {
     );
 }
 
+/// Test that a failure in the config script of a pack is a config error
+/// that names the pack and shows its hint.
+///   1. Resolve the sample pack with the mode that its script refuses
+///   2. Check the full error text
 #[test]
 fn pack_config_failure_is_error_with_pack_hint() {
     assert_eq!(
@@ -212,6 +244,10 @@ fn pack_config_failure_is_error_with_pack_hint() {
     );
 }
 
+/// Test that the error for a bad arg names the file that sets the arg, not
+/// the file that sets the version.
+///   1. Set the version in the local file and a bad arg in `airlock.toml`
+///   2. Check that the error names `airlock.toml`
 #[test]
 fn arg_value_is_checked_in_file_that_sets_it() {
     let dirs = ConfigDirs::new();
@@ -234,6 +270,9 @@ fn arg_value_is_checked_in_file_that_sets_it() {
     );
 }
 
+/// Test that two distro packs are a conflict, because both set the VM image.
+///   1. Resolve the alpine and debian packs together
+///   2. Check that the error names both packs and both images
 #[test]
 fn two_distro_packs_conflict_on_image() {
     assert_eq!(
