@@ -182,6 +182,10 @@ pub struct ResolvedTarget {
     /// proxy ignores all other addresses that the host resolves to. Thus a
     /// name cannot reach the host loopback, the LAN or cloud metadata.
     pub public_only: bool,
+    /// Canonical hosts of all network services. A request on a connection
+    /// that no service owns must not name one of them in its `Host` or
+    /// `:authority`.
+    pub service_hosts: Rc<[String]>,
 }
 
 impl ResolvedTarget {

@@ -13,8 +13,14 @@ to the service through an interceptor.
 ## Owned hosts
 
 - airlock always intercepts an owned host. It is never passthrough.
+- A service owns its hosts on port 443. airlock denies the other ports
+  of these hosts under all policies.
 - A TLS stream to an owned host that is not HTTP is closed before the
-  upstream connect. There is no raw relay.
+  upstream connect. There is no raw relay. Plain HTTP to an owned host
+  gets HTTP 421.
+- A request on another host gets HTTP 421 if its `Host` or `:authority`
+  names an owned host. Thus a server that routes on this header cannot
+  send the request to the service. The check runs after Lua middleware.
 - Monitor events and Lua middleware run before the service. They see
   only surrogates.
 

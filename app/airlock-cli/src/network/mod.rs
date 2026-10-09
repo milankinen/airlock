@@ -356,8 +356,8 @@ pub struct Network {
     /// targets.
     pub(crate) interceptors: Vec<Rc<dyn Interceptor>>,
     /// Hosts of enabled services that cannot run (no token store).
-    /// The network denies them under every policy. Thus the agents never
-    /// sign in without airlock.
+    /// The network denies them on all ports under every policy. Thus the
+    /// agents never sign in without airlock.
     pub(crate) unavailable_targets: Vec<NetworkTarget>,
     /// Port forward mappings: guest_port → host_port.
     pub(crate) port_forwards: HashMap<u16, u16>,
@@ -445,19 +445,18 @@ impl Network {
             (host, port, false)
         };
 
-        if !port_forwarded
-            && self
-                .unavailable_targets
-                .iter()
-                .any(|t| t.matches(host, port))
-        {
-            return denied(host, port);
-        }
         let interceptor = if port_forwarded {
             None
         } else {
             self.interceptor_for(host, port)
         };
+        // A service owns its hosts on all ports. Deny the ports that no
+        // interceptor handles, so that a guest cannot reach the real
+        // service on another port and get real tokens.
+        let service_hosts = self.service_hosts();
+        if !port_forwarded && interceptor.is_none() && is_service_host(&service_hosts, host) {
+            return denied(host, port);
+        }
         let allowed = self.is_allowed(host, port, policy)
             || port_forwarded
             || (interceptor.is_some() && !self.is_denied_by_rule(host, port));
@@ -492,7 +491,26 @@ impl Network {
             allowed,
             passthrough,
             public_only: self.public_only,
+            service_hosts,
         }
+    }
+
+    /// Get the canonical hosts of all network services, with the hosts of
+    /// the services that cannot run.
+    fn service_hosts(&self) -> Rc<[String]> {
+        let mut hosts: Vec<String> = Vec::new();
+        let targets = self
+            .interceptors
+            .iter()
+            .flat_map(|i| i.targets())
+            .chain(&self.unavailable_targets);
+        for t in targets {
+            let host = matchers::canonical_host(&t.host);
+            if !hosts.contains(&host) {
+                hosts.push(host);
+            }
+        }
+        hosts.into()
     }
 
     /// Find the enabled service interceptor that owns `host:port`.
@@ -610,7 +628,15 @@ fn denied(host: &str, port: u16) -> ResolvedTarget {
         allowed: false,
         passthrough: false,
         public_only: false,
+        service_hosts: Rc::from([]),
     }
+}
+
+/// Check if `host` is one of the canonical `service_hosts`, in any
+/// spelling.
+pub(crate) fn is_service_host(service_hosts: &[String], host: &str) -> bool {
+    let host = matchers::canonical_host(host);
+    service_hosts.contains(&host)
 }
 
 fn is_localhost(host: &str) -> bool {

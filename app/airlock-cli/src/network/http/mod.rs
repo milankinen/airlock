@@ -170,6 +170,7 @@ pub async fn relay(
     let middleware = target.middleware;
     let secrets = target.secrets;
     let interceptor = target.interceptor;
+    let service_hosts = target.service_hosts;
     // Where the guest connected, as the interceptor sees it.
     let endpoint = Rc::new(Endpoint::new(&target.host, target.port));
     let target_host = target.host.clone();
@@ -181,6 +182,7 @@ pub async fn relay(
         let middleware = middleware.clone();
         let secrets = secrets.clone();
         let interceptor = interceptor.clone();
+        let service_hosts = service_hosts.clone();
         let endpoint = endpoint.clone();
         let events = events.clone();
         let target_host = target_host.clone();
@@ -202,7 +204,24 @@ pub async fn relay(
             let send = {
                 let (upgrade, method) = (upgrade.clone(), method.clone());
                 let injected = secrets.clone();
+                let deny_reporter = deny_reporter.clone();
                 move |mut req: Request<ResponseBody>| async move {
+                    // The upstream (for example a CDN) can route on `Host`
+                    // and not on the connect target. Then a request on
+                    // another allowed host can reach a service host past
+                    // its interceptor. Check after middleware, because a
+                    // script can change the header.
+                    if interceptor.is_none() && names_service_host(&req, &service_hosts) {
+                        debug!(
+                            "denied: request names a service host on {}",
+                            endpoint.host()
+                        );
+                        deny_reporter.report();
+                        return Ok(text_response(
+                            StatusCode::MISDIRECTED_REQUEST,
+                            "request names a service host on a connection that the service does not handle\n",
+                        ));
+                    }
                     inject::request_identity(req.headers_mut(), &injected);
                     let upstream: Next = Box::new(move |req| {
                         Box::pin(async move {
@@ -386,6 +405,22 @@ where
         None if upgrade.switched() => Ok(Some(upstream.await.context("upstream connection task")?)),
         done => Ok(done),
     }
+}
+
+/// Check if the `:authority` or the `Host` header of `req` names one of the
+/// `service_hosts`. A `Host` value that does not parse counts as a match,
+/// because the upstream can read it in a different way.
+fn names_service_host<B>(req: &Request<B>, service_hosts: &[String]) -> bool {
+    let is_service = |h: &str| crate::network::is_service_host(service_hosts, h);
+    if req.uri().host().is_some_and(is_service) {
+        return true;
+    }
+    req.headers().get_all(hyper::header::HOST).iter().any(|v| {
+        v.to_str()
+            .ok()
+            .and_then(|v| v.parse::<hyper::http::uri::Authority>().ok())
+            .is_none_or(|a| is_service(a.host()))
+    })
 }
 
 fn text_response(status: StatusCode, body: &str) -> Response<ResponseBody> {
