@@ -122,3 +122,23 @@ EOF
     assert_output_contains "[]"
     [[ -d .airlock/sandbox ]]
 }
+
+# Test that airlock refuses a project that is the home directory, because
+# the sandbox then gets all secrets in it. The `insecure_mounts` setting
+# turns the check off.
+#   1. Start a sandbox in the home directory and check the refusal
+#   2. Set `insecure_mounts = true` and check that the sandbox starts
+@test "project in home directory is refused unless insecure mounts are allowed" {
+    cd "$TEST_HOME"
+    printf '[vm]\n' >airlock.toml
+    run_vm true
+    assert_failure
+    assert_output_contains "insecure_mounts"
+
+    mkdir -p .airlock
+    printf '[security]\ninsecure_mounts = true\n' >.airlock/settings.toml
+    run_vm echo started
+    rm .airlock/settings.toml airlock.toml
+    assert_success
+    assert_output_contains "started"
+}

@@ -36,6 +36,10 @@ pub struct Settings {
     /// Default answers of the setup wizard of `airlock start`.
     #[config(nest)]
     pub wizard_defaults: WizardDefaults,
+    /// Security settings that make the sandbox less isolated if they
+    /// change. The defaults are strict.
+    #[config(nest)]
+    pub security: SecuritySettings,
     /// Where `airlock start` puts the data of a new sandbox:
     ///  * `cache-dir` (default): in the airlock data directory, out of the
     ///    reach of the sandbox guest
@@ -47,6 +51,17 @@ pub struct Settings {
     /// cache. `~` expands to the home directory. The default is
     /// `airlock` in the user data directory of the platform.
     pub data_dir: Option<String>,
+}
+
+/// Settings under the `[security]` table.
+#[derive(Clone, Debug, Default, DescribeConfig, DeserializeConfig)]
+pub struct SecuritySettings {
+    /// Allow directory mounts (also the project) that contain the home
+    /// directory or the airlock data directory. Such a mount gives the
+    /// sandbox all secrets in it, for example SSH keys and the vault. The
+    /// default (false) refuses to start the sandbox.
+    #[config(default)]
+    pub insecure_mounts: bool,
 }
 
 /// Settings under the `[wizard_defaults]` table.

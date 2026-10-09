@@ -281,6 +281,15 @@ fn assemble_mounts(
 
     let mut mounts: Vec<_> = project_mount.into_iter().collect();
     mounts.extend(user_mounts);
+    if !project.context.settings.security.insecure_mounts {
+        mount::check_exposure(
+            &mounts,
+            &[
+                ("home directory", &project.host_home),
+                ("airlock data directory", &project.context.data_dir),
+            ],
+        )?;
+    }
     Ok(mounts)
 }
 

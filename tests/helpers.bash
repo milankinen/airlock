@@ -52,14 +52,14 @@ teardown() {
 
 # -- Run airlock in an isolated environment --
 
-# Run airlock with HOME set to the temp directory, so that it does not read
-# ~/.airlock or the airlock data directory of the real home. XDG_DATA_HOME
-# is removed for the same reason. Color output and backtraces are off. Stdin
+# Run airlock with HOME set to $TEST_HOME or the temp directory, so that it
+# does not read ~/.airlock or the airlock data directory of the real home.
+# XDG_DATA_HOME is removed for the same reason. Color output and backtraces are off. Stdin
 # is /dev/null, so there is no terminal.
 # Sets $status, $output and $lines, as the bats "run" command does.
 
 run_airlock() {
-    local _home="${TEST_TEMP_DIR:-$FILE_TEMP_DIR}"
+    local _home="${TEST_HOME:-${TEST_TEMP_DIR:-$FILE_TEMP_DIR}}"
     local _output
     _output="$(env -u XDG_DATA_HOME \
         NO_COLOR=1 \

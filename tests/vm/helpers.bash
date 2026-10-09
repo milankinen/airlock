@@ -20,9 +20,11 @@ require_vm_support() {
 # -- File-level setup and teardown for VM tests --
 
 # Check the binary and VM support. Then make one temp directory for all
-# tests of the file, so that the .airlock/ sandbox (disk, image cache link,
-# overlay) stays between tests. Each test boots a new VM but uses the same
-# sandbox state again. Call this from setup_file, then write the config.
+# tests of the file, so that the sandbox (disk, image cache link, overlay)
+# stays between tests. Each test boots a new VM but uses the same sandbox
+# state again. The temp directory has the home directory and the project
+# side by side, because airlock refuses a project that contains the home.
+# Call this from setup_file, then write the config.
 
 vm_setup_file() {
     if [[ ! -x "$AIRLOCK" ]]; then
@@ -33,8 +35,10 @@ vm_setup_file() {
     require_vm_support
     mkdir -p "$TEST_TEMP_ROOT"
     FILE_TEMP_DIR="$(mktemp -d "$TEST_TEMP_ROOT/XXXXXXXX")"
-    export FILE_TEMP_DIR
-    cd "$FILE_TEMP_DIR" || return 1
+    TEST_HOME="$FILE_TEMP_DIR/home"
+    export FILE_TEMP_DIR TEST_HOME
+    mkdir -p "$TEST_HOME" "$FILE_TEMP_DIR/project"
+    cd "$FILE_TEMP_DIR/project" || return 1
 }
 
 # Stop the host HTTP server and remove the shared temp directory, unless
@@ -49,9 +53,9 @@ teardown_file() {
     fi
 }
 
-# Start each test in the shared temp directory of the file.
+# Start each test in the shared project directory of the file.
 setup() {
-    cd "$FILE_TEMP_DIR" || return 1
+    cd "$FILE_TEMP_DIR/project" || return 1
 }
 
 # Serve http_root/index.html ("hello-from-host") on host port $1 until

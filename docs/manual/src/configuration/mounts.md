@@ -100,3 +100,18 @@ enabled = false
 source = "~/.ssh/config"
 target = "~/.ssh/config"
 ```
+
+## Mounts that expose the home directory
+
+airlock refuses to start if a directory mount or the project directory is
+the home directory, the airlock data directory, or a parent of one of
+them. These directories hold secrets, such as SSH keys and the vault.
+Mount only the subdirectories that the sandbox needs.
+
+To turn off this check (not recommended), set this in
+`~/.airlock/settings.toml`:
+
+```toml
+[security]
+insecure_mounts = true   # default: false
+```

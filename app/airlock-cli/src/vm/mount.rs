@@ -174,3 +174,104 @@ fn parse_mode(s: Option<&str>, default: u32) -> anyhow::Result<u32> {
         None => Ok(default),
     }
 }
+
+/// Make sure that no directory mount exposes a protected host directory.
+/// A mount exposes a directory if its source is the directory or one of
+/// its parents, for example `/home/me`, `/home` or `/` for `/home/me`.
+/// Args:
+///  - `mounts`: Resolved mounts, with the project mount
+///  - `protected`: `(name, path)` of each host directory that no mount can
+///    expose, for example the home directory
+///
+/// Returns:
+///   Error that names the first mount that exposes a protected directory.
+pub fn check_exposure(mounts: &[ResolvedMount], protected: &[(&str, &Path)]) -> anyhow::Result<()> {
+    // Compare real paths, so that a symlink cannot hide the overlap.
+    let real = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    for m in mounts {
+        let MountType::Dir { key } = &m.mount_type else {
+            continue;
+        };
+        let source = real(&m.source);
+        let Some((name, dir)) = protected.iter().find(|(_, p)| real(p).starts_with(&source)) else {
+            continue;
+        };
+        let what = if key == "project" {
+            "project directory"
+        } else {
+            "mount source"
+        };
+        anyhow::bail!(
+            "the {what} {} is or contains the {name} {}. The sandbox could read all \
+             secrets in it.\nUse a directory below it, or set `insecure_mounts = true` \
+             in the `[security]` table of ~/.airlock/settings.toml.",
+            m.source.display(),
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A directory mount of `source`. `key` is `project` for the project
+    /// mount.
+    fn dir(key: &str, source: &Path) -> ResolvedMount {
+        ResolvedMount {
+            mount_type: MountType::Dir { key: key.into() },
+            source: source.to_path_buf(),
+            target: "/mnt/x".into(),
+            read_only: true,
+        }
+    }
+
+    /// Test that a directory mount of the home directory, the data
+    /// directory or one of their parents is refused, because the sandbox
+    /// then gets all secrets in them. Mounts below them stay allowed.
+    ///   1. Make a home directory with a data directory and a pack mount
+    ///      directory in it
+    ///   2. Check that the home, its parents (also `/`), the data directory
+    ///      and a symlink to the home are refused
+    ///   3. Check that a project below the home, the pack mount directory
+    ///      and a file mount of the home are allowed
+    #[test]
+    fn mount_of_home_data_dir_or_parent_is_refused_and_subdirectory_is_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home/me");
+        let data = home.join(".local/share/airlock");
+        let pack = data.join("packs/mounts/claude");
+        let project = home.join("src/app");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        let protected = [
+            ("home directory", home.as_path()),
+            ("airlock data directory", data.as_path()),
+        ];
+
+        for (key, source) in [
+            ("project", home.as_path()),
+            ("project", home.parent().unwrap()),
+            ("dir_0", Path::new("/")),
+            ("dir_0", data.as_path()),
+            ("dir_0", link.as_path()),
+        ] {
+            let err = check_exposure(&[dir(key, source)], &protected)
+                .expect_err(&source.display().to_string())
+                .to_string();
+            assert!(err.contains("insecure_mounts"), "{err}");
+        }
+
+        let file = ResolvedMount {
+            mount_type: MountType::File {
+                mount_key: "f".into(),
+            },
+            ..dir("f", &home)
+        };
+        let allowed = [dir("project", &project), dir("dir_0", &pack), file];
+        check_exposure(&allowed, &protected).unwrap();
+    }
+}
