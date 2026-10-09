@@ -208,6 +208,12 @@ fn extract_tarball_to_cache(
                     )
                 })?;
             } else {
+                // `.wh.`, `.wh..` and `.wh...` name the parent directory or
+                // its parent. A delete of that target empties the layer
+                // cache, so refuse the layer.
+                if matches!(target_name, "" | "." | "..") || target_name.contains('/') {
+                    anyhow::bail!("refusing layer: unsafe whiteout name {}", path.display());
+                }
                 let dir = safe_join(&tmp, parent_rel)?;
                 std::fs::create_dir_all(&dir)?;
                 let target = dir.join(target_name);

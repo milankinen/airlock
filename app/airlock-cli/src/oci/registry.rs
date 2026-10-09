@@ -102,6 +102,13 @@ pub async fn resolve(
 
     let image_config: OciConfig = serde_json::from_str(&config_str)?;
 
+    // The digests name files in the shared cache. A hostile registry can
+    // send any string, for example one with `../` parts.
+    crate::cache::check_digest(&digest)?;
+    for layer in &manifest.layers {
+        crate::cache::check_digest(&layer.digest)?;
+    }
+
     Ok(RegistryImage {
         reference,
         digest,

@@ -177,3 +177,30 @@ fn whiteout_aimed_outside_layer_does_not_touch_host_files() {
         );
     }
 }
+
+/// Test that a whiteout that names its own directory or the parent
+/// directory refuses the layer, so that a hostile image cannot empty the
+/// shared layer cache.
+///   1. Cache a good layer
+///   2. Cache layers with the whiteouts `.wh.`, `.wh..` and `.wh...`
+///   3. Check that each of these layers is refused
+///   4. Check that the good layer is unchanged
+#[test]
+fn whiteout_naming_own_or_parent_directory_is_refused() {
+    let _home = TempHome::new();
+    let good = cache_layer("sha256:good", &LayerTar::default().file("keep", "yes").gz());
+
+    for (digest, name) in [
+        ("sha256:evil-empty", "dir/.wh."),
+        ("sha256:evil-dot", "dir/.wh.."),
+        ("sha256:evil-dotdot", "dir/.wh..."),
+    ] {
+        let tar = LayerTar::default().raw_file(name).gz();
+        let res = layer::ensure_layer_cached(digest, |dest| Ok(std::fs::write(dest, &tar)?), None);
+        let err = res.expect_err(name).to_string();
+        assert!(err.contains("unsafe whiteout name"), "{name}: {err}");
+    }
+
+    let keep = cache::layer_dir(&good).unwrap().join("keep");
+    assert_eq!(std::fs::read(keep).unwrap(), b"yes");
+}

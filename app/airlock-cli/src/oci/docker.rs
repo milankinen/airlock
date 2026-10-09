@@ -324,7 +324,11 @@ pub(super) fn save_from_stream<R: Read>(
         let mut layer_digests = Vec::with_capacity(manifest.layers.len());
         let mut seen: HashSet<String> = HashSet::new();
         for layer_ref in &manifest.layers {
-            let hex = blob_hex(layer_ref).unwrap_or(layer_ref).to_string();
+            // The layer digest names a cache entry, so accept only a
+            // content-addressed blob name.
+            let hex = blob_hex(layer_ref)
+                .ok_or_else(|| anyhow::anyhow!("unsupported layer {layer_ref:?} in docker save"))?
+                .to_string();
             let digest = format!("sha256:{hex}");
             layer_digests.push(digest.clone());
             if !seen.insert(hex.clone()) {

@@ -38,6 +38,27 @@ pub fn digest_name(digest: &str) -> &str {
     digest.split(':').next_back().unwrap_or(digest)
 }
 
+/// Check that `digest` is a SHA-256 OCI digest (`sha256:` and 64 lowercase
+/// hex digits). Use it on each digest from a registry or an image export
+/// before the digest names a cache entry.
+pub fn check_digest(digest: &str) -> anyhow::Result<()> {
+    let ok = digest.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    });
+    anyhow::ensure!(ok, "invalid image digest {digest:?}");
+    Ok(())
+}
+
+/// Make sure that `name` is one plain file name, so that a cache entry
+/// cannot point out of its cache directory.
+fn check_entry_name(name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !matches!(name, "" | "." | "..") && !name.contains(['/', '\0']),
+        "invalid cache entry name {name:?}"
+    );
+    Ok(())
+}
+
 /// Convert an OCI digest to the versioned layer key.
 /// Returns:
 ///   The layer key. It is the on-disk directory name and also the
@@ -153,7 +174,9 @@ pub fn images_root() -> anyhow::Result<PathBuf> {
 /// Get the path of a cached OCI image file for the image `digest`. The file
 /// possibly does not exist. The caller must check.
 pub fn image_path(digest: &str) -> anyhow::Result<PathBuf> {
-    Ok(images_root()?.join(digest_name(digest)))
+    let name = digest_name(digest);
+    check_entry_name(name)?;
+    Ok(images_root()?.join(name))
 }
 
 /// Get the root of the per-layer cache (`<data>/oci/layers/`).
@@ -175,5 +198,6 @@ pub fn layers_root() -> anyhow::Result<PathBuf> {
 ///    [`layer_key`] first. A key from `image_layers` (in the image JSON) is
 ///    already a layer key.
 pub fn layer_dir(key: &str) -> anyhow::Result<PathBuf> {
+    check_entry_name(key)?;
     Ok(layers_root()?.join(key))
 }

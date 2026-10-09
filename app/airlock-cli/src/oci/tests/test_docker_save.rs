@@ -221,3 +221,29 @@ fn docker_blob_whose_content_does_not_match_its_digest_is_rejected() {
         .collect();
     assert!(leftovers.is_empty());
 }
+
+/// Test that a `docker save` manifest with a layer name that is not a
+/// content-addressed blob is refused, so that the name cannot point out of
+/// the layer cache.
+///   1. Make an export whose manifest names a layer with `../` parts
+///   2. Stage the export and check the "unsupported layer" error
+#[test]
+fn docker_manifest_layer_with_path_parts_is_rejected() {
+    let _home = TempHome::new();
+    let config = config_json("", &[]);
+    let config_hex = sha256_hex(&config);
+    let manifest =
+        format!(r#"[{{"Config":"blobs/sha256/{config_hex}","Layers":["../../../etc/passwd"]}}]"#);
+    let export = LayerTar::default()
+        .file(&format!("blobs/sha256/{config_hex}"), &config)
+        .file("manifest.json", manifest)
+        .plain();
+
+    let Err(err) =
+        docker::save_from_stream(std::io::Cursor::new(export), &cache::layers_root().unwrap())
+    else {
+        panic!("layer with path parts must be rejected");
+    };
+
+    assert!(err.to_string().contains("unsupported layer"), "{err}");
+}
