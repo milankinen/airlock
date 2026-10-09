@@ -17,8 +17,9 @@ Plan: `docs/plans/2026-10-08-sandbox-data-dir.md`.
   `data_dir` setting changes it.
 - The root holds the database (`db/`, it was `~/.airlock/db`), the
   sandboxes (`boxes/<id>/`) and all of the former `~/.cache/airlock`
-  (`oci/`, `vm/`, `packs/mounts/`, `sock/`). There is no migration of the
-  old locations: they were not released.
+  (`oci/`, `vm/`, `packs/mounts/`, `sock/`). `~/.airlock/db` was not
+  released, so it has no migration. `~/.cache/airlock` was released, see
+  `2026-10-09-legacy-cache-move.md`.
 - One root keeps the `image` hard link of a sandbox and the image cache on
   one file system.
 - `~/.airlock` keeps only the settings and the vault.

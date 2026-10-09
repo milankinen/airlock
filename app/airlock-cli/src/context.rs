@@ -35,14 +35,16 @@ impl Context {
     /// Load the context. The settings come from the user's airlock
     /// directory `~/.airlock`. The database is in the data directory of the
     /// settings, which also becomes the data directory of the process (see
-    /// [`crate::cache::set_data_dir`]).
+    /// [`crate::cache::set_data_dir`]). If the cache of an older version
+    /// cannot move to the data directory, the old cache directory is the
+    /// data directory (see [`crate::cache::migrate_legacy_cache`]).
     /// Returns:
     ///   The context, or error if the settings file is malformed or the
     ///   database does not open. A missing settings file gives defaults.
     pub fn load() -> anyhow::Result<Self> {
         let settings = Settings::load_from(&Settings::dir()?)?;
         let vault = Vault::for_storage_type(settings.vault.storage);
-        let data_dir = settings.data_dir()?;
+        let data_dir = crate::cache::migrate_legacy_cache(settings.data_dir()?);
         crate::cache::set_data_dir(data_dir.clone());
         let db = Db::open(&data_dir.join(db::DIR))?;
         Ok(Self {

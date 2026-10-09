@@ -133,6 +133,12 @@ data_dir = "~/airlock-data"
 The data directory also holds the image cache. Keep it on one file
 system: airlock links each sandbox to its cached image with a hard link.
 
+Older airlock versions kept the image cache in `~/.cache/airlock`. If the
+data directory does not exist, airlock moves this cache to the data
+directory when it starts. If the data directory is on a different file
+system, airlock shows a warning and uses `~/.cache/airlock` as the data
+directory.
+
 ## Project-colocated sandboxes
 
 Older airlock versions kept the sandbox in `.airlock/sandbox` in the

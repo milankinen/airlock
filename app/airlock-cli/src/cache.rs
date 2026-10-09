@@ -101,6 +101,50 @@ pub fn data_dir() -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
+/// Move the cache of older airlock versions (`~/.cache/airlock`) to the
+/// data directory `data_dir`, if the data directory does not exist yet.
+/// Thus existing sandboxes keep their images and layers after an upgrade,
+/// and airlock does not ask the registry again.
+///
+/// Returns:
+///   The data directory to use. This is the old cache directory if the
+///   move is not possible, for example because the two directories are on
+///   different file systems.
+pub fn migrate_legacy_cache(data_dir: PathBuf) -> PathBuf {
+    let Some(legacy) = dirs::home_dir().map(|h| h.join(".cache").join("airlock")) else {
+        return data_dir;
+    };
+    if !legacy.is_dir() || data_dir.exists() {
+        return data_dir;
+    }
+    // One rename keeps the inodes. Thus running sandboxes keep their open
+    // files, and the hard links to cached images stay valid.
+    let moved = data_dir
+        .parent()
+        .map_or(Ok(()), create_private_dir)
+        .and_then(|()| Ok(std::fs::rename(&legacy, &data_dir)?))
+        .and_then(|()| {
+            use std::os::unix::fs::PermissionsExt as _;
+            // The data directory holds the sandbox data, so make it
+            // private like a new one.
+            let mode = std::fs::Permissions::from_mode(0o700);
+            Ok(std::fs::set_permissions(&data_dir, mode)?)
+        });
+    match moved {
+        Ok(()) => data_dir,
+        Err(e) => {
+            crate::cli::log!(
+                "{} cannot move {} to {}: {e}. Using {}.",
+                crate::cli::yellow("warning:"),
+                legacy.display(),
+                data_dir.display(),
+                legacy.display()
+            );
+            legacy
+        }
+    }
+}
+
 /// Create `dir` and its missing parents. A new directory gets mode 0700:
 /// the data directory holds the database and the sandbox data.
 pub fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
@@ -200,4 +244,39 @@ pub fn layers_root() -> anyhow::Result<PathBuf> {
 pub fn layer_dir(key: &str) -> anyhow::Result<PathBuf> {
     check_entry_name(key)?;
     Ok(layers_root()?.join(key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_cfg::home::TempHome;
+
+    /// Test that the cache of an older airlock moves to the data
+    /// directory, so that existing sandboxes find their images after an
+    /// upgrade.
+    ///   1. Fill `~/.cache/airlock` with an image and a layer
+    ///   2. Move the old cache
+    ///   3. Check that the data directory has the entries and is private,
+    ///      and that the old directory is gone
+    #[test]
+    fn legacy_cache_moves_to_data_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = TempHome::new();
+        let legacy = home.path().join(".cache/airlock");
+        std::fs::create_dir_all(legacy.join("oci/images")).unwrap();
+        std::fs::create_dir_all(legacy.join("oci/layers/2.abc")).unwrap();
+        std::fs::write(legacy.join("oci/images/abc"), "image").unwrap();
+        let data = home.data_dir();
+
+        assert_eq!(migrate_legacy_cache(data.clone()), data);
+
+        assert_eq!(
+            std::fs::read_to_string(data.join("oci/images/abc")).unwrap(),
+            "image"
+        );
+        assert!(data.join("oci/layers/2.abc").is_dir());
+        let mode = std::fs::metadata(&data).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        assert!(!legacy.exists());
+    }
 }
