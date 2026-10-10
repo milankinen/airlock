@@ -15,7 +15,7 @@ use crate::cli::prompt::style::Tone;
 use crate::context::Context;
 use crate::project::{self, SandboxLock};
 use crate::sandboxes::{self, Found, KEEP_IN_PROJECT, Location, MigrateError, registry};
-use crate::settings::SandboxLocation;
+use crate::settings::SandboxType;
 use crate::util::PinnedDir;
 
 /// The answer to the move question.
@@ -62,9 +62,9 @@ pub async fn lock_sandbox(
             Move::Later => SandboxLock::acquire(host_cwd)?,
         },
         Some(_) => SandboxLock::acquire(host_cwd)?,
-        None => match context.settings.sandbox_location {
-            SandboxLocation::ProjectDir => SandboxLock::acquire(host_cwd)?,
-            SandboxLocation::CacheDir => {
+        None => match context.settings.security.sandbox_type {
+            SandboxType::ProjectOwned => SandboxLock::acquire(host_cwd)?,
+            SandboxType::Managed => {
                 // A local project config in `.airlock` goes with the new
                 // sandbox. Check before anything is made.
                 sandboxes::check_local_config(host_cwd).map_err(|e| Exit::error(1, e))?;
@@ -102,7 +102,7 @@ async fn lock_box(context: &Context, host_cwd: &Path, id: &str) -> Result<Sandbo
 /// settings select the data directory, the user did not choose to keep the
 /// sandbox in the project, and no airlock process runs the sandbox.
 fn wants_move(context: &Context, found: &Found) -> bool {
-    if context.settings.sandbox_location != SandboxLocation::CacheDir
+    if context.settings.security.sandbox_type != SandboxType::Managed
         || project::is_running(&found.dir)
     {
         return false;

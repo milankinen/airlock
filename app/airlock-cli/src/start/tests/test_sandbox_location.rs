@@ -106,14 +106,17 @@ fn new_sandbox_goes_to_data_dir_and_project_gets_no_sandbox_data() {
     assert_eq!(&entries[0].id, id);
 }
 
-/// Test that the `project-dir` setting puts a new sandbox in the project,
+/// Test that the `project-owned` setting puts a new sandbox in the project,
 /// and keeps it out of the registry.
-///   1. Set `sandbox_location = "project-dir"` and start a project
+///   1. Set `sandbox_type = "project-owned"` and start a project
 ///   2. Check that the sandbox is in `.airlock/sandbox` and has a CA
 ///   3. Check that the registry is empty
 #[test]
 fn project_dir_setting_puts_new_sandbox_in_project() {
-    let project = StartProject::with_settings(test_packs(), "sandbox_location = \"project-dir\"\n");
+    let project = StartProject::with_settings(
+        test_packs(),
+        "[security]\nsandbox_type = \"project-owned\"\n",
+    );
     project.start(ONE, false).unwrap();
 
     let found = project.sandbox().unwrap();
@@ -238,7 +241,7 @@ fn project_sandbox_without_terminal_stays_and_later_start_can_move_it() {
 /// keep it there, or when the settings select the project directory.
 ///   1. Mark a project sandbox as kept (the "no" answer) and run the step
 ///      with `--yes`, and check that it stays
-///   2. With `sandbox_location = "project-dir"`, run the step with `--yes`
+///   2. With `sandbox_type = "project-owned"`, run the step with `--yes`
 ///      on an older project sandbox, and check that it stays
 ///   3. Check that the registry stays empty in both cases
 #[test]
@@ -248,7 +251,7 @@ fn kept_project_sandbox_or_project_dir_setting_is_not_moved() {
     std::fs::write(kept.project_sandbox().join(KEEP_IN_PROJECT), "").unwrap();
     assert_eq!(kept.lock(true), kept.project_sandbox());
 
-    let setting = Home::new("sandbox_location = \"project-dir\"\n");
+    let setting = Home::new("[security]\nsandbox_type = \"project-owned\"\n");
     legacy_sandbox(&setting.project);
     assert_eq!(setting.lock(true), setting.project_sandbox());
 

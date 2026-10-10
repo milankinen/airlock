@@ -128,7 +128,6 @@ mod tests {
     fn monitor_with_unknown_key_binding_is_refused() {
         let mut settings = Settings {
             vault: VaultSettings::default(),
-            sandbox_location: crate::settings::SandboxLocation::default(),
             data_dir: None,
             monitor: MonitorSettings {
                 buffers: MonitorBuffers {

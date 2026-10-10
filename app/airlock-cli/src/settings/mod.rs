@@ -40,13 +40,6 @@ pub struct Settings {
     /// change. The defaults are strict.
     #[config(nest)]
     pub security: SecuritySettings,
-    /// Where `airlock start` puts the data of a new sandbox:
-    ///  * `cache-dir` (default): in the airlock data directory, out of the
-    ///    reach of the sandbox guest
-    ///  * `project-dir`: in `.airlock/sandbox` in the project. Existing
-    ///    project sandboxes then stay there without a question.
-    #[config(default)]
-    pub sandbox_location: SandboxLocation,
     /// Airlock data directory: the database, the sandboxes and the image
     /// cache. `~` expands to the home directory. The default is
     /// `airlock` in the user data directory of the platform.
@@ -56,6 +49,14 @@ pub struct Settings {
 /// Settings under the `[security]` table.
 #[derive(Clone, Debug, Default, DescribeConfig, DeserializeConfig)]
 pub struct SecuritySettings {
+    /// Where `airlock start` puts the data of a new sandbox:
+    ///  * `managed` (default): in the airlock data directory, out of the
+    ///    reach of the sandbox guest
+    ///  * `project-owned`: in `.airlock/sandbox` in the project. The guest
+    ///    hides `.airlock`. Existing project sandboxes then stay there
+    ///    without a question.
+    #[config(default)]
+    pub sandbox_type: SandboxType,
     /// Allow directory mounts (also the project) that contain the home
     /// directory or the airlock data directory. Such a mount gives the
     /// sandbox all secrets in it, for example SSH keys and the vault. The
@@ -94,18 +95,19 @@ impl smart_config::de::WellKnown for WizardStart {
     const DE: Self::Deserializer = smart_config::de::Serde;
 }
 
-/// Location of the data of a new sandbox. Matches `sandbox_location`.
+/// Location of the data of a new sandbox. Matches
+/// `security.sandbox_type`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum SandboxLocation {
+pub enum SandboxType {
     /// `.airlock/sandbox` in the project directory.
-    ProjectDir,
+    ProjectOwned,
     /// `boxes/<id>` in the airlock data directory.
     #[default]
-    CacheDir,
+    Managed,
 }
 
-impl smart_config::de::WellKnown for SandboxLocation {
+impl smart_config::de::WellKnown for SandboxType {
     type Deserializer =
         smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
     const DE: Self::Deserializer = smart_config::de::Serde;
@@ -266,7 +268,8 @@ mod tests {
         assert_eq!(s.monitor.buffers.http, 100);
         assert_eq!(s.monitor.buffers.scrollback, 1000);
         assert_eq!(s.wizard_defaults.start, WizardStart::StartAndShare);
-        assert_eq!(s.sandbox_location, SandboxLocation::CacheDir);
+        assert_eq!(s.security.sandbox_type, SandboxType::Managed);
+        assert!(!s.security.insecure_mounts);
         assert_eq!(s.data_dir, None);
 
         std::fs::write(
@@ -288,8 +291,9 @@ mod tests {
         std::fs::write(
             dir.path().join("settings.toml"),
             "vault.storage = \"file\"\nwizard_defaults.start = \"start\"\n\
-             sandbox_location = \"project-dir\"\ndata_dir = \"~/airlock-data\"\n\
-             [monitor.buffers]\nhttp = 5\n",
+             data_dir = \"~/airlock-data\"\n\
+             [monitor.buffers]\nhttp = 5\n\
+             [security]\nsandbox_type = \"project-owned\"\ninsecure_mounts = true\n",
         )
         .unwrap();
         let s = Settings::load_from(dir.path()).unwrap();
@@ -297,7 +301,8 @@ mod tests {
         assert_eq!(s.monitor.buffers.http, 5);
         assert_eq!(s.monitor.buffers.tcp, 100);
         assert_eq!(s.wizard_defaults.start, WizardStart::Start);
-        assert_eq!(s.sandbox_location, SandboxLocation::ProjectDir);
+        assert_eq!(s.security.sandbox_type, SandboxType::ProjectOwned);
+        assert!(s.security.insecure_mounts);
         assert_eq!(s.data_dir.as_deref(), Some("~/airlock-data"));
     }
 
@@ -310,7 +315,7 @@ mod tests {
         for content in [
             "not valid = toml =",
             "vault.storage = \"typo\"\n",
-            "sandbox_location = \"typo\"\n",
+            "security.sandbox_type = \"typo\"\n",
         ] {
             let dir = temp_dir();
             std::fs::write(dir.path().join("settings.toml"), content).unwrap();

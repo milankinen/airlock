@@ -21,8 +21,9 @@ pub enum MigrateError {
     /// systems. A rename cannot move the sandbox.
     #[error(
         "cannot move {from} to {to}: they are on different file systems. Set \
-         `sandbox_location = \"project-dir\"` in ~/.airlock/settings.toml to keep the sandbox \
-         in the project, or remove it with `airlock rm`"
+         `sandbox_type = \"project-owned\"` in the `[security]` table of \
+         ~/.airlock/settings.toml to keep the sandbox in the project, or remove it with \
+         `airlock rm`"
     )]
     CrossDevice { from: String, to: String },
     /// `.airlock` holds files that airlock does not know. The move would

@@ -45,9 +45,9 @@ characters.
 
 ## Sandbox directory
 
-A sandbox directory is `<data>/boxes/<id>/`. With
-`sandbox_location = "project-dir"`, or for a sandbox that an older
-airlock made, it is `<project>/.airlock/sandbox/`. Such a sandbox is not
+A sandbox directory is `<data>/boxes/<id>/` (a managed sandbox). With
+`sandbox_type = "project-owned"` in the `[security]` settings, or for a
+sandbox that an older airlock made, it is `<project>/.airlock/sandbox/`. Such a sandbox is not
 in the registry. Both kinds have the same contents:
 
 ```

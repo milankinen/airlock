@@ -145,12 +145,15 @@ Older airlock versions kept the sandbox in `.airlock/sandbox` in the
 project directory. `airlock start` offers to move such a sandbox into the
 data directory.
 
-To keep new sandboxes in the project directory, set `sandbox_location` in
+To keep new sandboxes in the project directory, set `sandbox_type` in
 `~/.airlock/settings.toml`:
 
 ```toml
-sandbox_location = "project-dir"   # default: "cache-dir"
+[security]
+sandbox_type = "project-owned"   # default: "managed"
 ```
+
+The guest hides the `.airlock` directory of a project-owned sandbox.
 
 > [!WARNING]
 > A sandbox in the project directory is less secure. The sandbox guest
