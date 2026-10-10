@@ -31,3 +31,6 @@ airlock start --monitor
 The first start opens the wizard. Select the agent and the tools, and
 press Enter. Later starts use the same config and sandbox. `airlock rm`
 removes the sandbox and the local config.
+
+airlock does not start a sandbox in your home directory. See
+[Mounts that expose the home directory](../configuration/mounts.md#mounts-that-expose-the-home-directory).

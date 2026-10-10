@@ -159,6 +159,8 @@ When a service is on:
 
 - airlock allows the hosts of the service, also with `deny-by-default`.
   `deny-always` and `deny` patterns still block them.
+- airlock allows these hosts only on port 443. It denies the other ports
+  of these hosts with all policies.
 - The sign-in page opens in the browser of the host. If your `[env]` sets
   `BROWSER`, airlock does not change it.
 - airlock keeps the real tokens on the host and gives the agent
@@ -169,7 +171,7 @@ When a service is on:
   other credentials with HTTP 401.
 - airlock refuses an answer that contains a real token (HTTP 502).
 - All sandboxes share the sign-ins. A logout in one sandbox signs out all
-  sandboxes. `airlock show` lists the sign-ins.
+  sandboxes. `airlock info` lists the sign-ins.
 
 airlock encrypts the tokens with a key from the [secret vault](../secrets.md).
 If the vault is `disabled` or airlock cannot read the key, the service is
@@ -190,16 +192,13 @@ When you need to do more than just allow or deny connections — for example,
 injecting authentication headers or inspecting request paths — you can define
 middleware. Middleware is separate from rules and matches connections by its
 own `target` patterns. It triggers transparent TLS interception for matching
-hosts, letting airlock read and modify HTTP traffic.
+hosts, letting airlock read and change HTTP traffic.
 
 ```toml
 [network.middleware.my-api-auth]
 target = ["api.example.com:443"]
 env.TOKEN = "${MY_API_KEY}"
 script = '''
-if not env.TOKEN then
-    req:deny()
-end
 req:setHeader("Authorization", "Bearer " .. env.TOKEN)
 '''
 ```
@@ -208,11 +207,14 @@ The `target` field uses the same pattern syntax as rule `allow`/`deny` lists.
 Middleware only runs for connections that have been allowed (by policy or rules)
 — denied connections never reach middleware.
 
-The `env` table maps names to values expanded from the host environment using
-`${VAR}` syntax. Inside the Lua script, these are available as `env.TOKEN`
-(or `nil` if the host variable isn't set).
+The `env` table maps names to values. airlock resolves `${VAR}` first from
+the host environment and then from the [secret vault](../secrets.md), as in
+[`[env]`](./env.md#variable-substitution). Inside the Lua script, the values
+are in the `env` table, for example `env.TOKEN`. If a variable is not
+defined in either source, the sandbox does not start. Use
+`${VAR:default}` to give a fallback value.
 
-airlock automatically generates a per-project CA certificate and installs
+airlock automatically generates a CA certificate for each sandbox and installs
 it in the VM's system trust store. TLS interception is therefore
 transparent to processes inside the container — they see valid
 certificates.

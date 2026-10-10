@@ -64,7 +64,7 @@ nodejs = { version = "1" }
 enabled = false
 ```
 
-Run `airlock show` to see the result. See the
+Run `airlock info` to see the result. See the
 [built-in packs](https://github.com/milankinen/airlock/tree/main/packs)
 for the configuration of each pack.
 

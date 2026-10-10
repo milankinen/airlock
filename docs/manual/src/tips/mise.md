@@ -45,7 +45,7 @@ Then add a mise task to build it:
 # mise.toml
 [tasks."build:image"]
 description = "Build sandbox image"
-run = "docker build -t myproject:dev -f dev.dockerfile ."
+run = "docker build -t myproject:dev ."
 ```
 
 And point airlock at the local image:

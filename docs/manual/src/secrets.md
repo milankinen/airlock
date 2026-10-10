@@ -46,6 +46,10 @@ first and the vault as fallback. It injects the result as `API_TOKEN`
 inside the sandbox. The same substitution applies in Lua middleware
 `env` tables (see [Network scripting](./advanced/network-scripting.md)).
 
+The sandbox gets the real value. To keep the real value out of the
+sandbox, set `mask = true` on the entry (see
+[Masking](./configuration/env.md#masking)).
+
 ## Choosing a storage backend
 
 The vault supports four storage backends. Pick one with
@@ -95,7 +99,7 @@ Secrets live in `~/.airlock/vault.default.enc.json`, with the `data`
 field as an Argon2id-derived-key + ChaCha20-Poly1305-encrypted blob.
 The passphrase comes from `AIRLOCK_VAULT_PASSPHRASE` if set. Otherwise
 airlock prompts on the terminal. airlock prompts twice on first use
-(new vault) and once per process thereafter. It erases the prompt line
+(new vault) and once per process thereafter. It removes the prompt line
 on successful input so the terminal stays clean.
 
 **Why you might pick it**: it works on every platform, including
@@ -162,6 +166,7 @@ re-prompts on every `401`.
 ## Agent sign-ins
 
 The [network services](./configuration/network.md#network-services) keep
-the real sign-in tokens of the coding agents in `~/.airlock/db/`. airlock
+the real sign-in tokens of the coding agents in `db/` in the airlock data
+directory (see [Where airlock keeps sandbox data](./usage/managing-sandbox.md#where-airlock-keeps-sandbox-data)). airlock
 encrypts them with a key from the vault. airlock makes the key when it
 needs it the first time. `airlock secrets list` does not show it.

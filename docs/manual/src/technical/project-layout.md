@@ -73,10 +73,10 @@ airlock writes the JSON files atomically (temp file and rename) under the
 sandbox lock. Other processes (`airlock sandboxes list`, `airlock info`)
 read them at the same time without a wait.
 
-The local project config (`airlock.<ext>`, for example from the `start`
-option of the setup wizard) is in the sandbox directory of a sandbox in
-the data directory. Thus it is never in the repository. A project sandbox
-keeps it in `.airlock/`:
+The local project config (`airlock.<ext>`) is the file that the setup
+wizard writes when `Create airlock.toml` is off. It is in the sandbox
+directory of a sandbox in the data directory. Thus it is never in the
+repository. A project sandbox keeps it in `.airlock/`:
 
 ```
 <project>/

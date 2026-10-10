@@ -61,7 +61,7 @@ The pack status is one of these:
 | `install not confirmed`          | The last install did not complete correctly. The next start tries again |
 | `config only`                    | The pack installs nothing, it adds only config  |
 | `installed, removed from config` | The pack is still on the disk, but not in the config |
-| `kept, removed from config`      | You selected "continue with current" after you removed the pack |
+| `kept, removed from config`      | You selected "continue with current sandbox" after you removed the pack |
 
 ## Listing sandboxes
 

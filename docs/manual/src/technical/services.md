@@ -105,13 +105,14 @@ tokens (base64, JSON escapes, URL encoding).
 
 ## Token store
 
-The store is an LMDB database in `~/.airlock/db/`. Each service has
+The store is an LMDB database in `<data>/db/` (see
+[Project layout](./project-layout.md#data-directory)). Each service has
 three keys:
 
 - `<service>.secrets`: all sign-ins as one document, sealed with
   ChaCha20-Poly1305. The key comes from the vault field
   `service_store_key`.
-- `<service>.meta`: plain data for `airlock show` (account, scopes,
+- `<service>.meta`: plain data for `airlock info` (account, scopes,
   time). No tokens.
 - `<service>.generation`: a counter. A reader decrypts again only when
   the counter changed, so all processes see sign-outs at once.

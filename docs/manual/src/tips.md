@@ -17,3 +17,6 @@ keeping `deny-by-default` in `airlock.toml`.
 
 [Editor integration with ACP](./tips/editor-acp.md) shows how to connect
 an editor to a coding agent in the sandbox.
+
+[Experimental: Claude hooks](./tips/experimental-claude-hooks.md) shows how
+to tell Claude Code when the network policy denies a connection.

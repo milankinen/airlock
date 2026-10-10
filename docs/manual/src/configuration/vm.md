@@ -90,8 +90,10 @@ cpus = 4
 memory = "4 GB"
 ```
 
-Memory accepts human-readable sizes like `"512 MB"`, `"4 GB"`, or `"2G"`.
-The minimum is 512 MB, and the maximum is the total system RAM.
+Memory accepts human-readable sizes like `"512 MB"`, `"4 GB"`, or `"2GB"`.
+The units are `B`, `KB`, `MB` and `GB` (also `KiB`, `MiB` and `GiB`). They
+are binary units: 1 GB is 1024 MB. The default (half the system RAM) is
+at least 512 MB and at most the total system RAM.
 
 ## Security hardening
 

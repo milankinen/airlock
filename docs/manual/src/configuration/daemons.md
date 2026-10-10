@@ -17,8 +17,9 @@ command = ["redis-server", "/etc/redis.conf"]
 ```
 
 That is enough to keep a single Redis server running for the life of the
-sandbox. On crash it restarts (up to 10 times by default) with a one
-second delay per retry. When you exit the shell, airlock sends it
+sandbox. On crash it restarts (up to 10 times by default). The delay
+before each retry is one second longer than the delay before the last
+retry. When you exit the shell, airlock sends it
 `SIGTERM` and gives it 10 seconds to stop before it sends `SIGKILL`.
 
 ## Full reference
@@ -84,9 +85,9 @@ Default: `true`.
 Per-daemon environment variables. Supports the same `${VAR}` and
 `${VAR:default}` substitution as the top-level [`[env]`](./env.md)
 section, resolved from the host environment and the
-[secret vault](../secrets.md). Values declared here layer on top of
-the image's baseline environment. The daemon does not inherit the main
-shell's `[env]` entries.
+[secret vault](../secrets.md). The daemon gets the sandbox environment:
+the image environment and the top-level `[env]` entries. Values declared
+here override the values with the same name.
 
 ## Logs
 

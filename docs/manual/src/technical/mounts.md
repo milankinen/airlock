@@ -11,13 +11,13 @@ The full set of shares present at boot:
 
 | Tag               | Host path                          | Mode |
 |-------------------|------------------------------------|------|
-| `base`            | `<data>/oci/layers/…`              | ro   |
+| `layers`          | `<data>/oci/layers/`               | ro   |
 | `project`         | project CWD                        | rw   |
 | `dir_0`, `dir_1`… | each `[mounts.*]` directory mount  | configurable |
-| `files_rw`        | `<sandbox>/overlay/files/rw/`      | rw   |
-| `files_ro`        | `<sandbox>/overlay/files/ro/`      | ro   |
+| `files/rw`        | `<sandbox>/overlay/files/rw/`      | rw   |
+| `files/ro`        | `<sandbox>/overlay/files/ro/`      | ro   |
 
-airlock creates `files_rw` / `files_ro` only when the project has at
+airlock creates `files/rw` / `files/ro` only when the project has at
 least one file mount of that kind.
 
 ## Project directory
@@ -72,8 +72,8 @@ from its source into that staging dir under a unique key:
 
 Hard links share the inode with the source, so edits made inside the
 container appear on the host and vice versa without any copying. The
-two staging dirs (`rw/` and `ro/`) become the `files_rw` and
-`files_ro` VirtioFS shares. All file mounts ride a single device each.
+two staging dirs (`rw/` and `ro/`) become the `files/rw` and
+`files/ro` VirtioFS shares. All file mounts ride a single device each.
 
 If hard-linking fails (cross-filesystem `EXDEV` — happens when the
 project and the sandbox state live on different filesystems, e.g.
@@ -97,7 +97,7 @@ upper/etc/app/config.json →  /airlock/.files/rw/app-config
 When the overlay mounts, the symlink appears at its target
 path. A read on `~/.claude.json` inside the container follows the
 symlink to `/airlock/.files/rw/claude-json`, which is the
-directory-level bind mount of `/mnt/files_rw` — a VirtioFS directory,
+directory-level bind mount of `/mnt/files/rw` — a VirtioFS directory,
 where file-level access does work.
 
 The full write path:
@@ -106,7 +106,7 @@ The full write path:
 container: write ~/.claude.json
   → symlink in overlayfs upperdir
   → /airlock/.files/rw/claude-json           (bind mount)
-  → /mnt/files_rw/claude-json                (VirtioFS)
+  → /mnt/files/rw/claude-json                (VirtioFS)
   → overlay/files/rw/claude-json             (host, hard-linked)
   → ~/.claude.json                            (original source inode)
 ```

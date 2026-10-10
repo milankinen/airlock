@@ -10,7 +10,9 @@ airlock start
 On the first start, airlock shows a setup wizard. The wizard lets you
 customize the sandbox with [packs](../packs.md). To keep the config in
 version control, select `Create airlock.toml` in the wizard. Then airlock
-creates `airlock.toml`, which you can commit to version control.
+creates `airlock.toml`, which you can commit to version control. If you
+do not select it, airlock keeps the config in the sandbox directory, and
+`airlock rm` removes it with the sandbox.
 
 ## Sandbox changes
 
@@ -24,8 +26,13 @@ installs the pack into the existing disk. Code that is already on the
 disk can run during the install, with an open network. Use it only if you
 trust the sandbox contents.
 
+For a removed pack, you can also select "continue with current sandbox".
+Then the pack stays on the disk until you re-create the sandbox. A
+changed pack installs only into a re-created sandbox.
+
 Pass `--yes` (`-y`) to select the default answer for all questions, for
-example in scripts.
+example in scripts. Without a terminal and without `--yes`, airlock
+cannot ask and stops with exit code 2.
 
 ## Configuration basics
 
@@ -74,6 +81,10 @@ airlock start --login
 airlock automatically mounts the host project directory into the VM at the
 same path. The working directory inside the container defaults to the host's
 current directory, so files are right where you'd expect them.
+
+airlock does not start a sandbox in your home directory, or in a parent
+of it. The sandbox would see all secrets in the home directory. See
+[Mounts that expose the home directory](../configuration/mounts.md#mounts-that-expose-the-home-directory).
 
 To override the working directory inside the sandbox, use `--sandbox-cwd`:
 
@@ -155,7 +166,7 @@ sandbox shell, with live network, CPU, and memory views. See the
 ## Verbose output
 
 The `--verbose` flag (or `-v`) shows mounts and network rules during startup,
-which is helpful for verifying your configuration:
+which helps you check your configuration:
 
 ```bash
 airlock start --verbose

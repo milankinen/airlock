@@ -15,12 +15,12 @@ airlock binary contains all packs. A folder has these files:
   It must be idempotent. Without it, the pack is "config only".
 
 Packs are ordered by kind (distro, agent, tool), then by name. The
-installs, the wizard and `airlock show` use this order.
+installs, the wizard and `airlock info` use this order.
 
 ## Lua configs
 
 `config.lua` runs on the host each time airlock resolves the config
-(`airlock start`, `airlock show`). Pack code ships with airlock, so it is
+(`airlock start`, `airlock info`). Pack code ships with airlock, so it is
 trusted. It gets the full Lua standard library, unlike the sandboxed
 network middleware. Globals:
 
@@ -49,7 +49,8 @@ config files. A conflict is a config error.
 
 ## Install state
 
-`.airlock/sandbox/installs.json` holds the install records of the disk:
+`installs.json` in the [sandbox directory](./project-layout.md#sandbox-directory)
+holds the install records of the disk:
 the disk ID (random for each new disk), the image ID, and one record per
 pack. A record has a status, a fingerprint and a time:
 
@@ -102,7 +103,7 @@ there is no injection risk.
 Progress protocol: stdout (fd 3 in the script) carries only
 `steps <n>` and `status <text>` lines. airlock removes control
 characters and limits the length. stderr goes to
-`.airlock/sandbox/installs.log`, with a `[<pack>]` prefix on each line.
+`installs.log` in the sandbox directory, with a `[<pack>]` prefix on each line.
 
 `lib.sh` detects the distro, the CPU and the libc. It installs packages
 with apk or apt and downloads with https and TLS 1.2 or later. Exit

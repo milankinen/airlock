@@ -83,7 +83,7 @@ on macOS or [Cloud Hypervisor](https://www.cloudhypervisor.org/) + KVM on
 Linux. The binary embeds the VM kernel and initramfs — there is nothing
 else to install.
 
-Before the VM is started, airlock pulls an OCI image from a registry, Docker,
+Before it starts the VM, airlock pulls an OCI image from a registry, Docker,
 or Podman. It then shares the image layers into the VM via VirtioFS
 and assembles an overlayfs root filesystem inside the guest. The image can be
 anything: Ubuntu, Alpine, Fedora, a custom CI image — if it runs on Linux,
@@ -105,9 +105,10 @@ flows through a vsock RPC channel back to the host, where airlock enforces
 network policies. This isn't just an HTTP proxy — it's full TCP traffic
 control.
 
-* Configurable allow/deny rules with wildcard host and port matching
+* Deny-by-default network policy, with allow/deny rules and wildcard host
+  and port matching
 * Transparent TLS interception (MITM) for rules with Lua middleware —
-  airlock generates a per-project root CA automatically and installs it
+  airlock generates a per-sandbox root CA automatically and installs it
   into the VM's system certificate store
 * Lua-scriptable HTTP request and response modification (inject headers,
   rewrite requests, conditionally deny)
@@ -120,7 +121,7 @@ control.
 Sandbox configuration lives in a plain `airlock.toml` at the project root.
 Check it into version control, and every team member gets the same sandbox
 setup — same image, same network rules, same mounts. Local overrides go in
-`airlock.local.toml` (gitignored). On the first start, a setup wizard
+`airlock.local.toml` (do not commit it). On the first start, a setup wizard
 writes the config for you.
 
 ### Packs for tools and coding agents

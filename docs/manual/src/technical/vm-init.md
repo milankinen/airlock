@@ -6,11 +6,12 @@ starts the supervisor (`airlockd`). The supervisor's `setup` closure
 (driven by the `boot` RPC) does most of the work.
 
 Each stage is a small submodule under `airlockd/src/init/linux/`.
-`init/linux.rs` is just the ordering glue. The order is load-bearing.
+`init/linux/mod.rs` is just the ordering glue. The order is load-bearing.
 VirtioFS shares must be mounted before the overlay can reference them.
 Networking must be up before the proxy starts to accept connections.
-Container mounts run last so file bind mounts win over earlier dir
-bind mounts.
+Container mounts run after the overlay so file bind mounts win over
+earlier dir bind mounts. The sandbox mount namespace comes last, so it
+has all the mounts.
 
 ## Stages
 
@@ -78,19 +79,26 @@ bind mounts.
      Mounted with `userxattr` so overlayfs honors whiteouts encoded
      by the host-side extractor as `user.overlay.whiteout` /
      `user.overlay.opaque` xattrs (requires kernel ≥ 5.11).
-   - **Upper + work**: on the ext4 disk at `/mnt/disk/overlay/rootfs`
+   - **Upper + work**: on the ext4 disk at `/mnt/disk/overlay/upper`
      and `/mnt/disk/overlay/work`. The stage resets the overlay upper
-     if the stored image ID (`.image_id` on disk) differs from the one
-     passed in `boot`.
+     if the stored image ID (`/mnt/disk/overlay/.image_id`) differs from
+     the one passed in `boot`. The rootfs mounts at `/mnt/overlay/rootfs`.
+   - **Bind mounts**: the stage then applies the directory mounts, the
+     cache mounts and the masks inside the rootfs.
 
 6. **DNS** (`net::setup_dns`) — writes `nameserver 10.0.0.1` into the
    composed rootfs's `/etc/resolv.conf`. Queries go to the in-VM
    network proxy, which resolves them on the host.
 
 7. **Container mounts** (`container::setup`) — mounts `proc`, `sys`,
-   `dev`, cgroup2, and applies file bind mounts and cache bind mounts
-   inside the rootfs. Runs after overlay assembly so file bind mounts
-   can override paths inside dir-bind-mounted directories.
+   `dev`, cgroup2, and applies the file bind mounts inside the rootfs.
+   Runs after overlay assembly so file bind mounts can override paths
+   inside dir-bind-mounted directories.
+
+8. **Sandbox mount namespace** (`sandbox_ns::create`) — makes the
+   shared mount namespace of the container processes with `pivot_root`
+   into the finished rootfs. If this fails, spawns use `chroot`. See
+   [Container execution](./container-execution.md#process-spawning).
 
 The overlay upper layer on disk means writable container state
 persists across runs. When the base image changes, the stored image

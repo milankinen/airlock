@@ -35,10 +35,10 @@ re-runs only when the tooling definition changes:
 [tasks."sandbox:init"]
 description = "Fetch project tooling inside the sandbox (network open)"
 sources = ["mise.toml", "init.sh"]
-outputs = [".airlock/.init-done"]
+outputs = [".sandbox-init-done"]
 run = """
 airlock start --network=allow-always --login -- ./init.sh
-touch .airlock/.init-done
+touch .sandbox-init-done
 """
 
 [tasks.sandbox]
@@ -50,3 +50,7 @@ run = "exec airlock start --monitor --login"
 
 Now `mise sandbox` is the only command to remember, and `sandbox:init` is
 the only thing that ever runs with an open network.
+
+Add `.sandbox-init-done` to `.gitignore`. `airlock rm` does not remove
+this file. Remove it after `airlock rm`, so that `sandbox:init` runs again
+for the new sandbox disk.
