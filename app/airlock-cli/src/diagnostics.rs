@@ -4,14 +4,36 @@
 //!  * logs panics, also panics in background tasks
 //!  * reports fatal signals, for example crashes in native libraries
 //!
+//! Release builds do not print backtraces, also when the user's
+//! environment asks for them.
+//!
 //! The CLI installs these handlers when it starts, so they cover all later
 //! failures.
+
+/// Disable panic and error backtraces in release builds.
+///
+/// Removes `RUST_BACKTRACE` and `RUST_LIB_BACKTRACE` from the process
+/// environment. Call this first in `main`, before any other thread starts.
+/// Child processes also do not get these variables.
+pub fn disable_release_backtraces() {
+    #[cfg(not(debug_assertions))]
+    // SAFETY: The caller runs this first in `main`. The current-thread tokio
+    // runtime has no worker threads, and its blocking pool starts threads
+    // only on first use. So no other thread reads the environment now.
+    // std and anyhow read these variables on first use and then keep the
+    // value, so the removal applies to all later panics and errors.
+    unsafe {
+        std::env::remove_var("RUST_BACKTRACE");
+        std::env::remove_var("RUST_LIB_BACKTRACE");
+    }
+}
 
 /// Add a logging hook in front of the default Rust panic hook.
 ///
 /// The hook writes each panic to `airlock.log` (after logging starts). This
 /// includes panics in background `spawn_local` tasks, which tokio otherwise
-/// hides. The default hook still prints the panic and backtrace to stderr.
+/// hides. The default hook still prints the panic to stderr. It prints the
+/// backtrace only in debug builds, if the environment asks for it.
 ///
 /// The hook does not restore the terminal. The `Drop` of the raw mode guard
 /// does this during unwind.

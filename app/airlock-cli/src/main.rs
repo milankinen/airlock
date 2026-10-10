@@ -41,6 +41,9 @@ use crate::settings::Settings;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // Do this before any thread starts or reads the environment.
+    diagnostics::disable_release_backtraces();
+
     // Install the panic and fatal signal handlers first. Then a panic in a
     // later init step is also visible.
     diagnostics::install_panic_hook();
