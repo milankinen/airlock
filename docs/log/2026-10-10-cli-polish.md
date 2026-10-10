@@ -19,3 +19,15 @@ use the same lines. `main` sets it with clap `before_help` on the root
 command only. Clap does not copy `before_help` to subcommands, so
 `airlock help sandbox` and `airlock start --help` do not show it. The
 logo is bold through `console`, which drops the style when color is off.
+
+## Rename `sandbox` command to `sandboxes`
+
+The command that lists, shows and removes sandboxes is now
+`airlock sandboxes`, the plural form as in `airlock secrets`. `sandbox`
+stays as a clap alias, so old scripts and habits continue to work. The
+`Command::Sandbox` variant is now `Command::Sandboxes`. The module keeps
+its `cmd_sandbox` name, as `cmd_secret` does for `secrets`. Help text,
+the "see `airlock sandboxes list`" hint in errors, code comments, the
+manual and the bats tests use the new name. The bats file is now
+`tests/cli/sandboxes.bats`, and its list test runs `sandbox ls` to cover
+the alias.

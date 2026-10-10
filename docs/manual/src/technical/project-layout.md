@@ -40,7 +40,7 @@ User-level state stays in `~/.airlock/`:
 
 The `sandboxes` database in `db/` maps each sandbox id to its canonical
 project directory. It is the registry of the sandboxes in `boxes/`.
-`airlock sandbox list` shows it. The id is 8 random lowercase base32
+`airlock sandboxes list` shows it. The id is 8 random lowercase base32
 characters.
 
 ## Sandbox directory
@@ -70,7 +70,7 @@ in the registry. Both kinds have the same contents:
 ```
 
 airlock writes the JSON files atomically (temp file and rename) under the
-sandbox lock. Other processes (`airlock sandbox list`, `airlock info`)
+sandbox lock. Other processes (`airlock sandboxes list`, `airlock info`)
 read them at the same time without a wait.
 
 The local project config (`airlock.<ext>`, for example from the `start`
@@ -151,6 +151,6 @@ the digest changes, the guest resets the overlay upper layer.
 
 `lock` holds an exclusive `flock` while `airlock start` runs, and
 contains its PID for diagnostics. A second `airlock start` on the same
-sandbox fails at once. `airlock rm` and `airlock sandbox remove` probe
+sandbox fails at once. `airlock rm` and `airlock sandboxes remove` probe
 the lock without a wait, and refuse a running sandbox. The kernel
 releases the lock when the process exits, so there are no stale locks.

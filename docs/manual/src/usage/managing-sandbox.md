@@ -3,7 +3,7 @@
 ## View current sandbox
 
 The `airlock info` command shows the sandbox and the configuration 
-of the current project. It is a shortcut for `airlock sandbox info` 
+of the current project. It is a shortcut for `airlock sandboxes info` 
 without an id:
 
 ```bash
@@ -65,12 +65,12 @@ The pack status is one of these:
 
 ## Listing sandboxes
 
-The `airlock sandbox` command shows the sandboxes in the airlock data
-directory (see [Where airlock keeps sandbox data](#where-airlock-keeps-sandbox-data)):
+The `airlock sandboxes` command (alias `airlock sandbox`) shows the
+sandboxes in the airlock data directory (see [Where airlock keeps sandbox data](#where-airlock-keeps-sandbox-data)):
 
 ```bash
-airlock sandbox list              # All sandboxes in the data directory (alias: ls)
-airlock sandbox info k3x7q2ma     # Details of one sandbox (as `airlock info`)
+airlock sandboxes list            # All sandboxes in the data directory (alias: ls)
+airlock sandboxes info k3x7q2ma   # Details of one sandbox (as `airlock info`)
 ```
 
 The list shows the id, the status, the last run, the disk use and the
@@ -79,12 +79,12 @@ exists, the list shows `(missing)` next to it.
 
 The list does not show sandboxes in a project directory. `airlock info`
 shows them when you run it in their project. If the project directory of
-a sandbox is gone, `airlock sandbox info` shows only the sandbox.
+a sandbox is gone, `airlock sandboxes info` shows only the sandbox.
 
 ## Removing sandbox
 
 The `airlock remove` command (alias `airlock rm`) removes the sandbox of
-the current project. It is a shortcut for `airlock sandbox remove` without
+the current project. It is a shortcut for `airlock sandboxes remove` without
 an id. This removes the disk image, the CA certificate,
 the install records, the local project config and the other runtime
 state:
@@ -93,13 +93,13 @@ state:
 airlock remove
 ```
 
-The `airlock sandbox remove` command (alias `airlock sandbox rm`) removes
-any sandbox in the data directory by its id (see `airlock sandbox list`).
+The `airlock sandboxes remove` command (alias `airlock sandboxes rm`) removes
+any sandbox in the data directory by its id (see `airlock sandboxes list`).
 Use it for the sandbox of a project directory that no longer exists:
 
 ```bash
-airlock sandbox remove k3x7q2ma
-airlock sandbox remove k3x7q2ma x5bq7d2c   # Remove more than one
+airlock sandboxes remove k3x7q2ma
+airlock sandboxes remove k3x7q2ma x5bq7d2c   # Remove more than one
 ```
 
 Both commands ask you to confirm before they remove anything. To skip the

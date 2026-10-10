@@ -1,4 +1,4 @@
-//! The `airlock sandbox` command.
+//! The `airlock sandboxes` command.
 //!
 //! Lists the sandboxes in the airlock data directory, shows the details of
 //! one sandbox, and removes sandboxes. Without an id, `info` and `remove`
@@ -16,14 +16,14 @@ use crate::context::Context;
 use crate::sandboxes::{self, Found, Location, registry};
 use crate::{cli, oci, project};
 
-/// CLI arguments for `airlock sandbox`.
+/// CLI arguments for `airlock sandboxes`.
 #[derive(Args, Debug)]
 pub struct SandboxArgs {
     #[command(subcommand)]
     cmd: SandboxCmd,
 }
 
-/// Subcommands of `airlock sandbox`.
+/// Subcommands of `airlock sandboxes`.
 #[derive(Subcommand, Debug)]
 enum SandboxCmd {
     /// List the sandboxes in the airlock data directory
@@ -31,7 +31,7 @@ enum SandboxCmd {
     List,
     /// Show the details of a sandbox (default: the sandbox of the current directory)
     Info {
-        /// Sandbox id (see `airlock sandbox list`)
+        /// Sandbox id (see `airlock sandboxes list`)
         id: Option<String>,
         /// Print the details as JSON
         #[arg(long)]
@@ -40,7 +40,7 @@ enum SandboxCmd {
     /// Remove sandboxes from the airlock data directory (default: the sandbox of the current directory)
     #[command(alias = "rm")]
     Remove {
-        /// Sandbox ids (see `airlock sandbox list`)
+        /// Sandbox ids (see `airlock sandboxes list`)
         ids: Vec<String>,
         /// Do not ask for confirmation
         #[arg(short = 'f', long)]
@@ -48,7 +48,7 @@ enum SandboxCmd {
     },
 }
 
-/// Entry point for `airlock sandbox`.
+/// Entry point for `airlock sandboxes`.
 /// Returns:
 ///   Process exit code: 0 on success or abort, 1 on error.
 pub async fn main(args: SandboxArgs, context: &Context) -> i32 {

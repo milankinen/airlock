@@ -81,7 +81,7 @@ pub async fn lock_sandbox(
 }
 
 /// Take the lock of the sandbox `id` in the data directory.
-// `airlock sandbox rm` can remove the sandbox between the registry lookup
+// `airlock sandboxes rm` can remove the sandbox between the registry lookup
 // and the lock. The lock then makes a new empty directory. Check the
 // registry again under the lock, and remove that directory.
 async fn lock_box(context: &Context, host_cwd: &Path, id: &str) -> Result<SandboxLock, Exit> {

@@ -172,7 +172,7 @@ airlock start --log-level debug
 
 Log levels are `trace`, `debug`, `info` (default), `warn`, and `error`.
 airlock writes logs to `airlock.log` in the sandbox directory.
-`airlock sandbox info` shows the sandbox directory.
+`airlock sandboxes info` shows the sandbox directory.
 
 ## Quiet mode
 

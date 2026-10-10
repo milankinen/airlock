@@ -2,7 +2,7 @@
 //!
 //! Prints the details of a sandbox: status, disk, config, packs and network
 //! services. Without an id, it is the sandbox of the current directory.
-//! `airlock sandbox info` gives the same output for any sandbox.
+//! `airlock sandboxes info` gives the same output for any sandbox.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -421,7 +421,7 @@ pub(super) async fn find_by_id(context: &Context, id: &str) -> anyhow::Result<Fo
         None
     };
     let Some(project) = project else {
-        anyhow::bail!("No sandbox {id} (see `airlock sandbox list`)");
+        anyhow::bail!("No sandbox {id} (see `airlock sandboxes list`)");
     };
     Ok(Found {
         location: Location::DataDir { id: id.to_string() },

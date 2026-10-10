@@ -36,7 +36,7 @@ setup_file() {
 
 # The sandbox directory of the current project.
 sandbox_dir() {
-    run_airlock sandbox info --json
+    run_airlock sandboxes info --json
     sed -n 's/^  "dir": "\(.*\)",$/\1/p' <<<"$output"
 }
 

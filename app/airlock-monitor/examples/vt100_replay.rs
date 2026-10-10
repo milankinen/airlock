@@ -12,7 +12,7 @@ use std::io::Write;
 /// output stream to `<sandbox_dir>/pty.dump`.
 ///
 /// Usage: cargo run --example vt100_replay -- <dump-path> [rows] [cols]
-/// (`airlock sandbox info` shows the sandbox directory)
+/// (`airlock sandboxes info` shows the sandbox directory)
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let Some(path) = args.get(1).cloned() else {

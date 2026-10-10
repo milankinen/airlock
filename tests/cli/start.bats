@@ -157,8 +157,8 @@ python = { version = $version }"
 #   1. Write a config with a pack and make no disk
 #   2. Run start
 #   3. Check that there is no question and that the sandbox prepare starts
-#   4. Check that the project has no .airlock directory and that the
-#      sandbox list has the project
+#   4. Check that the project has no .airlock directory and that
+#      `sandboxes list` has the project
 @test "start with packs and no sandbox disk asks no question without terminal" {
     write_config "$BAD_IMAGE
 
@@ -169,7 +169,7 @@ python = { version = 1 }"
     assert_output_not_contains "Tools changed"
     assert_output_contains "Preparing sandbox"
     [[ ! -e .airlock ]]
-    run_airlock sandbox list
+    run_airlock sandboxes list
     assert_success
     assert_output_contains "$PWD"
 }
@@ -179,7 +179,7 @@ python = { version = 1 }"
 #   1. Make a sandbox disk in the project and write a config
 #   2. Run start with --yes
 #   3. Check that the move is reported and the project sandbox is gone
-#   4. Check that the sandbox list has the project
+#   4. Check that `sandboxes list` has the project
 @test "start with --yes moves project sandbox to data directory" {
     make_sandbox_disk
     write_config "$BAD_IMAGE"
@@ -187,7 +187,7 @@ python = { version = 1 }"
     assert_failure
     assert_output_contains "sandbox moved to"
     [[ ! -e .airlock/sandbox ]]
-    run_airlock sandbox list
+    run_airlock sandboxes list
     assert_success
     assert_output_contains "$PWD"
 }
