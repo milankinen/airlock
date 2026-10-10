@@ -59,17 +59,21 @@ impl MaskedSecret {
     /// Args:
     ///  - `name`: Variable name
     ///  - `real`: Real value
+    ///  - `keep_prefixes`: Public token prefixes that the surrogate keeps,
+    ///    from `env.<name>.keep_prefixes`
     ///
     /// Returns:
-    ///   Masked entry. The surrogate is an ASCII alphanumeric string with
-    ///   the same byte length as `real`. It is stable: it comes from the
-    ///   name and the length only, never from the value. Thus tools that
-    ///   store the credential on first run (Codex) continue to work after
-    ///   restarts and secret rotation.
-    pub fn new(name: &str, real: String) -> Self {
+    ///   Masked entry. The surrogate is an ASCII string with the same byte
+    ///   length as `real`. It starts with the longest prefix from
+    ///   `keep_prefixes` that `real` starts with, and the rest is
+    ///   alphanumeric. It is stable: it comes from the name, the length
+    ///   and the prefix only, never from the secret part of the value.
+    ///   Thus tools that store the credential on first run (Codex)
+    ///   continue to work after restarts and secret rotation.
+    pub fn new(name: &str, real: String, keep_prefixes: &[String]) -> Self {
         Self {
             name: name.to_string(),
-            surrogate: surrogate_for(name, &real),
+            surrogate: surrogate_for(name, &real, keep_prefixes),
             real,
         }
     }
@@ -134,7 +138,7 @@ impl SandboxEnv {
                     .map_err(|e| EnvError::new(key, e))?
             };
             if entry.mask {
-                let secret = MaskedSecret::new(key, real);
+                let secret = MaskedSecret::new(key, real, &entry.keep_prefixes);
                 guest.push((key.clone(), secret.surrogate.clone()));
                 masked.insert(key.clone(), secret);
             } else {
@@ -257,13 +261,31 @@ const SURROGATE_DOMAIN: &[u8] = b"airlock-surrogate-v1";
 const SURROGATE_ALPHABET: &[u8; 62] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
-/// Make a deterministic `[A-Za-z0-9]` string with the same byte length as
-/// `value`. Only `name` and the length give the result. The value is not
-/// in the hash, so the surrogate shows only the length.
-fn surrogate_for(name: &str, value: &str) -> String {
+/// Make a deterministic string with the same byte length as `value`. It
+/// starts with the longest prefix from `keep_prefixes` that `value` starts
+/// with. The other bytes are `[A-Za-z0-9]` and come only from `name` and
+/// the length. Thus the surrogate shows only the length and the prefix.
+fn surrogate_for(name: &str, value: &str, keep_prefixes: &[String]) -> String {
+    let random = random_surrogate(name, value.len());
+    // The random part must stay long enough to be unique in header text
+    // (see MIN_INJECT_LEN). Without a prefix, the surrogate is the same as
+    // before prefixes were kept, so stored surrogates stay valid.
+    let prefix = keep_prefixes
+        .iter()
+        .filter(|p| value.starts_with(p.as_str()) && value.len() - p.len() >= MIN_INJECT_LEN)
+        .max_by_key(|p| p.len());
+    match prefix {
+        // The random part is ASCII, so each index is a char boundary.
+        Some(prefix) => format!("{prefix}{}", &random[prefix.len()..]),
+        None => random,
+    }
+}
+
+/// Make a deterministic `[A-Za-z0-9]` string of `len` bytes. Only `name`
+/// and `len` give the result.
+fn random_surrogate(name: &str, len: usize) -> String {
     // ChaCha20 seeded with a SHA-256 of the inputs. Unlike `StdRng`, its
     // stream does not change across crate versions.
-    let len = value.len();
     let mut hasher = Sha256::new();
     hasher.update(SURROGATE_DOMAIN);
     hasher.update((name.len() as u64).to_le_bytes());
@@ -290,7 +312,7 @@ mod tests {
     #[test]
     fn surrogate_is_alphanumeric_with_same_byte_length() {
         for real in ["sk-ant-oat01-abcdefghijklmnop", "x", "", "ääkkönen-token"] {
-            let s = surrogate_for("TOKEN", real);
+            let s = surrogate_for("TOKEN", real, &[]);
             assert_eq!(s.len(), real.len(), "{real}");
             assert!(s.chars().all(|c| c.is_ascii_alphanumeric()), "{s}");
         }
@@ -304,20 +326,26 @@ mod tests {
     ///      and "TOKEN" with the same value
     #[test]
     fn surrogate_depends_only_on_name_and_length() {
-        let a = surrogate_for("OPENAI_API_KEY", "sk-aaaaaaaaaaaaaaaaaaaa");
+        let a = surrogate_for("OPENAI_API_KEY", "sk-aaaaaaaaaaaaaaaaaaaa", &[]);
         assert_eq!(
             a,
-            surrogate_for("OPENAI_API_KEY", "sk-bbbbbbbbbbbbbbbbbbbb")
+            surrogate_for("OPENAI_API_KEY", "sk-bbbbbbbbbbbbbbbbbbbb", &[])
         );
         assert_ne!(
             a,
-            surrogate_for("OPENAI_API_KEX", "sk-aaaaaaaaaaaaaaaaaaaa")
+            surrogate_for("OPENAI_API_KEX", "sk-aaaaaaaaaaaaaaaaaaaa", &[])
         );
-        assert_ne!(a, surrogate_for("OPENAI_API_KEY", "sk-aaaaaaaaaaaaaaaaaaa"));
-        assert_ne!(surrogate_for("TOKEN1", "ab"), surrogate_for("TOKEN", "ab"));
         assert_ne!(
-            surrogate_for("TOKEN1", "abcdefghij"),
-            surrogate_for("TOKEN", "abcdefghij")
+            a,
+            surrogate_for("OPENAI_API_KEY", "sk-aaaaaaaaaaaaaaaaaaa", &[])
+        );
+        assert_ne!(
+            surrogate_for("TOKEN1", "ab", &[]),
+            surrogate_for("TOKEN", "ab", &[])
+        );
+        assert_ne!(
+            surrogate_for("TOKEN1", "abcdefghij", &[]),
+            surrogate_for("TOKEN", "abcdefghij", &[])
         );
     }
 
@@ -330,20 +358,56 @@ mod tests {
         assert_eq!(
             surrogate_for(
                 "OPENAI_API_KEY",
-                "sk-proj-0123456789abcdefghijklmnopqrstuvwxyz0123"
+                "sk-proj-0123456789abcdefghijklmnopqrstuvwxyz0123",
+                &[]
             ),
             "gHPoAQXAEPp1xt0XCGvsexx4AicTJokPIS7jw7D8AvRuM4BL"
         );
         assert_eq!(
             surrogate_for(
                 "CLAUDE_CODE_OAUTH_TOKEN",
-                "sk-ant-oat01-0123456789abcdefghijklmnopqrstuvwxyz"
+                "sk-ant-oat01-0123456789abcdefghijklmnopqrstuvwxyz",
+                &[]
             ),
             "4YIqU4HuWttkzVxUuWLXos9ycGwcCfUKlxnsofMlyjpKd4LBC"
         );
         assert_eq!(
-            surrogate_for("LONG", &"x".repeat(100)),
+            surrogate_for("LONG", &"x".repeat(100), &[]),
             "csNmqNAJNbzpxubyNC7TSRONA5TTH97VhNl5WxXvbhDp23aR20Rwj0LDNCapy0BUKUbTb677RnbzvWeHfazQcvQ57sh8sOX1FBBX"
+        );
+    }
+
+    /// Test that a masked entry keeps a listed token prefix, because the
+    /// Copilot CLI asks for a login when the prefix does not show a known
+    /// token type.
+    ///   1. Resolve masked GitHub tokens with `keep_prefixes`
+    ///   2. Check that the longest matching prefix is kept and that the
+    ///      rest is the surrogate without a prefix
+    ///   3. Check that a prefix with a too short rest is not kept
+    #[test]
+    fn masked_entry_keeps_longest_listed_prefix() {
+        let prefixes = ["github_", "github_pat_", "gho_"].map(String::from);
+        let entry = |value: &str| EnvVar {
+            mask: true,
+            keep_prefixes: prefixes.to_vec(),
+            ..EnvVar::plain(value)
+        };
+        let pat = format!("github_pat_{}", "a".repeat(40));
+        let short = format!("gho_{}", "a".repeat(MIN_INJECT_LEN - 1));
+        let env = BTreeMap::from([
+            ("PAT".to_string(), entry(&pat)),
+            ("SHORT".to_string(), entry(&short)),
+        ]);
+        let resolved = SandboxEnv::resolve(&env, &host_env_vault(&[])).unwrap();
+
+        let plain = random_surrogate("PAT", pat.len());
+        assert_eq!(
+            resolved.guest_value("PAT").unwrap(),
+            format!("github_pat_{}", &plain[11..])
+        );
+        assert_eq!(
+            resolved.guest_value("SHORT").unwrap(),
+            random_surrogate("SHORT", short.len())
         );
     }
 
@@ -373,7 +437,7 @@ mod tests {
     ///   2. Check its debug text
     #[test]
     fn masked_secret_debug_never_prints_values() {
-        let secret = MaskedSecret::new("TOKEN", "real-secret-value".into());
+        let secret = MaskedSecret::new("TOKEN", "real-secret-value".into(), &[]);
         let debug = format!("{secret:?}");
         assert!(debug.contains("TOKEN"));
         assert!(!debug.contains("real-secret-value"));

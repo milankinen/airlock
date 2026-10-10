@@ -7,8 +7,15 @@ config.env = {
     -- The token from the host environment or the vault, if it exists.
     -- The real token stays on the host. The sandbox sees a random
     -- surrogate of the same length, and the `inject` rule below puts the
-    -- real value into request headers at the host boundary.
-    COPILOT_GITHUB_TOKEN = { value = "${COPILOT_GITHUB_TOKEN}", mask = true, optional = true },
+    -- real value into request headers at the host boundary. The surrogate
+    -- keeps the token prefix, because Copilot finds the token type from
+    -- the prefix and asks for a login if the type is not supported.
+    COPILOT_GITHUB_TOKEN = {
+        value = "${COPILOT_GITHUB_TOKEN}",
+        mask = true,
+        optional = true,
+        keep_prefixes = { "github_pat_", "gho_", "ghu_", "ghp_" },
+    },
 
     -- The setup script installs the Copilot CLI in /usr/local/bin, which
     -- the sandbox user cannot change, and the network rules do not allow

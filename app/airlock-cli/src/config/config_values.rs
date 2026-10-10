@@ -246,6 +246,11 @@ impl WellKnown for ImageRef {
 /// put the real value into outbound HTTP headers through the `inject` list
 /// of a network rule.
 ///
+/// With `keep_prefixes`, the surrogate starts with the longest listed
+/// prefix that the real value starts with. Some tools find the token type
+/// from a public prefix (for example `github_pat_`) before they send the
+/// token.
+///
 /// With `optional = true`, an entry whose template reads an undefined
 /// variable is left out of the guest, and `inject` lists skip it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -259,6 +264,11 @@ pub struct EnvVar {
     /// before.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub optional: bool,
+    /// Public token prefixes that the surrogate keeps. Used only with
+    /// `mask`. Not serialized when empty, thus configs without it
+    /// serialize as before.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub keep_prefixes: Vec<String>,
 }
 
 impl EnvVar {
@@ -268,6 +278,7 @@ impl EnvVar {
             value: value.into(),
             mask: false,
             optional: false,
+            keep_prefixes: Vec::new(),
         }
     }
 }
@@ -290,6 +301,8 @@ impl<'de> serde::Deserialize<'de> for EnvVar {
             mask: bool,
             #[serde(default)]
             optional: bool,
+            #[serde(default)]
+            keep_prefixes: Vec<String>,
         }
         match serde_json::Value::deserialize(d)? {
             serde_json::Value::String(value) => Ok(EnvVar::plain(value)),
@@ -298,11 +311,13 @@ impl<'de> serde::Deserialize<'de> for EnvVar {
                     value,
                     mask,
                     optional,
+                    keep_prefixes,
                 } = serde_json::from_value(table).map_err(D::Error::custom)?;
                 Ok(EnvVar {
                     value,
                     mask,
                     optional,
+                    keep_prefixes,
                 })
             }
             _ => Err(D::Error::custom(

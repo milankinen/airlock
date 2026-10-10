@@ -63,12 +63,31 @@ secret, list it in a network rule's
 [`inject`](network.md#injecting-masked-secrets), which swaps the surrogate
 for the real value in HTTP request headers.
 
-- The table form accepts only `value`, `mask` and `optional`. Other keys
-  are errors.
+- The table form accepts only `value`, `mask`, `optional` and
+  `keep_prefixes`. Other keys are errors.
 - airlock substitutes `value` first (`${VAR}` works as usual), then masks it.
 - A later config layer that writes the plain string form only replaces the
   value — the entry stays masked. Set `mask = false` to unmask.
 - Daemons and `airlock exec` see the surrogate too.
+
+### Token prefixes
+
+Some tools read the token type from a public prefix, for example
+`github_pat_`, and refuse a token without a known prefix. Use
+`keep_prefixes` to keep the prefix in the surrogate:
+
+```toml
+[env]
+GH_TOKEN = { value = "${GH_TOKEN}", mask = true, keep_prefixes = ["github_pat_", "gho_"] }
+```
+
+- The surrogate starts with the longest listed prefix that the real value
+  starts with. The bytes after the prefix are random alphanumerics, as
+  without `keep_prefixes`.
+- airlock keeps a prefix only if at least 8 bytes of the value come after
+  it. Otherwise the surrogate has no prefix.
+- Each config layer adds its prefixes to the list.
+- Without `mask = true`, airlock ignores `keep_prefixes`.
 
 ## Optional entries
 

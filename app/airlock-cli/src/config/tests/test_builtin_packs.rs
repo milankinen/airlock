@@ -336,3 +336,25 @@ fn agent_packs_inject_host_tokens_that_exist() {
         }
     }
 }
+
+/// Test that the copilot pack keeps the GitHub token prefix in the
+/// surrogate, because the Copilot CLI asks for a login when the prefix
+/// does not show a supported token type.
+///   1. Resolve the pack with a fine-grained PAT and an OAuth token
+///   2. Check that each surrogate keeps the prefix and hides the rest
+#[test]
+fn copilot_pack_surrogate_keeps_github_token_prefix() {
+    let values = resolve_project_toml("[packs]\ncopilot = { version = 1 }\n")
+        .unwrap()
+        .values;
+    for (prefix, real) in [
+        ("github_pat_", "github_pat_11ABCDEFG0123456789_secret"),
+        ("gho_", "gho_0123456789abcdefghij"),
+    ] {
+        let env = resolve_env(&values, &host_env_vault(&[("COPILOT_GITHUB_TOKEN", real)])).unwrap();
+        let surrogate = env.guest_value("COPILOT_GITHUB_TOKEN").unwrap();
+        assert!(surrogate.starts_with(prefix), "{surrogate}");
+        assert_eq!(surrogate.len(), real.len());
+        assert_ne!(surrogate, real);
+    }
+}
