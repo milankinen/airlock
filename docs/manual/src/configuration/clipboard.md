@@ -82,7 +82,9 @@ WAYLAND_DISPLAY = "airlock-0"
 ```
 
 airlock never uses the value itself. For example, Claude Code needs this
-for copying. Pasting works without it.
+for copying. Pasting works without it. The
+[`claude` pack](../packs/agents/claude-code.md#clipboard) sets this
+variable for you.
 
 **Still nothing.** A few applications handle the clipboard entirely
 internally rather than through the system, and airlock cannot bridge

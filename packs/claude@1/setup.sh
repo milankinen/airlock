@@ -1,6 +1,7 @@
-# Claude Code: the official native installer, with the binary moved to
-# /usr/local/bin for all users. With the `acp` arg, also the official
-# ACP adapter from npm.
+# Claude Code: the official native installer, with the binary in
+# ~/.local/share/claude/versions. A wrapper at ~/.local/bin/claude and
+# /usr/local/bin/claude runs the newest version there. With the `acp`
+# arg, also the official ACP adapter from npm.
 #
 # Sources:
 # - https://code.claude.com/docs/en/setup (native install with
@@ -8,6 +9,9 @@
 #   into ~/.local/share/claude/versions/. Alpine/musl: bash, curl, libgcc,
 #   libstdc++, ripgrep and USE_BUILTIN_RIPGREP=0. DISABLE_UPDATES also
 #   blocks `claude install`.)
+# - https://code.claude.com/docs/en/getting-started/installation#auto-updates
+#   (updates write ~/.local/share/claude/versions/<version>. Since
+#   v2.1.207, they do not replace a custom ~/.local/bin/claude.)
 # - https://claude.ai/install.sh (bash. It picks the -musl build on musl,
 #   checks the binary against the sha256 of the release manifest, then
 #   runs `claude install`, which writes only under $HOME.)
@@ -25,7 +29,7 @@
 # - The adapter is one executable from lib.sh bun_compile (Bun from
 #   https://github.com/oven-sh/bun/releases, in the scratch directory
 #   only). It has no Claude Code of its own. The pack config sets
-#   CLAUDE_CODE_EXECUTABLE to the binary of this script.
+#   CLAUDE_CODE_EXECUTABLE to the wrapper of this script.
 #
 # No sha pin: the installer checks the sha256 of the binary it downloads.
 # lib.sh bun_get checks Bun against the SHASUMS256.txt of the release. Bun
@@ -34,11 +38,12 @@
 # /usr/local/bin/claude-agent-acp is a stub that exits 1 with an error.
 # The pack config sets USE_BUILTIN_RIPGREP=0 (the ripgrep from this
 # script), DISABLE_AUTOUPDATER=1 and DISABLE_INSTALLATION_CHECKS=1 (no
-# warnings about the moved binary). It mounts ~/.claude from the host,
-# not ~/.claude.json. This script creates that file.
+# warnings about the wrapper). It mounts ~/.claude from the host, not
+# ~/.claude.json. This script creates that file.
 
 _claude=/usr/local/bin/claude
 _acp=/usr/local/bin/claude-agent-acp
+_versions=$HOME/.local/share/claude/versions
 
 # Steps: the CLI, then the ACP adapter with the `acp` arg.
 if [ "${AIRLOCK_PACK_ARG_ACP:-false}" = true ]; then
@@ -55,7 +60,8 @@ case "$DISTRO" in
     debian) pkg_install bash curl ca-certificates ripgrep ;;
 esac
 
-if "$_claude" --version </dev/null >/dev/null 2>&1 3>&-; then
+# The wrapper at ~/.local/bin/claude exists only after a complete install.
+if "$HOME/.local/bin/claude" --version </dev/null >/dev/null 2>&1 3>&-; then
     log "Claude Code is already installed"
 else
     log "downloading the Claude Code installer"
@@ -78,10 +84,36 @@ else
     _binary=$(readlink -f "$PACK_TMP/home/.local/bin/claude" 3>&-) || _binary=
     [ -f "$_binary" ] ||
         fail 12 "the Claude Code installer did not create ~/.local/bin/claude"
+    # Keep only the binary. The wrapper below replaces the launcher.
     chmod 755 "$_binary"
-    mkdir -p /usr/local/bin
-    mv -f "$_binary" "$_claude"
+    mkdir -p "$_versions"
+    mv -f "$_binary" "$_versions/${_binary##*/}"
 fi
+
+# The wrapper. Claude Code updates add versions to $_versions and keep
+# this wrapper. It does not run `claude` from PATH, thus it cannot run
+# itself. Claude Code copies with wl-copy only when WAYLAND_DISPLAY is
+# set. The wrapper sets it only when airlock grants clipboard copy (the
+# copy FIFO exists). Else Claude Code uses its other copy methods.
+cat >"$PACK_TMP/claude" <<'WRAPPER'
+#!/bin/sh
+# Managed by airlock (claude pack): runs the newest Claude Code.
+dir=$HOME/.local/share/claude/versions
+v=$(ls "$dir" 2>/dev/null | grep -x '[0-9][0-9.]*' | sort -V | tail -n 1)
+[ -n "$v" ] || { echo "airlock: no Claude Code in $dir" >&2; exit 127; }
+if [ -p /run/airlock/clipboard.copy ]; then
+    export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-airlock-0}"
+else
+    unset WAYLAND_DISPLAY
+fi
+exec "$dir/$v" "$@"
+WRAPPER
+for _f in "$HOME/.local/bin/claude" "$_claude"; do
+    mkdir -p "${_f%/*}"
+    cp "$PACK_TMP/claude" "$_f.new"
+    chmod 755 "$_f.new"
+    mv -f "$_f.new" "$_f"
+done
 
 "$_claude" --version </dev/null 3>&- || fail 12 "claude --version failed"
 
@@ -97,7 +129,7 @@ if [ "${AIRLOCK_PACK_ARG_ACP:-false}" = true ]; then
     airlock_status "installing acp"
     bun_compile @agentclientprotocol/claude-agent-acp claude-agent-acp "$_acp"
     "$_acp" --version </dev/null 3>&- || fail 12 "claude-agent-acp --version failed"
-    # The adapter runs the Claude Code binary of this script.
+    # The adapter runs the Claude Code wrapper of this script.
     CLAUDE_CODE_EXECUTABLE="$_claude" "$_acp" --cli --version </dev/null 3>&- ||
         fail 12 "claude-agent-acp --cli --version failed"
 else

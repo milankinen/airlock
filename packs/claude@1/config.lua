@@ -10,10 +10,9 @@ config.env = {
     -- Claude Code uses the Node.js CA list. Add the airlock CA to it.
     NODE_EXTRA_CA_CERTS = "/etc/ssl/certs/ca-certificates.crt",
 
-    -- The setup script installs Claude Code in /usr/local/bin, which the
-    -- sandbox user cannot change. Thus no self-updates, and no warnings
-    -- about the install location. A newer Claude Code comes with a new
-    -- sandbox.
+    -- No background updates. A newer Claude Code comes with a new
+    -- sandbox, or with `claude update`. The launcher at ~/.local/bin/claude
+    -- is a wrapper from the setup script. Thus no install checks.
     DISABLE_AUTOUPDATER = "1",
     DISABLE_INSTALLATION_CHECKS = "1",
     -- Use the system ripgrep from the setup script. The bundled ripgrep
@@ -22,7 +21,7 @@ config.env = {
 }
 
 if pack.args["acp"] then
-    -- The ACP adapter (claude-agent-acp) runs this Claude Code binary.
+    -- The ACP adapter (claude-agent-acp) runs this Claude Code wrapper.
     -- The adapter that the setup script compiles has no Claude Code of
     -- its own.
     config.env.CLAUDE_CODE_EXECUTABLE = "/usr/local/bin/claude"

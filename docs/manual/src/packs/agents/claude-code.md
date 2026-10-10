@@ -44,3 +44,16 @@ airlock secrets add CLAUDE_CODE_OAUTH_TOKEN
 
 Claude Code then uses it automatically. The real value stays on the host.
 Claude Code gets only a surrogate.
+
+## Clipboard
+
+The `claude` command sets `WAYLAND_DISPLAY` only when the
+[clipboard](../../configuration/clipboard.md) `copy` permission is on.
+Claude Code needs this variable to copy to your clipboard. You do not
+need to set it in `[env]`.
+
+## Updates
+
+The pack turns off the background updates of Claude Code. A new sandbox
+gets the newest version. You can also run `claude update`. The `claude`
+command always runs the newest installed version.
