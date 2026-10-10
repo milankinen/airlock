@@ -269,6 +269,6 @@ codex = { version = 1 }"
     echo 'not json' >.airlock/sandbox/installs.json
     run_airlock start
     assert_failure 2
-    assert_output_contains "The install records of the sandbox are not valid"
+    assert_output_contains "installs.json is not valid"
     assert_output_not_contains "Preparing sandbox"
 }
