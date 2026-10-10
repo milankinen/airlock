@@ -57,7 +57,7 @@ async fn main() {
 
     let matches = Program::command()
         .version(cli::version_string(true).leak() as &str)
-        .before_help(cli::help_logo())
+        .help_template(cli::help_template())
         .after_help(cli::platform_status())
         .get_matches_from(&airlock_args);
     let parsed = Program::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());

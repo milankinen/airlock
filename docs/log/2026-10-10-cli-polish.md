@@ -15,10 +15,18 @@ cached image) printed it. Both lines are removed.
 `airlock`, `airlock --help` and `airlock help` now show the "airlock"
 logo of the setup wizard above the about line. The logo moved from the
 wizard view to the `cli` module (`cli::LOGO`), so the wizard and the help
-use the same lines. `main` sets it with clap `before_help` on the root
-command only. Clap does not copy `before_help` to subcommands, so
+use the same lines. `main` sets it with a clap `help_template` on the
+root command only. Clap does not copy the template to subcommands, so
 `airlock help sandbox` and `airlock start --help` do not show it. The
 logo is bold through `console`, which drops the style when color is off.
+
+The help has an empty line above the logo and the about line directly
+below it. A first try used `before_help`, but clap always writes an
+empty line after the `before_help` text. `cli::help_template` is the
+clap default template with the logo written in place of
+`{before-help}`. Clap also removes the first line of the help when it
+is empty, so the template starts with two line breaks to keep one empty
+line above the logo.
 
 ## Rename `sandbox` command to `sandboxes`
 

@@ -32,12 +32,22 @@ pub const LOGO: [&str; 4] = [
     "▝▀▘▀▘▘   ▘▝▀ ▝▀ ▘ ▘",
 ];
 
-/// Return the logo in bold text for the top of the top-level help.
-pub fn help_logo() -> String {
-    LOGO.iter()
+/// Return the help template for the top-level help. It shows an empty
+/// line and the logo in bold text above the description.
+pub fn help_template() -> String {
+    let logo = LOGO
+        .iter()
         .map(|line| console::style(line).bold().to_string())
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    // Same as the default template, but with the logo in place of the
+    // "before help" text. The "before help" text always has an empty line
+    // after it, and the description must come directly below the logo.
+    // Clap removes the first line of the help when it is empty, thus the
+    // template starts with two line breaks to keep one empty line.
+    format!(
+        "\n\n{logo}\n{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n{{all-args}}{{after-help}}"
+    )
 }
 
 /// Return a "Status" section with the KVM access state for help output.
