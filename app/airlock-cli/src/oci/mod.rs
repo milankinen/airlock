@@ -292,7 +292,6 @@ pub async fn prepare(
 
     let overlay_dir = sandbox_dir.join("overlay");
     std::fs::create_dir_all(&overlay_dir)?;
-    cli::log!("  {} environment ready", cli::check());
 
     Ok(PreparedImage {
         image: oci_image,
@@ -302,7 +301,7 @@ pub async fn prepare(
 
 /// Finish [`prepare`] with an image that is already cached on disk. Creates
 /// the GC hardlink again, makes sure that the overlay dir exists, and reports
-/// the image as ready.
+/// the cached image.
 ///
 /// The fast path and the resolution-failure fallback both use this, so both
 /// leave the sandbox in the same state as a newly pulled image.
@@ -325,7 +324,6 @@ fn use_cached_image(
     );
     let overlay_dir = sandbox_dir.join("overlay");
     std::fs::create_dir_all(&overlay_dir)?;
-    cli::log!("  {} environment ready", cli::check());
     Ok(image)
 }
 
