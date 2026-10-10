@@ -79,7 +79,7 @@ EOF
 
 # kache: store in /cache, fast compression, half of the disk as budget.
 DISK_BYTES="$(df -B1 --output=size "$CACHE_DIR" | tail -n 1 | tr -d ' ')"
-MAX_SIZE="$((DISK_BYTES / 2 / 1024 / 1024))MiB"
+MAX_SIZE="$((DISK_BYTES / 3 / 1024 / 1024))MiB"
 KACHE_CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/kache/config.toml"
 echo "Writing $KACHE_CONFIG_FILE (max size ${MAX_SIZE})"
 mkdir -p "$(dirname "$KACHE_CONFIG_FILE")"

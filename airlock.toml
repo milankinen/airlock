@@ -55,3 +55,6 @@ while :; do
   sleep 60
 done
 ''']
+
+[daemons.kache]
+command = ["kache", "daemon", "run"]
