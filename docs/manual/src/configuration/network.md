@@ -19,16 +19,15 @@ Available policies:
 
 | Policy             | Behavior                                                              |
 |--------------------|-----------------------------------------------------------------------|
-| `allow-always`     | Skip rules, allow all connections (default)                           |
+| `allow-always`     | Skip rules, allow all connections                                     |
 | `deny-always`      | Skip rules, deny everything (including guest → host forwards/sockets) |
 | `allow-by-default` | Allow unless explicitly denied by a rule                              |
-| `deny-by-default`  | Deny unless explicitly allowed by a rule                              |
+| `deny-by-default`  | Deny unless explicitly allowed by a rule (default)                    |
 
 With `deny-by-default`, airlock permits only connections that match an
-explicit `allow` rule. This is the recommended starting point for
-security-sensitive projects. With `deny-always`, airlock blocks all network
-access from the guest — including guest → host port forwards and Unix
-socket forwarding. Host → guest reverse forwards are the exception (see
+explicit `allow` rule. This is the default policy. With `deny-always`,
+airlock blocks all network access from the guest — including guest → host
+port forwards and Unix socket forwarding. Host → guest reverse forwards are the exception (see
 [Port forwarding](#port-forwarding)).
 
 ## Network rules

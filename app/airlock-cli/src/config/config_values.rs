@@ -369,14 +369,14 @@ pub struct VirtualMachine {
 )]
 #[serde(rename_all = "kebab-case")]
 pub enum Policy {
-    /// Skip rules, allow all connections (default).
-    #[default]
+    /// Skip rules, allow all connections.
     AllowAlways,
     /// Skip rules, deny all connections (including port forwards and sockets).
     DenyAlways,
     /// Allow connections unless explicitly denied by a rule.
     AllowByDefault,
-    /// Deny connections unless explicitly allowed by a rule.
+    /// Deny connections unless explicitly allowed by a rule (default).
+    #[default]
     DenyByDefault,
 }
 
@@ -401,8 +401,8 @@ impl WellKnown for Policy {
 /// Network configuration.
 #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
 pub struct Network {
-    /// Network policy: `"allow-always"` (default), `"deny-always"`,
-    /// `"allow-by-default"`, or `"deny-by-default"`.
+    /// Network policy: `"allow-always"`, `"deny-always"`,
+    /// `"allow-by-default"`, or `"deny-by-default"` (default).
     #[config(default)]
     pub policy: Policy,
     /// Named network rules (allow/deny patterns).

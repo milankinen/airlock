@@ -88,12 +88,12 @@ and connects to whatever that returns.
 Once the proxy has `(host, port)` it asks the CLI whether to allow the
 connection. The policy model is:
 
-- `allow-always` (default): skip rules, allow everything
+- `allow-always`: skip rules, allow everything
 - `deny-always`: skip rules, deny everything — including guest → host
   port forwards and socket forwarding (host → guest reverse forwards
   are unaffected)
 - `allow-by-default`: allow unless a rule explicitly denies
-- `deny-by-default`: deny unless a rule explicitly allows
+- `deny-by-default` (default): deny unless a rule explicitly allows
 
 When a rule-based policy is in effect, the decision proceeds:
 
