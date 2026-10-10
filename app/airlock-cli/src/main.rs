@@ -164,13 +164,13 @@ struct GlobalArgs {
 enum Command {
     /// Start the sandbox VM for the current project directory
     Start(cmd_start::StartArgs),
-    /// Remove the sandbox of the current project (same as `airlock sandboxes rm`)
+    /// Remove the sandbox of the current project
     #[command(alias = "rm")]
     Remove(cmd_rm::RmArgs),
     /// Execute a command inside the running sandbox VM
     #[command(alias = "x")]
     Exec(cmd_exec::ExecArgs),
-    /// Show the sandbox of the current project (same as `airlock sandboxes info`)
+    /// Show the sandbox of the current project
     #[command(alias = "show")]
     Info(cmd_info::InfoArgs),
     /// Manage secrets stored in the system keyring

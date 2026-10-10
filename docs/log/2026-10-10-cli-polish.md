@@ -31,3 +31,10 @@ the "see `airlock sandboxes list`" hint in errors, code comments, the
 manual and the bats tests use the new name. The bats file is now
 `tests/cli/sandboxes.bats`, and its list test runs `sandbox ls` to cover
 the alias.
+
+## Shorter help for `info` and `remove`
+
+The help lines of the top-level `info` and `remove` commands had a
+"(same as `airlock sandboxes ...`)" note. The note made the command list
+wide and noisy. The help lines now only say what the command does. The
+manual still tells that both commands are shortcuts.
