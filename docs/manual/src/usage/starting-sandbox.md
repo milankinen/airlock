@@ -1,40 +1,16 @@
 # Starting a sandbox
 
 The `airlock start` command starts a sandbox VM in the current project
-directory. If the project has no config yet, airlock opens a setup wizard.
+directory.
 
 ```bash
 airlock start
 ```
 
-On first run, airlock pulls the configured OCI image, generates a
-per-project CA certificate, installs the [packs](../packs.md) and starts
-the VM. Subsequent runs reuse the cached image and existing sandbox state,
-so startup is near-instant.
-
-## Setup wizard
-
-`airlock start` opens the setup wizard when the project has no config and
-no sandbox. The wizard has these sections:
-
-- **Base image**: `alpine` or `debian`. If your user config sets
-  `vm.image`, the wizard also shows `custom`.
-- **Coding agents** and **Tools**: the [packs](../packs.md) to install.
-  Each selected pack shows its args.
-- **Capabilities**: [clipboard](../configuration/clipboard.md) copy and
-  paste.
-
-The last row has the start options:
-
-- `start` writes a local config to `.airlock/airlock.toml`
-- `start and share` writes a shareable config to `airlock.toml`
-- `cancel` writes nothing
-
-airlock writes the config file after it prepares the sandbox. If you
-cancel, or if the start fails before that, no config file stays.
-
-The wizard needs a terminal. Without a terminal, `airlock start` stops
-with exit code 2. Then write `airlock.toml` yourself.
+On the first start, airlock shows a setup wizard. The wizard lets you
+customize the sandbox with [packs](../packs.md). To keep the config in
+version control, select `Create airlock.toml` in the wizard. Then airlock
+creates `airlock.toml`, which you can commit to version control.
 
 ## Sandbox changes
 
@@ -53,13 +29,12 @@ example in scripts.
 
 ## Configuration basics
 
-Sandbox configuration lives in two files at the project root:
+If you selected `Create airlock.toml` in the wizard, airlock creates
+`airlock.toml` at the project root. You can put it in version control.
 
-- `airlock.toml` — the main config (commit it to version control)
-- `airlock.local.toml` — local overrides, typically gitignored
-
-A config can also be in `.airlock/airlock.toml`. The wizard writes it
-there if you select `start`.
+Each user can also configure airlock with `airlock.local.toml`. The values
+in this file override the values from `airlock.toml`. Do not commit this
+file.
 
 A minimal config that uses Ubuntu:
 

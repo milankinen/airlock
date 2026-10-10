@@ -26,3 +26,9 @@ with the arrow keys to write a local config.
   one Right press. The test of the setting is removed, because the first
   test covers the default and the user image test covers Left.
 - `settings` tests no longer check the setting.
+
+## Later change
+
+`2026-10-10-wizard-create-airlock-toml-checkbox.md` replaces the
+`start and share` option with the `Create airlock.toml` checkbox. That
+checkbox now chooses between a local and a shareable config.

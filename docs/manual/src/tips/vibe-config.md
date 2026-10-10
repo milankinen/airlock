@@ -17,7 +17,7 @@ policy = "deny-by-default"
 ```
 
 A user config cannot enable [packs](../packs.md). Instead, the
-[setup wizard](../usage/starting-sandbox.md#setup-wizard) asks for them on
+[setup wizard](../usage/starting-sandbox.md) asks for them on
 the first start in each directory.
 
 ## Running your setup

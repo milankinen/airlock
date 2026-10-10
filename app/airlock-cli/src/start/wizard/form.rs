@@ -18,11 +18,7 @@ use crate::start::wizard::Answers;
 pub const KINDS: [PackKind; 3] = [PackKind::Distro, PackKind::Agent, PackKind::Tool];
 
 /// The options of the start bar, in order.
-pub const START_CHOICES: [StartChoice; 3] = [
-    StartChoice::Start,
-    StartChoice::StartAndShare,
-    StartChoice::Cancel,
-];
+pub const START_CHOICES: [StartChoice; 2] = [StartChoice::Start, StartChoice::Cancel];
 
 /// A row that the focus can be on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +34,8 @@ pub enum Row {
     ClipboardCopy,
     /// The sandbox may read the host clipboard.
     ClipboardPaste,
+    /// Write the config to `airlock.toml` in the project, to share it.
+    ShareConfig,
     /// The start bar, the last row.
     Start,
 }
@@ -45,23 +43,10 @@ pub enum Row {
 /// An option of the start bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartChoice {
-    /// Start with the config in `.airlock/airlock.toml` (local).
+    /// Start with the config. [`Row::ShareConfig`] sets where it goes.
     Start,
-    /// Start with the config in `airlock.toml` (shareable).
-    StartAndShare,
     /// End without a config.
     Cancel,
-}
-
-impl StartChoice {
-    /// Return where the config goes, or `None` on cancel.
-    pub fn target(self) -> Option<Target> {
-        match self {
-            StartChoice::Start => Some(Target::Local),
-            StartChoice::StartAndShare => Some(Target::Project),
-            StartChoice::Cancel => None,
-        }
-    }
 }
 
 /// A pack in the view.
@@ -112,9 +97,10 @@ impl OtherSlot {
 /// arg rows. An arg row shows its values ([`listed_values`]). A choice arg
 /// with `other` has an "other" slot after the values, where the user types a
 /// value ([`OtherSlot`]). After the packs are the capabilities: checkboxes
-/// for the clipboard ([`Row::ClipboardCopy`], [`Row::ClipboardPaste`]). The
-/// last row is the start bar ([`Row::Start`]) with its options
-/// ([`START_CHOICES`]).
+/// for the clipboard ([`Row::ClipboardCopy`], [`Row::ClipboardPaste`]). Then
+/// the config section has a checkbox for a shareable config
+/// ([`Row::ShareConfig`]). The last row is the start bar ([`Row::Start`])
+/// with its options ([`START_CHOICES`]).
 pub struct Form {
     /// Airlock data directory, for the pack mount directories.
     data_dir: PathBuf,
@@ -123,6 +109,8 @@ pub struct Form {
     /// The image that the user files set ([`Row::Custom`]).
     custom_image: Option<UserImage>,
     clipboard: Clipboard,
+    /// True if the config goes to `airlock.toml` ([`Row::ShareConfig`]).
+    share: bool,
     /// The current option of the start bar.
     start: StartChoice,
     focus: Row,
@@ -146,8 +134,8 @@ impl Form {
     /// Returns:
     ///   The state. The image of the user files is selected, or else the
     ///   first distro pack. No agent or tool is selected, and the args have
-    ///   their defaults. The start bar is on `start and share`. The focus is
-    ///   on the first row.
+    ///   their defaults. The config is local. The start bar is on `start`.
+    ///   The focus is on the first row.
     pub fn new(data_dir: &Path, packs: &PackManager, custom_image: Option<UserImage>) -> Self {
         let offered = packs.builtin();
         let first_distro = offered
@@ -174,7 +162,8 @@ impl Form {
                 copy: true,
                 paste: false,
             },
-            start: StartChoice::StartAndShare,
+            share: false,
+            start: StartChoice::Start,
             focus: Row::Start,
             return_to: None,
             other: None,
@@ -242,6 +231,12 @@ impl Form {
         self.custom_image.as_ref()
     }
 
+    /// Return true if the config goes to `airlock.toml`
+    /// ([`Row::ShareConfig`]).
+    pub fn share(&self) -> bool {
+        self.share
+    }
+
     /// Return the current option of the start bar.
     pub fn start(&self) -> StartChoice {
         self.start
@@ -291,7 +286,8 @@ impl Form {
     /// keeps the focus. A text that the pack config does not accept keeps the
     /// focus and shows the error.
     /// Returns:
-    ///   The next [`Step`]. `Done` contains the target of the config.
+    ///   The next [`Step`]. `Done` contains the target of the config: the
+    ///   project with [`Row::ShareConfig`] on, else local.
     pub fn key(&mut self, key: KeyEvent) -> Step<Target> {
         if prompt::is_interrupt_key(key) {
             return Step::Interrupt;
@@ -309,7 +305,11 @@ impl Form {
             KeyCode::Left => self.change(false),
             KeyCode::Right => self.change(true),
             KeyCode::Enter if self.focus == Row::Start => {
-                return self.start.target().map_or(Step::Cancel, Step::Done);
+                return match self.start {
+                    StartChoice::Start if self.share => Step::Done(Target::Project),
+                    StartChoice::Start => Step::Done(Target::Local),
+                    StartChoice::Cancel => Step::Cancel,
+                };
             }
             KeyCode::Enter => {
                 let from = self.focus;
@@ -333,7 +333,12 @@ impl Form {
         KINDS
             .iter()
             .flat_map(|kind| self.section_rows(*kind))
-            .chain([Row::ClipboardCopy, Row::ClipboardPaste, Row::Start])
+            .chain([
+                Row::ClipboardCopy,
+                Row::ClipboardPaste,
+                Row::ShareConfig,
+                Row::Start,
+            ])
             .collect()
     }
 
@@ -438,6 +443,7 @@ impl Form {
             }
             Row::ClipboardCopy => self.clipboard.copy = !self.clipboard.copy,
             Row::ClipboardPaste => self.clipboard.paste = !self.clipboard.paste,
+            Row::ShareConfig => self.share = !self.share,
             Row::Start => {}
         }
     }
@@ -482,7 +488,11 @@ impl Form {
                     self.start = START_CHOICES[next];
                 }
             }
-            Row::Pack(_) | Row::Custom | Row::ClipboardCopy | Row::ClipboardPaste => {}
+            Row::Pack(_)
+            | Row::Custom
+            | Row::ClipboardCopy
+            | Row::ClipboardPaste
+            | Row::ShareConfig => {}
         }
     }
 }

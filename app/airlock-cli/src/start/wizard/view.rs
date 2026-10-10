@@ -30,6 +30,7 @@ const OTHER_CHOICE: &str = "other…";
 ///  * An empty line, the logo and an empty line
 ///  * One section per pack kind: its title and its rows
 ///  * The "Capabilities" section: the clipboard rows
+///  * The "Config" section: the row for a shareable config
 ///  * An empty line, and the keys for the focused row (gray, see [`keys`])
 ///  * The start bar
 ///
@@ -75,6 +76,7 @@ pub fn frame(form: &Form, room: usize) -> Frame {
                 Some("Capabilities"),
                 vec![Row::ClipboardCopy, Row::ClipboardPaste],
             ),
+            (Some("Config"), vec![Row::ShareConfig]),
             (None, vec![Row::Start]),
         ])
         .filter(|(_, rows)| !rows.is_empty());
@@ -122,9 +124,14 @@ fn keys(form: &Form) -> &'static str {
         (_, Some(other)) if other.error.is_some() => "edit the value · ← back",
         (_, Some(_)) => "↑↓ move · ← back · enter start",
         (Row::Arg(..), None) => "↑↓ move · ←→ change · enter start",
-        (Row::Pack(_) | Row::Custom | Row::ClipboardCopy | Row::ClipboardPaste, None) => {
-            "↑↓ move · space select · enter start"
-        }
+        (
+            Row::Pack(_)
+            | Row::Custom
+            | Row::ClipboardCopy
+            | Row::ClipboardPaste
+            | Row::ShareConfig,
+            None,
+        ) => "↑↓ move · space select · enter start",
     }
 }
 
@@ -132,7 +139,6 @@ fn keys(form: &Form) -> &'static str {
 fn start_label(choice: StartChoice) -> &'static str {
     match choice {
         StartChoice::Start => "start",
-        StartChoice::StartAndShare => "start and share",
         StartChoice::Cancel => "cancel",
     }
 }
@@ -161,6 +167,9 @@ fn row_lines(form: &Form, row: Row, room: usize, styles: &Styles) -> Shown {
         Row::ClipboardCopy if focused => Some("Sandbox can copy to the host clipboard"),
         Row::ClipboardPaste if focused => {
             Some("Sandbox can read the host clipboard. Enable only if you know what you are doing")
+        }
+        Row::ShareConfig if focused => {
+            Some("Write the config to the project, to share it. Otherwise it stays local")
         }
         _ => None,
     };
@@ -254,6 +263,14 @@ fn row_line(form: &Form, row: Row, focused: bool, styles: &Styles) -> Line {
             line.push(" ", &styles.plain);
             line.mark_indent();
             line.push(name, label);
+        }
+        Row::ShareConfig => {
+            let on = form.share();
+            line.lead(2, focused, styles);
+            line.push(style::checkbox(on), styles.mark(on));
+            line.push(" ", &styles.plain);
+            line.mark_indent();
+            line.push("Create airlock.toml", label);
         }
         Row::Start => {
             line.lead(0, focused, styles);

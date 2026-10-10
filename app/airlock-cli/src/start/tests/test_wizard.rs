@@ -89,8 +89,8 @@ fn check(packs: &PackManager, config: &LayeredConfig, form: &Form) -> anyhow::Re
 ///      mode a value that its config refuses
 ///   2. Check that the error shows and the focus cannot leave the row,
 ///      then change the value
-///   3. Disable the network arg, enable clipboard paste and choose start
-///      and share
+///   3. Disable the network arg, enable clipboard paste and
+///      `Create airlock.toml`, and choose start
 ///   4. Check the saved `airlock.toml` text
 ///   5. Resolve the text and check the packs, args, image, network rule,
 ///      clipboard and installs
@@ -125,9 +125,12 @@ fn choosing_packs_and_args_with_keys_saves_shared_config_that_resolves() {
     press(&mut form, KeyCode::Char(' '));
     press_down_until(&mut form, |form| form.focus() == Row::ClipboardPaste);
     press(&mut form, KeyCode::Char(' '));
+    press(&mut form, KeyCode::Down);
+    assert_eq!(form.focus(), Row::ShareConfig);
+    press(&mut form, KeyCode::Char(' '));
     press(&mut form, KeyCode::Enter);
     assert_eq!(form.focus(), Row::Start);
-    assert_eq!(form.start(), StartChoice::StartAndShare);
+    assert_eq!(form.start(), StartChoice::Start);
     let Step::Done(target) = press(&mut form, KeyCode::Enter) else {
         panic!("the wizard did not end with a start option");
     };
@@ -176,8 +179,8 @@ fn choosing_packs_and_args_with_keys_saves_shared_config_that_resolves() {
 /// distro pack replaces it.
 ///   1. Open the form with a user image and check that the custom image
 ///      row has the focus
-///   2. Choose `start` and check that the local config uses the user image
-///      and has no packs
+///   2. Start at once and check that the config is local, uses the user
+///      image and has no packs
 ///   3. Open the form again, choose a distro pack and check that the
 ///      answers have no image and the distro pack
 #[test]
@@ -191,7 +194,6 @@ fn user_image_is_preselected_until_distro_pack_is_chosen() {
     let mut form = Form::new(data.path(), &packs, Some(image.clone()));
     assert_eq!(form.focus(), Row::Custom);
     press(&mut form, KeyCode::Enter);
-    press(&mut form, KeyCode::Left);
     let Step::Done(target) = press(&mut form, KeyCode::Enter) else {
         panic!("the wizard did not end with a start option");
     };

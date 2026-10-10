@@ -24,7 +24,7 @@ airlock has three kinds of packs:
 
 ## Enabling packs
 
-The [setup wizard](./usage/starting-sandbox.md#setup-wizard) writes the
+The [setup wizard](./usage/starting-sandbox.md) writes the
 first `[packs]` table for you. You can also write it yourself:
 
 ```toml

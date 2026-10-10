@@ -133,9 +133,10 @@ pub async fn load_or_generate_config(
 ///  * The agents and the tools
 ///  * The args of each selected pack
 ///  * The clipboard capabilities (copy, paste)
-///  * The start bar: `start` (local config, in the sandbox directory or in
-///    `.airlock/`), `start and share` (shareable config, `airlock.toml`) or
-///    `cancel`. The bar is on `start and share` first.
+///  * The config: `Create airlock.toml` (off at first). On: a shareable
+///    config (`airlock.toml`). Off: a local config, in the sandbox directory
+///    or in `.airlock/`.
+///  * The start bar: `start` or `cancel`
 ///
 /// The user files do not select packs, because `[packs]` belongs in the
 /// project files. If the user files set an image, the distro group starts

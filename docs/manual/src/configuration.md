@@ -6,26 +6,18 @@ every team member gets the same sandbox setup.
 
 ## File hierarchy
 
-airlock loads configuration from up to six locations. Later files override
+airlock loads configuration from these locations. Later files override
 earlier ones:
 
 1. `~/.airlock/airlock.toml` — user-level settings (e.g. preferred CPU/memory)
 2. `~/.airlock/config.toml` — alternative user-level settings file
 3. `~/.airlock.toml` — alternative user-level settings file
-4. Local project config — the `start` option of the setup wizard writes
-   it. It is in the sandbox directory, out of the repository (see
-   [Project layout](./technical/project-layout.md#sandbox-directory))
-5. `airlock.toml` — project config (checked into version control)
-6. `airlock.local.toml` — local overrides (gitignored)
+4. `airlock.toml` — project config (checked into version control)
+5. `airlock.local.toml` — local overrides (gitignored)
 
 This layering lets a company ship global defaults and each developer set
 personal preferences. Each project defines its own sandbox, with room for
 local tweaks that don't affect the team.
-
-The [setup wizard](./usage/starting-sandbox.md#setup-wizard) writes the
-first project config to `.airlock/airlock.toml` (`start`) or to
-`airlock.toml` (`start and share`). `airlock rm` removes
-`.airlock/airlock.toml` together with the sandbox.
 
 airlock also accepts JSON and YAML files (e.g. `airlock.json`, `airlock.yaml`).
 For each slot, the first matching extension in the order `.toml`, `.json`,
