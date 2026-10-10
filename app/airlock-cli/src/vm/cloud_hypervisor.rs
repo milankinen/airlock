@@ -40,7 +40,10 @@ impl CloudHypervisorBackend {
         let mut fs_args: Vec<String> = Vec::new();
 
         for share in &config.shares {
-            let sock_name = share.tag.replace('/', "-");
+            // Use only the last part of the tag (`files/rw` -> `rw`). Short
+            // names keep the socket paths in the Unix socket limit. The last
+            // parts of the tags are unique.
+            let sock_name = share.tag.rsplit('/').next().unwrap_or(&share.tag);
             let sock_path = vfs_dir.join(format!("{sock_name}.sock"));
             let _ = std::fs::remove_file(&sock_path);
 

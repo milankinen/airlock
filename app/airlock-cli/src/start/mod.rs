@@ -16,7 +16,7 @@ pub mod run;
 pub mod sandbox;
 pub mod wizard;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub use exit::Exit;
 use tracing::info;
@@ -40,6 +40,37 @@ pub struct SandboxOptions {
 pub fn check_system_requirements() {
     #[cfg(target_os = "linux")]
     crate::vm::require_kvm();
+}
+
+/// Check that the data directory `data_dir` is short enough for the Unix
+/// sockets of the VM.
+/// Returns:
+///   Exit with code 1 and the fix, if the path is too long.
+pub fn check_data_dir(data_dir: &Path) -> Result<(), Exit> {
+    // On Linux, the VM sockets are in the sandbox directory
+    // `<data_dir>/boxes/<id>/`. A Unix socket path has a limit of 107
+    // bytes (108 with the trailing NUL). If a path is longer, virtiofsd
+    // cannot make its socket, and the boot fails without a clear reason.
+    // `/boxes/<id>` adds 15 bytes, and the longest socket name adds 16
+    // (`/vfs/layers.sock`, `/vsock.sock_1024`). Thus 76 bytes are the
+    // maximum. 70 keeps space for more mounts and new sockets. macOS does
+    // not use Unix sockets for the VM.
+    const MAX_DATA_DIR_LEN: usize = 70;
+
+    let len = data_dir.as_os_str().len();
+    if cfg!(target_os = "linux") && len > MAX_DATA_DIR_LEN {
+        return Err(Exit::error(
+            1,
+            format!(
+                "The data directory path {} is too long ({len} bytes, the limit is \
+                 {MAX_DATA_DIR_LEN}). Set a shorter data directory in {}, for example: \
+                 data_dir = \"~/airlock-data\"",
+                data_dir.display(),
+                crate::settings::Settings::expected_path().display(),
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Return the current directory. Make the path canonical when possible.

@@ -15,10 +15,12 @@ has_kvm_or_not_linux() {
     [[ "$(uname)" != "Linux" ]] || [[ -r /dev/kvm ]]
 }
 
-# Skip each test when KVM is not available, except the "without KVM" test.
+# Skip each test when KVM is not available, except the tests that stop
+# before the KVM check.
 setup() {
     setup_temp_dir
-    if [[ "$BATS_TEST_DESCRIPTION" != *"without KVM"* ]]; then
+    if [[ "$BATS_TEST_DESCRIPTION" != *"without KVM"* &&
+        "$BATS_TEST_DESCRIPTION" != *"too long data directory"* ]]; then
         has_kvm_or_not_linux || skip "no KVM access"
     fi
 }
@@ -96,6 +98,25 @@ codex = { version = 1, auth = "api-key" }' ]]
     run_airlock start
     assert_failure 1
     assert_output_contains "KVM not available"
+}
+
+# Test that start refuses a data directory that is too long for the VM
+# sockets on Linux. Without the check, the boot fails later without a
+# clear reason.
+#   1. Set XDG_DATA_HOME to a deep directory
+#   2. Run start
+#   3. Check exit code 1 and the message with the fix
+@test "start with too long data directory fails on Linux" {
+    [[ "$(uname)" == "Linux" ]] || skip "Linux only"
+    write_config '[vm]'
+    # Keep the original value, so that teardown removes the whole directory.
+    local data_home="$TEST_DATA_HOME"
+    TEST_DATA_HOME="$data_home/$(printf 'd%.0s' {1..60})"
+    run_airlock start
+    TEST_DATA_HOME="$data_home"
+    assert_failure 1
+    assert_output_contains "is too long"
+    assert_output_contains "data_dir = \"~/airlock-data\""
 }
 
 # Test that --network replaces the network policy of the config.

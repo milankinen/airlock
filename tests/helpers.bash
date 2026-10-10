@@ -29,10 +29,20 @@ setup_file() {
 # debugging easy. Set AIRLOCK_TEST_KEEP=1 to keep the temp directories.
 TEST_TEMP_ROOT="$REPO_ROOT/.tmp/tests"
 
+# Make a new data home directory in /tmp and write its path to stdout.
+# run_airlock uses it as XDG_DATA_HOME. The VM sockets are in the airlock
+# data directory, and a Unix socket path has a limit of 108 bytes. A data
+# directory under $TEST_TEMP_ROOT can be too deep for that.
+make_data_home() {
+    mktemp -d /tmp/airlock-test.XXXXXX
+}
+
 # Make a new $TEST_TEMP_DIR and go into it. run_airlock uses it as HOME.
+# Also make the $TEST_DATA_HOME of the test.
 setup_temp_dir() {
     mkdir -p "$TEST_TEMP_ROOT"
     TEST_TEMP_DIR="$(mktemp -d "$TEST_TEMP_ROOT/XXXXXXXX")"
+    TEST_DATA_HOME="$(make_data_home)"
     cd "$TEST_TEMP_DIR" || return 1
 }
 
@@ -41,8 +51,14 @@ setup() {
     setup_temp_dir
 }
 
-# Remove the temp directory of the test, unless AIRLOCK_TEST_KEEP=1.
+# Remove the temp and data home directories of the test, unless
+# AIRLOCK_TEST_KEEP=1.
 teardown() {
+    if [[ -n "${TEST_DATA_HOME:-}" && -d "${TEST_DATA_HOME:-}" ]]; then
+        if [[ "${AIRLOCK_TEST_KEEP:-}" != "1" ]]; then
+            rm -rf "$TEST_DATA_HOME"
+        fi
+    fi
     if [[ -n "$TEST_TEMP_DIR" && -d "$TEST_TEMP_DIR" ]]; then
         if [[ "${AIRLOCK_TEST_KEEP:-}" != "1" ]]; then
             rm -rf "$TEST_TEMP_DIR"
@@ -53,15 +69,16 @@ teardown() {
 # -- Run airlock in an isolated environment --
 
 # Run airlock with HOME set to $TEST_HOME or the temp directory, so that it
-# does not read ~/.airlock or the airlock data directory of the real home.
-# XDG_DATA_HOME is removed for the same reason. Color output and backtraces are off. Stdin
-# is /dev/null, so there is no terminal.
+# does not read ~/.airlock of the real home. XDG_DATA_HOME is set to
+# $TEST_DATA_HOME or $FILE_DATA_HOME, so that it does not use the real
+# airlock data directory. Color output and backtraces are off. Stdin is
+# /dev/null, so there is no terminal.
 # Sets $status, $output and $lines, as the bats "run" command does.
 
 run_airlock() {
     local _home="${TEST_HOME:-${TEST_TEMP_DIR:-$FILE_TEMP_DIR}}"
     local _output
-    _output="$(env -u XDG_DATA_HOME \
+    _output="$(env XDG_DATA_HOME="${TEST_DATA_HOME:-$FILE_DATA_HOME}" \
         NO_COLOR=1 \
         HOME="$_home" \
         RUST_BACKTRACE=0 \

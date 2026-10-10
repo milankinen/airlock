@@ -24,6 +24,7 @@ require_vm_support() {
 # stays between tests. Each test boots a new VM but uses the same sandbox
 # state again. The temp directory has the home directory and the project
 # side by side, because airlock refuses a project that contains the home.
+# Also make one data home directory for all tests of the file.
 # Call this from setup_file, then write the config.
 
 vm_setup_file() {
@@ -36,16 +37,22 @@ vm_setup_file() {
     mkdir -p "$TEST_TEMP_ROOT"
     FILE_TEMP_DIR="$(mktemp -d "$TEST_TEMP_ROOT/XXXXXXXX")"
     TEST_HOME="$FILE_TEMP_DIR/home"
-    export FILE_TEMP_DIR TEST_HOME
+    FILE_DATA_HOME="$(make_data_home)"
+    export FILE_TEMP_DIR TEST_HOME FILE_DATA_HOME
     mkdir -p "$TEST_HOME" "$FILE_TEMP_DIR/project"
     cd "$FILE_TEMP_DIR/project" || return 1
 }
 
-# Stop the host HTTP server and remove the shared temp directory, unless
-# AIRLOCK_TEST_KEEP=1.
+# Stop the host HTTP server and remove the shared temp and data home
+# directories, unless AIRLOCK_TEST_KEEP=1.
 teardown_file() {
     stop_host_http_server
     cd "$REPO_ROOT" || true
+    if [[ -n "${FILE_DATA_HOME:-}" && -d "${FILE_DATA_HOME:-}" ]]; then
+        if [[ "${AIRLOCK_TEST_KEEP:-}" != "1" ]]; then
+            rm -rf "$FILE_DATA_HOME"
+        fi
+    fi
     if [[ -n "${FILE_TEMP_DIR:-}" && -d "${FILE_TEMP_DIR:-}" ]]; then
         if [[ "${AIRLOCK_TEST_KEEP:-}" != "1" ]]; then
             rm -rf "$FILE_TEMP_DIR"

@@ -83,6 +83,7 @@ async fn run(
     extra_args: Vec<String>,
     context: Context,
 ) -> Result<i32, start::Exit> {
+    start::check_data_dir(&context.data_dir)?;
     start::check_system_requirements();
     let host_cwd = start::resolve_host_cwd()?;
     start::init_logging(args.log_level);

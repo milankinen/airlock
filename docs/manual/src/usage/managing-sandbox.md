@@ -130,6 +130,11 @@ To use a different directory, set `data_dir` in `~/.airlock/settings.toml`:
 data_dir = "~/airlock-data"
 ```
 
+On Linux, the path of the data directory must be 70 bytes or shorter.
+The VM uses Unix sockets in the data directory, and the length of a
+socket path has a limit. If the path is longer, `airlock start` stops
+with an error.
+
 The data directory also holds the image cache. Keep it on one file
 system: airlock links each sandbox to its cached image with a hard link.
 
