@@ -2,7 +2,11 @@
 -- mirrors. The rule also has the Ubuntu mirrors, for a `vm.image` of the
 -- Ubuntu family in a config file.
 
-config.vm = { image = "debian:stable-slim" }
+-- The cached image stays in use when the tag moves. The image settings
+-- are explicit, thus an image table in a user file cannot change them.
+config.vm = {
+    image = { name = "debian:stable-slim", insecure = false, ["pull-policy"] = "if-not-present" },
+}
 
 if pack.args["allow-apt"] then
     config.network = {

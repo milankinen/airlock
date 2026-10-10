@@ -277,7 +277,7 @@ fn arg_value_is_checked_in_file_that_sets_it() {
 fn two_distro_packs_conflict_on_image() {
     assert_eq!(
         project_toml_error("[packs]\nalpine = { version = 1 }\ndebian = { version = 1 }\n"),
-        "invalid configuration\n* packs alpine and debian both set `vm.image` \
+        "invalid configuration\n* packs alpine and debian both set `vm.image.name` \
          (\"alpine:latest\" vs \"debian:stable-slim\")"
     );
 }
