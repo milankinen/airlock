@@ -10,14 +10,6 @@ use crate::cli::prompt::style::{self, Line, Styles, Tone};
 use crate::packs::{ArgKind, ArgValue, PackKind};
 use crate::start::wizard::form::{self, Form, KINDS, Row, START_CHOICES, StartChoice};
 
-/// The logo, at the top of the view.
-const LOGO: [&str; 4] = [
-    "   ▗    ▜       ▌",
-    "▝▀▖▄ ▙▀▖▐ ▞▀▖▞▀▖▌▗▘",
-    "▞▀▌▐ ▌  ▐ ▌ ▌▌ ▖▛▚",
-    "▝▀▘▀▘▘   ▘▝▀ ▝▀ ▘ ▘",
-];
-
 /// The description of [`Row::Custom`].
 const CUSTOM_DESCRIPTION: &str = "User defined image";
 
@@ -62,7 +54,8 @@ pub fn frame(form: &Form, room: usize) -> Frame {
     let styles = Styles::new();
     let mut lines = vec![String::new()];
     lines.extend(
-        LOGO.iter()
+        cli::LOGO
+            .iter()
             .map(|line| styles.bold.apply_to(line).to_string()),
     );
     lines.push(String::new());

@@ -24,6 +24,22 @@ use tokio::sync::watch;
 
 // -- CLI argument parsing --
 
+/// The "airlock" logo. The setup wizard and the top-level help show it.
+pub const LOGO: [&str; 4] = [
+    "   ▗    ▜       ▌",
+    "▝▀▖▄ ▙▀▖▐ ▞▀▖▞▀▖▌▗▘",
+    "▞▀▌▐ ▌  ▐ ▌ ▌▌ ▖▛▚",
+    "▝▀▘▀▘▘   ▘▝▀ ▝▀ ▘ ▘",
+];
+
+/// Return the logo in bold text for the top of the top-level help.
+pub fn help_logo() -> String {
+    LOGO.iter()
+        .map(|line| console::style(line).bold().to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Return a "Status" section with the KVM access state for help output.
 #[cfg(target_os = "linux")]
 pub fn platform_status() -> String {
