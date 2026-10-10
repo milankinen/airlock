@@ -79,14 +79,26 @@ check_second_start() {
 
 # Check that each script can run again on a disk that has the pack. An
 # "unconfirmed" record means that the install did not confirm its disk
-# write. The next start then runs the script of the pack again on the same
-# disk. This is a retry, so it asks no question and needs no terminal.
+# write. If no session ran after the install, the next start runs the
+# script of the pack again on the same disk. This is a retry, so it asks no
+# question and needs no terminal. If a session ran, the session can have
+# left code on the disk, thus the start asks first.
 check_rerun() {
     local state
     state="$(sandbox_dir)/installs.json"
     sed -i.bak 's/"status": "installed"/"status": "unconfirmed"/' "$state"
     rm "$state.bak"
     [[ "$(pack_status rust)" == unconfirmed ]]
+
+    # The earlier starts ran sessions, so this is not a retry.
+    run_airlock start -- sh -c 'echo NOT-REACHED'
+    [[ "$status" -eq 2 ]]
+    assert_output_contains "Tools changed in the sandbox (added: claude, codex, copilot"
+    assert_output_not_contains "NOT-REACHED"
+
+    sed -i.bak 's/"ran_session": true/"ran_session": false/' "$state"
+    rm "$state.bak"
+    grep -q '"ran_session": false' "$state"
     run_airlock start -- sh -c "$VERSIONS"
     assert_success
     assert_output_not_contains "disk created"
@@ -135,12 +147,13 @@ check_legacy_installs_nothing() {
 
 # Test the pack life cycle on an Alpine sandbox: a new sandbox installs
 # every pack without a question, a second start installs nothing,
-# unconfirmed records run each script again, and a removed pack needs a
-# terminal or --yes.
+# unconfirmed records run each script again if no session ran after the
+# install, and a removed pack needs a terminal or --yes.
 #   1. Run start with all packs and no terminal, and check the installs
 #   2. Run start again and check that there is no install
-#   3. Change all install records to unconfirmed, run start, and check that
-#      each pack installs again with no failure
+#   3. Change all install records to unconfirmed and check that start
+#      fails, because sessions ran. Then mark that no session ran, run
+#      start, and check that each pack installs again with no failure
 #   4. Remove mise from the config and check that start fails, then run
 #      start --yes and check that a new disk has the other packs only
 @test "alpine: packs install, stay, run again and need --yes to remove" {
@@ -163,8 +176,9 @@ check_legacy_installs_nothing() {
 # Alpine test.
 #   1. Run start with all packs and no terminal, and check the installs
 #   2. Run start again and check that there is no install
-#   3. Change all install records to unconfirmed, run start, and check that
-#      each pack installs again with no failure
+#   3. Change all install records to unconfirmed and check that start
+#      fails, because sessions ran. Then mark that no session ran, run
+#      start, and check that each pack installs again with no failure
 #   4. Remove mise from the config and check that start fails, then run
 #      start --yes and check that a new disk has the other packs only
 @test "debian: packs install, stay, run again and need --yes to remove" {
