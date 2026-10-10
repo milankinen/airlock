@@ -175,6 +175,7 @@ impl LayeredConfig {
     /// pack overrides the user files). The layer of that entry overrides
     /// the pack.
     /// Args:
+    ///  - `data_dir`: Airlock data directory, for the pack mount directories
     ///  - `packs`: Known packs
     ///  - `overrides`: Command line overrides
     ///
@@ -185,6 +186,7 @@ impl LayeredConfig {
     ///   value differently.
     pub async fn resolve(
         &self,
+        data_dir: &Path,
         packs: &PackManager,
         overrides: &ConfigOverrides,
     ) -> anyhow::Result<ResolvedConfig> {
@@ -212,7 +214,7 @@ impl LayeredConfig {
         }
         // A `config.lua` runs here, on each resolve. The values of the
         // enabled packs must not conflict across all layers.
-        let pack_values = pack_configs(&configured).map_err(|problems| {
+        let pack_values = pack_configs(data_dir, &configured).map_err(|problems| {
             anyhow::anyhow!("invalid configuration\n{}", problems.join("\n"))
         })?;
         let mut values = merge_config(legacy_base, plain_layers, &configured, pack_values)?;
@@ -341,6 +343,7 @@ impl ResolvedConfig {
 
 /// Get the config values of the packs.
 /// Args:
+///  - `data_dir`: Airlock data directory, for the pack mount directories
 ///  - `packs`: Configured packs
 ///
 /// Returns:
@@ -348,7 +351,10 @@ impl ResolvedConfig {
 ///   [`normalize_env`]). Or the problems, one line each: a pack whose
 ///   `config.lua` fails, or a value that two packs set differently (see
 ///   [`pack_conflicts`]).
-fn pack_configs(packs: &[ConfiguredPack]) -> Result<Vec<serde_json::Value>, Vec<String>> {
+fn pack_configs(
+    data_dir: &Path,
+    packs: &[ConfiguredPack],
+) -> Result<Vec<serde_json::Value>, Vec<String>> {
     let mut docs = Vec::new();
     let mut problems = Vec::new();
     for pack in packs {
@@ -358,7 +364,7 @@ fn pack_configs(packs: &[ConfiguredPack]) -> Result<Vec<serde_json::Value>, Vec<
             metadata.name,
             metadata.version
         );
-        match pack.config_values() {
+        match pack.config_values(data_dir) {
             Ok(mut value) => {
                 normalize_env(&mut value);
                 docs.push((metadata.name.clone(), value));

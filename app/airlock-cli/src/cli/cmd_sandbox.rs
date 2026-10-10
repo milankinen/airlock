@@ -144,7 +144,7 @@ async fn remove(context: &Context, ids: &[String], force: bool) -> anyhow::Resul
         }
     }
     if removed {
-        oci::gc_sweep();
+        oci::gc_sweep(&context.data_dir);
     }
     Ok(code)
 }

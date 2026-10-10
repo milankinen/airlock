@@ -141,6 +141,7 @@ pub struct PreparedImage {
 
 /// Resolve, download and prepare the OCI image for a sandbox.
 /// Args:
+///  - `data_dir`: Airlock data directory
 ///  - `sandbox_dir`: Directory of the sandbox
 ///  - `image_cfg`: Configured image reference and pull settings
 ///  - `vault`: Vault that holds the registry credentials
@@ -151,6 +152,7 @@ pub struct PreparedImage {
 ///   The prepared image and what happened to the old image, or error.
 ///   Stops with [`ImageChangeStop`] if the user cancels or nobody can answer.
 pub async fn prepare(
+    data_dir: &Path,
     sandbox_dir: &Path,
     image_cfg: &ImageRef,
     vault: &Vault,
@@ -165,7 +167,7 @@ pub async fn prepare(
 
     // The cached image of this sandbox. Set only if it is complete on disk
     // and its name is still the configured image name.
-    let cached = read_ready_image(&sandbox_image).filter(|img| img.name == *image_name);
+    let cached = read_ready_image(data_dir, &sandbox_image).filter(|img| img.name == *image_name);
 
     // A file without `user` is older than named-USER resolution and can
     // contain a wrong uid/gid. The code below must check it again, so it
@@ -185,7 +187,7 @@ pub async fn prepare(
             || image_cfg.pinned_digest().is_some())
     {
         tracing::debug!("image cache hit for {image_name}");
-        return use_cached_image(sandbox_dir, &sandbox_image, img).map(unchanged);
+        return use_cached_image(data_dir, sandbox_dir, &sandbox_image, img).map(unchanged);
     }
 
     // Read only the stored digest (if any) for change detection.
@@ -208,7 +210,7 @@ pub async fn prepare(
             if !prompt_resolution_failed(&e)? {
                 return Err(e);
             }
-            return use_cached_image(sandbox_dir, &sandbox_image, img).map(unchanged);
+            return use_cached_image(data_dir, sandbox_dir, &sandbox_image, img).map(unchanged);
         }
     };
 
@@ -219,7 +221,7 @@ pub async fn prepare(
         .as_ref()
         .filter(|i| i.user.is_none() && i.image_id == image.digest)
     {
-        verify_legacy_user(img, &image)?;
+        verify_legacy_user(data_dir, img, &image)?;
     }
 
     // Check for an image change before the download.
@@ -244,8 +246,8 @@ pub async fn prepare(
             // share it, and the `image_id` describes neither image.
             // A return here makes this mismatch impossible. A digest gets to
             // `ensure_image` only from the same resolution as its source.
-            let old_image_path = crate::cache::image_path(old_digest.trim())?;
-            if let Some(mut old) = read_ready_image(&old_image_path) {
+            let old_image_path = crate::cache::image_path(data_dir, old_digest.trim())?;
+            if let Some(mut old) = read_ready_image(data_dir, &old_image_path) {
                 // Write the configured name into the kept image, so the
                 // name-keyed fast path finds it on the next start. Otherwise
                 // each later run resolves again and asks the same question.
@@ -253,7 +255,7 @@ pub async fn prepare(
                     old.name.clone_from(image_name);
                     write_cached_image(&old_image_path, &old)?;
                 }
-                return use_cached_image(sandbox_dir, &sandbox_image, old).map(|image| {
+                return use_cached_image(data_dir, sandbox_dir, &sandbox_image, old).map(|image| {
                     PreparedImage {
                         image,
                         change: ImageChange::KeepOld,
@@ -272,12 +274,12 @@ pub async fn prepare(
             cli::log!("  {} old environment erased", cli::check());
             // GC: remove images that no sandbox uses, and the layers that
             // only those images used.
-            gc::sweep();
+            gc::sweep(data_dir);
         }
     }
 
     let oci_image = tokio::select! {
-        res = ensure_image(&mut image, image_name, &auth, image_cfg.insecure) => res?,
+        res = ensure_image(data_dir, &mut image, image_name, &auth, image_cfg.insecure) => res?,
         () = cli::interrupted() => return Err(ImageChangeStop::Interrupted.into()),
     };
     // Hardlink the cached image file into the sandbox directory. nlink > 1
@@ -285,7 +287,7 @@ pub async fn prepare(
     // that creates a new image can start a sweep that deletes this one.
     // Always do this: also when the digest did not change, a previous run
     // can have left a standalone copy instead of a hardlink.
-    let image_path = crate::cache::image_path(&oci_image.image_id)?;
+    let image_path = crate::cache::image_path(data_dir, &oci_image.image_id)?;
     ensure_image_hardlink(&sandbox_image, &image_path, &oci_image)?;
 
     let overlay_dir = sandbox_dir.join("overlay");
@@ -305,6 +307,7 @@ pub async fn prepare(
 /// The fast path and the resolution-failure fallback both use this, so both
 /// leave the sandbox in the same state as a newly pulled image.
 fn use_cached_image(
+    data_dir: &Path,
     sandbox_dir: &Path,
     sandbox_image: &Path,
     image: OciImage,
@@ -313,7 +316,7 @@ fn use_cached_image(
     // file, so the GC sweep sees that the sandbox uses it. Repair it on each
     // prepare. A cache wipe, a cache-path migration, or an older run can
     // break the link. Then the sweep can delete the image.
-    let image_path = crate::cache::image_path(&image.image_id)?;
+    let image_path = crate::cache::image_path(data_dir, &image.image_id)?;
     ensure_image_hardlink(sandbox_image, &image_path, &image)?;
     cli::log!(
         "  {} image cached {}",
@@ -398,10 +401,14 @@ fn read_cached_image(path: &Path) -> Option<OciImage> {
 
 /// Like [`read_cached_image`], but all layers of the image must also exist
 /// on disk.
+/// Args:
+///  - `data_dir`: Airlock data directory
+///  - `path`: Cached image file
+///
 /// Returns:
 ///   The image, or `None` if the file is missing or a sweep removed a layer.
 ///   In both cases the caller must resolve the image again.
-fn read_ready_image(path: &Path) -> Option<OciImage> {
+fn read_ready_image(data_dir: &Path, path: &Path) -> Option<OciImage> {
     let image = read_cached_image(path)?;
     if image.image_layers.is_empty() {
         return None;
@@ -409,7 +416,7 @@ fn read_ready_image(path: &Path) -> Option<OciImage> {
     image
         .image_layers
         .iter()
-        .all(|k| cache::layer_dir(k).is_ok_and(|p| p.is_dir()))
+        .all(|k| cache::layer_dir(data_dir, k).is_ok_and(|p| p.is_dir()))
         .then_some(image)
 }
 
@@ -476,6 +483,7 @@ fn write_cached_image(path: &Path, image: &OciImage) -> anyhow::Result<()> {
 
 /// Make an [`OciImage`] from the parsed OCI image config and the layer list.
 /// Args:
+///  - `data_dir`: Airlock data directory
 ///  - `image_id`: Image digest
 ///  - `name`: Configured image reference
 ///  - `ordered_layers`: Layer keys, topmost first
@@ -486,6 +494,7 @@ fn write_cached_image(path: &Path, image: &OciImage) -> anyhow::Result<()> {
 ///   the image has no layers, or its user or home directory cannot be
 ///   resolved.
 fn build_oci_image(
+    data_dir: &Path,
     image_id: String,
     name: String,
     ordered_layers: Vec<String>,
@@ -497,8 +506,8 @@ fn build_oci_image(
 
     let cfg = image_config.config.as_ref();
     let user = cfg.and_then(|c| c.user.as_deref()).unwrap_or("");
-    let (uid, gid) = resolve_user(&ordered_layers, user)?;
-    let container_home = lookup_home_dir(&ordered_layers, uid)?;
+    let (uid, gid) = resolve_user(data_dir, &ordered_layers, user)?;
+    let container_home = lookup_home_dir(data_dir, &ordered_layers, uid)?;
 
     // Container command: entrypoint and cmd merged.
     let cmd: Vec<String> = {
@@ -608,12 +617,13 @@ pub(crate) fn apply_login_shell(cmd: Vec<String>) -> Vec<String> {
 /// image author wrote `USER` to prevent root access for an unprivileged
 /// user, so a silent change to root is not acceptable.
 /// Args:
+///  - `data_dir`: Airlock data directory
 ///  - `layer_keys`: Layer keys, topmost first
 ///  - `user`: The `USER` string from the image config.
 ///
 /// Returns:
 ///   The `(uid, gid)` pair, or error if a name is not found.
-fn resolve_user(layer_keys: &[String], user: &str) -> anyhow::Result<(u32, u32)> {
+fn resolve_user(data_dir: &Path, layer_keys: &[String], user: &str) -> anyhow::Result<(u32, u32)> {
     let (user_part, group_part) = match user.split_once(':') {
         Some((u, g)) => (u, Some(g)),
         None => (user, None),
@@ -622,7 +632,7 @@ fn resolve_user(layer_keys: &[String], user: &str) -> anyhow::Result<(u32, u32)>
     // Each passwd record is `name:pw:uid:gid:gecos:home:shell`. A match
     // gives `(uid, primary gid)`.
     let passwd_record = |matches: &dyn Fn(&[&str]) -> bool| {
-        lookup_layer_record(layer_keys, "etc/passwd", |f| {
+        lookup_layer_record(data_dir, layer_keys, "etc/passwd", |f| {
             if f.len() >= 4 && matches(f) {
                 Some((f[2].parse::<u32>().ok()?, f[3].parse::<u32>().ok()?))
             } else {
@@ -644,7 +654,7 @@ fn resolve_user(layer_keys: &[String], user: &str) -> anyhow::Result<(u32, u32)>
 
     let gid = match group_part {
         None | Some("") => primary_gid.unwrap_or(0),
-        Some(g) => resolve_group(layer_keys, g)?,
+        Some(g) => resolve_group(data_dir, layer_keys, g)?,
     };
 
     Ok((uid, gid))
@@ -652,12 +662,12 @@ fn resolve_user(layer_keys: &[String], user: &str) -> anyhow::Result<(u32, u32)>
 
 /// Resolve the group part of a `USER` string. A numeric gid is used as it
 /// is. A name is looked up in the image's `/etc/group`.
-fn resolve_group(layer_keys: &[String], group: &str) -> anyhow::Result<u32> {
+fn resolve_group(data_dir: &Path, layer_keys: &[String], group: &str) -> anyhow::Result<u32> {
     if let Ok(gid) = group.parse::<u32>() {
         return Ok(gid);
     }
     // Each group record is `name:pw:gid:members`.
-    lookup_layer_record(layer_keys, "etc/group", |f| {
+    lookup_layer_record(data_dir, layer_keys, "etc/group", |f| {
         if f.len() >= 3 && f[0] == group {
             f[2].parse::<u32>().ok()
         } else {
@@ -753,8 +763,8 @@ enum LegacyUser {
 
 /// Find uid/gid again for a legacy cache file (one without `user`). Uses
 /// the current `USER` string and the layers that the file refers to.
-fn check_legacy_user(stored: &OciImage, user: &str) -> anyhow::Result<LegacyUser> {
-    let (uid, gid) = resolve_user(&stored.image_layers, user)?;
+fn check_legacy_user(data_dir: &Path, stored: &OciImage, user: &str) -> anyhow::Result<LegacyUser> {
+    let (uid, gid) = resolve_user(data_dir, &stored.image_layers, user)?;
     Ok(if uid != stored.uid {
         LegacyUser::UidMismatch { uid, gid }
     } else if gid != stored.gid {
@@ -782,6 +792,7 @@ fn resolved_user(resolved: &ResolvedImage) -> anyhow::Result<String> {
 /// Check the uid/gid of a legacy cached image against the fixed `USER`
 /// resolution.
 /// Args:
+///  - `data_dir`: Airlock data directory
 ///  - `stored`: Cached image of this sandbox, written before named `USER`
 ///    resolution existed. It has the same digest as `resolved`
 ///  - `resolved`: The newly resolved image.
@@ -789,11 +800,15 @@ fn resolved_user(resolved: &ResolvedImage) -> anyhow::Result<String> {
 /// Returns:
 ///   `Ok` after it marks the file as verified or repairs its gid. Error that
 ///   tells the user to run `airlock rm` if the uid is wrong.
-fn verify_legacy_user(stored: &OciImage, resolved: &ResolvedImage) -> anyhow::Result<()> {
+fn verify_legacy_user(
+    data_dir: &Path,
+    stored: &OciImage,
+    resolved: &ResolvedImage,
+) -> anyhow::Result<()> {
     let user = resolved_user(resolved)?;
     let mut fixed = stored.clone();
     fixed.user = Some(user.clone());
-    match check_legacy_user(stored, &user)? {
+    match check_legacy_user(data_dir, stored, &user)? {
         LegacyUser::Verified => {}
         LegacyUser::GidOnly { gid } => {
             cli::log!(
@@ -821,7 +836,10 @@ fn verify_legacy_user(stored: &OciImage, resolved: &ResolvedImage) -> anyhow::Re
     }
     // Write the shared cache entry again. `prepare` links the sandbox copy
     // to the new file with `ensure_image_hardlink`.
-    write_cached_image(&crate::cache::image_path(&stored.image_id)?, &fixed)
+    write_cached_image(
+        &crate::cache::image_path(data_dir, &stored.image_id)?,
+        &fixed,
+    )
 }
 
 /// Resolve the configured image to a digest and config. Tries the local
@@ -977,6 +995,7 @@ enum ImageSource {
 /// from the per-layer cache. Registry and docker images both use
 /// [`layer::ensure_layer_cached`].
 /// Args:
+///  - `data_dir`: Airlock data directory
 ///  - `resolved`: The resolved image. Local resolution sets its config here
 ///  - `image_name`: Configured image reference
 ///  - `auth`: Registry auth
@@ -985,18 +1004,19 @@ enum ImageSource {
 /// Returns:
 ///   The cached image metadata, or error.
 async fn ensure_image(
+    data_dir: &Path,
     resolved: &mut ResolvedImage,
     image_name: &str,
     auth: &RegistryAuth,
     insecure: bool,
 ) -> anyhow::Result<OciImage> {
-    let image_path = crate::cache::image_path(&resolved.digest)?;
+    let image_path = crate::cache::image_path(data_dir, &resolved.digest)?;
 
     // Digest-keyed cache hit: a sibling project already pulled this image
     // and all its layers are still on disk. Skip the pull. Write the current
     // name, so the per-sandbox fast path in `prepare()` (which matches on
     // name) sees the current tag.
-    if let Some(mut cached) = read_ready_image(&image_path).filter(|c| c.user.is_some()) {
+    if let Some(mut cached) = read_ready_image(data_dir, &image_path).filter(|c| c.user.is_some()) {
         if cached.name != image_name {
             cached.name = image_name.to_string();
             write_cached_image(&image_path, &cached)?;
@@ -1007,13 +1027,14 @@ async fn ensure_image(
     let ordered_layers = match &resolved.source {
         ImageSource::Local { engine, image_ref } => {
             let image_ref = image_ref.clone();
-            let (cfg, layers) = ensure_local_image(engine, &image_ref).await?;
+            let (cfg, layers) = ensure_local_image(data_dir, engine, &image_ref).await?;
             resolved.config = cfg;
             layers
         }
-        ImageSource::Registry(reg) => ensure_registry_image(reg, auth, insecure).await?,
+        ImageSource::Registry(reg) => ensure_registry_image(data_dir, reg, auth, insecure).await?,
     };
     let image = build_oci_image(
+        data_dir,
         resolved.digest.clone(),
         image_name.to_string(),
         ordered_layers,
@@ -1026,12 +1047,14 @@ async fn ensure_image(
 /// Export an image from a local engine and extract its layers into the
 /// shared per-layer cache. Ctrl+C stops the export.
 /// Args:
+///  - `data_dir`: Airlock data directory
 ///  - `engine`: `docker` or `podman`
 ///  - `image_ref`: Image reference without a digest pin.
 ///
 /// Returns:
 ///   The parsed image config and the layer keys, topmost first.
 async fn ensure_local_image(
+    data_dir: &Path,
     engine: &'static str,
     image_ref: &str,
 ) -> anyhow::Result<(OciConfig, Vec<String>)> {
@@ -1039,11 +1062,13 @@ async fn ensure_local_image(
 
     let image_ref = image_ref.to_string();
     let pipeline = async {
-        let save = docker::save_layer_tarballs(engine, &image_ref).await?;
+        let save = docker::save_layer_tarballs(data_dir, engine, &image_ref).await?;
         for digest in &save.layer_digests {
             let digest = digest.clone();
+            let data_dir = data_dir.to_path_buf();
             tokio::task::spawn_blocking(move || {
                 layer::ensure_layer_cached(
+                    &data_dir,
                     &digest,
                     |_tmp| {
                         anyhow::bail!(
@@ -1088,6 +1113,7 @@ async fn ensure_local_image(
 /// Pull the layers of a registry image and extract them into the shared
 /// per-layer cache. Ctrl+C stops the pull.
 /// Args:
+///  - `data_dir`: Airlock data directory
 ///  - `reg`: The resolved registry image
 ///  - `auth`: Registry auth
 ///  - `insecure`: Allow plain-HTTP registry access.
@@ -1095,6 +1121,7 @@ async fn ensure_local_image(
 /// Returns:
 ///   The layer keys, topmost first.
 async fn ensure_registry_image(
+    data_dir: &Path,
     reg: &registry::RegistryImage,
     auth: &RegistryAuth,
     insecure: bool,
@@ -1103,7 +1130,9 @@ async fn ensure_registry_image(
 
     let cached_count = layers
         .iter()
-        .filter(|l| cache::layer_dir(&cache::layer_key(&l.digest)).is_ok_and(|p| p.is_dir()))
+        .filter(|l| {
+            cache::layer_dir(data_dir, &cache::layer_key(&l.digest)).is_ok_and(|p| p.is_dir())
+        })
         .count();
     if cached_count > 0 {
         cli::log!(
@@ -1117,7 +1146,9 @@ async fn ensure_registry_image(
     let to_fetch: Vec<usize> = layers
         .iter()
         .enumerate()
-        .filter(|(_, l)| !cache::layer_dir(&cache::layer_key(&l.digest)).is_ok_and(|p| p.is_dir()))
+        .filter(|(_, l)| {
+            !cache::layer_dir(data_dir, &cache::layer_key(&l.digest)).is_ok_and(|p| p.is_dir())
+        })
         .map(|(i, _)| i)
         .collect();
 
@@ -1149,7 +1180,10 @@ async fn ensure_registry_image(
                 .map(|i| async move {
                     let layer_desc = &layers[i];
                     let per_layer = &bars_ref[i];
-                    fetch_and_extract_layer(reference, layer_desc, per_layer, auth, insecure).await
+                    fetch_and_extract_layer(
+                        data_dir, reference, layer_desc, per_layer, auth, insecure,
+                    )
+                    .await
                 })
                 .buffer_unordered(3);
 
@@ -1192,12 +1226,14 @@ async fn ensure_registry_image(
 /// exists. Thus the `to_fetch` filter in the caller only makes it faster.
 /// Correct operation does not need it.
 /// Args:
+///  - `data_dir`: Airlock data directory
 ///  - `reference`: Image reference in the registry
 ///  - `layer_desc`: Descriptor of the layer
 ///  - `per_layer`: Progress bar of the layer
 ///  - `auth`: Registry auth
 ///  - `insecure`: Allow plain-HTTP registry access.
 async fn fetch_and_extract_layer(
+    data_dir: &Path,
     reference: &oci_client::Reference,
     layer_desc: &oci_client::manifest::OciDescriptor,
     per_layer: &indicatif::ProgressBar,
@@ -1209,16 +1245,17 @@ async fn fetch_and_extract_layer(
     let layer_desc = layer_desc.clone();
     let per_layer = per_layer.clone();
     let auth = auth.clone();
+    let blocking_data_dir = data_dir.to_path_buf();
 
     // `ensure_layer_cached` does blocking I/O (tar extraction), so it must
     // not run on the async runtime. Thus pull the blob with async code into
     // a temp file, then run the extraction in a blocking task.
-    let layers_root = cache::layers_root()?;
+    let layers_root = cache::layers_root(data_dir)?;
     let key = cache::layer_key(&digest);
     let download = layers_root.join(format!("{key}.download"));
 
     // Same fast path as in `ensure_layer_cached`.
-    let layer_dir = cache::layer_dir(&key)?;
+    let layer_dir = cache::layer_dir(data_dir, &key)?;
     if layer_dir.is_dir() {
         return Ok(());
     }
@@ -1245,6 +1282,7 @@ async fn fetch_and_extract_layer(
 
     tokio::task::spawn_blocking(move || {
         layer::ensure_layer_cached(
+            &blocking_data_dir,
             &digest,
             |_tmp| {
                 // The async pull above made `.download`, so this fetch
@@ -1282,6 +1320,7 @@ fn format_size(bytes: i64) -> String {
 ///    past a file that exists but has no match. A merged rootfs stops there.
 ///
 /// Args:
+///  - `data_dir`: Airlock data directory
 ///  - `layer_keys`: Layer keys, topmost first
 ///  - `rel_path`: File path in the layer (e.g. `etc/passwd`)
 ///  - `pick`: Gets the fields of a line, and returns a value on a match.
@@ -1290,13 +1329,14 @@ fn format_size(bytes: i64) -> String {
 ///   The first match, and all layer copies of the file that were refused
 ///   instead of read, with the reason.
 fn lookup_layer_record<T>(
+    data_dir: &Path,
     layer_keys: &[String],
     rel_path: &str,
     pick: impl Fn(&[&str]) -> Option<T>,
 ) -> anyhow::Result<Lookup<T>> {
     let mut ignored = Vec::new();
     for key in layer_keys {
-        let content = match read_layer_file(&cache::layer_dir(key)?, rel_path) {
+        let content = match read_layer_file(&cache::layer_dir(data_dir, key)?, rel_path) {
             Ok(Some(content)) => content,
             Ok(None) => continue,
             Err(Refused { why, suspicious }) => {
@@ -1455,15 +1495,16 @@ impl Refused {
 /// that is too large. An empty file (a whiteout in the layer cache) also
 /// continues to the next layer.
 /// Args:
+///  - `data_dir`: Airlock data directory
 ///  - `layer_keys`: Layer keys, topmost first
 ///  - `rel_path`: File path in the image (e.g. `etc/os-release`).
 ///
 /// Returns:
 ///   The file content, or `None` if no layer has the file.
-pub fn read_image_file(layer_keys: &[String], rel_path: &str) -> Option<String> {
+pub fn read_image_file(data_dir: &Path, layer_keys: &[String], rel_path: &str) -> Option<String> {
     let dirs: Vec<_> = layer_keys
         .iter()
-        .filter_map(|key| cache::layer_dir(key).ok())
+        .filter_map(|key| cache::layer_dir(data_dir, key).ok())
         .collect();
     read_file_in_layers(&dirs, rel_path)
 }
@@ -1493,13 +1534,17 @@ pub struct OsRelease {
 
 /// Read `etc/os-release` (or `usr/lib/os-release`, its usual link target)
 /// from the image layers.
+/// Args:
+///  - `data_dir`: Airlock data directory
+///  - `image`: The image to read
+///
 /// Returns:
 ///   The distribution identity, or `None` if neither file exists or has no
 ///   `ID`.
-pub fn os_release(image: &OciImage) -> Option<OsRelease> {
+pub fn os_release(data_dir: &Path, image: &OciImage) -> Option<OsRelease> {
     ["etc/os-release", "usr/lib/os-release"]
         .iter()
-        .find_map(|rel| read_image_file(&image.image_layers, rel))
+        .find_map(|rel| read_image_file(data_dir, &image.image_layers, rel))
         .and_then(|content| parse_os_release(&content))
 }
 
@@ -1529,8 +1574,8 @@ fn parse_os_release(content: &str) -> Option<OsRelease> {
 }
 
 /// Look up a user's home directory by uid in the image's `/etc/passwd`.
-fn lookup_home_dir(layer_keys: &[String], uid: u32) -> anyhow::Result<String> {
-    lookup_layer_record(layer_keys, "etc/passwd", |f| {
+fn lookup_home_dir(data_dir: &Path, layer_keys: &[String], uid: u32) -> anyhow::Result<String> {
+    lookup_layer_record(data_dir, layer_keys, "etc/passwd", |f| {
         (f.len() >= 6 && f[2].parse::<u32>().ok() == Some(uid)).then(|| f[5].to_string())
     })?
     .ok_or_else(|| format!("no home directory found for uid {uid} in any layer /etc/passwd"))

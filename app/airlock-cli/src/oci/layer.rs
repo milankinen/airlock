@@ -63,6 +63,7 @@ pub(super) fn download_tmp_path(layers_root: &Path, key: &str) -> PathBuf {
 /// from them (this function). The tarball is removed after a successful
 /// extraction.
 /// Args:
+///  - `data_dir`: Airlock data directory
 ///  - `digest`: Layer digest (`sha256:<hex>`)
 ///  - `fetch`: Writes the tarball to the given path. Called only if no
 ///    `<key>.download` exists
@@ -72,6 +73,7 @@ pub(super) fn download_tmp_path(layers_root: &Path, key: &str) -> PathBuf {
 /// Returns:
 ///   Path of the extracted layer directory.
 pub fn ensure_layer_cached<F>(
+    data_dir: &Path,
     digest: &str,
     fetch: F,
     progress: Option<&ProgressBar>,
@@ -80,7 +82,7 @@ where
     F: FnOnce(&Path) -> anyhow::Result<()>,
 {
     let key = cache::layer_key(digest);
-    let layer_dir = cache::layer_dir(&key)?;
+    let layer_dir = cache::layer_dir(data_dir, &key)?;
     // Fast path. The directory appears only with the atomic rename at the
     // end of the extraction, so if it exists, the layer is complete.
     if layer_dir.is_dir() {

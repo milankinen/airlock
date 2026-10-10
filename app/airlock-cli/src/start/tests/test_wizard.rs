@@ -71,9 +71,11 @@ fn user_files(user_toml: &str) -> LayeredConfig {
 /// before it ends.
 fn check(packs: &PackManager, config: &LayeredConfig, form: &Form) -> anyhow::Result<()> {
     let dir = temp_dir();
+    let data = temp_dir();
     let vault = Vault::for_storage_type(VaultStorageType::Disabled);
     let input = Input {
         host_cwd: dir.path(),
+        data_dir: data.path(),
         packs,
         config,
         vault: &vault,
@@ -95,7 +97,8 @@ fn check(packs: &PackManager, config: &LayeredConfig, form: &Form) -> anyhow::Re
 #[test]
 fn choosing_packs_and_args_with_keys_saves_shared_config_that_resolves() {
     let packs = crate::packs::init_with_sample();
-    let mut form = Form::new(&packs, None, StartChoice::Start);
+    let data = temp_dir();
+    let mut form = Form::new(data.path(), &packs, None, StartChoice::Start);
     focus_pack(&mut form, "debian");
     press(&mut form, KeyCode::Char(' '));
     focus_pack(&mut form, "claude");
@@ -181,11 +184,12 @@ fn choosing_packs_and_args_with_keys_saves_shared_config_that_resolves() {
 #[test]
 fn user_image_is_preselected_until_distro_pack_is_chosen() {
     let packs = crate::packs::init_with_sample();
+    let data = temp_dir();
     let image = UserImage {
         name: "my/image:1".into(),
         value: serde_json::json!("my/image:1"),
     };
-    let mut form = Form::new(&packs, Some(image.clone()), StartChoice::Start);
+    let mut form = Form::new(data.path(), &packs, Some(image.clone()), StartChoice::Start);
     assert_eq!(form.focus(), Row::Custom);
     press(&mut form, KeyCode::Enter);
     let Step::Done(target) = press(&mut form, KeyCode::Enter) else {
@@ -199,7 +203,7 @@ fn user_image_is_preselected_until_distro_pack_is_chosen() {
     assert!(resolved.packs.is_empty());
     assert_eq!(resolved.values.vm.image.name, "my/image:1");
 
-    let mut form = Form::new(&packs, Some(image), StartChoice::Start);
+    let mut form = Form::new(data.path(), &packs, Some(image), StartChoice::Start);
     focus_pack(&mut form, "alpine");
     press(&mut form, KeyCode::Char(' '));
     let answers = form.answers(Target::Local);
@@ -215,7 +219,8 @@ fn user_image_is_preselected_until_distro_pack_is_chosen() {
 #[test]
 fn answers_whose_env_does_not_resolve_fail_check() {
     let packs = crate::packs::init_with_sample();
-    let form = Form::new(&packs, None, StartChoice::Start);
+    let data = temp_dir();
+    let form = Form::new(data.path(), &packs, None, StartChoice::Start);
     check(&packs, &user_files("[env]\nPLAIN = \"1\"\n"), &form).unwrap();
     let config = user_files("[env]\nMINE = \"${AIRLOCK_TEST_UNSET_VAR}\"\n");
     let e = check(&packs, &config, &form).unwrap_err();
@@ -231,7 +236,8 @@ fn answers_whose_env_does_not_resolve_fail_check() {
 #[test]
 fn esc_cancel_and_ctrl_c_end_wizard_without_answers() {
     let packs = crate::packs::init_with_sample();
-    let mut form = Form::new(&packs, None, StartChoice::Start);
+    let data = temp_dir();
+    let mut form = Form::new(data.path(), &packs, None, StartChoice::Start);
     let first = form.focus();
     press(&mut form, KeyCode::Enter);
     assert_eq!(form.focus(), Row::Start);
@@ -239,7 +245,7 @@ fn esc_cancel_and_ctrl_c_end_wizard_without_answers() {
     assert_eq!(form.focus(), first);
     assert!(matches!(press(&mut form, KeyCode::Esc), Step::Cancel));
 
-    let mut form = Form::new(&packs, None, StartChoice::Start);
+    let mut form = Form::new(data.path(), &packs, None, StartChoice::Start);
     press(&mut form, KeyCode::Enter);
     press(&mut form, KeyCode::Right);
     press(&mut form, KeyCode::Right);
@@ -260,14 +266,15 @@ fn esc_cancel_and_ctrl_c_end_wizard_without_answers() {
 #[test]
 fn start_option_from_settings_is_first_choice_of_start_bar() {
     let packs = crate::packs::init_with_sample();
-    let mut form = Form::new(&packs, None, StartChoice::StartAndShare);
+    let data = temp_dir();
+    let mut form = Form::new(data.path(), &packs, None, StartChoice::StartAndShare);
     press(&mut form, KeyCode::Enter);
     assert!(matches!(
         press(&mut form, KeyCode::Enter),
         Step::Done(Target::Project)
     ));
 
-    let mut form = Form::new(&packs, None, StartChoice::StartAndShare);
+    let mut form = Form::new(data.path(), &packs, None, StartChoice::StartAndShare);
     press(&mut form, KeyCode::Enter);
     press(&mut form, KeyCode::Left);
     assert!(matches!(

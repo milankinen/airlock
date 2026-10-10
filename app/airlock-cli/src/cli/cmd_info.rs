@@ -59,7 +59,7 @@ pub(super) async fn run(context: Context, id: Option<&str>, json: bool) -> i32 {
             || project_dir.join(".airlock"),
             |found| sandboxes::local_config_dir(&project_dir, &found.dir),
         );
-        match resolve_config(&project_dir, &local_dir).await {
+        match resolve_config(&context.data_dir, &project_dir, &local_dir).await {
             Ok(resolved) => Some(resolved),
             Err(e) => {
                 cli::error!("Config error: {e:#}");
@@ -248,12 +248,19 @@ fn grant_line(grant: &store::GrantSummary) -> String {
     )
 }
 
-/// Load and resolve the config of the project `project_dir`, with the
-/// local project config in `local_dir`.
-async fn resolve_config(project_dir: &Path, local_dir: &Path) -> anyhow::Result<ResolvedConfig> {
+/// Load and resolve the config of a project.
+/// Args:
+///  - `data_dir`: Airlock data directory
+///  - `project_dir`: Project directory
+///  - `local_dir`: Directory of the local project config
+async fn resolve_config(
+    data_dir: &Path,
+    project_dir: &Path,
+    local_dir: &Path,
+) -> anyhow::Result<ResolvedConfig> {
     let packs = packs::init()?;
     config::load(project_dir, local_dir)?
-        .resolve(&packs, &config::ConfigOverrides::default())
+        .resolve(data_dir, &packs, &config::ConfigOverrides::default())
         .await
 }
 

@@ -94,6 +94,7 @@ async fn run(
     let local_dir = sandboxes::find_local_config_dir(&context, &host_cwd).await?;
     let config = Box::pin(start::wizard::load_or_generate_config(
         &host_cwd,
+        &context.data_dir,
         &local_dir,
         has_sandbox,
         &packs,
@@ -102,7 +103,7 @@ async fn run(
     ))
     .await?;
     let resolved = config
-        .resolve(&packs, &args.config_overrides())
+        .resolve(&context.data_dir, &packs, &args.config_overrides())
         .await
         .map_err(start::Exit::config)?;
     // The terminal runtime. Bad `[monitor.keys]` values fail here.

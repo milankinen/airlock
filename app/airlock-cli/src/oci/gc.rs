@@ -27,16 +27,18 @@ struct CachedLayers {
 /// Run this only after removals that the user started (`Recreate`,
 /// `airlock rm`). If it runs on each `prepare()`, it races with sibling
 /// sandboxes that are starting. Their hardlinks may not exist yet.
-pub fn sweep() {
-    sweep_images();
-    let live = collect_live_layers();
-    sweep_layers(&live);
+/// Args:
+///  - `data_dir`: Airlock data directory
+pub fn sweep(data_dir: &Path) {
+    sweep_images(data_dir);
+    let live = collect_live_layers(data_dir);
+    sweep_layers(data_dir, &live);
 }
 
 /// Remove the cached image files that have link count 1 (no sandbox uses
 /// them).
-fn sweep_images() {
-    let Ok(images_root) = cache::images_root() else {
+fn sweep_images(data_dir: &Path) {
+    let Ok(images_root) = cache::images_root(data_dir) else {
         return;
     };
     let Ok(entries) = std::fs::read_dir(&images_root) else {
@@ -59,9 +61,9 @@ fn sweep_images() {
 }
 
 /// Collect the layer keys of all remaining cached images.
-fn collect_live_layers() -> HashSet<String> {
+fn collect_live_layers(data_dir: &Path) -> HashSet<String> {
     let mut live = HashSet::new();
-    let Ok(images_root) = cache::images_root() else {
+    let Ok(images_root) = cache::images_root(data_dir) else {
         return live;
     };
     let Ok(entries) = std::fs::read_dir(&images_root) else {
@@ -83,8 +85,8 @@ fn collect_live_layers() -> HashSet<String> {
 }
 
 /// Remove staging entries and the layer dirs that are not in `live`.
-fn sweep_layers(live: &HashSet<String>) {
-    let Ok(layers_root) = cache::layers_root() else {
+fn sweep_layers(data_dir: &Path, live: &HashSet<String>) {
+    let Ok(layers_root) = cache::layers_root(data_dir) else {
         return;
     };
     let Ok(entries) = std::fs::read_dir(&layers_root) else {

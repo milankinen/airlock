@@ -37,6 +37,7 @@ use tokio::task::LocalSet;
 
 use crate::cli::{cmd_exec, cmd_info, cmd_rm, cmd_sandbox, cmd_secret, cmd_start};
 use crate::context::Context;
+use crate::settings::Settings;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -60,8 +61,9 @@ async fn main() {
 
     // Process-wide context for all subcommands: settings, vault and database.
     // A malformed settings file is a fatal error, so the user does not get
-    // defaults without notice.
-    let context = match Context::load() {
+    // defaults without notice. The move of the old cache must come before
+    // all other use of the data directory.
+    let context = match load_context() {
         Ok(context) => context,
         Err(e) => {
             cli::error!("{e:#}");
@@ -122,6 +124,14 @@ async fn main() {
     // "[airlock] fatal signal N" marker above it.
     tracing::info!("cli exit: code={exit_code}");
     std::process::exit(exit_code);
+}
+
+/// Load the user settings, move the cache of an older version into the
+/// data directory, and make the process context.
+fn load_context() -> anyhow::Result<Context> {
+    let settings = Settings::load()?;
+    let data_dir = cache::migrate_legacy_cache(settings.data_dir()?);
+    Context::new(settings, data_dir)
 }
 
 /// Top-level CLI definition. Clap derives the argument parser from it.

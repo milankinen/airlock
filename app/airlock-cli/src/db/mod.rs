@@ -22,7 +22,7 @@ const MAX_DBS: u32 = 32;
 /// The open database: one LMDB environment (through `heed`).
 ///
 /// Clones are cheap and share one environment. The process has one [`Db`].
-/// [`crate::context::Context::load`] opens it, and all users clone it from
+/// [`crate::context::Context::new`] opens it, and all users clone it from
 /// there. LMDB allows one environment handle per path in a process, and
 /// `heed` refuses a second open of the same directory.
 ///

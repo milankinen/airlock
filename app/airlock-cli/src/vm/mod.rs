@@ -183,7 +183,12 @@ pub async fn start(
     let overlay_dir = project.sandbox_dir.join("overlay");
 
     let mounts = assemble_mounts(project, container_home, opts.project_share)?;
-    let shares = prepare_shares(image, &mounts, &project.sandbox_dir)?;
+    let shares = prepare_shares(
+        &project.context.data_dir,
+        image,
+        &mounts,
+        &project.sandbox_dir,
+    )?;
     let (disk_image, caches) = disk::prepare(
         &project.sandbox_dir,
         &project.config.disk,
@@ -299,6 +304,7 @@ fn assemble_mounts(
 /// File mounts are hardlinked (copied on EXDEV) into
 /// `overlay/files/{rw,ro}/{key}`. Two shares give them to the guest.
 fn prepare_shares(
+    data_dir: &Path,
     _image: &OciImage,
     mounts: &[mount::ResolvedMount],
     sandbox_dir: &Path,
@@ -308,7 +314,7 @@ fn prepare_shares(
     // reads only the layers that `imageLayers` lists for this image.
     let mut shares = vec![VmShare {
         tag: "layers".to_string(),
-        host_path: crate::cache::layers_root()?,
+        host_path: crate::cache::layers_root(data_dir)?,
         read_only: true,
     }];
 

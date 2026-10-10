@@ -5,7 +5,6 @@ use std::path::Path;
 
 use crate::cli::cmd_exec::find_cli_sock;
 use crate::context::Context;
-use crate::test_cfg::home::TempHome;
 use crate::test_cfg::sandboxes::{data_dir_sandbox, legacy_sandbox};
 use crate::test_cfg::{block_on_local, temp_dir, test_context};
 use crate::vault::{Vault, VaultStorageType};
@@ -27,9 +26,9 @@ fn lookup(context: &Context, start: &Path) -> Option<std::path::PathBuf> {
 #[test]
 fn exec_finds_nearest_running_sandbox_of_either_kind() {
     for data_dir_parent in [true, false] {
-        // The socket path can be in the global data directory, if the
-        // default path is too long (macOS temporary directories).
-        let home = TempHome::new();
+        // The socket path can be in the data directory, if the default path
+        // is too long (macOS temporary directories).
+        let home = temp_dir();
         let context = test_context(
             home.path(),
             Vault::for_storage_type(VaultStorageType::Disabled),
@@ -49,8 +48,8 @@ fn exec_finds_nearest_running_sandbox_of_either_kind() {
                 data_dir_sandbox(&context, &child).1,
             )
         };
-        let parent_sock = crate::cache::cli_sock_path(&parent_dir).unwrap();
-        let child_sock = crate::cache::cli_sock_path(&child_dir).unwrap();
+        let parent_sock = crate::cache::cli_sock_path(&context.data_dir, &parent_dir).unwrap();
+        let child_sock = crate::cache::cli_sock_path(&context.data_dir, &child_dir).unwrap();
 
         assert_eq!(lookup(&context, &child), None);
 

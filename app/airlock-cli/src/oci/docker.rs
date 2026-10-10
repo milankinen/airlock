@@ -170,14 +170,19 @@ impl Drop for DockerSaveGuard {
 /// ready for [`super::layer::ensure_layer_cached`] to extract. If the
 /// future is cancelled (e.g. Ctrl+C), the engine process stops.
 /// Args:
+///  - `data_dir`: Airlock data directory
 ///  - `engine`: `docker` or `podman`
 ///  - `image_ref`: Image reference to export.
 ///
 /// Returns:
 ///   The parsed image config and the layer digests. On error, all staging
 ///   files of this call are removed.
-pub async fn save_layer_tarballs(engine: &str, image_ref: &str) -> anyhow::Result<DockerSave> {
-    let layers_root = cache::layers_root()?;
+pub async fn save_layer_tarballs(
+    data_dir: &Path,
+    engine: &str,
+    image_ref: &str,
+) -> anyhow::Result<DockerSave> {
+    let data_dir = data_dir.to_path_buf();
 
     let mut child = Command::new(engine)
         .args(["image", "save", image_ref])
@@ -191,8 +196,7 @@ pub async fn save_layer_tarballs(engine: &str, image_ref: &str) -> anyhow::Resul
     // child through the drop guard. If the future is cancelled (e.g. Ctrl+C
     // in a parent `tokio::select!`), the guard kills docker. That closes
     // stdout, so the detached blocking task stops quickly.
-    let result =
-        tokio::task::spawn_blocking(move || save_from_stream(stdout, &layers_root)).await?;
+    let result = tokio::task::spawn_blocking(move || save_from_stream(&data_dir, stdout)).await?;
 
     // Success: reap the docker child normally, so the `Drop` of the guard
     // does not try to kill a process that already exited.
@@ -238,15 +242,13 @@ fn copy_hashing<R: Read, W: Write>(mut reader: R, mut writer: W) -> std::io::Res
 /// A blob that is not the config and not a layer in the manifest is
 /// deleted as unused.
 /// Args:
+///  - `data_dir`: Airlock data directory
 ///  - `stdout`: Output stream of `docker image save`
-///  - `layers_root`: Root directory of the layer cache.
 ///
 /// Returns:
 ///   The parsed image config and the layer digests, bottom first.
-pub(super) fn save_from_stream<R: Read>(
-    stdout: R,
-    layers_root: &Path,
-) -> anyhow::Result<DockerSave> {
+pub(super) fn save_from_stream<R: Read>(data_dir: &Path, stdout: R) -> anyhow::Result<DockerSave> {
+    let layers_root = &cache::layers_root(data_dir)?;
     let mut archive = tar::Archive::new(stdout);
 
     let mut manifest_json: Option<Vec<DockerManifestEntry>> = None;
@@ -282,7 +284,7 @@ pub(super) fn save_from_stream<R: Read>(
             // config blob never has the same digest as a layer (different
             // content), so a layer dir match is always a cached layer.
             let digest = format!("sha256:{hex}");
-            if cache::layer_dir(&cache::layer_key(&digest)).is_ok_and(|d| d.is_dir()) {
+            if cache::layer_dir(data_dir, &cache::layer_key(&digest)).is_ok_and(|d| d.is_dir()) {
                 std::io::copy(&mut entry, &mut std::io::sink())?;
                 continue;
             }

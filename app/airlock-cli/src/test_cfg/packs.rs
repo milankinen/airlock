@@ -95,7 +95,8 @@ pub fn load_packs(files: Vec<(&'static str, String)>) -> PackManager {
 pub fn resolve_with(packs: &PackManager, toml: &str) -> anyhow::Result<ResolvedConfig> {
     let layers =
         LayeredConfig::from_values(vec![], None, vec![("airlock.toml", toml::from_str(toml)?)])?;
-    block_on(layers.resolve(packs, &ConfigOverrides::default()))
+    let data = temp_dir();
+    block_on(layers.resolve(data.path(), packs, &ConfigOverrides::default()))
 }
 
 /// The install scripts of the packs that `toml` configures, in pack order.

@@ -35,7 +35,8 @@ pub fn resolve_layers(
     layers: &LayeredConfig,
     overrides: ConfigOverrides,
 ) -> anyhow::Result<ResolvedConfig> {
-    block_on(layers.resolve(&crate::packs::init_with_sample(), &overrides))
+    let data = temp_dir();
+    block_on(layers.resolve(data.path(), &crate::packs::init_with_sample(), &overrides))
 }
 
 /// A temporary home directory and project directory with real config

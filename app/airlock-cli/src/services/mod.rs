@@ -213,7 +213,7 @@ impl Services {
 /// Args:
 ///  - `config`: The `[network.services]` table
 ///  - `context`: Context with the vault (for the token-store key) and the
-///    database (open since [`Context::load`])
+///    database (open since [`Context::new`])
 ///  - `tls_client`: TLS config for the proxy's own calls to token
 ///    endpoints.
 ///

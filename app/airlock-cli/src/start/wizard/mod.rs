@@ -72,6 +72,8 @@ impl Answers {
 pub(super) struct Input<'a> {
     /// Project directory on the host.
     pub(super) host_cwd: &'a Path,
+    /// Airlock data directory, for the pack mount directories.
+    pub(super) data_dir: &'a Path,
     /// Available packs.
     pub(super) packs: &'a PackManager,
     /// The user files (the project has no config yet). The answers must
@@ -85,6 +87,7 @@ pub(super) struct Input<'a> {
 /// project has none (see [`LayeredConfig::has_project_config`]).
 /// Args:
 ///  - `host_cwd`: Project directory on the host
+///  - `data_dir`: Airlock data directory
 ///  - `local_dir`: Directory of the local project config (see
 ///    [`crate::sandboxes::local_config_dir`])
 ///  - `has_sandbox`: The project has a sandbox with a disk or install
@@ -99,6 +102,7 @@ pub(super) struct Input<'a> {
 ///   The caller saves it after the sandbox is stored (see [`save_config`]).
 pub async fn load_or_generate_config(
     host_cwd: &Path,
+    data_dir: &Path,
     local_dir: &Path,
     has_sandbox: bool,
     packs: &PackManager,
@@ -118,7 +122,7 @@ pub async fn load_or_generate_config(
         );
         return Err(Exit::Code(2));
     }
-    let generated = Box::pin(run_wizard(host_cwd, packs, &config, vault, start)).await?;
+    let generated = Box::pin(run_wizard(host_cwd, data_dir, packs, &config, vault, start)).await?;
     config
         .with_generated_project(generated)
         .map_err(Exit::config)
@@ -148,6 +152,7 @@ pub async fn load_or_generate_config(
 /// lock.
 /// Args:
 ///  - `host_cwd`: Project directory on the host
+///  - `data_dir`: Airlock data directory
 ///  - `packs`: Available packs
 ///  - `config`: The user config files only
 ///  - `vault`: Vault that resolves the `[env]` of the answers
@@ -164,6 +169,7 @@ pub async fn load_or_generate_config(
 ///    * Ctrl+C: exit code 130
 pub async fn run_wizard(
     host_cwd: &Path,
+    data_dir: &Path,
     packs: &PackManager,
     config: &LayeredConfig,
     vault: &Vault,
@@ -178,6 +184,7 @@ pub async fn run_wizard(
     }
     let input = Input {
         host_cwd,
+        data_dir,
         packs,
         config,
         vault,
@@ -212,7 +219,12 @@ enum End {
 /// config. The start bar is on `start` first. Messages print after the
 /// terminal is restored.
 async fn ask_config(input: &Input<'_>, start: StartChoice) -> Result<GeneratedConfig, Exit> {
-    let mut form = Form::new(input.packs, input.config.user_image(), start);
+    let mut form = Form::new(
+        input.data_dir,
+        input.packs,
+        input.config.user_image(),
+        start,
+    );
     let mut screen = Screen::open()?;
     let end = Box::pin(run_view(input, &mut form, &mut screen)).await;
     let closed = screen.close();
@@ -278,7 +290,11 @@ pub(super) async fn check_answers(input: &Input<'_>, answers: &Answers) -> anyho
         .clone()
         .with_generated_project(answers.config(input.host_cwd))?;
     let resolved = config
-        .resolve(input.packs, &config::ConfigOverrides::default())
+        .resolve(
+            input.data_dir,
+            input.packs,
+            &config::ConfigOverrides::default(),
+        )
         .await?;
     crate::project::resolve_env(&resolved.values, input.vault)?;
     Ok(())

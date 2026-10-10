@@ -17,6 +17,7 @@ pub mod lua_config;
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::Path;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -333,19 +334,23 @@ impl ConfiguredPack {
     }
 
     /// Get the config values that the pack applies.
+    /// Args:
+    ///  - `data_dir`: Airlock data directory, for the mount directory of the
+    ///    pack (see [`crate::cache::pack_mounts_dir`])
+    ///
     /// Returns:
     ///   The static config document, or the result of `config.lua` for the
     ///   arg values (see [`lua_config::evaluate`]). An empty object if the
     ///   pack has no config. An error `pack <name>: …` if `config.lua` or
     ///   the pack directory fails.
-    pub fn config_values(&self) -> anyhow::Result<Value> {
+    pub fn config_values(&self, data_dir: &Path) -> anyhow::Result<Value> {
         match &self.pack.0.config {
             None => Ok(Value::Object(Map::new())),
             Some(PackConfig::Static(value)) => Ok(value.clone()),
             Some(PackConfig::Lua(source)) => {
                 let metadata = self.metadata();
                 // Create the pack directory before `config.lua` runs.
-                let directory = crate::cache::pack_mounts_dir(&metadata.name)
+                let directory = crate::cache::pack_mounts_dir(data_dir, &metadata.name)
                     .map_err(|e| anyhow::anyhow!("pack {}: {e:#}", metadata.name))?;
                 lua_config::evaluate(metadata, source, &self.args, &directory)
             }

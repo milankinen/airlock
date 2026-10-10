@@ -9,17 +9,18 @@ use crate::cli::cmd_rm::{RmArgs, run};
 use crate::context::Context;
 use crate::project::SandboxLock;
 use crate::sandboxes::registry;
-use crate::test_cfg::home::TempHome;
-use crate::test_cfg::{block_on_local, test_context};
+use crate::test_cfg::{TempDir, block_on_local, temp_dir, test_context};
 use crate::vault::{Vault, VaultStorageType};
 
 const FORCE: RmArgs = RmArgs { force: true };
 
-/// The process context of the temp home. Its data directory is the default
-/// one, so it shares the image cache with the sandboxes.
-fn context(home: &TempHome) -> Context {
+/// The process context of the temp home. Its data directory is `data` in the
+/// home, so it shares the image cache with the sandboxes.
+fn context(home: &TempDir) -> Context {
+    let data_dir = home.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
     test_context(
-        &home.data_dir(),
+        &data_dir,
         Vault::for_storage_type(VaultStorageType::Disabled),
     )
 }
@@ -40,17 +41,17 @@ struct Project {
 impl Project {
     /// Make the project `name` with a sandbox disk in the project and a
     /// cached image.
-    fn started(home: &TempHome, name: &str) -> Self {
+    fn started(home: &TempDir, context: &Context, name: &str) -> Self {
         let dir = Self::make_dir(home, name);
         // The lock makes `.airlock/sandbox`. Release it at once, so that
         // the sandbox is not running.
         let sandbox = SandboxLock::acquire(&dir).unwrap().dir().to_path_buf();
-        Self::finish(dir, sandbox, name)
+        Self::finish(context, dir, sandbox, name)
     }
 
     /// Make the project `name` with a sandbox disk in the data directory
     /// and a cached image.
-    fn started_in_data_dir(home: &TempHome, context: &Context, name: &str) -> Self {
+    fn started_in_data_dir(home: &TempDir, context: &Context, name: &str) -> Self {
         let dir = Self::make_dir(home, name);
         let boxes = context.boxes_dir();
         let id = block_on_local(registry::find_or_register(&context.db, &boxes, &dir)).unwrap();
@@ -58,20 +59,20 @@ impl Project {
             .unwrap()
             .dir()
             .to_path_buf();
-        Self::finish(dir, sandbox, name)
+        Self::finish(context, dir, sandbox, name)
     }
 
     /// Make the canonical project directory `name` in the temp home.
-    fn make_dir(home: &TempHome, name: &str) -> PathBuf {
+    fn make_dir(home: &TempDir, name: &str) -> PathBuf {
         let dir = home.path().join(name);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::canonicalize(dir).unwrap()
     }
 
     /// Add a disk and a cached image to the sandbox `sandbox` of `dir`.
-    fn finish(dir: PathBuf, sandbox: PathBuf, name: &str) -> Self {
+    fn finish(context: &Context, dir: PathBuf, sandbox: PathBuf, name: &str) -> Self {
         std::fs::write(sandbox.join("disk.img"), b"data").unwrap();
-        let image = cache::image_path(&format!("sha256:{name}")).unwrap();
+        let image = cache::image_path(&context.data_dir, &format!("sha256:{name}")).unwrap();
         std::fs::write(&image, br#"{"schema":"v2","image_layers":[]}"#).unwrap();
         std::fs::hard_link(&image, sandbox.join("image")).unwrap();
         Self {
@@ -99,9 +100,9 @@ fn exists(path: &Path) -> bool {
 ///   3. Check that `.airlock` and the image are gone and the project stays
 #[test]
 fn rm_of_project_removes_its_airlock_dir_and_unused_image() {
-    let home = TempHome::new();
+    let home = temp_dir();
     let context = context(&home);
-    let project = Project::started(&home, "proj");
+    let project = Project::started(&home, &context, "proj");
     std::fs::write(project.airlock().join("airlock.toml"), "").unwrap();
     std::fs::write(project.airlock().join(".gitignore"), "*\n").unwrap();
 
@@ -123,7 +124,7 @@ fn rm_of_project_removes_its_airlock_dir_and_unused_image() {
 ///   4. Check that the `.airlock` file stays
 #[test]
 fn rm_of_data_dir_sandbox_removes_it_with_local_config() {
-    let home = TempHome::new();
+    let home = temp_dir();
     let context = context(&home);
     let project = Project::started_in_data_dir(&home, &context, "proj");
     std::fs::write(project.sandbox.join("airlock.toml"), "").unwrap();
@@ -149,7 +150,7 @@ fn rm_of_data_dir_sandbox_removes_it_with_local_config() {
 ///   3. Check that the user data stays, and the sandbox and image are gone
 #[test]
 fn rm_of_airlock_dir_with_user_files_removes_only_sandbox() {
-    let home = TempHome::new();
+    let home = temp_dir();
     let context = context(&home);
     let markers = [
         ("settings.yaml", false),
@@ -163,7 +164,7 @@ fn rm_of_airlock_dir_with_user_files_removes_only_sandbox() {
     ];
 
     for (marker, is_dir) in markers {
-        let project = Project::started(&home, &format!("proj-{marker}"));
+        let project = Project::started(&home, &context, &format!("proj-{marker}"));
         let path = project.airlock().join(marker);
         if is_dir {
             std::fs::create_dir_all(&path).unwrap();
@@ -187,9 +188,9 @@ fn rm_of_airlock_dir_with_user_files_removes_only_sandbox() {
 ///   3. Check that the disk and the image stay
 #[test]
 fn rm_of_running_sandbox_is_refused() {
-    let home = TempHome::new();
+    let home = temp_dir();
     let context = context(&home);
-    let in_project = Project::started(&home, "proj");
+    let in_project = Project::started(&home, &context, "proj");
     let in_data_dir = Project::started_in_data_dir(&home, &context, "boxed");
     let _running = SandboxLock::acquire(&in_project.dir).unwrap();
     let id = block_on_local(registry::list(&context.db)).unwrap()[0]
@@ -216,9 +217,9 @@ fn rm_of_running_sandbox_is_refused() {
 ///   4. Check that the victim files and image stay
 #[test]
 fn rm_removes_symlinked_airlock_dir_or_sandbox_but_not_their_targets() {
-    let home = TempHome::new();
+    let home = temp_dir();
     let context = context(&home);
-    let victim = Project::started(&home, "victim");
+    let victim = Project::started(&home, &context, "victim");
     let victim_disk = victim.airlock().join("sandbox/disk.img");
     std::fs::write(victim.airlock().join("settings.yaml"), "").unwrap();
 

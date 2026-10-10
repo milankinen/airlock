@@ -1,8 +1,9 @@
 //! Tests for the extraction of layer tarballs into the layer cache:
 //! whiteouts, reuse, interrupted downloads, races and path escapes.
 
+use airlock_test_utils::temp_dir;
+
 use super::*;
-use crate::test_cfg::home::TempHome;
 
 /// The value of the extended attribute `name` of `path`.
 fn xattr_of(path: &Path, name: &str) -> Option<Vec<u8>> {
@@ -11,8 +12,8 @@ fn xattr_of(path: &Path, name: &str) -> Option<Vec<u8>> {
 
 /// The names of staging entries (`.tmp` and `.download`) in the layer
 /// cache.
-fn staging_entries() -> Vec<String> {
-    std::fs::read_dir(cache::layers_root().unwrap())
+fn staging_entries(data_dir: &Path) -> Vec<String> {
+    std::fs::read_dir(cache::layers_root(data_dir).unwrap())
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .filter(|name| {
@@ -32,7 +33,8 @@ fn staging_entries() -> Vec<String> {
 ///   5. Ask for the layer again and check that no fetch happens
 #[test]
 fn layer_tarball_extracts_with_whiteouts_as_overlay_xattrs_and_is_reused() {
-    let _home = TempHome::new();
+    let tmp = temp_dir();
+    let data_dir = tmp.path();
     let tar = LayerTar::default()
         .dir("etc")
         .file("etc/hello", "world")
@@ -41,8 +43,8 @@ fn layer_tarball_extracts_with_whiteouts_as_overlay_xattrs_and_is_reused() {
         .file("opt/app/.wh..wh..opq", "")
         .file("opt/app/new", "n")
         .gz();
-    let key = cache_layer("sha256:whiteouts", &tar);
-    let layer = cache::layer_dir(&key).unwrap();
+    let key = cache_layer(data_dir, "sha256:whiteouts", &tar);
+    let layer = cache::layer_dir(data_dir, &key).unwrap();
 
     assert_eq!(std::fs::read(layer.join("etc/hello")).unwrap(), b"world");
     assert!(layer.join("bin/sh").is_file());
@@ -64,9 +66,10 @@ fn layer_tarball_extracts_with_whiteouts_as_overlay_xattrs_and_is_reused() {
         xattr_of(&layer.join("opt/app"), "user.overlay.opaque").as_deref(),
         Some(&b"y"[..])
     );
-    assert!(staging_entries().is_empty());
+    assert!(staging_entries(data_dir).is_empty());
 
     let again = layer::ensure_layer_cached(
+        data_dir,
         "sha256:whiteouts",
         |_| panic!("cached layer must not be fetched again"),
         None,
@@ -82,20 +85,27 @@ fn layer_tarball_extracts_with_whiteouts_as_overlay_xattrs_and_is_reused() {
 ///   3. Check the layer contents and that no staging entry is left
 #[test]
 fn interrupted_download_is_discarded_and_fetched_again() {
-    let _home = TempHome::new();
+    let tmp = temp_dir();
+    let data_dir = tmp.path();
     let key = cache::layer_key("sha256:interrupted");
-    let stale = cache::layers_root()
+    let stale = cache::layers_root(data_dir)
         .unwrap()
         .join(format!("{key}.download.tmp"));
     std::fs::write(&stale, b"partial garbage").unwrap();
 
     cache_layer(
+        data_dir,
         "sha256:interrupted",
         &LayerTar::default().file("ok", "yes").gz(),
     );
 
-    assert!(cache::layer_dir(&key).unwrap().join("ok").is_file());
-    assert!(staging_entries().is_empty());
+    assert!(
+        cache::layer_dir(data_dir, &key)
+            .unwrap()
+            .join("ok")
+            .is_file()
+    );
+    assert!(staging_entries(data_dir).is_empty());
 }
 
 /// Test that a layer that another process publishes during the download is
@@ -106,12 +116,14 @@ fn interrupted_download_is_discarded_and_fetched_again() {
 ///   3. Check that no staging entry is left
 #[test]
 fn layer_published_by_peer_during_download_is_kept() {
-    let _home = TempHome::new();
+    let tmp = temp_dir();
+    let data_dir = tmp.path();
     let key = cache::layer_key("sha256:race");
-    let layer = cache::layer_dir(&key).unwrap();
+    let layer = cache::layer_dir(data_dir, &key).unwrap();
     let tar = LayerTar::default().file("loser", "x").gz();
 
     layer::ensure_layer_cached(
+        data_dir,
         "sha256:race",
         |dest| {
             std::fs::create_dir_all(&layer)?;
@@ -124,7 +136,7 @@ fn layer_published_by_peer_during_download_is_kept() {
 
     assert_eq!(std::fs::read(layer.join("winner")).unwrap(), b"kept");
     assert!(!layer.join("loser").exists());
-    assert!(staging_entries().is_empty());
+    assert!(staging_entries(data_dir).is_empty());
 }
 
 /// Test that a whiteout that points out of the layer does not delete host
@@ -135,7 +147,8 @@ fn layer_published_by_peer_during_download_is_kept() {
 ///   3. Check that all host files are unchanged
 #[test]
 fn whiteout_aimed_outside_layer_does_not_touch_host_files() {
-    let home = TempHome::new();
+    let home = temp_dir();
+    let data_dir = home.path();
     let outside = home.path().join("outside");
     std::fs::create_dir_all(&outside).unwrap();
     for victim in ["via-symlink", "via-absolute", "via-parent"] {
@@ -148,6 +161,7 @@ fn whiteout_aimed_outside_layer_does_not_touch_host_files() {
         .gz();
     // The extraction can fail or succeed. Only the host files matter.
     let _ = layer::ensure_layer_cached(
+        data_dir,
         "sha256:evil-symlink",
         |dest| Ok(std::fs::write(dest, &through_symlink)?),
         None,
@@ -156,6 +170,7 @@ fn whiteout_aimed_outside_layer_does_not_touch_host_files() {
         .raw_file(&format!("{}/.wh.via-absolute", outside.display()))
         .gz();
     let _ = layer::ensure_layer_cached(
+        data_dir,
         "sha256:evil-absolute",
         |dest| Ok(std::fs::write(dest, &absolute)?),
         None,
@@ -164,6 +179,7 @@ fn whiteout_aimed_outside_layer_does_not_touch_host_files() {
         .raw_file("../../../../../outside/.wh.via-parent")
         .gz();
     let _ = layer::ensure_layer_cached(
+        data_dir,
         "sha256:evil-parent",
         |dest| Ok(std::fs::write(dest, &parent)?),
         None,
@@ -187,8 +203,13 @@ fn whiteout_aimed_outside_layer_does_not_touch_host_files() {
 ///   4. Check that the good layer is unchanged
 #[test]
 fn whiteout_naming_own_or_parent_directory_is_refused() {
-    let _home = TempHome::new();
-    let good = cache_layer("sha256:good", &LayerTar::default().file("keep", "yes").gz());
+    let tmp = temp_dir();
+    let data_dir = tmp.path();
+    let good = cache_layer(
+        data_dir,
+        "sha256:good",
+        &LayerTar::default().file("keep", "yes").gz(),
+    );
 
     for (digest, name) in [
         ("sha256:evil-empty", "dir/.wh."),
@@ -196,11 +217,16 @@ fn whiteout_naming_own_or_parent_directory_is_refused() {
         ("sha256:evil-dotdot", "dir/.wh..."),
     ] {
         let tar = LayerTar::default().raw_file(name).gz();
-        let res = layer::ensure_layer_cached(digest, |dest| Ok(std::fs::write(dest, &tar)?), None);
+        let res = layer::ensure_layer_cached(
+            data_dir,
+            digest,
+            |dest| Ok(std::fs::write(dest, &tar)?),
+            None,
+        );
         let err = res.expect_err(name).to_string();
         assert!(err.contains("unsafe whiteout name"), "{name}: {err}");
     }
 
-    let keep = cache::layer_dir(&good).unwrap().join("keep");
+    let keep = cache::layer_dir(data_dir, &good).unwrap().join("keep");
     assert_eq!(std::fs::read(keep).unwrap(), b"yes");
 }

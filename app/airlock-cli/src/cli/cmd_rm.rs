@@ -69,7 +69,7 @@ pub(super) async fn run(args: &RmArgs, context: &Context, host_cwd: &Path) -> i3
             return 1;
         }
     }
-    rm_project_sandbox(args, host_cwd)
+    rm_project_sandbox(args, context, host_cwd)
 }
 
 /// Remove the sandbox `id` from the data directory (see
@@ -96,7 +96,7 @@ async fn rm_box(args: &RmArgs, context: &Context, id: &str) -> i32 {
         cli::error!("Failed to remove sandbox: {e:#}");
         return 1;
     }
-    oci::gc_sweep();
+    oci::gc_sweep(&context.data_dir);
     match local_config {
         Some(name) => cli::log!("Sandbox removed (including the local config {name})"),
         None => cli::log!("Sandbox removed"),
@@ -106,9 +106,14 @@ async fn rm_box(args: &RmArgs, context: &Context, id: &str) -> i32 {
 
 /// Remove the sandbox in the project `host_cwd` and the project
 /// `.airlock/` directory (see [`main`]).
+/// Args:
+///  - `args`: Command arguments
+///  - `context`: Process context
+///  - `host_cwd`: Project directory
+///
 /// Returns:
 ///   Process exit code.
-fn rm_project_sandbox(args: &RmArgs, host_cwd: &Path) -> i32 {
+fn rm_project_sandbox(args: &RmArgs, context: &Context, host_cwd: &Path) -> i32 {
     let paths = project::paths(host_cwd);
 
     // `.airlock` can be a symlink. An untrusted repo can commit one that
@@ -134,7 +139,13 @@ fn rm_project_sandbox(args: &RmArgs, host_cwd: &Path) -> i32 {
 
     if is_user_home_project(&paths.cache_dir) {
         let kept_note = "the other files in ~/.airlock: the project is the home directory";
-        return rm_sandbox_only(args, &paths.cache_dir, &paths.sandbox_dir, kept_note);
+        return rm_sandbox_only(
+            args,
+            context,
+            &paths.cache_dir,
+            &paths.sandbox_dir,
+            kept_note,
+        );
     }
     if let Some(marker) = user_file_marker(&paths.cache_dir) {
         cli::log!(
@@ -144,7 +155,13 @@ fn rm_project_sandbox(args: &RmArgs, host_cwd: &Path) -> i32 {
         );
         let kept_note =
             format!("the other files in .airlock: it holds user-level files ({marker})");
-        return rm_sandbox_only(args, &paths.cache_dir, &paths.sandbox_dir, &kept_note);
+        return rm_sandbox_only(
+            args,
+            context,
+            &paths.cache_dir,
+            &paths.sandbox_dir,
+            &kept_note,
+        );
     }
 
     let local_config = local_config_name(&paths.cache_dir);
@@ -163,7 +180,7 @@ fn rm_project_sandbox(args: &RmArgs, host_cwd: &Path) -> i32 {
 
     // The image hardlink of the sandbox was in its cache dir. Remove the
     // images and layers that no longer have live references.
-    oci::gc_sweep();
+    oci::gc_sweep(&context.data_dir);
 
     match local_config {
         Some(name) => cli::log!("Sandbox removed (including .airlock/{name})"),
@@ -179,13 +196,20 @@ fn rm_project_sandbox(args: &RmArgs, host_cwd: &Path) -> i32 {
 /// [`user_file_marker`] found a user-level file.
 /// Args:
 ///  - `args`: Command arguments
+///  - `context`: Process context
 ///  - `cache_dir`: Project `.airlock/` directory
 ///  - `sandbox_dir`: The `.airlock/sandbox` directory to remove
 ///  - `kept_note`: Message that tells what stays and why
 ///
 /// Returns:
 ///   Process exit code.
-fn rm_sandbox_only(args: &RmArgs, cache_dir: &Path, sandbox_dir: &Path, kept_note: &str) -> i32 {
+fn rm_sandbox_only(
+    args: &RmArgs,
+    context: &Context,
+    cache_dir: &Path,
+    sandbox_dir: &Path,
+    kept_note: &str,
+) -> i32 {
     if std::fs::symlink_metadata(sandbox_dir).is_err() {
         cli::log!("No sandbox to remove (kept {kept_note})");
         return 0;
@@ -214,7 +238,7 @@ fn rm_sandbox_only(args: &RmArgs, cache_dir: &Path, sandbox_dir: &Path, kept_not
         return 1;
     }
 
-    oci::gc_sweep();
+    oci::gc_sweep(&context.data_dir);
     cli::log!("Sandbox removed (kept {kept_note})");
     0
 }

@@ -76,13 +76,14 @@ pub fn fake_image(name: &str) -> OciImage {
 /// [`OnImageChange::Recreate`] makes it again and [`OnImageChange::Refuse`]
 /// stops.
 pub async fn prepare_image(
+    data_dir: &Path,
     sandbox_dir: &Path,
     image_cfg: &ImageRef,
     vault: &Vault,
     on_change: OnImageChange,
 ) -> anyhow::Result<PreparedImage> {
     if !fake_host(|host| host.enabled) {
-        return crate::oci::prepare(sandbox_dir, image_cfg, vault, on_change).await;
+        return crate::oci::prepare(data_dir, sandbox_dir, image_cfg, vault, on_change).await;
     }
     fake_host(|host| host.prepared += 1);
     let link = sandbox_dir.join("test-image");
@@ -103,9 +104,9 @@ pub async fn prepare_image(
 }
 
 /// `facts::check` for tests. With the fakes on, each image can take packs.
-pub fn check_image(image: &OciImage) -> anyhow::Result<()> {
+pub fn check_image(data_dir: &Path, image: &OciImage) -> anyhow::Result<()> {
     if !fake_host(|host| host.enabled) {
-        return crate::packs::install::facts::check(image);
+        return crate::packs::install::facts::check(data_dir, image);
     }
     Ok(())
 }

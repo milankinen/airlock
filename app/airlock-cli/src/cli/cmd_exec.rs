@@ -139,7 +139,7 @@ pub(super) async fn find_cli_sock(
         if !found.dir.is_dir() {
             continue;
         }
-        if let Ok(candidate) = crate::cache::cli_sock_path(&found.dir)
+        if let Ok(candidate) = crate::cache::cli_sock_path(&context.data_dir, &found.dir)
             && candidate.exists()
         {
             return Ok(Some(candidate));

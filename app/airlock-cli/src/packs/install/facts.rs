@@ -3,6 +3,8 @@
 //! Checks on the host, before the install boot, that the setup scripts can
 //! run in the sandbox image.
 
+use std::path::Path;
+
 use crate::oci::{self, OciImage};
 
 /// Check that the setup scripts can run in `image`.
@@ -11,7 +13,14 @@ use crate::oci::{self, OciImage};
 /// and all processes in the sandbox run as the image user. The image must
 /// also be Alpine- or Debian-based (see [`supported`]). The check reads the
 /// image layers.
-pub fn check(image: &OciImage) -> anyhow::Result<()> {
+///
+/// Args:
+///  - `data_dir`: Airlock data directory, where the layers are
+///  - `image`: Image to check
+///
+/// Returns:
+///   Nothing, or the reason why the image cannot take packs.
+pub fn check(data_dir: &Path, image: &OciImage) -> anyhow::Result<()> {
     if image.uid != 0 {
         anyhow::bail!(
             "image {} runs as uid {}; packs install only into an image that runs as root",
@@ -19,7 +28,7 @@ pub fn check(image: &OciImage) -> anyhow::Result<()> {
             image.uid
         );
     }
-    let os = oci::os_release(image)
+    let os = oci::os_release(data_dir, image)
         .ok_or_else(|| anyhow::anyhow!("image {} has no /etc/os-release", image.name))?;
     anyhow::ensure!(
         supported(&os),
@@ -44,6 +53,7 @@ mod tests {
     //! Tests of the image checks before a pack install.
 
     use super::*;
+    use crate::test_cfg::temp_dir;
 
     /// An os-release with `ID` `id` and `ID_LIKE` `like`.
     fn os(id: &str, like: &[&str]) -> oci::OsRelease {
@@ -91,9 +101,9 @@ mod tests {
     ///   2. Check a root image with no layers and check the error
     #[test]
     fn check_refuses_non_root_image_and_image_without_os_release() {
-        let err = check(&image(1000)).unwrap_err();
+        let err = check(temp_dir().path(), &image(1000)).unwrap_err();
         assert!(err.to_string().contains("uid 1000"), "{err}");
-        let err = check(&image(0)).unwrap_err();
+        let err = check(temp_dir().path(), &image(0)).unwrap_err();
         assert!(err.to_string().contains("os-release"), "{err}");
     }
 }

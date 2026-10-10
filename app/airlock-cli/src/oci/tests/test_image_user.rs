@@ -1,13 +1,15 @@
 //! Tests for the resolution of the image `USER` to uid, gid and home
 //! through the passwd and group files in the image layers.
 
+use airlock_test_utils::temp_dir;
+
 use super::*;
-use crate::test_cfg::home::TempHome;
 
 /// Build an image over `layers` (topmost first) with the `USER` value
 /// `user`.
-fn build(layers: &[String], user: &str) -> anyhow::Result<OciImage> {
+fn build(data_dir: &Path, layers: &[String], user: &str) -> anyhow::Result<OciImage> {
     build_oci_image(
+        data_dir,
         "sha256:img".into(),
         "node:22".into(),
         layers.to_vec(),
@@ -22,8 +24,8 @@ fn build(layers: &[String], user: &str) -> anyhow::Result<OciImage> {
 
 /// Build an image as [`build`] does and return the error message. Panics
 /// if the build succeeds.
-fn build_err(layers: &[String], user: &str) -> String {
-    match build(layers, user) {
+fn build_err(data_dir: &Path, layers: &[String], user: &str) -> String {
+    match build(data_dir, layers, user) {
         Ok(_) => panic!("USER {user:?} over {layers:?} must not resolve"),
         Err(e) => e.to_string(),
     }
@@ -37,8 +39,9 @@ fn build_err(layers: &[String], user: &str) -> String {
 ///   4. Check that an empty `USER` gives root
 #[test]
 fn image_user_resolves_through_image_passwd_and_group() {
-    let _home = TempHome::new();
-    let layers = [passwd_layer("sha256:passwd")];
+    let tmp = temp_dir();
+    let data_dir = tmp.path();
+    let layers = [passwd_layer(data_dir, "sha256:passwd")];
 
     for user in [
         "node",
@@ -48,12 +51,12 @@ fn image_user_resolves_through_image_passwd_and_group() {
         "node:1000",
         "1000:1000",
     ] {
-        let image = build(&layers, user).unwrap();
+        let image = build(data_dir, &layers, user).unwrap();
         assert_eq!((image.uid, image.gid), (1000, 1000), "USER {user:?}");
         assert_eq!(image.container_home, "/home/node", "USER {user:?}");
         assert_eq!(image.user.as_deref(), Some(user));
     }
-    let root = build(&layers, "").unwrap();
+    let root = build(data_dir, &layers, "").unwrap();
     assert_eq!(
         (root.uid, root.gid, root.container_home.as_str()),
         (0, 0, "/root")
@@ -67,11 +70,15 @@ fn image_user_resolves_through_image_passwd_and_group() {
 ///   3. Check that each error names the unknown value
 #[test]
 fn unknown_image_user_or_group_is_error_not_root() {
-    let _home = TempHome::new();
-    let layers = [passwd_layer("sha256:passwd")];
+    let tmp = temp_dir();
+    let data_dir = tmp.path();
+    let layers = [passwd_layer(data_dir, "sha256:passwd")];
 
     for user in ["ghost", "ghost:node", "node:ghost", "1000:ghost"] {
-        assert!(build_err(&layers, user).contains("ghost"), "USER {user:?}");
+        assert!(
+            build_err(data_dir, &layers, user).contains("ghost"),
+            "USER {user:?}"
+        );
     }
 }
 
@@ -86,15 +93,17 @@ fn unknown_image_user_or_group_is_error_not_root() {
 ///      layer"
 #[test]
 fn passwd_symlinked_out_of_layer_is_never_read() {
-    let home = TempHome::new();
+    let home = temp_dir();
+    let data_dir = home.path();
     let host_passwd = "node:x:1000:1000:Host:/leaked-from-host:/bin/sh\n";
     let host_etc = home.path().join("host-etc");
     std::fs::create_dir_all(&host_etc).unwrap();
     std::fs::write(host_etc.join("passwd"), host_passwd).unwrap();
     let empty_etc = home.path().join("host-etc-empty");
     std::fs::create_dir_all(&empty_etc).unwrap();
-    let real = passwd_layer("sha256:real");
+    let real = passwd_layer(data_dir, "sha256:real");
     let file_link = cache_layer(
+        data_dir,
         "sha256:file-link",
         &LayerTar::default()
             .dir("etc")
@@ -102,20 +111,22 @@ fn passwd_symlinked_out_of_layer_is_never_read() {
             .gz(),
     );
     let dir_link = cache_layer(
+        data_dir,
         "sha256:dir-link",
         &LayerTar::default().symlink("etc", &host_etc).gz(),
     );
     let empty_dir_link = cache_layer(
+        data_dir,
         "sha256:empty-dir-link",
         &LayerTar::default().symlink("etc", &empty_etc).gz(),
     );
 
     for link in [&file_link, &dir_link] {
         // The link layer is skipped and the real layer below it is used.
-        let image = build(&[link.clone(), real.clone()], "node").unwrap();
+        let image = build(data_dir, &[link.clone(), real.clone()], "node").unwrap();
         assert_eq!(image.container_home, "/home/node");
 
-        let err = build_err(std::slice::from_ref(link), "1000");
+        let err = build_err(data_dir, std::slice::from_ref(link), "1000");
         assert!(
             err.contains("no home directory found for uid 1000"),
             "{err}"
@@ -126,13 +137,13 @@ fn passwd_symlinked_out_of_layer_is_never_read() {
         );
         assert!(!err.contains("leaked-from-host"), "{err}");
 
-        let err = build_err(std::slice::from_ref(link), "node");
+        let err = build_err(data_dir, std::slice::from_ref(link), "node");
         assert!(
             err.contains("no user node found") && err.contains("outside the layer"),
             "{err}"
         );
     }
-    let err = build_err(&[empty_dir_link], "1000");
+    let err = build_err(data_dir, &[empty_dir_link], "1000");
     assert!(err.contains("outside the layer"), "{err}");
 }
 
@@ -144,18 +155,22 @@ fn passwd_symlinked_out_of_layer_is_never_read() {
 ///   3. Check that each error gives the correct reason
 #[test]
 fn passwd_that_cannot_be_read_safely_is_named_in_error() {
-    let _home = TempHome::new();
+    let tmp = temp_dir();
+    let data_dir = tmp.path();
     let mut huge = "#".repeat(usize::try_from(MAX_LAYER_RECORD_FILE).unwrap() + 1);
     huge.push_str("\nnode:x:1000:1000:Node:/home/node:/bin/sh\n");
     let oversized = cache_layer(
+        data_dir,
         "sha256:oversized",
         &LayerTar::default().file("etc/passwd", huge).gz(),
     );
     let directory = cache_layer(
+        data_dir,
         "sha256:directory",
         &LayerTar::default().dir("etc/passwd").gz(),
     );
     let dangling = cache_layer(
+        data_dir,
         "sha256:dangling",
         &LayerTar::default()
             .dir("etc")
@@ -168,7 +183,7 @@ fn passwd_that_cannot_be_read_safely_is_named_in_error() {
         (directory, "not a regular file"),
         (dangling, "cannot be resolved"),
     ] {
-        let err = build_err(&[layer], "1000");
+        let err = build_err(data_dir, &[layer], "1000");
         assert!(err.contains(why), "{err}");
     }
 }
@@ -179,8 +194,10 @@ fn passwd_that_cannot_be_read_safely_is_named_in_error() {
 ///   2. Check that uid 1000 resolves to its home directory
 #[test]
 fn passwd_linked_inside_layer_is_followed() {
-    let _home = TempHome::new();
+    let tmp = temp_dir();
+    let data_dir = tmp.path();
     let merged_usr = cache_layer(
+        data_dir,
         "sha256:merged-usr",
         &LayerTar::default()
             .file(
@@ -193,7 +210,9 @@ fn passwd_linked_inside_layer_is_followed() {
     );
 
     assert_eq!(
-        build(&[merged_usr], "1000").unwrap().container_home,
+        build(data_dir, &[merged_usr], "1000")
+            .unwrap()
+            .container_home,
         "/home/node"
     );
 }
@@ -208,20 +227,24 @@ fn passwd_linked_inside_layer_is_followed() {
 ///   5. Fix the gid and check that the entry is verified
 #[test]
 fn legacy_cache_entry_user_is_checked_against_image_passwd() {
-    let _home = TempHome::new();
-    let mut stored = image("sha256:legacy", vec![passwd_layer("sha256:passwd")]);
+    let tmp = temp_dir();
+    let data_dir = tmp.path();
+    let mut stored = image(
+        "sha256:legacy",
+        vec![passwd_layer(data_dir, "sha256:passwd")],
+    );
     stored.user = None;
 
     assert_eq!(
-        check_legacy_user(&stored, "").unwrap(),
+        check_legacy_user(data_dir, &stored, "").unwrap(),
         LegacyUser::Verified
     );
     assert_eq!(
-        check_legacy_user(&stored, "root").unwrap(),
+        check_legacy_user(data_dir, &stored, "root").unwrap(),
         LegacyUser::Verified
     );
     assert_eq!(
-        check_legacy_user(&stored, "node").unwrap(),
+        check_legacy_user(data_dir, &stored, "node").unwrap(),
         LegacyUser::UidMismatch {
             uid: 1000,
             gid: 1000
@@ -229,12 +252,12 @@ fn legacy_cache_entry_user_is_checked_against_image_passwd() {
     );
     stored.uid = 1000;
     assert_eq!(
-        check_legacy_user(&stored, "1000").unwrap(),
+        check_legacy_user(data_dir, &stored, "1000").unwrap(),
         LegacyUser::GidOnly { gid: 1000 }
     );
     stored.gid = 1000;
     assert_eq!(
-        check_legacy_user(&stored, "1000").unwrap(),
+        check_legacy_user(data_dir, &stored, "1000").unwrap(),
         LegacyUser::Verified
     );
 }

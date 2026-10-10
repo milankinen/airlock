@@ -7,7 +7,6 @@
 //! the directory.
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
 
@@ -72,33 +71,12 @@ pub fn layer_key(digest: &str) -> String {
     format!("{LAYER_FORMAT}.{}", digest_name(digest))
 }
 
-/// Data directory of the process, from the user settings (see
-/// [`set_data_dir`]).
-static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
-
-/// Set the data directory of the process. Call it one time, before the
-/// first use. Later calls have no effect.
-pub fn set_data_dir(dir: PathBuf) {
-    let _ = DATA_DIR.set(dir);
-}
-
 /// Get the default data directory: `airlock` in the user data directory of
 /// the platform (`~/Library/Application Support` on macOS,
 /// `$XDG_DATA_HOME` or `~/.local/share` on Linux).
 pub fn default_data_dir() -> anyhow::Result<PathBuf> {
     let base = dirs::data_dir().ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
     Ok(base.join("airlock"))
-}
-
-/// Get the airlock data directory. Creates it (mode 0700) if it does not
-/// exist.
-pub fn data_dir() -> anyhow::Result<PathBuf> {
-    let dir = match DATA_DIR.get() {
-        Some(dir) => dir.clone(),
-        None => default_data_dir()?,
-    };
-    create_private_dir(&dir)?;
-    Ok(dir)
 }
 
 /// Move the cache of older airlock versions (`~/.cache/airlock`) to the
@@ -157,17 +135,13 @@ pub fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
 }
 
 /// Get the mount directory of the pack `name`
-/// (`<data>/share/all/packs/<name>/`). Creates it if it does not exist.
+/// (`<data_dir>/share/all/packs/<name>/`). Creates it if it does not exist.
 ///
 /// The pack's `config.lua` gets it as `pack.directory`. The pack keeps the
 /// host side of its mounts there (for example the agent settings and
 /// credential files). All sandboxes that use the pack share it.
-pub fn pack_mounts_dir(name: &str) -> anyhow::Result<PathBuf> {
-    let dir = data_dir()?
-        .join("share")
-        .join("all")
-        .join("packs")
-        .join(name);
+pub fn pack_mounts_dir(data_dir: &Path, name: &str) -> anyhow::Result<PathBuf> {
+    let dir = data_dir.join("share").join("all").join("packs").join(name);
     std::fs::create_dir_all(&dir)
         .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.display()))?;
     Ok(dir)
@@ -176,9 +150,9 @@ pub fn pack_mounts_dir(name: &str) -> anyhow::Result<PathBuf> {
 /// Get the path of the CLI RPC Unix socket for the sandbox at `sandbox_dir`.
 /// Creates the parent directory if necessary.
 /// Returns:
-///   `<sandbox_dir>/cli.sock`, or `<data>/sock/<hash>.sock` if
+///   `<sandbox_dir>/cli.sock`, or `<data_dir>/sock/<hash>.sock` if
 ///   the default path is too long for a Unix socket.
-pub fn cli_sock_path(sandbox_dir: &Path) -> anyhow::Result<PathBuf> {
+pub fn cli_sock_path(data_dir: &Path, sandbox_dir: &Path) -> anyhow::Result<PathBuf> {
     // `AF_UNIX` has a hard `sun_path` limit of 104 bytes on macOS (108 on
     // Linux). Deeply nested project paths can be longer. 103 is the smaller
     // limit minus the trailing NUL.
@@ -195,59 +169,60 @@ pub fn cli_sock_path(sandbox_dir: &Path) -> anyhow::Result<PathBuf> {
     let mut hasher = Sha256::new();
     hasher.update(sandbox_dir.as_os_str().as_encoded_bytes());
     let hash = hex::encode(&hasher.finalize()[..8]);
-    let dir = data_dir()?.join("sock");
+    let dir = data_dir.join("sock");
     std::fs::create_dir_all(&dir)?;
     Ok(dir.join(format!("{hash}.sock")))
 }
 
-/// Get the root of the OCI cache (`<data>/oci/`). Creates it if it
+/// Get the root of the OCI cache (`<data_dir>/oci/`). Creates it if it
 /// does not exist. It contains the `images/` and `layers/` subtrees. They
 /// have their own namespace, so they do not collide with other cache kinds
 /// (VM assets and others).
-fn oci_root() -> anyhow::Result<PathBuf> {
-    let dir = data_dir()?.join("oci");
+fn oci_root(data_dir: &Path) -> anyhow::Result<PathBuf> {
+    let dir = data_dir.join("oci");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
-/// Get the root of the image cache (`<data>/oci/images/`). Creates
+/// Get the root of the image cache (`<data_dir>/oci/images/`). Creates
 /// it if it does not exist. Each entry is one `<image-digest>` JSON file with
 /// the complete `OciImage` (with a schema tag from `crate::oci::CachedImage`).
-pub fn images_root() -> anyhow::Result<PathBuf> {
-    let dir = oci_root()?.join("images");
+pub fn images_root(data_dir: &Path) -> anyhow::Result<PathBuf> {
+    let dir = oci_root(data_dir)?.join("images");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
 /// Get the path of a cached OCI image file for the image `digest`. The file
 /// possibly does not exist. The caller must check.
-pub fn image_path(digest: &str) -> anyhow::Result<PathBuf> {
+pub fn image_path(data_dir: &Path, digest: &str) -> anyhow::Result<PathBuf> {
     let name = digest_name(digest);
     check_entry_name(name)?;
-    Ok(images_root()?.join(name))
+    Ok(images_root(data_dir)?.join(name))
 }
 
-/// Get the root of the per-layer cache (`<data>/oci/layers/`).
+/// Get the root of the per-layer cache (`<data_dir>/oci/layers/`).
 /// Creates it if it does not exist.
 ///
 /// Each entry is a `<layer-key>/` directory (see [`layer_key`]) with the
 /// layer contents at its root. If the directory exists, the layer is
 /// complete, because the directory appears only through the atomic rename
 /// from a `<layer-key>.<...>.tmp/` staging directory.
-pub fn layers_root() -> anyhow::Result<PathBuf> {
-    let dir = oci_root()?.join("layers");
+pub fn layers_root(data_dir: &Path) -> anyhow::Result<PathBuf> {
+    let dir = oci_root(data_dir)?.join("layers");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
 /// Get the directory of one cached OCI layer.
 /// Args:
+///  - `data_dir`: Airlock data directory
 ///  - `key`: Versioned layer key. Convert a raw OCI digest with
 ///    [`layer_key`] first. A key from `image_layers` (in the image JSON) is
 ///    already a layer key.
-pub fn layer_dir(key: &str) -> anyhow::Result<PathBuf> {
+pub fn layer_dir(data_dir: &Path, key: &str) -> anyhow::Result<PathBuf> {
     check_entry_name(key)?;
-    Ok(layers_root()?.join(key))
+    Ok(layers_root(data_dir)?.join(key))
 }
 
 #[cfg(test)]

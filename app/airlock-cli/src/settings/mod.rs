@@ -202,6 +202,12 @@ impl Settings {
         PathBuf::from("~/.airlock/settings.toml")
     }
 
+    /// Load the settings from the user's airlock directory `~/.airlock`
+    /// (see [`Self::load_from`]).
+    pub fn load() -> Result<Self> {
+        Self::load_from(&Self::dir()?)
+    }
+
     /// Load the settings from the first `settings.*` file in the airlock
     /// directory `dir` (`~/.airlock`, see [`Self::dir`]).
     /// Returns:

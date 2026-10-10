@@ -12,7 +12,7 @@ use crate::vault::Vault;
 
 /// User settings, vault and database of the process.
 ///
-/// `main` creates it once with [`Context::load`] and gives it to the
+/// `main` creates it once with [`Context::new`] and gives it to the
 /// commands. A [`crate::project::Project`] holds it, and the project modules
 /// take what they need from there. Clones are cheap because the vault and the
 /// database are shared handles.
@@ -32,20 +32,19 @@ pub struct Context {
 }
 
 impl Context {
-    /// Load the context. The settings come from the user's airlock
-    /// directory `~/.airlock`. The database is in the data directory of the
-    /// settings, which also becomes the data directory of the process (see
-    /// [`crate::cache::set_data_dir`]). If the cache of an older version
-    /// cannot move to the data directory, the old cache directory is the
-    /// data directory (see [`crate::cache::migrate_legacy_cache`]).
+    /// Make the context of the process.
+    /// Args:
+    ///  - `settings`: User settings (see [`Settings::load`])
+    ///  - `data_dir`: Airlock data directory, after the move of the cache
+    ///    of an older version (see [`crate::cache::migrate_legacy_cache`]).
+    ///    Created with mode 0700 if it does not exist.
+    ///
     /// Returns:
-    ///   The context, or error if the settings file is malformed or the
-    ///   database does not open. A missing settings file gives defaults.
-    pub fn load() -> anyhow::Result<Self> {
-        let settings = Settings::load_from(&Settings::dir()?)?;
+    ///   The context, or error if airlock cannot make the data directory or
+    ///   open the database.
+    pub fn new(settings: Settings, data_dir: PathBuf) -> anyhow::Result<Self> {
+        crate::cache::create_private_dir(&data_dir)?;
         let vault = Vault::for_storage_type(settings.vault.storage);
-        let data_dir = crate::cache::migrate_legacy_cache(settings.data_dir()?);
-        crate::cache::set_data_dir(data_dir.clone());
         let db = Db::open(&data_dir.join(db::DIR))?;
         Ok(Self {
             settings,

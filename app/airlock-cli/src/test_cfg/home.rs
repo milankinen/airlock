@@ -1,4 +1,4 @@
-//! A temporary `HOME` for tests that use the global airlock data directory.
+//! A temporary `HOME` for tests that depend on the home directory.
 
 use std::ffi::OsString;
 use std::path::Path;

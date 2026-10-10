@@ -263,6 +263,7 @@ pub async fn ensure_sandbox(
     let values = &resolved.values;
     sandbox::report::print_preparing(sandbox_dir.path(), &values.vm.image.name);
     let prepared = prepare_image(
+        &context.data_dir,
         sandbox_dir.path(),
         &values.vm.image,
         vault,
@@ -300,7 +301,7 @@ pub async fn ensure_sandbox(
     // Check the image before a tool question answer removes the disk, or
     // before anything installs.
     if !candidates.is_empty() && (recreate || !plan.pending.is_empty()) {
-        check_image(&image).map_err(|e| Exit::error(2, e))?;
+        check_image(&context.data_dir, &image).map_err(|e| Exit::error(2, e))?;
     }
     if recreate {
         project::reset_disk(&sandbox_dir)?;

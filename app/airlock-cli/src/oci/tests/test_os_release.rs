@@ -1,11 +1,12 @@
 //! Tests for the detection of the image distribution from `os-release`.
 
+use airlock_test_utils::temp_dir;
+
 use super::*;
-use crate::test_cfg::home::TempHome;
 
 /// The `os-release` identity of an image over `layers` (topmost first).
-fn os_release_of(layers: Vec<String>) -> Option<OsRelease> {
-    os_release(&image("sha256:img", layers))
+fn os_release_of(data_dir: &Path, layers: Vec<String>) -> Option<OsRelease> {
+    os_release(data_dir, &image("sha256:img", layers))
 }
 
 /// Test that `os-release` comes from the topmost layer with a safe and
@@ -17,8 +18,10 @@ fn os_release_of(layers: Vec<String>) -> Option<OsRelease> {
 ///   3. Check that a file with no `ID` gives no result
 #[test]
 fn os_release_comes_from_topmost_layer_that_has_it_safely() {
-    let _home = TempHome::new();
+    let tmp = temp_dir();
+    let data_dir = tmp.path();
     let ubuntu = cache_layer(
+        data_dir,
         "sha256:ubuntu",
         &LayerTar::default()
             .file(
@@ -28,6 +31,7 @@ fn os_release_comes_from_topmost_layer_that_has_it_safely() {
             .gz(),
     );
     let escaping = cache_layer(
+        data_dir,
         "sha256:escaping",
         &LayerTar::default()
             .dir("etc")
@@ -35,17 +39,20 @@ fn os_release_comes_from_topmost_layer_that_has_it_safely() {
             .gz(),
     );
     let emptied = cache_layer(
+        data_dir,
         "sha256:emptied",
         &LayerTar::default().file("etc/os-release", "").gz(),
     );
     let unrelated = cache_layer(
+        data_dir,
         "sha256:unrelated",
         &LayerTar::default().file("app/main.js", "").gz(),
     );
 
     // An empty file is a whiteout in the layer cache, so the search goes on
     // to the next layer.
-    let release = os_release_of(vec![emptied, escaping, unrelated, ubuntu.clone()]).unwrap();
+    let release =
+        os_release_of(data_dir, vec![emptied, escaping, unrelated, ubuntu.clone()]).unwrap();
     assert_eq!(
         release,
         OsRelease {
@@ -55,6 +62,7 @@ fn os_release_comes_from_topmost_layer_that_has_it_safely() {
     );
 
     let rocky = cache_layer(
+        data_dir,
         "sha256:rocky",
         &LayerTar::default()
             .file(
@@ -65,13 +73,14 @@ fn os_release_comes_from_topmost_layer_that_has_it_safely() {
             .symlink("etc/os-release", "../usr/lib/os-release")
             .gz(),
     );
-    let release = os_release_of(vec![rocky, ubuntu]).unwrap();
+    let release = os_release_of(data_dir, vec![rocky, ubuntu]).unwrap();
     assert_eq!(release.id, "rocky");
     assert_eq!(release.id_like, ["rhel", "centos", "fedora"]);
 
     let nameless = cache_layer(
+        data_dir,
         "sha256:nameless",
         &LayerTar::default().file("etc/os-release", "NAME=x\n").gz(),
     );
-    assert!(os_release_of(vec![nameless]).is_none());
+    assert!(os_release_of(data_dir, vec![nameless]).is_none());
 }

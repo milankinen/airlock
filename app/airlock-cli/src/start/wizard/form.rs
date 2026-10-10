@@ -4,6 +4,7 @@
 //! the user presses keys.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent};
 
@@ -125,6 +126,8 @@ impl OtherSlot {
 /// last row is the start bar ([`Row::Start`]) with its options
 /// ([`START_CHOICES`]).
 pub struct Form {
+    /// Airlock data directory, for the pack mount directories.
+    data_dir: PathBuf,
     /// All offered packs (the newest version of each), in pack order.
     entries: Vec<Entry>,
     /// The image that the user files set ([`Row::Custom`]).
@@ -146,6 +149,7 @@ pub struct Form {
 impl Form {
     /// Create the start state of the view.
     /// Args:
+    ///  - `data_dir`: Airlock data directory
     ///  - `packs`: Available packs. The view offers the built-in packs.
     ///  - `custom_image`: The image of the user files, if set
     ///  - `start`: The first option of the start bar
@@ -155,7 +159,12 @@ impl Form {
     ///   first distro pack. No agent or tool is selected, and the args have
     ///   their defaults. The start bar is on `start`. The focus is on the
     ///   first row.
-    pub fn new(packs: &PackManager, custom_image: Option<UserImage>, start: StartChoice) -> Self {
+    pub fn new(
+        data_dir: &Path,
+        packs: &PackManager,
+        custom_image: Option<UserImage>,
+        start: StartChoice,
+    ) -> Self {
         let offered = packs.builtin();
         let first_distro = offered
             .iter()
@@ -174,6 +183,7 @@ impl Form {
             })
             .collect();
         let mut form = Self {
+            data_dir: data_dir.to_path_buf(),
             entries,
             custom_image,
             clipboard: Clipboard {
@@ -399,7 +409,7 @@ impl Form {
             entry.pack.args()[a].key.clone(),
             ArgValue::Text(other.text.trim().to_string()),
         );
-        match entry.pack.configure(&values).config_values() {
+        match entry.pack.configure(&values).config_values(&self.data_dir) {
             Ok(_) => {
                 entry.values = values;
                 self.other = None;
