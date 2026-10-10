@@ -89,6 +89,7 @@ cat >"$KACHE_CONFIG_FILE" <<EOF
 local_store = "$CACHE_DIR/kache"
 compression_level = 1
 local_max_size = "$MAX_SIZE"
+adaptive_incremental = false
 EOF
 
 kache doctor || true
