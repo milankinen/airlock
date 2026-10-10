@@ -137,7 +137,7 @@ fn ask_move(found: &Found, can_prompt: bool, yes: bool) -> Result<Move, Exit> {
     });
     let answer = Choose {
         title: "Migrate sandbox to secure directory?",
-        notes: &["See airlock v2026.10.2 release notes for details"],
+        notes: &["See airlock v2026.10.1 release notes for details"],
         choices: &choices,
         default: 0,
         report: true,
