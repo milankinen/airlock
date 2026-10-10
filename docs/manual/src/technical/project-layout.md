@@ -33,7 +33,7 @@ User-level state stays in `~/.airlock/`:
 
 ```
 ~/.airlock/
-  settings.toml                  # application settings (vault, wizard defaults, data_dir)
+  settings.toml                  # application settings (vault, data_dir)
   airlock.toml, config.toml      # user config
   vault.*                        # file vault backends
 ```

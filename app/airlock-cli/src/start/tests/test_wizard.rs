@@ -98,7 +98,7 @@ fn check(packs: &PackManager, config: &LayeredConfig, form: &Form) -> anyhow::Re
 fn choosing_packs_and_args_with_keys_saves_shared_config_that_resolves() {
     let packs = crate::packs::init_with_sample();
     let data = temp_dir();
-    let mut form = Form::new(data.path(), &packs, None, StartChoice::Start);
+    let mut form = Form::new(data.path(), &packs, None);
     focus_pack(&mut form, "debian");
     press(&mut form, KeyCode::Char(' '));
     focus_pack(&mut form, "claude");
@@ -127,7 +127,6 @@ fn choosing_packs_and_args_with_keys_saves_shared_config_that_resolves() {
     press(&mut form, KeyCode::Char(' '));
     press(&mut form, KeyCode::Enter);
     assert_eq!(form.focus(), Row::Start);
-    press(&mut form, KeyCode::Right);
     assert_eq!(form.start(), StartChoice::StartAndShare);
     let Step::Done(target) = press(&mut form, KeyCode::Enter) else {
         panic!("the wizard did not end with a start option");
@@ -177,7 +176,7 @@ fn choosing_packs_and_args_with_keys_saves_shared_config_that_resolves() {
 /// distro pack replaces it.
 ///   1. Open the form with a user image and check that the custom image
 ///      row has the focus
-///   2. Start at once and check that the local config uses the user image
+///   2. Choose `start` and check that the local config uses the user image
 ///      and has no packs
 ///   3. Open the form again, choose a distro pack and check that the
 ///      answers have no image and the distro pack
@@ -189,9 +188,10 @@ fn user_image_is_preselected_until_distro_pack_is_chosen() {
         name: "my/image:1".into(),
         value: serde_json::json!("my/image:1"),
     };
-    let mut form = Form::new(data.path(), &packs, Some(image.clone()), StartChoice::Start);
+    let mut form = Form::new(data.path(), &packs, Some(image.clone()));
     assert_eq!(form.focus(), Row::Custom);
     press(&mut form, KeyCode::Enter);
+    press(&mut form, KeyCode::Left);
     let Step::Done(target) = press(&mut form, KeyCode::Enter) else {
         panic!("the wizard did not end with a start option");
     };
@@ -203,7 +203,7 @@ fn user_image_is_preselected_until_distro_pack_is_chosen() {
     assert!(resolved.packs.is_empty());
     assert_eq!(resolved.values.vm.image.name, "my/image:1");
 
-    let mut form = Form::new(data.path(), &packs, Some(image), StartChoice::Start);
+    let mut form = Form::new(data.path(), &packs, Some(image));
     focus_pack(&mut form, "alpine");
     press(&mut form, KeyCode::Char(' '));
     let answers = form.answers(Target::Local);
@@ -220,7 +220,7 @@ fn user_image_is_preselected_until_distro_pack_is_chosen() {
 fn answers_whose_env_does_not_resolve_fail_check() {
     let packs = crate::packs::init_with_sample();
     let data = temp_dir();
-    let form = Form::new(data.path(), &packs, None, StartChoice::Start);
+    let form = Form::new(data.path(), &packs, None);
     check(&packs, &user_files("[env]\nPLAIN = \"1\"\n"), &form).unwrap();
     let config = user_files("[env]\nMINE = \"${AIRLOCK_TEST_UNSET_VAR}\"\n");
     let e = check(&packs, &config, &form).unwrap_err();
@@ -237,7 +237,7 @@ fn answers_whose_env_does_not_resolve_fail_check() {
 fn esc_cancel_and_ctrl_c_end_wizard_without_answers() {
     let packs = crate::packs::init_with_sample();
     let data = temp_dir();
-    let mut form = Form::new(data.path(), &packs, None, StartChoice::Start);
+    let mut form = Form::new(data.path(), &packs, None);
     let first = form.focus();
     press(&mut form, KeyCode::Enter);
     assert_eq!(form.focus(), Row::Start);
@@ -245,40 +245,12 @@ fn esc_cancel_and_ctrl_c_end_wizard_without_answers() {
     assert_eq!(form.focus(), first);
     assert!(matches!(press(&mut form, KeyCode::Esc), Step::Cancel));
 
-    let mut form = Form::new(data.path(), &packs, None, StartChoice::Start);
+    let mut form = Form::new(data.path(), &packs, None);
     press(&mut form, KeyCode::Enter);
-    press(&mut form, KeyCode::Right);
-    press(&mut form, KeyCode::Right);
     press(&mut form, KeyCode::Right);
     assert_eq!(form.start(), StartChoice::Cancel);
     assert!(matches!(press(&mut form, KeyCode::Enter), Step::Cancel));
 
     let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
     assert!(matches!(form.key(ctrl_c), Step::Interrupt));
-}
-
-/// Test that the start option from the user settings is the first option
-/// of the start bar, so that Enter on the start bar uses it.
-///   1. Open the form with `start and share` first
-///   2. Press Enter two times and check that the config is shareable
-///   3. Open the form again, go left to `start` and check that the config
-///      is local
-#[test]
-fn start_option_from_settings_is_first_choice_of_start_bar() {
-    let packs = crate::packs::init_with_sample();
-    let data = temp_dir();
-    let mut form = Form::new(data.path(), &packs, None, StartChoice::StartAndShare);
-    press(&mut form, KeyCode::Enter);
-    assert!(matches!(
-        press(&mut form, KeyCode::Enter),
-        Step::Done(Target::Project)
-    ));
-
-    let mut form = Form::new(data.path(), &packs, None, StartChoice::StartAndShare);
-    press(&mut form, KeyCode::Enter);
-    press(&mut form, KeyCode::Left);
-    assert!(matches!(
-        press(&mut form, KeyCode::Enter),
-        Step::Done(Target::Local)
-    ));
 }

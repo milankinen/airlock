@@ -33,9 +33,6 @@ pub struct Settings {
     /// per-project `airlock.toml`.
     #[config(nest)]
     pub monitor: MonitorSettings,
-    /// Default answers of the setup wizard of `airlock start`.
-    #[config(nest)]
-    pub wizard_defaults: WizardDefaults,
     /// Security settings that make the sandbox less isolated if they
     /// change. The defaults are strict.
     #[config(nest)]
@@ -63,36 +60,6 @@ pub struct SecuritySettings {
     /// default (false) refuses to start the sandbox.
     #[config(default)]
     pub insecure_mounts: bool,
-}
-
-/// Settings under the `[wizard_defaults]` table.
-#[derive(Clone, Debug, Default, DescribeConfig, DeserializeConfig)]
-pub struct WizardDefaults {
-    /// The option of the start bar at the start of the setup wizard:
-    ///  * `start-and-share` (default): start with a shareable config
-    ///    (`airlock.toml`)
-    ///  * `start`: start with a local config (in the sandbox directory, out
-    ///    of the repository)
-    #[config(default)]
-    pub start: WizardStart,
-}
-
-/// The start option that the setup wizard selects first. Matches
-/// `settings.wizard_defaults.start`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum WizardStart {
-    /// Start with a local config.
-    Start,
-    /// Start with a shareable config.
-    #[default]
-    StartAndShare,
-}
-
-impl smart_config::de::WellKnown for WizardStart {
-    type Deserializer =
-        smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
-    const DE: Self::Deserializer = smart_config::de::Serde;
 }
 
 /// Location of the data of a new sandbox. Matches
@@ -273,7 +240,6 @@ mod tests {
         assert_eq!(s.vault.storage, VaultStorageType::Keyring);
         assert_eq!(s.monitor.buffers.http, 100);
         assert_eq!(s.monitor.buffers.scrollback, 1000);
-        assert_eq!(s.wizard_defaults.start, WizardStart::StartAndShare);
         assert_eq!(s.security.sandbox_type, SandboxType::Managed);
         assert!(!s.security.insecure_mounts);
         assert_eq!(s.data_dir, None);
@@ -296,7 +262,7 @@ mod tests {
 
         std::fs::write(
             dir.path().join("settings.toml"),
-            "vault.storage = \"file\"\nwizard_defaults.start = \"start\"\n\
+            "vault.storage = \"file\"\n\
              data_dir = \"~/airlock-data\"\n\
              [monitor.buffers]\nhttp = 5\n\
              [security]\nsandbox_type = \"project-owned\"\ninsecure_mounts = true\n",
@@ -306,7 +272,6 @@ mod tests {
         assert_eq!(s.vault.storage, VaultStorageType::File);
         assert_eq!(s.monitor.buffers.http, 5);
         assert_eq!(s.monitor.buffers.tcp, 100);
-        assert_eq!(s.wizard_defaults.start, WizardStart::Start);
         assert_eq!(s.security.sandbox_type, SandboxType::ProjectOwned);
         assert!(s.security.insecure_mounts);
         assert_eq!(s.data_dir.as_deref(), Some("~/airlock-data"));

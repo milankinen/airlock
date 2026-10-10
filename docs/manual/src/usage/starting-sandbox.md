@@ -33,14 +33,6 @@ The last row has the start options:
 airlock writes the config file after it prepares the sandbox. If you
 cancel, or if the start fails before that, no config file stays.
 
-The wizard selects `start and share` first. To select `start` first, set
-this value in `~/.airlock/settings.toml`:
-
-```toml
-[wizard_defaults]
-start = "start"  # default: "start-and-share"
-```
-
 The wizard needs a terminal. Without a terminal, `airlock start` stops
 with exit code 2. Then write `airlock.toml` yourself.
 

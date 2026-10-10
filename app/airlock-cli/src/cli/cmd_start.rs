@@ -99,7 +99,6 @@ async fn run(
         has_sandbox,
         &packs,
         &context.vault,
-        context.settings.wizard_defaults.start,
     ))
     .await?;
     let resolved = config

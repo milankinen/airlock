@@ -17,8 +17,7 @@ use crate::cli::prompt::screen::{self, Screen};
 use crate::config::generated::{Clipboard, GeneratedConfig, NewEntry, Target};
 use crate::config::{self, LayeredConfig};
 use crate::packs::{ConfiguredPack, PackManager};
-use crate::settings::WizardStart;
-use crate::start::wizard::form::{Form, StartChoice};
+use crate::start::wizard::form::Form;
 use crate::vault::Vault;
 
 /// All answers of the wizard.
@@ -94,7 +93,6 @@ pub(super) struct Input<'a> {
 ///    records (see [`crate::sandboxes::has_content`])
 ///  - `packs`: Available packs
 ///  - `vault`: Vault that resolves the `[env]` of the answers
-///  - `start`: The first start option of the wizard, from the user settings
 ///
 /// Returns:
 ///   The loaded config. After the wizard, the config contains the answers as
@@ -107,7 +105,6 @@ pub async fn load_or_generate_config(
     has_sandbox: bool,
     packs: &PackManager,
     vault: &Vault,
-    start: WizardStart,
 ) -> Result<LayeredConfig, Exit> {
     let config = config::load(host_cwd, local_dir).map_err(Exit::config)?;
     if config.has_project_config() {
@@ -122,7 +119,7 @@ pub async fn load_or_generate_config(
         );
         return Err(Exit::Code(2));
     }
-    let generated = Box::pin(run_wizard(host_cwd, data_dir, packs, &config, vault, start)).await?;
+    let generated = Box::pin(run_wizard(host_cwd, data_dir, packs, &config, vault)).await?;
     config
         .with_generated_project(generated)
         .map_err(Exit::config)
@@ -138,7 +135,7 @@ pub async fn load_or_generate_config(
 ///  * The clipboard capabilities (copy, paste)
 ///  * The start bar: `start` (local config, in the sandbox directory or in
 ///    `.airlock/`), `start and share` (shareable config, `airlock.toml`) or
-///    `cancel`. The user settings select the first option.
+///    `cancel`. The bar is on `start and share` first.
 ///
 /// The user files do not select packs, because `[packs]` belongs in the
 /// project files. If the user files set an image, the distro group starts
@@ -156,7 +153,6 @@ pub async fn load_or_generate_config(
 ///  - `packs`: Available packs
 ///  - `config`: The user config files only
 ///  - `vault`: Vault that resolves the `[env]` of the answers
-///  - `start`: The first option of the start bar
 ///
 /// Returns:
 ///   The new config file (not saved yet, see [`crate::config::generated`]).
@@ -173,7 +169,6 @@ pub async fn run_wizard(
     packs: &PackManager,
     config: &LayeredConfig,
     vault: &Vault,
-    start: WizardStart,
 ) -> Result<GeneratedConfig, Exit> {
     if !prompt::can_prompt() {
         cli::error!(
@@ -189,7 +184,7 @@ pub async fn run_wizard(
         config,
         vault,
     };
-    Box::pin(ask_config(&input, start.into())).await
+    Box::pin(ask_config(&input)).await
 }
 
 /// Save the config of the wizard. Call this after the sandbox is stored.
@@ -216,15 +211,9 @@ enum End {
 }
 
 /// Show the view until it ends (see [`run_wizard`]) and return the new
-/// config. The start bar is on `start` first. Messages print after the
-/// terminal is restored.
-async fn ask_config(input: &Input<'_>, start: StartChoice) -> Result<GeneratedConfig, Exit> {
-    let mut form = Form::new(
-        input.data_dir,
-        input.packs,
-        input.config.user_image(),
-        start,
-    );
+/// config. Messages print after the terminal is restored.
+async fn ask_config(input: &Input<'_>) -> Result<GeneratedConfig, Exit> {
+    let mut form = Form::new(input.data_dir, input.packs, input.config.user_image());
     let mut screen = Screen::open()?;
     let end = Box::pin(run_view(input, &mut form, &mut screen)).await;
     let closed = screen.close();
