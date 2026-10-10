@@ -4,7 +4,7 @@
 use smart_config::ByteSize;
 
 use crate::config::ConfigOverrides;
-use crate::config::config_values::Policy;
+use crate::config::config_values::{Policy, PullPolicy, Resolution};
 use crate::test_cfg::{ConfigDirs, resolve_layers};
 
 /// Test that user, local and project files merge in precedence order. Lists
@@ -108,20 +108,30 @@ fn user_local_and_project_files_merge_in_precedence_order() {
 /// Test that a pack in a project file overrides user files, that a file's
 /// own value overrides its own pack, and that the project file
 /// `airlock.toml` overrides a pack in the local file.
-///   1. Set a user image and an alpine pack in the local file, and check that
-///      the pack image wins
+///   1. Set a user image table and an alpine pack in the local file, and
+///      check that the pack image and all its image settings win
 ///   2. Also set an image in the local file and check that it wins over the
 ///      pack of the same file
 ///   3. Set an image in `airlock.toml` and check that it wins
 #[test]
 fn project_pack_overrides_user_files_and_its_own_file_overrides_pack() {
     let dirs = ConfigDirs::new();
-    dirs.user_file(".airlock.toml", "[vm]\nimage = \"user:1\"\n")
-        .project_file(
-            ".airlock/airlock.toml",
-            "[packs]\nalpine = { version = 1 }\n",
-        );
-    assert_eq!(dirs.values().vm.image.name, "alpine:latest");
+    dirs.user_file(
+        ".airlock.toml",
+        "[vm.image]\nname = \"user:1\"\nresolution = \"docker\"\n\
+         insecure = true\npull-policy = \"if-changed\"\n",
+    )
+    .project_file(
+        ".airlock/airlock.toml",
+        "[packs]\nalpine = { version = 1 }\n",
+    );
+    // The pack image comes from Docker Hub. A user table must not send it
+    // to a local image store or over plain HTTP.
+    let image = dirs.values().vm.image;
+    assert_eq!(image.name, "alpine:latest");
+    assert!(matches!(image.resolution, Resolution::Registry));
+    assert!(!image.insecure);
+    assert_eq!(image.pull_policy, PullPolicy::IfNotPresent);
 
     dirs.project_file(
         ".airlock/airlock.toml",

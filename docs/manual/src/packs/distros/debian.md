@@ -1,6 +1,7 @@
 # Debian
 
-The `debian` pack uses the `debian:stable-slim` image.
+The `debian` pack uses the `debian:stable-slim` image. airlock pulls it
+from the registry. It does not use a local Docker or Podman image.
 
 ```toml
 [packs]

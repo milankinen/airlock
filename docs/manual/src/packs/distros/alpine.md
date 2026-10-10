@@ -1,6 +1,7 @@
 # Alpine
 
-The `alpine` pack uses the `alpine:latest` image.
+The `alpine` pack uses the `alpine:latest` image. airlock pulls it from the
+registry. It does not use a local Docker or Podman image.
 
 ```toml
 [packs]
