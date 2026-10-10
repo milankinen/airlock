@@ -3,7 +3,7 @@
 use crate::project::SandboxLock;
 use crate::sandboxes::{registry, remove_box};
 use crate::test_cfg::sandboxes::data_dir_sandbox;
-use crate::test_cfg::{block_on_local, temp_dir, test_context};
+use crate::test_cfg::{block_on_local, eventually, temp_dir, test_context};
 use crate::vault::{Vault, VaultStorageType};
 
 /// Test that the removal deletes the sandbox directory and the registry
@@ -29,7 +29,9 @@ fn remove_box_deletes_stopped_sandbox_and_refuses_running_or_bad_id() {
     assert!(dir.join("disk.img").is_file());
     drop(running);
 
-    block_on_local(remove_box(&context, &id)).unwrap();
+    eventually("stopped sandbox is removed", || {
+        block_on_local(remove_box(&context, &id)).ok()
+    });
     assert!(!dir.exists());
     assert!(
         block_on_local(registry::list(&context.db))

@@ -5,13 +5,13 @@
 use std::path::{Path, PathBuf};
 
 use crate::context::Context;
-use crate::project::SandboxLock;
+use crate::project::{self, SandboxLock};
 use crate::sandboxes::{KEEP_IN_PROJECT, Location, migrate, registry};
 use crate::start::location::lock_sandbox;
 use crate::test_cfg::packs::test_packs;
 use crate::test_cfg::sandboxes::{LEGACY_CA, legacy_sandbox};
 use crate::test_cfg::start::StartProject;
-use crate::test_cfg::{TempDir, block_on_local, temp_dir, test_context};
+use crate::test_cfg::{TempDir, block_on_local, eventually, temp_dir, test_context};
 use crate::vault::{Vault, VaultStorageType};
 
 /// A config with one pack that has a setup script.
@@ -49,21 +49,23 @@ impl Home {
     ///
     /// The lock of a previous step can stay held for a short time after it
     /// drops: a process that a parallel test starts has a copy of the lock
-    /// descriptor until it execs. Thus a step that finds the lock held tries
-    /// again (as [`StartProject::start`] does).
+    /// descriptor until it execs. Thus the step waits until the lock is
+    /// free, and tries again if it finds the lock held (as
+    /// [`StartProject::start`] does).
     /// Returns:
     ///   The sandbox directory. The lock is released.
     fn lock(&self, yes: bool) -> PathBuf {
-        for _ in 0..200 {
+        eventually("sandbox lock is free", || {
+            // The step does not move a running sandbox, and does not fail.
+            if project::is_running(&self.project_sandbox()) {
+                return None;
+            }
             match block_on_local(lock_sandbox(&self.context, &self.project, false, yes)) {
-                Ok(lock) => return lock.dir().to_path_buf(),
-                Err(e) if format!("{e:?}").contains("another airlock instance") => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
+                Ok(lock) => Some(lock.dir().to_path_buf()),
+                Err(e) if format!("{e:?}").contains("another airlock instance") => None,
                 Err(e) => panic!("{e:?}"),
             }
-        }
-        panic!("the sandbox lock stays held");
+        })
     }
 
     /// The project sandbox directory.

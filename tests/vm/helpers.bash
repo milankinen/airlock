@@ -66,7 +66,8 @@ setup() {
 }
 
 # Serve http_root/index.html ("hello-from-host") on host port $1 until
-# teardown_file. Call from setup_file in $FILE_TEMP_DIR.
+# teardown_file. Return when the server is ready. Call from setup_file in
+# $FILE_TEMP_DIR.
 start_host_http_server() {
     mkdir -p http_root
     echo "hello-from-host" > http_root/index.html
@@ -74,6 +75,16 @@ start_host_http_server() {
         >"$FILE_TEMP_DIR/http_server.log" 2>&1 &
     HTTP_PID=$!
     export HTTP_PID
+    # Wait until the server accepts connections, for at most 30 seconds.
+    local i
+    for i in $(seq 300); do
+        if (: >"/dev/tcp/127.0.0.1/$1") 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "host HTTP server on port $1 did not start" >&2
+    return 1
 }
 
 # Stop the server of start_host_http_server, if it runs.

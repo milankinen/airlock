@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use crate::cache;
 use crate::cli::cmd_rm::{RmArgs, run};
 use crate::context::Context;
-use crate::project::SandboxLock;
-use crate::sandboxes::registry;
+use crate::project::{self, SandboxLock};
+use crate::sandboxes::{PROJECT_SANDBOX, registry};
+use crate::test_cfg::sandboxes::stopped_sandbox_dir;
 use crate::test_cfg::{TempDir, block_on_local, temp_dir, test_context};
 use crate::vault::{Vault, VaultStorageType};
 
@@ -43,9 +44,9 @@ impl Project {
     /// cached image.
     fn started(home: &TempDir, context: &Context, name: &str) -> Self {
         let dir = Self::make_dir(home, name);
-        // The lock makes `.airlock/sandbox`. Release it at once, so that
-        // the sandbox is not running.
-        let sandbox = SandboxLock::acquire(&dir).unwrap().dir().to_path_buf();
+        project::ensure_cache_dir(&dir).unwrap();
+        let sandbox = dir.join(PROJECT_SANDBOX);
+        stopped_sandbox_dir(&sandbox);
         Self::finish(context, dir, sandbox, name)
     }
 
@@ -55,10 +56,8 @@ impl Project {
         let dir = Self::make_dir(home, name);
         let boxes = context.boxes_dir();
         let id = block_on_local(registry::find_or_register(&context.db, &boxes, &dir)).unwrap();
-        let sandbox = SandboxLock::acquire_box(&dir, &boxes, &id)
-            .unwrap()
-            .dir()
-            .to_path_buf();
+        let sandbox = boxes.join(id);
+        stopped_sandbox_dir(&sandbox);
         Self::finish(context, dir, sandbox, name)
     }
 

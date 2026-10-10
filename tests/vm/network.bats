@@ -44,9 +44,7 @@ EOF
 #   2. Try a localhost port that is not forwarded
 #   3. Check the page and that the other port is denied
 @test "forwarded host port is reachable and other localhost port is not" {
-    # The sleep gives the host HTTP server time to start.
-    run_vm sh -c 'sleep 2
-                  wget -q -O- --timeout=5 http://localhost:18080/index.html 2>&1
+    run_vm sh -c 'wget -q -O- --timeout=5 http://localhost:18080/index.html 2>&1
                   wget -q -O- --timeout=5 http://localhost:19999/ >/dev/null 2>&1 || echo other-port-denied'
     assert_success
     assert_output_contains "hello-from-host"

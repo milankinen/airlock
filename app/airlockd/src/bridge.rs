@@ -7,7 +7,7 @@
 
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use tracing::warn;
@@ -94,6 +94,25 @@ pub fn install_shim(guest_path: &str, body: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Replace the FIFO at `path` with a new FIFO with the same owner.
+///
+/// A FIFO has no boundary between two bridge operations. If a process opens
+/// the same FIFO again before the other side of the last operation sees end
+/// of file, the two operations mix. A process that has the old FIFO open
+/// keeps it, but no new process can open it. So the close of one side
+/// always gives the other side end of file, and the next operation goes to
+/// a new FIFO.
+pub(crate) fn renew_fifo(path: &Path) -> std::io::Result<()> {
+    let meta = std::fs::metadata(path)?;
+    let mut new = path.as_os_str().to_owned();
+    new.push(".new");
+    let new = PathBuf::from(new);
+    make_fifo_at(&new, meta.uid(), meta.gid()).map_err(std::io::Error::other)?;
+    // The rename replaces the path in one step, so a new reader always
+    // finds a FIFO.
+    std::fs::rename(&new, path)
+}
+
 /// Read one payload from a FIFO, with a size limit.
 ///
 /// Blocks until a writer opens the FIFO, then reads until the writer closes
@@ -113,6 +132,11 @@ pub fn read_capped(path: &Path, limit: u64) -> std::io::Result<Result<Vec<u8>, u
     // limit, so `cat /dev/zero > fifo` uses constant memory and cannot stop
     // PID 1.
     let mut file = std::fs::File::open(path)?;
+    // A writer that comes later gets a new FIFO, so its payload does not
+    // mix into this one. It waits for the next read.
+    if let Err(e) = renew_fifo(path) {
+        warn!("bridge: renew of {} failed: {e}", path.display());
+    }
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
     let mut total: u64 = 0;

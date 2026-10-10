@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use airlock_test_utils::block_on_local;
 
 use crate::context::Context;
-use crate::project::SandboxLock;
 use crate::sandboxes::registry;
 
 /// The `ca.json` of a legacy sandbox.
@@ -30,6 +29,17 @@ pub fn legacy_sandbox(project: &Path) -> PathBuf {
     dir
 }
 
+/// Make the directory `dir` of a stopped sandbox, with the lock file that a
+/// run leaves.
+///
+/// Takes no lock. A lock that the test takes and releases can stay held for
+/// a short time, because a `fork` in a parallel test copies the open lock
+/// file.
+pub fn stopped_sandbox_dir(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("lock"), b"").unwrap();
+}
+
 /// Make a stopped sandbox of the project `project` in the data directory of
 /// `context`.
 /// Returns:
@@ -37,6 +47,7 @@ pub fn legacy_sandbox(project: &Path) -> PathBuf {
 pub fn data_dir_sandbox(context: &Context, project: &Path) -> (String, PathBuf) {
     let boxes = context.boxes_dir();
     let id = block_on_local(registry::find_or_register(&context.db, &boxes, project)).unwrap();
-    let lock = SandboxLock::acquire_box(project, &boxes, &id).unwrap();
-    (id, lock.dir().to_path_buf())
+    let dir = boxes.join(&id);
+    stopped_sandbox_dir(&dir);
+    (id, dir)
 }

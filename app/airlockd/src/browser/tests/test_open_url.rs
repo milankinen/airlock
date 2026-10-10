@@ -3,12 +3,13 @@
 
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
 
 use airlock_common::BROWSER_URL_MAX;
 
 use crate::browser::{READ_LIMIT, open_loop, shim_body};
-use crate::test_cfg::{BridgeDir, HostBrowser, eventually, run_bridge, run_shim, write_fifo};
+use crate::test_cfg::{
+    BridgeDir, HostBrowser, eventually_async, run_bridge, run_shim, write_fifo, write_fifo_cycle,
+};
 
 /// A running browser bridge in a temp directory, with a fake host browser.
 struct Browser {
@@ -37,7 +38,10 @@ impl Browser {
     /// Wait until the host opened at least `count` URLs. Return all opened
     /// URLs.
     async fn opened_after(&self, count: usize) -> Vec<String> {
-        eventually("opened urls", || self.host.opened.borrow().len() >= count).await;
+        eventually_async("opened urls", async || {
+            (self.host.opened.borrow().len() >= count).then_some(())
+        })
+        .await;
         self.host.opened.borrow().clone()
     }
 }
@@ -136,12 +140,9 @@ fn oversized_non_utf8_or_refused_open_does_not_stop_bridge() {
         browser.host.refuse_opens.set(1);
 
         let oversized = format!("https://a.example/\n{}", "x".repeat(READ_LIMIT as usize));
-        write_fifo(&browser.fifo, oversized.into_bytes()).await;
-        // Let the loop finish the cycle, so the next write gets its own cycle.
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        write_fifo(&browser.fifo, b"https://b.example/\xff\n".to_vec()).await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        write_fifo(&browser.fifo, b"https://refused.example/\n".to_vec()).await;
+        write_fifo_cycle(&browser.fifo, oversized.into_bytes()).await;
+        write_fifo_cycle(&browser.fifo, b"https://b.example/\xff\n".to_vec()).await;
+        write_fifo_cycle(&browser.fifo, b"https://refused.example/\n".to_vec()).await;
         run_shim(&browser.shim, &["https://ok.example/"], b"").await;
 
         assert_eq!(browser.opened_after(1).await, ["https://ok.example/"]);

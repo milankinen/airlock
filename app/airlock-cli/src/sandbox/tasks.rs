@@ -67,10 +67,10 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    use tokio::net::{UnixListener, UnixStream};
+    use tokio::net::UnixListener;
 
     use super::*;
-    use crate::test_cfg::{block_on_local, temp_dir};
+    use crate::test_cfg::{block_on_local, eventually_async, temp_dir};
 
     /// Sets its flag when it drops, which happens when its task stops.
     struct DropFlag(Rc<Cell<bool>>);
@@ -126,8 +126,14 @@ mod tests {
             tasks.stop_services().await;
             assert!(service_dropped.get());
             assert!(!transport_dropped.get());
-            let err = UnixStream::connect(&path).await.unwrap_err();
-            assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+            // A `fork` in a parallel test can keep a copy of the listener
+            // for a short time.
+            eventually_async("connect is refused", async || {
+                std::os::unix::net::UnixStream::connect(&path)
+                    .err()
+                    .filter(|e| e.kind() == std::io::ErrorKind::ConnectionRefused)
+            })
+            .await;
 
             tasks.stop_transport().await;
             assert!(transport_dropped.get());

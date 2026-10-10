@@ -84,7 +84,8 @@ pub struct LoopbackSignIn {
 /// A callback port forwarded into the guest.
 struct Forward {
     port: u16,
-    /// The accept loops. A drop of the set stops them.
+    /// The task that serves the forward. It ends after the forward ends
+    /// and its port is free.
     tasks: JoinSet<()>,
     state: CallbackForward,
 }
@@ -116,8 +117,11 @@ impl LoopbackSignIn {
     pub async fn detach(&self) {
         self.guest.replace(None);
         let forward = self.forward.take();
-        if let Some(Forward { mut tasks, .. }) = forward {
-            tasks.abort_all();
+        if let Some(Forward {
+            mut tasks, state, ..
+        }) = forward
+        {
+            state.end();
             while tasks.join_next().await.is_some() {}
         }
     }
@@ -147,8 +151,13 @@ impl LoopbackSignIn {
             Ok(bound) => {
                 let mut tasks = JoinSet::new();
                 let state = callback::serve(bound, guest, &mut tasks, &self.codes, callback);
-                // The accept loops of the old forward stop with its set.
-                *current = Some(Forward { port, tasks, state });
+                // The old forward frees its port in its own task. Do not
+                // abort the task, else the port can stay bound.
+                if let Some(old) = current.replace(Forward { port, tasks, state }) {
+                    old.state.end();
+                    let mut old_tasks = old.tasks;
+                    old_tasks.detach_all();
+                }
                 tracing::debug!("sign-in: forwarding callback port {port}");
                 Ok(())
             }
@@ -307,8 +316,8 @@ mod tests {
 
     use super::*;
     use crate::rpc::browser::checked_url;
-    use crate::test_cfg::block_on_local;
     use crate::test_cfg::services::{free_claude_callback_port, idle_guest};
+    use crate::test_cfg::{block_on_local, eventually_async};
 
     // Sign-in URLs in the form that Claude Code and Codex open.
     const CLAUDE_URL: &str = "https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A35527%2Fcallback&scope=user%3Ainference&code_challenge=Zm9vYmFyYmF6cXV4&code_challenge_method=S256&state=c3RhdGVzdGF0ZQ";
@@ -489,20 +498,16 @@ mod tests {
             let second = free_claude_callback_port();
             assert_eq!(allow(&sign_in, second), GrantAnswer::Allow);
             assert!(reverse_forward::bind_exclusive(second, second).is_err());
-            // The old forward closes in a task on this thread. Yield to
-            // let it free the port.
-            let mut freed = false;
-            for _ in 0..50 {
-                if let Ok(l) = reverse_forward::bind_exclusive(first, first) {
-                    drop(l);
-                    freed = true;
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-            assert!(freed, "the replaced forward still holds port {first}");
+            // The old forward closes in a task on this thread.
+            eventually_async("replaced forward frees its port", async || {
+                reverse_forward::bind_exclusive(first, first).ok()
+            })
+            .await;
             sign_in.detach().await;
-            drop(reverse_forward::bind_exclusive(second, second).unwrap());
+            eventually_async("detach frees the port", async || {
+                reverse_forward::bind_exclusive(second, second).ok()
+            })
+            .await;
         });
     }
 

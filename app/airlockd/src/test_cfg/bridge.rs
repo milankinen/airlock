@@ -2,12 +2,12 @@
 
 use std::cell::RefCell;
 use std::future::Future;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use airlock_test_utils::{TempDir, temp_dir};
+use airlock_test_utils::{TempDir, eventually_async, temp_dir};
 use tokio::io::AsyncWriteExt;
 use tokio::task::LocalSet;
 
@@ -135,14 +135,17 @@ pub(crate) async fn write_fifo(fifo: &Path, data: Vec<u8>) {
     .unwrap();
 }
 
-/// Wait until `cond` is true. Panics with `what` after five seconds.
-pub(crate) async fn eventually(what: &str, cond: impl Fn() -> bool) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while !cond() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for {what}"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+/// Write `data` to the bridge FIFO `fifo` as one operation, and wait until
+/// the read loop took it.
+///
+/// The read loop renews the FIFO when it opens it. A fast writer that comes
+/// next can open the old FIFO before the renew, and then its data mixes into
+/// this operation. Thus wait for the new FIFO.
+pub(crate) async fn write_fifo_cycle(fifo: &Path, data: Vec<u8>) {
+    let old = std::fs::metadata(fifo).unwrap().ino();
+    write_fifo(fifo, data).await;
+    eventually_async("the read loop renews the fifo", async || {
+        (std::fs::metadata(fifo).ok()?.ino() != old).then_some(())
+    })
+    .await;
 }

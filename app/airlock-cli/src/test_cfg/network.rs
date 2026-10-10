@@ -396,6 +396,27 @@ impl TestConnection {
         self.recv_and_close(timeout_ms).await.0
     }
 
+    /// Read data until `done` is true for all data read. Panics if that does
+    /// not happen in 10 seconds or the server closes the connection before.
+    /// Use it on a keep-alive connection, where the server does not close.
+    /// Returns:
+    ///   All data read, as lossy UTF-8.
+    pub async fn recv_until(&mut self, done: impl Fn(&str) -> bool) -> String {
+        let mut buf = bytes::BytesMut::new();
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+        loop {
+            let text = String::from_utf8_lossy(&buf).into_owned();
+            if done(&text) {
+                return text;
+            }
+            let chunk = tokio::time::timeout_at(deadline, self.container_rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("timed out, got: {text:?}"))
+                .unwrap_or_else(|| panic!("connection closed, got: {text:?}"));
+            buf.extend_from_slice(&chunk);
+        }
+    }
+
     /// Read data until the server closes the connection. Panics if it does
     /// not close in `timeout_ms`.
     /// Returns:

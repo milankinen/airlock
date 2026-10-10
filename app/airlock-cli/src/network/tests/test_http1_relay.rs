@@ -101,9 +101,9 @@ fn http1_keepalive_connection_serves_several_requests() {
         for path in ["first", "second"] {
             conn.send(http_get_keepalive(port, &format!("/{path}")).as_bytes())
                 .await;
-            let resp = conn.recv(500).await;
+            let end = format!("GET {path} ");
+            let resp = conn.recv_until(|r| r.ends_with(&end)).await;
             assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
-            assert!(resp.ends_with(&format!("GET {path} ")), "{resp}");
         }
     });
 }
@@ -122,7 +122,7 @@ fn http1_upstream_close_closes_guest_connection_without_502() {
         let mut conn = TestConnection::local(&proxy, addr.port()).await;
         conn.send(http_get_keepalive(addr.port(), "/").as_bytes())
             .await;
-        let resp = conn.recv(500).await;
+        let resp = conn.recv_until(|r| r.ends_with("hello")).await;
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
 
         // The graceful shutdown closes the idle keep-alive connection.

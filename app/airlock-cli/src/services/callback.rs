@@ -24,6 +24,7 @@ use hyper::header::{
 use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
 use url::Url;
@@ -86,6 +87,8 @@ struct ForwardState {
     /// True if the forward closed permanently. Its port is free, or
     /// becomes free.
     ended: Cell<bool>,
+    /// Wakes the wait for the close when the forward ends early.
+    stop: Notify,
 }
 
 impl CallbackForward {
@@ -97,6 +100,7 @@ impl CallbackForward {
             opened: Cell::new(Instant::now()),
             code_seen: Cell::new(None),
             ended: Cell::new(false),
+            stop: Notify::new(),
         }))
     }
 
@@ -128,10 +132,21 @@ impl CallbackForward {
         !self.0.ended.get() && Instant::now() < self.deadline()
     }
 
+    /// Close the forward permanently now. Its task then frees the port and
+    /// ends.
+    pub fn end(&self) {
+        self.0.ended.set(true);
+        // `notify_one` keeps a permit if no task waits now.
+        self.0.stop.notify_one();
+    }
+
     /// Wait until the forward closes, and mark it as closed permanently.
     async fn closed(&self) {
         while self.is_open() {
-            tokio::time::sleep_until(self.deadline().into()).await;
+            tokio::select! {
+                () = tokio::time::sleep_until(self.deadline().into()) => {}
+                () = self.0.stop.notified() => {}
+            }
         }
         self.0.ended.set(true);
     }
@@ -159,7 +174,9 @@ impl CallbackForward {
 ///
 /// Relays each connection to the same port on `guest`, and replaces the
 /// `code` of each request with a surrogate code. A task in `tasks` runs
-/// the accept loops until the forward closes, and then frees the port.
+/// the accept loops until the forward closes, and then frees the port. The
+/// task ends only after the port is free. Do not abort it to stop the
+/// forward. Use [`CallbackForward::end`].
 /// Args:
 ///  - `forward`: The bound callback port
 ///  - `guest`: The guest network
@@ -206,8 +223,10 @@ fn serve_until_closed(
     tasks.spawn_local(async move {
         state.closed().await;
         debug!("sign-in callback on {port} closed; freeing the port");
-        // The accept loops, and their listeners, end with their set.
-        drop(accept_loops);
+        // An abort only marks the accept loops. Their listeners drop when
+        // the runtime polls them again. Wait for this, so that the port is
+        // free when the task ends.
+        accept_loops.shutdown().await;
     });
 }
 
@@ -403,8 +422,8 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
-    use crate::test_cfg::block_on_local;
     use crate::test_cfg::services::idle_guest;
+    use crate::test_cfg::{block_on_local, eventually_async};
 
     const PORT: u16 = 1455;
     const CALLBACK: Callback = Callback {
@@ -772,18 +791,11 @@ mod tests {
             state.0.opened.set(past);
             let mut tasks = JoinSet::new();
             serve_until_closed(bound, &idle_guest(), &mut tasks, state.clone());
-            // The serve task runs on this thread. Yield to let it close the
-            // forward and drop the listener.
-            let mut freed = false;
-            for _ in 0..50 {
-                tokio::task::yield_now().await;
-                if let Ok(l) = reverse_forward::bind_exclusive(port, port) {
-                    drop(l);
-                    freed = true;
-                    break;
-                }
-            }
-            assert!(freed, "the closed forward still holds port {port}");
+            // The serve task runs on this thread.
+            eventually_async("closed forward frees its port", async || {
+                reverse_forward::bind_exclusive(port, port).ok()
+            })
+            .await;
             assert!(!state.reopen(CALLBACK));
             assert!(!state.is_open());
         });

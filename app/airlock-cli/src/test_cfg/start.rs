@@ -7,9 +7,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-use airlock_test_utils::{TempDir, block_on_local, temp_dir};
+use airlock_test_utils::{TempDir, block_on_local, eventually, temp_dir};
 use indicatif::ProgressBar;
 use sha2::{Digest, Sha256};
 
@@ -214,7 +213,8 @@ impl StartProject {
     /// The sandbox lock of the previous start can stay held for a short
     /// time after it drops. The cause is a process that a parallel test
     /// starts: it has a copy of the lock descriptor until it execs. Thus a
-    /// start that finds the lock held tries again.
+    /// start waits until the lock is free, and tries again if it finds the
+    /// lock held.
     pub fn start(&self, toml: &str, yes: bool) -> Result<(), Exit> {
         let resolved = resolve_with(&self.packs, toml).map_err(Exit::config)?;
         let options = SandboxOptions {
@@ -222,15 +222,20 @@ impl StartProject {
             log_level: LogLevel::Info,
             verbose: false,
         };
-        for _ in 0..200 {
+        let project_sandbox = self.project_dir().join(sandboxes::PROJECT_SANDBOX);
+        eventually("sandbox lock is free", || {
+            // The start does not move a running project sandbox, and does
+            // not fail.
+            if project::is_running(&project_sandbox) {
+                return None;
+            }
             match self.start_once(&resolved, &options) {
                 Err(Exit::Failed(e)) if e.to_string().starts_with("another airlock instance") => {
-                    std::thread::sleep(Duration::from_millis(5));
+                    None
                 }
-                result => return result,
+                result => Some(result),
             }
-        }
-        panic!("the sandbox lock stays held");
+        })
     }
 
     /// One try of [`Self::start`].

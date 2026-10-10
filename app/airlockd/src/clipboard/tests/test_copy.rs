@@ -7,7 +7,7 @@ use std::rc::Rc;
 use super::Clipboard;
 use crate::bridge::in_rootfs;
 use crate::clipboard::{BIN_DIR, COPY_FIFO, ClipboardConfig, PASTE_FIFO, copy_loop, start};
-use crate::test_cfg::{HostClipboard, eventually, run_bridge, run_shim};
+use crate::test_cfg::{HostClipboard, eventually_async, run_bridge, run_shim};
 
 /// Start the copy loop for `clipboard` with the byte limit `limit`.
 fn serve(clipboard: &Clipboard, host: &Rc<HostClipboard>, limit: u64) {
@@ -36,7 +36,10 @@ fn copy_through_every_tool_name_reaches_host_clipboard() {
             assert_eq!(run.code, 0, "{tool}: {run:?}");
         }
 
-        eventually("three copies", || host.copies.borrow().len() == 3).await;
+        eventually_async("three copies", async || {
+            (host.copies.borrow().len() == 3).then_some(())
+        })
+        .await;
         assert_eq!(host.copied(), ["wl-copy", "xclip", "xsel"]);
         let meta = std::fs::metadata(&clipboard.copy_fifo).unwrap();
         assert!(meta.file_type().is_fifo());
@@ -71,7 +74,10 @@ fn copy_over_limit_or_empty_is_dropped_and_bridge_keeps_serving() {
             assert_eq!(run_shim(&wl_copy, &[], payload).await.code, 0);
         }
 
-        eventually("two copies", || host.copies.borrow().len() == 2).await;
+        eventually_async("two copies", async || {
+            (host.copies.borrow().len() == 2).then_some(())
+        })
+        .await;
         assert_eq!(host.copied(), ["exactly 16 bytes", "after"]);
     });
 }
@@ -92,7 +98,10 @@ fn copy_refused_by_host_does_not_stop_bridge() {
         run_shim(&wl_copy, &[], b"refused").await;
         run_shim(&wl_copy, &[], b"accepted").await;
 
-        eventually("one copy", || host.copies.borrow().len() == 1).await;
+        eventually_async("one copy", async || {
+            (host.copies.borrow().len() == 1).then_some(())
+        })
+        .await;
         assert_eq!(host.copied(), ["accepted"]);
     });
 }

@@ -606,7 +606,7 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     use super::*;
-    use crate::test_cfg::{host_env_vault, temp_dir, test_context};
+    use crate::test_cfg::{eventually, host_env_vault, temp_dir, test_context};
 
     /// The permission bits of `path`.
     fn mode(path: &Path) -> u32 {
@@ -617,10 +617,10 @@ mod tests {
     /// running check and the idle probe follow the lock state.
     ///   1. Take the lock and check that the sandbox runs and a second take
     ///      fails
-    ///   2. Release the lock and check that the sandbox does not run
+    ///   2. Release the lock, take the idle probe and check that the probe
+    ///      holds the lock until it drops
     ///   3. Take the lock again and check that the idle probe says "running"
-    ///   4. Release it, take the idle probe and check that the probe holds
-    ///      the lock until it drops
+    ///   4. Release the lock and check that the sandbox does not run
     ///   5. Remove the directory and check that the probe says "missing"
     #[test]
     fn lock_is_exclusive_and_is_running_tracks_it() {
@@ -635,17 +635,17 @@ mod tests {
         assert!(acquire_lock(&lock).is_err());
 
         drop(held);
-        assert!(!is_running(&dir));
-        let held2 = acquire_lock(&lock).unwrap();
-        assert!(matches!(lock_if_idle(&dir), IdleLock::Running));
-        drop(held2);
-
-        let IdleLock::Held(probe) = lock_if_idle(&dir) else {
-            panic!("idle lock is not taken");
-        };
+        let probe = eventually("idle lock is taken", || match lock_if_idle(&dir) {
+            IdleLock::Held(file) => Some(file),
+            _ => None,
+        });
         assert!(acquire_lock(&lock).is_err());
         drop(probe);
-        assert!(acquire_lock(&lock).is_ok());
+
+        let held2 = eventually("lock is taken", || acquire_lock(&lock).ok());
+        assert!(matches!(lock_if_idle(&dir), IdleLock::Running));
+        drop(held2);
+        eventually("sandbox does not run", || (!is_running(&dir)).then_some(()));
 
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(matches!(lock_if_idle(&dir), IdleLock::Missing));

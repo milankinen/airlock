@@ -9,13 +9,12 @@
 //! two concurrent copies does not mix.
 
 use std::io::Write;
-use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use airlock_common::supervisor_capnp::clipboard;
 use tracing::{debug, info, warn};
 
-use crate::bridge::{in_rootfs, install_shim, make_fifo, make_fifo_at, read_capped};
+use crate::bridge::{in_rootfs, install_shim, make_fifo, read_capped, renew_fifo};
 
 // Paths as the container sees them. In the default container `PATH`,
 // `/usr/local/bin` comes before `/usr/bin` and `/bin` (see `DEFAULT_PATH` in
@@ -247,25 +246,6 @@ async fn paste_loop(path: PathBuf, sink: clipboard::Client) {
             Err(e) => warn!("clipboard: paste writer task failed: {e}"),
         }
     }
-}
-
-/// Replace the FIFO at `path` with a new FIFO with the same owner.
-///
-/// A FIFO has no boundary between two pastes. If the loop opens the same
-/// FIFO again before the reader of the last paste sees end of file, that
-/// reader stays connected and gets the clipboard again. A reader that has
-/// the old FIFO open keeps it, but no new reader can open it. So the close
-/// of the write end always gives that reader end of file, and the next
-/// paste goes to a new reader.
-fn renew_fifo(path: &Path) -> std::io::Result<()> {
-    let meta = std::fs::metadata(path)?;
-    let mut new = path.as_os_str().to_owned();
-    new.push(".new");
-    let new = PathBuf::from(new);
-    make_fifo_at(&new, meta.uid(), meta.gid()).map_err(std::io::Error::other)?;
-    // The rename replaces the path in one step, so a new reader always
-    // finds a FIFO.
-    std::fs::rename(&new, path)
 }
 
 #[cfg(test)]

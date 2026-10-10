@@ -714,7 +714,7 @@ mod tests {
     ///      of `a` in one-byte chunks
     ///   2. Push each in small and large chunks
     ///   3. Check that all bytes go out and that each scan takes less than
-    ///      one second
+    ///      ten seconds
     #[test]
     fn adversarial_runs_are_scanned_in_bounded_time() {
         for (pattern, chunk) in [
@@ -740,9 +740,12 @@ mod tests {
             }
             out += s.finish().unwrap().len();
             assert_eq!(out, size, "{pattern:?}");
+            // A scan takes much less than one second. A loaded CI machine
+            // can make it slower. A quadratic scan of 1 MiB is much slower
+            // than ten seconds, so the high limit still finds it.
             let elapsed = started.elapsed();
             assert!(
-                elapsed < std::time::Duration::from_secs(1),
+                elapsed < std::time::Duration::from_secs(10),
                 "{pattern:?} {chunk}: {elapsed:?}"
             );
         }

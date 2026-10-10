@@ -7,7 +7,6 @@ use std::io::Write as _;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use airlock_common::network_capnp::network_proxy;
 use axum::Router;
@@ -22,6 +21,7 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
 use super::context::{StoreHome, test_store};
+use super::eventually_async;
 use super::network::{TestNetworkConfig, run_with_config};
 use super::upstream::{FakeUpstream, GuestResponse, Seen, SeenLog, guest_request, post};
 use crate::network::interceptor::Interceptor;
@@ -97,8 +97,6 @@ pub struct Options {
     pub gzip: bool,
     /// The answer status of a revoke.
     pub revoke_status: u16,
-    /// How long a revoke takes.
-    pub revoke_delay: Duration,
     /// Fields that the code exchange answer has in addition to the usual
     /// fields. A field with a usual name replaces the usual value.
     pub exchange_extra: Option<Value>,
@@ -112,7 +110,6 @@ impl Default for Options {
             account: true,
             gzip: false,
             revoke_status: 200,
-            revoke_delay: Duration::ZERO,
             exchange_extra: None,
         }
     }
@@ -135,18 +132,28 @@ pub struct FakeProvider {
     pub refresh_extra: Mutex<Option<Value>>,
     /// Holds the next refresh until its release. With `None`, refreshes
     /// answer immediately.
-    refresh_gate: Mutex<Option<RefreshGate>>,
+    refresh_gate: Mutex<Option<RequestGate>>,
+    /// Holds the next revoke until its release. With `None`, revokes
+    /// answer immediately.
+    revoke_gate: Mutex<Option<RequestGate>>,
 }
 
-/// A refresh that the provider holds. `arrived` fires when the refresh
-/// gets to the token endpoint. The provider answers it after `release`
-/// fires.
+/// A request that the provider holds. `arrived` fires when the request
+/// gets to the provider. The provider answers it after `release` fires.
 #[derive(Clone, Default)]
-pub struct RefreshGate {
-    /// Fires when the held refresh gets to the token endpoint.
+pub struct RequestGate {
+    /// Fires when the held request gets to the provider.
     pub arrived: Arc<tokio::sync::Notify>,
-    /// Fire it to let the provider answer the held refresh.
+    /// Fire it to let the provider answer the held request.
     pub release: Arc<tokio::sync::Notify>,
+}
+
+impl RequestGate {
+    /// Hold the request here until the release.
+    async fn hold(&self) {
+        self.arrived.notify_one();
+        self.release.notified().await;
+    }
 }
 
 /// A JWT with `claims` and a signature that marks it as real. `n` makes
@@ -197,6 +204,7 @@ impl FakeProvider {
             refreshed_plan: Mutex::new(None),
             refresh_extra: Mutex::new(None),
             refresh_gate: Mutex::new(None),
+            revoke_gate: Mutex::new(None),
         };
         fake.rotate(0);
         Arc::new(fake)
@@ -246,9 +254,16 @@ impl FakeProvider {
     }
 
     /// Hold the next refresh until the release of the returned gate.
-    pub fn hold_next_refresh(&self) -> RefreshGate {
-        let gate = RefreshGate::default();
+    pub fn hold_next_refresh(&self) -> RequestGate {
+        let gate = RequestGate::default();
         *self.refresh_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    /// Hold the next revoke until the release of the returned gate.
+    pub fn hold_next_revoke(&self) -> RequestGate {
+        let gate = RequestGate::default();
+        *self.revoke_gate.lock().unwrap() = Some(gate.clone());
         gate
     }
 
@@ -298,13 +313,15 @@ impl FakeProvider {
                 None
             };
             if let Some(gate) = gate {
-                gate.arrived.notify_one();
-                gate.release.notified().await;
+                gate.hold().await;
             }
             return self.token(&seen);
         }
         if post && path == revoke_path(self.service) {
-            tokio::time::sleep(self.opts.revoke_delay).await;
+            let gate = self.revoke_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.hold().await;
+            }
             let status = StatusCode::from_u16(self.opts.revoke_status).unwrap();
             return (status, axum::Json(json!({}))).into_response();
         }
@@ -787,30 +804,24 @@ impl Running {
             .count()
     }
 
-    /// Wait until the provider got `n` revokes, for at most about one
-    /// second. It does not fail when the time ends.
+    /// Wait until the provider got `n` revokes. Panics after 10 seconds.
     pub async fn wait_for_revokes(&self, n: usize) {
-        for _ in 0..50 {
-            if self.revokes().len() >= n {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        eventually_async("revokes", async || {
+            (self.revokes().len() >= n).then_some(())
+        })
+        .await;
     }
 
-    /// Wait until the provider got a revoke of `token`, for at most about
-    /// one second.
+    /// Wait until the provider got a revoke of `token`. Panics after 10
+    /// seconds.
     /// Returns:
     ///   The `token` values of all revokes that the provider got.
     pub async fn wait_for_revoke_of(&self, token: &str) -> Vec<Value> {
-        for _ in 0..50 {
+        eventually_async("revoke of token", async || {
             let revoked: Vec<Value> = self.revokes().iter().map(|b| b["token"].clone()).collect();
-            if revoked.iter().any(|t| t == token) {
-                return revoked;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        self.revokes().iter().map(|b| b["token"].clone()).collect()
+            revoked.iter().any(|t| t == token).then_some(revoked)
+        })
+        .await
     }
 
     /// The grants in the store.

@@ -1,11 +1,10 @@
 //! Anthropic refreshes and sign-outs through the proxy: what the proxy sends
 //! to the provider, what it refuses locally, and how it deletes grants.
 
-use std::time::Duration;
-
 use serde_json::{Value, json};
 
 use crate::services::ServiceId;
+use crate::test_cfg::eventually_async;
 use crate::test_cfg::provider::*;
 use crate::test_cfg::upstream::post;
 
@@ -228,24 +227,24 @@ fn failed_upstream_revoke_still_deletes_grant() {
 }
 
 /// Test that a revoke completes also when the guest drops the request.
-///   1. Make the provider answer revokes after 300 ms
-///   2. Sign in, send a revoke and drop it after 100 ms
-///   3. Check that the provider gets the revoke and the grant is gone
+///   1. Sign in and make the provider hold the next revoke
+///   2. Send a revoke and drop it when it gets to the provider
+///   3. Release the revoke and check that the grant is gone
 #[test]
 fn revoke_dropped_by_guest_still_completes() {
-    let opts = Options {
-        revoke_delay: Duration::from_millis(300),
-        ..Options::default()
-    };
-    Setup::new(ServiceId::Anthropic, opts).run(|r| async move {
+    Setup::new(ServiceId::Anthropic, Options::default()).run(|r| async move {
         let answer = r.sign_in().await;
+        let gate = r.fake.hold_next_revoke();
         let revoke = json!({ "token": answer["refresh_token"] });
-        let dropped =
-            tokio::time::timeout(Duration::from_millis(100), r.post_revoke(&revoke)).await;
-        assert!(dropped.is_err());
-        // Wait longer than the revoke delay, so that the revoke can complete.
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        tokio::select! {
+            _ = r.post_revoke(&revoke) => panic!("the provider answered a held revoke"),
+            () = gate.arrived.notified() => {}
+        }
+        gate.release.notify_one();
+        eventually_async("grant is gone", async || {
+            r.grants().await.is_empty().then_some(())
+        })
+        .await;
         assert_eq!(r.revokes().len(), 1);
-        assert!(r.grants().await.is_empty());
     });
 }
