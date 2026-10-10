@@ -267,11 +267,11 @@ fn agent_packs_enable_their_service_unless_project_turns_it_off() {
     assert!(crate::services::enabled(&off.values.network.services).is_empty());
 }
 
-/// Test that the claude and codex packs pass the API tokens of the host
-/// as masked secrets and inject them into the API requests. A token that
-/// the host does not have is left out.
+/// Test that the agent packs pass the API tokens of the host as masked
+/// secrets and inject them into the API requests. A token that the host
+/// does not have is left out, and the start does not stop.
 ///   1. Resolve each pack with the tokens in the host env
-///   2. Check that the guest sees surrogates and that the API host gets
+///   2. Check that the guest sees surrogates and that each API host gets
 ///      the real values
 ///   3. Resolve each pack without tokens and check that the start passes
 ///      with no token in the guest and no injection
@@ -280,7 +280,7 @@ fn agent_packs_inject_host_tokens_that_exist() {
     let cases = [
         (
             "claude",
-            "api.anthropic.com",
+            vec!["api.anthropic.com"],
             vec![
                 ("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-real-oauth-token"),
                 ("ANTHROPIC_API_KEY", "sk-ant-api03-real-api-key"),
@@ -288,11 +288,16 @@ fn agent_packs_inject_host_tokens_that_exist() {
         ),
         (
             "codex",
-            "api.openai.com",
+            vec!["api.openai.com"],
             vec![("OPENAI_API_KEY", "sk-proj-real-api-key")],
         ),
+        (
+            "copilot",
+            vec!["*.githubcopilot.com", "api.github.com", "github.com"],
+            vec![("COPILOT_GITHUB_TOKEN", "github_pat_real-token")],
+        ),
     ];
-    for (pack, api_host, tokens) in cases {
+    for (pack, api_hosts, tokens) in cases {
         let resolve = |host_env: &[(&str, &str)]| {
             let values = resolve_project_toml(&format!("[packs]\n{pack} = {{ version = 1 }}\n"))
                 .unwrap()
@@ -303,19 +308,21 @@ fn agent_packs_inject_host_tokens_that_exist() {
         };
 
         let (env, inject) = resolve(&tokens);
-        let [target] = inject.as_slice() else {
-            panic!("{pack}: {} inject targets", inject.len());
-        };
-        assert_eq!((target.host.as_str(), target.port), (api_host, Some(443)));
-        let mut injected: Vec<(&str, &str)> = target
-            .secrets
-            .iter()
-            .map(|s| (s.name.as_str(), s.real.as_str()))
-            .collect();
-        injected.sort_unstable();
+        let mut hosts: Vec<&str> = inject.iter().map(|t| t.host.as_str()).collect();
+        hosts.sort_unstable();
+        assert_eq!(hosts, api_hosts, "{pack}");
         let mut expected = tokens.clone();
         expected.sort_unstable();
-        assert_eq!(injected, expected, "{pack}");
+        for target in &inject {
+            assert_eq!(target.port, Some(443), "{pack}");
+            let mut injected: Vec<(&str, &str)> = target
+                .secrets
+                .iter()
+                .map(|s| (s.name.as_str(), s.real.as_str()))
+                .collect();
+            injected.sort_unstable();
+            assert_eq!(injected, expected, "{pack}");
+        }
         for (name, real) in &tokens {
             let surrogate = env.guest_value(name).unwrap();
             assert_eq!(surrogate, env.masked(name).unwrap().surrogate);

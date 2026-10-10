@@ -26,8 +26,6 @@ docker --version && git --version && mise version && echo ALL-PACKS-OK'
 setup_file() {
     vm_setup_file
 
-    export COPILOT_GITHUB_TOKEN=airlock-test
-
     mkdir -p alpine debian
     printf '[vm]\nimage = "alpine:latest"\n\n%s\n' "$PACKS" >alpine/airlock.toml
     printf '[vm]\nimage = "debian:stable-slim"\n\n%s\n' "$PACKS" >debian/airlock.toml

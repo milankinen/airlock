@@ -30,11 +30,12 @@ airlock secrets add COPILOT_GITHUB_TOKEN
 ```
 
 airlock reads the token from the host environment first and then from the
-vault. If neither has the token, `airlock start` stops with an error.
+vault. The token is optional. If neither has the token, the sandbox starts
+without `COPILOT_GITHUB_TOKEN`.
 
-The sandbox sees only a [masked](../../configuration/env.md#masking)
-surrogate, so you do not need `/login`. airlock puts the real token into
-the requests. For the supported token types, see the
-[Copilot CLI authentication docs][copilot-auth].
+If the token is set, the sandbox sees only a
+[masked](../../configuration/env.md#masking) surrogate, so you do not need
+`/login`. airlock puts the real token into the requests. For the supported
+token types, see the [Copilot CLI authentication docs][copilot-auth].
 
 [copilot-auth]: https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/authenticate-copilot-cli#authenticating-with-environment-variables

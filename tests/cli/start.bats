@@ -239,18 +239,20 @@ $BAD_IMAGE"
 }
 
 # Test that agent packs need no credentials in the host environment,
-# because the user signs in later through the host.
-#   1. Remove the tokens and write a config with the claude and codex packs
+# because the tokens are optional. The user can sign in later.
+#   1. Remove the tokens and write a config with the claude, codex and
+#      copilot packs
 #   2. Run start
 #   3. Check that there is no config error and no sign-in, and that the
 #      sandbox prepare starts
 @test "start with agent packs and no credentials passes env check" {
-    unset CLAUDE_CODE_OAUTH_TOKEN OPENAI_API_KEY
+    unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY COPILOT_GITHUB_TOKEN
     write_config "$BAD_IMAGE
 
 [packs]
 claude = { version = 1 }
-codex = { version = 1 }"
+codex = { version = 1 }
+copilot = { version = 1 }"
     run_airlock start
     assert_failure
     assert_output_not_contains "Config error"

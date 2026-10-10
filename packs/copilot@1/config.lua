@@ -4,10 +4,11 @@
 -- https://docs.github.com/en/copilot/how-tos/copilot-on-github/customize-copilot/customize-cloud-agent/customize-the-agent-environment
 
 config.env = {
+    -- The token from the host environment or the vault, if it exists.
     -- The real token stays on the host. The sandbox sees a random
     -- surrogate of the same length, and the `inject` rule below puts the
     -- real value into request headers at the host boundary.
-    COPILOT_GITHUB_TOKEN = { value = "${COPILOT_GITHUB_TOKEN}", mask = true },
+    COPILOT_GITHUB_TOKEN = { value = "${COPILOT_GITHUB_TOKEN}", mask = true, optional = true },
 
     -- The setup script installs the Copilot CLI in /usr/local/bin, which
     -- the sandbox user cannot change, and the network rules do not allow
