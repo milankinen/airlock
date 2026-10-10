@@ -241,7 +241,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home/me");
         let data = home.join(".local/share/airlock");
-        let pack = data.join("packs/mounts/claude");
+        let pack = data.join("share/all/packs/claude");
         let project = home.join("src/app");
         std::fs::create_dir_all(&pack).unwrap();
         std::fs::create_dir_all(&project).unwrap();

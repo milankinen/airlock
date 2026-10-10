@@ -157,13 +157,17 @@ pub fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
 }
 
 /// Get the mount directory of the pack `name`
-/// (`<data>/packs/mounts/<name>/`). Creates it if it does not exist.
+/// (`<data>/share/all/packs/<name>/`). Creates it if it does not exist.
 ///
 /// The pack's `config.lua` gets it as `pack.directory`. The pack keeps the
 /// host side of its mounts there (for example the agent settings and
 /// credential files). All sandboxes that use the pack share it.
 pub fn pack_mounts_dir(name: &str) -> anyhow::Result<PathBuf> {
-    let dir = data_dir()?.join("packs").join("mounts").join(name);
+    let dir = data_dir()?
+        .join("share")
+        .join("all")
+        .join("packs")
+        .join(name);
     std::fs::create_dir_all(&dir)
         .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.display()))?;
     Ok(dir)

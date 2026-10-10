@@ -37,7 +37,7 @@ Packs:
   rust 1 (toolchain = nightly) — installed
 
 Mounts:
-  claude-dir: /Users/me/Library/Application Support/airlock/packs/mounts/claude/claude → ~/.claude
+  claude-dir: /Users/me/Library/Application Support/airlock/share/all/packs/claude/claude → ~/.claude
 
 Network policy: deny-by-default
 Network rules:

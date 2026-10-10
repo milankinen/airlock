@@ -26,7 +26,7 @@ network middleware. Globals:
 
 - `config`: the table that the script fills
 - `pack.name`, `pack.version`, `pack.args` (with defaults)
-- `pack.directory`: `~/.cache/airlock/packs/mounts/<name>/`, the host
+- `pack.directory`: `<data>/share/all/packs/<name>/`, the host
   side of the pack mounts. All projects with the pack share it.
 - `fail(msg)`: stops with the config error `pack <name>: <msg>`
 

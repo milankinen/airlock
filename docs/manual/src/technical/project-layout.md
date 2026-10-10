@@ -25,7 +25,7 @@ The default is `~/Library/Application Support/airlock` on macOS and
                                  # in-flight download, one per process (swept on next run)
     layers/<digest>.download     # complete tarball pending extraction
     layers/<digest>.tmp/         # in-flight extraction (swept on next run)
-  packs/mounts/<pack>/           # host side of the pack mounts
+  share/all/packs/<pack>/        # host side of the pack mounts
   sock/<hash>.sock               # CLI socket when the default path is too long
 ```
 
