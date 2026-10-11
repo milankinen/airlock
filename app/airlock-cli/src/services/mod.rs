@@ -290,18 +290,21 @@ fn unavailable_warning(ids: &[ServiceId], reason: &str) -> String {
     let names: Vec<&str> = ids.iter().map(|id| id.name()).collect();
     let opt_out: Vec<String> = ids
         .iter()
-        .map(|id| format!("`[network.services] {} = false`", id.name()))
+        .map(|id| crate::messages::services::service_opt_out_setting(id.name()))
         .collect();
     let (services, are, their, agents) = if ids.len() == 1 {
         ("service", "is", "its", "agent")
     } else {
         ("services", "are", "their", "agents")
     };
-    format!(
-        "the network {services} {} {are} unavailable ({reason}), so airlock denies {their} \
-         hosts; to let the {agents} sign in without airlock, set {}",
+    crate::messages::services::services_unavailable(
+        services,
         names.join(", "),
-        opt_out.join(" and ")
+        are,
+        reason,
+        their,
+        agents,
+        opt_out.join(" and "),
     )
 }
 
@@ -320,7 +323,7 @@ fn warn_once(warned: &AtomicBool, msg: &str) -> bool {
 /// its vault. The vault creates the key on first use.
 fn open_store(context: &Context) -> anyhow::Result<store::TokenStore> {
     if context.vault.storage_type() == VaultStorageType::Disabled {
-        anyhow::bail!("the vault is disabled");
+        anyhow::bail!(crate::messages::services::VAULT_DISABLED);
     }
     let key = context.vault.service_store_key()?;
     Ok(store::TokenStore::new(context.db.clone(), &key))

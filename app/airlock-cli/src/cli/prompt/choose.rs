@@ -5,18 +5,14 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::cli::prompt::screen::Frame;
-use crate::cli::prompt::style::{self, Line, Styles, Tone};
+use crate::cli::prompt::style::{self, Line, Styles};
 use crate::cli::prompt::{self, PromptError, Step};
-
-/// Key help line of the list.
-const KEYS: &str = "↑↓ move · enter confirm · esc cancel";
+use crate::messages;
 
 /// One option of the list.
 pub struct Choice<'a> {
     /// Option text.
     pub label: &'a str,
-    /// Color of the label. A [`Tone::Danger`] label is red.
-    pub tone: Tone,
 }
 
 /// Lines that a key shows and hides, below the notes of a [`Choose`].
@@ -44,7 +40,7 @@ pub struct Details<'a> {
 ///  * An empty line and the key help (gray)
 ///
 /// Keys: ↑/↓ move the focus (and wrap at the ends). Enter selects the focused
-/// option. Esc cancels. Ctrl+C interrupts.
+/// option. Esc aborts. Ctrl+C interrupts.
 pub struct Choose<'a> {
     /// Question text (bold). Can have many lines.
     pub title: &'a str,
@@ -114,7 +110,7 @@ impl Choose<'_> {
             .flat_map(|line| style::indented(line, 0, room, &styles.bold))
             .collect();
         for note in self.notes {
-            lines.extend(style::indented(note, 2, room, &styles.dim));
+            lines.extend(style::indented(note, 0, room, &styles.dim));
         }
         if let Some(details) = details {
             let hint = if state.details {
@@ -134,7 +130,7 @@ impl Choose<'_> {
             line.lead(2, focused, &styles);
             line.push(style::radio(focused), styles.mark(focused));
             line.push(" ", &styles.plain);
-            line.push(choice.label, styles.label(focused, choice.tone));
+            line.push(choice.label, styles.label(focused));
             if focused {
                 let start = if i == 0 { 0 } else { lines.len() };
                 focus = start..lines.len() + 1;
@@ -142,13 +138,39 @@ impl Choose<'_> {
             lines.push(line.text);
         }
         lines.push(String::new());
-        lines.push(styles.dim.apply_to(KEYS).to_string());
+        lines.push(styles.dim.apply_to(messages::cli::CHOOSE_KEYS).to_string());
         Frame {
             lines,
             focus,
             cursor: None,
         }
     }
+}
+
+/// Ask the user to confirm a dangerous action. The options are `Abort`
+/// (the default) and `action`. The question and the answer stay on
+/// the terminal.
+/// Args:
+///  - `title`: The question
+///  - `notes`: Gray lines below the question
+///  - `action`: Label of the option that confirms
+///
+/// Returns:
+///   True if the user selected `action`. False on `Abort` or Esc.
+pub fn confirm(title: &str, notes: &[&str], action: &str) -> Result<bool, PromptError> {
+    let question = Choose {
+        title,
+        notes,
+        choices: &[
+            Choice {
+                label: messages::cli::ABORT_CHOICE,
+            },
+            Choice { label: action },
+        ],
+        default: 0,
+        report: true,
+    };
+    Ok(question.ask()? == Some(1))
 }
 
 /// The focused option in a list of `len` options, and whether the details
@@ -169,7 +191,7 @@ impl State {
             KeyCode::Up => self.focus = (self.focus + len - 1) % len,
             KeyCode::Down => self.focus = (self.focus + 1) % len,
             KeyCode::Enter if self.len > 0 => return Step::Done(self.focus),
-            KeyCode::Esc => return Step::Cancel,
+            KeyCode::Esc => return Step::Abort,
             _ => {}
         }
         Step::Stay

@@ -120,7 +120,7 @@ impl Vm {
             pty,
         } = spec;
         let Some((cmd, args)) = argv.split_first() else {
-            anyhow::bail!("spawn: empty command");
+            anyhow::bail!(crate::messages::sandbox::SPAWN_EMPTY_COMMAND);
         };
         let env = util::merge_env(&self.instance.env, env, &unset);
         let cwd = cwd.unwrap_or_else(|| self.instance.cwd.clone());
@@ -194,7 +194,7 @@ impl Vm {
         info!("vm shutdown");
         let stopped = self.instance.shutdown().await;
         self.tasks.stop_transport().await;
-        stopped.context("VM stop not confirmed")?;
+        stopped.context(crate::messages::sandbox::VM_STOP_NOT_CONFIRMED)?;
         Ok(Stopped {
             project: self.project,
             synced,

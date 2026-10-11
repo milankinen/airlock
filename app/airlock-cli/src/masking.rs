@@ -4,7 +4,7 @@
 //! that the guest supervisor uses. Also shows a summary of the masks in
 //! verbose mode.
 
-use crate::{cli, project, rpc};
+use crate::{cli, messages, project, rpc};
 
 /// Validate the enabled mask blocks of the project config and convert them
 /// to the wire format.
@@ -33,23 +33,17 @@ pub fn build_specs(project: &project::Project) -> anyhow::Result<Vec<rpc::MaskSp
 /// leading `/` or `~`, and no `..` segments.
 fn validate_path(name: &str, idx: usize, path: &str) -> anyhow::Result<()> {
     if path.is_empty() {
-        anyhow::bail!("mask.{name}.paths[{idx}]: empty path");
+        anyhow::bail!(messages::app::mask_path_empty(name, idx));
     }
     if path.starts_with('/') {
-        anyhow::bail!(
-            "mask.{name}.paths[{idx}]: absolute paths are not allowed (got `{path}`); paths must be project-relative"
-        );
+        anyhow::bail!(messages::app::mask_path_absolute(name, idx, path));
     }
     if path.starts_with('~') {
-        anyhow::bail!(
-            "mask.{name}.paths[{idx}]: home-relative paths are not allowed (got `{path}`); paths must be project-relative"
-        );
+        anyhow::bail!(messages::app::mask_path_home_relative(name, idx, path));
     }
     for seg in path.split('/') {
         if seg == ".." {
-            anyhow::bail!(
-                "mask.{name}.paths[{idx}]: `..` is not allowed in mask paths (got `{path}`)"
-            );
+            anyhow::bail!(messages::app::mask_path_dotdot(name, idx, path));
         }
     }
     Ok(())
@@ -67,12 +61,15 @@ pub fn print_verbose(project: &project::Project) {
     if enabled.is_empty() {
         return;
     }
-    cli::verbose!("  {} masks: {}", cli::bullet(), enabled.len());
+    cli::verbose!(
+        "  {} {}",
+        cli::bullet(),
+        messages::app::masks_summary(enabled.len())
+    );
     for (name, m) in &enabled {
         cli::verbose!(
-            "      {name}: {} path(s): {}",
-            m.paths.len(),
-            m.paths.join(", ")
+            "      {}",
+            messages::app::mask_details(name, m.paths.len(), m.paths.join(", "))
         );
     }
 }

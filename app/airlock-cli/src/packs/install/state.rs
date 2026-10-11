@@ -143,9 +143,9 @@ pub fn read(dir: &PinnedDir) -> ReadState {
         Some(v) if v > u64::from(STATE_VERSION) => {
             return ReadState::TooNew(u32::try_from(v).unwrap_or(u32::MAX));
         }
-        Some(0) => return ReadState::Corrupt("version 0".into()),
+        Some(0) => return ReadState::Corrupt(crate::messages::packs::STATE_VERSION_ZERO.into()),
         Some(_) => {}
-        None => return ReadState::Corrupt("no version".into()),
+        None => return ReadState::Corrupt(crate::messages::packs::STATE_NO_VERSION.into()),
     }
     let state: InstallState = match serde_json::from_value(value) {
         Ok(s) => s,
@@ -172,18 +172,18 @@ fn validate(state: &InstallState) -> Result<(), String> {
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
         if !well_formed {
-            return Err(format!("invalid pack name {id:?}"));
+            return Err(crate::messages::packs::state_pack_name_invalid(id));
         }
         if record.fingerprint.len() != 64
             || !record.fingerprint.chars().all(|c| c.is_ascii_hexdigit())
         {
-            return Err(format!("invalid fingerprint of {id}"));
+            return Err(crate::messages::packs::state_fingerprint_invalid(id));
         }
     }
     if let Some(image) = &state.image_id
         && image.chars().any(char::is_control)
     {
-        return Err("invalid image id".into());
+        return Err(crate::messages::packs::STATE_IMAGE_ID_INVALID.into());
     }
     Ok(())
 }

@@ -122,7 +122,9 @@ impl GeneratedConfig {
                 let in_project = self.path.parent() == Some(local_dir);
                 if in_project {
                     let host_cwd = local_dir.parent().ok_or_else(|| {
-                        anyhow::anyhow!("{} has no project directory", local_dir.display())
+                        anyhow::anyhow!(crate::messages::config::no_project_directory(
+                            local_dir.display()
+                        ))
                     })?;
                     project::ensure_cache_dir(host_cwd)?;
                 }
@@ -131,10 +133,12 @@ impl GeneratedConfig {
         };
         create_new(&path, &self.toml).map_err(|e| match e.kind() {
             std::io::ErrorKind::AlreadyExists => anyhow::anyhow!(
-                "{} appeared while the setup questions were open; it was not changed",
-                path.display()
+                crate::messages::config::config_appeared_during_setup(path.display())
             ),
-            _ => anyhow::anyhow!("create {}: {e}", path.display()),
+            _ => anyhow::anyhow!(crate::messages::config::create_config_failed(
+                path.display(),
+                e
+            )),
         })?;
         Ok(path)
     }

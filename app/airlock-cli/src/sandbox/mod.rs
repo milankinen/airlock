@@ -22,7 +22,7 @@ use crate::oci::{self, OciImage};
 /// Error: a boot step got the user's Ctrl+C or SIGTERM and stopped. The step
 /// already removed what it built. Commands map this error to exit code 130.
 #[derive(Debug, thiserror::Error)]
-#[error("interrupted")]
+#[error("{}", crate::messages::cli::PROMPT_INTERRUPTED)]
 pub struct Interrupted;
 
 /// Get the argv of the main process.

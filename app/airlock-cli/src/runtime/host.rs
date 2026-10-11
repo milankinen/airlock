@@ -37,10 +37,9 @@ impl HostRuntime {
         if !monitor {
             return Ok(Self::Raw(RawTerminalRuntime::new()));
         }
-        let tui = settings
-            .monitor
-            .tui_settings()
-            .map_err(|e| anyhow::anyhow!("invalid monitor key bindings:\n{e}"))?;
+        let tui = settings.monitor.tui_settings().map_err(|e| {
+            anyhow::anyhow!(crate::messages::runtime::invalid_monitor_key_bindings(e))
+        })?;
         Ok(Self::Monitor(MonitorRuntime::new(tui)))
     }
 }

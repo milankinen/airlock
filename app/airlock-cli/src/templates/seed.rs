@@ -8,11 +8,11 @@
 use std::path::Path;
 
 use super::{CA_FILE, IMAGE_FILE, Template};
-use crate::cli;
 use crate::packs::install::state::{self as install_state, ReadState};
 use crate::util::PinnedDir;
 use crate::util::clone::{CloneKind, clone_file};
 use crate::vm::disk::{self, DISK_FILE};
+use crate::{cli, messages};
 
 /// Copy the template `template` into the new sandbox `sandbox`.
 ///
@@ -31,12 +31,12 @@ pub fn seed(template: &Template, sandbox: &PinnedDir) -> anyhow::Result<()> {
     let src = template.dir.join(DISK_FILE);
     let dst = sandbox.path().join(DISK_FILE);
     let copied = clone_file(&src, &dst).map_err(|e| {
-        anyhow::anyhow!(
-            "template {}: copy {} to {}: {e}",
-            template.name,
+        anyhow::anyhow!(messages::templates::copy_disk_failed(
+            &template.name,
             src.display(),
-            dst.display()
-        )
+            dst.display(),
+            e
+        ))
     });
     let kind = match copied {
         Ok(kind) => kind,
@@ -57,13 +57,13 @@ pub fn seed(template: &Template, sandbox: &PinnedDir) -> anyhow::Result<()> {
         sandbox.path().join(IMAGE_FILE),
     );
     let how = match kind {
-        CloneKind::Reflink => "copy-on-write",
-        CloneKind::Copy => "copy",
+        CloneKind::Reflink => messages::templates::DISK_COPY_ON_WRITE,
+        CloneKind::Copy => messages::templates::DISK_COPY,
     };
     cli::log!(
-        "  {} disk copied from template {} {}",
+        "  {} {} {}",
         cli::check(),
-        template.name,
+        messages::templates::disk_copied(&template.name),
         cli::dim(&format!("({how})"))
     );
     Ok(())
@@ -77,10 +77,10 @@ fn seed_records(template: &Template, sandbox: &PinnedDir) -> anyhow::Result<()> 
     let mut state = match install_state::read(&source) {
         ReadState::Ok(state) => state,
         ReadState::Absent => return Ok(()),
-        other => anyhow::bail!(
-            "template {}: the install records are not valid ({other:?})",
-            template.name
-        ),
+        other => anyhow::bail!(messages::templates::install_records_invalid(
+            &template.name,
+            other
+        )),
     };
     state.disk = disk::read_id(sandbox.path());
     install_state::write(sandbox, &state)

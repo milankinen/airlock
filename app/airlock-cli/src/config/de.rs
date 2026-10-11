@@ -66,7 +66,7 @@ where
         let result = match parser.parse() {
             Ok(parsed) => Ok(parsed),
             Err(errors) => {
-                let e = format_error("invalid configuration", errors);
+                let e = format_error(crate::messages::config::INVALID_CONFIGURATION, errors);
                 Err(ErrorWithOrigin::custom(e))
             }
         };
@@ -89,7 +89,7 @@ pub fn format_error(title: impl Into<String>, errors: smart_config::ParseErrors)
     for e in errors {
         let path = e.path();
         let detail = if matches!(e.category(), smart_config::ParseErrorCategory::MissingField) {
-            "missing".to_string()
+            crate::messages::config::MISSING.to_string()
         } else {
             e.inner().to_string()
         };

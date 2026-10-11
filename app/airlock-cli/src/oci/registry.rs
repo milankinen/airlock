@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use super::OciConfig;
+use crate::messages;
 
 /// A resolved registry image with manifest and config.
 pub struct RegistryImage {
@@ -172,19 +173,19 @@ pub async fn pull_layer(
     let expected_size = layer.size as u64;
     if metadata.len() != expected_size {
         let _ = tokio::fs::remove_file(dest).await;
-        anyhow::bail!(
-            "layer size mismatch: expected {expected_size} bytes, got {}",
+        anyhow::bail!(messages::oci::layer_size_mismatch(
+            expected_size,
             metadata.len()
-        );
+        ));
     }
 
     let actual_digest = format!("sha256:{}", hex::encode(digest));
     if !actual_digest.eq_ignore_ascii_case(&layer.digest) {
         let _ = tokio::fs::remove_file(dest).await;
-        anyhow::bail!(
-            "layer digest mismatch: expected {}, got {actual_digest}",
-            layer.digest
-        );
+        anyhow::bail!(messages::oci::layer_digest_mismatch(
+            &layer.digest,
+            actual_digest
+        ));
     }
     Ok(())
 }

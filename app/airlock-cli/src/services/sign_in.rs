@@ -138,7 +138,7 @@ impl LoopbackSignIn {
     fn forward(&self, port: u16, callback: Callback) -> Result<(), String> {
         let guest = self.guest.borrow();
         let Some(guest) = guest.as_ref() else {
-            return Err("the sandbox is not ready for a sign-in".into());
+            return Err(crate::messages::services::SANDBOX_NOT_READY_FOR_SIGN_IN.into());
         };
         let mut current = self.forward.borrow_mut();
         if let Some(forward) = current.as_ref().filter(|f| f.port == port)
@@ -161,13 +161,10 @@ impl LoopbackSignIn {
                 tracing::debug!("sign-in: forwarding callback port {port}");
                 Ok(())
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Err(format!(
-                "port {port} is in use on this computer, so the browser cannot \
-                 reach the sign-in in the sandbox"
-            )),
-            Err(e) => Err(format!(
-                "could not listen on port {port} for the sign-in: {e}"
-            )),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                Err(crate::messages::services::sign_in_port_in_use(port))
+            }
+            Err(e) => Err(crate::messages::services::sign_in_listen_failed(port, e)),
         }
     }
 }
@@ -180,7 +177,11 @@ impl BrowserGrant for LoopbackSignIn {
         let place = format!("{}{}", page.host, page.path);
         let checked = match check_params(url, page) {
             Ok(checked) => checked,
-            Err(e) => return GrantAnswer::Refuse(format!("refused to open a page: {place}: {e}")),
+            Err(e) => {
+                return GrantAnswer::Refuse(crate::messages::services::refused_to_open_page(
+                    place, e,
+                ));
+            }
         };
         let callback = Callback {
             service: self.service,
@@ -231,36 +232,39 @@ fn check_params(url: &Url, page: &SignInPage) -> Result<Checked, String> {
             .collect();
         match <[String; 1]>::try_from(values) {
             Ok([value]) => Ok(value),
-            Err(values) => Err(format!("expected one {name}, found {}", values.len())),
+            Err(values) => Err(crate::messages::services::expected_one_param(
+                name,
+                values.len(),
+            )),
         }
     };
     if one("client_id")?.is_empty() {
-        return Err("the client_id is empty".into());
+        return Err(crate::messages::services::CLIENT_ID_EMPTY.into());
     }
     if one("response_type")? != "code" {
-        return Err("the response_type is not code".into());
+        return Err(crate::messages::services::RESPONSE_TYPE_NOT_CODE.into());
     }
     if one("code_challenge_method")? != "S256" {
-        return Err("the code_challenge_method is not S256".into());
+        return Err(crate::messages::services::CODE_CHALLENGE_METHOD_NOT_S256.into());
     }
     let challenge = one("code_challenge")?;
     if challenge.is_empty() {
-        return Err("the code_challenge is empty".into());
+        return Err(crate::messages::services::CODE_CHALLENGE_EMPTY.into());
     }
     let scope = one("scope")?;
     let scopes: Vec<&str> = scope.split(' ').collect();
     if scopes.iter().any(|s| !is_scope_token(s)) {
-        return Err("the scope is malformed".into());
+        return Err(crate::messages::services::SCOPE_MALFORMED.into());
     }
     if scopes.iter().collect::<HashSet<_>>().len() != scopes.len() {
-        return Err("the scope names a scope twice".into());
+        return Err(crate::messages::services::SCOPE_DUPLICATE.into());
     }
     for (k, v) in url.query_pairs() {
         if k == "response_mode" {
-            return Err("the URL sets a response_mode".into());
+            return Err(crate::messages::services::URL_SETS_RESPONSE_MODE.into());
         }
         if k == "prompt" && v.split_whitespace().any(|p| p == "none") {
-            return Err("the URL asks for prompt=none".into());
+            return Err(crate::messages::services::URL_ASKS_PROMPT_NONE.into());
         }
     }
     let port = check_redirect(&one("redirect_uri")?, page)?;
@@ -281,28 +285,28 @@ fn is_scope_token(s: &str) -> bool {
 /// Returns:
 ///   The port, or an error message.
 fn check_redirect(raw: &str, page: &SignInPage) -> Result<u16, String> {
-    let url = Url::parse(raw).map_err(|_| "the redirect_uri is not a URL".to_string())?;
+    let url =
+        Url::parse(raw).map_err(|_| crate::messages::services::REDIRECT_URI_NOT_URL.to_string())?;
     let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1"));
     if url.scheme() != "http" || !loopback {
-        return Err("the redirect_uri is not an http loopback address".into());
+        return Err(crate::messages::services::REDIRECT_URI_NOT_LOOPBACK.into());
     }
     if !url.username().is_empty() || url.password().is_some() {
-        return Err("the redirect_uri carries a user name".into());
+        return Err(crate::messages::services::REDIRECT_URI_HAS_USER.into());
     }
     if url.query().is_some() || url.fragment().is_some() {
-        return Err("the redirect_uri has a query".into());
+        return Err(crate::messages::services::REDIRECT_URI_HAS_QUERY.into());
     }
     if url.path() != page.callback_path {
-        return Err(format!(
-            "the redirect_uri path is not {}",
-            page.callback_path
+        return Err(crate::messages::services::redirect_uri_wrong_path(
+            page.callback_path,
         ));
     }
     let port = url
         .port()
-        .ok_or_else(|| "the redirect_uri names no port".to_string())?;
+        .ok_or_else(|| crate::messages::services::REDIRECT_URI_NO_PORT.to_string())?;
     if !page.callback_ports.iter().any(|r| r.contains(&port)) {
-        return Err(format!("callback port {port} is not allowed"));
+        return Err(crate::messages::services::callback_port_not_allowed(port));
     }
     Ok(port)
 }

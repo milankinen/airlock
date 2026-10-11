@@ -152,8 +152,9 @@ pub fn for_config(config: &Clipboard) -> Option<ClipboardImpl> {
     }
     let Some(tool) = detect() else {
         crate::cli::log!(
-            "  {} clipboard disabled: no clipboard program found on the host",
-            crate::cli::bullet()
+            "  {} {}",
+            crate::cli::bullet(),
+            crate::messages::rpc::CLIPBOARD_DISABLED_NO_PROGRAM
         );
         return None;
     };

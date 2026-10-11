@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Context, anyhow};
 
 use super::Storage;
+use crate::messages;
 use crate::settings::Settings;
 
 const KEYRING_SERVICE: &str = "airlock-vault";
@@ -25,25 +26,26 @@ impl Storage for KeyringStorage {
         match keyring_entry()?.get_password() {
             Ok(s) => Ok(Some(s)),
             Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(anyhow!("read airlock vault from keyring: {e}")),
+            Err(e) => Err(anyhow!(messages::vault::read_vault_from_keyring(e))),
         }
     }
 
     fn store(&self, data: &str) -> anyhow::Result<()> {
         keyring_entry()?
             .set_password(data)
-            .context("write airlock vault to keyring")
+            .context(messages::vault::WRITE_VAULT_TO_KEYRING)
     }
 
     fn lock_path(&self) -> anyhow::Result<Option<PathBuf>> {
         // The keychain has no compare-and-swap, so writers from different
         // processes serialize on a lock file.
-        let dir = Settings::dir().context("find the airlock directory for the vault lock")?;
+        let dir = Settings::dir().context(messages::vault::FIND_VAULT_LOCK_DIR)?;
         Ok(Some(dir.join("vault.keyring.lock")))
     }
 }
 
 /// Open the keychain entry of the vault.
 fn keyring_entry() -> anyhow::Result<keyring::Entry> {
-    keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT).context("construct airlock keyring entry")
+    keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
+        .context(messages::vault::CONSTRUCT_KEYRING_ENTRY)
 }

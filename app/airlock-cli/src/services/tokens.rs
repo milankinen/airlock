@@ -258,8 +258,12 @@ pub enum Refusal {
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Refusal::Unknown(key) => write!(f, "the value of {key:?} is in no known token format"),
-            Refusal::NotAllowed(kind) => write!(f, "the answer carries a {kind:?} token"),
+            Refusal::Unknown(key) => {
+                f.write_str(&crate::messages::services::token_key_unknown_format(key))
+            }
+            Refusal::NotAllowed(kind) => {
+                f.write_str(&crate::messages::services::answer_carries_token_kind(kind))
+            }
         }
     }
 }

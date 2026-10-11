@@ -56,16 +56,16 @@ pub fn evaluate(
 ) -> anyhow::Result<serde_json::Value> {
     let name = &pack.name;
     let value = run(pack, source, args, directory).map_err(|e| match e.downcast_ref::<Fail>() {
-        Some(fail) => anyhow::anyhow!("pack {name}: {fail}"),
-        None => anyhow::anyhow!("pack {name}: {e}"),
+        Some(fail) => anyhow::anyhow!(crate::messages::packs::pack_failed(name, fail)),
+        None => anyhow::anyhow!(crate::messages::packs::pack_failed(name, e)),
     })?;
     anyhow::ensure!(
         value.is_object(),
-        "pack {name}: config.lua must leave `config` a table, not {value}"
+        crate::messages::packs::lua_config_not_table(name, &value)
     );
     anyhow::ensure!(
         value.get("packs").is_none() && value.get("presets").is_none(),
-        "pack {name}: config.lua cannot set `packs` or `presets`"
+        crate::messages::packs::lua_config_reserved_keys(name)
     );
     Ok(value)
 }

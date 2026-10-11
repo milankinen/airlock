@@ -11,7 +11,6 @@ use super::install::{self, InstallDecision};
 use super::{Exit, SandboxOptions};
 use crate::cli::prompt;
 use crate::cli::prompt::choose::{Choice, Choose};
-use crate::cli::prompt::style::Tone;
 use crate::config::{LayeredConfig, ResolvedConfig};
 use crate::context::Context;
 #[cfg(not(test))]
@@ -27,7 +26,7 @@ use crate::templates::{self, Template};
 #[cfg(test)]
 use crate::test_cfg::start::{check_image, prepare_image};
 use crate::util::PinnedDir;
-use crate::{cli, sandbox};
+use crate::{cli, messages, sandbox};
 
 /// The stored sandbox, ready for the install step.
 pub struct EnsuredSandbox {
@@ -87,11 +86,6 @@ enum ToolAnswer {
     InstallAdded,
 }
 
-/// The gray line before the added-tools question, if the sandbox continues
-/// with a new image because the old image is gone.
-const OLD_IMAGE_GONE_NOTE: &str =
-    "The old image is not available any more, so the tools install again for the new image.";
-
 /// Return what `oci::prepare` does about a changed image.
 ///
 /// A new disk and `--yes` re-create without a question. With a terminal,
@@ -121,13 +115,11 @@ fn image_resets_disk(change: ImageChange, new_disk: bool) -> bool {
 fn added_tools_notes(change: ImageChange) -> Vec<&'static str> {
     let mut notes = Vec::new();
     if change == ImageChange::OldImageGone {
-        notes.push(OLD_IMAGE_GONE_NOTE);
+        notes.push(messages::start::OLD_IMAGE_GONE_NOTE);
     }
     notes.extend([
-        "The install reaches the public internet without limits (local and private addresses \
-         are blocked) inside the existing sandbox; code already in the sandbox can run during \
-         it.",
-        "Re-create the sandbox for a clean install.",
+        messages::start::ADDED_TOOLS_NOTE_INTERNET,
+        messages::start::ADDED_TOOLS_NOTE_RECREATE,
     ]);
     notes
 }
@@ -177,18 +169,19 @@ fn tools_changed_message(plan: &Plan) -> String {
     let added: Vec<&str> = asked(&plan.pending).iter().map(|p| p.id.as_str()).collect();
     let mut parts = Vec::new();
     if !plan.changed.is_empty() {
-        parts.push(format!("changed: {}", plan.changed.join(", ")));
+        parts.push(messages::start::tools_changed_changed(
+            plan.changed.join(", "),
+        ));
     }
     if !added.is_empty() {
-        parts.push(format!("added: {}", added.join(", ")));
+        parts.push(messages::start::tools_changed_added(added.join(", ")));
     }
     if !plan.removed.is_empty() {
-        parts.push(format!("removed: {}", plan.removed.join(", ")));
+        parts.push(messages::start::tools_changed_removed(
+            plan.removed.join(", "),
+        ));
     }
-    format!(
-        "Tools changed in the sandbox ({}). Run in a terminal or pass --yes.",
-        parts.join("; ")
-    )
+    messages::start::tools_changed(parts.join("; "))
 }
 
 /// Prepare the stored sandbox for `resolved` and decide which tools to
@@ -199,13 +192,13 @@ fn tools_changed_message(plan: &Plan) -> String {
 ///
 /// For an existing sandbox, the step can ask these questions:
 ///  * A changed config (see [`config_change::check`]). The answers are
-///    `abort` (the default), `accept changes` and `continue with old
+///    `Abort` (the default), `Accept changes` and `Continue with old
 ///    configuration`. `--allow-configuration-changes` accepts the changes.
 ///
-/// The default answer of each of these is `re-create sandbox`:
+/// The default answer of each of these is `Re-create sandbox`:
 ///  * A changed image
 ///  * Changed packs (the definition is different from the one on the disk).
-///    The only other answer is `cancel`.
+///    The only other answer is `Abort`.
 ///  * Tools removed from the config
 ///  * Tools added to the config
 ///
@@ -228,7 +221,7 @@ fn tools_changed_message(plan: &Plan) -> String {
 ///
 /// Returns:
 ///   The stored sandbox with the config of the run, or the exit for an
-///   error or a cancelled question.
+///   error or an aborted question.
 // Steps: check `[env]`, find or make the sandbox and take its lock (see
 // [`super::location::lock_sandbox`]), check the config changes, copy the
 // template into a new sandbox, read the install records, prepare the image,
@@ -463,14 +456,14 @@ fn apply_tool_answer(plan: &mut Plan, answer: ToolAnswer) -> bool {
 
 /// Ask about the changed packs of `plan`.
 ///
-/// Only a new sandbox installs them, so the answers are "re-create sandbox"
-/// and "cancel".
+/// Only a new sandbox installs them, so the answers are "Re-create sandbox"
+/// and "Abort".
 fn ask_changed_packs(candidates: &[InstallerScript], plan: &Plan) -> Result<ToolAnswer, Exit> {
     let labels = candidate_labels(plan.changed.iter().map(String::as_str), candidates);
     ask(
-        &format!("Packs have changed: {}", labels.join(", ")),
-        &["Changed packs install only into a re-created sandbox."],
-        &[("re-create sandbox", ToolAnswer::Recreate)],
+        &messages::start::packs_changed(labels.join(", ")),
+        &[messages::start::PACKS_CHANGED_NOTE],
+        &[(messages::start::RECREATE_SANDBOX, ToolAnswer::Recreate)],
     )
 }
 
@@ -478,14 +471,11 @@ fn ask_changed_packs(candidates: &[InstallerScript], plan: &Plan) -> Result<Tool
 fn ask_removed_tools(packs: &PackManager, plan: &Plan) -> Result<ToolAnswer, Exit> {
     let labels: Vec<String> = plan.removed.iter().map(|id| label(packs, id)).collect();
     ask(
-        &format!(
-            "Tools have been removed from sandbox: {}",
-            labels.join(", ")
-        ),
-        &["Removed tools remain in the sandbox until recreation."],
+        &messages::start::tools_removed(labels.join(", ")),
+        &[messages::start::TOOLS_REMOVED_NOTE],
         &[
-            ("re-create sandbox", ToolAnswer::Recreate),
-            ("continue with current sandbox", ToolAnswer::KeepRemoved),
+            (messages::start::RECREATE_SANDBOX, ToolAnswer::Recreate),
+            (messages::start::KEEP_SANDBOX, ToolAnswer::KeepRemoved),
         ],
     )
 }
@@ -501,32 +491,29 @@ fn ask_added_tools(
         candidates,
     );
     ask(
-        &format!("Tools have been added to sandbox: {}", labels.join(", ")),
+        &messages::start::tools_added(labels.join(", ")),
         notes,
         &[
-            ("re-create sandbox", ToolAnswer::Recreate),
-            ("install anyways", ToolAnswer::InstallAdded),
+            (messages::start::RECREATE_SANDBOX, ToolAnswer::Recreate),
+            (messages::start::INSTALL_ANYWAYS, ToolAnswer::InstallAdded),
         ],
     )
 }
 
-/// Ask a question with a last `cancel` choice.
+/// Ask a question with a last `Abort` choice.
 /// Args:
 ///  - `title`: The question
 ///  - `notes`: Gray lines below the question
 ///  - `choices`: Labels and answers. The first is the default.
 ///
 /// Returns:
-///   The selected answer. Cancel and Esc end the run.
+///   The selected answer. Abort and Esc end the run.
 fn ask(title: &str, notes: &[&str], choices: &[(&str, ToolAnswer)]) -> Result<ToolAnswer, Exit> {
     let options: Vec<Choice> = choices
         .iter()
         .map(|(label, _)| *label)
-        .chain(["cancel"])
-        .map(|label| Choice {
-            label,
-            tone: Tone::Plain,
-        })
+        .chain([messages::cli::ABORT_CHOICE])
+        .map(|label| Choice { label })
         .collect();
     let question = Choose {
         title,
@@ -544,11 +531,11 @@ fn ask(title: &str, notes: &[&str], choices: &[(&str, ToolAnswer)]) -> Result<To
 /// Convert a failed image preparation to the end of the run.
 ///
 /// The cases: a changed image that nobody can answer about (exit code 2),
-/// Cancel, Ctrl+C, or a failure.
+/// Abort, Ctrl+C, or a failure.
 fn image_error(e: anyhow::Error) -> Exit {
     match e.downcast_ref::<ImageChangeStop>() {
         Some(ImageChangeStop::NeedsTerminal) => Exit::error(2, e),
-        Some(ImageChangeStop::Cancelled) => Exit::aborted(),
+        Some(ImageChangeStop::Aborted) => Exit::aborted(),
         Some(ImageChangeStop::Interrupted) => Exit::INTERRUPTED,
         None => Exit::Failed(e),
     }
@@ -575,26 +562,21 @@ fn read_state(sandbox: &PinnedDir, can_prompt: bool) -> Result<InstallState, Exi
         ReadState::Ok(state) => Ok(state),
         ReadState::TooNew(version) => {
             cli::error!(
-                "{} was written by a newer airlock (format {version}); update airlock, or run \
-                 `airlock rm` to start over",
-                path.display()
+                "{}",
+                messages::start::state_too_new(path.display(), version)
             );
             Err(Exit::Code(2))
         }
         ReadState::Corrupt(why) if can_prompt => {
             cli::log!(
-                "{} {} is not valid ({why}); treating every pack as not installed",
+                "{} {}",
                 cli::yellow("!"),
-                path.display()
+                messages::start::state_corrupt_ignored(path.display(), why)
             );
             Ok(InstallState::default())
         }
         ReadState::Corrupt(why) => {
-            cli::error!(
-                "{} is not valid ({why}); run `airlock start` in a terminal, or `airlock rm` \
-                 to start over",
-                path.display()
-            );
+            cli::error!("{}", messages::start::state_corrupt(path.display(), why));
             Err(Exit::Code(2))
         }
     }
@@ -750,14 +732,14 @@ mod tests {
         }
         assert_eq!(
             added_tools_notes(ImageChange::OldImageGone)[0],
-            OLD_IMAGE_GONE_NOTE
+            "The old image is not available any more, so the tools install again for the new image."
         );
         for change in [
             ImageChange::Unchanged,
             ImageChange::KeepOld,
             ImageChange::Recreate,
         ] {
-            assert!(!added_tools_notes(change).contains(&OLD_IMAGE_GONE_NOTE));
+            assert!(!added_tools_notes(change).contains(&"The old image is not available any more, so the tools install again for the new image."));
         }
     }
 

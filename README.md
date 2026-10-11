@@ -90,7 +90,7 @@ Config
   □ Create airlock.toml
 
 ←→ choose · enter confirm
-« start · cancel »
+« start · abort »
 ```
 
 ### 3. Start Claude Code and log in

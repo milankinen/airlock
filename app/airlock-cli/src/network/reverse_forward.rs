@@ -48,7 +48,7 @@ pub async fn bind(forwards: Vec<(u16, u16)>) -> anyhow::Result<Vec<BoundForward>
     for (host_port, guest_port) in forwards {
         let v4 = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), host_port))
             .await
-            .with_context(|| format!("bind 127.0.0.1:{host_port} for reverse port forward"))?;
+            .with_context(|| crate::messages::network::reverse_forward_bind_v4(host_port))?;
         let v6 =
             match TcpListener::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), host_port))
                 .await
@@ -56,7 +56,7 @@ pub async fn bind(forwards: Vec<(u16, u16)>) -> anyhow::Result<Vec<BoundForward>
                 Ok(l) => Some(l),
                 Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                     return Err(e).with_context(|| {
-                        format!("bind [::1]:{host_port} for reverse port forward")
+                        crate::messages::network::reverse_forward_bind_v6(host_port)
                     });
                 }
                 Err(e) => {

@@ -187,10 +187,10 @@ impl Pack {
     /// List the arg keys as text for error messages.
     pub fn known_args(&self) -> String {
         if self.args().is_empty() {
-            return "it has no args".to_string();
+            return crate::messages::packs::ARGS_NONE.to_string();
         }
         let keys: Vec<&str> = self.args().iter().map(|arg| arg.key.as_str()).collect();
-        format!("known: {}", keys.join(", "))
+        crate::messages::packs::args_known(keys.join(", "))
     }
 }
 
@@ -244,9 +244,9 @@ impl ArgKind {
                 if values.contains(text) || (*other && !text.is_empty()) {
                     Ok(())
                 } else {
-                    Err(format!(
-                        "`{text}` is not valid ({})",
-                        expected_choice(values, *other)
+                    Err(crate::messages::packs::arg_value_invalid(
+                        text,
+                        expected_choice(values, *other),
                     ))
                 }
             }
@@ -257,9 +257,9 @@ impl ArgKind {
     /// Error text for a value of the wrong type.
     fn wrong_type(&self) -> String {
         match self {
-            ArgKind::Bool => "must be true or false".to_string(),
+            ArgKind::Bool => crate::messages::packs::ARG_MUST_BE_BOOL.to_string(),
             ArgKind::Choice { values, other } => {
-                format!("must be a string ({})", expected_choice(values, *other))
+                crate::messages::packs::arg_must_be_string(expected_choice(values, *other))
             }
         }
     }
@@ -268,12 +268,9 @@ impl ArgKind {
 /// Describe the valid values of a choice arg, for error messages.
 fn expected_choice(values: &[String], other: bool) -> String {
     if other {
-        format!(
-            "one of: {}, or any other non-empty string",
-            values.join(", ")
-        )
+        crate::messages::packs::arg_expected_choice_or_other(values.join(", "))
     } else {
-        format!("one of: {}", values.join(", "))
+        crate::messages::packs::arg_expected_choice(values.join(", "))
     }
 }
 
@@ -350,8 +347,13 @@ impl ConfiguredPack {
             Some(PackConfig::Lua(source)) => {
                 let metadata = self.metadata();
                 // Create the pack directory before `config.lua` runs.
-                let directory = crate::cache::pack_mounts_dir(data_dir, &metadata.name)
-                    .map_err(|e| anyhow::anyhow!("pack {}: {e:#}", metadata.name))?;
+                let directory =
+                    crate::cache::pack_mounts_dir(data_dir, &metadata.name).map_err(|e| {
+                        anyhow::anyhow!(crate::messages::packs::pack_failed(
+                            &metadata.name,
+                            format!("{e:#}")
+                        ))
+                    })?;
                 lua_config::evaluate(metadata, source, &self.args, &directory)
             }
         }

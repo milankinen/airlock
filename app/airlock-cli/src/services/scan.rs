@@ -410,7 +410,7 @@ pub async fn scan_answer(
             done = true;
             break;
         };
-        let frame = frame.map_err(|e| anyhow::anyhow!("API answer: {e}"))?;
+        let frame = frame.map_err(|e| anyhow::anyhow!(crate::messages::services::api_answer(e)))?;
         match frame.into_data() {
             Ok(data) => match scanner.push(&data) {
                 Ok(out) => {

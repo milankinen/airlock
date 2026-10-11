@@ -17,10 +17,13 @@ use crate::project::{self, IdleLock};
 /// Returns:
 ///   Error if the id is not valid, the sandbox runs, or the removal fails.
 pub async fn remove_box(context: &Context, id: &str) -> anyhow::Result<()> {
-    anyhow::ensure!(registry::is_valid_id(id), "not a sandbox id: {id}");
+    anyhow::ensure!(
+        registry::is_valid_id(id),
+        crate::messages::sandboxes::not_sandbox_id(id)
+    );
     let dir = context.boxes_dir().join(id);
     let _lock = match project::lock_if_idle(&dir) {
-        IdleLock::Running => anyhow::bail!("Sandbox is running, stop it first"),
+        IdleLock::Running => anyhow::bail!(crate::messages::sandboxes::SANDBOX_RUNNING_STOP_FIRST),
         IdleLock::Held(file) => Some(file),
         IdleLock::Missing => None,
     };
@@ -28,8 +31,9 @@ pub async fn remove_box(context: &Context, id: &str) -> anyhow::Result<()> {
         // `remove_dir_all` does not follow a symlink at `dir`, but remove
         // only the link to make that clear.
         Ok(meta) if meta.file_type().is_symlink() => std::fs::remove_file(&dir)?,
-        Ok(_) => std::fs::remove_dir_all(&dir)
-            .map_err(|e| anyhow::anyhow!("remove {}: {e}", dir.display()))?,
+        Ok(_) => std::fs::remove_dir_all(&dir).map_err(|e| {
+            anyhow::anyhow!(crate::messages::sandboxes::remove_failed(dir.display(), e))
+        })?,
         Err(_) => {}
     }
     registry::unregister(&context.db, id).await?;

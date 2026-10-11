@@ -19,7 +19,7 @@ use crate::templates::{Template, TemplatePack};
 pub const KINDS: [PackKind; 3] = [PackKind::Distro, PackKind::Agent, PackKind::Tool];
 
 /// The options of the start bar, in order.
-pub const START_CHOICES: [StartChoice; 2] = [StartChoice::Start, StartChoice::Cancel];
+pub const START_CHOICES: [StartChoice; 2] = [StartChoice::Start, StartChoice::Abort];
 
 /// What the wizard makes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,7 +60,7 @@ pub enum StartChoice {
     /// Start with the config. [`Row::ShareConfig`] sets where it goes.
     Start,
     /// End without a config.
-    Cancel,
+    Abort,
 }
 
 /// A pack in the view.
@@ -381,7 +381,7 @@ impl Form {
     ///  * Enter: Move the focus to the start bar. On the start bar, end the
     ///    view with the focused option.
     ///  * Esc: On the start bar after Enter, go back to the earlier row.
-    ///    Otherwise cancel.
+    ///    Otherwise abort.
     ///  * Ctrl+C: Interrupt.
     ///
     /// The "other" slot: → from the last value makes it the current item,
@@ -416,7 +416,7 @@ impl Form {
                 return match self.start {
                     StartChoice::Start if self.share => Step::Done(Target::Project),
                     StartChoice::Start => Step::Done(Target::Local),
-                    StartChoice::Cancel => Step::Cancel,
+                    StartChoice::Abort => Step::Abort,
                 };
             }
             KeyCode::Enter => {
@@ -430,7 +430,7 @@ impl Form {
                 let back = self.return_to.take();
                 self.go_to(back.unwrap_or(Row::Start));
             }
-            KeyCode::Esc => return Step::Cancel,
+            KeyCode::Esc => return Step::Abort,
             _ => {}
         }
         Step::Stay

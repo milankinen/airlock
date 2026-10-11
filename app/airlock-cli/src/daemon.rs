@@ -14,7 +14,7 @@ use std::time::Duration;
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::config::config_values::RestartPolicy;
-use crate::{cli, project, rpc};
+use crate::{cli, messages, project, rpc};
 
 /// Convert the enabled daemons of the project config to the wire format.
 /// Args:
@@ -40,11 +40,9 @@ pub fn build_specs(
                 .env
                 .iter()
                 .map(|(key, template)| {
-                    let value = project
-                        .context
-                        .vault
-                        .subst(template)
-                        .map_err(|e| anyhow::anyhow!("daemons.{name}.env.{key}: {e}"))?;
+                    let value = project.context.vault.subst(template).map_err(|e| {
+                        anyhow::anyhow!(messages::app::daemon_env_failed(name, key, e))
+                    })?;
                     Ok((key, value))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
@@ -75,7 +73,11 @@ pub fn print_verbose(project: &project::Project) {
     if enabled.is_empty() {
         return;
     }
-    cli::verbose!("  {} daemons: {}", cli::bullet(), enabled.len());
+    cli::verbose!(
+        "  {} {}",
+        cli::bullet(),
+        messages::app::daemons_summary(enabled.len())
+    );
     for (name, d) in &enabled {
         let cmd = d.command.join(" ");
         let restart = match d.restart {
@@ -88,8 +90,8 @@ pub fn print_verbose(project: &project::Project) {
             d.max_restarts.to_string()
         };
         cli::verbose!(
-            "      {name}: {cmd} (restart={restart}, max={max}, harden={})",
-            d.harden
+            "      {}",
+            messages::app::daemon_details(name, cmd, restart, max, d.harden)
         );
     }
 }
@@ -110,7 +112,7 @@ pub async fn run_shutdown(supervisor: &rpc::Supervisor, names: &[String]) {
     for name in names {
         let pb = mp.add(ProgressBar::new_spinner());
         pb.set_style(style.clone());
-        pb.set_message(format!("daemon {name}: shutting down..."));
+        pb.set_message(messages::app::daemon_shutting_down(name));
         pb.enable_steady_tick(Duration::from_millis(100));
         bars.insert(name.clone(), pb);
     }
@@ -122,7 +124,7 @@ pub async fn run_shutdown(supervisor: &rpc::Supervisor, names: &[String]) {
                 for pb in bars.values() {
                     pb.finish_and_clear();
                 }
-                cli::error!("Killed by user");
+                cli::error!("{}", messages::app::KILLED_BY_USER);
                 return;
             }
         }
@@ -145,10 +147,14 @@ pub async fn run_shutdown(supervisor: &rpc::Supervisor, names: &[String]) {
             };
             pb.finish_and_clear();
             let label = match state {
-                rpc::DaemonState::Killed => "killed",
-                _ => "shut down",
+                rpc::DaemonState::Killed => messages::app::DAEMON_KILLED,
+                _ => messages::app::DAEMON_SHUT_DOWN,
             };
-            let _ = mp.println(format!("{} daemon {name}: {label}", cli::check()));
+            let _ = mp.println(format!(
+                "{} {}",
+                cli::check(),
+                messages::app::daemon_ended(name, label)
+            ));
         }
         if bars.is_empty() {
             break;

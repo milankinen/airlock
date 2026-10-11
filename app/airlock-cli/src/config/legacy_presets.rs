@@ -54,17 +54,16 @@ pub(crate) fn validate_names(origin: &str, names: &[String], known: &[Pack]) -> 
     };
     let is_table_name = known.iter().any(|p| p.metadata().name == *name);
     let hint = if is_table_name {
-        format!(
-            "; newer packs use the [packs] table of a project config file, for example \
-             `[packs] {name} = {{ version = 1 }}`"
-        )
+        crate::messages::config::preset_use_packs_table_hint(name)
     } else {
         String::new()
     };
-    anyhow::bail!(
-        "{origin}: unknown preset `{name}` (known: {}){hint}",
-        released.join(", ")
-    )
+    anyhow::bail!(crate::messages::config::unknown_preset_in_list(
+        origin,
+        name,
+        released.join(", "),
+        hint
+    ))
 }
 
 /// Remove `presets` from a config value and check that it is a list of
@@ -93,18 +92,14 @@ pub(crate) fn take_presets_key(
                 .map(|item| match item {
                     Value::String(name) => Ok(name),
                     other => Err(anyhow::anyhow!(
-                        "{origin}: `presets` list entries must be preset names (strings), \
-                         not {other}"
+                        crate::messages::config::presets_entry_not_string(origin, other)
                     )),
                 })
                 .collect::<anyhow::Result<_>>()?;
             Ok(Some(names))
         }
-        Value::Object(_) => anyhow::bail!(
-            "{origin}: `presets` must be a list of preset names; use a [packs] table in a \
-             project config file for versioned, installable packs"
-        ),
-        other => anyhow::bail!("{origin}: `presets` must be a list of preset names, not {other}"),
+        Value::Object(_) => anyhow::bail!(crate::messages::config::presets_is_table(origin)),
+        other => anyhow::bail!(crate::messages::config::presets_not_list(origin, other)),
     }
 }
 
@@ -154,10 +149,10 @@ fn apply(
         return Ok(base);
     }
     if chain.iter().any(|c| c == name) {
-        anyhow::bail!(
-            "circular preset dependency: {} -> {name}",
-            chain.join(" -> ")
-        );
+        anyhow::bail!(crate::messages::config::circular_preset_dependency(
+            chain.join(" -> "),
+            name
+        ));
     }
     let mut document = document(name)?;
     let nested: Vec<String> = match document.as_object_mut().and_then(|d| d.remove("presets")) {
@@ -183,11 +178,12 @@ fn apply(
 fn document(name: &str) -> anyhow::Result<Value> {
     let file = DOCUMENTS
         .get_file(format!("{name}.toml"))
-        .ok_or_else(|| anyhow::anyhow!("unknown preset: `{name}`"))?;
+        .ok_or_else(|| anyhow::anyhow!(crate::messages::config::unknown_preset(name)))?;
     let text = file
         .contents_utf8()
-        .ok_or_else(|| anyhow::anyhow!("preset `{name}` is not UTF-8"))?;
-    toml::from_str(text).map_err(|e| anyhow::anyhow!("preset `{name}`: {e}"))
+        .ok_or_else(|| anyhow::anyhow!(crate::messages::config::preset_not_utf8(name)))?;
+    toml::from_str(text)
+        .map_err(|e| anyhow::anyhow!(crate::messages::config::preset_parse_failed(name, e)))
 }
 
 #[cfg(test)]

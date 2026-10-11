@@ -5,6 +5,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::messages;
+
 /// A mount with expanded and validated host and guest paths.
 #[derive(Debug)]
 pub struct ResolvedMount {
@@ -103,13 +105,15 @@ pub fn resolve_mounts(
         if !source.exists() {
             match m.missing {
                 MissingAction::Fail => {
-                    anyhow::bail!("mount source does not exist: {}", source.display());
+                    anyhow::bail!(messages::vm::mount_source_missing(source.display()));
                 }
                 MissingAction::Warn => {
                     crate::cli::log!(
-                        "  {} mount skipped (not found): {}",
+                        "  {} {}",
                         crate::cli::bullet(),
-                        crate::cli::dim(&source.display().to_string())
+                        messages::vm::mount_skipped_not_found(crate::cli::dim(
+                            &source.display().to_string()
+                        ))
                     );
                     continue;
                 }
@@ -168,9 +172,8 @@ pub fn resolve_mounts(
 /// if there is no string.
 fn parse_mode(s: Option<&str>, default: u32) -> anyhow::Result<u32> {
     match s {
-        Some(s) => {
-            u32::from_str_radix(s, 8).map_err(|_| anyhow::anyhow!("invalid octal mode: {s:?}"))
-        }
+        Some(s) => u32::from_str_radix(s, 8)
+            .map_err(|_| anyhow::anyhow!(messages::vm::invalid_octal_mode(s))),
         None => Ok(default),
     }
 }
@@ -197,17 +200,16 @@ pub fn check_exposure(mounts: &[ResolvedMount], protected: &[(&str, &Path)]) -> 
             continue;
         };
         let what = if key == "project" {
-            "project directory"
+            messages::vm::MOUNT_KIND_PROJECT
         } else {
-            "mount source"
+            messages::vm::MOUNT_KIND_SOURCE
         };
-        anyhow::bail!(
-            "the {what} {} is or contains the {name} {}. The sandbox could read all \
-             secrets in it.\nUse a directory below it, or set `insecure_mounts = true` \
-             in the `[security]` table of ~/.airlock/settings.toml.",
+        anyhow::bail!(messages::vm::mount_exposes_directory(
+            what,
             m.source.display(),
+            name,
             dir.display()
-        );
+        ));
     }
     Ok(())
 }

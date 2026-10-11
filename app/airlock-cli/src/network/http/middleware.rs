@@ -71,7 +71,7 @@ pub fn compile(
     for (key, template) in env_vars {
         let value = vault
             .subst(template)
-            .with_context(|| format!("resolve middleware env.{key}"))?;
+            .with_context(|| crate::messages::network::resolve_middleware_env(key))?;
         env_table.set(key.as_str(), value)?;
     }
     lua.globals().set("env", env_table)?;
@@ -84,7 +84,11 @@ pub fn compile(
         .load(&wrapped)
         .set_name("middleware")
         .eval()
-        .map_err(|e| anyhow::anyhow!("failed to compile middleware '{script}': {e}"))?;
+        .map_err(|e| {
+            anyhow::anyhow!(crate::messages::network::compile_middleware_failed(
+                script, e
+            ))
+        })?;
 
     Ok(CompiledMiddleware(Rc::new(Inner { lua, func })))
 }

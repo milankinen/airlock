@@ -29,7 +29,7 @@ use crate::start::{Exit, SandboxOptions};
 #[cfg(test)]
 use crate::test_cfg::start::{check_image, prepare_image};
 use crate::util::PinnedDir;
-use crate::{cli, start};
+use crate::{cli, messages, start};
 
 /// Prefix of the build directory of a template. A template name cannot
 /// start with `.`, thus the template list does not show the build, staging
@@ -54,7 +54,7 @@ const OLD_PREFIX: &str = ".old-";
 ///  - `verbose`: Show the install output
 ///
 /// Returns:
-///   The exit for an error, a cancelled wizard or a failed install. A
+///   The exit for an error, an aborted wizard or a failed install. A
 ///   template with the same name is an error without `force`.
 pub async fn create(
     context: &Context,
@@ -97,7 +97,11 @@ pub async fn create(
         context, name, &packs, &config, &options, force,
     ))
     .await?;
-    cli::log!("{} template {name} created", cli::check());
+    cli::log!(
+        "{} {}",
+        cli::check(),
+        messages::templates::template_created(name)
+    );
     Ok(())
 }
 
@@ -175,7 +179,7 @@ async fn build_locked(
     }
 
     let values = &resolved.values;
-    cli::log!("Building template {name}...");
+    cli::log!("{}", messages::templates::building_template(name));
     let prepared = prepare_image(
         &context.data_dir,
         sandbox.path(),
@@ -232,7 +236,7 @@ async fn build_locked(
 
     let generated = config
         .generated_project()
-        .ok_or_else(|| Exit::error(1, "the template has no wizard config"))?;
+        .ok_or_else(|| Exit::error(1, messages::templates::NO_WIZARD_CONFIG))?;
     pin_image(&generated.toml, &values.vm.image, pin.as_deref()).map_err(|e| Exit::error(1, e))
 }
 
@@ -304,7 +308,10 @@ fn keep_files(
     })();
     if let Err(e) = staged {
         let _ = std::fs::remove_dir_all(&staging);
-        return Err(Exit::error(1, format!("save template {name}: {e:#}")));
+        return Err(Exit::error(
+            1,
+            messages::templates::save_template_failed(name, e),
+        ));
     }
     let old = root.join(format!("{OLD_PREFIX}{name}"));
     let _ = std::fs::remove_dir_all(&old);
@@ -318,7 +325,7 @@ fn keep_files(
         return Err(if dir.exists() {
             exists_error(name)
         } else {
-            Exit::error(1, format!("save template {name}: {e}"))
+            Exit::error(1, messages::templates::save_template_failed(name, e))
         });
     }
     if replaced {
@@ -359,20 +366,14 @@ fn check_absent(data_dir: &Path, name: &str) -> Result<(), Exit> {
 
 /// The error for a template that exists.
 fn exists_error(name: &str) -> Exit {
-    Exit::error(
-        1,
-        format!(
-            "Template {name} exists. Re-create it with `airlock templates create --force {name}`, \
-             or use a different name."
-        ),
-    )
+    Exit::error(1, messages::templates::template_exists(name))
 }
 
 /// Convert a failed image preparation to the end of the build.
 fn image_error(e: anyhow::Error) -> Exit {
     match e.downcast_ref::<ImageChangeStop>() {
         Some(ImageChangeStop::Interrupted) => Exit::INTERRUPTED,
-        Some(ImageChangeStop::Cancelled) => Exit::aborted(),
+        Some(ImageChangeStop::Aborted) => Exit::aborted(),
         _ => Exit::Failed(e),
     }
 }

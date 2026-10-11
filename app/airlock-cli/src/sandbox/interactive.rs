@@ -17,7 +17,7 @@ use crate::rpc::browser::Browser;
 use crate::rpc::clipboard;
 use crate::runtime::{DumpSink, HostRuntime, Runtime, Terminal};
 use crate::services::{self, Services};
-use crate::{daemon, masking};
+use crate::{daemon, masking, messages};
 
 /// Run an interactive sandbox session.
 ///
@@ -83,7 +83,7 @@ pub async fn run_interactive(
     let mut vm = match Box::pin(boot(spec)).await {
         Ok(vm) => vm,
         Err(e) if e.is::<Interrupted>() => return Ok(130), // 128 + SIGINT
-        Err(e) => return Err(e.context("boot the sandbox VM")),
+        Err(e) => return Err(e.context(messages::sandbox::BOOT_SANDBOX_VM)),
     };
     services.attach(&vm.guest_network());
 
@@ -111,7 +111,7 @@ pub async fn run_interactive(
     let proc = match vm.spawn(main).await {
         Ok(proc) => proc,
         Err(e) => {
-            let e = e.context("start the main process");
+            let e = e.context(messages::sandbox::START_MAIN_PROCESS);
             return Err(shut_down_after(vm, &services, e).await);
         }
     };
@@ -136,7 +136,10 @@ pub async fn run_interactive(
     services.detach().await;
     if let Some(browser) = &browser {
         for notice in browser.take_notices() {
-            cli::log!("{} {notice}", cli::yellow("browser:"));
+            cli::log!(
+                "{} {notice}",
+                cli::yellow(messages::sandbox::BROWSER_NOTICE_LABEL)
+            );
         }
     }
 

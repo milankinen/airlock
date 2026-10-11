@@ -13,7 +13,7 @@ use std::process::{Child, Command, Stdio};
 use sha2::{Digest, Sha256};
 
 use super::{OciConfig, layer};
-use crate::cache;
+use crate::{cache, messages};
 
 /// Get the digest hex of a blob member, or `None` for metadata. Docker 25+
 /// writes `blobs/sha256/<hex>`. The podman `docker-archive` format writes
@@ -107,12 +107,13 @@ pub fn image_user(engine: &str, image_id: &str) -> anyhow::Result<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .map_err(|e| anyhow::anyhow!("failed to run {engine} image inspect: {e}"))?;
+        .map_err(|e| anyhow::anyhow!(messages::oci::run_inspect_failed(engine, e)))?;
     if !output.status.success() {
-        anyhow::bail!(
-            "{engine} image inspect {image_id} failed: {}",
+        anyhow::bail!(messages::oci::inspect_failed(
+            engine,
+            image_id,
             String::from_utf8_lossy(&output.stderr).trim()
-        );
+        ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
@@ -299,24 +300,21 @@ pub(super) fn save_from_stream<R: Read>(data_dir: &Path, stdout: R) -> anyhow::R
             if !actual.eq_ignore_ascii_case(hex) {
                 drop(file);
                 let _ = std::fs::remove_file(&tmp);
-                anyhow::bail!(
-                    "docker layer digest mismatch: blob named sha256:{hex} \
-                     hashes to sha256:{actual}"
-                );
+                anyhow::bail!(messages::oci::docker_blob_digest_mismatch(hex, actual));
             }
             staged.insert(hex.to_string(), tmp);
         }
 
         let manifest = manifest_json
             .and_then(|m| m.into_iter().next())
-            .ok_or_else(|| anyhow::anyhow!("no manifest.json in docker save output"))?;
+            .ok_or_else(|| anyhow::anyhow!(messages::oci::NO_MANIFEST_IN_SAVE))?;
 
         let config_hex = blob_hex(&manifest.config)
             .unwrap_or(&manifest.config)
             .to_string();
         let config_tmp = staged
             .remove(&config_hex)
-            .ok_or_else(|| anyhow::anyhow!("config blob {config_hex} missing in docker save"))?;
+            .ok_or_else(|| anyhow::anyhow!(messages::oci::config_blob_missing(&config_hex)))?;
         let image_config: OciConfig = serde_json::from_slice(&std::fs::read(&config_tmp)?)?;
         let _ = std::fs::remove_file(&config_tmp);
 
@@ -329,7 +327,7 @@ pub(super) fn save_from_stream<R: Read>(data_dir: &Path, stdout: R) -> anyhow::R
             // The layer digest names a cache entry, so accept only a
             // content-addressed blob name.
             let hex = blob_hex(layer_ref)
-                .ok_or_else(|| anyhow::anyhow!("unsupported layer {layer_ref:?} in docker save"))?
+                .ok_or_else(|| anyhow::anyhow!(messages::oci::unsupported_layer_ref(layer_ref)))?
                 .to_string();
             let digest = format!("sha256:{hex}");
             layer_digests.push(digest.clone());

@@ -19,11 +19,11 @@ use crate::network::reverse_forward::BoundForward;
 use crate::network::{self, Network, NetworkHandle};
 use crate::oci::{self, OciImage};
 use crate::project::Project;
-use crate::rpc;
 use crate::rpc::browser::Browser;
 use crate::rpc::clipboard::ClipboardImpl;
 use crate::rpc::guest_network::GuestNetwork;
 use crate::vm::{self, VmInstance};
+use crate::{messages, rpc};
 
 /// Interval of the host wall clock sync to the guest.
 const CLOCK_SYNC_INTERVAL: Duration = Duration::from_mins(1);
@@ -127,7 +127,7 @@ pub async fn boot(spec: BootSpec<'_>) -> anyhow::Result<Vm> {
     .await?;
 
     if !options.quiet {
-        cli::log!("Booting VM...");
+        cli::log!("{}", messages::sandbox::BOOTING_VM);
     }
     let container_home = oci::effective_container_home(&project, image);
     let (instance, vsock_fd) = vm::start(&project, image, &container_home, env, &options).await?;
@@ -140,7 +140,9 @@ pub async fn boot(spec: BootSpec<'_>) -> anyhow::Result<Vm> {
             Err(e) => {
                 return match stop_vm(instance, tasks).await {
                     Ok(()) => Err(e),
-                    Err(stop) => Err(stop.context(format!("boot failed: {e:#}"))),
+                    Err(stop) => {
+                        Err(stop.context(messages::sandbox::boot_failed(format!("{e:#}"))))
+                    }
                 };
             }
         };
@@ -163,7 +165,7 @@ pub async fn boot(spec: BootSpec<'_>) -> anyhow::Result<Vm> {
         let vm = Vm::new(project, instance, supervisor, network, vec![], tasks);
         return match vm.shutdown().await {
             Ok(_) => Err(e),
-            Err(stop) => Err(stop.context(format!("boot failed: {e:#}"))),
+            Err(stop) => Err(stop.context(messages::sandbox::boot_failed(format!("{e:#}")))),
         };
     }
     info!("vm booted");
@@ -238,7 +240,7 @@ async fn stop_vm(vm: VmInstance, mut tasks: BootTasks) -> anyhow::Result<()> {
     info!("vm shutdown");
     let stopped = vm.shutdown().await;
     tasks.stop_transport().await;
-    stopped.context("VM stop not confirmed")
+    stopped.context(messages::sandbox::VM_STOP_NOT_CONFIRMED)
 }
 
 /// Add the browser shim to `env` (see [`guest_env`]).

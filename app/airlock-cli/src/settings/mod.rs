@@ -17,6 +17,7 @@ use smart_config::{ConfigRepository, ConfigSchema, DescribeConfig, DeserializeCo
 
 use crate::config::de::format_error;
 use crate::config::files::{EXTENSIONS, parse_file};
+use crate::messages;
 use crate::vault::VaultStorageType;
 
 /// All user settings. Add new fields here. The default of each field must
@@ -145,18 +146,18 @@ pub struct MonitorBuffers {
 impl Settings {
     /// Get the airlock directory of the user (`~/.airlock`).
     pub fn dir() -> Result<PathBuf> {
-        let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory missing"))?;
+        let home = dirs::home_dir().ok_or_else(|| anyhow!(messages::settings::HOME_DIR_MISSING))?;
         Ok(home.join(".airlock"))
     }
 
     /// Get the airlock data directory: `data_dir` with `~` expanded, or
     /// `airlock` in the user data directory of the platform.
     pub fn data_dir(&self) -> Result<PathBuf> {
-        let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory missing"))?;
+        let home = dirs::home_dir().ok_or_else(|| anyhow!(messages::settings::HOME_DIR_MISSING))?;
         if let Some(dir) = &self.data_dir {
             let dir = crate::util::expand_tilde(dir, &home);
             if !dir.is_absolute() {
-                bail!("data_dir must be an absolute path: {}", dir.display());
+                bail!(messages::settings::data_dir_not_absolute(dir.display()));
             }
             return Ok(dir);
         }
@@ -190,10 +191,10 @@ impl Settings {
                 continue;
             }
             let content = std::fs::read_to_string(&path)
-                .with_context(|| format!("read settings file {}", path.display()))?;
+                .with_context(|| messages::settings::read_settings_file(path.display()))?;
             let value = parse_file(&path, &content)?;
             return parse_settings(value)
-                .with_context(|| format!("load settings file {}", path.display()));
+                .with_context(|| messages::settings::load_settings_file(path.display()));
         }
         // No file: still parse an empty source with smart-config, so the
         // per-field `default_t` annotations apply. This is important for the
@@ -208,7 +209,7 @@ impl Settings {
 ///   The settings, or a structured parse error for type mismatches.
 fn parse_settings(value: serde_json::Value) -> Result<Settings> {
     let serde_json::Value::Object(map) = value else {
-        bail!("settings must be a table");
+        bail!(messages::settings::SETTINGS_NOT_TABLE);
     };
     let schema = ConfigSchema::new(&Settings::DESCRIPTION, "");
     let source = Json::new("settings", map);
@@ -216,7 +217,7 @@ fn parse_settings(value: serde_json::Value) -> Result<Settings> {
     let parser = repo.single::<Settings>()?;
     parser
         .parse()
-        .map_err(|errors| anyhow!(format_error("invalid settings", errors)))
+        .map_err(|errors| anyhow!(format_error(messages::settings::INVALID_SETTINGS, errors)))
 }
 
 #[cfg(test)]

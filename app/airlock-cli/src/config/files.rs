@@ -107,7 +107,9 @@ pub(super) fn load_first(base: &Path) -> anyhow::Result<Option<(PathBuf, serde_j
             // uses permissive defaults.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
-                return Err(anyhow::anyhow!("read config file {}: {e}", path.display()));
+                return Err(anyhow::anyhow!(
+                    crate::messages::config::read_config_failed(path.display(), e)
+                ));
             }
         };
         let value = parse_file(&path, &content)?;
@@ -135,6 +137,8 @@ pub(crate) fn parse_file(path: &Path, content: &str) -> anyhow::Result<serde_jso
         Some("yaml" | "yml") => {
             serde_yaml::from_str(content).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
         }
-        _ => anyhow::bail!("unsupported config format: {}", path.display()),
+        _ => anyhow::bail!(crate::messages::config::unsupported_config_format(
+            path.display()
+        )),
     }
 }

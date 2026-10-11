@@ -32,7 +32,7 @@ const KILL_DRAIN: Duration = Duration::from_secs(5);
 #[derive(Debug, thiserror::Error)]
 pub enum SetupError {
     /// The user pressed Ctrl+C during the boot.
-    #[error("interrupted")]
+    #[error("{}", crate::messages::cli::PROMPT_INTERRUPTED)]
     Interrupted,
     /// Another error.
     #[error(transparent)]
@@ -59,12 +59,13 @@ impl Ended {
     pub fn reason(&self) -> Option<String> {
         match self {
             Ended::Exited(_) => None,
-            Ended::Interrupted => Some("interrupted".into()),
-            Ended::TimedOut => Some(format!(
-                "the install printed nothing for {} minutes and was stopped",
-                IDLE_TIMEOUT.as_secs() / 60
+            Ended::Interrupted => Some(crate::messages::cli::PROMPT_INTERRUPTED.into()),
+            Ended::TimedOut => Some(crate::messages::packs::install_idle_timeout(
+                IDLE_TIMEOUT.as_secs() / 60,
             )),
-            Ended::ExecFailed(e) => Some(format!("could not start the install: {e:#}")),
+            Ended::ExecFailed(e) => Some(crate::messages::packs::install_start_failed(format!(
+                "{e:#}"
+            ))),
         }
     }
 }
@@ -128,7 +129,10 @@ pub async fn install_loop<E: Exec>(
         progress.begin(name, &installer.label);
         let Some(ended) = exec.run(installer, progress).await else {
             // Nothing ran. The record of the pack stays as it was.
-            progress.end(" not started", false);
+            progress.end(
+                &format!(" {}", crate::messages::packs::INSTALL_NOT_STARTED),
+                false,
+            );
             outcome.stopped = Some(Ended::Interrupted);
             break;
         };
@@ -140,13 +144,22 @@ pub async fn install_loop<E: Exec>(
             }
             Ended::Exited(code) => {
                 state.set(name, PackStatus::Failed, fingerprint);
-                progress.end(&format!(" failed (exit code {code})"), false);
+                progress.end(
+                    &format!(
+                        " {}",
+                        crate::messages::packs::install_failed_exit_code(code)
+                    ),
+                    false,
+                );
                 progress.print_tail();
                 outcome.failed.push((name.to_string(), code));
             }
             other => {
                 state.set(name, PackStatus::Failed, fingerprint);
-                progress.end(" stopped", false);
+                progress.end(
+                    &format!(" {}", crate::messages::packs::INSTALL_STOPPED),
+                    false,
+                );
                 if !matches!(other, Ended::Interrupted) {
                     progress.print_tail();
                 }
@@ -229,7 +242,9 @@ pub async fn install(
             if e.is::<sandbox::Interrupted>() {
                 return Err(SetupError::Interrupted);
             }
-            return Err(SetupError::Failed(e.context("boot the install VM")));
+            return Err(SetupError::Failed(
+                e.context(crate::messages::packs::INSTALL_VM_BOOT),
+            ));
         }
     };
 

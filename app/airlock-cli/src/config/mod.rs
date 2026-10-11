@@ -82,9 +82,7 @@ impl Layer {
         let layer = Self::from_file(file)?;
         anyhow::ensure!(
             layer.value.get("packs").is_none(),
-            "`[packs]` is allowed only in project config files (airlock.toml or the local \
-             project config); remove it from {}",
-            layer.origin
+            crate::messages::config::packs_only_in_project_files(&layer.origin)
         );
         Ok(layer)
     }
@@ -137,9 +135,9 @@ impl LayeredConfig {
     pub fn with_generated_project(mut self, generated: GeneratedConfig) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !self.has_project_config(),
-            "the project has a config file already"
+            crate::messages::config::PROJECT_HAS_CONFIG_ALREADY
         );
-        let origin = format!("setup wizard ({})", generated.path.display());
+        let origin = crate::messages::config::setup_wizard_origin(generated.path.display());
         let value: serde_json::Value =
             toml::from_str(&generated.toml).map_err(|e| anyhow::anyhow!("{origin}: {e}"))?;
         self.project = vec![Layer::new(origin, value)?];
@@ -215,12 +213,16 @@ impl LayeredConfig {
         }
         let configured = pack_entries::configure_packs(entries, packs, &known, &mut problems).await;
         if !problems.is_empty() {
-            anyhow::bail!("invalid configuration\n{}", problems.join("\n"));
+            anyhow::bail!(crate::messages::config::invalid_configuration_problems(
+                problems.join("\n")
+            ));
         }
         // A `config.lua` runs here, on each resolve. The values of the
         // enabled packs must not conflict across all layers.
         let pack_values = pack_configs(data_dir, &configured).map_err(|problems| {
-            anyhow::anyhow!("invalid configuration\n{}", problems.join("\n"))
+            anyhow::anyhow!(crate::messages::config::invalid_configuration_problems(
+                problems.join("\n")
+            ))
         })?;
         let mut values = merge_config(legacy_base, plain_layers, &configured, pack_values)?;
         let configured_policy = values.network.policy;

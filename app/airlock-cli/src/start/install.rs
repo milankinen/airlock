@@ -5,7 +5,6 @@
 //! install again.
 
 use super::{Exit, SandboxOptions};
-use crate::cli;
 use crate::cli::prompt;
 use crate::config::ResolvedConfig;
 use crate::oci::OciImage;
@@ -18,6 +17,7 @@ use crate::project::{self, Project};
 #[cfg(test)]
 use crate::test_cfg::start::install_boot;
 use crate::util::PinnedDir;
+use crate::{cli, messages};
 
 /// The tools that [`install_tools`] installs.
 ///
@@ -122,7 +122,7 @@ pub async fn install_tools(
 
     if to_install.iter().any(|t| !state.is_installed(&t.pack)) {
         let log = setup::log_path(&project.sandbox_dir);
-        eprint!("Full log: {}\r\n", log.display());
+        eprint!("{}\r\n", messages::start::full_log(log.display()));
         return Err(Exit::Code(1));
     }
     if install {
@@ -153,7 +153,7 @@ async fn run_install(
     save: &mut setup::Save<'_>,
     options: &SandboxOptions,
 ) -> Result<(), Exit> {
-    cli::log!("Installing packs...");
+    cli::log!("{}", messages::start::INSTALLING_PACKS);
     let report = match Box::pin(install_boot(
         project,
         image,
@@ -183,16 +183,13 @@ async fn run_install(
             .iter()
             .find(|t| &t.pack == id)
             .map_or(id.as_str(), |t| t.label.as_str());
-        cli::error!("{label} failed (exit code {code})");
+        cli::error!("{}", messages::start::install_failed(label, code));
         if let Some(hint) = compose::exit_hint(*code) {
-            cli::error!("hint: {hint}");
+            cli::error!("{}", messages::start::install_hint(hint));
         }
     }
     if !report.synced {
-        cli::error!(
-            "The install VM did not confirm that its disk was written; the packs \
-             install again on the next start"
-        );
+        cli::error!("{}", messages::start::INSTALL_DISK_UNCONFIRMED);
     }
     Ok(())
 }

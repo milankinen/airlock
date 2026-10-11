@@ -141,9 +141,12 @@ fn merge_pack_value(
                     .rev()
                     .find_map(|len| owners.get(&path[..len]))
                     .map_or(pack, String::as_str);
-                conflicts.push(format!(
-                    "packs {owner} and {pack} both set `{}` ({base} vs {overlay})",
-                    path.join(".")
+                conflicts.push(crate::messages::config::packs_set_same_key(
+                    owner,
+                    pack,
+                    path.join("."),
+                    &base,
+                    &overlay,
                 ));
             }
             base

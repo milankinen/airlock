@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
+use crate::messages;
 use crate::util::PinnedDir;
 
 /// A sync destination, held by an FD of its parent directory that was opened
@@ -36,11 +37,19 @@ impl SyncDest {
     /// Pin the parent directory of `source` and keep its file name.
     fn open(source: &Path) -> io::Result<Self> {
         let parent = source.parent().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "source has no parent dir")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                messages::vm::SYNC_SOURCE_NO_PARENT,
+            )
         })?;
         let basename = source
             .file_name()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "source has no file name"))?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    messages::vm::SYNC_SOURCE_NO_FILE_NAME,
+                )
+            })?
             .to_os_string();
         Ok(Self {
             parent: PinnedDir::pin(parent)?,

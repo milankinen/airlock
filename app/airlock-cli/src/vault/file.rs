@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Context, bail};
 
 use super::{Envelope, Storage, VaultData, atomic_write, read_vault_file};
+use crate::messages;
 
 /// Storage backend that keeps the vault as plaintext JSON in one file.
 ///
@@ -32,23 +33,23 @@ impl Storage for FileStorage {
             return Ok(None);
         };
         match serde_json::from_str::<Envelope>(&raw)
-            .with_context(|| format!("parse vault file {}", self.path.display()))?
+            .with_context(|| messages::vault::parse_vault_file(self.path.display()))?
         {
             Envelope::File(data) => Ok(Some(
-                serde_json::to_string(&data).context("re-serialize vault data")?,
+                serde_json::to_string(&data).context(messages::vault::RESERIALIZE_VAULT_DATA)?,
             )),
-            Envelope::EncryptedFile(_) => bail!(
-                "{} is an encrypted vault, but vault.storage = \"file\" in settings. \
-                 Set vault.storage = \"encrypted-file\" (or delete the file to start fresh).",
+            Envelope::EncryptedFile(_) => bail!(messages::vault::encrypted_vault_but_file_storage(
                 self.path.display()
-            ),
+            )),
         }
     }
 
     fn store(&self, data: &str) -> anyhow::Result<()> {
-        let parsed: VaultData = serde_json::from_str(data).context("parse vault data")?;
+        let parsed: VaultData =
+            serde_json::from_str(data).context(messages::vault::PARSE_VAULT_DATA)?;
         let envelope = Envelope::File(parsed);
-        let json = serde_json::to_string_pretty(&envelope).context("serialize vault envelope")?;
+        let json = serde_json::to_string_pretty(&envelope)
+            .context(messages::vault::SERIALIZE_VAULT_ENVELOPE)?;
         atomic_write(&self.path, json.as_bytes())
     }
 

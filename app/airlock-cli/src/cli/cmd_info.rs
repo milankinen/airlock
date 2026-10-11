@@ -20,7 +20,7 @@ use crate::services::{self, store};
 use crate::util::PinnedDir;
 use crate::vault::VaultStorageType;
 use crate::vm::disk;
-use crate::{cli, config, packs, project, sandboxes};
+use crate::{cli, config, messages, packs, project, sandboxes};
 
 /// CLI arguments for `airlock info`.
 #[derive(Args, Debug)]
@@ -62,7 +62,7 @@ pub(super) async fn run(context: Context, id: Option<&str>, json: bool) -> i32 {
         match resolve_config(&context.data_dir, &project_dir, &local_dir).await {
             Ok(resolved) => Some(resolved),
             Err(e) => {
-                cli::error!("Config error: {e:#}");
+                cli::error!("{}", messages::cli::config_error(format!("{e:#}")));
                 return 2;
             }
         }
@@ -73,8 +73,8 @@ pub(super) async fn run(context: Context, id: Option<&str>, json: bool) -> i32 {
         Some(found) if std::fs::symlink_metadata(&found.dir).is_ok() => found,
         _ => {
             cli::error!(
-                "No sandbox for {} — run `airlock start` first",
-                project_dir.display()
+                "{}",
+                messages::cli::no_sandbox_for_project(project_dir.display())
             );
             return 1;
         }
@@ -99,76 +99,106 @@ pub(super) async fn run(context: Context, id: Option<&str>, json: bool) -> i32 {
     let project = match project::load(values, context, &found) {
         Ok(s) => s,
         Err(e) => {
-            cli::error!("Sandbox details loading failed: {e:#}");
+            cli::error!(
+                "{}",
+                messages::cli::sandbox_details_loading_failed(format!("{e:#}"))
+            );
             return 1;
         }
     };
 
     let status = if project.is_running() {
-        cli::red("running")
+        cli::red(messages::cli::STATUS_RUNNING)
     } else {
-        cli::dim("stopped")
+        cli::dim(messages::cli::STATUS_STOPPED)
     };
 
-    println!("Path:     {}", project.display_cwd());
+    println!("{}", messages::cli::info_path(project.display_cwd()));
     if let Some(id) = &details.id {
-        println!("ID:       {id}");
+        println!("{}", messages::cli::info_id(id));
     }
-    println!("Status:   {status}");
-    println!("Image:    {}", project.config.vm.image);
-    println!("CPUs:     {}", project.config.vm.cpus);
-    println!("Memory:   {}", project.config.vm.memory);
+    println!("{}", messages::cli::info_status(status));
+    println!("{}", messages::cli::info_image(&project.config.vm.image));
+    println!("{}", messages::cli::info_cpus(project.config.vm.cpus));
+    println!("{}", messages::cli::info_memory(project.config.vm.memory));
 
     if let Some(ago) = project.last_run_ago() {
-        println!("Last run: {ago}");
+        println!("{}", messages::cli::info_last_run(ago));
     }
 
-    println!("Sandbox:  {}", project.sandbox_dir.display());
+    println!(
+        "{}",
+        messages::cli::info_sandbox(project.sandbox_dir.display())
+    );
 
     if let Some(disk) = details.disk_text() {
-        println!("Disk:     {disk}");
+        println!("{}", messages::cli::info_disk(disk));
     }
 
     print_packs(&project, &packs);
 
     if !project.config.disk.cache.is_empty() {
-        println!("Disk cache:");
+        println!("{}", messages::cli::INFO_DISK_CACHE);
         for (key, mount) in &project.config.disk.cache {
-            let status = if mount.enabled { "" } else { " (disabled)" };
-            println!("  {key}: {}{status}", mount.paths.join(", "));
-        }
-    }
-
-    if !project.config.mounts.is_empty() {
-        println!("Mounts:");
-        for (key, mount) in &project.config.mounts {
-            let status = if mount.enabled { "" } else { " (disabled)" };
+            let status = if mount.enabled {
+                ""
+            } else {
+                messages::cli::DISABLED_SUFFIX
+            };
             println!(
-                "  {key}: {} \u{2192} {}{status}",
-                mount.source, mount.target
+                "  {}",
+                messages::cli::info_disk_cache_entry(key, mount.paths.join(", "), status)
             );
         }
     }
 
-    println!("Network policy: {}", project.config.network.policy.label());
+    if !project.config.mounts.is_empty() {
+        println!("{}", messages::cli::INFO_MOUNTS);
+        for (key, mount) in &project.config.mounts {
+            let status = if mount.enabled {
+                ""
+            } else {
+                messages::cli::DISABLED_SUFFIX
+            };
+            println!(
+                "  {}",
+                messages::cli::info_mount(key, &mount.source, &mount.target, status)
+            );
+        }
+    }
+
+    println!(
+        "{}",
+        messages::cli::info_network_policy(project.config.network.policy.label())
+    );
 
     if !project.config.network.rules.is_empty() {
-        println!("Network rules:");
+        println!("{}", messages::cli::INFO_NETWORK_RULES);
         for (key, rule) in &project.config.network.rules {
-            let status = if rule.enabled { "" } else { " (disabled)" };
+            let status = if rule.enabled {
+                ""
+            } else {
+                messages::cli::DISABLED_SUFFIX
+            };
             println!(
-                "  {key}: allow {} deny {}{status}",
-                rule.allow.len(),
-                rule.deny.len()
+                "  {}",
+                messages::cli::info_network_rule(key, rule.allow.len(), rule.deny.len(), status)
             );
         }
     }
 
     if !project.config.network.middleware.is_empty() {
-        println!("Network middleware:");
+        println!("{}", messages::cli::INFO_NETWORK_MIDDLEWARE);
         for (key, mw) in &project.config.network.middleware {
-            let status = if mw.enabled { "" } else { " (disabled)" };
-            println!("  {key}: {} targets{status}", mw.target.len());
+            let status = if mw.enabled {
+                ""
+            } else {
+                messages::cli::DISABLED_SUFFIX
+            };
+            println!(
+                "  {}",
+                messages::cli::info_network_middleware(key, mw.target.len(), status)
+            );
         }
     }
 
@@ -184,14 +214,14 @@ async fn print_services(project: &project::Project) {
     if ids.is_empty() {
         return;
     }
-    println!("Services:");
-    println!("  (sign-ins are the user's: all sandboxes share them)");
+    println!("{}", messages::cli::INFO_SERVICES);
+    println!("  {}", messages::cli::SERVICES_SIGN_INS_SHARED);
     let grants = if project.context.vault.storage_type() == VaultStorageType::Disabled {
-        Err(anyhow::anyhow!("the vault is disabled"))
+        Err(anyhow::anyhow!(messages::services::VAULT_DISABLED))
     } else {
         store::list_grants(&project.context.db)
             .await
-            .map_err(|e| e.context("cannot read the token store"))
+            .map_err(|e| e.context(messages::cli::CANNOT_READ_TOKEN_STORE))
     };
     let grants = match grants {
         Ok(grants) => grants,
@@ -209,7 +239,7 @@ async fn print_services(project: &project::Project) {
             .map(grant_line)
             .collect();
         if lines.is_empty() {
-            println!("  {}: not signed in", id.name());
+            println!("  {}", messages::cli::service_not_signed_in(id.name()));
             continue;
         }
         println!("  {}:", id.name());
@@ -223,29 +253,26 @@ async fn print_services(project: &project::Project) {
 /// the reason and tells that the service hosts are denied.
 fn unavailable_line(id: services::ServiceId, reason: &str) -> String {
     let name = id.name();
-    format!(
-        "{name}: unavailable ({reason}); its hosts are denied \
-         (`[network.services] {name} = false` to sign in without airlock)"
-    )
+    messages::cli::service_unavailable(name, reason)
 }
 
 /// Return the line for one stored sign-in: account, scopes and age.
 // The store does not record if the sign-in still works. The agent knows
 // that, because the agent refreshes the sign-in itself.
 fn grant_line(grant: &store::GrantSummary) -> String {
-    let account = grant.account.as_deref().unwrap_or("unknown account");
+    let account = grant
+        .account
+        .as_deref()
+        .unwrap_or(messages::cli::UNKNOWN_ACCOUNT);
     let scopes = match grant.scopes.as_slice() {
-        [] => "no scopes".to_string(),
+        [] => messages::cli::NO_SCOPES.to_string(),
         [one] => one.clone(),
-        many => format!("{} scopes", many.len()),
+        many => messages::cli::scope_count(many.len()),
     };
     let age = std::time::Duration::from_millis(
         u64::try_from(store::now_ms() - grant.created_at).unwrap_or_default(),
     );
-    format!(
-        "{account} ({scopes}), saved {}",
-        timeago::Formatter::new().convert(age)
-    )
+    messages::cli::grant_summary(account, scopes, timeago::Formatter::new().convert(age))
 }
 
 /// Load and resolve the config of a project.
@@ -275,7 +302,7 @@ fn print_packs(project: &project::Project, packs: &[ConfiguredPack]) {
     if packs.is_empty() && removed.is_empty() {
         return;
     }
-    println!("Packs:");
+    println!("{}", messages::cli::INFO_PACKS);
     for pack in packs {
         println!(
             "  {} \u{2014} {}",
@@ -330,9 +357,9 @@ fn pack_line(pack: &ConfiguredPack) -> String {
 /// without a setup script. Otherwise it is the install status.
 fn pack_status(pack: &ConfiguredPack, state: Option<&InstallState>) -> &'static str {
     if pack.metadata().has_setup {
-        install_status(state, &pack.metadata().name)
+        install_status(state, &pack.metadata().name).text()
     } else {
-        "config only"
+        messages::cli::PACK_CONFIG_ONLY
     }
 }
 
@@ -357,7 +384,7 @@ fn read_install_state(project: &project::Project) -> Option<InstallState> {
         Ok(Some(dir)) => dir,
         Ok(None) => return None,
         Err(why) => {
-            println!("  (cannot read the sandbox directory: {why})");
+            println!("  {}", messages::cli::cannot_read_sandbox_dir(why));
             return None;
         }
     };
@@ -371,15 +398,65 @@ fn read_install_state(project: &project::Project) -> Option<InstallState> {
     }
 }
 
-/// Return the install status of the pack `name`.
-fn install_status(state: Option<&InstallState>, name: &str) -> &'static str {
-    match state.and_then(|s| s.packs.get(name)).map(|r| r.status) {
-        Some(PackStatus::Installed | PackStatus::Kept { confirmed: true }) => "installed",
-        Some(PackStatus::Unconfirmed | PackStatus::Kept { confirmed: false }) => {
-            "install not confirmed"
+/// Install status of a pack. The JSON output uses the serialized values.
+/// They are machine output and do not change with the texts.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub(super) enum InstallStatus {
+    #[serde(rename = "installed")]
+    Installed,
+    #[serde(rename = "install not confirmed")]
+    NotConfirmed,
+    #[serde(rename = "install failed")]
+    Failed,
+    #[serde(rename = "pending")]
+    Pending,
+}
+
+impl InstallStatus {
+    /// Return the text of the status for the human output.
+    fn text(self) -> &'static str {
+        match self {
+            Self::Installed => messages::cli::PACK_INSTALLED,
+            Self::NotConfirmed => messages::cli::PACK_INSTALL_NOT_CONFIRMED,
+            Self::Failed => messages::cli::PACK_INSTALL_FAILED,
+            Self::Pending => messages::cli::PACK_PENDING,
         }
-        Some(PackStatus::Failed) => "install failed",
-        None => "pending",
+    }
+}
+
+/// Status of a sandbox. The JSON output uses the serialized values. They are
+/// machine output and do not change with the texts.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum SandboxStatus {
+    Running,
+    Stopped,
+    /// The sandbox has no directory.
+    Missing,
+}
+
+impl SandboxStatus {
+    /// Return the text of the status for the human output.
+    pub(super) fn text(self) -> &'static str {
+        match self {
+            Self::Running => messages::cli::STATUS_RUNNING,
+            Self::Stopped => messages::cli::STATUS_STOPPED,
+            Self::Missing => messages::cli::STATUS_MISSING,
+        }
+    }
+}
+
+/// Return the install status of the pack `name`.
+fn install_status(state: Option<&InstallState>, name: &str) -> InstallStatus {
+    match state.and_then(|s| s.packs.get(name)).map(|r| r.status) {
+        Some(PackStatus::Installed | PackStatus::Kept { confirmed: true }) => {
+            InstallStatus::Installed
+        }
+        Some(PackStatus::Unconfirmed | PackStatus::Kept { confirmed: false }) => {
+            InstallStatus::NotConfirmed
+        }
+        Some(PackStatus::Failed) => InstallStatus::Failed,
+        None => InstallStatus::Pending,
     }
 }
 
@@ -387,8 +464,10 @@ fn install_status(state: Option<&InstallState>, name: &str) -> &'static str {
 /// part of it is on the disk.
 fn removed_status(status: PackStatus) -> Option<&'static str> {
     match status {
-        PackStatus::Installed | PackStatus::Unconfirmed => Some("installed, removed from config"),
-        PackStatus::Kept { .. } => Some("kept, removed from config"),
+        PackStatus::Installed | PackStatus::Unconfirmed => {
+            Some(messages::cli::PACK_INSTALLED_REMOVED)
+        }
+        PackStatus::Kept { .. } => Some(messages::cli::PACK_KEPT_REMOVED),
         PackStatus::Failed => None,
     }
 }
@@ -403,11 +482,11 @@ async fn find(context: &Context, id: Option<&str>) -> anyhow::Result<(PathBuf, O
         return Ok((found.project.clone(), Some(found)));
     }
     let cwd = std::env::current_dir()
-        .map_err(|e| anyhow::anyhow!("Cannot determine current directory: {e}"))?;
+        .map_err(|e| anyhow::anyhow!(messages::cli::cannot_determine_cwd(e)))?;
     let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
     let found = sandboxes::resolve_sandbox(context, &cwd, false, false)
         .await
-        .map_err(|e| e.context("Sandbox lookup failed"))?;
+        .map_err(|e| e.context(messages::cli::SANDBOX_LOOKUP_FAILED_CONTEXT))?;
     Ok((cwd, found))
 }
 
@@ -421,7 +500,7 @@ pub(super) async fn find_by_id(context: &Context, id: &str) -> anyhow::Result<Fo
         None
     };
     let Some(project) = project else {
-        anyhow::bail!("No sandbox {id} (see `airlock sandboxes list`)");
+        anyhow::bail!(messages::cli::no_sandbox_with_id(id));
     };
     Ok(Found {
         location: Location::DataDir { id: id.to_string() },
@@ -443,7 +522,7 @@ pub(super) struct Details {
     /// Sandbox directory.
     dir: PathBuf,
     /// `running`, `stopped` or `missing` (no sandbox directory).
-    pub(super) status: &'static str,
+    pub(super) status: SandboxStatus,
     /// Unix time of the last boot.
     pub(super) last_run: Option<u64>,
     /// Working directory in the guest of the last run.
@@ -453,7 +532,7 @@ pub(super) struct Details {
     /// Size of the disk image in bytes.
     disk_size: Option<u64>,
     /// Install status of each pack with a record.
-    packs: BTreeMap<String, &'static str>,
+    packs: BTreeMap<String, InstallStatus>,
 }
 
 impl Details {
@@ -463,11 +542,11 @@ impl Details {
         use std::os::unix::fs::MetadataExt;
         let dir = &found.dir;
         let status = if std::fs::symlink_metadata(dir).is_err() {
-            "missing"
+            SandboxStatus::Missing
         } else if project::is_running(dir) {
-            "running"
+            SandboxStatus::Running
         } else {
-            "stopped"
+            SandboxStatus::Stopped
         };
         let run = read_run_meta(dir);
         let mut packs = BTreeMap::new();
@@ -501,10 +580,9 @@ impl Details {
 
     /// Format the disk use as `<used> / <size>`.
     fn disk_text(&self) -> Option<String> {
-        Some(format!(
-            "{} / {}",
+        Some(messages::cli::disk_use(
             cli::format_bytes(self.disk_used?),
-            cli::format_bytes(self.disk_size?)
+            cli::format_bytes(self.disk_size?),
         ))
     }
 }
@@ -512,22 +590,28 @@ impl Details {
 /// Print the details of a sandbox whose project directory is gone. There is
 /// no config to show.
 fn print_sandbox_only(details: &Details) {
-    println!("Path:     {} (missing)", details.project.display());
+    println!(
+        "{}",
+        messages::cli::info_path_missing(details.project.display())
+    );
     if let Some(id) = &details.id {
-        println!("ID:       {id}");
+        println!("{}", messages::cli::info_id(id));
     }
-    println!("Status:   {}", details.status);
+    println!("{}", messages::cli::info_status(details.status.text()));
     if let Some(last_run) = details.last_run {
-        println!("Last run: {}", project::time_ago(last_run));
+        println!(
+            "{}",
+            messages::cli::info_last_run(project::time_ago(last_run))
+        );
     }
-    println!("Sandbox:  {}", details.dir.display());
+    println!("{}", messages::cli::info_sandbox(details.dir.display()));
     if let Some(disk) = details.disk_text() {
-        println!("Disk:     {disk}");
+        println!("{}", messages::cli::info_disk(disk));
     }
     if !details.packs.is_empty() {
-        println!("Packs:");
+        println!("{}", messages::cli::INFO_PACKS);
         for (name, status) in &details.packs {
-            println!("  {name} \u{2014} {status}");
+            println!("  {name} \u{2014} {}", status.text());
         }
     }
 }

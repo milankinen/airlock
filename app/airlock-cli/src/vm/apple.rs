@@ -17,6 +17,7 @@ use objc2_virtualization::*;
 use tracing::{debug, error, info};
 
 use super::config::VmConfig;
+use crate::messages;
 
 /// Read and write ends of a Unix pipe.
 struct PipeEnds {
@@ -34,8 +35,8 @@ struct PipeEnds {
 /// that can be reported.
 fn catch_obj<R, F: FnOnce() -> R + UnwindSafe>(f: F) -> std::result::Result<R, String> {
     objc2::exception::catch(f).map_err(|exc| match exc {
-        Some(e) => format!("ObjC exception: {e:?}"),
-        None => "ObjC exception (nil)".to_string(),
+        Some(e) => messages::vm::objc_exception(e),
+        None => messages::vm::OBJC_EXCEPTION_NIL.to_string(),
     })
 }
 
@@ -110,7 +111,7 @@ impl AppleVmBackend {
         catch_obj(AssertUnwindSafe(|| unsafe {
             vm_config
                 .validateWithError()
-                .map_err(|e| anyhow::anyhow!(format!("VM configuration validation failed: {e}")))
+                .map_err(|e| anyhow::anyhow!(messages::vm::vm_config_invalid(e)))
         }))
         .map_err(|e| anyhow::anyhow!(e))??;
         debug!("VM configuration validated");
@@ -176,11 +177,11 @@ impl AppleVmBackend {
             if config.kvm {
                 anyhow::ensure!(
                     objc2::available!(macos = 15.0),
-                    "vm.kvm requires macOS 15 or later"
+                    messages::vm::KVM_NEEDS_MACOS_15
                 );
                 anyhow::ensure!(
                     VZGenericPlatformConfiguration::isNestedVirtualizationSupported(),
-                    "vm.kvm requires nested virtualization support on this Mac (M3 or later)"
+                    messages::vm::KVM_NEEDS_NESTED_VIRT
                 );
                 platform.setNestedVirtualizationEnabled(true);
             }
@@ -275,7 +276,7 @@ impl AppleVmBackend {
                     &url,
                     false,
                 )
-                .map_err(|e| anyhow::anyhow!("cache disk attachment: {e}"))?;
+                .map_err(|e| anyhow::anyhow!(messages::vm::cache_disk_attach_failed(e)))?;
                 let block_config = VZVirtioBlockDeviceConfiguration::initWithAttachment(
                     VZVirtioBlockDeviceConfiguration::alloc(),
                     &attachment.into_super(),
@@ -339,7 +340,7 @@ impl AppleVmBackend {
             let caught = catch_obj(AssertUnwindSafe(move || {
                 let vm_raw = vm_ptr.load(Ordering::Acquire);
                 if vm_raw.is_null() {
-                    deliver_err(&tx_body, "VM dropped before start".into());
+                    deliver_err(&tx_body, messages::vm::VM_DROPPED_BEFORE_START.into());
                     return;
                 }
                 let vm = unsafe { &*vm_raw };
@@ -368,8 +369,8 @@ impl AppleVmBackend {
         });
 
         rx.await
-            .map_err(|_| anyhow::anyhow!("VM start channel closed"))?
-            .map_err(|e| anyhow::anyhow!(format!("VM start failed: {e}")))?;
+            .map_err(|_| anyhow::anyhow!(messages::vm::VM_START_CHANNEL_CLOSED))?
+            .map_err(|e| anyhow::anyhow!(messages::vm::vm_start_failed(e)))?;
 
         info!("VM started");
         Ok(())
@@ -393,7 +394,7 @@ impl AppleVmBackend {
             let caught = catch_obj(AssertUnwindSafe(move || {
                 let vm_raw = vm_ptr.load(Ordering::Acquire);
                 if vm_raw.is_null() {
-                    deliver_err(&tx_body, "VM dropped before stop".into());
+                    deliver_err(&tx_body, messages::vm::VM_DROPPED_BEFORE_STOP.into());
                     return;
                 }
                 let tx_handler = tx_body.clone();
@@ -431,8 +432,8 @@ impl AppleVmBackend {
         });
 
         rx.await
-            .map_err(|_| anyhow::anyhow!("VM stop channel closed"))?
-            .map_err(|e| anyhow::anyhow!(format!("VM stop failed: {e}")))?;
+            .map_err(|_| anyhow::anyhow!(messages::vm::VM_STOP_CHANNEL_CLOSED))?
+            .map_err(|e| anyhow::anyhow!(messages::vm::vm_stop_failed(e)))?;
 
         info!("VM stopped");
         Ok(())
@@ -453,14 +454,14 @@ impl AppleVmBackend {
             let caught = catch_obj(AssertUnwindSafe(move || {
                 let vm_raw = vm_ptr.load(Ordering::Acquire);
                 if vm_raw.is_null() {
-                    deliver_err(&tx_body, "VM dropped".into());
+                    deliver_err(&tx_body, messages::vm::VM_DROPPED.into());
                     return;
                 }
                 unsafe {
                     let vm = &*vm_raw;
                     let devices = vm.socketDevices();
                     let Some(device) = devices.firstObject_unchecked() else {
-                        deliver_err(&tx_body, "no vsock device".into());
+                        deliver_err(&tx_body, messages::vm::NO_VSOCK_DEVICE.into());
                         return;
                     };
                     // Downcast VZSocketDevice to VZVirtioSocketDevice.
@@ -480,7 +481,7 @@ impl AppleVmBackend {
                                     // the connection is closed.
                                     let fd = libc::dup(conn.fileDescriptor());
                                     if fd < 0 {
-                                        Err("failed to dup vsock fd".into())
+                                        Err(messages::vm::VSOCK_DUP_FAILED.into())
                                     } else {
                                         Ok(fd)
                                     }
@@ -488,7 +489,7 @@ impl AppleVmBackend {
                                     let err = &*err_ptr;
                                     Err(format!("{}", err.localizedDescription()))
                                 } else {
-                                    Err("vsock connect returned null".into())
+                                    Err(messages::vm::VSOCK_CONNECT_NULL.into())
                                 }
                             }));
                             let result = caught.unwrap_or_else(Err);
@@ -507,8 +508,8 @@ impl AppleVmBackend {
 
         let fd = rx
             .await
-            .map_err(|_| anyhow::anyhow!("vsock connect channel closed"))?
-            .map_err(|e| anyhow::anyhow!(format!("vsock connect failed: {e}")))?;
+            .map_err(|_| anyhow::anyhow!(messages::vm::VSOCK_CHANNEL_CLOSED))?
+            .map_err(|e| anyhow::anyhow!(messages::vm::vsock_connect_failed(e)))?;
 
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }

@@ -8,15 +8,14 @@
 use std::path::Path;
 
 use super::Exit;
-use crate::cli;
 use crate::cli::prompt::PromptError;
 use crate::cli::prompt::choose::{Choice, Choose};
-use crate::cli::prompt::style::Tone;
 use crate::context::Context;
 use crate::project::{self, SandboxLock};
 use crate::sandboxes::{self, Found, KEEP_IN_PROJECT, Location, MigrateError, registry};
 use crate::settings::SandboxType;
 use crate::util::PinnedDir;
+use crate::{cli, messages};
 
 /// The answer to the move question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +36,7 @@ enum Move {
 ///  - `yes`: `--yes`: move a project sandbox without a question
 ///
 /// Returns:
-///   The held lock, or the exit for an error or a cancelled question.
+///   The held lock, or the exit for an error or an aborted question.
 pub async fn lock_sandbox(
     context: &Context,
     host_cwd: &Path,
@@ -92,7 +91,7 @@ async fn lock_box(context: &Context, host_cwd: &Path, id: &str) -> Result<Sandbo
         let _ = std::fs::remove_dir_all(&dir);
         return Err(Exit::error(
             1,
-            "the sandbox was removed while airlock started it; run `airlock start` again",
+            messages::start::SANDBOX_REMOVED_DURING_START,
         ));
     }
     Ok(lock)
@@ -116,28 +115,29 @@ fn wants_move(context: &Context, found: &Found) -> bool {
 }
 
 /// Ask if the project sandbox `found` moves into the data directory. The
-/// answers are "Yes, migrate" (default), "No, keep current" and "Cancel".
-/// Cancel and Esc end the run.
+/// answers are "Yes, migrate" (default), "No, keep current" and "Abort".
+/// Abort and Esc end the run.
 fn ask_move(found: &Found, can_prompt: bool, yes: bool) -> Result<Move, Exit> {
     if yes {
         return Ok(Move::Yes);
     }
     if !can_prompt {
         cli::log!(
-            "{} the sandbox data is in {}, where the sandbox can see it; run `airlock start` \
-             in a terminal to move it",
+            "{} {}",
             cli::yellow("!"),
-            found.dir.display()
+            messages::start::sandbox_data_visible(found.dir.display())
         );
         return Ok(Move::Later);
     }
-    let choices = ["Yes, migrate", "No, keep current", "Cancel"].map(|label| Choice {
-        label,
-        tone: Tone::Plain,
-    });
+    let choices = [
+        messages::start::MOVE_CHOICE_YES,
+        messages::start::MOVE_CHOICE_NO,
+        messages::cli::ABORT_CHOICE,
+    ]
+    .map(|label| Choice { label });
     let answer = Choose {
-        title: "Migrate sandbox to secure directory?",
-        notes: &["See airlock v2026.10.1 release notes for details"],
+        title: messages::start::MOVE_TITLE,
+        notes: &[messages::start::MOVE_NOTE],
         choices: &choices,
         default: 0,
         report: true,
@@ -146,7 +146,7 @@ fn ask_move(found: &Found, can_prompt: bool, yes: bool) -> Result<Move, Exit> {
     match answer {
         Ok(Some(0)) => Ok(Move::Yes),
         Ok(Some(1)) => Ok(Move::No),
-        // Cancel and Esc end the run.
+        // Abort and Esc end the run.
         Ok(_) => Err(Exit::aborted()),
         Err(PromptError::NotInteractive) => Ok(Move::Later),
         Err(e) => Err(e.into()),
@@ -159,15 +159,15 @@ async fn move_to_data_dir(context: &Context, host_cwd: &Path) -> Result<SandboxL
         Ok(id) => id,
         // The same failure as a lock that a different instance holds.
         Err(MigrateError::Running) => {
-            return Err(anyhow::anyhow!("another airlock instance is using this sandbox").into());
+            return Err(anyhow::anyhow!(messages::project::SANDBOX_IN_USE).into());
         }
         Err(e) => return Err(Exit::error(1, e)),
     };
     let lock = lock_box(context, host_cwd, &id).await?;
     cli::log!(
-        "  {} sandbox moved to {}",
+        "  {} {}",
         cli::check(),
-        lock.dir().display()
+        messages::start::sandbox_moved(lock.dir().display())
     );
     Ok(lock)
 }

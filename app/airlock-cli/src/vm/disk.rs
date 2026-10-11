@@ -7,11 +7,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::cli;
 use crate::cli::prompt::PromptError;
 use crate::cli::prompt::choose::{Choice, Choose};
-use crate::cli::prompt::style::Tone;
 use crate::config::config_values::Disk;
+use crate::{cli, messages};
 
 /// Default disk size (10 GB) for the overlay upper layer and cache dirs.
 const DEFAULT_DISK_BYTES: u64 = 10 * 1024 * 1024 * 1024;
@@ -50,24 +49,26 @@ pub fn ensure(cache_dir: &Path, config: &Disk) -> anyhow::Result<()> {
                 fs::remove_file(&image_path)?;
                 create_sparse(&image_path, bytes)?;
                 cli::log!(
-                    "  {} disk recreated {} (previous data erased)",
+                    "  {} {}",
                     cli::check(),
-                    cli::dim(&format_size(bytes))
+                    messages::vm::disk_recreated(cli::dim(&format_size(bytes)))
                 );
             } else {
                 cli::log!(
-                    "  {} disk kept at {} (configured {} is smaller; data preserved)",
+                    "  {} {}",
                     cli::yellow("!"),
-                    cli::dim(&format_size(current_size)),
-                    cli::dim(&format_size(bytes))
+                    messages::vm::disk_kept(
+                        cli::dim(&format_size(current_size)),
+                        cli::dim(&format_size(bytes))
+                    )
                 );
             }
         } else if current_size < bytes {
             grow_sparse(&image_path, bytes)?;
             cli::log!(
-                "  {} disk grown to {}",
+                "  {} {}",
                 cli::check(),
-                cli::dim(&format_size(bytes))
+                messages::vm::disk_grown(cli::dim(&format_size(bytes)))
             );
         }
         // A disk from before identity files existed.
@@ -77,9 +78,9 @@ pub fn ensure(cache_dir: &Path, config: &Disk) -> anyhow::Result<()> {
     } else {
         create_sparse(&image_path, bytes)?;
         cli::log!(
-            "  {} disk created {}",
+            "  {} {}",
             cli::check(),
-            cli::dim(&format_size(bytes))
+            messages::vm::disk_created(cli::dim(&format_size(bytes)))
         );
     }
     Ok(())
@@ -138,9 +139,9 @@ pub fn prepare(
 /// Format a byte count as whole GB or MB.
 fn format_size(bytes: u64) -> String {
     if bytes >= 1024 * 1024 * 1024 {
-        format!("{} GB", bytes / (1024 * 1024 * 1024))
+        messages::vm::size_gb(bytes / (1024 * 1024 * 1024))
     } else {
-        format!("{} MB", bytes / (1024 * 1024))
+        messages::vm::size_mb(bytes / (1024 * 1024))
     }
 }
 
@@ -156,24 +157,16 @@ fn prompt_shrink_disk(current: u64, target: u64) -> anyhow::Result<bool> {
     if !cli::is_interactive() {
         return Ok(false);
     }
-    let title = format!(
-        "Configured disk size {} is smaller than the current {}",
-        format_size(target),
-        format_size(current),
-    );
-    let erase = format!("erase and recreate at {}", format_size(target));
+    let title = messages::vm::disk_shrink_title(format_size(target), format_size(current));
+    let erase = messages::vm::disk_shrink_erase(format_size(target));
     let question = Choose {
         title: &title,
-        notes: &["Shrinking erases all sandbox data on the disk."],
+        notes: &[messages::vm::DISK_SHRINK_NOTE],
         choices: &[
             Choice {
-                label: "keep the current disk",
-                tone: Tone::Plain,
+                label: messages::vm::DISK_SHRINK_KEEP,
             },
-            Choice {
-                label: &erase,
-                tone: Tone::Danger,
-            },
+            Choice { label: &erase },
         ],
         default: 0,
         report: false,
@@ -226,7 +219,7 @@ pub(crate) fn write_id(dir: &Path) -> anyhow::Result<()> {
     let mut bytes = [0u8; 16];
     rand::rngs::SysRng
         .try_fill_bytes(&mut bytes)
-        .map_err(|e| anyhow::anyhow!("random disk id: {e}"))?;
+        .map_err(|e| anyhow::anyhow!(messages::vm::disk_random_id_failed(e)))?;
     fs::write(
         dir.join(DISK_ID_FILE),
         format!("{:032x}\n", u128::from_be_bytes(bytes)),

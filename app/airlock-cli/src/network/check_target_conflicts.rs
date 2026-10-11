@@ -26,7 +26,7 @@ pub fn check_reverse_forward_conflicts(forwards: &[LabeledReverseForward]) -> an
     for (i, a) in forwards.iter().enumerate() {
         for b in &forwards[i + 1..] {
             if a.host_port == b.host_port {
-                conflicts.push(format!("{} conflicts with {}", a.label, b.label));
+                conflicts.push(crate::messages::network::conflicts_with(&a.label, &b.label));
             }
         }
     }
@@ -35,8 +35,7 @@ pub fn check_reverse_forward_conflicts(forwards: &[LabeledReverseForward]) -> an
         Ok(())
     } else {
         anyhow::bail!(
-            "network config: reverse port forward(s) share a host port:\n  {}",
-            conflicts.join("\n  ")
+            crate::messages::network::reverse_forward_host_port_conflict(conflicts.join("\n  "))
         );
     }
 }
@@ -68,7 +67,9 @@ pub fn check_passthrough_conflicts(
     for pt in passthrough {
         for mw in middleware {
             if targets_overlap(&pt.target, &mw.target) {
-                conflicts.push(format!("{} conflicts with {}", pt.label, mw.label));
+                conflicts.push(crate::messages::network::conflicts_with(
+                    &pt.label, &mw.label,
+                ));
             }
         }
     }
@@ -76,10 +77,9 @@ pub fn check_passthrough_conflicts(
     if conflicts.is_empty() {
         Ok(())
     } else {
-        anyhow::bail!(
-            "network config: passthrough target(s) overlap intercepting (middleware/inject) target(s):\n  {}",
+        anyhow::bail!(crate::messages::network::passthrough_intercept_conflict(
             conflicts.join("\n  ")
-        );
+        ));
     }
 }
 

@@ -21,6 +21,7 @@ use super::{
     NONCE_BYTES, SALT_BYTES, Storage, atomic_write, decode_b64_array, read_vault_file,
 };
 use crate::cli::prompt::fields::{Field, Fields, Invalid};
+use crate::messages;
 
 /// Env var that gives the encrypted-vault passphrase without a prompt
 /// (CI, scripts, and headless shells without a TTY).
@@ -84,12 +85,12 @@ impl EncryptedFileStorage {
     fn derive_key(passphrase: &str, kdf: &KdfInputs) -> anyhow::Result<[u8; ARGON2_KEY_BYTES]> {
         let KdfInputs { salt, m_kib, t, p } = *kdf;
         let params = Params::new(m_kib, t, p, Some(ARGON2_KEY_BYTES))
-            .map_err(|e| anyhow!("invalid argon2 params: {e}"))?;
+            .map_err(|e| anyhow!(messages::vault::invalid_argon2_params(e)))?;
         let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
         let mut out = [0u8; ARGON2_KEY_BYTES];
         argon2
             .hash_password_into(passphrase.as_bytes(), &salt, &mut out)
-            .map_err(|e| anyhow!("argon2id kdf failed: {e}"))?;
+            .map_err(|e| anyhow!(messages::vault::argon2_kdf_failed(e)))?;
         Ok(out)
     }
 }
@@ -108,29 +109,24 @@ impl Storage for EncryptedFileStorage {
             return Ok(None);
         };
         let envelope: Envelope = serde_json::from_str(&raw)
-            .with_context(|| format!("parse vault file {}", self.path.display()))?;
+            .with_context(|| messages::vault::parse_vault_file(self.path.display()))?;
         let blob = match envelope {
             Envelope::EncryptedFile(b) => b,
-            Envelope::File(_) => bail!(
-                "{} is a plaintext vault, but vault.storage = \"encrypted-file\" in settings. \
-                 Set vault.storage = \"file\" (or delete the file to re-create encrypted).",
+            Envelope::File(_) => bail!(messages::vault::plaintext_vault_but_encrypted_storage(
                 self.path.display()
-            ),
+            )),
         };
 
         if blob.kdf.algo != "argon2id" {
-            bail!("unsupported vault KDF algo: {}", blob.kdf.algo);
+            bail!(messages::vault::unsupported_kdf_algo(blob.kdf.algo));
         }
         // Derive the key with the m/t/p values in the file, not with the
         // constants. A later release or another tool can write other values.
         // The limits stop a hostile file from causing a very large allocation.
         if blob.kdf.m > MAX_ARGON2_M_KIB || blob.kdf.t > MAX_ARGON2_T || blob.kdf.p > MAX_ARGON2_P {
-            bail!(
-                "vault KDF parameters out of bounds (m={} t={} p={})",
-                blob.kdf.m,
-                blob.kdf.t,
-                blob.kdf.p
-            );
+            bail!(messages::vault::kdf_params_out_of_bounds(
+                blob.kdf.m, blob.kdf.t, blob.kdf.p
+            ));
         }
         let kdf = KdfInputs {
             salt: decode_b64_array::<SALT_BYTES>(&blob.kdf.salt, "salt")?,
@@ -141,7 +137,7 @@ impl Storage for EncryptedFileStorage {
         let nonce = decode_b64_array::<NONCE_BYTES>(&blob.nonce, "nonce")?;
         let ciphertext = STANDARD_NO_PAD
             .decode(&blob.ciphertext)
-            .context("decode vault ciphertext")?;
+            .context(messages::vault::DECODE_VAULT_CIPHERTEXT)?;
 
         // Use the cached key again if this process already unlocked the
         // vault and the KDF inputs in the file did not change. Thus a read
@@ -156,12 +152,12 @@ impl Storage for EncryptedFileStorage {
         let cipher = ChaCha20Poly1305::new(<&Key>::from(&key));
         let plaintext = cipher
             .decrypt(<&Nonce>::from(&nonce), ciphertext.as_ref())
-            .map_err(|_| anyhow!("decrypt vault: wrong passphrase or corrupt data"))?;
+            .map_err(|_| anyhow!(messages::vault::DECRYPT_VAULT_FAILED))?;
 
         *self.unlocked.lock() = Some(UnlockedKey { key, kdf });
 
         Ok(Some(
-            String::from_utf8(plaintext).context("decrypted vault is not valid UTF-8")?,
+            String::from_utf8(plaintext).context(messages::vault::DECRYPTED_VAULT_NOT_UTF8)?,
         ))
     }
 
@@ -179,7 +175,7 @@ impl Storage for EncryptedFileStorage {
                 let mut salt = [0u8; SALT_BYTES];
                 SysRng
                     .try_fill_bytes(&mut salt)
-                    .context("generate vault salt")?;
+                    .context(messages::vault::GENERATE_VAULT_SALT)?;
                 let kdf = KdfInputs {
                     salt,
                     m_kib: ARGON2_M_KIB,
@@ -201,11 +197,11 @@ impl Storage for EncryptedFileStorage {
         let mut nonce = [0u8; NONCE_BYTES];
         SysRng
             .try_fill_bytes(&mut nonce)
-            .context("generate vault nonce")?;
+            .context(messages::vault::GENERATE_VAULT_NONCE)?;
         let cipher = ChaCha20Poly1305::new(<&Key>::from(&key));
         let ciphertext = cipher
             .encrypt(<&Nonce>::from(&nonce), data.as_bytes())
-            .map_err(|e| anyhow!("encrypt vault: {e}"))?;
+            .map_err(|e| anyhow!(messages::vault::encrypt_vault_failed(e)))?;
 
         let envelope = Envelope::EncryptedFile(EncryptedBlob {
             kdf: KdfParams {
@@ -218,8 +214,8 @@ impl Storage for EncryptedFileStorage {
             nonce: STANDARD_NO_PAD.encode(nonce),
             ciphertext: STANDARD_NO_PAD.encode(&ciphertext),
         });
-        let json =
-            serde_json::to_string_pretty(&envelope).context("serialize encrypted envelope")?;
+        let json = serde_json::to_string_pretty(&envelope)
+            .context(messages::vault::SERIALIZE_ENCRYPTED_ENVELOPE)?;
         atomic_write(&self.path, json.as_bytes())
     }
 
@@ -244,13 +240,13 @@ impl PassphraseSource for InteractivePassphrase {
         if let Ok(p) = std::env::var(PASSPHRASE_ENV) {
             return Ok(p);
         }
-        prompt_once("vault passphrase")
+        prompt_once(messages::vault::PASSPHRASE_UNLOCK_LABEL)
     }
 
     fn create(&self) -> anyhow::Result<String> {
         if let Ok(p) = std::env::var(PASSPHRASE_ENV) {
             if p.is_empty() {
-                bail!("{PASSPHRASE_ENV} is empty");
+                bail!(messages::vault::passphrase_env_empty(PASSPHRASE_ENV));
             }
             return Ok(p);
         }
@@ -264,10 +260,7 @@ impl PassphraseSource for InteractivePassphrase {
 ///  - `label`: Label of the input row
 fn prompt_once(label: &str) -> anyhow::Result<String> {
     if !crate::cli::is_interactive() {
-        bail!(
-            "no TTY available to prompt for the vault passphrase — set {PASSPHRASE_ENV} \
-             or run from an interactive terminal"
-        );
+        bail!(messages::vault::no_tty_for_unlock(PASSPHRASE_ENV));
     }
     let form = Fields {
         title: None,
@@ -275,13 +268,13 @@ fn prompt_once(label: &str) -> anyhow::Result<String> {
             label,
             secret: true,
         }],
-        keys: "enter unlock · esc cancel",
+        keys: messages::vault::UNLOCK_KEYS,
     };
     let texts = form
         .ask(|texts| required(texts, 0))
-        .context("read vault passphrase")?;
+        .context(messages::vault::READ_VAULT_PASSPHRASE)?;
     let Some(mut texts) = texts else {
-        bail!("vault passphrase prompt cancelled");
+        bail!(messages::vault::PASSPHRASE_PROMPT_ABORTED);
     };
     Ok(texts.swap_remove(0))
 }
@@ -290,24 +283,21 @@ fn prompt_once(label: &str) -> anyhow::Result<String> {
 /// input.
 fn prompt_create() -> anyhow::Result<String> {
     if !crate::cli::is_interactive() {
-        bail!(
-            "no TTY available to set a new vault passphrase — set {PASSPHRASE_ENV} \
-             or run from an interactive terminal"
-        );
+        bail!(messages::vault::no_tty_for_create(PASSPHRASE_ENV));
     }
     let form = Fields {
-        title: Some("Set a vault passphrase"),
+        title: Some(messages::vault::NEW_PASSPHRASE_TITLE),
         rows: &[
             Field {
-                label: "new passphrase",
+                label: messages::vault::NEW_PASSPHRASE_LABEL,
                 secret: true,
             },
             Field {
-                label: "confirm",
+                label: messages::vault::CONFIRM_PASSPHRASE_LABEL,
                 secret: true,
             },
         ],
-        keys: "enter next · esc cancel",
+        keys: messages::vault::CREATE_KEYS,
     };
     let check = |texts: &[String]| {
         required(texts, 0)?;
@@ -316,13 +306,15 @@ fn prompt_create() -> anyhow::Result<String> {
         } else {
             Err(Invalid {
                 field: 1,
-                message: "passphrases do not match".to_string(),
+                message: messages::vault::PASSPHRASES_DIFFER.to_string(),
             })
         }
     };
-    let texts = form.ask(check).context("read vault passphrase")?;
+    let texts = form
+        .ask(check)
+        .context(messages::vault::READ_VAULT_PASSPHRASE)?;
     let Some(mut texts) = texts else {
-        bail!("vault passphrase prompt cancelled");
+        bail!(messages::vault::PASSPHRASE_PROMPT_ABORTED);
     };
     Ok(texts.swap_remove(0))
 }
@@ -333,7 +325,7 @@ fn required(texts: &[String], field: usize) -> Result<(), Invalid> {
     if texts[field].is_empty() {
         return Err(Invalid {
             field,
-            message: "vault passphrase must not be empty".to_string(),
+            message: messages::vault::PASSPHRASE_EMPTY.to_string(),
         });
     }
     Ok(())

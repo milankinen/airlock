@@ -11,10 +11,10 @@ use clap::{Args, Subcommand};
 
 use super::cmd_info::{self, Details, find_by_id};
 use super::cmd_rm::{self, RmArgs};
-use crate::cli::prompt::yes_no::YesNo;
+use crate::cli::prompt::choose;
 use crate::context::Context;
 use crate::sandboxes::{self, Found, Location, registry};
-use crate::{cli, oci, project};
+use crate::{cli, messages, oci, project};
 
 /// CLI arguments for `airlock sandboxes`.
 #[derive(Args, Debug)]
@@ -75,7 +75,10 @@ pub async fn main(args: SandboxArgs, context: &Context) -> i32 {
 async fn list(context: &Context) -> anyhow::Result<i32> {
     let entries = registry::list(&context.db).await?;
     if entries.is_empty() {
-        cli::log!("No sandboxes in {}", context.boxes_dir().display());
+        cli::log!(
+            "{}",
+            messages::cli::no_sandboxes_in(context.boxes_dir().display())
+        );
         return Ok(0);
     }
     let mut rows = Vec::new();
@@ -90,21 +93,21 @@ async fn list(context: &Context) -> anyhow::Result<i32> {
         let details = Details::read(&found);
         let mut project = details.project.display().to_string();
         if !details.project.is_dir() {
-            project.push_str(" (missing)");
+            project.push_str(messages::cli::PROJECT_MISSING_SUFFIX);
         }
         rows.push([
             entry.id,
-            details.status.to_string(),
+            details.status.text().to_string(),
             details
                 .last_run
-                .map_or_else(|| "never".to_string(), project::time_ago),
+                .map_or_else(|| messages::cli::NEVER.to_string(), project::time_ago),
             details
                 .disk_used
                 .map_or_else(String::new, cli::format_bytes),
             project,
         ]);
     }
-    let header = ["ID", "STATUS", "LAST RUN", "DISK", "PROJECT"];
+    let header = messages::cli::SANDBOX_LIST_HEADER;
     let widths: Vec<usize> = (0..header.len() - 1)
         .map(|i| {
             rows.iter()
@@ -152,31 +155,31 @@ async fn remove(context: &Context, ids: &[String], force: bool) -> anyhow::Resul
 /// Remove the registered sandbox `id` after a confirmation (unless
 /// `force`).
 /// Returns:
-///   `true` if the sandbox was removed, `false` if the user said no.
+///   `true` if the sandbox was removed, `false` if the user aborted.
 async fn remove_one(context: &Context, id: &str, force: bool) -> anyhow::Result<bool> {
     let found = find_by_id(context, id).await?;
     // Fail before the question. `remove_box` checks again under the lock.
     anyhow::ensure!(
         !project::is_running(&found.dir),
-        "Sandbox {id} is running, stop it first"
+        messages::cli::sandbox_id_running_stop_first(id)
     );
     if !force && !confirm(id, &found.project) {
-        cli::error!("Aborted ({id}).");
+        cli::error!("{}", messages::cli::aborted_id(id));
         return Ok(false);
     }
     sandboxes::remove_box(context, id).await?;
-    cli::log!("Sandbox {id} removed");
+    cli::log!("{}", messages::cli::sandbox_id_removed(id));
     Ok(true)
 }
 
 /// Ask to confirm the removal of the sandbox `id` of `project`.
 /// Returns:
-///   True if confirmed. Esc, no terminal or a failed prompt is "no".
+///   True if confirmed. Abort, Esc, no terminal or a failed prompt is "no".
 fn confirm(id: &str, project: &Path) -> bool {
-    let question = format!("Remove sandbox {id} of {}?", project.display());
-    let question = YesNo {
-        question: &question,
-        default: false,
-    };
-    matches!(question.ask(), Ok(Some(true)))
+    let title = messages::cli::remove_sandbox_id_title(id);
+    let note = messages::cli::project_note(project.display());
+    matches!(
+        choose::confirm(&title, &[&note], messages::cli::REMOVE_SANDBOX_YES),
+        Ok(true)
+    )
 }

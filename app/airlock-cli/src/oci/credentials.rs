@@ -7,6 +7,7 @@
 use oci_client::secrets::RegistryAuth;
 
 use crate::cli::prompt::fields::{Field, Fields, Invalid};
+use crate::messages;
 use crate::vault::{RegistryCreds, Vault};
 
 /// Conversion of stored credentials to `RegistryAuth`. Callers can write
@@ -52,32 +53,32 @@ pub fn save(vault: &Vault, registry_host: &str, creds: &RegistryCreds) -> anyhow
 ///   Esc.
 pub fn prompt(registry_host: &str) -> anyhow::Result<RegistryCreds> {
     if !crate::cli::is_interactive() {
-        anyhow::bail!("registry {registry_host} requires authentication");
+        anyhow::bail!(messages::oci::registry_requires_auth(registry_host));
     }
-    let title = format!("Sign in to {registry_host}");
+    let title = messages::oci::sign_in_title(registry_host);
     let form = Fields {
         title: Some(&title),
         rows: &[
             Field {
-                label: "username",
+                label: messages::oci::USERNAME_LABEL,
                 secret: false,
             },
             Field {
-                label: "password",
+                label: messages::oci::PASSWORD_LABEL,
                 secret: true,
             },
         ],
-        keys: "enter next · esc cancel",
+        keys: messages::vault::CREATE_KEYS,
     };
     let required = |texts: &[String]| match texts.iter().position(String::is_empty) {
         Some(field) => Err(Invalid {
             field,
-            message: format!("{} must not be empty", form.rows[field].label),
+            message: messages::oci::field_must_not_be_empty(form.rows[field].label),
         }),
         None => Ok(()),
     };
     let Some(mut texts) = form.ask(required)? else {
-        anyhow::bail!("sign-in to {registry_host} cancelled");
+        anyhow::bail!(messages::oci::sign_in_aborted(registry_host));
     };
     let password = texts.pop().unwrap_or_default();
     let username = texts.pop().unwrap_or_default();

@@ -15,6 +15,7 @@ pub(crate) mod sandbox_env;
 pub use self::sandbox_env::{EnvError, MaskedSecret, SandboxEnv};
 use crate::config::config_values::{ConfigValues, Disk};
 use crate::context::Context;
+use crate::messages;
 use crate::sandboxes::{Found, PROJECT_SANDBOX};
 use crate::util::PinnedDir;
 use crate::vault::Vault;
@@ -149,7 +150,7 @@ pub fn paths(host_cwd: &Path) -> ProjectPaths {
 ///    [`crate::sandboxes::resolve_sandbox`])
 pub fn load(config: ConfigValues, context: Context, found: &Found) -> anyhow::Result<Project> {
     let home_dir =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!(messages::project::HOME_DIR_UNKNOWN))?;
     let host_cwd = found.project.clone();
     let sandbox_dir = found.dir.clone();
     let (ca_cert, ca_key) = read_ca(&sandbox_dir).unwrap_or_default();
@@ -208,7 +209,7 @@ impl SandboxLock {
     pub fn acquire_box(host_cwd: &Path, boxes_dir: &Path, id: &str) -> anyhow::Result<Self> {
         anyhow::ensure!(
             crate::sandboxes::registry::is_valid_id(id),
-            "not a sandbox id: {id}"
+            messages::sandboxes::not_sandbox_id(id)
         );
         crate::cache::create_private_dir(boxes_dir)?;
         let pinned = PinnedDir::open(boxes_dir, Path::new(id), true)?;
@@ -268,7 +269,7 @@ pub fn open(
     context: Context,
 ) -> anyhow::Result<Project> {
     let home_dir =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!(messages::project::HOME_DIR_UNKNOWN))?;
     let host_cwd = lock.host_cwd.clone();
     let sandbox_dir = lock.sandbox_dir.clone();
     let guest_cwd = sandbox_cwd_override.map_or_else(|| host_cwd.clone(), PathBuf::from);
@@ -334,10 +335,10 @@ pub fn ensure_disk(sandbox_dir: &Path, config: &Disk) -> anyhow::Result<()> {
 pub fn reset_disk(sandbox_dir: &PinnedDir) -> anyhow::Result<()> {
     sandbox_dir
         .remove(disk::DISK_FILE)
-        .map_err(|e| anyhow::anyhow!("remove sandbox disk: {e}"))?;
+        .map_err(|e| anyhow::anyhow!(messages::project::remove_disk_failed(e)))?;
     sandbox_dir
         .remove(disk::DISK_ID_FILE)
-        .map_err(|e| anyhow::anyhow!("remove sandbox disk id: {e}"))?;
+        .map_err(|e| anyhow::anyhow!(messages::project::remove_disk_id_failed(e)))?;
     Ok(())
 }
 
@@ -395,15 +396,10 @@ fn airlock_dir_problem(path: &Path) -> Option<String> {
 /// directory.
 fn airlock_dir_problem_for(path: &Path, is_symlink: bool, owner_uid: u32) -> Option<String> {
     if is_symlink {
-        return Some(format!(
-            "{} is a symbolic link; airlock does not follow it. Run `airlock rm` to remove \
-             just the link (its target is left untouched), or replace it with a real \
-             directory.",
-            path.display()
-        ));
+        return Some(messages::project::airlock_dir_is_symlink(path.display()));
     }
     if owner_uid != unsafe { libc::geteuid() } {
-        return Some(format!("{} is owned by another user", path.display()));
+        return Some(messages::project::airlock_dir_foreign_owner(path.display()));
     }
     None
 }
@@ -561,15 +557,13 @@ fn acquire_lock(sandbox_dir: &PinnedDir) -> anyhow::Result<std::fs::File> {
                 .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
                 .filter(|s| !s.is_empty());
             return match holder {
-                Some(pid) => Err(anyhow::anyhow!(
-                    "another airlock instance (pid {pid}) is using this sandbox"
-                )),
-                None => Err(anyhow::anyhow!(
-                    "another airlock instance is using this sandbox"
-                )),
+                Some(pid) => Err(anyhow::anyhow!(messages::project::sandbox_in_use_by_pid(
+                    pid
+                ))),
+                None => Err(anyhow::anyhow!(messages::project::SANDBOX_IN_USE)),
             };
         }
-        return Err(anyhow::anyhow!("failed to lock sandbox: {err}"));
+        return Err(anyhow::anyhow!(messages::project::lock_failed(err)));
     }
 
     // This process holds the lock. Write its PID for diagnostics. The file
@@ -617,7 +611,7 @@ fn generate_ca(sandbox_dir: &Path) -> anyhow::Result<()> {
 /// Read the CA cert and key PEM strings from `ca.json`.
 fn read_ca(sandbox_dir: &Path) -> anyhow::Result<(String, String)> {
     let json = std::fs::read_to_string(sandbox_dir.join("ca.json"))
-        .map_err(|_| anyhow::anyhow!("CA not found — run `airlock start` first"))?;
+        .map_err(|_| anyhow::anyhow!(messages::project::CA_NOT_FOUND))?;
     let ca: CaData = serde_json::from_str(&json)?;
     Ok((ca.cert, ca.key))
 }

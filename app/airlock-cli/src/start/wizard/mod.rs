@@ -11,7 +11,6 @@ pub mod view;
 use std::path::Path;
 
 use super::Exit;
-use crate::cli;
 use crate::cli::prompt;
 use crate::cli::prompt::Step;
 use crate::cli::prompt::screen::{self, Screen};
@@ -21,6 +20,7 @@ use crate::packs::{ConfiguredPack, PackManager};
 use crate::start::wizard::form::{Form, Mode};
 use crate::templates::Template;
 use crate::vault::Vault;
+use crate::{cli, messages};
 
 /// All answers of the wizard.
 pub struct Answers {
@@ -125,10 +125,11 @@ pub async fn load_or_generate_config(
     }
     if has_sandbox {
         cli::error!(
-            "A sandbox exists in {}, but there is no config. Put the config in airlock.toml or \
-             {} (restore it), or run `airlock rm` to start over.",
-            host_cwd.display(),
-            local_dir.join("airlock.toml").display()
+            "{}",
+            messages::start::sandbox_without_config(
+                host_cwd.display(),
+                local_dir.join("airlock.toml").display()
+            )
         );
         return Err(Exit::Code(2));
     }
@@ -155,7 +156,7 @@ pub async fn load_or_generate_config(
 ///  * The config: `Create airlock.toml` (off at first). On: a shareable
 ///    config (`airlock.toml`). Off: a local config, in the sandbox directory
 ///    or in `.airlock/`.
-///  * The start bar: `start` or `cancel`
+///  * The start bar: `start` or `abort`
 ///
 /// The user files do not select packs, because `[packs]` belongs in the
 /// project files. If the user files set an image, the distro group starts
@@ -182,7 +183,7 @@ pub async fn load_or_generate_config(
 ///   the user image. With a template, the file is the template config with
 ///   the other selected packs and `[clipboard]`. Errors:
 ///    * No terminal: exit code 2
-///    * Esc or `cancel`: exit code 0, or 2 after a failed check (the error
+///    * Esc or `abort`: exit code 0, or 2 after a failed check (the error
 ///      stays valid)
 ///    * Ctrl+C: exit code 130
 pub async fn run_wizard(
@@ -195,8 +196,8 @@ pub async fn run_wizard(
 ) -> Result<GeneratedConfig, Exit> {
     if !prompt::can_prompt() {
         cli::error!(
-            "No airlock config in {}. Run `airlock start` in a terminal, or create airlock.toml.",
-            host_cwd.display()
+            "{}",
+            messages::start::no_config_no_terminal(host_cwd.display())
         );
         return Err(Exit::Code(2));
     }
@@ -215,7 +216,7 @@ pub async fn run_wizard(
 /// Run the setup wizard for a new template (`airlock templates create`).
 ///
 /// The view is the view of [`run_wizard`], but without the config section,
-/// and the start bar has `create` and `cancel`. A new template can start
+/// and the start bar has `create` and `abort`. A new template can start
 /// from a template.
 /// Args:
 ///  - `host_cwd`: Directory of the command, for the config path
@@ -229,7 +230,7 @@ pub async fn run_wizard(
 ///   The config of the new template (local target, see [`run_wizard`]).
 ///   Errors:
 ///    * No terminal: exit code 2
-///    * Esc or `cancel`: exit code 0, or 2 after a failed check
+///    * Esc or `abort`: exit code 0, or 2 after a failed check
 ///    * Ctrl+C: exit code 130
 pub async fn run_template_wizard(
     host_cwd: &Path,
@@ -240,7 +241,7 @@ pub async fn run_template_wizard(
     templates: &[Template],
 ) -> Result<GeneratedConfig, Exit> {
     if !prompt::can_prompt() {
-        cli::error!("`airlock templates create` needs a terminal.");
+        cli::error!("{}", messages::start::TEMPLATE_NEEDS_TERMINAL);
         return Err(Exit::Code(2));
     }
     let input = Input {
@@ -263,7 +264,11 @@ pub async fn run_template_wizard(
 pub fn save_config(generated: &GeneratedConfig, local_dir: &Path) -> Result<(), Exit> {
     generated.save(local_dir).map_err(|e| Exit::error(1, e))?;
     if generated.target == Target::Project {
-        cli::log!("  {} created {}", cli::check(), generated.path.display());
+        cli::log!(
+            "  {} {}",
+            cli::check(),
+            messages::start::config_created(generated.path.display())
+        );
     }
     Ok(())
 }
@@ -272,8 +277,8 @@ pub fn save_config(generated: &GeneratedConfig, local_dir: &Path) -> Result<(), 
 enum End {
     /// A start option, with answers that passed [`check_answers`].
     Done(Answers),
-    /// Esc or `cancel`.
-    Cancelled,
+    /// Esc or `abort`.
+    Aborted,
     /// Ctrl+C or an interrupt signal.
     Interrupted,
 }
@@ -296,13 +301,13 @@ async fn ask_config(input: &Input<'_>) -> Result<GeneratedConfig, Exit> {
     closed?;
     match end {
         End::Done(answers) => Ok(answers.config(input.host_cwd)),
-        End::Cancelled => {
+        End::Aborted => {
             if let Some(e) = form.check_error() {
                 return Err(Exit::config(e));
             }
             match input.mode {
-                Mode::Start => cli::error!("Aborted; no config written."),
-                Mode::Template => cli::error!("Aborted; no template created."),
+                Mode::Start => cli::error!("{}", messages::start::ABORTED_NO_CONFIG),
+                Mode::Template => cli::error!("{}", messages::start::ABORTED_NO_TEMPLATE),
             }
             Err(Exit::Code(0))
         }
@@ -325,7 +330,7 @@ async fn run_view(
         };
         match form.key(key) {
             Step::Stay => {}
-            Step::Cancel => return Ok(End::Cancelled),
+            Step::Abort => return Ok(End::Aborted),
             Step::Interrupt => return Ok(End::Interrupted),
             Step::Done(target) => {
                 let answers = form.answers(target);

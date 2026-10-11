@@ -64,29 +64,29 @@ pub fn require_kvm() {
     match kvm_status() {
         KvmStatus::Available => {}
         KvmStatus::NotFound => {
-            cli::error!("KVM not available (/dev/kvm not found)");
-            cli::error!("ensure KVM is enabled in your kernel/BIOS");
+            cli::error!("{}", messages::vm::KVM_NOT_FOUND);
+            cli::error!("{}", messages::vm::KVM_ENABLE_HINT);
             std::process::exit(1);
         }
         KvmStatus::NoPermission => {
-            cli::error!("no permission to access /dev/kvm");
-            cli::error!("run: sudo usermod -aG kvm $USER  (then re-login)");
+            cli::error!("{}", messages::vm::KVM_NO_PERMISSION);
+            cli::error!("{}", messages::vm::KVM_PERMISSION_HINT);
             std::process::exit(1);
         }
         KvmStatus::Unavailable(err) => {
-            cli::error!("cannot open /dev/kvm: {err}");
+            cli::error!("{}", messages::vm::kvm_open_failed(err));
             std::process::exit(1);
         }
     }
 }
 
 use crate::assets::Assets;
-use crate::cli;
 use crate::cli::LogLevel;
 use crate::oci::OciImage;
 use crate::project::Project;
 use crate::sandbox::boot::BootOptions;
 use crate::vm::config::VmShare;
+use crate::{cli, messages};
 
 /// A running VM instance. When dropped, it kills the VM and stops the file
 /// sync.
@@ -151,10 +151,11 @@ impl VmInstance {
                 }
             }
         }
-        Err(anyhow::anyhow!(
-            "vsock connect to port {port} failed after {MAX_ATTEMPTS} attempts: {}",
+        Err(anyhow::anyhow!(messages::vm::vsock_connect_retries_failed(
+            port,
+            MAX_ATTEMPTS,
             last_err.expect("at least one attempt")
-        ))
+        )))
     }
 }
 
@@ -290,8 +291,8 @@ fn assemble_mounts(
         mount::check_exposure(
             &mounts,
             &[
-                ("home directory", &project.host_home),
-                ("airlock data directory", &project.context.data_dir),
+                (messages::vm::HOME_DIRECTORY, &project.host_home),
+                (messages::vm::DATA_DIRECTORY, &project.context.data_dir),
             ],
         )?;
     }
@@ -365,15 +366,13 @@ fn prepare_shares(
         if let Err(e) = std::fs::hard_link(&m.source, &link_path) {
             if e.kind() == std::io::ErrorKind::CrossesDevices {
                 cli::log!(
-                    "file mount {}: cross-device hard link failed, falling back to copy \
-                     (writes inside the VM will NOT sync back to the host)",
-                    m.source.display()
+                    "{}",
+                    messages::vm::file_mount_cross_device(m.source.display())
                 );
                 std::fs::copy(&m.source, &link_path)?;
             } else {
-                return Err(
-                    anyhow::Error::from(e).context(format!("file mount {}", m.source.display()))
-                );
+                return Err(anyhow::Error::from(e)
+                    .context(messages::vm::file_mount_failed(m.source.display())));
             }
         }
         has_ro_files = has_ro_files || m.read_only;
@@ -410,19 +409,19 @@ fn build_kernel_cmdline(log_level: LogLevel) -> String {
 /// Print the VM resources summary (cpus, memory, disk).
 fn log_config(project: &Project) {
     cli::log!(
-        "  {} cpus:   {}",
+        "  {} {}",
         cli::bullet(),
-        cli::dim(&project.config.vm.cpus.to_string())
+        messages::vm::config_cpus(cli::dim(&project.config.vm.cpus.to_string()))
     );
     cli::log!(
-        "  {} memory: {}",
+        "  {} {}",
         cli::bullet(),
-        cli::dim(&project.config.vm.memory.to_string())
+        messages::vm::config_memory(cli::dim(&project.config.vm.memory.to_string()))
     );
     cli::log!(
-        "  {} disk:   {}",
+        "  {} {}",
         cli::bullet(),
-        cli::dim(&project.config.disk.size.to_string())
+        messages::vm::config_disk(cli::dim(&project.config.disk.size.to_string()))
     );
 }
 
@@ -446,7 +445,7 @@ async fn boot_backend(vm_config: &config::VmConfig) -> anyhow::Result<Box<dyn Vm
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = vm_config;
-        Err(anyhow::anyhow!("unsupported platform"))
+        Err(anyhow::anyhow!(messages::vm::UNSUPPORTED_PLATFORM))
     }
 }
 

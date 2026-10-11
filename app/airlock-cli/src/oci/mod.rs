@@ -24,12 +24,11 @@ use oci_client::secrets::RegistryAuth;
 
 use crate::cli::prompt::PromptError;
 use crate::cli::prompt::choose::{Choice, Choose};
-use crate::cli::prompt::style::Tone;
 use crate::config::config_values::{ImageRef, PullPolicy};
 use crate::oci::credentials::ToRegistryAuth;
 use crate::project::Project;
 use crate::vault::Vault;
-use crate::{cache, cli};
+use crate::{cache, cli, messages};
 
 /// The `PATH` of a container whose image sets none.
 pub const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -92,7 +91,7 @@ pub struct OciImage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnImageChange {
     /// Ask the user to re-create the sandbox, continue with the current one,
-    /// or cancel.
+    /// or abort.
     Ask,
     /// Re-create the sandbox without a question (`--yes`).
     Recreate,
@@ -121,13 +120,13 @@ pub enum ImageChange {
 #[derive(Debug, thiserror::Error)]
 pub enum ImageChangeStop {
     /// There is no terminal for the question, and no `--yes`.
-    #[error("Sandbox image has been changed. Run in a terminal or pass --yes.")]
+    #[error("{}", crate::messages::oci::IMAGE_CHANGED_NEEDS_TERMINAL)]
     NeedsTerminal,
-    /// The user chose Cancel (or pressed Esc).
-    #[error("cancelled by user")]
-    Cancelled,
+    /// The user chose abort (or pressed Esc).
+    #[error("{}", crate::messages::oci::ABORTED_BY_USER)]
+    Aborted,
     /// Ctrl+C during the question or the image download.
-    #[error("interrupted")]
+    #[error("{}", crate::messages::cli::PROMPT_INTERRUPTED)]
     Interrupted,
 }
 
@@ -155,7 +154,7 @@ pub struct PreparedImage {
 ///
 /// Returns:
 ///   The prepared image and what happened to the old image, or error.
-///   Stops with [`ImageChangeStop`] if the user cancels or nobody can answer.
+///   Stops with [`ImageChangeStop`] if the user aborts or nobody can answer.
 pub async fn prepare(
     data_dir: &Path,
     sandbox_dir: &Path,
@@ -276,14 +275,19 @@ pub async fn prepare(
             }
             change = ImageChange::OldImageGone;
             cli::log!(
-                "  {} the old image is not available any more — using the new image",
-                cli::bullet()
+                "  {} {}",
+                cli::bullet(),
+                messages::oci::OLD_IMAGE_UNAVAILABLE
             );
         } else {
             // Remove the image hardlink. This sandbox then no longer marks
             // the old image as in use, so the sweep below can collect it.
             let _ = std::fs::remove_file(&sandbox_image);
-            cli::log!("  {} old environment erased", cli::check());
+            cli::log!(
+                "  {} {}",
+                cli::check(),
+                messages::oci::OLD_ENVIRONMENT_ERASED
+            );
             // GC: remove images that no sandbox uses, and the layers that
             // only those images used.
             gc::sweep(data_dir);
@@ -338,9 +342,9 @@ fn use_cached_image(
     let image_path = crate::cache::image_path(data_dir, &image.image_id)?;
     ensure_image_hardlink(sandbox_image, &image_path, &image)?;
     cli::log!(
-        "  {} image cached {}",
+        "  {} {}",
         cli::check(),
-        cli::dim(&image.image_id[..19.min(image.image_id.len())])
+        messages::oci::image_cached(cli::dim(&image.image_id[..19.min(image.image_id.len())]))
     );
     let overlay_dir = sandbox_dir.join("overlay");
     std::fs::create_dir_all(&overlay_dir)?;
@@ -376,7 +380,7 @@ async fn resolve_with_auth(
             }
             Err(e) if registry::is_auth_error(&e) => {
                 if cli::is_interrupted() {
-                    anyhow::bail!("cancelled by user");
+                    anyhow::bail!(messages::oci::ABORTED_BY_USER);
                 }
                 if auth == RegistryAuth::Anonymous
                     && let Some(creds) = credentials::load(vault, registry_host)
@@ -384,7 +388,7 @@ async fn resolve_with_auth(
                     auth = creds.to_auth();
                     continue;
                 }
-                cli::error!("authentication failed, try again");
+                cli::error!("{}", messages::oci::AUTH_FAILED_RETRY);
                 let creds = credentials::prompt(registry_host)?;
                 updated_creds = Some(creds.clone());
                 auth = creds.to_auth();
@@ -475,12 +479,11 @@ fn ensure_image_hardlink(
     // probable cause is a cross-filesystem config problem. Without the link,
     // GC does not protect the sandbox image.
     std::fs::hard_link(image_path, sandbox_image).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to hardlink image ref {} → {}: {e} \
-             (both paths must live on the same filesystem)",
+        anyhow::anyhow!(messages::oci::hardlink_image_failed(
             image_path.display(),
-            sandbox_image.display()
-        )
+            sandbox_image.display(),
+            e
+        ))
     })?;
     Ok(())
 }
@@ -519,7 +522,7 @@ fn build_oci_image(
     image_config: &OciConfig,
 ) -> anyhow::Result<OciImage> {
     if ordered_layers.is_empty() {
-        anyhow::bail!("image {image_id} has no layers");
+        anyhow::bail!(messages::oci::image_has_no_layers(image_id));
     }
 
     let cfg = image_config.config.as_ref();
@@ -666,7 +669,7 @@ fn resolve_user(data_dir: &Path, layer_keys: &[String], user: &str) -> anyhow::R
         (uid, record.value.map(|(_, gid)| gid))
     } else {
         let (uid, gid) = passwd_record(&|f| f[0] == user_part)?
-            .ok_or_else(|| format!("no user {user_part} found in any layer /etc/passwd"))?;
+            .ok_or_else(|| messages::oci::user_not_found(user_part))?;
         (uid, Some(gid))
     };
 
@@ -692,27 +695,24 @@ fn resolve_group(data_dir: &Path, layer_keys: &[String], group: &str) -> anyhow:
             None
         }
     })?
-    .ok_or_else(|| format!("no group {group} found in any layer /etc/group"))
+    .ok_or_else(|| messages::oci::group_not_found(group))
 }
 
 /// Ask the user what to do with the changed image of an existing sandbox.
-/// Esc and Cancel stop with [`ImageChangeStop::Cancelled`].
+/// Esc and abort stop with [`ImageChangeStop::Aborted`].
 fn ask_image_changed() -> anyhow::Result<ImageChange> {
     let question = Choose {
-        title: "Sandbox image has been changed",
+        title: messages::oci::IMAGE_CHANGED_TITLE,
         notes: &[],
         choices: &[
             Choice {
-                label: "re-create sandbox",
-                tone: Tone::Plain,
+                label: messages::start::RECREATE_SANDBOX,
             },
             Choice {
-                label: "continue with current sandbox",
-                tone: Tone::Plain,
+                label: messages::start::KEEP_SANDBOX,
             },
             Choice {
-                label: "cancel",
-                tone: Tone::Plain,
+                label: messages::cli::ABORT_CHOICE,
             },
         ],
         default: 0,
@@ -726,7 +726,7 @@ fn ask_image_changed() -> anyhow::Result<ImageChange> {
     match choice {
         Some(0) => Ok(ImageChange::Recreate),
         Some(1) => Ok(ImageChange::KeepOld),
-        _ => Err(ImageChangeStop::Cancelled.into()),
+        _ => Err(ImageChangeStop::Aborted.into()),
     }
 }
 
@@ -740,18 +740,16 @@ fn prompt_resolution_failed(err: &anyhow::Error) -> anyhow::Result<bool> {
     if !cli::is_interactive() {
         return Ok(false);
     }
-    let title = format!("Image resolution failed: {err}");
+    let title = messages::oci::resolution_failed_title(err);
     let question = Choose {
         title: &title,
         notes: &[],
         choices: &[
             Choice {
-                label: "cancel",
-                tone: Tone::Plain,
+                label: messages::cli::ABORT_CHOICE,
             },
             Choice {
-                label: "continue with the cached image",
-                tone: Tone::Plain,
+                label: messages::oci::CONTINUE_WITH_CACHED_IMAGE,
             },
         ],
         default: 0,
@@ -830,9 +828,9 @@ fn verify_legacy_user(
         LegacyUser::Verified => {}
         LegacyUser::GidOnly { gid } => {
             cli::log!(
-                "  {} container gid corrected {} → {gid}",
+                "  {} {}",
                 cli::bullet(),
-                stored.gid
+                messages::oci::container_gid_corrected(stored.gid, gid)
             );
             fixed.gid = gid;
         }
@@ -840,16 +838,9 @@ fn verify_legacy_user(
             // After `airlock rm`, the next start finds no sandbox image, and
             // `ensure_image` makes the shared entry again instead of using
             // the legacy one.
-            anyhow::bail!(
-                "This sandbox was created by an airlock version that resolved the \
-                 image's `USER {user}` to uid {}, gid {} instead of uid {uid}, gid {gid}, \
-                 so everything inside it has been running as the wrong user. That bug \
-                 is fixed (https://github.com/milankinen/airlock/pull/12), but the \
-                 sandbox's disk already holds state owned by the wrong user, so the \
-                 sandbox must be re-created: run `airlock rm` and start again.",
-                stored.uid,
-                stored.gid
-            );
+            anyhow::bail!(messages::oci::legacy_uid_mismatch(
+                user, stored.uid, stored.gid, uid, gid
+            ));
         }
     }
     // Write the shared cache entry again. `prepare` links the sandbox copy
@@ -887,13 +878,19 @@ async fn resolve_image(
             // The image is local but not usable. With a single engine there
             // is no other source, so show the reason, not a generic
             // "not found".
-            Err(reason) if local_only => anyhow::bail!("{reason}"),
-            Err(reason) => cli::log!("  {} {reason} — trying next", cli::bullet()),
+            Err(reason) if local_only => anyhow::bail!(reason),
+            Err(reason) => cli::log!(
+                "  {} {}",
+                cli::bullet(),
+                messages::oci::local_image_unusable_trying_next(reason)
+            ),
             Ok(None) => {}
         }
     }
     if local_only {
-        anyhow::bail!("image {image_ref} not found in {}", engines[0]);
+        anyhow::bail!(messages::oci::image_not_found_in_engine(
+            image_ref, engines[0]
+        ));
     }
 
     let reg = registry::resolve(image_ref, auth, image_cfg.insecure).await?;
@@ -903,15 +900,20 @@ async fn resolve_image(
         && reg.digest != want
         && reg.list_digest.as_deref() != Some(want)
     {
-        anyhow::bail!(
-            "registry resolved {image_ref} to digest {}, which does not match the pinned {want}",
-            reg.digest
-        );
+        anyhow::bail!(messages::oci::registry_digest_mismatch(
+            image_ref,
+            &reg.digest,
+            want
+        ));
     }
     cli::log!(
-        "  {} image resolved {}",
+        "  {} {}",
         cli::check(),
-        cli::dim(&format!("{}@{}", reg.reference, &reg.digest[..19]))
+        messages::oci::image_resolved(cli::dim(&format!(
+            "{}@{}",
+            reg.reference,
+            &reg.digest[..19]
+        )))
     );
     Ok(ResolvedImage {
         digest: reg.digest.clone(),
@@ -955,8 +957,8 @@ fn resolve_local(
             .iter()
             .any(|d| d == want)
     {
-        return Err(format!(
-            "{engine} image {query_ref} does not match the pinned digest {want}"
+        return Err(messages::oci::local_image_pin_mismatch(
+            engine, query_ref, want,
         ));
     }
 
@@ -967,13 +969,15 @@ fn resolve_local(
     };
     let image_arch = docker::image_arch(engine, &image_id).unwrap_or_default();
     if !image_arch.is_empty() && image_arch != host_arch {
-        return Err(format!("{engine} image is {image_arch}, need {host_arch}"));
+        return Err(messages::oci::local_image_arch_mismatch(
+            engine, image_arch, host_arch,
+        ));
     }
 
     cli::log!(
-        "  {} image resolved via {engine} {}",
+        "  {} {}",
         cli::check(),
-        cli::dim(&image_id[..19.min(image_id.len())])
+        messages::oci::image_resolved_via(engine, cli::dim(&image_id[..19.min(image_id.len())]))
     );
     Ok(Some(ResolvedImage {
         digest: image_id,
@@ -1076,7 +1080,7 @@ async fn ensure_local_image(
     engine: &'static str,
     image_ref: &str,
 ) -> anyhow::Result<(OciConfig, Vec<String>)> {
-    let sp = cli::spinner(&format!("exporting from {engine}..."));
+    let sp = cli::spinner(&messages::oci::exporting_from(engine));
 
     let image_ref = image_ref.to_string();
     let pipeline = async {
@@ -1088,12 +1092,7 @@ async fn ensure_local_image(
                 layer::ensure_layer_cached(
                     &data_dir,
                     &digest,
-                    |_tmp| {
-                        anyhow::bail!(
-                            "{engine} save stream did not include blob for layer {digest} \
-                             (manifest referenced a layer that was not in the export)"
-                        )
-                    },
+                    |_tmp| anyhow::bail!(messages::oci::save_stream_missing_layer(engine, &digest)),
                     None,
                 )
             })
@@ -1110,12 +1109,16 @@ async fn ensure_local_image(
         res = pipeline => res?,
         () = cli::interrupted() => {
             sp.finish_and_clear();
-            anyhow::bail!("cancelled by user");
+            anyhow::bail!(messages::oci::ABORTED_BY_USER);
         }
     };
 
     sp.finish_and_clear();
-    cli::log!("  {} exported from {engine}", cli::check());
+    cli::log!(
+        "  {} {}",
+        cli::check(),
+        messages::oci::exported_from(engine)
+    );
 
     // Docker save manifests list layers bottom first. Overlayfs needs
     // topmost first.
@@ -1154,10 +1157,9 @@ async fn ensure_registry_image(
         .count();
     if cached_count > 0 {
         cli::log!(
-            "  {} {} of {} layers found from cache",
+            "  {} {}",
             cli::check(),
-            cached_count,
-            layers.len()
+            messages::oci::layers_found_from_cache(cached_count, layers.len())
         );
     }
 
@@ -1184,7 +1186,7 @@ async fn ensure_registry_image(
                 let pb = cli::layer_progress_bar(&mp, layer_desc.size as u64);
                 if !fetch_set.contains(&i) {
                     pb.set_position(layer_desc.size as u64);
-                    pb.set_message("cached");
+                    pb.set_message(messages::oci::PROGRESS_CACHED);
                 }
                 pb
             })
@@ -1215,20 +1217,19 @@ async fn ensure_registry_image(
             res = fetch => { res?; }
             () = cli::interrupted() => {
                 let _ = mp.clear();
-                anyhow::bail!("cancelled by user");
+                anyhow::bail!(messages::oci::ABORTED_BY_USER);
             }
         }
         let _ = mp.clear();
 
         let downloaded_bytes: u64 = to_fetch.iter().map(|i| layers[*i].size as u64).sum();
         cli::log!(
-            "  {} downloaded {}",
+            "  {} {}",
             cli::check(),
-            cli::dim(&format!(
-                "{} layers, {}",
+            messages::oci::downloaded(cli::dim(&messages::oci::downloaded_layers(
                 to_fetch.len(),
                 format_size(downloaded_bytes as i64)
-            ))
+            )))
         );
     }
 
@@ -1305,7 +1306,7 @@ async fn fetch_and_extract_layer(
             |_tmp| {
                 // The async pull above made `.download`, so this fetch
                 // closure does not run. If it runs, fail with an error.
-                anyhow::bail!("unreachable: layer tarball missing after pull")
+                anyhow::bail!(messages::oci::LAYER_TARBALL_MISSING_AFTER_PULL)
             },
             Some(&per_layer),
         )
@@ -1317,11 +1318,11 @@ async fn fetch_and_extract_layer(
 /// Format a byte count for humans (`B`, `KB` or `MB`).
 fn format_size(bytes: i64) -> String {
     if bytes < 1024 {
-        format!("{bytes}B")
+        messages::oci::size_bytes(bytes)
     } else if bytes < 1024 * 1024 {
-        format!("{:.1}KB", bytes as f64 / 1024.0)
+        messages::oci::size_kb(bytes as f64 / 1024.0)
     } else {
-        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+        messages::oci::size_mb(bytes as f64 / (1024.0 * 1024.0))
     }
 }
 
@@ -1363,7 +1364,7 @@ fn lookup_layer_record<T>(
                 } else {
                     tracing::debug!("{rel_path} in layer {key}: {why}, ignoring");
                 }
-                ignored.push(format!("{rel_path} in layer {key}: {why}"));
+                ignored.push(messages::oci::layer_file_refused(rel_path, key, &why));
                 continue;
             }
         };
@@ -1402,7 +1403,7 @@ impl<T> Lookup<T> {
         let msg = if self.ignored.is_empty() {
             not_found()
         } else {
-            format!("{} (ignored: {})", not_found(), self.ignored.join("; "))
+            messages::oci::not_found_with_refused(not_found(), self.ignored.join("; "))
         };
         Err(anyhow::anyhow!(msg))
     }
@@ -1430,7 +1431,7 @@ fn read_layer_file(layer_dir: &Path, rel_path: &str) -> Result<Option<String>, R
     use std::io::Read;
 
     let root = std::fs::canonicalize(layer_dir)
-        .map_err(|e| Refused::suspicious(format!("cannot resolve layer dir: {e}")))?;
+        .map_err(|e| Refused::suspicious(messages::oci::cannot_resolve_layer_dir(e)))?;
 
     // Examine one component at a time. `lstat` does not follow the last
     // component, but it follows symlinks in the parent components. Thus a
@@ -1443,15 +1444,11 @@ fn read_layer_file(layer_dir: &Path, rel_path: &str) -> Result<Option<String>, R
             return Ok(None);
         };
         if meta.file_type().is_symlink() {
-            let target = std::fs::canonicalize(&path).map_err(|e| {
-                Refused::unresolved(format!(
-                    "symlink target cannot be resolved in this layer: {e}"
-                ))
-            })?;
+            let target = std::fs::canonicalize(&path)
+                .map_err(|e| Refused::unresolved(messages::oci::symlink_target_unresolved(e)))?;
             if !target.starts_with(&root) {
-                return Err(Refused::suspicious(format!(
-                    "symlink resolves outside the layer ({})",
-                    target.display()
+                return Err(Refused::suspicious(messages::oci::symlink_outside_layer(
+                    target.display(),
                 )));
             }
         }
@@ -1459,12 +1456,14 @@ fn read_layer_file(layer_dir: &Path, rel_path: &str) -> Result<Option<String>, R
 
     let meta = std::fs::metadata(&path).map_err(|e| Refused::suspicious(e.to_string()))?;
     if !meta.is_file() {
-        return Err(Refused::suspicious("not a regular file".to_string()));
+        return Err(Refused::suspicious(
+            messages::oci::NOT_REGULAR_FILE.to_string(),
+        ));
     }
     if meta.len() > MAX_LAYER_RECORD_FILE {
-        return Err(Refused::suspicious(format!(
-            "{} bytes, larger than the {MAX_LAYER_RECORD_FILE} byte limit",
-            meta.len()
+        return Err(Refused::suspicious(messages::oci::layer_file_too_large(
+            meta.len(),
+            MAX_LAYER_RECORD_FILE,
         )));
     }
     let mut content = String::new();
@@ -1596,7 +1595,7 @@ fn lookup_home_dir(data_dir: &Path, layer_keys: &[String], uid: u32) -> anyhow::
     lookup_layer_record(data_dir, layer_keys, "etc/passwd", |f| {
         (f.len() >= 6 && f[2].parse::<u32>().ok() == Some(uid)).then(|| f[5].to_string())
     })?
-    .ok_or_else(|| format!("no home directory found for uid {uid} in any layer /etc/passwd"))
+    .ok_or_else(|| messages::oci::home_dir_not_found(uid))
 }
 
 #[cfg(test)]

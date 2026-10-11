@@ -14,6 +14,7 @@ use rand::{Rng, SeedableRng};
 use sha2::{Digest, Sha256};
 
 use crate::config::config_values::EnvVar;
+use crate::messages;
 use crate::vault::Vault;
 
 /// Minimum length of a value that a network rule can inject. A shorter
@@ -25,7 +26,7 @@ pub const MIN_INJECT_LEN: usize = 8;
 /// start` can identify it as a configuration error (exit code 2), also when
 /// it comes from deep inside the project setup.
 #[derive(Debug, thiserror::Error)]
-#[error("env.{name}: {reason}")]
+#[error("{}", crate::messages::project::env_error(.name, .reason))]
 pub struct EnvError {
     /// Name of the `[env]` entry.
     pub name: String,
@@ -216,23 +217,19 @@ impl SandboxEnv {
         let Some(secret) = self.masked.get(name) else {
             return Err(EnvError::new(
                 name,
-                "must be defined in [env] with mask = true to be injected",
+                messages::project::ENV_INJECT_NOT_MASKED,
             ));
         };
         if secret.real.len() < MIN_INJECT_LEN {
             return Err(EnvError::new(
                 name,
-                format!("injected value is shorter than {MIN_INJECT_LEN} bytes"),
+                messages::project::env_inject_too_short(MIN_INJECT_LEN),
             ));
         }
         // Without this check, a stray newline from a `.env` loader would
         // pass startup and then break each request with an opaque 502.
         if hyper::header::HeaderValue::from_str(&secret.real).is_err() {
-            return Err(EnvError::new(
-                name,
-                "injected value contains bytes that are not allowed in an HTTP header \
-                 (a newline or control character, perhaps a trailing newline)",
-            ));
+            return Err(EnvError::new(name, messages::project::ENV_INJECT_BAD_BYTES));
         }
         Ok(())
     }

@@ -92,6 +92,14 @@ they explain. Write them for the "why": reasons, invariants, safety,
 ordering, and things that are not obvious. Do not restate the code.
 Keep tags like `SAFETY:` and `TODO`.
 
+## CLI output texts
+
+Put all user-facing CLI texts (messages, prompts, progress, error texts)
+in `app/airlock-cli/src/messages.rs`, one `pub mod` per area. Fixed text
+is a `const`, text with values a `fn -> String`. Marks, indents and colors
+stay at the call site. Exclude tracing logs, panics, tests, clap help,
+sandbox-side texts and machine output (JSON values, config keys).
+
 ## Tests
 
 Run Rust tests with `mise run test`, bats tests with `mise run bats`.

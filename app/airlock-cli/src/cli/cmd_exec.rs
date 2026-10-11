@@ -11,7 +11,7 @@ use futures::AsyncReadExt;
 
 use crate::context::Context;
 use crate::runtime::{self, RawTerminalRuntime};
-use crate::{oci, rpc, sandbox, sandboxes};
+use crate::{messages, oci, rpc, sandbox, sandboxes};
 
 /// CLI arguments for `airlock exec`.
 #[derive(Args, Debug)]
@@ -60,17 +60,14 @@ pub async fn main(args: ExecArgs, context: &Context) -> anyhow::Result<i32> {
     };
     let (cmd, args) = argv.split_first().expect("argv holds the command");
 
-    let host_cwd = std::env::current_dir().map_err(|e| anyhow::anyhow!("get cwd: {e}"))?;
+    let host_cwd = std::env::current_dir()
+        .map_err(|e| anyhow::anyhow!(messages::cli::exec_get_cwd_failed(e)))?;
     // The registry has canonical project paths.
     let lookup_dir = std::fs::canonicalize(&host_cwd).unwrap_or_else(|_| host_cwd.clone());
     let sock_path = find_cli_sock(context, &lookup_dir, follow_git_worktree)
         .await?
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no running sandbox for {} or its parent directories. \
-             is 'airlock start' running in this project?",
-                host_cwd.display()
-            )
+            anyhow::anyhow!(messages::cli::exec_no_running_sandbox(host_cwd.display()))
         })?;
 
     let stream = tokio::net::UnixStream::connect(&sock_path)
@@ -80,12 +77,9 @@ pub async fn main(args: ExecArgs, context: &Context) -> anyhow::Result<i32> {
                 e.kind(),
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
             ) {
-                anyhow::anyhow!(
-                    "stale cli.sock at {} — is 'airlock start' still running?",
-                    sock_path.display()
-                )
+                anyhow::anyhow!(messages::cli::exec_stale_cli_sock(sock_path.display()))
             } else {
-                anyhow::anyhow!("failed to connect to {}: {e}", sock_path.display())
+                anyhow::anyhow!(messages::cli::exec_connect_failed(sock_path.display(), e))
             }
         })?;
 
@@ -167,9 +161,9 @@ pub(super) async fn find_cli_sock(
             // from a worktree link. Tell the user which sandbox it is.
             if !start.starts_with(&found.project) {
                 crate::cli::log!(
-                    "{} attached to the sandbox of {}",
+                    "{} {}",
                     crate::cli::bullet(),
-                    found.project.display()
+                    messages::cli::attached_to_sandbox(found.project.display())
                 );
             }
             return Ok(Some(candidate));
@@ -182,8 +176,7 @@ pub(super) async fn find_cli_sock(
 fn refuse_symlink(path: &std::path::Path, meta: &std::fs::Metadata) -> anyhow::Result<()> {
     anyhow::ensure!(
         !meta.file_type().is_symlink(),
-        "{} is a symlink; remove it and run `airlock start` again",
-        path.display()
+        messages::cli::path_is_symlink(path.display())
     );
     Ok(())
 }

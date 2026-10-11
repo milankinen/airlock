@@ -162,7 +162,10 @@ impl InstallProgress {
             return;
         }
         self.spinner.suspend(|| {
-            cli::error!("Last output of {}:", self.label);
+            cli::error!(
+                "{}",
+                crate::messages::packs::install_last_output(&self.label)
+            );
             for line in tail {
                 eprint!("  {}\r\n", cli::dim(line));
             }

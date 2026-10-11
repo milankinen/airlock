@@ -12,6 +12,7 @@ use std::process::{Child, Command, Stdio};
 use tracing::{debug, error};
 
 use super::config::VmConfig;
+use crate::messages;
 
 /// Linux VM backend that uses cloud-hypervisor and virtiofsd.
 pub struct CloudHypervisorBackend {
@@ -65,9 +66,9 @@ impl CloudHypervisorBackend {
             tie_to_airlock(&mut cmd);
 
             debug!("virtiofsd: {:?}", cmd);
-            let mut child = cmd
-                .spawn()
-                .map_err(|e| anyhow::anyhow!("failed to start virtiofsd for {}: {e}", share.tag))?;
+            let mut child = cmd.spawn().map_err(|e| {
+                anyhow::anyhow!(messages::vm::virtiofsd_start_failed(&share.tag, e))
+            })?;
 
             spawn_stderr_drain(&share.tag, &mut child);
             wait_for_socket(&sock_path, &share.tag)?;
@@ -131,7 +132,7 @@ impl CloudHypervisorBackend {
 
         let ch_child = cmd
             .spawn()
-            .map_err(|e| anyhow::anyhow!("failed to start cloud-hypervisor: {e}"))?;
+            .map_err(|e| anyhow::anyhow!(messages::vm::cloud_hypervisor_start_failed(e)))?;
 
         Ok(Self {
             ch_child: Some(ch_child),
@@ -147,7 +148,10 @@ impl CloudHypervisorBackend {
     ///   The connected socket, or error if the `CONNECT` handshake fails.
     pub fn vsock_connect(&self, port: u32) -> anyhow::Result<OwnedFd> {
         let mut stream = UnixStream::connect(&self.vsock_socket_path).map_err(|e| {
-            anyhow::anyhow!("vsock connect to {}: {e}", self.vsock_socket_path.display())
+            anyhow::anyhow!(messages::vm::vsock_socket_connect_failed(
+                self.vsock_socket_path.display(),
+                e
+            ))
         })?;
 
         // Cloud Hypervisor vsock needs a `CONNECT <port>` handshake.
@@ -158,7 +162,7 @@ impl CloudHypervisorBackend {
         let mut response = String::new();
         reader.read_line(&mut response)?;
         if !response.starts_with("OK") {
-            anyhow::bail!("vsock CONNECT failed: {response}");
+            anyhow::bail!(messages::vm::vsock_handshake_failed(response));
         }
 
         Ok(OwnedFd::from(stream))
@@ -205,7 +209,7 @@ fn kill_and_reap(mut child: Child, name: &str) -> anyhow::Result<()> {
     }
     let status = child
         .wait()
-        .map_err(|e| anyhow::anyhow!("{name} wait: {e}"))?;
+        .map_err(|e| anyhow::anyhow!(messages::vm::child_wait_failed(name, e)))?;
     debug!("{name} exited: {status}");
     Ok(())
 }
@@ -253,7 +257,7 @@ fn wait_for_socket(path: &Path, tag: &str) -> anyhow::Result<()> {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    anyhow::bail!("virtiofsd socket not ready after 5s: {tag}")
+    anyhow::bail!(messages::vm::virtiofsd_socket_timeout(tag))
 }
 
 /// Start a thread that reads the stderr of `child` and logs each line.

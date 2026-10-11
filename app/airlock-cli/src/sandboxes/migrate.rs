@@ -15,24 +15,15 @@ use crate::project::{self, IdleLock};
 #[derive(Debug, thiserror::Error)]
 pub enum MigrateError {
     /// An airlock process uses the sandbox now.
-    #[error("the sandbox is in use by another airlock process")]
+    #[error("{}", crate::messages::sandboxes::SANDBOX_IN_USE)]
     Running,
     /// The project sandbox and the data directory are on different file
     /// systems. A rename cannot move the sandbox.
-    #[error(
-        "cannot move {from} to {to}: they are on different file systems. Set \
-         `sandbox_type = \"project-owned\"` in the `[security]` table of \
-         ~/.airlock/settings.toml to keep the sandbox in the project, or remove it with \
-         `airlock rm`"
-    )]
+    #[error("{}", crate::messages::sandboxes::cross_device(from, to))]
     CrossDevice { from: String, to: String },
     /// `.airlock` holds files that airlock does not know. The move would
     /// remove them.
-    #[error(
-        ".airlock directory contains extra files ({}), can't migrate - remove extra files or \
-         continue using current directory",
-        names.join(", ")
-    )]
+    #[error("{}", crate::messages::sandboxes::extra_files(names))]
     ExtraFiles { names: Vec<String> },
     /// Another failure.
     #[error(transparent)]
@@ -73,11 +64,16 @@ pub async fn migrate(context: &Context, host_cwd: &Path) -> Result<String, Migra
     // below go through them.
     let airlock = host_cwd.join(".airlock");
     if std::fs::symlink_metadata(&airlock).is_ok_and(|m| !m.is_dir()) {
-        return Err(anyhow::anyhow!("{} is not a directory", airlock.display()).into());
+        return Err(anyhow::anyhow!(crate::messages::sandboxes::not_a_directory(
+            airlock.display()
+        ))
+        .into());
     }
     let from = host_cwd.join(PROJECT_SANDBOX);
     if std::fs::symlink_metadata(&from).is_ok_and(|m| !m.is_dir()) {
-        return Err(anyhow::anyhow!("{} is not a directory", from.display()).into());
+        return Err(
+            anyhow::anyhow!(crate::messages::sandboxes::not_a_directory(from.display())).into(),
+        );
     }
     check_known_entries(&airlock)?;
     // Keep the lock of the old sandbox until the rename is done. Thus no
@@ -93,7 +89,9 @@ pub async fn migrate(context: &Context, host_cwd: &Path) -> Result<String, Migra
         return Ok(entry.id.clone());
     }
     if std::fs::symlink_metadata(&from).is_err() {
-        return Err(anyhow::anyhow!("{} does not exist", from.display()).into());
+        return Err(
+            anyhow::anyhow!(crate::messages::sandboxes::does_not_exist(from.display())).into(),
+        );
     }
 
     crate::cache::create_private_dir(&boxes)?;
@@ -111,7 +109,12 @@ pub async fn migrate(context: &Context, host_cwd: &Path) -> Result<String, Migra
                 to: context.data_dir.join(BOXES_DIR).display().to_string(),
             });
         }
-        return Err(anyhow::anyhow!("move {} to {}: {e}", from.display(), to.display()).into());
+        return Err(anyhow::anyhow!(crate::messages::sandboxes::move_failed(
+            from.display(),
+            to.display(),
+            e
+        ))
+        .into());
     }
     drop(held);
     move_local_config(&airlock, &to)?;
@@ -173,17 +176,21 @@ fn check_known_entries(airlock: &Path) -> Result<(), MigrateError> {
 fn move_local_config(airlock: &Path, sandbox_dir: &Path) -> Result<(), MigrateError> {
     for name in local_config_names(airlock) {
         std::fs::rename(airlock.join(&name), sandbox_dir.join(&name)).map_err(|e| {
-            anyhow::anyhow!(
-                "move {} to {}: {e}",
+            anyhow::anyhow!(crate::messages::sandboxes::move_failed(
                 airlock.join(&name).display(),
-                sandbox_dir.display()
-            )
+                sandbox_dir.display(),
+                e
+            ))
         })?;
     }
     // `.airlock` is a real directory (checked by the callers), so the
     // removal does not follow a link.
-    std::fs::remove_dir_all(airlock)
-        .map_err(|e| anyhow::anyhow!("remove {}: {e}", airlock.display()))?;
+    std::fs::remove_dir_all(airlock).map_err(|e| {
+        anyhow::anyhow!(crate::messages::sandboxes::remove_failed(
+            airlock.display(),
+            e
+        ))
+    })?;
     Ok(())
 }
 

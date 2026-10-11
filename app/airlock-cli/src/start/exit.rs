@@ -24,7 +24,7 @@ impl Exit {
 
     /// Report a configuration error (exit code 2).
     pub fn config(e: impl fmt::Display) -> Self {
-        cli::error!("Config error: {e:#}");
+        cli::error!("{}", crate::messages::start::config_error(e));
         Exit::Code(2)
     }
 
@@ -34,13 +34,13 @@ impl Exit {
         Exit::Code(code)
     }
 
-    /// Report that the user cancelled a question. Exit code 0, or 130 after
+    /// Report that the user aborted a question. Exit code 0, or 130 after
     /// Ctrl+C.
     pub fn aborted() -> Self {
         if cli::is_interrupted() {
             return Exit::INTERRUPTED;
         }
-        cli::error!("Aborted.");
+        cli::error!("{}", crate::messages::cli::ABORTED);
         Exit::Code(0)
     }
 

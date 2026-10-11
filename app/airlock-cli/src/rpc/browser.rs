@@ -71,29 +71,29 @@ pub trait BrowserGrant {
 ///   Parsed URL. The opener gets its string form. The error is a message
 ///   for the user. It never contains the query.
 pub fn checked_url(raw: &str) -> Result<Url, String> {
-    let url = Url::parse(raw).map_err(|_| "not a valid URL".to_string())?;
+    let url = Url::parse(raw).map_err(|_| crate::messages::rpc::URL_NOT_VALID.to_string())?;
     if url.scheme() != "https" {
-        return Err(format!("{}: only https pages open", url.scheme()));
+        return Err(crate::messages::rpc::url_only_https(url.scheme()));
     }
     let place = place_of(&url);
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(format!("{place}: the URL carries a user name"));
+        return Err(crate::messages::rpc::url_has_user_name(place));
     }
     if url.port().is_some() {
-        return Err(format!("{place}: the URL names a port"));
+        return Err(crate::messages::rpc::url_has_port(place));
     }
     if url.fragment().is_some() {
-        return Err(format!("{place}: the URL has a fragment"));
+        return Err(crate::messages::rpc::url_has_fragment(place));
     }
     if url.as_str().len() > BROWSER_URL_MAX {
-        return Err(format!("{place}: the URL is too long"));
+        return Err(crate::messages::rpc::url_too_long(place));
     }
     if url
         .as_str()
         .chars()
         .any(|c| c.is_whitespace() || c.is_control() || FORBIDDEN.contains(&c))
     {
-        return Err(format!("{place}: the URL has characters airlock refuses"));
+        return Err(crate::messages::rpc::url_has_forbidden_chars(place));
     }
     Ok(url)
 }
@@ -210,9 +210,7 @@ impl Browser {
     pub fn take_notices(&self) -> Vec<String> {
         let Notices { mut items, dropped } = self.0.notices.take();
         if dropped > 0 {
-            items.push(format!(
-                "{dropped} more requests to open a page were refused"
-            ));
+            items.push(crate::messages::rpc::browser_more_requests_refused(dropped));
         }
         items
     }
@@ -245,10 +243,7 @@ impl Browser {
         })?;
         let page = place_of(&url);
         let Some(opener) = &self.0.opener else {
-            self.notice(format!(
-                "no browser program found on this computer; open the sign-in link \
-                 for {page} yourself"
-            ));
+            self.notice(crate::messages::rpc::browser_no_program(&page));
             return Ok(());
         };
         match opener(url.as_str()) {
@@ -257,7 +252,7 @@ impl Browser {
                 Ok(())
             }
             Err(e) => {
-                let msg = format!("could not start the browser: {e}");
+                let msg = crate::messages::rpc::browser_start_failed(e);
                 self.notice(msg.clone());
                 Err(msg)
             }
@@ -270,7 +265,7 @@ impl Browser {
     ///   URL that a grant allowed, or a refusal message.
     fn admit(&self, raw: &str) -> Result<Url, String> {
         self.count_open()?;
-        let url = checked_url(raw).map_err(|r| format!("refused to open a page: {r}"))?;
+        let url = checked_url(raw).map_err(crate::messages::rpc::browser_refused_to_open)?;
         let mut refusals = vec![];
         for grant in &self.0.grants {
             match grant.allow(&url) {
@@ -283,10 +278,7 @@ impl Browser {
             }
         }
         if refusals.is_empty() {
-            return Err(format!(
-                "refused to open a page: {} is not a sign-in page airlock knows",
-                place_of(&url)
-            ));
+            return Err(crate::messages::rpc::browser_page_not_known(place_of(&url)));
         }
         Err(refusals.join("; "))
     }
@@ -303,7 +295,7 @@ impl Browser {
             recent.pop_front();
         }
         if recent.len() >= max_opens {
-            return Err("the sandbox asked to open too many pages; refused".into());
+            return Err(crate::messages::rpc::BROWSER_TOO_MANY_OPENS.into());
         }
         recent.push_back(now);
         Ok(())

@@ -88,17 +88,12 @@ pub fn load(root: &'static Dir<'static>) -> anyhow::Result<PackManager> {
             continue;
         }
         let DirEntry::Dir(folder) = entry else {
-            bail!("packs/{file_name}: unknown file (a pack is a folder <name>@<version>)");
+            bail!(crate::messages::packs::pack_root_file_unknown(file_name));
         };
         let (name, version) = file_name
             .split_once('@')
             .filter(|(name, version)| is_identifier(name) && is_version(version))
-            .with_context(|| {
-                format!(
-                    "packs/{file_name}: the folder name must be <name>@<version> \
-                     (name: [a-z][a-z0-9-]*, version: a whole number from 1)"
-                )
-            })?;
+            .with_context(|| crate::messages::packs::pack_folder_name_invalid(file_name))?;
         let number = version.parse::<u64>()?;
         let data = load_version(name, version, folder)?;
         by_name.entry(name).or_default().push((number, data));
@@ -112,13 +107,11 @@ pub fn load(root: &'static Dir<'static>) -> anyhow::Result<PackManager> {
             let at = format!("packs/{name}@{}/{PACK_FILE}", data.metadata.version);
             ensure!(
                 data.metadata.label == first.label,
-                "{at}: the label \"{}\" differs from \"{}\" of the other versions",
-                data.metadata.label,
-                first.label
+                crate::messages::packs::pack_label_differs(&at, &data.metadata.label, &first.label)
             );
             ensure!(
                 data.metadata.kind == first.kind,
-                "{at}: the kind differs from the kind of the other versions"
+                crate::messages::packs::pack_kind_differs(&at)
             );
         }
         groups.push(versions.into_iter().map(|(_, data)| data).collect());
@@ -148,7 +141,7 @@ fn load_version(
             continue;
         }
         let DirEntry::File(file) = entry else {
-            bail!("{}: unknown folder", at(file_name));
+            bail!(crate::messages::packs::pack_folder_unknown(at(file_name)));
         };
         files.insert(file_name, file);
     }
@@ -156,13 +149,13 @@ fn load_version(
 
     let pack_file = files
         .get(PACK_FILE)
-        .with_context(|| format!("{}: missing", at(PACK_FILE)))?;
+        .with_context(|| crate::messages::packs::pack_file_missing(at(PACK_FILE)))?;
     used.insert(PACK_FILE);
     let pack_at = at(PACK_FILE);
     let pack: PackFile = toml::from_str(utf8(pack_file)?).with_context(|| pack_at.clone())?;
     ensure!(
         !pack.description.trim().is_empty(),
-        "{pack_at}: `description` is empty"
+        crate::messages::packs::pack_description_empty(&pack_at)
     );
     let args = load_args(&pack_at, pack.args)?;
 
@@ -178,9 +171,10 @@ fn load_version(
         .collect();
     ensure!(
         config_files.len() <= 1,
-        "packs/{}: more than one config file: {}",
-        folder.path().display(),
-        config_files.join(", ")
+        crate::messages::packs::pack_config_files_many(
+            folder.path().display(),
+            config_files.join(", ")
+        )
     );
     let config = match config_files.first() {
         Some(&LUA_CONFIG_FILE) => {
@@ -203,7 +197,7 @@ fn load_version(
     };
 
     if let Some(file_name) = files.keys().find(|file_name| !used.contains(*file_name)) {
-        bail!("{}: unknown file", at(file_name));
+        bail!(crate::messages::packs::pack_file_unknown(at(file_name)));
     }
 
     Ok(PackVersionData {
@@ -233,27 +227,33 @@ fn load_version(
 fn load_args(at: &str, entries: Vec<ArgEntry>) -> anyhow::Result<Vec<PackArg>> {
     let mut args: Vec<PackArg> = Vec::new();
     for entry in entries {
-        let arg_at = format!("{at}: arg `{}`", entry.key);
+        let arg_at = crate::messages::packs::arg_at(at, &entry.key);
         ensure!(
             is_identifier(&entry.key) && !RESERVED_ARG_KEYS.contains(&entry.key.as_str()),
-            "{arg_at}: the key must match [a-z][a-z0-9-]* and not be `version`, `enabled` or \
-             `args`"
+            crate::messages::packs::arg_key_invalid(&arg_at)
         );
         ensure!(
             !args.iter().any(|arg| arg.key == entry.key),
-            "{arg_at}: the key is used twice"
+            crate::messages::packs::arg_key_duplicate(&arg_at)
         );
         let kind = match (entry.r#type, entry.values) {
             (ArgType::Bool, None) if entry.other.is_none() => ArgKind::Bool,
-            (ArgType::Bool, _) => bail!("{arg_at}: `values` and `other` are only for a choice"),
-            (ArgType::Choice, None) => bail!("{arg_at}: a choice needs `values`"),
+            (ArgType::Bool, _) => {
+                bail!(crate::messages::packs::arg_values_only_for_choice(&arg_at))
+            }
+            (ArgType::Choice, None) => {
+                bail!(crate::messages::packs::arg_choice_needs_values(&arg_at))
+            }
             (ArgType::Choice, Some(values)) => {
-                ensure!(!values.is_empty(), "{arg_at}: `values` is empty");
+                ensure!(
+                    !values.is_empty(),
+                    crate::messages::packs::arg_values_empty(&arg_at)
+                );
                 let mut seen = HashSet::new();
                 for value in &values {
                     ensure!(
                         seen.insert(value.as_str()),
-                        "{arg_at}: the value `{value}` is in `values` twice"
+                        crate::messages::packs::arg_value_duplicate(&arg_at, value)
                     );
                 }
                 ArgKind::Choice {
@@ -264,7 +264,7 @@ fn load_args(at: &str, entries: Vec<ArgEntry>) -> anyhow::Result<Vec<PackArg>> {
         };
         let default = kind
             .parse(&entry.default)
-            .map_err(|e| anyhow!("{arg_at}: default {e}"))?;
+            .map_err(|e| anyhow!(crate::messages::packs::arg_default_invalid(&arg_at, e)))?;
         args.push(PackArg {
             key: entry.key,
             description: entry.description,
@@ -282,13 +282,11 @@ fn document(file: &'static File<'static>) -> anyhow::Result<Value> {
     let value = parse_file(&path, utf8(file)?)?;
     ensure!(
         value.is_object(),
-        "{}: a pack config must be a table",
-        path.display()
+        crate::messages::packs::pack_config_file_not_table(path.display())
     );
     ensure!(
         value.get("packs").is_none() && value.get("presets").is_none(),
-        "{}: a pack config cannot set `packs` or `presets`",
-        path.display()
+        crate::messages::packs::pack_config_file_reserved_keys(path.display())
     );
     Ok(value)
 }
@@ -297,13 +295,13 @@ fn document(file: &'static File<'static>) -> anyhow::Result<Value> {
 fn file_name(path: &'static Path) -> anyhow::Result<&'static str> {
     path.file_name()
         .and_then(|name| name.to_str())
-        .with_context(|| format!("packs/{}: the name is not UTF-8", path.display()))
+        .with_context(|| crate::messages::packs::pack_file_name_not_utf8(path.display()))
 }
 
 /// The contents of `file` as UTF-8.
 fn utf8(file: &'static File<'static>) -> anyhow::Result<&'static str> {
     file.contents_utf8()
-        .with_context(|| format!("packs/{}: not UTF-8", file.path().display()))
+        .with_context(|| crate::messages::packs::pack_file_not_utf8(file.path().display()))
 }
 
 /// Check if the file is hidden or an editor backup (`.DS_Store`,

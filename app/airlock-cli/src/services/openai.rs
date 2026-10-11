@@ -122,7 +122,7 @@ fn is_openai_jwt(v: &str) -> bool {
 
 /// Make a fake JWT surrogate for the real JWT `real`.
 fn mint_fake_jwt(real: &str) -> anyhow::Result<String> {
-    tokens::fake_jwt(real)?.ok_or_else(|| anyhow::anyhow!("the token is no JWT"))
+    tokens::fake_jwt(real)?.ok_or_else(|| anyhow::anyhow!(crate::messages::services::TOKEN_NOT_JWT))
 }
 
 /// The hosts of the service.

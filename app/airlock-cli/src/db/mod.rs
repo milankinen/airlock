@@ -9,6 +9,8 @@ use std::path::Path;
 use anyhow::{Context as _, bail};
 use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn, WithoutTls};
 
+use crate::messages;
+
 /// Directory of the database in the airlock data directory.
 pub const DIR: &str = "db";
 
@@ -60,7 +62,7 @@ impl Db {
             let mut txn = db.0.write_txn()?;
             let database =
                 db.0.create_database(&mut txn, Some(&name))
-                    .with_context(|| format!("create the database {name}"))?;
+                    .with_context(|| messages::db::create_database(name))?;
             txn.commit()?;
             Ok(database)
         })
@@ -101,7 +103,7 @@ impl Db {
     ) -> anyhow::Result<T> {
         let db = self.clone();
         blocking(move || {
-            let txn = db.0.read_txn().context("begin a database transaction")?;
+            let txn = db.0.read_txn().context(messages::db::BEGIN_TRANSACTION)?;
             body(&txn)
         })
         .await
@@ -117,9 +119,9 @@ impl Db {
     ) -> anyhow::Result<T> {
         let db = self.clone();
         blocking(move || {
-            let mut txn = db.0.write_txn().context("begin a database transaction")?;
+            let mut txn = db.0.write_txn().context(messages::db::BEGIN_TRANSACTION)?;
             let value = body(&mut txn)?;
-            txn.commit().context("commit a database transaction")?;
+            txn.commit().context(messages::db::COMMIT_TRANSACTION)?;
             Ok(value)
         })
         .await
@@ -154,7 +156,7 @@ async fn blocking<T: Send + 'static>(
 ) -> anyhow::Result<T> {
     tokio::task::spawn_blocking(op)
         .await
-        .context("database task")?
+        .context(messages::db::DATABASE_TASK)?
 }
 
 /// Open the environment in `dir`. Creates the directory (mode 0700, LMDB
@@ -169,12 +171,12 @@ fn open_env(dir: &Path) -> anyhow::Result<Env<WithoutTls>> {
     // context, and `heed` refuses a second open of the same path). The
     // directory is private to the user and is in the data directory, not on
     // a network file system.
-    let env = unsafe { options.open(dir) }
-        .with_context(|| format!("open the database {}", dir.display()))?;
+    let env =
+        unsafe { options.open(dir) }.with_context(|| messages::db::open_database(dir.display()))?;
     // Reader slots of processes that died during a read keep old pages
     // in use. Clear them.
     env.clear_stale_readers()
-        .context("clear stale database readers")?;
+        .context(messages::db::CLEAR_STALE_READERS)?;
     Ok(env)
 }
 
@@ -187,14 +189,14 @@ fn prepare_dir(dir: &Path) -> anyhow::Result<()> {
         .recursive(true)
         .mode(0o700)
         .create(dir)
-        .with_context(|| format!("create {}", dir.display()))?;
+        .with_context(|| messages::db::create_dir(dir.display()))?;
     let meta = std::fs::symlink_metadata(dir)?;
     if !meta.is_dir() {
-        bail!("{} is not a directory", dir.display());
+        bail!(messages::db::not_a_directory(dir.display()));
     }
     if meta.permissions().mode() & 0o077 != 0 {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("restrict {} to its owner", dir.display()))?;
+            .with_context(|| messages::db::restrict_dir_to_owner(dir.display()))?;
     }
     Ok(())
 }

@@ -49,7 +49,8 @@ impl Version {
     /// Returns:
     ///   The version, or error if the tag is not `vYYYY.M.N`.
     pub fn parse(tag: &str) -> anyhow::Result<Self> {
-        let invalid = || anyhow::anyhow!("invalid release version '{tag}'");
+        let invalid =
+            || anyhow::anyhow!(crate::messages::self_update::invalid_release_version(tag));
         let nums = tag.strip_prefix('v').ok_or_else(invalid)?;
         let parsed: Vec<u64> = nums
             .split('.')
@@ -84,7 +85,7 @@ pub fn http_client(current: &Version) -> anyhow::Result<reqwest::Client> {
         .connect_timeout(std::time::Duration::from_secs(30))
         .read_timeout(std::time::Duration::from_mins(1))
         .build()
-        .context("failed to create HTTP client")
+        .context(crate::messages::self_update::HTTP_CLIENT_FAILED)
 }
 
 /// Get the version of the latest release.
@@ -100,13 +101,13 @@ pub async fn latest_version(
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
-        .context("failed to get the latest release")?;
+        .context(crate::messages::self_update::LATEST_RELEASE_FAILED)?;
     let url = response.url();
     let tag = url
         .path_segments()
         .and_then(|mut segments| segments.next_back())
         .filter(|_| url.path().contains("/releases/tag/"))
-        .with_context(|| format!("unexpected latest release location {url}"))?;
+        .with_context(|| crate::messages::self_update::unexpected_latest_location(url))?;
     Version::parse(tag)
 }
 
@@ -117,11 +118,11 @@ pub fn archive_name(version: &Version) -> anyhow::Result<String> {
     let os = match std::env::consts::OS {
         "macos" => "darwin",
         "linux" => "linux",
-        other => bail!("no airlock releases for {other}"),
+        other => bail!(crate::messages::self_update::no_release_for(other)),
     };
     let arch = match std::env::consts::ARCH {
         arch @ ("x86_64" | "aarch64") => arch,
-        other => bail!("no airlock releases for {other}"),
+        other => bail!(crate::messages::self_update::no_release_for(other)),
     };
     let variant = if cfg!(feature = "distroless") {
         "distroless"
@@ -151,23 +152,27 @@ pub async fn install(
 
     let checksum = download(client, &format!("{archive_url}.sha256"), None)
         .await
-        .context("failed to download the release checksum")?;
+        .context(crate::messages::self_update::CHECKSUM_DOWNLOAD_FAILED)?;
     let expected = String::from_utf8_lossy(&checksum)
         .split_whitespace()
         .next()
         .map(str::to_ascii_lowercase)
-        .context("release checksum file is empty")?;
+        .context(crate::messages::self_update::CHECKSUM_FILE_EMPTY)?;
 
     let archive = download(client, &archive_url, Some(progress))
         .await
-        .with_context(|| format!("failed to download {archive_name}"))?;
+        .with_context(|| crate::messages::self_update::archive_download_failed(&archive_name))?;
     let actual = hex::encode(Sha256::digest(&archive));
     if actual != expected {
-        bail!("checksum mismatch in {archive_name}: expected {expected}, got {actual}");
+        bail!(crate::messages::self_update::checksum_mismatch(
+            &archive_name,
+            expected,
+            actual
+        ));
     }
 
     let binary = extract_binary(&archive)
-        .with_context(|| format!("failed to extract the binary from {archive_name}"))?;
+        .with_context(|| crate::messages::self_update::extract_failed(&archive_name))?;
     replace_binary(target, &binary, version)
 }
 
@@ -204,7 +209,7 @@ fn extract_binary(archive: &[u8]) -> anyhow::Result<Vec<u8>> {
             return Ok(binary);
         }
     }
-    bail!("archive has no airlock binary")
+    bail!(crate::messages::self_update::ARCHIVE_NO_BINARY)
 }
 
 /// Replace the binary at `target` with `binary`.
@@ -217,7 +222,7 @@ fn replace_binary(target: &Path, binary: &[u8], version: &Version) -> anyhow::Re
 
     let dir = target
         .parent()
-        .with_context(|| format!("{} has no parent directory", target.display()))?;
+        .with_context(|| crate::messages::self_update::no_parent_directory(target.display()))?;
     // The new file must be in the same directory as the target. Then the
     // rename is atomic and a running airlock keeps its old file.
     let tmp = TempFile(dir.join(format!(".airlock-update-{}", std::process::id())));
@@ -232,14 +237,15 @@ fn replace_binary(target: &Path, binary: &[u8], version: &Version) -> anyhow::Re
     };
     write().map_err(|e| no_access_hint(e, dir))?;
 
-    let output = run_version(&tmp.0).context("failed to run the new binary")?;
+    let output =
+        run_version(&tmp.0).context(crate::messages::self_update::NEW_BINARY_RUN_FAILED)?;
     let reported = String::from_utf8_lossy(&output.stdout);
     let reported_version = reported.split_whitespace().nth(1);
     if !output.status.success() || reported_version != Some(&version.tag) {
-        bail!(
-            "new binary reports '{}', expected airlock {version}",
-            reported.trim()
-        );
+        bail!(crate::messages::self_update::new_binary_wrong_version(
+            reported.trim(),
+            version
+        ));
     }
 
     std::fs::rename(&tmp.0, target).map_err(|e| no_access_hint(e, dir))?;
@@ -266,14 +272,10 @@ fn run_version(binary: &Path) -> std::io::Result<std::process::Output> {
 /// Add a hint about missing write access to `e`.
 fn no_access_hint(e: std::io::Error, dir: &Path) -> anyhow::Error {
     if e.kind() == std::io::ErrorKind::PermissionDenied {
-        anyhow::anyhow!(
-            "no write access to {}. Run the update as a user that can write there",
-            dir.display()
-        )
+        anyhow::anyhow!(crate::messages::self_update::no_write_access(dir.display()))
     } else {
-        anyhow::Error::new(e).context(format!(
-            "failed to write the new binary to {}",
-            dir.display()
+        anyhow::Error::new(e).context(crate::messages::self_update::write_binary_failed(
+            dir.display(),
         ))
     }
 }

@@ -5,8 +5,8 @@
 
 use clap::Args;
 
-use crate::cli;
 use crate::self_update::{self, ReleaseSource, Version};
+use crate::{cli, messages};
 
 /// CLI arguments for `airlock self-update`.
 #[derive(Args, Debug)]
@@ -23,12 +23,12 @@ pub struct SelfUpdateArgs {
 pub async fn main(args: &SelfUpdateArgs) -> i32 {
     let result = tokio::select! {
         result = run(args) => result,
-        () = cli::interrupted() => Err(anyhow::anyhow!("update interrupted")),
+        () = cli::interrupted() => Err(anyhow::anyhow!(messages::cli::UPDATE_INTERRUPTED)),
     };
     match result {
         Ok(()) => 0,
         Err(e) => {
-            cli::error!("Self-update failed: {e:#}");
+            cli::error!("{}", messages::cli::self_update_failed(format!("{e:#}")));
             1
         }
     }
@@ -36,27 +36,30 @@ pub async fn main(args: &SelfUpdateArgs) -> i32 {
 
 async fn run(args: &SelfUpdateArgs) -> anyhow::Result<()> {
     let Some(current) = cli::release_version() else {
-        anyhow::bail!(
-            "this is a development build ({}). Only release builds can update",
-            cli::version_string(true)
-        );
+        anyhow::bail!(messages::cli::dev_build_cannot_update(cli::version_string(
+            true
+        )));
     };
     let current = Version::parse(&current)?;
     let source = ReleaseSource::default();
     let client = self_update::http_client(&current)?;
 
-    let spinner = cli::spinner("checking for updates");
+    let spinner = cli::spinner(messages::cli::CHECKING_FOR_UPDATES);
     let latest = self_update::latest_version(&client, &source).await;
     spinner.finish_and_clear();
     let latest = latest?;
 
     if latest <= current {
-        cli::log!("{} airlock {current} is the latest version", cli::check());
+        cli::log!(
+            "{} {}",
+            cli::check(),
+            messages::cli::already_latest_version(current)
+        );
         return Ok(());
     }
     if args.check {
-        cli::log!("airlock {latest} is available (current version: {current})");
-        cli::log!("Run `airlock self-update` to install it.");
+        cli::log!("{}", messages::cli::update_available(latest, current));
+        cli::log!("{}", messages::cli::RUN_SELF_UPDATE_HINT);
         return Ok(());
     }
 
@@ -64,18 +67,18 @@ async fn run(args: &SelfUpdateArgs) -> anyhow::Result<()> {
     // the link to it.
     let target = std::env::current_exe()
         .and_then(std::fs::canonicalize)
-        .map_err(|e| anyhow::anyhow!("cannot find the airlock binary: {e}"))?;
+        .map_err(|e| anyhow::anyhow!(messages::cli::cannot_find_binary(e)))?;
 
-    cli::log!("Updating airlock {current} -> {latest}");
+    cli::log!("{}", messages::cli::updating_airlock(&current, &latest));
     let mp = cli::multi_progress();
     let pb = cli::layer_progress_bar(&mp, 0);
     let result = self_update::install(&client, &source, &latest, &target, &pb).await;
     let _ = mp.clear();
     result?;
     cli::log!(
-        "{} airlock {latest} installed to {}",
+        "{} {}",
         cli::check(),
-        target.display()
+        messages::cli::airlock_installed(&latest, target.display())
     );
     Ok(())
 }

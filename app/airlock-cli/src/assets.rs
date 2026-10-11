@@ -7,6 +7,8 @@
 
 use std::path::PathBuf;
 
+#[cfg(not(test))]
+use crate::messages;
 use crate::project::Project;
 
 /// Paths to the extracted VM boot assets.
@@ -170,11 +172,10 @@ fn acquire_extract_lock(path: &std::path::Path) -> anyhow::Result<std::fs::File>
         .open(path)?;
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
     if rc != 0 {
-        anyhow::bail!(
-            "failed to lock VM asset cache {}: {}",
+        anyhow::bail!(messages::app::asset_lock_failed(
             path.display(),
             std::io::Error::last_os_error()
-        );
+        ));
     }
     Ok(file)
 }
@@ -199,11 +200,7 @@ fn resolve_asset(
     name: &str,
 ) -> anyhow::Result<PathBuf> {
     let Some(raw) = custom else {
-        return bundled.ok_or_else(|| {
-            anyhow::anyhow!(
-                "vm.{name} must be set in config (this is a distroless build with no bundled {name})"
-            )
-        });
+        return bundled.ok_or_else(|| anyhow::anyhow!(messages::app::asset_must_be_set(name)));
     };
 
     let path = project.expand_host_tilde(raw);
@@ -214,7 +211,7 @@ fn resolve_asset(
     };
 
     if !path.exists() {
-        anyhow::bail!("custom {name} not found: {}", path.display());
+        anyhow::bail!(messages::app::custom_asset_not_found(name, path.display()));
     }
 
     Ok(path)

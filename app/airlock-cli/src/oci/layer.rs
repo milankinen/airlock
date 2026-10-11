@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 use flate2::read::GzDecoder;
 use indicatif::ProgressBar;
 
-use crate::cache;
+use crate::{cache, messages};
 
 /// OCI whiteout marker prefix (an AUFS convention that OCI also uses).
 const WHITEOUT_PREFIX: &str = ".wh.";
@@ -91,10 +91,10 @@ where
 
     let parent = layer_dir
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("layer dir has no parent"))?;
+        .ok_or_else(|| anyhow::anyhow!(messages::oci::LAYER_DIR_NO_PARENT))?;
     let dir_name = layer_dir
         .file_name()
-        .ok_or_else(|| anyhow::anyhow!("layer dir has no file name"))?
+        .ok_or_else(|| anyhow::anyhow!(messages::oci::LAYER_DIR_NO_FILE_NAME))?
         .to_string_lossy()
         .into_owned();
 
@@ -113,7 +113,7 @@ where
     extract_tarball_to_cache(&layer_dir, &download, progress)?;
     let _ = std::fs::remove_file(&download);
     if let Some(pb) = progress {
-        pb.set_message("ready");
+        pb.set_message(messages::oci::PROGRESS_READY);
     }
     Ok(layer_dir)
 }
@@ -140,10 +140,10 @@ fn extract_tarball_to_cache(
 ) -> anyhow::Result<()> {
     let parent = layer_dir
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("layer dir has no parent"))?;
+        .ok_or_else(|| anyhow::anyhow!(messages::oci::LAYER_DIR_NO_PARENT))?;
     let dir_name = layer_dir
         .file_name()
-        .ok_or_else(|| anyhow::anyhow!("layer dir has no file name"))?
+        .ok_or_else(|| anyhow::anyhow!(messages::oci::LAYER_DIR_NO_FILE_NAME))?
         .to_string_lossy()
         .into_owned();
     // Use a process-unique staging dir. Thus two `airlock` processes that
@@ -166,7 +166,7 @@ fn extract_tarball_to_cache(
             let total = file.metadata().map_or(0, |m| m.len());
             pb.set_length(total);
             pb.set_position(0);
-            pb.set_message("extracting");
+            pb.set_message(messages::oci::PROGRESS_EXTRACTING);
             Box::new(ProgressReader {
                 inner: file,
                 bar: pb.clone(),
@@ -203,18 +203,18 @@ fn extract_tarball_to_cache(
                 let dir = safe_join(&tmp, parent_rel)?;
                 std::fs::create_dir_all(&dir)?;
                 xattr::set(&dir, "user.overlay.opaque", b"y").map_err(|e| {
-                    anyhow::anyhow!(
-                        "set user.overlay.opaque on {}: {e} \
-                         (host filesystem must support user xattrs)",
-                        dir.display()
-                    )
+                    anyhow::anyhow!(messages::oci::set_xattr_failed(
+                        "user.overlay.opaque",
+                        dir.display(),
+                        e
+                    ))
                 })?;
             } else {
                 // `.wh.`, `.wh..` and `.wh...` name the parent directory or
                 // its parent. A delete of that target empties the layer
                 // cache, so refuse the layer.
                 if matches!(target_name, "" | "." | "..") || target_name.contains('/') {
-                    anyhow::bail!("refusing layer: unsafe whiteout name {}", path.display());
+                    anyhow::bail!(messages::oci::unsafe_whiteout_name(path.display()));
                 }
                 let dir = safe_join(&tmp, parent_rel)?;
                 std::fs::create_dir_all(&dir)?;
@@ -223,11 +223,11 @@ fn extract_tarball_to_cache(
                 let _ = std::fs::remove_dir_all(&target);
                 std::fs::File::create(&target)?;
                 xattr::set(&target, "user.overlay.whiteout", b"y").map_err(|e| {
-                    anyhow::anyhow!(
-                        "set user.overlay.whiteout on {}: {e} \
-                         (host filesystem must support user xattrs)",
-                        target.display()
-                    )
+                    anyhow::anyhow!(messages::oci::set_xattr_failed(
+                        "user.overlay.whiteout",
+                        target.display(),
+                        e
+                    ))
                 })?;
                 // Mark the parent as a directory with xattr whiteouts.
                 // Overlayfs readdir examines entries for xattr whiteouts
@@ -238,11 +238,11 @@ fn extract_tarball_to_cache(
                 let opq = xattr::get(&dir, "user.overlay.opaque").ok().flatten();
                 if opq.as_deref() != Some(b"y") {
                     xattr::set(&dir, "user.overlay.opaque", b"x").map_err(|e| {
-                        anyhow::anyhow!(
-                            "set user.overlay.opaque=x on {}: {e} \
-                             (host filesystem must support user xattrs)",
-                            dir.display()
-                        )
+                        anyhow::anyhow!(messages::oci::set_xattr_failed(
+                            "user.overlay.opaque=x",
+                            dir.display(),
+                            e
+                        ))
                     })?;
                 }
             }
@@ -306,17 +306,11 @@ fn safe_join(root: &Path, rel: &Path) -> anyhow::Result<PathBuf> {
                 if let Ok(md) = std::fs::symlink_metadata(&cur)
                     && md.file_type().is_symlink()
                 {
-                    anyhow::bail!(
-                        "refusing layer: whiteout path traverses a symlink at {}",
-                        cur.display()
-                    );
+                    anyhow::bail!(messages::oci::whiteout_traverses_symlink(cur.display()));
                 }
             }
             Component::CurDir => {}
-            _ => anyhow::bail!(
-                "refusing layer: unsafe whiteout path component in {}",
-                rel.display()
-            ),
+            _ => anyhow::bail!(messages::oci::unsafe_whiteout_component(rel.display())),
         }
     }
     Ok(cur)

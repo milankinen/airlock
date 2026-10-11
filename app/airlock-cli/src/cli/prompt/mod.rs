@@ -1,13 +1,12 @@
 //! Interactive terminal prompts.
 //!
 //! The prompts know nothing about airlock. The caller gives the titles, notes,
-//! options and checks. The available prompts are a single choice from a list, a
-//! yes/no question and a form of text inputs. Callers can also make custom
-//! prompts.
+//! options and checks. The available prompts are a single choice from a list
+//! and a form of text inputs. Callers can also make custom prompts.
 //!
 //! Every prompt:
 //!  * fails unless stdin and stderr are terminals
-//!  * lets the caller tell a cancel (Esc) from an error
+//!  * lets the caller tell an abort (Esc) from an error
 //!  * stops on Ctrl+C or on an earlier interrupt signal
 //!  * erases its view and restores the terminal on every path
 
@@ -15,7 +14,6 @@ pub mod choose;
 pub mod fields;
 pub mod screen;
 pub mod style;
-pub mod yes_no;
 
 use std::io::IsTerminal;
 
@@ -28,13 +26,13 @@ use crate::cli::prompt::screen::{Frame, Input, Screen};
 #[derive(Debug, thiserror::Error)]
 pub enum PromptError {
     /// stdin or stderr is not a terminal.
-    #[error("this step needs a terminal (stdin and stderr must be a TTY)")]
+    #[error("{}", crate::messages::cli::PROMPT_NEEDS_TERMINAL)]
     NotInteractive,
     /// Ctrl+C or SIGTERM while the prompt was open.
-    #[error("interrupted")]
+    #[error("{}", crate::messages::cli::PROMPT_INTERRUPTED)]
     Interrupted,
     /// Terminal I/O error.
-    #[error("prompt failed: {0}")]
+    #[error("{}", crate::messages::cli::prompt_failed(.0))]
     Io(std::io::Error),
 }
 
@@ -44,8 +42,8 @@ pub enum Step<T> {
     Stay,
     /// The prompt ends with the answer.
     Done(T),
-    /// The user pressed Esc or selected a cancel option.
-    Cancel,
+    /// The user pressed Esc or selected an abort option.
+    Abort,
     /// The user pressed Ctrl+C.
     Interrupt,
 }
@@ -128,7 +126,7 @@ pub fn run<S, T>(
         match step {
             Step::Stay => {}
             Step::Done(answer) => break Ok(Some(answer)),
-            Step::Cancel => break Ok(None),
+            Step::Abort => break Ok(None),
             Step::Interrupt => break Err(PromptError::Interrupted),
         }
     };

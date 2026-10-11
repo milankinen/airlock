@@ -6,7 +6,7 @@
 use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::cli::prompt::screen::Frame;
-use crate::cli::prompt::style::{self, Line, Styles, Tone};
+use crate::cli::prompt::style::{self, Line, Styles};
 use crate::cli::prompt::{self, PromptError, Step};
 
 /// Mask that replaces each character of a secret text.
@@ -31,7 +31,7 @@ pub struct Field<'a> {
 ///
 /// Keys: characters go to the focused text. Backspace deletes the last
 /// character. Enter moves to the next row. On the last row, Enter runs the
-/// caller's check. Esc cancels. Ctrl+C interrupts.
+/// caller's check. Esc aborts. Ctrl+C interrupts.
 ///
 /// If the check fails, the view stays open. The focus and the error go to
 /// the row that the error names. A secret text in that row is cleared,
@@ -81,7 +81,7 @@ impl Fields<'_> {
                     }
                 },
                 Step::Stay => Step::Stay,
-                Step::Cancel => Step::Cancel,
+                Step::Abort => Step::Abort,
                 Step::Interrupt => Step::Interrupt,
             },
         )
@@ -104,10 +104,7 @@ impl Fields<'_> {
             let mut line = Line::default();
             line.lead(indent, focused, &styles);
             line.mark_indent();
-            line.push(
-                &format!("{}: ", field.label),
-                styles.label(focused, Tone::Plain),
-            );
+            line.push(&format!("{}: ", field.label), styles.label(focused));
             if field.secret {
                 line.push(&MASK.repeat(text.chars().count()), &styles.plain);
             } else {
@@ -160,7 +157,7 @@ impl State {
         match key.code {
             KeyCode::Enter if self.focus + 1 < self.texts.len() => self.focus += 1,
             KeyCode::Enter => return Step::Done(()),
-            KeyCode::Esc => return Step::Cancel,
+            KeyCode::Esc => return Step::Abort,
             _ => {}
         }
         Step::Stay

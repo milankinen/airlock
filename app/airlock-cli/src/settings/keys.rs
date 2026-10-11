@@ -12,6 +12,8 @@ use airlock_monitor::{Action, KeyBindings};
 use smart_config::de::WellKnown;
 use smart_config::metadata::BasicTypes;
 
+use crate::messages;
+
 /// One or more key strings bound to one action. Deserializes from a TOML
 /// string (`back = "q"`) or array (`cancel = ["esc", "x"]`).
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -64,9 +66,7 @@ pub fn into_bindings(user: &BTreeMap<String, KeyList>) -> Result<KeyBindings, St
             Some(action) => {
                 by_action.insert(action, list.0.clone());
             }
-            None => errors.push(format!(
-                "monitor.keys.{name}: unknown action (see the manual for the list)"
-            )),
+            None => errors.push(messages::settings::monitor_keys_unknown_action(name)),
         }
     }
 
@@ -79,7 +79,7 @@ pub fn into_bindings(user: &BTreeMap<String, KeyList>) -> Result<KeyBindings, St
                     .iter()
                     .find_map(|(n, a, _)| (*a == *action).then_some(*n))
                     .unwrap_or("?");
-                errors.push(format!("monitor.keys.{name}: {e}"));
+                errors.push(messages::settings::monitor_keys_invalid_key(name, e));
             }
         }
         bindings.bind(*action, keys.clone());

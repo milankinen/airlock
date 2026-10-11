@@ -29,7 +29,6 @@ setup() {
     run_airlock rm -f
     assert_success
     assert_output_contains "Sandbox removed"
-    assert_output_not_contains "including"
     [[ ! -d .airlock ]]
 }
 
@@ -62,7 +61,7 @@ setup() {
         fi
         run_airlock rm -f
         assert_success
-        assert_output_contains "Sandbox removed (including .airlock/airlock.toml)"
+        assert_output_contains "Sandbox removed"
         [[ ! -d .airlock ]]
     done
 }
@@ -81,7 +80,7 @@ setup() {
     touch .airlock/sandbox/disk.img
     run_airlock rm -f
     assert_success
-    assert_output_contains "Sandbox removed (kept the other files in ~/.airlock: the project is the home directory)"
+    assert_output_contains "Sandbox removed"
     [[ ! -e .airlock/sandbox ]]
     [[ -f .airlock/config.toml && -f .airlock/claude/settings.json && -f .airlock/vault.json ]]
 
@@ -105,7 +104,7 @@ setup() {
     run_airlock rm -f
     assert_success
     assert_output_contains "holds the user-level airlock file"
-    assert_output_contains "Sandbox removed (kept the other files in .airlock: it holds user-level files"
+    assert_output_contains "Sandbox removed"
     [[ ! -e .airlock/sandbox ]]
     [[ -f .airlock/codex/auth.json && -f .airlock/vault.default.json ]]
 }

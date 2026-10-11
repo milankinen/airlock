@@ -35,6 +35,7 @@ use parking_lot::{Mutex, MutexGuard};
 use rand::TryRng as _;
 use serde::{Deserialize, Serialize};
 
+use crate::messages;
 use crate::settings::Settings;
 
 // Argon2id parameters from the OWASP 2023 "second recommendation": 19 MiB
@@ -252,8 +253,9 @@ impl Vault {
     /// keyring entry) is not an error. It gives an empty vault.
     fn load(&self) -> anyhow::Result<VaultData> {
         match self.inner.storage.load()? {
-            Some(json) => serde_json::from_str::<VaultData>(&json)
-                .context("parse airlock vault blob — storage may be corrupt"),
+            Some(json) => {
+                serde_json::from_str::<VaultData>(&json).context(messages::vault::PARSE_VAULT_BLOB)
+            }
             None => Ok(VaultData::default()),
         }
     }
@@ -269,7 +271,7 @@ impl Vault {
     }
 
     fn flush(&self, data: &VaultData) -> anyhow::Result<()> {
-        let json = serde_json::to_string(data).context("serialize airlock vault")?;
+        let json = serde_json::to_string(data).context(messages::vault::SERIALIZE_VAULT)?;
         self.inner.storage.store(&json)
     }
 
@@ -309,7 +311,7 @@ impl Vault {
     pub fn set_secret(&self, name: &str, value: &str) -> anyhow::Result<()> {
         validate_secret_name(name)?;
         if value.is_empty() {
-            bail!("secret value must not be empty");
+            bail!(messages::vault::SECRET_VALUE_EMPTY);
         }
         self.mutate(|data| {
             data.secrets.insert(
@@ -359,7 +361,7 @@ impl Vault {
     /// Store or overwrite registry credentials for `host`.
     pub fn set_registry(&self, host: &str, creds: &RegistryCreds) -> anyhow::Result<()> {
         if host.is_empty() {
-            bail!("registry host must not be empty");
+            bail!(messages::vault::REGISTRY_HOST_EMPTY);
         }
         self.mutate(|data| {
             data.registries.insert(
@@ -390,7 +392,7 @@ impl Vault {
             let mut key = [0u8; 32];
             rand::rngs::SysRng
                 .try_fill_bytes(&mut key)
-                .context("generate the service store key")?;
+                .context(messages::vault::GENERATE_SERVICE_STORE_KEY)?;
             data.service_store_key = Some(STANDARD_NO_PAD.encode(key));
             Ok(key)
         })
@@ -455,16 +457,16 @@ impl OpenedVault<'_> {
 /// (`[A-Z_][A-Z0-9_]*`). Other names cannot be used in `${NAME}`.
 pub fn validate_secret_name(name: &str) -> anyhow::Result<()> {
     if name.is_empty() {
-        bail!("secret name must not be empty");
+        bail!(messages::vault::SECRET_NAME_EMPTY);
     }
     let mut chars = name.chars();
     let first = chars.next().expect("non-empty");
     if !(first.is_ascii_uppercase() || first == '_') {
-        bail!("secret name must start with A-Z or '_', got '{first}' in \"{name}\"");
+        bail!(messages::vault::secret_name_bad_start(first, name));
     }
     for c in chars {
         if !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_') {
-            bail!("secret name must be [A-Z_][A-Z0-9_]*, got '{c}' in \"{name}\"");
+            bail!(messages::vault::secret_name_bad_char(c, name));
         }
     }
     Ok(())
@@ -571,7 +573,7 @@ pub(crate) fn read_vault_file(path: &Path) -> anyhow::Result<Option<String>> {
     match std::fs::read_to_string(path) {
         Ok(s) => Ok(Some(s)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(anyhow!("read vault file {}: {e}", path.display())),
+        Err(e) => Err(anyhow!(messages::vault::read_vault_file(path.display(), e))),
     }
 }
 
@@ -581,7 +583,7 @@ fn acquire_file_lock(path: &Path) -> anyhow::Result<File> {
     use std::os::unix::io::AsRawFd;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
-            .with_context(|| format!("create vault directory {}", parent.display()))?;
+            .with_context(|| messages::vault::create_vault_directory(parent.display()))?;
     }
     // `O_NOFOLLOW`: refuse a symlink at the lock path. Do not follow it to
     // create or lock a different file.
@@ -593,16 +595,15 @@ fn acquire_file_lock(path: &Path) -> anyhow::Result<File> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
-        .with_context(|| format!("open vault lock {}", path.display()))?;
+        .with_context(|| messages::vault::open_vault_lock(path.display()))?;
     // The lock blocks (writes are short), so concurrent writers wait in a
     // queue and do not fail.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
     if rc != 0 {
-        return Err(anyhow!(
-            "lock vault {}: {}",
+        return Err(anyhow!(messages::vault::lock_vault(
             path.display(),
             std::io::Error::last_os_error()
-        ));
+        )));
     }
     Ok(file)
 }
@@ -614,11 +615,11 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     // write cannot leave a truncated vault.
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
-            .with_context(|| format!("create vault directory {}", parent.display()))?;
+            .with_context(|| messages::vault::create_vault_directory(parent.display()))?;
     }
     let file_name = path
         .file_name()
-        .ok_or_else(|| anyhow!("vault path has no file name: {}", path.display()))?;
+        .ok_or_else(|| anyhow!(messages::vault::vault_path_no_file_name(path.display())))?;
     // The temp name is unique per process. Thus two concurrent writers
     // cannot rename a half-written temp file of the other process.
     let unique = std::process::id();
@@ -631,14 +632,14 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         .truncate(true)
         .mode(0o600)
         .open(&tmp)
-        .with_context(|| format!("create vault tempfile {}", tmp.display()))?;
+        .with_context(|| messages::vault::create_vault_tempfile(tmp.display()))?;
     f.write_all(bytes)
-        .with_context(|| format!("write vault tempfile {}", tmp.display()))?;
+        .with_context(|| messages::vault::write_vault_tempfile(tmp.display()))?;
     f.sync_all()
-        .with_context(|| format!("fsync vault tempfile {}", tmp.display()))?;
+        .with_context(|| messages::vault::fsync_vault_tempfile(tmp.display()))?;
     drop(f);
     std::fs::rename(&tmp, path)
-        .with_context(|| format!("rename vault tempfile to {}", path.display()))?;
+        .with_context(|| messages::vault::rename_vault_tempfile(path.display()))?;
     Ok(())
 }
 
@@ -653,9 +654,9 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 pub(crate) fn decode_b64_array<const N: usize>(s: &str, label: &str) -> anyhow::Result<[u8; N]> {
     let bytes = STANDARD_NO_PAD
         .decode(s)
-        .with_context(|| format!("decode vault {label}"))?;
+        .with_context(|| messages::vault::decode_vault_value(label))?;
     <[u8; N]>::try_from(bytes.as_slice())
-        .map_err(|_| anyhow!("vault {label} has wrong length: expected {N} bytes"))
+        .map_err(|_| anyhow!(messages::vault::vault_value_wrong_length(label, N)))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────

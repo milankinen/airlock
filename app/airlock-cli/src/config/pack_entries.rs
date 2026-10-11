@@ -52,7 +52,8 @@ pub fn read_layer_packs(
         Some(Value::Object(table)) => read_table(origin, table, known, problems),
         Some(other) => {
             problems.push(format!(
-                "* `packs` must be a table, not {other} (set in: {origin})"
+                "* {}",
+                crate::messages::config::packs_not_table(other, origin)
             ));
             vec![]
         }
@@ -72,19 +73,20 @@ fn read_table(
         if !known.iter().any(|p| p.metadata().name == name) {
             let known: Vec<&str> = known.iter().map(|p| p.metadata().name.as_str()).collect();
             let hint = if legacy_presets::is_released_name(&name) {
-                format!("; `{name}` is a list-form name: write `presets = [\"{name}\"]`")
+                crate::messages::config::pack_list_form_hint(&name)
             } else {
                 String::new()
             };
             problems.push(format!(
-                "* `packs.{name}` unknown pack (known: {}){hint} (set in: {origin})",
-                known.join(", ")
+                "* {}",
+                crate::messages::config::unknown_pack(&name, known.join(", "), hint, origin)
             ));
             continue;
         }
         let Value::Object(mut entry) = raw else {
             problems.push(format!(
-                "* `packs.{name}` must be a table (set in: {origin})"
+                "* {}",
+                crate::messages::config::pack_entry_not_table(&name, origin)
             ));
             continue;
         };
@@ -93,7 +95,8 @@ fn read_table(
             Some(Value::Bool(b)) => Some(b),
             Some(_) => {
                 problems.push(format!(
-                    "* `packs.{name}.enabled` must be true or false (set in: {origin})"
+                    "* {}",
+                    crate::messages::config::pack_enabled_not_bool(&name, origin)
                 ));
                 None
             }
@@ -102,7 +105,10 @@ fn read_table(
             None => None,
             Some(Ok(version)) => Some(version),
             Some(Err(e)) => {
-                problems.push(format!("* `packs.{name}.version` {e} (set in: {origin})"));
+                problems.push(format!(
+                    "* {}",
+                    crate::messages::config::pack_version_invalid(&name, e, origin)
+                ));
                 None
             }
         };
@@ -111,15 +117,16 @@ fn read_table(
             Some(Value::Object(args)) => args,
             Some(_) => {
                 problems.push(format!(
-                    "* `packs.{name}.args` must be a table (set in: {origin})"
+                    "* {}",
+                    crate::messages::config::pack_args_not_table(&name, origin)
                 ));
                 Map::new()
             }
         };
         for key in entry.keys() {
             problems.push(format!(
-                "* `packs.{name}.{key}` unknown key (known: {ENTRY_KEYS}; args go in \
-                 `args = {{ {key} = … }}`) (set in: {origin})"
+                "* {}",
+                crate::messages::config::pack_unknown_key(&name, key, ENTRY_KEYS, origin)
             ));
         }
         entries.push(PackEntry {
@@ -140,10 +147,12 @@ fn normalize_version(value: &Value) -> Result<String, String> {
         Value::String(s) => Ok(s.clone()),
         Value::Number(n) => match (n.as_u64(), n.as_i64()) {
             (Some(n), _) if n >= 1 => Ok(n.to_string()),
-            (Some(_), _) | (None, Some(_)) => Err("must be 1 or higher".into()),
-            (None, None) => Err(format!("must be a string or a whole number, not {n}")),
+            (Some(_), _) | (None, Some(_)) => {
+                Err(crate::messages::config::VERSION_BELOW_ONE.into())
+            }
+            (None, None) => Err(crate::messages::config::version_wrong_type(n)),
         },
-        other => Err(format!("must be a string or a whole number, not {other}")),
+        other => Err(crate::messages::config::version_wrong_type(other)),
     }
 }
 
@@ -251,9 +260,12 @@ async fn configure_entry(
     let name = &newest.metadata().name;
     let Some(source) = entry.version_source() else {
         return Err(vec![format!(
-            "* `packs.{name}` needs `version` (set in: {}): {}",
-            entry.files(),
-            supported_versions(packs, newest).await.join(" or ")
+            "* {}",
+            crate::messages::config::pack_needs_version(
+                name,
+                entry.files(),
+                supported_versions(packs, newest).await.join(" or ")
+            )
         )]);
     };
     let version = source.version.clone().expect("the source sets version");
@@ -262,9 +274,13 @@ async fn configure_entry(
             && let Some(released) = legacy_presets::released_name(name)
         {
             return Err(vec![format!(
-                "* `packs.{name}`: version \"{version}\" is not supported; use the list \
-                 form `presets = [\"{released}\"]` (set in: {})",
-                entry.files()
+                "* {}",
+                crate::messages::config::pack_version_use_list_form(
+                    name,
+                    &version,
+                    released,
+                    entry.files()
+                )
             )]);
         }
         let supported: Vec<String> = supported_versions(packs, newest)
@@ -273,10 +289,13 @@ async fn configure_entry(
             .map(|v| format!("\"{v}\""))
             .collect();
         return Err(vec![format!(
-            "* `packs.{name}`: version \"{version}\" is not supported (supported: {}) \
-             (set in: {})",
-            supported.join(", "),
-            entry.files()
+            "* {}",
+            crate::messages::config::pack_version_unsupported(
+                name,
+                &version,
+                supported.join(", "),
+                entry.files()
+            )
         )]);
     };
 
@@ -307,9 +326,13 @@ async fn configure_entry(
         let Some(arg) = pack.args().iter().find(|arg| arg.key == key) else {
             let files: Vec<&str> = sources.iter().map(|(file, _)| *file).collect();
             problems.push(format!(
-                "* {path} unknown arg of version \"{version}\" ({}) (set in: {})",
-                pack.known_args(),
-                files.join(", ")
+                "* {}",
+                crate::messages::config::pack_unknown_arg(
+                    &path,
+                    &version,
+                    pack.known_args(),
+                    files.join(", ")
+                )
             ));
             continue;
         };
@@ -318,7 +341,10 @@ async fn configure_entry(
                 Ok(value) => {
                     args.insert(key.to_string(), value);
                 }
-                Err(e) => problems.push(format!("* {path} {e} (set in: {file})")),
+                Err(e) => problems.push(format!(
+                    "* {}",
+                    crate::messages::config::pack_arg_invalid(&path, e, file)
+                )),
             }
         }
     }

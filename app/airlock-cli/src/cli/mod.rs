@@ -24,6 +24,8 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use tokio::signal::unix::SignalKind;
 use tokio::sync::watch;
 
+use crate::messages;
+
 // -- CLI argument parsing --
 
 /// The "airlock" logo. The setup wizard and the top-level help show it.
@@ -57,12 +59,19 @@ pub fn help_template() -> String {
 pub fn platform_status() -> String {
     use crate::vm::{KvmStatus, kvm_status};
     let kvm_line = match kvm_status() {
-        KvmStatus::Available => format!("{} kvm access granted", check()),
-        KvmStatus::NotFound => format!("{} kvm not available", red("!")),
-        KvmStatus::NoPermission => format!("{} kvm permission denied", red("!")),
-        KvmStatus::Unavailable(err) => format!("{} kvm unavailable: {err}", red("!")),
+        KvmStatus::Available => format!("{} {}", check(), messages::cli::KVM_ACCESS_GRANTED),
+        KvmStatus::NotFound => format!("{} {}", red("!"), messages::cli::KVM_NOT_AVAILABLE),
+        KvmStatus::NoPermission => {
+            format!("{} {}", red("!"), messages::cli::KVM_PERMISSION_DENIED)
+        }
+        KvmStatus::Unavailable(err) => {
+            format!("{} {}", red("!"), messages::cli::kvm_unavailable(err))
+        }
     };
-    format!("{}:\n  {kvm_line}\n", console::style("Status").underlined())
+    format!(
+        "{}:\n  {kvm_line}\n",
+        console::style(messages::cli::HELP_STATUS_TITLE).underlined()
+    )
 }
 
 /// Return an empty status section. Other platforms have no status to show.
@@ -131,9 +140,13 @@ pub fn version_string(include_hash: bool) -> String {
         String::new()
     };
     match release_version() {
-        Some(v) if distroless => format!("{v} [distroless]{hash_suffix}"),
+        Some(v) if distroless => format!("{v} {}{hash_suffix}", messages::cli::DISTROLESS_TAG),
         Some(v) => format!("{v}{hash_suffix}"),
-        None if distroless => format!("{} [distroless]{hash_suffix}", env!("CARGO_PKG_VERSION")),
+        None if distroless => format!(
+            "{} {}{hash_suffix}",
+            env!("CARGO_PKG_VERSION"),
+            messages::cli::DISTROLESS_TAG
+        ),
         None => format!("{}{hash_suffix}", env!("CARGO_PKG_VERSION")),
     }
 }
@@ -214,11 +227,11 @@ pub fn set_verbose(value: bool) {
 /// Format a byte count as a human-readable string (GB/MB/KB).
 pub fn format_bytes(bytes: u64) -> String {
     if bytes >= 1024 * 1024 * 1024 {
-        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+        messages::cli::size_gb(bytes as f64 / (1024.0 * 1024.0 * 1024.0))
     } else if bytes >= 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+        messages::cli::size_mb(bytes as f64 / (1024.0 * 1024.0))
     } else {
-        format!("{} KB", bytes / 1024)
+        messages::cli::size_kb(bytes / 1024)
     }
 }
 
@@ -234,7 +247,7 @@ pub fn format_local_time(t: std::time::SystemTime) -> String {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let ok = unsafe { !libc::localtime_r(&raw const tt, &raw mut tm).is_null() };
     if !ok {
-        return "----/--/-- --:--:--".to_string();
+        return messages::cli::UNKNOWN_TIME.to_string();
     }
     format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
@@ -319,7 +332,7 @@ pub fn layer_progress_bar(mp: &MultiProgress, total: u64) -> ProgressBar {
             .unwrap()
             .progress_chars("━╸ "),
     );
-    pb.set_message("downloading");
+    pb.set_message(messages::cli::DOWNLOADING);
     pb
 }
 

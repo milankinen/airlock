@@ -22,10 +22,10 @@ use similar::{ChangeTag, TextDiff};
 
 use super::Exit;
 use crate::cli::prompt::choose::{Choice, Choose, Details};
-use crate::cli::prompt::style::{Styles, Tone};
+use crate::cli::prompt::style::Styles;
 use crate::config::{ConfigOverrides, LayeredConfig, ResolvedConfig};
 use crate::packs::PackManager;
-use crate::project;
+use crate::{messages, project};
 
 /// The key that shows and hides the changes.
 const DIFF_KEY: char = 's';
@@ -97,11 +97,7 @@ async fn check_with(
     // `--yes` selects the default answer, which is abort. A script must not
     // accept a change that code in the sandbox can make.
     if input.yes || !input.can_prompt {
-        return Err(Exit::error(
-            2,
-            "The sandbox configuration has changed since the last run. Run in a terminal \
-             without --yes to see the changes, or pass --allow-configuration-changes.",
-        ));
+        return Err(Exit::error(2, messages::start::CONFIG_CHANGED_NO_PROMPT));
     }
     let styles = Styles::new();
     match last {
@@ -113,7 +109,7 @@ async fn check_with(
             }
         }
         Err(e) => {
-            let note = format!("The configuration of the last run is not valid any more: {e:#}");
+            let note = messages::start::last_config_invalid(e);
             let diff = diff("", &to_toml(&current), &styles);
             ask(&diff, Some(&note))?;
             Ok(Checked::Current)
@@ -167,7 +163,7 @@ fn hide_masked_value(entry: &mut Value) {
         && let Some(text) = value.as_str()
     {
         let hash = hex::encode(Sha256::digest(text.as_bytes()));
-        *value = format!("<masked, sha256:{}>", &hash[..16]).into();
+        *value = messages::start::masked_value_hash(&hash[..16]).into();
     }
 }
 
@@ -190,23 +186,20 @@ enum Answer {
 /// Returns:
 ///   The answer. Abort and Esc end the run.
 fn ask(diff: &[String], invalid_last: Option<&str>) -> Result<Answer, Exit> {
-    let show_hint = format!("Press {DIFF_KEY} to show the changes");
-    let hide_hint = format!("Press {DIFF_KEY} to hide the changes");
-    let mut answers = vec![("Accept changes", Answer::Accept)];
+    let show_hint = messages::start::diff_show_hint(DIFF_KEY);
+    let hide_hint = messages::start::diff_hide_hint(DIFF_KEY);
+    let mut answers = vec![(messages::start::CONFIG_CHOICE_ACCEPT, Answer::Accept)];
     if invalid_last.is_none() {
-        answers.push(("Continue with old configuration", Answer::Last));
+        answers.push((messages::start::CONFIG_CHOICE_LAST, Answer::Last));
     }
-    let choices: Vec<Choice> = ["Abort"]
+    let choices: Vec<Choice> = [messages::cli::ABORT_CHOICE]
         .into_iter()
         .chain(answers.iter().map(|(label, _)| *label))
-        .map(|label| Choice {
-            label,
-            tone: Tone::Plain,
-        })
+        .map(|label| Choice { label })
         .collect();
     let notes: Vec<&str> = invalid_last.into_iter().collect();
     let question = Choose {
-        title: "Sandbox configuration has changed since last run:",
+        title: messages::start::CONFIG_CHANGED_TITLE,
         notes: &notes,
         choices: &choices,
         default: 0,

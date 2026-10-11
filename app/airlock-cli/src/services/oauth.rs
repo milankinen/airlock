@@ -152,7 +152,11 @@ impl Upstream {
             self.post_unbounded(path, body.to_string().into_bytes()),
         )
         .await
-        .map_err(|_| anyhow!("{} did not answer in time", self.endpoint.host()))?
+        .map_err(|_| {
+            anyhow!(crate::messages::services::endpoint_answer_timeout(
+                self.endpoint.host()
+            ))
+        })?
     }
 
     async fn post_unbounded(
@@ -164,15 +168,15 @@ impl Upstream {
         let port = self.endpoint.port();
         let tcp = tokio::net::TcpStream::connect((host, port))
             .await
-            .with_context(|| format!("connect to {host}:{port}"))?;
+            .with_context(|| crate::messages::services::connect_to(host, port))?;
         let mut config = (*self.tls).clone();
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
         let name = rustls::pki_types::ServerName::try_from(host.to_string())
-            .map_err(|e| anyhow!("invalid hostname {host}: {e}"))?;
+            .map_err(|e| anyhow!(crate::messages::services::invalid_hostname(host, e)))?;
         let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
             .connect(name, tcp)
             .await
-            .with_context(|| format!("TLS to {host}"))?;
+            .with_context(|| crate::messages::services::tls_to(host))?;
         let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls)).await?;
         tokio::spawn(async move {
             if let Err(e) = conn.await {
@@ -203,7 +207,7 @@ where
         .collect()
         .await
         .map(http_body_util::Collected::to_bytes)
-        .map_err(|e| anyhow!("read a token endpoint body: {e}"))
+        .map_err(|e| anyhow!(crate::messages::services::read_token_endpoint_body(e)))
 }
 
 /// Make a local response with a JSON body.
@@ -366,11 +370,14 @@ pub fn pin_authority(req: &mut Request<ResponseBody>, to: &Endpoint) -> anyhow::
     } else {
         req.headers_mut().insert(
             HOST,
-            HeaderValue::from_str(&authority).context("endpoint authority")?,
+            HeaderValue::from_str(&authority)
+                .context(crate::messages::services::ENDPOINT_AUTHORITY)?,
         );
         path
     };
-    *req.uri_mut() = uri.parse().context("pinned request URI")?;
+    *req.uri_mut() = uri
+        .parse()
+        .context(crate::messages::services::PINNED_REQUEST_URI)?;
     Ok(())
 }
 
@@ -549,7 +556,7 @@ fn routed_uri(uri: &hyper::Uri, path: &str) -> anyhow::Result<hyper::Uri> {
         (Some(scheme), Some(authority)) => format!("{scheme}://{authority}{path}"),
         _ => path.to_string(),
     };
-    uri.parse().context("route URI")
+    uri.parse().context(crate::messages::services::ROUTE_URI)
 }
 
 /// Set the URI of `req` to the route `path`, with no query.
@@ -995,8 +1002,9 @@ impl Grants {
                 } else {
                     resolved.real
                 };
-                let mut real = HeaderValue::from_str(&real)
-                    .map_err(|_| anyhow!("a stored token is not a valid header value"))?;
+                let mut real = HeaderValue::from_str(&real).map_err(|_| {
+                    anyhow!(crate::messages::services::STORED_TOKEN_NOT_HEADER_VALUE)
+                })?;
                 real.set_sensitive(true);
                 headers.append(&name, real);
                 credential = Credential::Grant(resolved.grant_id);
@@ -1068,7 +1076,7 @@ impl Grants {
                             self.service().name()
                         );
                     }
-                    return Err(e.context("read the token store for the answer scan"));
+                    return Err(e.context(crate::messages::services::READ_STORE_FOR_ANSWER_SCAN));
                 }
             },
         };
@@ -1222,7 +1230,7 @@ impl Grants {
             .await;
             tracing::debug!("{}: signed out", service.name());
         });
-        task.await.context("revoke task")?;
+        task.await.context(crate::messages::services::REVOKE_TASK)?;
         Ok(done())
     }
 
@@ -1274,7 +1282,10 @@ impl Grants {
         let task = tokio::task::spawn_local(async move {
             relay_one(provider, &store, &upstream, &surrogate).await
         });
-        match task.await.context("refresh relay task")?? {
+        match task
+            .await
+            .context(crate::messages::services::REFRESH_RELAY_TASK)??
+        {
             Relayed::Unknown => Ok(unknown()),
             Relayed::Refused(resp) => Ok(resp),
             Relayed::Answer(answer) => Ok(json_response(StatusCode::OK, &answer)),

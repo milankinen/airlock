@@ -14,6 +14,7 @@ mod daemon;
 mod db;
 mod diagnostics;
 mod masking;
+mod messages;
 
 pub(crate) mod network;
 mod oci;
@@ -71,7 +72,7 @@ async fn main() {
     // data directory cannot block an update that can fix it.
     if let Command::SelfUpdate(ref args) = parsed.command {
         if !extra_args.is_empty() {
-            cli::error!("'--' args are only supported with 'start'");
+            cli::error!("{}", messages::app::DASH_ARGS_ONLY_WITH_START);
             std::process::exit(2);
         }
         std::process::exit(cmd_self_update::main(args).await);
@@ -96,42 +97,42 @@ async fn main() {
                 Command::Start(args) => cli::cmd_start::main(args, extra_args, context).await,
                 Command::Exec(args) => {
                     if !extra_args.is_empty() {
-                        cli::error!("'--' args are not supported with 'exec'");
+                        cli::error!("{}", messages::app::DASH_ARGS_NOT_WITH_EXEC);
                         std::process::exit(2);
                     }
                     cli::cmd_exec::main(args, &context).await
                 }
                 Command::Info(ref args) => {
                     if !extra_args.is_empty() {
-                        cli::error!("'--' args are only supported with 'start'");
+                        cli::error!("{}", messages::app::DASH_ARGS_ONLY_WITH_START);
                         std::process::exit(2);
                     }
                     Ok(cli::cmd_info::main(args, context).await)
                 }
                 Command::Remove(ref args) => {
                     if !extra_args.is_empty() {
-                        cli::error!("'--' args are only supported with 'start'");
+                        cli::error!("{}", messages::app::DASH_ARGS_ONLY_WITH_START);
                         std::process::exit(2);
                     }
                     Ok(cli::cmd_rm::main(args, &context).await)
                 }
                 Command::Secrets(args) => {
                     if !extra_args.is_empty() {
-                        cli::error!("'--' args are only supported with 'start'");
+                        cli::error!("{}", messages::app::DASH_ARGS_ONLY_WITH_START);
                         std::process::exit(2);
                     }
                     Ok(cli::cmd_secret::main(args, &context))
                 }
                 Command::Sandboxes(args) => {
                     if !extra_args.is_empty() {
-                        cli::error!("'--' args are only supported with 'start'");
+                        cli::error!("{}", messages::app::DASH_ARGS_ONLY_WITH_START);
                         std::process::exit(2);
                     }
                     Ok(cli::cmd_sandbox::main(args, &context).await)
                 }
                 Command::Templates(args) => {
                     if !extra_args.is_empty() {
-                        cli::error!("'--' args are only supported with 'start'");
+                        cli::error!("{}", messages::app::DASH_ARGS_ONLY_WITH_START);
                         std::process::exit(2);
                     }
                     Ok(cli::cmd_templates::main(args, &context).await)
@@ -139,7 +140,7 @@ async fn main() {
                 Command::SelfUpdate(_) => unreachable!("self-update runs before the context"),
             };
             result.unwrap_or_else(|e| {
-                cli::error!("Error: {e:?}");
+                cli::error!("{}", messages::app::command_failed(&e));
                 1
             })
         })

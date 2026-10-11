@@ -9,11 +9,11 @@ use std::os::unix::fs::MetadataExt;
 use clap::{Args, Subcommand};
 
 use crate::cli::LogLevel;
-use crate::cli::prompt::yes_no::YesNo;
+use crate::cli::prompt::choose;
 use crate::context::Context;
 use crate::templates::{self, CONFIG_FILE, Template};
 use crate::vm::disk::DISK_FILE;
-use crate::{cli, oci, start};
+use crate::{cli, messages, oci, start};
 
 /// CLI arguments for `airlock templates`.
 #[derive(Args, Debug)]
@@ -113,7 +113,7 @@ async fn create(
 fn list(context: &Context) {
     let templates = templates::list(&context.data_dir);
     if templates.is_empty() {
-        cli::log!("No templates. Create one with `airlock templates create <name>`.");
+        cli::log!("{}", messages::cli::NO_TEMPLATES);
         return;
     }
     let rows: Vec<[String; 4]> = templates
@@ -127,7 +127,7 @@ fn list(context: &Context) {
             ]
         })
         .collect();
-    let header = ["NAME", "IMAGE", "DISK", "PACKS"];
+    let header = messages::cli::TEMPLATE_LIST_HEADER;
     let widths: Vec<usize> = (0..header.len() - 1)
         .map(|i| {
             rows.iter()
@@ -152,36 +152,49 @@ fn list(context: &Context) {
 fn info(context: &Context, name: &str) -> anyhow::Result<i32> {
     let template = templates::find(&context.data_dir, name)?;
     let config = &template.config;
-    println!("Name:      {}", template.name);
-    println!("Directory: {}", template.dir.display());
+    println!("{}", messages::cli::template_info_name(&template.name));
+    println!(
+        "{}",
+        messages::cli::template_info_directory(template.dir.display())
+    );
     if let Ok(meta) = std::fs::metadata(template.dir.join(CONFIG_FILE))
         && let Ok(created) = meta.modified()
     {
-        println!("Created:   {}", cli::format_local_time(created));
+        println!(
+            "{}",
+            messages::cli::template_info_created(cli::format_local_time(created))
+        );
     }
     if let Some(image) = &config.image {
-        println!("Image:     {image}");
+        println!("{}", messages::cli::template_info_image(image));
     }
     if let (Some(used), Ok(meta)) = (
         disk_used(&template),
         std::fs::metadata(template.dir.join(DISK_FILE)),
     ) {
         println!(
-            "Disk:      {} / {}",
-            cli::format_bytes(used),
-            cli::format_bytes(meta.len())
+            "{}",
+            messages::cli::template_info_disk(
+                cli::format_bytes(used),
+                cli::format_bytes(meta.len())
+            )
         );
     }
     if let Some(clipboard) = config.clipboard {
-        let on = |b: bool| if b { "yes" } else { "no" };
+        let on = |b: bool| {
+            if b {
+                messages::cli::YES
+            } else {
+                messages::cli::NO
+            }
+        };
         println!(
-            "Clipboard: copy {}, paste {}",
-            on(clipboard.copy),
-            on(clipboard.paste)
+            "{}",
+            messages::cli::template_info_clipboard(on(clipboard.copy), on(clipboard.paste))
         );
     }
     if !config.packs.is_empty() {
-        println!("Packs:");
+        println!("{}", messages::cli::INFO_PACKS);
         for pack in &config.packs {
             let args: Vec<String> = pack
                 .args
@@ -207,25 +220,24 @@ fn remove(context: &Context, name: &str, force: bool) -> anyhow::Result<i32> {
     // Fail before the question.
     templates::find(&context.data_dir, name)?;
     if !force && !confirm(name) {
-        cli::error!("Aborted.");
+        cli::error!("{}", messages::cli::ABORTED);
         return Ok(0);
     }
     templates::remove(&context.data_dir, name)?;
     oci::gc_sweep(&context.data_dir);
-    cli::log!("Template {name} removed");
+    cli::log!("{}", messages::cli::template_removed(name));
     Ok(0)
 }
 
 /// Ask to confirm the removal of the template `name`.
 /// Returns:
-///   True if confirmed. Esc, no terminal or a failed prompt is "no".
+///   True if confirmed. Abort, Esc, no terminal or a failed prompt is "no".
 fn confirm(name: &str) -> bool {
-    let question = format!("Remove template {name}?");
-    let question = YesNo {
-        question: &question,
-        default: false,
-    };
-    matches!(question.ask(), Ok(Some(true)))
+    let title = messages::cli::remove_template_title(name);
+    matches!(
+        choose::confirm(&title, &[], messages::cli::REMOVE_SANDBOX_YES),
+        Ok(true)
+    )
 }
 
 /// Return the allocated size of the disk of `template`, if it has a disk.

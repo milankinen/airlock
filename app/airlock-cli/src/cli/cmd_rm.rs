@@ -9,11 +9,11 @@ use std::path::Path;
 
 use clap::Args;
 
-use crate::cli::prompt::yes_no::YesNo;
-use crate::config::files::{EXTENSIONS, local_config_names};
+use crate::cli::prompt::choose;
+use crate::config::files::EXTENSIONS;
 use crate::context::Context;
 use crate::sandboxes::{self, Location};
-use crate::{cli, oci, project};
+use crate::{cli, messages, oci, project};
 
 /// CLI arguments for `airlock rm`.
 #[derive(Args, Debug)]
@@ -46,7 +46,7 @@ pub async fn main(args: &RmArgs, context: &Context) -> i32 {
     let host_cwd = match std::env::current_dir() {
         Ok(cwd) => std::fs::canonicalize(&cwd).unwrap_or(cwd),
         Err(e) => {
-            cli::error!("Cannot determine current directory: {e}");
+            cli::error!("{}", messages::cli::cannot_determine_cwd(e));
             return 1;
         }
     };
@@ -65,7 +65,7 @@ pub(super) async fn run(args: &RmArgs, context: &Context, host_cwd: &Path) -> i3
         }
         Ok(None) => {}
         Err(e) => {
-            cli::error!("Sandbox lookup failed: {e:#}");
+            cli::error!("{}", messages::cli::sandbox_lookup_failed(format!("{e:#}")));
             return 1;
         }
     }
@@ -79,28 +79,22 @@ pub(super) async fn run(args: &RmArgs, context: &Context, host_cwd: &Path) -> i3
 async fn rm_box(args: &RmArgs, context: &Context, id: &str) -> i32 {
     // Fail before the question. `remove_box` checks again under the lock.
     if project::is_running(&context.boxes_dir().join(id)) {
-        cli::error!("Sandbox is running, stop it first");
+        cli::error!("{}", messages::sandboxes::SANDBOX_RUNNING_STOP_FIRST);
         return 1;
     }
-    // The local project config of the sandbox is in the sandbox directory,
-    // so it goes with the sandbox.
-    let local_config = local_config_name(&context.boxes_dir().join(id));
-    let note = local_config
-        .as_ref()
-        .map(|name| format!("This also deletes the local config {name}."));
-    if !confirm(args, note.as_deref()) {
-        cli::error!("Aborted.");
+    if !confirm(args) {
+        cli::error!("{}", messages::cli::ABORTED);
         return 0;
     }
     if let Err(e) = sandboxes::remove_box(context, id).await {
-        cli::error!("Failed to remove sandbox: {e:#}");
+        cli::error!(
+            "{}",
+            messages::cli::failed_to_remove_sandbox(format!("{e:#}"))
+        );
         return 1;
     }
     oci::gc_sweep(&context.data_dir);
-    match local_config {
-        Some(name) => cli::log!("Sandbox removed (including the local config {name})"),
-        None => cli::log!("Sandbox removed"),
-    }
+    cli::log!("{}", messages::cli::SANDBOX_REMOVED);
     0
 }
 
@@ -130,7 +124,7 @@ fn rm_project_sandbox(args: &RmArgs, context: &Context, host_cwd: &Path) -> i32 
 
     let _lock = match project::lock_if_idle(&paths.sandbox_dir) {
         project::IdleLock::Running => {
-            cli::error!("Sandbox is running, stop it first");
+            cli::error!("{}", messages::sandboxes::SANDBOX_RUNNING_STOP_FIRST);
             return 1;
         }
         project::IdleLock::Held(file) => Some(file),
@@ -138,43 +132,23 @@ fn rm_project_sandbox(args: &RmArgs, context: &Context, host_cwd: &Path) -> i32 
     };
 
     if is_user_home_project(&paths.cache_dir) {
-        let kept_note = "the other files in ~/.airlock: the project is the home directory";
-        return rm_sandbox_only(
-            args,
-            context,
-            &paths.cache_dir,
-            &paths.sandbox_dir,
-            kept_note,
-        );
+        return rm_sandbox_only(args, context, &paths.cache_dir, &paths.sandbox_dir);
     }
     if let Some(marker) = user_file_marker(&paths.cache_dir) {
         cli::log!(
-            "warning: {} holds the user-level airlock file {marker}; \
-             it is a user airlock directory, so only its sandbox goes",
-            paths.cache_dir.display()
+            "{}",
+            messages::cli::user_airlock_dir_warning(paths.cache_dir.display(), marker)
         );
-        let kept_note =
-            format!("the other files in .airlock: it holds user-level files ({marker})");
-        return rm_sandbox_only(
-            args,
-            context,
-            &paths.cache_dir,
-            &paths.sandbox_dir,
-            &kept_note,
-        );
+        return rm_sandbox_only(args, context, &paths.cache_dir, &paths.sandbox_dir);
     }
 
-    let local_config = local_config_name(&paths.cache_dir);
-    let note = local_config
-        .as_ref()
-        .map(|name| format!("This also deletes the local config .airlock/{name}."));
-    if !confirm(args, note.as_deref()) {
-        cli::error!("Aborted.");
+    if !confirm(args) {
+        cli::error!("{}", messages::cli::ABORTED);
         return 0;
     }
 
     if let Err(e) = std::fs::remove_dir_all(&paths.cache_dir) {
-        cli::error!("Failed to remove sandbox: {e}");
+        cli::error!("{}", messages::cli::failed_to_remove_sandbox(e));
         return 1;
     }
 
@@ -182,10 +156,7 @@ fn rm_project_sandbox(args: &RmArgs, context: &Context, host_cwd: &Path) -> i32 
     // images and layers that no longer have live references.
     oci::gc_sweep(&context.data_dir);
 
-    match local_config {
-        Some(name) => cli::log!("Sandbox removed (including .airlock/{name})"),
-        None => cli::log!("Sandbox removed"),
-    }
+    cli::log!("{}", messages::cli::SANDBOX_REMOVED);
     0
 }
 
@@ -199,24 +170,17 @@ fn rm_project_sandbox(args: &RmArgs, context: &Context, host_cwd: &Path) -> i32 
 ///  - `context`: Process context
 ///  - `cache_dir`: Project `.airlock/` directory
 ///  - `sandbox_dir`: The `.airlock/sandbox` directory to remove
-///  - `kept_note`: Message that tells what stays and why
 ///
 /// Returns:
 ///   Process exit code.
-fn rm_sandbox_only(
-    args: &RmArgs,
-    context: &Context,
-    cache_dir: &Path,
-    sandbox_dir: &Path,
-    kept_note: &str,
-) -> i32 {
+fn rm_sandbox_only(args: &RmArgs, context: &Context, cache_dir: &Path, sandbox_dir: &Path) -> i32 {
     if std::fs::symlink_metadata(sandbox_dir).is_err() {
-        cli::log!("No sandbox to remove (kept {kept_note})");
+        cli::log!("{}", messages::cli::NO_SANDBOX_TO_REMOVE);
         return 0;
     }
 
-    if !confirm(args, None) {
-        cli::error!("Aborted.");
+    if !confirm(args) {
+        cli::error!("{}", messages::cli::ABORTED);
         return 0;
     }
 
@@ -228,18 +192,21 @@ fn rm_sandbox_only(
     match std::fs::symlink_metadata(cache_dir) {
         Ok(meta) if !meta.file_type().is_symlink() => {}
         _ => {
-            cli::error!("{} is now a symbolic link; aborting", cache_dir.display());
+            cli::error!(
+                "{}",
+                messages::cli::airlock_dir_now_symlink(cache_dir.display())
+            );
             return 1;
         }
     }
 
     if let Err(e) = remove_entry(sandbox_dir) {
-        cli::error!("Failed to remove sandbox: {e}");
+        cli::error!("{}", messages::cli::failed_to_remove_sandbox(e));
         return 1;
     }
 
     oci::gc_sweep(&context.data_dir);
-    cli::log!("Sandbox removed (kept {kept_note})");
+    cli::log!("{}", messages::cli::SANDBOX_REMOVED);
     0
 }
 
@@ -252,59 +219,36 @@ fn rm_sandbox_only(
 /// Returns:
 ///   Process exit code.
 fn rm_symlinked_airlock(args: &RmArgs, cache_dir: &Path) -> i32 {
-    let target =
-        std::fs::read_link(cache_dir).map_or_else(|_| "?".to_string(), |p| p.display().to_string());
-
-    if !confirm_prompt(
-        args,
-        &format!(
-            "Remove the .airlock link? It is a symbolic link to {target}; the target is left \
-             untouched."
-        ),
-    ) {
-        cli::error!("Aborted.");
+    if !confirm(args) {
+        cli::error!("{}", messages::cli::ABORTED);
         return 0;
     }
 
     if let Err(e) = std::fs::remove_file(cache_dir) {
-        cli::error!("Failed to remove the .airlock link: {e}");
+        cli::error!("{}", messages::cli::failed_to_remove_airlock_link(e));
         return 1;
     }
 
-    cli::log!("Removed the .airlock link to {target}; its target was not touched");
+    cli::log!("{}", messages::cli::SANDBOX_REMOVED);
     0
 }
 
-/// Ask for confirmation with the standard "Remove sandbox?" prompt.
-/// Args:
-///  - `args`: Command arguments
-///  - `note`: Optional text after the prompt about other effects of the
-///    removal, for example that the local project config is also removed
-///
+/// Ask to confirm the removal of the sandbox. With `--force`, do not ask.
 /// Returns:
-///   True if the user confirmed (see [`confirm_prompt`]).
-fn confirm(args: &RmArgs, note: Option<&str>) -> bool {
-    let prompt = match note {
-        Some(note) => format!("Remove sandbox? {note}"),
-        None => "Remove sandbox?".to_string(),
-    };
-    confirm_prompt(args, &prompt)
-}
-
-/// Ask `prompt` to confirm a removal. With `--force`, do not ask.
-/// Returns:
-///   True if confirmed. Esc, no terminal or a failed prompt is "no".
-// Removals that are not "the sandbox" (for example a symlinked `.airlock`)
-// call this directly. Other removals call it through [`confirm`].
-fn confirm_prompt(args: &RmArgs, prompt: &str) -> bool {
+///   True if confirmed. Abort, Esc, no terminal or a failed prompt is "no".
+// All removals ask the same question and report the same result.
+fn confirm(args: &RmArgs) -> bool {
     if args.force {
         return true;
     }
-    let question = YesNo {
-        question: prompt,
-        default: false,
-    };
-    matches!(question.ask(), Ok(Some(true)))
+    matches!(
+        choose::confirm(
+            messages::cli::REMOVE_SANDBOX_TITLE,
+            &[],
+            messages::cli::REMOVE_SANDBOX_YES
+        ),
+        Ok(true)
+    )
 }
 
 /// Return true if the project of `cache_dir` (`<project>/.airlock`) is the
@@ -357,14 +301,6 @@ fn is_home_dir(cache_dir: &Path, home: &Path) -> bool {
     cache_dir
         .parent()
         .is_some_and(|project| canonical(project) == canonical(home))
-}
-
-/// Return the file name of the local project config (`airlock.<ext>`) in
-/// `dir`, if it exists.
-// Only the confirmation prompt and the report use the name. The removal
-// deletes the whole directory in all cases.
-fn local_config_name(dir: &Path) -> Option<String> {
-    local_config_names(dir).into_iter().next()
 }
 
 /// Files and directories that only a user airlock directory (`~/.airlock`)

@@ -121,7 +121,7 @@ fn new_id() -> anyhow::Result<String> {
     let mut bytes = [0u8; 8];
     rand::rngs::SysRng
         .try_fill_bytes(&mut bytes[..5])
-        .map_err(|e| anyhow::anyhow!("random sandbox id: {e}"))?;
+        .map_err(|e| anyhow::anyhow!(crate::messages::sandboxes::random_id_failed(e)))?;
     let bits = u64::from_be_bytes(bytes) >> 24;
     Ok((0..ID_LEN)
         .rev()

@@ -181,11 +181,10 @@ fn labeled_services(
             id.targets()
                 .into_iter()
                 .map(move |target| check_target_conflicts::LabeledTarget {
-                    label: format!(
-                        "service `{}` host `{}:{}`",
+                    label: crate::messages::network::label_service(
                         id.name(),
-                        target.host,
-                        target.port.map_or("*".to_string(), |p| p.to_string())
+                        &target.host,
+                        target.port.map_or("*".to_string(), |p| p.to_string()),
                     ),
                     target,
                 })
@@ -209,7 +208,7 @@ fn labeled_passthrough(
         for allow in &rule.allow {
             let (host, port) = rules::parse_pattern(allow)?;
             out.push(check_target_conflicts::LabeledTarget {
-                label: format!("rule `{rule_name}` allow=`{allow}` (passthrough)"),
+                label: crate::messages::network::label_rule_passthrough(rule_name, allow),
                 target: NetworkTarget {
                     host: host.to_string(),
                     port,
@@ -233,7 +232,7 @@ fn labeled_middleware(
         for target_str in &mw.target {
             let (host, port) = rules::parse_pattern(target_str)?;
             out.push(check_target_conflicts::LabeledTarget {
-                label: format!("middleware `{mw_name}` target=`{target_str}`"),
+                label: crate::messages::network::label_middleware(mw_name, target_str),
                 target: NetworkTarget {
                     host: host.to_string(),
                     port,
@@ -259,7 +258,7 @@ fn labeled_inject(
         for allow in &rule.allow {
             let (host, port) = rules::parse_pattern(allow)?;
             out.push(check_target_conflicts::LabeledTarget {
-                label: format!("rule `{rule_name}` inject target=`{allow}`"),
+                label: crate::messages::network::label_rule_inject(rule_name, allow),
                 target: NetworkTarget {
                     host: host.to_string(),
                     port,
@@ -282,9 +281,10 @@ fn labeled_reverse_forwards(
         }
         for mapping in &pf.guest {
             out.push(check_target_conflicts::LabeledReverseForward {
-                label: format!(
-                    "ports `{group_name}` guest=`{}:{}`",
-                    mapping.host, mapping.guest
+                label: crate::messages::network::label_ports_guest(
+                    group_name,
+                    mapping.host,
+                    mapping.guest,
                 ),
                 host_port: mapping.host,
             });

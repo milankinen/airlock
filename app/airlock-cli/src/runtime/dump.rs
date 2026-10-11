@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::Path;
 
 use super::OutputSink;
-use crate::cli;
+use crate::{cli, messages};
 
 /// Output sink that forwards guest output to `inner`. When a dump file is
 /// open, it also appends each stdout and stderr chunk to the file,
@@ -60,11 +60,14 @@ impl<S: OutputSink> OutputSink for DumpSink<'_, S> {
 fn open_dump(path: &Path) -> Option<File> {
     match File::create(path) {
         Ok(f) => {
-            cli::log!("PTY dump: {}", path.display());
+            cli::log!("{}", messages::runtime::pty_dump_path(path.display()));
             Some(f)
         }
         Err(e) => {
-            cli::error!("Failed to open PTY dump {}: {e}", path.display());
+            cli::error!(
+                "{}",
+                messages::runtime::pty_dump_open_failed(path.display(), e)
+            );
             None
         }
     }

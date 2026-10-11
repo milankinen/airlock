@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::config::generated::Clipboard;
+use crate::messages;
 use crate::packs::install::state::STATE_FILE;
 use crate::vm::disk::{DISK_FILE, DISK_ID_FILE};
 
@@ -93,7 +94,7 @@ impl TemplateConfig {
                 let version = match entry.get("version") {
                     Some(serde_json::Value::String(v)) => v.clone(),
                     Some(serde_json::Value::Number(n)) => n.to_string(),
-                    _ => anyhow::bail!("pack {name} has no version"),
+                    _ => anyhow::bail!(messages::templates::pack_has_no_version(name)),
                 };
                 let args = entry
                     .get("args")
@@ -146,8 +147,7 @@ pub fn is_valid_name(name: &str) -> bool {
 pub fn check_name(name: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         is_valid_name(name),
-        "`{name}` is not a valid template name (use 1 to {MAX_NAME_LEN} letters, digits, `-`, \
-         `_` or `.`, and start with a letter or a digit)"
+        messages::templates::invalid_name(name, MAX_NAME_LEN)
     );
     Ok(())
 }
@@ -159,17 +159,22 @@ pub fn check_name(name: &str) -> anyhow::Result<()> {
 pub fn find(data_dir: &Path, name: &str) -> anyhow::Result<Template> {
     check_name(name)?;
     let dir = templates_dir(data_dir).join(name);
-    anyhow::ensure!(dir.is_dir(), "template {name} does not exist");
+    anyhow::ensure!(dir.is_dir(), messages::templates::template_missing(name));
     read(name, dir)
 }
 
 /// Read the template `name` in its directory `dir`.
 fn read(name: &str, dir: PathBuf) -> anyhow::Result<Template> {
     let path = dir.join(CONFIG_FILE);
-    let toml = std::fs::read_to_string(&path)
-        .map_err(|e| anyhow::anyhow!("template {name}: read {}: {e}", path.display()))?;
-    let config =
-        TemplateConfig::parse(&toml).map_err(|e| anyhow::anyhow!("template {name}: {e:#}"))?;
+    let toml = std::fs::read_to_string(&path).map_err(|e| {
+        anyhow::anyhow!(messages::templates::read_config_failed(
+            name,
+            path.display(),
+            e
+        ))
+    })?;
+    let config = TemplateConfig::parse(&toml)
+        .map_err(|e| anyhow::anyhow!(messages::templates::config_invalid(name, e)))?;
     Ok(Template {
         name: name.to_string(),
         dir,
@@ -210,7 +215,8 @@ pub fn list(data_dir: &Path) -> Vec<Template> {
 pub fn remove(data_dir: &Path, name: &str) -> anyhow::Result<()> {
     check_name(name)?;
     let dir = templates_dir(data_dir).join(name);
-    anyhow::ensure!(dir.is_dir(), "template {name} does not exist");
-    std::fs::remove_dir_all(&dir).map_err(|e| anyhow::anyhow!("remove {}: {e}", dir.display()))?;
+    anyhow::ensure!(dir.is_dir(), messages::templates::template_missing(name));
+    std::fs::remove_dir_all(&dir)
+        .map_err(|e| anyhow::anyhow!(messages::templates::remove_failed(dir.display(), e)))?;
     Ok(())
 }

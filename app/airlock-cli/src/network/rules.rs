@@ -45,7 +45,7 @@ pub fn resolve(network: &Network) -> anyhow::Result<RuleTargets> {
 
         for target_str in &rule.allow {
             let (host, port) = parse_pattern(target_str)
-                .with_context(|| format!("network.rules.{rule_name}.allow"))?;
+                .with_context(|| crate::messages::network::rule_allow_context(rule_name))?;
             let target = NetworkTarget {
                 host: host.to_string(),
                 port,
@@ -58,7 +58,7 @@ pub fn resolve(network: &Network) -> anyhow::Result<RuleTargets> {
 
         for target_str in &rule.deny {
             let (host, port) = parse_pattern(target_str)
-                .with_context(|| format!("network.rules.{rule_name}.deny"))?;
+                .with_context(|| crate::messages::network::rule_deny_context(rule_name))?;
             deny.push(NetworkTarget {
                 host: host.to_string(),
                 port,
@@ -99,7 +99,7 @@ pub fn resolve_middleware(
 
         for target_str in &mw.target {
             let (host, port) = parse_pattern(target_str)
-                .with_context(|| format!("network.middleware.{mw_name}.target"))?;
+                .with_context(|| crate::messages::network::middleware_target_context(mw_name))?;
             targets.push(MiddlewareTarget {
                 host: host.to_string(),
                 port,
@@ -140,9 +140,7 @@ pub fn resolve_inject(network: &Network, env: &SandboxEnv) -> anyhow::Result<Vec
                 continue;
             }
             let Some(secret) = env.masked(name) else {
-                anyhow::bail!(
-                    "network.rules.{rule_name}.inject: `{name}` must be defined in [env] with mask = true"
-                );
+                anyhow::bail!(crate::messages::network::inject_not_masked(rule_name, name));
             };
             if !secrets.iter().any(|s| s.name == *name) {
                 secrets.push(InjectedSecret::new(secret.clone()));
@@ -155,7 +153,7 @@ pub fn resolve_inject(network: &Network, env: &SandboxEnv) -> anyhow::Result<Vec
 
         for target_str in &rule.allow {
             let (host, port) = parse_pattern(target_str)
-                .with_context(|| format!("network.rules.{rule_name}.allow"))?;
+                .with_context(|| crate::messages::network::rule_allow_context(rule_name))?;
             targets.push(InjectTarget {
                 host: host.to_string(),
                 port,
@@ -250,9 +248,10 @@ pub fn parse_pattern(target: &str) -> anyhow::Result<(&str, Option<u16>)> {
     // inject the secret into all ports of that host.
     let port = match port {
         None | Some("*") => None,
-        Some(p) => Some(p.parse::<u16>().map_err(|_| {
-            anyhow::anyhow!("`{target}`: port `{p}` must be a number in 0-65535 or `*`")
-        })?),
+        Some(p) => Some(
+            p.parse::<u16>()
+                .map_err(|_| anyhow::anyhow!(crate::messages::network::invalid_port(target, p)))?,
+        ),
     };
     Ok((host, port))
 }

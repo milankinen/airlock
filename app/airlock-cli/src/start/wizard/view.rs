@@ -4,20 +4,11 @@
 
 use console::measure_text_width;
 
-use crate::cli;
 use crate::cli::prompt::screen::Frame;
-use crate::cli::prompt::style::{self, Line, Styles, Tone};
+use crate::cli::prompt::style::{self, Line, Styles};
 use crate::packs::{ArgKind, ArgValue, PackKind};
 use crate::start::wizard::form::{self, Form, KINDS, Mode, Row, START_CHOICES, StartChoice};
-
-/// The description of [`Row::Custom`].
-const CUSTOM_DESCRIPTION: &str = "User defined image";
-
-/// The description of a template without packs.
-const NO_PACKS_DESCRIPTION: &str = "No preinstalled packs";
-
-/// The item of the "other" slot of a choice arg, when it is not current.
-const OTHER_CHOICE: &str = "other…";
+use crate::{cli, messages};
 
 /// Make the lines of the wizard view.
 ///
@@ -40,9 +31,10 @@ const OTHER_CHOICE: &str = "other…";
 ///
 /// The focused row has a cyan label. A focused pack row has its description
 /// in gray: ` - description` after the label, or on the next lines if it does
-/// not fit. A focused arg row shows all its values, and the focused start bar
-/// shows all its options. The current one is green and the others are gray.
-/// A choice arg with `other` shows [`OTHER_CHOICE`] as its last value. When
+/// not fit. A focused arg row shows all its values. The current value is green
+/// and the others are gray. The focused start bar shows all its options. The
+/// current option is cyan and the others are plain.
+/// A choice arg with `other` shows [`messages::start::WIZARD_OTHER_CHOICE`] as its last value. When
 /// the "other" slot is current, its text shows in green with the text cursor
 /// after it. The error of the "other" slot shows in red below its row. The
 /// error of the last check shows below the start bar.
@@ -73,21 +65,24 @@ pub fn frame(form: &Form, room: usize) -> Frame {
         Mode::Start => vec![Row::ShareConfig],
         Mode::Template => Vec::new(),
     };
-    let sections = std::iter::once((Some("Template"), form.template_rows()))
-        .chain(
-            KINDS
-                .iter()
-                .map(|kind| (Some(section_title(*kind)), form.section_rows(*kind))),
-        )
-        .chain([
-            (
-                Some("Capabilities"),
-                vec![Row::ClipboardCopy, Row::ClipboardPaste],
-            ),
-            (Some("Config"), share),
-            (None, vec![Row::Start]),
-        ])
-        .filter(|(_, rows)| !rows.is_empty());
+    let sections = std::iter::once((
+        Some(messages::start::WIZARD_SECTION_TEMPLATE),
+        form.template_rows(),
+    ))
+    .chain(
+        KINDS
+            .iter()
+            .map(|kind| (Some(section_title(*kind)), form.section_rows(*kind))),
+    )
+    .chain([
+        (
+            Some(messages::start::WIZARD_SECTION_CAPABILITIES),
+            vec![Row::ClipboardCopy, Row::ClipboardPaste],
+        ),
+        (Some(messages::start::WIZARD_SECTION_CONFIG), share),
+        (None, vec![Row::Start]),
+    ])
+    .filter(|(_, rows)| !rows.is_empty());
     for (s, (title, rows)) in sections.enumerate() {
         let section_start = if s == 0 { 0 } else { lines.len() };
         if let Some(title) = title {
@@ -118,9 +113,9 @@ pub fn frame(form: &Form, room: usize) -> Frame {
 /// Return the section title for the packs of `kind`.
 fn section_title(kind: PackKind) -> &'static str {
     match kind {
-        PackKind::Distro => "Base image",
-        PackKind::Agent => "Coding agents",
-        PackKind::Tool => "Tools",
+        PackKind::Distro => messages::start::WIZARD_SECTION_BASE_IMAGE,
+        PackKind::Agent => messages::start::WIZARD_SECTION_AGENTS,
+        PackKind::Tool => messages::start::WIZARD_SECTION_TOOLS,
     }
 }
 
@@ -128,11 +123,15 @@ fn section_title(kind: PackKind) -> &'static str {
 fn keys(form: &Form) -> String {
     let enter = start_label(StartChoice::Start, form.mode());
     match (form.focus(), form.other()) {
-        (Row::Start, _) => "←→ choose · enter confirm".to_string(),
-        (_, Some(other)) if other.is_empty() => "type a value · ← back".to_string(),
-        (_, Some(other)) if other.error.is_some() => "edit the value · ← back".to_string(),
-        (_, Some(_)) => format!("↑↓ move · ← back · enter {enter}"),
-        (Row::Arg(..), None) => format!("↑↓ move · ←→ change · enter {enter}"),
+        (Row::Start, _) => messages::start::WIZARD_KEYS_START_BAR.to_string(),
+        (_, Some(other)) if other.is_empty() => {
+            messages::start::WIZARD_KEYS_OTHER_EMPTY.to_string()
+        }
+        (_, Some(other)) if other.error.is_some() => {
+            messages::start::WIZARD_KEYS_OTHER_ERROR.to_string()
+        }
+        (_, Some(_)) => messages::start::wizard_keys_other(enter),
+        (Row::Arg(..), None) => messages::start::wizard_keys_arg(enter),
         (
             Row::Template(_)
             | Row::Pack(_)
@@ -141,16 +140,16 @@ fn keys(form: &Form) -> String {
             | Row::ClipboardPaste
             | Row::ShareConfig,
             None,
-        ) => format!("↑↓ move · space select · enter {enter}"),
+        ) => messages::start::wizard_keys_select(enter),
     }
 }
 
 /// Return the label of a start bar option in `mode`.
 fn start_label(choice: StartChoice, mode: Mode) -> &'static str {
     match (choice, mode) {
-        (StartChoice::Start, Mode::Start) => "start",
-        (StartChoice::Start, Mode::Template) => "create",
-        (StartChoice::Cancel, _) => "cancel",
+        (StartChoice::Start, Mode::Start) => messages::start::WIZARD_START_LABEL_START,
+        (StartChoice::Start, Mode::Template) => messages::start::WIZARD_START_LABEL_CREATE,
+        (StartChoice::Abort, _) => messages::start::WIZARD_START_LABEL_ABORT,
     }
 }
 
@@ -172,17 +171,17 @@ fn template_description(form: &Form, template: Option<usize>) -> String {
             .collect()
     });
     if packs.is_empty() {
-        NO_PACKS_DESCRIPTION.to_string()
+        messages::start::WIZARD_NO_PACKS_DESCRIPTION.to_string()
     } else {
-        format!("packs: {}", packs.join(", "))
+        messages::start::wizard_template_packs(packs.join(", "))
     }
 }
 
 /// Return the display text of an arg value. A bool shows as `yes` or `no`.
 fn value_text(value: &ArgValue) -> &str {
     match value {
-        ArgValue::Bool(true) => "yes",
-        ArgValue::Bool(false) => "no",
+        ArgValue::Bool(true) => messages::start::WIZARD_YES,
+        ArgValue::Bool(false) => messages::start::WIZARD_NO,
         ArgValue::Text(text) => text,
     }
 }
@@ -199,20 +198,21 @@ fn row_lines(form: &Form, row: Row, room: usize, styles: &Styles) -> Shown {
     let description = match row {
         Row::Template(t) if focused => Some(template_description(form, t)),
         Row::Pack(i) if focused => Some(form.entries()[i].pack.metadata().description.clone()),
-        Row::Custom if focused => Some(CUSTOM_DESCRIPTION.to_string()),
-        Row::ClipboardCopy if focused => Some("Sandbox can copy to the host clipboard".to_string()),
-        Row::ClipboardPaste if focused => Some(
-            "Sandbox can read the host clipboard. Enable only if you know what you are doing"
-                .to_string(),
-        ),
-        Row::ShareConfig if focused => Some(
-            "Write the config to the project, to share it. Otherwise it stays local".to_string(),
-        ),
+        Row::Custom if focused => Some(messages::start::WIZARD_CUSTOM_DESCRIPTION.to_string()),
+        Row::ClipboardCopy if focused => {
+            Some(messages::start::WIZARD_CLIPBOARD_COPY_DESCRIPTION.to_string())
+        }
+        Row::ClipboardPaste if focused => {
+            Some(messages::start::WIZARD_CLIPBOARD_PASTE_DESCRIPTION.to_string())
+        }
+        Row::ShareConfig if focused => {
+            Some(messages::start::WIZARD_SHARE_CONFIG_DESCRIPTION.to_string())
+        }
         _ => None,
     };
     let error = match row {
         Row::Arg(..) if focused => form.other().and_then(|o| o.error.clone()),
-        Row::Start => form.check_error().map(|e| format!("Config error: {e}")),
+        Row::Start => form.check_error().map(messages::start::config_error),
         _ => None,
     };
     let mut lines = Vec::new();
@@ -241,7 +241,7 @@ fn row_line(form: &Form, row: Row, focused: bool, styles: &Styles) -> Line {
     let label = if locked {
         &styles.dim
     } else {
-        styles.label(focused, Tone::Plain)
+        styles.label(focused)
     };
     let mark = |selected| {
         if locked {
@@ -257,7 +257,9 @@ fn row_line(form: &Form, row: Row, focused: bool, styles: &Styles) -> Line {
             line.push(style::radio(selected), styles.mark(selected));
             line.push(" ", &styles.plain);
             line.mark_indent();
-            let name = t.map_or("empty", |t| form.templates()[t].name.as_str());
+            let name = t.map_or(messages::start::WIZARD_TEMPLATE_EMPTY, |t| {
+                form.templates()[t].name.as_str()
+            });
             line.push(name, label);
         }
         Row::Pack(i) => {
@@ -280,7 +282,7 @@ fn row_line(form: &Form, row: Row, focused: bool, styles: &Styles) -> Line {
             line.push(" ", &styles.plain);
             line.mark_indent();
             let image = form.custom_image().map_or("", |image| image.name.as_str());
-            line.push(&format!("custom ({image})"), label);
+            line.push(&messages::start::wizard_custom_image(image), label);
         }
         Row::Arg(i, a) => {
             let entry = &form.entries()[i];
@@ -306,15 +308,21 @@ fn row_line(form: &Form, row: Row, focused: bool, styles: &Styles) -> Line {
                 line.push(" ", &styles.plain);
                 match other {
                     Some(other) => line.push_item(&other.text, true, true, styles),
-                    None => line.push(OTHER_CHOICE, &styles.dim),
+                    None => line.push(messages::start::WIZARD_OTHER_CHOICE, &styles.dim),
                 }
             }
         }
         Row::ClipboardCopy | Row::ClipboardPaste => {
             let (name, on) = if row == Row::ClipboardCopy {
-                ("clipboard: copy", form.clipboard().copy)
+                (
+                    messages::start::WIZARD_CLIPBOARD_COPY,
+                    form.clipboard().copy,
+                )
             } else {
-                ("clipboard: paste", form.clipboard().paste)
+                (
+                    messages::start::WIZARD_CLIPBOARD_PASTE,
+                    form.clipboard().paste,
+                )
             };
             line.lead(2, focused, styles);
             line.push(style::checkbox(on), styles.mark(on));
@@ -328,7 +336,7 @@ fn row_line(form: &Form, row: Row, focused: bool, styles: &Styles) -> Line {
             line.push(style::checkbox(on), styles.mark(on));
             line.push(" ", &styles.plain);
             line.mark_indent();
-            line.push("Create airlock.toml", label);
+            line.push(messages::start::WIZARD_CREATE_CONFIG, label);
         }
         Row::Start => {
             line.lead(0, focused, styles);
@@ -339,13 +347,8 @@ fn row_line(form: &Form, row: Row, focused: bool, styles: &Styles) -> Line {
                     if n > 0 {
                         line.push(" · ", &styles.plain);
                     }
-                    let tone = if choice == StartChoice::Cancel {
-                        Tone::Danger
-                    } else {
-                        Tone::Plain
-                    };
                     let text = start_label(choice, form.mode());
-                    line.push_option(text, choice == form.start(), tone, styles);
+                    line.push_option(text, choice == form.start(), styles);
                 }
             } else {
                 line.push(start_label(form.start(), form.mode()), &styles.plain);

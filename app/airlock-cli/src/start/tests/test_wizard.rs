@@ -277,14 +277,14 @@ fn answers_whose_env_does_not_resolve_fail_check() {
     assert!(format!("{e:#}").contains("MINE"), "{e:#}");
 }
 
-/// Test that Esc, the cancel choice and Ctrl+C end the wizard with no
+/// Test that Esc, the abort choice and Ctrl+C end the wizard with no
 /// answers.
 ///   1. Go to the start row, press Esc and check that the focus goes back
-///   2. Press Esc again and check that the wizard cancels
-///   3. Choose cancel on the start row and check that Enter cancels
+///   2. Press Esc again and check that the wizard aborts
+///   3. Choose abort on the start row and check that Enter aborts
 ///   4. Press Ctrl+C and check that the wizard ends as interrupted
 #[test]
-fn esc_cancel_and_ctrl_c_end_wizard_without_answers() {
+fn esc_abort_and_ctrl_c_end_wizard_without_answers() {
     let packs = crate::packs::init_with_sample();
     let data = temp_dir();
     let mut form = Form::new(data.path(), &packs, None, &[], Mode::Start);
@@ -293,13 +293,13 @@ fn esc_cancel_and_ctrl_c_end_wizard_without_answers() {
     assert_eq!(form.focus(), Row::Start);
     assert!(matches!(press(&mut form, KeyCode::Esc), Step::Stay));
     assert_eq!(form.focus(), first);
-    assert!(matches!(press(&mut form, KeyCode::Esc), Step::Cancel));
+    assert!(matches!(press(&mut form, KeyCode::Esc), Step::Abort));
 
     let mut form = Form::new(data.path(), &packs, None, &[], Mode::Start);
     press(&mut form, KeyCode::Enter);
     press(&mut form, KeyCode::Right);
-    assert_eq!(form.start(), StartChoice::Cancel);
-    assert!(matches!(press(&mut form, KeyCode::Enter), Step::Cancel));
+    assert_eq!(form.start(), StartChoice::Abort);
+    assert!(matches!(press(&mut form, KeyCode::Enter), Step::Abort));
 
     let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
     assert!(matches!(form.key(ctrl_c), Step::Interrupt));

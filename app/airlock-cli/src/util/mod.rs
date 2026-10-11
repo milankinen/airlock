@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 pub(crate) use safe_fs::PinnedDir;
 
+use crate::messages;
+
 /// Expand a `~` prefix in a path string to `home`.
 pub(crate) fn expand_tilde(path: &str, home: &Path) -> PathBuf {
     if path == "~" {
@@ -135,8 +137,12 @@ pub(crate) fn read_json<T: serde::de::DeserializeOwned>(
     let Some(bytes) = dir.read(name, cap)? else {
         return Ok(None);
     };
-    let value = serde_json::from_slice(&bytes)
-        .map_err(|e| anyhow::anyhow!("parse {}: {e}", dir.path().join(name).display()))?;
+    let value = serde_json::from_slice(&bytes).map_err(|e| {
+        anyhow::anyhow!(messages::util::parse_failed(
+            dir.path().join(name).display(),
+            e
+        ))
+    })?;
     Ok(Some(value))
 }
 
@@ -150,8 +156,12 @@ pub(crate) fn write_json<T: serde::Serialize>(
 ) -> anyhow::Result<()> {
     let mut json = serde_json::to_vec_pretty(value)?;
     json.push(b'\n');
-    dir.write_atomic(name, &json, mode)
-        .map_err(|e| anyhow::anyhow!("write {}: {e}", dir.path().join(name).display()))
+    dir.write_atomic(name, &json, mode).map_err(|e| {
+        anyhow::anyhow!(messages::util::write_failed(
+            dir.path().join(name).display(),
+            e
+        ))
+    })
 }
 
 #[cfg(test)]

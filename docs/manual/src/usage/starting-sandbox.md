@@ -24,12 +24,12 @@ When the image or the [packs](../packs.md) of an existing sandbox change,
 sandbox: airlock removes the sandbox disk and installs all packs into a
 new disk.
 
-For an added pack, you can also select "install anyways". Then airlock
+For an added pack, you can also select "Install anyways". Then airlock
 installs the pack into the existing disk. Code that is already on the
 disk can run during the install, with an open network. Use it only if you
 trust the sandbox contents.
 
-For a removed pack, you can also select "continue with current sandbox".
+For a removed pack, you can also select "Continue with current sandbox".
 Then the pack stays on the disk until you re-create the sandbox. A
 changed pack installs only into a re-created sandbox.
 

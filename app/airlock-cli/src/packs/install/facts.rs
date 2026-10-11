@@ -22,19 +22,16 @@ use crate::oci::{self, OciImage};
 ///   Nothing, or the reason why the image cannot take packs.
 pub fn check(data_dir: &Path, image: &OciImage) -> anyhow::Result<()> {
     if image.uid != 0 {
-        anyhow::bail!(
-            "image {} runs as uid {}; packs install only into an image that runs as root",
-            image.name,
+        anyhow::bail!(crate::messages::packs::image_uid_not_root(
+            &image.name,
             image.uid
-        );
+        ));
     }
     let os = oci::os_release(data_dir, image)
-        .ok_or_else(|| anyhow::anyhow!("image {} has no /etc/os-release", image.name))?;
+        .ok_or_else(|| anyhow::anyhow!(crate::messages::packs::image_no_os_release(&image.name)))?;
     anyhow::ensure!(
         supported(&os),
-        "image {} is {}; packs install only into Alpine- and Debian-based images",
-        image.name,
-        os.id
+        crate::messages::packs::image_os_unsupported(&image.name, &os.id)
     );
     Ok(())
 }

@@ -15,6 +15,8 @@ use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use crate::messages;
+
 /// An open directory. All file operations resolve relative to it and never
 /// follow a symlink at the final component. A later swap of a directory on
 /// the path cannot redirect them.
@@ -67,7 +69,7 @@ impl PinnedDir {
             let Component::Normal(name) = component else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("not a plain relative path: {}", rel.display()),
+                    messages::util::not_plain_relative_path(rel.display()),
                 ));
             };
             dir = dir.subdir(name, create)?;
@@ -136,10 +138,7 @@ impl PinnedDir {
         if meta.len() > cap {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "{} is larger than {cap} bytes",
-                    self.display.join(name).display()
-                ),
+                messages::util::file_too_large(self.display.join(name).display(), cap),
             ));
         }
         let mut buf = Vec::with_capacity(meta.len() as usize);
@@ -147,10 +146,7 @@ impl PinnedDir {
         if buf.len() as u64 > cap {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "{} is larger than {cap} bytes",
-                    self.display.join(name).display()
-                ),
+                messages::util::file_too_large(self.display.join(name).display(), cap),
             ));
         }
         Ok(Some(buf))
@@ -265,7 +261,7 @@ impl PinnedDir {
     pub fn link_from(&self, _src: &File, _name: impl AsRef<OsStr>) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "linkat from fd not available on this platform",
+            messages::util::LINK_FROM_FD_UNSUPPORTED,
         ))
     }
 
@@ -333,7 +329,7 @@ impl PinnedDir {
         if !meta.file_type().is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("{} is not a regular file", path.display()),
+                messages::util::not_regular_file(path.display()),
             ));
         }
         check_owner(meta, &path)
@@ -346,10 +342,10 @@ impl PinnedDir {
         if e.raw_os_error() == Some(libc::ELOOP) {
             return io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("{} is a symlink; refusing to follow it", path.display()),
+                messages::util::symlink_refused(path.display()),
             );
         }
-        io::Error::new(e.kind(), format!("{}: {e}", path.display()))
+        io::Error::new(e.kind(), messages::util::path_error(path.display(), e))
     }
 }
 
@@ -385,7 +381,7 @@ fn file_name(name: &OsStr) -> io::Result<CString> {
     if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("not a file name: {}", name.to_string_lossy()),
+            messages::util::not_file_name(name.to_string_lossy()),
         ));
     }
     Ok(CString::new(bytes)?)
@@ -407,11 +403,7 @@ fn check_owner(meta: &std::fs::Metadata, path: &Path) -> io::Result<()> {
     if meta.uid() != euid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!(
-                "{} is owned by uid {}, not by the current user",
-                path.display(),
-                meta.uid()
-            ),
+            messages::util::owned_by_other_user(path.display(), meta.uid()),
         ));
     }
     Ok(())

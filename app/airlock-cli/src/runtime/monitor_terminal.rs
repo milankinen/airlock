@@ -84,10 +84,10 @@ impl Runtime for MonitorRuntime {
     ) -> anyhow::Result<MonitorTerminal> {
         let stdin_tx = self
             .stdin_tx
-            .ok_or_else(|| anyhow::anyhow!("attach_stdin must be called before launch"))?;
+            .ok_or_else(|| anyhow::anyhow!(crate::messages::runtime::ATTACH_STDIN_BEFORE_LAUNCH))?;
         let sig_tx = self
             .sig_tx
-            .ok_or_else(|| anyhow::anyhow!("signals must be called before launch"))?;
+            .ok_or_else(|| anyhow::anyhow!(crate::messages::runtime::SIGNALS_BEFORE_LAUNCH))?;
         let project_path = project.host_cwd.display().to_string();
         let control: std::sync::Arc<dyn airlock_monitor::NetworkControl> =
             std::sync::Arc::new(network.control());

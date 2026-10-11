@@ -320,9 +320,7 @@ impl<'de> serde::Deserialize<'de> for EnvVar {
                     keep_prefixes,
                 })
             }
-            _ => Err(D::Error::custom(
-                "expected a string or a table `{ value = \"...\", mask = true }`",
-            )),
+            _ => Err(D::Error::custom(crate::messages::config::ENV_VAR_EXPECTED)),
         }
     }
 }
@@ -593,7 +591,7 @@ impl<'de> serde::Deserialize<'de> for PortMapping {
             type Value = PortMapping;
 
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a port number or \"host:guest\" string")
+                f.write_str(crate::messages::config::PORT_MAPPING_EXPECTED)
             }
 
             fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<PortMapping, E> {
@@ -607,9 +605,9 @@ impl<'de> serde::Deserialize<'de> for PortMapping {
             }
 
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<PortMapping, E> {
-                let (host, guest) = v
-                    .split_once(':')
-                    .ok_or_else(|| serde::de::Error::custom("expected \"host:guest\""))?;
+                let (host, guest) = v.split_once(':').ok_or_else(|| {
+                    serde::de::Error::custom(crate::messages::config::PORT_MAPPING_NEEDS_COLON)
+                })?;
                 let host: u16 = host.parse().map_err(serde::de::Error::custom)?;
                 let guest: u16 = guest.parse().map_err(serde::de::Error::custom)?;
                 Ok(PortMapping { host, guest })
@@ -898,10 +896,9 @@ impl<'de> serde::Deserialize<'de> for Signal {
             "SIGUSR1" => Ok(Signal::Usr1),
             "SIGUSR2" => Ok(Signal::Usr2),
             "SIGKILL" => Ok(Signal::Kill),
-            other => Err(serde::de::Error::custom(format!(
-                "unknown signal '{other}' — expected one of SIGTERM, SIGINT, SIGHUP, \
-                 SIGQUIT, SIGUSR1, SIGUSR2, SIGKILL"
-            ))),
+            other => Err(serde::de::Error::custom(
+                crate::messages::config::unknown_signal(other),
+            )),
         }
     }
 }
@@ -987,7 +984,7 @@ impl WellKnown for Mask {
 ///   The config values, or an error that lists all problems.
 pub(crate) fn parse(merged: serde_json::Value) -> anyhow::Result<ConfigValues> {
     let serde_json::Value::Object(map) = merged else {
-        anyhow::bail!("config must be a TOML table");
+        anyhow::bail!(crate::messages::config::CONFIG_NOT_TABLE);
     };
 
     let schema = smart_config::ConfigSchema::new(&ConfigValues::DESCRIPTION, "");
@@ -998,7 +995,7 @@ pub(crate) fn parse(merged: serde_json::Value) -> anyhow::Result<ConfigValues> {
         Ok(config) => config,
         Err(errors) => {
             return Err(anyhow::anyhow!(format_error(
-                "invalid configuration",
+                crate::messages::config::INVALID_CONFIGURATION,
                 errors,
             )));
         }
@@ -1038,8 +1035,8 @@ fn validate_network(config: &ConfigValues) -> anyhow::Result<()> {
         if ServiceId::from_name(name).is_none() {
             let known: Vec<&str> = ServiceId::ALL.iter().map(|s| s.name()).collect();
             problems.push(format!(
-                "* `network.services.{name}` unknown service (known: {})",
-                known.join(", ")
+                "* {}",
+                crate::messages::config::unknown_service(name, known.join(", "))
             ));
         }
     }
@@ -1050,20 +1047,25 @@ fn validate_network(config: &ConfigValues) -> anyhow::Result<()> {
         for (field, patterns) in [("allow", &rule.allow), ("deny", &rule.deny)] {
             for pattern in patterns {
                 if let Err(e) = parse_pattern(pattern) {
-                    problems.push(format!("* `network.rules.{rule_name}.{field}` {e}"));
+                    problems.push(format!(
+                        "* {}",
+                        crate::messages::config::rule_pattern_invalid(rule_name, field, e)
+                    ));
                 }
             }
         }
         if rule.passthrough && !rule.inject.is_empty() {
             problems.push(format!(
-                "* `network.rules.{rule_name}` inject cannot be combined with passthrough"
+                "* {}",
+                crate::messages::config::rule_inject_with_passthrough(rule_name)
             ));
         }
         for var in &rule.inject {
             let masked = config.env.get(var).is_some_and(|e| e.mask);
             if !masked {
                 problems.push(format!(
-                    "* `network.rules.{rule_name}.inject` `{var}` must be defined in [env] with mask = true"
+                    "* {}",
+                    crate::messages::config::rule_inject_not_masked(rule_name, var)
                 ));
             }
         }
@@ -1074,14 +1076,19 @@ fn validate_network(config: &ConfigValues) -> anyhow::Result<()> {
         }
         for pattern in &mw.target {
             if let Err(e) = parse_pattern(pattern) {
-                problems.push(format!("* `network.middleware.{mw_name}.target` {e}"));
+                problems.push(format!(
+                    "* {}",
+                    crate::messages::config::middleware_target_invalid(mw_name, e)
+                ));
             }
         }
     }
     if problems.is_empty() {
         Ok(())
     } else {
-        anyhow::bail!("invalid configuration\n{}", problems.join("\n"));
+        anyhow::bail!(crate::messages::config::invalid_configuration_problems(
+            problems.join("\n")
+        ));
     }
 }
 

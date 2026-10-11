@@ -69,11 +69,10 @@ pub fn check_data_dir(data_dir: &Path) -> Result<(), Exit> {
     if cfg!(target_os = "linux") && len > MAX_DATA_DIR_LEN {
         return Err(Exit::error(
             1,
-            format!(
-                "The data directory path {} is too long ({len} bytes, the limit is \
-                 {MAX_DATA_DIR_LEN}). Set a shorter data directory in {}, for example: \
-                 data_dir = \"~/airlock-data\"",
+            crate::messages::start::data_dir_too_long(
                 data_dir.display(),
+                len,
+                MAX_DATA_DIR_LEN,
                 crate::settings::Settings::expected_path().display(),
             ),
         ));
@@ -87,7 +86,7 @@ pub fn resolve_host_cwd() -> Result<PathBuf, Exit> {
         Ok(p) => Ok(std::fs::canonicalize(&p).unwrap_or(p)),
         Err(e) => Err(Exit::error(
             1,
-            format!("Cannot determine current directory: {e}"),
+            crate::messages::cli::cannot_determine_cwd(e),
         )),
     }
 }

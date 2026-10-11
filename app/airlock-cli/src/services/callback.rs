@@ -292,14 +292,16 @@ where
     // gets the answer that hyper already received.
     let mut browser = std::pin::pin!(browser);
     tokio::select! {
-        served = browser.as_mut() => return served.context("sign-in callback"),
+        served = browser.as_mut() => return served.context(crate::messages::services::SIGN_IN_CALLBACK),
         ended = guest_conn => {
             if let Err(e) = ended {
                 debug!("sign-in callback to the guest: {e}");
             }
         }
     }
-    browser.await.context("sign-in callback")
+    browser
+        .await
+        .context(crate::messages::services::SIGN_IN_CALLBACK)
 }
 
 /// Change the browser's request for the guest.
@@ -329,7 +331,8 @@ fn to_guest(
         state.code_seen.set(Some(Instant::now()));
     }
     let path_and_query = format!("{}?{query}", req.uri().path());
-    *req.uri_mut() = Uri::try_from(path_and_query).context("rewritten callback URI")?;
+    *req.uri_mut() =
+        Uri::try_from(path_and_query).context(crate::messages::services::REWRITTEN_CALLBACK_URI)?;
     Ok(req)
 }
 

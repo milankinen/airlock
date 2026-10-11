@@ -66,11 +66,13 @@ impl Process {
                         Ok(data_frame::Eof(())) => {}
                         Ok(data_frame::Data(Err(e))) => {
                             tracing::error!("guest stdout frame decode failed: {e}");
-                            anyhow::bail!("guest stdout frame decode failed: {e}");
+                            anyhow::bail!(crate::messages::rpc::guest_stdout_frame_decode_failed(
+                                e
+                            ));
                         }
                         Err(e) => {
                             tracing::error!("unknown guest stdout frame (schema skew?): {e}");
-                            anyhow::bail!("unknown guest stdout frame: {e}");
+                            anyhow::bail!(crate::messages::rpc::unknown_guest_stdout_frame(e));
                         }
                     }
                 }
@@ -83,17 +85,19 @@ impl Process {
                         Ok(data_frame::Eof(())) => {}
                         Ok(data_frame::Data(Err(e))) => {
                             tracing::error!("guest stderr frame decode failed: {e}");
-                            anyhow::bail!("guest stderr frame decode failed: {e}");
+                            anyhow::bail!(crate::messages::rpc::guest_stderr_frame_decode_failed(
+                                e
+                            ));
                         }
                         Err(e) => {
                             tracing::error!("unknown guest stderr frame (schema skew?): {e}");
-                            anyhow::bail!("unknown guest stderr frame: {e}");
+                            anyhow::bail!(crate::messages::rpc::unknown_guest_stderr_frame(e));
                         }
                     }
                 }
                 Err(e) => {
                     tracing::error!("unknown guest process output (schema skew?): {e}");
-                    anyhow::bail!("unknown guest process output: {e}");
+                    anyhow::bail!(crate::messages::rpc::unknown_guest_process_output(e));
                 }
             }
         }

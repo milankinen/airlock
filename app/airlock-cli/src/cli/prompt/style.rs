@@ -1,21 +1,12 @@
 //! Shared look of the prompts.
 //!
-//! Titles are bold. Notes and hints are gray. The focused label is cyan. A
-//! current mark or option is green. Errors and destructive options are red.
-//! Without colors (`NO_COLOR`, `CLICOLOR=0`, or a terminal without colors), a
+//! Titles are bold. Notes and hints are gray. The focused label and the
+//! current option of a bar are cyan. A current mark or value is green. Errors
+//! are red. Without colors (`NO_COLOR`, `CLICOLOR=0`, or a terminal without colors), a
 //! `❯` before the focused row shows the focus. Brackets show the current option
 //! (`[yes]`). Also wraps long text to the terminal width.
 
 use console::{Style, measure_text_width};
-
-/// Kind of an option. Sets the color of the option.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Tone {
-    /// A normal option.
-    Plain,
-    /// The option destroys data or ends the run. Shows in red.
-    Danger,
-}
 
 /// The styles of a prompt on stderr. No colors if stderr does not support
 /// them.
@@ -28,11 +19,11 @@ pub struct Styles {
     pub bold: Style,
     /// Gray text, for notes and hints.
     pub dim: Style,
-    /// Cyan text, for the focused label.
+    /// Cyan text, for the focused label and the current option of a bar.
     pub cyan: Style,
-    /// Green text, for the current mark or option.
+    /// Green text, for the current mark or value.
     pub green: Style,
-    /// Red text, for errors and destructive options.
+    /// Red text, for errors.
     pub red: Style,
 }
 
@@ -56,14 +47,9 @@ impl Styles {
         if selected { &self.green } else { &self.plain }
     }
 
-    /// Return the style of a row label: cyan when `focused`, red for
-    /// [`Tone::Danger`].
-    pub fn label(&self, focused: bool, tone: Tone) -> &Style {
-        match tone {
-            Tone::Danger => &self.red,
-            Tone::Plain if focused => &self.cyan,
-            Tone::Plain => &self.plain,
-        }
+    /// Return the style of a row label: cyan when `focused`.
+    pub fn label(&self, focused: bool) -> &Style {
+        if focused { &self.cyan } else { &self.plain }
     }
 }
 
@@ -174,17 +160,15 @@ impl Line {
 
     /// Add an option of a bar (`« a · b »`).
     ///
-    /// The `current` option is green, or red for [`Tone::Danger`]. Without
-    /// colors, it is in brackets. Other options are plain.
-    pub fn push_option(&mut self, text: &str, current: bool, tone: Tone, styles: &Styles) {
+    /// The `current` option is cyan, like a focused label. Without colors, it
+    /// is in brackets. Other options are plain.
+    pub fn push_option(&mut self, text: &str, current: bool, styles: &Styles) {
         if !current {
             self.push(text, &styles.plain);
         } else if !styles.colors {
             self.push(&format!("[{text}]"), &styles.plain);
-        } else if tone == Tone::Danger {
-            self.push(text, &styles.red);
         } else {
-            self.push(text, &styles.green);
+            self.push(text, &styles.cyan);
         }
     }
 

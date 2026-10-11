@@ -39,13 +39,10 @@ pub fn argv(installer: &InstallerScript) -> Vec<String> {
 ///   A hint, or `None` for an exit code without a known meaning.
 pub fn exit_hint(code: i32) -> Option<&'static str> {
     match code {
-        10 => Some("the image is not Alpine- or Debian-based, or the CPU is not supported"),
-        11 => Some("a package could not be installed; see the log"),
-        12 => Some(
-            "a download failed; check the network (GitHub rate limits show as HTTP 403) \
-             and run `airlock start` again",
-        ),
-        13 => Some("an arg value of the pack is not valid; check the [packs] args"),
+        10 => Some(crate::messages::packs::EXIT_HINT_IMAGE_UNSUPPORTED),
+        11 => Some(crate::messages::packs::EXIT_HINT_PACKAGE_FAILED),
+        12 => Some(crate::messages::packs::EXIT_HINT_DOWNLOAD_FAILED),
+        13 => Some(crate::messages::packs::EXIT_HINT_ARG_INVALID),
         _ => None,
     }
 }

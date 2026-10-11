@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use crate::messages;
+
 /// On-disk format version of the per-layer cache.
 ///
 /// Increase it when the on-disk contract changes. For example, the
@@ -44,7 +46,7 @@ pub fn check_digest(digest: &str) -> anyhow::Result<()> {
     let ok = digest.strip_prefix("sha256:").is_some_and(|hex| {
         hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
     });
-    anyhow::ensure!(ok, "invalid image digest {digest:?}");
+    anyhow::ensure!(ok, messages::app::invalid_image_digest(digest));
     Ok(())
 }
 
@@ -53,7 +55,7 @@ pub fn check_digest(digest: &str) -> anyhow::Result<()> {
 fn check_entry_name(name: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         !matches!(name, "" | "." | "..") && !name.contains(['/', '\0']),
-        "invalid cache entry name {name:?}"
+        messages::app::invalid_cache_entry_name(name)
     );
     Ok(())
 }
@@ -75,7 +77,7 @@ pub fn layer_key(digest: &str) -> String {
 /// the platform (`~/Library/Application Support` on macOS,
 /// `$XDG_DATA_HOME` or `~/.local/share` on Linux).
 pub fn default_data_dir() -> anyhow::Result<PathBuf> {
-    let base = dirs::data_dir().ok_or_else(|| anyhow::anyhow!("HOME not set"))?;
+    let base = dirs::data_dir().ok_or_else(|| anyhow::anyhow!(messages::app::HOME_NOT_SET))?;
     Ok(base.join("airlock"))
 }
 
@@ -112,11 +114,13 @@ pub fn migrate_legacy_cache(data_dir: PathBuf) -> PathBuf {
         Ok(()) => data_dir,
         Err(e) => {
             crate::cli::log!(
-                "{} cannot move {} to {}: {e}. Using {}.",
-                crate::cli::yellow("warning:"),
-                legacy.display(),
-                data_dir.display(),
-                legacy.display()
+                "{}",
+                messages::app::cache_move_failed(
+                    crate::cli::yellow("warning:"),
+                    legacy.display(),
+                    data_dir.display(),
+                    e
+                )
             );
             legacy
         }
@@ -131,7 +135,7 @@ pub fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
         .recursive(true)
         .mode(0o700)
         .create(dir)
-        .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.display()))
+        .map_err(|e| anyhow::anyhow!(messages::app::cannot_create_dir(dir.display(), e)))
 }
 
 /// Get the mount directory of the pack `name`
@@ -143,7 +147,7 @@ pub fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
 pub fn pack_mounts_dir(data_dir: &Path, name: &str) -> anyhow::Result<PathBuf> {
     let dir = data_dir.join("share").join("all").join("packs").join(name);
     std::fs::create_dir_all(&dir)
-        .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", dir.display()))?;
+        .map_err(|e| anyhow::anyhow!(messages::app::cannot_create_dir(dir.display(), e)))?;
     Ok(dir)
 }
 

@@ -9,23 +9,20 @@ use std::io::Read;
 use anyhow::{Context, bail};
 
 use super::{Vault, VaultStorageType};
-use crate::cli;
+use crate::cli::prompt::choose;
 use crate::cli::prompt::fields::{Field, Fields};
-use crate::cli::prompt::yes_no::YesNo;
 use crate::settings::Settings;
+use crate::{cli, messages};
+
+/// The user aborted a prompt. The command ends with exit code 0.
+#[derive(Debug, thiserror::Error)]
+#[error("{}", crate::messages::cli::ABORTED)]
+pub struct Aborted;
 
 /// Error message for commands that must store a secret while the vault is
 /// disabled. Tells how to enable the vault.
 pub fn disabled_message() -> String {
-    format!(
-        "the airlock vault is disabled. Enable it to store user \
-         secrets and registry credentials.\n\n\
-         Edit {} and set:\n\n  \
-         vault.storage = \"keyring\"         # system keychain / Secret Service (default), or\n  \
-         vault.storage = \"encrypted-file\"  # passphrase-encrypted, or\n  \
-         vault.storage = \"file\"            # plain 0600 JSON\n",
-        Settings::expected_path().display()
-    )
+    messages::vault::vault_disabled(Settings::expected_path().display())
 }
 
 /// Make sure that the vault can store a secret.
@@ -35,10 +32,10 @@ pub fn disabled_message() -> String {
 ///
 /// Returns:
 ///   Error if the vault is disabled, or if the vault is plaintext (`file`)
-///   and the user does not confirm it.
+///   and the user does not confirm it. [`Aborted`] if the user aborts.
 pub fn ensure_writable(vault: &Vault, assume_yes: bool) -> anyhow::Result<()> {
     match vault.storage_type() {
-        VaultStorageType::Disabled => bail!("{}", disabled_message()),
+        VaultStorageType::Disabled => bail!(disabled_message()),
         VaultStorageType::File if !assume_yes => confirm_plaintext_vault(),
         _ => Ok(()),
     }
@@ -50,31 +47,18 @@ pub fn ensure_writable(vault: &Vault, assume_yes: bool) -> anyhow::Result<()> {
 /// The warning shows the two better backends, so the user knows what to
 /// do. A non-interactive shell fails. Scripts can use `--yes`.
 fn confirm_plaintext_vault() -> anyhow::Result<()> {
-    let msg = "\
-Your vault backend is \"file\" — secrets will be written as plaintext
-JSON to ~/.airlock/vault.default.json (mode 0600). Anyone with read access to
-that file can recover them. For stronger at-rest protection, set one of
-these in ~/.airlock/settings.toml:
-
-# RECOMMENDED: Keychain (macOS) / Secret Service (Linux)
-vault.storage = \"keyring\"
-# AEAD-encrypted, passphrase on first use (AIRLOCK_VAULT_PASSPHRASE for non-interactive)
-vault.storage = \"encrypted-file\"
-";
-    println!("{}", cli::yellow(msg));
+    println!("{}", cli::yellow(messages::vault::PLAINTEXT_VAULT_WARNING));
     if !cli::is_interactive() {
-        bail!(
-            "vault is \"file\" (plaintext). Re-run with --yes to confirm, or switch to \
-             \"encrypted-file\" / \"keyring\" in ~/.airlock/settings.toml."
-        );
+        bail!(messages::vault::PLAINTEXT_VAULT_NEEDS_YES);
     }
-    let question = YesNo {
-        question: "Proceed with the plaintext vault?",
-        default: false,
-    };
-    let ok = question.ask().context("confirm plaintext vault")?;
-    if ok != Some(true) {
-        bail!("cancelled");
+    let ok = choose::confirm(
+        messages::vault::PROCEED_PLAINTEXT_VAULT_QUESTION,
+        &[],
+        messages::vault::PROCEED_PLAINTEXT_VAULT_YES,
+    )
+    .context(messages::vault::CONFIRM_PLAINTEXT_VAULT)?;
+    if !ok {
+        return Err(Aborted.into());
     }
     Ok(())
 }
@@ -87,12 +71,12 @@ pub fn read_from_stdin() -> anyhow::Result<String> {
     // SAFETY: `libc::isatty` on fd 0 is side-effect-free.
     let is_tty = unsafe { libc::isatty(0) } == 1;
     if is_tty {
-        bail!("--stdin requires piped input; omit it to prompt interactively");
+        bail!(messages::vault::STDIN_NEEDS_PIPED_INPUT);
     }
     let mut buf = String::new();
     std::io::stdin()
         .read_to_string(&mut buf)
-        .context("read secret from stdin")?;
+        .context(messages::vault::READ_SECRET_FROM_STDIN)?;
     // Remove exactly one trailing newline, so `echo $FOO | ...` gives the
     // original value.
     if buf.ends_with('\n') {
@@ -109,11 +93,11 @@ pub fn read_from_stdin() -> anyhow::Result<String> {
 ///  - `label`: Label of the input row
 ///
 /// Returns:
-///   Text that the user typed. Error if the terminal is not interactive
-///   or the user pushes Esc.
+///   Text that the user typed. Error if the terminal is not interactive.
+///   [`Aborted`] if the user pushes Esc.
 pub fn read_from_prompt(label: &str) -> anyhow::Result<String> {
     if !cli::is_interactive() {
-        bail!("no TTY available — use `--stdin` to pipe the value in");
+        bail!(messages::vault::NO_TTY_USE_STDIN);
     }
     let form = Fields {
         title: None,
@@ -121,11 +105,13 @@ pub fn read_from_prompt(label: &str) -> anyhow::Result<String> {
             label,
             secret: true,
         }],
-        keys: "enter save · esc cancel",
+        keys: messages::vault::SECRET_KEYS,
     };
-    let texts = form.ask(|_| Ok(())).context("read secret value")?;
+    let texts = form
+        .ask(|_| Ok(()))
+        .context(messages::vault::READ_SECRET_VALUE)?;
     let Some(mut texts) = texts else {
-        bail!("cancelled");
+        return Err(Aborted.into());
     };
     Ok(texts.swap_remove(0))
 }

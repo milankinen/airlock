@@ -402,7 +402,7 @@ impl Keys {
                     aad: &aad(key),
                 },
             )
-            .map_err(|_| anyhow!("encrypt {key}"))?;
+            .map_err(|_| anyhow!(crate::messages::services::encrypt_key(key)))?;
         let mut out = vec![FORMAT_VERSION];
         out.extend_from_slice(&nonce);
         out.extend(ciphertext);
@@ -411,13 +411,15 @@ impl Keys {
 
     fn open(&self, key: &str, sealed: &[u8]) -> anyhow::Result<Vec<u8>> {
         let Some((&version, rest)) = sealed.split_first() else {
-            bail!("{key} is empty");
+            bail!(crate::messages::services::store_value_empty(key));
         };
         if version != FORMAT_VERSION {
-            bail!("{key} has the unknown format version {version}");
+            bail!(crate::messages::services::store_value_unknown_version(
+                key, version
+            ));
         }
         if rest.len() < 12 {
-            bail!("{key} is too short");
+            bail!(crate::messages::services::store_value_too_short(key));
         }
         let (nonce, ciphertext) = rest.split_at(12);
         let nonce = <[u8; 12]>::try_from(nonce).expect("12 bytes");
@@ -429,7 +431,7 @@ impl Keys {
                     aad: &aad(key),
                 },
             )
-            .map_err(|_| anyhow!("decrypt {key}: wrong key or corrupt data"))
+            .map_err(|_| anyhow!(crate::messages::services::decrypt_key(key)))
     }
 }
 
@@ -452,7 +454,7 @@ pub fn random_bytes<const N: usize>() -> anyhow::Result<[u8; N]> {
     let mut bytes = [0u8; N];
     SysRng
         .try_fill_bytes(&mut bytes)
-        .map_err(|e| anyhow!("random bytes: {e}"))?;
+        .map_err(|e| anyhow!(crate::messages::services::random_bytes_failed(e)))?;
     Ok(bytes)
 }
 
@@ -474,7 +476,8 @@ fn read_generation(table: Table, txn: &RoTxn, service: ServiceId) -> anyhow::Res
     let Some(bytes) = table.get(txn, &key_name(service, "generation"))? else {
         return Ok(0);
     };
-    let bytes = <[u8; 8]>::try_from(bytes).map_err(|_| anyhow!("corrupt store generation"))?;
+    let bytes = <[u8; 8]>::try_from(bytes)
+        .map_err(|_| anyhow!(crate::messages::services::CORRUPT_STORE_GENERATION))?;
     Ok(u64::from_be_bytes(bytes))
 }
 
@@ -489,7 +492,7 @@ fn read_secrets(
         return Ok(Secrets::default());
     };
     let plain = keys.open(&key, sealed)?;
-    serde_json::from_slice(&plain).with_context(|| format!("parse {key}"))
+    serde_json::from_slice(&plain).with_context(|| crate::messages::services::parse_key(&key))
 }
 
 /// Write all three keys of `service`. Returns the new generation.
@@ -502,7 +505,7 @@ fn write_all(
     secrets: &Secrets,
 ) -> anyhow::Result<u64> {
     let key = key_name(service, "secrets");
-    let plain = serde_json::to_vec(secrets).context("serialize the grants")?;
+    let plain = serde_json::to_vec(secrets).context(crate::messages::services::SERIALIZE_GRANTS)?;
     table.put(txn, &key, &keys.seal(&key, &plain)?)?;
     let meta: BTreeMap<&String, GrantMeta> = secrets
         .grants
@@ -766,7 +769,7 @@ impl TokenStore {
             })
             .await?;
         if done.is_none() {
-            bail!("the sign-in was removed");
+            bail!(crate::messages::services::SIGN_IN_REMOVED);
         }
         Ok(())
     }
@@ -820,7 +823,7 @@ pub async fn list_grants(db: &Db) -> anyhow::Result<Vec<GrantSummary>> {
                 continue;
             };
             let meta: BTreeMap<String, GrantMeta> =
-                serde_json::from_slice(bytes).context("parse the sign-ins")?;
+                serde_json::from_slice(bytes).context(crate::messages::services::PARSE_SIGN_INS)?;
             out.extend(meta.into_values().map(|m| GrantSummary {
                 service: service.name().to_string(),
                 account: m.account,
