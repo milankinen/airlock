@@ -4,10 +4,12 @@
 //!  * checks that the host can run sandboxes
 //!  * helps the user create a config for a new project
 //!  * finds `[env]` errors before the slow steps start
+//!  * asks the user to accept config changes since the last run
 //!  * prepares the sandbox and decides which tools to install
 //!  * installs the tools that the project needs
 //!  * starts the sandbox and runs the user's command in it
 
+pub mod config_change;
 pub mod env;
 mod exit;
 pub mod install;
@@ -32,6 +34,12 @@ pub struct SandboxOptions {
     pub log_level: LogLevel,
     /// Show the install output (`--verbose`).
     pub verbose: bool,
+    /// Accept config changes without a question
+    /// (`--allow-configuration-changes`).
+    pub allow_config_changes: bool,
+    /// Config overrides (`--network`). They also apply to the config of
+    /// the last run (see [`config_change::check`]).
+    pub overrides: crate::config::ConfigOverrides,
 }
 
 /// Check that the host can run a sandbox. On Linux, this checks KVM access.

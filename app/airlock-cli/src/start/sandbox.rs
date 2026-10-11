@@ -6,12 +6,13 @@
 
 use std::path::Path;
 
+use super::config_change::{self, CheckInput, Checked};
 use super::install::{self, InstallDecision};
 use super::{Exit, SandboxOptions};
 use crate::cli::prompt;
 use crate::cli::prompt::choose::{Choice, Choose};
 use crate::cli::prompt::style::Tone;
-use crate::config::ResolvedConfig;
+use crate::config::{LayeredConfig, ResolvedConfig};
 use crate::context::Context;
 #[cfg(not(test))]
 use crate::oci::prepare as prepare_image;
@@ -35,6 +36,9 @@ pub struct EnsuredSandbox {
     pub image: OciImage,
     /// The tools that [`super::install::install_tools`] installs.
     pub installs: InstallDecision,
+    /// The config of the run. It is the config of the last run if the user
+    /// selected it (see [`config_change::check`]).
+    pub resolved: ResolvedConfig,
 }
 
 /// How the sandbox questions get their answers.
@@ -189,8 +193,12 @@ fn tools_changed_message(plan: &Plan) -> String {
 /// Prepare the stored sandbox for `resolved` and decide which tools to
 /// install.
 ///
-/// For an existing sandbox, the step can ask these questions. The default
-/// answer of each is `re-create sandbox`:
+/// For an existing sandbox, the step can ask these questions:
+///  * A changed config (see [`config_change::check`]). The answers are
+///    `abort` (the default), `accept changes` and `continue with old
+///    configuration`. `--allow-configuration-changes` accepts the changes.
+///
+/// The default answer of each of these is `re-create sandbox`:
 ///  * A changed image
 ///  * Changed packs (the definition is different from the one on the disk).
 ///    The only other answer is `cancel`.
@@ -208,20 +216,24 @@ fn tools_changed_message(plan: &Plan) -> String {
 ///    the image.
 ///  - `host_cwd`: Canonical project directory on the host
 ///  - `packs`: Available packs
-///  - `resolved`: Resolved config
+///  - `config`: Config files of the run
+///  - `resolved`: Resolved `config`
 ///  - `options`: Command-line options
 ///
 /// Returns:
-///   The stored sandbox, or the exit for an error or a cancelled question.
+///   The stored sandbox with the config of the run, or the exit for an
+///   error or a cancelled question.
 // Steps: check `[env]`, find or make the sandbox and take its lock (see
-// [`super::location::lock_sandbox`]), read the install records, prepare the
-// image, answer the image and tool questions, re-create the disk if that is
-// the answer, create (or resize) the disk, and save the record changes.
+// [`super::location::lock_sandbox`]), check the config changes, read the
+// install records, prepare the image, answer the image and tool questions,
+// re-create the disk if that is the answer, create (or resize) the disk, and
+// save the config copy and the record changes.
 pub async fn ensure_sandbox(
     context: &Context,
     host_cwd: &Path,
     packs: &PackManager,
-    resolved: &ResolvedConfig,
+    config: &LayeredConfig,
+    resolved: ResolvedConfig,
     options: &SandboxOptions,
 ) -> Result<EnsuredSandbox, Exit> {
     let vault = &context.vault;
@@ -234,6 +246,25 @@ pub async fn ensure_sandbox(
         super::location::lock_sandbox(context, host_cwd, answering.can_prompt, answering.yes)
             .await?;
     let sandbox_dir = PinnedDir::pin(lock.dir()).map_err(anyhow::Error::from)?;
+    // The config question comes before all other sandbox questions.
+    let checked = config_change::check(&CheckInput {
+        sandbox_dir: sandbox_dir.path(),
+        resolved: &resolved,
+        data_dir: &context.data_dir,
+        packs,
+        overrides: &options.overrides,
+        can_prompt: answering.can_prompt,
+        yes: answering.yes,
+        allow_changes: options.allow_config_changes,
+    })
+    .await?;
+    let (resolved, save_config) = match checked {
+        Checked::Current => (resolved, true),
+        Checked::Last(last) => {
+            super::env::check_env_early(&last.values, vault)?;
+            (*last, false)
+        }
+    };
     let mut state = read_state(&sandbox_dir, answering.can_prompt)?;
     let candidates = install::install_candidates(&resolved.packs);
     let wanted: Vec<Wanted> = candidates
@@ -312,6 +343,12 @@ pub async fn ensure_sandbox(
         .into_iter()
         .filter(|t| plan.pending.iter().any(|p| p.id == t.pack))
         .collect();
+    // Save the config only now. Thus if a later question ends the run, the
+    // next run asks about the config changes again. The config of the last
+    // run is not saved, so the next run also asks again.
+    if save_config {
+        config_change::save(sandbox_dir.path(), config)?;
+    }
     let transitions = std::mem::take(&mut plan.transitions);
     let installs = InstallDecision::save(
         sandbox_dir,
@@ -324,6 +361,7 @@ pub async fn ensure_sandbox(
         lock,
         image,
         installs,
+        resolved,
     })
 }
 

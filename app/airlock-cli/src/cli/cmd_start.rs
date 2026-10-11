@@ -33,9 +33,13 @@ pub struct StartArgs {
     /// Use this network policy instead of `[network] policy`, for this run only
     #[arg(long, value_name = "POLICY")]
     pub network: Option<Policy>,
-    /// Use the default answer for every sandbox question (re-create the sandbox)
+    /// Use the default answer for every sandbox question (re-create the sandbox, abort on a
+    /// config change)
     #[arg(short = 'y', long)]
     pub yes: bool,
+    /// Accept config changes since the last run without a question
+    #[arg(long)]
+    pub allow_configuration_changes: bool,
 }
 
 impl StartArgs {
@@ -45,6 +49,8 @@ impl StartArgs {
             yes: self.yes,
             log_level: self.log_level,
             verbose: self.verbose,
+            allow_config_changes: self.allow_configuration_changes,
+            overrides: self.config_overrides(),
         }
     }
 
@@ -102,19 +108,21 @@ async fn run(
         &context.vault,
     ))
     .await?;
+    let options = args.sandbox_options();
     let resolved = config
-        .resolve(&context.data_dir, &packs, &args.config_overrides())
+        .resolve(&context.data_dir, &packs, &options.overrides)
         .await
         .map_err(start::Exit::config)?;
     // The terminal runtime. Bad `[monitor.keys]` values fail here.
     let runtime =
         HostRuntime::new(args.monitor, &context.settings).map_err(|e| start::Exit::error(2, e))?;
 
-    let options = args.sandbox_options();
+    // The sandbox step can select the config of the last run.
     let sandbox = Box::pin(start::sandbox::ensure_sandbox(
-        &context, &host_cwd, &packs, &resolved, &options,
+        &context, &host_cwd, &packs, &config, resolved, &options,
     ))
     .await?;
+    let resolved = &sandbox.resolved;
     // The log lines so far wait in memory. Now the log file is known.
     cli::logging::attach(sandbox.lock.dir());
     if let Some(generated) = config.generated_project() {
@@ -129,7 +137,7 @@ async fn run(
     )?;
     Box::pin(start::install::install_tools(
         &project,
-        &resolved,
+        resolved,
         &sandbox.image,
         sandbox.installs,
         &options,

@@ -295,3 +295,27 @@ copilot = { version = 1 }"
     assert_output_contains "installs.json is not valid"
     assert_output_not_contains "Preparing sandbox"
 }
+
+# Test that a config that is different from the config of the last start
+# stops start when there is no terminal to ask the user.
+#   1. Write a config, and a copy of a different config of the last start
+#   2. Run start
+#   3. Check exit code 2 and the message, before the sandbox prepare
+#   4. Run start --yes and check exit code 2
+#   5. Run start --yes --allow-configuration-changes and check that the
+#      sandbox prepare starts
+@test "start with changed config and no terminal fails" {
+    write_config "$BAD_IMAGE"
+    mkdir -p .airlock/sandbox
+    echo '{"last_run_config": {"user": [], "local": null, "project": [{"origin": "airlock.toml", "value": {"vm": {"cpus": 1}}, "legacy_presets": null}]}}' \
+        >.airlock/sandbox/run.json
+    run_airlock start
+    assert_failure 2
+    assert_output_contains "The sandbox configuration has changed since the last run."
+    assert_output_not_contains "Preparing sandbox"
+    run_airlock start --yes
+    assert_failure 2
+    assert_output_not_contains "Preparing sandbox"
+    run_airlock start --yes --allow-configuration-changes
+    assert_output_contains "Preparing sandbox"
+}

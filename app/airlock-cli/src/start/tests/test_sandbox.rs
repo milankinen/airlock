@@ -82,8 +82,9 @@ fn first_start_installs_packs_on_new_disk_and_next_start_installs_nothing() {
 
 /// Test that tool changes without a terminal fail with exit code 2 before
 /// the image pull. Nobody can answer the question, so nothing must change.
-///   1. For each kind of change, start a project, then start it again with
-///      the changed config and no terminal
+///   1. For each kind of change, start a project, accept the changed config
+///      (see [`StartProject::accept_config`]), then start again with the
+///      changed config and no terminal
 ///   2. Check the exit code 2
 ///   3. Check that no image was prepared, nothing ran and the state stays
 ///      the same
@@ -92,6 +93,7 @@ fn tool_changes_without_terminal_fail_before_image_pull() {
     for changed in [ADDED, REMOVED, DISABLED, NEW_ARGS, NEW_VERSION] {
         let project = started(TWO);
         let before = project.state();
+        project.accept_config(changed);
         assert_eq!(code(project.start(changed, false)), 2, "{changed}");
         assert_eq!(prepared(), 0, "{changed}");
         assert!(ran().is_empty(), "{changed}");
@@ -101,8 +103,8 @@ fn tool_changes_without_terminal_fail_before_image_pull() {
 
 /// Test that tool changes with `--yes` re-create the sandbox and install
 /// only the configured packs.
-///   1. For each kind of change, start a project, then start it again with
-///      the changed config and `--yes`
+///   1. For each kind of change, start a project, accept the changed
+///      config, then start again with it and `--yes`
 ///   2. Check that the disk is new and that only the configured packs ran
 ///   3. Check that the state has only those packs, all installed, on the
 ///      new disk
@@ -117,6 +119,7 @@ fn tool_changes_with_yes_re_create_sandbox_with_configured_packs() {
     ] {
         let project = started(TWO);
         let disk = project.disk_id();
+        project.accept_config(changed);
         project.start(changed, true).unwrap();
         assert_ne!(project.disk_id(), disk, "{changed}");
         assert_eq!(ran(), installed, "{changed}");
@@ -184,7 +187,7 @@ fn unfinished_install_ends_start_and_next_start_retries_without_question() {
 /// Test that the next start forgets a failed pack that is no longer in the
 /// config, without a question.
 ///   1. Start with the second pack failing
-///   2. Start again without the failed pack
+///   2. Accept the config without the failed pack, and start with it
 ///   3. Check that nothing ran and that the failed record is gone
 #[test]
 fn failed_pack_removed_from_config_is_forgotten_without_question() {
@@ -193,6 +196,7 @@ fn failed_pack_removed_from_config_is_forgotten_without_question() {
     assert_eq!(code(project.start(TWO, false)), 1);
     fake_host(|host| host.failing.clear());
     ran();
+    project.accept_config(REMOVED);
     project.start(REMOVED, false).unwrap();
     assert!(ran().is_empty());
     let state = project.state();
@@ -202,7 +206,8 @@ fn failed_pack_removed_from_config_is_forgotten_without_question() {
 
 /// Test that a changed image without a terminal fails with exit code 2,
 /// and that `--yes` re-creates the sandbox.
-///   1. Start a project, then start it with another image and no terminal
+///   1. Start a project, accept the config with another image, then start
+///      with it and no terminal
 ///   2. Check exit code 2 and that nothing ran or changed
 ///   3. Start with another image and `--yes`
 ///   4. Check that the disk is new and the packs installed for the new
@@ -213,6 +218,7 @@ fn changed_image_without_terminal_is_exit_2_and_yes_re_creates_sandbox() {
     let disk = project.disk_id();
     let before = project.state();
     let other_image = format!("{TWO}[vm]\nimage = \"other:1\"\n");
+    project.accept_config(&other_image);
     assert_eq!(code(project.start(&other_image, false)), 2);
     assert!(ran().is_empty());
     assert_eq!(project.state(), before);

@@ -109,19 +109,20 @@ check_rerun() {
 }
 
 # Check that a pack removed from the config needs a question. Without a
-# terminal and without --yes, start fails before the image pull. --yes makes
-# a new sandbox: a new disk with only the packs of the config. The config
-# comes back at the end, but the sandbox stays without mise. Thus this check
-# must run last for its sandbox.
+# terminal and without --yes, start fails before the image pull. The config
+# change question comes before the tool questions. --yes with
+# --allow-configuration-changes makes a new sandbox: a new disk with only
+# the packs of the config. The config comes back at the end, but the
+# sandbox stays without mise. Thus this check must run last for its sandbox.
 check_removed_pack() {
     sed -i.bak '/^mise = { version = 1 }$/d' airlock.toml
     run_airlock start -- sh -c 'echo NOT-REACHED'
     [[ "$status" -eq 2 ]]
-    assert_output_contains "Tools changed in the sandbox (removed: mise). Run in a terminal or pass --yes."
+    assert_output_contains "The sandbox configuration has changed since the last run."
     assert_output_not_contains "Preparing sandbox"
     assert_output_not_contains "NOT-REACHED"
 
-    run_airlock start --yes -- sh -c 'echo RECREATED-OK'
+    run_airlock start --yes --allow-configuration-changes -- sh -c 'echo RECREATED-OK'
     mv airlock.toml.bak airlock.toml
     assert_success
     assert_output_contains "disk created"

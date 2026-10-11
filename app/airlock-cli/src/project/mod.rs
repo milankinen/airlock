@@ -485,6 +485,9 @@ pub struct RunMeta {
     /// Working directory in the guest of the last run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guest_cwd: Option<String>,
+    /// Final config of the last run (see [`crate::start::config_change`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_config: Option<serde_json::Value>,
 }
 
 /// Read `run.json`. Gives default metadata if the file is missing or not
@@ -494,6 +497,14 @@ pub fn read_run_meta(sandbox_dir: &Path) -> RunMeta {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+/// Save `config` as the final config of the last run in `run.json` of
+/// `sandbox_dir`.
+pub fn save_last_run_config(sandbox_dir: &Path, config: serde_json::Value) -> anyhow::Result<()> {
+    let mut meta = read_run_meta(sandbox_dir);
+    meta.last_run_config = Some(config);
+    write_run_meta(sandbox_dir, &meta)
 }
 
 /// Write `run.json` atomically (temp file and rename).

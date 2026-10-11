@@ -34,6 +34,12 @@ Pass `--yes` (`-y`) to select the default answer for all questions, for
 example in scripts. Without a terminal and without `--yes`, airlock
 cannot ask and stops with exit code 2.
 
+> [!IMPORTANT]
+> When the configuration changed since the last start, `airlock start`
+> asks before it continues. The default answer, and `--yes`, aborts. Add
+> `--allow-configuration-changes` to accept the changes without the
+> question.
+
 ## Configuration basics
 
 If you selected `Create airlock.toml` in the wizard, airlock creates

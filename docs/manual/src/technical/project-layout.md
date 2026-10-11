@@ -53,7 +53,7 @@ in the registry. Both kinds have the same contents:
 ```
 <sandbox>/
   ca.json                        # CA certificate + key PEMs (single JSON file)
-  run.json                       # last-run timestamp, guest_cwd
+  run.json                       # last-run timestamp, guest_cwd, config files of the last start
   installs.json                  # pack install records
   keep-in-project                # (project sandbox only) do not offer a move
   airlock.toml                   # (data directory only) local project config

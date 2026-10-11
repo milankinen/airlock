@@ -33,7 +33,7 @@ pub fn load(project_root: &Path, local_dir: &Path) -> anyhow::Result<LayeredConf
 }
 
 /// One config file (or in-memory document) before merging.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Layer {
     /// Source of the layer (a file path), for logs and errors.
     origin: String,
@@ -99,7 +99,11 @@ pub struct ConfigOverrides {
 
 /// The config files of a project, lowest precedence first:
 /// user files < local project file < project files.
-#[derive(Clone)]
+///
+/// The serialized form has the layers, without the generated project
+/// config. The config change check keeps it (see
+/// [`crate::start::config_change`]).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct LayeredConfig {
     /// `~/.airlock/airlock.<ext>`, `~/.airlock/config.<ext>`,
     /// `~/.airlock.<ext>`. They have no `[packs]` (see
@@ -111,6 +115,7 @@ pub struct LayeredConfig {
     project: Vec<Layer>,
     /// Project config that the setup wizard generated (see
     /// [`Self::with_generated_project`]). It is not written to disk yet.
+    #[serde(skip)]
     generated: Option<GeneratedConfig>,
 }
 
@@ -218,6 +223,7 @@ impl LayeredConfig {
             anyhow::anyhow!("invalid configuration\n{}", problems.join("\n"))
         })?;
         let mut values = merge_config(legacy_base, plain_layers, &configured, pack_values)?;
+        let configured_policy = values.network.policy;
         if let Some(policy) = overrides.network_policy {
             tracing::info!("network policy overridden by --network: {}", policy.label());
             values.network.policy = policy;
@@ -225,6 +231,7 @@ impl LayeredConfig {
         Ok(ResolvedConfig {
             values,
             packs: configured,
+            configured_policy,
         })
     }
 
@@ -331,6 +338,8 @@ pub struct ResolvedConfig {
     pub values: ConfigValues,
     /// All enabled `[packs]` entries, in pack order.
     pub packs: Vec<ConfiguredPack>,
+    /// The network policy of the config, without the `--network` policy.
+    pub configured_policy: Policy,
 }
 
 impl ResolvedConfig {

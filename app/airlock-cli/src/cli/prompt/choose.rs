@@ -2,7 +2,7 @@
 //!
 //! Lets the user select one option from a vertical radio list.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::cli::prompt::screen::Frame;
 use crate::cli::prompt::style::{self, Line, Styles, Tone};
@@ -19,11 +19,26 @@ pub struct Choice<'a> {
     pub tone: Tone,
 }
 
+/// Lines that a key shows and hides, below the notes of a [`Choose`].
+pub struct Details<'a> {
+    /// The key that shows and hides the lines.
+    pub key: char,
+    /// Gray hint while the lines are hidden, for example
+    /// `Press s to show the changes`.
+    pub show_hint: &'a str,
+    /// Gray hint while the lines show.
+    pub hide_hint: &'a str,
+    /// The lines, with their styles. Lines that are too long are cut.
+    pub lines: &'a [String],
+}
+
 /// A prompt that selects one option from a vertical radio list.
 ///
 /// The view shows:
 ///  * The title (bold)
 ///  * The notes (gray, indented by 2 columns)
+///  * With [`Choose::ask_with_details`]: the details hint (gray, no indent)
+///    and the details lines while they show
 ///  * One option per line. The focused option has a green `◉` and a cyan
 ///    label.
 ///  * An empty line and the key help (gray)
@@ -48,14 +63,38 @@ impl Choose<'_> {
     /// Returns:
     ///   Index of the selected option, `None` on Esc, or error.
     pub fn ask(&self) -> Result<Option<usize>, PromptError> {
+        self.ask_inner(None)
+    }
+
+    /// Ask the question with `details`. The hint of `details` shows below
+    /// the notes, without indent. The key of `details` shows and hides its
+    /// lines between the hint and the options. The lines are hidden at the
+    /// start.
+    /// Returns:
+    ///   Index of the selected option, `None` on Esc, or error.
+    pub fn ask_with_details(&self, details: &Details) -> Result<Option<usize>, PromptError> {
+        self.ask_inner(Some(details))
+    }
+
+    fn ask_inner(&self, details: Option<&Details>) -> Result<Option<usize>, PromptError> {
         let mut state = State {
             focus: self.default.min(self.choices.len().saturating_sub(1)),
             len: self.choices.len(),
+            details: false,
         };
         let picked = prompt::run(
             &mut state,
-            |state, room| self.frame(state, room),
-            State::key,
+            |state, room| self.frame(state, room, details),
+            |state, key| match details {
+                Some(details)
+                    if key.code == KeyCode::Char(details.key)
+                        && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    state.details = !state.details;
+                    Step::Stay
+                }
+                _ => state.key(key),
+            },
         )?;
         if let Some(i) = picked
             && self.report
@@ -65,8 +104,9 @@ impl Choose<'_> {
         Ok(picked)
     }
 
-    /// Return the lines of the list in `state`, for `room` columns of text.
-    fn frame(&self, state: &State, room: usize) -> Frame {
+    /// Return the lines of the list in `state`, with the optional `details`,
+    /// for `room` columns of text.
+    fn frame(&self, state: &State, room: usize, details: Option<&Details>) -> Frame {
         let styles = Styles::new();
         let mut lines: Vec<String> = self
             .title
@@ -75,6 +115,17 @@ impl Choose<'_> {
             .collect();
         for note in self.notes {
             lines.extend(style::indented(note, 2, room, &styles.dim));
+        }
+        if let Some(details) = details {
+            let hint = if state.details {
+                details.hide_hint
+            } else {
+                details.show_hint
+            };
+            lines.extend(style::indented(hint, 0, room, &styles.dim));
+            if state.details {
+                lines.extend(details.lines.iter().cloned());
+            }
         }
         let mut focus = 0..0;
         for (i, choice) in self.choices.iter().enumerate() {
@@ -100,10 +151,12 @@ impl Choose<'_> {
     }
 }
 
-/// The focused option in a list of `len` options.
+/// The focused option in a list of `len` options, and whether the details
+/// show.
 struct State {
     focus: usize,
     len: usize,
+    details: bool,
 }
 
 impl State {

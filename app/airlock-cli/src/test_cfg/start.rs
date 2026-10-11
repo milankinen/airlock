@@ -13,10 +13,10 @@ use indicatif::ProgressBar;
 use sha2::{Digest, Sha256};
 
 use super::context::test_context;
-use super::packs::{HostExec, resolve_with};
+use super::packs::HostExec;
 use crate::cli::LogLevel;
-use crate::config::ResolvedConfig;
 use crate::config::config_values::ImageRef;
+use crate::config::{ConfigOverrides, LayeredConfig};
 use crate::context::Context;
 use crate::oci::{ImageChange, ImageChangeStop, OciImage, OnImageChange, PreparedImage};
 use crate::packs::install::progress::InstallProgress;
@@ -25,7 +25,7 @@ use crate::packs::install::state::{self, InstallState, ReadState};
 use crate::packs::{InstallerScript, PackManager};
 use crate::project::{self, Project};
 use crate::sandboxes::{self, Found};
-use crate::start::{Exit, SandboxOptions};
+use crate::start::{Exit, SandboxOptions, config_change};
 use crate::util::PinnedDir;
 use crate::vault::{Vault, VaultStorageType};
 
@@ -142,6 +142,16 @@ pub async fn install_boot(
     Ok(Report { outcome, synced })
 }
 
+/// The config with one project file `airlock.toml` with the content `toml`.
+fn project_config(toml: &str) -> LayeredConfig {
+    LayeredConfig::from_values(
+        vec![],
+        None,
+        vec![("airlock.toml", toml::from_str(toml).unwrap())],
+    )
+    .unwrap()
+}
+
 /// A project directory and a home directory for `airlock start` with the
 /// fakes on. The home is also the data directory, so the sandbox goes there.
 pub struct StartProject {
@@ -217,11 +227,24 @@ impl StartProject {
     /// start waits until the lock is free, and tries again if it finds the
     /// lock held.
     pub fn start(&self, toml: &str, yes: bool) -> Result<(), Exit> {
-        let resolved = resolve_with(&self.packs, toml).map_err(Exit::config)?;
+        self.start_with(toml, yes, false)
+    }
+
+    /// [`Self::start`] with `allow_config_changes`, the
+    /// `--allow-configuration-changes` flag.
+    pub fn start_with(
+        &self,
+        toml: &str,
+        yes: bool,
+        allow_config_changes: bool,
+    ) -> Result<(), Exit> {
+        let config = project_config(toml);
         let options = SandboxOptions {
             yes,
             log_level: LogLevel::Info,
             verbose: false,
+            allow_config_changes,
+            overrides: ConfigOverrides::default(),
         };
         let project_sandbox = self.project_dir().join(sandboxes::PROJECT_SANDBOX);
         eventually("sandbox lock is free", || {
@@ -230,7 +253,7 @@ impl StartProject {
             if project::is_running(&project_sandbox) {
                 return None;
             }
-            match self.start_once(&resolved, &options) {
+            match self.start_once(&config, &options) {
                 Err(Exit::Failed(e)) if e.to_string().starts_with("another airlock instance") => {
                     None
                 }
@@ -240,16 +263,22 @@ impl StartProject {
     }
 
     /// One try of [`Self::start`].
-    fn start_once(&self, resolved: &ResolvedConfig, options: &SandboxOptions) -> Result<(), Exit> {
+    fn start_once(&self, config: &LayeredConfig, options: &SandboxOptions) -> Result<(), Exit> {
         block_on_local(async {
+            let resolved = config
+                .resolve(&self.context.data_dir, &self.packs, &options.overrides)
+                .await
+                .map_err(Exit::config)?;
             let sandbox = crate::start::sandbox::ensure_sandbox(
                 &self.context,
                 &self.project_dir(),
                 &self.packs,
+                config,
                 resolved,
                 options,
             )
             .await?;
+            let resolved = &sandbox.resolved;
             let project = project::open(
                 &sandbox.lock,
                 resolved.values.clone(),
@@ -265,6 +294,14 @@ impl StartProject {
             )
             .await
         })
+    }
+
+    /// Save the config of the project file `toml` as the config of the
+    /// last start. Thus the next start with `toml` gets no config question
+    /// (see [`crate::start::config_change`]). Panics if there is no
+    /// sandbox.
+    pub fn accept_config(&self, toml: &str) {
+        config_change::save(&self.sandbox_dir(), &project_config(toml)).unwrap();
     }
 
     /// The install state of the sandbox. Empty when there is no state.
