@@ -405,7 +405,7 @@ async fn find(context: &Context, id: Option<&str>) -> anyhow::Result<(PathBuf, O
     let cwd = std::env::current_dir()
         .map_err(|e| anyhow::anyhow!("Cannot determine current directory: {e}"))?;
     let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
-    let found = sandboxes::resolve_sandbox(context, &cwd, false)
+    let found = sandboxes::resolve_sandbox(context, &cwd, false, false)
         .await
         .map_err(|e| e.context("Sandbox lookup failed"))?;
     Ok((cwd, found))

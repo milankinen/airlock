@@ -198,6 +198,7 @@ impl StartProject {
             &self.context,
             &self.project_dir(),
             false,
+            false,
         ))
         .unwrap()
     }

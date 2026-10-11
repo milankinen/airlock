@@ -57,7 +57,7 @@ pub async fn main(args: &RmArgs, context: &Context) -> i32 {
 // The argument lets tests run it without a change to the current directory
 // of the process.
 pub(super) async fn run(args: &RmArgs, context: &Context, host_cwd: &Path) -> i32 {
-    match sandboxes::resolve_sandbox(context, host_cwd, false).await {
+    match sandboxes::resolve_sandbox(context, host_cwd, false, false).await {
         Ok(Some(found)) => {
             if let Location::DataDir { id } = found.location {
                 return rm_box(args, context, &id).await;

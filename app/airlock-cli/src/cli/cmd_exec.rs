@@ -30,6 +30,9 @@ pub struct ExecArgs {
     /// Run the command in a login shell (reads /etc/profile, ~/.profile)
     #[arg(short = 'l', long)]
     pub login: bool,
+    /// In a git worktree, also look for the sandbox of the main repository
+    #[arg(long)]
+    pub follow_git_worktree: bool,
 }
 
 /// Entry point for `airlock exec <cmd> [args...]`.
@@ -47,6 +50,7 @@ pub async fn main(args: ExecArgs, context: &Context) -> anyhow::Result<i32> {
         cwd,
         env,
         login,
+        follow_git_worktree,
     } = args;
     let argv: Vec<String> = std::iter::once(cmd).chain(args).collect();
     let argv = if login {
@@ -59,13 +63,15 @@ pub async fn main(args: ExecArgs, context: &Context) -> anyhow::Result<i32> {
     let host_cwd = std::env::current_dir().map_err(|e| anyhow::anyhow!("get cwd: {e}"))?;
     // The registry has canonical project paths.
     let lookup_dir = std::fs::canonicalize(&host_cwd).unwrap_or_else(|_| host_cwd.clone());
-    let sock_path = find_cli_sock(context, &lookup_dir).await?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "no running sandbox for {} or its parent directories. \
+    let sock_path = find_cli_sock(context, &lookup_dir, follow_git_worktree)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no running sandbox for {} or its parent directories. \
              is 'airlock start' running in this project?",
-            host_cwd.display()
-        )
-    })?;
+                host_cwd.display()
+            )
+        })?;
 
     let stream = tokio::net::UnixStream::connect(&sock_path)
         .await
@@ -124,26 +130,60 @@ pub async fn main(args: ExecArgs, context: &Context) -> anyhow::Result<i32> {
 }
 
 /// Find the CLI socket of the nearest running sandbox at or above `start`.
-/// Sandboxes in the data directory and in the project both count.
+/// Sandboxes in the data directory and in the project both count. With
+/// `follow_git_worktree`, the search goes on from the root of a git
+/// worktree to the root of its main repository.
+///
 /// Returns:
-///   The first socket path that exists, or `None`.
+///   The first socket path that exists, or `None`. Error for a sandbox
+///   directory or a socket that is a symlink.
 // A sandbox without a socket does not run. The search then goes on to the
 // parent directories. The socket path is `cli.sock` in the sandbox
 // directory. If that path is longer than the `AF_UNIX` limit, the path is a
 // hash-keyed fallback under `<data>/sock/`.
+//
+// Code in a sandbox can write its project mount. A symlink there at
+// `.airlock/sandbox` or `cli.sock` could send the command, the env values
+// and the terminal to a different sandbox. Thus never follow a symlink.
 pub(super) async fn find_cli_sock(
     context: &Context,
     start: &std::path::Path,
+    follow_git_worktree: bool,
 ) -> anyhow::Result<Option<PathBuf>> {
-    for found in sandboxes::candidates(context, start, true).await? {
-        if !found.dir.is_dir() {
+    for found in sandboxes::candidates(context, start, true, follow_git_worktree).await? {
+        let Ok(meta) = std::fs::symlink_metadata(&found.dir) else {
+            continue;
+        };
+        refuse_symlink(&found.dir, &meta)?;
+        if !meta.is_dir() {
             continue;
         }
-        if let Ok(candidate) = crate::cache::cli_sock_path(&context.data_dir, &found.dir)
-            && candidate.exists()
-        {
+        let Ok(candidate) = crate::cache::cli_sock_path(&context.data_dir, &found.dir) else {
+            continue;
+        };
+        if let Ok(meta) = std::fs::symlink_metadata(&candidate) {
+            refuse_symlink(&candidate, &meta)?;
+            // A sandbox out of the start directory and its parents comes
+            // from a worktree link. Tell the user which sandbox it is.
+            if !start.starts_with(&found.project) {
+                crate::cli::log!(
+                    "{} attached to the sandbox of {}",
+                    crate::cli::bullet(),
+                    found.project.display()
+                );
+            }
             return Ok(Some(candidate));
         }
     }
     Ok(None)
+}
+
+/// Return an error if `path`, with the metadata `meta`, is a symlink.
+fn refuse_symlink(path: &std::path::Path, meta: &std::fs::Metadata) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !meta.file_type().is_symlink(),
+        "{} is a symlink; remove it and run `airlock start` again",
+        path.display()
+    );
+    Ok(())
 }

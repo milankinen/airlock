@@ -44,7 +44,7 @@ pub async fn lock_sandbox(
     can_prompt: bool,
     yes: bool,
 ) -> Result<SandboxLock, Exit> {
-    let found = sandboxes::resolve_sandbox(context, host_cwd, false).await?;
+    let found = sandboxes::resolve_sandbox(context, host_cwd, false, false).await?;
     let lock = match found {
         Some(Found {
             location: Location::DataDir { id },

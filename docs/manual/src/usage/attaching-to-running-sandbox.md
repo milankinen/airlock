@@ -40,6 +40,22 @@ airlock x pwd          # prints: /home/example/my-project/src
 airlock x -w /tmp pwd  # prints: /tmp
 ```
 
+## Git worktrees
+
+airlock supports git worktrees that live outside their main repository.
+To use the sandbox of the main repository from such a worktree, use
+`--follow-git-worktree`:
+
+```bash
+cd /home/example/worktrees/my-feature
+airlock x --follow-git-worktree git status
+```
+
+> [!IMPORTANT]
+> airlock mounts only the project directory automatically. Add a
+> [mount](../configuration/mounts.md) for the worktrees directory, so that
+> the worktrees are available in the sandbox.
+
 ## Environment variables
 
 Pass extra environment variables with `-e` (repeatable):
