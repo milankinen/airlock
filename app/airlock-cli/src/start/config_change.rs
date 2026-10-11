@@ -141,10 +141,24 @@ async fn resolve_last(
 
 /// Return the final config values of `resolved` for the comparison and the
 /// diff. The `--network` policy is not in them, because it applies to one
-/// run only. Masked `[env]` values are replaced with a hash.
+/// run only. Masked `[env]` values are replaced with a hash. The enabled
+/// packs with their versions and args are in them.
 fn final_values(resolved: &ResolvedConfig) -> anyhow::Result<Value> {
     let mut value = serde_json::to_value(&resolved.values)?;
     value["network"]["policy"] = serde_json::to_value(resolved.configured_policy)?;
+    // A pack can have no config values. Without the pack list, a change of
+    // such a pack is not a config change.
+    let mut packs = serde_json::Map::new();
+    for pack in &resolved.packs {
+        let metadata = pack.metadata();
+        let mut entry = serde_json::Map::new();
+        entry.insert("version".into(), metadata.version.clone().into());
+        for (key, arg) in pack.args() {
+            entry.insert(key.clone(), serde_json::to_value(arg)?);
+        }
+        packs.insert(metadata.name.clone(), entry.into());
+    }
+    value["packs"] = packs.into();
     if let Some(env) = value.get_mut("env").and_then(Value::as_object_mut) {
         for entry in env.values_mut() {
             hide_masked_value(entry);
@@ -389,6 +403,17 @@ mod tests {
         let mut overridden = resolve_project_toml(config).unwrap();
         overridden.values.network.policy = Policy::AllowAlways;
         assert_eq!(values(config), final_values(&overridden).unwrap());
+    }
+
+    /// Test that a removed pack without config values changes the final
+    /// values, so that the config question comes before the tool question.
+    ///   1. Get the final values of a config with the mise pack, which has
+    ///      no config values
+    ///   2. Get the final values of the same config without the pack
+    ///   3. Check that the values are different
+    #[test]
+    fn removed_pack_without_config_values_is_config_change() {
+        assert_ne!(values("[packs]\nmise = { version = 1 }\n"), values(""));
     }
 
     /// Test that the final values do not show masked `[env]` values, but a
