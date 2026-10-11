@@ -44,7 +44,7 @@ impl InstallDecision {
     /// Returns:
     ///   The decision, or error if the save fails. The records are saved if
     ///   they changed or if something installs.
-    pub(super) fn save(
+    pub(crate) fn save(
         sandbox: PinnedDir,
         mut state: InstallState,
         transitions: &[plan::Transition],

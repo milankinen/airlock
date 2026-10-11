@@ -14,6 +14,9 @@ creates `airlock.toml`, which you can commit to version control. If you
 do not select it, airlock keeps the config in the sandbox directory, and
 `airlock rm` removes it with the sandbox.
 
+You can also create the sandbox from a [template](../templates.md), if
+you created one.
+
 ## Sandbox changes
 
 When the image or the [packs](../packs.md) of an existing sandbox change,

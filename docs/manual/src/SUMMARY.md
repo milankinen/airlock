@@ -29,6 +29,7 @@
         - [Node.js](./packs/tools/nodejs.md)
         - [Python](./packs/tools/python.md)
         - [Rust](./packs/tools/rust.md)
+- [Templates](./templates.md)
 - [Secrets management](./secrets.md)
 - [Tips and tricks](./tips.md)
     - [Pairing with mise](./tips/mise.md)

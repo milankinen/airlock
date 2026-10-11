@@ -13,6 +13,7 @@ pub mod cmd_sandbox;
 pub mod cmd_secret;
 pub mod cmd_self_update;
 pub mod cmd_start;
+pub mod cmd_templates;
 pub mod logging;
 pub mod prompt;
 

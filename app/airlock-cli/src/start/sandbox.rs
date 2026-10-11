@@ -23,6 +23,7 @@ use crate::packs::install::plan::{self, DecideInput, Pending, Plan, Transition, 
 use crate::packs::install::state::{self as install_state, InstallState, ReadState};
 use crate::packs::{InstallerScript, PackManager};
 use crate::project::{self, SandboxLock};
+use crate::templates::{self, Template};
 #[cfg(test)]
 use crate::test_cfg::start::{check_image, prepare_image};
 use crate::util::PinnedDir;
@@ -193,6 +194,9 @@ fn tools_changed_message(plan: &Plan) -> String {
 /// Prepare the stored sandbox for `resolved` and decide which tools to
 /// install.
 ///
+/// A new sandbox with `template` starts with a copy of the template (see
+/// [`templates::seed`]).
+///
 /// For an existing sandbox, the step can ask these questions:
 ///  * A changed config (see [`config_change::check`]). The answers are
 ///    `abort` (the default), `accept changes` and `continue with old
@@ -219,15 +223,18 @@ fn tools_changed_message(plan: &Plan) -> String {
 ///  - `config`: Config files of the run
 ///  - `resolved`: Resolved `config`
 ///  - `options`: Command-line options
+///  - `template`: The template of a new sandbox. An existing sandbox
+///    ignores it.
 ///
 /// Returns:
 ///   The stored sandbox with the config of the run, or the exit for an
 ///   error or a cancelled question.
 // Steps: check `[env]`, find or make the sandbox and take its lock (see
-// [`super::location::lock_sandbox`]), check the config changes, read the
-// install records, prepare the image, answer the image and tool questions,
-// re-create the disk if that is the answer, create (or resize) the disk, and
-// save the config copy and the record changes.
+// [`super::location::lock_sandbox`]), check the config changes, copy the
+// template into a new sandbox, read the install records, prepare the image,
+// answer the image and tool questions, re-create the disk if that is the
+// answer, create (or resize) the disk, and save the config copy and the
+// record changes.
 pub async fn ensure_sandbox(
     context: &Context,
     host_cwd: &Path,
@@ -235,6 +242,7 @@ pub async fn ensure_sandbox(
     config: &LayeredConfig,
     resolved: ResolvedConfig,
     options: &SandboxOptions,
+    template: Option<&Template>,
 ) -> Result<EnsuredSandbox, Exit> {
     let vault = &context.vault;
     super::env::check_env_early(&resolved.values, vault)?;
@@ -265,6 +273,15 @@ pub async fn ensure_sandbox(
             (*last, false)
         }
     };
+    // A sandbox from a template starts with a copy of the template disk.
+    // It still counts as a new disk: the tools that the template does not
+    // have install without a question.
+    let new_disk = !project::has_disk(sandbox_dir.path());
+    let mut seeded = SeedGuard(None);
+    if new_disk && let Some(template) = template {
+        templates::seed::seed(template, &sandbox_dir)?;
+        seeded.0 = Some(sandbox_dir.path().to_path_buf());
+    }
     let mut state = read_state(&sandbox_dir, answering.can_prompt)?;
     let candidates = install::install_candidates(&resolved.packs);
     let wanted: Vec<Wanted> = candidates
@@ -282,7 +299,6 @@ pub async fn ensure_sandbox(
             image_id,
         })
     };
-    let new_disk = !project::has_disk(sandbox_dir.path());
 
     // Stop before the pull if a tool question is necessary and nobody can
     // answer it.
@@ -307,6 +323,12 @@ pub async fn ensure_sandbox(
     let image_reset = image_resets_disk(prepared.change, new_disk);
     if image_reset {
         project::reset_disk(&sandbox_dir)?;
+    }
+    // The template disk belongs to the template image. With an other
+    // image, start with an empty disk.
+    if seeded.0.is_some() && prepared.change != ImageChange::Unchanged {
+        project::reset_disk(&sandbox_dir)?;
+        state = InstallState::default();
     }
     let mut plan = decide(&state, Some(&image.image_id));
     let mut recreate = false;
@@ -357,12 +379,34 @@ pub async fn ensure_sandbox(
         to_install,
         &image,
     )?;
+    seeded.keep();
     Ok(EnsuredSandbox {
         lock,
         image,
         installs,
         resolved,
     })
+}
+
+/// The sandbox directory of a template copy, until the sandbox step
+/// succeeds. On drop, it removes the copy (see [`templates::seed::unseed`]).
+/// Thus after a failed first start, the next start sees a new sandbox, and
+/// the setup wizard runs again.
+struct SeedGuard(Option<std::path::PathBuf>);
+
+impl SeedGuard {
+    /// Keep the copy: the sandbox is ready.
+    fn keep(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for SeedGuard {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.0 {
+            templates::seed::unseed(dir);
+        }
+    }
 }
 
 /// Ask the tool questions for `plan` and apply the answers (see

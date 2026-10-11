@@ -1,8 +1,9 @@
-//! The setup wizard of `airlock start`.
+//! The setup wizard of `airlock start` and `airlock templates create`.
 //!
-//! Runs when the project has no config. Asks the user for packs and settings,
-//! and makes a new project config from the answers. The config is saved only
-//! after the sandbox is ready.
+//! Runs when the project has no config. Asks the user for a template, packs
+//! and settings, and makes a new project config from the answers. The config
+//! is saved only after the sandbox is ready. The same view also makes the
+//! config of a new template.
 
 pub mod form;
 pub mod view;
@@ -17,16 +18,21 @@ use crate::cli::prompt::screen::{self, Screen};
 use crate::config::generated::{Clipboard, GeneratedConfig, NewEntry, Target};
 use crate::config::{self, LayeredConfig};
 use crate::packs::{ConfiguredPack, PackManager};
-use crate::start::wizard::form::Form;
+use crate::start::wizard::form::{Form, Mode};
+use crate::templates::Template;
 use crate::vault::Vault;
 
 /// All answers of the wizard.
 pub struct Answers {
+    /// The selected template, if any. The config starts from its config.
+    pub template: Option<Template>,
     /// The selected packs at their newest version, with the answered args.
-    /// In pack order: the distro pack, the agents, the tools.
+    /// In pack order: the distro pack, the agents, the tools. With a
+    /// template, only the packs that the template does not have.
     pub packs: Vec<ConfiguredPack>,
     /// The image of the user files, if the user selected it instead of a
-    /// distro pack (`vm.image` as the file has it).
+    /// distro pack (`vm.image` as the file has it). Never set with a
+    /// template.
     pub image: Option<serde_json::Value>,
     /// The clipboard capabilities (copy, paste).
     pub clipboard: Clipboard,
@@ -63,6 +69,7 @@ impl Answers {
             &self.entries(),
             self.image.as_ref(),
             Some(self.clipboard),
+            self.template.as_ref(),
         )
     }
 }
@@ -80,6 +87,10 @@ pub(super) struct Input<'a> {
     pub(super) config: &'a LayeredConfig,
     /// The vault that resolves `[env]` (see [`check_answers`]).
     pub(super) vault: &'a Vault,
+    /// The templates, sorted by name.
+    pub(super) templates: &'a [Template],
+    /// What the wizard makes.
+    pub(super) mode: Mode,
 }
 
 /// Load the config files of the project, or run the setup wizard if the
@@ -93,6 +104,7 @@ pub(super) struct Input<'a> {
 ///    records (see [`crate::sandboxes::has_content`])
 ///  - `packs`: Available packs
 ///  - `vault`: Vault that resolves the `[env]` of the answers
+///  - `templates`: The templates that the wizard offers, sorted by name
 ///
 /// Returns:
 ///   The loaded config. After the wizard, the config contains the answers as
@@ -105,6 +117,7 @@ pub async fn load_or_generate_config(
     has_sandbox: bool,
     packs: &PackManager,
     vault: &Vault,
+    templates: &[Template],
 ) -> Result<LayeredConfig, Exit> {
     let config = config::load(host_cwd, local_dir).map_err(Exit::config)?;
     if config.has_project_config() {
@@ -119,7 +132,10 @@ pub async fn load_or_generate_config(
         );
         return Err(Exit::Code(2));
     }
-    let generated = Box::pin(run_wizard(host_cwd, data_dir, packs, &config, vault)).await?;
+    let generated = Box::pin(run_wizard(
+        host_cwd, data_dir, packs, &config, vault, templates,
+    ))
+    .await?;
     config
         .with_generated_project(generated)
         .map_err(Exit::config)
@@ -129,6 +145,9 @@ pub async fn load_or_generate_config(
 ///
 /// The wizard is one view with the packs grouped by kind
 /// ([`PackKind`](crate::packs::PackKind)):
+///  * The template, if templates exist: `empty` (selected at
+///    first) or a template. A template selects and locks its packs and the
+///    image (see [`Form`]).
 ///  * The distro pack, or the image of the user files
 ///  * The agents and the tools
 ///  * The args of each selected pack
@@ -154,12 +173,14 @@ pub async fn load_or_generate_config(
 ///  - `packs`: Available packs
 ///  - `config`: The user config files only
 ///  - `vault`: Vault that resolves the `[env]` of the answers
+///  - `templates`: The templates that the wizard offers, sorted by name
 ///
 /// Returns:
 ///   The new config file (not saved yet, see [`crate::config::generated`]).
 ///   It has the selected packs at their newest version with all their args,
 ///   and `[clipboard]`. The distro pack sets the image, or the file repeats
-///   the user image. Errors:
+///   the user image. With a template, the file is the template config with
+///   the other selected packs and `[clipboard]`. Errors:
 ///    * No terminal: exit code 2
 ///    * Esc or `cancel`: exit code 0, or 2 after a failed check (the error
 ///      stays valid)
@@ -170,6 +191,7 @@ pub async fn run_wizard(
     packs: &PackManager,
     config: &LayeredConfig,
     vault: &Vault,
+    templates: &[Template],
 ) -> Result<GeneratedConfig, Exit> {
     if !prompt::can_prompt() {
         cli::error!(
@@ -184,6 +206,51 @@ pub async fn run_wizard(
         packs,
         config,
         vault,
+        templates,
+        mode: Mode::Start,
+    };
+    Box::pin(ask_config(&input)).await
+}
+
+/// Run the setup wizard for a new template (`airlock templates create`).
+///
+/// The view is the view of [`run_wizard`], but without the config section,
+/// and the start bar has `create` and `cancel`. A new template can start
+/// from a template.
+/// Args:
+///  - `host_cwd`: Directory of the command, for the config path
+///  - `data_dir`: Airlock data directory
+///  - `packs`: Available packs
+///  - `config`: The user config files only
+///  - `vault`: Vault that resolves the `[env]` of the answers
+///  - `templates`: The templates that the wizard offers, sorted by name
+///
+/// Returns:
+///   The config of the new template (local target, see [`run_wizard`]).
+///   Errors:
+///    * No terminal: exit code 2
+///    * Esc or `cancel`: exit code 0, or 2 after a failed check
+///    * Ctrl+C: exit code 130
+pub async fn run_template_wizard(
+    host_cwd: &Path,
+    data_dir: &Path,
+    packs: &PackManager,
+    config: &LayeredConfig,
+    vault: &Vault,
+    templates: &[Template],
+) -> Result<GeneratedConfig, Exit> {
+    if !prompt::can_prompt() {
+        cli::error!("`airlock templates create` needs a terminal.");
+        return Err(Exit::Code(2));
+    }
+    let input = Input {
+        host_cwd,
+        data_dir,
+        packs,
+        config,
+        vault,
+        templates,
+        mode: Mode::Template,
     };
     Box::pin(ask_config(&input)).await
 }
@@ -211,10 +278,17 @@ enum End {
     Interrupted,
 }
 
-/// Show the view until it ends (see [`run_wizard`]) and return the new
+/// Show the view until it ends (see [`run_wizard`] and
+/// [`run_template_wizard`]) and return the new
 /// config. Messages print after the terminal is restored.
 async fn ask_config(input: &Input<'_>) -> Result<GeneratedConfig, Exit> {
-    let mut form = Form::new(input.data_dir, input.packs, input.config.user_image());
+    let mut form = Form::new(
+        input.data_dir,
+        input.packs,
+        input.config.user_image(),
+        input.templates,
+        input.mode,
+    );
     let mut screen = Screen::open()?;
     let end = Box::pin(run_view(input, &mut form, &mut screen)).await;
     let closed = screen.close();
@@ -226,7 +300,10 @@ async fn ask_config(input: &Input<'_>) -> Result<GeneratedConfig, Exit> {
             if let Some(e) = form.check_error() {
                 return Err(Exit::config(e));
             }
-            cli::error!("Aborted; no config written.");
+            match input.mode {
+                Mode::Start => cli::error!("Aborted; no config written."),
+                Mode::Template => cli::error!("Aborted; no template created."),
+            }
             Err(Exit::Code(0))
         }
         End::Interrupted => Err(Exit::INTERRUPTED),

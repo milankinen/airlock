@@ -13,6 +13,7 @@ use crate::config::UserImage;
 use crate::config::generated::{Clipboard, Target};
 use crate::packs::{ArgKind, ArgValue, Pack, PackKind, PackManager};
 use crate::start::wizard::Answers;
+use crate::templates::{Template, TemplatePack};
 
 /// The pack kinds of the sections, in pack order. Each kind has one section.
 pub const KINDS: [PackKind; 3] = [PackKind::Distro, PackKind::Agent, PackKind::Tool];
@@ -20,9 +21,22 @@ pub const KINDS: [PackKind; 3] = [PackKind::Distro, PackKind::Agent, PackKind::T
 /// The options of the start bar, in order.
 pub const START_CHOICES: [StartChoice; 2] = [StartChoice::Start, StartChoice::Cancel];
 
+/// What the wizard makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// The config of a new sandbox (`airlock start`).
+    Start,
+    /// The config of a new template (`airlock templates create`). There is
+    /// no [`Row::ShareConfig`], and the start bar says `create`.
+    Template,
+}
+
 /// A row that the focus can be on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Row {
+    /// The empty template (`None`), or the template `templates[t]`. The
+    /// template rows are a radio group, the first section of the view.
+    Template(Option<usize>),
     /// The pack of `entries[i]`.
     Pack(usize),
     /// The image of the user files, with no distro pack. It is the first row
@@ -66,6 +80,17 @@ impl Entry {
     }
 }
 
+/// The user state that a template replaces. The empty template or another
+/// template restores it.
+struct Saved {
+    /// The selected flag and the arg values of the packs that the template
+    /// has, by entry index.
+    entries: BTreeMap<usize, (bool, BTreeMap<String, ArgValue>)>,
+    /// The selected distro pack, or `None` for [`Row::Custom`].
+    distro: Option<usize>,
+    clipboard: Clipboard,
+}
+
 /// The "other" slot of the focused choice arg, when it is the current item.
 ///
 /// The user types a custom value in the slot. The arg keeps its old value
@@ -88,7 +113,19 @@ impl OtherSlot {
 
 /// The state of the setup wizard view.
 ///
-/// The view has one section per pack kind ([`KINDS`]):
+/// If templates exist, the first section is a radio group of the templates
+/// ([`Row::Template`]): the empty template first (selected at the start),
+/// then the templates by name. A selected template selects its packs with
+/// its arg values, and locks them. Locked rows show in gray, the keys do
+/// not change them, and the focus skips them. A template also locks the
+/// distro group: its distro pack (if any) is selected and the other distro
+/// rows are not. The clipboard rows get the template values, but the user
+/// can change them. Before the first template, the form keeps the user
+/// state of the packs that the template has, the distro group and the
+/// clipboard. The empty template unlocks the rows and restores that state.
+/// A change to another template also restores it first.
+///
+/// Then the view has one section per pack kind ([`KINDS`]):
 ///  * The distro packs are a radio group. If the user files set an image,
 ///    the first row is that image ([`Row::Custom`], no distro pack).
 ///  * The agents and the tools are checkboxes.
@@ -99,11 +136,19 @@ impl OtherSlot {
 /// value ([`OtherSlot`]). After the packs are the capabilities: checkboxes
 /// for the clipboard ([`Row::ClipboardCopy`], [`Row::ClipboardPaste`]). Then
 /// the config section has a checkbox for a shareable config
-/// ([`Row::ShareConfig`]). The last row is the start bar ([`Row::Start`])
-/// with its options ([`START_CHOICES`]).
+/// ([`Row::ShareConfig`]), only in [`Mode::Start`]. The last row is the
+/// start bar ([`Row::Start`]) with its options ([`START_CHOICES`]).
 pub struct Form {
     /// Airlock data directory, for the pack mount directories.
     data_dir: PathBuf,
+    mode: Mode,
+    /// The templates, sorted by name. [`Row::Template`] indexes this list.
+    templates: Vec<Template>,
+    /// The selected template. `None` is the empty template.
+    template: Option<usize>,
+    /// The user state from before the template, while a template is
+    /// selected.
+    saved: Option<Saved>,
     /// All offered packs (the newest version of each), in pack order.
     entries: Vec<Entry>,
     /// The image that the user files set ([`Row::Custom`]).
@@ -130,32 +175,41 @@ impl Form {
     ///  - `data_dir`: Airlock data directory
     ///  - `packs`: Available packs. The view offers the built-in packs.
     ///  - `custom_image`: The image of the user files, if set
+    ///  - `templates`: The templates, sorted by name
+    ///  - `mode`: What the wizard makes
     ///
     /// Returns:
-    ///   The state. The image of the user files is selected, or else the
-    ///   first distro pack. No agent or tool is selected, and the args have
-    ///   their defaults. The config is local. The start bar is on `start`.
-    ///   The focus is on the first row.
-    pub fn new(data_dir: &Path, packs: &PackManager, custom_image: Option<UserImage>) -> Self {
+    ///   The state. The empty template is selected. The image of the user
+    ///   files is selected, or else the first distro pack. No agent or tool
+    ///   is selected, and the args have their defaults. The config is local.
+    ///   The start bar is on `start`. The focus is on the first row.
+    pub fn new(
+        data_dir: &Path,
+        packs: &PackManager,
+        custom_image: Option<UserImage>,
+        templates: &[Template],
+        mode: Mode,
+    ) -> Self {
         let offered = packs.builtin();
-        let first_distro = offered
+        let default_distro = offered
             .iter()
-            .position(|p| p.metadata().kind == PackKind::Distro);
+            .position(|p| p.metadata().kind == PackKind::Distro)
+            .filter(|_| custom_image.is_none());
         let entries: Vec<Entry> = offered
             .into_iter()
             .enumerate()
             .map(|(i, pack)| Entry {
-                selected: custom_image.is_none() && Some(i) == first_distro,
-                values: pack
-                    .args()
-                    .iter()
-                    .map(|arg| (arg.key.clone(), arg.default.clone()))
-                    .collect(),
+                selected: Some(i) == default_distro,
+                values: default_values(&pack),
                 pack,
             })
             .collect();
         let mut form = Self {
             data_dir: data_dir.to_path_buf(),
+            mode,
+            templates: templates.to_vec(),
+            template: None,
+            saved: None,
             entries,
             custom_image,
             clipboard: Clipboard {
@@ -173,23 +227,28 @@ impl Form {
         form
     }
 
-    /// Return the answers: the selected packs with their arg values, in pack
-    /// order, and `target`, where the config goes.
+    /// Return the answers: the selected template, the selected packs with
+    /// their arg values, in pack order, and `target`, where the config goes.
+    /// With a template, the packs are only the packs that the template does
+    /// not have, and there is no image (the template config has it).
     pub fn answers(&self, target: Target) -> Answers {
+        let template = self.selected_template();
         Answers {
             packs: self
                 .entries
                 .iter()
-                .filter(|e| e.selected)
-                .map(|e| e.pack.configure(&e.values))
+                .enumerate()
+                .filter(|(i, e)| e.selected && self.template_pack(*i).is_none())
+                .map(|(_, e)| e.pack.configure(&e.values))
                 .collect(),
             image: self
                 .custom_image
                 .as_ref()
-                .filter(|_| !self.entries.iter().any(|e| e.is_distro() && e.selected))
+                .filter(|_| template.is_none() && !self.distro_selected())
                 .map(|image| image.value.clone()),
             clipboard: self.clipboard,
             target,
+            template: template.cloned(),
         }
     }
 
@@ -208,6 +267,54 @@ impl Form {
     /// are indexes into this list.
     pub fn entries(&self) -> &[Entry] {
         &self.entries
+    }
+
+    /// Return the templates, sorted by name. [`Row::Template`] indexes this
+    /// list.
+    pub fn templates(&self) -> &[Template] {
+        &self.templates
+    }
+
+    /// Return the index of the selected template in [`Form::templates`], or
+    /// `None` for the empty template.
+    pub fn template(&self) -> Option<usize> {
+        self.template
+    }
+
+    /// Return the selected template, or `None` for the empty template.
+    pub fn selected_template(&self) -> Option<&Template> {
+        self.template.map(|t| &self.templates[t])
+    }
+
+    /// Return what the wizard makes.
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// Return true if `row` is locked: the selected template sets it. The
+    /// keys do not change a locked row, and the focus skips it.
+    pub fn is_locked(&self, row: Row) -> bool {
+        match row {
+            Row::Pack(i) | Row::Arg(i, _) => self.is_locked_entry(i),
+            Row::Custom => self.template.is_some(),
+            _ => false,
+        }
+    }
+
+    /// Return true if a distro pack is selected.
+    pub fn distro_selected(&self) -> bool {
+        self.entries.iter().any(|e| e.is_distro() && e.selected)
+    }
+
+    /// Return the rows of the template section: the empty template, then
+    /// one row per template. Empty if there are no templates.
+    pub fn template_rows(&self) -> Vec<Row> {
+        if self.templates.is_empty() {
+            return Vec::new();
+        }
+        std::iter::once(Row::Template(None))
+            .chain((0..self.templates.len()).map(|t| Row::Template(Some(t))))
+            .collect()
     }
 
     /// Return the focused row.
@@ -267,7 +374,7 @@ impl Form {
     /// Apply a key press to the state.
     ///
     /// Keys:
-    ///  * ↑/↓: Move the focus (wraps at the ends).
+    ///  * ↑/↓: Move the focus (wraps at the ends). Skips locked rows.
     ///  * Space: Toggle a checkbox or a bool, or select a radio row.
     ///  * ←/→: Go to the previous or next value of an arg row, or option of
     ///    the start bar (no wrap).
@@ -287,7 +394,8 @@ impl Form {
     /// focus and shows the error.
     /// Returns:
     ///   The next [`Step`]. `Done` contains the target of the config: the
-    ///   project with [`Row::ShareConfig`] on, else local.
+    ///   project with [`Row::ShareConfig`] on, else local (always local in
+    ///   [`Mode::Template`]).
     pub fn key(&mut self, key: KeyEvent) -> Step<Target> {
         if prompt::is_interrupt_key(key) {
             return Step::Interrupt;
@@ -330,16 +438,96 @@ impl Form {
 
     /// Return all rows, top to bottom.
     fn rows(&self) -> Vec<Row> {
-        KINDS
-            .iter()
-            .flat_map(|kind| self.section_rows(*kind))
-            .chain([
-                Row::ClipboardCopy,
-                Row::ClipboardPaste,
-                Row::ShareConfig,
-                Row::Start,
-            ])
+        let share = (self.mode == Mode::Start).then_some(Row::ShareConfig);
+        self.template_rows()
+            .into_iter()
+            .chain(KINDS.iter().flat_map(|kind| self.section_rows(*kind)))
+            .chain([Row::ClipboardCopy, Row::ClipboardPaste])
+            .chain(share)
+            .chain([Row::Start])
             .collect()
+    }
+
+    /// Return the pack of the selected template that `entries[i]` is, if
+    /// any.
+    fn template_pack(&self, i: usize) -> Option<&TemplatePack> {
+        let name = &self.entries[i].pack.metadata().name;
+        self.selected_template()?
+            .config
+            .packs
+            .iter()
+            .find(|p| p.name == *name)
+    }
+
+    /// Return true if the selected template locks `entries[i]`: the
+    /// template has the pack, or the pack is a distro pack.
+    fn is_locked_entry(&self, i: usize) -> bool {
+        self.template.is_some() && (self.entries[i].is_distro() || self.template_pack(i).is_some())
+    }
+
+    /// Select the template `templates[chosen]`, or the empty template.
+    ///
+    /// First, the user state from before the earlier template comes back.
+    /// Then the form keeps the user state, and the packs of the new
+    /// template become selected with the template args. Its distro pack (or
+    /// no distro pack) is selected. The clipboard gets the template values,
+    /// if the template sets them.
+    fn select_template(&mut self, chosen: Option<usize>) {
+        if chosen == self.template {
+            return;
+        }
+        if let Some(saved) = self.saved.take() {
+            for (i, (selected, values)) in saved.entries {
+                self.entries[i].selected = selected;
+                self.entries[i].values = values;
+            }
+            self.select_distro(saved.distro);
+            self.clipboard = saved.clipboard;
+        }
+        self.template = chosen;
+        let Some(template) = chosen.map(|t| &self.templates[t]) else {
+            return;
+        };
+        let clipboard = template.config.clipboard;
+        let distro = self
+            .entries
+            .iter()
+            .position(|e| e.is_distro() && e.selected);
+        let entries = (0..self.entries.len())
+            .filter(|i| self.template_pack(*i).is_some())
+            .map(|i| {
+                let entry = &self.entries[i];
+                (i, (entry.selected, entry.values.clone()))
+            })
+            .collect();
+        self.saved = Some(Saved {
+            entries,
+            distro,
+            clipboard: self.clipboard,
+        });
+        if let Some(clipboard) = clipboard {
+            self.clipboard = clipboard;
+        }
+        self.select_distro(None);
+        for i in 0..self.entries.len() {
+            let Some(pack) = self.template_pack(i).cloned() else {
+                continue;
+            };
+            let entry = &mut self.entries[i];
+            entry.selected = true;
+            entry.values = default_values(&entry.pack);
+            for arg in entry.pack.args() {
+                // A value that the newest pack does not accept keeps the
+                // default.
+                if let Some(value) = pack
+                    .args
+                    .get(&arg.key)
+                    .and_then(|raw| arg.kind.parse(raw).ok())
+                {
+                    entry.values.insert(arg.key.clone(), value);
+                }
+            }
+        }
     }
 
     /// Select the distro pack of `entries[chosen]`, or no distro pack. Clear
@@ -356,7 +544,8 @@ impl Form {
     /// ends (see [`Form::go_to`]).
     fn move_focus(&mut self, forward: bool) {
         self.return_to = None;
-        let rows = self.rows();
+        let mut rows = self.rows();
+        rows.retain(|row| !self.is_locked(*row));
         let at = rows.iter().position(|r| *r == self.focus).unwrap_or(0);
         let next = if forward {
             (at + 1) % rows.len()
@@ -430,7 +619,11 @@ impl Form {
     /// Space: toggle the focused checkbox or bool, or select the focused
     /// radio row.
     fn toggle(&mut self) {
+        if self.is_locked(self.focus) {
+            return;
+        }
         match self.focus {
+            Row::Template(t) => self.select_template(t),
             Row::Pack(i) if self.entries[i].is_distro() => self.select_distro(Some(i)),
             Row::Pack(i) => self.entries[i].selected = !self.entries[i].selected,
             Row::Custom => self.select_distro(None),
@@ -454,6 +647,9 @@ impl Form {
     /// After the last value of a choice arg with `other`, → goes to the
     /// "other" slot. From the slot, ← goes back to the last value.
     fn change(&mut self, forward: bool) {
+        if self.is_locked(self.focus) {
+            return;
+        }
         match self.focus {
             Row::Arg(i, a) => {
                 let entry = &mut self.entries[i];
@@ -488,13 +684,22 @@ impl Form {
                     self.start = START_CHOICES[next];
                 }
             }
-            Row::Pack(_)
+            Row::Template(_)
+            | Row::Pack(_)
             | Row::Custom
             | Row::ClipboardCopy
             | Row::ClipboardPaste
             | Row::ShareConfig => {}
         }
     }
+}
+
+/// Return the default value of each arg of `pack`, by key.
+fn default_values(pack: &Pack) -> BTreeMap<String, ArgValue> {
+    pack.args()
+        .iter()
+        .map(|arg| (arg.key.clone(), arg.default.clone()))
+        .collect()
 }
 
 /// Return the values that the row of an arg of `kind` shows, in order.

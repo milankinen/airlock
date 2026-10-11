@@ -215,6 +215,19 @@ impl SandboxLock {
         Self::lock(boxes_dir.join(id), host_cwd.to_path_buf(), &pinned)
     }
 
+    /// Create the sandbox directory `sandbox_dir` that has no project, and
+    /// take its lock. A template build uses this. Fails when a different
+    /// airlock instance holds the lock.
+    /// Args:
+    ///  - `sandbox_dir`: Sandbox directory, created with mode 0700
+    ///  - `host_cwd`: Directory that the sandbox uses as the project
+    ///    directory
+    pub fn acquire_dir(sandbox_dir: &Path, host_cwd: &Path) -> anyhow::Result<Self> {
+        crate::cache::create_private_dir(sandbox_dir)?;
+        let pinned = PinnedDir::pin(sandbox_dir)?;
+        Self::lock(sandbox_dir.to_path_buf(), host_cwd.to_path_buf(), &pinned)
+    }
+
     /// Take the lock of the sandbox directory `pinned`.
     fn lock(sandbox_dir: PathBuf, host_cwd: PathBuf, pinned: &PinnedDir) -> anyhow::Result<Self> {
         // The sandbox holds the CA private key. Keep other local users out.

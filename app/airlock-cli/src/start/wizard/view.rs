@@ -8,10 +8,13 @@ use crate::cli;
 use crate::cli::prompt::screen::Frame;
 use crate::cli::prompt::style::{self, Line, Styles, Tone};
 use crate::packs::{ArgKind, ArgValue, PackKind};
-use crate::start::wizard::form::{self, Form, KINDS, Row, START_CHOICES, StartChoice};
+use crate::start::wizard::form::{self, Form, KINDS, Mode, Row, START_CHOICES, StartChoice};
 
 /// The description of [`Row::Custom`].
 const CUSTOM_DESCRIPTION: &str = "User defined image";
+
+/// The description of a template without packs.
+const NO_PACKS_DESCRIPTION: &str = "No preinstalled packs";
 
 /// The item of the "other" slot of a choice arg, when it is not current.
 const OTHER_CHOICE: &str = "other…";
@@ -20,15 +23,20 @@ const OTHER_CHOICE: &str = "other…";
 ///
 /// The view shows, from top to bottom:
 ///  * An empty line, the logo and an empty line
+///  * The "Template" section, if templates exist: the empty template and
+///    the templates
 ///  * One section per pack kind: its title and its rows
 ///  * The "Capabilities" section: the clipboard rows
-///  * The "Config" section: the row for a shareable config
+///  * The "Config" section: the row for a shareable config (not in
+///    [`Mode::Template`])
 ///  * An empty line, and the keys for the focused row (gray, see [`keys`])
 ///  * The start bar
 ///
-/// A pack row has a radio mark (distro) or a checkbox, and a label. Its arg
-/// rows are below it, with more indent, as `<label>: <value>`. The value is
-/// gray (`yes` or `no` for a bool). The start bar shows its current option.
+/// A template row has a radio mark and the template name. A pack row has a
+/// radio mark (distro) or a checkbox, and a label. Its arg rows are below
+/// it, with more indent, as `<label>: <value>`. The value is gray (`yes` or
+/// `no` for a bool). A locked row (see [`Form::is_locked`]) is all gray. The
+/// start bar shows its current option.
 ///
 /// The focused row has a cyan label. A focused pack row has its description
 /// in gray: ` - description` after the label, or on the next lines if it does
@@ -61,15 +69,22 @@ pub fn frame(form: &Form, room: usize) -> Frame {
     lines.push(String::new());
     let mut focus = 0..0;
     let mut cursor = None;
-    let sections = KINDS
-        .iter()
-        .map(|kind| (Some(section_title(*kind)), form.section_rows(*kind)))
+    let share = match form.mode() {
+        Mode::Start => vec![Row::ShareConfig],
+        Mode::Template => Vec::new(),
+    };
+    let sections = std::iter::once((Some("Template"), form.template_rows()))
+        .chain(
+            KINDS
+                .iter()
+                .map(|kind| (Some(section_title(*kind)), form.section_rows(*kind))),
+        )
         .chain([
             (
                 Some("Capabilities"),
                 vec![Row::ClipboardCopy, Row::ClipboardPaste],
             ),
-            (Some("Config"), vec![Row::ShareConfig]),
+            (Some("Config"), share),
             (None, vec![Row::Start]),
         ])
         .filter(|(_, rows)| !rows.is_empty());
@@ -110,29 +125,56 @@ fn section_title(kind: PackKind) -> &'static str {
 }
 
 /// Return the key help for the focused row of `form`.
-fn keys(form: &Form) -> &'static str {
+fn keys(form: &Form) -> String {
+    let enter = start_label(StartChoice::Start, form.mode());
     match (form.focus(), form.other()) {
-        (Row::Start, _) => "←→ choose · enter confirm",
-        (_, Some(other)) if other.is_empty() => "type a value · ← back",
-        (_, Some(other)) if other.error.is_some() => "edit the value · ← back",
-        (_, Some(_)) => "↑↓ move · ← back · enter start",
-        (Row::Arg(..), None) => "↑↓ move · ←→ change · enter start",
+        (Row::Start, _) => "←→ choose · enter confirm".to_string(),
+        (_, Some(other)) if other.is_empty() => "type a value · ← back".to_string(),
+        (_, Some(other)) if other.error.is_some() => "edit the value · ← back".to_string(),
+        (_, Some(_)) => format!("↑↓ move · ← back · enter {enter}"),
+        (Row::Arg(..), None) => format!("↑↓ move · ←→ change · enter {enter}"),
         (
-            Row::Pack(_)
+            Row::Template(_)
+            | Row::Pack(_)
             | Row::Custom
             | Row::ClipboardCopy
             | Row::ClipboardPaste
             | Row::ShareConfig,
             None,
-        ) => "↑↓ move · space select · enter start",
+        ) => format!("↑↓ move · space select · enter {enter}"),
     }
 }
 
-/// Return the label of a start bar option.
-fn start_label(choice: StartChoice) -> &'static str {
-    match choice {
-        StartChoice::Start => "start",
-        StartChoice::Cancel => "cancel",
+/// Return the label of a start bar option in `mode`.
+fn start_label(choice: StartChoice, mode: Mode) -> &'static str {
+    match (choice, mode) {
+        (StartChoice::Start, Mode::Start) => "start",
+        (StartChoice::Start, Mode::Template) => "create",
+        (StartChoice::Cancel, _) => "cancel",
+    }
+}
+
+/// Return the description of the template row `template`: the packs of
+/// the template that the view knows.
+fn template_description(form: &Form, template: Option<usize>) -> String {
+    let known = |name: &str| {
+        form.entries()
+            .iter()
+            .any(|e| e.pack.metadata().name == name)
+    };
+    let packs: Vec<&str> = template.map_or(Vec::new(), |t| {
+        form.templates()[t]
+            .config
+            .packs
+            .iter()
+            .map(|p| p.name.as_str())
+            .filter(|name| known(name))
+            .collect()
+    });
+    if packs.is_empty() {
+        NO_PACKS_DESCRIPTION.to_string()
+    } else {
+        format!("packs: {}", packs.join(", "))
     }
 }
 
@@ -155,15 +197,17 @@ fn row_lines(form: &Form, row: Row, room: usize, styles: &Styles) -> Shown {
     let indent = line.indent;
     let cursor = line.cursor;
     let description = match row {
-        Row::Pack(i) if focused => Some(form.entries()[i].pack.metadata().description.as_str()),
-        Row::Custom if focused => Some(CUSTOM_DESCRIPTION),
-        Row::ClipboardCopy if focused => Some("Sandbox can copy to the host clipboard"),
-        Row::ClipboardPaste if focused => {
-            Some("Sandbox can read the host clipboard. Enable only if you know what you are doing")
-        }
-        Row::ShareConfig if focused => {
-            Some("Write the config to the project, to share it. Otherwise it stays local")
-        }
+        Row::Template(t) if focused => Some(template_description(form, t)),
+        Row::Pack(i) if focused => Some(form.entries()[i].pack.metadata().description.clone()),
+        Row::Custom if focused => Some(CUSTOM_DESCRIPTION.to_string()),
+        Row::ClipboardCopy if focused => Some("Sandbox can copy to the host clipboard".to_string()),
+        Row::ClipboardPaste if focused => Some(
+            "Sandbox can read the host clipboard. Enable only if you know what you are doing"
+                .to_string(),
+        ),
+        Row::ShareConfig if focused => Some(
+            "Write the config to the project, to share it. Otherwise it stays local".to_string(),
+        ),
         _ => None,
     };
     let error = match row {
@@ -173,14 +217,14 @@ fn row_lines(form: &Form, row: Row, room: usize, styles: &Styles) -> Shown {
     };
     let mut lines = Vec::new();
     match description {
-        Some(text) if line.width + 3 + measure_text_width(text) <= room => {
+        Some(text) if line.width + 3 + measure_text_width(&text) <= room => {
             let mut line = line;
             line.push(&format!(" - {text}"), &styles.dim);
             lines.push(line.text);
         }
         Some(text) => {
             lines.push(line.text);
-            lines.extend(style::indented(text, indent, room, &styles.dim));
+            lines.extend(style::indented(&text, indent, room, &styles.dim));
         }
         None => lines.push(line.text),
     }
@@ -193,25 +237,46 @@ fn row_lines(form: &Form, row: Row, room: usize, styles: &Styles) -> Shown {
 /// Return the line of `row`, without description and errors.
 fn row_line(form: &Form, row: Row, focused: bool, styles: &Styles) -> Line {
     let mut line = Line::default();
-    let label = styles.label(focused, Tone::Plain);
+    let locked = form.is_locked(row);
+    let label = if locked {
+        &styles.dim
+    } else {
+        styles.label(focused, Tone::Plain)
+    };
+    let mark = |selected| {
+        if locked {
+            &styles.dim
+        } else {
+            styles.mark(selected)
+        }
+    };
     match row {
+        Row::Template(t) => {
+            let selected = form.template() == t;
+            line.lead(2, focused, styles);
+            line.push(style::radio(selected), styles.mark(selected));
+            line.push(" ", &styles.plain);
+            line.mark_indent();
+            let name = t.map_or("empty", |t| form.templates()[t].name.as_str());
+            line.push(name, label);
+        }
         Row::Pack(i) => {
             let entry = &form.entries()[i];
-            let mark = if entry.is_distro() {
+            let symbol = if entry.is_distro() {
                 style::radio(entry.selected)
             } else {
                 style::checkbox(entry.selected)
             };
             line.lead(2, focused, styles);
-            line.push(mark, styles.mark(entry.selected));
+            line.push(symbol, mark(entry.selected));
             line.push(" ", &styles.plain);
             line.mark_indent();
             line.push(&entry.pack.metadata().label, label);
         }
         Row::Custom => {
-            let selected = !form.entries().iter().any(|e| e.is_distro() && e.selected);
+            let selected = form.selected_template().is_none() && !form.distro_selected();
             line.lead(2, focused, styles);
-            line.push(style::radio(selected), styles.mark(selected));
+            line.push(style::radio(selected), mark(selected));
             line.push(" ", &styles.plain);
             line.mark_indent();
             let image = form.custom_image().map_or("", |image| image.name.as_str());
@@ -279,10 +344,11 @@ fn row_line(form: &Form, row: Row, focused: bool, styles: &Styles) -> Line {
                     } else {
                         Tone::Plain
                     };
-                    line.push_option(start_label(choice), choice == form.start(), tone, styles);
+                    let text = start_label(choice, form.mode());
+                    line.push_option(text, choice == form.start(), tone, styles);
                 }
             } else {
-                line.push(start_label(form.start()), &styles.plain);
+                line.push(start_label(form.start(), form.mode()), &styles.plain);
             }
             line.push(" »", &styles.plain);
         }

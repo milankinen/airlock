@@ -5,7 +5,7 @@ use crate::config::config_values::PullPolicy;
 use crate::config::generated::{Clipboard, GeneratedConfig, NewEntry, Target};
 use crate::config::{ConfigOverrides, LayeredConfig, ResolvedConfig};
 use crate::packs::ArgValue;
-use crate::test_cfg::{ConfigDirs, resolve_layers, temp_dir};
+use crate::test_cfg::{ConfigDirs, resolve_layers, resolve_project_toml, temp_dir, test_template};
 
 /// Return a wizard pack entry at version 1 with the given args.
 fn entry<'a>(name: &'a str, args: Vec<(&'a str, &'a ArgValue)>) -> NewEntry<'a> {
@@ -72,6 +72,7 @@ fn wizard_project_config_resolves_before_save_and_after_reload() {
             copy: true,
             paste: false,
         }),
+        None,
     );
     assert_eq!(generated.path, dirs.project().join("airlock.toml"));
     assert_eq!(
@@ -105,7 +106,7 @@ fn wizard_project_config_resolves_before_save_and_after_reload() {
     assert_wizard_choices(&dirs.resolve().unwrap());
 
     // The project file exists now, so the save of a new config must fail.
-    let other = GeneratedConfig::new(&dirs.project(), Target::Project, &[], None, None);
+    let other = GeneratedConfig::new(&dirs.project(), Target::Project, &[], None, None, None);
     let err = other.save(&local_dir).unwrap_err().to_string();
     assert!(err.contains("appeared"), "{err}");
     assert_eq!(
@@ -127,7 +128,7 @@ fn wizard_project_config_resolves_before_save_and_after_reload() {
 #[test]
 fn wizard_local_config_goes_to_airlock_dir_or_sandbox_dir() {
     let dirs = ConfigDirs::new();
-    let generated = GeneratedConfig::new(&dirs.project(), Target::Local, &[], None, None);
+    let generated = GeneratedConfig::new(&dirs.project(), Target::Local, &[], None, None, None);
     assert_eq!(generated.toml, "");
     assert_eq!(generated.path, dirs.project().join(".airlock/airlock.toml"));
     let local_dir = dirs.project().join(".airlock");
@@ -142,10 +143,71 @@ fn wizard_local_config_goes_to_airlock_dir_or_sandbox_dir() {
 
     let boxed = ConfigDirs::new();
     let sandbox = temp_dir();
-    let generated = GeneratedConfig::new(&boxed.project(), Target::Local, &[], None, None);
+    let generated = GeneratedConfig::new(&boxed.project(), Target::Local, &[], None, None, None);
     let path = generated.save(sandbox.path()).unwrap();
     assert_eq!(path, sandbox.path().join("airlock.toml"));
     assert!(std::fs::read_dir(boxed.project()).unwrap().next().is_none());
     let layers = LayeredConfig::load_from(&boxed.home(), &boxed.project(), sandbox.path()).unwrap();
     assert!(layers.has_project_config());
+}
+
+/// Test that a wizard config from a template keeps the template config and
+/// adds the extra packs and the clipboard choices. The template disk has
+/// the template packs, so their versions, args and the pinned image must
+/// not change.
+///   1. Make the config from a template with an extra pack and new
+///      clipboard choices
+///   2. Check the TOML text and the template name
+///   3. Resolve the text and check the packs, args, image and clipboard
+#[test]
+fn wizard_config_from_template_keeps_template_and_adds_extra_packs() {
+    let image = "debian@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let template = test_template(
+        "base",
+        &format!(
+            "[packs]\n\
+             debian = {{ version = \"1\" }}\n\
+             sample = {{ version = \"1\", args = {{ mode = \"slow\" }} }}\n\n\
+             [vm]\nimage = \"{image}\"\n\n\
+             [clipboard]\ncopy = true\npaste = true\n"
+        ),
+    );
+    let dirs = ConfigDirs::new();
+    let generated = GeneratedConfig::new(
+        &dirs.project(),
+        Target::Local,
+        &[entry("claude", vec![])],
+        None,
+        Some(Clipboard {
+            copy: false,
+            paste: false,
+        }),
+        Some(&template),
+    );
+    assert_eq!(generated.template.as_deref(), Some("base"));
+    assert_eq!(
+        generated.toml,
+        format!(
+            "[packs]\n\
+             debian = {{ version = \"1\" }}\n\
+             sample = {{ version = \"1\", args = {{ mode = \"slow\" }} }}\n\
+             claude = {{ version = \"1\" }}\n\n\
+             [vm]\nimage = \"{image}\"\n\n\
+             [clipboard]\ncopy = false\npaste = false\n"
+        )
+    );
+
+    let resolved = resolve_project_toml(&generated.toml).unwrap();
+    let names: Vec<&str> = resolved
+        .packs
+        .iter()
+        .map(|c| c.metadata().name.as_str())
+        .collect();
+    assert_eq!(names, ["debian", "claude", "sample"]);
+    assert_eq!(
+        resolved.packs[2].non_default_args(),
+        [("mode", &ArgValue::Text("slow".into()))]
+    );
+    assert_eq!(resolved.values.vm.image.name, image);
+    assert!(!resolved.values.clipboard.copy);
 }

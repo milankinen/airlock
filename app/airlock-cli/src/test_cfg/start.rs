@@ -96,10 +96,13 @@ pub async fn prepare_image(
         _ => ImageChange::Unchanged,
     };
     std::fs::write(&link, name)?;
-    Ok(PreparedImage {
-        image: fake_image(name),
-        change,
-    })
+    let mut image = fake_image(name);
+    // A pinned digest names the image, as with a real registry.
+    if let Some(digest) = image_cfg.pinned_digest() {
+        image.image_id = digest.to_string();
+    }
+    let pin = Some(image.image_id.clone());
+    Ok(PreparedImage { image, change, pin })
 }
 
 /// `facts::check` for tests. With the fakes on, each image can take packs.
@@ -238,7 +241,17 @@ impl StartProject {
         yes: bool,
         allow_config_changes: bool,
     ) -> Result<(), Exit> {
-        let config = project_config(toml);
+        self.start_config(&project_config(toml), yes, allow_config_changes)
+    }
+
+    /// [`Self::start_with`] with the config files `config`, for example a
+    /// config of the setup wizard.
+    pub fn start_config(
+        &self,
+        config: &LayeredConfig,
+        yes: bool,
+        allow_config_changes: bool,
+    ) -> Result<(), Exit> {
         let options = SandboxOptions {
             yes,
             log_level: LogLevel::Info,
@@ -253,7 +266,7 @@ impl StartProject {
             if project::is_running(&project_sandbox) {
                 return None;
             }
-            match self.start_once(&config, &options) {
+            match self.start_once(config, &options) {
                 Err(Exit::Failed(e)) if e.to_string().starts_with("another airlock instance") => {
                     None
                 }
@@ -269,6 +282,10 @@ impl StartProject {
                 .resolve(&self.context.data_dir, &self.packs, &options.overrides)
                 .await
                 .map_err(Exit::config)?;
+            let template = config
+                .generated_project()
+                .and_then(|g| g.template.as_deref())
+                .map(|name| crate::templates::find(&self.context.data_dir, name).unwrap());
             let sandbox = crate::start::sandbox::ensure_sandbox(
                 &self.context,
                 &self.project_dir(),
@@ -276,6 +293,7 @@ impl StartProject {
                 config,
                 resolved,
                 options,
+                template.as_ref(),
             )
             .await?;
             let resolved = &sandbox.resolved;
@@ -312,6 +330,32 @@ impl StartProject {
             ReadState::Absent => InstallState::default(),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// Build the template `name` from the config files `config` (see
+    /// [`crate::templates::create::build_template`]). `replace` replaces a
+    /// template with the same name.
+    pub fn build_template(
+        &self,
+        name: &str,
+        config: &LayeredConfig,
+        replace: bool,
+    ) -> Result<(), Exit> {
+        let options = SandboxOptions {
+            yes: true,
+            log_level: LogLevel::Info,
+            verbose: false,
+            allow_config_changes: false,
+            overrides: ConfigOverrides::default(),
+        };
+        block_on_local(crate::templates::create::build_template(
+            &self.context,
+            name,
+            &self.packs,
+            config,
+            &options,
+            replace,
+        ))
     }
 
     /// The identity of the sandbox disk.

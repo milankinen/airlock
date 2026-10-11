@@ -221,7 +221,7 @@ fn parse_id(text: &str) -> Option<(u64, u64)> {
 }
 
 /// Write a new random identity for the disk image in `dir`.
-fn write_id(dir: &Path) -> anyhow::Result<()> {
+pub(crate) fn write_id(dir: &Path) -> anyhow::Result<()> {
     use rand::TryRng;
     let mut bytes = [0u8; 16];
     rand::rngs::SysRng

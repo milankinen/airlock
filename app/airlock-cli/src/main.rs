@@ -27,6 +27,7 @@ mod self_update;
 pub(crate) mod services;
 mod settings;
 mod start;
+mod templates;
 #[cfg(test)]
 mod test_cfg;
 mod util;
@@ -36,7 +37,9 @@ mod vm;
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::task::LocalSet;
 
-use crate::cli::{cmd_exec, cmd_info, cmd_rm, cmd_sandbox, cmd_secret, cmd_self_update, cmd_start};
+use crate::cli::{
+    cmd_exec, cmd_info, cmd_rm, cmd_sandbox, cmd_secret, cmd_self_update, cmd_start, cmd_templates,
+};
 use crate::context::Context;
 use crate::settings::Settings;
 
@@ -126,6 +129,13 @@ async fn main() {
                     }
                     Ok(cli::cmd_sandbox::main(args, &context).await)
                 }
+                Command::Templates(args) => {
+                    if !extra_args.is_empty() {
+                        cli::error!("'--' args are only supported with 'start'");
+                        std::process::exit(2);
+                    }
+                    Ok(cli::cmd_templates::main(args, &context).await)
+                }
                 Command::SelfUpdate(_) => unreachable!("self-update runs before the context"),
             };
             result.unwrap_or_else(|e| {
@@ -191,6 +201,9 @@ enum Command {
     /// List, inspect and remove sandboxes
     #[command(alias = "sandbox")]
     Sandboxes(cmd_sandbox::SandboxArgs),
+    /// Create, list, inspect and remove sandbox templates
+    #[command(alias = "template")]
+    Templates(cmd_templates::TemplateArgs),
     /// Update airlock to the latest release
     SelfUpdate(cmd_self_update::SelfUpdateArgs),
 }

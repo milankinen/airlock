@@ -8,9 +8,10 @@ use crate::config::generated::Target;
 use crate::config::{LayeredConfig, UserImage};
 use crate::packs::{ArgValue, PackManager};
 use crate::start::install::install_candidates;
-use crate::start::wizard::form::{Form, Row, StartChoice};
-use crate::start::wizard::{Input, check_answers, save_config};
-use crate::test_cfg::{block_on, resolve_project_toml, temp_dir};
+use crate::start::wizard::form::{Form, Mode, Row, StartChoice};
+use crate::start::wizard::{Input, check_answers, save_config, view};
+use crate::templates::Template;
+use crate::test_cfg::{block_on, resolve_project_toml, temp_dir, test_template};
 use crate::vault::{Vault, VaultStorageType};
 
 /// Press `code` without modifiers.
@@ -57,6 +58,51 @@ fn focus_arg(form: &mut Form, name: &str, key: &str) {
     });
 }
 
+/// Return true if pack `name` is selected.
+fn is_selected(form: &Form, name: &str) -> bool {
+    form.entries()
+        .iter()
+        .any(|e| e.selected && e.pack.metadata().name == name)
+}
+
+/// The value of arg `key` of pack `name`.
+fn arg_value<'a>(form: &'a Form, name: &str, key: &str) -> &'a ArgValue {
+    let entry = form
+        .entries()
+        .iter()
+        .find(|e| e.pack.metadata().name == name)
+        .unwrap();
+    &entry.values[key]
+}
+
+/// The row of pack `name`.
+fn pack_row(form: &Form, name: &str) -> Row {
+    let i = (0..form.entries().len())
+        .find(|i| pack_name(form, *i) == name)
+        .unwrap();
+    Row::Pack(i)
+}
+
+/// The template `base`: debian with `allow-apt` off, sample in slow mode, a
+/// pack that is not known, a pinned image and clipboard paste.
+fn base_template() -> Template {
+    test_template(
+        "base",
+        "[packs]\n\
+         debian = { version = \"1\", args = { allow-apt = false } }\n\
+         sample = { version = \"1\", args = { mode = \"slow\", network = \"bad\" } }\n\
+         ghost = { version = \"1\" }\n\n\
+         [vm]\nimage = \"debian@sha256:0123\"\n\n\
+         [clipboard]\ncopy = true\npaste = true\n",
+    )
+}
+
+/// The text of the view of `form`, without colors.
+fn view_text(form: &Form) -> String {
+    let frame = view::frame(form, 200);
+    console::strip_ansi_codes(&frame.lines.join("\n")).to_string()
+}
+
 /// A layered config with only the user file `user_toml`.
 fn user_files(user_toml: &str) -> LayeredConfig {
     LayeredConfig::from_values(
@@ -79,6 +125,8 @@ fn check(packs: &PackManager, config: &LayeredConfig, form: &Form) -> anyhow::Re
         packs,
         config,
         vault: &vault,
+        templates: &[],
+        mode: Mode::Start,
     };
     block_on(check_answers(&input, &form.answers(Target::Local)))
 }
@@ -98,7 +146,7 @@ fn check(packs: &PackManager, config: &LayeredConfig, form: &Form) -> anyhow::Re
 fn choosing_packs_and_args_with_keys_saves_shared_config_that_resolves() {
     let packs = crate::packs::init_with_sample();
     let data = temp_dir();
-    let mut form = Form::new(data.path(), &packs, None);
+    let mut form = Form::new(data.path(), &packs, None, &[], Mode::Start);
     focus_pack(&mut form, "debian");
     press(&mut form, KeyCode::Char(' '));
     focus_pack(&mut form, "claude");
@@ -191,7 +239,7 @@ fn user_image_is_preselected_until_distro_pack_is_chosen() {
         name: "my/image:1".into(),
         value: serde_json::json!("my/image:1"),
     };
-    let mut form = Form::new(data.path(), &packs, Some(image.clone()));
+    let mut form = Form::new(data.path(), &packs, Some(image.clone()), &[], Mode::Start);
     assert_eq!(form.focus(), Row::Custom);
     press(&mut form, KeyCode::Enter);
     let Step::Done(target) = press(&mut form, KeyCode::Enter) else {
@@ -205,7 +253,7 @@ fn user_image_is_preselected_until_distro_pack_is_chosen() {
     assert!(resolved.packs.is_empty());
     assert_eq!(resolved.values.vm.image.name, "my/image:1");
 
-    let mut form = Form::new(data.path(), &packs, Some(image));
+    let mut form = Form::new(data.path(), &packs, Some(image), &[], Mode::Start);
     focus_pack(&mut form, "alpine");
     press(&mut form, KeyCode::Char(' '));
     let answers = form.answers(Target::Local);
@@ -222,7 +270,7 @@ fn user_image_is_preselected_until_distro_pack_is_chosen() {
 fn answers_whose_env_does_not_resolve_fail_check() {
     let packs = crate::packs::init_with_sample();
     let data = temp_dir();
-    let form = Form::new(data.path(), &packs, None);
+    let form = Form::new(data.path(), &packs, None, &[], Mode::Start);
     check(&packs, &user_files("[env]\nPLAIN = \"1\"\n"), &form).unwrap();
     let config = user_files("[env]\nMINE = \"${AIRLOCK_TEST_UNSET_VAR}\"\n");
     let e = check(&packs, &config, &form).unwrap_err();
@@ -239,7 +287,7 @@ fn answers_whose_env_does_not_resolve_fail_check() {
 fn esc_cancel_and_ctrl_c_end_wizard_without_answers() {
     let packs = crate::packs::init_with_sample();
     let data = temp_dir();
-    let mut form = Form::new(data.path(), &packs, None);
+    let mut form = Form::new(data.path(), &packs, None, &[], Mode::Start);
     let first = form.focus();
     press(&mut form, KeyCode::Enter);
     assert_eq!(form.focus(), Row::Start);
@@ -247,7 +295,7 @@ fn esc_cancel_and_ctrl_c_end_wizard_without_answers() {
     assert_eq!(form.focus(), first);
     assert!(matches!(press(&mut form, KeyCode::Esc), Step::Cancel));
 
-    let mut form = Form::new(data.path(), &packs, None);
+    let mut form = Form::new(data.path(), &packs, None, &[], Mode::Start);
     press(&mut form, KeyCode::Enter);
     press(&mut form, KeyCode::Right);
     assert_eq!(form.start(), StartChoice::Cancel);
@@ -255,4 +303,220 @@ fn esc_cancel_and_ctrl_c_end_wizard_without_answers() {
 
     let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
     assert!(matches!(form.key(ctrl_c), Step::Interrupt));
+}
+
+/// Test that the template section is first and only shows when templates
+/// exist. The empty template must be the default, so a new user gets the
+/// old wizard.
+///   1. Open the form without templates and check that there are no
+///      template rows and the focus is on the first distro pack
+///   2. Open it with two templates and check the rows: empty template
+///      first, then the templates in order
+///   3. Check that the focus is on the empty template, and that it is
+///      selected
+#[test]
+fn template_section_is_first_only_when_templates_exist() {
+    let packs = crate::packs::init_with_sample();
+    let data = temp_dir();
+    let form = Form::new(data.path(), &packs, None, &[], Mode::Start);
+    assert!(form.template_rows().is_empty());
+    assert_eq!(form.focus(), pack_row(&form, "alpine"));
+    assert!(!view_text(&form).contains("Template"));
+
+    let templates = [base_template(), test_template("other", "")];
+    let form = Form::new(data.path(), &packs, None, &templates, Mode::Start);
+    assert_eq!(
+        form.template_rows(),
+        [
+            Row::Template(None),
+            Row::Template(Some(0)),
+            Row::Template(Some(1))
+        ]
+    );
+    assert_eq!(form.focus(), Row::Template(None));
+    assert!(form.selected_template().is_none());
+    let text = view_text(&form);
+    assert!(text.contains("empty - No preinstalled packs"), "{text}");
+}
+
+/// Test that a template selects and locks its packs and the distro group,
+/// and that the empty template unlocks them again. The template config
+/// already has these packs, so the answers must not repeat them.
+///   1. Select the template and check the packs, args, clipboard and locks
+///   2. Move the focus through all rows and check that it skips the locked
+///      rows
+///   3. Select an extra agent and check the answers and the config
+///   4. Select the empty template and check that the template packs are
+///      off with default args, the first distro is back and the agent
+///      stays
+#[test]
+fn template_locks_its_packs_until_empty_template_is_selected() {
+    let packs = crate::packs::init_with_sample();
+    let data = temp_dir();
+    let templates = [base_template()];
+    let mut form = Form::new(data.path(), &packs, None, &templates, Mode::Start);
+    press(&mut form, KeyCode::Down);
+    assert_eq!(form.focus(), Row::Template(Some(0)));
+    assert!(view_text(&form).contains("base - packs: debian, sample"));
+    press(&mut form, KeyCode::Char(' '));
+    assert_eq!(form.selected_template().unwrap().name, "base");
+    assert!(is_selected(&form, "debian"));
+    assert!(!is_selected(&form, "alpine"));
+    assert!(is_selected(&form, "sample"));
+    assert_eq!(
+        arg_value(&form, "debian", "allow-apt"),
+        &ArgValue::Bool(false)
+    );
+    assert_eq!(
+        arg_value(&form, "sample", "mode"),
+        &ArgValue::Text("slow".into())
+    );
+    // The template value has the wrong type, thus the default stays.
+    assert_eq!(arg_value(&form, "sample", "network"), &ArgValue::Bool(true));
+    assert!(form.clipboard().paste);
+    for name in ["alpine", "debian", "sample"] {
+        assert!(form.is_locked(pack_row(&form, name)), "{name}");
+    }
+    assert!(!form.is_locked(pack_row(&form, "claude")));
+
+    // One round through all rows comes back to the template row.
+    let mut seen = Vec::new();
+    loop {
+        press(&mut form, KeyCode::Down);
+        if form.focus() == Row::Template(Some(0)) {
+            break;
+        }
+        seen.push(form.focus());
+    }
+    assert!(seen.iter().all(|row| !form.is_locked(*row)), "{seen:?}");
+    assert!(seen.contains(&Row::ShareConfig));
+    assert_eq!(seen[0], pack_row(&form, "claude"));
+
+    focus_pack(&mut form, "claude");
+    press(&mut form, KeyCode::Char(' '));
+    let answers = form.answers(Target::Local);
+    assert_eq!(answers.template.as_ref().unwrap().name, "base");
+    assert!(answers.image.is_none());
+    let names: Vec<&str> = answers
+        .packs
+        .iter()
+        .map(|c| c.metadata().name.as_str())
+        .collect();
+    assert_eq!(names, ["claude"]);
+    let generated = answers.config(data.path());
+    assert_eq!(generated.template.as_deref(), Some("base"));
+    assert!(
+        generated.toml.contains(
+            "ghost = { version = \"1\" }\nclaude = { version = \"1\", args = { acp = false } }\n"
+        ),
+        "{}",
+        generated.toml
+    );
+
+    press_down_until(&mut form, |form| form.focus() == Row::Template(None));
+    press(&mut form, KeyCode::Char(' '));
+    assert!(form.selected_template().is_none());
+    assert!(is_selected(&form, "alpine"));
+    assert!(!is_selected(&form, "debian"));
+    assert!(!is_selected(&form, "sample"));
+    assert!(is_selected(&form, "claude"));
+    assert_eq!(
+        arg_value(&form, "debian", "allow-apt"),
+        &ArgValue::Bool(true)
+    );
+    assert_eq!(
+        arg_value(&form, "sample", "mode"),
+        &ArgValue::Text("fast".into())
+    );
+    assert!(!form.is_locked(pack_row(&form, "debian")));
+    let answers = form.answers(Target::Local);
+    assert!(answers.template.is_none());
+    assert_eq!(answers.packs.len(), 2);
+}
+
+/// Test that a template change restores the user choices that the earlier
+/// template replaced. Otherwise a template could leave, for example,
+/// clipboard paste on without the user seeing it.
+///   1. Select debian and the sample pack with network off
+///   2. Select the template that has them and sets clipboard paste
+///   3. Change to a template without packs and clipboard, and check that
+///      the sample pack, its args and the clipboard come back
+///   4. Select the empty template and check that debian comes back too
+#[test]
+fn template_change_restores_user_packs_and_clipboard() {
+    let packs = crate::packs::init_with_sample();
+    let data = temp_dir();
+    let templates = [base_template(), test_template("other", "")];
+    let mut form = Form::new(data.path(), &packs, None, &templates, Mode::Start);
+    focus_pack(&mut form, "debian");
+    press(&mut form, KeyCode::Char(' '));
+    focus_pack(&mut form, "sample");
+    press(&mut form, KeyCode::Char(' '));
+    focus_arg(&mut form, "sample", "network");
+    press(&mut form, KeyCode::Char(' '));
+    assert_eq!(
+        arg_value(&form, "sample", "network"),
+        &ArgValue::Bool(false)
+    );
+
+    press_down_until(&mut form, |form| form.focus() == Row::Template(Some(0)));
+    press(&mut form, KeyCode::Char(' '));
+    assert_eq!(arg_value(&form, "sample", "network"), &ArgValue::Bool(true));
+    assert!(form.clipboard().paste);
+
+    press(&mut form, KeyCode::Down);
+    assert_eq!(form.focus(), Row::Template(Some(1)));
+    press(&mut form, KeyCode::Char(' '));
+    assert!(is_selected(&form, "sample"));
+    assert!(!form.is_locked(pack_row(&form, "sample")));
+    assert_eq!(
+        arg_value(&form, "sample", "network"),
+        &ArgValue::Bool(false)
+    );
+    assert_eq!(
+        arg_value(&form, "sample", "mode"),
+        &ArgValue::Text("fast".into())
+    );
+    assert!(!form.clipboard().paste);
+    // The template locks the distro group and has no distro pack.
+    assert!(!form.distro_selected());
+
+    press_down_until(&mut form, |form| form.focus() == Row::Template(None));
+    press(&mut form, KeyCode::Char(' '));
+    assert!(is_selected(&form, "debian"));
+    assert!(!is_selected(&form, "alpine"));
+    assert!(is_selected(&form, "sample"));
+    assert!(!form.clipboard().paste);
+}
+
+/// Test that the template mode has no shared config option and that the
+/// start bar creates the template. A template is not a project file, so
+/// the option makes no sense there.
+///   1. Open the form in template mode and move through all rows
+///   2. Check that no row is the shared config row
+///   3. Check that the view shows `create` and no "Config" section
+///   4. Press Enter twice and check that the wizard ends with a local
+///      target
+#[test]
+fn template_mode_has_no_share_row_and_creates() {
+    let packs = crate::packs::init_with_sample();
+    let data = temp_dir();
+    let mut form = Form::new(data.path(), &packs, None, &[], Mode::Template);
+    let first = form.focus();
+    loop {
+        assert_ne!(form.focus(), Row::ShareConfig);
+        press(&mut form, KeyCode::Down);
+        if form.focus() == first {
+            break;
+        }
+    }
+    let text = view_text(&form);
+    assert!(text.contains("enter create"), "{text}");
+    assert!(text.contains("« create »"), "{text}");
+    assert!(!text.contains("Config"), "{text}");
+    press(&mut form, KeyCode::Enter);
+    assert!(matches!(
+        press(&mut form, KeyCode::Enter),
+        Step::Done(Target::Local)
+    ));
 }

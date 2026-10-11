@@ -16,9 +16,9 @@ struct CachedLayers {
     image_layers: Vec<String>,
 }
 
-/// Remove the cached images and layers that no sandbox uses.
+/// Remove the cached images and layers that no sandbox or template uses.
 ///
-/// An image is in use if a sandbox has a hardlink to its `images/<digest>`
+/// An image is in use if a sandbox or a template has a hardlink to its `images/<digest>`
 /// file (link count > 1). A layer is in use if at least one image in use
 /// lists it. The sweep deletes all other images and layers. It also always
 /// removes stray staging entries (`.download`, `.download.tmp`, `.tmp`),
@@ -30,9 +30,35 @@ struct CachedLayers {
 /// Args:
 ///  - `data_dir`: Airlock data directory
 pub fn sweep(data_dir: &Path) {
+    relink_templates(data_dir);
     sweep_images(data_dir);
     let live = collect_live_layers(data_dir);
     sweep_layers(data_dir, &live);
+}
+
+/// Make the image file of each template a hardlink to its cache entry
+/// again.
+// A pull of the same image under an other name writes the cache entry
+// again, and the entry gets a new inode. A sandbox repairs its link on
+// each start, but nothing starts a template. Without the repair, the sweep
+// removes the image of the template.
+fn relink_templates(data_dir: &Path) {
+    let dir = crate::templates::templates_dir(data_dir);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let link = entry.path().join(crate::templates::IMAGE_FILE);
+        let Some(image) = super::read_cached_image(&link) else {
+            continue;
+        };
+        let Ok(path) = cache::image_path(data_dir, &image.image_id) else {
+            continue;
+        };
+        if let Err(e) = super::ensure_image_hardlink(&link, &path, &image) {
+            tracing::warn!("gc: relink {}: {e:#}", link.display());
+        }
+    }
 }
 
 /// Remove the cached image files that have link count 1 (no sandbox uses

@@ -9,7 +9,7 @@ use crate::cli::{self, LogLevel};
 use crate::config::config_values::Policy;
 use crate::context::Context;
 use crate::runtime::HostRuntime;
-use crate::{config, packs, project, sandboxes, start};
+use crate::{config, packs, project, sandboxes, start, templates};
 
 /// CLI arguments for `airlock start`.
 #[derive(Args, Debug)]
@@ -106,6 +106,7 @@ async fn run(
         has_sandbox,
         &packs,
         &context.vault,
+        &crate::templates::list(&context.data_dir),
     ))
     .await?;
     let options = args.sandbox_options();
@@ -117,9 +118,22 @@ async fn run(
     let runtime =
         HostRuntime::new(args.monitor, &context.settings).map_err(|e| start::Exit::error(2, e))?;
 
+    // A wizard config can name a template for the new sandbox.
+    let template = config
+        .generated_project()
+        .and_then(|g| g.template.as_deref())
+        .map(|name| templates::find(&context.data_dir, name))
+        .transpose()
+        .map_err(|e| start::Exit::error(1, e))?;
     // The sandbox step can select the config of the last run.
     let sandbox = Box::pin(start::sandbox::ensure_sandbox(
-        &context, &host_cwd, &packs, &config, resolved, &options,
+        &context,
+        &host_cwd,
+        &packs,
+        &config,
+        resolved,
+        &options,
+        template.as_ref(),
     ))
     .await?;
     let resolved = &sandbox.resolved;

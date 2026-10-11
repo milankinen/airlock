@@ -157,3 +157,13 @@ pub fn configured_variants(pack: &Pack) -> Vec<ConfiguredPack> {
     }
     variants.iter().map(|args| pack.configure(args)).collect()
 }
+
+/// A template `name` with the config text `toml`. The template directory
+/// does not exist.
+pub fn test_template(name: &str, toml: &str) -> crate::templates::Template {
+    crate::templates::Template {
+        name: name.to_string(),
+        dir: std::path::PathBuf::from("/nonexistent/templates").join(name),
+        config: crate::templates::TemplateConfig::parse(toml).unwrap(),
+    }
+}

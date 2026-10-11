@@ -4,6 +4,7 @@
 //! terminal-safe text and JSON files. Also gives file access that does not
 //! follow symlinks.
 
+pub(crate) mod clone;
 pub(crate) mod safe_fs;
 
 use std::os::unix::fs::PermissionsExt;

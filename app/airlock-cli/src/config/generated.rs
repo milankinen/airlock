@@ -2,13 +2,15 @@
 //!
 //! Makes and saves the project config file that the setup wizard creates.
 //! The file contains the selected packs, and optionally an image and
-//! clipboard access.
+//! clipboard access. A config from a template starts with the template
+//! config and adds the other selections to it.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::packs::ArgValue;
 use crate::project;
+use crate::templates::Template;
 
 /// Location of a new project config file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,12 +67,16 @@ pub struct GeneratedConfig {
     /// [`Self::save`] can write the file to the sandbox directory instead.
     pub path: PathBuf,
     /// TOML content of the file:
+    ///  * the template config, if a template is given
     ///  * the pack entries (`[packs] <name> = { version = "1", args = { … } }`,
     ///    `args` only if there are args)
     ///  * `vm.image` and `[clipboard]`, if given
     ///
     /// Empty if none of them is given.
     pub toml: String,
+    /// Name of the template that the config starts from, if any. The
+    /// sandbox gets a copy of the template disk.
+    pub template: Option<String>,
 }
 
 impl GeneratedConfig {
@@ -80,18 +86,23 @@ impl GeneratedConfig {
     ///  - `target`: Location of the file
     ///  - `entries`: Pack entries
     ///  - `image`: `vm.image` as it is in a config file, if any
-    ///  - `clipboard`: Clipboard access, if any
+    ///  - `clipboard`: Clipboard access, if any. Replaces the `[clipboard]`
+    ///    of the template.
+    ///  - `template`: The template that the config starts from, if any.
+    ///    `entries` are the packs that the template does not have.
     pub fn new(
         host_cwd: &Path,
         target: Target,
         entries: &[NewEntry<'_>],
         image: Option<&serde_json::Value>,
         clipboard: Option<Clipboard>,
+        template: Option<&Template>,
     ) -> Self {
         Self {
             target,
             path: target.path(host_cwd),
-            toml: render(entries, image, clipboard),
+            toml: render(template, entries, image, clipboard),
+            template: template.map(|t| t.name.clone()),
         }
     }
 
@@ -131,11 +142,17 @@ impl GeneratedConfig {
 
 /// Make the content of a new config file (see [`GeneratedConfig::toml`]).
 fn render(
+    template: Option<&Template>,
     entries: &[NewEntry<'_>],
     image: Option<&serde_json::Value>,
     clipboard: Option<Clipboard>,
 ) -> String {
-    let mut doc = toml_edit::DocumentMut::new();
+    let mut doc = template.map_or_else(toml_edit::DocumentMut::new, |t| {
+        t.config.toml.parse().unwrap_or_else(|e| {
+            tracing::warn!("config: template {} is not used: {e}", t.name);
+            toml_edit::DocumentMut::new()
+        })
+    });
     if !entries.is_empty() {
         let mut table = toml_edit::Table::new();
         for new in entries {
@@ -150,11 +167,31 @@ fn render(
             }
             table.insert(new.name, toml_edit::value(entry));
         }
-        doc["packs"] = toml_edit::Item::Table(table);
+        // Add to the `[packs]` of the template, if it has one.
+        match doc
+            .get_mut("packs")
+            .and_then(toml_edit::Item::as_table_like_mut)
+        {
+            Some(packs) => {
+                for (name, entry) in table {
+                    packs.insert(&name, entry);
+                }
+            }
+            None => doc["packs"] = toml_edit::Item::Table(table),
+        }
     }
     if let Some(image) = image {
         match vm_image(image) {
-            Ok(vm) => doc["vm"] = vm,
+            // Keep the other `[vm]` settings of the template.
+            Ok(vm) => match doc
+                .get_mut("vm")
+                .and_then(toml_edit::Item::as_table_like_mut)
+            {
+                Some(table) => {
+                    table.insert("image", vm["image"].clone());
+                }
+                None => doc["vm"] = vm,
+            },
             Err(e) => tracing::warn!("config: the user image is not written: {e:#}"),
         }
     }

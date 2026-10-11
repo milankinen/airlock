@@ -137,6 +137,11 @@ pub struct PreparedImage {
     pub image: OciImage,
     /// What [`prepare`] did with the image of the sandbox.
     pub change: ImageChange,
+    /// A digest that pins the image in the configured reference
+    /// (`<name>@<digest>`): the registry digest of an image from a registry.
+    /// `None` if the image came from the cache without a resolution, or from
+    /// a local engine.
+    pub pin: Option<String>,
 }
 
 /// Resolve, download and prepare the OCI image for a sandbox.
@@ -163,11 +168,17 @@ pub async fn prepare(
     let unchanged = |image| PreparedImage {
         image,
         change: ImageChange::Unchanged,
+        pin: None,
     };
 
     // The cached image of this sandbox. Set only if it is complete on disk
-    // and its name is still the configured image name.
-    let cached = read_ready_image(data_dir, &sandbox_image).filter(|img| img.name == *image_name);
+    // and its name is still the configured image name, or its digest is
+    // the pinned digest. Sandboxes share the cache entry, and a different
+    // name can be in it. A pinned digest names one image, thus the name
+    // is not necessary then. A sandbox from a template uses this.
+    let pinned = image_cfg.pinned_digest();
+    let cached = read_ready_image(data_dir, &sandbox_image)
+        .filter(|img| img.name == *image_name || pinned == Some(img.image_id.as_str()));
 
     // A file without `user` is older than named-USER resolution and can
     // contain a wrong uid/gid. The code below must check it again, so it
@@ -259,6 +270,7 @@ pub async fn prepare(
                     PreparedImage {
                         image,
                         change: ImageChange::KeepOld,
+                        pin: None,
                     }
                 });
             }
@@ -278,6 +290,13 @@ pub async fn prepare(
         }
     }
 
+    // A local image ID is not a registry digest, and a registry digest that
+    // the engine recorded is not the cached image ID. Thus only a registry
+    // image gets a pin.
+    let pin = match &image.source {
+        ImageSource::Registry(_) => Some(image.digest.clone()),
+        ImageSource::Local { .. } => None,
+    };
     let oci_image = tokio::select! {
         res = ensure_image(data_dir, &mut image, image_name, &auth, image_cfg.insecure) => res?,
         () = cli::interrupted() => return Err(ImageChangeStop::Interrupted.into()),
@@ -296,6 +315,7 @@ pub async fn prepare(
     Ok(PreparedImage {
         image: oci_image,
         change,
+        pin,
     })
 }
 

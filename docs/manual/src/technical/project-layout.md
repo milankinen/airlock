@@ -25,6 +25,9 @@ The default is `~/Library/Application Support/airlock` on macOS and
                                  # in-flight download, one per process (swept on next run)
     layers/<digest>.download     # complete tarball pending extraction
     layers/<digest>.tmp/         # in-flight extraction (swept on next run)
+  templates/
+    <name>/                      # one sandbox template (see below)
+    .build-<name>/               # build directory of a template (temporary)
   share/all/packs/<pack>/        # host side of the pack mounts
   sock/<hash>.sock               # CLI socket when the default path is too long
 ```
@@ -42,6 +45,25 @@ The `sandboxes` database in `db/` maps each sandbox id to its canonical
 project directory. It is the registry of the sandboxes in `boxes/`.
 `airlock sandboxes list` shows it. The id is 8 random lowercase base32
 characters.
+
+## Template directory
+
+A template directory is `<data>/templates/<name>/`. See
+[Templates](../templates.md). It holds only these files:
+
+```
+<template>/
+  airlock.toml                   # wizard config, vm.image pinned to name@<digest>, if known
+  disk.img                       # disk with the installed packs
+  disk.id                        # identity of disk.img
+  installs.json                  # pack install records
+  ca.json                        # CA keypair of the build sandbox
+  image                          # link to the cached image
+```
+
+The `image` link keeps the cached image from cleanup. A build runs in
+`<data>/templates/.build-<name>/`. After a failed build, only the install
+log (`sandbox/installs.log`) stays there.
 
 ## Sandbox directory
 
