@@ -195,6 +195,11 @@ mod tests {
 
     const GIB: u64 = 1 << 30;
 
+    /// Upper limit of allocated bytes for a sparse 1 GiB copy. A full copy
+    /// allocates 1 GiB. Some file systems, for example APFS, allocate more
+    /// space than the written blocks need.
+    const MAX_ALLOCATED: u64 = 64 << 20;
+
     /// Create a sparse file of 1 GiB with data at offsets 0 and 512 MiB.
     fn sparse_source(path: &Path) {
         let f = File::create(path).unwrap();
@@ -220,8 +225,12 @@ mod tests {
         let meta = std::fs::metadata(&dst).unwrap();
         assert_eq!(meta.len(), GIB);
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
-        // Blocks are 512 bytes. Allow 16 MiB.
-        assert!(meta.blocks() * 512 < 16 << 20, "blocks: {}", meta.blocks());
+        // Blocks are 512 bytes.
+        assert!(
+            meta.blocks() * 512 < MAX_ALLOCATED,
+            "blocks: {}",
+            meta.blocks()
+        );
         let f = File::open(&dst).unwrap();
         let mut a = vec![0u8; 5000];
         f.read_exact_at(&mut a, 0).unwrap();
@@ -256,7 +265,11 @@ mod tests {
 
         let meta = std::fs::metadata(&dst).unwrap();
         assert_eq!(meta.len(), GIB);
-        assert!(meta.blocks() * 512 < 16 << 20, "blocks: {}", meta.blocks());
+        assert!(
+            meta.blocks() * 512 < MAX_ALLOCATED,
+            "blocks: {}",
+            meta.blocks()
+        );
         let mut c = vec![0u8; 7000];
         d.read_exact_at(&mut c, GIB / 2 + 100).unwrap();
         assert!(c.iter().all(|b| *b == 0xcd));

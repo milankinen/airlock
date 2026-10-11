@@ -568,21 +568,26 @@ pub mod cli {
     }
 
     /// Line of the help status section when KVM access works.
+    #[cfg(target_os = "linux")]
     pub const KVM_ACCESS_GRANTED: &str = "kvm access granted";
 
     /// Line of the help status section when KVM does not exist.
+    #[cfg(target_os = "linux")]
     pub const KVM_NOT_AVAILABLE: &str = "kvm not available";
 
     /// Line of the help status section when KVM access is denied.
+    #[cfg(target_os = "linux")]
     pub const KVM_PERMISSION_DENIED: &str = "kvm permission denied";
 
     /// Line of the help status section when KVM is not usable for another
     /// reason.
+    #[cfg(target_os = "linux")]
     pub fn kvm_unavailable(err: impl Display) -> String {
         format!("kvm unavailable: {err}")
     }
 
     /// Title of the help status section.
+    #[cfg(target_os = "linux")]
     pub const HELP_STATUS_TITLE: &str = "Status";
 
     /// Tag of a distroless build in the version string.
