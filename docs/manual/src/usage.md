@@ -26,6 +26,17 @@ curl -fsSL https://github.com/milankinen/airlock/releases/latest/download/instal
 Set the `AIRLOCK_INSTALL_DIR` environment variable to change the install
 directory. Set `AIRLOCK_VERSION` to pin a specific version.
 
+## Update
+
+To update airlock to the latest release, run:
+
+```bash
+airlock self-update           # Install the latest release
+airlock self-update --check   # Only check for a newer release
+```
+
+The update keeps your variant (bundled or distroless).
+
 ## Quick overview
 
 After installation, the basic workflow is:
@@ -37,6 +48,7 @@ airlock exec bash                   # Attach to a running VM
 airlock info                        # Show sandbox status and config
 airlock remove                      # Remove sandbox state
 airlock sandboxes list              # List sandboxes
+airlock self-update                 # Update airlock to the latest release
 ```
 
 The first time you run `airlock start` in a project directory, a setup

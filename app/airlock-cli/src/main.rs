@@ -23,6 +23,7 @@ mod rpc;
 mod runtime;
 mod sandbox;
 mod sandboxes;
+mod self_update;
 pub(crate) mod services;
 mod settings;
 mod start;
@@ -35,7 +36,7 @@ mod vm;
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::task::LocalSet;
 
-use crate::cli::{cmd_exec, cmd_info, cmd_rm, cmd_sandbox, cmd_secret, cmd_start};
+use crate::cli::{cmd_exec, cmd_info, cmd_rm, cmd_sandbox, cmd_secret, cmd_self_update, cmd_start};
 use crate::context::Context;
 use crate::settings::Settings;
 
@@ -62,6 +63,16 @@ async fn main() {
         .get_matches_from(&airlock_args);
     let parsed = Program::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     cli::initialize(parsed.global.quiet);
+
+    // Self-update does not need the context. Thus a bad settings file or
+    // data directory cannot block an update that can fix it.
+    if let Command::SelfUpdate(ref args) = parsed.command {
+        if !extra_args.is_empty() {
+            cli::error!("'--' args are only supported with 'start'");
+            std::process::exit(2);
+        }
+        std::process::exit(cmd_self_update::main(args).await);
+    }
 
     // Process-wide context for all subcommands: settings, vault and database.
     // A malformed settings file is a fatal error, so the user does not get
@@ -115,6 +126,7 @@ async fn main() {
                     }
                     Ok(cli::cmd_sandbox::main(args, &context).await)
                 }
+                Command::SelfUpdate(_) => unreachable!("self-update runs before the context"),
             };
             result.unwrap_or_else(|e| {
                 cli::error!("Error: {e:?}");
@@ -179,6 +191,8 @@ enum Command {
     /// List, inspect and remove sandboxes
     #[command(alias = "sandbox")]
     Sandboxes(cmd_sandbox::SandboxArgs),
+    /// Update airlock to the latest release
+    SelfUpdate(cmd_self_update::SelfUpdateArgs),
 }
 
 /// Split argv at the first "--".

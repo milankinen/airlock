@@ -11,6 +11,7 @@ pub mod cmd_info;
 pub mod cmd_rm;
 pub mod cmd_sandbox;
 pub mod cmd_secret;
+pub mod cmd_self_update;
 pub mod cmd_start;
 pub mod logging;
 pub mod prompt;
@@ -157,7 +158,11 @@ pub static AIRLOCK_VERSION_SLOT: [u8; 80] = {
     buf
 };
 
-fn release_version() -> Option<String> {
+/// Return the release version that the release action wrote into
+/// [`AIRLOCK_VERSION_SLOT`], for example `v2026.9.3`.
+/// Returns:
+///   The version, or `None` in development builds.
+pub fn release_version() -> Option<String> {
     const SENTINEL_LEN: usize = 16;
     // `read_volatile` prevents LTO from putting the compile-time initializer
     // of the slot into the call site.

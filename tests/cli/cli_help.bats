@@ -50,3 +50,13 @@ load helpers
     assert_failure 2
     assert_output_contains "invalid value 'allow-all'"
 }
+
+# Test that self-update refuses a development build. A development build
+# has no release version, so it cannot compare versions.
+#   1. Run airlock self-update --check with a build that has no version
+#   2. Check that it fails with a development build message
+@test "self-update refuses development build" {
+    run_airlock self-update --check
+    assert_failure 1
+    assert_output_contains "development build"
+}

@@ -83,6 +83,7 @@ dependencies = [
  "rand 0.10.2",
  "rcgen",
  "regex",
+ "reqwest",
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",

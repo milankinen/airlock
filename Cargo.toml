@@ -53,6 +53,8 @@ rcgen = "0.14"
 hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
 hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "server-auto"] }
 http-body-util = "0.1"
+# HTTPS client for self-update. oci-client already uses it.
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 url = "2"
 
 # Cap'n Proto RPC

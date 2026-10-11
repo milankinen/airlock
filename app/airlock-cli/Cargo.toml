@@ -52,6 +52,7 @@ quick_cache = { workspace = true }
 rand = { workspace = true }
 rcgen = { workspace = true, features = ["pem", "x509-parser"] }
 regex = { workspace = true }
+reqwest = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
 serde = { workspace = true }
