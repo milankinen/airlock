@@ -324,9 +324,10 @@ pub fn resolve_env(config: &ConfigValues, vault: &Vault) -> Result<SandboxEnv, E
 
 /// Create the sandbox disk in `sandbox_dir`, or change it to the size in
 /// `config` (`[disk] size`). Prints a line for each change. Use only under
-/// the sandbox lock, while no VM runs.
-pub fn ensure_disk(sandbox_dir: &Path, config: &Disk) -> anyhow::Result<()> {
-    disk::ensure(sandbox_dir, config)
+/// the sandbox lock, while no VM runs. Set `copied` if the disk is a new
+/// copy of a template disk.
+pub fn ensure_disk(sandbox_dir: &Path, config: &Disk, copied: bool) -> anyhow::Result<()> {
+    disk::ensure(sandbox_dir, config, copied)
 }
 
 /// Delete the sandbox disk in `sandbox_dir` (the stored rootfs changes and
@@ -801,10 +802,10 @@ mod tests {
         assert!(disk_id(dir).is_none());
         assert!(!has_disk(dir));
 
-        ensure_disk(dir, &project.config.disk).unwrap();
+        ensure_disk(dir, &project.config.disk, false).unwrap();
         assert!(has_disk(dir));
         let id = disk_id(dir).unwrap();
-        ensure_disk(dir, &project.config.disk).unwrap();
+        ensure_disk(dir, &project.config.disk, false).unwrap();
         assert_eq!(disk_id(dir), Some(id));
 
         reset_disk(&pinned).unwrap();
@@ -826,7 +827,7 @@ mod tests {
         let tmp = temp_dir();
         let (project, pinned) = open_project(tmp.path());
         let dir = &project.sandbox_dir;
-        let prepare = || ensure_disk(dir, &project.config.disk).unwrap();
+        let prepare = || ensure_disk(dir, &project.config.disk, false).unwrap();
 
         disk::prepare(dir, &project.config.disk, "/root", Path::new("/")).unwrap();
         let id = disk_id(dir).unwrap();
@@ -856,7 +857,7 @@ mod tests {
         let tmp = temp_dir();
         let (project, pinned) = open_project(tmp.path());
         let dir = &project.sandbox_dir;
-        ensure_disk(dir, &project.config.disk).unwrap();
+        ensure_disk(dir, &project.config.disk, false).unwrap();
 
         let victim = tmp.path().join("victim");
         std::fs::write(&victim, "host file").unwrap();

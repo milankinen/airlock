@@ -27,7 +27,12 @@ pub type CacheEntry = (String, bool, Vec<String>);
 /// Make the disk image in `cache_dir` match the configured size. Creates
 /// the image, grows it, or (if the user confirms) makes it again smaller.
 /// Prints a line for each change.
-pub fn ensure(cache_dir: &Path, config: &Disk) -> anyhow::Result<()> {
+/// Args:
+///  - `cache_dir`: Sandbox directory that contains the disk image
+///  - `config`: Disk config
+///  - `copied`: True if the disk image is a new copy of a template disk.
+///    Then a line tells about the copy and its size.
+pub fn ensure(cache_dir: &Path, config: &Disk, copied: bool) -> anyhow::Result<()> {
     let image_path = cache_dir.join(DISK_FILE);
 
     let bytes = (config.size.0 + 511) & !511;
@@ -63,13 +68,26 @@ pub fn ensure(cache_dir: &Path, config: &Disk) -> anyhow::Result<()> {
                     )
                 );
             }
-        } else if current_size < bytes {
-            grow_sparse(&image_path, bytes)?;
-            cli::log!(
-                "  {} {}",
-                cli::check(),
-                messages::vm::disk_grown(cli::dim(&format_size(bytes)))
-            );
+        } else {
+            let grown = current_size < bytes;
+            if grown {
+                grow_sparse(&image_path, bytes)?;
+            }
+            // For a template copy, one line tells about the copy and the
+            // final size.
+            if copied {
+                cli::log!(
+                    "  {} {}",
+                    cli::check(),
+                    messages::vm::disk_copied(cli::dim(&format_size(bytes)))
+                );
+            } else if grown {
+                cli::log!(
+                    "  {} {}",
+                    cli::check(),
+                    messages::vm::disk_grown(cli::dim(&format_size(bytes)))
+                );
+            }
         }
         // A disk from before identity files existed.
         if read_id(cache_dir).is_none() {
@@ -105,7 +123,7 @@ pub fn prepare(
 ) -> anyhow::Result<(PathBuf, Vec<CacheEntry>)> {
     let image_path = cache_dir.join(DISK_FILE);
     if !image_path.exists() {
-        ensure(cache_dir, config)?;
+        ensure(cache_dir, config, false)?;
     }
 
     let container_home = PathBuf::from(container_home);

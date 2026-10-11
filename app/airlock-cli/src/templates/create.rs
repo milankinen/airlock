@@ -221,7 +221,7 @@ async fn build_locked(
     if !plan.pending.is_empty() {
         check_image(&context.data_dir, &image).map_err(|e| Exit::error(2, e))?;
     }
-    project::ensure_disk(sandbox.path(), &values.disk)?;
+    project::ensure_disk(sandbox.path(), &values.disk, base.is_some())?;
     let to_install: Vec<InstallerScript> = candidates
         .into_iter()
         .filter(|t| plan.pending.iter().any(|p| p.id == t.pack))

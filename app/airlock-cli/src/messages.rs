@@ -2814,17 +2814,6 @@ pub mod templates {
     pub fn install_records_invalid(name: impl Display, state: impl Debug) -> String {
         format!("template {name}: the install records are not valid ({state:?})")
     }
-
-    /// Shows after the disk of a template is in the new sandbox.
-    pub fn disk_copied(name: impl Display) -> String {
-        format!("disk copied from template {name}")
-    }
-
-    /// Tells that the disk copy used a copy-on-write clone.
-    pub const DISK_COPY_ON_WRITE: &str = "copy-on-write";
-
-    /// Tells that the disk copy used a normal copy.
-    pub const DISK_COPY: &str = "copy";
 }
 
 pub mod util {
@@ -3294,6 +3283,11 @@ pub mod vm {
     /// Status line after the disk grows.
     pub fn disk_grown(size: impl Display) -> String {
         format!("disk grown to {size}")
+    }
+
+    /// Status line after the disk of a template is in the new sandbox.
+    pub fn disk_copied(size: impl Display) -> String {
+        format!("disk copied from template {size}")
     }
 
     /// Status line after a new disk is created.

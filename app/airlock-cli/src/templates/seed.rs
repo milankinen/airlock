@@ -8,11 +8,11 @@
 use std::path::Path;
 
 use super::{CA_FILE, IMAGE_FILE, Template};
+use crate::messages;
 use crate::packs::install::state::{self as install_state, ReadState};
 use crate::util::PinnedDir;
-use crate::util::clone::{CloneKind, clone_file};
+use crate::util::clone::clone_file;
 use crate::vm::disk::{self, DISK_FILE};
-use crate::{cli, messages};
 
 /// Copy the template `template` into the new sandbox `sandbox`.
 ///
@@ -38,13 +38,10 @@ pub fn seed(template: &Template, sandbox: &PinnedDir) -> anyhow::Result<()> {
             e
         ))
     });
-    let kind = match copied {
-        Ok(kind) => kind,
-        Err(e) => {
-            let _ = sandbox.remove(DISK_FILE);
-            return Err(e);
-        }
-    };
+    if let Err(e) = copied {
+        let _ = sandbox.remove(DISK_FILE);
+        return Err(e);
+    }
     let result = seed_records(template, sandbox).and_then(|()| seed_ca(template, sandbox));
     if result.is_err() {
         unseed(sandbox.path());
@@ -55,16 +52,6 @@ pub fn seed(template: &Template, sandbox: &PinnedDir) -> anyhow::Result<()> {
     let _ = std::fs::hard_link(
         template.dir.join(IMAGE_FILE),
         sandbox.path().join(IMAGE_FILE),
-    );
-    let how = match kind {
-        CloneKind::Reflink => messages::templates::DISK_COPY_ON_WRITE,
-        CloneKind::Copy => messages::templates::DISK_COPY,
-    };
-    cli::log!(
-        "  {} {} {}",
-        cli::check(),
-        messages::templates::disk_copied(&template.name),
-        cli::dim(&format!("({how})"))
     );
     Ok(())
 }

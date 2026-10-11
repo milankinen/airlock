@@ -353,7 +353,7 @@ pub async fn ensure_sandbox(
         project::reset_disk(&sandbox_dir)?;
         plan = decide(&state, Some(&image.image_id));
     }
-    project::ensure_disk(sandbox_dir.path(), &values.disk)?;
+    project::ensure_disk(sandbox_dir.path(), &values.disk, seeded.0.is_some())?;
     let to_install: Vec<InstallerScript> = candidates
         .into_iter()
         .filter(|t| plan.pending.iter().any(|p| p.id == t.pack))
