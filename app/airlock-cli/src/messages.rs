@@ -142,7 +142,6 @@ pub mod app {
     }
 
     /// Error when a configured custom VM asset does not exist.
-    #[cfg(not(test))]
     pub fn custom_asset_not_found(name: impl Display, path: impl Display) -> String {
         format!("custom {name} not found: {path}")
     }
@@ -3388,6 +3387,27 @@ pub mod vm {
 
     /// Kind of the exposing mount when it is a user mount source.
     pub const MOUNT_KIND_SOURCE: &str = "mount source";
+
+    /// Kind of a host path in the config: the custom VM kernel or
+    /// initramfs.
+    pub fn custom_asset_kind(name: impl Display) -> String {
+        format!("custom {name}")
+    }
+
+    /// Error when a host path in the config goes into a directory that the
+    /// sandbox can write, and a symlink there points out of that directory.
+    pub fn path_leaves_writable_dir(
+        kind: impl Display,
+        given: impl Display,
+        dir: impl Display,
+        resolved: impl Display,
+    ) -> String {
+        format!(
+            "the {kind} {given} goes through {dir}, which the sandbox can write, to \
+             {resolved} outside of it. The sandbox can change the symlinks there.\n\
+             Set the real path {resolved} in the config."
+        )
+    }
 
     /// Error when a mount exposes a protected host directory.
     pub fn mount_exposes_directory(

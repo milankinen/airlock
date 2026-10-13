@@ -34,6 +34,16 @@ impl Host {
     /// The enabled `[mounts]` of the project config `toml`, resolved for
     /// a container whose home is `/home/user` and cwd `/workdir`.
     fn resolve(&self, toml: &str) -> anyhow::Result<Vec<ResolvedMount>> {
+        self.resolve_shared(toml, true)
+    }
+
+    /// As [`Self::resolve`]. `project_share` tells if the sandbox can
+    /// write the project directory.
+    fn resolve_shared(
+        &self,
+        toml: &str,
+        project_share: bool,
+    ) -> anyhow::Result<Vec<ResolvedMount>> {
         let config = resolve_project_toml(toml)?;
         let mounts: Vec<_> = config
             .values
@@ -48,6 +58,7 @@ impl Host {
             "/home/user",
             &self.project,
             Path::new("/workdir"),
+            project_share,
         )
     }
 }
@@ -272,6 +283,44 @@ fn missing_mount_source_is_created_on_request() {
     assert!(err.to_string().contains("invalid octal mode"), "{err}");
 }
 
+/// Test that a mount source through a symlink in the project, which the
+/// sandbox can write, is refused when the link points out of the project.
+/// The sandbox can change such a link and get any host directory.
+///   1. Make a directory outside the project and a link to it in the project
+///   2. Resolve a mount of the link and a `create-dir` mount below it
+///   3. Check that both are refused with the real path, and that nothing
+///      was created outside
+///   4. Check that the real path and a link inside the project are allowed
+#[test]
+fn mount_source_through_project_link_to_outside_is_refused() {
+    let host = Host::new();
+    let outside = host.home.join("secret");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::create_dir_all(host.project.join("real")).unwrap();
+    std::os::unix::fs::symlink(&outside, host.project.join("out")).unwrap();
+    std::os::unix::fs::symlink("real", host.project.join("in")).unwrap();
+
+    for toml in [
+        "[mounts.x]\nsource = \"out\"\ntarget = \"/x\"\n",
+        "[mounts.x]\nsource = \"./out/new\"\ntarget = \"/x\"\nmissing = \"create-dir\"\n",
+    ] {
+        let err = host.resolve(toml).unwrap_err().to_string();
+        assert!(err.contains("Set the real path"), "{err}");
+        assert!(err.contains(&outside.display().to_string()), "{err}");
+    }
+    assert!(!outside.join("new").exists());
+
+    let mounts = host
+        .resolve(&format!(
+            "[mounts.a]\nsource = \"{}\"\ntarget = \"/a\"\n\
+             [mounts.b]\nsource = \"in\"\ntarget = \"/b\"\n",
+            outside.display()
+        ))
+        .unwrap();
+    let sources: Vec<_> = summary(&mounts).into_iter().map(|m| m.1).collect();
+    assert_eq!(sources, [outside, host.project.join("real")]);
+}
+
 /// Test that `create-file` does not follow a dangling symlink at the mount
 /// source. The sandbox can put such a link in the project to make the host
 /// write a file at a place that the sandbox picks.
@@ -288,4 +337,54 @@ fn create_file_mount_source_does_not_follow_dangling_link() {
     host.resolve("[mounts.x]\nsource = \"planted\"\ntarget = \"/x\"\nmissing = \"create-file\"\n")
         .unwrap_err();
     assert!(!victim.exists());
+}
+
+/// Test that a symlink in a writable dir mount in the project must stay in
+/// that mount, also when it points to an other place in the project. The
+/// project counts only when the sandbox shares it.
+///   1. Make a writable dir mount `work` in the project, and in it a link to
+///      an other project dir
+///   2. Check that a mount through the link is refused
+///   3. Check that a project link to outside is allowed when the project is
+///      not shared
+#[test]
+fn link_in_nested_writable_mount_must_stay_in_mount() {
+    let host = Host::new();
+    std::fs::create_dir_all(host.project.join("work")).unwrap();
+    std::fs::create_dir_all(host.project.join("other")).unwrap();
+    std::os::unix::fs::symlink(host.project.join("other"), host.project.join("work/link")).unwrap();
+
+    let err = host
+        .resolve(
+            "[mounts.a]\nsource = \"work\"\ntarget = \"/a\"\n\
+             [mounts.b]\nsource = \"work/link\"\ntarget = \"/b\"\nread_only = true\n",
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Set the real path"), "{err}");
+
+    std::os::unix::fs::symlink(&host.home, host.project.join("out")).unwrap();
+    host.resolve_shared("[mounts.x]\nsource = \"out\"\ntarget = \"/x\"\n", false)
+        .unwrap();
+}
+
+/// Test that a link chain that goes through the project is checked at each
+/// link. A user link outside the project can point to a project path that
+/// is a link of the sandbox.
+///   1. Make a user link `~/dot` to `<project>/x`, and a link `x` to a dir
+///      outside the project
+///   2. Check that a mount of `~/dot` is refused
+#[test]
+fn link_chain_through_project_is_refused() {
+    let host = Host::new();
+    let outside = host.home.join("secret");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, host.project.join("x")).unwrap();
+    std::os::unix::fs::symlink(host.project.join("x"), host.home.join("dot")).unwrap();
+
+    let err = host
+        .resolve("[mounts.x]\nsource = \"~/dot\"\ntarget = \"/x\"\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Set the real path"), "{err}");
 }

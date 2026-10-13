@@ -4,11 +4,13 @@
 //! shares a directory or a single file from the host with the sandbox.
 //!
 //! Mount sources can be symlinks, for example into a dotfiles repo. The
-//! symlinks are resolved one time, at the start.
+//! symlinks are resolved one time, at the start. A source that goes into a
+//! directory that the sandbox can write must stay in that directory: the
+//! sandbox can change the symlinks there.
 
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::config::config_values::{ConfigValues, Mount};
 use crate::messages;
@@ -86,21 +88,26 @@ impl ResolvedMount {
 ///  - `container_home`: Guest home for `~` expansion of target paths
 ///  - `cwd`: Host project directory. Relative source paths resolve from it
 ///  - `guest_cwd`: Guest base directory for relative target paths
+///  - `project_share`: If `true`, the sandbox can write the project
+///    directory.
 ///
 /// Returns:
 ///   The resolved mounts, without skipped ones. Error if a source is missing
 ///   and its action is `MissingAction::Fail`, if a create mode is not valid,
-///   or if the creation of a source fails.
+///   if the creation of a source fails, or if a source goes into a directory
+///   that the sandbox can write and a symlink there points out of it.
 pub fn resolve_mounts(
     mounts: &[(&str, Mount)],
     host_home: &Path,
     container_home: &str,
     cwd: &Path,
     guest_cwd: &Path,
+    project_share: bool,
 ) -> anyhow::Result<Vec<ResolvedMount>> {
     use crate::config::config_values::MissingAction;
 
     let found = resolve_sources(mounts, host_home, cwd)?;
+    let writable = writable_dirs(project_share.then_some(cwd), &found)?;
 
     let container_home = PathBuf::from(container_home);
     let mut result = Vec::new();
@@ -108,10 +115,15 @@ pub fn resolve_mounts(
     for Source {
         name,
         mount: m,
+        path,
         resolved: source,
         is_dir,
     } in found
     {
+        // Check before a create, so that a create cannot go through a link
+        // out of the writable directory.
+        check_stays_in(messages::vm::MOUNT_KIND_SOURCE, &path, &source, &writable)?;
+
         let is_dir = match is_dir {
             Some(is_dir) => is_dir,
             None => match m.missing {
@@ -177,15 +189,17 @@ pub fn resolve_mounts(
 
 /// A mount source with its symlinks resolved. Its missing action did not
 /// run yet.
-struct Source<'a> {
+pub(crate) struct Source<'a> {
     /// Config key of the mount.
-    name: &'a str,
+    pub name: &'a str,
     /// The mount config.
-    mount: &'a Mount,
+    pub mount: &'a Mount,
+    /// Absolute path before the symlinks are resolved.
+    pub path: PathBuf,
     /// The path with its symlinks resolved.
-    resolved: VerifiedPath,
+    pub resolved: VerifiedPath,
     /// True for a directory, `None` if the source is missing.
-    is_dir: Option<bool>,
+    pub is_dir: Option<bool>,
 }
 
 /// Get the enabled mounts of `config`, sorted by config key.
@@ -204,7 +218,7 @@ pub(crate) fn enabled_mounts(config: &ConfigValues) -> Vec<(&str, Mount)> {
 /// nothing. See [`resolve_mounts`] for the args.
 /// Returns:
 ///   The sources, or error if a source cannot be resolved.
-fn resolve_sources<'a>(
+pub(crate) fn resolve_sources<'a>(
     mounts: &'a [(&'a str, Mount)],
     host_home: &Path,
     cwd: &Path,
@@ -222,11 +236,35 @@ fn resolve_sources<'a>(
         found.push(Source {
             name,
             mount: m,
+            path,
             resolved: source,
             is_dir,
         });
     }
     Ok(found)
+}
+
+/// Get the directories that the sandbox can write: the shared project
+/// directory `project_dir` and the writable directory mounts of `sources`. A missing source
+/// with `create-dir` counts as a directory.
+pub(crate) fn writable_dirs(
+    project_dir: Option<&Path>,
+    sources: &[Source],
+) -> io::Result<Vec<VerifiedPath>> {
+    use crate::config::config_values::MissingAction;
+    let mut writable = Vec::new();
+    if let Some(dir) = project_dir {
+        writable.push(VerifiedPath::new_follow(dir, None)?);
+    }
+    for s in sources {
+        let dir = s
+            .is_dir
+            .unwrap_or(matches!(s.mount.missing, MissingAction::CreateDir));
+        if dir && !s.mount.read_only {
+            writable.push(s.resolved.clone());
+        }
+    }
+    Ok(writable)
 }
 
 /// Make a host path from the config absolute: expand `~` from
@@ -258,6 +296,112 @@ fn create_file(source: &VerifiedPath, content: &str, mode: u32) -> anyhow::Resul
     file.write_all(content.as_bytes())?;
     file.set_permissions(std::fs::Permissions::from_mode(mode))?;
     Ok(())
+}
+
+/// Check that a host path from the config stays in each directory that the
+/// sandbox can write and that the path goes through. The sandbox can put
+/// symlinks in these directories. Thus a path through such a symlink can
+/// point to any host file.
+/// Args:
+///  - `kind`: Kind of the path for the error message, for example
+///    `mount source`
+///  - `path`: Absolute path before the symlinks are resolved
+///  - `resolved`: The path with its symlinks resolved
+///  - `writable`: Directories that the sandbox can write
+///
+/// Returns:
+///   Error if a place on the way of `path` (a directory, a symlink or the
+///   end) is in a directory of `writable`, and `resolved` is not in the
+///   deepest such directory. Also error if a symlink cannot be read.
+pub(crate) fn check_stays_in(
+    kind: &str,
+    path: &Path,
+    resolved: &VerifiedPath,
+    writable: &[VerifiedPath],
+) -> anyhow::Result<()> {
+    let target = resolved.to_entry_path()?;
+    let dirs = writable
+        .iter()
+        .map(VerifiedPath::to_entry_path)
+        .collect::<io::Result<Vec<_>>>()?;
+    for place in visited_places(path)? {
+        // A writable mount can be in the project. A symlink in the mount
+        // must then stay in the mount.
+        let Some(dir) = dirs
+            .iter()
+            .filter(|d| place.starts_with(d))
+            .max_by_key(|d| d.components().count())
+        else {
+            continue;
+        };
+        anyhow::ensure!(
+            target.starts_with(dir),
+            messages::vm::path_leaves_writable_dir(
+                kind,
+                path.display(),
+                dir.display(),
+                target.display()
+            )
+        );
+    }
+    Ok(())
+}
+
+/// Most symlinks that one path can go through. Linux has the same limit.
+const MAX_HOPS: usize = 40;
+
+/// Resolve the absolute path `path` one symlink at a time.
+/// Returns:
+///   Each place on the way: each directory, each symlink and the end.
+///   Error if a symlink cannot be read or there are too many symlinks.
+fn visited_places(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    // The parts to resolve, the next part last. The target of a symlink
+    // goes in front of the rest.
+    let parts = |p: &Path| -> Vec<PathBuf> {
+        p.components()
+            .rev()
+            .map(|c| PathBuf::from(c.as_os_str()))
+            .collect()
+    };
+    let mut todo = parts(path);
+    let mut places = Vec::new();
+    // `current` has no symlinks: each part in it was checked.
+    let mut current = PathBuf::from("/");
+    let mut hops = 0;
+    let mut missing = false;
+    while let Some(part) = todo.pop() {
+        match part.components().next() {
+            Some(Component::RootDir) => current = PathBuf::from("/"),
+            Some(Component::ParentDir) => {
+                current.pop();
+            }
+            Some(Component::Normal(name)) => {
+                let next = current.join(name);
+                // From the first missing part on, there are no symlinks.
+                if !missing {
+                    let entry = VerifiedPath::new_follow(&current, None)?.join(name)?;
+                    match vfs::symlink_metadata(&entry) {
+                        Ok(md) if md.file_type().is_symlink() => {
+                            hops += 1;
+                            if hops > MAX_HOPS {
+                                return Err(io::Error::from_raw_os_error(libc::ELOOP).into());
+                            }
+                            todo.extend(parts(&vfs::read_link(&entry)?));
+                            places.push(next);
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => missing = true,
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                current = next;
+                places.push(current.clone());
+            }
+            Some(Component::CurDir | Component::Prefix(_)) | None => {}
+        }
+    }
+    Ok(places)
 }
 
 /// Parse an octal mode string (e.g. "755") into a `u32`. Return `default`

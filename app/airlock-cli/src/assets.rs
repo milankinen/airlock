@@ -5,13 +5,13 @@
 //! them to the cache on the host when they change. The `[vm]` config can
 //! replace the bundled kernel and initramfs with custom files.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-#[cfg(not(test))]
+use crate::config::config_values::Mount;
 use crate::messages;
 use crate::project::Project;
-#[cfg(any(not(test), not(feature = "distroless")))]
 use crate::util::{VerifiedPath, vfs};
+use crate::vm::mount;
 
 /// Paths to the extracted VM boot assets.
 pub struct Assets {
@@ -206,7 +206,7 @@ fn acquire_extract_lock(path: &VerifiedPath) -> anyhow::Result<std::fs::File> {
 /// Args:
 ///  - `custom`: Custom path from the project config, if set. Expands `~`,
 ///    resolves relative paths from the project directory and follows
-///    symlinks.
+///    symlinks. A path into the project directory must stay in it.
 ///  - `project`: Project for path expansion
 ///  - `bundled`: Path of the extracted bundled asset. `None` for
 ///    `distroless` builds, which then require `custom`.
@@ -214,7 +214,8 @@ fn acquire_extract_lock(path: &VerifiedPath) -> anyhow::Result<std::fs::File> {
 ///
 /// Returns:
 ///   The resolved path of `custom` if set, else `bundled`. Error if the
-///   custom file does not exist or no path is available.
+///   custom file does not exist, its path leaves the project directory
+///   through a symlink, or no path is available.
 #[cfg(not(test))]
 fn resolve_asset(
     custom: Option<&str>,
@@ -228,9 +229,48 @@ fn resolve_asset(
         return Ok(bundled.to_path()?.to_path_buf());
     };
 
-    let path = crate::vm::mount::absolute(raw, &project.host_home, &project.host_cwd);
+    resolve_custom(
+        raw,
+        &project.host_home,
+        &project.host_cwd,
+        &crate::vm::mount::enabled_mounts(&project.config),
+        name,
+    )
+}
+
+/// Resolve the custom path of one VM asset.
+/// Args:
+///  - `raw`: Path from the project config
+///  - `host_home`: Host home for `~` expansion
+///  - `cwd`: Project directory. Relative paths resolve from it
+///  - `mounts`: Enabled mounts of the project config
+///  - `name`: Asset name for error messages
+///
+/// Returns:
+///   The resolved path, or error if the file does not exist, or if its path
+///   goes into a directory that the sandbox can write and a symlink there
+///   points out of it.
+fn resolve_custom(
+    raw: &str,
+    host_home: &Path,
+    cwd: &Path,
+    mounts: &[(&str, Mount)],
+    name: &str,
+) -> anyhow::Result<PathBuf> {
+    let path = mount::absolute(raw, host_home, cwd);
     // The user can pick a symlink, for example to the current kernel build.
     let resolved = VerifiedPath::new_follow(&path, None)?;
+    // The sandbox can write the project dir and the writable dir mounts,
+    // and put symlinks there. The project share is not known here, so the
+    // project dir counts as writable.
+    let sources = mount::resolve_sources(mounts, host_home, cwd)?;
+    let writable = mount::writable_dirs(Some(cwd), &sources)?;
+    mount::check_stays_in(
+        &messages::vm::custom_asset_kind(name),
+        &path,
+        &resolved,
+        &writable,
+    )?;
     match vfs::metadata(&resolved) {
         Ok(_) => Ok(resolved.to_path()?.to_path_buf()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -240,21 +280,52 @@ fn resolve_asset(
     }
 }
 
-#[cfg(all(test, not(feature = "distroless")))]
+#[cfg(test)]
 mod tests {
-    //! Tests for the atomic write of the bundled VM assets.
+    //! Tests for the atomic write of the bundled VM assets and for the
+    //! custom asset paths.
 
-    use super::write_atomic;
+    use super::resolve_custom;
     use crate::test_cfg::temp_dir;
-    use crate::util::{Roots, VerifiedPath};
 
+    /// Test that a custom kernel path through a symlink in the project is
+    /// refused when the link points out of the project. The sandbox can
+    /// change such a link and give a host file to the VM as its kernel.
+    ///   1. Make a kernel file outside the project and a link to it in the
+    ///      project
+    ///   2. Resolve the link as the custom kernel and check the refusal
+    ///   3. Resolve the real path and check that it is allowed
+    #[test]
+    fn custom_kernel_through_project_link_to_outside_is_refused() {
+        let tmp = temp_dir();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let project = root.join("project");
+        std::fs::create_dir(&project).unwrap();
+        let kernel = root.join("Image");
+        std::fs::write(&kernel, b"kernel").unwrap();
+        std::os::unix::fs::symlink(&kernel, project.join("Image")).unwrap();
+
+        let err = resolve_custom("Image", &root, &project, &[], "kernel")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Set the real path"), "{err}");
+        let real = kernel.to_str().unwrap();
+        assert_eq!(
+            resolve_custom(real, &root, &project, &[], "kernel").unwrap(),
+            kernel
+        );
+    }
     /// Test that an asset write replaces the old file and leaves no temporary
     /// file, so that a reader never sees a partial asset.
     ///   1. Write an asset, then write it again with longer content
     ///   2. Check that the file has the new content
     ///   3. Check that the directory has only the asset file
+    #[cfg(not(feature = "distroless"))]
     #[test]
     fn asset_write_replaces_file_and_leaves_no_temp_file() {
+        use super::write_atomic;
+        use crate::util::{Roots, VerifiedPath};
+
         let tmp = temp_dir();
         let dir = tmp.path();
         let roots = Roots::resolve(dir, dir, dir).unwrap();

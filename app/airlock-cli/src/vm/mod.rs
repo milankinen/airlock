@@ -286,6 +286,7 @@ fn assemble_mounts(
         container_home,
         &project.host_cwd,
         &project.guest_cwd,
+        project_share,
     )?;
 
     let mut mounts: Vec<_> = project_mount.into_iter().collect();
