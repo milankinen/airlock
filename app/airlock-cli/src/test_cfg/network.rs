@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::net::TcpListener as StdListener;
+use std::path::Path;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -257,20 +258,24 @@ pub struct ConfigNetwork {
 /// `airlock start` does: resolve the config, resolve `[env]`, then call
 /// [`Network::new`] with its checks.
 pub fn network_from_toml(toml: &str) -> anyhow::Result<ConfigNetwork> {
+    network_in_project(toml, temp_dir().path())
+}
+
+/// [`network_from_toml`] with `dir` as the project dir and the home dir.
+/// The project dir is shared, so the sandbox can write it.
+pub fn network_in_project(toml: &str, dir: &Path) -> anyhow::Result<ConfigNetwork> {
     let config = super::resolve_project_toml(toml)?.values;
-    let home = temp_dir();
     let context = super::test_context(
-        home.path(),
+        dir,
         crate::vault::Vault::for_storage_type(crate::vault::VaultStorageType::Disabled),
     );
     let env = crate::project::resolve_env(&config, &context.vault)?;
     let ca = TestCa::generate();
     let project = Project {
-        sandbox_dir: crate::util::VerifiedPath::new_follow(home.path().join("sandbox"), None)
-            .unwrap(),
-        host_home: home.path().to_path_buf(),
-        host_cwd: home.path().to_path_buf(),
-        guest_cwd: home.path().to_path_buf(),
+        sandbox_dir: crate::util::VerifiedPath::new_follow(dir.join("sandbox"), None).unwrap(),
+        host_home: dir.to_path_buf(),
+        host_cwd: dir.to_path_buf(),
+        guest_cwd: dir.to_path_buf(),
         config,
         env: env.clone(),
         ca_cert: ca.cert_pem,
@@ -283,6 +288,7 @@ pub fn network_from_toml(toml: &str) -> anyhow::Result<ConfigNetwork> {
         crate::network::native_tls_client(),
         vec![],
         vec![],
+        true,
     )?;
     Ok(ConfigNetwork { network, env })
 }
@@ -356,7 +362,31 @@ impl TestConnection {
         tcp.set_host(host);
         tcp.set_port(port);
         req.get().set_client(client_sink);
+        Self::open(req, container_rx).await
+    }
 
+    /// Connect to the guest socket `guest_path` through the proxy.
+    /// Returns:
+    ///   The connection, or `None` if the network denies it. Panics on a
+    ///   connect error.
+    pub async fn socket(proxy: &network_proxy::Client, guest_path: &str) -> Option<Self> {
+        let (tx, container_rx) = mpsc::channel::<Bytes>(16);
+        let client_sink: tcp_sink::Client = capnp_rpc::new_client(CollectorSink::new(tx));
+        let mut req = proxy.connect_request();
+        req.get().init_target().set_socket(guest_path);
+        req.get().set_client(client_sink);
+        Self::open(req, container_rx).await
+    }
+
+    /// Send the connect request `req` and make the connection from its
+    /// answer.
+    async fn open(
+        req: capnp::capability::Request<
+            network_proxy::connect_params::Owned,
+            network_proxy::connect_results::Owned,
+        >,
+        container_rx: mpsc::Receiver<Bytes>,
+    ) -> Option<Self> {
         let response = req.send().promise.await.unwrap();
         let result = response.get().unwrap().get_result().unwrap();
         match result.which().unwrap() {

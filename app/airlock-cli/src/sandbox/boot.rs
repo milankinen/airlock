@@ -220,7 +220,7 @@ async fn connect(
     let socket_fwds = network
         .socket_map
         .iter()
-        .map(|(guest, host)| (host.to_string(), guest.clone()))
+        .map(|(guest, host)| (host.path().to_string(), guest.clone()))
         .collect();
     let handle = network.handle();
 

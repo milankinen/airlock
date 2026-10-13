@@ -60,6 +60,8 @@ pub async fn run_interactive(
         tls_client,
         services.interceptors(),
         services.denied_targets(),
+        // The project dir is shared (see `project_share` below).
+        true,
     )?;
     let env = guest_env(&project, image, browser.is_some());
     let daemons = daemon::build_specs(&project, &env)?;

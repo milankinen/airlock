@@ -12,9 +12,9 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use tracing::debug;
 
+use super::host_socket::HostSocket;
 use super::target::ResolvedTarget;
 use super::{DenyReporter, Network, http, io, tcp, tls, traffic};
-use crate::util::{VerifiedPath, vfs};
 
 impl network_proxy::Server for Network {
     async fn connect(
@@ -85,7 +85,7 @@ impl network_proxy::Server for Network {
                         .set_denied("no matching socket rule");
                     return Ok(());
                 };
-                debug!("connect socket: {guest_path} → {host_path}");
+                debug!("connect socket: {guest_path} → {}", host_path.path());
                 let sink = spawn_socket_connection(host_path.clone(), client_sink);
                 results.get().init_result().set_server(sink);
             }
@@ -156,14 +156,18 @@ fn spawn_tcp_connection(
 }
 
 /// Start a background task for a Unix socket connection. The task connects
-/// to the host socket at `path` and relays bytes in both directions.
+/// to the host socket `host` and relays bytes in both directions.
 /// Returns:
 ///   RPC sink that receives the container bytes of the connection.
-fn spawn_socket_connection(path: VerifiedPath, client_sink: tcp_sink::Client) -> tcp_sink::Client {
+fn spawn_socket_connection(
+    host: Rc<HostSocket>,
+    client_sink: tcp_sink::Client,
+) -> tcp_sink::Client {
     let (tx, rx) = mpsc::channel::<Bytes>(1);
     let error: io::RelayError = Rc::new(RefCell::new(None));
     let task_error = error.clone();
 
+    let path = host.path().to_string();
     tokio::task::spawn_local(async move {
         let result: anyhow::Result<()> = async {
             let rpc_io = io::RpcTransport::new(Bytes::new(), rx, client_sink);
@@ -174,12 +178,10 @@ fn spawn_socket_connection(path: VerifiedPath, client_sink: tcp_sink::Client) ->
                 h2: false,
             };
 
-            let socket = tokio::time::timeout(
-                crate::constants::SOCKET_CONNECT_TIMEOUT,
-                vfs::connect_unix_async(&path),
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("socket connect timed out: {path}"))??;
+            let socket =
+                tokio::time::timeout(crate::constants::SOCKET_CONNECT_TIMEOUT, host.connect())
+                    .await
+                    .map_err(|_| anyhow::anyhow!("socket connect timed out: {path}"))??;
             let (sr, sw) = socket.into_split();
             let server = io::Transport {
                 read: Box::new(sr),

@@ -64,11 +64,6 @@ pub struct Project {
 }
 
 impl Project {
-    /// Expand `~` in `path` using the host home directory.
-    pub fn expand_host_tilde(&self, path: &str) -> PathBuf {
-        crate::util::expand_tilde(path, &self.host_home)
-    }
-
     /// Check if the sandbox data is in the project (`.airlock/sandbox`), and
     /// not in the data directory. True also if the path check fails.
     pub fn sandbox_in_project(&self) -> bool {

@@ -7,6 +7,7 @@ mod test_anthropic_api;
 mod test_anthropic_refresh_and_revoke;
 mod test_anthropic_sign_in;
 mod test_credential_swap;
+mod test_host_socket_forward;
 mod test_http1_relay;
 mod test_http_upgrade;
 mod test_middleware_lua;

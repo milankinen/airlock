@@ -1153,6 +1153,21 @@ pub mod network {
     pub fn compile_middleware_failed(script: impl Display, err: impl Display) -> String {
         format!("failed to compile middleware '{script}': {err}")
     }
+
+    /// Kind of a host path in the config: the host side of a socket
+    /// forward.
+    pub const SOCKET_KIND_HOST: &str = "host socket";
+
+    /// Error when the host socket of a socket forward is not the socket
+    /// that was there at the start or at the first connection, or has more
+    /// than one hard link.
+    pub fn host_socket_replaced(path: impl Display) -> String {
+        format!(
+            "host socket {path} is not the socket of the start, or it has more \
+             than one link. Airlock refuses connections to it. If the host \
+             service restarted, restart the sandbox"
+        )
+    }
 }
 
 pub mod network_forward {

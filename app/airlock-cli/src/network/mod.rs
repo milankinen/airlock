@@ -9,6 +9,7 @@
 mod check_target_conflicts;
 mod control;
 mod deny_reporter;
+mod host_socket;
 pub(crate) mod http;
 pub(crate) mod interceptor;
 pub(crate) mod io;
@@ -34,6 +35,7 @@ use tokio::sync::broadcast;
 
 pub use self::control::NetworkControl;
 pub use self::deny_reporter::DenyReporter;
+use self::host_socket::HostSocket;
 use crate::config::config_values::Policy;
 use crate::network::http::middleware::CompiledMiddleware;
 use crate::network::interceptor::Interceptor;
@@ -41,7 +43,6 @@ use crate::network::target::{
     InjectTarget, InjectedSecret, MiddlewareTarget, NetworkTarget, ResolvedTarget,
 };
 use crate::project::Project;
-use crate::util::VerifiedPath;
 
 const NETWORK_EVENTS_BUFFER: usize = 10;
 
@@ -72,6 +73,8 @@ impl Network {
     ///    hosts that it owns.
     ///  - `denied_targets`: Targets to deny under every policy (the hosts of
     ///    services that cannot run).
+    ///  - `project_share`: If `true`, the sandbox can write the project
+    ///    directory. A host socket path into it must stay in it.
     ///
     /// Returns:
     ///   The network, or error if the config is not valid.
@@ -81,6 +84,7 @@ impl Network {
         tls_client: Arc<rustls::ClientConfig>,
         interceptors: Vec<Rc<dyn Interceptor>>,
         denied_targets: Vec<NetworkTarget>,
+        project_share: bool,
     ) -> anyhow::Result<Self> {
         let net = &project.config.network;
         let log = middleware::tracing_log();
@@ -98,16 +102,26 @@ impl Network {
 
         let (events, _) = broadcast::channel(NETWORK_EVENTS_BUFFER);
 
-        // Resolve the host socket paths one time, at the start. The user
-        // picks them, so their symlinks are followed.
+        // A host socket in a writable dir must stay in it, as a mount
+        // source.
+        let mounts = crate::vm::mount::enabled_mounts(&project.config);
+        let sources =
+            crate::vm::mount::resolve_sources(&mounts, &project.host_home, &project.host_cwd)?;
+        let project_dir = project_share.then_some(project.host_cwd.as_path());
+        let writable = crate::vm::mount::writable_dirs(project_dir, &sources)?;
         let mut socket_map = HashMap::new();
         for s in net.sockets.values().filter(|s| s.enabled) {
             let guest =
                 crate::util::expand_tilde(&s.host.target, std::path::Path::new(container_home))
                     .to_string_lossy()
                     .into_owned();
-            let host = VerifiedPath::new_follow(project.expand_host_tilde(&s.host.source), None)?;
-            socket_map.insert(guest, host);
+            let host = HostSocket::resolve(
+                &s.host.source,
+                &project.host_home,
+                &project.host_cwd,
+                &writable,
+            )?;
+            socket_map.insert(guest, Rc::new(host));
         }
 
         tracing::debug!(
@@ -361,7 +375,7 @@ pub struct Network {
     pub(crate) port_forwards: HashMap<u16, u16>,
     /// Map from guest socket path to host socket path, for Unix socket
     /// forwarding.
-    pub(crate) socket_map: HashMap<String, VerifiedPath>,
+    pub(crate) socket_map: HashMap<String, Rc<HostSocket>>,
     /// Sender of network events for subscribers.
     // TODO: this NetworkEvent should be Network event agnostic to any TUI
     pub(crate) events: broadcast::Sender<airlock_monitor::NetworkEvent>,

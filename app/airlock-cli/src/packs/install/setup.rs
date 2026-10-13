@@ -273,6 +273,7 @@ async fn boot_install_vm(
         network::native_tls_client(),
         vec![],
         vec![],
+        false,
     )?
     .public_only();
     let env = boot::guest_env(&project, image, false);
