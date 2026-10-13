@@ -239,11 +239,12 @@ impl AppleVmBackend {
             // VirtioFS shares (image layers and mounts)
             if !config.shares.is_empty() {
                 let mut fs_devices_vec = Vec::new();
+                // The share paths are absolute and resolved: the mount
+                // sources at the start, the other shares from the roots.
                 for share in &config.shares {
-                    let abs_path = std::fs::canonicalize(&share.host_path)
-                        .unwrap_or_else(|_| share.host_path.clone());
-                    let url =
-                        NSURL::fileURLWithPath(&NSString::from_str(&abs_path.to_string_lossy()));
+                    let url = NSURL::fileURLWithPath(&NSString::from_str(
+                        &share.host_path.to_string_lossy(),
+                    ));
                     let shared_dir = VZSharedDirectory::initWithURL_readOnly(
                         VZSharedDirectory::alloc(),
                         &url,
@@ -267,10 +268,9 @@ impl AppleVmBackend {
             }
 
             // VirtIO block device for cache volume
+            // The disk path is absolute and resolved (see the shares).
             if let Some(disk_path) = &config.cache_disk {
-                let abs_path =
-                    std::fs::canonicalize(disk_path).unwrap_or_else(|_| disk_path.clone());
-                let url = NSURL::fileURLWithPath(&NSString::from_str(&abs_path.to_string_lossy()));
+                let url = NSURL::fileURLWithPath(&NSString::from_str(&disk_path.to_string_lossy()));
                 let attachment = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
                     VZDiskImageStorageDeviceAttachment::alloc(),
                     &url,
@@ -284,7 +284,7 @@ impl AppleVmBackend {
                 let storage: Retained<VZStorageDeviceConfiguration> = block_config.into_super();
                 let storage_devices = NSArray::from_retained_slice(&[storage]);
                 vm_config.setStorageDevices(&storage_devices);
-                debug!("cache block device attached: {}", abs_path.display());
+                debug!("cache block device attached: {}", disk_path.display());
             }
 
             Ok(vm_config)

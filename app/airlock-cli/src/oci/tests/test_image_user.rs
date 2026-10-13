@@ -7,7 +7,7 @@ use super::*;
 
 /// Build an image over `layers` (topmost first) with the `USER` value
 /// `user`.
-fn build(data_dir: &Path, layers: &[String], user: &str) -> anyhow::Result<OciImage> {
+fn build(data_dir: &VerifiedPath, layers: &[String], user: &str) -> anyhow::Result<OciImage> {
     build_oci_image(
         data_dir,
         "sha256:img".into(),
@@ -24,7 +24,7 @@ fn build(data_dir: &Path, layers: &[String], user: &str) -> anyhow::Result<OciIm
 
 /// Build an image as [`build`] does and return the error message. Panics
 /// if the build succeeds.
-fn build_err(data_dir: &Path, layers: &[String], user: &str) -> String {
+fn build_err(data_dir: &VerifiedPath, layers: &[String], user: &str) -> String {
     match build(data_dir, layers, user) {
         Ok(_) => panic!("USER {user:?} over {layers:?} must not resolve"),
         Err(e) => e.to_string(),
@@ -40,7 +40,7 @@ fn build_err(data_dir: &Path, layers: &[String], user: &str) -> String {
 #[test]
 fn image_user_resolves_through_image_passwd_and_group() {
     let tmp = temp_dir();
-    let data_dir = tmp.path();
+    let data_dir = &verified_dir(tmp.path());
     let layers = [passwd_layer(data_dir, "sha256:passwd")];
 
     for user in [
@@ -71,7 +71,7 @@ fn image_user_resolves_through_image_passwd_and_group() {
 #[test]
 fn unknown_image_user_or_group_is_error_not_root() {
     let tmp = temp_dir();
-    let data_dir = tmp.path();
+    let data_dir = &verified_dir(tmp.path());
     let layers = [passwd_layer(data_dir, "sha256:passwd")];
 
     for user in ["ghost", "ghost:node", "node:ghost", "1000:ghost"] {
@@ -85,16 +85,18 @@ fn unknown_image_user_or_group_is_error_not_root() {
 /// Test that a passwd file or `etc` directory that links out of its layer is
 /// never read, so that an image cannot read host files.
 ///   1. Write a passwd file on the host and make an empty host directory
-///   2. Cache layers whose `etc/passwd` or `etc` links to them
+///   2. Cache layers whose `etc/passwd` or `etc` links to them with an
+///      absolute path, and a layer whose `etc` link goes up out of the
+///      layer with `..`
 ///   3. Check that a lower layer with a real passwd still resolves the user
-///   4. Check that a link layer alone gives an error that says "outside the
-///      layer" and has no host data
-///   5. Check that a link to an empty host directory also says "outside the
+///   4. Check that an absolute link resolves in the layer, so its error says
+///      "cannot be resolved" and has no host data
+///   5. Check that the `..` link gives an error that says "outside the
 ///      layer"
 #[test]
 fn passwd_symlinked_out_of_layer_is_never_read() {
     let home = temp_dir();
-    let data_dir = home.path();
+    let data_dir = &verified_dir(home.path());
     let host_passwd = "node:x:1000:1000:Host:/leaked-from-host:/bin/sh\n";
     let host_etc = home.path().join("host-etc");
     std::fs::create_dir_all(&host_etc).unwrap();
@@ -120,43 +122,52 @@ fn passwd_symlinked_out_of_layer_is_never_read() {
         "sha256:empty-dir-link",
         &LayerTar::default().symlink("etc", &empty_etc).gz(),
     );
+    // The layer dir is `<data>/oci/layers/<key>`, so three `..` reach the
+    // host dir with `host-etc`.
+    let parent_link = cache_layer(
+        data_dir,
+        "sha256:parent-link",
+        &LayerTar::default().symlink("etc", "../../../host-etc").gz(),
+    );
 
-    for link in [&file_link, &dir_link] {
+    for link in [&file_link, &dir_link, &parent_link] {
         // The link layer is skipped and the real layer below it is used.
         let image = build(data_dir, &[link.clone(), real.clone()], "node").unwrap();
         assert_eq!(image.container_home, "/home/node");
 
         let err = build_err(data_dir, std::slice::from_ref(link), "1000");
         assert!(
-            err.contains("no home directory found for uid 1000"),
-            "{err}"
-        );
-        assert!(
-            err.contains("etc/passwd") && err.contains("outside the layer"),
+            err.contains("no home directory found for uid 1000") && err.contains("etc/passwd"),
             "{err}"
         );
         assert!(!err.contains("leaked-from-host"), "{err}");
+        let why = if link == &parent_link {
+            "outside the layer"
+        } else {
+            "cannot be resolved"
+        };
+        assert!(err.contains(why), "{err}");
 
         let err = build_err(data_dir, std::slice::from_ref(link), "node");
         assert!(
-            err.contains("no user node found") && err.contains("outside the layer"),
+            err.contains("no user node found") && err.contains(why),
             "{err}"
         );
     }
     let err = build_err(data_dir, &[empty_dir_link], "1000");
-    assert!(err.contains("outside the layer"), "{err}");
+    assert!(err.contains("cannot be resolved"), "{err}");
 }
 
 /// Test that a passwd file that is not safe to read is named in the error
 /// with the reason.
-///   1. Cache layers with an oversized passwd file, a passwd directory and
-///      a passwd symlink to a missing file
+///   1. Cache layers with an oversized passwd file, a passwd directory, a
+///      passwd symlink to a missing file and a passwd symlink to itself
 ///   2. Build an image over each layer
 ///   3. Check that each error gives the correct reason
 #[test]
 fn passwd_that_cannot_be_read_safely_is_named_in_error() {
     let tmp = temp_dir();
-    let data_dir = tmp.path();
+    let data_dir = &verified_dir(tmp.path());
     let mut huge = "#".repeat(usize::try_from(MAX_LAYER_RECORD_FILE).unwrap() + 1);
     huge.push_str("\nnode:x:1000:1000:Node:/home/node:/bin/sh\n");
     let oversized = cache_layer(
@@ -168,6 +179,14 @@ fn passwd_that_cannot_be_read_safely_is_named_in_error() {
         data_dir,
         "sha256:directory",
         &LayerTar::default().dir("etc/passwd").gz(),
+    );
+    let looping = cache_layer(
+        data_dir,
+        "sha256:loop",
+        &LayerTar::default()
+            .dir("etc")
+            .symlink("etc/passwd", "passwd")
+            .gz(),
     );
     let dangling = cache_layer(
         data_dir,
@@ -182,6 +201,7 @@ fn passwd_that_cannot_be_read_safely_is_named_in_error() {
         (oversized, "larger than"),
         (directory, "not a regular file"),
         (dangling, "cannot be resolved"),
+        (looping, "cannot be resolved"),
     ] {
         let err = build_err(data_dir, &[layer], "1000");
         assert!(err.contains(why), "{err}");
@@ -189,13 +209,15 @@ fn passwd_that_cannot_be_read_safely_is_named_in_error() {
 }
 
 /// Test that a passwd symlink to a file in the same layer is followed, as
-/// in images with a merged `/usr`.
-///   1. Cache a layer whose `etc/passwd` links to `usr/lib/passwd`
-///   2. Check that uid 1000 resolves to its home directory
+/// in images with a merged `/usr`. An absolute target resolves from the
+/// layer root, as in the guest.
+///   1. Cache layers whose `etc/passwd` links to `../usr/lib/passwd` and
+///      to `/usr/lib/passwd`
+///   2. Check that uid 1000 resolves to its home directory in both
 #[test]
 fn passwd_linked_inside_layer_is_followed() {
     let tmp = temp_dir();
-    let data_dir = tmp.path();
+    let data_dir = &verified_dir(tmp.path());
     let merged_usr = cache_layer(
         data_dir,
         "sha256:merged-usr",
@@ -209,12 +231,25 @@ fn passwd_linked_inside_layer_is_followed() {
             .gz(),
     );
 
-    assert_eq!(
-        build(data_dir, &[merged_usr], "1000")
-            .unwrap()
-            .container_home,
-        "/home/node"
+    let absolute = cache_layer(
+        data_dir,
+        "sha256:absolute-usr",
+        &LayerTar::default()
+            .file(
+                "usr/lib/passwd",
+                "node:x:1000:1000:Node:/home/node:/bin/sh\n",
+            )
+            .dir("etc")
+            .symlink("etc/passwd", "/usr/lib/passwd")
+            .gz(),
     );
+
+    for layer in [merged_usr, absolute] {
+        assert_eq!(
+            build(data_dir, &[layer], "1000").unwrap().container_home,
+            "/home/node"
+        );
+    }
 }
 
 /// Test that the uid and gid of a cache entry without a `user` field are
@@ -228,7 +263,7 @@ fn passwd_linked_inside_layer_is_followed() {
 #[test]
 fn legacy_cache_entry_user_is_checked_against_image_passwd() {
     let tmp = temp_dir();
-    let data_dir = tmp.path();
+    let data_dir = &verified_dir(tmp.path());
     let mut stored = image(
         "sha256:legacy",
         vec![passwd_layer(data_dir, "sha256:passwd")],

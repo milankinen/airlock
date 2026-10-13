@@ -3,7 +3,6 @@
 //! fake: its loopback is the host loopback.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
 use std::rc::Rc;
 
 use airlock_common::supervisor_capnp::{listen_handle, local_connector, supervisor};
@@ -23,10 +22,12 @@ use crate::network::io::{ChannelSink, RelayError, RpcTransport, rpc_pipe};
 use crate::network::reverse_forward::relay_stream;
 use crate::rpc::Supervisor;
 use crate::test_cfg::network::network_from_toml;
+use crate::test_cfg::oci::verified_dir;
 use crate::test_cfg::{
     TempDir, block_on_local, echo_server, eventually_async, free_port, resolve_project_toml,
     rpc_loopback, serve_echo, temp_dir,
 };
+use crate::util::verified_path::VerifiedPath;
 
 /// Guest supervisor with only the two loopback calls. The guest loopback
 /// is the host loopback.
@@ -105,7 +106,7 @@ impl Drop for GuestListener {
 /// CLI server of a fake running sandbox.
 struct Sandbox {
     _dir: TempDir,
-    sock: PathBuf,
+    sock: VerifiedPath,
     server: JoinHandle<()>,
     network: NetworkControl,
 }
@@ -129,14 +130,17 @@ impl Sandbox {
         let supervisor: supervisor::Client =
             rpc_loopback(capnp_rpc::new_client::<supervisor::Client, _>(LoopbackGuest).client);
         let dir = temp_dir();
-        let sock = dir.path().join("cli.sock");
+        let sock = verified_dir(dir.path()).join("cli.sock").unwrap();
         let server = tokio::task::spawn_local(cli_server::serve(
             sock.clone(),
             Supervisor::from_client(supervisor),
             vec![],
             rules,
         ));
-        eventually_async("cli socket", async || sock.exists().then_some(())).await;
+        eventually_async("cli socket", async || {
+            sock.symlink_metadata().is_ok().then_some(())
+        })
+        .await;
         Self {
             _dir: dir,
             sock,

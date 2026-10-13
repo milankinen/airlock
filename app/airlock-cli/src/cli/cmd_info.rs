@@ -17,7 +17,8 @@ use crate::packs::install::state::{self, InstallState, PackStatus, ReadState};
 use crate::project::read_run_meta;
 use crate::sandboxes::{Found, Location, registry};
 use crate::services::{self, store};
-use crate::util::PinnedDir;
+use crate::util::verified_path::VerifiedPath;
+use crate::util::{PinnedDir, vfs};
 use crate::vault::VaultStorageType;
 use crate::vm::disk;
 use crate::{cli, config, messages, packs, project, sandboxes};
@@ -54,11 +55,17 @@ pub(super) async fn run(context: Context, id: Option<&str>, json: bool) -> i32 {
     // Check config errors first, with the config error exit code (same as
     // `start`). The local project config is in the sandbox directory or in
     // the project.
-    let resolved = if project_dir.is_dir() {
-        let local_dir = found.as_ref().map_or_else(
-            || project_dir.join(".airlock"),
-            |found| sandboxes::local_config_dir(&project_dir, &found.dir),
-        );
+    let resolved = if is_dir(&context, &project_dir) {
+        let local_dir = match &found {
+            None => project_dir.join(".airlock"),
+            Some(found) => match sandboxes::local_config_dir(&project_dir, &found.dir) {
+                Ok(dir) => dir,
+                Err(e) => {
+                    cli::error!("{e}");
+                    return 1;
+                }
+            },
+        };
         match resolve_config(&context.data_dir, &project_dir, &local_dir).await {
             Ok(resolved) => Some(resolved),
             Err(e) => {
@@ -70,12 +77,19 @@ pub(super) async fn run(context: Context, id: Option<&str>, json: bool) -> i32 {
         None
     };
     let found = match found {
-        Some(found) if std::fs::symlink_metadata(&found.dir).is_ok() => found,
+        Some(found) if vfs::symlink_metadata(&found.dir).is_ok() => found,
         _ => {
             cli::error!(
                 "{}",
                 messages::cli::no_sandbox_for_project(project_dir.display())
             );
+            if sandboxes::airlock_dir_is_symlink(&context, &project_dir) {
+                let dir = project_dir.join(".airlock");
+                cli::log!(
+                    "{}",
+                    messages::sandboxes::airlock_dir_symlink_hint(dir.display())
+                );
+            }
             return 1;
         }
     };
@@ -126,10 +140,7 @@ pub(super) async fn run(context: Context, id: Option<&str>, json: bool) -> i32 {
         println!("{}", messages::cli::info_last_run(ago));
     }
 
-    println!(
-        "{}",
-        messages::cli::info_sandbox(project.sandbox_dir.display())
-    );
+    println!("{}", messages::cli::info_sandbox(&project.sandbox_dir));
 
     if let Some(disk) = details.disk_text() {
         println!("{}", messages::cli::info_disk(disk));
@@ -368,8 +379,8 @@ fn pack_status(pack: &ConfiguredPack, state: Option<&InstallState>) -> &'static 
 ///   `Ok(None)` if the directory does not exist. `Err` with a short message
 ///   for all other failures (a symlink, a foreign owner, ...), so that
 ///   callers do not treat it as absent.
-fn open_sandbox_dir(dir: &Path) -> Result<Option<PinnedDir>, String> {
-    match PinnedDir::pin(dir) {
+fn open_sandbox_dir(dir: &VerifiedPath) -> Result<Option<PinnedDir>, String> {
+    match dir.to_path().and_then(PinnedDir::pin) {
         Ok(dir) => Ok(Some(dir)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.to_string()),
@@ -389,11 +400,7 @@ fn read_install_state(project: &project::Project) -> Option<InstallState> {
         }
     };
     match state::read(&dir) {
-        ReadState::Ok(s)
-            if s.disk.is_some() && s.disk == project::disk_id(&project.sandbox_dir) =>
-        {
-            Some(s)
-        }
+        ReadState::Ok(s) if s.disk.is_some() && s.disk == project::disk_id(&dir) => Some(s),
         _ => None,
     }
 }
@@ -484,9 +491,7 @@ pub(super) async fn find(
         let found = find_by_id(context, id).await?;
         return Ok((found.project.clone(), Some(found)));
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| anyhow::anyhow!(messages::cli::cannot_determine_cwd(e)))?;
-    let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    let cwd = sandboxes::project_dir(context)?;
     let found = sandboxes::resolve_sandbox(context, &cwd, false, false)
         .await
         .map_err(|e| e.context(messages::cli::SANDBOX_LOOKUP_FAILED_CONTEXT))?;
@@ -508,8 +513,16 @@ pub(super) async fn find_by_id(context: &Context, id: &str) -> anyhow::Result<Fo
     Ok(Found {
         location: Location::DataDir { id: id.to_string() },
         project,
-        dir: context.boxes_dir().join(id),
+        dir: sandboxes::boxes_dir(context)?.join(id)?,
     })
+}
+
+/// Check if `path` is a directory. A path through a symlink below the
+/// trusted roots does not count.
+pub(super) fn is_dir(context: &Context, path: &Path) -> bool {
+    VerifiedPath::new(path, &context.roots)
+        .and_then(|path| vfs::metadata(&path))
+        .is_ok_and(|m| m.is_dir())
 }
 
 /// Details of one sandbox, without its config. The JSON output and the
@@ -523,7 +536,7 @@ pub(super) struct Details {
     /// Project directory.
     pub(super) project: PathBuf,
     /// Sandbox directory.
-    dir: PathBuf,
+    dir: String,
     /// `running`, `stopped` or `missing` (no sandbox directory).
     pub(super) status: SandboxStatus,
     /// Unix time of the last boot.
@@ -544,7 +557,7 @@ impl Details {
     pub(super) fn read(found: &Found) -> Self {
         use std::os::unix::fs::MetadataExt;
         let dir = &found.dir;
-        let status = if std::fs::symlink_metadata(dir).is_err() {
+        let status = if vfs::symlink_metadata(dir).is_err() {
             SandboxStatus::Missing
         } else if project::is_running(dir) {
             SandboxStatus::Running
@@ -554,7 +567,7 @@ impl Details {
         let run = read_run_meta(dir);
         let mut packs = BTreeMap::new();
         // A symlinked sandbox directory is not read.
-        if let Ok(pinned) = PinnedDir::pin(dir)
+        if let Ok(pinned) = dir.to_path().and_then(PinnedDir::pin)
             && let ReadState::Ok(installs) = state::read(&pinned)
         {
             for name in installs.packs.keys() {
@@ -563,7 +576,10 @@ impl Details {
         }
         // The disk is a sparse file: `blocks() * 512` gives the allocated
         // size.
-        let disk = std::fs::metadata(dir.join(disk::DISK_FILE)).ok();
+        let disk = dir
+            .join(disk::DISK_FILE)
+            .and_then(|p| vfs::metadata(&p))
+            .ok();
         Self {
             id: found.id().map(ToString::to_string),
             location: match found.location {
@@ -571,7 +587,7 @@ impl Details {
                 Location::ProjectDir => "project-dir",
             },
             project: found.project.clone(),
-            dir: dir.clone(),
+            dir: dir.to_string(),
             status,
             last_run: run.last_run,
             guest_cwd: run.guest_cwd,
@@ -607,7 +623,7 @@ fn print_sandbox_only(details: &Details) {
             messages::cli::info_last_run(project::time_ago(last_run))
         );
     }
-    println!("{}", messages::cli::info_sandbox(details.dir.display()));
+    println!("{}", messages::cli::info_sandbox(&details.dir));
     if let Some(disk) = details.disk_text() {
         println!("{}", messages::cli::info_disk(disk));
     }
@@ -637,11 +653,14 @@ mod tests {
     fn sandbox_dir_behind_symlink_is_unreadable_not_missing() {
         let project = temp_dir();
         let elsewhere = temp_dir();
-        let sandbox = project.path().join(".airlock/sandbox");
+        let sandbox = VerifiedPath::new_follow(project.path(), None)
+            .and_then(|p| p.join(".airlock/sandbox"))
+            .unwrap();
         assert!(matches!(open_sandbox_dir(&sandbox), Ok(None)));
 
         std::fs::create_dir_all(project.path().join(".airlock")).unwrap();
-        std::os::unix::fs::symlink(elsewhere.path(), &sandbox).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), project.path().join(".airlock/sandbox"))
+            .unwrap();
 
         assert!(open_sandbox_dir(&sandbox).is_err_and(|why| !why.is_empty()));
     }

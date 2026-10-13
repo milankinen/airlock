@@ -188,11 +188,6 @@ pub mod cli {
         )
     }
 
-    /// Error when `.airlock` changes to a symlink during the confirmation.
-    pub fn airlock_dir_now_symlink(dir: impl Display) -> String {
-        format!("{dir} is now a symbolic link; aborting")
-    }
-
     /// Error when `rm` cannot remove the `.airlock` link.
     pub fn failed_to_remove_airlock_link(err: impl Display) -> String {
         format!("Failed to remove the .airlock link: {err}")
@@ -752,6 +747,12 @@ pub mod config {
         format!("{local_dir} has no project directory")
     }
 
+    /// Error when a local config directory outside `.airlock` resolves into
+    /// the project directory.
+    pub fn local_dir_in_project(local_dir: impl Display, project: impl Display) -> String {
+        format!("{local_dir} is in the project directory {project}, but not in its .airlock")
+    }
+
     /// Error when a config file appears while the setup questions are open.
     pub fn config_appeared_during_setup(path: impl Display) -> String {
         format!("{path} appeared while the setup questions were open; it was not changed")
@@ -765,6 +766,14 @@ pub mod config {
     /// Error when a config file exists but cannot be read.
     pub fn read_config_failed(path: impl Display, error: impl Display) -> String {
         format!("read config file {path}: {error}")
+    }
+
+    /// Error when a project config file is a symlink that leaves the project.
+    pub fn config_link_leaves_project(path: impl Display, project: impl Display) -> String {
+        format!(
+            "config file {path} is a symlink that points outside the project {project}; \
+             only links inside the project are allowed"
+        )
     }
 
     /// Error when a config file has an unknown extension.
@@ -1427,11 +1436,6 @@ pub mod oci {
         format!("{not_found} (ignored: {refused})")
     }
 
-    /// Reason when the layer directory cannot be resolved.
-    pub fn cannot_resolve_layer_dir(err: impl Display) -> String {
-        format!("cannot resolve layer dir: {err}")
-    }
-
     /// Reason when a symlink in a layer file path does not resolve.
     pub fn symlink_target_unresolved(err: impl Display) -> String {
         format!("symlink target cannot be resolved in this layer: {err}")
@@ -1510,12 +1514,6 @@ pub mod oci {
     pub fn unsupported_layer_ref(layer_ref: impl Debug) -> String {
         format!("unsupported layer {layer_ref:?} in docker save")
     }
-
-    /// Error when the layer directory has no parent.
-    pub const LAYER_DIR_NO_PARENT: &str = "layer dir has no parent";
-
-    /// Error when the layer directory has no file name.
-    pub const LAYER_DIR_NO_FILE_NAME: &str = "layer dir has no file name";
 
     /// Progress bar text of a layer that is ready.
     pub const PROGRESS_READY: &str = "ready";
@@ -2112,6 +2110,12 @@ pub mod sandboxes {
     //! Texts of the `sandboxes` area.
 
     use std::fmt::Display;
+
+    /// Hint when the project `.airlock` is a symlink. The sandbox search
+    /// does not go through it.
+    pub fn airlock_dir_symlink_hint(dir: impl Display) -> String {
+        format!("hint: {dir} is a symbolic link. Airlock does not look for a sandbox through it")
+    }
 
     /// Error when an id is not a sandbox id. Shows for `rm` and for the project
     /// lookup.
@@ -2967,6 +2971,37 @@ pub mod util {
     pub fn owned_by_other_user(path: impl Display, uid: impl Display) -> String {
         format!("{path} is owned by uid {uid}, not by the current user")
     }
+
+    /// Shows when airlock refuses a host path. `given` is the path that the
+    /// user wrote, `resolved` its absolute form, `at` the component with the
+    /// problem and `reason` the problem.
+    pub fn path_refused(
+        given: impl Display,
+        resolved: impl Display,
+        at: impl Display,
+        reason: impl Display,
+    ) -> String {
+        format!("refusing path {given} ({resolved}): {at} {reason}")
+    }
+
+    /// Reason when a path component is a symlink.
+    pub const REFUSED_SYMLINK: &str = "is a symlink";
+    /// Reason when a path component that must be a directory is not one.
+    pub const REFUSED_NOT_DIR: &str = "is not a directory";
+    /// Reason when a file is a FIFO.
+    pub const REFUSED_FIFO: &str = "is a FIFO";
+    /// Reason when a directory changed after airlock checked the path.
+    pub const REFUSED_REPLACED: &str = "changed after the check";
+    /// Reason when a path has a `..` component.
+    pub const REFUSED_DOT: &str = "has a '..' component";
+    /// Reason when a path that must be relative is absolute.
+    pub const REFUSED_ABSOLUTE: &str = "is not a relative path";
+    /// Reason when a path is not below its allowed directory.
+    pub fn refused_outside(scope: impl Display) -> String {
+        format!("is not below {scope}")
+    }
+    /// Reason when a path is empty or has no file name.
+    pub const REFUSED_NO_NAME: &str = "has no file name";
 }
 
 pub mod vault {

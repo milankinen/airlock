@@ -4,7 +4,6 @@
 //! and downloads its layers. Each downloaded layer is verified against the image
 //! manifest.
 
-use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -18,6 +17,8 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use super::OciConfig;
 use crate::messages;
+use crate::util::verified_path::VerifiedPath;
+use crate::util::vfs;
 
 /// A resolved registry image with manifest and config.
 pub struct RegistryImage {
@@ -126,7 +127,7 @@ pub async fn resolve(
 /// Args:
 ///  - `reference`: Image reference in the registry
 ///  - `layer`: Descriptor of the layer from the manifest
-///  - `dest`: File to write the blob to
+///  - `dest`: New file to write the blob to. It must not exist
 ///  - `per_layer`: Optional progress bar of the layer
 ///  - `overall`: Optional progress bar of all layers
 ///  - `auth`: Registry auth
@@ -138,7 +139,7 @@ pub async fn resolve(
 pub async fn pull_layer(
     reference: &Reference,
     layer: &oci_client::manifest::OciDescriptor,
-    dest: &Path,
+    dest: &VerifiedPath,
     per_layer: Option<&ProgressBar>,
     overall: Option<&ProgressBar>,
     auth: &RegistryAuth,
@@ -149,7 +150,8 @@ pub async fn pull_layer(
     let registry = reference.resolve_registry();
     client.store_auth_if_needed(registry, auth).await;
 
-    let file = tokio::fs::File::create(dest).await?;
+    // The staging name is unique, so the create never meets an old file.
+    let file = tokio::fs::File::from_std(vfs::create_new(dest)?);
     // Both progress bars get the same number of bytes as the writes.
     let bars: Vec<ProgressBar> = per_layer.into_iter().chain(overall).cloned().collect();
     let mut writer = HashingWriter {
@@ -161,7 +163,7 @@ pub async fn pull_layer(
     let digest = writer.hasher.finalize();
 
     if let Err(e) = pull_result {
-        let _ = tokio::fs::remove_file(dest).await;
+        let _ = vfs::remove_file(dest);
         return Err(e.into());
     }
     flush_result?;
@@ -169,10 +171,10 @@ pub async fn pull_layer(
     // Check size and SHA-256 digest against the manifest. This protects
     // against a compromised or MITM registry that sends a different blob of
     // the same size. It does not depend on checks inside `oci-client`.
-    let metadata = tokio::fs::metadata(dest).await?;
+    let metadata = writer.inner.inner.metadata().await?;
     let expected_size = layer.size as u64;
     if metadata.len() != expected_size {
-        let _ = tokio::fs::remove_file(dest).await;
+        let _ = vfs::remove_file(dest);
         anyhow::bail!(messages::oci::layer_size_mismatch(
             expected_size,
             metadata.len()
@@ -181,7 +183,7 @@ pub async fn pull_layer(
 
     let actual_digest = format!("sha256:{}", hex::encode(digest));
     if !actual_digest.eq_ignore_ascii_case(&layer.digest) {
-        let _ = tokio::fs::remove_file(dest).await;
+        let _ = vfs::remove_file(dest);
         anyhow::bail!(messages::oci::layer_digest_mismatch(
             &layer.digest,
             actual_digest

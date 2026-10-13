@@ -1,10 +1,19 @@
-//! A builder of OCI layer tarballs for tests.
+//! A builder of OCI layer tarballs for tests, and the data dir path of
+//! OCI tests.
 
 use std::io::Write;
 use std::path::Path;
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
+
+use crate::util::VerifiedPath;
+
+/// The directory `path` as a verified path, for example a temp dir as the
+/// data dir.
+pub fn verified_dir(path: &Path) -> VerifiedPath {
+    VerifiedPath::new_follow(path, None).unwrap()
+}
 
 /// An OCI layer tarball that is built in memory, one entry at a time, in
 /// order.
@@ -50,6 +59,17 @@ impl LayerTar {
         header.set_entry_type(tar::EntryType::Symlink);
         header.set_size(0);
         header.set_mode(0o777);
+        self.0.append_link(&mut header, path, target).unwrap();
+        self
+    }
+
+    /// A hard link `path` to the earlier entry `target`.
+    #[must_use]
+    pub fn hard_link(mut self, path: &str, target: &str) -> Self {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Link);
+        header.set_size(0);
+        header.set_mode(0o644);
         self.0.append_link(&mut header, path, target).unwrap();
         self
     }

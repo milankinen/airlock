@@ -4,6 +4,7 @@
 //! sandbox disk with installed packs. The setup wizard of `airlock start`
 //! offers the templates as the base of a new sandbox.
 
+use std::fs::Metadata;
 use std::os::unix::fs::MetadataExt;
 
 use clap::{Args, Subcommand};
@@ -12,6 +13,7 @@ use crate::cli::LogLevel;
 use crate::cli::prompt::choose;
 use crate::context::Context;
 use crate::templates::{self, CONFIG_FILE, Template};
+use crate::util::vfs;
 use crate::vm::disk::DISK_FILE;
 use crate::{cli, messages, oci, start};
 
@@ -111,7 +113,7 @@ async fn create(
 
 /// Print the table of the templates.
 fn list(context: &Context) {
-    let templates = templates::list(&context.data_dir);
+    let templates = templates::list(&context.roots.data_dir);
     if templates.is_empty() {
         cli::log!("{}", messages::cli::NO_TEMPLATES);
         return;
@@ -150,14 +152,11 @@ fn list(context: &Context) {
 
 /// Print the details of the template `name`.
 fn info(context: &Context, name: &str) -> anyhow::Result<i32> {
-    let template = templates::find(&context.data_dir, name)?;
+    let template = templates::find(&context.roots.data_dir, name)?;
     let config = &template.config;
     println!("{}", messages::cli::template_info_name(&template.name));
-    println!(
-        "{}",
-        messages::cli::template_info_directory(template.dir.display())
-    );
-    if let Ok(meta) = std::fs::metadata(template.dir.join(CONFIG_FILE))
+    println!("{}", messages::cli::template_info_directory(&template.dir));
+    if let Some(meta) = file_meta(&template, CONFIG_FILE)
         && let Ok(created) = meta.modified()
     {
         println!(
@@ -168,10 +167,8 @@ fn info(context: &Context, name: &str) -> anyhow::Result<i32> {
     if let Some(image) = &config.image {
         println!("{}", messages::cli::template_info_image(image));
     }
-    if let (Some(used), Ok(meta)) = (
-        disk_used(&template),
-        std::fs::metadata(template.dir.join(DISK_FILE)),
-    ) {
+    if let Some(meta) = file_meta(&template, DISK_FILE) {
+        let used = meta.blocks() * 512;
         println!(
             "{}",
             messages::cli::template_info_disk(
@@ -218,13 +215,13 @@ fn info(context: &Context, name: &str) -> anyhow::Result<i32> {
 /// remove the images that nothing uses.
 fn remove(context: &Context, name: &str, force: bool) -> anyhow::Result<i32> {
     // Fail before the question.
-    templates::find(&context.data_dir, name)?;
+    templates::find(&context.roots.data_dir, name)?;
     if !force && !confirm(name) {
         cli::error!("{}", messages::cli::ABORTED);
         return Ok(0);
     }
-    templates::remove(&context.data_dir, name)?;
-    oci::gc_sweep(&context.data_dir);
+    templates::remove(&context.roots.data_dir, name)?;
+    oci::gc_sweep(&context.roots.data_dir);
     cli::log!("{}", messages::cli::template_removed(name));
     Ok(0)
 }
@@ -242,9 +239,12 @@ fn confirm(name: &str) -> bool {
 
 /// Return the allocated size of the disk of `template`, if it has a disk.
 fn disk_used(template: &Template) -> Option<u64> {
-    std::fs::metadata(template.dir.join(DISK_FILE))
-        .ok()
-        .map(|m| m.blocks() * 512)
+    file_meta(template, DISK_FILE).map(|m| m.blocks() * 512)
+}
+
+/// Return the metadata of the file `name` of `template`, if it exists.
+fn file_meta(template: &Template, name: &str) -> Option<Metadata> {
+    vfs::metadata(&template.dir.join(name).ok()?).ok()
 }
 
 /// Return the pack names of `template`, separated with commas.

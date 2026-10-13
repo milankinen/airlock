@@ -11,6 +11,8 @@ use heed::Database;
 use heed::types::{Bytes, Str};
 
 use crate::db::Db;
+use crate::util::verified_path::VerifiedPath;
+use crate::util::vfs;
 
 /// Name of the registry database.
 const DATABASE: &str = "sandboxes";
@@ -81,9 +83,13 @@ pub async fn get(db: &Db, id: &str) -> anyhow::Result<Option<PathBuf>> {
 ///
 /// Returns:
 ///   The sandbox id.
-pub async fn find_or_register(db: &Db, boxes_dir: &Path, project: &Path) -> anyhow::Result<String> {
+pub async fn find_or_register(
+    db: &Db,
+    boxes_dir: &VerifiedPath,
+    project: &Path,
+) -> anyhow::Result<String> {
     let table: Table = db.database(DATABASE).await?;
-    let boxes_dir = boxes_dir.to_path_buf();
+    let boxes_dir = boxes_dir.clone();
     let project = project.to_path_buf();
     db.write(move |txn| {
         let key = project.as_os_str().as_bytes();
@@ -96,7 +102,7 @@ pub async fn find_or_register(db: &Db, boxes_dir: &Path, project: &Path) -> anyh
         loop {
             let id = new_id()?;
             let taken = table.get(txn, &id)?.is_some()
-                || std::fs::symlink_metadata(boxes_dir.join(&id)).is_ok();
+                || vfs::symlink_metadata(&boxes_dir.join(&id)?).is_ok();
             if !taken {
                 table.put(txn, &id, key)?;
                 return Ok(id);
@@ -147,7 +153,7 @@ mod tests {
     fn register_gives_one_valid_id_per_project() {
         let (home, db) = test_db();
         block_on_local(async {
-            let boxes = home.path().join("boxes");
+            let boxes = VerifiedPath::new_follow(home.path().join("boxes"), None).unwrap();
             let a = find_or_register(&db, &boxes, Path::new("/p/a"))
                 .await
                 .unwrap();

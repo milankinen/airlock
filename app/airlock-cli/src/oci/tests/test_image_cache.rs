@@ -6,7 +6,7 @@ use airlock_test_utils::temp_dir;
 use super::*;
 
 /// Cache a small layer as `digest` and return its layer key.
-fn small_layer(data_dir: &Path, digest: &str) -> String {
+fn small_layer(data_dir: &VerifiedPath, digest: &str) -> String {
     cache_layer(
         data_dir,
         digest,
@@ -15,8 +15,8 @@ fn small_layer(data_dir: &Path, digest: &str) -> String {
 }
 
 /// Whether the layer `key` exists in the layer cache.
-fn layer_exists(data_dir: &Path, key: &str) -> bool {
-    cache::layer_dir(data_dir, key).unwrap().exists()
+fn layer_exists(data_dir: &VerifiedPath, key: &str) -> bool {
+    real(&cache::layer_dir(data_dir, key).unwrap()).exists()
 }
 
 /// Test that a cached image is ready only while all its layers exist, so
@@ -28,13 +28,18 @@ fn layer_exists(data_dir: &Path, key: &str) -> bool {
 #[test]
 fn cached_image_is_ready_only_while_all_its_layers_exist() {
     let tmp = temp_dir();
-    let data_dir = tmp.path();
+    let data_dir = &verified_dir(tmp.path());
     let key = small_layer(data_dir, "sha256:L1");
     let path = cache::image_path(data_dir, "sha256:swept").unwrap();
-    write_cached_image(&path, &image("sha256:swept", vec![key.clone()])).unwrap();
+    write_cached_image(
+        data_dir,
+        "sha256:swept",
+        &image("sha256:swept", vec![key.clone()]),
+    )
+    .unwrap();
     assert!(read_ready_image(data_dir, &path).is_some());
 
-    std::fs::remove_dir_all(cache::layer_dir(data_dir, &key).unwrap()).unwrap();
+    std::fs::remove_dir_all(real(&cache::layer_dir(data_dir, &key).unwrap())).unwrap();
     assert!(read_cached_image(&path).is_some());
     assert!(read_ready_image(data_dir, &path).is_none());
 
@@ -42,7 +47,7 @@ fn cached_image_is_ready_only_while_all_its_layers_exist() {
     assert!(read_ready_image(data_dir, &path).is_some());
 
     let empty = cache::image_path(data_dir, "sha256:empty").unwrap();
-    write_cached_image(&empty, &image("sha256:empty", vec![])).unwrap();
+    write_cached_image(data_dir, "sha256:empty", &image("sha256:empty", vec![])).unwrap();
     assert!(read_ready_image(data_dir, &empty).is_none());
 }
 
@@ -56,21 +61,21 @@ fn cached_image_is_ready_only_while_all_its_layers_exist() {
 #[test]
 fn gc_sweep_keeps_only_images_linked_by_sandboxes_and_their_layers() {
     let home = temp_dir();
-    let data_dir = home.path();
+    let data_dir = &verified_dir(home.path());
     let shared = small_layer(data_dir, "sha256:shared");
     let own = small_layer(data_dir, "sha256:own");
     let orphaned = small_layer(data_dir, "sha256:orphaned");
     let live = image("sha256:live", vec![own.clone(), shared.clone()]);
     let orphan = image("sha256:orphan", vec![orphaned.clone(), shared.clone()]);
-    let live_path = cache::image_path(data_dir, &live.image_id).unwrap();
-    let orphan_path = cache::image_path(data_dir, &orphan.image_id).unwrap();
-    write_cached_image(&orphan_path, &orphan).unwrap();
-    let sandbox = home.path().join("project/.airlock/sandbox");
-    std::fs::create_dir_all(&sandbox).unwrap();
+    let live_path = real(&cache::image_path(data_dir, &live.image_id).unwrap());
+    let orphan_path = real(&cache::image_path(data_dir, &orphan.image_id).unwrap());
+    write_cached_image(data_dir, &orphan.image_id, &orphan).unwrap();
+    std::fs::create_dir_all(home.path().join("project/.airlock/sandbox")).unwrap();
+    let sandbox_image = data_dir.join("project/.airlock/sandbox/image").unwrap();
     // The second call must see the existing link and do nothing.
-    ensure_image_hardlink(&sandbox.join("image"), &live_path, &live).unwrap();
-    ensure_image_hardlink(&sandbox.join("image"), &live_path, &live).unwrap();
-    let layers = cache::layers_root(data_dir).unwrap();
+    ensure_image_hardlink(data_dir, &sandbox_image, &live).unwrap();
+    ensure_image_hardlink(data_dir, &sandbox_image, &live).unwrap();
+    let layers = real(&cache::layers_root(data_dir).unwrap());
     std::fs::write(layers.join("abc.download.tmp"), b"").unwrap();
     std::fs::write(layers.join("def.download"), b"").unwrap();
     std::fs::create_dir_all(layers.join("ghi.tmp")).unwrap();
@@ -105,14 +110,14 @@ fn gc_sweep_keeps_only_images_linked_by_sandboxes_and_their_layers() {
 #[test]
 fn sandbox_image_link_is_restored_when_cache_entry_was_wiped() {
     let home = temp_dir();
-    let data_dir = home.path();
+    let data_dir = &verified_dir(home.path());
     let live = image("sha256:live", vec![small_layer(data_dir, "sha256:L1")]);
     let live_path = cache::image_path(data_dir, &live.image_id).unwrap();
-    let sandbox_image = home.path().join("image");
-    ensure_image_hardlink(&sandbox_image, &live_path, &live).unwrap();
+    let sandbox_image = data_dir.join("image").unwrap();
+    ensure_image_hardlink(data_dir, &sandbox_image, &live).unwrap();
 
-    std::fs::remove_file(&live_path).unwrap();
-    ensure_image_hardlink(&sandbox_image, &live_path, &live).unwrap();
+    std::fs::remove_file(real(&live_path)).unwrap();
+    ensure_image_hardlink(data_dir, &sandbox_image, &live).unwrap();
 
     gc_sweep(data_dir);
     assert_eq!(
@@ -129,7 +134,7 @@ fn sandbox_image_link_is_restored_when_cache_entry_was_wiped() {
 #[test]
 fn cache_file_from_before_user_field_loads_as_legacy() {
     let tmp = temp_dir();
-    let data_dir = tmp.path();
+    let data_dir = &verified_dir(tmp.path());
     let path = cache::image_path(data_dir, "sha256:legacy").unwrap();
     let legacy = serde_json::json!({
         "schema": "v2",
@@ -142,13 +147,76 @@ fn cache_file_from_before_user_field_loads_as_legacy() {
         "cmd": ["/bin/sh"],
         "env": [],
     });
-    std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    std::fs::write(real(&path), serde_json::to_vec(&legacy).unwrap()).unwrap();
     assert_eq!(read_cached_image(&path).unwrap().user, None);
 
     write_cached_image(
-        &path,
+        data_dir,
+        "sha256:legacy",
         &image("sha256:legacy", vec![cache::layer_key("sha256:L1")]),
     )
     .unwrap();
     assert_eq!(read_cached_image(&path).unwrap().user, Some(String::new()));
+}
+
+/// Test that a symlink that the guest plants at the `image` file of its
+/// sandbox is not followed. The guest can write the sandbox dir of a
+/// project, and a followed link lets airlock read or link a host file.
+///   1. Write a host file and put a symlink to it at the sandbox `image`
+///   2. Check that the image read ignores the link
+///   3. Link the sandbox to a cached image
+///   4. Check that the host file did not change and that `image` is now a
+///      hard link to the cache entry
+#[test]
+fn planted_sandbox_image_symlink_is_not_followed() {
+    use std::os::unix::fs::MetadataExt;
+
+    let home = temp_dir();
+    let data_dir = &verified_dir(home.path());
+    let victim = home.path().join("victim.json");
+    let live = image("sha256:live", vec![small_layer(data_dir, "sha256:L1")]);
+    let json = serde_json::to_vec(&CachedImage::V2(live.clone())).unwrap();
+    std::fs::write(&victim, &json).unwrap();
+    std::os::unix::fs::symlink(&victim, home.path().join("image")).unwrap();
+    let sandbox_image = data_dir.join("image").unwrap();
+
+    assert!(read_cached_image(&sandbox_image).is_none());
+    ensure_image_hardlink(data_dir, &sandbox_image, &live).unwrap();
+
+    assert_eq!(std::fs::read(&victim).unwrap(), json);
+    let link = std::fs::symlink_metadata(home.path().join("image")).unwrap();
+    let entry =
+        std::fs::metadata(real(&cache::image_path(data_dir, &live.image_id).unwrap())).unwrap();
+    assert!(link.is_file());
+    assert_eq!((link.dev(), link.ino()), (entry.dev(), entry.ino()));
+}
+
+/// Test that the sweep does not follow a symlink or open a FIFO in the
+/// images dir. A followed link reads a file that can keep layers live, and
+/// an open of a FIFO blocks the sweep.
+///   1. Write a host file that lists a layer, and link to it from the
+///      images dir
+///   2. Make a FIFO in the images dir
+///   3. Sweep and check that the layer is gone and both entries stay
+#[test]
+fn gc_sweep_skips_symlink_and_fifo_in_images_dir() {
+    let home = temp_dir();
+    let data_dir = &verified_dir(home.path());
+    let layer = small_layer(data_dir, "sha256:L1");
+    let host = home.path().join("host.json");
+    let json = serde_json::to_vec(&CachedImage::V2(image("sha256:x", vec![layer.clone()])));
+    std::fs::write(&host, json.unwrap()).unwrap();
+    let images = real(&cache::images_root(data_dir).unwrap());
+    std::os::unix::fs::symlink(&host, images.join("link")).unwrap();
+    let fifo =
+        std::ffi::CString::new(images.join("fifo").into_os_string().into_encoded_bytes()).unwrap();
+    // SAFETY: `fifo` is a valid C string.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+    gc_sweep(data_dir);
+
+    assert!(!layer_exists(data_dir, &layer));
+    assert!(std::fs::symlink_metadata(images.join("link")).is_ok());
+    assert!(std::fs::symlink_metadata(images.join("fifo")).is_ok());
+    assert!(host.exists());
 }

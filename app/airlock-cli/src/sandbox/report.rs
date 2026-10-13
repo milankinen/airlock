@@ -2,9 +2,8 @@
 //!
 //! Shows the terminal output while a sandbox is prepared and booted.
 
-use std::path::Path;
-
 use crate::messages::sandbox as msg;
+use crate::util::VerifiedPath;
 use crate::{cli, daemon, masking, project};
 
 /// Print the "Preparing sandbox" header.
@@ -13,7 +12,7 @@ use crate::{cli, daemon, masking, project};
 ///    the output tells that a new one is generated ([`project::open`]
 ///    generates it).
 ///  - `image_name`: Image name to show
-pub fn print_preparing(sandbox_dir: &Path, image_name: &str) {
+pub fn print_preparing(sandbox_dir: &VerifiedPath, image_name: &str) {
     cli::log!("{}", msg::PREPARING_SANDBOX);
     cli::log!(
         "  {}",

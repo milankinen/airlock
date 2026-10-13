@@ -106,7 +106,7 @@ async fn run(
         has_sandbox,
         &packs,
         &context.vault,
-        &crate::templates::list(&context.data_dir),
+        &crate::templates::list(&context.roots.data_dir),
     ))
     .await?;
     let options = args.sandbox_options();
@@ -122,7 +122,7 @@ async fn run(
     let template = config
         .generated_project()
         .and_then(|g| g.template.as_deref())
-        .map(|name| templates::find(&context.data_dir, name))
+        .map(|name| templates::find(&context.roots.data_dir, name))
         .transpose()
         .map_err(|e| start::Exit::error(1, e))?;
     // The sandbox step can select the config of the last run.
@@ -138,9 +138,10 @@ async fn run(
     .await?;
     let resolved = &sandbox.resolved;
     // The log lines so far wait in memory. Now the log file is known.
-    cli::logging::attach(sandbox.lock.dir());
+    cli::logging::attach(sandbox.lock.dir().to_path().map_err(anyhow::Error::from)?);
     if let Some(generated) = config.generated_project() {
-        let local_dir = sandboxes::local_config_dir(&host_cwd, sandbox.lock.dir());
+        let local_dir = sandboxes::local_config_dir(&host_cwd, sandbox.lock.dir())
+            .map_err(anyhow::Error::from)?;
         start::wizard::save_config(generated, &local_dir)?;
     }
     let project = project::open(

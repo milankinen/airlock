@@ -42,7 +42,7 @@ fn wizard_config(project: &StartProject, toml: &str, template: Option<&str>) -> 
 #[test]
 fn sandbox_from_template_installs_only_extra_packs() {
     let project = StartProject::new(test_packs());
-    let data_dir = &project.context().data_dir;
+    let data_dir = &project.context().roots.data_dir;
     let base = "[packs]\nalpha = { version = 1 }\n";
     project
         .build_template("base", &wizard_config(&project, base, None), false)
@@ -51,7 +51,10 @@ fn sandbox_from_template_installs_only_extra_packs() {
 
     let template = templates::find(data_dir, "base").unwrap();
     for file in FILES.iter().filter(|f| **f != templates::IMAGE_FILE) {
-        assert!(template.dir.join(file).is_file(), "{file}");
+        assert!(
+            template.dir.to_path().unwrap().join(file).is_file(),
+            "{file}"
+        );
     }
     let image = template.config.image.clone().expect("a pinned image");
     assert!(image.contains("@sha256:"), "{image}");
@@ -81,7 +84,9 @@ fn sandbox_from_template_installs_only_extra_packs() {
     assert_eq!(state.disk, project.disk_id());
     assert_ne!(
         project.disk_id(),
-        crate::vm::disk::read_id(&template.dir),
+        crate::vm::disk::read_id(
+            &crate::util::PinnedDir::pin(template.dir.to_path().unwrap()).unwrap()
+        ),
         "the copy has its own disk identity"
     );
     for pack in ["alpha", "beta"] {
@@ -89,7 +94,11 @@ fn sandbox_from_template_installs_only_extra_packs() {
     }
     assert!(project.sandbox_dir().join(DISK_FILE).is_file());
     let ca = |dir: &std::path::Path| std::fs::read(dir.join(templates::CA_FILE)).unwrap();
-    assert_eq!(ca(&project.sandbox_dir()), ca(&template.dir), "same CA");
+    assert_eq!(
+        ca(&project.sandbox_dir()),
+        ca(template.dir.to_path().unwrap()),
+        "same CA"
+    );
 
     project.accept_config(&toml);
     project.start(&toml, false).unwrap();
@@ -113,7 +122,7 @@ fn existing_template_needs_replace_and_removed_template_is_gone() {
         assert!(!templates::is_valid_name(name), "{name}");
     }
     let project = StartProject::new(test_packs());
-    let data_dir = &project.context().data_dir;
+    let data_dir = &project.context().roots.data_dir;
     let alpha = "[packs]\nalpha = { version = 1 }\n";
     let beta = "[packs]\nbeta = { version = 1 }\n";
     project
@@ -134,10 +143,15 @@ fn existing_template_needs_replace_and_removed_template_is_gone() {
         .build_template("base", &wizard_config(&project, beta, None), true)
         .unwrap();
     assert_eq!(packs("base"), ["beta"]);
-    let entries: Vec<_> = std::fs::read_dir(templates::templates_dir(data_dir))
-        .unwrap()
-        .map(|e| e.unwrap().file_name())
-        .collect();
+    let entries: Vec<_> = std::fs::read_dir(
+        templates::templates_dir(data_dir)
+            .unwrap()
+            .to_path()
+            .unwrap(),
+    )
+    .unwrap()
+    .map(|e| e.unwrap().file_name())
+    .collect();
     assert_eq!(entries, ["base"]);
 
     templates::remove(data_dir, "base").unwrap();

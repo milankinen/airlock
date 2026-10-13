@@ -11,11 +11,27 @@ use crate::cli::sandbox_client::find_cli_sock;
 use crate::context::Context;
 use crate::test_cfg::sandboxes::{data_dir_sandbox, legacy_sandbox};
 use crate::test_cfg::{TempDir, block_on_local, temp_dir, test_context};
+use crate::util::VerifiedPath;
 use crate::vault::{Vault, VaultStorageType};
 
 /// Run the sandbox lookup from `start`.
 fn lookup(context: &Context, start: &Path) -> Option<std::path::PathBuf> {
-    block_on_local(find_cli_sock(context, start, false)).unwrap()
+    lookup_with(context, start, false)
+}
+
+/// Get the socket path of the sandbox directory `dir`.
+fn sock_of(context: &Context, dir: &Path) -> std::path::PathBuf {
+    let dir = VerifiedPath::new_follow(dir, None).unwrap();
+    let sock = crate::cache::cli_sock_path(&context.roots.data_dir, &dir).unwrap();
+    sock.to_path().unwrap().to_path_buf()
+}
+
+/// Run the sandbox lookup from `start`, with or without the git
+/// worktree link.
+fn lookup_with(context: &Context, start: &Path, follow: bool) -> Option<std::path::PathBuf> {
+    block_on_local(find_cli_sock(context, start, follow))
+        .unwrap()
+        .map(|sock| sock.to_path().unwrap().to_path_buf())
 }
 
 /// Make the socket of a running sandbox at `path`.
@@ -79,8 +95,8 @@ fn exec_finds_nearest_running_sandbox_of_either_kind() {
                 data_dir_sandbox(&context, &child).1,
             )
         };
-        let parent_sock = crate::cache::cli_sock_path(&context.data_dir, &parent_dir).unwrap();
-        let child_sock = crate::cache::cli_sock_path(&context.data_dir, &child_dir).unwrap();
+        let parent_sock = sock_of(&context, &parent_dir);
+        let child_sock = sock_of(&context, &child_dir);
 
         assert_eq!(lookup(&context, &child), None);
 
@@ -118,14 +134,11 @@ fn exec_from_git_worktree_finds_main_repository_sandbox_with_option() {
     std::fs::create_dir_all(&sub).unwrap();
 
     let main_dir = data_dir_sandbox(&context, &main).1;
-    let main_sock = crate::cache::cli_sock_path(&context.data_dir, &main_dir).unwrap();
+    let main_sock = sock_of(&context, &main_dir);
     listen(&main_sock);
 
     assert_eq!(lookup(&context, &sub), None);
-    assert_eq!(
-        block_on_local(find_cli_sock(&context, &sub, true)).unwrap(),
-        Some(main_sock.clone())
-    );
+    assert_eq!(lookup_with(&context, &sub, true), Some(main_sock.clone()));
 
     // Git 2.48+ with `worktree.useRelativePaths` writes relative links.
     std::fs::write(root.join("wt/.git"), "gitdir: ../main/.git/worktrees/wt\n").unwrap();
@@ -134,10 +147,7 @@ fn exec_from_git_worktree_finds_main_repository_sandbox_with_option() {
         "../../../../wt/.git\n",
     )
     .unwrap();
-    assert_eq!(
-        block_on_local(find_cli_sock(&context, &sub, true)).unwrap(),
-        Some(main_sock)
-    );
+    assert_eq!(lookup_with(&context, &sub, true), Some(main_sock));
 }
 
 /// Test that a forged worktree link does not send exec to the sandbox of a
@@ -163,9 +173,9 @@ fn forged_worktree_link_does_not_reach_other_repository() {
     git(&b, &["init", "-q"]);
     git(&b, &["commit", "-q", "--allow-empty", "-m", "init"]);
     git(&b, &["worktree", "add", "-q", "../wt"]);
-    let a_sock = crate::cache::cli_sock_path(&context.data_dir, &legacy_sandbox(&a)).unwrap();
+    let a_sock = sock_of(&context, &legacy_sandbox(&a));
     let b_dir = data_dir_sandbox(&context, &b).1;
-    let b_sock = crate::cache::cli_sock_path(&context.data_dir, &b_dir).unwrap();
+    let b_sock = sock_of(&context, &b_dir);
     listen(&a_sock);
     listen(&b_sock);
 
@@ -173,19 +183,13 @@ fn forged_worktree_link_does_not_reach_other_repository() {
     std::fs::create_dir_all(&sub).unwrap();
     let forged = format!("gitdir: {}\n", b.join(".git/worktrees/wt").display());
     std::fs::write(sub.join(".git"), forged).unwrap();
-    assert_eq!(
-        block_on_local(find_cli_sock(&context, &sub, true)).unwrap(),
-        Some(a_sock.clone())
-    );
+    assert_eq!(lookup_with(&context, &sub, true), Some(a_sock.clone()));
 
     // The link back of the worktree names the `.git` file of the worktree.
     // A symlink to that file must not pass as the same file.
     std::fs::remove_file(sub.join(".git")).unwrap();
     std::os::unix::fs::symlink(root.join("wt/.git"), sub.join(".git")).unwrap();
-    assert_eq!(
-        block_on_local(find_cli_sock(&context, &sub, true)).unwrap(),
-        Some(a_sock)
-    );
+    assert_eq!(lookup_with(&context, &sub, true), Some(a_sock));
 }
 
 /// Test that exec refuses a symlinked project sandbox directory and a
@@ -196,6 +200,8 @@ fn forged_worktree_link_does_not_reach_other_repository() {
 ///      and check that the lookup fails and names the symlink
 ///   3. Make `.airlock/sandbox` a real directory with a `cli.sock` symlink
 ///      to the socket of B and check that the lookup fails
+///   4. Make `.airlock` of A a symlink to `.airlock` of B and check that
+///      the lookup does not find the sandbox of B
 #[test]
 fn symlinked_sandbox_or_socket_is_refused() {
     let (_home, context) = context();
@@ -204,7 +210,7 @@ fn symlinked_sandbox_or_socket_is_refused() {
     let a = root.join("a");
     let b = root.join("b");
     let b_dir = legacy_sandbox(&b);
-    let b_sock = crate::cache::cli_sock_path(&context.data_dir, &b_dir).unwrap();
+    let b_sock = sock_of(&context, &b_dir);
     listen(&b_sock);
 
     let a_dir = a.join(".airlock/sandbox");
@@ -215,8 +221,12 @@ fn symlinked_sandbox_or_socket_is_refused() {
 
     std::fs::remove_file(&a_dir).unwrap();
     let a_dir = legacy_sandbox(&a);
-    let a_sock = crate::cache::cli_sock_path(&context.data_dir, &a_dir).unwrap();
+    let a_sock = sock_of(&context, &a_dir);
     std::os::unix::fs::symlink(&b_sock, &a_sock).unwrap();
     let error = block_on_local(find_cli_sock(&context, &a, false)).unwrap_err();
     assert!(error.to_string().contains("is a symlink"), "{error}");
+
+    std::fs::remove_dir_all(a.join(".airlock")).unwrap();
+    std::os::unix::fs::symlink(b.join(".airlock"), a.join(".airlock")).unwrap();
+    assert_eq!(lookup(&context, &a), None);
 }

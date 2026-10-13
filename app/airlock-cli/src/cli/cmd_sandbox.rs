@@ -91,18 +91,19 @@ async fn list(context: &Context) -> anyhow::Result<i32> {
         );
         return Ok(0);
     }
+    let boxes = sandboxes::boxes_dir(context)?;
     let mut rows = Vec::new();
     for entry in entries {
         let found = Found {
             location: Location::DataDir {
                 id: entry.id.clone(),
             },
-            dir: context.boxes_dir().join(&entry.id),
+            dir: boxes.join(&entry.id)?,
             project: entry.project,
         };
         let details = Details::read(&found);
         let mut project = details.project.display().to_string();
-        if !details.project.is_dir() {
+        if !cmd_info::is_dir(context, &details.project) {
             project.push_str(messages::cli::PROJECT_MISSING_SUFFIX);
         }
         rows.push([
@@ -157,7 +158,7 @@ async fn remove(context: &Context, ids: &[String], force: bool) -> anyhow::Resul
         }
     }
     if removed {
-        oci::gc_sweep(&context.data_dir);
+        oci::gc_sweep(&context.roots.data_dir);
     }
     Ok(code)
 }

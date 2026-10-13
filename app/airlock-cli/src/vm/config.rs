@@ -5,6 +5,8 @@
 
 use std::path::PathBuf;
 
+use crate::util::VerifiedPath;
+
 /// A VirtioFS directory that the host shares with the guest.
 pub struct VmShare {
     /// VirtioFS tag that the guest uses to mount the share.
@@ -33,7 +35,7 @@ pub struct VmConfig {
     /// Sparse raw disk image for the cache volume (VirtIO block device).
     pub cache_disk: Option<PathBuf>,
     /// Directory for runtime files (e.g., vsock UNIX sockets).
-    pub runtime_dir: PathBuf,
+    pub runtime_dir: VerifiedPath,
     /// Path to cloud-hypervisor binary (Linux only).
     #[cfg(target_os = "linux")]
     pub cloud_hypervisor: PathBuf,

@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use crate::db::{self, Db};
 use crate::settings::Settings;
+use crate::util::Roots;
 use crate::vault::Vault;
 
 /// User settings, vault and database of the process.
@@ -29,6 +30,10 @@ pub struct Context {
     /// The airlock data directory (see [`crate::cache`]). The sandboxes
     /// that are not in their project are in `<data_dir>/boxes/`.
     pub data_dir: PathBuf,
+    /// The trusted roots of the process: the current dir, the home dir and
+    /// the data dir, with symlinks resolved one time. Make host paths from
+    /// them (see [`crate::util::verified_path::VerifiedPath`]).
+    pub roots: Roots,
 }
 
 impl Context {
@@ -43,14 +48,19 @@ impl Context {
     ///   The context, or error if airlock cannot make the data directory or
     ///   open the database.
     pub fn new(settings: Settings, data_dir: PathBuf) -> anyhow::Result<Self> {
-        crate::cache::create_private_dir(&data_dir)?;
+        // The user can move the data directory with a link. Make it before
+        // the roots, so that its root has the identity of the real dir.
+        let data = crate::util::VerifiedPath::new_follow(&data_dir, None)?;
+        crate::cache::create_private_dir(&data)?;
+        let roots = Roots::for_process(&data_dir)?;
         let vault = Vault::for_storage_type(settings.vault.storage);
-        let db = Db::open(&data_dir.join(db::DIR))?;
+        let db = Db::open(&roots.data_dir.join(db::DIR)?)?;
         Ok(Self {
             settings,
             vault,
             db,
             data_dir,
+            roots,
         })
     }
 

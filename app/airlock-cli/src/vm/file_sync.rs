@@ -9,12 +9,12 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::messages;
-use crate::util::PinnedDir;
+use crate::util::{PinnedDir, VerifiedPath, vfs};
 
 /// A sync destination, held by an FD of its parent directory that was opened
 /// at sandbox start.
@@ -35,7 +35,8 @@ struct SyncDest {
 
 impl SyncDest {
     /// Pin the parent directory of `source` and keep its file name.
-    fn open(source: &Path) -> io::Result<Self> {
+    fn open(source: &VerifiedPath) -> io::Result<Self> {
+        let path = source.to_path()?;
         let parent = source.parent().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -52,9 +53,9 @@ impl SyncDest {
             })?
             .to_os_string();
         Ok(Self {
-            parent: PinnedDir::pin(parent)?,
+            parent: PinnedDir::pin(parent.to_path()?)?,
             basename,
-            display: source.to_path_buf(),
+            display: path.to_path_buf(),
         })
     }
 }
@@ -103,13 +104,19 @@ impl Drop for SyncHandle {
 ///  - `overlay_dir`: Overlay directory of the sandbox.
 ///
 /// Returns:
-///   The task handle, or `None` if there are no writable file mounts or the
-///   watcher setup fails.
+///   The task handle, or `None` if there are no writable file mounts, the
+///   watcher setup fails, or the overlay directory is not valid.
 pub(super) fn start(
     mounts: &[super::mount::ResolvedMount],
-    overlay_dir: &Path,
+    overlay_dir: &VerifiedPath,
 ) -> Option<SyncHandle> {
-    let files_rw_dir = overlay_dir.join("files").join("rw");
+    let files_rw_dir = match overlay_dir.join("files/rw") {
+        Ok(dir) => dir,
+        Err(e) => {
+            tracing::warn!("file sync dir {overlay_dir}: {e}");
+            return None;
+        }
+    };
     // Open the parent dir of each writable mount now. If a parent cannot be
     // opened (missing, not readable, not a dir), log a warning and never
     // sync that mount. That is better than a silent write to whatever is
@@ -122,7 +129,7 @@ pub(super) fn start(
             Err(e) => {
                 tracing::warn!(
                     "file sync skipping {} (parent dir not pinnable): {e}",
-                    m.source.display()
+                    m.source
                 );
                 None
             }
@@ -146,7 +153,12 @@ pub(super) fn start(
             return None;
         }
     };
-    if let Err(e) = watcher.watch(&files_rw_dir, RecursiveMode::NonRecursive) {
+    let watched = files_rw_dir.to_path().and_then(|dir| {
+        watcher
+            .watch(dir, RecursiveMode::NonRecursive)
+            .map_err(io::Error::other)
+    });
+    if let Err(e) = watched {
         tracing::warn!("file sync watch failed: {e}");
         return None;
     }
@@ -166,7 +178,7 @@ pub(super) fn start(
 /// Handle watcher events until the watcher is dropped, and sync each
 /// changed file to its destination.
 async fn watch_loop(
-    files_rw_dir: PathBuf,
+    files_rw_dir: VerifiedPath,
     rw_files: Vec<(String, SyncDest)>,
     mut rx: tokio::sync::mpsc::Receiver<notify::Result<notify::Event>>,
 ) -> anyhow::Result<()> {
@@ -174,8 +186,10 @@ async fn watch_loop(
     // and atomic renames (new inode).
     type FileState = (u64, i64, i64);
 
+    // The guest can put a symlink at the name. The metadata of a symlink is
+    // refused, so the event is skipped.
     let read_state = |key: &str| -> Option<FileState> {
-        let m = std::fs::metadata(files_rw_dir.join(key)).ok()?;
+        let m = vfs::metadata(&files_rw_dir.join(key).ok()?).ok()?;
         Some((m.ino(), m.mtime(), m.mtime_nsec()))
     };
 
@@ -215,8 +229,10 @@ async fn watch_loop(
             // The first state is the boot-time baseline. Do not sync yet.
             let Some(_) = old_state else { continue };
 
-            let overlay_path = files_rw_dir.join(filename);
-            sync_file(&overlay_path, dest);
+            match files_rw_dir.join(filename) {
+                Ok(overlay_path) => sync_file(&overlay_path, dest),
+                Err(e) => tracing::warn!("file sync {filename}: {e}"),
+            }
         }
     }
 
@@ -234,7 +250,7 @@ async fn watch_loop(
 ///    start (see [`SyncDest`] and [`PinnedDir`]). Each write uses an `*at()`
 ///    syscall relative to it. Thus a host-side directory swap on the path to
 ///    the source cannot redirect the write.
-fn sync_file(overlay_path: &Path, dest: &SyncDest) {
+fn sync_file(overlay_path: &VerifiedPath, dest: &SyncDest) {
     // Steps:
     //  1. `fstat` the overlay FD. Reject entries that are not regular files
     //     (a symlink already failed the `O_NOFOLLOW` open with `ELOOP`).
@@ -249,22 +265,19 @@ fn sync_file(overlay_path: &Path, dest: &SyncDest) {
         Err(e) => {
             // ELOOP here means that the guest put a symlink here. Skip it
             // with a warning.
-            tracing::warn!("file sync open {}: {e}", overlay_path.display());
+            tracing::warn!("file sync open {overlay_path}: {e}");
             return;
         }
     };
     let overlay_meta = match overlay_file.metadata() {
         Ok(m) => m,
         Err(e) => {
-            tracing::warn!("file sync fstat {}: {e}", overlay_path.display());
+            tracing::warn!("file sync fstat {overlay_path}: {e}");
             return;
         }
     };
     if !overlay_meta.file_type().is_file() {
-        tracing::warn!(
-            "file sync skipped non-regular overlay entry {}",
-            overlay_path.display()
-        );
+        tracing::warn!("file sync skipped non-regular overlay entry {overlay_path}");
         return;
     }
 
@@ -277,7 +290,7 @@ fn sync_file(overlay_path: &Path, dest: &SyncDest) {
     if dest.parent.link_from(&overlay_file, &dest.basename).is_ok() {
         tracing::debug!(
             "file sync (hard-link): {} → {}",
-            overlay_path.display(),
+            overlay_path,
             dest.display.display()
         );
         return;
@@ -286,7 +299,7 @@ fn sync_file(overlay_path: &Path, dest: &SyncDest) {
     match dest.parent.copy_from(&overlay_file, &dest.basename, 0o600) {
         Ok(()) => tracing::debug!(
             "file sync (copy): {} → {}",
-            overlay_path.display(),
+            overlay_path,
             dest.display.display()
         ),
         Err(e) => tracing::warn!("file sync {}: {e}", dest.display.display()),
@@ -296,11 +309,15 @@ fn sync_file(overlay_path: &Path, dest: &SyncDest) {
 /// Open `path` with `O_NOFOLLOW`. If `path` is a symbolic link, the open
 /// fails with `ELOOP` and does not silently redirect the read. Later
 /// operations use the returned FD, never the path.
-fn open_nofollow(path: &Path) -> io::Result<File> {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
+fn open_nofollow(path: &VerifiedPath) -> io::Result<File> {
+    // O_NONBLOCK: the open of a FIFO that the guest put there must not
+    // block. The type check of the caller refuses it.
+    vfs::open_with(
+        path,
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK),
+    )
 }
 
 #[cfg(test)]
@@ -311,6 +328,7 @@ mod tests {
 
     use super::{SyncDest, sync_file};
     use crate::test_cfg::temp_dir;
+    use crate::util::{Roots, VerifiedPath};
 
     /// Test that a sync writes to the parent directory that was pinned at the
     /// start, also when the parent path changes to a symlink later. Thus a
@@ -334,9 +352,11 @@ mod tests {
         fs::create_dir_all(&overlay).unwrap();
         let source = safe.join(".bashrc");
         fs::write(&source, b"ORIGINAL\n").unwrap();
-        let dest = SyncDest::open(&source).unwrap();
+        let roots = Roots::resolve(root, root, root).unwrap();
+        let dest = SyncDest::open(&VerifiedPath::new(&source, &roots).unwrap()).unwrap();
         let overlay_path = overlay.join("mount_key");
         fs::write(&overlay_path, b"PAYLOAD\n").unwrap();
+        let overlay_path = VerifiedPath::new(&overlay_path, &roots).unwrap();
 
         fs::rename(&safe, &safe_real).unwrap();
         std::os::unix::fs::symlink(&outside, &safe).unwrap();

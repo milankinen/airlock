@@ -17,7 +17,9 @@ mod file_sync;
 pub mod mount;
 
 use std::os::unix::io::OwnedFd;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use crate::util::{VerifiedPath, vfs};
 
 /// Result of the KVM access check.
 #[cfg(target_os = "linux")]
@@ -41,13 +43,13 @@ pub fn kvm_status() -> KvmStatus {
 /// Check if the current user can open the KVM device at `path`.
 #[cfg(target_os = "linux")]
 fn kvm_status_at(path: &Path) -> KvmStatus {
-    // Open the file instead of reading the mode bits, so the kernel also
-    // applies ACLs.
-    match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-    {
+    // The device path is fixed. On some systems it is a symlink.
+    let opened = VerifiedPath::new_follow(path, None).and_then(|path| {
+        // Open the file instead of reading the mode bits, so the kernel
+        // also applies ACLs.
+        vfs::open_with(&path, std::fs::OpenOptions::new().read(true).write(true))
+    });
+    match opened {
         Ok(_) => KvmStatus::Available,
         Err(err) => match err.kind() {
             std::io::ErrorKind::NotFound => KvmStatus::NotFound,
@@ -103,7 +105,7 @@ pub struct VmInstance {
     /// Resolved mounts, including the project mount if it is shared.
     pub mounts: Vec<mount::ResolvedMount>,
     /// Path of the sandbox disk image.
-    pub disk_image: PathBuf,
+    pub disk_image: VerifiedPath,
     /// Cache directories on the sandbox disk.
     pub caches: Vec<disk::CacheEntry>,
     /// Resolved guest home directory.
@@ -181,17 +183,18 @@ pub async fn start(
     opts: &BootOptions,
 ) -> anyhow::Result<(VmInstance, OwnedFd)> {
     let assets = Assets::init(project)?;
-    let overlay_dir = project.sandbox_dir.join("overlay");
+    let sandbox_dir = project.sandbox_dir.clone();
+    let overlay_dir = sandbox_dir.join("overlay")?;
 
     let mounts = assemble_mounts(project, container_home, opts.project_share)?;
     let shares = prepare_shares(
-        &project.context.data_dir,
+        &project.context.roots.data_dir,
         image,
         &mounts,
-        &project.sandbox_dir,
+        &overlay_dir,
     )?;
     let (disk_image, caches) = disk::prepare(
-        &project.sandbox_dir,
+        &sandbox_dir,
         &project.config.disk,
         container_home,
         &project.host_cwd,
@@ -221,8 +224,8 @@ pub async fn start(
         initramfs: assets.initramfs,
         kernel_cmdline: build_kernel_cmdline(opts.log_level),
         shares,
-        cache_disk: Some(disk_image.clone()),
-        runtime_dir: project.sandbox_dir.clone(),
+        cache_disk: Some(disk_image.to_path()?.to_path_buf()),
+        runtime_dir: sandbox_dir,
         #[cfg(target_os = "linux")]
         cloud_hypervisor: assets.cloud_hypervisor,
         #[cfg(target_os = "linux")]
@@ -260,23 +263,23 @@ fn assemble_mounts(
     container_home: &str,
     project_share: bool,
 ) -> anyhow::Result<Vec<mount::ResolvedMount>> {
-    let project_mount = project_share.then(|| mount::ResolvedMount {
-        mount_type: mount::MountType::Dir {
-            key: "project".to_string(),
-        },
-        source: project.host_cwd.clone(),
-        target: project.guest_cwd.to_string_lossy().into(),
-        read_only: false,
-    });
+    let project_mount = if project_share {
+        Some(mount::ResolvedMount {
+            mount_type: mount::MountType::Dir {
+                key: "project".to_string(),
+            },
+            name: "project".to_string(),
+            given: project.host_cwd.display().to_string(),
+            // The project can be below a symlinked dir.
+            source: VerifiedPath::new_follow(&project.host_cwd, None)?,
+            target: project.guest_cwd.to_string_lossy().into(),
+            read_only: false,
+        })
+    } else {
+        None
+    };
 
-    let mut enabled_mounts: Vec<_> = project
-        .config
-        .mounts
-        .iter()
-        .filter(|(_, m)| m.enabled)
-        .map(|(k, m)| (k.as_str(), m.clone()))
-        .collect();
-    enabled_mounts.sort_by_key(|(k, _)| *k);
+    let enabled_mounts = mount::enabled_mounts(&project.config);
     let user_mounts = mount::resolve_mounts(
         &enabled_mounts,
         &project.host_home,
@@ -287,12 +290,17 @@ fn assemble_mounts(
 
     let mut mounts: Vec<_> = project_mount.into_iter().collect();
     mounts.extend(user_mounts);
+    for m in &mounts {
+        let resolved = m.source.to_path().ok();
+        tracing::debug!("mount source: {} = {:?} → {resolved:?}", m.name, m.given);
+    }
     if !project.context.settings.security.insecure_mounts {
+        let roots = &project.context.roots;
         mount::check_exposure(
             &mounts,
             &[
-                (messages::vm::HOME_DIRECTORY, &project.host_home),
-                (messages::vm::DATA_DIRECTORY, &project.context.data_dir),
+                (messages::vm::HOME_DIRECTORY, roots.home()?),
+                (messages::vm::DATA_DIRECTORY, &roots.data_dir),
             ],
         )?;
     }
@@ -305,17 +313,19 @@ fn assemble_mounts(
 /// File mounts are hardlinked (copied on EXDEV) into
 /// `overlay/files/{rw,ro}/{key}`. Two shares give them to the guest.
 fn prepare_shares(
-    data_dir: &Path,
+    data_dir: &VerifiedPath,
     _image: &OciImage,
     mounts: &[mount::ResolvedMount],
-    sandbox_dir: &Path,
+    overlay_dir: &VerifiedPath,
 ) -> anyhow::Result<Vec<VmShare>> {
     // The guest makes the image rootfs with overlayfs from
     // `/mnt/layers/<d>`. Share the per-layer cache root one time. The guest
     // reads only the layers that `imageLayers` lists for this image.
     let mut shares = vec![VmShare {
         tag: "layers".to_string(),
-        host_path: crate::cache::layers_root(data_dir)?,
+        host_path: crate::cache::layers_root(data_dir)?
+            .to_path()?
+            .to_path_buf(),
         read_only: true,
     }];
 
@@ -325,24 +335,24 @@ fn prepare_shares(
     {
         tracing::debug!(
             "mount: {} → {} → {} (read-only: {})",
-            m.source.display(),
+            m.source,
             m.vm_path(),
             m.target,
             m.read_only
         );
         shares.push(VmShare {
             tag: m.key().into(),
-            host_path: m.source.clone(),
+            host_path: m.source.to_path()?.to_path_buf(),
             read_only: m.read_only,
         });
     }
 
     // Hardlink file mounts into overlay/files/{rw|ro}/{key}. Make the dirs
     // again on each boot, so old entries are removed.
-    let files_rw_dir = sandbox_dir.join("overlay").join("files").join("rw");
-    let files_ro_dir = sandbox_dir.join("overlay").join("files").join("ro");
-    let _ = std::fs::remove_dir_all(&files_rw_dir);
-    let _ = std::fs::remove_dir_all(&files_ro_dir);
+    let files_rw_dir = overlay_dir.join("files/rw")?;
+    let files_ro_dir = overlay_dir.join("files/ro")?;
+    let _ = vfs::remove_dir_all(&files_rw_dir);
+    let _ = vfs::remove_dir_all(&files_ro_dir);
     let mut has_rw_files = false;
     let mut has_ro_files = false;
 
@@ -352,7 +362,7 @@ fn prepare_shares(
     {
         tracing::debug!(
             "file mount: {} → {} (read-only: {})",
-            m.source.display(),
+            m.source,
             m.target,
             m.read_only
         );
@@ -361,18 +371,16 @@ fn prepare_shares(
         } else {
             &files_rw_dir
         };
-        std::fs::create_dir_all(dir)?;
-        let link_path = dir.join(m.key());
-        if let Err(e) = std::fs::hard_link(&m.source, &link_path) {
+        vfs::create_dir_all(dir)?;
+        let link_path = dir.join(m.key())?;
+        if let Err(e) = vfs::hard_link(&m.source, &link_path) {
             if e.kind() == std::io::ErrorKind::CrossesDevices {
-                cli::log!(
-                    "{}",
-                    messages::vm::file_mount_cross_device(m.source.display())
-                );
-                std::fs::copy(&m.source, &link_path)?;
+                cli::log!("{}", messages::vm::file_mount_cross_device(&m.source));
+                vfs::copy(&m.source, &link_path)?;
             } else {
-                return Err(anyhow::Error::from(e)
-                    .context(messages::vm::file_mount_failed(m.source.display())));
+                return Err(
+                    anyhow::Error::from(e).context(messages::vm::file_mount_failed(&m.source))
+                );
             }
         }
         has_ro_files = has_ro_files || m.read_only;
@@ -382,14 +390,14 @@ fn prepare_shares(
     if has_rw_files {
         shares.push(VmShare {
             tag: "files/rw".to_string(),
-            host_path: files_rw_dir,
+            host_path: files_rw_dir.to_path()?.to_path_buf(),
             read_only: false,
         });
     }
     if has_ro_files {
         shares.push(VmShare {
             tag: "files/ro".to_string(),
-            host_path: files_ro_dir,
+            host_path: files_ro_dir.to_path()?.to_path_buf(),
             read_only: true,
         });
     }

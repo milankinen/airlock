@@ -4,9 +4,11 @@
 
 use std::collections::HashSet;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::time::Duration;
 
 use crate::cache;
+use crate::util::verified_path::VerifiedPath;
+use crate::util::vfs;
 
 /// Minimal shape to parse only the layer list of a cached image file. Thus
 /// this module does not need the full `OciImage` deserialization.
@@ -29,7 +31,7 @@ struct CachedLayers {
 /// sandboxes that are starting. Their hardlinks may not exist yet.
 /// Args:
 ///  - `data_dir`: Airlock data directory
-pub fn sweep(data_dir: &Path) {
+pub fn sweep(data_dir: &VerifiedPath) {
     relink_templates(data_dir);
     sweep_images(data_dir);
     let live = collect_live_layers(data_dir);
@@ -42,37 +44,47 @@ pub fn sweep(data_dir: &Path) {
 // again, and the entry gets a new inode. A sandbox repairs its link on
 // each start, but nothing starts a template. Without the repair, the sweep
 // removes the image of the template.
-fn relink_templates(data_dir: &Path) {
-    let dir = crate::templates::templates_dir(data_dir);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+fn relink_templates(data_dir: &VerifiedPath) {
+    let Ok(dir) = crate::templates::templates_dir(data_dir) else {
+        return;
+    };
+    let Ok(entries) = vfs::read_dir(&dir) else {
         return;
     };
     for entry in entries.flatten() {
-        let link = entry.path().join(crate::templates::IMAGE_FILE);
+        let Ok(link) = dir
+            .join(entry.file_name())
+            .and_then(|t| t.join(crate::templates::IMAGE_FILE))
+        else {
+            continue;
+        };
         let Some(image) = super::read_cached_image(&link) else {
             continue;
         };
-        let Ok(path) = cache::image_path(data_dir, &image.image_id) else {
-            continue;
-        };
-        if let Err(e) = super::ensure_image_hardlink(&link, &path, &image) {
-            tracing::warn!("gc: relink {}: {e:#}", link.display());
+        if let Err(e) = super::ensure_image_hardlink(data_dir, &link, &image) {
+            tracing::warn!("gc: relink {link}: {e:#}");
         }
     }
 }
 
+/// Age after which the sweep removes the temp file of an image write. A
+/// younger temp file can belong to a write that runs now.
+const STALE_TMP_AGE: Duration = Duration::from_hours(1);
+
 /// Remove the cached image files that have link count 1 (no sandbox uses
-/// them).
-fn sweep_images(data_dir: &Path) {
+/// them), and old temp files of image writes.
+fn sweep_images(data_dir: &VerifiedPath) {
     let Ok(images_root) = cache::images_root(data_dir) else {
         return;
     };
-    let Ok(entries) = std::fs::read_dir(&images_root) else {
+    let Ok(entries) = vfs::read_dir(&images_root) else {
         return;
     };
     for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(meta) = std::fs::metadata(&path) else {
+        let Ok(path) = images_root.join(entry.file_name()) else {
+            continue;
+        };
+        let Ok(meta) = vfs::symlink_metadata(&path) else {
             continue;
         };
         if !meta.is_file() {
@@ -80,26 +92,37 @@ fn sweep_images(data_dir: &Path) {
             // and other entries. Only files are real cache entries.
             continue;
         }
-        if meta.nlink() <= 1 {
-            let _ = std::fs::remove_file(&path);
+        let is_tmp = entry.file_name().to_string_lossy().ends_with(".tmp");
+        let stale = || {
+            meta.modified()
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > STALE_TMP_AGE)
+        };
+        if meta.nlink() <= 1 && (!is_tmp || stale()) {
+            let _ = vfs::remove_file(&path);
         }
     }
 }
 
 /// Collect the layer keys of all remaining cached images.
-fn collect_live_layers(data_dir: &Path) -> HashSet<String> {
+fn collect_live_layers(data_dir: &VerifiedPath) -> HashSet<String> {
     let mut live = HashSet::new();
     let Ok(images_root) = cache::images_root(data_dir) else {
         return live;
     };
-    let Ok(entries) = std::fs::read_dir(&images_root) else {
+    let Ok(entries) = vfs::read_dir(&images_root) else {
         return live;
     };
     for entry in entries.flatten() {
-        let Ok(data) = std::fs::read(entry.path()) else {
+        let Some(data) = images_root
+            .join(entry.file_name())
+            .ok()
+            .and_then(|path| super::read_image_json(&path))
+        else {
             continue;
         };
-        let Ok(parsed) = serde_json::from_slice::<CachedLayers>(&data) else {
+        let Ok(parsed) = serde_json::from_str::<CachedLayers>(&data) else {
             continue;
         };
         // `image_layers` contains versioned layer keys (e.g. `2.<hex>`).
@@ -111,22 +134,24 @@ fn collect_live_layers(data_dir: &Path) -> HashSet<String> {
 }
 
 /// Remove staging entries and the layer dirs that are not in `live`.
-fn sweep_layers(data_dir: &Path, live: &HashSet<String>) {
+fn sweep_layers(data_dir: &VerifiedPath, live: &HashSet<String>) {
     let Ok(layers_root) = cache::layers_root(data_dir) else {
         return;
     };
-    let Ok(entries) = std::fs::read_dir(&layers_root) else {
+    let Ok(entries) = vfs::read_dir(&layers_root) else {
         return;
     };
     for entry in entries.flatten() {
-        let path = entry.path();
+        let Ok(path) = layers_root.join(entry.file_name()) else {
+            continue;
+        };
         let name = entry.file_name().to_string_lossy().into_owned();
         if is_staging_name(&name) {
             let _ = remove_any(&path);
             continue;
         }
         if !live.contains(name.as_str()) {
-            let _ = std::fs::remove_dir_all(&path);
+            let _ = vfs::remove_dir_all(&path);
         }
     }
 }
@@ -138,10 +163,10 @@ fn is_staging_name(name: &str) -> bool {
 }
 
 /// Remove a file or a directory tree.
-fn remove_any(path: &Path) -> std::io::Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Ok(m) if m.is_dir() => std::fs::remove_dir_all(path),
-        Ok(_) => std::fs::remove_file(path),
+fn remove_any(path: &VerifiedPath) -> std::io::Result<()> {
+    match vfs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => vfs::remove_dir_all(path),
+        Ok(_) => vfs::remove_file(path),
         Err(e) => Err(e),
     }
 }

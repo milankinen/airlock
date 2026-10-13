@@ -26,6 +26,7 @@ use crate::cli::prompt::style::Styles;
 use crate::config::export::{self, Format};
 use crate::config::{ConfigOverrides, LayeredConfig, ResolvedConfig};
 use crate::packs::PackManager;
+use crate::util::VerifiedPath;
 use crate::{messages, project};
 
 /// The key that shows and hides the changes.
@@ -36,7 +37,7 @@ const DIFF_CONTEXT: usize = 3;
 /// The config of the run, and how to find the config of the last run.
 pub struct CheckInput<'a> {
     /// Sandbox directory with the config of the last run
-    pub sandbox_dir: &'a Path,
+    pub sandbox_dir: &'a VerifiedPath,
     /// Resolved config of this run
     pub resolved: &'a ResolvedConfig,
     /// Airlock data directory, to resolve the config of the last run
@@ -120,7 +121,7 @@ async fn check_with(
 
 /// Save the config files `config` as the config of the last run in the
 /// sandbox directory `sandbox_dir`.
-pub fn save(sandbox_dir: &Path, config: &LayeredConfig) -> anyhow::Result<()> {
+pub fn save(sandbox_dir: &VerifiedPath, config: &LayeredConfig) -> anyhow::Result<()> {
     project::save_last_run_config(sandbox_dir, serde_json::to_value(config)?)
 }
 
@@ -302,14 +303,15 @@ mod tests {
         answer: Answer,
     ) -> (Result<Checked, Exit>, Option<Asked>) {
         let sandbox = temp_dir();
+        let sandbox_dir = VerifiedPath::new_follow(sandbox.path(), None).unwrap();
         let data = temp_dir();
         let packs = crate::packs::init_with_sample();
-        save(sandbox.path(), &layers(last)).unwrap();
+        save(&sandbox_dir, &layers(last)).unwrap();
         let config = layers(toml);
         let resolved =
             block_on(config.resolve(data.path(), &packs, &ConfigOverrides::default())).unwrap();
         let input = CheckInput {
-            sandbox_dir: sandbox.path(),
+            sandbox_dir: &sandbox_dir,
             resolved: &resolved,
             data_dir: data.path(),
             packs: &packs,

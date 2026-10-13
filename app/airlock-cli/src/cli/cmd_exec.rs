@@ -59,7 +59,7 @@ pub async fn main(args: ExecArgs, context: &Context) -> anyhow::Result<i32> {
 
     let host_cwd = std::env::current_dir()
         .map_err(|e| anyhow::anyhow!(messages::cli::exec_get_cwd_failed(e)))?;
-    let client = SandboxClient::connect(context, &host_cwd, follow_git_worktree).await?;
+    let client = SandboxClient::connect(context, follow_git_worktree).await?;
     let cli_service = client.service;
     tokio::task::spawn_local(client.rpc_system);
 

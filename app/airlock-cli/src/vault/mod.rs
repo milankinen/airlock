@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::messages;
 use crate::settings::Settings;
+use crate::util::{VerifiedPath, vfs};
 
 // Argon2id parameters from the OWASP 2023 "second recommendation": 19 MiB
 // memory, t=2, p=1. These values are safe and keep an interactive unlock
@@ -566,35 +567,51 @@ pub(crate) struct KdfParams {
 
 // ── File I/O helpers ───────────────────────────────────────────────────────
 
-/// Read a vault file.
+/// Read a vault file. The file and its directory can be links, for
+/// example into a dotfiles repo.
 /// Returns:
 ///   File contents, or `None` if the file does not exist.
 pub(crate) fn read_vault_file(path: &Path) -> anyhow::Result<Option<String>> {
-    match std::fs::read_to_string(path) {
+    match VerifiedPath::new_follow(path, None).and_then(|path| vfs::read_to_string(&path)) {
         Ok(s) => Ok(Some(s)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(anyhow!(messages::vault::read_vault_file(path.display(), e))),
     }
 }
 
+/// Split `path` into its directory and its file name. The directory
+/// follows symlinks: it is a user directory, for example `~/.airlock`.
+fn vault_dir(path: &Path) -> anyhow::Result<(VerifiedPath, &std::ffi::OsStr)> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!(messages::vault::vault_path_no_file_name(path.display())))?;
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    Ok((VerifiedPath::new_follow(parent, None)?, name))
+}
+
 /// Take an exclusive advisory lock on `path`. The lock stays until the
 /// returned handle drops. Serializes vault writes across processes.
 fn acquire_file_lock(path: &Path) -> anyhow::Result<File> {
     use std::os::unix::io::AsRawFd;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| messages::vault::create_vault_directory(parent.display()))?;
-    }
+    let (dir, name) = vault_dir(path)?;
+    vfs::create_dir_all(&dir).with_context(|| messages::vault::create_vault_directory(&dir))?;
     // `O_NOFOLLOW`: refuse a symlink at the lock path. Do not follow it to
     // create or lock a different file.
-    let file = OpenOptions::new()
-        .read(true)
+    let mut opts = OpenOptions::new();
+    opts.read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
+        .custom_flags(libc::O_NOFOLLOW);
+    let file = dir
+        .join(name)
+        .and_then(|lock| vfs::open_with(&lock, &opts))
         .with_context(|| messages::vault::open_vault_lock(path.display()))?;
     // The lock blocks (writes are short), so concurrent writers wait in a
     // queue and do not fail.
@@ -608,38 +625,49 @@ fn acquire_file_lock(path: &Path) -> anyhow::Result<File> {
     Ok(file)
 }
 
-/// Write `bytes` to `path` atomically, with mode 0600. Creates the parent
-/// directory if it does not exist.
+/// Write `bytes` to the vault file `path` atomically, with mode 0600.
+/// Creates the directory if it does not exist. The directory can be a
+/// link (see [`read_vault_file`]). A link at `path` is replaced, not
+/// followed.
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    // Write to a sibling temp file and rename it, so a crash during the
-    // write cannot leave a truncated vault.
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| messages::vault::create_vault_directory(parent.display()))?;
-    }
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| anyhow!(messages::vault::vault_path_no_file_name(path.display())))?;
-    // The temp name is unique per process. Thus two concurrent writers
-    // cannot rename a half-written temp file of the other process.
-    let unique = std::process::id();
-    let mut tmp = path.to_path_buf();
-    tmp.set_file_name(format!("{}.{unique}.tmp", file_name.to_string_lossy()));
+    let (dir, name) = vault_dir(path)?;
+    atomic_write_in(&dir, name, bytes)
+}
 
-    let mut f: File = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)
-        .with_context(|| messages::vault::create_vault_tempfile(tmp.display()))?;
+/// Write `bytes` to the file `name` in `dir` atomically, with mode 0600.
+/// Creates `dir` if it does not exist. Never follows a symlink at `name`
+/// or at the temp file.
+pub(crate) fn atomic_write_in(
+    dir: &VerifiedPath,
+    name: impl AsRef<std::ffi::OsStr>,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    let name = name.as_ref();
+    vfs::create_dir_all(dir).with_context(|| messages::vault::create_vault_directory(dir))?;
+    let path = dir.join(name)?;
+    // Write to a sibling temp file and rename it, so a crash during the
+    // write cannot leave a truncated file. The temp name is unique per
+    // process. Thus two concurrent writers cannot rename a half-written
+    // temp file of the other process.
+    let unique = std::process::id();
+    let tmp = dir.join(format!("{}.{unique}.tmp", name.to_string_lossy()))?;
+
+    // Remove a stale temp file of a dead process with the same PID, or a
+    // link that the guest put there. `create_new` never follows a link
+    // that appears after the remove.
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true).mode(0o600);
+    let opened = match vfs::remove_file(&tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => vfs::open_with(&tmp, &opts),
+    };
+    let mut f: File = opened.with_context(|| messages::vault::create_vault_tempfile(&tmp))?;
     f.write_all(bytes)
-        .with_context(|| messages::vault::write_vault_tempfile(tmp.display()))?;
+        .with_context(|| messages::vault::write_vault_tempfile(&tmp))?;
     f.sync_all()
-        .with_context(|| messages::vault::fsync_vault_tempfile(tmp.display()))?;
+        .with_context(|| messages::vault::fsync_vault_tempfile(&tmp))?;
     drop(f);
-    std::fs::rename(&tmp, path)
-        .with_context(|| messages::vault::rename_vault_tempfile(path.display()))?;
+    vfs::rename(&tmp, &path).with_context(|| messages::vault::rename_vault_tempfile(&path))?;
     Ok(())
 }
 

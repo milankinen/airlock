@@ -7,6 +7,7 @@ use heed::types::Str;
 
 use crate::db::{DIR, Db};
 use crate::test_cfg::{block_on_local, temp_dir};
+use crate::util::VerifiedPath;
 
 /// The permission bits of `path`.
 fn mode(path: &std::path::Path) -> u32 {
@@ -26,7 +27,7 @@ fn database_commits_successful_writes_for_all_clones_in_private_files() {
     let dir = home.path().join(DIR);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let db = Db::open(&dir).unwrap();
+    let db = Db::open(&VerifiedPath::new_follow(&dir, None).unwrap()).unwrap();
     assert!(!db.has_database("test.values"));
 
     block_on_local(async {
@@ -72,10 +73,10 @@ fn database_that_cannot_open_is_error() {
     let home = temp_dir();
     let file = home.path().join("file");
     std::fs::write(&file, b"").unwrap();
-    assert!(Db::open(&file).is_err());
+    assert!(Db::open(&VerifiedPath::new_follow(&file, None).unwrap()).is_err());
 
     let dir = home.path().join(DIR);
     // `heed` refuses a second environment for the same path in one process.
-    let _first = Db::open(&dir).unwrap();
-    assert!(Db::open(&dir).is_err());
+    let _first = Db::open(&VerifiedPath::new_follow(&dir, None).unwrap()).unwrap();
+    assert!(Db::open(&VerifiedPath::new_follow(&dir, None).unwrap()).is_err());
 }

@@ -35,7 +35,7 @@ fn config_json(user: &str, layers: &[&str]) -> Vec<u8> {
 /// `ensure_local_image` does.
 /// Returns:
 ///   The layer keys, topmost first.
-fn extract_saved_layers(data_dir: &Path, save: &docker::DockerSave) -> Vec<String> {
+fn extract_saved_layers(data_dir: &VerifiedPath, save: &docker::DockerSave) -> Vec<String> {
     let mut keys: Vec<String> = save
         .layer_digests
         .iter()
@@ -55,16 +55,16 @@ fn extract_saved_layers(data_dir: &Path, save: &docker::DockerSave) -> Vec<Strin
 }
 
 /// The path of the staged tarball of the layer `hex`.
-fn staged(data_dir: &Path, hex: &str) -> std::path::PathBuf {
-    cache::layers_root(data_dir).unwrap().join(format!(
+fn staged(data_dir: &VerifiedPath, hex: &str) -> std::path::PathBuf {
+    real(&cache::layers_root(data_dir).unwrap()).join(format!(
         "{}.download",
         cache::layer_key(&format!("sha256:{hex}"))
     ))
 }
 
 /// The names of temporary staging files left in the layer cache.
-fn staging_leftovers(data_dir: &Path) -> Vec<String> {
-    std::fs::read_dir(cache::layers_root(data_dir).unwrap())
+fn staging_leftovers(data_dir: &VerifiedPath) -> Vec<String> {
+    std::fs::read_dir(real(&cache::layers_root(data_dir).unwrap()))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .filter(|name| {
@@ -87,7 +87,7 @@ fn staging_leftovers(data_dir: &Path) -> Vec<String> {
 #[test]
 fn podman_archive_export_becomes_image_with_named_user() {
     let tmp = temp_dir();
-    let data_dir = tmp.path();
+    let data_dir = &verified_dir(tmp.path());
     let base = LayerTar::default()
         .file(
             "etc/passwd",
@@ -138,8 +138,7 @@ fn podman_archive_export_becomes_image_with_named_user() {
     assert!(image.env.contains(&"NODE_VERSION=22.1.0".to_string()));
     assert_eq!(os_release(data_dir, &image).unwrap().id, "debian");
     assert!(
-        cache::layer_dir(data_dir, &layers[0])
-            .unwrap()
+        real(&cache::layer_dir(data_dir, &layers[0]).unwrap())
             .join("usr/local/bin/node")
             .is_file()
     );
@@ -156,7 +155,7 @@ fn podman_archive_export_becomes_image_with_named_user() {
 #[test]
 fn docker_oci_layout_export_skips_cached_layers_and_legacy_members() {
     let tmp = temp_dir();
-    let data_dir = tmp.path();
+    let data_dir = &verified_dir(tmp.path());
     let cached = LayerTar::default().file("cached", "1").plain();
     let fresh = LayerTar::default().file("fresh", "2").plain();
     let (cached_hex, fresh_hex) = (sha256_hex(&cached), sha256_hex(&fresh));
@@ -182,14 +181,12 @@ fn docker_oci_layout_export_skips_cached_layers_and_legacy_members() {
     assert!(staged(data_dir, &fresh_hex).is_file());
     let layers = extract_saved_layers(data_dir, &save);
     assert!(
-        cache::layer_dir(data_dir, &layers[0])
-            .unwrap()
+        real(&cache::layer_dir(data_dir, &layers[0]).unwrap())
             .join("fresh")
             .is_file()
     );
     assert!(
-        cache::layer_dir(data_dir, &layers[1])
-            .unwrap()
+        real(&cache::layer_dir(data_dir, &layers[1]).unwrap())
             .join("cached")
             .is_file()
     );
@@ -204,7 +201,7 @@ fn docker_oci_layout_export_skips_cached_layers_and_legacy_members() {
 #[test]
 fn docker_blob_whose_content_does_not_match_its_digest_is_rejected() {
     let tmp = temp_dir();
-    let data_dir = tmp.path();
+    let data_dir = &verified_dir(tmp.path());
     let claimed = "a".repeat(64);
     let export = LayerTar::default()
         .file(&format!("blobs/sha256/{claimed}"), "poison")
@@ -215,7 +212,7 @@ fn docker_blob_whose_content_does_not_match_its_digest_is_rejected() {
     };
 
     assert!(err.to_string().contains("digest mismatch"), "{err}");
-    let leftovers: Vec<_> = std::fs::read_dir(cache::layers_root(data_dir).unwrap())
+    let leftovers: Vec<_> = std::fs::read_dir(real(&cache::layers_root(data_dir).unwrap()))
         .unwrap()
         .collect();
     assert!(leftovers.is_empty());
@@ -229,7 +226,7 @@ fn docker_blob_whose_content_does_not_match_its_digest_is_rejected() {
 #[test]
 fn docker_manifest_layer_with_path_parts_is_rejected() {
     let tmp = temp_dir();
-    let data_dir = tmp.path();
+    let data_dir = &verified_dir(tmp.path());
     let config = config_json("", &[]);
     let config_hex = sha256_hex(&config);
     let manifest =

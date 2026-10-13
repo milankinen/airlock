@@ -12,6 +12,7 @@ use crate::test_cfg::packs::test_packs;
 use crate::test_cfg::sandboxes::{LEGACY_CA, legacy_sandbox};
 use crate::test_cfg::start::StartProject;
 use crate::test_cfg::{TempDir, block_on_local, eventually, temp_dir, test_context};
+use crate::util::VerifiedPath;
 use crate::vault::{Vault, VaultStorageType};
 
 /// A config with one pack that has a setup script.
@@ -57,11 +58,12 @@ impl Home {
     fn lock(&self, yes: bool) -> PathBuf {
         eventually("sandbox lock is free", || {
             // The step does not move a running sandbox, and does not fail.
-            if project::is_running(&self.project_sandbox()) {
+            let sandbox = VerifiedPath::new_follow(self.project_sandbox(), None).unwrap();
+            if project::is_running(&sandbox) {
                 return None;
             }
             match block_on_local(lock_sandbox(&self.context, &self.project, false, yes)) {
-                Ok(lock) => Some(lock.dir().to_path_buf()),
+                Ok(lock) => Some(lock.dir().to_path().unwrap().to_path_buf()),
                 Err(e) if format!("{e:?}").contains("another airlock instance") => None,
                 Err(e) => panic!("{e:?}"),
             }
@@ -96,10 +98,12 @@ fn new_sandbox_goes_to_data_dir_and_project_gets_no_sandbox_data() {
     let Location::DataDir { id } = &found.location else {
         panic!("{found:?}");
     };
-    assert_eq!(found.dir, project.context().boxes_dir().join(id));
+    let dir = found.dir.to_path().unwrap();
+    let boxes = crate::sandboxes::boxes_dir(project.context()).unwrap();
+    assert_eq!(found.dir, boxes.join(id).unwrap());
     assert!(!project.project_dir().join(".airlock").exists());
     for name in ["ca.json", "run.json", "installs.json"] {
-        assert!(found.dir.join(name).is_file(), "{name}");
+        assert!(dir.join(name).is_file(), "{name}");
     }
 
     project.start(ONE, false).unwrap();
@@ -123,8 +127,9 @@ fn project_dir_setting_puts_new_sandbox_in_project() {
 
     let found = project.sandbox().unwrap();
     assert_eq!(found.location, Location::ProjectDir);
-    assert_eq!(found.dir, project.project_dir().join(".airlock/sandbox"));
-    assert!(found.dir.join("ca.json").is_file());
+    let dir = found.dir.to_path().unwrap();
+    assert_eq!(dir, project.project_dir().join(".airlock/sandbox"));
+    assert!(dir.join("ca.json").is_file());
     assert!(
         block_on_local(registry::list(&project.context().db))
             .unwrap()

@@ -8,8 +8,8 @@
 //! Guest → host forwards obey the live network policy, the same as the
 //! config port forwards. The server refuses forwards that make a loop with a
 //! config port forward.
+
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::rc::Rc;
 
 use airlock_common::cli_capnp::*;
@@ -21,6 +21,8 @@ use crate::config::config_values::Network as NetworkConfig;
 use crate::messages;
 use crate::network::NetworkControl;
 use crate::rpc::{Process, ProcessEvent, Supervisor};
+use crate::util::verified_path::VerifiedPath;
+use crate::util::vfs;
 
 /// Limits for the port forwards that clients add at run time.
 #[derive(Clone)]
@@ -48,11 +50,11 @@ impl ForwardRules {
 }
 
 /// Guard that removes the Unix socket file when dropped.
-struct SockGuard(PathBuf);
+struct SockGuard(VerifiedPath);
 
 impl Drop for SockGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = vfs::remove_file(&self.0);
     }
 }
 
@@ -70,13 +72,13 @@ impl Drop for SockGuard {
 ///   client connections. The sandbox shutdown aborts the future. This
 ///   closes the connections and removes the socket file.
 pub async fn serve(
-    sock_path: PathBuf,
+    sock_path: VerifiedPath,
     supervisor: Supervisor,
     base_env: Vec<String>,
     forwards: ForwardRules,
 ) {
-    let _ = tokio::fs::remove_file(&sock_path).await;
-    let listener = match tokio::net::UnixListener::bind(&sock_path) {
+    let _ = vfs::remove_file(&sock_path);
+    let listener = match vfs::bind_unix_async(&sock_path) {
         Ok(l) => l,
         Err(e) => {
             tracing::error!("cli server bind failed: {e}");

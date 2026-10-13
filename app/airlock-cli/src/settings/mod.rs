@@ -18,6 +18,7 @@ use smart_config::{ConfigRepository, ConfigSchema, DescribeConfig, DeserializeCo
 use crate::config::de::format_error;
 use crate::config::files::{EXTENSIONS, parse_file};
 use crate::messages;
+use crate::util::{VerifiedPath, vfs};
 use crate::vault::VaultStorageType;
 
 /// All user settings. Add new fields here. The default of each field must
@@ -187,11 +188,17 @@ impl Settings {
         // `settings.json` cannot hide the user's primary `settings.toml`.
         for ext in EXTENSIONS {
             let path = dir.join(format!("settings.{ext}"));
-            if !path.exists() {
-                continue;
-            }
-            let content = std::fs::read_to_string(&path)
-                .with_context(|| messages::settings::read_settings_file(path.display()))?;
+            // The settings can be a link into a dotfiles repo.
+            let content = match VerifiedPath::new_follow(&path, None)
+                .and_then(|verified| vfs::read_to_string(&verified))
+            {
+                Ok(content) => content,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(anyhow::Error::from(e)
+                        .context(messages::settings::read_settings_file(path.display())));
+                }
+            };
             let value = parse_file(&path, &content)?;
             return parse_settings(value)
                 .with_context(|| messages::settings::load_settings_file(path.display()));

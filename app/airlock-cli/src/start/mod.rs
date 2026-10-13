@@ -24,6 +24,7 @@ pub use exit::Exit;
 use tracing::info;
 
 use crate::cli::{self, LogLevel, logging};
+use crate::util::VerifiedPath;
 
 /// Command-line options for the sandbox step ([`sandbox::ensure_sandbox`]) and
 /// the install step ([`install::install_tools`]).
@@ -83,7 +84,11 @@ pub fn check_data_dir(data_dir: &Path) -> Result<(), Exit> {
 /// Return the current directory. Make the path canonical when possible.
 pub fn resolve_host_cwd() -> Result<PathBuf, Exit> {
     match std::env::current_dir() {
-        Ok(p) => Ok(std::fs::canonicalize(&p).unwrap_or(p)),
+        // The project can be below a symlink, for example macOS `/tmp`.
+        Ok(p) => Ok(VerifiedPath::new_follow(&p, None)
+            .ok()
+            .and_then(|cwd| cwd.to_path().ok().map(Path::to_path_buf))
+            .unwrap_or(p)),
         Err(e) => Err(Exit::error(
             1,
             crate::messages::cli::cannot_determine_cwd(e),

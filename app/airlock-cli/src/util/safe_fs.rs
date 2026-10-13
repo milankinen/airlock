@@ -6,6 +6,9 @@
 //! path that the guest selects. This module gives file access that prevents
 //! this.
 
+// The file sync uses this module with descriptors, not paths.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::ffi::{CString, OsStr};
 use std::fs::File;
 use std::io::{self, Read, Write};

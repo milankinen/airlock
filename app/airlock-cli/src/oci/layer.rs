@@ -4,12 +4,14 @@
 //! guest can then stack the cached layers directly to make the container
 //! root file system.
 
-use std::io::{BufReader, Read};
-use std::path::{Component, Path, PathBuf};
+use std::io::{self, BufReader, Read};
+use std::path::{Component, Path};
 
 use flate2::read::GzDecoder;
 use indicatif::ProgressBar;
 
+use crate::util::verified_path::VerifiedPath;
+use crate::util::{is_dir, vfs};
 use crate::{cache, messages};
 
 /// OCI whiteout marker prefix (an AUFS convention that OCI also uses).
@@ -30,8 +32,9 @@ static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 ///  - `key`: Versioned layer key
 ///
 /// Returns:
-///   Path `<key>.download.<pid>.<seq>.tmp` in `layers_root`.
-pub(super) fn download_tmp_path(layers_root: &Path, key: &str) -> PathBuf {
+///   Path `<key>.download.<pid>.<seq>.tmp` in `layers_root`, or error if
+///   the check of the path fails.
+pub(super) fn download_tmp_path(layers_root: &VerifiedPath, key: &str) -> io::Result<VerifiedPath> {
     // A unique name for each download. Otherwise two `airlock` processes
     // that pull the same uncached image both write one shared file and
     // corrupt the tarball. The rename to the shared `<key>.download` name
@@ -65,53 +68,45 @@ pub(super) fn download_tmp_path(layers_root: &Path, key: &str) -> PathBuf {
 /// Args:
 ///  - `data_dir`: Airlock data directory
 ///  - `digest`: Layer digest (`sha256:<hex>`)
-///  - `fetch`: Writes the tarball to the given path. Called only if no
-///    `<key>.download` exists
+///  - `fetch`: Writes the tarball to the given new file path. Called only
+///    if no `<key>.download` exists
 ///  - `progress`: Optional bar to show the extraction progress. Its length,
 ///    position and message are reset before the extraction.
 ///
 /// Returns:
 ///   Path of the extracted layer directory.
 pub fn ensure_layer_cached<F>(
-    data_dir: &Path,
+    data_dir: &VerifiedPath,
     digest: &str,
     fetch: F,
     progress: Option<&ProgressBar>,
-) -> anyhow::Result<PathBuf>
+) -> anyhow::Result<VerifiedPath>
 where
-    F: FnOnce(&Path) -> anyhow::Result<()>,
+    F: FnOnce(&VerifiedPath) -> anyhow::Result<()>,
 {
     let key = cache::layer_key(digest);
     let layer_dir = cache::layer_dir(data_dir, &key)?;
     // Fast path. The directory appears only with the atomic rename at the
     // end of the extraction, so if it exists, the layer is complete.
-    if layer_dir.is_dir() {
+    if is_dir(&layer_dir) {
         return Ok(layer_dir);
     }
 
-    let parent = layer_dir
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!(messages::oci::LAYER_DIR_NO_PARENT))?;
-    let dir_name = layer_dir
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!(messages::oci::LAYER_DIR_NO_FILE_NAME))?
-        .to_string_lossy()
-        .into_owned();
-
-    let download = parent.join(format!("{dir_name}.download"));
+    let parent = cache::layers_root(data_dir)?;
+    let download = parent.join(format!("{key}.download"))?;
 
     // If `<key>.download` exists (from a previous run, or from a caller
     // that staged it, like the docker path), skip `fetch` and extract.
-    if !download.exists() {
+    if vfs::symlink_metadata(&download).is_err() {
         // Also remove an old fixed-name tmp file that an older binary left.
-        let _ = std::fs::remove_file(parent.join(format!("{dir_name}.download.tmp")));
-        let download_tmp = download_tmp_path(parent, &dir_name);
+        let _ = vfs::remove_file(&parent.join(format!("{key}.download.tmp"))?);
+        let download_tmp = download_tmp_path(&parent, &key)?;
         fetch(&download_tmp)?;
-        std::fs::rename(&download_tmp, &download)?;
+        vfs::rename(&download_tmp, &download)?;
     }
 
-    extract_tarball_to_cache(&layer_dir, &download, progress)?;
-    let _ = std::fs::remove_file(&download);
+    extract_tarball_to_cache(&parent, &key, &download, progress)?;
+    let _ = vfs::remove_file(&download);
     if let Some(pb) = progress {
         pb.set_message(messages::oci::PROGRESS_READY);
     }
@@ -130,22 +125,17 @@ where
 ///    This makes the directory fully opaque (lower layers are hidden there).
 ///
 /// Args:
-///  - `layer_dir`: Final layer directory
+///  - `parent`: Root directory of the layer cache
+///  - `dir_name`: Name of the final layer directory in `parent`
 ///  - `tarball`: Layer tarball (gzip or plain tar)
 ///  - `progress`: Optional bar to show the extraction progress.
 fn extract_tarball_to_cache(
-    layer_dir: &Path,
-    tarball: &Path,
+    parent: &VerifiedPath,
+    dir_name: &str,
+    tarball: &VerifiedPath,
     progress: Option<&ProgressBar>,
 ) -> anyhow::Result<()> {
-    let parent = layer_dir
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!(messages::oci::LAYER_DIR_NO_PARENT))?;
-    let dir_name = layer_dir
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!(messages::oci::LAYER_DIR_NO_FILE_NAME))?
-        .to_string_lossy()
-        .into_owned();
+    let layer_dir = parent.join(dir_name)?;
     // Use a process-unique staging dir. Thus two `airlock` processes that
     // extract the same uncached layer never write into the same `.tmp` tree.
     // The final rename below is the commit point for all processes.
@@ -153,14 +143,14 @@ fn extract_tarball_to_cache(
         "{dir_name}.{}.{}.tmp",
         std::process::id(),
         TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp)?;
+    ))?;
+    let _ = vfs::remove_dir_all(&tmp);
+    vfs::create_dir_all(&tmp)?;
 
     // Layer blobs can be gzip-compressed (OCI spec, registry pulls) or plain
     // tar (`docker image save` with the classic driver). Use the magic bytes
     // to select the decoder.
-    let file = std::fs::File::open(tarball)?;
+    let file = vfs::open(tarball)?;
     let file: Box<dyn Read> = match progress {
         Some(pb) => {
             let total = file.metadata().map_or(0, |m| m.len());
@@ -201,11 +191,11 @@ fn extract_tarball_to_cache(
             let parent_rel = path.parent().unwrap_or_else(|| Path::new(""));
             if name == OPAQUE_WHITEOUT {
                 let dir = safe_join(&tmp, parent_rel)?;
-                std::fs::create_dir_all(&dir)?;
-                xattr::set(&dir, "user.overlay.opaque", b"y").map_err(|e| {
+                vfs::create_dir_all(&dir)?;
+                xattr::set(dir.to_path()?, "user.overlay.opaque", b"y").map_err(|e| {
                     anyhow::anyhow!(messages::oci::set_xattr_failed(
                         "user.overlay.opaque",
-                        dir.display(),
+                        &dir,
                         e
                     ))
                 })?;
@@ -217,15 +207,15 @@ fn extract_tarball_to_cache(
                     anyhow::bail!(messages::oci::unsafe_whiteout_name(path.display()));
                 }
                 let dir = safe_join(&tmp, parent_rel)?;
-                std::fs::create_dir_all(&dir)?;
-                let target = dir.join(target_name);
-                let _ = std::fs::remove_file(&target);
-                let _ = std::fs::remove_dir_all(&target);
-                std::fs::File::create(&target)?;
-                xattr::set(&target, "user.overlay.whiteout", b"y").map_err(|e| {
+                vfs::create_dir_all(&dir)?;
+                let target = dir.join(target_name)?;
+                let _ = vfs::remove_file(&target);
+                let _ = vfs::remove_dir_all(&target);
+                vfs::create_new(&target)?;
+                xattr::set(target.to_path()?, "user.overlay.whiteout", b"y").map_err(|e| {
                     anyhow::anyhow!(messages::oci::set_xattr_failed(
                         "user.overlay.whiteout",
-                        target.display(),
+                        &target,
                         e
                     ))
                 })?;
@@ -235,12 +225,13 @@ fn extract_tarball_to_cache(
                 // it, lookup still returns ENOENT, but directory listings
                 // show the "deleted" name as an empty file. Value "y" makes
                 // the full dir opaque. Do not overwrite a "y".
-                let opq = xattr::get(&dir, "user.overlay.opaque").ok().flatten();
+                let dir_path = dir.to_path()?;
+                let opq = xattr::get(dir_path, "user.overlay.opaque").ok().flatten();
                 if opq.as_deref() != Some(b"y") {
-                    xattr::set(&dir, "user.overlay.opaque", b"x").map_err(|e| {
+                    xattr::set(dir_path, "user.overlay.opaque", b"x").map_err(|e| {
                         anyhow::anyhow!(messages::oci::set_xattr_failed(
                             "user.overlay.opaque=x",
-                            dir.display(),
+                            &dir,
                             e
                         ))
                     })?;
@@ -252,7 +243,7 @@ fn extract_tarball_to_cache(
         // `unpack_in` resolves the entry path relative to the extraction
         // root. It also keeps hardlink targets in the root, so a hardlink
         // to an absolute host path cannot occur.
-        entry.unpack_in(&tmp)?;
+        entry.unpack_in(tmp.to_path()?)?;
     }
 
     // Commit with an atomic rename. If `<key>/` exists now, a concurrent
@@ -261,14 +252,14 @@ fn extract_tarball_to_cache(
     // process can still read it. The other process can also publish between
     // this check and the rename. The rename then fails with ENOTEMPTY.
     // Handle that case the same way.
-    if layer_dir.is_dir() {
-        let _ = std::fs::remove_dir_all(&tmp);
+    if is_dir(&layer_dir) {
+        let _ = vfs::remove_dir_all(&tmp);
         return Ok(());
     }
-    match std::fs::rename(&tmp, layer_dir) {
+    match vfs::rename(&tmp, &layer_dir) {
         Ok(()) => Ok(()),
-        Err(_) if layer_dir.is_dir() => {
-            let _ = std::fs::remove_dir_all(&tmp);
+        Err(_) if is_dir(&layer_dir) => {
+            let _ = vfs::remove_dir_all(&tmp);
             Ok(())
         }
         Err(e) => Err(e.into()),
@@ -291,22 +282,22 @@ fn extract_tarball_to_cache(
 ///
 /// Returns:
 ///   The joined path, or error if the path is not safe.
-fn safe_join(root: &Path, rel: &Path) -> anyhow::Result<PathBuf> {
+fn safe_join(root: &VerifiedPath, rel: &Path) -> anyhow::Result<VerifiedPath> {
     // Make the path again one component at a time from `root`. Accept only
     // `Normal` components (reject absolute prefixes and any `..`). Refuse
     // if an existing component on the path is a symlink. The extraction
     // loop has one thread, and only this function and `unpack_in` write
     // under `root`. Thus a symlink component can only come from an earlier
     // entry in the same layer.
-    let mut cur = root.to_path_buf();
+    let mut cur = root.clone();
     for comp in rel.components() {
         match comp {
             Component::Normal(c) => {
-                cur.push(c);
-                if let Ok(md) = std::fs::symlink_metadata(&cur)
+                cur = cur.join(c)?;
+                if let Ok(md) = vfs::symlink_metadata(&cur)
                     && md.file_type().is_symlink()
                 {
-                    anyhow::bail!(messages::oci::whiteout_traverses_symlink(cur.display()));
+                    anyhow::bail!(messages::oci::whiteout_traverses_symlink(&cur));
                 }
             }
             Component::CurDir => {}

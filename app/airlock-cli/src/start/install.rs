@@ -121,7 +121,11 @@ pub async fn install_tools(
     }
 
     if to_install.iter().any(|t| !state.is_installed(&t.pack)) {
-        let log = setup::log_path(&project.sandbox_dir);
+        let log = project
+            .sandbox_dir
+            .to_path()
+            .map(setup::log_path)
+            .unwrap_or_default();
         eprint!("{}\r\n", messages::start::full_log(log.display()));
         return Err(Exit::Code(1));
     }
@@ -139,7 +143,7 @@ pub async fn install_tools(
 
 /// Save `state` with the current disk and `image_id`.
 fn save_state(sandbox: &PinnedDir, image_id: &str, state: &mut InstallState) -> anyhow::Result<()> {
-    state.disk = project::disk_id(sandbox.path());
+    state.disk = project::disk_id(sandbox);
     state.image_id = Some(image_id.to_string());
     install_state::write(sandbox, state)
 }

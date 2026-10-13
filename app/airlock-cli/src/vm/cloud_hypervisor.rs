@@ -5,21 +5,20 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::io::OwnedFd;
-use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use tracing::{debug, error};
 
 use super::config::VmConfig;
 use crate::messages;
+use crate::util::{VerifiedPath, vfs};
 
 /// Linux VM backend that uses cloud-hypervisor and virtiofsd.
 pub struct CloudHypervisorBackend {
     ch_child: Option<Child>,
     virtiofsd_children: Vec<Child>,
-    vsock_socket_path: PathBuf,
-    runtime_dir: PathBuf,
+    vsock_socket_path: VerifiedPath,
+    runtime_dir: VerifiedPath,
 }
 
 impl CloudHypervisorBackend {
@@ -27,11 +26,11 @@ impl CloudHypervisorBackend {
     /// cloud-hypervisor with vsock support.
     pub fn start(config: &VmConfig) -> anyhow::Result<Self> {
         let runtime_dir = &config.runtime_dir;
-        let vfs_dir = runtime_dir.join("vfs");
-        std::fs::create_dir_all(&vfs_dir)?;
-        let vsock_socket_path = runtime_dir.join("vsock.sock");
+        let vfs_dir = runtime_dir.join("vfs")?;
+        vfs::create_dir_all(&vfs_dir)?;
+        let vsock_socket_path = runtime_dir.join("vsock.sock")?;
 
-        cleanup_sockets(runtime_dir, &vfs_dir);
+        cleanup_sockets(runtime_dir);
 
         let host_uid = unsafe { libc::getuid() };
         let host_gid = unsafe { libc::getgid() };
@@ -45,11 +44,11 @@ impl CloudHypervisorBackend {
             // names keep the socket paths in the Unix socket limit. The last
             // parts of the tags are unique.
             let sock_name = share.tag.rsplit('/').next().unwrap_or(&share.tag);
-            let sock_path = vfs_dir.join(format!("{sock_name}.sock"));
-            let _ = std::fs::remove_file(&sock_path);
+            let sock_path = vfs_dir.join(format!("{sock_name}.sock"))?;
+            let _ = vfs::remove_file(&sock_path);
 
             let mut cmd = Command::new(&config.virtiofsd);
-            cmd.arg("--socket-path").arg(&sock_path);
+            cmd.arg("--socket-path").arg(sock_path.to_path()?);
             cmd.arg("--shared-dir").arg(&share.host_path);
             cmd.arg("--xattr");
             cmd.arg("--sandbox").arg("none");
@@ -78,7 +77,7 @@ impl CloudHypervisorBackend {
             fs_args.push(format!(
                 "tag={},socket={},num_queues=1,queue_size=1024",
                 share.tag,
-                sock_path.display()
+                sock_path.to_path()?.display()
             ));
         }
 
@@ -97,13 +96,19 @@ impl CloudHypervisorBackend {
         cmd.arg("--cpus").arg(cpus_arg);
         cmd.arg("--memory")
             .arg(format!("size={ram_mib}M,shared=on"));
-        let serial_log = config.runtime_dir.join("serial.log");
+        let serial_log = runtime_dir.join("serial.log")?;
+        // Cloud Hypervisor opens the file. Remove a symlink that the guest
+        // put there, so that the open makes a new file.
+        remove_old(&serial_log)?;
         cmd.arg("--console").arg("off");
         cmd.arg("--serial")
-            .arg(format!("file={}", serial_log.display()));
-        cmd.arg("--vsock")
-            .arg(format!("cid=3,socket={}", vsock_socket_path.display()));
-        cmd.arg("--api-socket").arg(runtime_dir.join("ch-api.sock"));
+            .arg(format!("file={}", serial_log.to_path()?.display()));
+        cmd.arg("--vsock").arg(format!(
+            "cid=3,socket={}",
+            vsock_socket_path.to_path()?.display()
+        ));
+        cmd.arg("--api-socket")
+            .arg(runtime_dir.join("ch-api.sock")?.to_path()?);
 
         // VirtioFS shares (each uses a virtiofsd socket).
         if !fs_args.is_empty() {
@@ -119,8 +124,9 @@ impl CloudHypervisorBackend {
                 .arg(format!("path={},image_type=raw", cache_disk.display()));
         }
 
-        let ch_log = config.runtime_dir.join("cloud-hypervisor.log");
-        let log_file = std::fs::File::create(&ch_log)?;
+        let ch_log = runtime_dir.join("cloud-hypervisor.log")?;
+        remove_old(&ch_log)?;
+        let log_file = vfs::create_new(&ch_log)?;
         let log_file_err = log_file.try_clone()?;
 
         cmd.stdin(Stdio::null());
@@ -147,9 +153,9 @@ impl CloudHypervisorBackend {
     /// Returns:
     ///   The connected socket, or error if the `CONNECT` handshake fails.
     pub fn vsock_connect(&self, port: u32) -> anyhow::Result<OwnedFd> {
-        let mut stream = UnixStream::connect(&self.vsock_socket_path).map_err(|e| {
+        let mut stream = vfs::connect_unix(&self.vsock_socket_path).map_err(|e| {
             anyhow::anyhow!(messages::vm::vsock_socket_connect_failed(
-                self.vsock_socket_path.display(),
+                &self.vsock_socket_path,
                 e
             ))
         })?;
@@ -186,7 +192,7 @@ impl CloudHypervisorBackend {
                 result = reaped;
             }
         }
-        cleanup_sockets(&self.runtime_dir, &self.runtime_dir.join("vfs"));
+        cleanup_sockets(&self.runtime_dir);
         result
     }
 }
@@ -241,17 +247,25 @@ fn tie_to_airlock(cmd: &mut Command) {
     }
 }
 
-/// Path of the per-port vsock socket (`<base>_<port>`).
-fn vsock_port_path(base: &Path, port: u32) -> PathBuf {
-    let mut path = base.as_os_str().to_owned();
-    path.push(format!("_{port}"));
-    PathBuf::from(path)
+/// Remove the old entry at `path`, if any. Never follows a symlink.
+/// A directory is removed too, so a planted directory cannot block a start.
+fn remove_old(path: &VerifiedPath) -> std::io::Result<()> {
+    let is_dir = vfs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
+    let result = if is_dir {
+        vfs::remove_dir_all(path)
+    } else {
+        vfs::remove_file(path)
+    };
+    match result {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
 }
 
 /// Wait up to 5 s until the virtiofsd socket at `path` exists.
-fn wait_for_socket(path: &Path, tag: &str) -> anyhow::Result<()> {
+fn wait_for_socket(path: &VerifiedPath, tag: &str) -> anyhow::Result<()> {
     for _ in 0..100 {
-        if path.exists() {
+        if vfs::metadata(path).is_ok() {
             debug!("virtiofsd socket ready: {tag}");
             return Ok(());
         }
@@ -279,24 +293,27 @@ fn spawn_stderr_drain(tag: &str, child: &mut Child) {
     }
 }
 
-/// Remove the cloud-hypervisor, vsock and virtiofsd sockets.
-fn cleanup_sockets(dir: &Path, vfs_dir: &Path) {
-    let patterns = ["vsock.sock", "ch-api.sock"];
-    for pat in &patterns {
-        let _ = std::fs::remove_file(dir.join(pat));
+/// Remove the cloud-hypervisor, vsock and virtiofsd sockets in the runtime
+/// directory `dir`.
+fn cleanup_sockets(dir: &VerifiedPath) {
+    // `vsock.sock_<port>` is the socket of the supervisor port.
+    let supervisor = format!("vsock.sock_{}", airlock_common::SUPERVISOR_PORT);
+    for name in ["vsock.sock", "ch-api.sock", supervisor.as_str()] {
+        if let Ok(path) = dir.join(name) {
+            let _ = vfs::remove_file(&path);
+        }
     }
-    // Remove the `vsock.sock_<port>` file of the supervisor port.
-    let _ = std::fs::remove_file(vsock_port_path(
-        &dir.join("vsock.sock"),
-        airlock_common::SUPERVISOR_PORT,
-    ));
-    // Remove the virtiofsd sockets.
-    if let Ok(entries) = std::fs::read_dir(vfs_dir) {
+    // Remove the virtiofsd sockets. A `vfs` symlink is refused.
+    let Ok(vfs_dir) = dir.join("vfs") else {
+        return;
+    };
+    if let Ok(entries) = vfs::read_dir(&vfs_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.ends_with(".sock") {
-                let _ = std::fs::remove_file(entry.path());
+            if name.to_string_lossy().ends_with(".sock")
+                && let Ok(path) = vfs_dir.join(&name)
+            {
+                let _ = vfs::remove_file(&path);
             }
         }
     }
@@ -307,6 +324,49 @@ mod tests {
     //! Tests for the start of VM helper processes.
 
     use super::*;
+    use crate::test_cfg::temp_dir;
+    use crate::util::Roots;
+
+    /// Test that the VM start does not follow symlinks at the log files in
+    /// the runtime dir. The guest can put them in a sandbox in the project
+    /// to make the host write a host file.
+    ///   1. Put symlinks to a host file at the serial and hypervisor logs
+    ///   2. Start the backend with a hypervisor that exits at once
+    ///   3. Check that the host file did not change and the logs are not
+    ///      symlinks
+    #[test]
+    fn vm_start_does_not_follow_planted_log_links() {
+        let tmp = temp_dir();
+        let root = tmp.path();
+        let victim = root.join("victim");
+        std::fs::write(&victim, b"data").unwrap();
+        let runtime = root.join("sandbox");
+        std::fs::create_dir(&runtime).unwrap();
+        for name in ["serial.log", "cloud-hypervisor.log"] {
+            std::os::unix::fs::symlink(&victim, runtime.join(name)).unwrap();
+        }
+        let roots = Roots::resolve(root, root, root).unwrap();
+        let config = VmConfig {
+            cpus: 1,
+            memory_bytes: 1 << 20,
+            kernel: "Image".into(),
+            initramfs: "initramfs.gz".into(),
+            kernel_cmdline: String::new(),
+            shares: Vec::new(),
+            cache_disk: None,
+            runtime_dir: VerifiedPath::new(&runtime, &roots).unwrap(),
+            cloud_hypervisor: "true".into(),
+            virtiofsd: "true".into(),
+            kvm: false,
+        };
+
+        drop(CloudHypervisorBackend::start(&config).unwrap());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"data");
+        for name in ["serial.log", "cloud-hypervisor.log"] {
+            let md = std::fs::symlink_metadata(runtime.join(name));
+            assert!(!md.is_ok_and(|m| m.file_type().is_symlink()), "{name}");
+        }
+    }
 
     /// Test that a process tied to airlock leads its own process group, so
     /// that a Ctrl+C of the terminal goes only to airlock.

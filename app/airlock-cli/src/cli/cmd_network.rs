@@ -75,9 +75,7 @@ pub async fn main(args: NetworkArgs, context: &Context) -> anyhow::Result<i32> {
     let NetworkCommand::Forward(args) = args.command;
     // Check the arguments before the connection to the sandbox.
     check_duplicates(args.mode, &args.forwards)?;
-    let cwd = std::env::current_dir()
-        .map_err(|e| anyhow::anyhow!(messages::cli::cannot_determine_cwd(e)))?;
-    let client = SandboxClient::connect(context, &cwd, args.follow_git_worktree).await?;
+    let client = SandboxClient::connect(context, args.follow_git_worktree).await?;
     forward(
         client,
         args.mode,

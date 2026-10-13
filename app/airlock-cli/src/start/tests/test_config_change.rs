@@ -56,7 +56,7 @@ fn sandbox_without_config_copy_starts_and_gets_copy() {
 
     project.start(CHANGED, false).unwrap();
     assert!(
-        read_run_meta(&project.sandbox_dir())
+        read_run_meta(&project.sandbox().unwrap().dir)
             .last_run_config
             .is_some()
     );

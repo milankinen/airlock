@@ -25,7 +25,6 @@ pub(crate) mod tls;
 mod traffic;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,6 +41,7 @@ use crate::network::target::{
     InjectTarget, InjectedSecret, MiddlewareTarget, NetworkTarget, ResolvedTarget,
 };
 use crate::project::Project;
+use crate::util::VerifiedPath;
 
 const NETWORK_EVENTS_BUFFER: usize = 10;
 
@@ -98,19 +98,17 @@ impl Network {
 
         let (events, _) = broadcast::channel(NETWORK_EVENTS_BUFFER);
 
-        let socket_map: HashMap<String, PathBuf> = net
-            .sockets
-            .values()
-            .filter(|s| s.enabled)
-            .map(|s| {
-                let guest =
-                    crate::util::expand_tilde(&s.host.target, std::path::Path::new(container_home))
-                        .to_string_lossy()
-                        .into_owned();
-                let host = project.expand_host_tilde(&s.host.source);
-                (guest, host)
-            })
-            .collect();
+        // Resolve the host socket paths one time, at the start. The user
+        // picks them, so their symlinks are followed.
+        let mut socket_map = HashMap::new();
+        for s in net.sockets.values().filter(|s| s.enabled) {
+            let guest =
+                crate::util::expand_tilde(&s.host.target, std::path::Path::new(container_home))
+                    .to_string_lossy()
+                    .into_owned();
+            let host = VerifiedPath::new_follow(project.expand_host_tilde(&s.host.source), None)?;
+            socket_map.insert(guest, host);
+        }
 
         tracing::debug!(
             "network: {} allow, {} deny, {} passthrough, {} middleware, {} inject targets, \
@@ -363,7 +361,7 @@ pub struct Network {
     pub(crate) port_forwards: HashMap<u16, u16>,
     /// Map from guest socket path to host socket path, for Unix socket
     /// forwarding.
-    pub(crate) socket_map: HashMap<String, PathBuf>,
+    pub(crate) socket_map: HashMap<String, VerifiedPath>,
     /// Sender of network events for subscribers.
     // TODO: this NetworkEvent should be Network event agnostic to any TUI
     pub(crate) events: broadcast::Sender<airlock_monitor::NetworkEvent>,

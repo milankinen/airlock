@@ -4,12 +4,12 @@
 //! disk. The disk keeps all changes that the sandbox makes to the container
 //! file system, and the contents of the named caches.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::cli::prompt::PromptError;
 use crate::cli::prompt::choose::{Choice, Choose};
 use crate::config::config_values::Disk;
+use crate::util::{PinnedDir, VerifiedPath, vfs};
 use crate::{cli, messages};
 
 /// Default disk size (10 GB) for the overlay upper layer and cache dirs.
@@ -20,6 +20,13 @@ pub const DISK_FILE: &str = "disk.img";
 /// The identity file of the disk image, next to the image. Contains a random
 /// id that changes with each new image ([`read_id`]).
 pub const DISK_ID_FILE: &str = "disk.id";
+
+/// Size limit of the identity file. The guest can write a sandbox in the
+/// project.
+const DISK_ID_CAP: u64 = 64;
+
+/// Permission bits of the disk image and its identity file.
+const DISK_MODE: u32 = 0o600;
 
 /// Named cache entry: `(name, enabled, expanded_container_paths)`.
 pub type CacheEntry = (String, bool, Vec<String>);
@@ -32,9 +39,7 @@ pub type CacheEntry = (String, bool, Vec<String>);
 ///  - `config`: Disk config
 ///  - `copied`: True if the disk image is a new copy of a template disk.
 ///    Then a line tells about the copy and its size.
-pub fn ensure(cache_dir: &Path, config: &Disk, copied: bool) -> anyhow::Result<()> {
-    let image_path = cache_dir.join(DISK_FILE);
-
+pub fn ensure(cache_dir: &PinnedDir, config: &Disk, copied: bool) -> anyhow::Result<()> {
     let bytes = (config.size.0 + 511) & !511;
     let bytes = if bytes > 0 {
         bytes
@@ -42,8 +47,10 @@ pub fn ensure(cache_dir: &Path, config: &Disk, copied: bool) -> anyhow::Result<(
         (DEFAULT_DISK_BYTES + 511) & !511
     };
 
-    if image_path.exists() {
-        let current_size = fs::metadata(&image_path)?.len();
+    if cache_dir.ino(DISK_FILE).is_some() {
+        // The open refuses a symlink and a file that is not regular.
+        let image = cache_dir.open_read_write(DISK_FILE, DISK_MODE)?;
+        let current_size = image.metadata()?.len();
         if current_size > bytes {
             // The disk holds the overlay upper layer (all sandbox writes) and
             // the named caches. A smaller disk destroys this data, so do it
@@ -51,8 +58,8 @@ pub fn ensure(cache_dir: &Path, config: &Disk, copied: bool) -> anyhow::Result<(
             // smaller size. If the user declines or there is no TTY, keep the
             // larger disk.
             if prompt_shrink_disk(current_size, bytes)? {
-                fs::remove_file(&image_path)?;
-                create_sparse(&image_path, bytes)?;
+                drop(image);
+                create_sparse(cache_dir, bytes)?;
                 cli::log!(
                     "  {} {}",
                     cli::check(),
@@ -71,7 +78,7 @@ pub fn ensure(cache_dir: &Path, config: &Disk, copied: bool) -> anyhow::Result<(
         } else {
             let grown = current_size < bytes;
             if grown {
-                grow_sparse(&image_path, bytes)?;
+                image.set_len(bytes)?;
             }
             // For a template copy, one line tells about the copy and the
             // final size.
@@ -94,7 +101,7 @@ pub fn ensure(cache_dir: &Path, config: &Disk, copied: bool) -> anyhow::Result<(
             write_id(cache_dir)?;
         }
     } else {
-        create_sparse(&image_path, bytes)?;
+        create_sparse(cache_dir, bytes)?;
         cli::log!(
             "  {} {}",
             cli::check(),
@@ -116,14 +123,18 @@ pub fn ensure(cache_dir: &Path, config: &Disk, copied: bool) -> anyhow::Result<(
 /// Returns:
 ///   The disk image path and all cache entries (enabled and disabled).
 pub fn prepare(
-    cache_dir: &Path,
+    cache_dir: &VerifiedPath,
     config: &Disk,
     container_home: &str,
     cwd: &Path,
-) -> anyhow::Result<(PathBuf, Vec<CacheEntry>)> {
-    let image_path = cache_dir.join(DISK_FILE);
-    if !image_path.exists() {
-        ensure(cache_dir, config, false)?;
+) -> anyhow::Result<(VerifiedPath, Vec<CacheEntry>)> {
+    let image_path = cache_dir.join(DISK_FILE)?;
+    match vfs::metadata(&image_path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            ensure(&PinnedDir::pin(cache_dir.to_path()?)?, config, false)?;
+        }
+        Err(e) => return Err(e.into()),
     }
 
     let container_home = PathBuf::from(container_home);
@@ -196,13 +207,14 @@ fn prompt_shrink_disk(current: u64, target: u64) -> anyhow::Result<bool> {
     }
 }
 
-/// Create a new disk image and give it a new identity. The old identity is
-/// removed first, so a crash never leaves the new image with the old
-/// identity.
-fn create_sparse(path: &Path, size: u64) -> anyhow::Result<()> {
-    let dir = path.parent().unwrap_or(Path::new("."));
+/// Create a new disk image in `dir` and give it a new identity. The old
+/// identity is removed first, so a crash never leaves the new image with
+/// the old identity.
+fn create_sparse(dir: &PinnedDir, size: u64) -> anyhow::Result<()> {
     remove_id(dir)?;
-    let file = fs::File::create(path)?;
+    // Remove the old image, so that the open makes a new empty file.
+    dir.remove(DISK_FILE)?;
+    let file = dir.open_read_write(DISK_FILE, DISK_MODE)?;
     file.set_len(size)?;
     write_id(dir)
 }
@@ -214,12 +226,10 @@ fn create_sparse(path: &Path, size: u64) -> anyhow::Result<()> {
 /// old one, also if it has the same inode.
 /// Returns:
 ///   The identity, or `None` if there is no image or no valid identity file.
-pub fn read_id(dir: &Path) -> Option<(u64, u64)> {
-    if !dir.join(DISK_FILE).is_file() {
-        return None;
-    }
-    let text = fs::read_to_string(dir.join(DISK_ID_FILE)).ok()?;
-    parse_id(text.trim())
+pub fn read_id(dir: &PinnedDir) -> Option<(u64, u64)> {
+    dir.ino(DISK_FILE)?;
+    let bytes = dir.read(DISK_ID_FILE, DISK_ID_CAP).ok()??;
+    parse_id(std::str::from_utf8(&bytes).ok()?.trim())
 }
 
 /// Parse a 32-digit hex identity into two `u64` halves.
@@ -232,30 +242,46 @@ fn parse_id(text: &str) -> Option<(u64, u64)> {
 }
 
 /// Write a new random identity for the disk image in `dir`.
-pub(crate) fn write_id(dir: &Path) -> anyhow::Result<()> {
+pub(crate) fn write_id(dir: &PinnedDir) -> anyhow::Result<()> {
     use rand::TryRng;
     let mut bytes = [0u8; 16];
     rand::rngs::SysRng
         .try_fill_bytes(&mut bytes)
         .map_err(|e| anyhow::anyhow!(messages::vm::disk_random_id_failed(e)))?;
-    fs::write(
-        dir.join(DISK_ID_FILE),
-        format!("{:032x}\n", u128::from_be_bytes(bytes)),
-    )?;
+    let text = format!("{:032x}\n", u128::from_be_bytes(bytes));
+    dir.write_atomic(DISK_ID_FILE, text.as_bytes(), DISK_MODE)?;
     Ok(())
 }
 
 /// Remove the identity file in `dir`, if any.
-fn remove_id(dir: &Path) -> std::io::Result<()> {
-    match fs::remove_file(dir.join(DISK_ID_FILE)) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-        _ => Ok(()),
-    }
+fn remove_id(dir: &PinnedDir) -> std::io::Result<()> {
+    dir.remove(DISK_ID_FILE).map(|_| ())
 }
 
-/// Grow an existing sparse file to a larger size.
-fn grow_sparse(path: &Path, size: u64) -> anyhow::Result<()> {
-    let file = fs::OpenOptions::new().write(true).open(path)?;
-    file.set_len(size)?;
-    Ok(())
+#[cfg(test)]
+mod tests {
+    //! Tests for the symlink safety of the sandbox disk.
+
+    use super::*;
+    use crate::test_cfg::{resolve_project_toml, temp_dir};
+
+    /// Test that the disk setup does not follow a symlink at the disk image.
+    /// The guest can put one in a sandbox in the project to make the host
+    /// change the size of a host file.
+    ///   1. Put a symlink to a host file at the disk image name
+    ///   2. Make the disk
+    ///   3. Check that it fails and the host file did not change
+    #[test]
+    fn disk_setup_does_not_follow_planted_link() {
+        let tmp = temp_dir();
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, b"data").unwrap();
+        let sandbox = tmp.path().join("sandbox");
+        std::fs::create_dir(&sandbox).unwrap();
+        std::os::unix::fs::symlink(&victim, sandbox.join(DISK_FILE)).unwrap();
+        let config = resolve_project_toml("").unwrap().values.disk;
+
+        ensure(&PinnedDir::pin(&sandbox).unwrap(), &config, false).unwrap_err();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"data");
+    }
 }

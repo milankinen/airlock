@@ -8,16 +8,23 @@ mod test_image_user;
 mod test_layer_cache;
 mod test_os_release;
 
+use std::path::{Path, PathBuf};
+
 use super::*;
-use crate::test_cfg::oci::LayerTar;
+use crate::test_cfg::oci::{LayerTar, verified_dir};
+
+/// The real path of `path`, for fixture setup and checks.
+fn real(path: &VerifiedPath) -> PathBuf {
+    path.to_path().unwrap().to_path_buf()
+}
 
 /// Extract `tar` into the layer cache as the layer `digest`, the way a
 /// registry pull does, and return its layer key.
-fn cache_layer(data_dir: &Path, digest: &str, tar: &[u8]) -> String {
+fn cache_layer(data_dir: &VerifiedPath, digest: &str, tar: &[u8]) -> String {
     layer::ensure_layer_cached(
         data_dir,
         digest,
-        |dest| Ok(std::fs::write(dest, tar)?),
+        |dest| Ok(std::fs::write(dest.to_path()?, tar)?),
         None,
     )
     .unwrap();
@@ -28,7 +35,7 @@ fn cache_layer(data_dir: &Path, digest: &str, tar: &[u8]) -> String {
 /// normal user (`node`, uid 1000), as images such as `node` have.
 /// Returns:
 ///   The layer key.
-fn passwd_layer(data_dir: &Path, digest: &str) -> String {
+fn passwd_layer(data_dir: &VerifiedPath, digest: &str) -> String {
     cache_layer(
         data_dir,
         digest,

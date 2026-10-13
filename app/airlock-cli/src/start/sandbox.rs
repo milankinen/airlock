@@ -246,10 +246,14 @@ pub async fn ensure_sandbox(
     let lock =
         super::location::lock_sandbox(context, host_cwd, answering.can_prompt, answering.yes)
             .await?;
-    let sandbox_dir = PinnedDir::pin(lock.dir()).map_err(anyhow::Error::from)?;
+    let sandbox_dir = lock
+        .dir()
+        .to_path()
+        .and_then(PinnedDir::pin)
+        .map_err(anyhow::Error::from)?;
     // The config question comes before all other sandbox questions.
     let checked = config_change::check(&CheckInput {
-        sandbox_dir: sandbox_dir.path(),
+        sandbox_dir: lock.dir(),
         resolved: &resolved,
         data_dir: &context.data_dir,
         packs,
@@ -269,11 +273,11 @@ pub async fn ensure_sandbox(
     // A sandbox from a template starts with a copy of the template disk.
     // It still counts as a new disk: the tools that the template does not
     // have install without a question.
-    let new_disk = !project::has_disk(sandbox_dir.path());
+    let new_disk = !project::has_disk(lock.dir());
     let mut seeded = SeedGuard(None);
     if new_disk && let Some(template) = template {
-        templates::seed::seed(template, &sandbox_dir)?;
-        seeded.0 = Some(sandbox_dir.path().to_path_buf());
+        templates::seed::seed(template, &sandbox_dir, lock.dir())?;
+        seeded.0 = Some(lock.dir().clone());
     }
     let mut state = read_state(&sandbox_dir, answering.can_prompt)?;
     let candidates = install::install_candidates(&resolved.packs);
@@ -288,7 +292,7 @@ pub async fn ensure_sandbox(
         plan::decide(&DecideInput {
             state,
             wanted: &wanted,
-            disk: project::disk_id(sandbox_dir.path()),
+            disk: project::disk_id(&sandbox_dir),
             image_id,
         })
     };
@@ -301,10 +305,10 @@ pub async fn ensure_sandbox(
     }
 
     let values = &resolved.values;
-    sandbox::report::print_preparing(sandbox_dir.path(), &values.vm.image.name);
+    sandbox::report::print_preparing(lock.dir(), &values.vm.image.name);
     let prepared = prepare_image(
-        &context.data_dir,
-        sandbox_dir.path(),
+        &context.roots.data_dir,
+        lock.dir(),
         &values.vm.image,
         vault,
         on_image_change(new_disk, answering),
@@ -347,13 +351,13 @@ pub async fn ensure_sandbox(
     // Check the image before a tool question answer removes the disk, or
     // before anything installs.
     if !candidates.is_empty() && (recreate || !plan.pending.is_empty()) {
-        check_image(&context.data_dir, &image).map_err(|e| Exit::error(2, e))?;
+        check_image(&context.roots.data_dir, &image).map_err(|e| Exit::error(2, e))?;
     }
     if recreate {
         project::reset_disk(&sandbox_dir)?;
         plan = decide(&state, Some(&image.image_id));
     }
-    project::ensure_disk(sandbox_dir.path(), &values.disk, seeded.0.is_some())?;
+    project::ensure_disk(&sandbox_dir, &values.disk, seeded.0.is_some())?;
     let to_install: Vec<InstallerScript> = candidates
         .into_iter()
         .filter(|t| plan.pending.iter().any(|p| p.id == t.pack))
@@ -362,7 +366,7 @@ pub async fn ensure_sandbox(
     // next run asks about the config changes again. The config of the last
     // run is not saved, so the next run also asks again.
     if save_config {
-        config_change::save(sandbox_dir.path(), config)?;
+        config_change::save(lock.dir(), config)?;
     }
     let transitions = std::mem::take(&mut plan.transitions);
     let installs = InstallDecision::save(
@@ -385,7 +389,7 @@ pub async fn ensure_sandbox(
 /// succeeds. On drop, it removes the copy (see [`templates::seed::unseed`]).
 /// Thus after a failed first start, the next start sees a new sandbox, and
 /// the setup wizard runs again.
-struct SeedGuard(Option<std::path::PathBuf>);
+struct SeedGuard(Option<crate::util::VerifiedPath>);
 
 impl SeedGuard {
     /// Keep the copy: the sandbox is ready.

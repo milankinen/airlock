@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use crate::packs::ArgValue;
 use crate::project;
 use crate::templates::Template;
+use crate::util::{VerifiedPath, vfs};
 
 /// Location of a new project config file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,22 +117,42 @@ impl GeneratedConfig {
     /// Returns:
     ///   The path of the written file.
     pub fn save(&self, local_dir: &Path) -> anyhow::Result<PathBuf> {
-        let path = match self.target {
-            Target::Project => self.path.clone(),
+        let no_project = || {
+            anyhow::anyhow!(crate::messages::config::no_project_directory(
+                local_dir.display()
+            ))
+        };
+        // The project dir is a trusted base, but the guest can write in it.
+        // Thus no link is followed below it.
+        let (path, file) = match self.target {
+            Target::Project => {
+                let host_cwd = self.path.parent().ok_or_else(no_project)?;
+                let dir = VerifiedPath::new_follow(host_cwd, None)?;
+                (self.path.clone(), dir.join(Target::Project.file())?)
+            }
             Target::Local => {
+                let path = local_dir.join("airlock.toml");
                 let in_project = self.path.parent() == Some(local_dir);
-                if in_project {
-                    let host_cwd = local_dir.parent().ok_or_else(|| {
-                        anyhow::anyhow!(crate::messages::config::no_project_directory(
-                            local_dir.display()
-                        ))
-                    })?;
+                let file = if in_project {
+                    let host_cwd = local_dir.parent().ok_or_else(no_project)?;
                     project::ensure_cache_dir(host_cwd)?;
-                }
-                local_dir.join("airlock.toml")
+                    VerifiedPath::new_follow(host_cwd, None)?.join(Target::Local.file())?
+                } else {
+                    // A sandbox in the data directory. The project dir is
+                    // the parent of `.airlock` in `self.path`.
+                    let host_cwd = self
+                        .path
+                        .parent()
+                        .and_then(Path::parent)
+                        .ok_or_else(no_project)?;
+                    let project_dir = VerifiedPath::new_follow(host_cwd, None)?;
+                    crate::config::files::sandbox_local_dir(local_dir, &project_dir)?
+                        .join("airlock.toml")?
+                };
+                (path, file)
             }
         };
-        create_new(&path, &self.toml).map_err(|e| match e.kind() {
+        create_new(&file, &self.toml).map_err(|e| match e.kind() {
             std::io::ErrorKind::AlreadyExists => anyhow::anyhow!(
                 crate::messages::config::config_appeared_during_setup(path.display())
             ),
@@ -223,11 +244,10 @@ fn toml_value(value: &ArgValue) -> toml_edit::Value {
     }
 }
 
-/// Create the file `path` with `content`. An existing file is an error.
-fn create_new(path: &Path, content: &str) -> std::io::Result<()> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?
-        .write_all(content.as_bytes())
+/// Create the file `path` with `content`. An existing file or symlink is
+/// an error.
+fn create_new(path: &VerifiedPath, content: &str) -> std::io::Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    vfs::open_with(path, &opts)?.write_all(content.as_bytes())
 }

@@ -64,7 +64,7 @@ fn summary(mounts: &[ResolvedMount]) -> Vec<(String, PathBuf, String, bool, bool
         .map(|m| {
             (
                 m.key().to_string(),
-                m.source.clone(),
+                m.source.to_path().unwrap().to_path_buf(),
                 m.target.clone(),
                 m.read_only,
                 matches!(m.mount_type, MountType::Dir { .. }),
@@ -270,4 +270,22 @@ fn missing_mount_source_is_created_on_request() {
         )
         .unwrap_err();
     assert!(err.to_string().contains("invalid octal mode"), "{err}");
+}
+
+/// Test that `create-file` does not follow a dangling symlink at the mount
+/// source. The sandbox can put such a link in the project to make the host
+/// write a file at a place that the sandbox picks.
+///   1. Put a dangling link in the project that points to a missing file
+///      outside the project
+///   2. Resolve a `create-file` mount of the link
+///   3. Check that it fails and the file outside does not exist
+#[test]
+fn create_file_mount_source_does_not_follow_dangling_link() {
+    let host = Host::new();
+    let victim = host.home.join(".bashrc");
+    std::os::unix::fs::symlink(&victim, host.project.join("planted")).unwrap();
+
+    host.resolve("[mounts.x]\nsource = \"planted\"\ntarget = \"/x\"\nmissing = \"create-file\"\n")
+        .unwrap_err();
+    assert!(!victim.exists());
 }

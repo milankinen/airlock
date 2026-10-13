@@ -10,6 +10,8 @@ use std::path::PathBuf;
 #[cfg(not(test))]
 use crate::messages;
 use crate::project::Project;
+#[cfg(any(not(test), not(feature = "distroless")))]
+use crate::util::{VerifiedPath, vfs};
 
 /// Paths to the extracted VM boot assets.
 pub struct Assets {
@@ -39,8 +41,8 @@ impl Assets {
     pub fn init(project: &Project) -> anyhow::Result<Assets> {
         const CHECKSUM: &str = env!("AIRLOCK_ASSETS_CHECKSUM");
 
-        let dir = project.context.data_dir.join("vm");
-        std::fs::create_dir_all(&dir)?;
+        let dir = project.context.roots.data_dir.join("vm")?;
+        vfs::create_dir_all(&dir)?;
 
         // Serialize the checksum check and extraction across processes. Take
         // a blocking exclusive lock before the checksum read. Then two
@@ -48,10 +50,10 @@ impl Assets {
         // write the boot assets. Also, the hypervisor never memory-maps a
         // file while another process writes it. The lock releases when
         // `_lock` drops.
-        let _lock = acquire_extract_lock(&dir.join("lock"))?;
+        let _lock = acquire_extract_lock(&dir.join("lock")?)?;
 
-        let checksum_file = dir.join("checksum");
-        let cached_checksum = std::fs::read_to_string(&checksum_file).unwrap_or_default();
+        let checksum_file = dir.join("checksum")?;
+        let cached_checksum = vfs::read_to_string(&checksum_file).unwrap_or_default();
         if cached_checksum.trim() != CHECKSUM {
             #[cfg(not(feature = "distroless"))]
             {
@@ -81,16 +83,16 @@ impl Assets {
                 )?;
             }
 
-            std::fs::write(&checksum_file, CHECKSUM)?;
+            vfs::write(&checksum_file, CHECKSUM)?;
         }
 
         #[cfg(not(feature = "distroless"))]
-        let bundled_kernel = Some(dir.join("Image"));
+        let bundled_kernel = Some(dir.join("Image")?);
         #[cfg(feature = "distroless")]
         let bundled_kernel = None;
 
         #[cfg(not(feature = "distroless"))]
-        let bundled_initramfs = Some(dir.join("initramfs.gz"));
+        let bundled_initramfs = Some(dir.join("initramfs.gz")?);
         #[cfg(feature = "distroless")]
         let bundled_initramfs = None;
 
@@ -111,9 +113,9 @@ impl Assets {
             kernel,
             initramfs,
             #[cfg(target_os = "linux")]
-            cloud_hypervisor: dir.join("cloud-hypervisor"),
+            cloud_hypervisor: dir.join("cloud-hypervisor")?.to_path()?.to_path_buf(),
             #[cfg(target_os = "linux")]
-            virtiofsd: dir.join("virtiofsd"),
+            virtiofsd: dir.join("virtiofsd")?.to_path()?.to_path_buf(),
         })
     }
 
@@ -127,13 +129,29 @@ impl Assets {
 /// Write an executable to `dir/name` through a temp file and rename. This
 /// prevents ETXTBSY if the old executable still runs.
 #[cfg(all(target_os = "linux", not(test)))]
-fn write_executable(dir: &std::path::Path, name: &str, data: &[u8]) -> anyhow::Result<()> {
+fn write_executable(dir: &VerifiedPath, name: &str, data: &[u8]) -> anyhow::Result<()> {
+    let tmp = dir.join(format!(".{name}.tmp"))?;
+    write_new(&tmp, data, 0o755)?;
+    vfs::rename(&tmp, &dir.join(name)?)?;
+    Ok(())
+}
+
+/// Write `data` to the new file `path` with the permission bits `mode`.
+/// Removes an old file at `path` first. The create never follows a
+/// symlink at `path`.
+#[cfg(any(all(target_os = "linux", not(test)), not(feature = "distroless")))]
+fn write_new(path: &VerifiedPath, data: &[u8], mode: u32) -> anyhow::Result<()> {
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
-    let tmp = dir.join(format!(".{name}.tmp"));
-    std::fs::write(&tmp, data)?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
-    std::fs::rename(&tmp, dir.join(name))?;
+    // A temp file from a crashed run can remain.
+    match vfs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
+    let mut file = vfs::create_new(path)?;
+    file.write_all(data)?;
+    file.set_permissions(std::fs::Permissions::from_mode(mode))?;
     Ok(())
 }
 
@@ -143,12 +161,12 @@ fn write_executable(dir: &std::path::Path, name: &str, data: &[u8]) -> anyhow::R
 /// `write_executable`, it works on all platforms and does not set the
 /// executable bit.
 #[cfg(not(feature = "distroless"))]
-fn write_atomic(dir: &std::path::Path, name: &str, data: &[u8]) -> anyhow::Result<()> {
+fn write_atomic(dir: &VerifiedPath, name: &str, data: &[u8]) -> anyhow::Result<()> {
     // The temp name contains the pid, so a stray temp file of another
     // process never goes into place.
-    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, dir.join(name))?;
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()))?;
+    write_new(&tmp, data, 0o644)?;
+    vfs::rename(&tmp, &dir.join(name)?)?;
     Ok(())
 }
 
@@ -161,19 +179,23 @@ fn write_atomic(dir: &std::path::Path, name: &str, data: &[u8]) -> anyhow::Resul
 /// again. Same `flock` pattern as `project::acquire_lock` and
 /// `vault::acquire_file_lock`.
 #[cfg(not(test))]
-fn acquire_extract_lock(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
+fn acquire_extract_lock(path: &VerifiedPath) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
 
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
+    let file = vfs::open_with(
+        path,
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .custom_flags(libc::O_NOFOLLOW),
+    )?;
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
     if rc != 0 {
         anyhow::bail!(messages::app::asset_lock_failed(
-            path.display(),
+            path,
             std::io::Error::last_os_error()
         ));
     }
@@ -182,39 +204,40 @@ fn acquire_extract_lock(path: &std::path::Path) -> anyhow::Result<std::fs::File>
 
 /// Resolve the path of one VM asset.
 /// Args:
-///  - `custom`: Custom path from the project config, if set. Expands `~` and
-///    resolves relative paths from the project directory.
+///  - `custom`: Custom path from the project config, if set. Expands `~`,
+///    resolves relative paths from the project directory and follows
+///    symlinks.
 ///  - `project`: Project for path expansion
 ///  - `bundled`: Path of the extracted bundled asset. `None` for
 ///    `distroless` builds, which then require `custom`.
 ///  - `name`: Asset name for error messages
 ///
 /// Returns:
-///   `custom` if set, else `bundled`. Error if the custom file does not
-///   exist or no path is available.
+///   The resolved path of `custom` if set, else `bundled`. Error if the
+///   custom file does not exist or no path is available.
 #[cfg(not(test))]
 fn resolve_asset(
     custom: Option<&str>,
     project: &Project,
-    bundled: Option<PathBuf>,
+    bundled: Option<VerifiedPath>,
     name: &str,
 ) -> anyhow::Result<PathBuf> {
     let Some(raw) = custom else {
-        return bundled.ok_or_else(|| anyhow::anyhow!(messages::app::asset_must_be_set(name)));
+        let bundled =
+            bundled.ok_or_else(|| anyhow::anyhow!(messages::app::asset_must_be_set(name)))?;
+        return Ok(bundled.to_path()?.to_path_buf());
     };
 
-    let path = project.expand_host_tilde(raw);
-    let path = if path.is_relative() {
-        project.host_cwd.join(path)
-    } else {
-        path
-    };
-
-    if !path.exists() {
-        anyhow::bail!(messages::app::custom_asset_not_found(name, path.display()));
+    let path = crate::vm::mount::absolute(raw, &project.host_home, &project.host_cwd);
+    // The user can pick a symlink, for example to the current kernel build.
+    let resolved = VerifiedPath::new_follow(&path, None)?;
+    match vfs::metadata(&resolved) {
+        Ok(_) => Ok(resolved.to_path()?.to_path_buf()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!(messages::app::custom_asset_not_found(name, path.display()))
+        }
+        Err(e) => Err(e.into()),
     }
-
-    Ok(path)
 }
 
 #[cfg(all(test, not(feature = "distroless")))]
@@ -223,6 +246,7 @@ mod tests {
 
     use super::write_atomic;
     use crate::test_cfg::temp_dir;
+    use crate::util::{Roots, VerifiedPath};
 
     /// Test that an asset write replaces the old file and leaves no temporary
     /// file, so that a reader never sees a partial asset.
@@ -233,9 +257,11 @@ mod tests {
     fn asset_write_replaces_file_and_leaves_no_temp_file() {
         let tmp = temp_dir();
         let dir = tmp.path();
+        let roots = Roots::resolve(dir, dir, dir).unwrap();
+        let verified = VerifiedPath::new(dir, &roots).unwrap();
 
-        write_atomic(dir, "Image", b"kernel-bytes").unwrap();
-        write_atomic(dir, "Image", b"newer-and-longer-bytes").unwrap();
+        write_atomic(&verified, "Image", b"kernel-bytes").unwrap();
+        write_atomic(&verified, "Image", b"newer-and-longer-bytes").unwrap();
 
         assert_eq!(
             std::fs::read(dir.join("Image")).unwrap(),

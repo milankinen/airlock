@@ -6,7 +6,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use airlock_test_utils::{TempDir, block_on_local, eventually, temp_dir};
 use indicatif::ProgressBar;
@@ -27,6 +27,7 @@ use crate::project::{self, Project};
 use crate::sandboxes::{self, Found};
 use crate::start::{Exit, SandboxOptions, config_change};
 use crate::util::PinnedDir;
+use crate::util::verified_path::VerifiedPath;
 use crate::vault::{Vault, VaultStorageType};
 
 /// What the fakes at the edges of `airlock start` do, and what they
@@ -75,8 +76,8 @@ pub fn fake_image(name: &str) -> OciImage {
 /// [`OnImageChange::Recreate`] makes it again and [`OnImageChange::Refuse`]
 /// stops.
 pub async fn prepare_image(
-    data_dir: &Path,
-    sandbox_dir: &Path,
+    data_dir: &VerifiedPath,
+    sandbox_dir: &VerifiedPath,
     image_cfg: &ImageRef,
     vault: &Vault,
     on_change: OnImageChange,
@@ -85,7 +86,7 @@ pub async fn prepare_image(
         return crate::oci::prepare(data_dir, sandbox_dir, image_cfg, vault, on_change).await;
     }
     fake_host(|host| host.prepared += 1);
-    let link = sandbox_dir.join("test-image");
+    let link = sandbox_dir.to_path()?.join("test-image");
     let name = image_cfg.name.as_str();
     let change = match std::fs::read_to_string(&link) {
         Ok(old) if old != name => match on_change {
@@ -106,7 +107,7 @@ pub async fn prepare_image(
 }
 
 /// `facts::check` for tests. With the fakes on, each image can take packs.
-pub fn check_image(data_dir: &Path, image: &OciImage) -> anyhow::Result<()> {
+pub fn check_image(data_dir: &VerifiedPath, image: &OciImage) -> anyhow::Result<()> {
     if !fake_host(|host| host.enabled) {
         return crate::packs::install::facts::check(data_dir, image);
     }
@@ -129,7 +130,7 @@ pub async fn install_boot(
     if !fake_host(|host| host.enabled) {
         return setup::install(project, image, installers, state, save, log_level, verbose).await;
     }
-    let log = File::create(setup::log_path(&project.sandbox_dir)).ok();
+    let log = File::create(setup::log_path(project.sandbox_dir.to_path().unwrap())).ok();
     let mut progress = InstallProgress::new(ProgressBar::hidden(), log, verbose);
     let (failing, synced) = fake_host(|host| (host.failing.clone(), !host.unsynced));
     let mut exec = HostExec::new();
@@ -218,7 +219,8 @@ impl StartProject {
 
     /// The sandbox directory of the project. Panics if there is no sandbox.
     pub fn sandbox_dir(&self) -> PathBuf {
-        self.sandbox().expect("a sandbox").dir
+        let dir = self.sandbox().expect("a sandbox").dir;
+        dir.to_path().unwrap().to_path_buf()
     }
 
     /// Run the sandbox and install steps of `airlock start` with the
@@ -263,7 +265,8 @@ impl StartProject {
         eventually("sandbox lock is free", || {
             // The start does not move a running project sandbox, and does
             // not fail.
-            if project::is_running(&project_sandbox) {
+            let dir = crate::util::VerifiedPath::new_follow(&project_sandbox, None).unwrap();
+            if project::is_running(&dir) {
                 return None;
             }
             match self.start_once(config, &options) {
@@ -285,7 +288,7 @@ impl StartProject {
             let template = config
                 .generated_project()
                 .and_then(|g| g.template.as_deref())
-                .map(|name| crate::templates::find(&self.context.data_dir, name).unwrap());
+                .map(|name| crate::templates::find(&self.context.roots.data_dir, name).unwrap());
             let sandbox = crate::start::sandbox::ensure_sandbox(
                 &self.context,
                 &self.project_dir(),
@@ -319,7 +322,8 @@ impl StartProject {
     /// (see [`crate::start::config_change`]). Panics if there is no
     /// sandbox.
     pub fn accept_config(&self, toml: &str) {
-        config_change::save(&self.sandbox_dir(), &project_config(toml)).unwrap();
+        let dir = self.sandbox().expect("a sandbox").dir;
+        config_change::save(&dir, &project_config(toml)).unwrap();
     }
 
     /// The install state of the sandbox. Empty when there is no state.
@@ -360,6 +364,6 @@ impl StartProject {
 
     /// The identity of the sandbox disk.
     pub fn disk_id(&self) -> Option<(u64, u64)> {
-        project::disk_id(&self.sandbox_dir())
+        project::disk_id(&PinnedDir::pin(&self.sandbox_dir()).unwrap())
     }
 }

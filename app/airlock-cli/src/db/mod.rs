@@ -4,12 +4,11 @@
 //! the user share it. It contains named databases for different purposes.
 //! This module does not know the contents of any of them.
 
-use std::path::Path;
-
 use anyhow::{Context as _, bail};
 use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn, WithoutTls};
 
 use crate::messages;
+use crate::util::{VerifiedPath, vfs};
 
 /// Directory of the database in the airlock data directory.
 pub const DIR: &str = "db";
@@ -40,7 +39,7 @@ pub struct Db(Env<WithoutTls>);
 impl Db {
     /// Open the database in the directory `dir`. Creates the directory
     /// (mode 0700, LMDB files 0600) if it does not exist. Blocks.
-    pub fn open(dir: &Path) -> anyhow::Result<Self> {
+    pub fn open(dir: &VerifiedPath) -> anyhow::Result<Self> {
         open_env(dir).map(Self)
     }
 
@@ -161,7 +160,7 @@ async fn blocking<T: Send + 'static>(
 
 /// Open the environment in `dir`. Creates the directory (mode 0700, LMDB
 /// files 0600) if it does not exist. Blocks.
-fn open_env(dir: &Path) -> anyhow::Result<Env<WithoutTls>> {
+fn open_env(dir: &VerifiedPath) -> anyhow::Result<Env<WithoutTls>> {
     prepare_dir(dir)?;
     let mut options = EnvOpenOptions::new().read_txn_without_tls();
     options.map_size(MAP_SIZE).max_dbs(MAX_DBS);
@@ -171,8 +170,8 @@ fn open_env(dir: &Path) -> anyhow::Result<Env<WithoutTls>> {
     // context, and `heed` refuses a second open of the same path). The
     // directory is private to the user and is in the data directory, not on
     // a network file system.
-    let env =
-        unsafe { options.open(dir) }.with_context(|| messages::db::open_database(dir.display()))?;
+    let env = unsafe { options.open(dir.to_path()?) }
+        .with_context(|| messages::db::open_database(dir))?;
     // Reader slots of processes that died during a read keep old pages
     // in use. Clear them.
     env.clear_stale_readers()
@@ -183,20 +182,18 @@ fn open_env(dir: &Path) -> anyhow::Result<Env<WithoutTls>> {
 /// Create the environment directory (mode 0700) before LMDB creates its
 /// files (0600) in it. If the directory exists with wider modes, restrict it
 /// to 0700.
-fn prepare_dir(dir: &Path) -> anyhow::Result<()> {
+fn prepare_dir(dir: &VerifiedPath) -> anyhow::Result<()> {
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .with_context(|| messages::db::create_dir(dir.display()))?;
-    let meta = std::fs::symlink_metadata(dir)?;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700);
+    vfs::create_dir_with(dir, &builder).with_context(|| messages::db::create_dir(dir))?;
+    let meta = vfs::symlink_metadata(dir)?;
     if !meta.is_dir() {
-        bail!(messages::db::not_a_directory(dir.display()));
+        bail!(messages::db::not_a_directory(dir));
     }
     if meta.permissions().mode() & 0o077 != 0 {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| messages::db::restrict_dir_to_owner(dir.display()))?;
+        vfs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| messages::db::restrict_dir_to_owner(dir))?;
     }
     Ok(())
 }

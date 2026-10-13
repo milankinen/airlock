@@ -14,13 +14,16 @@ use crate::vault::Vault;
 
 /// The process context of a test: the settings in `home` (defaults if
 /// there is no file), `vault`, and `home` as the data directory with the
-/// database in it. The caller keeps the `home` directory.
+/// database in it. All roots are `home`. The caller keeps the `home`
+/// directory.
 pub fn test_context(home: &Path, vault: Vault) -> Context {
+    let roots = crate::util::Roots::resolve(home, home, home).unwrap();
     Context {
         settings: Settings::load_from(home).unwrap(),
         vault,
-        db: Db::open(&home.join(crate::db::DIR)).unwrap(),
+        db: Db::open(&roots.data_dir.join(crate::db::DIR).unwrap()).unwrap(),
         data_dir: home.to_path_buf(),
+        roots,
     }
 }
 
@@ -28,7 +31,8 @@ pub fn test_context(home: &Path, vault: Vault) -> Context {
 /// returned directory exists.
 pub fn test_db() -> (TempDir, Db) {
     let dir = temp_dir();
-    let db = Db::open(&dir.path().join(crate::db::DIR)).unwrap();
+    let path = crate::util::VerifiedPath::new_follow(dir.path().join(crate::db::DIR), None);
+    let db = Db::open(&path.unwrap()).unwrap();
     (dir, db)
 }
 

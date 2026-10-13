@@ -163,7 +163,11 @@ pub fn configured_variants(pack: &Pack) -> Vec<ConfiguredPack> {
 pub fn test_template(name: &str, toml: &str) -> crate::templates::Template {
     crate::templates::Template {
         name: name.to_string(),
-        dir: std::path::PathBuf::from("/nonexistent/templates").join(name),
+        dir: crate::util::VerifiedPath::new_follow(
+            std::path::Path::new("/nonexistent/templates").join(name),
+            None,
+        )
+        .unwrap(),
         config: crate::templates::TemplateConfig::parse(toml).unwrap(),
     }
 }

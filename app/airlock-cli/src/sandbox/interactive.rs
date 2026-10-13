@@ -126,7 +126,7 @@ pub async fn run_interactive(
     // If AIRLOCK_PTY_DUMP=1, also write all guest output to
     // <sandbox_dir>/pty.dump for offline replay and diagnosis.
     let exit_code = {
-        let mut sink = DumpSink::from_env(&mut terminal, &vm.project().sandbox_dir);
+        let mut sink = DumpSink::from_env(&mut terminal, vm.project());
         drive(&proc, &mut sink).await
     };
     info!("vm process exited, code = {exit_code}");

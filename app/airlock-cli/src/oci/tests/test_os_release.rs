@@ -5,7 +5,7 @@ use airlock_test_utils::temp_dir;
 use super::*;
 
 /// The `os-release` identity of an image over `layers` (topmost first).
-fn os_release_of(data_dir: &Path, layers: Vec<String>) -> Option<OsRelease> {
+fn os_release_of(data_dir: &VerifiedPath, layers: Vec<String>) -> Option<OsRelease> {
     os_release(data_dir, &image("sha256:img", layers))
 }
 
@@ -19,7 +19,7 @@ fn os_release_of(data_dir: &Path, layers: Vec<String>) -> Option<OsRelease> {
 #[test]
 fn os_release_comes_from_topmost_layer_that_has_it_safely() {
     let tmp = temp_dir();
-    let data_dir = tmp.path();
+    let data_dir = &verified_dir(tmp.path());
     let ubuntu = cache_layer(
         data_dir,
         "sha256:ubuntu",

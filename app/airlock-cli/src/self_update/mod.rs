@@ -7,13 +7,16 @@
 //! old one. Thus a failed update keeps the old binary.
 
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context as _, bail};
 use bytes::{Bytes, BytesMut};
 use indicatif::ProgressBar;
 use sha2::{Digest, Sha256};
+
+use crate::util::verified_path::VerifiedPath;
+use crate::util::vfs;
 
 /// GitHub repository that publishes the airlock releases.
 const REPO: &str = "milankinen/airlock";
@@ -220,25 +223,36 @@ fn replace_binary(target: &Path, binary: &[u8], version: &Version) -> anyhow::Re
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
-    let dir = target
-        .parent()
-        .with_context(|| crate::messages::self_update::no_parent_directory(target.display()))?;
+    let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
+        bail!(crate::messages::self_update::no_parent_directory(
+            target.display()
+        ));
+    };
+    // The caller resolved the symlinks of `target`. Thus this follow does
+    // not change the directory. The new file and the rename do not follow
+    // a symlink below it.
+    let dir = VerifiedPath::new_follow(parent, None).map_err(|e| no_access_hint(e, parent))?;
+    let target = dir.join(name).map_err(|e| no_access_hint(e, parent))?;
     // The new file must be in the same directory as the target. Then the
     // rename is atomic and a running airlock keeps its old file.
-    let tmp = TempFile(dir.join(format!(".airlock-update-{}", std::process::id())));
+    let tmp = dir
+        .join(format!(".airlock-update-{}", std::process::id()))
+        .map_err(|e| no_access_hint(e, parent))?;
+    let tmp = TempFile(tmp);
     let write = || -> std::io::Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o755)
-            .open(&tmp.0)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true).mode(0o755);
+        let mut file = vfs::open_with(&tmp.0, &opts)?;
         file.write_all(binary)?;
         file.sync_all()
     };
-    write().map_err(|e| no_access_hint(e, dir))?;
+    write().map_err(|e| no_access_hint(e, parent))?;
 
-    let output =
-        run_version(&tmp.0).context(crate::messages::self_update::NEW_BINARY_RUN_FAILED)?;
+    let output = tmp
+        .0
+        .to_path()
+        .and_then(run_version)
+        .context(crate::messages::self_update::NEW_BINARY_RUN_FAILED)?;
     let reported = String::from_utf8_lossy(&output.stdout);
     let reported_version = reported.split_whitespace().nth(1);
     if !output.status.success() || reported_version != Some(&version.tag) {
@@ -248,7 +262,7 @@ fn replace_binary(target: &Path, binary: &[u8], version: &Version) -> anyhow::Re
         ));
     }
 
-    std::fs::rename(&tmp.0, target).map_err(|e| no_access_hint(e, dir))?;
+    vfs::rename(&tmp.0, &target).map_err(|e| no_access_hint(e, parent))?;
     Ok(())
 }
 
@@ -281,11 +295,11 @@ fn no_access_hint(e: std::io::Error, dir: &Path) -> anyhow::Error {
 }
 
 /// Temporary file that is deleted on drop if it still exists.
-struct TempFile(PathBuf);
+struct TempFile(VerifiedPath);
 
 impl Drop for TempFile {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = vfs::remove_file(&self.0);
     }
 }
 

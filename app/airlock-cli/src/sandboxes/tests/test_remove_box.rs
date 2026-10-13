@@ -24,7 +24,12 @@ fn remove_box_deletes_stopped_sandbox_and_refuses_running_or_bad_id() {
     let (id, dir) = data_dir_sandbox(&context, &project);
     std::fs::write(dir.join("disk.img"), b"disk").unwrap();
 
-    let running = SandboxLock::acquire_box(&project, &context.boxes_dir(), &id).unwrap();
+    let running = SandboxLock::acquire_box(
+        &project,
+        &crate::sandboxes::boxes_dir(&context).unwrap(),
+        &id,
+    )
+    .unwrap();
     assert!(block_on_local(remove_box(&context, &id)).is_err());
     assert!(dir.join("disk.img").is_file());
     drop(running);

@@ -8,7 +8,7 @@
 //! The build runs in a build directory next to the templates. The template
 //! appears only after a successful build.
 
-use std::path::{Path, PathBuf};
+use std::io::Write;
 
 use super::{CONFIG_FILE, FILES, templates_dir};
 use crate::cli::LogLevel;
@@ -28,7 +28,8 @@ use crate::start::install::{self, InstallDecision};
 use crate::start::{Exit, SandboxOptions};
 #[cfg(test)]
 use crate::test_cfg::start::{check_image, prepare_image};
-use crate::util::PinnedDir;
+use crate::util::verified_path::VerifiedPath;
+use crate::util::{PinnedDir, vfs};
 use crate::{cli, messages, start};
 
 /// Prefix of the build directory of a template. A template name cannot
@@ -65,17 +66,17 @@ pub async fn create(
 ) -> Result<(), Exit> {
     super::check_name(name).map_err(|e| Exit::error(2, e))?;
     if !force {
-        check_absent(&context.data_dir, name)?;
+        check_absent(&context.roots.data_dir, name)?;
     }
     let packs = crate::packs::init().map_err(Exit::config)?;
-    let build = BuildDir::new(&context.data_dir, name);
+    let build = BuildDir::new(&context.roots.data_dir, name)?;
+    let project_dir = build.project.to_path().map_err(anyhow::Error::from)?;
     // The wizard checks the answers with the user files only. The build
     // project directory has no config files.
-    let config =
-        config::load(&build.project, &build.project.join(".airlock")).map_err(Exit::config)?;
-    let templates = super::list(&context.data_dir);
+    let config = config::load(project_dir, &project_dir.join(".airlock")).map_err(Exit::config)?;
+    let templates = super::list(&context.roots.data_dir);
     let generated = Box::pin(start::wizard::run_template_wizard(
-        &build.project,
+        project_dir,
         &context.data_dir,
         &packs,
         &config,
@@ -131,17 +132,21 @@ pub(crate) async fn build_template(
     options: &SandboxOptions,
     replace: bool,
 ) -> Result<(), Exit> {
-    let build = BuildDir::new(&context.data_dir, name);
-    crate::cache::create_private_dir(&templates_dir(&context.data_dir))?;
-    let lock = SandboxLock::acquire_dir(&build.sandbox, &build.project)?;
+    let data_dir = &context.roots.data_dir;
+    let build = BuildDir::new(data_dir, name)?;
+    crate::cache::create_private_dir(&templates_dir(data_dir).map_err(anyhow::Error::from)?)?;
+    let lock = SandboxLock::acquire_dir(
+        &build.sandbox,
+        build.project.to_path().map_err(anyhow::Error::from)?,
+    )?;
     let result = Box::pin(build_locked(
         context, name, packs, config, options, &build, &lock,
     ))
     .await
-    .and_then(|toml| keep_files(&context.data_dir, name, &build.sandbox, &toml, replace));
+    .and_then(|toml| keep_files(data_dir, name, &build.sandbox, &toml, replace));
     drop(lock);
     if result.is_ok() {
-        let _ = std::fs::remove_dir_all(&build.root);
+        let _ = vfs::remove_dir_all(&build.root);
     } else {
         remove_except_log(&build);
     }
@@ -166,23 +171,24 @@ async fn build_locked(
         .await
         .map_err(Exit::config)?;
     start::env::check_env_early(&resolved.values, &context.vault)?;
-    std::fs::create_dir_all(&build.project).map_err(anyhow::Error::from)?;
-    let sandbox = PinnedDir::pin(lock.dir()).map_err(anyhow::Error::from)?;
+    vfs::create_dir_all(&build.project).map_err(anyhow::Error::from)?;
+    let sandbox = PinnedDir::pin(lock.dir().to_path().map_err(anyhow::Error::from)?)
+        .map_err(anyhow::Error::from)?;
     // Remove the files of an earlier build that stopped.
     for file in FILES {
         sandbox.remove(file).map_err(anyhow::Error::from)?;
     }
     let base = config.generated_project().and_then(|g| g.template.clone());
     if let Some(base) = &base {
-        let template = super::find(&context.data_dir, base).map_err(|e| Exit::error(1, e))?;
-        super::seed::seed(&template, &sandbox)?;
+        let template = super::find(&context.roots.data_dir, base).map_err(|e| Exit::error(1, e))?;
+        super::seed::seed(&template, &sandbox, &build.sandbox)?;
     }
 
     let values = &resolved.values;
     cli::log!("{}", messages::templates::building_template(name));
     let prepared = prepare_image(
-        &context.data_dir,
-        sandbox.path(),
+        &context.roots.data_dir,
+        &build.sandbox,
         &values.vm.image,
         &context.vault,
         OnImageChange::Recreate,
@@ -215,13 +221,13 @@ async fn build_locked(
     let mut plan = plan::decide(&DecideInput {
         state: &state,
         wanted: &wanted,
-        disk: project::disk_id(sandbox.path()),
+        disk: project::disk_id(&sandbox),
         image_id: Some(&image.image_id),
     });
     if !plan.pending.is_empty() {
-        check_image(&context.data_dir, &image).map_err(|e| Exit::error(2, e))?;
+        check_image(&context.roots.data_dir, &image).map_err(|e| Exit::error(2, e))?;
     }
-    project::ensure_disk(sandbox.path(), &values.disk, base.is_some())?;
+    project::ensure_disk(&sandbox, &values.disk, base.is_some())?;
     let to_install: Vec<InstallerScript> = candidates
         .into_iter()
         .filter(|t| plan.pending.iter().any(|p| p.id == t.pack))
@@ -285,51 +291,55 @@ fn pin_image(toml: &str, image: &ImageRef, pin: Option<&str>) -> anyhow::Result<
 // there. A replaced template moves aside first, and is removed after the
 // commit.
 fn keep_files(
-    data_dir: &Path,
+    data_dir: &VerifiedPath,
     name: &str,
-    sandbox_dir: &Path,
+    sandbox_dir: &VerifiedPath,
     toml: &str,
     replace: bool,
 ) -> Result<(), Exit> {
-    let root = templates_dir(data_dir);
-    let dir = root.join(name);
-    let staging = root.join(format!("{STAGING_PREFIX}{name}"));
-    let _ = std::fs::remove_dir_all(&staging);
+    let root = templates_dir(data_dir).map_err(anyhow::Error::from)?;
+    let dir = root.join(name).map_err(anyhow::Error::from)?;
+    let staging = root
+        .join(format!("{STAGING_PREFIX}{name}"))
+        .map_err(anyhow::Error::from)?;
+    let _ = vfs::remove_dir_all(&staging);
     let staged = (|| -> anyhow::Result<()> {
-        std::fs::create_dir(&staging)?;
+        vfs::create_dir(&staging)?;
         for file in FILES {
-            let src = sandbox_dir.join(file);
-            if src.exists() {
-                std::fs::rename(&src, staging.join(file))?;
+            let src = sandbox_dir.join(file)?;
+            if vfs::symlink_metadata(&src).is_ok() {
+                vfs::rename(&src, &staging.join(file)?)?;
             }
         }
-        std::fs::write(staging.join(CONFIG_FILE), toml)?;
+        vfs::create_new(&staging.join(CONFIG_FILE)?)?.write_all(toml.as_bytes())?;
         Ok(())
     })();
     if let Err(e) = staged {
-        let _ = std::fs::remove_dir_all(&staging);
+        let _ = vfs::remove_dir_all(&staging);
         return Err(Exit::error(
             1,
             messages::templates::save_template_failed(name, e),
         ));
     }
-    let old = root.join(format!("{OLD_PREFIX}{name}"));
-    let _ = std::fs::remove_dir_all(&old);
-    let replaced = replace && std::fs::rename(&dir, &old).is_ok();
-    if let Err(e) = std::fs::rename(&staging, &dir) {
-        let _ = std::fs::remove_dir_all(&staging);
+    let old = root
+        .join(format!("{OLD_PREFIX}{name}"))
+        .map_err(anyhow::Error::from)?;
+    let _ = vfs::remove_dir_all(&old);
+    let replaced = replace && vfs::rename(&dir, &old).is_ok();
+    if let Err(e) = vfs::rename(&staging, &dir) {
+        let _ = vfs::remove_dir_all(&staging);
         if replaced {
-            let _ = std::fs::rename(&old, &dir);
+            let _ = vfs::rename(&old, &dir);
         }
         // Renaming onto a non-empty directory fails: the template exists.
-        return Err(if dir.exists() {
+        return Err(if vfs::symlink_metadata(&dir).is_ok() {
             exists_error(name)
         } else {
             Exit::error(1, messages::templates::save_template_failed(name, e))
         });
     }
     if replaced {
-        let _ = std::fs::remove_dir_all(&old);
+        let _ = vfs::remove_dir_all(&old);
         // The old template image can be unused now.
         crate::oci::gc_sweep(data_dir);
     }
@@ -340,25 +350,35 @@ fn keep_files(
 /// install log. The user can then read the log. The cached image is not
 /// in use any more.
 fn remove_except_log(build: &BuildDir) {
-    let log = crate::packs::install::setup::log_path(&build.sandbox);
-    let _ = std::fs::remove_dir_all(&build.project);
-    let Ok(entries) = std::fs::read_dir(&build.sandbox) else {
-        return;
+    let _ = vfs::remove_dir_all(&build.project);
+    let log = crate::packs::install::setup::log_path(build.sandbox.given());
+    let entries = match vfs::read_dir(&build.sandbox) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!("templates: clean up {}: {e}", build.sandbox);
+            return;
+        }
     };
     for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        if path != log {
-            let _ = match entry.file_type() {
-                Ok(t) if t.is_dir() => std::fs::remove_dir_all(&path),
-                _ => std::fs::remove_file(&path),
-            };
+        if Some(entry.file_name().as_os_str()) == log.file_name() {
+            continue;
         }
+        let Ok(path) = build.sandbox.join(entry.file_name()) else {
+            continue;
+        };
+        let _ = match entry.file_type() {
+            Ok(t) if t.is_dir() => vfs::remove_dir_all(&path),
+            _ => vfs::remove_file(&path),
+        };
     }
 }
 
 /// Check that the template `name` does not exist yet.
-fn check_absent(data_dir: &Path, name: &str) -> Result<(), Exit> {
-    if templates_dir(data_dir).join(name).exists() {
+fn check_absent(data_dir: &VerifiedPath, name: &str) -> Result<(), Exit> {
+    let dir = templates_dir(data_dir)
+        .and_then(|root| root.join(name))
+        .map_err(anyhow::Error::from)?;
+    if vfs::symlink_metadata(&dir).is_ok() {
         return Err(exists_error(name));
     }
     Ok(())
@@ -381,21 +401,23 @@ fn image_error(e: anyhow::Error) -> Exit {
 /// The paths of the build directory of a template.
 struct BuildDir {
     /// `<data_dir>/templates/.build-<name>`.
-    root: PathBuf,
+    root: VerifiedPath,
     /// The sandbox of the build (`<root>/sandbox`).
-    sandbox: PathBuf,
+    sandbox: VerifiedPath,
     /// The empty project directory of the build (`<root>/project`).
-    project: PathBuf,
+    project: VerifiedPath,
 }
 
 impl BuildDir {
     /// Return the build directory of the template `name`.
-    fn new(data_dir: &Path, name: &str) -> Self {
-        let root = templates_dir(data_dir).join(format!("{BUILD_PREFIX}{name}"));
-        Self {
-            sandbox: root.join("sandbox"),
-            project: root.join("project"),
+    /// Returns:
+    ///   The paths, or error if the path check fails.
+    fn new(data_dir: &VerifiedPath, name: &str) -> anyhow::Result<Self> {
+        let root = templates_dir(data_dir)?.join(format!("{BUILD_PREFIX}{name}"))?;
+        Ok(Self {
+            sandbox: root.join("sandbox")?,
+            project: root.join("project")?,
             root,
-        }
+        })
     }
 }

@@ -123,8 +123,9 @@ fn resolved_document_in_each_format_resolves_to_same_config() {
     }
 
     let sandbox = temp_dir();
-    crate::start::config_change::save(sandbox.path(), &layers).unwrap();
-    let stored = crate::project::read_run_meta(sandbox.path())
+    let sandbox_dir = crate::util::VerifiedPath::new_follow(sandbox.path(), None).unwrap();
+    crate::start::config_change::save(&sandbox_dir, &layers).unwrap();
+    let stored = crate::project::read_run_meta(&sandbox_dir)
         .last_run_config
         .unwrap();
     let stored: LayeredConfig = serde_json::from_value(stored).unwrap();

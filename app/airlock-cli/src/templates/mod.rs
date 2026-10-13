@@ -15,11 +15,13 @@ pub mod seed;
 mod tests;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::io;
 
 use crate::config::generated::Clipboard;
 use crate::messages;
 use crate::packs::install::state::STATE_FILE;
+use crate::util::verified_path::VerifiedPath;
+use crate::util::{self, is_dir, vfs};
 use crate::vm::disk::{DISK_FILE, DISK_ID_FILE};
 
 /// Directory of the templates in the data directory.
@@ -42,6 +44,9 @@ pub const FILES: [&str; 6] = [
     STATE_FILE,
     CA_FILE,
 ];
+/// Largest config file of a template. Airlock writes it, but the user can
+/// change it.
+const MAX_CONFIG_FILE: u64 = 1024 * 1024;
 /// Longest template name.
 const MAX_NAME_LEN: usize = 64;
 
@@ -51,7 +56,7 @@ pub struct Template {
     /// Template name (see [`is_valid_name`]).
     pub name: String,
     /// Template directory `<data_dir>/templates/<name>`.
-    pub dir: PathBuf,
+    pub dir: VerifiedPath,
     /// The config of the template.
     pub config: TemplateConfig,
 }
@@ -128,7 +133,9 @@ impl TemplateConfig {
 }
 
 /// Return the templates directory of the data directory `data_dir`.
-pub fn templates_dir(data_dir: &Path) -> PathBuf {
+/// Returns:
+///   The path, or error if the path check fails.
+pub fn templates_dir(data_dir: &VerifiedPath) -> io::Result<VerifiedPath> {
     data_dir.join(TEMPLATES_DIR)
 }
 
@@ -156,23 +163,18 @@ pub fn check_name(name: &str) -> anyhow::Result<()> {
 /// Returns:
 ///   The template, or error if it does not exist or its config is not
 ///   valid.
-pub fn find(data_dir: &Path, name: &str) -> anyhow::Result<Template> {
+pub fn find(data_dir: &VerifiedPath, name: &str) -> anyhow::Result<Template> {
     check_name(name)?;
-    let dir = templates_dir(data_dir).join(name);
-    anyhow::ensure!(dir.is_dir(), messages::templates::template_missing(name));
+    let dir = templates_dir(data_dir)?.join(name)?;
+    anyhow::ensure!(is_dir(&dir), messages::templates::template_missing(name));
     read(name, dir)
 }
 
 /// Read the template `name` in its directory `dir`.
-fn read(name: &str, dir: PathBuf) -> anyhow::Result<Template> {
-    let path = dir.join(CONFIG_FILE);
-    let toml = std::fs::read_to_string(&path).map_err(|e| {
-        anyhow::anyhow!(messages::templates::read_config_failed(
-            name,
-            path.display(),
-            e
-        ))
-    })?;
+fn read(name: &str, dir: VerifiedPath) -> anyhow::Result<Template> {
+    let path = dir.join(CONFIG_FILE)?;
+    let toml = util::read_to_string_capped(&path, MAX_CONFIG_FILE)
+        .map_err(|e| anyhow::anyhow!(messages::templates::read_config_failed(name, &path, e)))?;
     let config = TemplateConfig::parse(&toml)
         .map_err(|e| anyhow::anyhow!(messages::templates::config_invalid(name, e)))?;
     Ok(Template {
@@ -187,8 +189,11 @@ fn read(name: &str, dir: PathBuf) -> anyhow::Result<Template> {
 ///   The templates sorted by name. A template that cannot be read is not in
 ///   the list (the log tells why). Directories with a name that is not
 ///   valid are build directories, and are not in the list.
-pub fn list(data_dir: &Path) -> Vec<Template> {
-    let Ok(entries) = std::fs::read_dir(templates_dir(data_dir)) else {
+pub fn list(data_dir: &VerifiedPath) -> Vec<Template> {
+    let Ok(root) = templates_dir(data_dir) else {
+        return Vec::new();
+    };
+    let Ok(entries) = vfs::read_dir(&root) else {
         return Vec::new();
     };
     let mut templates: Vec<Template> = entries
@@ -199,7 +204,9 @@ pub fn list(data_dir: &Path) -> Vec<Template> {
             if !is_valid_name(&name) {
                 return None;
             }
-            read(&name, e.path())
+            root.join(&name)
+                .map_err(anyhow::Error::from)
+                .and_then(|dir| read(&name, dir))
                 .inspect_err(|e| tracing::warn!("templates: {e:#}"))
                 .ok()
         })
@@ -212,11 +219,11 @@ pub fn list(data_dir: &Path) -> Vec<Template> {
 /// unused images after this (see [`crate::oci::gc_sweep`]).
 /// Returns:
 ///   Error if the template does not exist or the removal fails.
-pub fn remove(data_dir: &Path, name: &str) -> anyhow::Result<()> {
+pub fn remove(data_dir: &VerifiedPath, name: &str) -> anyhow::Result<()> {
     check_name(name)?;
-    let dir = templates_dir(data_dir).join(name);
-    anyhow::ensure!(dir.is_dir(), messages::templates::template_missing(name));
-    std::fs::remove_dir_all(&dir)
-        .map_err(|e| anyhow::anyhow!(messages::templates::remove_failed(dir.display(), e)))?;
+    let dir = templates_dir(data_dir)?.join(name)?;
+    anyhow::ensure!(is_dir(&dir), messages::templates::template_missing(name));
+    vfs::remove_dir_all(&dir)
+        .map_err(|e| anyhow::anyhow!(messages::templates::remove_failed(&dir, e)))?;
     Ok(())
 }

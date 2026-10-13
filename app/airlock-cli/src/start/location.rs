@@ -14,7 +14,7 @@ use crate::context::Context;
 use crate::project::{self, SandboxLock};
 use crate::sandboxes::{self, Found, KEEP_IN_PROJECT, Location, MigrateError, registry};
 use crate::settings::SandboxType;
-use crate::util::PinnedDir;
+use crate::util::{PinnedDir, vfs};
 use crate::{cli, messages};
 
 /// The answer to the move question.
@@ -53,7 +53,9 @@ pub async fn lock_sandbox(
             Move::Yes => move_to_data_dir(context, host_cwd).await?,
             Move::No => {
                 let lock = SandboxLock::acquire(host_cwd)?;
-                PinnedDir::pin(lock.dir())
+                lock.dir()
+                    .to_path()
+                    .and_then(PinnedDir::pin)
                     .and_then(|dir| dir.write_atomic(KEEP_IN_PROJECT, b"", 0o600))
                     .map_err(anyhow::Error::from)?;
                 lock
@@ -66,11 +68,12 @@ pub async fn lock_sandbox(
             SandboxType::Managed => {
                 // A local project config in `.airlock` goes with the new
                 // sandbox. Check before anything is made.
-                sandboxes::check_local_config(host_cwd).map_err(|e| Exit::error(1, e))?;
-                let boxes = context.boxes_dir();
+                sandboxes::check_local_config(context, host_cwd).map_err(|e| Exit::error(1, e))?;
+                let boxes = sandboxes::boxes_dir(context).map_err(anyhow::Error::from)?;
                 let id = registry::find_or_register(&context.db, &boxes, host_cwd).await?;
                 let lock = lock_box(context, host_cwd, &id).await?;
-                sandboxes::adopt_local_config(host_cwd, lock.dir())
+                let dir = lock.dir().to_path().map_err(anyhow::Error::from)?;
+                sandboxes::adopt_local_config(context, host_cwd, dir)
                     .map_err(|e| Exit::error(1, e))?;
                 lock
             }
@@ -84,11 +87,12 @@ pub async fn lock_sandbox(
 // and the lock. The lock then makes a new empty directory. Check the
 // registry again under the lock, and remove that directory.
 async fn lock_box(context: &Context, host_cwd: &Path, id: &str) -> Result<SandboxLock, Exit> {
-    let lock = SandboxLock::acquire_box(host_cwd, &context.boxes_dir(), id)?;
+    let boxes = sandboxes::boxes_dir(context).map_err(anyhow::Error::from)?;
+    let lock = SandboxLock::acquire_box(host_cwd, &boxes, id)?;
     if registry::get(&context.db, id).await?.as_deref() != Some(host_cwd) {
-        let dir = lock.dir().to_path_buf();
+        let dir = lock.dir().clone();
         drop(lock);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = vfs::remove_dir_all(&dir);
         return Err(Exit::error(
             1,
             messages::start::SANDBOX_REMOVED_DURING_START,
@@ -108,10 +112,14 @@ fn wants_move(context: &Context, found: &Found) -> bool {
     }
     // A symlinked sandbox directory gets no question. The lock reports the
     // problem.
-    if !std::fs::symlink_metadata(&found.dir).is_ok_and(|m| m.is_dir()) {
+    if !vfs::symlink_metadata(&found.dir).is_ok_and(|m| m.is_dir()) {
         return false;
     }
-    std::fs::symlink_metadata(found.dir.join(KEEP_IN_PROJECT)).is_err()
+    found
+        .dir
+        .join(KEEP_IN_PROJECT)
+        .and_then(|p| vfs::symlink_metadata(&p))
+        .is_err()
 }
 
 /// Ask if the project sandbox `found` moves into the data directory. The
@@ -125,7 +133,7 @@ fn ask_move(found: &Found, can_prompt: bool, yes: bool) -> Result<Move, Exit> {
         cli::log!(
             "{} {}",
             cli::yellow("!"),
-            messages::start::sandbox_data_visible(found.dir.display())
+            messages::start::sandbox_data_visible(&found.dir)
         );
         return Ok(Move::Later);
     }
@@ -167,7 +175,7 @@ async fn move_to_data_dir(context: &Context, host_cwd: &Path) -> Result<SandboxL
     cli::log!(
         "  {} {}",
         cli::check(),
-        messages::start::sandbox_moved(lock.dir().display())
+        messages::start::sandbox_moved(lock.dir())
     );
     Ok(lock)
 }

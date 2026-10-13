@@ -6,6 +6,8 @@
 //! one airlock process at a time uses the sandbox of a project. Also resolves
 //! the environment variables that the project gives to the sandbox.
 
+use std::fmt::Display;
+use std::io::Write as _;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -17,9 +19,15 @@ use crate::config::config_values::{ConfigValues, Disk};
 use crate::context::Context;
 use crate::messages;
 use crate::sandboxes::{Found, PROJECT_SANDBOX};
-use crate::util::PinnedDir;
+use crate::util::{PinnedDir, VerifiedPath, read_to_string_capped, vfs};
 use crate::vault::Vault;
 use crate::vm::disk;
+
+/// Size limit of `run.json`. The guest can write a project sandbox.
+const RUN_META_CAP: u64 = 4 * 1024 * 1024;
+
+/// Size limit of `ca.json`. The guest can write a project sandbox.
+const CA_CAP: u64 = 64 * 1024;
 
 /// A resolved project: its working directory, sandbox paths, config and CA.
 ///
@@ -31,7 +39,7 @@ use crate::vm::disk;
 #[derive(Clone)]
 pub struct Project {
     /// Sandbox directory: CA, overlay, disk image, lock, run metadata.
-    pub sandbox_dir: PathBuf,
+    pub sandbox_dir: VerifiedPath,
     /// Host user's home directory.
     pub host_home: PathBuf,
     /// Absolute working directory on the host.
@@ -62,9 +70,14 @@ impl Project {
     }
 
     /// Check if the sandbox data is in the project (`.airlock/sandbox`), and
-    /// not in the data directory.
+    /// not in the data directory. True also if the path check fails.
     pub fn sandbox_in_project(&self) -> bool {
-        self.sandbox_dir == self.host_cwd.join(PROJECT_SANDBOX)
+        // Fail closed: if the check of the path fails, treat the sandbox as
+        // in the project. Then the guest still cannot see `.airlock`.
+        match self.sandbox_dir.to_entry_path() {
+            Ok(dir) => dir == self.host_cwd.join(PROJECT_SANDBOX),
+            Err(_) => true,
+        }
     }
 
     /// Check if an `airlock start` process runs this project now (see
@@ -121,25 +134,6 @@ impl Project {
     }
 }
 
-/// On-disk locations of the sandbox data of a project.
-pub struct ProjectPaths {
-    /// `.airlock/` under the project root.
-    pub cache_dir: PathBuf,
-    /// `.airlock/sandbox/`.
-    pub sandbox_dir: PathBuf,
-}
-
-/// Get the locations of a sandbox in the project directory `host_cwd`.
-/// Only joins paths: it reads and creates nothing, and needs no config.
-pub fn paths(host_cwd: &Path) -> ProjectPaths {
-    let cache_dir = host_cwd.join(".airlock");
-    let sandbox_dir = host_cwd.join(PROJECT_SANDBOX);
-    ProjectPaths {
-        cache_dir,
-        sandbox_dir,
-    }
-}
-
 /// Load the project of a found sandbox without a lock. Does not make a CA
 /// and does not resolve `[env]`. For read-only subcommands (`info`).
 /// Args:
@@ -182,7 +176,7 @@ pub fn load(config: ConfigValues, context: Context, found: &Found) -> anyhow::Re
 /// like a lock from a different process.
 pub struct SandboxLock {
     host_cwd: PathBuf,
-    sandbox_dir: PathBuf,
+    sandbox_dir: VerifiedPath,
     /// Held exclusive `flock`. Never read. It is only the RAII guard that
     /// releases the lock when `SandboxLock` drops.
     #[allow(dead_code)]
@@ -194,10 +188,13 @@ impl SandboxLock {
     /// `host_cwd` and take its lock. Fails when a different airlock instance
     /// holds the lock.
     pub fn acquire(host_cwd: &Path) -> anyhow::Result<Self> {
-        let host_cwd = std::fs::canonicalize(host_cwd).unwrap_or_else(|_| host_cwd.to_path_buf());
+        // The project can be below a symlink. Below the project root, the
+        // guest can write, so no link is followed there.
+        let root = VerifiedPath::new_follow(host_cwd, None)?;
+        let host_cwd = root.to_path()?.to_path_buf();
         ensure_cache_dir(&host_cwd)?;
         let pinned = PinnedDir::open(&host_cwd, Path::new(PROJECT_SANDBOX), true)?;
-        Self::lock(host_cwd.join(PROJECT_SANDBOX), host_cwd, &pinned)
+        Self::lock(root.join(PROJECT_SANDBOX)?, host_cwd, &pinned)
     }
 
     /// Create the sandbox `id` in the data directory and take its lock.
@@ -206,14 +203,18 @@ impl SandboxLock {
     ///  - `host_cwd`: Canonical project directory
     ///  - `boxes_dir`: Sandboxes directory in the data directory
     ///  - `id`: Registry id of the sandbox
-    pub fn acquire_box(host_cwd: &Path, boxes_dir: &Path, id: &str) -> anyhow::Result<Self> {
+    pub fn acquire_box(
+        host_cwd: &Path,
+        boxes_dir: &VerifiedPath,
+        id: &str,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             crate::sandboxes::registry::is_valid_id(id),
             messages::sandboxes::not_sandbox_id(id)
         );
         crate::cache::create_private_dir(boxes_dir)?;
-        let pinned = PinnedDir::open(boxes_dir, Path::new(id), true)?;
-        Self::lock(boxes_dir.join(id), host_cwd.to_path_buf(), &pinned)
+        let pinned = PinnedDir::open(boxes_dir.to_path()?, Path::new(id), true)?;
+        Self::lock(boxes_dir.join(id)?, host_cwd.to_path_buf(), &pinned)
     }
 
     /// Create the sandbox directory `sandbox_dir` that has no project, and
@@ -223,14 +224,18 @@ impl SandboxLock {
     ///  - `sandbox_dir`: Sandbox directory, created with mode 0700
     ///  - `host_cwd`: Directory that the sandbox uses as the project
     ///    directory
-    pub fn acquire_dir(sandbox_dir: &Path, host_cwd: &Path) -> anyhow::Result<Self> {
+    pub fn acquire_dir(sandbox_dir: &VerifiedPath, host_cwd: &Path) -> anyhow::Result<Self> {
         crate::cache::create_private_dir(sandbox_dir)?;
-        let pinned = PinnedDir::pin(sandbox_dir)?;
-        Self::lock(sandbox_dir.to_path_buf(), host_cwd.to_path_buf(), &pinned)
+        let pinned = PinnedDir::pin(sandbox_dir.to_path()?)?;
+        Self::lock(sandbox_dir.clone(), host_cwd.to_path_buf(), &pinned)
     }
 
     /// Take the lock of the sandbox directory `pinned`.
-    fn lock(sandbox_dir: PathBuf, host_cwd: PathBuf, pinned: &PinnedDir) -> anyhow::Result<Self> {
+    fn lock(
+        sandbox_dir: VerifiedPath,
+        host_cwd: PathBuf,
+        pinned: &PinnedDir,
+    ) -> anyhow::Result<Self> {
         // The sandbox holds the CA private key. Keep other local users out.
         // This is defense in depth only. The key file is always 0600.
         harden_dir_permissions(&sandbox_dir);
@@ -243,7 +248,7 @@ impl SandboxLock {
     }
 
     /// Get the sandbox directory.
-    pub fn dir(&self) -> &Path {
+    pub fn dir(&self) -> &VerifiedPath {
         &self.sandbox_dir
     }
 }
@@ -326,7 +331,7 @@ pub fn resolve_env(config: &ConfigValues, vault: &Vault) -> Result<SandboxEnv, E
 /// `config` (`[disk] size`). Prints a line for each change. Use only under
 /// the sandbox lock, while no VM runs. Set `copied` if the disk is a new
 /// copy of a template disk.
-pub fn ensure_disk(sandbox_dir: &Path, config: &Disk, copied: bool) -> anyhow::Result<()> {
+pub fn ensure_disk(sandbox_dir: &PinnedDir, config: &Disk, copied: bool) -> anyhow::Result<()> {
     disk::ensure(sandbox_dir, config, copied)
 }
 
@@ -344,19 +349,28 @@ pub fn reset_disk(sandbox_dir: &PinnedDir) -> anyhow::Result<()> {
 }
 
 /// Check if the sandbox in `sandbox_dir` has its CA keypair (`ca.json`).
-pub fn has_ca(sandbox_dir: &Path) -> bool {
-    sandbox_dir.join("ca.json").exists()
+/// A symlink there is no CA: the next open replaces it with a new CA.
+pub fn has_ca(sandbox_dir: &VerifiedPath) -> bool {
+    sandbox_dir
+        .join("ca.json")
+        .and_then(|path| vfs::metadata(&path))
+        .is_ok_and(|m| m.is_file())
 }
 
 /// Check if the sandbox in `sandbox_dir` has a disk image. Also true for
-/// an image from an older airlock without an identity file.
-pub fn has_disk(sandbox_dir: &Path) -> bool {
-    sandbox_dir.join(disk::DISK_FILE).is_file()
+/// an image from an older airlock without an identity file. Only a
+/// regular file counts. The check does not open the file, so a planted
+/// FIFO cannot block it.
+pub fn has_disk(sandbox_dir: &VerifiedPath) -> bool {
+    sandbox_dir
+        .join(disk::DISK_FILE)
+        .and_then(|path| vfs::symlink_metadata(&path))
+        .is_ok_and(|m| m.is_file())
 }
 
 /// Get the identity of the sandbox disk image: a random id that each new
 /// image gets (see [`disk::read_id`]). `None` if there is no identity yet.
-pub fn disk_id(sandbox_dir: &Path) -> Option<(u64, u64)> {
+pub fn disk_id(sandbox_dir: &PinnedDir) -> Option<(u64, u64)> {
     disk::read_id(sandbox_dir)
 }
 
@@ -370,8 +384,8 @@ pub fn ensure_cache_dir(host_cwd: &Path) -> anyhow::Result<PathBuf> {
     // Do not follow symlinks at `.airlock` and `.airlock/.gitignore` (see
     // `PinnedDir`). For a symlinked or foreign-owned `.airlock`, give a
     // clear message, not the raw `ELOOP`/`EPERM` of `PinnedDir::open`.
-    let path = host_cwd.join(".airlock");
-    if let Some(problem) = airlock_dir_problem(&path) {
+    let airlock = VerifiedPath::new_follow(host_cwd, None)?.join(".airlock")?;
+    if let Some(problem) = airlock_dir_problem(&airlock) {
         anyhow::bail!(problem);
     }
     let cache_dir = PinnedDir::open(host_cwd, Path::new(".airlock"), true)?;
@@ -387,27 +401,27 @@ pub fn ensure_cache_dir(host_cwd: &Path) -> anyhow::Result<PathBuf> {
 /// Returns:
 ///   `None` if `path` does not exist ([`ensure_cache_dir`] creates it) or
 ///   its metadata cannot be read (`PinnedDir::open` then reports it).
-fn airlock_dir_problem(path: &Path) -> Option<String> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
+fn airlock_dir_problem(path: &VerifiedPath) -> Option<String> {
+    let meta = vfs::symlink_metadata(path).ok()?;
     airlock_dir_problem_for(path, meta.file_type().is_symlink(), meta.uid())
 }
 
 /// Message logic of [`airlock_dir_problem`] with metadata that is already
 /// read. Thus tests can run it without a real symlink or a foreign-owned
 /// directory.
-fn airlock_dir_problem_for(path: &Path, is_symlink: bool, owner_uid: u32) -> Option<String> {
+fn airlock_dir_problem_for(path: impl Display, is_symlink: bool, owner_uid: u32) -> Option<String> {
     if is_symlink {
-        return Some(messages::project::airlock_dir_is_symlink(path.display()));
+        return Some(messages::project::airlock_dir_is_symlink(path));
     }
     if owner_uid != unsafe { libc::geteuid() } {
-        return Some(messages::project::airlock_dir_foreign_owner(path.display()));
+        return Some(messages::project::airlock_dir_foreign_owner(path));
     }
     None
 }
 
 /// Check if a project runs now. Tries its sandbox lock (see
 /// [`lock_if_idle`]) and releases the lock immediately if it gets it.
-pub fn is_running(sandbox_dir: &Path) -> bool {
+pub fn is_running(sandbox_dir: &VerifiedPath) -> bool {
     matches!(lock_if_idle(sandbox_dir), IdleLock::Running)
 }
 
@@ -432,7 +446,7 @@ pub enum IdleLock {
 ///
 /// Returns:
 ///   State of the lock, see [`IdleLock`].
-pub fn lock_if_idle(sandbox_dir: &Path) -> IdleLock {
+pub fn lock_if_idle(sandbox_dir: &VerifiedPath) -> IdleLock {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
 
@@ -440,15 +454,17 @@ pub fn lock_if_idle(sandbox_dir: &Path) -> IdleLock {
     // `.airlock/sandbox -> ~/.airlock/sandbox` or a `lock` symlink must not
     // give access to the lock of a different sandbox. airlock never creates
     // a symlinked `sandbox_dir`, so treat it as `Missing`.
-    if std::fs::symlink_metadata(sandbox_dir).is_ok_and(|m| m.file_type().is_symlink()) {
+    if vfs::symlink_metadata(sandbox_dir).is_ok_and(|m| m.file_type().is_symlink()) {
         return IdleLock::Missing;
     }
     // O_NONBLOCK: the open of a planted FIFO at `lock` must not block. The
     // regular-file check below refuses the FIFO.
-    let opened = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(sandbox_dir.join("lock"));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let opened = sandbox_dir
+        .join("lock")
+        .and_then(|lock| vfs::open_with(&lock, &opts));
     let Ok(file) = opened else {
         return IdleLock::Missing;
     };
@@ -472,7 +488,7 @@ pub fn lock_if_idle(sandbox_dir: &Path) -> IdleLock {
 /// Format the last run time of the sandbox as "X ago".
 /// Returns:
 ///   Formatted time, or `None` if `run.json` has no last run.
-pub fn last_run_ago(sandbox_dir: &Path) -> Option<String> {
+pub fn last_run_ago(sandbox_dir: &VerifiedPath) -> Option<String> {
     read_run_meta(sandbox_dir).last_run.map(time_ago)
 }
 
@@ -502,8 +518,10 @@ pub struct RunMeta {
 
 /// Read `run.json`. Gives default metadata if the file is missing or not
 /// valid.
-pub fn read_run_meta(sandbox_dir: &Path) -> RunMeta {
-    std::fs::read_to_string(sandbox_dir.join("run.json"))
+pub fn read_run_meta(sandbox_dir: &VerifiedPath) -> RunMeta {
+    sandbox_dir
+        .join("run.json")
+        .and_then(|path| read_to_string_capped(&path, RUN_META_CAP))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
@@ -511,18 +529,29 @@ pub fn read_run_meta(sandbox_dir: &Path) -> RunMeta {
 
 /// Save `config` as the final config of the last run in `run.json` of
 /// `sandbox_dir`.
-pub fn save_last_run_config(sandbox_dir: &Path, config: serde_json::Value) -> anyhow::Result<()> {
+pub fn save_last_run_config(
+    sandbox_dir: &VerifiedPath,
+    config: serde_json::Value,
+) -> anyhow::Result<()> {
     let mut meta = read_run_meta(sandbox_dir);
     meta.last_run_config = Some(config);
     write_run_meta(sandbox_dir, &meta)
 }
 
 /// Write `run.json` atomically (temp file and rename).
-fn write_run_meta(sandbox_dir: &Path, meta: &RunMeta) -> anyhow::Result<()> {
+fn write_run_meta(sandbox_dir: &VerifiedPath, meta: &RunMeta) -> anyhow::Result<()> {
     let json = serde_json::to_string_pretty(meta)?;
-    let tmp = sandbox_dir.join(".run.json.tmp");
-    std::fs::write(&tmp, &json)?;
-    std::fs::rename(&tmp, sandbox_dir.join("run.json"))?;
+    let tmp = sandbox_dir.join(".run.json.tmp")?;
+    // Remove a stale temp file or a planted link. `create_new` never
+    // follows a link that appears after the remove.
+    match vfs::remove_file(&tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    vfs::open_with(&tmp, &opts)?.write_all(json.as_bytes())?;
+    vfs::rename(&tmp, &sandbox_dir.join("run.json")?)?;
     Ok(())
 }
 
@@ -578,13 +607,13 @@ fn acquire_lock(sandbox_dir: &PinnedDir) -> anyhow::Result<std::fs::File> {
 /// Try to limit a directory to its owner (0700). Ignores failure (for
 /// example on filesystems without Unix modes). The sensitive file in it is
 /// always 0600, which is the real protection.
-fn harden_dir_permissions(dir: &Path) {
+fn harden_dir_permissions(dir: &VerifiedPath) {
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    let _ = vfs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
 }
 
 /// Generate a self-signed CA keypair and write it to `ca.json`.
-fn generate_ca(sandbox_dir: &Path) -> anyhow::Result<()> {
+fn generate_ca(sandbox_dir: &VerifiedPath) -> anyhow::Result<()> {
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 
     let mut params = CertificateParams::new(vec![])?;
@@ -604,14 +633,16 @@ fn generate_ca(sandbox_dir: &Path) -> anyhow::Result<()> {
     // atomically. A truncated file after a crash blocks all later runs:
     // `has_ca` skips a new CA, but `read_ca` cannot parse the file.
     let json = serde_json::to_string_pretty(&ca_data)?;
-    crate::vault::atomic_write(&sandbox_dir.join("ca.json"), json.as_bytes())?;
+    crate::vault::atomic_write_in(sandbox_dir, "ca.json", json.as_bytes())?;
 
     Ok(())
 }
 
 /// Read the CA cert and key PEM strings from `ca.json`.
-fn read_ca(sandbox_dir: &Path) -> anyhow::Result<(String, String)> {
-    let json = std::fs::read_to_string(sandbox_dir.join("ca.json"))
+fn read_ca(sandbox_dir: &VerifiedPath) -> anyhow::Result<(String, String)> {
+    let json = sandbox_dir
+        .join("ca.json")
+        .and_then(|path| read_to_string_capped(&path, CA_CAP))
         .map_err(|_| anyhow::anyhow!(messages::project::CA_NOT_FOUND))?;
     let ca: CaData = serde_json::from_str(&json)?;
     Ok((ca.cert, ca.key))
@@ -632,6 +663,11 @@ mod tests {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
+    /// The verified form of the test path `path`.
+    fn verified(path: &Path) -> VerifiedPath {
+        VerifiedPath::new_follow(path, None).unwrap()
+    }
+
     /// Test that only one holder can have the sandbox lock, and that the
     /// running check and the idle probe follow the lock state.
     ///   1. Take the lock and check that the sandbox runs and a second take
@@ -644,9 +680,10 @@ mod tests {
     #[test]
     fn lock_is_exclusive_and_is_running_tracks_it() {
         let tmp = temp_dir();
-        let dir = tmp.path().join("sandbox");
-        std::fs::create_dir(&dir).unwrap();
-        let lock = PinnedDir::pin(&dir).unwrap();
+        let path = tmp.path().join("sandbox");
+        std::fs::create_dir(&path).unwrap();
+        let dir = verified(&path);
+        let lock = PinnedDir::pin(&path).unwrap();
         assert!(!is_running(&dir));
 
         let held = acquire_lock(&lock).unwrap();
@@ -666,7 +703,7 @@ mod tests {
         drop(held2);
         eventually("sandbox does not run", || (!is_running(&dir)).then_some(()));
 
-        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&path).unwrap();
         assert!(matches!(lock_if_idle(&dir), IdleLock::Missing));
     }
 
@@ -730,6 +767,102 @@ mod tests {
         assert!(!other.join("sandbox").exists());
     }
 
+    /// Test that the run data and the CA never go through a symlink that
+    /// the guest put in the project sandbox. A link must not leak a host
+    /// file as the CA key or let airlock write a host file.
+    ///   1. Make `run.json`, `ca.json` and their temp files symlinks to
+    ///      host files
+    ///   2. Open the project
+    ///   3. Check that the host files did not change, that the CA is new,
+    ///      and that `run.json` and `ca.json` are regular files
+    #[test]
+    fn run_data_and_ca_do_not_follow_planted_symlinks() {
+        let tmp = temp_dir();
+        let dir = tmp.path().join("project");
+        let sandbox = dir.join(".airlock/sandbox");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let victim = tmp.path().join("victim");
+        let secret = tmp.path().join("secret");
+        std::fs::write(&victim, "host file").unwrap();
+        std::fs::write(&secret, r#"{"cert": "host", "key": "host"}"#).unwrap();
+        symlink(&secret, sandbox.join("ca.json")).unwrap();
+        symlink(&secret, sandbox.join("run.json")).unwrap();
+        symlink(&victim, sandbox.join(".run.json.tmp")).unwrap();
+        let ca_tmp = format!("ca.json.{}.tmp", std::process::id());
+        symlink(&victim, sandbox.join(ca_tmp)).unwrap();
+
+        let (project, _) = open_project(&dir);
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "host file");
+        assert!(std::fs::read_to_string(&secret).unwrap().contains("host"));
+        assert!(project.ca_cert.contains("BEGIN CERTIFICATE"));
+        for name in ["ca.json", "run.json"] {
+            let meta = std::fs::symlink_metadata(sandbox.join(name)).unwrap();
+            assert!(meta.is_file(), "{name}");
+        }
+    }
+
+    /// Make a FIFO at `path`.
+    fn mkfifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    }
+
+    /// Test that a FIFO or a link that the guest put at the disk path is
+    /// no disk, and that the check does not block on the FIFO.
+    ///   1. Put a symlink at the disk path and check that there is no disk
+    ///   2. Put a FIFO there and check that there is no disk
+    #[test]
+    fn planted_disk_link_or_fifo_is_no_disk() {
+        let tmp = temp_dir();
+        let (project, _) = open_project(tmp.path());
+        let disk = project.sandbox_dir.to_path().unwrap().join(disk::DISK_FILE);
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, "host file").unwrap();
+
+        symlink(&victim, &disk).unwrap();
+        assert!(!has_disk(&project.sandbox_dir));
+        std::fs::remove_file(&disk).unwrap();
+        mkfifo(&disk);
+        assert!(!has_disk(&project.sandbox_dir));
+    }
+
+    /// Test that a FIFO that the guest put at `ca.json` does not block the
+    /// open and gets a new CA, and that a directory there fails the open.
+    ///   1. Put a FIFO at `ca.json` and open the project
+    ///   2. Check that `ca.json` is a regular file with a new CA
+    ///   3. Put a directory at `ca.json` and check that the open fails
+    #[test]
+    fn ca_json_fifo_is_replaced_and_ca_json_dir_fails_open() {
+        let tmp = temp_dir();
+        let dir = tmp.path().join("project");
+        let sandbox = dir.join(".airlock/sandbox");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        mkfifo(&sandbox.join("ca.json"));
+        // Keep one lock for both opens. A fork in a parallel test can hold a
+        // copy of a released lock for a short time, so a second acquire can
+        // fail.
+        let lock = SandboxLock::acquire(&dir).unwrap();
+        let open_with_lock = || {
+            let config = crate::config::config_values::parse(serde_json::json!({})).unwrap();
+            open(&lock, config, None, test_context(&dir, host_env_vault(&[])))
+        };
+
+        let project = open_with_lock().unwrap();
+        assert!(project.ca_cert.contains("BEGIN CERTIFICATE"));
+        assert!(
+            std::fs::symlink_metadata(sandbox.join("ca.json"))
+                .unwrap()
+                .is_file()
+        );
+        drop(project);
+
+        std::fs::remove_file(sandbox.join("ca.json")).unwrap();
+        std::fs::create_dir(sandbox.join("ca.json")).unwrap();
+        assert!(open_with_lock().is_err());
+    }
+
     /// Test that an `.airlock` directory of another user is refused, and that
     /// the symlink message comes first when both problems exist.
     ///   1. Check that a directory of the current user has no problem
@@ -740,13 +873,14 @@ mod tests {
         let path = Path::new("/some/.airlock");
         let euid = unsafe { libc::geteuid() };
         let other = euid.wrapping_add(1);
-        assert_eq!(airlock_dir_problem_for(path, false, euid), None);
+        let path = path.display();
+        assert_eq!(airlock_dir_problem_for(&path, false, euid), None);
         assert_eq!(
-            airlock_dir_problem_for(path, false, other),
+            airlock_dir_problem_for(&path, false, other),
             Some("/some/.airlock is owned by another user".to_string())
         );
         assert!(
-            airlock_dir_problem_for(path, true, other)
+            airlock_dir_problem_for(&path, true, other)
                 .unwrap()
                 .contains("is a symbolic link")
         );
@@ -765,7 +899,7 @@ mod tests {
             test_context(dir, host_env_vault(&[])),
         )
         .unwrap();
-        let pinned = PinnedDir::pin(&project.sandbox_dir).unwrap();
+        let pinned = PinnedDir::pin(project.sandbox_dir.to_path().unwrap()).unwrap();
         (project, pinned)
     }
 
@@ -780,8 +914,9 @@ mod tests {
     fn opened_project_has_private_ca_and_run_metadata() {
         let tmp = temp_dir();
         let (project, _) = open_project(tmp.path());
-        assert_eq!(mode(&project.sandbox_dir), 0o700);
-        assert_eq!(mode(&project.sandbox_dir.join("ca.json")), 0o600);
+        let dir = project.sandbox_dir.to_path().unwrap();
+        assert_eq!(mode(dir), 0o700);
+        assert_eq!(mode(&dir.join("ca.json")), 0o600);
         assert!(project.ca_cert.contains("BEGIN CERTIFICATE"));
         project.save_meta();
         assert!(read_run_meta(&project.sandbox_dir).guest_cwd.is_some());
@@ -798,19 +933,20 @@ mod tests {
     fn disk_identity_stays_until_reset() {
         let tmp = temp_dir();
         let (project, pinned) = open_project(tmp.path());
-        let dir = &project.sandbox_dir;
-        assert!(disk_id(dir).is_none());
-        assert!(!has_disk(dir));
+        let path = project.sandbox_dir.to_path().unwrap().to_path_buf();
+        let dir = &path;
+        assert!(disk_id(&pinned).is_none());
+        assert!(!has_disk(&project.sandbox_dir));
 
-        ensure_disk(dir, &project.config.disk, false).unwrap();
-        assert!(has_disk(dir));
-        let id = disk_id(dir).unwrap();
-        ensure_disk(dir, &project.config.disk, false).unwrap();
-        assert_eq!(disk_id(dir), Some(id));
+        ensure_disk(&pinned, &project.config.disk, false).unwrap();
+        assert!(has_disk(&project.sandbox_dir));
+        let id = disk_id(&pinned).unwrap();
+        ensure_disk(&pinned, &project.config.disk, false).unwrap();
+        assert_eq!(disk_id(&pinned), Some(id));
 
         reset_disk(&pinned).unwrap();
-        assert!(disk_id(dir).is_none());
-        assert!(!has_disk(dir));
+        assert!(disk_id(&pinned).is_none());
+        assert!(!has_disk(&project.sandbox_dir));
         assert!(!dir.join(disk::DISK_ID_FILE).exists());
         reset_disk(&pinned).unwrap();
     }
@@ -826,25 +962,32 @@ mod tests {
     fn each_new_disk_gets_new_identity() {
         let tmp = temp_dir();
         let (project, pinned) = open_project(tmp.path());
-        let dir = &project.sandbox_dir;
-        let prepare = || ensure_disk(dir, &project.config.disk, false).unwrap();
+        let path = project.sandbox_dir.to_path().unwrap().to_path_buf();
+        let dir = &path;
+        let prepare = || ensure_disk(&pinned, &project.config.disk, false).unwrap();
 
-        disk::prepare(dir, &project.config.disk, "/root", Path::new("/")).unwrap();
-        let id = disk_id(dir).unwrap();
+        disk::prepare(
+            &project.sandbox_dir,
+            &project.config.disk,
+            "/root",
+            Path::new("/"),
+        )
+        .unwrap();
+        let id = disk_id(&pinned).unwrap();
         reset_disk(&pinned).unwrap();
         prepare();
-        let id2 = disk_id(dir).unwrap();
+        let id2 = disk_id(&pinned).unwrap();
         assert_ne!(id2, id);
 
         std::fs::remove_file(dir.join(disk::DISK_FILE)).unwrap();
-        assert!(disk_id(dir).is_none());
+        assert!(disk_id(&pinned).is_none());
         prepare();
-        assert_ne!(disk_id(dir), Some(id2));
+        assert_ne!(disk_id(&pinned), Some(id2));
 
         std::fs::remove_file(dir.join(disk::DISK_ID_FILE)).unwrap();
-        assert!(disk_id(dir).is_none());
+        assert!(disk_id(&pinned).is_none());
         prepare();
-        assert!(disk_id(dir).is_some());
+        assert!(disk_id(&pinned).is_some());
     }
 
     /// Test that a disk reset never follows a symlink. A link at the disk
@@ -856,15 +999,16 @@ mod tests {
     fn disk_reset_does_not_follow_symlink() {
         let tmp = temp_dir();
         let (project, pinned) = open_project(tmp.path());
-        let dir = &project.sandbox_dir;
-        ensure_disk(dir, &project.config.disk, false).unwrap();
+        let path = project.sandbox_dir.to_path().unwrap().to_path_buf();
+        let dir = &path;
+        ensure_disk(&pinned, &project.config.disk, false).unwrap();
 
         let victim = tmp.path().join("victim");
         std::fs::write(&victim, "host file").unwrap();
         std::fs::remove_file(dir.join(disk::DISK_FILE)).unwrap();
         symlink(&victim, dir.join(disk::DISK_FILE)).unwrap();
         reset_disk(&pinned).unwrap();
-        assert!(!has_disk(dir));
+        assert!(!has_disk(&project.sandbox_dir));
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "host file");
     }
 }

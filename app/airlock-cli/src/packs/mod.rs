@@ -347,8 +347,11 @@ impl ConfiguredPack {
             Some(PackConfig::Lua(source)) => {
                 let metadata = self.metadata();
                 // Create the pack directory before `config.lua` runs.
-                let directory =
-                    crate::cache::pack_mounts_dir(data_dir, &metadata.name).map_err(|e| {
+                let directory = crate::util::VerifiedPath::new_follow(data_dir, None)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|data_dir| crate::cache::pack_mounts_dir(&data_dir, &metadata.name))
+                    .and_then(|dir| Ok(dir.to_path()?.to_path_buf()))
+                    .map_err(|e| {
                         anyhow::anyhow!(crate::messages::packs::pack_failed(
                             &metadata.name,
                             format!("{e:#}")

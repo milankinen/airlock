@@ -5,12 +5,13 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
 use crate::cache;
-use crate::cli::cmd_rm::{RmArgs, run};
+use crate::cli::cmd_rm::{RmArgs, rm_sandbox_only, run};
 use crate::context::Context;
 use crate::project::{self, SandboxLock};
-use crate::sandboxes::{PROJECT_SANDBOX, registry};
+use crate::sandboxes::{self, PROJECT_SANDBOX, registry};
 use crate::test_cfg::sandboxes::stopped_sandbox_dir;
 use crate::test_cfg::{TempDir, block_on_local, temp_dir, test_context};
+use crate::util::VerifiedPath;
 use crate::vault::{Vault, VaultStorageType};
 
 const FORCE: RmArgs = RmArgs { force: true };
@@ -54,9 +55,9 @@ impl Project {
     /// and a cached image.
     fn started_in_data_dir(home: &TempDir, context: &Context, name: &str) -> Self {
         let dir = Self::make_dir(home, name);
-        let boxes = context.boxes_dir();
+        let boxes = sandboxes::boxes_dir(context).unwrap();
         let id = block_on_local(registry::find_or_register(&context.db, &boxes, &dir)).unwrap();
-        let sandbox = boxes.join(id);
+        let sandbox = context.boxes_dir().join(id);
         stopped_sandbox_dir(&sandbox);
         Self::finish(context, dir, sandbox, name)
     }
@@ -71,7 +72,8 @@ impl Project {
     /// Add a disk and a cached image to the sandbox `sandbox` of `dir`.
     fn finish(context: &Context, dir: PathBuf, sandbox: PathBuf, name: &str) -> Self {
         std::fs::write(sandbox.join("disk.img"), b"data").unwrap();
-        let image = cache::image_path(&context.data_dir, &format!("sha256:{name}")).unwrap();
+        let image = cache::image_path(&context.roots.data_dir, &format!("sha256:{name}")).unwrap();
+        let image = image.to_path().unwrap().to_path_buf();
         std::fs::write(&image, br#"{"schema":"v2","image_layers":[]}"#).unwrap();
         std::fs::hard_link(&image, sandbox.join("image")).unwrap();
         Self {
@@ -195,8 +197,12 @@ fn rm_of_running_sandbox_is_refused() {
     let id = block_on_local(registry::list(&context.db)).unwrap()[0]
         .id
         .clone();
-    let _running_box =
-        SandboxLock::acquire_box(&in_data_dir.dir, &context.boxes_dir(), &id).unwrap();
+    let _running_box = SandboxLock::acquire_box(
+        &in_data_dir.dir,
+        &sandboxes::boxes_dir(&context).unwrap(),
+        &id,
+    )
+    .unwrap();
 
     for project in [&in_project, &in_data_dir] {
         assert_eq!(rm(&context, &project.dir), 1);
@@ -247,4 +253,29 @@ fn rm_removes_symlinked_airlock_dir_or_sandbox_but_not_their_targets() {
     assert!(victim.airlock().join("settings.yaml").is_file());
     assert!(victim_disk.is_file());
     assert!(victim.image.exists());
+}
+
+/// Test that rm refuses the removal if `.airlock` changes to a symlink
+/// after the check, for example while the prompt waits. The removal must
+/// not reach the sandbox of the link target.
+///   1. Start a victim project and a project with a user file
+///   2. Check the sandbox path of the project, then swap its `.airlock`
+///      for a symlink to the `.airlock` of the victim
+///   3. Run the sandbox removal and check that it fails
+///   4. Check that the victim sandbox and the link stay
+#[test]
+fn rm_after_airlock_dir_swapped_for_link_is_refused() {
+    let home = temp_dir();
+    let context = context(&home);
+    let victim = Project::started(&home, &context, "victim");
+    let project = Project::started(&home, &context, "proj");
+    std::fs::write(project.airlock().join("settings.yaml"), "").unwrap();
+    let sandbox_dir = VerifiedPath::new_follow(&project.sandbox, None).unwrap();
+
+    std::fs::rename(project.airlock(), project.dir.join("old-airlock")).unwrap();
+    symlink(victim.airlock(), project.airlock()).unwrap();
+    assert_eq!(rm_sandbox_only(&FORCE, &context, &sandbox_dir), 1);
+
+    assert!(victim.sandbox.join("disk.img").is_file());
+    assert!(project.airlock().symlink_metadata().unwrap().is_symlink());
 }

@@ -15,7 +15,7 @@ mod gc;
 mod layer;
 mod registry;
 
-use std::path::Path;
+use std::io::{self, Read};
 
 use futures::stream::{self, StreamExt};
 pub use gc::sweep as gc_sweep;
@@ -27,8 +27,10 @@ use crate::cli::prompt::choose::{Choice, Choose};
 use crate::config::config_values::{ImageRef, PullPolicy};
 use crate::oci::credentials::ToRegistryAuth;
 use crate::project::Project;
+use crate::util::verified_path::{self, Refusal, VerifiedPath};
+use crate::util::{is_dir, vfs};
 use crate::vault::Vault;
-use crate::{cache, cli, messages};
+use crate::{cache, cli, messages, util};
 
 /// The `PATH` of a container whose image sets none.
 pub const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -38,6 +40,15 @@ pub const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bi
 /// counts as "no records" and is not read, so an image cannot control how
 /// much memory these reads use.
 const MAX_LAYER_RECORD_FILE: u64 = 1024 * 1024;
+
+/// Largest cached image file that the host reads. Real files are a few KB.
+/// The guest can write the `image` file of a sandbox in its project, and
+/// that file is a hard link to the cache entry.
+const MAX_IMAGE_FILE: u64 = 4 * 1024 * 1024;
+
+/// Counter that makes the temp names of image file writes unique in a
+/// process.
+static IMAGE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Image metadata that configures the container process. [`prepare`]
 /// returns it.
@@ -156,13 +167,13 @@ pub struct PreparedImage {
 ///   The prepared image and what happened to the old image, or error.
 ///   Stops with [`ImageChangeStop`] if the user aborts or nobody can answer.
 pub async fn prepare(
-    data_dir: &Path,
-    sandbox_dir: &Path,
+    data_dir: &VerifiedPath,
+    sandbox_dir: &VerifiedPath,
     image_cfg: &ImageRef,
     vault: &Vault,
     on_change: OnImageChange,
 ) -> anyhow::Result<PreparedImage> {
-    let sandbox_image = sandbox_dir.join("image");
+    let sandbox_image = sandbox_dir.join("image")?;
     let image_name = &image_cfg.name;
     let unchanged = |image| PreparedImage {
         image,
@@ -256,14 +267,15 @@ pub async fn prepare(
             // share it, and the `image_id` describes neither image.
             // A return here makes this mismatch impossible. A digest gets to
             // `ensure_image` only from the same resolution as its source.
-            let old_image_path = crate::cache::image_path(data_dir, old_digest.trim())?;
+            let old_digest = old_digest.trim();
+            let old_image_path = cache::image_path(data_dir, old_digest)?;
             if let Some(mut old) = read_ready_image(data_dir, &old_image_path) {
                 // Write the configured name into the kept image, so the
                 // name-keyed fast path finds it on the next start. Otherwise
                 // each later run resolves again and asks the same question.
                 if old.name != *image_name {
                     old.name.clone_from(image_name);
-                    write_cached_image(&old_image_path, &old)?;
+                    write_cached_image(data_dir, old_digest, &old)?;
                 }
                 return use_cached_image(data_dir, sandbox_dir, &sandbox_image, old).map(|image| {
                     PreparedImage {
@@ -282,7 +294,7 @@ pub async fn prepare(
         } else {
             // Remove the image hardlink. This sandbox then no longer marks
             // the old image as in use, so the sweep below can collect it.
-            let _ = std::fs::remove_file(&sandbox_image);
+            let _ = vfs::remove_file(&sandbox_image);
             cli::log!(
                 "  {} {}",
                 cli::check(),
@@ -310,11 +322,8 @@ pub async fn prepare(
     // that creates a new image can start a sweep that deletes this one.
     // Always do this: also when the digest did not change, a previous run
     // can have left a standalone copy instead of a hardlink.
-    let image_path = crate::cache::image_path(data_dir, &oci_image.image_id)?;
-    ensure_image_hardlink(&sandbox_image, &image_path, &oci_image)?;
-
-    let overlay_dir = sandbox_dir.join("overlay");
-    std::fs::create_dir_all(&overlay_dir)?;
+    ensure_image_hardlink(data_dir, &sandbox_image, &oci_image)?;
+    vfs::create_dir_all(&sandbox_dir.join("overlay")?)?;
 
     Ok(PreparedImage {
         image: oci_image,
@@ -330,24 +339,22 @@ pub async fn prepare(
 /// The fast path and the resolution-failure fallback both use this, so both
 /// leave the sandbox in the same state as a newly pulled image.
 fn use_cached_image(
-    data_dir: &Path,
-    sandbox_dir: &Path,
-    sandbox_image: &Path,
+    data_dir: &VerifiedPath,
+    sandbox_dir: &VerifiedPath,
+    sandbox_image: &VerifiedPath,
     image: OciImage,
 ) -> anyhow::Result<OciImage> {
     // Invariant: `sandbox/image` must be a hardlink to the canonical cache
     // file, so the GC sweep sees that the sandbox uses it. Repair it on each
     // prepare. A cache wipe, a cache-path migration, or an older run can
     // break the link. Then the sweep can delete the image.
-    let image_path = crate::cache::image_path(data_dir, &image.image_id)?;
-    ensure_image_hardlink(sandbox_image, &image_path, &image)?;
+    ensure_image_hardlink(data_dir, sandbox_image, &image)?;
     cli::log!(
         "  {} {}",
         cli::check(),
         messages::oci::image_cached(cli::dim(&image.image_id[..19.min(image.image_id.len())]))
     );
-    let overlay_dir = sandbox_dir.join("overlay");
-    std::fs::create_dir_all(&overlay_dir)?;
+    vfs::create_dir_all(&sandbox_dir.join("overlay")?)?;
     Ok(image)
 }
 
@@ -410,13 +417,21 @@ enum CachedImage {
     V2(OciImage),
 }
 
+/// Read a cached image JSON file.
+/// Returns:
+///   The file content, or `None` if the file is missing, cannot be read or
+///   is larger than [`MAX_IMAGE_FILE`].
+fn read_image_json(path: &VerifiedPath) -> Option<String> {
+    util::read_to_string_capped(path, MAX_IMAGE_FILE).ok()
+}
+
 /// Read a cached image JSON file and unwrap it into an [`OciImage`].
 /// Returns:
 ///   The image, or `None` if the file is missing, cannot be read, or has an
 ///   unknown schema version. Callers treat `None` as a cache miss.
-fn read_cached_image(path: &Path) -> Option<OciImage> {
-    let data = std::fs::read(path).ok()?;
-    let wrapped: CachedImage = serde_json::from_slice(&data).ok()?;
+fn read_cached_image(path: &VerifiedPath) -> Option<OciImage> {
+    let data = read_image_json(path)?;
+    let wrapped: CachedImage = serde_json::from_str(&data).ok()?;
     let CachedImage::V2(image) = wrapped;
     Some(image)
 }
@@ -430,7 +445,7 @@ fn read_cached_image(path: &Path) -> Option<OciImage> {
 /// Returns:
 ///   The image, or `None` if the file is missing or a sweep removed a layer.
 ///   In both cases the caller must resolve the image again.
-fn read_ready_image(data_dir: &Path, path: &Path) -> Option<OciImage> {
+fn read_ready_image(data_dir: &VerifiedPath, path: &VerifiedPath) -> Option<OciImage> {
     let image = read_cached_image(path)?;
     if image.image_layers.is_empty() {
         return None;
@@ -438,31 +453,31 @@ fn read_ready_image(data_dir: &Path, path: &Path) -> Option<OciImage> {
     image
         .image_layers
         .iter()
-        .all(|k| cache::layer_dir(data_dir, k).is_ok_and(|p| p.is_dir()))
+        .all(|k| cache::layer_dir(data_dir, k).is_ok_and(|p| is_dir(&p)))
         .then_some(image)
 }
 
 /// Make sure that `sandbox_image` is a hardlink to `images/<digest>`. The
 /// hardlink tells GC that the sandbox uses the image.
 /// Args:
+///  - `data_dir`: Airlock data directory
 ///  - `sandbox_image`: The `image` file in the sandbox directory
-///  - `image_path`: The canonical cache file `images/<digest>`
-///  - `image`: Image to write if the cache file is missing.
+///  - `image`: Image of the cache file. Written if the cache file is
+///    missing.
 ///
 /// Returns:
 ///   Error if the hardlink fails.
 fn ensure_image_hardlink(
-    sandbox_image: &Path,
-    image_path: &Path,
+    data_dir: &VerifiedPath,
+    sandbox_image: &VerifiedPath,
     image: &OciImage,
 ) -> anyhow::Result<()> {
     // Do nothing if the inodes already match. Otherwise remove the old
-    // `sandbox_image` and link it again.
+    // `sandbox_image` and link it again. The metadata does not follow a
+    // symlink, so a planted link never counts as linked.
     use std::os::unix::fs::MetadataExt;
-    let linked = match (
-        std::fs::metadata(sandbox_image),
-        std::fs::metadata(image_path),
-    ) {
+    let image_path = cache::image_path(data_dir, &image.image_id)?;
+    let linked = match (vfs::metadata(sandbox_image), vfs::metadata(&image_path)) {
         (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
         _ => false,
     };
@@ -471,35 +486,49 @@ fn ensure_image_hardlink(
     }
     // A cache wipe or a path migration can remove the canonical cache file.
     // Write the sandbox copy back first, so there is a file to link to.
-    if !image_path.exists() {
-        write_cached_image(image_path, image)?;
+    if vfs::symlink_metadata(&image_path).is_err() {
+        write_cached_image(data_dir, &image.image_id, image)?;
     }
-    let _ = std::fs::remove_file(sandbox_image);
+    let _ = vfs::remove_file(sandbox_image);
     // Fail on a link error. Both paths are under `$HOME`, so the only
     // probable cause is a cross-filesystem config problem. Without the link,
     // GC does not protect the sandbox image.
-    std::fs::hard_link(image_path, sandbox_image).map_err(|e| {
+    vfs::hard_link(&image_path, sandbox_image).map_err(|e| {
         anyhow::anyhow!(messages::oci::hardlink_image_failed(
-            image_path.display(),
-            sandbox_image.display(),
+            &image_path,
+            sandbox_image,
             e
         ))
     })?;
     Ok(())
 }
 
-/// Write a cached image file atomically.
-fn write_cached_image(path: &Path, image: &OciImage) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // Write to `<path>.tmp`, then rename. The rename is the commit point,
-    // the same as in the layer cache.
-    let tmp = path.with_extension("tmp");
+/// Write the cache file of the image `digest` atomically.
+fn write_cached_image(
+    data_dir: &VerifiedPath,
+    digest: &str,
+    image: &OciImage,
+) -> anyhow::Result<()> {
+    // The path check also makes the images dir.
+    let path = cache::image_path(data_dir, digest)?;
+    // Write to a temp file, then rename. The rename is the commit point,
+    // the same as in the layer cache. The temp name is unique for each
+    // process and write, so parallel writers never share a temp file. The
+    // sweep removes old temp files after a crash.
+    let tmp = cache::images_root(data_dir)?.join(format!(
+        "{}.{}.{}.tmp",
+        cache::digest_name(digest),
+        std::process::id(),
+        IMAGE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))?;
     let bytes = serde_json::to_vec_pretty(&CachedImage::V2(image.clone()))?;
-    std::fs::write(&tmp, &bytes)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    let written = vfs::create_new(&tmp)
+        .and_then(|mut file| io::Write::write_all(&mut file, &bytes))
+        .and_then(|()| vfs::rename(&tmp, &path));
+    if written.is_err() {
+        let _ = vfs::remove_file(&tmp);
+    }
+    Ok(written?)
 }
 
 /// Make an [`OciImage`] from the parsed OCI image config and the layer list.
@@ -515,7 +544,7 @@ fn write_cached_image(path: &Path, image: &OciImage) -> anyhow::Result<()> {
 ///   the image has no layers, or its user or home directory cannot be
 ///   resolved.
 fn build_oci_image(
-    data_dir: &Path,
+    data_dir: &VerifiedPath,
     image_id: String,
     name: String,
     ordered_layers: Vec<String>,
@@ -644,7 +673,11 @@ pub(crate) fn apply_login_shell(cmd: Vec<String>) -> Vec<String> {
 ///
 /// Returns:
 ///   The `(uid, gid)` pair, or error if a name is not found.
-fn resolve_user(data_dir: &Path, layer_keys: &[String], user: &str) -> anyhow::Result<(u32, u32)> {
+fn resolve_user(
+    data_dir: &VerifiedPath,
+    layer_keys: &[String],
+    user: &str,
+) -> anyhow::Result<(u32, u32)> {
     let (user_part, group_part) = match user.split_once(':') {
         Some((u, g)) => (u, Some(g)),
         None => (user, None),
@@ -683,7 +716,11 @@ fn resolve_user(data_dir: &Path, layer_keys: &[String], user: &str) -> anyhow::R
 
 /// Resolve the group part of a `USER` string. A numeric gid is used as it
 /// is. A name is looked up in the image's `/etc/group`.
-fn resolve_group(data_dir: &Path, layer_keys: &[String], group: &str) -> anyhow::Result<u32> {
+fn resolve_group(
+    data_dir: &VerifiedPath,
+    layer_keys: &[String],
+    group: &str,
+) -> anyhow::Result<u32> {
     if let Ok(gid) = group.parse::<u32>() {
         return Ok(gid);
     }
@@ -779,7 +816,11 @@ enum LegacyUser {
 
 /// Find uid/gid again for a legacy cache file (one without `user`). Uses
 /// the current `USER` string and the layers that the file refers to.
-fn check_legacy_user(data_dir: &Path, stored: &OciImage, user: &str) -> anyhow::Result<LegacyUser> {
+fn check_legacy_user(
+    data_dir: &VerifiedPath,
+    stored: &OciImage,
+    user: &str,
+) -> anyhow::Result<LegacyUser> {
     let (uid, gid) = resolve_user(data_dir, &stored.image_layers, user)?;
     Ok(if uid != stored.uid {
         LegacyUser::UidMismatch { uid, gid }
@@ -817,7 +858,7 @@ fn resolved_user(resolved: &ResolvedImage) -> anyhow::Result<String> {
 ///   `Ok` after it marks the file as verified or repairs its gid. Error that
 ///   tells the user to run `airlock rm` if the uid is wrong.
 fn verify_legacy_user(
-    data_dir: &Path,
+    data_dir: &VerifiedPath,
     stored: &OciImage,
     resolved: &ResolvedImage,
 ) -> anyhow::Result<()> {
@@ -845,10 +886,7 @@ fn verify_legacy_user(
     }
     // Write the shared cache entry again. `prepare` links the sandbox copy
     // to the new file with `ensure_image_hardlink`.
-    write_cached_image(
-        &crate::cache::image_path(data_dir, &stored.image_id)?,
-        &fixed,
-    )
+    write_cached_image(data_dir, &stored.image_id, &fixed)
 }
 
 /// Resolve the configured image to a digest and config. Tries the local
@@ -1026,13 +1064,13 @@ enum ImageSource {
 /// Returns:
 ///   The cached image metadata, or error.
 async fn ensure_image(
-    data_dir: &Path,
+    data_dir: &VerifiedPath,
     resolved: &mut ResolvedImage,
     image_name: &str,
     auth: &RegistryAuth,
     insecure: bool,
 ) -> anyhow::Result<OciImage> {
-    let image_path = crate::cache::image_path(data_dir, &resolved.digest)?;
+    let image_path = cache::image_path(data_dir, &resolved.digest)?;
 
     // Digest-keyed cache hit: a sibling project already pulled this image
     // and all its layers are still on disk. Skip the pull. Write the current
@@ -1041,7 +1079,7 @@ async fn ensure_image(
     if let Some(mut cached) = read_ready_image(data_dir, &image_path).filter(|c| c.user.is_some()) {
         if cached.name != image_name {
             cached.name = image_name.to_string();
-            write_cached_image(&image_path, &cached)?;
+            write_cached_image(data_dir, &resolved.digest, &cached)?;
         }
         return Ok(cached);
     }
@@ -1062,7 +1100,7 @@ async fn ensure_image(
         ordered_layers,
         &resolved.config,
     )?;
-    write_cached_image(&image_path, &image)?;
+    write_cached_image(data_dir, &resolved.digest, &image)?;
     Ok(image)
 }
 
@@ -1076,7 +1114,7 @@ async fn ensure_image(
 /// Returns:
 ///   The parsed image config and the layer keys, topmost first.
 async fn ensure_local_image(
-    data_dir: &Path,
+    data_dir: &VerifiedPath,
     engine: &'static str,
     image_ref: &str,
 ) -> anyhow::Result<(OciConfig, Vec<String>)> {
@@ -1087,7 +1125,7 @@ async fn ensure_local_image(
         let save = docker::save_layer_tarballs(data_dir, engine, &image_ref).await?;
         for digest in &save.layer_digests {
             let digest = digest.clone();
-            let data_dir = data_dir.to_path_buf();
+            let data_dir = data_dir.clone();
             tokio::task::spawn_blocking(move || {
                 layer::ensure_layer_cached(
                     &data_dir,
@@ -1142,7 +1180,7 @@ async fn ensure_local_image(
 /// Returns:
 ///   The layer keys, topmost first.
 async fn ensure_registry_image(
-    data_dir: &Path,
+    data_dir: &VerifiedPath,
     reg: &registry::RegistryImage,
     auth: &RegistryAuth,
     insecure: bool,
@@ -1152,7 +1190,7 @@ async fn ensure_registry_image(
     let cached_count = layers
         .iter()
         .filter(|l| {
-            cache::layer_dir(data_dir, &cache::layer_key(&l.digest)).is_ok_and(|p| p.is_dir())
+            cache::layer_dir(data_dir, &cache::layer_key(&l.digest)).is_ok_and(|p| is_dir(&p))
         })
         .count();
     if cached_count > 0 {
@@ -1167,7 +1205,7 @@ async fn ensure_registry_image(
         .iter()
         .enumerate()
         .filter(|(_, l)| {
-            !cache::layer_dir(data_dir, &cache::layer_key(&l.digest)).is_ok_and(|p| p.is_dir())
+            !cache::layer_dir(data_dir, &cache::layer_key(&l.digest)).is_ok_and(|p| is_dir(&p))
         })
         .map(|(i, _)| i)
         .collect();
@@ -1252,7 +1290,7 @@ async fn ensure_registry_image(
 ///  - `auth`: Registry auth
 ///  - `insecure`: Allow plain-HTTP registry access.
 async fn fetch_and_extract_layer(
-    data_dir: &Path,
+    data_dir: &VerifiedPath,
     reference: &oci_client::Reference,
     layer_desc: &oci_client::manifest::OciDescriptor,
     per_layer: &indicatif::ProgressBar,
@@ -1264,23 +1302,22 @@ async fn fetch_and_extract_layer(
     let layer_desc = layer_desc.clone();
     let per_layer = per_layer.clone();
     let auth = auth.clone();
-    let blocking_data_dir = data_dir.to_path_buf();
+    let blocking_data_dir = data_dir.clone();
 
     // `ensure_layer_cached` does blocking I/O (tar extraction), so it must
     // not run on the async runtime. Thus pull the blob with async code into
     // a temp file, then run the extraction in a blocking task.
     let layers_root = cache::layers_root(data_dir)?;
     let key = cache::layer_key(&digest);
-    let download = layers_root.join(format!("{key}.download"));
+    let download = layers_root.join(format!("{key}.download"))?;
 
     // Same fast path as in `ensure_layer_cached`.
-    let layer_dir = cache::layer_dir(data_dir, &key)?;
-    if layer_dir.is_dir() {
+    if is_dir(&cache::layer_dir(data_dir, &key)?) {
         return Ok(());
     }
 
-    if !download.exists() {
-        let download_tmp = layer::download_tmp_path(&layers_root, &key);
+    if vfs::symlink_metadata(&download).is_err() {
+        let download_tmp = layer::download_tmp_path(&layers_root, &key)?;
         let pulled = registry::pull_layer(
             &reference,
             &layer_desc,
@@ -1291,10 +1328,10 @@ async fn fetch_and_extract_layer(
             insecure,
         )
         .await
-        .and_then(|()| Ok(std::fs::rename(&download_tmp, &download)?));
+        .and_then(|()| Ok(vfs::rename(&download_tmp, &download)?));
         if pulled.is_err() {
             // The name is unique, so no later pull reuses or removes it.
-            let _ = std::fs::remove_file(&download_tmp);
+            let _ = vfs::remove_file(&download_tmp);
         }
         pulled?;
     }
@@ -1348,7 +1385,7 @@ fn format_size(bytes: i64) -> String {
 ///   The first match, and all layer copies of the file that were refused
 ///   instead of read, with the reason.
 fn lookup_layer_record<T>(
-    data_dir: &Path,
+    data_dir: &VerifiedPath,
     layer_keys: &[String],
     rel_path: &str,
     pick: impl Fn(&[&str]) -> Option<T>,
@@ -1427,34 +1464,26 @@ impl<T> Lookup<T> {
 ///   the read was refused. Callers treat a refusal as "no records in this
 ///   layer" and continue to the next layer, the same as for a whiteout. But
 ///   they can report the refusal if nothing else resolves.
-fn read_layer_file(layer_dir: &Path, rel_path: &str) -> Result<Option<String>, Refused> {
-    use std::io::Read;
-
-    let root = std::fs::canonicalize(layer_dir)
-        .map_err(|e| Refused::suspicious(messages::oci::cannot_resolve_layer_dir(e)))?;
-
-    // Examine one component at a time. `lstat` does not follow the last
-    // component, but it follows symlinks in the parent components. Thus a
-    // single check of `etc/passwd` follows `etc -> /` to the host. Each
-    // symlink on the path gets the same stay-inside check.
-    let mut path = layer_dir.to_path_buf();
+fn read_layer_file(layer_dir: &VerifiedPath, rel_path: &str) -> Result<Option<String>, Refused> {
+    // Examine one component at a time. A check of the full path follows
+    // `etc -> /` to the host. Each symlink on the path resolves with the
+    // layer dir as its scope, so a link out of the layer is refused.
+    let mut path = layer_dir.clone();
     for component in rel_path.split('/') {
-        path.push(component);
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+        let next = path
+            .join(component)
+            .map_err(|e| Refused::suspicious(e.to_string()))?;
+        let Ok(meta) = vfs::symlink_metadata(&next) else {
             return Ok(None);
         };
-        if meta.file_type().is_symlink() {
-            let target = std::fs::canonicalize(&path)
-                .map_err(|e| Refused::unresolved(messages::oci::symlink_target_unresolved(e)))?;
-            if !target.starts_with(&root) {
-                return Err(Refused::suspicious(messages::oci::symlink_outside_layer(
-                    target.display(),
-                )));
-            }
-        }
+        path = if meta.file_type().is_symlink() {
+            resolve_layer_link(layer_dir, &path, component)?
+        } else {
+            next
+        };
     }
 
-    let meta = std::fs::metadata(&path).map_err(|e| Refused::suspicious(e.to_string()))?;
+    let meta = vfs::symlink_metadata(&path).map_err(|e| Refused::suspicious(e.to_string()))?;
     if !meta.is_file() {
         return Err(Refused::suspicious(
             messages::oci::NOT_REGULAR_FILE.to_string(),
@@ -1467,12 +1496,48 @@ fn read_layer_file(layer_dir: &Path, rel_path: &str) -> Result<Option<String>, R
         )));
     }
     let mut content = String::new();
-    std::fs::File::open(&path)
+    vfs::open(&path)
         .map_err(|e| Refused::suspicious(e.to_string()))?
         .take(MAX_LAYER_RECORD_FILE)
         .read_to_string(&mut content)
         .map_err(|e| Refused::suspicious(e.to_string()))?;
     Ok(Some(content))
+}
+
+/// Resolve the symlink `name` in the dir `parent` of a layer tree. An
+/// absolute target resolves from the layer root, as in the guest.
+/// Returns:
+///   The target, or the refusal if the target is outside `layer_dir` or
+///   does not exist.
+fn resolve_layer_link(
+    layer_dir: &VerifiedPath,
+    parent: &VerifiedPath,
+    name: &str,
+) -> Result<VerifiedPath, Refused> {
+    let unresolved =
+        |e: io::Error| Refused::unresolved(messages::oci::symlink_target_unresolved(e));
+    let link = parent.join(name).map_err(unresolved)?;
+    let link_target = vfs::read_link(&link).map_err(unresolved)?;
+    // The rest of an absolute target resolves on the host. Thus an absolute
+    // link in it leaves the layer and is refused.
+    let followed = match link_target.strip_prefix("/") {
+        Ok(rel) => layer_dir.join_follow(rel, Some(layer_dir)),
+        Err(_) => parent.join_follow(name, Some(layer_dir)),
+    };
+    let target = followed.map_err(|e| match verified_path::refusal(&e) {
+        Some(Refusal::Outside) => Refused::suspicious(messages::oci::symlink_outside_layer(e)),
+        _ => unresolved(e),
+    })?;
+    // A link to a missing target resolves to the link itself.
+    match vfs::symlink_metadata(&target) {
+        Ok(meta) if !meta.file_type().is_symlink() => Ok(target),
+        Ok(_) => Err(Refused::unresolved(
+            messages::oci::symlink_target_unresolved(io::Error::from(io::ErrorKind::NotFound)),
+        )),
+        Err(e) => Err(Refused::unresolved(
+            messages::oci::symlink_target_unresolved(e),
+        )),
+    }
 }
 
 /// Why a layer file was not read.
@@ -1518,7 +1583,11 @@ impl Refused {
 ///
 /// Returns:
 ///   The file content, or `None` if no layer has the file.
-pub fn read_image_file(data_dir: &Path, layer_keys: &[String], rel_path: &str) -> Option<String> {
+pub fn read_image_file(
+    data_dir: &VerifiedPath,
+    layer_keys: &[String],
+    rel_path: &str,
+) -> Option<String> {
     let dirs: Vec<_> = layer_keys
         .iter()
         .filter_map(|key| cache::layer_dir(data_dir, key).ok())
@@ -1527,13 +1596,13 @@ pub fn read_image_file(data_dir: &Path, layer_keys: &[String], rel_path: &str) -
 }
 
 /// [`read_image_file`] over explicit layer directories, topmost first.
-fn read_file_in_layers(layer_dirs: &[std::path::PathBuf], rel_path: &str) -> Option<String> {
+fn read_file_in_layers(layer_dirs: &[VerifiedPath], rel_path: &str) -> Option<String> {
     for dir in layer_dirs {
         match read_layer_file(dir, rel_path) {
             Ok(Some(content)) if !content.is_empty() => return Some(content),
             Ok(_) => {}
             Err(Refused { why, .. }) => {
-                tracing::debug!("{rel_path} in {}: {why}, ignoring", dir.display());
+                tracing::debug!("{rel_path} in {dir}: {why}, ignoring");
             }
         }
     }
@@ -1558,7 +1627,7 @@ pub struct OsRelease {
 /// Returns:
 ///   The distribution identity, or `None` if neither file exists or has no
 ///   `ID`.
-pub fn os_release(data_dir: &Path, image: &OciImage) -> Option<OsRelease> {
+pub fn os_release(data_dir: &VerifiedPath, image: &OciImage) -> Option<OsRelease> {
     ["etc/os-release", "usr/lib/os-release"]
         .iter()
         .find_map(|rel| read_image_file(data_dir, &image.image_layers, rel))
@@ -1591,7 +1660,11 @@ fn parse_os_release(content: &str) -> Option<OsRelease> {
 }
 
 /// Look up a user's home directory by uid in the image's `/etc/passwd`.
-fn lookup_home_dir(data_dir: &Path, layer_keys: &[String], uid: u32) -> anyhow::Result<String> {
+fn lookup_home_dir(
+    data_dir: &VerifiedPath,
+    layer_keys: &[String],
+    uid: u32,
+) -> anyhow::Result<String> {
     lookup_layer_record(data_dir, layer_keys, "etc/passwd", |f| {
         (f.len() >= 6 && f[2].parse::<u32>().ok() == Some(uid)).then(|| f[5].to_string())
     })?

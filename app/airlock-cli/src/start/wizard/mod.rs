@@ -276,7 +276,7 @@ pub fn save_config(generated: &GeneratedConfig, local_dir: &Path) -> Result<(), 
 /// How the view ended.
 enum End {
     /// A start option, with answers that passed [`check_answers`].
-    Done(Answers),
+    Done(Box<Answers>),
     /// Esc or `abort`.
     Aborted,
     /// Ctrl+C or an interrupt signal.
@@ -338,7 +338,7 @@ async fn run_view(
                 // check (a vault passphrase prompt) shows as usual.
                 screen.suspend()?;
                 match check_answers(input, &answers).await {
-                    Ok(()) => return Ok(End::Done(answers)),
+                    Ok(()) => return Ok(End::Done(Box::new(answers))),
                     Err(e) => {
                         form.check_failed(format!("{e:#}"));
                         screen.resume()?;

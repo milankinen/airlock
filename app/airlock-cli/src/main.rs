@@ -3,6 +3,8 @@
 //! Host-side CLI for the airlock VM sandbox. Parses the arguments and runs
 //! the selected subcommand.
 
+#![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_types))]
+
 mod assets;
 mod cache;
 pub(crate) mod cli;

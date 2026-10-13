@@ -266,7 +266,8 @@ pub fn network_from_toml(toml: &str) -> anyhow::Result<ConfigNetwork> {
     let env = crate::project::resolve_env(&config, &context.vault)?;
     let ca = TestCa::generate();
     let project = Project {
-        sandbox_dir: home.path().join("sandbox"),
+        sandbox_dir: crate::util::VerifiedPath::new_follow(home.path().join("sandbox"), None)
+            .unwrap(),
         host_home: home.path().to_path_buf(),
         host_cwd: home.path().to_path_buf(),
         guest_cwd: home.path().to_path_buf(),

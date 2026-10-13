@@ -2,15 +2,19 @@
 //!
 //! Small helpers for paths, environment variables, executables,
 //! terminal-safe text and JSON files. Also gives file access that does not
-//! follow symlinks.
+//! follow symlinks, and checked host paths.
 
 pub(crate) mod clone;
 pub(crate) mod safe_fs;
+pub(crate) mod verified_path;
+pub(crate) mod vfs;
 
+use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 pub(crate) use safe_fs::PinnedDir;
+pub(crate) use verified_path::{Roots, VerifiedPath};
 
 use crate::messages;
 
@@ -73,8 +77,38 @@ pub(crate) fn on_path(program: &str) -> bool {
 }
 
 /// Return `true` if `path` is a regular file with an execute bit set.
+/// Symlinks are followed: programs on `PATH` are often links.
 pub(crate) fn is_executable(path: &Path) -> bool {
-    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    VerifiedPath::new_follow(path, None)
+        .and_then(|path| vfs::metadata(&path))
+        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// Read the whole UTF-8 file at `path`, with a size limit.
+/// Args:
+///  - `path`: File to read
+///  - `cap`: Maximum file size in bytes
+///
+/// Returns:
+///   The file content, or error if the read fails or the file is larger
+///   than `cap`.
+pub(crate) fn read_to_string_capped(path: &VerifiedPath, cap: u64) -> io::Result<String> {
+    let mut content = String::new();
+    vfs::open(path)?
+        .take(cap + 1)
+        .read_to_string(&mut content)?;
+    if content.len() as u64 > cap {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            messages::util::file_too_large(path, cap),
+        ));
+    }
+    Ok(content)
+}
+
+/// Return `true` if `path` is a real directory (not a symlink).
+pub(crate) fn is_dir(path: &VerifiedPath) -> bool {
+    vfs::metadata(path).is_ok_and(|m| m.is_dir())
 }
 
 /// Make guest text safe to print on the host terminal. Guest output is

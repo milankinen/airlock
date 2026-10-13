@@ -4,6 +4,8 @@
 //! available to the CLI at compile time. Rebuilds the CLI when the VM assets
 //! or the built-in packs change.
 
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 

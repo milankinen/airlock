@@ -7,8 +7,10 @@
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
-use std::path::Path;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
+
+use super::verified_path::VerifiedPath;
+use super::vfs;
 
 /// Size of the copy buffer.
 const BUF_SIZE: usize = 1 << 20;
@@ -27,21 +29,20 @@ pub(crate) enum CloneKind {
 
 /// Clone the file `src` to the new file `dst`.
 /// Args:
-///  - `src`: Existing regular file
+///  - `src`: Existing regular file. It cannot be a symlink
 ///  - `dst`: New file path. It must not exist. It gets mode 0600.
 ///
 /// Returns:
 ///   How the clone was made, or error if `dst` exists or the copy fails.
 ///   After a failed copy `dst` does not exist.
-pub(crate) fn clone_file(src: &Path, dst: &Path) -> io::Result<CloneKind> {
+pub(crate) fn clone_file(src: &VerifiedPath, dst: &VerifiedPath) -> io::Result<CloneKind> {
     #[cfg(target_os = "macos")]
     {
+        use std::os::unix::fs::PermissionsExt as _;
         match clonefile(src, dst) {
             Ok(()) => {
-                if let Err(e) =
-                    std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o600))
-                {
-                    let _ = std::fs::remove_file(dst);
+                if let Err(e) = vfs::set_permissions(dst, std::fs::Permissions::from_mode(0o600)) {
+                    let _ = vfs::remove_file(dst);
                     return Err(e);
                 }
                 return Ok(CloneKind::Reflink);
@@ -59,12 +60,11 @@ pub(crate) fn clone_file(src: &Path, dst: &Path) -> io::Result<CloneKind> {
         }
     }
 
-    let src_file = File::open(src)?;
-    let dst_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(dst)?;
+    let src_file = vfs::open(src)?;
+    let dst_file = vfs::open_with(
+        dst,
+        OpenOptions::new().write(true).create_new(true).mode(0o600),
+    )?;
 
     #[cfg(target_os = "linux")]
     {
@@ -81,7 +81,7 @@ pub(crate) fn clone_file(src: &Path, dst: &Path) -> io::Result<CloneKind> {
         Ok(()) => Ok(CloneKind::Copy),
         Err(e) => {
             drop(dst_file);
-            let _ = std::fs::remove_file(dst);
+            let _ = vfs::remove_file(dst);
             Err(e)
         }
     }
@@ -89,17 +89,20 @@ pub(crate) fn clone_file(src: &Path, dst: &Path) -> io::Result<CloneKind> {
 
 /// Create `dst` as an APFS clone of `src`.
 #[cfg(target_os = "macos")]
-fn clonefile(src: &Path, dst: &Path) -> io::Result<()> {
+fn clonefile(src: &VerifiedPath, dst: &VerifiedPath) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    let to_c = |p: &Path| {
+    /// Do not follow a symlink at the source.
+    const CLONE_NOFOLLOW: u32 = 0x0001;
+
+    let to_c = |p: &std::path::Path| {
         CString::new(p.as_os_str().as_bytes())
             .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
     };
-    let (src, dst) = (to_c(src)?, to_c(dst)?);
+    let (src, dst) = (to_c(src.to_path()?)?, to_c(dst.to_path()?)?);
     // SAFETY: both pointers are valid NUL-terminated strings.
-    if unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), 0) } == 0 {
+    if unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), CLONE_NOFOLLOW) } == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
@@ -188,10 +191,21 @@ fn copy_range(src: &File, dst: &File, start: u64, end: u64, buf: &mut [u8]) -> i
 mod tests {
     //! Tests for file cloning with sparse disk images.
 
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::path::Path;
 
     use super::*;
     use crate::test_cfg::temp_dir;
+    use crate::util::Roots;
+
+    /// The paths `src` and `dst` in `dir`, as verified paths.
+    fn paths(dir: &Path) -> (VerifiedPath, VerifiedPath) {
+        let roots = Roots::resolve(dir, dir, dir).unwrap();
+        (
+            VerifiedPath::new("src", &roots).unwrap(),
+            VerifiedPath::new("dst", &roots).unwrap(),
+        )
+    }
 
     const GIB: u64 = 1 << 30;
 
@@ -220,7 +234,8 @@ mod tests {
         let (src, dst) = (dir.path().join("src"), dir.path().join("dst"));
         sparse_source(&src);
 
-        clone_file(&src, &dst).unwrap();
+        let (vsrc, vdst) = paths(dir.path());
+        clone_file(&vsrc, &vdst).unwrap();
 
         let meta = std::fs::metadata(&dst).unwrap();
         assert_eq!(meta.len(), GIB);
@@ -286,7 +301,8 @@ mod tests {
         std::fs::write(&src, b"new").unwrap();
         std::fs::write(&dst, b"old").unwrap();
 
-        let err = clone_file(&src, &dst).unwrap_err();
+        let (vsrc, vdst) = paths(dir.path());
+        let err = clone_file(&vsrc, &vdst).unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&dst).unwrap(), b"old");

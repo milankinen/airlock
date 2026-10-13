@@ -6,10 +6,12 @@
 
 use std::path::Path;
 
-use super::{BOXES_DIR, PROJECT_SANDBOX, registry};
+use super::{BOXES_DIR, registry};
 use crate::config::files::local_config_names;
 use crate::context::Context;
 use crate::project::{self, IdleLock};
+use crate::util::verified_path::VerifiedPath;
+use crate::util::vfs;
 
 /// Why a move failed.
 #[derive(Debug, thiserror::Error)]
@@ -62,18 +64,13 @@ const KNOWN_ENTRIES: [&str; 3] = [".gitignore", "airlock.log", "sandbox"];
 pub async fn migrate(context: &Context, host_cwd: &Path) -> Result<String, MigrateError> {
     // Never follow a symlink at `.airlock` or `.airlock/sandbox`. All paths
     // below go through them.
-    let airlock = host_cwd.join(".airlock");
-    if std::fs::symlink_metadata(&airlock).is_ok_and(|m| !m.is_dir()) {
-        return Err(anyhow::anyhow!(crate::messages::sandboxes::not_a_directory(
-            airlock.display()
-        ))
-        .into());
+    let airlock = airlock_dir(context, host_cwd)?;
+    if vfs::symlink_metadata(&airlock).is_ok_and(|m| !m.is_dir()) {
+        return Err(anyhow::anyhow!(crate::messages::sandboxes::not_a_directory(&airlock)).into());
     }
-    let from = host_cwd.join(PROJECT_SANDBOX);
-    if std::fs::symlink_metadata(&from).is_ok_and(|m| !m.is_dir()) {
-        return Err(
-            anyhow::anyhow!(crate::messages::sandboxes::not_a_directory(from.display())).into(),
-        );
+    let from = airlock.join("sandbox").map_err(anyhow::Error::from)?;
+    if vfs::symlink_metadata(&from).is_ok_and(|m| !m.is_dir()) {
+        return Err(anyhow::anyhow!(crate::messages::sandboxes::not_a_directory(&from)).into());
     }
     check_known_entries(&airlock)?;
     // Keep the lock of the old sandbox until the rename is done. Thus no
@@ -83,56 +80,71 @@ pub async fn migrate(context: &Context, host_cwd: &Path) -> Result<String, Migra
         IdleLock::Held(file) => Some(file),
         IdleLock::Missing => None,
     };
-    let boxes = context.boxes_dir();
+    let boxes = super::boxes_dir(context).map_err(anyhow::Error::from)?;
     let existing = registry::list(&context.db).await?;
     if let Some(entry) = existing.iter().find(|e| e.project == host_cwd) {
         return Ok(entry.id.clone());
     }
-    if std::fs::symlink_metadata(&from).is_err() {
-        return Err(
-            anyhow::anyhow!(crate::messages::sandboxes::does_not_exist(from.display())).into(),
-        );
+    if vfs::symlink_metadata(&from).is_err() {
+        return Err(anyhow::anyhow!(crate::messages::sandboxes::does_not_exist(&from)).into());
     }
 
     crate::cache::create_private_dir(&boxes)?;
     let id = registry::find_or_register(&context.db, &boxes, host_cwd).await?;
-    let to = boxes.join(&id);
+    let to = boxes.join(&id).map_err(anyhow::Error::from)?;
     for entry in RUNTIME_ENTRIES {
-        remove_entry(&from.join(entry));
+        if let Ok(path) = from.join(entry) {
+            remove_entry(&path);
+        }
     }
     remove_vsock_listeners(&from);
-    if let Err(e) = std::fs::rename(&from, &to) {
+    if let Err(e) = vfs::rename(&from, &to) {
         registry::unregister(&context.db, &id).await?;
         if e.raw_os_error() == Some(libc::EXDEV) {
             return Err(MigrateError::CrossDevice {
-                from: from.display().to_string(),
+                from: from.to_string(),
                 to: context.data_dir.join(BOXES_DIR).display().to_string(),
             });
         }
-        return Err(anyhow::anyhow!(crate::messages::sandboxes::move_failed(
-            from.display(),
-            to.display(),
-            e
-        ))
-        .into());
+        return Err(anyhow::anyhow!(crate::messages::sandboxes::move_failed(&from, &to, e)).into());
     }
     drop(held);
     move_local_config(&airlock, &to)?;
     Ok(id)
 }
 
+/// Get the `.airlock` directory of the project `host_cwd`.
+fn airlock_dir(context: &Context, host_cwd: &Path) -> anyhow::Result<VerifiedPath> {
+    Ok(VerifiedPath::new(
+        host_cwd.join(".airlock"),
+        &context.roots,
+    )?)
+}
+
 /// Move the local project config of `host_cwd` into the sandbox directory
 /// `sandbox_dir` of a new sandbox in the data directory, and remove the
 /// `.airlock` directory of the project. Does nothing if there is no local
 /// project config.
+/// Args:
+///  - `context`: Process context, for the trusted roots
+///  - `host_cwd`: Canonical project directory
+///  - `sandbox_dir`: Sandbox directory of the new sandbox
+///
 /// Returns:
 ///   [`MigrateError::ExtraFiles`] if `.airlock` holds other files. Nothing
 ///   changes then.
-pub fn adopt_local_config(host_cwd: &Path, sandbox_dir: &Path) -> Result<(), MigrateError> {
-    if !check_local_config(host_cwd)? {
+pub fn adopt_local_config(
+    context: &Context,
+    host_cwd: &Path,
+    sandbox_dir: &Path,
+) -> Result<(), MigrateError> {
+    if !check_local_config(context, host_cwd)? {
         return Ok(());
     }
-    move_local_config(&host_cwd.join(".airlock"), sandbox_dir)
+    let sandbox_dir =
+        VerifiedPath::new(sandbox_dir, &context.roots).map_err(anyhow::Error::from)?;
+    move_local_config(&airlock_dir(context, host_cwd)?, &sandbox_dir)?;
+    Ok(())
 }
 
 /// Check if [`adopt_local_config`] can move the local project config of
@@ -140,9 +152,9 @@ pub fn adopt_local_config(host_cwd: &Path, sandbox_dir: &Path) -> Result<(), Mig
 /// Returns:
 ///   `true` if there is a local project config to move, `false` if there is
 ///   none, or [`MigrateError::ExtraFiles`] if `.airlock` holds other files.
-pub fn check_local_config(host_cwd: &Path) -> Result<bool, MigrateError> {
-    let airlock = host_cwd.join(".airlock");
-    if !std::fs::symlink_metadata(&airlock).is_ok_and(|m| m.is_dir())
+pub fn check_local_config(context: &Context, host_cwd: &Path) -> Result<bool, MigrateError> {
+    let airlock = airlock_dir(context, host_cwd)?;
+    if !vfs::symlink_metadata(&airlock).is_ok_and(|m| m.is_dir())
         || local_config_names(&airlock).is_empty()
     {
         return Ok(false);
@@ -153,8 +165,8 @@ pub fn check_local_config(host_cwd: &Path) -> Result<bool, MigrateError> {
 
 /// Check that the `.airlock` directory `airlock` holds only entries that
 /// airlock knows: [`KNOWN_ENTRIES`] and the local project config files.
-fn check_known_entries(airlock: &Path) -> Result<(), MigrateError> {
-    let Ok(entries) = std::fs::read_dir(airlock) else {
+fn check_known_entries(airlock: &VerifiedPath) -> Result<(), MigrateError> {
+    let Ok(entries) = vfs::read_dir(airlock) else {
         return Ok(());
     };
     let configs = local_config_names(airlock);
@@ -173,30 +185,27 @@ fn check_known_entries(airlock: &Path) -> Result<(), MigrateError> {
 /// Move the local project config files from the `.airlock` directory
 /// `airlock` into `sandbox_dir`, and remove `airlock`. Call it only after
 /// [`check_known_entries`].
-fn move_local_config(airlock: &Path, sandbox_dir: &Path) -> Result<(), MigrateError> {
+fn move_local_config(airlock: &VerifiedPath, sandbox_dir: &VerifiedPath) -> anyhow::Result<()> {
     for name in local_config_names(airlock) {
-        std::fs::rename(airlock.join(&name), sandbox_dir.join(&name)).map_err(|e| {
+        let (from, to) = (airlock.join(&name)?, sandbox_dir.join(&name)?);
+        vfs::rename(&from, &to).map_err(|e| {
             anyhow::anyhow!(crate::messages::sandboxes::move_failed(
-                airlock.join(&name).display(),
-                sandbox_dir.display(),
+                &from,
+                sandbox_dir,
                 e
             ))
         })?;
     }
-    // `.airlock` is a real directory (checked by the callers), so the
-    // removal does not follow a link.
-    std::fs::remove_dir_all(airlock).map_err(|e| {
-        anyhow::anyhow!(crate::messages::sandboxes::remove_failed(
-            airlock.display(),
-            e
-        ))
-    })?;
+    // The check before use refuses a symlink in place of `.airlock`. A
+    // symlink at the last name is removed, not followed.
+    vfs::remove_dir_all(airlock)
+        .map_err(|e| anyhow::anyhow!(crate::messages::sandboxes::remove_failed(airlock, e)))?;
     Ok(())
 }
 
 /// Remove the `vsock.sock_<port>` listener sockets of a stopped sandbox.
-fn remove_vsock_listeners(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+fn remove_vsock_listeners(dir: &VerifiedPath) {
+    let Ok(entries) = vfs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
@@ -204,21 +213,22 @@ fn remove_vsock_listeners(dir: &Path) {
             .file_name()
             .to_string_lossy()
             .starts_with("vsock.sock_")
+            && let Ok(path) = dir.join(entry.file_name())
         {
-            remove_entry(&entry.path());
+            remove_entry(&path);
         }
     }
 }
 
 /// Remove a file, symlink or directory tree without following symlinks.
 /// Ignores errors: the entries are runtime data only.
-fn remove_entry(path: &Path) {
-    match std::fs::symlink_metadata(path) {
+fn remove_entry(path: &VerifiedPath) {
+    match vfs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => {
-            let _ = std::fs::remove_dir_all(path);
+            let _ = vfs::remove_dir_all(path);
         }
         Ok(_) => {
-            let _ = std::fs::remove_file(path);
+            let _ = vfs::remove_file(path);
         }
         Err(_) => {}
     }

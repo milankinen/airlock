@@ -38,10 +38,24 @@ run = "cargo +nightly fmt --all"
 [tasks.lint]
 quiet = true
 description = "Lint all code"
-run = """
+shell = "bash -c"
+run = '''
+set -euo pipefail
 cargo +nightly fmt --all -- --check
 cargo clippy --workspace --tests -- -D warnings
-"""
+
+# The test build allows the file access bans, so lint the normal build of
+# airlock-cli too. It embeds the VM assets: put empty files in place of the
+# missing ones and remove them after the lint.
+made=""
+cleanup() { if [[ -n "$made" ]]; then rm -f $made; fi; }
+trap cleanup EXIT
+mkdir -p target/vm
+for f in Image initramfs.gz cloud-hypervisor virtiofsd; do
+  if [[ ! -e target/vm/$f ]]; then touch "target/vm/$f"; made="$made target/vm/$f"; fi
+done
+cargo clippy -p airlock-cli -- -D warnings
+'''
 
 [tasks."docs:build"]
 quiet = true

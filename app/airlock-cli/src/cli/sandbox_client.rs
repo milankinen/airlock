@@ -5,12 +5,14 @@
 //! share this code. Never follows symlinks while it looks for the sandbox,
 //! because code in a sandbox can write its project mount.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use airlock_common::cli_capnp::cli_service;
 use futures::AsyncReadExt;
 
 use crate::context::Context;
+use crate::util::verified_path::VerifiedPath;
+use crate::util::vfs;
 use crate::{messages, sandboxes};
 
 /// Open connection to the CLI service of a running sandbox.
@@ -23,47 +25,47 @@ pub struct SandboxClient {
 }
 
 impl SandboxClient {
-    /// Connect to the nearest running sandbox at or above `start`.
+    /// Connect to the nearest running sandbox at or above the current
+    /// directory.
     /// Args:
     ///  - `context`: Context with the sandbox registry
-    ///  - `start`: Directory where the search starts
     ///  - `follow_git_worktree`: Also look for the sandbox of the main
     ///    repository of a git worktree
     ///
     /// Returns:
     ///   Connected client, or error if no sandbox runs or the connection fails.
-    pub async fn connect(
-        context: &Context,
-        start: &Path,
-        follow_git_worktree: bool,
-    ) -> anyhow::Result<Self> {
-        // The registry has canonical project paths.
-        let lookup_dir = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
+    pub async fn connect(context: &Context, follow_git_worktree: bool) -> anyhow::Result<Self> {
+        let lookup_dir = sandboxes::project_dir(context)?;
         let sock_path = find_cli_sock(context, &lookup_dir, follow_git_worktree)
             .await?
-            .ok_or_else(|| anyhow::anyhow!(messages::cli::no_running_sandbox(start.display())))?;
+            .ok_or_else(|| {
+                let mut text = messages::cli::no_running_sandbox(lookup_dir.display());
+                if sandboxes::airlock_dir_is_symlink(context, &lookup_dir) {
+                    let dir = lookup_dir.join(".airlock");
+                    text = format!(
+                        "{text}\n{}",
+                        messages::sandboxes::airlock_dir_symlink_hint(dir.display())
+                    );
+                }
+                anyhow::anyhow!(text)
+            })?;
         Self::connect_sock(&sock_path).await
     }
 
     /// Connect to the CLI socket at `sock_path`.
     /// Returns:
     ///   Connected client, or error if the connection fails.
-    pub async fn connect_sock(sock_path: &Path) -> anyhow::Result<Self> {
-        let stream = tokio::net::UnixStream::connect(sock_path)
-            .await
-            .map_err(|e| {
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                ) {
-                    anyhow::anyhow!(messages::cli::stale_cli_sock(sock_path.display()))
-                } else {
-                    anyhow::anyhow!(messages::cli::sandbox_connect_failed(
-                        sock_path.display(),
-                        e
-                    ))
-                }
-            })?;
+    pub async fn connect_sock(sock_path: &VerifiedPath) -> anyhow::Result<Self> {
+        let stream = vfs::connect_unix_async(sock_path).await.map_err(|e| {
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) {
+                anyhow::anyhow!(messages::cli::stale_cli_sock(sock_path))
+            } else {
+                anyhow::anyhow!(messages::cli::sandbox_connect_failed(sock_path, e))
+            }
+        })?;
 
         let (reader, writer) = tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
         let network = capnp_rpc::twoparty::VatNetwork::new(
@@ -102,19 +104,19 @@ pub(super) async fn find_cli_sock(
     context: &Context,
     start: &Path,
     follow_git_worktree: bool,
-) -> anyhow::Result<Option<PathBuf>> {
+) -> anyhow::Result<Option<VerifiedPath>> {
     for found in sandboxes::candidates(context, start, true, follow_git_worktree).await? {
-        let Ok(meta) = std::fs::symlink_metadata(&found.dir) else {
+        let Ok(meta) = vfs::symlink_metadata(&found.dir) else {
             continue;
         };
         refuse_symlink(&found.dir, &meta)?;
         if !meta.is_dir() {
             continue;
         }
-        let Ok(candidate) = crate::cache::cli_sock_path(&context.data_dir, &found.dir) else {
+        let Ok(candidate) = crate::cache::cli_sock_path(&context.roots.data_dir, &found.dir) else {
             continue;
         };
-        if let Ok(meta) = std::fs::symlink_metadata(&candidate) {
+        if let Ok(meta) = vfs::symlink_metadata(&candidate) {
             refuse_symlink(&candidate, &meta)?;
             // A sandbox out of the start directory and its parents comes
             // from a worktree link. Tell the user which sandbox it is.
@@ -132,10 +134,10 @@ pub(super) async fn find_cli_sock(
 }
 
 /// Return an error if `path`, with the metadata `meta`, is a symlink.
-fn refuse_symlink(path: &Path, meta: &std::fs::Metadata) -> anyhow::Result<()> {
+fn refuse_symlink(path: &VerifiedPath, meta: &std::fs::Metadata) -> anyhow::Result<()> {
     anyhow::ensure!(
         !meta.file_type().is_symlink(),
-        messages::cli::path_is_symlink(path.display())
+        messages::cli::path_is_symlink(path)
     );
     Ok(())
 }

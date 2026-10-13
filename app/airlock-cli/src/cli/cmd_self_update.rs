@@ -6,6 +6,7 @@
 use clap::Args;
 
 use crate::self_update::{self, ReleaseSource, Version};
+use crate::util::verified_path::VerifiedPath;
 use crate::{cli, messages};
 
 /// CLI arguments for `airlock self-update`.
@@ -64,9 +65,10 @@ async fn run(args: &SelfUpdateArgs) -> anyhow::Result<()> {
     }
 
     // Resolve symlinks, so that the update replaces the real file and not
-    // the link to it.
+    // the link to it. A package manager often installs a link.
     let target = std::env::current_exe()
-        .and_then(std::fs::canonicalize)
+        .and_then(|exe| VerifiedPath::new_follow(exe, None))
+        .and_then(|exe| exe.to_path().map(std::path::Path::to_path_buf))
         .map_err(|e| anyhow::anyhow!(messages::cli::cannot_find_binary(e)))?;
 
     cli::log!("{}", messages::cli::updating_airlock(&current, &latest));

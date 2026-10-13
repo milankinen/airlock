@@ -12,8 +12,8 @@ fn xattr_of(path: &Path, name: &str) -> Option<Vec<u8>> {
 
 /// The names of staging entries (`.tmp` and `.download`) in the layer
 /// cache.
-fn staging_entries(data_dir: &Path) -> Vec<String> {
-    std::fs::read_dir(cache::layers_root(data_dir).unwrap())
+fn staging_entries(data_dir: &VerifiedPath) -> Vec<String> {
+    std::fs::read_dir(real(&cache::layers_root(data_dir).unwrap()))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .filter(|name| {
@@ -34,7 +34,7 @@ fn staging_entries(data_dir: &Path) -> Vec<String> {
 #[test]
 fn layer_tarball_extracts_with_whiteouts_as_overlay_xattrs_and_is_reused() {
     let tmp = temp_dir();
-    let data_dir = tmp.path();
+    let data_dir = &verified_dir(tmp.path());
     let tar = LayerTar::default()
         .dir("etc")
         .file("etc/hello", "world")
@@ -44,7 +44,7 @@ fn layer_tarball_extracts_with_whiteouts_as_overlay_xattrs_and_is_reused() {
         .file("opt/app/new", "n")
         .gz();
     let key = cache_layer(data_dir, "sha256:whiteouts", &tar);
-    let layer = cache::layer_dir(data_dir, &key).unwrap();
+    let layer = real(&cache::layer_dir(data_dir, &key).unwrap());
 
     assert_eq!(std::fs::read(layer.join("etc/hello")).unwrap(), b"world");
     assert!(layer.join("bin/sh").is_file());
@@ -75,7 +75,7 @@ fn layer_tarball_extracts_with_whiteouts_as_overlay_xattrs_and_is_reused() {
         None,
     )
     .unwrap();
-    assert_eq!(again, layer);
+    assert_eq!(real(&again), layer);
 }
 
 /// Test that a partial download from an earlier run is discarded and the
@@ -86,11 +86,9 @@ fn layer_tarball_extracts_with_whiteouts_as_overlay_xattrs_and_is_reused() {
 #[test]
 fn interrupted_download_is_discarded_and_fetched_again() {
     let tmp = temp_dir();
-    let data_dir = tmp.path();
+    let data_dir = &verified_dir(tmp.path());
     let key = cache::layer_key("sha256:interrupted");
-    let stale = cache::layers_root(data_dir)
-        .unwrap()
-        .join(format!("{key}.download.tmp"));
+    let stale = real(&cache::layers_root(data_dir).unwrap()).join(format!("{key}.download.tmp"));
     std::fs::write(&stale, b"partial garbage").unwrap();
 
     cache_layer(
@@ -100,8 +98,7 @@ fn interrupted_download_is_discarded_and_fetched_again() {
     );
 
     assert!(
-        cache::layer_dir(data_dir, &key)
-            .unwrap()
+        real(&cache::layer_dir(data_dir, &key).unwrap())
             .join("ok")
             .is_file()
     );
@@ -117,9 +114,9 @@ fn interrupted_download_is_discarded_and_fetched_again() {
 #[test]
 fn layer_published_by_peer_during_download_is_kept() {
     let tmp = temp_dir();
-    let data_dir = tmp.path();
+    let data_dir = &verified_dir(tmp.path());
     let key = cache::layer_key("sha256:race");
-    let layer = cache::layer_dir(data_dir, &key).unwrap();
+    let layer = real(&cache::layer_dir(data_dir, &key).unwrap());
     let tar = LayerTar::default().file("loser", "x").gz();
 
     layer::ensure_layer_cached(
@@ -128,7 +125,7 @@ fn layer_published_by_peer_during_download_is_kept() {
         |dest| {
             std::fs::create_dir_all(&layer)?;
             std::fs::write(layer.join("winner"), b"kept")?;
-            Ok(std::fs::write(dest, &tar)?)
+            Ok(std::fs::write(dest.to_path()?, &tar)?)
         },
         None,
     )
@@ -148,7 +145,7 @@ fn layer_published_by_peer_during_download_is_kept() {
 #[test]
 fn whiteout_aimed_outside_layer_does_not_touch_host_files() {
     let home = temp_dir();
-    let data_dir = home.path();
+    let data_dir = &verified_dir(home.path());
     let outside = home.path().join("outside");
     std::fs::create_dir_all(&outside).unwrap();
     for victim in ["via-symlink", "via-absolute", "via-parent"] {
@@ -163,7 +160,7 @@ fn whiteout_aimed_outside_layer_does_not_touch_host_files() {
     let _ = layer::ensure_layer_cached(
         data_dir,
         "sha256:evil-symlink",
-        |dest| Ok(std::fs::write(dest, &through_symlink)?),
+        |dest| Ok(std::fs::write(dest.to_path()?, &through_symlink)?),
         None,
     );
     let absolute = LayerTar::default()
@@ -172,7 +169,7 @@ fn whiteout_aimed_outside_layer_does_not_touch_host_files() {
     let _ = layer::ensure_layer_cached(
         data_dir,
         "sha256:evil-absolute",
-        |dest| Ok(std::fs::write(dest, &absolute)?),
+        |dest| Ok(std::fs::write(dest.to_path()?, &absolute)?),
         None,
     );
     let parent = LayerTar::default()
@@ -181,7 +178,7 @@ fn whiteout_aimed_outside_layer_does_not_touch_host_files() {
     let _ = layer::ensure_layer_cached(
         data_dir,
         "sha256:evil-parent",
-        |dest| Ok(std::fs::write(dest, &parent)?),
+        |dest| Ok(std::fs::write(dest.to_path()?, &parent)?),
         None,
     );
 
@@ -204,7 +201,7 @@ fn whiteout_aimed_outside_layer_does_not_touch_host_files() {
 #[test]
 fn whiteout_naming_own_or_parent_directory_is_refused() {
     let tmp = temp_dir();
-    let data_dir = tmp.path();
+    let data_dir = &verified_dir(tmp.path());
     let good = cache_layer(
         data_dir,
         "sha256:good",
@@ -220,13 +217,55 @@ fn whiteout_naming_own_or_parent_directory_is_refused() {
         let res = layer::ensure_layer_cached(
             data_dir,
             digest,
-            |dest| Ok(std::fs::write(dest, &tar)?),
+            |dest| Ok(std::fs::write(dest.to_path()?, &tar)?),
             None,
         );
         let err = res.expect_err(name).to_string();
         assert!(err.contains("unsafe whiteout name"), "{name}: {err}");
     }
 
-    let keep = cache::layer_dir(data_dir, &good).unwrap().join("keep");
+    let keep = real(&cache::layer_dir(data_dir, &good).unwrap()).join("keep");
     assert_eq!(std::fs::read(keep).unwrap(), b"yes");
+}
+
+/// Test that a hard link entry whose source is a symlink out of the layer
+/// does not link a host file into the cache. A link in the cache to a host
+/// file lets the guest read and change that file.
+///   1. Write a host file out of the layer cache
+///   2. Cache a layer with a symlink to the host file and a hard link to
+///      the symlink
+///   3. Check that the layer has no hard link to the host file and that
+///      the extracted entry is not a copy of the host file
+#[test]
+fn hard_link_to_symlink_out_of_layer_does_not_link_host_file() {
+    use std::os::unix::fs::MetadataExt;
+
+    let home = temp_dir();
+    let data_dir = &verified_dir(home.path());
+    let host = home.path().join("host-secret");
+    std::fs::write(&host, b"secret").unwrap();
+    let tar = LayerTar::default()
+        .symlink("esc", &host)
+        .hard_link("copy", "esc")
+        .gz();
+    // The extraction can fail or succeed. Only the host file and the
+    // extracted entry matter.
+    // Linux `link()` does not follow symlinks, so it links the symlink
+    // itself there. macOS follows them, so the test proves the defense there.
+    let result = layer::ensure_layer_cached(
+        data_dir,
+        "sha256:evil-hardlink",
+        |dest| Ok(std::fs::write(dest.to_path()?, &tar)?),
+        None,
+    );
+
+    assert_eq!(std::fs::metadata(&host).unwrap().nlink(), 1);
+    assert_eq!(std::fs::read(&host).unwrap(), b"secret");
+    if let Ok(dir) = result {
+        let copy = dir.to_path().unwrap().join("copy");
+        if let Ok(meta) = std::fs::symlink_metadata(&copy) {
+            let host_copy = meta.is_file() && std::fs::read(&copy).is_ok_and(|c| c == b"secret");
+            assert!(!host_copy, "entry is a regular file with host content");
+        }
+    }
 }

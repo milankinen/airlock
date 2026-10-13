@@ -3,6 +3,7 @@
 use super::registry;
 use crate::context::Context;
 use crate::project::{self, IdleLock};
+use crate::util::vfs;
 
 /// Remove the sandbox `id` from the data directory and from the registry.
 ///
@@ -21,20 +22,18 @@ pub async fn remove_box(context: &Context, id: &str) -> anyhow::Result<()> {
         registry::is_valid_id(id),
         crate::messages::sandboxes::not_sandbox_id(id)
     );
-    let dir = context.boxes_dir().join(id);
+    let dir = super::boxes_dir(context)?.join(id)?;
     let _lock = match project::lock_if_idle(&dir) {
         IdleLock::Running => anyhow::bail!(crate::messages::sandboxes::SANDBOX_RUNNING_STOP_FIRST),
         IdleLock::Held(file) => Some(file),
         IdleLock::Missing => None,
     };
-    match std::fs::symlink_metadata(&dir) {
-        // `remove_dir_all` does not follow a symlink at `dir`, but remove
-        // only the link to make that clear.
-        Ok(meta) if meta.file_type().is_symlink() => std::fs::remove_file(&dir)?,
-        Ok(_) => std::fs::remove_dir_all(&dir).map_err(|e| {
-            anyhow::anyhow!(crate::messages::sandboxes::remove_failed(dir.display(), e))
-        })?,
-        Err(_) => {}
+    // A symlink at `dir` is removed, not followed.
+    match vfs::remove_dir_all(&dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            anyhow::bail!(crate::messages::sandboxes::remove_failed(dir, e))
+        }
+        _ => {}
     }
     registry::unregister(&context.db, id).await?;
     Ok(())

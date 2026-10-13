@@ -22,7 +22,8 @@ pub use self::migrate::{MigrateError, adopt_local_config, check_local_config, mi
 pub use self::remove::remove_box;
 use crate::context::Context;
 use crate::packs::install::state::STATE_FILE;
-use crate::util::PinnedDir;
+use crate::util::verified_path::VerifiedPath;
+use crate::util::{PinnedDir, vfs};
 use crate::vm::disk;
 
 /// Directory of the sandboxes in the data directory.
@@ -53,7 +54,7 @@ pub struct Found {
     pub project: PathBuf,
     /// Sandbox directory. It can be missing for a registered sandbox whose
     /// directory was deleted.
-    pub dir: PathBuf,
+    pub dir: VerifiedPath,
 }
 
 impl Found {
@@ -84,23 +85,35 @@ pub async fn candidates(
     follow_git_worktree: bool,
 ) -> anyhow::Result<Vec<Found>> {
     let entries = registry::list(&context.db).await?;
-    let boxes = context.boxes_dir();
+    let boxes = boxes_dir(context)?;
     let mut found = Vec::new();
     for dir in search_dirs(start, parents, follow_git_worktree) {
         let dir = dir.as_path();
         for entry in entries.iter().filter(|e| e.project == dir) {
+            // A bad entry must not stop the lookup of the other sandboxes.
+            let sandbox_dir = match boxes.join(&entry.id) {
+                Ok(sandbox_dir) => sandbox_dir,
+                Err(e) => {
+                    tracing::debug!("skip sandbox {}: {e}", entry.id);
+                    continue;
+                }
+            };
             found.push(Found {
                 location: Location::DataDir {
                     id: entry.id.clone(),
                 },
                 project: dir.to_path_buf(),
-                dir: boxes.join(&entry.id),
+                dir: sandbox_dir,
             });
         }
-        // Any entry counts, also a symlink. The users of the sandbox
-        // directory refuse a symlink with a clear message.
-        let project_dir = dir.join(PROJECT_SANDBOX);
-        if std::fs::symlink_metadata(&project_dir).is_ok() {
+        // Any entry at `.airlock/sandbox` counts, also a symlink. The users
+        // of the sandbox directory refuse a symlink with a clear message. A
+        // symlink at `.airlock` does not count: the path is refused. `start`
+        // refuses the link, and `exec` and `info` give a hint (see
+        // `airlock_dir_is_symlink`).
+        if let Ok(project_dir) = VerifiedPath::new(dir.join(PROJECT_SANDBOX), &context.roots)
+            && vfs::symlink_metadata(&project_dir).is_ok()
+        {
             found.push(Found {
                 location: Location::ProjectDir,
                 project: dir.to_path_buf(),
@@ -144,25 +157,38 @@ fn search_dirs(start: &Path, parents: bool, follow_git_worktree: bool) -> Vec<Pa
 // link back must name `dir/.git`, else `dir` is not a worktree of that
 // repository. The `.git` file must not be a symlink: a symlink to the
 // `.git` file of a real worktree would pass the link back check.
+//
+// The git paths can go through symlinks, for example a linked home dir.
+// Thus the compare resolves them with symlinks followed. The reads of the
+// git files refuse a symlink at the file.
 fn git_worktree_main(dir: &Path) -> Option<PathBuf> {
     let dot_git = read_git_file(dir, ".git")?;
-    let gitdir = std::fs::canonicalize(dir.join(dot_git.strip_prefix("gitdir:")?.trim())).ok()?;
+    let gitdir = canonical(&dir.join(dot_git.strip_prefix("gitdir:")?.trim()))?;
     let worktrees = gitdir.parent()?;
     let common = worktrees.parent()?;
     if worktrees.file_name()? != "worktrees" || common.file_name()? != ".git" {
         return None;
     }
     let commondir = read_git_file(&gitdir, "commondir")?;
-    if std::fs::canonicalize(gitdir.join(commondir)).ok()? != common {
+    if canonical(&gitdir.join(commondir))? != common {
         return None;
     }
     // Git 2.48+ can write a path relative to the git directory. `dir` is
     // canonical, thus `dir/.git` is canonical too.
     let back = read_git_file(&gitdir, "gitdir")?;
-    if std::fs::canonicalize(gitdir.join(back)).ok()? != dir.join(".git") {
+    if canonical(&gitdir.join(back))? != dir.join(".git") {
         return None;
     }
     common.parent().map(Path::to_path_buf)
+}
+
+/// Resolve `path` with symlinks followed. Use it only for paths that
+/// airlock compares and does not open.
+/// Returns:
+///   The absolute path, or `None` if it cannot be resolved.
+pub(crate) fn canonical(path: &Path) -> Option<PathBuf> {
+    let path = VerifiedPath::new_follow(path, None).ok()?;
+    path.to_entry_path().ok().map(Path::to_path_buf)
 }
 
 /// Read the git file `name` in `dir` (see [`PinnedDir::read`]).
@@ -192,6 +218,32 @@ pub async fn resolve_sandbox(
         .next())
 }
 
+/// Get the directory of the sandboxes in the data directory.
+/// Returns:
+///   The verified path, or error if it cannot be resolved.
+// Only airlock and the user can write the data dir. The user can move the
+// sandboxes to an other disk with a symlink, so follow it.
+pub(crate) fn boxes_dir(context: &Context) -> std::io::Result<VerifiedPath> {
+    context.roots.data_dir.join_follow(BOXES_DIR, None)
+}
+
+/// Check if the `.airlock` directory of the project `project` is a
+/// symlink. The sandbox search does not go through such a link.
+pub(crate) fn airlock_dir_is_symlink(context: &Context, project: &Path) -> bool {
+    VerifiedPath::new(project.join(".airlock"), &context.roots)
+        .and_then(|dir| vfs::symlink_metadata(&dir))
+        .is_ok_and(|m| m.file_type().is_symlink())
+}
+
+/// Get the project directory of the current directory, for the sandbox
+/// search. The registry has canonical project paths.
+/// Returns:
+///   The current directory with its symlinks resolved, or error if a part
+///   of it changed since the start of the process.
+pub(crate) fn project_dir(context: &Context) -> std::io::Result<PathBuf> {
+    Ok(context.roots.cwd()?.to_path()?.to_path_buf())
+}
+
 /// Get the directory of the local project config (`airlock.<ext>`) of a
 /// sandbox. A sandbox in the data directory keeps it in the sandbox
 /// directory, out of the repository. A project sandbox keeps it in
@@ -199,12 +251,16 @@ pub async fn resolve_sandbox(
 /// Args:
 ///  - `host_cwd`: Canonical project directory
 ///  - `sandbox_dir`: Sandbox directory of the project
-pub fn local_config_dir(host_cwd: &Path, sandbox_dir: &Path) -> PathBuf {
-    if sandbox_dir == host_cwd.join(PROJECT_SANDBOX) {
+///
+/// Returns:
+///   The directory, or error if a part of `sandbox_dir` changed.
+pub fn local_config_dir(host_cwd: &Path, sandbox_dir: &VerifiedPath) -> std::io::Result<PathBuf> {
+    let sandbox_dir = sandbox_dir.to_entry_path()?;
+    Ok(if sandbox_dir == host_cwd.join(PROJECT_SANDBOX) {
         host_cwd.join(".airlock")
     } else {
         sandbox_dir.to_path_buf()
-    }
+    })
 }
 
 /// Find the directory of the local project config of the project
@@ -213,7 +269,7 @@ pub fn local_config_dir(host_cwd: &Path, sandbox_dir: &Path) -> PathBuf {
 pub async fn find_local_config_dir(context: &Context, host_cwd: &Path) -> anyhow::Result<PathBuf> {
     Ok(
         match resolve_sandbox(context, host_cwd, false, false).await? {
-            Some(found) => local_config_dir(host_cwd, &found.dir),
+            Some(found) => local_config_dir(host_cwd, &found.dir)?,
             None => host_cwd.join(".airlock"),
         },
     )
@@ -225,7 +281,8 @@ pub async fn has_content(context: &Context, host_cwd: &Path) -> anyhow::Result<b
     let Some(found) = resolve_sandbox(context, host_cwd, false, false).await? else {
         return Ok(false);
     };
-    Ok(found.dir.join(disk::DISK_FILE).exists() || found.dir.join(STATE_FILE).exists())
+    let exists = |name: &str| found.dir.join(name).and_then(|p| vfs::metadata(&p)).is_ok();
+    Ok(exists(disk::DISK_FILE) || exists(STATE_FILE))
 }
 
 #[cfg(test)]

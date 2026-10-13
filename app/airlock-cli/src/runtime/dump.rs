@@ -4,10 +4,11 @@
 //! replay and examine the session later.
 
 use std::fs::File;
-use std::io::Write;
-use std::path::Path;
+use std::io::{self, Write};
 
 use super::OutputSink;
+use crate::project::Project;
+use crate::util::vfs;
 use crate::{cli, messages};
 
 /// Output sink that forwards guest output to `inner`. When a dump file is
@@ -25,12 +26,12 @@ impl<'a, S: OutputSink> DumpSink<'a, S> {
         Self { inner, file }
     }
 
-    /// Make a sink that copies the output into `<sandbox_dir>/pty.dump`
-    /// when `AIRLOCK_PTY_DUMP=1`. Truncates the file. If the file does not
-    /// open, reports the error and makes no copy.
-    pub fn from_env(inner: &'a mut S, sandbox_dir: &Path) -> Self {
+    /// Make a sink that copies the output into `pty.dump` in the sandbox
+    /// directory of `project` when `AIRLOCK_PTY_DUMP=1`. Replaces an old
+    /// file. If the file does not open, reports the error and makes no copy.
+    pub fn from_env(inner: &'a mut S, project: &Project) -> Self {
         let file = if std::env::var("AIRLOCK_PTY_DUMP").as_deref() == Ok("1") {
-            open_dump(&sandbox_dir.join("pty.dump"))
+            open_dump(project)
         } else {
             None
         };
@@ -56,18 +57,28 @@ impl<S: OutputSink> OutputSink for DumpSink<'_, S> {
     }
 }
 
-/// Create the dump file. Reports the result to the user.
-fn open_dump(path: &Path) -> Option<File> {
-    match File::create(path) {
+/// Create the dump file in the sandbox directory. Reports the result to
+/// the user.
+fn open_dump(project: &Project) -> Option<File> {
+    const NAME: &str = "pty.dump";
+    let shown = format!("{}/{NAME}", project.sandbox_dir);
+    let created = project.sandbox_dir.join(NAME).and_then(|path| {
+        // The guest can write a sandbox in the project. Remove the old
+        // entry and make a new file, so that a symlink there is not
+        // followed.
+        match vfs::remove_file(&path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        vfs::create_new(&path)
+    });
+    match created {
         Ok(f) => {
-            cli::log!("{}", messages::runtime::pty_dump_path(path.display()));
+            cli::log!("{}", messages::runtime::pty_dump_path(&shown));
             Some(f)
         }
         Err(e) => {
-            cli::error!(
-                "{}",
-                messages::runtime::pty_dump_open_failed(path.display(), e)
-            );
+            cli::error!("{}", messages::runtime::pty_dump_open_failed(&shown, e));
             None
         }
     }
