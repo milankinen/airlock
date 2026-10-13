@@ -124,7 +124,8 @@ fn resolved_document_in_each_format_resolves_to_same_config() {
 
     let sandbox = temp_dir();
     let sandbox_dir = crate::util::VerifiedPath::new_follow(sandbox.path(), None).unwrap();
-    crate::start::config_change::save(&sandbox_dir, &layers).unwrap();
+    crate::start::config_change::save(&sandbox_dir, &layers, &crate::project::HostPaths::new())
+        .unwrap();
     let stored = crate::project::read_run_meta(&sandbox_dir)
         .last_run_config
         .unwrap();

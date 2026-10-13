@@ -323,7 +323,15 @@ impl StartProject {
     /// sandbox.
     pub fn accept_config(&self, toml: &str) {
         let dir = self.sandbox().expect("a sandbox").dir;
-        config_change::save(&dir, &project_config(toml)).unwrap();
+        let config = project_config(toml);
+        let resolved = block_on_local(config.resolve(
+            &self.context.data_dir,
+            &self.packs,
+            &ConfigOverrides::default(),
+        ))
+        .unwrap();
+        let paths = config_change::host_paths(&resolved.values, &self.context, &self.project_dir());
+        config_change::save(&dir, &config, &paths).unwrap();
     }
 
     /// The install state of the sandbox. Empty when there is no state.

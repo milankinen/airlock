@@ -509,6 +509,24 @@ pub struct RunMeta {
     /// Final config of the last run (see [`crate::start::config_change`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_run_config: Option<serde_json::Value>,
+    /// Resolved host paths of the last run, by config key (see
+    /// [`crate::start::config_change`]). `None` in a file of an older
+    /// airlock.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_run_paths: Option<HostPaths>,
+}
+
+/// Host paths of a config, by config key, for example
+/// `mounts.data.source`.
+pub type HostPaths = std::collections::BTreeMap<String, HostPath>;
+
+/// A host path of the config.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct HostPath {
+    /// The path as the config gives it, for example `./data`.
+    pub given: String,
+    /// The absolute path with its symlinks resolved.
+    pub resolved: String,
 }
 
 /// Read `run.json`. Gives default metadata if the file is missing or not
@@ -522,14 +540,16 @@ pub fn read_run_meta(sandbox_dir: &VerifiedPath) -> RunMeta {
         .unwrap_or_default()
 }
 
-/// Save `config` as the final config of the last run in `run.json` of
-/// `sandbox_dir`.
+/// Save `config` and its resolved host paths `paths` as the final config
+/// of the last run in `run.json` of `sandbox_dir`.
 pub fn save_last_run_config(
     sandbox_dir: &VerifiedPath,
     config: serde_json::Value,
+    paths: HostPaths,
 ) -> anyhow::Result<()> {
     let mut meta = read_run_meta(sandbox_dir);
     meta.last_run_config = Some(config);
+    meta.last_run_paths = Some(paths);
     write_run_meta(sandbox_dir, &meta)
 }
 

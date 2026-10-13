@@ -2619,6 +2619,24 @@ pub mod start {
         format!("<masked, sha256:{hash}>")
     }
 
+    /// Title of the host path changes in the config diff.
+    pub const HOST_PATHS_CHANGED: &str = "Resolved host paths:";
+
+    /// One host path in the config diff. `resolved` is the path, or the
+    /// old and the new path (see [`host_path_moved`]).
+    pub fn host_path_line(
+        key: impl Display,
+        given: impl Display,
+        resolved: impl Display,
+    ) -> String {
+        format!("{key} = \"{given}\": {resolved}")
+    }
+
+    /// The old and the new resolved path of a changed host path.
+    pub fn host_path_moved(old: impl Display, new: impl Display) -> String {
+        format!("{old} → {new}")
+    }
+
     /// Key help of the config question while the changes are hidden.
     pub fn diff_show_hint(key: impl Display) -> String {
         format!("Press {key} to show the changes")

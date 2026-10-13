@@ -62,3 +62,38 @@ fn sandbox_without_config_copy_starts_and_gets_copy() {
     );
     assert!(matches!(project.start(FIRST, false), Err(Exit::Code(2))));
 }
+
+/// Test that a mount source symlink that points to an other dir since the
+/// last start stops a start without a terminal. Code in the sandbox can
+/// change the symlink in the project dir. A `run.json` of an older airlock
+/// without host paths gives no stop.
+///   1. Make the dirs `a` and `b` and the symlink `data` to `a` in the
+///      project, and start two times with a mount of `data`
+///   2. Change the symlink to `b` and check exit code 2
+///   3. Remove the host paths from `run.json` and check that the start
+///      runs
+#[test]
+fn retargeted_mount_source_symlink_stops_start() {
+    let project = StartProject::new(test_packs());
+    let dir = project.project_dir();
+    std::fs::create_dir(dir.join("a")).unwrap();
+    std::fs::create_dir(dir.join("b")).unwrap();
+    std::os::unix::fs::symlink("a", dir.join("data")).unwrap();
+    let toml = "[mounts.data]\nsource = \"./data\"\ntarget = \"/data\"\n";
+    project.start(toml, false).unwrap();
+    project.start(toml, false).unwrap();
+
+    std::fs::remove_file(dir.join("data")).unwrap();
+    std::os::unix::fs::symlink("b", dir.join("data")).unwrap();
+    assert!(matches!(project.start(toml, false), Err(Exit::Code(2))));
+
+    let run_json = project.sandbox_dir().join("run.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&run_json).unwrap()).unwrap();
+    meta.as_object_mut()
+        .unwrap()
+        .remove("last_run_paths")
+        .unwrap();
+    std::fs::write(&run_json, meta.to_string()).unwrap();
+    project.start(toml, false).unwrap();
+}

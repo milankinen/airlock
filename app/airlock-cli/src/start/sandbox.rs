@@ -251,10 +251,14 @@ pub async fn ensure_sandbox(
         .to_path()
         .and_then(PinnedDir::pin)
         .map_err(anyhow::Error::from)?;
+    // Resolve the host paths before the compare. Thus a symlink that points
+    // to an other place since the last run is a change.
+    let paths = config_change::host_paths(&resolved.values, context, host_cwd);
     // The config question comes before all other sandbox questions.
     let checked = config_change::check(&CheckInput {
         sandbox_dir: lock.dir(),
         resolved: &resolved,
+        paths: &paths,
         data_dir: &context.data_dir,
         packs,
         overrides: &options.overrides,
@@ -366,7 +370,7 @@ pub async fn ensure_sandbox(
     // next run asks about the config changes again. The config of the last
     // run is not saved, so the next run also asks again.
     if save_config {
-        config_change::save(lock.dir(), config)?;
+        config_change::save(lock.dir(), config, &paths)?;
     }
     let transitions = std::mem::take(&mut plan.transitions);
     let installs = InstallDecision::save(

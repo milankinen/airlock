@@ -8,14 +8,21 @@
 //! code in the sandbox cannot quietly change the config of the next run, for
 //! example with an edit of the project config file.
 //!
+//! The check also compares the host paths of the config (mount sources, the
+//! custom kernel and initramfs, and host sockets) after their symlinks are
+//! resolved. Thus a symlink that points to an other place since the last
+//! run also gives the question, also when the config text is the same.
+//!
 //! A sandbox without a copy (a new sandbox, or a sandbox of an older airlock)
-//! gets no question. The run keeps a copy for the next run.
+//! gets no question. The run keeps a copy for the next run. A copy of an
+//! older airlock without host paths gives no question about host paths.
 //!
 //! The diff does not show the real values of masked `[env]` entries. A hash
 //! of each value replaces it.
 
 use std::path::Path;
 
+use console::Style;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
@@ -23,9 +30,12 @@ use similar::{ChangeTag, TextDiff};
 use super::Exit;
 use crate::cli::prompt::choose::{Choice, Choose, Details};
 use crate::cli::prompt::style::Styles;
+use crate::config::config_values::ConfigValues;
 use crate::config::export::{self, Format};
 use crate::config::{ConfigOverrides, LayeredConfig, ResolvedConfig};
+use crate::context::Context;
 use crate::packs::PackManager;
+use crate::project::{HostPath, HostPaths};
 use crate::util::VerifiedPath;
 use crate::{messages, project};
 
@@ -40,6 +50,8 @@ pub struct CheckInput<'a> {
     pub sandbox_dir: &'a VerifiedPath,
     /// Resolved config of this run
     pub resolved: &'a ResolvedConfig,
+    /// Resolved host paths of this run (see [`host_paths`])
+    pub paths: &'a HostPaths,
     /// Airlock data directory, to resolve the config of the last run
     pub data_dir: &'a Path,
     /// Known packs, to resolve the config of the last run
@@ -83,13 +95,21 @@ async fn check_with(
     input: &CheckInput<'_>,
     ask: impl FnOnce(&[String], Option<&str>) -> Result<Answer, Exit>,
 ) -> Result<Checked, Exit> {
-    let Some(stored) = project::read_run_meta(input.sandbox_dir).last_run_config else {
+    let meta = project::read_run_meta(input.sandbox_dir);
+    let Some(stored) = meta.last_run_config else {
         return Ok(Checked::Current);
     };
     let last = resolve_last(input, stored).await;
     let current = final_values(input.resolved)?;
+    let styles = Styles::new();
+    // A `run.json` of an older airlock has no paths: no path change.
+    let moved = meta
+        .last_run_paths
+        .map(|last| path_diff(&last, input.paths, &styles))
+        .unwrap_or_default();
     if let Ok((_, values)) = &last
         && *values == current
+        && moved.is_empty()
     {
         return Ok(Checked::Current);
     }
@@ -101,10 +121,10 @@ async fn check_with(
     if input.yes || !input.can_prompt {
         return Err(Exit::error(2, messages::start::CONFIG_CHANGED_NO_PROMPT));
     }
-    let styles = Styles::new();
     match last {
         Ok((resolved, values)) => {
-            let diff = diff(&to_toml(&values), &to_toml(&current), &styles);
+            let mut diff = diff(&to_toml(&values), &to_toml(&current), &styles);
+            diff.extend(moved);
             match ask(&diff, None)? {
                 Answer::Accept => Ok(Checked::Current),
                 Answer::Last => Ok(Checked::Last(Box::new(resolved))),
@@ -112,17 +132,108 @@ async fn check_with(
         }
         Err(e) => {
             let note = messages::start::last_config_invalid(e);
-            let diff = diff("", &to_toml(&current), &styles);
+            let mut diff = diff("", &to_toml(&current), &styles);
+            diff.extend(moved);
             ask(&diff, Some(&note))?;
             Ok(Checked::Current)
         }
     }
 }
 
-/// Save the config files `config` as the config of the last run in the
-/// sandbox directory `sandbox_dir`.
-pub fn save(sandbox_dir: &VerifiedPath, config: &LayeredConfig) -> anyhow::Result<()> {
-    project::save_last_run_config(sandbox_dir, serde_json::to_value(config)?)
+/// Save the config files `config` and their resolved host paths `paths` as
+/// the config of the last run in the sandbox directory `sandbox_dir`.
+pub fn save(
+    sandbox_dir: &VerifiedPath,
+    config: &LayeredConfig,
+    paths: &HostPaths,
+) -> anyhow::Result<()> {
+    project::save_last_run_config(sandbox_dir, serde_json::to_value(config)?, paths.clone())
+}
+
+/// Resolve the host paths of `values`: the sources of the enabled mounts,
+/// `vm.kernel`, `vm.initramfs` and the host sockets of the enabled socket
+/// forwards. Creates nothing.
+/// Args:
+///  - `context`: Process context. Its home dir expands `~`
+///  - `cwd`: Project directory. Relative paths resolve from it
+///
+/// Returns:
+///   The paths by config key. A path that does not resolve keeps its
+///   absolute form.
+pub fn host_paths(values: &ConfigValues, context: &Context, cwd: &Path) -> HostPaths {
+    let host_home = context
+        .roots
+        .home()
+        .and_then(|home| home.to_entry_path().map(Path::to_path_buf))
+        .ok()
+        .or_else(dirs::home_dir)
+        .unwrap_or_default();
+    let mounts = values
+        .mounts
+        .iter()
+        .filter(|(_, m)| m.enabled)
+        .map(|(name, m)| (format!("mounts.{name}.source"), &m.source));
+    let assets = [
+        ("vm.kernel", &values.vm.kernel),
+        ("vm.initramfs", &values.vm.initramfs),
+    ]
+    .into_iter()
+    .filter_map(|(key, path)| Some((key.to_string(), path.as_ref()?)));
+    let sockets = values
+        .network
+        .sockets
+        .iter()
+        .filter(|(_, s)| s.enabled)
+        .map(|(name, s)| (format!("network.sockets.{name}.host"), &s.host.source));
+    mounts
+        .chain(assets)
+        .chain(sockets)
+        .map(|(key, given)| {
+            let path = crate::vm::mount::absolute(given, &host_home, cwd);
+            let resolved = VerifiedPath::new_follow(&path, None)
+                .ok()
+                .and_then(|p| p.to_entry_path().ok().map(Path::to_path_buf))
+                .unwrap_or(path);
+            let resolved = resolved.display().to_string();
+            (
+                key,
+                HostPath {
+                    given: given.clone(),
+                    resolved,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Return the host paths that `new` resolves to an other place than
+/// `last`, also the added and removed ones, as diff lines. Empty if no
+/// path changed.
+fn path_diff(last: &HostPaths, new: &HostPaths, styles: &Styles) -> Vec<String> {
+    use messages::start as m;
+    let line = |style: &Style, sign: char, key: &str, path: &HostPath, resolved: String| {
+        let text = m::host_path_line(key, &path.given, resolved);
+        style.apply_to(format!("{sign} {text}")).to_string()
+    };
+    let mut lines = Vec::new();
+    for (key, old) in last {
+        match new.get(key) {
+            None => lines.push(line(&styles.red, '-', key, old, old.resolved.clone())),
+            Some(path) if path.resolved != old.resolved => {
+                let moved = m::host_path_moved(&old.resolved, &path.resolved);
+                lines.push(line(&styles.cyan, '~', key, path, moved));
+            }
+            Some(_) => {}
+        }
+    }
+    for (key, path) in new.iter().filter(|(key, _)| !last.contains_key(*key)) {
+        lines.push(line(&styles.green, '+', key, path, path.resolved.clone()));
+    }
+    if !lines.is_empty() {
+        lines.insert(0, String::new());
+        lines.insert(1, styles.dim.apply_to(m::HOST_PATHS_CHANGED).to_string());
+    }
+    lines
 }
 
 /// Resolve the stored config files of the last run.
@@ -302,17 +413,30 @@ mod tests {
         toml: &str,
         answer: Answer,
     ) -> (Result<Checked, Exit>, Option<Asked>) {
+        check_paths_answer(last, toml, &HostPaths::new(), &HostPaths::new(), answer)
+    }
+
+    /// [`check_answer`] with the host paths `last_paths` of the last run
+    /// and `paths` of this run.
+    fn check_paths_answer(
+        last: &str,
+        toml: &str,
+        last_paths: &HostPaths,
+        paths: &HostPaths,
+        answer: Answer,
+    ) -> (Result<Checked, Exit>, Option<Asked>) {
         let sandbox = temp_dir();
         let sandbox_dir = VerifiedPath::new_follow(sandbox.path(), None).unwrap();
         let data = temp_dir();
         let packs = crate::packs::init_with_sample();
-        save(&sandbox_dir, &layers(last)).unwrap();
+        save(&sandbox_dir, &layers(last), last_paths).unwrap();
         let config = layers(toml);
         let resolved =
             block_on(config.resolve(data.path(), &packs, &ConfigOverrides::default())).unwrap();
         let input = CheckInput {
             sandbox_dir: &sandbox_dir,
             resolved: &resolved,
+            paths,
             data_dir: data.path(),
             packs: &packs,
             overrides: &ConfigOverrides::default(),
@@ -371,6 +495,43 @@ mod tests {
         );
         assert!(asked.expect("a question").invalid_last.is_some());
         assert!(matches!(checked, Ok(Checked::Current)));
+    }
+
+    /// Test that a mount source symlink that points to an other dir since
+    /// the last run gives the question, and that the question shows the old
+    /// and the new path. Code in the sandbox can change a symlink in the
+    /// project dir.
+    ///   1. Make the dirs `a` and `b` and the symlink `data` to `a`
+    ///   2. Resolve the host paths, then change the symlink to `b`
+    ///   3. Check the same config with the new paths
+    ///   4. Check that the question came and shows both paths
+    #[test]
+    fn retargeted_mount_source_symlink_shows_old_and_new_path() {
+        let dir = temp_dir();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("a")).unwrap();
+        std::fs::create_dir(root.join("b")).unwrap();
+        std::os::unix::fs::symlink(root.join("a"), root.join("data")).unwrap();
+        let toml = "[mounts.data]\nsource = \"./data\"\ntarget = \"/data\"\n";
+        let values = resolve_project_toml(toml).unwrap().values;
+        let context = crate::test_cfg::test_context(
+            &root,
+            crate::vault::Vault::for_storage_type(crate::vault::VaultStorageType::Disabled),
+        );
+        let last = host_paths(&values, &context, &root);
+        std::fs::remove_file(root.join("data")).unwrap();
+        std::os::unix::fs::symlink(root.join("b"), root.join("data")).unwrap();
+        let paths = host_paths(&values, &context, &root);
+
+        let (checked, asked) = check_paths_answer(toml, toml, &last, &paths, Answer::Accept);
+        assert!(matches!(checked, Ok(Checked::Current)));
+        let line = format!(
+            "~ mounts.data.source = \"./data\": {} → {}",
+            root.join("a").display(),
+            root.join("b").display()
+        );
+        let diff = asked.expect("a question").diff;
+        assert!(diff.contains(&line), "{diff:?}");
     }
 
     /// The final values of the project file `toml`.
