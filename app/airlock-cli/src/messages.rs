@@ -249,11 +249,6 @@ pub mod cli {
         format!("attached to the sandbox of {project}")
     }
 
-    /// Error when a sandbox directory or socket is a symlink.
-    pub fn path_is_symlink(path: impl Display) -> String {
-        format!("{path} is a symlink; remove it and run `airlock start` again")
-    }
-
     /// Status when `secrets remove` finds no secret with this name.
     pub fn no_secret_named(name: impl Display) -> String {
         format!("No secret named {name}")
@@ -1816,15 +1811,6 @@ pub mod project {
         format!("remove sandbox disk id: {err}")
     }
 
-    /// Error when the `.airlock` directory is a symbolic link.
-    pub fn airlock_dir_is_symlink(path: impl Display) -> String {
-        format!(
-            "{path} is a symbolic link; airlock does not follow it. Run `airlock rm` to remove \
-             just the link (its target is left untouched), or replace it with a real \
-             directory."
-        )
-    }
-
     /// Error when another user owns the `.airlock` directory.
     pub fn airlock_dir_foreign_owner(path: impl Display) -> String {
         format!("{path} is owned by another user")
@@ -2106,12 +2092,6 @@ pub mod sandboxes {
     //! Texts of the `sandboxes` area.
 
     use std::fmt::Display;
-
-    /// Hint when the project `.airlock` is a symlink. The sandbox search
-    /// does not go through it.
-    pub fn airlock_dir_symlink_hint(dir: impl Display) -> String {
-        format!("hint: {dir} is a symbolic link. Airlock does not look for a sandbox through it")
-    }
 
     /// Error when an id is not a sandbox id. Shows for `rm` and for the project
     /// lookup.

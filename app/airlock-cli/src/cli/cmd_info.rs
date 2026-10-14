@@ -93,11 +93,6 @@ pub(super) async fn run(context: Context, id: Option<&str>, json: bool) -> i32 {
         Some(found) if found.dir.symlink_metadata().is_ok() => found,
         _ => {
             cli::error!("{}", messages::cli::no_sandbox_for_project(&project_dir));
-            if sandboxes::airlock_dir_is_symlink(&project_dir)
-                && let Ok(dir) = project_dir.join(".airlock")
-            {
-                cli::log!("{}", messages::sandboxes::airlock_dir_symlink_hint(dir));
-            }
             return 1;
         }
     };

@@ -123,7 +123,7 @@ fn rm_project_sandbox(args: &RmArgs, data: &DataDir, host_cwd: &VerifiedPath) ->
 
     // `.airlock` can be a symlink. An untrusted repo can commit one that
     // points to, for example, `~/.airlock`. `start` refuses it (see
-    // `project::airlock_dir_problem_for`). All code below builds paths from
+    // `project::ensure_cache_dir`). All code below builds paths from
     // `cache_dir`, and the file operations refuse a symlink in their path.
     // Thus handle the link separately and remove only the link.
     let Ok(cache_meta) = cache_dir.symlink_metadata() else {

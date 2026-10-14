@@ -379,10 +379,14 @@ pub fn disk_id(sandbox_dir: &PinnedDir) -> Option<(u64, u64)> {
 ///   Error if `.airlock` is a symlink or another user owns it.
 pub fn ensure_cache_dir(host_cwd: &VerifiedPath) -> anyhow::Result<VerifiedPath> {
     // Do not follow symlinks at `.airlock` and `.airlock/.gitignore` (see
-    // `PinnedDir`). For a symlinked or foreign-owned `.airlock`, give a
-    // clear message, not the raw `ELOOP`/`EPERM` of `PinnedDir::open`.
+    // `PinnedDir`). A symlinked `.airlock` gives the path check error. For
+    // a foreign-owned `.airlock`, give a clear message, not the raw `EPERM`
+    // of `PinnedDir::open`.
     let airlock = host_cwd.join(".airlock")?;
-    if let Some(problem) = airlock_dir_problem(&airlock) {
+    airlock.to_path()?;
+    if let Ok(meta) = airlock.symlink_metadata()
+        && let Some(problem) = airlock_dir_problem_for(&airlock, meta.uid())
+    {
         anyhow::bail!(problem);
     }
     let cache_dir = PinnedDir::open(host_cwd.to_path()?, ".airlock".as_ref(), true)?;
@@ -392,24 +396,15 @@ pub fn ensure_cache_dir(host_cwd: &VerifiedPath) -> anyhow::Result<VerifiedPath>
     Ok(airlock.reverify()?)
 }
 
-/// Make a clear message when `path` (`.airlock`) is a symlink or another
-/// user owns it. The raw `ELOOP`/`EPERM` error of `PinnedDir::open` is not
-/// clear.
+/// Message when another user owns `path` (`.airlock`). The raw `EPERM`
+/// error of `PinnedDir::open` is not clear.
+/// Args:
+///  - `path`: The `.airlock` directory
+///  - `owner_uid`: User ID of the owner of `path`
+///
 /// Returns:
-///   `None` if `path` does not exist ([`ensure_cache_dir`] creates it) or
-///   its metadata cannot be read (`PinnedDir::open` then reports it).
-fn airlock_dir_problem(path: &VerifiedPath) -> Option<String> {
-    let meta = path.symlink_metadata().ok()?;
-    airlock_dir_problem_for(path, meta.file_type().is_symlink(), meta.uid())
-}
-
-/// Message logic of [`airlock_dir_problem`] with metadata that is already
-/// read. Thus tests can run it without a real symlink or a foreign-owned
-/// directory.
-fn airlock_dir_problem_for(path: impl Display, is_symlink: bool, owner_uid: u32) -> Option<String> {
-    if is_symlink {
-        return Some(messages::project::airlock_dir_is_symlink(path));
-    }
+///   `None` if the current user owns `path`.
+fn airlock_dir_problem_for(path: impl Display, owner_uid: u32) -> Option<String> {
     if owner_uid != unsafe { libc::geteuid() } {
         return Some(messages::project::airlock_dir_foreign_owner(path));
     }
@@ -777,9 +772,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "{} is a symbolic link; airlock does not follow it. Run `airlock rm` to \
-                 remove just the link (its target is left untouched), or replace it with a \
-                 real directory.",
+                "refusing path {0} ({0}): {0} is a symlink",
                 dir.join(".airlock").display()
             )
         );
@@ -884,26 +877,19 @@ mod tests {
         assert!(open_with_lock().is_err());
     }
 
-    /// Test that an `.airlock` directory of another user is refused, and that
-    /// the symlink message comes first when both problems exist.
+    /// Test that an `.airlock` directory of another user is refused.
     ///   1. Check that a directory of the current user has no problem
     ///   2. Check the message for a directory of another user
-    ///   3. Check that a symlink of another user gives the symlink message
     #[test]
-    fn airlock_dir_owned_by_another_user_is_refused_after_symlink_check() {
+    fn airlock_dir_owned_by_another_user_is_refused() {
         let path = Path::new("/some/.airlock");
         let euid = unsafe { libc::geteuid() };
         let other = euid.wrapping_add(1);
         let path = path.display();
-        assert_eq!(airlock_dir_problem_for(&path, false, euid), None);
+        assert_eq!(airlock_dir_problem_for(&path, euid), None);
         assert_eq!(
-            airlock_dir_problem_for(&path, false, other),
+            airlock_dir_problem_for(&path, other),
             Some("/some/.airlock is owned by another user".to_string())
-        );
-        assert!(
-            airlock_dir_problem_for(&path, true, other)
-                .unwrap()
-                .contains("is a symbolic link")
         );
     }
 

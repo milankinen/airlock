@@ -100,10 +100,8 @@ pub async fn candidates(
             });
         }
         // Any entry at `.airlock/sandbox` counts, also a symlink. The users
-        // of the sandbox directory refuse a symlink with a clear message. A
-        // symlink at `.airlock` does not count: the path is refused. `start`
-        // refuses the link, and `exec` and `info` give a hint (see
-        // `airlock_dir_is_symlink`).
+        // of the sandbox directory refuse a symlink. A symlink at `.airlock`
+        // does not count: the path is refused.
         if let Ok(project_dir) = dir.join(PROJECT_SANDBOX)
             && project_dir.symlink_metadata().is_ok()
         {
@@ -209,15 +207,6 @@ pub async fn resolve_sandbox(
         .await?
         .into_iter()
         .next())
-}
-
-/// Check if the `.airlock` directory of the project `project` is a
-/// symlink. The sandbox search does not go through such a link.
-pub(crate) fn airlock_dir_is_symlink(project: &VerifiedPath) -> bool {
-    project
-        .join(".airlock")
-        .and_then(|dir| dir.symlink_metadata())
-        .is_ok_and(|m| m.file_type().is_symlink())
 }
 
 /// Get the project directory of the current directory `work`, for the

@@ -46,6 +46,7 @@
     - [VM init](./technical/vm-init.md)
     - [Container execution](./technical/container-execution.md)
     - [Mounts](./technical/mounts.md)
+    - [I/O security](./technical/io-security.md)
     - [Networking](./technical/networking.md)
     - [Packs](./technical/packs.md)
     - [Network services](./technical/services.md)

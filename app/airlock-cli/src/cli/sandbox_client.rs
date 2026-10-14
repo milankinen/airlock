@@ -35,18 +35,7 @@ impl SandboxClient {
         let lookup_dir = sandboxes::project_dir(&context.work)?;
         let sock_path = find_cli_sock(context, &lookup_dir, follow_git_worktree)
             .await?
-            .ok_or_else(|| {
-                let mut text = messages::cli::no_running_sandbox(&context.work);
-                if sandboxes::airlock_dir_is_symlink(&lookup_dir)
-                    && let Ok(dir) = lookup_dir.join(".airlock")
-                {
-                    text = format!(
-                        "{text}\n{}",
-                        messages::sandboxes::airlock_dir_symlink_hint(dir)
-                    );
-                }
-                anyhow::anyhow!(text)
-            })?;
+            .ok_or_else(|| anyhow::anyhow!(messages::cli::no_running_sandbox(&context.work)))?;
         Self::connect_sock(&sock_path).await
     }
 
@@ -107,15 +96,16 @@ pub(super) async fn find_cli_sock(
         let Ok(meta) = found.dir.symlink_metadata() else {
             continue;
         };
-        refuse_symlink(&found.dir, &meta)?;
+        // A symlink here gives the path check error.
+        found.dir.to_path()?;
         if !meta.is_dir() {
             continue;
         }
         let Ok(candidate) = crate::cache::cli_sock_path(&context.data, &found.dir) else {
             continue;
         };
-        if let Ok(meta) = candidate.symlink_metadata() {
-            refuse_symlink(&candidate, &meta)?;
+        if candidate.symlink_metadata().is_ok() {
+            candidate.to_path()?;
             // A sandbox out of the start directory and its parents comes
             // from a worktree link. Tell the user which sandbox it is.
             if !start.starts_with(&found.project) {
@@ -129,13 +119,4 @@ pub(super) async fn find_cli_sock(
         }
     }
     Ok(None)
-}
-
-/// Return an error if `path`, with the metadata `meta`, is a symlink.
-fn refuse_symlink(path: &VerifiedPath, meta: &std::fs::Metadata) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !meta.file_type().is_symlink(),
-        messages::cli::path_is_symlink(path)
-    );
-    Ok(())
 }
