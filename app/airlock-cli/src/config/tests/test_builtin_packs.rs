@@ -359,3 +359,54 @@ fn copilot_pack_surrogate_keeps_github_token_prefix() {
         assert_ne!(surrogate, real);
     }
 }
+
+/// Test that the git pack gives the guest the commit identity of the host.
+/// The host env wins over the git config, and a role key wins over the
+/// `user` key, as in git. An empty env var counts as not set. Names with
+/// `$` and `\` stay as they are.
+///   1. Load the git pack with fakes for the host env and `git config`
+///   2. Resolve the pack and its env
+///   3. Check each identity var, and that a var without a value is not set
+#[test]
+fn git_pack_sets_host_commit_identity() {
+    // The fakes replace the host reads of the script. The host of the test
+    // has its own git config, thus the real reads would give other values.
+    let fakes = r#"
+        local fake_env = { GIT_COMMITTER_NAME = "Env Committer", GIT_AUTHOR_EMAIL = "" }
+        local fake_config = {
+            ["user.name"] = "User Name",
+            ["author.name"] = "Jo $HOME \\o/",
+            ["author.email"] = "author@example.com",
+        }
+        os.getenv = function(name) return fake_env[name] end
+        io.popen = function(cmd)
+            local key = cmd:match("%-%-get (%S+)")
+            return {
+                read = function() return fake_config[key] end,
+                close = function() end,
+            }
+        end
+    "#;
+    let source = format!(
+        "{fakes}\n{}",
+        include_str!("../../../../../packs/git@1/config.lua")
+    );
+    let packs = crate::test_cfg::packs::load_packs(vec![
+        (
+            "git@1/pack.toml",
+            "label = \"git\"\ndescription = \"Git\"\nkind = \"tool\"\n".to_string(),
+        ),
+        ("git@1/config.lua", source),
+    ]);
+    let values = crate::test_cfg::packs::resolve_with(&packs, "[packs]\ngit = { version = 1 }\n")
+        .unwrap()
+        .values;
+    let env = resolve_env(&values, &host_env_vault(&[("HOME", "/home/host")])).unwrap();
+    assert_eq!(env.guest_value("GIT_AUTHOR_NAME"), Some("Jo $HOME \\o/"));
+    assert_eq!(
+        env.guest_value("GIT_AUTHOR_EMAIL"),
+        Some("author@example.com")
+    );
+    assert_eq!(env.guest_value("GIT_COMMITTER_NAME"), Some("Env Committer"));
+    assert_eq!(env.guest_value("GIT_COMMITTER_EMAIL"), None);
+}
