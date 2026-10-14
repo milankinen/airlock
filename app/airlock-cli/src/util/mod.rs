@@ -1,31 +1,31 @@
 //! Shared host-side helpers.
 //!
 //! Small helpers for paths, environment variables, executables,
-//! terminal-safe text and JSON files. Also gives file access that does not
-//! follow symlinks, and checked host paths.
+//! terminal-safe text and JSON files. Also gives checked host paths with
+//! their file operations, and file access that does not follow symlinks.
 
 pub(crate) mod clone;
 pub(crate) mod safe_fs;
 pub(crate) mod verified_path;
-pub(crate) mod vfs;
 
-use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
 
 pub(crate) use safe_fs::PinnedDir;
 pub(crate) use verified_path::{Roots, VerifiedPath};
 
 use crate::messages;
 
-/// Expand a `~` prefix in a path string to `home`.
-pub(crate) fn expand_tilde(path: &str, home: &Path) -> PathBuf {
+/// Expand a `~` prefix in a host path string to `home`.
+/// Returns:
+///   The path with `home` (as given) in place of `~`, or `path` if it has
+///   no `~` prefix.
+pub(crate) fn expand_tilde(path: &str, home: &VerifiedPath) -> String {
     if path == "~" {
-        home.to_path_buf()
+        home.to_string()
     } else if let Some(rest) = path.strip_prefix("~/") {
-        home.join(rest)
+        format!("{}/{rest}", home.to_string().trim_end_matches('/'))
     } else {
-        PathBuf::from(path)
+        path.to_string()
     }
 }
 
@@ -73,42 +73,16 @@ pub(crate) fn on_path(program: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };
-    std::env::split_paths(&path).any(|dir| is_executable(&dir.join(program)))
+    // Programs on `PATH` are often links, so follow them.
+    std::env::split_paths(&path)
+        .filter_map(|dir| VerifiedPath::new_follow(dir.join(program), None).ok())
+        .any(|path| is_executable(&path))
 }
 
 /// Return `true` if `path` is a regular file with an execute bit set.
-/// Symlinks are followed: programs on `PATH` are often links.
-pub(crate) fn is_executable(path: &Path) -> bool {
-    VerifiedPath::new_follow(path, None)
-        .and_then(|path| vfs::metadata(&path))
+fn is_executable(path: &VerifiedPath) -> bool {
+    path.metadata()
         .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-}
-
-/// Read the whole UTF-8 file at `path`, with a size limit.
-/// Args:
-///  - `path`: File to read
-///  - `cap`: Maximum file size in bytes
-///
-/// Returns:
-///   The file content, or error if the read fails or the file is larger
-///   than `cap`.
-pub(crate) fn read_to_string_capped(path: &VerifiedPath, cap: u64) -> io::Result<String> {
-    let mut content = String::new();
-    vfs::open(path)?
-        .take(cap + 1)
-        .read_to_string(&mut content)?;
-    if content.len() as u64 > cap {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            messages::util::file_too_large(path, cap),
-        ));
-    }
-    Ok(content)
-}
-
-/// Return `true` if `path` is a real directory (not a symlink).
-pub(crate) fn is_dir(path: &VerifiedPath) -> bool {
-    vfs::metadata(path).is_ok_and(|m| m.is_dir())
 }
 
 /// Make guest text safe to print on the host terminal. Guest output is
@@ -237,7 +211,9 @@ mod tests {
     fn on_path_finds_executable_files_only() {
         assert!(on_path("sh"));
         assert!(!on_path("airlock-definitely-not-a-real-program"));
-        assert!(!is_executable(Path::new("/")));
+        assert!(!is_executable(
+            &VerifiedPath::new_follow("/", None).unwrap()
+        ));
     }
 
     /// Test that guest text loses all terminal escapes and control

@@ -35,7 +35,7 @@ fn config_json(user: &str, layers: &[&str]) -> Vec<u8> {
 /// `ensure_local_image` does.
 /// Returns:
 ///   The layer keys, topmost first.
-fn extract_saved_layers(data_dir: &VerifiedPath, save: &docker::DockerSave) -> Vec<String> {
+fn extract_saved_layers(data_dir: &DataDir, save: &docker::DockerSave) -> Vec<String> {
     let mut keys: Vec<String> = save
         .layer_digests
         .iter()
@@ -55,7 +55,7 @@ fn extract_saved_layers(data_dir: &VerifiedPath, save: &docker::DockerSave) -> V
 }
 
 /// The path of the staged tarball of the layer `hex`.
-fn staged(data_dir: &VerifiedPath, hex: &str) -> std::path::PathBuf {
+fn staged(data_dir: &DataDir, hex: &str) -> std::path::PathBuf {
     real(&cache::layers_root(data_dir).unwrap()).join(format!(
         "{}.download",
         cache::layer_key(&format!("sha256:{hex}"))
@@ -63,7 +63,7 @@ fn staged(data_dir: &VerifiedPath, hex: &str) -> std::path::PathBuf {
 }
 
 /// The names of temporary staging files left in the layer cache.
-fn staging_leftovers(data_dir: &VerifiedPath) -> Vec<String> {
+fn staging_leftovers(data_dir: &DataDir) -> Vec<String> {
     std::fs::read_dir(real(&cache::layers_root(data_dir).unwrap()))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -87,7 +87,7 @@ fn staging_leftovers(data_dir: &VerifiedPath) -> Vec<String> {
 #[test]
 fn podman_archive_export_becomes_image_with_named_user() {
     let tmp = temp_dir();
-    let data_dir = &verified_dir(tmp.path());
+    let data_dir = &data_dir_at(tmp.path());
     let base = LayerTar::default()
         .file(
             "etc/passwd",
@@ -155,7 +155,7 @@ fn podman_archive_export_becomes_image_with_named_user() {
 #[test]
 fn docker_oci_layout_export_skips_cached_layers_and_legacy_members() {
     let tmp = temp_dir();
-    let data_dir = &verified_dir(tmp.path());
+    let data_dir = &data_dir_at(tmp.path());
     let cached = LayerTar::default().file("cached", "1").plain();
     let fresh = LayerTar::default().file("fresh", "2").plain();
     let (cached_hex, fresh_hex) = (sha256_hex(&cached), sha256_hex(&fresh));
@@ -201,7 +201,7 @@ fn docker_oci_layout_export_skips_cached_layers_and_legacy_members() {
 #[test]
 fn docker_blob_whose_content_does_not_match_its_digest_is_rejected() {
     let tmp = temp_dir();
-    let data_dir = &verified_dir(tmp.path());
+    let data_dir = &data_dir_at(tmp.path());
     let claimed = "a".repeat(64);
     let export = LayerTar::default()
         .file(&format!("blobs/sha256/{claimed}"), "poison")
@@ -226,7 +226,7 @@ fn docker_blob_whose_content_does_not_match_its_digest_is_rejected() {
 #[test]
 fn docker_manifest_layer_with_path_parts_is_rejected() {
     let tmp = temp_dir();
-    let data_dir = &verified_dir(tmp.path());
+    let data_dir = &data_dir_at(tmp.path());
     let config = config_json("", &[]);
     let config_hex = sha256_hex(&config);
     let manifest =

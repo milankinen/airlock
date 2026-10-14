@@ -1,8 +1,6 @@
 //! Tests for the config export: the project document and the resolved document,
 //! and the parse of the exported text as a config file.
 
-use std::path::Path;
-
 use serde_json::json;
 
 use crate::config::export::{self, Format};
@@ -89,9 +87,10 @@ fn project_document_has_merged_project_files_without_user_files() {
 #[test]
 fn resolved_document_in_each_format_resolves_to_same_config() {
     let data = temp_dir();
+    let data_dir = crate::test_cfg::oci::data_dir_at(data.path());
     let resolve = |layers: &LayeredConfig| -> ResolvedConfig {
         let packs = crate::packs::init_with_sample();
-        block_on(layers.resolve(data.path(), &packs, &ConfigOverrides::default())).unwrap()
+        block_on(layers.resolve(&data_dir, &packs, &ConfigOverrides::default())).unwrap()
     };
     let user = toml::from_str("[vm]\nmemory = \"3 GB\"\n[env]\nFROM_USER = \"u\"\n").unwrap();
     let project = toml::from_str(FULL_CONFIG).unwrap();
@@ -115,8 +114,7 @@ fn resolved_document_in_each_format_resolves_to_same_config() {
         (Format::Yaml, "yaml"),
     ] {
         let text = export::render(&expected, format).unwrap();
-        let path = Path::new("airlock").with_extension(ext);
-        let value = files::parse_file(&path, &text).unwrap();
+        let value = files::parse_file(&format!("airlock.{ext}"), &text).unwrap();
         let layers = LayeredConfig::from_values(vec![], None, vec![(ext, value)]).unwrap();
         let actual = export::resolved_document(&resolve(&layers)).unwrap();
         assert_eq!(actual, expected, "{ext}:\n{text}");

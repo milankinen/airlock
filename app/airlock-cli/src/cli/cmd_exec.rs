@@ -8,7 +8,7 @@ use clap::Args;
 use crate::cli::sandbox_client::SandboxClient;
 use crate::context::Context;
 use crate::runtime::{self, RawTerminalRuntime};
-use crate::{messages, oci, rpc, sandbox};
+use crate::{oci, rpc, sandbox};
 
 /// CLI arguments for `airlock exec`.
 #[derive(Args, Debug)]
@@ -57,8 +57,8 @@ pub async fn main(args: ExecArgs, context: &Context) -> anyhow::Result<i32> {
     };
     let (cmd, args) = argv.split_first().expect("argv holds the command");
 
-    let host_cwd = std::env::current_dir()
-        .map_err(|e| anyhow::anyhow!(messages::cli::exec_get_cwd_failed(e)))?;
+    // The current dir as the user sees it. It is the default guest cwd.
+    let host_cwd = context.work.to_string();
     let client = SandboxClient::connect(context, follow_git_worktree).await?;
     let cli_service = client.service;
     tokio::task::spawn_local(client.rpc_system);
@@ -75,7 +75,7 @@ pub async fn main(args: ExecArgs, context: &Context) -> anyhow::Result<i32> {
     for (i, a) in args.iter().enumerate() {
         args_b.set(i as u32, a.as_str());
     }
-    let cwd = cwd.unwrap_or_else(|| host_cwd.to_string_lossy().into_owned());
+    let cwd = cwd.unwrap_or(host_cwd);
     req.get().set_cwd(&cwd);
 
     let mut env_b = req.get().init_env(env.len() as u32);

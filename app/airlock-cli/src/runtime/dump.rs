@@ -8,7 +8,6 @@ use std::io::{self, Write};
 
 use super::OutputSink;
 use crate::project::Project;
-use crate::util::vfs;
 use crate::{cli, messages};
 
 /// Output sink that forwards guest output to `inner`. When a dump file is
@@ -66,11 +65,11 @@ fn open_dump(project: &Project) -> Option<File> {
         // The guest can write a sandbox in the project. Remove the old
         // entry and make a new file, so that a symlink there is not
         // followed.
-        match vfs::remove_file(&path) {
+        match path.remove_file() {
             Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
             _ => {}
         }
-        vfs::create_new(&path)
+        path.create_new()
     });
     match created {
         Ok(f) => {

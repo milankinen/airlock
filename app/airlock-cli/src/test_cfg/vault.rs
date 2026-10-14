@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+use crate::util::VerifiedPath;
 use crate::vault::{PassphraseSource, Storage, Vault, VaultStorageType};
 
 /// A vault backend in memory. Clones share one blob, as two processes on
@@ -39,8 +40,11 @@ impl Storage for MemoryStorage {
         *self.blob.lock() = Some(data.to_string());
         Ok(())
     }
-    fn lock_path(&self) -> anyhow::Result<Option<PathBuf>> {
-        Ok(self.lock.clone())
+    fn lock_path(&self) -> anyhow::Result<Option<VerifiedPath>> {
+        let lock = self.lock.as_ref();
+        Ok(lock
+            .map(|p| VerifiedPath::new_follow(p, None))
+            .transpose()?)
     }
 }
 

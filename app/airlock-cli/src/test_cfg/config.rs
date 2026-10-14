@@ -9,6 +9,8 @@ use airlock_test_utils::{TempDir, block_on, temp_dir};
 use crate::config::config_values::ConfigValues;
 use crate::config::{ConfigOverrides, LayeredConfig, ResolvedConfig};
 use crate::packs::{ArgKind, ArgValue, ConfiguredPack, Pack};
+use crate::test_cfg::oci::verified_dir;
+use crate::util::VerifiedPath;
 use crate::vault::{DisabledStorage, Vault, VaultStorageType};
 
 /// Resolve one project file `airlock.toml` with the content `toml`. Uses
@@ -36,7 +38,8 @@ pub fn resolve_layers(
     overrides: ConfigOverrides,
 ) -> anyhow::Result<ResolvedConfig> {
     let data = temp_dir();
-    block_on(layers.resolve(data.path(), &crate::packs::init_with_sample(), &overrides))
+    let data_dir = crate::test_cfg::oci::data_dir_at(data.path());
+    block_on(layers.resolve(&data_dir, &crate::packs::init_with_sample(), &overrides))
 }
 
 /// A temporary home directory and project directory with real config
@@ -64,6 +67,11 @@ impl ConfigDirs {
         self.dir.path().join("project")
     }
 
+    /// The project directory as a verified path.
+    pub fn project_dir(&self) -> VerifiedPath {
+        verified_dir(&self.project())
+    }
+
     /// Write `content` to `rel` under the home directory.
     pub fn user_file(&self, rel: &str, content: &str) -> &Self {
         write_file(&self.home().join(rel), content);
@@ -84,10 +92,11 @@ impl ConfigDirs {
 
     /// Find and parse the config files.
     pub fn load(&self) -> anyhow::Result<LayeredConfig> {
+        let project = self.project_dir();
         LayeredConfig::load_from(
-            &self.home(),
-            &self.project(),
-            &self.project().join(".airlock"),
+            &verified_dir(&self.home()),
+            &project,
+            &project.join(".airlock")?,
         )
     }
 

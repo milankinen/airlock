@@ -5,8 +5,6 @@
 //! in the project directory, the step can offer to move it into the airlock
 //! data directory, where the sandbox guest cannot see it.
 
-use std::path::Path;
-
 use super::Exit;
 use crate::cli::prompt::PromptError;
 use crate::cli::prompt::choose::{Choice, Choose};
@@ -14,7 +12,7 @@ use crate::context::Context;
 use crate::project::{self, SandboxLock};
 use crate::sandboxes::{self, Found, KEEP_IN_PROJECT, Location, MigrateError, registry};
 use crate::settings::SandboxType;
-use crate::util::{PinnedDir, vfs};
+use crate::util::{PinnedDir, VerifiedPath};
 use crate::{cli, messages};
 
 /// The answer to the move question.
@@ -39,7 +37,7 @@ enum Move {
 ///   The held lock, or the exit for an error or an aborted question.
 pub async fn lock_sandbox(
     context: &Context,
-    host_cwd: &Path,
+    host_cwd: &VerifiedPath,
     can_prompt: bool,
     yes: bool,
 ) -> Result<SandboxLock, Exit> {
@@ -68,12 +66,11 @@ pub async fn lock_sandbox(
             SandboxType::Managed => {
                 // A local project config in `.airlock` goes with the new
                 // sandbox. Check before anything is made.
-                sandboxes::check_local_config(context, host_cwd).map_err(|e| Exit::error(1, e))?;
-                let boxes = sandboxes::boxes_dir(context).map_err(anyhow::Error::from)?;
-                let id = registry::find_or_register(&context.db, &boxes, host_cwd).await?;
+                sandboxes::check_local_config(host_cwd).map_err(|e| Exit::error(1, e))?;
+                let boxes = &context.data.sandboxes;
+                let id = registry::find_or_register(&context.db, boxes, host_cwd).await?;
                 let lock = lock_box(context, host_cwd, &id).await?;
-                let dir = lock.dir().to_path().map_err(anyhow::Error::from)?;
-                sandboxes::adopt_local_config(context, host_cwd, dir)
+                sandboxes::adopt_local_config(host_cwd, lock.dir())
                     .map_err(|e| Exit::error(1, e))?;
                 lock
             }
@@ -86,13 +83,18 @@ pub async fn lock_sandbox(
 // `airlock sandboxes rm` can remove the sandbox between the registry lookup
 // and the lock. The lock then makes a new empty directory. Check the
 // registry again under the lock, and remove that directory.
-async fn lock_box(context: &Context, host_cwd: &Path, id: &str) -> Result<SandboxLock, Exit> {
-    let boxes = sandboxes::boxes_dir(context).map_err(anyhow::Error::from)?;
-    let lock = SandboxLock::acquire_box(host_cwd, &boxes, id)?;
-    if registry::get(&context.db, id).await?.as_deref() != Some(host_cwd) {
+async fn lock_box(
+    context: &Context,
+    host_cwd: &VerifiedPath,
+    id: &str,
+) -> Result<SandboxLock, Exit> {
+    let boxes = &context.data.sandboxes;
+    let lock = SandboxLock::acquire_box(host_cwd, boxes, id)?;
+    let cwd = host_cwd.to_entry_path().map_err(anyhow::Error::from)?;
+    if registry::get(&context.db, id).await?.as_deref() != Some(cwd.as_os_str()) {
         let dir = lock.dir().clone();
         drop(lock);
-        let _ = vfs::remove_dir_all(&dir);
+        let _ = dir.remove_dir_all();
         return Err(Exit::error(
             1,
             messages::start::SANDBOX_REMOVED_DURING_START,
@@ -112,13 +114,13 @@ fn wants_move(context: &Context, found: &Found) -> bool {
     }
     // A symlinked sandbox directory gets no question. The lock reports the
     // problem.
-    if !vfs::symlink_metadata(&found.dir).is_ok_and(|m| m.is_dir()) {
+    if !found.dir.symlink_metadata().is_ok_and(|m| m.is_dir()) {
         return false;
     }
     found
         .dir
         .join(KEEP_IN_PROJECT)
-        .and_then(|p| vfs::symlink_metadata(&p))
+        .and_then(|p| p.symlink_metadata())
         .is_err()
 }
 
@@ -162,7 +164,7 @@ fn ask_move(found: &Found, can_prompt: bool, yes: bool) -> Result<Move, Exit> {
 }
 
 /// Move the project sandbox into the data directory and take its lock.
-async fn move_to_data_dir(context: &Context, host_cwd: &Path) -> Result<SandboxLock, Exit> {
+async fn move_to_data_dir(context: &Context, host_cwd: &VerifiedPath) -> Result<SandboxLock, Exit> {
     let id = match sandboxes::migrate(context, host_cwd).await {
         Ok(id) => id,
         // The same failure as a lock that a different instance holds.

@@ -15,13 +15,12 @@ pub mod seed;
 mod tests;
 
 use std::collections::BTreeMap;
-use std::io;
 
 use crate::config::generated::Clipboard;
+use crate::data_dir::DataDir;
 use crate::messages;
 use crate::packs::install::state::STATE_FILE;
 use crate::util::verified_path::VerifiedPath;
-use crate::util::{self, is_dir, vfs};
 use crate::vm::disk::{DISK_FILE, DISK_ID_FILE};
 
 /// Directory of the templates in the data directory.
@@ -132,13 +131,6 @@ impl TemplateConfig {
     }
 }
 
-/// Return the templates directory of the data directory `data_dir`.
-/// Returns:
-///   The path, or error if the path check fails.
-pub fn templates_dir(data_dir: &VerifiedPath) -> io::Result<VerifiedPath> {
-    data_dir.join(TEMPLATES_DIR)
-}
-
 /// Return true if `name` is a valid template name: 1 to 64 ASCII letters,
 /// digits, `-`, `_` or `.`. The first character is a letter or a digit.
 pub fn is_valid_name(name: &str) -> bool {
@@ -163,17 +155,18 @@ pub fn check_name(name: &str) -> anyhow::Result<()> {
 /// Returns:
 ///   The template, or error if it does not exist or its config is not
 ///   valid.
-pub fn find(data_dir: &VerifiedPath, name: &str) -> anyhow::Result<Template> {
+pub fn find(data_dir: &DataDir, name: &str) -> anyhow::Result<Template> {
     check_name(name)?;
-    let dir = templates_dir(data_dir)?.join(name)?;
-    anyhow::ensure!(is_dir(&dir), messages::templates::template_missing(name));
+    let dir = data_dir.templates.clone().join(name)?;
+    anyhow::ensure!(dir.is_dir(), messages::templates::template_missing(name));
     read(name, dir)
 }
 
 /// Read the template `name` in its directory `dir`.
 fn read(name: &str, dir: VerifiedPath) -> anyhow::Result<Template> {
     let path = dir.join(CONFIG_FILE)?;
-    let toml = util::read_to_string_capped(&path, MAX_CONFIG_FILE)
+    let toml = path
+        .read_to_string_capped(MAX_CONFIG_FILE)
         .map_err(|e| anyhow::anyhow!(messages::templates::read_config_failed(name, &path, e)))?;
     let config = TemplateConfig::parse(&toml)
         .map_err(|e| anyhow::anyhow!(messages::templates::config_invalid(name, e)))?;
@@ -189,11 +182,9 @@ fn read(name: &str, dir: VerifiedPath) -> anyhow::Result<Template> {
 ///   The templates sorted by name. A template that cannot be read is not in
 ///   the list (the log tells why). Directories with a name that is not
 ///   valid are build directories, and are not in the list.
-pub fn list(data_dir: &VerifiedPath) -> Vec<Template> {
-    let Ok(root) = templates_dir(data_dir) else {
-        return Vec::new();
-    };
-    let Ok(entries) = vfs::read_dir(&root) else {
+pub fn list(data_dir: &DataDir) -> Vec<Template> {
+    let root = &data_dir.templates;
+    let Ok(entries) = root.read_dir() else {
         return Vec::new();
     };
     let mut templates: Vec<Template> = entries
@@ -219,11 +210,11 @@ pub fn list(data_dir: &VerifiedPath) -> Vec<Template> {
 /// unused images after this (see [`crate::oci::gc_sweep`]).
 /// Returns:
 ///   Error if the template does not exist or the removal fails.
-pub fn remove(data_dir: &VerifiedPath, name: &str) -> anyhow::Result<()> {
+pub fn remove(data_dir: &DataDir, name: &str) -> anyhow::Result<()> {
     check_name(name)?;
-    let dir = templates_dir(data_dir)?.join(name)?;
-    anyhow::ensure!(is_dir(&dir), messages::templates::template_missing(name));
-    vfs::remove_dir_all(&dir)
+    let dir = data_dir.templates.clone().join(name)?;
+    anyhow::ensure!(dir.is_dir(), messages::templates::template_missing(name));
+    dir.remove_dir_all()
         .map_err(|e| anyhow::anyhow!(messages::templates::remove_failed(&dir, e)))?;
     Ok(())
 }

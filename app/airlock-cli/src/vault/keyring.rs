@@ -3,13 +3,12 @@
 //! Used for `settings.vault.storage = "keyring"`. Keeps the vault in the system
 //! keychain or Secret Service.
 
-use std::path::PathBuf;
-
 use anyhow::{Context, anyhow};
 
 use super::Storage;
 use crate::messages;
 use crate::settings::Settings;
+use crate::util::VerifiedPath;
 
 const KEYRING_SERVICE: &str = "airlock-vault";
 const KEYRING_ACCOUNT: &str = "default";
@@ -36,11 +35,11 @@ impl Storage for KeyringStorage {
             .context(messages::vault::WRITE_VAULT_TO_KEYRING)
     }
 
-    fn lock_path(&self) -> anyhow::Result<Option<PathBuf>> {
+    fn lock_path(&self) -> anyhow::Result<Option<VerifiedPath>> {
         // The keychain has no compare-and-swap, so writers from different
         // processes serialize on a lock file.
         let dir = Settings::dir().context(messages::vault::FIND_VAULT_LOCK_DIR)?;
-        Ok(Some(dir.join("vault.keyring.lock")))
+        Ok(Some(dir.join("vault.keyring.lock")?))
     }
 }
 

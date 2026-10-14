@@ -3,10 +3,8 @@
 //! Finds the user and project config files of a project and parses them.
 //! Config files can be TOML, JSON or YAML.
 
-use std::path::{Path, PathBuf};
-
+use crate::util::VerifiedPath;
 use crate::util::verified_path::{self, Refusal};
-use crate::util::{VerifiedPath, read_to_string_capped, vfs};
 
 /// Size limit of one config file. The project files are in a directory
 /// that the guest can write.
@@ -15,15 +13,15 @@ const CONFIG_CAP: u64 = 4 * 1024 * 1024;
 /// Supported config file extensions, in priority order.
 pub(crate) const EXTENSIONS: &[&str] = &["toml", "json", "yaml", "yml"];
 
-/// Config files that [`discover_in`] found, each as its path and parsed
-/// value. Each slot is in order of precedence, lowest first.
+/// Config files that [`discover_in`] found, each as its path (for display)
+/// and parsed value. Each slot is in order of precedence, lowest first.
 pub(crate) struct DiscoveredFiles {
     /// `~/.airlock/airlock.<ext>`, `~/.airlock/config.<ext>`, `~/.airlock.<ext>`
-    pub user: Vec<(PathBuf, serde_json::Value)>,
+    pub user: Vec<(String, serde_json::Value)>,
     /// `<local_dir>/airlock.<ext>` (see [`discover_in`])
-    pub local: Option<(PathBuf, serde_json::Value)>,
+    pub local: Option<(String, serde_json::Value)>,
     /// `<project_root>/airlock.<ext>`, `<project_root>/airlock.local.<ext>`
-    pub project: Vec<(PathBuf, serde_json::Value)>,
+    pub project: Vec<(String, serde_json::Value)>,
 }
 
 /// Find and parse the config files of a project.
@@ -55,41 +53,46 @@ pub(crate) struct DiscoveredFiles {
 ///   The parsed files, or an error if a file exists but is not readable or
 ///   not valid.
 pub(crate) fn discover_in(
-    home: &Path,
-    project_root: &Path,
-    local_dir: &Path,
+    home: &VerifiedPath,
+    project_root: &VerifiedPath,
+    local_dir: &VerifiedPath,
 ) -> anyhow::Result<DiscoveredFiles> {
     // The home dir and the project root are trusted bases. They can be
     // below a symlink. The user files can be links into a dotfiles repo.
     // The project dir and `.airlock/` are guest-writable. A file in the
     // project dir can be a link that stays in the project. A file in
     // `.airlock/` must not be a link.
-    let home_dir = VerifiedPath::new_follow(home, None)?;
-    let project_dir = VerifiedPath::new_follow(project_root, None)?;
-    let local = match local_dir.strip_prefix(project_root) {
-        Ok(rel) => project_dir.join(rel)?,
-        Err(_) => sandbox_local_dir(local_dir, &project_dir)?,
+    let home_dir = home;
+    let project_dir = project_root;
+    // A local dir in the project comes again from the project root, so no
+    // link is followed below it.
+    let in_project = [
+        local_dir.given().strip_prefix(project_dir.given()).ok(),
+        local_dir
+            .to_entry_path()?
+            .strip_prefix(project_dir.to_entry_path()?)
+            .ok(),
+    ];
+    let local = match in_project.into_iter().flatten().next() {
+        Some(rel) if rel.as_os_str().is_empty() => project_dir.clone(),
+        Some(rel) => project_dir.join(rel)?,
+        None => sandbox_local_dir(local_dir, project_dir)?,
     };
     let home_is_project = home_dir == project_dir;
 
     let mut user = Vec::new();
     if !home_is_project {
-        user.extend(load_first(&home_dir, home, ".airlock/airlock", Links::Any)?);
+        user.extend(load_first(home_dir, ".airlock/airlock", Links::Any)?);
     }
     for stem in [".airlock/config", ".airlock"] {
-        user.extend(load_first(&home_dir, home, stem, Links::Any)?);
+        user.extend(load_first(home_dir, stem, Links::Any)?);
     }
 
-    let local = load_first(&local, local_dir, "airlock", Links::None)?;
+    let local = load_first(&local, "airlock", Links::None)?;
 
     let mut project = Vec::new();
     for stem in ["airlock", "airlock.local"] {
-        project.extend(load_first(
-            &project_dir,
-            project_root,
-            stem,
-            Links::Within(&project_dir),
-        )?);
+        project.extend(load_first(project_dir, stem, Links::Within(project_dir))?);
     }
 
     Ok(DiscoveredFiles {
@@ -110,16 +113,16 @@ pub(crate) fn discover_in(
 ///   A path there can have guest links, so it must come from the project
 ///   root.
 pub(crate) fn sandbox_local_dir(
-    local_dir: &Path,
+    local_dir: &VerifiedPath,
     project_dir: &VerifiedPath,
 ) -> anyhow::Result<VerifiedPath> {
-    let dir = VerifiedPath::new_follow(local_dir, None)?;
+    let dir = VerifiedPath::new_follow(local_dir.to_entry_path()?, None)?;
     if dir
         .to_entry_path()?
         .starts_with(project_dir.to_entry_path()?)
     {
         anyhow::bail!(crate::messages::config::local_dir_in_project(
-            local_dir.display(),
+            local_dir,
             project_dir
         ));
     }
@@ -134,7 +137,7 @@ pub(crate) fn local_config_names(dir: &VerifiedPath) -> Vec<String> {
         .map(|ext| format!("airlock.{ext}"))
         .filter(|name| {
             dir.join(name)
-                .and_then(|path| vfs::symlink_metadata(&path))
+                .and_then(|path| path.symlink_metadata())
                 .is_ok_and(|m| m.is_file())
         })
         .collect()
@@ -154,9 +157,8 @@ enum Links<'a> {
 /// Try each supported extension for `stem` in `dir` and parse the first
 /// file found.
 /// Args:
-///  - `dir`: Directory of the file
-///  - `shown`: Path of `dir` as the user knows it, for the origin and
-///    for messages
+///  - `dir`: Directory of the file. Its given form is the origin and
+///    goes in messages.
 ///  - `stem`: File path below `dir` without the extension
 ///  - `links`: Which symlinks the file can be
 ///
@@ -164,19 +166,18 @@ enum Links<'a> {
 ///   The path and parsed value, or `None` if no file exists.
 fn load_first(
     dir: &VerifiedPath,
-    shown: &Path,
     stem: &str,
     links: Links,
-) -> anyhow::Result<Option<(PathBuf, serde_json::Value)>> {
+) -> anyhow::Result<Option<(String, serde_json::Value)>> {
     for ext in EXTENSIONS {
         let name = format!("{stem}.{ext}");
-        let path = shown.join(&name);
+        let path = dir.given().join(&name).display().to_string();
         let read = match links {
             Links::Any => dir.join_follow(&name, None),
             Links::Within(root) => dir.join_follow(&name, Some(root)),
             Links::None => dir.join(&name),
         }
-        .and_then(|file| read_to_string_capped(&file, CONFIG_CAP));
+        .and_then(|file| file.read_to_string_capped(CONFIG_CAP));
         let content = match read {
             Ok(content) => content,
             // Only a missing file goes to the next extension. Other errors
@@ -190,11 +191,11 @@ fn load_first(
                     && verified_path::refusal(&e) == Some(Refusal::Outside)
                 {
                     return Err(anyhow::anyhow!(
-                        crate::messages::config::config_link_leaves_project(path.display(), root)
+                        crate::messages::config::config_link_leaves_project(&path, root)
                     ));
                 }
                 return Err(anyhow::anyhow!(
-                    crate::messages::config::read_config_failed(path.display(), e)
+                    crate::messages::config::read_config_failed(&path, e)
                 ));
             }
         };
@@ -212,20 +213,20 @@ fn load_first(
 /// Returns:
 ///   The parsed value, or an error for a syntax error or an unsupported
 ///   extension.
-pub(crate) fn parse_file(path: &Path, content: &str) -> anyhow::Result<serde_json::Value> {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("toml") => {
-            toml::from_str(content).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
-        }
-        Some("json") => {
-            serde_json::from_str(content).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
-        }
+pub(crate) fn parse_file(path: &str, content: &str) -> anyhow::Result<serde_json::Value> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    // A leading dot starts a hidden name, not an extension.
+    let ext = name
+        .rsplit_once('.')
+        .filter(|(stem, _)| !stem.is_empty())
+        .map(|(_, ext)| ext);
+    match ext {
+        Some("toml") => toml::from_str(content).map_err(|e| anyhow::anyhow!("{path}: {e}")),
+        Some("json") => serde_json::from_str(content).map_err(|e| anyhow::anyhow!("{path}: {e}")),
         Some("yaml" | "yml") => {
-            serde_yaml::from_str(content).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
+            serde_yaml::from_str(content).map_err(|e| anyhow::anyhow!("{path}: {e}"))
         }
-        _ => anyhow::bail!(crate::messages::config::unsupported_config_format(
-            path.display()
-        )),
+        _ => anyhow::bail!(crate::messages::config::unsupported_config_format(path)),
     }
 }
 
@@ -234,6 +235,7 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
+    use crate::test_cfg::oci::verified_dir as verified;
     use crate::test_cfg::temp_dir;
 
     /// Test that the config load follows user file links and project file
@@ -260,8 +262,11 @@ mod tests {
         let link = project.join("airlock.toml");
         symlink(&host_file, &link).unwrap();
         let local = project.join(".airlock");
+        let (home_dir, project_dir) = (verified(&home), verified(&project));
+        let local_dir = project_dir.join(".airlock").unwrap();
+        let discover = || discover_in(&home_dir, &project_dir, &local_dir);
 
-        let err = discover_in(&home, &project, &local).err().unwrap();
+        let err = discover().err().unwrap();
         assert!(
             err.to_string().contains(&link.display().to_string()),
             "{err}"
@@ -271,14 +276,14 @@ mod tests {
         std::fs::remove_file(&link).unwrap();
         std::fs::write(project.join("real.toml"), "c = 3\n").unwrap();
         symlink("real.toml", &link).unwrap();
-        let files = discover_in(&home, &project, &local).unwrap();
+        let files = discover().unwrap();
         assert_eq!(files.user.len(), 1);
         assert_eq!(files.user[0].1["a"], 1);
         assert_eq!(files.project.len(), 1);
         assert_eq!(files.project[0].1["c"], 3);
 
         symlink("../real.toml", local.join("airlock.toml")).unwrap();
-        let err = discover_in(&home, &project, &local).err().unwrap();
+        let err = discover().err().unwrap();
         let shown = local.join("airlock.toml").display().to_string();
         assert!(err.to_string().contains(&shown), "{err}");
     }
@@ -295,9 +300,10 @@ mod tests {
         let project = tmp.path().join("project");
         std::fs::create_dir_all(project.join("sub")).unwrap();
         std::fs::create_dir_all(tmp.path().join("data/outside")).unwrap();
-        let link = tmp.path().join("data/sandbox");
-        symlink(project.join("sub"), &link).unwrap();
-        let project_dir = VerifiedPath::new_follow(&project, None).unwrap();
+        symlink(project.join("sub"), tmp.path().join("data/sandbox")).unwrap();
+        let data = verified(&tmp.path().join("data"));
+        let link = data.join("sandbox").unwrap();
+        let project_dir = verified(&project);
 
         let err = sandbox_local_dir(&link, &project_dir).err().unwrap();
         assert!(
@@ -305,7 +311,7 @@ mod tests {
             "{err}"
         );
 
-        let ok = tmp.path().join("data/outside");
+        let ok = data.join("outside").unwrap();
         assert!(sandbox_local_dir(&ok, &project_dir).is_ok());
     }
 }

@@ -9,9 +9,20 @@
 //! Paths that the user picks (for example mount sources) can follow
 //! symlinks one time when airlock resolves them. The result can be limited
 //! to a directory.
+//!
+//! A verified path also gives the host file and Unix socket operations.
+//! Each operation checks the path again just before it runs. Operations on
+//! the entry itself (remove, rename, link metadata) accept any type at the
+//! last name, because they do not follow it.
+
+// This module wraps the plain path types. The rest of the crate uses only
+// the verified paths.
+#![allow(clippy::disallowed_types)]
 
 use std::ffi::OsStr;
+use std::fs::{self, DirBuilder, File, Metadata, OpenOptions, Permissions, ReadDir};
 use std::hash::{Hash, Hasher};
+use std::io::Read as _;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Component, Path, PathBuf};
 use std::{fmt, io};
@@ -42,33 +53,12 @@ pub(crate) struct VerifiedPath {
 /// paths resolve from them.
 #[derive(Clone, Debug)]
 pub(crate) struct Roots {
+    /// Home dir of the user.
+    pub home: VerifiedPath,
+    /// Current dir of the process.
+    pub work: VerifiedPath,
     /// Airlock data directory.
-    pub data_dir: VerifiedPath,
-    // The current dir and home can be missing (deleted cwd, no `HOME`).
-    // Only the paths that need them fail then.
-    cwd: Result<VerifiedPath, RootError>,
-    home: Result<VerifiedPath, RootError>,
-}
-
-/// A root that airlock cannot resolve. `io::Error` is not `Clone`, so
-/// keep its parts.
-#[derive(Clone, Debug)]
-struct RootError {
-    kind: io::ErrorKind,
-    message: String,
-}
-
-impl RootError {
-    fn new(e: &io::Error, message: String) -> Self {
-        Self {
-            kind: e.kind(),
-            message,
-        }
-    }
-
-    fn to_io(&self) -> io::Error {
-        io::Error::new(self.kind, self.message.clone())
-    }
+    pub data: VerifiedPath,
 }
 
 /// The reason why airlock refuses a path.
@@ -152,7 +142,7 @@ enum Last {
 }
 
 impl VerifiedPath {
-    /// Check a path below the context roots. No component below the root
+    /// Check a path below the trusted roots. No component below the root
     /// can be a symlink. The last component can be of any type: the check
     /// before use refuses it if necessary. Missing components are allowed
     /// at all levels.
@@ -169,7 +159,7 @@ impl VerifiedPath {
     pub(crate) fn new(path: impl AsRef<Path>, roots: &Roots) -> io::Result<Self> {
         let path = path.as_ref();
         no_empty(path)?;
-        let (base, known, rel) = roots.split(path)?;
+        let (base, known, rel) = roots.split(path);
         let rel = lexical(path, rel)?;
         Self::verified(path.to_path_buf(), base.join(rel), known)
     }
@@ -191,6 +181,34 @@ impl VerifiedPath {
     ) -> io::Result<Self> {
         let path = path.as_ref();
         Self::follow(path.to_path_buf(), path, scope)
+    }
+
+    /// Resolve the home dir of the user. It follows symlinks one time.
+    /// Returns:
+    ///   The home dir, or error if it is not known (for example no `HOME`).
+    pub(crate) fn home_dir() -> io::Result<Self> {
+        let home = dirs::home_dir()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, messages::app::HOME_NOT_SET))?;
+        Self::new_follow(home, None)
+    }
+
+    /// Resolve the current dir of the process. It follows symlinks one
+    /// time.
+    /// Returns:
+    ///   The current dir, or error if it is not known (for example because
+    ///   it was deleted).
+    pub(crate) fn current_dir() -> io::Result<Self> {
+        let cwd = std::env::current_dir()
+            .map_err(|e| io::Error::new(e.kind(), messages::cli::cannot_determine_cwd(&e)))?;
+        Self::new_follow(cwd, None)
+    }
+
+    /// Check the path again and keep the identities of the directories
+    /// that exist now. Use it after airlock made a directory of the path.
+    /// Returns:
+    ///   The checked path, or error as in [`Self::to_entry_path`].
+    pub(crate) fn reverify(&self) -> io::Result<Self> {
+        Self::verified(self.given.clone(), self.resolved.clone(), &self.ids)
     }
 
     /// Make a sub-path. The new components get the same checks as in
@@ -249,6 +267,13 @@ impl VerifiedPath {
     ///   The file name, or `None` for the root of the file system.
     pub(crate) fn file_name(&self) -> Option<&OsStr> {
         self.resolved.file_name()
+    }
+
+    /// Return `true` if `base` is this path or a parent of it. It compares
+    /// the resolved paths as at the check and does not touch the file
+    /// system.
+    pub(crate) fn starts_with(&self, base: &VerifiedPath) -> bool {
+        self.resolved.starts_with(&base.resolved)
     }
 
     /// Get the path as the user wrote it. Use it only for messages. Never
@@ -369,28 +394,160 @@ impl VerifiedPath {
     }
 }
 
-impl Roots {
-    /// Resolve the roots of the process: the current dir, `HOME` and
-    /// `data_dir`. Each root follows symlinks one time. On macOS this
-    /// resolves `/var` and `/tmp`, for example.
-    /// Returns:
-    ///   The roots, or error if `data_dir` cannot be resolved. A missing
-    ///   current dir or home is not an error here. [`Self::cwd`] and
-    ///   [`Self::home`] give the error later.
-    pub(crate) fn for_process(data_dir: &Path) -> io::Result<Self> {
-        let cwd = std::env::current_dir()
-            .map_err(|e| RootError::new(&e, messages::cli::cannot_determine_cwd(&e)));
-        let home = dirs::home_dir().ok_or_else(|| RootError {
-            kind: io::ErrorKind::NotFound,
-            message: messages::app::HOME_NOT_SET.to_string(),
-        });
-        Ok(Self {
-            data_dir: VerifiedPath::new_follow(data_dir, None)?,
-            cwd: cwd.and_then(|p| Self::root(&p)),
-            home: home.and_then(|p| Self::root(&p)),
-        })
+// The file operations on a verified path. Each one checks the path again
+// and then runs the standard operation. The standard operations are only
+// allowed here, after the check. Creates check the path one time and then
+// run as the standard operation, so a small race window stays. Reads have
+// no size limit: the caller sets it.
+#[allow(clippy::disallowed_methods)]
+impl VerifiedPath {
+    /// Read the whole file.
+    pub(crate) fn read(&self) -> io::Result<Vec<u8>> {
+        fs::read(self.to_path()?)
     }
 
+    /// Read the whole UTF-8 file.
+    pub(crate) fn read_to_string(&self) -> io::Result<String> {
+        fs::read_to_string(self.to_path()?)
+    }
+
+    /// Read the whole UTF-8 file, with a size limit.
+    /// Args:
+    ///  - `cap`: Maximum file size in bytes
+    ///
+    /// Returns:
+    ///   The file content, or error if the read fails or the file is larger
+    ///   than `cap`.
+    pub(crate) fn read_to_string_capped(&self, cap: u64) -> io::Result<String> {
+        let mut content = String::new();
+        self.open()?
+            .take(cap.saturating_add(1))
+            .read_to_string(&mut content)?;
+        if content.len() as u64 > cap {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                messages::util::file_too_large(self, cap),
+            ));
+        }
+        Ok(content)
+    }
+
+    /// Write `contents` to the file. Creates or truncates the file, as the
+    /// standard write. It is not atomic.
+    // Only the asset extract uses it, and test builds do not extract.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn write(&self, contents: impl AsRef<[u8]>) -> io::Result<()> {
+        fs::write(self.to_path()?, contents)
+    }
+
+    /// Open the file for reading.
+    pub(crate) fn open(&self) -> io::Result<File> {
+        File::open(self.to_path()?)
+    }
+
+    /// Create a new file and open it for writing. Error if the name exists.
+    pub(crate) fn create_new(&self) -> io::Result<File> {
+        File::create_new(self.to_path()?)
+    }
+
+    /// Open the file with the options `opts`.
+    pub(crate) fn open_with(&self, opts: &OpenOptions) -> io::Result<File> {
+        opts.open(self.to_path()?)
+    }
+
+    /// Get the metadata. Refuses a FIFO and a symlink at the last name.
+    pub(crate) fn metadata(&self) -> io::Result<Metadata> {
+        fs::metadata(self.to_path()?)
+    }
+
+    /// Get the metadata without a follow of the last component.
+    pub(crate) fn symlink_metadata(&self) -> io::Result<Metadata> {
+        fs::symlink_metadata(self.to_entry_path()?)
+    }
+
+    /// Return `true` if the path is a real directory (not a symlink).
+    pub(crate) fn is_dir(&self) -> bool {
+        self.metadata().is_ok_and(|m| m.is_dir())
+    }
+
+    /// Read the target of the symlink.
+    pub(crate) fn read_link(&self) -> io::Result<PathBuf> {
+        fs::read_link(self.to_entry_path()?)
+    }
+
+    /// List the entries of the directory.
+    pub(crate) fn read_dir(&self) -> io::Result<ReadDir> {
+        fs::read_dir(self.to_path()?)
+    }
+
+    /// Make the directory. Its parent must exist.
+    pub(crate) fn mkdir(&self) -> io::Result<()> {
+        fs::create_dir(self.to_path()?)
+    }
+
+    /// Make the directory and its missing parents. The check covers the
+    /// existing components. The standard operation makes the missing ones.
+    pub(crate) fn mkdirs(&self) -> io::Result<()> {
+        fs::create_dir_all(self.to_path()?)
+    }
+
+    /// Make the directory with the options `builder`.
+    pub(crate) fn mkdir_with(&self, builder: &DirBuilder) -> io::Result<()> {
+        builder.create(self.to_path()?)
+    }
+
+    /// Remove the file. A symlink at the last name is removed, not
+    /// followed.
+    pub(crate) fn remove_file(&self) -> io::Result<()> {
+        fs::remove_file(self.to_entry_path()?)
+    }
+
+    /// Remove the directory and all its content. A symlink at the last name
+    /// is removed, not followed.
+    pub(crate) fn remove_dir_all(&self) -> io::Result<()> {
+        fs::remove_dir_all(self.to_entry_path()?)
+    }
+
+    /// Rename this entry to `to`. Replaces a file at `to`. A symlink at this
+    /// path is moved, not followed.
+    pub(crate) fn rename_to(&self, to: &VerifiedPath) -> io::Result<()> {
+        fs::rename(self.to_entry_path()?, to.to_entry_path()?)
+    }
+
+    /// Set the permissions to `perm`.
+    pub(crate) fn set_permissions(&self, perm: Permissions) -> io::Result<()> {
+        fs::set_permissions(self.to_path()?, perm)
+    }
+
+    /// Make the hard link `link` to this file.
+    pub(crate) fn hard_link_to(&self, link: &VerifiedPath) -> io::Result<()> {
+        fs::hard_link(self.to_path()?, link.to_path()?)
+    }
+
+    /// Copy this file to `to`.
+    /// Returns:
+    ///   The number of bytes that were copied.
+    pub(crate) fn copy_to(&self, to: &VerifiedPath) -> io::Result<u64> {
+        fs::copy(self.to_path()?, to.to_path()?)
+    }
+
+    /// Connect to the Unix socket.
+    pub(crate) fn connect_unix(&self) -> io::Result<std::os::unix::net::UnixStream> {
+        std::os::unix::net::UnixStream::connect(self.to_path()?)
+    }
+
+    /// Bind an async Unix socket listener.
+    pub(crate) fn bind_unix_async(&self) -> io::Result<tokio::net::UnixListener> {
+        tokio::net::UnixListener::bind(self.to_path()?)
+    }
+
+    /// Connect to the Unix socket, async.
+    pub(crate) async fn connect_unix_async(&self) -> io::Result<tokio::net::UnixStream> {
+        tokio::net::UnixStream::connect(self.to_path()?).await
+    }
+}
+
+impl Roots {
     /// Resolve the given roots for a test. Each root follows symlinks one
     /// time.
     /// Returns:
@@ -398,52 +555,25 @@ impl Roots {
     #[cfg(test)]
     pub(crate) fn resolve(cwd: &Path, home: &Path, data_dir: &Path) -> io::Result<Self> {
         Ok(Self {
-            cwd: Ok(VerifiedPath::new_follow(cwd, None)?),
-            home: Ok(VerifiedPath::new_follow(home, None)?),
-            data_dir: VerifiedPath::new_follow(data_dir, None)?,
+            work: VerifiedPath::new_follow(cwd, None)?,
+            home: VerifiedPath::new_follow(home, None)?,
+            data: VerifiedPath::new_follow(data_dir, None)?,
         })
-    }
-
-    /// Get the current dir of the process.
-    /// Returns:
-    ///   The current dir, or error if it was not known at the start (for
-    ///   example because it was deleted).
-    pub(crate) fn cwd(&self) -> io::Result<&VerifiedPath> {
-        self.cwd.as_ref().map_err(RootError::to_io)
-    }
-
-    /// Get the home dir of the user.
-    /// Returns:
-    ///   The home dir, or error if it is not known (for example no `HOME`).
-    pub(crate) fn home(&self) -> io::Result<&VerifiedPath> {
-        self.home.as_ref().map_err(RootError::to_io)
-    }
-
-    /// Resolve one root and keep the error for later.
-    fn root(path: &Path) -> Result<VerifiedPath, RootError> {
-        VerifiedPath::new_follow(path, None).map_err(|e| RootError::new(&e, e.to_string()))
     }
 
     /// Find the root of `path`.
     /// Returns:
     ///   The resolved base, the identities of its components and the rest
-    ///   of `path` below the base. Error if `path` needs a missing root.
-    fn split<'a>(&'a self, path: &'a Path) -> io::Result<(&'a Path, &'a [Option<Id>], &'a Path)> {
+    ///   of `path` below the base.
+    fn split<'a>(&'a self, path: &'a Path) -> (&'a Path, &'a [Option<Id>], &'a Path) {
         if let Ok(rest) = path.strip_prefix("~") {
-            let home = self.home()?;
-            return Ok((&home.resolved, &home.ids, rest));
+            return (&self.home.resolved, &self.home.ids, rest);
         }
         if path.is_relative() {
-            let cwd = self.cwd()?;
-            return Ok((&cwd.resolved, &cwd.ids, path));
+            return (&self.work.resolved, &self.work.ids, path);
         }
         let mut best: Option<(usize, &VerifiedPath, &Path)> = None;
-        let roots = [
-            self.cwd.as_ref().ok(),
-            self.home.as_ref().ok(),
-            Some(&self.data_dir),
-        ];
-        for root in roots.into_iter().flatten() {
+        for root in [&self.work, &self.home, &self.data] {
             // The user can write the root in its given form, for example
             // `/var/...` on macOS, or in its resolved form.
             for form in [&root.given, &root.resolved] {
@@ -458,10 +588,10 @@ impl Roots {
         // A path outside all roots is checked from `/`. On macOS a path
         // through the `/tmp` or `/var` link is then refused: write the
         // resolved form or use a follow variant.
-        Ok(match best {
+        match best {
             Some((_, root, rest)) => (&root.resolved, &root.ids, rest),
             None => (Path::new("/"), &[], path.strip_prefix("/").unwrap_or(path)),
-        })
+        }
     }
 }
 
@@ -599,10 +729,7 @@ mod tests {
         let link = VerifiedPath::new("link", &roots).unwrap();
         assert!(link.to_entry_path().is_ok());
         assert_eq!(refusal_of(link.to_path()), Refusal::Symlink);
-        assert_eq!(
-            refusal_of(roots.cwd().unwrap().join("link/x")),
-            Refusal::Symlink
-        );
+        assert_eq!(refusal_of(roots.work.join("link/x")), Refusal::Symlink);
         assert!(VerifiedPath::new("real/file", &roots).is_ok());
     }
 
@@ -638,11 +765,8 @@ mod tests {
             refusal_of(VerifiedPath::new("a/../b", &roots)),
             Refusal::Dot
         );
-        assert_eq!(refusal_of(roots.cwd().unwrap().join("../x")), Refusal::Dot);
-        assert_eq!(
-            refusal_of(roots.cwd().unwrap().join("/etc")),
-            Refusal::Absolute
-        );
+        assert_eq!(refusal_of(roots.work.join("../x")), Refusal::Dot);
+        assert_eq!(refusal_of(roots.work.join("/etc")), Refusal::Absolute);
     }
 
     /// Test that the check before use finds a directory that the guest
@@ -731,13 +855,10 @@ mod tests {
         let cwd = temp_dir();
         let home = temp_dir();
         let roots = Roots::resolve(cwd.path(), home.path(), cwd.path()).unwrap();
-        assert_eq!(
-            &VerifiedPath::new("~", &roots).unwrap(),
-            roots.home().unwrap()
-        );
+        assert_eq!(&VerifiedPath::new("~", &roots).unwrap(), &roots.home);
         assert_eq!(
             VerifiedPath::new("~/x", &roots).unwrap(),
-            roots.home().unwrap().join("x").unwrap()
+            roots.home.join("x").unwrap()
         );
     }
 
@@ -753,7 +874,7 @@ mod tests {
             VerifiedPath::new("a", &roots).unwrap()
         );
         assert_eq!(refusal_of(VerifiedPath::new("", &roots)), Refusal::NoName);
-        assert_eq!(refusal_of(roots.cwd().unwrap().join("")), Refusal::NoName);
+        assert_eq!(refusal_of(roots.work.join("")), Refusal::NoName);
     }
 
     /// Test that an absolute path resolves from the longest root that
@@ -844,7 +965,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("in")).unwrap();
         symlink("in", dir.path().join("to_in")).unwrap();
         symlink(outside.path(), dir.path().join("to_out")).unwrap();
-        let scope = roots.cwd().unwrap();
+        let scope = &roots.work;
 
         let inside = scope.join_follow("to_in", Some(scope)).unwrap();
         assert_eq!(inside, scope.join("in").unwrap());
@@ -903,5 +1024,51 @@ mod tests {
         let root = VerifiedPath::new_follow("/", None).unwrap();
         assert!(root.parent().is_none());
         assert!(root.file_name().is_none());
+    }
+
+    /// A temp dir with a file `target` and a symlink `link` to it.
+    fn dir_with_link() -> (TempDir, Roots) {
+        let (dir, roots) = roots();
+        std::fs::write(dir.path().join("target"), "data").unwrap();
+        symlink("target", dir.path().join("link")).unwrap();
+        (dir, roots)
+    }
+
+    /// Test that the remove of a symlink that the guest planted removes
+    /// only the link and not its target.
+    ///   1. Make a file and a symlink to it
+    ///   2. Remove the symlink
+    ///   3. Check that the link is gone and the target stays
+    #[test]
+    fn remove_file_of_planted_symlink_removes_only_link() {
+        let (dir, roots) = dir_with_link();
+        VerifiedPath::new("link", &roots)
+            .unwrap()
+            .remove_file()
+            .unwrap();
+        assert!(std::fs::symlink_metadata(dir.path().join("link")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("target")).unwrap(),
+            "data"
+        );
+    }
+
+    /// Test that the rename of a symlink moves the link and not its
+    /// target.
+    ///   1. Make a file and a symlink to it
+    ///   2. Rename the symlink
+    ///   3. Check that the new name is a symlink and the target stays
+    #[test]
+    fn rename_of_symlink_moves_link() {
+        let (dir, roots) = dir_with_link();
+        let from = VerifiedPath::new("link", &roots).unwrap();
+        let to = VerifiedPath::new("moved", &roots).unwrap();
+        from.rename_to(&to).unwrap();
+        let md = std::fs::symlink_metadata(dir.path().join("moved")).unwrap();
+        assert!(md.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("target")).unwrap(),
+            "data"
+        );
     }
 }

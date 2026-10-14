@@ -13,6 +13,7 @@ mod config;
 mod constants;
 mod context;
 mod daemon;
+mod data_dir;
 mod db;
 mod diagnostics;
 mod masking;
@@ -175,7 +176,7 @@ async fn main() {
 fn load_context() -> anyhow::Result<Context> {
     let settings = Settings::load()?;
     let data_dir = cache::migrate_legacy_cache(settings.data_dir()?);
-    Context::new(settings, data_dir)
+    Context::new(settings, &data_dir)
 }
 
 /// Top-level CLI definition. Clap derives the argument parser from it.

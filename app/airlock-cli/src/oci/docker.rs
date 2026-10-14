@@ -11,8 +11,8 @@ use std::process::{Child, Command, Stdio};
 use sha2::{Digest, Sha256};
 
 use super::{OciConfig, layer};
+use crate::data_dir::DataDir;
 use crate::util::verified_path::VerifiedPath;
-use crate::util::{is_dir, vfs};
 use crate::{cache, messages};
 
 /// Get the digest hex of a blob member, or `None` for metadata. Docker 25+
@@ -179,7 +179,7 @@ impl Drop for DockerSaveGuard {
 ///   The parsed image config and the layer digests. On error, all staging
 ///   files of this call are removed.
 pub async fn save_layer_tarballs(
-    data_dir: &VerifiedPath,
+    data_dir: &DataDir,
     engine: &str,
     image_ref: &str,
 ) -> anyhow::Result<DockerSave> {
@@ -249,7 +249,7 @@ fn copy_hashing<R: Read, W: Write>(mut reader: R, mut writer: W) -> std::io::Res
 /// Returns:
 ///   The parsed image config and the layer digests, bottom first.
 pub(super) fn save_from_stream<R: Read>(
-    data_dir: &VerifiedPath,
+    data_dir: &DataDir,
     stdout: R,
 ) -> anyhow::Result<DockerSave> {
     let layers_root = &cache::layers_root(data_dir)?;
@@ -288,12 +288,12 @@ pub(super) fn save_from_stream<R: Read>(
             // config blob never has the same digest as a layer (different
             // content), so a layer dir match is always a cached layer.
             let digest = format!("sha256:{hex}");
-            if cache::layer_dir(data_dir, &cache::layer_key(&digest)).is_ok_and(|d| is_dir(&d)) {
+            if cache::layer_dir(data_dir, &cache::layer_key(&digest)).is_ok_and(|d| d.is_dir()) {
                 std::io::copy(&mut entry, &mut std::io::sink())?;
                 continue;
             }
             let tmp = layer::download_tmp_path(layers_root, &cache::layer_key(&digest))?;
-            let mut file = vfs::create_new(&tmp)?;
+            let mut file = tmp.create_new()?;
             let actual = copy_hashing(&mut entry, &mut file)?;
             // Prevent cross-source cache poisoning. The member name gives the
             // digest, but Docker does not verify the content. Reject a blob
@@ -302,7 +302,7 @@ pub(super) fn save_from_stream<R: Read>(
             // `registry::pull_layer` does the same check.
             if !actual.eq_ignore_ascii_case(hex) {
                 drop(file);
-                let _ = vfs::remove_file(&tmp);
+                let _ = tmp.remove_file();
                 anyhow::bail!(messages::oci::docker_blob_digest_mismatch(hex, actual));
             }
             staged.insert(hex.to_string(), tmp);
@@ -318,8 +318,8 @@ pub(super) fn save_from_stream<R: Read>(
         let config_tmp = staged
             .remove(&config_hex)
             .ok_or_else(|| anyhow::anyhow!(messages::oci::config_blob_missing(&config_hex)))?;
-        let image_config: OciConfig = serde_json::from_slice(&vfs::read(&config_tmp)?)?;
-        let _ = vfs::remove_file(&config_tmp);
+        let image_config: OciConfig = serde_json::from_slice(&config_tmp.read()?)?;
+        let _ = config_tmp.remove_file();
 
         // Rename the staged layer blobs to `.download` for extraction. The
         // stream loop skipped cached layers, so each layer that is still in
@@ -343,7 +343,7 @@ pub(super) fn save_from_stream<R: Read>(
                 continue;
             };
             let download = layers_root.join(format!("{}.download", cache::layer_key(&digest)))?;
-            vfs::rename(&tmp, &download)?;
+            tmp.rename_to(&download)?;
         }
 
         Ok(DockerSave {
@@ -354,7 +354,7 @@ pub(super) fn save_from_stream<R: Read>(
 
     // Remove the staging files that are still on disk (errors, unused blobs).
     for (_, tmp) in staged {
-        let _ = vfs::remove_file(&tmp);
+        let _ = tmp.remove_file();
     }
 
     result

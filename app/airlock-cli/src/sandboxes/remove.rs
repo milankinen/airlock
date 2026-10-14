@@ -3,7 +3,6 @@
 use super::registry;
 use crate::context::Context;
 use crate::project::{self, IdleLock};
-use crate::util::vfs;
 
 /// Remove the sandbox `id` from the data directory and from the registry.
 ///
@@ -22,14 +21,14 @@ pub async fn remove_box(context: &Context, id: &str) -> anyhow::Result<()> {
         registry::is_valid_id(id),
         crate::messages::sandboxes::not_sandbox_id(id)
     );
-    let dir = super::boxes_dir(context)?.join(id)?;
+    let dir = context.data.sandboxes.join(id)?;
     let _lock = match project::lock_if_idle(&dir) {
         IdleLock::Running => anyhow::bail!(crate::messages::sandboxes::SANDBOX_RUNNING_STOP_FIRST),
         IdleLock::Held(file) => Some(file),
         IdleLock::Missing => None,
     };
     // A symlink at `dir` is removed, not followed.
-    match vfs::remove_dir_all(&dir) {
+    match dir.remove_dir_all() {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
             anyhow::bail!(crate::messages::sandboxes::remove_failed(dir, e))
         }

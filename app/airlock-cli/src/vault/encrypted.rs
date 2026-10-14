@@ -4,8 +4,6 @@
 //! that a passphrase encrypts. Gets the passphrase from an environment
 //! variable, or asks the user for it.
 
-use std::path::PathBuf;
-
 use anyhow::{Context, anyhow, bail};
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine;
@@ -19,9 +17,11 @@ use rand::rngs::SysRng;
 use super::{
     ARGON2_KEY_BYTES, ARGON2_M_KIB, ARGON2_P, ARGON2_T, EncryptedBlob, Envelope, KdfParams,
     NONCE_BYTES, SALT_BYTES, Storage, atomic_write, decode_b64_array, read_vault_file,
+    vault_lock_file,
 };
 use crate::cli::prompt::fields::{Field, Fields, Invalid};
 use crate::messages;
+use crate::util::VerifiedPath;
 
 /// Env var that gives the encrypted-vault passphrase without a prompt
 /// (CI, scripts, and headless shells without a TTY).
@@ -40,7 +40,7 @@ pub trait PassphraseSource: Send + Sync + 'static {
 /// key comes from the passphrase and a per-vault salt. The user gives the
 /// passphrase one time per process.
 pub struct EncryptedFileStorage {
-    path: PathBuf,
+    path: VerifiedPath,
     passphrase: Box<dyn PassphraseSource>,
     /// Cached key with the KDF inputs that gave it. Made on the first
     /// unlock or create, and used again after that, so the user gets only
@@ -70,7 +70,7 @@ impl EncryptedFileStorage {
     /// Args:
     ///  - `path`: Path of the vault file
     ///  - `passphrase`: Source of the passphrase
-    pub fn new(path: PathBuf, passphrase: Box<dyn PassphraseSource>) -> Self {
+    pub fn new(path: VerifiedPath, passphrase: Box<dyn PassphraseSource>) -> Self {
         Self {
             path,
             passphrase,
@@ -109,11 +109,11 @@ impl Storage for EncryptedFileStorage {
             return Ok(None);
         };
         let envelope: Envelope = serde_json::from_str(&raw)
-            .with_context(|| messages::vault::parse_vault_file(self.path.display()))?;
+            .with_context(|| messages::vault::parse_vault_file(&self.path))?;
         let blob = match envelope {
             Envelope::EncryptedFile(b) => b,
             Envelope::File(_) => bail!(messages::vault::plaintext_vault_but_encrypted_storage(
-                self.path.display()
+                &self.path
             )),
         };
 
@@ -219,8 +219,8 @@ impl Storage for EncryptedFileStorage {
         atomic_write(&self.path, json.as_bytes())
     }
 
-    fn lock_path(&self) -> anyhow::Result<Option<PathBuf>> {
-        Ok(Some(self.path.with_extension("lock")))
+    fn lock_path(&self) -> anyhow::Result<Option<VerifiedPath>> {
+        vault_lock_file(&self.path).map(Some)
     }
 }
 
@@ -347,12 +347,13 @@ mod tests {
     };
     use crate::test_cfg::temp_dir;
     use crate::test_cfg::vault::FixedPassphrase;
+    use crate::util::VerifiedPath;
 
     /// Write `envelope` to a vault file and load it with the passphrase
     /// `pass`.
     fn load_envelope(envelope: &Envelope, pass: &'static str) -> anyhow::Result<Option<String>> {
         let tmp = temp_dir();
-        let path = tmp.path().join("vault.enc.json");
+        let path = VerifiedPath::new_follow(tmp.path().join("vault.enc.json"), None).unwrap();
         atomic_write(
             &path,
             serde_json::to_string_pretty(envelope).unwrap().as_bytes(),
@@ -401,7 +402,7 @@ mod tests {
         });
 
         let tmp = temp_dir();
-        let path = tmp.path().join("vault.enc.json");
+        let path = VerifiedPath::new_follow(tmp.path().join("vault.enc.json"), None).unwrap();
         atomic_write(&path, serde_json::to_string(&envelope).unwrap().as_bytes()).unwrap();
         let open = || EncryptedFileStorage::new(path.clone(), Box::new(FixedPassphrase("hunter2")));
         let vault = open();

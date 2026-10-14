@@ -12,7 +12,8 @@ use crate::test_cfg::{configured_variants, host_env_vault, resolve_project_toml}
 /// its arg values, as `(pack name, label, value)`.
 fn builtin_values() -> Vec<(String, String, serde_json::Value)> {
     let mut values = Vec::new();
-    let data = crate::test_cfg::temp_dir();
+    let tmp = crate::test_cfg::temp_dir();
+    let data = crate::test_cfg::oci::data_dir_at(tmp.path());
     for pack in crate::packs::init().unwrap().builtin() {
         for configured in configured_variants(&pack) {
             let label = format!(
@@ -24,7 +25,7 @@ fn builtin_values() -> Vec<(String, String, serde_json::Value)> {
             values.push((
                 pack.metadata().name.clone(),
                 label,
-                configured.config_values(data.path()).unwrap(),
+                configured.config_values(&data).unwrap(),
             ));
         }
     }

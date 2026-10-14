@@ -3,8 +3,8 @@
 //! Checks on the host, before the install boot, that the setup scripts can
 //! run in the sandbox image.
 
+use crate::data_dir::DataDir;
 use crate::oci::{self, OciImage};
-use crate::util::VerifiedPath;
 
 /// Check that the setup scripts can run in `image`.
 ///
@@ -19,7 +19,7 @@ use crate::util::VerifiedPath;
 ///
 /// Returns:
 ///   Nothing, or the reason why the image cannot take packs.
-pub fn check(data_dir: &VerifiedPath, image: &OciImage) -> anyhow::Result<()> {
+pub fn check(data_dir: &DataDir, image: &OciImage) -> anyhow::Result<()> {
     if image.uid != 0 {
         anyhow::bail!(crate::messages::packs::image_uid_not_root(
             &image.name,
@@ -98,7 +98,7 @@ mod tests {
     #[test]
     fn check_refuses_non_root_image_and_image_without_os_release() {
         let dir = temp_dir();
-        let data_dir = crate::test_cfg::oci::verified_dir(dir.path());
+        let data_dir = crate::test_cfg::oci::data_dir_at(dir.path());
         let err = check(&data_dir, &image(1000)).unwrap_err();
         assert!(err.to_string().contains("uid 1000"), "{err}");
         let err = check(&data_dir, &image(0)).unwrap_err();

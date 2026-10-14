@@ -18,7 +18,6 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use super::OciConfig;
 use crate::messages;
 use crate::util::verified_path::VerifiedPath;
-use crate::util::vfs;
 
 /// A resolved registry image with manifest and config.
 pub struct RegistryImage {
@@ -151,7 +150,7 @@ pub async fn pull_layer(
     client.store_auth_if_needed(registry, auth).await;
 
     // The staging name is unique, so the create never meets an old file.
-    let file = tokio::fs::File::from_std(vfs::create_new(dest)?);
+    let file = tokio::fs::File::from_std(dest.create_new()?);
     // Both progress bars get the same number of bytes as the writes.
     let bars: Vec<ProgressBar> = per_layer.into_iter().chain(overall).cloned().collect();
     let mut writer = HashingWriter {
@@ -163,7 +162,7 @@ pub async fn pull_layer(
     let digest = writer.hasher.finalize();
 
     if let Err(e) = pull_result {
-        let _ = vfs::remove_file(dest);
+        let _ = dest.remove_file();
         return Err(e.into());
     }
     flush_result?;
@@ -174,7 +173,7 @@ pub async fn pull_layer(
     let metadata = writer.inner.inner.metadata().await?;
     let expected_size = layer.size as u64;
     if metadata.len() != expected_size {
-        let _ = vfs::remove_file(dest);
+        let _ = dest.remove_file();
         anyhow::bail!(messages::oci::layer_size_mismatch(
             expected_size,
             metadata.len()
@@ -183,7 +182,7 @@ pub async fn pull_layer(
 
     let actual_digest = format!("sha256:{}", hex::encode(digest));
     if !actual_digest.eq_ignore_ascii_case(&layer.digest) {
-        let _ = vfs::remove_file(dest);
+        let _ = dest.remove_file();
         anyhow::bail!(messages::oci::layer_digest_mismatch(
             &layer.digest,
             actual_digest

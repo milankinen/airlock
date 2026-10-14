@@ -5,26 +5,24 @@
 //! them to the cache on the host when they change. The `[vm]` config can
 //! replace the bundled kernel and initramfs with custom files.
 
-use std::path::{Path, PathBuf};
-
 use crate::config::config_values::Mount;
 use crate::messages;
 use crate::project::Project;
-use crate::util::{VerifiedPath, vfs};
+use crate::util::VerifiedPath;
 use crate::vm::mount;
 
 /// Paths to the extracted VM boot assets.
 pub struct Assets {
     /// Kernel image.
-    pub kernel: PathBuf,
+    pub kernel: VerifiedPath,
     /// Initramfs archive.
-    pub initramfs: PathBuf,
+    pub initramfs: VerifiedPath,
     /// `cloud-hypervisor` executable.
     #[cfg(target_os = "linux")]
-    pub cloud_hypervisor: PathBuf,
+    pub cloud_hypervisor: VerifiedPath,
     /// `virtiofsd` executable.
     #[cfg(target_os = "linux")]
-    pub virtiofsd: PathBuf,
+    pub virtiofsd: VerifiedPath,
 }
 
 impl Assets {
@@ -41,8 +39,7 @@ impl Assets {
     pub fn init(project: &Project) -> anyhow::Result<Assets> {
         const CHECKSUM: &str = env!("AIRLOCK_ASSETS_CHECKSUM");
 
-        let dir = project.context.roots.data_dir.join("vm")?;
-        vfs::create_dir_all(&dir)?;
+        let dir = crate::data_dir::make_dir(&project.context.data.vm)?;
 
         // Serialize the checksum check and extraction across processes. Take
         // a blocking exclusive lock before the checksum read. Then two
@@ -53,7 +50,7 @@ impl Assets {
         let _lock = acquire_extract_lock(&dir.join("lock")?)?;
 
         let checksum_file = dir.join("checksum")?;
-        let cached_checksum = vfs::read_to_string(&checksum_file).unwrap_or_default();
+        let cached_checksum = checksum_file.read_to_string().unwrap_or_default();
         if cached_checksum.trim() != CHECKSUM {
             #[cfg(not(feature = "distroless"))]
             {
@@ -83,7 +80,7 @@ impl Assets {
                 )?;
             }
 
-            vfs::write(&checksum_file, CHECKSUM)?;
+            checksum_file.write(CHECKSUM)?;
         }
 
         #[cfg(not(feature = "distroless"))]
@@ -113,9 +110,9 @@ impl Assets {
             kernel,
             initramfs,
             #[cfg(target_os = "linux")]
-            cloud_hypervisor: dir.join("cloud-hypervisor")?.to_path()?.to_path_buf(),
+            cloud_hypervisor: dir.join("cloud-hypervisor")?,
             #[cfg(target_os = "linux")]
-            virtiofsd: dir.join("virtiofsd")?.to_path()?.to_path_buf(),
+            virtiofsd: dir.join("virtiofsd")?,
         })
     }
 
@@ -132,7 +129,7 @@ impl Assets {
 fn write_executable(dir: &VerifiedPath, name: &str, data: &[u8]) -> anyhow::Result<()> {
     let tmp = dir.join(format!(".{name}.tmp"))?;
     write_new(&tmp, data, 0o755)?;
-    vfs::rename(&tmp, &dir.join(name)?)?;
+    tmp.rename_to(&dir.join(name)?)?;
     Ok(())
 }
 
@@ -145,11 +142,11 @@ fn write_new(path: &VerifiedPath, data: &[u8], mode: u32) -> anyhow::Result<()> 
     use std::os::unix::fs::PermissionsExt;
 
     // A temp file from a crashed run can remain.
-    match vfs::remove_file(path) {
+    match path.remove_file() {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
         _ => {}
     }
-    let mut file = vfs::create_new(path)?;
+    let mut file = path.create_new()?;
     file.write_all(data)?;
     file.set_permissions(std::fs::Permissions::from_mode(mode))?;
     Ok(())
@@ -166,7 +163,7 @@ fn write_atomic(dir: &VerifiedPath, name: &str, data: &[u8]) -> anyhow::Result<(
     // process never goes into place.
     let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()))?;
     write_new(&tmp, data, 0o644)?;
-    vfs::rename(&tmp, &dir.join(name)?)?;
+    tmp.rename_to(&dir.join(name)?)?;
     Ok(())
 }
 
@@ -183,8 +180,7 @@ fn acquire_extract_lock(path: &VerifiedPath) -> anyhow::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
 
-    let file = vfs::open_with(
-        path,
+    let file = path.open_with(
         std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -222,11 +218,9 @@ fn resolve_asset(
     project: &Project,
     bundled: Option<VerifiedPath>,
     name: &str,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<VerifiedPath> {
     let Some(raw) = custom else {
-        let bundled =
-            bundled.ok_or_else(|| anyhow::anyhow!(messages::app::asset_must_be_set(name)))?;
-        return Ok(bundled.to_path()?.to_path_buf());
+        return bundled.ok_or_else(|| anyhow::anyhow!(messages::app::asset_must_be_set(name)));
     };
 
     resolve_custom(
@@ -252,29 +246,23 @@ fn resolve_asset(
 ///   points out of it.
 fn resolve_custom(
     raw: &str,
-    host_home: &Path,
-    cwd: &Path,
+    host_home: &VerifiedPath,
+    cwd: &VerifiedPath,
     mounts: &[(&str, Mount)],
     name: &str,
-) -> anyhow::Result<PathBuf> {
-    let path = mount::absolute(raw, host_home, cwd);
+) -> anyhow::Result<VerifiedPath> {
     // The user can pick a symlink, for example to the current kernel build.
-    let resolved = VerifiedPath::new_follow(&path, None)?;
+    let resolved = mount::host_path(raw, host_home, cwd)?;
     // The sandbox can write the project dir and the writable dir mounts,
     // and put symlinks there. The project share is not known here, so the
     // project dir counts as writable.
     let sources = mount::resolve_sources(mounts, host_home, cwd)?;
-    let writable = mount::writable_dirs(Some(cwd), &sources)?;
-    mount::check_stays_in(
-        &messages::vm::custom_asset_kind(name),
-        &path,
-        &resolved,
-        &writable,
-    )?;
-    match vfs::metadata(&resolved) {
-        Ok(_) => Ok(resolved.to_path()?.to_path_buf()),
+    let writable = mount::writable_dirs(Some(cwd), &sources);
+    mount::check_stays_in(&messages::vm::custom_asset_kind(name), &resolved, &writable)?;
+    match resolved.metadata() {
+        Ok(_) => Ok(resolved),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            anyhow::bail!(messages::app::custom_asset_not_found(name, path.display()))
+            anyhow::bail!(messages::app::custom_asset_not_found(name, &resolved))
         }
         Err(e) => Err(e.into()),
     }
@@ -287,6 +275,7 @@ mod tests {
 
     use super::resolve_custom;
     use crate::test_cfg::temp_dir;
+    use crate::util::VerifiedPath;
 
     /// Test that a custom kernel path through a symlink in the project is
     /// refused when the link points out of the project. The sandbox can
@@ -305,15 +294,15 @@ mod tests {
         std::fs::write(&kernel, b"kernel").unwrap();
         std::os::unix::fs::symlink(&kernel, project.join("Image")).unwrap();
 
-        let err = resolve_custom("Image", &root, &project, &[], "kernel")
+        let home = VerifiedPath::new_follow(&root, None).unwrap();
+        let cwd = VerifiedPath::new_follow(&project, None).unwrap();
+        let err = resolve_custom("Image", &home, &cwd, &[], "kernel")
             .unwrap_err()
             .to_string();
         assert!(err.contains("Set the real path"), "{err}");
         let real = kernel.to_str().unwrap();
-        assert_eq!(
-            resolve_custom(real, &root, &project, &[], "kernel").unwrap(),
-            kernel
-        );
+        let resolved = resolve_custom(real, &home, &cwd, &[], "kernel").unwrap();
+        assert_eq!(resolved.to_path().unwrap(), kernel);
     }
     /// Test that an asset write replaces the old file and leaves no temporary
     /// file, so that a reader never sees a partial asset.

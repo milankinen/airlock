@@ -1,17 +1,15 @@
-//! Airlock data directory locations.
+//! Airlock data directory entries.
 //!
-//! Gives the locations in the user's airlock data directory. All sandboxes
-//! share it. It contains the database, the sandboxes that are not in their
-//! project, the VM boot assets, the OCI images and layers, the host side of
-//! the pack mounts, and fallback CLI sockets. The user settings can move
-//! the directory.
-
-use std::path::PathBuf;
+//! Gives the cache entries in the user's airlock data directory: the OCI
+//! images and layers, the host side of the pack mounts, and fallback CLI
+//! sockets. Also finds the default data directory and moves the cache of
+//! older airlock versions into it.
 
 use sha2::{Digest, Sha256};
 
+use crate::data_dir::{DataDir, create_private_dir, make_dir};
 use crate::messages;
-use crate::util::{VerifiedPath, vfs};
+use crate::util::VerifiedPath;
 
 /// On-disk format version of the per-layer cache.
 ///
@@ -76,100 +74,80 @@ pub fn layer_key(digest: &str) -> String {
 
 /// Get the default data directory: `airlock` in the user data directory of
 /// the platform (`~/Library/Application Support` on macOS,
-/// `$XDG_DATA_HOME` or `~/.local/share` on Linux).
-pub fn default_data_dir() -> anyhow::Result<PathBuf> {
+/// `$XDG_DATA_HOME` or `~/.local/share` on Linux). It follows symlinks one
+/// time: the user can move the data directory with a link.
+pub fn default_data_dir() -> anyhow::Result<VerifiedPath> {
     let base = dirs::data_dir().ok_or_else(|| anyhow::anyhow!(messages::app::HOME_NOT_SET))?;
-    Ok(base.join("airlock"))
+    Ok(VerifiedPath::new_follow(base.join("airlock"), None)?)
 }
 
 /// Move the cache of older airlock versions (`~/.cache/airlock`) to the
 /// data directory `data_dir`, if the data directory does not exist yet.
 /// Thus existing sandboxes keep their images and layers after an upgrade,
 /// and airlock does not ask the registry again.
+/// Args:
+///  - `data_dir`: Data directory from the settings, with its symlinks
+///    followed
 ///
 /// Returns:
 ///   The data directory to use. This is the old cache directory if the
 ///   move is not possible, for example because the two directories are on
 ///   different file systems.
-pub fn migrate_legacy_cache(data_dir: PathBuf) -> PathBuf {
-    let Some(legacy_path) = dirs::home_dir().map(|h| h.join(".cache").join("airlock")) else {
-        return data_dir;
-    };
+pub fn migrate_legacy_cache(data_dir: VerifiedPath) -> VerifiedPath {
     // The user can move the old cache and the data directory with a link.
     // A linked old cache moves as a link, so its target stays where it is.
-    let (Some(cache), Ok(target)) = (
-        legacy_path.parent(),
-        VerifiedPath::new_follow(&data_dir, None),
-    ) else {
+    let Ok(cache) = VerifiedPath::home_dir().and_then(|home| home.join_follow(".cache", None))
+    else {
         return data_dir;
     };
-    let Ok(legacy) = VerifiedPath::new_follow(cache, None).and_then(|c| c.join("airlock")) else {
+    let Ok(legacy) = cache.join("airlock") else {
         return data_dir;
     };
-    let legacy_is_dir = VerifiedPath::new_follow(&legacy_path, None)
-        .and_then(|dir| vfs::metadata(&dir))
+    let legacy_is_dir = follow_last(&legacy)
+        .and_then(|dir| dir.metadata())
         .is_ok_and(|m| m.is_dir());
-    if !legacy_is_dir || vfs::symlink_metadata(&target).is_ok() {
+    if !legacy_is_dir || data_dir.symlink_metadata().is_ok() {
         return data_dir;
     }
     // One rename keeps the inodes. Thus running sandboxes keep their open
     // files, and the hard links to cached images stay valid.
     let moved = data_dir
         .parent()
-        .map_or(Ok(()), |parent| {
-            create_private_dir(&VerifiedPath::new_follow(parent, None)?)
-        })
-        .and_then(|()| Ok(vfs::rename(&legacy, &target)?))
+        .map_or(Ok(()), |parent| create_private_dir(&parent).map(drop))
+        .and_then(|()| Ok(legacy.rename_to(&data_dir)?))
         .and_then(|()| {
             use std::os::unix::fs::PermissionsExt as _;
             // The data directory holds the sandbox data, so make it
             // private like a new one. Resolve it again: it can be a link
             // now.
             let mode = std::fs::Permissions::from_mode(0o700);
-            let dir = VerifiedPath::new_follow(&data_dir, None)?;
-            Ok(vfs::set_permissions(&dir, mode)?)
+            let dir = follow_last(&data_dir)?;
+            dir.set_permissions(mode)?;
+            Ok(dir)
         });
     match moved {
-        Ok(()) => data_dir,
+        Ok(dir) => dir,
         Err(e) => {
             crate::cli::log!(
                 "{}",
                 messages::app::cache_move_failed(
                     crate::cli::yellow("warning:"),
-                    legacy_path.display(),
-                    data_dir.display(),
+                    &legacy,
+                    &data_dir,
                     e
                 )
             );
-            legacy_path
+            follow_last(&legacy).unwrap_or(legacy)
         }
     }
 }
 
-/// Create `dir` and its missing parents. A new directory gets mode 0700:
-/// the data directory holds the database and the sandbox data.
-pub fn create_private_dir(dir: &VerifiedPath) -> anyhow::Result<()> {
-    use std::os::unix::fs::DirBuilderExt as _;
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true).mode(0o700);
-    vfs::create_dir_with(dir, &builder)
-        .map_err(|e| anyhow::anyhow!(messages::app::cannot_create_dir(dir, e)))
-}
-
-/// Make a directory in the data directory, with its missing parents.
-/// Args:
-///  - `data_dir`: Airlock data directory, or a directory in it
-///  - `rel`: Relative path of the directory below `data_dir`, without
-///    `..` components
-///
-/// Returns:
-///   The directory, or error if a part of the path is a symlink or the
-///   directory cannot be made.
-fn data_subdir(data_dir: &VerifiedPath, rel: &str) -> anyhow::Result<VerifiedPath> {
-    let dir = data_dir.join(rel)?;
-    vfs::create_dir_all(&dir)
-        .map_err(|e| anyhow::anyhow!(messages::app::cannot_create_dir(&dir, e)))?;
-    Ok(dir)
+/// Resolve `path` again and follow a symlink at its last name.
+fn follow_last(path: &VerifiedPath) -> std::io::Result<VerifiedPath> {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => parent.join_follow(name, None),
+        _ => path.reverify(),
+    }
 }
 
 /// Get the mount directory of the pack `name`
@@ -178,8 +156,8 @@ fn data_subdir(data_dir: &VerifiedPath, rel: &str) -> anyhow::Result<VerifiedPat
 /// The pack's `config.lua` gets it as `pack.directory`. The pack keeps the
 /// host side of its mounts there (for example the agent settings and
 /// credential files). All sandboxes that use the pack share it.
-pub fn pack_mounts_dir(data_dir: &VerifiedPath, name: &str) -> anyhow::Result<VerifiedPath> {
-    data_subdir(data_dir, &format!("share/all/packs/{name}"))
+pub fn pack_mounts_dir(data_dir: &DataDir, name: &str) -> anyhow::Result<VerifiedPath> {
+    make_dir(&data_dir.packs.join(name)?)
 }
 
 /// Get the path of the CLI RPC Unix socket for the sandbox at `sandbox_dir`.
@@ -188,7 +166,7 @@ pub fn pack_mounts_dir(data_dir: &VerifiedPath, name: &str) -> anyhow::Result<Ve
 ///   `<sandbox_dir>/cli.sock`, or `<data_dir>/sock/<hash>.sock` if
 ///   the default path is too long for a Unix socket.
 pub fn cli_sock_path(
-    data_dir: &VerifiedPath,
+    data_dir: &DataDir,
     sandbox_dir: &VerifiedPath,
 ) -> anyhow::Result<VerifiedPath> {
     // `AF_UNIX` has a hard `sun_path` limit of 104 bytes on macOS (108 on
@@ -213,27 +191,19 @@ pub fn cli_sock_path(
     let mut hasher = Sha256::new();
     hasher.update(sandbox_dir.as_os_str().as_encoded_bytes());
     let hash = hex::encode(&hasher.finalize()[..8]);
-    Ok(data_subdir(data_dir, "sock")?.join(format!("{hash}.sock"))?)
-}
-
-/// Get the root of the OCI cache (`<data_dir>/oci/`). Creates it if it
-/// does not exist. It contains the `images/` and `layers/` subtrees. They
-/// have their own namespace, so they do not collide with other cache kinds
-/// (VM assets and others).
-fn oci_root(data_dir: &VerifiedPath) -> anyhow::Result<VerifiedPath> {
-    data_subdir(data_dir, "oci")
+    Ok(make_dir(&data_dir.sock)?.join(format!("{hash}.sock"))?)
 }
 
 /// Get the root of the image cache (`<data_dir>/oci/images/`). Creates
 /// it if it does not exist. Each entry is one `<image-digest>` JSON file with
 /// the complete `OciImage` (with a schema tag from `crate::oci::CachedImage`).
-pub fn images_root(data_dir: &VerifiedPath) -> anyhow::Result<VerifiedPath> {
-    data_subdir(&oci_root(data_dir)?, "images")
+pub fn images_root(data_dir: &DataDir) -> anyhow::Result<VerifiedPath> {
+    make_dir(&data_dir.images)
 }
 
 /// Get the path of a cached OCI image file for the image `digest`. The file
 /// possibly does not exist. The caller must check.
-pub fn image_path(data_dir: &VerifiedPath, digest: &str) -> anyhow::Result<VerifiedPath> {
+pub fn image_path(data_dir: &DataDir, digest: &str) -> anyhow::Result<VerifiedPath> {
     let name = digest_name(digest);
     check_entry_name(name)?;
     Ok(images_root(data_dir)?.join(name)?)
@@ -246,8 +216,8 @@ pub fn image_path(data_dir: &VerifiedPath, digest: &str) -> anyhow::Result<Verif
 /// layer contents at its root. If the directory exists, the layer is
 /// complete, because the directory appears only through the atomic rename
 /// from a `<layer-key>.<...>.tmp/` staging directory.
-pub fn layers_root(data_dir: &VerifiedPath) -> anyhow::Result<VerifiedPath> {
-    data_subdir(&oci_root(data_dir)?, "layers")
+pub fn layers_root(data_dir: &DataDir) -> anyhow::Result<VerifiedPath> {
+    make_dir(&data_dir.layers)
 }
 
 /// Get the directory of one cached OCI layer.
@@ -256,7 +226,7 @@ pub fn layers_root(data_dir: &VerifiedPath) -> anyhow::Result<VerifiedPath> {
 ///  - `key`: Versioned layer key. Convert a raw OCI digest with
 ///    [`layer_key`] first. A key from `image_layers` (in the image JSON) is
 ///    already a layer key.
-pub fn layer_dir(data_dir: &VerifiedPath, key: &str) -> anyhow::Result<VerifiedPath> {
+pub fn layer_dir(data_dir: &DataDir, key: &str) -> anyhow::Result<VerifiedPath> {
     check_entry_name(key)?;
     Ok(layers_root(data_dir)?.join(key)?)
 }
@@ -283,7 +253,8 @@ mod tests {
         std::fs::write(legacy.join("oci/images/abc"), "image").unwrap();
         let data = home.data_dir();
 
-        assert_eq!(migrate_legacy_cache(data.clone()), data);
+        let moved = migrate_legacy_cache(VerifiedPath::new_follow(&data, None).unwrap());
+        assert_eq!(moved.given(), data);
 
         assert_eq!(
             std::fs::read_to_string(data.join("oci/images/abc")).unwrap(),
@@ -312,7 +283,8 @@ mod tests {
         std::os::unix::fs::symlink(&real, home.path().join(".cache/airlock")).unwrap();
         let data = home.data_dir();
 
-        assert_eq!(migrate_legacy_cache(data.clone()), data);
+        let moved = migrate_legacy_cache(VerifiedPath::new_follow(&data, None).unwrap());
+        assert_eq!(moved.given(), data);
 
         assert_eq!(std::fs::read_link(&data).unwrap(), real);
         assert_eq!(

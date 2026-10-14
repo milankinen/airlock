@@ -5,20 +5,21 @@
 //! `airlock sandboxes info` gives the same output for any sandbox.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
 
 use clap::Args;
 use serde::Serialize;
 
 use crate::config::ResolvedConfig;
 use crate::context::Context;
+use crate::data_dir::DataDir;
 use crate::packs::ConfiguredPack;
 use crate::packs::install::state::{self, InstallState, PackStatus, ReadState};
 use crate::project::read_run_meta;
 use crate::sandboxes::{Found, Location, registry};
 use crate::services::{self, store};
+use crate::util::PinnedDir;
 use crate::util::verified_path::VerifiedPath;
-use crate::util::{PinnedDir, vfs};
 use crate::vault::VaultStorageType;
 use crate::vm::disk;
 use crate::{cli, config, messages, packs, project, sandboxes};
@@ -45,6 +46,17 @@ pub async fn main(args: &InfoArgs, context: Context) -> i32 {
 /// Returns:
 ///   Process exit code: 0 on success, 2 on a config error, 1 on other errors.
 pub(super) async fn run(context: Context, id: Option<&str>, json: bool) -> i32 {
+    // A registered project path that fails the check (for example a symlink
+    // in it) shows as text, like in `sandboxes ls`.
+    if let Some(id) = id
+        && let Ok(project) = registered_project(&context, id).await
+        && VerifiedPath::new(&project, &context.roots()).is_err()
+        && let Ok(dir) = context.data.sandboxes.join(id)
+    {
+        let location = Location::DataDir { id: id.to_string() };
+        let details = Details::read(&location, project.display().to_string(), &dir);
+        return print_details_only(&details, json);
+    }
     let (project_dir, found) = match find(&context, id).await {
         Ok(found) => found,
         Err(e) => {
@@ -55,18 +67,19 @@ pub(super) async fn run(context: Context, id: Option<&str>, json: bool) -> i32 {
     // Check config errors first, with the config error exit code (same as
     // `start`). The local project config is in the sandbox directory or in
     // the project.
-    let resolved = if is_dir(&context, &project_dir) {
+    let resolved = if project_dir.is_dir() {
         let local_dir = match &found {
             None => project_dir.join(".airlock"),
-            Some(found) => match sandboxes::local_config_dir(&project_dir, &found.dir) {
-                Ok(dir) => dir,
-                Err(e) => {
-                    cli::error!("{e}");
-                    return 1;
-                }
-            },
+            Some(found) => sandboxes::local_config_dir(&project_dir, &found.dir),
         };
-        match resolve_config(&context.data_dir, &project_dir, &local_dir).await {
+        let local_dir = match local_dir {
+            Ok(dir) => dir,
+            Err(e) => {
+                cli::error!("{e}");
+                return 1;
+            }
+        };
+        match resolve_config(&context.data, &project_dir, &local_dir).await {
             Ok(resolved) => Some(resolved),
             Err(e) => {
                 cli::error!("{}", messages::cli::config_error(format!("{e:#}")));
@@ -77,49 +90,26 @@ pub(super) async fn run(context: Context, id: Option<&str>, json: bool) -> i32 {
         None
     };
     let found = match found {
-        Some(found) if vfs::symlink_metadata(&found.dir).is_ok() => found,
+        Some(found) if found.dir.symlink_metadata().is_ok() => found,
         _ => {
-            cli::error!(
-                "{}",
-                messages::cli::no_sandbox_for_project(project_dir.display())
-            );
-            if sandboxes::airlock_dir_is_symlink(&context, &project_dir) {
-                let dir = project_dir.join(".airlock");
-                cli::log!(
-                    "{}",
-                    messages::sandboxes::airlock_dir_symlink_hint(dir.display())
-                );
+            cli::error!("{}", messages::cli::no_sandbox_for_project(&project_dir));
+            if sandboxes::airlock_dir_is_symlink(&project_dir)
+                && let Ok(dir) = project_dir.join(".airlock")
+            {
+                cli::log!("{}", messages::sandboxes::airlock_dir_symlink_hint(dir));
             }
             return 1;
         }
     };
-    let details = Details::read(&found);
+    let details = Details::read(&found.location, found.project.to_string(), &found.dir);
     if json {
-        return match serde_json::to_string_pretty(&details) {
-            Ok(text) => {
-                println!("{text}");
-                0
-            }
-            Err(e) => {
-                cli::error!("{e}");
-                1
-            }
-        };
+        return print_json(&details);
     }
     let Some(ResolvedConfig { values, packs, .. }) = resolved else {
         print_sandbox_only(&details);
         return 0;
     };
-    let project = match project::load(values, context, &found) {
-        Ok(s) => s,
-        Err(e) => {
-            cli::error!(
-                "{}",
-                messages::cli::sandbox_details_loading_failed(format!("{e:#}"))
-            );
-            return 1;
-        }
-    };
+    let project = project::load(values, context, &found);
 
     let status = if project.is_running() {
         cli::red(messages::cli::STATUS_RUNNING)
@@ -292,9 +282,9 @@ fn grant_line(grant: &store::GrantSummary) -> String {
 ///  - `project_dir`: Project directory
 ///  - `local_dir`: Directory of the local project config
 async fn resolve_config(
-    data_dir: &Path,
-    project_dir: &Path,
-    local_dir: &Path,
+    data_dir: &DataDir,
+    project_dir: &VerifiedPath,
+    local_dir: &VerifiedPath,
 ) -> anyhow::Result<ResolvedConfig> {
     let packs = packs::init()?;
     config::load(project_dir, local_dir)?
@@ -486,12 +476,12 @@ fn removed_status(status: PackStatus) -> Option<&'static str> {
 pub(super) async fn find(
     context: &Context,
     id: Option<&str>,
-) -> anyhow::Result<(PathBuf, Option<Found>)> {
+) -> anyhow::Result<(VerifiedPath, Option<Found>)> {
     if let Some(id) = id {
         let found = find_by_id(context, id).await?;
         return Ok((found.project.clone(), Some(found)));
     }
-    let cwd = sandboxes::project_dir(context)?;
+    let cwd = sandboxes::project_dir(&context.work)?;
     let found = sandboxes::resolve_sandbox(context, &cwd, false, false)
         .await
         .map_err(|e| e.context(messages::cli::SANDBOX_LOOKUP_FAILED_CONTEXT))?;
@@ -500,29 +490,28 @@ pub(super) async fn find(
 
 /// Get the registered sandbox `id`.
 /// Returns:
-///   The sandbox, or error if `id` is not registered.
-pub(super) async fn find_by_id(context: &Context, id: &str) -> anyhow::Result<Found> {
+///   The sandbox, or error if `id` is not registered or a part of its
+///   project path before the last is a symlink.
+async fn find_by_id(context: &Context, id: &str) -> anyhow::Result<Found> {
+    let project = registered_project(context, id).await?;
+    Ok(Found {
+        location: Location::DataDir { id: id.to_string() },
+        project: VerifiedPath::new(project, &context.roots())?,
+        dir: context.data.sandboxes.join(id)?,
+    })
+}
+
+/// Get the project directory of the registered sandbox `id`, as the
+/// registry has it.
+/// Returns:
+///   The project directory, or error if `id` is not registered.
+pub(super) async fn registered_project(context: &Context, id: &str) -> anyhow::Result<OsString> {
     let project = if registry::is_valid_id(id) {
         registry::get(&context.db, id).await?
     } else {
         None
     };
-    let Some(project) = project else {
-        anyhow::bail!(messages::cli::no_sandbox_with_id(id));
-    };
-    Ok(Found {
-        location: Location::DataDir { id: id.to_string() },
-        project,
-        dir: sandboxes::boxes_dir(context)?.join(id)?,
-    })
-}
-
-/// Check if `path` is a directory. A path through a symlink below the
-/// trusted roots does not count.
-pub(super) fn is_dir(context: &Context, path: &Path) -> bool {
-    VerifiedPath::new(path, &context.roots)
-        .and_then(|path| vfs::metadata(&path))
-        .is_ok_and(|m| m.is_dir())
+    project.ok_or_else(|| anyhow::anyhow!(messages::cli::no_sandbox_with_id(id)))
 }
 
 /// Details of one sandbox, without its config. The JSON output and the
@@ -534,7 +523,7 @@ pub(super) struct Details {
     /// `data-dir` or `project-dir`.
     location: &'static str,
     /// Project directory.
-    pub(super) project: PathBuf,
+    pub(super) project: String,
     /// Sandbox directory.
     dir: String,
     /// `running`, `stopped` or `missing` (no sandbox directory).
@@ -552,12 +541,15 @@ pub(super) struct Details {
 }
 
 impl Details {
-    /// Read the details of the sandbox `found`. Takes no lock and writes
-    /// nothing. Records that cannot be read are left out.
-    pub(super) fn read(found: &Found) -> Self {
+    /// Read the details of a sandbox. Takes no lock and writes nothing.
+    /// Records that cannot be read are left out.
+    /// Args:
+    ///  - `location`: Where the sandbox keeps its data
+    ///  - `project`: Project directory, for the output only
+    ///  - `dir`: Sandbox directory
+    pub(super) fn read(location: &Location, project: String, dir: &VerifiedPath) -> Self {
         use std::os::unix::fs::MetadataExt;
-        let dir = &found.dir;
-        let status = if vfs::symlink_metadata(dir).is_err() {
+        let status = if dir.symlink_metadata().is_err() {
             SandboxStatus::Missing
         } else if project::is_running(dir) {
             SandboxStatus::Running
@@ -576,17 +568,17 @@ impl Details {
         }
         // The disk is a sparse file: `blocks() * 512` gives the allocated
         // size.
-        let disk = dir
-            .join(disk::DISK_FILE)
-            .and_then(|p| vfs::metadata(&p))
-            .ok();
+        let disk = dir.join(disk::DISK_FILE).and_then(|p| p.metadata()).ok();
         Self {
-            id: found.id().map(ToString::to_string),
-            location: match found.location {
+            id: match location {
+                Location::DataDir { id } => Some(id.clone()),
+                Location::ProjectDir => None,
+            },
+            location: match location {
                 Location::DataDir { .. } => "data-dir",
                 Location::ProjectDir => "project-dir",
             },
-            project: found.project.clone(),
+            project,
             dir: dir.to_string(),
             status,
             last_run: run.last_run,
@@ -606,13 +598,37 @@ impl Details {
     }
 }
 
+/// Print the details as JSON.
+/// Returns:
+///   Process exit code.
+fn print_json(details: &Details) -> i32 {
+    match serde_json::to_string_pretty(details) {
+        Ok(text) => {
+            println!("{text}");
+            0
+        }
+        Err(e) => {
+            cli::error!("{e}");
+            1
+        }
+    }
+}
+
+/// Print only the sandbox details, as JSON or as text.
+/// Returns:
+///   Process exit code.
+fn print_details_only(details: &Details, json: bool) -> i32 {
+    if json {
+        return print_json(details);
+    }
+    print_sandbox_only(details);
+    0
+}
+
 /// Print the details of a sandbox whose project directory is gone. There is
 /// no config to show.
 fn print_sandbox_only(details: &Details) {
-    println!(
-        "{}",
-        messages::cli::info_path_missing(details.project.display())
-    );
+    println!("{}", messages::cli::info_path_missing(&details.project));
     if let Some(id) = &details.id {
         println!("{}", messages::cli::info_id(id));
     }

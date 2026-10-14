@@ -8,7 +8,6 @@
 pub(crate) mod keys;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 pub use keys::KeyList;
@@ -18,7 +17,7 @@ use smart_config::{ConfigRepository, ConfigSchema, DescribeConfig, DeserializeCo
 use crate::config::de::format_error;
 use crate::config::files::{EXTENSIONS, parse_file};
 use crate::messages;
-use crate::util::{VerifiedPath, vfs};
+use crate::util::VerifiedPath;
 use crate::vault::VaultStorageType;
 
 /// All user settings. Add new fields here. The default of each field must
@@ -145,30 +144,34 @@ pub struct MonitorBuffers {
 }
 
 impl Settings {
-    /// Get the airlock directory of the user (`~/.airlock`).
-    pub fn dir() -> Result<PathBuf> {
-        let home = dirs::home_dir().ok_or_else(|| anyhow!(messages::settings::HOME_DIR_MISSING))?;
-        Ok(home.join(".airlock"))
+    /// Get the airlock directory of the user (`~/.airlock`). It can be a
+    /// link into a dotfiles repo.
+    pub fn dir() -> Result<VerifiedPath> {
+        let home =
+            VerifiedPath::home_dir().map_err(|_| anyhow!(messages::settings::HOME_DIR_MISSING))?;
+        Ok(home.join_follow(".airlock", None)?)
     }
 
     /// Get the airlock data directory: `data_dir` with `~` expanded, or
-    /// `airlock` in the user data directory of the platform.
-    pub fn data_dir(&self) -> Result<PathBuf> {
-        let home = dirs::home_dir().ok_or_else(|| anyhow!(messages::settings::HOME_DIR_MISSING))?;
+    /// `airlock` in the user data directory of the platform. The user can
+    /// move the data directory with a link.
+    pub fn data_dir(&self) -> Result<VerifiedPath> {
+        let home =
+            VerifiedPath::home_dir().map_err(|_| anyhow!(messages::settings::HOME_DIR_MISSING))?;
         if let Some(dir) = &self.data_dir {
             let dir = crate::util::expand_tilde(dir, &home);
-            if !dir.is_absolute() {
-                bail!(messages::settings::data_dir_not_absolute(dir.display()));
+            if !dir.starts_with('/') {
+                bail!(messages::settings::data_dir_not_absolute(&dir));
             }
-            return Ok(dir);
+            return Ok(VerifiedPath::new_follow(dir, None)?);
         }
         crate::cache::default_data_dir()
     }
 
     /// Get the display path of the TOML settings file. For error messages
     /// that tell the user to create or edit the file.
-    pub fn expected_path() -> PathBuf {
-        PathBuf::from("~/.airlock/settings.toml")
+    pub fn expected_path() -> &'static str {
+        "~/.airlock/settings.toml"
     }
 
     /// Load the settings from the user's airlock directory `~/.airlock`
@@ -182,26 +185,28 @@ impl Settings {
     /// Returns:
     ///   The settings, or the defaults if no file exists. Error if the file
     ///   is malformed, so the user does not get defaults without notice.
-    pub fn load_from(dir: &Path) -> Result<Self> {
+    pub fn load_from(dir: &VerifiedPath) -> Result<Self> {
         // Same extension order (TOML, JSON, YAML) as the project config
         // loader. If there are multiple files, TOML wins. Thus a stray
         // `settings.json` cannot hide the user's primary `settings.toml`.
         for ext in EXTENSIONS {
-            let path = dir.join(format!("settings.{ext}"));
+            let name = format!("settings.{ext}");
+            let path = dir.given().join(&name).display().to_string();
             // The settings can be a link into a dotfiles repo.
-            let content = match VerifiedPath::new_follow(&path, None)
-                .and_then(|verified| vfs::read_to_string(&verified))
+            let content = match dir
+                .join_follow(&name, None)
+                .and_then(|verified| verified.read_to_string())
             {
                 Ok(content) => content,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
                     return Err(anyhow::Error::from(e)
-                        .context(messages::settings::read_settings_file(path.display())));
+                        .context(messages::settings::read_settings_file(&path)));
                 }
             };
             let value = parse_file(&path, &content)?;
             return parse_settings(value)
-                .with_context(|| messages::settings::load_settings_file(path.display()));
+                .with_context(|| messages::settings::load_settings_file(&path));
         }
         // No file: still parse an empty source with smart-config, so the
         // per-field `default_t` annotations apply. This is important for the
@@ -232,6 +237,7 @@ mod tests {
     //! Tests for the load of the user settings file.
 
     use super::*;
+    use crate::test_cfg::oci::verified_dir;
     use crate::test_cfg::temp_dir;
 
     /// Test that the settings come from the first file in the order TOML,
@@ -244,7 +250,8 @@ mod tests {
     #[test]
     fn settings_load_from_first_file_by_format_or_defaults() {
         let dir = temp_dir();
-        let s = Settings::load_from(&dir.path().join("missing")).unwrap();
+        let missing = verified_dir(dir.path()).join("missing").unwrap();
+        let s = Settings::load_from(&missing).unwrap();
         assert_eq!(s.vault.storage, VaultStorageType::Keyring);
         assert_eq!(s.monitor.buffers.http, 100);
         assert_eq!(s.monitor.buffers.scrollback, 1000);
@@ -257,7 +264,7 @@ mod tests {
             "vault:\n  storage: disabled\n",
         )
         .unwrap();
-        let s = Settings::load_from(dir.path()).unwrap();
+        let s = Settings::load_from(&verified_dir(dir.path())).unwrap();
         assert_eq!(s.vault.storage, VaultStorageType::Disabled);
 
         std::fs::write(
@@ -265,7 +272,7 @@ mod tests {
             r#"{"vault": {"storage": "keyring"}}"#,
         )
         .unwrap();
-        let s = Settings::load_from(dir.path()).unwrap();
+        let s = Settings::load_from(&verified_dir(dir.path())).unwrap();
         assert_eq!(s.vault.storage, VaultStorageType::Keyring);
 
         std::fs::write(
@@ -276,7 +283,7 @@ mod tests {
              [security]\nsandbox_type = \"project-owned\"\ninsecure_mounts = true\n",
         )
         .unwrap();
-        let s = Settings::load_from(dir.path()).unwrap();
+        let s = Settings::load_from(&verified_dir(dir.path())).unwrap();
         assert_eq!(s.vault.storage, VaultStorageType::File);
         assert_eq!(s.monitor.buffers.http, 5);
         assert_eq!(s.monitor.buffers.tcp, 100);
@@ -298,7 +305,10 @@ mod tests {
         ] {
             let dir = temp_dir();
             std::fs::write(dir.path().join("settings.toml"), content).unwrap();
-            let err = format!("{:#}", Settings::load_from(dir.path()).unwrap_err());
+            let err = format!(
+                "{:#}",
+                Settings::load_from(&verified_dir(dir.path())).unwrap_err()
+            );
             assert!(err.contains("settings.toml"), "{err}");
         }
     }

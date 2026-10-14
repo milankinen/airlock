@@ -153,14 +153,14 @@ impl AppleVmBackend {
     ) -> anyhow::Result<Retained<VZVirtualMachineConfiguration>> {
         unsafe {
             // Boot loader
-            let kernel_path = config.kernel.to_string_lossy();
+            let kernel_path = config.kernel.to_path()?.to_string_lossy();
             let kernel_url = NSURL::fileURLWithPath(&NSString::from_str(&kernel_path));
             let boot_loader =
                 VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &kernel_url);
 
             boot_loader.setCommandLine(&NSString::from_str(&config.kernel_cmdline));
 
-            let initramfs_path = config.initramfs.to_string_lossy();
+            let initramfs_path = config.initramfs.to_path()?.to_string_lossy();
             let initramfs_url = NSURL::fileURLWithPath(&NSString::from_str(&initramfs_path));
             boot_loader.setInitialRamdiskURL(Some(&initramfs_url));
 
@@ -243,7 +243,7 @@ impl AppleVmBackend {
                 // sources at the start, the other shares from the roots.
                 for share in &config.shares {
                     let url = NSURL::fileURLWithPath(&NSString::from_str(
-                        &share.host_path.to_string_lossy(),
+                        &share.host_path.to_path()?.to_string_lossy(),
                     ));
                     let shared_dir = VZSharedDirectory::initWithURL_readOnly(
                         VZSharedDirectory::alloc(),
@@ -270,7 +270,9 @@ impl AppleVmBackend {
             // VirtIO block device for cache volume
             // The disk path is absolute and resolved (see the shares).
             if let Some(disk_path) = &config.cache_disk {
-                let url = NSURL::fileURLWithPath(&NSString::from_str(&disk_path.to_string_lossy()));
+                let url = NSURL::fileURLWithPath(&NSString::from_str(
+                    &disk_path.to_path()?.to_string_lossy(),
+                ));
                 let attachment = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
                     VZDiskImageStorageDeviceAttachment::alloc(),
                     &url,
@@ -284,7 +286,7 @@ impl AppleVmBackend {
                 let storage: Retained<VZStorageDeviceConfiguration> = block_config.into_super();
                 let storage_devices = NSArray::from_retained_slice(&[storage]);
                 vm_config.setStorageDevices(&storage_devices);
-                debug!("cache block device attached: {}", disk_path.display());
+                debug!("cache block device attached: {disk_path}");
             }
 
             Ok(vm_config)

@@ -6,11 +6,11 @@
 //! API.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use mlua::{Lua, LuaSerdeExt};
 
 use crate::packs::{ArgValue, PackMetadata};
+use crate::util::VerifiedPath;
 
 /// Error that the Lua function `fail(message)` raises.
 #[derive(Debug, thiserror::Error)]
@@ -52,7 +52,7 @@ pub fn evaluate(
     pack: &PackMetadata,
     source: &str,
     args: &BTreeMap<String, ArgValue>,
-    directory: &Path,
+    directory: &VerifiedPath,
 ) -> anyhow::Result<serde_json::Value> {
     let name = &pack.name;
     let value = run(pack, source, args, directory).map_err(|e| match e.downcast_ref::<Fail>() {
@@ -76,7 +76,7 @@ fn run(
     pack: &PackMetadata,
     source: &str,
     args: &BTreeMap<String, ArgValue>,
-    directory: &Path,
+    directory: &VerifiedPath,
 ) -> mlua::Result<serde_json::Value> {
     // Pack code is trusted because it ships with airlock. Thus the state
     // has the full standard library and no limits, unlike the sandboxed
@@ -95,6 +95,7 @@ fn run(
     pack_table.set("name", pack.name.as_str())?;
     pack_table.set("version", pack.version.as_str())?;
     pack_table.set("args", arg_table)?;
+    let directory = directory.to_path().map_err(mlua::Error::external)?;
     pack_table.set(
         "directory",
         lua.create_string(directory.as_os_str().as_encoded_bytes())?,

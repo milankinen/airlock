@@ -4,12 +4,11 @@
 //! disk. The disk keeps all changes that the sandbox makes to the container
 //! file system, and the contents of the named caches.
 
-use std::path::{Path, PathBuf};
-
 use crate::cli::prompt::PromptError;
 use crate::cli::prompt::choose::{Choice, Choose};
 use crate::config::config_values::Disk;
-use crate::util::{PinnedDir, VerifiedPath, vfs};
+use crate::util::{PinnedDir, VerifiedPath};
+use crate::vm::mount;
 use crate::{cli, messages};
 
 /// Default disk size (10 GB) for the overlay upper layer and cache dirs.
@@ -118,7 +117,7 @@ pub fn ensure(cache_dir: &PinnedDir, config: &Disk, copied: bool) -> anyhow::Res
 ///  - `cache_dir`: Sandbox directory that contains the disk image
 ///  - `config`: Disk config
 ///  - `container_home`: Guest home for `~` expansion of cache paths
-///  - `cwd`: Base directory for relative cache paths.
+///  - `cwd`: Project directory, base for relative cache paths
 ///
 /// Returns:
 ///   The disk image path and all cache entries (enabled and disabled).
@@ -126,10 +125,10 @@ pub fn prepare(
     cache_dir: &VerifiedPath,
     config: &Disk,
     container_home: &str,
-    cwd: &Path,
+    cwd: &str,
 ) -> anyhow::Result<(VerifiedPath, Vec<CacheEntry>)> {
     let image_path = cache_dir.join(DISK_FILE)?;
-    match vfs::metadata(&image_path) {
+    match image_path.metadata() {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             ensure(&PinnedDir::pin(cache_dir.to_path()?)?, config, false)?;
@@ -137,7 +136,6 @@ pub fn prepare(
         Err(e) => return Err(e.into()),
     }
 
-    let container_home = PathBuf::from(container_home);
     // Include all entries (enabled and disabled), so the supervisor knows
     // all declared names. It removes the disk dirs of names that are not in
     // this list, and does not mount disabled entries.
@@ -148,15 +146,7 @@ pub fn prepare(
             let paths = m
                 .paths
                 .iter()
-                .map(|p| {
-                    let target = crate::util::expand_tilde(p, &container_home);
-                    let target = if target.is_relative() {
-                        cwd.join(target)
-                    } else {
-                        target
-                    };
-                    target.to_string_lossy().into_owned()
-                })
+                .map(|p| mount::join_str(cwd, &mount::expand_tilde_str(p, container_home)))
                 .collect();
             (name.clone(), m.enabled, paths)
         })

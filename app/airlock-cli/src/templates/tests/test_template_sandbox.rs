@@ -19,7 +19,7 @@ fn ran() -> Vec<String> {
 fn wizard_config(project: &StartProject, toml: &str, template: Option<&str>) -> LayeredConfig {
     let generated = GeneratedConfig {
         target: Target::Local,
-        path: Target::Local.path(&project.project_dir()),
+        project: crate::test_cfg::oci::verified_dir(&project.project_dir()),
         toml: toml.to_string(),
         template: template.map(str::to_string),
     };
@@ -42,7 +42,7 @@ fn wizard_config(project: &StartProject, toml: &str, template: Option<&str>) -> 
 #[test]
 fn sandbox_from_template_installs_only_extra_packs() {
     let project = StartProject::new(test_packs());
-    let data_dir = &project.context().roots.data_dir;
+    let data_dir = &project.context().data;
     let base = "[packs]\nalpha = { version = 1 }\n";
     project
         .build_template("base", &wizard_config(&project, base, None), false)
@@ -66,7 +66,7 @@ fn sandbox_from_template_installs_only_extra_packs() {
         args: vec![],
     };
     let generated = GeneratedConfig::new(
-        &project.project_dir(),
+        &crate::test_cfg::oci::verified_dir(&project.project_dir()),
         Target::Local,
         &[beta],
         None,
@@ -122,7 +122,7 @@ fn existing_template_needs_replace_and_removed_template_is_gone() {
         assert!(!templates::is_valid_name(name), "{name}");
     }
     let project = StartProject::new(test_packs());
-    let data_dir = &project.context().roots.data_dir;
+    let data_dir = &project.context().data;
     let alpha = "[packs]\nalpha = { version = 1 }\n";
     let beta = "[packs]\nbeta = { version = 1 }\n";
     project
@@ -143,15 +143,10 @@ fn existing_template_needs_replace_and_removed_template_is_gone() {
         .build_template("base", &wizard_config(&project, beta, None), true)
         .unwrap();
     assert_eq!(packs("base"), ["beta"]);
-    let entries: Vec<_> = std::fs::read_dir(
-        templates::templates_dir(data_dir)
-            .unwrap()
-            .to_path()
-            .unwrap(),
-    )
-    .unwrap()
-    .map(|e| e.unwrap().file_name())
-    .collect();
+    let entries: Vec<_> = std::fs::read_dir(data_dir.templates.to_path().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
     assert_eq!(entries, ["base"]);
 
     templates::remove(data_dir, "base").unwrap();

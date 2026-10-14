@@ -68,7 +68,6 @@ async fn run(args: &SelfUpdateArgs) -> anyhow::Result<()> {
     // the link to it. A package manager often installs a link.
     let target = std::env::current_exe()
         .and_then(|exe| VerifiedPath::new_follow(exe, None))
-        .and_then(|exe| exe.to_path().map(std::path::Path::to_path_buf))
         .map_err(|e| anyhow::anyhow!(messages::cli::cannot_find_binary(e)))?;
 
     cli::log!("{}", messages::cli::updating_airlock(&current, &latest));
@@ -80,7 +79,7 @@ async fn run(args: &SelfUpdateArgs) -> anyhow::Result<()> {
     cli::log!(
         "{} {}",
         cli::check(),
-        messages::cli::airlock_installed(&latest, target.display())
+        messages::cli::airlock_installed(&latest, &target)
     );
     Ok(())
 }

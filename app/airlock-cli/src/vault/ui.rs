@@ -22,7 +22,7 @@ pub struct Aborted;
 /// Error message for commands that must store a secret while the vault is
 /// disabled. Tells how to enable the vault.
 pub fn disabled_message() -> String {
-    messages::vault::vault_disabled(Settings::expected_path().display())
+    messages::vault::vault_disabled(Settings::expected_path())
 }
 
 /// Make sure that the vault can store a secret.

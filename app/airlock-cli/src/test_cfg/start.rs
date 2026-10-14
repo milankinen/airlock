@@ -18,6 +18,7 @@ use crate::cli::LogLevel;
 use crate::config::config_values::ImageRef;
 use crate::config::{ConfigOverrides, LayeredConfig};
 use crate::context::Context;
+use crate::data_dir::DataDir;
 use crate::oci::{ImageChange, ImageChangeStop, OciImage, OnImageChange, PreparedImage};
 use crate::packs::install::progress::InstallProgress;
 use crate::packs::install::setup::{self, Ended, Report, Save, SetupError};
@@ -76,7 +77,7 @@ pub fn fake_image(name: &str) -> OciImage {
 /// [`OnImageChange::Recreate`] makes it again and [`OnImageChange::Refuse`]
 /// stops.
 pub async fn prepare_image(
-    data_dir: &VerifiedPath,
+    data_dir: &DataDir,
     sandbox_dir: &VerifiedPath,
     image_cfg: &ImageRef,
     vault: &Vault,
@@ -107,7 +108,7 @@ pub async fn prepare_image(
 }
 
 /// `facts::check` for tests. With the fakes on, each image can take packs.
-pub fn check_image(data_dir: &VerifiedPath, image: &OciImage) -> anyhow::Result<()> {
+pub fn check_image(data_dir: &DataDir, image: &OciImage) -> anyhow::Result<()> {
     if !fake_host(|host| host.enabled) {
         return crate::packs::install::facts::check(data_dir, image);
     }
@@ -130,7 +131,13 @@ pub async fn install_boot(
     if !fake_host(|host| host.enabled) {
         return setup::install(project, image, installers, state, save, log_level, verbose).await;
     }
-    let log = File::create(setup::log_path(project.sandbox_dir.to_path().unwrap())).ok();
+    let log = File::create(
+        setup::log_path(&project.sandbox_dir)
+            .unwrap()
+            .to_path()
+            .unwrap(),
+    )
+    .ok();
     let mut progress = InstallProgress::new(ProgressBar::hidden(), log, verbose);
     let (failing, synced) = fake_host(|host| (host.failing.clone(), !host.unsynced));
     let mut exec = HostExec::new();
@@ -210,7 +217,7 @@ impl StartProject {
     pub fn sandbox(&self) -> Option<Found> {
         block_on_local(sandboxes::resolve_sandbox(
             &self.context,
-            &self.project_dir(),
+            &super::oci::verified_dir(&self.project_dir()),
             false,
             false,
         ))
@@ -282,16 +289,16 @@ impl StartProject {
     fn start_once(&self, config: &LayeredConfig, options: &SandboxOptions) -> Result<(), Exit> {
         block_on_local(async {
             let resolved = config
-                .resolve(&self.context.data_dir, &self.packs, &options.overrides)
+                .resolve(&self.context.data, &self.packs, &options.overrides)
                 .await
                 .map_err(Exit::config)?;
             let template = config
                 .generated_project()
                 .and_then(|g| g.template.as_deref())
-                .map(|name| crate::templates::find(&self.context.roots.data_dir, name).unwrap());
+                .map(|name| crate::templates::find(&self.context.data, name).unwrap());
             let sandbox = crate::start::sandbox::ensure_sandbox(
                 &self.context,
-                &self.project_dir(),
+                &super::oci::verified_dir(&self.project_dir()),
                 &self.packs,
                 config,
                 resolved,
@@ -325,12 +332,13 @@ impl StartProject {
         let dir = self.sandbox().expect("a sandbox").dir;
         let config = project_config(toml);
         let resolved = block_on_local(config.resolve(
-            &self.context.data_dir,
+            &self.context.data,
             &self.packs,
             &ConfigOverrides::default(),
         ))
         .unwrap();
-        let paths = config_change::host_paths(&resolved.values, &self.context, &self.project_dir());
+        let cwd = super::oci::verified_dir(&self.project_dir());
+        let paths = config_change::host_paths(&resolved.values, &self.context.home, &cwd);
         config_change::save(&dir, &config, &paths).unwrap();
     }
 

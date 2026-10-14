@@ -5,16 +5,14 @@
 //! For a sandbox in the project, also deletes the local state in the
 //! project.
 
-use std::path::Path;
-
 use clap::Args;
 
 use crate::cli::prompt::choose;
 use crate::config::files::EXTENSIONS;
 use crate::context::Context;
+use crate::data_dir::DataDir;
 use crate::sandboxes::{self, Location};
 use crate::util::verified_path::VerifiedPath;
-use crate::util::vfs;
 use crate::{cli, messages, oci, project};
 
 /// CLI arguments for `airlock rm`.
@@ -45,7 +43,7 @@ pub struct RmArgs {
 // The sandbox lock stays held until the removal is complete. Thus a parallel
 // `airlock start` cannot take the sandbox during the removal.
 pub async fn main(args: &RmArgs, context: &Context) -> i32 {
-    let host_cwd = match sandboxes::project_dir(context) {
+    let host_cwd = match sandboxes::project_dir(&context.work) {
         Ok(cwd) => cwd,
         Err(e) => {
             cli::error!("{}", messages::cli::cannot_determine_cwd(e));
@@ -58,7 +56,7 @@ pub async fn main(args: &RmArgs, context: &Context) -> i32 {
 /// Body of [`main`], with the project directory as an argument.
 // The argument lets tests run it without a change to the current directory
 // of the process.
-pub(super) async fn run(args: &RmArgs, context: &Context, host_cwd: &Path) -> i32 {
+pub(super) async fn run(args: &RmArgs, context: &Context, host_cwd: &VerifiedPath) -> i32 {
     match sandboxes::resolve_sandbox(context, host_cwd, false, false).await {
         Ok(Some(found)) => {
             if let Location::DataDir { id } = found.location {
@@ -71,7 +69,7 @@ pub(super) async fn run(args: &RmArgs, context: &Context, host_cwd: &Path) -> i3
             return 1;
         }
     }
-    rm_project_sandbox(args, context, host_cwd)
+    rm_project_sandbox(args, &context.data, host_cwd)
 }
 
 /// Remove the sandbox `id` from the data directory (see
@@ -80,8 +78,10 @@ pub(super) async fn run(args: &RmArgs, context: &Context, host_cwd: &Path) -> i3
 ///   Process exit code.
 async fn rm_box(args: &RmArgs, context: &Context, id: &str) -> i32 {
     // Fail before the question. `remove_box` checks again under the lock.
-    let running = sandboxes::boxes_dir(context)
-        .and_then(|boxes| boxes.join(id))
+    let running = context
+        .data
+        .sandboxes
+        .join(id)
         .is_ok_and(|dir| project::is_running(&dir));
     if running {
         cli::error!("{}", messages::sandboxes::SANDBOX_RUNNING_STOP_FIRST);
@@ -98,7 +98,7 @@ async fn rm_box(args: &RmArgs, context: &Context, id: &str) -> i32 {
         );
         return 1;
     }
-    oci::gc_sweep(&context.roots.data_dir);
+    oci::gc_sweep(&context.data);
     cli::log!("{}", messages::cli::SANDBOX_REMOVED);
     0
 }
@@ -107,13 +107,13 @@ async fn rm_box(args: &RmArgs, context: &Context, id: &str) -> i32 {
 /// `.airlock/` directory (see [`main`]).
 /// Args:
 ///  - `args`: Command arguments
-///  - `context`: Process context
+///  - `data`: Airlock data directory, for the image clean-up
 ///  - `host_cwd`: Project directory
 ///
 /// Returns:
 ///   Process exit code.
-fn rm_project_sandbox(args: &RmArgs, context: &Context, host_cwd: &Path) -> i32 {
-    let cache_dir = match VerifiedPath::new(host_cwd.join(".airlock"), &context.roots) {
+fn rm_project_sandbox(args: &RmArgs, data: &DataDir, host_cwd: &VerifiedPath) -> i32 {
+    let cache_dir = match host_cwd.join(".airlock") {
         Ok(dir) => dir,
         Err(e) => {
             cli::error!("{}", messages::cli::failed_to_remove_sandbox(e));
@@ -126,7 +126,7 @@ fn rm_project_sandbox(args: &RmArgs, context: &Context, host_cwd: &Path) -> i32 
     // `project::airlock_dir_problem_for`). All code below builds paths from
     // `cache_dir`, and the file operations refuse a symlink in their path.
     // Thus handle the link separately and remove only the link.
-    let Ok(cache_meta) = vfs::symlink_metadata(&cache_dir) else {
+    let Ok(cache_meta) = cache_dir.symlink_metadata() else {
         return 0;
     };
     if cache_meta.file_type().is_symlink() {
@@ -150,14 +150,14 @@ fn rm_project_sandbox(args: &RmArgs, context: &Context, host_cwd: &Path) -> i32 
     };
 
     if is_user_home_project(&cache_dir) {
-        return rm_sandbox_only(args, context, &sandbox_dir);
+        return rm_sandbox_only(args, data, &sandbox_dir);
     }
     if let Some(marker) = user_file_marker(&cache_dir) {
         cli::log!(
             "{}",
             messages::cli::user_airlock_dir_warning(&cache_dir, marker)
         );
-        return rm_sandbox_only(args, context, &sandbox_dir);
+        return rm_sandbox_only(args, data, &sandbox_dir);
     }
 
     if !confirm(args) {
@@ -167,14 +167,14 @@ fn rm_project_sandbox(args: &RmArgs, context: &Context, host_cwd: &Path) -> i32 
 
     // The check before use refuses `.airlock` if it changed to a symlink
     // or to an other directory while the prompt waited.
-    if let Err(e) = vfs::remove_dir_all(&cache_dir) {
+    if let Err(e) = cache_dir.remove_dir_all() {
         cli::error!("{}", messages::cli::failed_to_remove_sandbox(e));
         return 1;
     }
 
     // The image hardlink of the sandbox was in its cache dir. Remove the
     // images and layers that no longer have live references.
-    oci::gc_sweep(&context.roots.data_dir);
+    oci::gc_sweep(data);
 
     cli::log!("{}", messages::cli::SANDBOX_REMOVED);
     0
@@ -187,13 +187,13 @@ fn rm_project_sandbox(args: &RmArgs, context: &Context, host_cwd: &Path) -> i32 
 /// [`user_file_marker`] found a user-level file.
 /// Args:
 ///  - `args`: Command arguments
-///  - `context`: Process context
+///  - `data`: Airlock data directory, for the image clean-up
 ///  - `sandbox_dir`: The `.airlock/sandbox` directory to remove
 ///
 /// Returns:
 ///   Process exit code.
-pub(super) fn rm_sandbox_only(args: &RmArgs, context: &Context, sandbox_dir: &VerifiedPath) -> i32 {
-    match vfs::symlink_metadata(sandbox_dir) {
+pub(super) fn rm_sandbox_only(args: &RmArgs, data: &DataDir, sandbox_dir: &VerifiedPath) -> i32 {
+    match sandbox_dir.symlink_metadata() {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             cli::log!("{}", messages::cli::NO_SANDBOX_TO_REMOVE);
@@ -219,7 +219,7 @@ pub(super) fn rm_sandbox_only(args: &RmArgs, context: &Context, sandbox_dir: &Ve
         return 1;
     }
 
-    oci::gc_sweep(&context.roots.data_dir);
+    oci::gc_sweep(data);
     cli::log!("{}", messages::cli::SANDBOX_REMOVED);
     0
 }
@@ -238,7 +238,7 @@ fn rm_symlinked_airlock(args: &RmArgs, cache_dir: &VerifiedPath) -> i32 {
         return 0;
     }
 
-    if let Err(e) = vfs::remove_file(cache_dir) {
+    if let Err(e) = cache_dir.remove_file() {
         cli::error!("{}", messages::cli::failed_to_remove_airlock_link(e));
         return 1;
     }
@@ -271,23 +271,30 @@ fn confirm(args: &RmArgs) -> bool {
 // `$HOME` alone is not trusted, because `sudo` or a changed `HOME` can point
 // it to a different directory. Thus the homes of the current user and of the
 // owner of `cache_dir`, from the password database, also count.
+// The home dir can be a symlink, so the compare follows symlinks. The
+// project path is canonical.
 fn is_user_home_project(cache_dir: &VerifiedPath) -> bool {
     use std::os::unix::fs::MetadataExt;
-    let Ok(path) = cache_dir.to_entry_path() else {
+    if cache_dir.to_entry_path().is_err() {
+        return false;
+    }
+    let Some(project) = cache_dir.parent() else {
         return false;
     };
     // SAFETY: getuid cannot fail.
     let current_uid = unsafe { libc::getuid() };
-    let owner_uid = vfs::symlink_metadata(cache_dir).ok().map(|m| m.uid());
-    dirs::home_dir()
+    let owner_uid = cache_dir.symlink_metadata().ok().map(|m| m.uid());
+    VerifiedPath::home_dir()
+        .ok()
         .into_iter()
         .chain(passwd_home(current_uid))
         .chain(owner_uid.and_then(passwd_home))
-        .any(|home| is_home_dir(path, &home))
+        .any(|home| home == project)
 }
 
-/// Return the home directory of `uid` from the password database.
-fn passwd_home(uid: libc::uid_t) -> Option<std::path::PathBuf> {
+/// Return the home directory of `uid` from the password database, with
+/// its symlinks resolved.
+fn passwd_home(uid: libc::uid_t) -> Option<VerifiedPath> {
     use std::os::unix::ffi::OsStrExt;
     let mut buf = vec![0 as libc::c_char; 16 * 1024];
     // SAFETY: an all-zero passwd is a valid value for getpwuid_r to fill.
@@ -309,16 +316,7 @@ fn passwd_home(uid: libc::uid_t) -> Option<std::path::PathBuf> {
     }
     // SAFETY: getpwuid_r succeeded, so pw_dir is a NUL-terminated string in `buf`.
     let dir = unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) };
-    Some(std::ffi::OsStr::from_bytes(dir.to_bytes()).into())
-}
-
-/// Return true if the parent of `cache_dir` is `home` (canonical paths).
-// The home dir can be a symlink, so the compare follows symlinks.
-fn is_home_dir(cache_dir: &Path, home: &Path) -> bool {
-    let canonical = |p: &Path| sandboxes::canonical(p).unwrap_or_else(|| p.to_path_buf());
-    cache_dir
-        .parent()
-        .is_some_and(|project| canonical(project) == canonical(home))
+    VerifiedPath::new_follow(std::ffi::OsStr::from_bytes(dir.to_bytes()), None).ok()
 }
 
 /// Files and directories that only a user airlock directory (`~/.airlock`)
@@ -356,17 +354,17 @@ fn user_file_marker(cache_dir: &VerifiedPath) -> Option<String> {
         .find(|name| {
             cache_dir
                 .join(name)
-                .and_then(|p| vfs::symlink_metadata(&p))
+                .and_then(|p| p.symlink_metadata())
                 .is_ok()
         })
 }
 
 /// Remove a file, symlink or directory tree without following symlinks.
 fn remove_entry(path: &VerifiedPath) -> std::io::Result<()> {
-    if vfs::symlink_metadata(path)?.is_dir() {
-        vfs::remove_dir_all(path)
+    if path.symlink_metadata()?.is_dir() {
+        path.remove_dir_all()
     } else {
-        vfs::remove_file(path)
+        path.remove_file()
     }
 }
 
@@ -390,14 +388,15 @@ mod tests {
         let home = home.path();
         std::fs::create_dir_all(home.join(".airlock")).unwrap();
         std::fs::create_dir_all(home.join("proj/.airlock")).unwrap();
-        let check =
-            |path: &Path| is_user_home_project(&VerifiedPath::new_follow(path, None).unwrap());
+        let check = |path: &std::path::Path| {
+            is_user_home_project(&VerifiedPath::new_follow(path, None).unwrap())
+        };
         assert!(check(&home.join(".airlock")));
         assert!(!check(&home.join("proj/.airlock")));
 
         let uid = unsafe { libc::getuid() };
         if let Some(passwd_home) = passwd_home(uid) {
-            assert!(check(&passwd_home.join(".airlock")));
+            assert!(is_user_home_project(&passwd_home.join(".airlock").unwrap()));
         }
     }
 }

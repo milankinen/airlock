@@ -17,13 +17,15 @@ use crate::vault::Vault;
 /// database in it. All roots are `home`. The caller keeps the `home`
 /// directory.
 pub fn test_context(home: &Path, vault: Vault) -> Context {
-    let roots = crate::util::Roots::resolve(home, home, home).unwrap();
+    let dir = crate::util::VerifiedPath::new_follow(home, None).unwrap();
+    let data = crate::data_dir::DataDir::init(&dir).unwrap();
     Context {
-        settings: Settings::load_from(home).unwrap(),
+        settings: Settings::load_from(&dir).unwrap(),
         vault,
-        db: Db::open(&roots.data_dir.join(crate::db::DIR).unwrap()).unwrap(),
-        data_dir: home.to_path_buf(),
-        roots,
+        db: Db::open(&data.db).unwrap(),
+        home: dir.clone(),
+        work: dir,
+        data,
     }
 }
 

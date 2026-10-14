@@ -6,16 +6,17 @@
 //! and `airlock rm` do. Sandboxes in a project directory are not in the
 //! list.
 
-use std::path::Path;
+use std::ffi::OsStr;
 
 use clap::{Args, Subcommand};
 
 use super::cmd_config::{self, ConfigArgs};
-use super::cmd_info::{self, Details, find_by_id};
+use super::cmd_info::{self, Details};
 use super::cmd_rm::{self, RmArgs};
 use crate::cli::prompt::choose;
 use crate::context::Context;
-use crate::sandboxes::{self, Found, Location, registry};
+use crate::sandboxes::{self, Location, registry};
+use crate::util::verified_path::VerifiedPath;
 use crate::{cli, messages, oci, project};
 
 /// CLI arguments for `airlock sandboxes`.
@@ -87,23 +88,23 @@ async fn list(context: &Context) -> anyhow::Result<i32> {
     if entries.is_empty() {
         cli::log!(
             "{}",
-            messages::cli::no_sandboxes_in(context.boxes_dir().display())
+            messages::cli::no_sandboxes_in(context.data.sandboxes.given().display())
         );
         return Ok(0);
     }
-    let boxes = sandboxes::boxes_dir(context)?;
+    let boxes = &context.data.sandboxes;
+    let roots = context.roots();
     let mut rows = Vec::new();
     for entry in entries {
-        let found = Found {
-            location: Location::DataDir {
-                id: entry.id.clone(),
-            },
-            dir: boxes.join(&entry.id)?,
-            project: entry.project,
+        let location = Location::DataDir {
+            id: entry.id.clone(),
         };
-        let details = Details::read(&found);
-        let mut project = details.project.display().to_string();
-        if !cmd_info::is_dir(context, &details.project) {
+        let dir = boxes.join(&entry.id)?;
+        let details = Details::read(&location, entry.project.display().to_string(), &dir);
+        let mut project = details.project.clone();
+        // A path through a symlink below the trusted roots does not count.
+        let is_dir = VerifiedPath::new(&entry.project, &roots).is_ok_and(|p| p.is_dir());
+        if !is_dir {
             project.push_str(messages::cli::PROJECT_MISSING_SUFFIX);
         }
         rows.push([
@@ -158,7 +159,7 @@ async fn remove(context: &Context, ids: &[String], force: bool) -> anyhow::Resul
         }
     }
     if removed {
-        oci::gc_sweep(&context.roots.data_dir);
+        oci::gc_sweep(&context.data);
     }
     Ok(code)
 }
@@ -168,13 +169,13 @@ async fn remove(context: &Context, ids: &[String], force: bool) -> anyhow::Resul
 /// Returns:
 ///   `true` if the sandbox was removed, `false` if the user aborted.
 async fn remove_one(context: &Context, id: &str, force: bool) -> anyhow::Result<bool> {
-    let found = find_by_id(context, id).await?;
+    let project = cmd_info::registered_project(context, id).await?;
     // Fail before the question. `remove_box` checks again under the lock.
     anyhow::ensure!(
-        !project::is_running(&found.dir),
+        !project::is_running(&context.data.sandboxes.join(id)?),
         messages::cli::sandbox_id_running_stop_first(id)
     );
-    if !force && !confirm(id, &found.project) {
+    if !force && !confirm(id, &project) {
         cli::error!("{}", messages::cli::aborted_id(id));
         return Ok(false);
     }
@@ -186,7 +187,7 @@ async fn remove_one(context: &Context, id: &str, force: bool) -> anyhow::Result<
 /// Ask to confirm the removal of the sandbox `id` of `project`.
 /// Returns:
 ///   True if confirmed. Abort, Esc, no terminal or a failed prompt is "no".
-fn confirm(id: &str, project: &Path) -> bool {
+fn confirm(id: &str, project: &OsStr) -> bool {
     let title = messages::cli::remove_sandbox_id_title(id);
     let note = messages::cli::project_note(project.display());
     matches!(

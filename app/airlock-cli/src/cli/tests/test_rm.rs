@@ -8,7 +8,8 @@ use crate::cache;
 use crate::cli::cmd_rm::{RmArgs, rm_sandbox_only, run};
 use crate::context::Context;
 use crate::project::{self, SandboxLock};
-use crate::sandboxes::{self, PROJECT_SANDBOX, registry};
+use crate::sandboxes::{PROJECT_SANDBOX, registry};
+use crate::test_cfg::oci::verified_dir;
 use crate::test_cfg::sandboxes::stopped_sandbox_dir;
 use crate::test_cfg::{TempDir, block_on_local, temp_dir, test_context};
 use crate::util::VerifiedPath;
@@ -29,7 +30,7 @@ fn context(home: &TempDir) -> Context {
 
 /// Run `airlock rm` with force in the project `dir`.
 fn rm(context: &Context, dir: &Path) -> i32 {
-    block_on_local(run(&FORCE, context, dir))
+    block_on_local(run(&FORCE, context, &verified_dir(dir)))
 }
 
 /// A project in the temp home with a started sandbox. The sandbox image is
@@ -45,7 +46,8 @@ impl Project {
     /// cached image.
     fn started(home: &TempDir, context: &Context, name: &str) -> Self {
         let dir = Self::make_dir(home, name);
-        project::ensure_cache_dir(&dir).unwrap();
+        project::ensure_cache_dir(&crate::util::VerifiedPath::new_follow(&dir, None).unwrap())
+            .unwrap();
         let sandbox = dir.join(PROJECT_SANDBOX);
         stopped_sandbox_dir(&sandbox);
         Self::finish(context, dir, sandbox, name)
@@ -55,9 +57,14 @@ impl Project {
     /// and a cached image.
     fn started_in_data_dir(home: &TempDir, context: &Context, name: &str) -> Self {
         let dir = Self::make_dir(home, name);
-        let boxes = sandboxes::boxes_dir(context).unwrap();
-        let id = block_on_local(registry::find_or_register(&context.db, &boxes, &dir)).unwrap();
-        let sandbox = context.boxes_dir().join(id);
+        let boxes = &context.data.sandboxes;
+        let id = block_on_local(registry::find_or_register(
+            &context.db,
+            boxes,
+            &verified_dir(&dir),
+        ))
+        .unwrap();
+        let sandbox = context.data.sandboxes.given().join(id);
         stopped_sandbox_dir(&sandbox);
         Self::finish(context, dir, sandbox, name)
     }
@@ -72,7 +79,7 @@ impl Project {
     /// Add a disk and a cached image to the sandbox `sandbox` of `dir`.
     fn finish(context: &Context, dir: PathBuf, sandbox: PathBuf, name: &str) -> Self {
         std::fs::write(sandbox.join("disk.img"), b"data").unwrap();
-        let image = cache::image_path(&context.roots.data_dir, &format!("sha256:{name}")).unwrap();
+        let image = cache::image_path(&context.data, &format!("sha256:{name}")).unwrap();
         let image = image.to_path().unwrap().to_path_buf();
         std::fs::write(&image, br#"{"schema":"v2","image_layers":[]}"#).unwrap();
         std::fs::hard_link(&image, sandbox.join("image")).unwrap();
@@ -193,13 +200,16 @@ fn rm_of_running_sandbox_is_refused() {
     let context = context(&home);
     let in_project = Project::started(&home, &context, "proj");
     let in_data_dir = Project::started_in_data_dir(&home, &context, "boxed");
-    let _running = SandboxLock::acquire(&in_project.dir).unwrap();
+    let _running = SandboxLock::acquire(
+        &crate::util::VerifiedPath::new_follow(&in_project.dir, None).unwrap(),
+    )
+    .unwrap();
     let id = block_on_local(registry::list(&context.db)).unwrap()[0]
         .id
         .clone();
     let _running_box = SandboxLock::acquire_box(
-        &in_data_dir.dir,
-        &sandboxes::boxes_dir(&context).unwrap(),
+        &crate::util::VerifiedPath::new_follow(&in_data_dir.dir, None).unwrap(),
+        &context.data.sandboxes,
         &id,
     )
     .unwrap();
@@ -274,7 +284,7 @@ fn rm_after_airlock_dir_swapped_for_link_is_refused() {
 
     std::fs::rename(project.airlock(), project.dir.join("old-airlock")).unwrap();
     symlink(victim.airlock(), project.airlock()).unwrap();
-    assert_eq!(rm_sandbox_only(&FORCE, &context, &sandbox_dir), 1);
+    assert_eq!(rm_sandbox_only(&FORCE, &context.data, &sandbox_dir), 1);
 
     assert!(victim.sandbox.join("disk.img").is_file());
     assert!(project.airlock().symlink_metadata().unwrap().is_symlink());

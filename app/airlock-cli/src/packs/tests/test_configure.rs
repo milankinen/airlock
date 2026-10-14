@@ -40,8 +40,9 @@ fn configuring_lua_pack_from_config_text_fills_defaults_and_applies_its_config()
         ])
     );
     assert_eq!(sample.non_default_args(), [("mode", &text("turbo"))]);
-    let data = crate::test_cfg::temp_dir();
-    let values = sample.config_values(data.path()).unwrap();
+    let tmp = crate::test_cfg::temp_dir();
+    let data = crate::test_cfg::oci::data_dir_at(tmp.path());
+    let values = sample.config_values(&data).unwrap();
     assert_eq!(
         values["mounts"]["sample-dir"]["source"],
         "~/.airlock/sample"

@@ -6,12 +6,11 @@
 //! config and adds the other selections to it.
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
 
 use crate::packs::ArgValue;
 use crate::project;
 use crate::templates::Template;
-use crate::util::{VerifiedPath, vfs};
+use crate::util::VerifiedPath;
 
 /// Location of a new project config file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,11 +31,6 @@ impl Target {
             Target::Project => "airlock.toml",
             Target::Local => ".airlock/airlock.toml",
         }
-    }
-
-    /// Path of the target file in the project directory `host_cwd`.
-    pub fn path(self, host_cwd: &Path) -> PathBuf {
-        host_cwd.join(self.file())
     }
 }
 
@@ -64,9 +58,10 @@ pub struct NewEntry<'a> {
 pub struct GeneratedConfig {
     /// Location of the file.
     pub target: Target,
-    /// Path of the `target` file in the project. For [`Target::Local`],
-    /// [`Self::save`] can write the file to the sandbox directory instead.
-    pub path: PathBuf,
+    /// Project directory. The `target` file is in it. For
+    /// [`Target::Local`], [`Self::save`] can write the file to the sandbox
+    /// directory instead.
+    pub project: VerifiedPath,
     /// TOML content of the file:
     ///  * the template config, if a template is given
     ///  * the pack entries (`[packs] <name> = { version = "1", args = { … } }`,
@@ -92,7 +87,7 @@ impl GeneratedConfig {
     ///  - `template`: The template that the config starts from, if any.
     ///    `entries` are the packs that the template does not have.
     pub fn new(
-        host_cwd: &Path,
+        host_cwd: &VerifiedPath,
         target: Target,
         entries: &[NewEntry<'_>],
         image: Option<&serde_json::Value>,
@@ -101,10 +96,19 @@ impl GeneratedConfig {
     ) -> Self {
         Self {
             target,
-            path: target.path(host_cwd),
+            project: host_cwd.clone(),
             toml: render(template, entries, image, clipboard),
             template: template.map(|t| t.name.clone()),
         }
+    }
+
+    /// Get the path of the `target` file in the project, for messages.
+    pub fn path(&self) -> String {
+        self.project
+            .given()
+            .join(self.target.file())
+            .display()
+            .to_string()
     }
 
     /// Write the file as a new file. If a file appeared in the meantime,
@@ -115,53 +119,34 @@ impl GeneratedConfig {
     ///    there. For `.airlock/`, `.airlock/.gitignore` is created first.
     ///
     /// Returns:
-    ///   The path of the written file.
-    pub fn save(&self, local_dir: &Path) -> anyhow::Result<PathBuf> {
-        let no_project = || {
-            anyhow::anyhow!(crate::messages::config::no_project_directory(
-                local_dir.display()
-            ))
-        };
+    ///   The written file.
+    pub fn save(&self, local_dir: &VerifiedPath) -> anyhow::Result<VerifiedPath> {
         // The project dir is a trusted base, but the guest can write in it.
         // Thus no link is followed below it.
-        let (path, file) = match self.target {
-            Target::Project => {
-                let host_cwd = self.path.parent().ok_or_else(no_project)?;
-                let dir = VerifiedPath::new_follow(host_cwd, None)?;
-                (self.path.clone(), dir.join(Target::Project.file())?)
-            }
+        let file = match self.target {
+            Target::Project => self.project.join(Target::Project.file())?,
             Target::Local => {
-                let path = local_dir.join("airlock.toml");
-                let in_project = self.path.parent() == Some(local_dir);
-                let file = if in_project {
-                    let host_cwd = local_dir.parent().ok_or_else(no_project)?;
-                    project::ensure_cache_dir(host_cwd)?;
-                    VerifiedPath::new_follow(host_cwd, None)?.join(Target::Local.file())?
+                let in_project = local_dir.parent().as_ref() == Some(&self.project)
+                    && local_dir.file_name().is_some_and(|name| name == ".airlock");
+                if in_project {
+                    project::ensure_cache_dir(&self.project)?;
+                    // Join after the create, so that the path has the
+                    // identity of the new `.airlock`.
+                    self.project.join(Target::Local.file())?
                 } else {
-                    // A sandbox in the data directory. The project dir is
-                    // the parent of `.airlock` in `self.path`.
-                    let host_cwd = self
-                        .path
-                        .parent()
-                        .and_then(Path::parent)
-                        .ok_or_else(no_project)?;
-                    let project_dir = VerifiedPath::new_follow(host_cwd, None)?;
-                    crate::config::files::sandbox_local_dir(local_dir, &project_dir)?
+                    // A sandbox in the data directory.
+                    crate::config::files::sandbox_local_dir(local_dir, &self.project)?
                         .join("airlock.toml")?
-                };
-                (path, file)
+                }
             }
         };
         create_new(&file, &self.toml).map_err(|e| match e.kind() {
-            std::io::ErrorKind::AlreadyExists => anyhow::anyhow!(
-                crate::messages::config::config_appeared_during_setup(path.display())
-            ),
-            _ => anyhow::anyhow!(crate::messages::config::create_config_failed(
-                path.display(),
-                e
-            )),
+            std::io::ErrorKind::AlreadyExists => {
+                anyhow::anyhow!(crate::messages::config::config_appeared_during_setup(&file))
+            }
+            _ => anyhow::anyhow!(crate::messages::config::create_config_failed(&file, e)),
         })?;
-        Ok(path)
+        Ok(file)
     }
 }
 
@@ -249,5 +234,5 @@ fn toml_value(value: &ArgValue) -> toml_edit::Value {
 fn create_new(path: &VerifiedPath, content: &str) -> std::io::Result<()> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
-    vfs::open_with(path, &opts)?.write_all(content.as_bytes())
+    path.open_with(&opts)?.write_all(content.as_bytes())
 }

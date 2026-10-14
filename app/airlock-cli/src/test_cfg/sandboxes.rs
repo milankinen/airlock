@@ -45,9 +45,14 @@ pub fn stopped_sandbox_dir(dir: &Path) {
 /// Returns:
 ///   The registry id and the sandbox directory.
 pub fn data_dir_sandbox(context: &Context, project: &Path) -> (String, PathBuf) {
-    let boxes = crate::sandboxes::boxes_dir(context).unwrap();
-    let id = block_on_local(registry::find_or_register(&context.db, &boxes, project)).unwrap();
-    let dir = context.boxes_dir().join(&id);
+    let boxes = &context.data.sandboxes;
+    let id = block_on_local(registry::find_or_register(
+        &context.db,
+        boxes,
+        &super::oci::verified_dir(project),
+    ))
+    .unwrap();
+    let dir = context.data.sandboxes.given().join(&id);
     stopped_sandbox_dir(&dir);
     (id, dir)
 }

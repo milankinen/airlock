@@ -9,12 +9,11 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::PathBuf;
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::messages;
-use crate::util::{PinnedDir, VerifiedPath, vfs};
+use crate::util::{PinnedDir, VerifiedPath};
 
 /// A sync destination, held by an FD of its parent directory that was opened
 /// at sandbox start.
@@ -30,7 +29,7 @@ struct SyncDest {
     /// Last path component (file name).
     basename: OsString,
     /// Original full path. Only for logs, never given to a syscall.
-    display: PathBuf,
+    display: String,
 }
 
 impl SyncDest {
@@ -55,7 +54,7 @@ impl SyncDest {
         Ok(Self {
             parent: PinnedDir::pin(parent.to_path()?)?,
             basename,
-            display: path.to_path_buf(),
+            display: path.display().to_string(),
         })
     }
 }
@@ -189,7 +188,7 @@ async fn watch_loop(
     // The guest can put a symlink at the name. The metadata of a symlink is
     // refused, so the event is skipped.
     let read_state = |key: &str| -> Option<FileState> {
-        let m = vfs::metadata(&files_rw_dir.join(key).ok()?).ok()?;
+        let m = files_rw_dir.join(key).ok()?.metadata().ok()?;
         Some((m.ino(), m.mtime(), m.mtime_nsec()))
     };
 
@@ -288,21 +287,13 @@ fn sync_file(overlay_path: &VerifiedPath, dest: &SyncDest) {
     }
 
     if dest.parent.link_from(&overlay_file, &dest.basename).is_ok() {
-        tracing::debug!(
-            "file sync (hard-link): {} → {}",
-            overlay_path,
-            dest.display.display()
-        );
+        tracing::debug!("file sync (hard-link): {} → {}", overlay_path, dest.display);
         return;
     }
 
     match dest.parent.copy_from(&overlay_file, &dest.basename, 0o600) {
-        Ok(()) => tracing::debug!(
-            "file sync (copy): {} → {}",
-            overlay_path,
-            dest.display.display()
-        ),
-        Err(e) => tracing::warn!("file sync {}: {e}", dest.display.display()),
+        Ok(()) => tracing::debug!("file sync (copy): {} → {}", overlay_path, dest.display),
+        Err(e) => tracing::warn!("file sync {}: {e}", dest.display),
     }
 }
 
@@ -312,8 +303,7 @@ fn sync_file(overlay_path: &VerifiedPath, dest: &SyncDest) {
 fn open_nofollow(path: &VerifiedPath) -> io::Result<File> {
     // O_NONBLOCK: the open of a FIFO that the guest put there must not
     // block. The type check of the caller refuses it.
-    vfs::open_with(
-        path,
+    path.open_with(
         std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK),

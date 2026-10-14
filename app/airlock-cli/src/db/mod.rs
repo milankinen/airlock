@@ -8,7 +8,7 @@ use anyhow::{Context as _, bail};
 use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn, WithoutTls};
 
 use crate::messages;
-use crate::util::{VerifiedPath, vfs};
+use crate::util::VerifiedPath;
 
 /// Directory of the database in the airlock data directory.
 pub const DIR: &str = "db";
@@ -186,13 +186,14 @@ fn prepare_dir(dir: &VerifiedPath) -> anyhow::Result<()> {
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true).mode(0o700);
-    vfs::create_dir_with(dir, &builder).with_context(|| messages::db::create_dir(dir))?;
-    let meta = vfs::symlink_metadata(dir)?;
+    dir.mkdir_with(&builder)
+        .with_context(|| messages::db::create_dir(dir))?;
+    let meta = dir.symlink_metadata()?;
     if !meta.is_dir() {
         bail!(messages::db::not_a_directory(dir));
     }
     if meta.permissions().mode() & 0o077 != 0 {
-        vfs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        dir.set_permissions(std::fs::Permissions::from_mode(0o700))
             .with_context(|| messages::db::restrict_dir_to_owner(dir))?;
     }
     Ok(())

@@ -25,12 +25,12 @@ use oci_client::secrets::RegistryAuth;
 use crate::cli::prompt::PromptError;
 use crate::cli::prompt::choose::{Choice, Choose};
 use crate::config::config_values::{ImageRef, PullPolicy};
+use crate::data_dir::DataDir;
 use crate::oci::credentials::ToRegistryAuth;
 use crate::project::Project;
 use crate::util::verified_path::{self, Refusal, VerifiedPath};
-use crate::util::{is_dir, vfs};
 use crate::vault::Vault;
-use crate::{cache, cli, messages, util};
+use crate::{cache, cli, messages};
 
 /// The `PATH` of a container whose image sets none.
 pub const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -167,7 +167,7 @@ pub struct PreparedImage {
 ///   The prepared image and what happened to the old image, or error.
 ///   Stops with [`ImageChangeStop`] if the user aborts or nobody can answer.
 pub async fn prepare(
-    data_dir: &VerifiedPath,
+    data_dir: &DataDir,
     sandbox_dir: &VerifiedPath,
     image_cfg: &ImageRef,
     vault: &Vault,
@@ -294,7 +294,7 @@ pub async fn prepare(
         } else {
             // Remove the image hardlink. This sandbox then no longer marks
             // the old image as in use, so the sweep below can collect it.
-            let _ = vfs::remove_file(&sandbox_image);
+            let _ = sandbox_image.remove_file();
             cli::log!(
                 "  {} {}",
                 cli::check(),
@@ -323,7 +323,7 @@ pub async fn prepare(
     // Always do this: also when the digest did not change, a previous run
     // can have left a standalone copy instead of a hardlink.
     ensure_image_hardlink(data_dir, &sandbox_image, &oci_image)?;
-    vfs::create_dir_all(&sandbox_dir.join("overlay")?)?;
+    sandbox_dir.join("overlay")?.mkdirs()?;
 
     Ok(PreparedImage {
         image: oci_image,
@@ -339,7 +339,7 @@ pub async fn prepare(
 /// The fast path and the resolution-failure fallback both use this, so both
 /// leave the sandbox in the same state as a newly pulled image.
 fn use_cached_image(
-    data_dir: &VerifiedPath,
+    data_dir: &DataDir,
     sandbox_dir: &VerifiedPath,
     sandbox_image: &VerifiedPath,
     image: OciImage,
@@ -354,7 +354,7 @@ fn use_cached_image(
         cli::check(),
         messages::oci::image_cached(cli::dim(&image.image_id[..19.min(image.image_id.len())]))
     );
-    vfs::create_dir_all(&sandbox_dir.join("overlay")?)?;
+    sandbox_dir.join("overlay")?.mkdirs()?;
     Ok(image)
 }
 
@@ -422,7 +422,7 @@ enum CachedImage {
 ///   The file content, or `None` if the file is missing, cannot be read or
 ///   is larger than [`MAX_IMAGE_FILE`].
 fn read_image_json(path: &VerifiedPath) -> Option<String> {
-    util::read_to_string_capped(path, MAX_IMAGE_FILE).ok()
+    path.read_to_string_capped(MAX_IMAGE_FILE).ok()
 }
 
 /// Read a cached image JSON file and unwrap it into an [`OciImage`].
@@ -445,7 +445,7 @@ fn read_cached_image(path: &VerifiedPath) -> Option<OciImage> {
 /// Returns:
 ///   The image, or `None` if the file is missing or a sweep removed a layer.
 ///   In both cases the caller must resolve the image again.
-fn read_ready_image(data_dir: &VerifiedPath, path: &VerifiedPath) -> Option<OciImage> {
+fn read_ready_image(data_dir: &DataDir, path: &VerifiedPath) -> Option<OciImage> {
     let image = read_cached_image(path)?;
     if image.image_layers.is_empty() {
         return None;
@@ -453,7 +453,7 @@ fn read_ready_image(data_dir: &VerifiedPath, path: &VerifiedPath) -> Option<OciI
     image
         .image_layers
         .iter()
-        .all(|k| cache::layer_dir(data_dir, k).is_ok_and(|p| is_dir(&p)))
+        .all(|k| cache::layer_dir(data_dir, k).is_ok_and(|p| p.is_dir()))
         .then_some(image)
 }
 
@@ -468,7 +468,7 @@ fn read_ready_image(data_dir: &VerifiedPath, path: &VerifiedPath) -> Option<OciI
 /// Returns:
 ///   Error if the hardlink fails.
 fn ensure_image_hardlink(
-    data_dir: &VerifiedPath,
+    data_dir: &DataDir,
     sandbox_image: &VerifiedPath,
     image: &OciImage,
 ) -> anyhow::Result<()> {
@@ -477,7 +477,7 @@ fn ensure_image_hardlink(
     // symlink, so a planted link never counts as linked.
     use std::os::unix::fs::MetadataExt;
     let image_path = cache::image_path(data_dir, &image.image_id)?;
-    let linked = match (vfs::metadata(sandbox_image), vfs::metadata(&image_path)) {
+    let linked = match (sandbox_image.metadata(), image_path.metadata()) {
         (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
         _ => false,
     };
@@ -486,14 +486,14 @@ fn ensure_image_hardlink(
     }
     // A cache wipe or a path migration can remove the canonical cache file.
     // Write the sandbox copy back first, so there is a file to link to.
-    if vfs::symlink_metadata(&image_path).is_err() {
+    if image_path.symlink_metadata().is_err() {
         write_cached_image(data_dir, &image.image_id, image)?;
     }
-    let _ = vfs::remove_file(sandbox_image);
+    let _ = sandbox_image.remove_file();
     // Fail on a link error. Both paths are under `$HOME`, so the only
     // probable cause is a cross-filesystem config problem. Without the link,
     // GC does not protect the sandbox image.
-    vfs::hard_link(&image_path, sandbox_image).map_err(|e| {
+    image_path.hard_link_to(sandbox_image).map_err(|e| {
         anyhow::anyhow!(messages::oci::hardlink_image_failed(
             &image_path,
             sandbox_image,
@@ -504,11 +504,7 @@ fn ensure_image_hardlink(
 }
 
 /// Write the cache file of the image `digest` atomically.
-fn write_cached_image(
-    data_dir: &VerifiedPath,
-    digest: &str,
-    image: &OciImage,
-) -> anyhow::Result<()> {
+fn write_cached_image(data_dir: &DataDir, digest: &str, image: &OciImage) -> anyhow::Result<()> {
     // The path check also makes the images dir.
     let path = cache::image_path(data_dir, digest)?;
     // Write to a temp file, then rename. The rename is the commit point,
@@ -522,11 +518,12 @@ fn write_cached_image(
         IMAGE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ))?;
     let bytes = serde_json::to_vec_pretty(&CachedImage::V2(image.clone()))?;
-    let written = vfs::create_new(&tmp)
+    let written = tmp
+        .create_new()
         .and_then(|mut file| io::Write::write_all(&mut file, &bytes))
-        .and_then(|()| vfs::rename(&tmp, &path));
+        .and_then(|()| tmp.rename_to(&path));
     if written.is_err() {
-        let _ = vfs::remove_file(&tmp);
+        let _ = tmp.remove_file();
     }
     Ok(written?)
 }
@@ -544,7 +541,7 @@ fn write_cached_image(
 ///   the image has no layers, or its user or home directory cannot be
 ///   resolved.
 fn build_oci_image(
-    data_dir: &VerifiedPath,
+    data_dir: &DataDir,
     image_id: String,
     name: String,
     ordered_layers: Vec<String>,
@@ -632,9 +629,11 @@ pub fn effective_container_home(project: &Project, image: &OciImage) -> String {
 /// the arguments without quoting.
 pub(crate) fn apply_login_shell(cmd: Vec<String>) -> Vec<String> {
     let is_lone_shell = cmd.len() == 1 && {
-        let name = std::path::Path::new(&cmd[0])
-            .file_name()
-            .and_then(|n| n.to_str())
+        // The command is a guest path. Use its last name.
+        let name = cmd[0]
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
             .unwrap_or("");
         matches!(name, "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh") || name.ends_with("sh")
     };
@@ -674,7 +673,7 @@ pub(crate) fn apply_login_shell(cmd: Vec<String>) -> Vec<String> {
 /// Returns:
 ///   The `(uid, gid)` pair, or error if a name is not found.
 fn resolve_user(
-    data_dir: &VerifiedPath,
+    data_dir: &DataDir,
     layer_keys: &[String],
     user: &str,
 ) -> anyhow::Result<(u32, u32)> {
@@ -716,11 +715,7 @@ fn resolve_user(
 
 /// Resolve the group part of a `USER` string. A numeric gid is used as it
 /// is. A name is looked up in the image's `/etc/group`.
-fn resolve_group(
-    data_dir: &VerifiedPath,
-    layer_keys: &[String],
-    group: &str,
-) -> anyhow::Result<u32> {
+fn resolve_group(data_dir: &DataDir, layer_keys: &[String], group: &str) -> anyhow::Result<u32> {
     if let Ok(gid) = group.parse::<u32>() {
         return Ok(gid);
     }
@@ -817,7 +812,7 @@ enum LegacyUser {
 /// Find uid/gid again for a legacy cache file (one without `user`). Uses
 /// the current `USER` string and the layers that the file refers to.
 fn check_legacy_user(
-    data_dir: &VerifiedPath,
+    data_dir: &DataDir,
     stored: &OciImage,
     user: &str,
 ) -> anyhow::Result<LegacyUser> {
@@ -858,7 +853,7 @@ fn resolved_user(resolved: &ResolvedImage) -> anyhow::Result<String> {
 ///   `Ok` after it marks the file as verified or repairs its gid. Error that
 ///   tells the user to run `airlock rm` if the uid is wrong.
 fn verify_legacy_user(
-    data_dir: &VerifiedPath,
+    data_dir: &DataDir,
     stored: &OciImage,
     resolved: &ResolvedImage,
 ) -> anyhow::Result<()> {
@@ -1064,7 +1059,7 @@ enum ImageSource {
 /// Returns:
 ///   The cached image metadata, or error.
 async fn ensure_image(
-    data_dir: &VerifiedPath,
+    data_dir: &DataDir,
     resolved: &mut ResolvedImage,
     image_name: &str,
     auth: &RegistryAuth,
@@ -1114,7 +1109,7 @@ async fn ensure_image(
 /// Returns:
 ///   The parsed image config and the layer keys, topmost first.
 async fn ensure_local_image(
-    data_dir: &VerifiedPath,
+    data_dir: &DataDir,
     engine: &'static str,
     image_ref: &str,
 ) -> anyhow::Result<(OciConfig, Vec<String>)> {
@@ -1180,7 +1175,7 @@ async fn ensure_local_image(
 /// Returns:
 ///   The layer keys, topmost first.
 async fn ensure_registry_image(
-    data_dir: &VerifiedPath,
+    data_dir: &DataDir,
     reg: &registry::RegistryImage,
     auth: &RegistryAuth,
     insecure: bool,
@@ -1190,7 +1185,7 @@ async fn ensure_registry_image(
     let cached_count = layers
         .iter()
         .filter(|l| {
-            cache::layer_dir(data_dir, &cache::layer_key(&l.digest)).is_ok_and(|p| is_dir(&p))
+            cache::layer_dir(data_dir, &cache::layer_key(&l.digest)).is_ok_and(|p| p.is_dir())
         })
         .count();
     if cached_count > 0 {
@@ -1205,7 +1200,7 @@ async fn ensure_registry_image(
         .iter()
         .enumerate()
         .filter(|(_, l)| {
-            !cache::layer_dir(data_dir, &cache::layer_key(&l.digest)).is_ok_and(|p| is_dir(&p))
+            !cache::layer_dir(data_dir, &cache::layer_key(&l.digest)).is_ok_and(|p| p.is_dir())
         })
         .map(|(i, _)| i)
         .collect();
@@ -1290,7 +1285,7 @@ async fn ensure_registry_image(
 ///  - `auth`: Registry auth
 ///  - `insecure`: Allow plain-HTTP registry access.
 async fn fetch_and_extract_layer(
-    data_dir: &VerifiedPath,
+    data_dir: &DataDir,
     reference: &oci_client::Reference,
     layer_desc: &oci_client::manifest::OciDescriptor,
     per_layer: &indicatif::ProgressBar,
@@ -1312,11 +1307,11 @@ async fn fetch_and_extract_layer(
     let download = layers_root.join(format!("{key}.download"))?;
 
     // Same fast path as in `ensure_layer_cached`.
-    if is_dir(&cache::layer_dir(data_dir, &key)?) {
+    if cache::layer_dir(data_dir, &key)?.is_dir() {
         return Ok(());
     }
 
-    if vfs::symlink_metadata(&download).is_err() {
+    if download.symlink_metadata().is_err() {
         let download_tmp = layer::download_tmp_path(&layers_root, &key)?;
         let pulled = registry::pull_layer(
             &reference,
@@ -1328,10 +1323,10 @@ async fn fetch_and_extract_layer(
             insecure,
         )
         .await
-        .and_then(|()| Ok(vfs::rename(&download_tmp, &download)?));
+        .and_then(|()| Ok(download_tmp.rename_to(&download)?));
         if pulled.is_err() {
             // The name is unique, so no later pull reuses or removes it.
-            let _ = vfs::remove_file(&download_tmp);
+            let _ = download_tmp.remove_file();
         }
         pulled?;
     }
@@ -1385,7 +1380,7 @@ fn format_size(bytes: i64) -> String {
 ///   The first match, and all layer copies of the file that were refused
 ///   instead of read, with the reason.
 fn lookup_layer_record<T>(
-    data_dir: &VerifiedPath,
+    data_dir: &DataDir,
     layer_keys: &[String],
     rel_path: &str,
     pick: impl Fn(&[&str]) -> Option<T>,
@@ -1473,7 +1468,7 @@ fn read_layer_file(layer_dir: &VerifiedPath, rel_path: &str) -> Result<Option<St
         let next = path
             .join(component)
             .map_err(|e| Refused::suspicious(e.to_string()))?;
-        let Ok(meta) = vfs::symlink_metadata(&next) else {
+        let Ok(meta) = next.symlink_metadata() else {
             return Ok(None);
         };
         path = if meta.file_type().is_symlink() {
@@ -1483,7 +1478,9 @@ fn read_layer_file(layer_dir: &VerifiedPath, rel_path: &str) -> Result<Option<St
         };
     }
 
-    let meta = vfs::symlink_metadata(&path).map_err(|e| Refused::suspicious(e.to_string()))?;
+    let meta = path
+        .symlink_metadata()
+        .map_err(|e| Refused::suspicious(e.to_string()))?;
     if !meta.is_file() {
         return Err(Refused::suspicious(
             messages::oci::NOT_REGULAR_FILE.to_string(),
@@ -1496,7 +1493,7 @@ fn read_layer_file(layer_dir: &VerifiedPath, rel_path: &str) -> Result<Option<St
         )));
     }
     let mut content = String::new();
-    vfs::open(&path)
+    path.open()
         .map_err(|e| Refused::suspicious(e.to_string()))?
         .take(MAX_LAYER_RECORD_FILE)
         .read_to_string(&mut content)
@@ -1517,7 +1514,7 @@ fn resolve_layer_link(
     let unresolved =
         |e: io::Error| Refused::unresolved(messages::oci::symlink_target_unresolved(e));
     let link = parent.join(name).map_err(unresolved)?;
-    let link_target = vfs::read_link(&link).map_err(unresolved)?;
+    let link_target = link.read_link().map_err(unresolved)?;
     // The rest of an absolute target resolves on the host. Thus an absolute
     // link in it leaves the layer and is refused.
     let followed = match link_target.strip_prefix("/") {
@@ -1529,7 +1526,7 @@ fn resolve_layer_link(
         _ => unresolved(e),
     })?;
     // A link to a missing target resolves to the link itself.
-    match vfs::symlink_metadata(&target) {
+    match target.symlink_metadata() {
         Ok(meta) if !meta.file_type().is_symlink() => Ok(target),
         Ok(_) => Err(Refused::unresolved(
             messages::oci::symlink_target_unresolved(io::Error::from(io::ErrorKind::NotFound)),
@@ -1584,7 +1581,7 @@ impl Refused {
 /// Returns:
 ///   The file content, or `None` if no layer has the file.
 pub fn read_image_file(
-    data_dir: &VerifiedPath,
+    data_dir: &DataDir,
     layer_keys: &[String],
     rel_path: &str,
 ) -> Option<String> {
@@ -1627,7 +1624,7 @@ pub struct OsRelease {
 /// Returns:
 ///   The distribution identity, or `None` if neither file exists or has no
 ///   `ID`.
-pub fn os_release(data_dir: &VerifiedPath, image: &OciImage) -> Option<OsRelease> {
+pub fn os_release(data_dir: &DataDir, image: &OciImage) -> Option<OsRelease> {
     ["etc/os-release", "usr/lib/os-release"]
         .iter()
         .find_map(|rel| read_image_file(data_dir, &image.image_layers, rel))
@@ -1660,11 +1657,7 @@ fn parse_os_release(content: &str) -> Option<OsRelease> {
 }
 
 /// Look up a user's home directory by uid in the image's `/etc/passwd`.
-fn lookup_home_dir(
-    data_dir: &VerifiedPath,
-    layer_keys: &[String],
-    uid: u32,
-) -> anyhow::Result<String> {
+fn lookup_home_dir(data_dir: &DataDir, layer_keys: &[String], uid: u32) -> anyhow::Result<String> {
     lookup_layer_record(data_dir, layer_keys, "etc/passwd", |f| {
         (f.len() >= 6 && f[2].parse::<u32>().ok() == Some(uid)).then(|| f[5].to_string())
     })?

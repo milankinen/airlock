@@ -12,7 +12,7 @@ fn xattr_of(path: &Path, name: &str) -> Option<Vec<u8>> {
 
 /// The names of staging entries (`.tmp` and `.download`) in the layer
 /// cache.
-fn staging_entries(data_dir: &VerifiedPath) -> Vec<String> {
+fn staging_entries(data_dir: &DataDir) -> Vec<String> {
     std::fs::read_dir(real(&cache::layers_root(data_dir).unwrap()))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -34,7 +34,7 @@ fn staging_entries(data_dir: &VerifiedPath) -> Vec<String> {
 #[test]
 fn layer_tarball_extracts_with_whiteouts_as_overlay_xattrs_and_is_reused() {
     let tmp = temp_dir();
-    let data_dir = &verified_dir(tmp.path());
+    let data_dir = &data_dir_at(tmp.path());
     let tar = LayerTar::default()
         .dir("etc")
         .file("etc/hello", "world")
@@ -86,7 +86,7 @@ fn layer_tarball_extracts_with_whiteouts_as_overlay_xattrs_and_is_reused() {
 #[test]
 fn interrupted_download_is_discarded_and_fetched_again() {
     let tmp = temp_dir();
-    let data_dir = &verified_dir(tmp.path());
+    let data_dir = &data_dir_at(tmp.path());
     let key = cache::layer_key("sha256:interrupted");
     let stale = real(&cache::layers_root(data_dir).unwrap()).join(format!("{key}.download.tmp"));
     std::fs::write(&stale, b"partial garbage").unwrap();
@@ -114,7 +114,7 @@ fn interrupted_download_is_discarded_and_fetched_again() {
 #[test]
 fn layer_published_by_peer_during_download_is_kept() {
     let tmp = temp_dir();
-    let data_dir = &verified_dir(tmp.path());
+    let data_dir = &data_dir_at(tmp.path());
     let key = cache::layer_key("sha256:race");
     let layer = real(&cache::layer_dir(data_dir, &key).unwrap());
     let tar = LayerTar::default().file("loser", "x").gz();
@@ -145,7 +145,7 @@ fn layer_published_by_peer_during_download_is_kept() {
 #[test]
 fn whiteout_aimed_outside_layer_does_not_touch_host_files() {
     let home = temp_dir();
-    let data_dir = &verified_dir(home.path());
+    let data_dir = &data_dir_at(home.path());
     let outside = home.path().join("outside");
     std::fs::create_dir_all(&outside).unwrap();
     for victim in ["via-symlink", "via-absolute", "via-parent"] {
@@ -201,7 +201,7 @@ fn whiteout_aimed_outside_layer_does_not_touch_host_files() {
 #[test]
 fn whiteout_naming_own_or_parent_directory_is_refused() {
     let tmp = temp_dir();
-    let data_dir = &verified_dir(tmp.path());
+    let data_dir = &data_dir_at(tmp.path());
     let good = cache_layer(
         data_dir,
         "sha256:good",
@@ -241,7 +241,7 @@ fn hard_link_to_symlink_out_of_layer_does_not_link_host_file() {
     use std::os::unix::fs::MetadataExt;
 
     let home = temp_dir();
-    let data_dir = &verified_dir(home.path());
+    let data_dir = &data_dir_at(home.path());
     let host = home.path().join("host-secret");
     std::fs::write(&host, b"secret").unwrap();
     let tar = LayerTar::default()

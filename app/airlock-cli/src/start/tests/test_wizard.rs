@@ -11,6 +11,7 @@ use crate::start::install::install_candidates;
 use crate::start::wizard::form::{Form, Mode, Row, StartChoice};
 use crate::start::wizard::{Input, check_answers, save_config, view};
 use crate::templates::Template;
+use crate::test_cfg::oci::{data_dir_at, verified_dir};
 use crate::test_cfg::{block_on, resolve_project_toml, temp_dir, test_template};
 use crate::vault::{Vault, VaultStorageType};
 
@@ -119,9 +120,10 @@ fn check(packs: &PackManager, config: &LayeredConfig, form: &Form) -> anyhow::Re
     let dir = temp_dir();
     let data = temp_dir();
     let vault = Vault::for_storage_type(VaultStorageType::Disabled);
+    let (host_cwd, data_dir) = (verified_dir(dir.path()), data_dir_at(data.path()));
     let input = Input {
-        host_cwd: dir.path(),
-        data_dir: data.path(),
+        host_cwd: &host_cwd,
+        data_dir: &data_dir,
         packs,
         config,
         vault: &vault,
@@ -146,7 +148,7 @@ fn check(packs: &PackManager, config: &LayeredConfig, form: &Form) -> anyhow::Re
 fn choosing_packs_and_args_with_keys_saves_shared_config_that_resolves() {
     let packs = crate::packs::init_with_sample();
     let data = temp_dir();
-    let mut form = Form::new(data.path(), &packs, None, &[], Mode::Start);
+    let mut form = Form::new(&data_dir_at(data.path()), &packs, None, &[], Mode::Start);
     focus_pack(&mut form, "debian");
     press(&mut form, KeyCode::Char(' '));
     focus_pack(&mut form, "claude");
@@ -187,9 +189,10 @@ fn choosing_packs_and_args_with_keys_saves_shared_config_that_resolves() {
     let config = LayeredConfig::from_values(vec![], None, vec![]).unwrap();
     check(&packs, &config, &form).unwrap();
     let dir = temp_dir();
+    let project = verified_dir(dir.path());
     save_config(
-        &form.answers(target).config(dir.path()),
-        &dir.path().join(".airlock"),
+        &form.answers(target).config(&project),
+        &project.join(".airlock").unwrap(),
     )
     .unwrap();
     let text = std::fs::read_to_string(dir.path().join("airlock.toml")).unwrap();
@@ -239,7 +242,13 @@ fn user_image_is_preselected_until_distro_pack_is_chosen() {
         name: "my/image:1".into(),
         value: serde_json::json!("my/image:1"),
     };
-    let mut form = Form::new(data.path(), &packs, Some(image.clone()), &[], Mode::Start);
+    let mut form = Form::new(
+        &data_dir_at(data.path()),
+        &packs,
+        Some(image.clone()),
+        &[],
+        Mode::Start,
+    );
     assert_eq!(form.focus(), Row::Custom);
     press(&mut form, KeyCode::Enter);
     let Step::Done(target) = press(&mut form, KeyCode::Enter) else {
@@ -247,13 +256,25 @@ fn user_image_is_preselected_until_distro_pack_is_chosen() {
     };
     assert_eq!(target, Target::Local);
     let dir = temp_dir();
-    let generated = form.answers(target).config(dir.path());
-    assert_eq!(generated.path, dir.path().join(".airlock/airlock.toml"));
+    let generated = form.answers(target).config(&verified_dir(dir.path()));
+    assert_eq!(
+        generated.path(),
+        dir.path()
+            .join(".airlock/airlock.toml")
+            .display()
+            .to_string()
+    );
     let resolved = resolve_project_toml(&generated.toml).unwrap();
     assert!(resolved.packs.is_empty());
     assert_eq!(resolved.values.vm.image.name, "my/image:1");
 
-    let mut form = Form::new(data.path(), &packs, Some(image), &[], Mode::Start);
+    let mut form = Form::new(
+        &data_dir_at(data.path()),
+        &packs,
+        Some(image),
+        &[],
+        Mode::Start,
+    );
     focus_pack(&mut form, "alpine");
     press(&mut form, KeyCode::Char(' '));
     let answers = form.answers(Target::Local);
@@ -270,7 +291,7 @@ fn user_image_is_preselected_until_distro_pack_is_chosen() {
 fn answers_whose_env_does_not_resolve_fail_check() {
     let packs = crate::packs::init_with_sample();
     let data = temp_dir();
-    let form = Form::new(data.path(), &packs, None, &[], Mode::Start);
+    let form = Form::new(&data_dir_at(data.path()), &packs, None, &[], Mode::Start);
     check(&packs, &user_files("[env]\nPLAIN = \"1\"\n"), &form).unwrap();
     let config = user_files("[env]\nMINE = \"${AIRLOCK_TEST_UNSET_VAR}\"\n");
     let e = check(&packs, &config, &form).unwrap_err();
@@ -287,7 +308,7 @@ fn answers_whose_env_does_not_resolve_fail_check() {
 fn esc_abort_and_ctrl_c_end_wizard_without_answers() {
     let packs = crate::packs::init_with_sample();
     let data = temp_dir();
-    let mut form = Form::new(data.path(), &packs, None, &[], Mode::Start);
+    let mut form = Form::new(&data_dir_at(data.path()), &packs, None, &[], Mode::Start);
     let first = form.focus();
     press(&mut form, KeyCode::Enter);
     assert_eq!(form.focus(), Row::Start);
@@ -295,7 +316,7 @@ fn esc_abort_and_ctrl_c_end_wizard_without_answers() {
     assert_eq!(form.focus(), first);
     assert!(matches!(press(&mut form, KeyCode::Esc), Step::Abort));
 
-    let mut form = Form::new(data.path(), &packs, None, &[], Mode::Start);
+    let mut form = Form::new(&data_dir_at(data.path()), &packs, None, &[], Mode::Start);
     press(&mut form, KeyCode::Enter);
     press(&mut form, KeyCode::Right);
     assert_eq!(form.start(), StartChoice::Abort);
@@ -318,13 +339,19 @@ fn esc_abort_and_ctrl_c_end_wizard_without_answers() {
 fn template_section_is_first_only_when_templates_exist() {
     let packs = crate::packs::init_with_sample();
     let data = temp_dir();
-    let form = Form::new(data.path(), &packs, None, &[], Mode::Start);
+    let form = Form::new(&data_dir_at(data.path()), &packs, None, &[], Mode::Start);
     assert!(form.template_rows().is_empty());
     assert_eq!(form.focus(), pack_row(&form, "alpine"));
     assert!(!view_text(&form).contains("Template"));
 
     let templates = [base_template(), test_template("other", "")];
-    let form = Form::new(data.path(), &packs, None, &templates, Mode::Start);
+    let form = Form::new(
+        &data_dir_at(data.path()),
+        &packs,
+        None,
+        &templates,
+        Mode::Start,
+    );
     assert_eq!(
         form.template_rows(),
         [
@@ -354,7 +381,13 @@ fn template_locks_its_packs_until_empty_template_is_selected() {
     let packs = crate::packs::init_with_sample();
     let data = temp_dir();
     let templates = [base_template()];
-    let mut form = Form::new(data.path(), &packs, None, &templates, Mode::Start);
+    let mut form = Form::new(
+        &data_dir_at(data.path()),
+        &packs,
+        None,
+        &templates,
+        Mode::Start,
+    );
     press(&mut form, KeyCode::Down);
     assert_eq!(form.focus(), Row::Template(Some(0)));
     assert!(view_text(&form).contains("base - packs: debian, sample"));
@@ -403,7 +436,7 @@ fn template_locks_its_packs_until_empty_template_is_selected() {
         .map(|c| c.metadata().name.as_str())
         .collect();
     assert_eq!(names, ["claude"]);
-    let generated = answers.config(data.path());
+    let generated = answers.config(&verified_dir(data.path()));
     assert_eq!(generated.template.as_deref(), Some("base"));
     assert!(
         generated.toml.contains(
@@ -447,7 +480,13 @@ fn template_change_restores_user_packs_and_clipboard() {
     let packs = crate::packs::init_with_sample();
     let data = temp_dir();
     let templates = [base_template(), test_template("other", "")];
-    let mut form = Form::new(data.path(), &packs, None, &templates, Mode::Start);
+    let mut form = Form::new(
+        &data_dir_at(data.path()),
+        &packs,
+        None,
+        &templates,
+        Mode::Start,
+    );
     focus_pack(&mut form, "debian");
     press(&mut form, KeyCode::Char(' '));
     focus_pack(&mut form, "sample");
@@ -501,7 +540,7 @@ fn template_change_restores_user_packs_and_clipboard() {
 fn template_mode_has_no_share_row_and_creates() {
     let packs = crate::packs::init_with_sample();
     let data = temp_dir();
-    let mut form = Form::new(data.path(), &packs, None, &[], Mode::Template);
+    let mut form = Form::new(&data_dir_at(data.path()), &packs, None, &[], Mode::Template);
     let first = form.focus();
     loop {
         assert_ne!(form.focus(), Row::ShareConfig);

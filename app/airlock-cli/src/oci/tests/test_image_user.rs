@@ -7,7 +7,7 @@ use super::*;
 
 /// Build an image over `layers` (topmost first) with the `USER` value
 /// `user`.
-fn build(data_dir: &VerifiedPath, layers: &[String], user: &str) -> anyhow::Result<OciImage> {
+fn build(data_dir: &DataDir, layers: &[String], user: &str) -> anyhow::Result<OciImage> {
     build_oci_image(
         data_dir,
         "sha256:img".into(),
@@ -24,7 +24,7 @@ fn build(data_dir: &VerifiedPath, layers: &[String], user: &str) -> anyhow::Resu
 
 /// Build an image as [`build`] does and return the error message. Panics
 /// if the build succeeds.
-fn build_err(data_dir: &VerifiedPath, layers: &[String], user: &str) -> String {
+fn build_err(data_dir: &DataDir, layers: &[String], user: &str) -> String {
     match build(data_dir, layers, user) {
         Ok(_) => panic!("USER {user:?} over {layers:?} must not resolve"),
         Err(e) => e.to_string(),
@@ -40,7 +40,7 @@ fn build_err(data_dir: &VerifiedPath, layers: &[String], user: &str) -> String {
 #[test]
 fn image_user_resolves_through_image_passwd_and_group() {
     let tmp = temp_dir();
-    let data_dir = &verified_dir(tmp.path());
+    let data_dir = &data_dir_at(tmp.path());
     let layers = [passwd_layer(data_dir, "sha256:passwd")];
 
     for user in [
@@ -71,7 +71,7 @@ fn image_user_resolves_through_image_passwd_and_group() {
 #[test]
 fn unknown_image_user_or_group_is_error_not_root() {
     let tmp = temp_dir();
-    let data_dir = &verified_dir(tmp.path());
+    let data_dir = &data_dir_at(tmp.path());
     let layers = [passwd_layer(data_dir, "sha256:passwd")];
 
     for user in ["ghost", "ghost:node", "node:ghost", "1000:ghost"] {
@@ -96,7 +96,7 @@ fn unknown_image_user_or_group_is_error_not_root() {
 #[test]
 fn passwd_symlinked_out_of_layer_is_never_read() {
     let home = temp_dir();
-    let data_dir = &verified_dir(home.path());
+    let data_dir = &data_dir_at(home.path());
     let host_passwd = "node:x:1000:1000:Host:/leaked-from-host:/bin/sh\n";
     let host_etc = home.path().join("host-etc");
     std::fs::create_dir_all(&host_etc).unwrap();
@@ -167,7 +167,7 @@ fn passwd_symlinked_out_of_layer_is_never_read() {
 #[test]
 fn passwd_that_cannot_be_read_safely_is_named_in_error() {
     let tmp = temp_dir();
-    let data_dir = &verified_dir(tmp.path());
+    let data_dir = &data_dir_at(tmp.path());
     let mut huge = "#".repeat(usize::try_from(MAX_LAYER_RECORD_FILE).unwrap() + 1);
     huge.push_str("\nnode:x:1000:1000:Node:/home/node:/bin/sh\n");
     let oversized = cache_layer(
@@ -217,7 +217,7 @@ fn passwd_that_cannot_be_read_safely_is_named_in_error() {
 #[test]
 fn passwd_linked_inside_layer_is_followed() {
     let tmp = temp_dir();
-    let data_dir = &verified_dir(tmp.path());
+    let data_dir = &data_dir_at(tmp.path());
     let merged_usr = cache_layer(
         data_dir,
         "sha256:merged-usr",
@@ -263,7 +263,7 @@ fn passwd_linked_inside_layer_is_followed() {
 #[test]
 fn legacy_cache_entry_user_is_checked_against_image_passwd() {
     let tmp = temp_dir();
-    let data_dir = &verified_dir(tmp.path());
+    let data_dir = &data_dir_at(tmp.path());
     let mut stored = image(
         "sha256:legacy",
         vec![passwd_layer(data_dir, "sha256:passwd")],

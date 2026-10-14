@@ -104,23 +104,14 @@ impl Network {
 
         // A host socket in a writable dir must stay in it, as a mount
         // source.
+        let (host_home, host_cwd) = (&project.host_home, &project.host_cwd);
         let mounts = crate::vm::mount::enabled_mounts(&project.config);
-        let sources =
-            crate::vm::mount::resolve_sources(&mounts, &project.host_home, &project.host_cwd)?;
-        let project_dir = project_share.then_some(project.host_cwd.as_path());
-        let writable = crate::vm::mount::writable_dirs(project_dir, &sources)?;
+        let sources = crate::vm::mount::resolve_sources(&mounts, host_home, host_cwd)?;
+        let writable = crate::vm::mount::writable_dirs(project_share.then_some(host_cwd), &sources);
         let mut socket_map = HashMap::new();
         for s in net.sockets.values().filter(|s| s.enabled) {
-            let guest =
-                crate::util::expand_tilde(&s.host.target, std::path::Path::new(container_home))
-                    .to_string_lossy()
-                    .into_owned();
-            let host = HostSocket::resolve(
-                &s.host.source,
-                &project.host_home,
-                &project.host_cwd,
-                &writable,
-            )?;
+            let guest = crate::vm::mount::expand_tilde_str(&s.host.target, container_home);
+            let host = HostSocket::resolve(&s.host.source, host_home, host_cwd, &writable)?;
             socket_map.insert(guest, Rc::new(host));
         }
 

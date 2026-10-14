@@ -4,7 +4,6 @@
 //! that each pack version is valid.
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, anyhow, bail, ensure};
@@ -83,7 +82,7 @@ pub fn load(root: &'static Dir<'static>) -> anyhow::Result<PackManager> {
     // The versions of each pack, by name.
     let mut by_name: BTreeMap<&'static str, Vec<(u64, PackVersionData)>> = BTreeMap::new();
     for entry in root.entries() {
-        let file_name = file_name(entry.path())?;
+        let file_name = file_name(entry)?;
         if is_skipped(file_name) {
             continue;
         }
@@ -136,7 +135,7 @@ fn load_version(
     let at = |file_name: &str| format!("packs/{}/{file_name}", folder.path().display());
     let mut files: BTreeMap<&'static str, &'static File<'static>> = BTreeMap::new();
     for entry in folder.entries() {
-        let file_name = file_name(entry.path())?;
+        let file_name = file_name(entry)?;
         if is_skipped(file_name) {
             continue;
         }
@@ -278,21 +277,22 @@ fn load_args(at: &str, entries: Vec<ArgEntry>) -> anyhow::Result<Vec<PackArg>> {
 /// Parse a static config file of a version folder. The file must be a
 /// table that does not set `packs` or `presets`.
 fn document(file: &'static File<'static>) -> anyhow::Result<Value> {
-    let path = Path::new("packs").join(file.path());
+    let path = format!("packs/{}", file.path().display());
     let value = parse_file(&path, utf8(file)?)?;
     ensure!(
         value.is_object(),
-        crate::messages::packs::pack_config_file_not_table(path.display())
+        crate::messages::packs::pack_config_file_not_table(&path)
     );
     ensure!(
         value.get("packs").is_none() && value.get("presets").is_none(),
-        crate::messages::packs::pack_config_file_reserved_keys(path.display())
+        crate::messages::packs::pack_config_file_reserved_keys(&path)
     );
     Ok(value)
 }
 
-/// The file name of `path` as UTF-8.
-fn file_name(path: &'static Path) -> anyhow::Result<&'static str> {
+/// The file name of `entry` as UTF-8.
+fn file_name(entry: &'static DirEntry<'static>) -> anyhow::Result<&'static str> {
+    let path = entry.path();
     path.file_name()
         .and_then(|name| name.to_str())
         .with_context(|| crate::messages::packs::pack_file_name_not_utf8(path.display()))

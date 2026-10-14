@@ -3,12 +3,11 @@
 //! Used for `settings.vault.storage = "file"`. Keeps the vault in a file without
 //! encryption.
 
-use std::path::PathBuf;
-
 use anyhow::{Context, bail};
 
-use super::{Envelope, Storage, VaultData, atomic_write, read_vault_file};
+use super::{Envelope, Storage, VaultData, atomic_write, read_vault_file, vault_lock_file};
 use crate::messages;
+use crate::util::VerifiedPath;
 
 /// Storage backend that keeps the vault as plaintext JSON in one file.
 ///
@@ -17,12 +16,12 @@ use crate::messages;
 /// read this file as encrypted, and the reverse. It does not silently
 /// start an empty vault.
 pub struct FileStorage {
-    path: PathBuf,
+    path: VerifiedPath,
 }
 
 impl FileStorage {
     /// Make a backend for the vault file at `path`.
-    pub fn new(path: PathBuf) -> Self {
+    pub fn new(path: VerifiedPath) -> Self {
         Self { path }
     }
 }
@@ -33,13 +32,13 @@ impl Storage for FileStorage {
             return Ok(None);
         };
         match serde_json::from_str::<Envelope>(&raw)
-            .with_context(|| messages::vault::parse_vault_file(self.path.display()))?
+            .with_context(|| messages::vault::parse_vault_file(&self.path))?
         {
             Envelope::File(data) => Ok(Some(
                 serde_json::to_string(&data).context(messages::vault::RESERIALIZE_VAULT_DATA)?,
             )),
             Envelope::EncryptedFile(_) => bail!(messages::vault::encrypted_vault_but_file_storage(
-                self.path.display()
+                &self.path
             )),
         }
     }
@@ -53,7 +52,7 @@ impl Storage for FileStorage {
         atomic_write(&self.path, json.as_bytes())
     }
 
-    fn lock_path(&self) -> anyhow::Result<Option<PathBuf>> {
-        Ok(Some(self.path.with_extension("lock")))
+    fn lock_path(&self) -> anyhow::Result<Option<VerifiedPath>> {
+        vault_lock_file(&self.path).map(Some)
     }
 }

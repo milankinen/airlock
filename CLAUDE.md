@@ -103,31 +103,43 @@ sandbox-side texts and machine output (JSON values, config keys).
 ## File system access
 
 The guest can put symlinks in host dirs (project dir, `.airlock/`, rw
-mounts). Do host file operations in airlock-cli only with `util::vfs::*`
-on a `util::verified_path::VerifiedPath`. Clippy refuses `std::fs`,
-`tokio::fs`, path probes (`exists`, `is_file`, `canonicalize`, ...),
-Unix socket bind and connect, `symlink` and `chown`.
+mounts). Do host file operations in airlock-cli only with the methods of
+`util::verified_path::VerifiedPath` (`read`, `open_with`, `mkdirs`,
+`rename_to`, ...). Clippy refuses `std::fs`, `tokio::fs`, path probes
+(`exists`, `is_file`, `canonicalize`, ...), Unix socket bind and connect,
+`symlink`, `chown`, and the types `Path` and `PathBuf`.
 
-* Make paths from the context roots (`context.roots.data_dir`,
-  `context.roots.cwd()?`, `context.roots.home()?`) with
-  `VerifiedPath::new` or `join`. These refuse a symlink in each component
-  before the last, and `..`. Missing components are allowed.
+* Make paths from the context dirs (`context.home`, `context.work` (the
+  cwd), the `context.data` sub-dirs) with `join`, or with
+  `VerifiedPath::new(path, &context.roots())`. These refuse a symlink in
+  each component before the last, and `..`. Missing components are allowed.
+* `context.data` is a `DataDir` (`data_dir.rs`): one field per data
+  sub-dir (`sandboxes`, `templates`, `images`, `layers`, ...). Add new
+  sub-dirs there. A sub-dir can be missing: make it with `make_dir` or
+  `create_private_dir`.
+* Give a function `&VerifiedPath` or `&DataDir`, not `&Context`, when it
+  needs only dirs.
+* Keep user config text and guest paths as `String`. Make the
+  `VerifiedPath` when the config resolves. Use `vp.to_path()?` inline for
+  child process args.
 * Use `new_follow` and `join_follow` only at entry points that the user
   picks: dotfile config, mount sources, `current_exe`, `PATH`, a moved
   data dir. Give a scope when the path must stay in a dir.
-* Each `vfs` call checks the path again. A symlink or a swapped dir
-  causes an error. At the last name, a symlink or a FIFO causes an
-  error. Sockets and devices are allowed.
-* `remove_file`, `remove_dir_all`, `rename` and `symlink_metadata` act on
-  the entry and do not follow it. They accept a symlink at the last name.
-* `vfs` reads have no size limit. Set the limit at the call site.
-* `vfs` creates and writes are the plain std operations after the check
-  (`write` truncates, `create_dir_all` is not atomic).
+* Each method checks the path again. A symlink or a swapped dir causes an
+  error. At the last name, a symlink or a FIFO causes an error. Sockets
+  and devices are allowed.
+* `remove_file`, `remove_dir_all`, `rename_to`, `symlink_metadata` and
+  `read_link` act on the entry and do not follow it. They accept a symlink
+  at the last name.
+* Reads have no size limit. Set the limit at the call site, or use
+  `read_to_string_capped`.
+* Creates and writes are the plain std operations after the check
+  (`write` truncates, `mkdirs` is not atomic).
 * A dir that is made after the `VerifiedPath` check is not pinned by
-  identity. Make a new `VerifiedPath` when that is important.
+  identity. Use `reverify` when that is important.
 * Use `PinnedDir` (`util/safe_fs.rs`) only for the file sync.
 * `allow`/`expect` of `clippy::disallowed_*` (also `clippy::all` and
-  `warnings`) is permitted only in `util/vfs.rs`, `util/verified_path.rs`,
+  `warnings`) is permitted only in `util/verified_path.rs`,
   `util/safe_fs.rs`, `build.rs` and the test-only allow in `main.rs`.
 
 ## Tests

@@ -20,8 +20,6 @@
 //! The diff does not show the real values of masked `[env]` entries. A hash
 //! of each value replaces it.
 
-use std::path::Path;
-
 use console::Style;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -33,7 +31,7 @@ use crate::cli::prompt::style::Styles;
 use crate::config::config_values::ConfigValues;
 use crate::config::export::{self, Format};
 use crate::config::{ConfigOverrides, LayeredConfig, ResolvedConfig};
-use crate::context::Context;
+use crate::data_dir::DataDir;
 use crate::packs::PackManager;
 use crate::project::{HostPath, HostPaths};
 use crate::util::VerifiedPath;
@@ -53,7 +51,7 @@ pub struct CheckInput<'a> {
     /// Resolved host paths of this run (see [`host_paths`])
     pub paths: &'a HostPaths,
     /// Airlock data directory, to resolve the config of the last run
-    pub data_dir: &'a Path,
+    pub data_dir: &'a DataDir,
     /// Known packs, to resolve the config of the last run
     pub packs: &'a PackManager,
     /// Command line overrides of this run. They also apply to the config of
@@ -154,20 +152,13 @@ pub fn save(
 /// `vm.kernel`, `vm.initramfs` and the host sockets of the enabled socket
 /// forwards. Creates nothing.
 /// Args:
-///  - `context`: Process context. Its home dir expands `~`
+///  - `home`: Home dir of the user. It expands `~`
 ///  - `cwd`: Project directory. Relative paths resolve from it
 ///
 /// Returns:
 ///   The paths by config key. A path that does not resolve keeps its
 ///   absolute form.
-pub fn host_paths(values: &ConfigValues, context: &Context, cwd: &Path) -> HostPaths {
-    let host_home = context
-        .roots
-        .home()
-        .and_then(|home| home.to_entry_path().map(Path::to_path_buf))
-        .ok()
-        .or_else(dirs::home_dir)
-        .unwrap_or_default();
+pub fn host_paths(values: &ConfigValues, home: &VerifiedPath, cwd: &VerifiedPath) -> HostPaths {
     let mounts = values
         .mounts
         .iter()
@@ -185,16 +176,24 @@ pub fn host_paths(values: &ConfigValues, context: &Context, cwd: &Path) -> HostP
         .iter()
         .filter(|(_, s)| s.enabled)
         .map(|(name, s)| (format!("network.sockets.{name}.host"), &s.host.source));
+    // Fallback base for `~` when a path does not resolve.
+    let home_text = home
+        .to_entry_path()
+        .map_or_else(|_| home.to_string(), |p| p.display().to_string());
     mounts
         .chain(assets)
         .chain(sockets)
         .map(|(key, given)| {
-            let path = crate::vm::mount::absolute(given, &host_home, cwd);
-            let resolved = VerifiedPath::new_follow(&path, None)
-                .ok()
-                .and_then(|p| p.to_entry_path().ok().map(Path::to_path_buf))
-                .unwrap_or(path);
-            let resolved = resolved.display().to_string();
+            let resolved = crate::vm::mount::host_path(given, home, cwd)
+                .and_then(|p| Ok(p.to_entry_path()?.display().to_string()))
+                .unwrap_or_else(|_| {
+                    let path = crate::vm::mount::expand_tilde_str(given, &home_text);
+                    if path.starts_with('/') {
+                        path
+                    } else {
+                        format!("{cwd}/{path}")
+                    }
+                });
             (
                 key,
                 HostPath {
@@ -428,16 +427,17 @@ mod tests {
         let sandbox = temp_dir();
         let sandbox_dir = VerifiedPath::new_follow(sandbox.path(), None).unwrap();
         let data = temp_dir();
+        let data_dir = crate::test_cfg::oci::data_dir_at(data.path());
         let packs = crate::packs::init_with_sample();
         save(&sandbox_dir, &layers(last), last_paths).unwrap();
         let config = layers(toml);
         let resolved =
-            block_on(config.resolve(data.path(), &packs, &ConfigOverrides::default())).unwrap();
+            block_on(config.resolve(&data_dir, &packs, &ConfigOverrides::default())).unwrap();
         let input = CheckInput {
             sandbox_dir: &sandbox_dir,
             resolved: &resolved,
             paths,
-            data_dir: data.path(),
+            data_dir: &data_dir,
             packs: &packs,
             overrides: &ConfigOverrides::default(),
             can_prompt: true,
@@ -514,14 +514,11 @@ mod tests {
         std::os::unix::fs::symlink(root.join("a"), root.join("data")).unwrap();
         let toml = "[mounts.data]\nsource = \"./data\"\ntarget = \"/data\"\n";
         let values = resolve_project_toml(toml).unwrap().values;
-        let context = crate::test_cfg::test_context(
-            &root,
-            crate::vault::Vault::for_storage_type(crate::vault::VaultStorageType::Disabled),
-        );
-        let last = host_paths(&values, &context, &root);
+        let cwd = crate::test_cfg::oci::verified_dir(&root);
+        let last = host_paths(&values, &cwd, &cwd);
         std::fs::remove_file(root.join("data")).unwrap();
         std::os::unix::fs::symlink(root.join("b"), root.join("data")).unwrap();
-        let paths = host_paths(&values, &context, &root);
+        let paths = host_paths(&values, &cwd, &cwd);
 
         let (checked, asked) = check_paths_answer(toml, toml, &last, &paths, Answer::Accept);
         assert!(matches!(checked, Ok(Checked::Current)));

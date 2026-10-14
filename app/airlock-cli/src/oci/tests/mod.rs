@@ -11,7 +11,7 @@ mod test_os_release;
 use std::path::{Path, PathBuf};
 
 use super::*;
-use crate::test_cfg::oci::{LayerTar, verified_dir};
+use crate::test_cfg::oci::{LayerTar, data_dir_at};
 
 /// The real path of `path`, for fixture setup and checks.
 fn real(path: &VerifiedPath) -> PathBuf {
@@ -20,7 +20,7 @@ fn real(path: &VerifiedPath) -> PathBuf {
 
 /// Extract `tar` into the layer cache as the layer `digest`, the way a
 /// registry pull does, and return its layer key.
-fn cache_layer(data_dir: &VerifiedPath, digest: &str, tar: &[u8]) -> String {
+fn cache_layer(data_dir: &DataDir, digest: &str, tar: &[u8]) -> String {
     layer::ensure_layer_cached(
         data_dir,
         digest,
@@ -35,7 +35,7 @@ fn cache_layer(data_dir: &VerifiedPath, digest: &str, tar: &[u8]) -> String {
 /// normal user (`node`, uid 1000), as images such as `node` have.
 /// Returns:
 ///   The layer key.
-fn passwd_layer(data_dir: &VerifiedPath, digest: &str) -> String {
+fn passwd_layer(data_dir: &DataDir, digest: &str) -> String {
     cache_layer(
         data_dir,
         digest,

@@ -18,18 +18,21 @@ pub(crate) mod pack_entries;
 #[cfg(test)]
 mod tests;
 
-use std::path::{Path, PathBuf};
-
 use crate::config::config_values::{ConfigValues, Policy};
 use crate::config::generated::GeneratedConfig;
 use crate::config::merge::{merge_json, normalize_env, pack_conflicts};
+use crate::data_dir::DataDir;
 use crate::packs::{ConfiguredPack, Pack, PackManager};
+use crate::util::VerifiedPath;
 
 /// Load the config files of the project `project_root`. The user files come
 /// from the home directory of the user, and the local project file from
 /// `local_dir` (see [`crate::sandboxes::local_config_dir`]).
-pub fn load(project_root: &Path, local_dir: &Path) -> anyhow::Result<LayeredConfig> {
-    let home = dirs::home_dir().unwrap_or_default();
+pub fn load(
+    project_root: &VerifiedPath,
+    local_dir: &VerifiedPath,
+) -> anyhow::Result<LayeredConfig> {
+    let home = VerifiedPath::home_dir()?;
     LayeredConfig::load_from(&home, project_root, local_dir)
 }
 
@@ -69,8 +72,8 @@ impl Layer {
     }
 
     /// Make the layer of a discovered config file and log it.
-    fn from_file((path, value): (PathBuf, serde_json::Value)) -> anyhow::Result<Self> {
-        let layer = Self::new(path.display().to_string(), value)?;
+    fn from_file((path, value): (String, serde_json::Value)) -> anyhow::Result<Self> {
+        let layer = Self::new(path, value)?;
         tracing::debug!("config: loaded {}", layer.origin);
         tracing::trace!("config: {}: {}", layer.origin, layer.value);
         Ok(layer)
@@ -79,7 +82,7 @@ impl Layer {
     /// Make the layer of a discovered user file (see [`Self::from_file`]).
     /// A `packs` key is an error, because only project-level files can
     /// enable packs.
-    fn from_user_file(file: (PathBuf, serde_json::Value)) -> anyhow::Result<Self> {
+    fn from_user_file(file: (String, serde_json::Value)) -> anyhow::Result<Self> {
         let layer = Self::from_file(file)?;
         anyhow::ensure!(
             layer.value.get("packs").is_none(),
@@ -138,7 +141,7 @@ impl LayeredConfig {
             !self.has_project_config(),
             crate::messages::config::PROJECT_HAS_CONFIG_ALREADY
         );
-        let origin = crate::messages::config::setup_wizard_origin(generated.path.display());
+        let origin = crate::messages::config::setup_wizard_origin(generated.path());
         let value: serde_json::Value =
             toml::from_str(&generated.toml).map_err(|e| anyhow::anyhow!("{origin}: {e}"))?;
         self.project = vec![Layer::new(origin, value)?];
@@ -190,7 +193,7 @@ impl LayeredConfig {
     ///   value differently.
     pub async fn resolve(
         &self,
-        data_dir: &Path,
+        data_dir: &DataDir,
         packs: &PackManager,
         overrides: &ConfigOverrides,
     ) -> anyhow::Result<ResolvedConfig> {
@@ -281,9 +284,9 @@ impl LayeredConfig {
     /// directory and the local project file in `local_dir` (see
     /// [`files::discover_in`]).
     pub(crate) fn load_from(
-        home: &Path,
-        project_root: &Path,
-        local_dir: &Path,
+        home: &VerifiedPath,
+        project_root: &VerifiedPath,
+        local_dir: &VerifiedPath,
     ) -> anyhow::Result<Self> {
         let files = files::discover_in(home, project_root, local_dir)?;
         Ok(Self::new(
@@ -364,7 +367,7 @@ impl ResolvedConfig {
 ///   `config.lua` fails, or a value that two packs set differently (see
 ///   [`pack_conflicts`]).
 fn pack_configs(
-    data_dir: &Path,
+    data_dir: &DataDir,
     packs: &[ConfiguredPack],
 ) -> Result<Vec<serde_json::Value>, Vec<String>> {
     let mut docs = Vec::new();

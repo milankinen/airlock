@@ -10,7 +10,6 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 
 use super::verified_path::VerifiedPath;
-use super::vfs;
 
 /// Size of the copy buffer.
 const BUF_SIZE: usize = 1 << 20;
@@ -41,8 +40,8 @@ pub(crate) fn clone_file(src: &VerifiedPath, dst: &VerifiedPath) -> io::Result<C
         use std::os::unix::fs::PermissionsExt as _;
         match clonefile(src, dst) {
             Ok(()) => {
-                if let Err(e) = vfs::set_permissions(dst, std::fs::Permissions::from_mode(0o600)) {
-                    let _ = vfs::remove_file(dst);
+                if let Err(e) = dst.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+                    let _ = dst.remove_file();
                     return Err(e);
                 }
                 return Ok(CloneKind::Reflink);
@@ -60,11 +59,8 @@ pub(crate) fn clone_file(src: &VerifiedPath, dst: &VerifiedPath) -> io::Result<C
         }
     }
 
-    let src_file = vfs::open(src)?;
-    let dst_file = vfs::open_with(
-        dst,
-        OpenOptions::new().write(true).create_new(true).mode(0o600),
-    )?;
+    let src_file = src.open()?;
+    let dst_file = dst.open_with(OpenOptions::new().write(true).create_new(true).mode(0o600))?;
 
     #[cfg(target_os = "linux")]
     {
@@ -81,7 +77,7 @@ pub(crate) fn clone_file(src: &VerifiedPath, dst: &VerifiedPath) -> io::Result<C
         Ok(()) => Ok(CloneKind::Copy),
         Err(e) => {
             drop(dst_file);
-            let _ = vfs::remove_file(dst);
+            let _ = dst.remove_file();
             Err(e)
         }
     }
@@ -96,11 +92,13 @@ fn clonefile(src: &VerifiedPath, dst: &VerifiedPath) -> io::Result<()> {
     /// Do not follow a symlink at the source.
     const CLONE_NOFOLLOW: u32 = 0x0001;
 
-    let to_c = |p: &std::path::Path| {
-        CString::new(p.as_os_str().as_bytes())
-            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+    let to_c = |p: &std::ffi::OsStr| {
+        CString::new(p.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
     };
-    let (src, dst) = (to_c(src.to_path()?)?, to_c(dst.to_path()?)?);
+    let (src, dst) = (
+        to_c(src.to_path()?.as_os_str())?,
+        to_c(dst.to_path()?.as_os_str())?,
+    );
     // SAFETY: both pointers are valid NUL-terminated strings.
     if unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), CLONE_NOFOLLOW) } == 0 {
         Ok(())

@@ -226,11 +226,6 @@ pub mod cli {
         format!("removed secret {name}")
     }
 
-    /// Error when the current directory is unknown in `exec`.
-    pub fn exec_get_cwd_failed(err: impl Display) -> String {
-        format!("get cwd: {err}")
-    }
-
     /// Error when no running sandbox serves a directory.
     pub fn no_running_sandbox(dir: impl Display) -> String {
         format!(
@@ -371,11 +366,6 @@ pub mod cli {
     /// Error when `airlock config` cannot export the config.
     pub fn config_export_failed(err: impl Display) -> String {
         format!("Cannot export config: {err}")
-    }
-
-    /// Error when `info` cannot load the sandbox details.
-    pub fn sandbox_details_loading_failed(err: impl Display) -> String {
-        format!("Sandbox details loading failed: {err}")
     }
 
     /// Status text of a running sandbox.
@@ -739,11 +729,6 @@ pub mod config {
         overlay: impl Display,
     ) -> String {
         format!("packs {owner} and {pack} both set `{key}` ({base} vs {overlay})")
-    }
-
-    /// Error when the project directory of a local config is unknown.
-    pub fn no_project_directory(local_dir: impl Display) -> String {
-        format!("{local_dir} has no project directory")
     }
 
     /// Error when a local config directory outside `.airlock` resolves into
@@ -1820,9 +1805,6 @@ pub mod project {
     //! Texts of the `project` area.
 
     use std::fmt::Display;
-
-    /// Error when the home directory of the host user is unknown.
-    pub const HOME_DIR_UNKNOWN: &str = "cannot determine home directory";
 
     /// Error when the sandbox disk file cannot be removed.
     pub fn remove_disk_failed(err: impl Display) -> String {
@@ -3295,6 +3277,9 @@ pub mod vault {
     /// The keyring cannot store the vault.
     pub const WRITE_VAULT_TO_KEYRING: &str = "write airlock vault to keyring";
 
+    /// The airlock directory for the vault file is unknown.
+    pub const FIND_VAULT_DIR: &str = "find the airlock directory for the vault";
+
     /// The airlock directory for the vault lock file is unknown.
     pub const FIND_VAULT_LOCK_DIR: &str = "find the airlock directory for the vault lock";
 
@@ -3425,6 +3410,11 @@ pub mod vm {
     /// initramfs.
     pub fn custom_asset_kind(name: impl Display) -> String {
         format!("custom {name}")
+    }
+
+    /// Error when the given path of a host path is not absolute.
+    pub fn path_not_absolute(path: impl Display) -> String {
+        format!("host path is not absolute: {path}")
     }
 
     /// Error when a host path in the config goes into a directory that the

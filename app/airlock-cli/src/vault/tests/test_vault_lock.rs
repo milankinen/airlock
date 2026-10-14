@@ -26,7 +26,7 @@ impl Storage for StallingStorage {
         }
         self.inner.store(data)
     }
-    fn lock_path(&self) -> anyhow::Result<Option<PathBuf>> {
+    fn lock_path(&self) -> anyhow::Result<Option<VerifiedPath>> {
         self.inner.lock_path()
     }
 }
@@ -41,7 +41,7 @@ impl Storage for NoLockPath {
     fn store(&self, data: &str) -> anyhow::Result<()> {
         self.0.store(data)
     }
-    fn lock_path(&self) -> anyhow::Result<Option<PathBuf>> {
+    fn lock_path(&self) -> anyhow::Result<Option<VerifiedPath>> {
         anyhow::bail!("no home directory")
     }
 }

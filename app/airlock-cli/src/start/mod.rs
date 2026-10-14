@@ -18,12 +18,11 @@ pub mod run;
 pub mod sandbox;
 pub mod wizard;
 
-use std::path::{Path, PathBuf};
-
 pub use exit::Exit;
 use tracing::info;
 
 use crate::cli::{self, LogLevel, logging};
+use crate::data_dir::DataDir;
 use crate::util::VerifiedPath;
 
 /// Command-line options for the sandbox step ([`sandbox::ensure_sandbox`]) and
@@ -55,7 +54,7 @@ pub fn check_system_requirements() {
 /// sockets of the VM.
 /// Returns:
 ///   Exit with code 1 and the fix, if the path is too long.
-pub fn check_data_dir(data_dir: &Path) -> Result<(), Exit> {
+pub fn check_data_dir(data_dir: &DataDir) -> Result<(), Exit> {
     // On Linux, the VM sockets are in the sandbox directory
     // `<data_dir>/boxes/<id>/`. A Unix socket path has a limit of 107
     // bytes (108 with the trailing NUL). If a path is longer, virtiofsd
@@ -66,34 +65,26 @@ pub fn check_data_dir(data_dir: &Path) -> Result<(), Exit> {
     // not use Unix sockets for the VM.
     const MAX_DATA_DIR_LEN: usize = 70;
 
-    let len = data_dir.as_os_str().len();
+    let len = data_dir.root.given().as_os_str().len();
     if cfg!(target_os = "linux") && len > MAX_DATA_DIR_LEN {
         return Err(Exit::error(
             1,
             crate::messages::start::data_dir_too_long(
-                data_dir.display(),
+                &data_dir.root,
                 len,
                 MAX_DATA_DIR_LEN,
-                crate::settings::Settings::expected_path().display(),
+                crate::settings::Settings::expected_path(),
             ),
         ));
     }
     Ok(())
 }
 
-/// Return the current directory. Make the path canonical when possible.
-pub fn resolve_host_cwd() -> Result<PathBuf, Exit> {
-    match std::env::current_dir() {
-        // The project can be below a symlink, for example macOS `/tmp`.
-        Ok(p) => Ok(VerifiedPath::new_follow(&p, None)
-            .ok()
-            .and_then(|cwd| cwd.to_path().ok().map(Path::to_path_buf))
-            .unwrap_or(p)),
-        Err(e) => Err(Exit::error(
-            1,
-            crate::messages::cli::cannot_determine_cwd(e),
-        )),
-    }
+/// Return the current directory. It follows symlinks one time, so a
+/// project below a symlink (for example macOS `/tmp`) has its real path.
+pub fn resolve_host_cwd() -> Result<VerifiedPath, Exit> {
+    VerifiedPath::current_dir()
+        .map_err(|e| Exit::error(1, crate::messages::cli::cannot_determine_cwd(e)))
 }
 
 /// Initialize logging. The log goes to the sandbox directory when the

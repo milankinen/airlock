@@ -88,7 +88,7 @@ impl Runtime for MonitorRuntime {
         let sig_tx = self
             .sig_tx
             .ok_or_else(|| anyhow::anyhow!(crate::messages::runtime::SIGNALS_BEFORE_LAUNCH))?;
-        let project_path = project.host_cwd.display().to_string();
+        let project_path = project.host_cwd.to_string();
         let control: std::sync::Arc<dyn airlock_monitor::NetworkControl> =
             std::sync::Arc::new(network.control());
         let tui = airlock_monitor::spawn(

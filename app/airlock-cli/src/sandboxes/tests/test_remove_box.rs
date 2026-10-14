@@ -25,8 +25,8 @@ fn remove_box_deletes_stopped_sandbox_and_refuses_running_or_bad_id() {
     std::fs::write(dir.join("disk.img"), b"disk").unwrap();
 
     let running = SandboxLock::acquire_box(
-        &project,
-        &crate::sandboxes::boxes_dir(&context).unwrap(),
+        &crate::util::VerifiedPath::new_follow(&project, None).unwrap(),
+        &context.data.sandboxes,
         &id,
     )
     .unwrap();

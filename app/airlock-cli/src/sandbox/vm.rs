@@ -133,10 +133,8 @@ impl Vm {
     /// of the sandbox until shutdown. The shutdown removes the socket. The
     /// exec processes get the sandbox env with the overrides of the client.
     pub fn serve_cli(&mut self) -> anyhow::Result<()> {
-        let sock_path = crate::cache::cli_sock_path(
-            &self.project.context.roots.data_dir,
-            &self.project.sandbox_dir,
-        )?;
+        let sock_path =
+            crate::cache::cli_sock_path(&self.project.context.data, &self.project.sandbox_dir)?;
         let base_env = self.instance.env.clone();
         let forwards =
             cli_server::ForwardRules::new(&self.project.config.network, self.network.control());

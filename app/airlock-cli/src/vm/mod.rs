@@ -17,9 +17,9 @@ mod file_sync;
 pub mod mount;
 
 use std::os::unix::io::OwnedFd;
-use std::path::Path;
 
-use crate::util::{VerifiedPath, vfs};
+use crate::data_dir::DataDir;
+use crate::util::VerifiedPath;
 
 /// Result of the KVM access check.
 #[cfg(target_os = "linux")]
@@ -37,17 +37,17 @@ pub enum KvmStatus {
 /// Check if the current user can use `/dev/kvm`.
 #[cfg(target_os = "linux")]
 pub fn kvm_status() -> KvmStatus {
-    kvm_status_at(Path::new("/dev/kvm"))
+    kvm_status_at("/dev/kvm")
 }
 
 /// Check if the current user can open the KVM device at `path`.
 #[cfg(target_os = "linux")]
-fn kvm_status_at(path: &Path) -> KvmStatus {
+fn kvm_status_at(path: impl AsRef<std::ffi::OsStr>) -> KvmStatus {
     // The device path is fixed. On some systems it is a symlink.
-    let opened = VerifiedPath::new_follow(path, None).and_then(|path| {
+    let opened = VerifiedPath::new_follow(path.as_ref(), None).and_then(|path| {
         // Open the file instead of reading the mode bits, so the kernel
         // also applies ACLs.
-        vfs::open_with(&path, std::fs::OpenOptions::new().read(true).write(true))
+        path.open_with(std::fs::OpenOptions::new().read(true).write(true))
     });
     match opened {
         Ok(_) => KvmStatus::Available,
@@ -187,20 +187,15 @@ pub async fn start(
     let overlay_dir = sandbox_dir.join("overlay")?;
 
     let mounts = assemble_mounts(project, container_home, opts.project_share)?;
-    let shares = prepare_shares(
-        &project.context.roots.data_dir,
-        image,
-        &mounts,
-        &overlay_dir,
-    )?;
+    let shares = prepare_shares(&project.context.data, image, &mounts, &overlay_dir)?;
     let (disk_image, caches) = disk::prepare(
         &sandbox_dir,
         &project.config.disk,
         container_home,
-        &project.host_cwd,
+        &project.host_cwd.to_string(),
     )?;
     let cwd = if opts.project_share {
-        project.guest_cwd.to_string_lossy().into_owned()
+        project.guest_cwd.clone()
     } else {
         "/".to_string()
     };
@@ -212,7 +207,7 @@ pub async fn start(
         tracing::debug!(
             "share: tag={}, host_path={}, ro={}",
             share.tag,
-            share.host_path.display(),
+            share.host_path,
             share.read_only
         );
     }
@@ -224,7 +219,7 @@ pub async fn start(
         initramfs: assets.initramfs,
         kernel_cmdline: build_kernel_cmdline(opts.log_level),
         shares,
-        cache_disk: Some(disk_image.to_path()?.to_path_buf()),
+        cache_disk: Some(disk_image.clone()),
         runtime_dir: sandbox_dir,
         #[cfg(target_os = "linux")]
         cloud_hypervisor: assets.cloud_hypervisor,
@@ -269,10 +264,9 @@ fn assemble_mounts(
                 key: "project".to_string(),
             },
             name: "project".to_string(),
-            given: project.host_cwd.display().to_string(),
-            // The project can be below a symlinked dir.
-            source: VerifiedPath::new_follow(&project.host_cwd, None)?,
-            target: project.guest_cwd.to_string_lossy().into(),
+            given: project.host_cwd.to_string(),
+            source: project.host_cwd.clone(),
+            target: project.guest_cwd.clone(),
             read_only: false,
         })
     } else {
@@ -296,12 +290,12 @@ fn assemble_mounts(
         tracing::debug!("mount source: {} = {:?} → {resolved:?}", m.name, m.given);
     }
     if !project.context.settings.security.insecure_mounts {
-        let roots = &project.context.roots;
+        let context = &project.context;
         mount::check_exposure(
             &mounts,
             &[
-                (messages::vm::HOME_DIRECTORY, roots.home()?),
-                (messages::vm::DATA_DIRECTORY, &roots.data_dir),
+                (messages::vm::HOME_DIRECTORY, &context.home),
+                (messages::vm::DATA_DIRECTORY, &context.data.root),
             ],
         )?;
     }
@@ -314,7 +308,7 @@ fn assemble_mounts(
 /// File mounts are hardlinked (copied on EXDEV) into
 /// `overlay/files/{rw,ro}/{key}`. Two shares give them to the guest.
 fn prepare_shares(
-    data_dir: &VerifiedPath,
+    data_dir: &DataDir,
     _image: &OciImage,
     mounts: &[mount::ResolvedMount],
     overlay_dir: &VerifiedPath,
@@ -324,9 +318,7 @@ fn prepare_shares(
     // reads only the layers that `imageLayers` lists for this image.
     let mut shares = vec![VmShare {
         tag: "layers".to_string(),
-        host_path: crate::cache::layers_root(data_dir)?
-            .to_path()?
-            .to_path_buf(),
+        host_path: crate::cache::layers_root(data_dir)?,
         read_only: true,
     }];
 
@@ -343,7 +335,7 @@ fn prepare_shares(
         );
         shares.push(VmShare {
             tag: m.key().into(),
-            host_path: m.source.to_path()?.to_path_buf(),
+            host_path: m.source.clone(),
             read_only: m.read_only,
         });
     }
@@ -352,8 +344,8 @@ fn prepare_shares(
     // again on each boot, so old entries are removed.
     let files_rw_dir = overlay_dir.join("files/rw")?;
     let files_ro_dir = overlay_dir.join("files/ro")?;
-    let _ = vfs::remove_dir_all(&files_rw_dir);
-    let _ = vfs::remove_dir_all(&files_ro_dir);
+    let _ = files_rw_dir.remove_dir_all();
+    let _ = files_ro_dir.remove_dir_all();
     let mut has_rw_files = false;
     let mut has_ro_files = false;
 
@@ -372,12 +364,12 @@ fn prepare_shares(
         } else {
             &files_rw_dir
         };
-        vfs::create_dir_all(dir)?;
+        dir.mkdirs()?;
         let link_path = dir.join(m.key())?;
-        if let Err(e) = vfs::hard_link(&m.source, &link_path) {
+        if let Err(e) = m.source.hard_link_to(&link_path) {
             if e.kind() == std::io::ErrorKind::CrossesDevices {
                 cli::log!("{}", messages::vm::file_mount_cross_device(&m.source));
-                vfs::copy(&m.source, &link_path)?;
+                m.source.copy_to(&link_path)?;
             } else {
                 return Err(
                     anyhow::Error::from(e).context(messages::vm::file_mount_failed(&m.source))
@@ -388,17 +380,18 @@ fn prepare_shares(
         has_rw_files = has_rw_files || !m.read_only;
     }
 
+    // The share dirs are new: check them again to pin them.
     if has_rw_files {
         shares.push(VmShare {
             tag: "files/rw".to_string(),
-            host_path: files_rw_dir.to_path()?.to_path_buf(),
+            host_path: files_rw_dir.reverify()?,
             read_only: false,
         });
     }
     if has_ro_files {
         shares.push(VmShare {
             tag: "files/ro".to_string(),
-            host_path: files_ro_dir.to_path()?.to_path_buf(),
+            host_path: files_ro_dir.reverify()?,
             read_only: true,
         });
     }

@@ -11,6 +11,7 @@ use indicatif::ProgressBar;
 use sha2::{Digest, Sha256};
 
 use crate::self_update::{self, ReleaseSource, Version};
+use crate::test_cfg::oci::verified_dir;
 use crate::test_cfg::{serve, temp_dir};
 
 const LATEST: &str = "v2099.1.0";
@@ -94,9 +95,15 @@ async fn update_to_latest_release_replaces_binary() {
 
     let latest = self_update::latest_version(&client, &source).await.unwrap();
     assert_eq!(latest.to_string(), LATEST);
-    self_update::install(&client, &source, &latest, &target, &ProgressBar::hidden())
-        .await
-        .unwrap();
+    self_update::install(
+        &client,
+        &source,
+        &latest,
+        &verified_dir(&target),
+        &ProgressBar::hidden(),
+    )
+    .await
+    .unwrap();
 
     let installed = std::fs::read_to_string(&target).unwrap();
     assert!(
@@ -121,9 +128,15 @@ async fn update_with_checksum_mismatch_keeps_old_binary() {
     let client = self_update::http_client(&Version::parse("v2026.1.0").unwrap()).unwrap();
 
     let latest = Version::parse(LATEST).unwrap();
-    let err = self_update::install(&client, &source, &latest, &target, &ProgressBar::hidden())
-        .await
-        .unwrap_err();
+    let err = self_update::install(
+        &client,
+        &source,
+        &latest,
+        &verified_dir(&target),
+        &ProgressBar::hidden(),
+    )
+    .await
+    .unwrap_err();
 
     assert!(format!("{err:#}").contains("checksum mismatch"), "{err:#}");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "old binary");
@@ -145,9 +158,15 @@ async fn update_with_wrong_binary_version_keeps_old_binary() {
     let client = self_update::http_client(&Version::parse("v2026.1.0").unwrap()).unwrap();
 
     let latest = Version::parse(LATEST).unwrap();
-    let err = self_update::install(&client, &source, &latest, &target, &ProgressBar::hidden())
-        .await
-        .unwrap_err();
+    let err = self_update::install(
+        &client,
+        &source,
+        &latest,
+        &verified_dir(&target),
+        &ProgressBar::hidden(),
+    )
+    .await
+    .unwrap_err();
 
     assert!(format!("{err:#}").contains("new binary reports"), "{err:#}");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "old binary");

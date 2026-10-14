@@ -62,7 +62,12 @@ impl Home {
             if project::is_running(&sandbox) {
                 return None;
             }
-            match block_on_local(lock_sandbox(&self.context, &self.project, false, yes)) {
+            match block_on_local(lock_sandbox(
+                &self.context,
+                &crate::test_cfg::oci::verified_dir(&self.project),
+                false,
+                yes,
+            )) {
                 Ok(lock) => Some(lock.dir().to_path().unwrap().to_path_buf()),
                 Err(e) if format!("{e:?}").contains("another airlock instance") => None,
                 Err(e) => panic!("{e:?}"),
@@ -99,7 +104,7 @@ fn new_sandbox_goes_to_data_dir_and_project_gets_no_sandbox_data() {
         panic!("{found:?}");
     };
     let dir = found.dir.to_path().unwrap();
-    let boxes = crate::sandboxes::boxes_dir(project.context()).unwrap();
+    let boxes = &project.context().data.sandboxes;
     assert_eq!(found.dir, boxes.join(id).unwrap());
     assert!(!project.project_dir().join(".airlock").exists());
     for name in ["ca.json", "run.json", "installs.json"] {
@@ -163,8 +168,11 @@ fn yes_moves_project_sandbox_and_local_config_and_removes_airlock_dir() {
 
     let entries = block_on_local(registry::list(&home.context.db)).unwrap();
     assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].project, home.project);
-    assert_eq!(dir, home.context.boxes_dir().join(&entries[0].id));
+    assert_eq!(entries[0].project, home.project.as_os_str());
+    assert_eq!(
+        dir,
+        home.context.data.sandboxes.given().join(&entries[0].id)
+    );
     assert_eq!(read(&dir, "disk.img"), "disk");
     assert_eq!(read(&dir, "ca.json"), LEGACY_CA);
     assert!(dir.join("run.json").is_file() && dir.join("installs.json").is_file());
@@ -185,14 +193,25 @@ fn move_with_extra_files_in_airlock_dir_is_refused_and_changes_nothing() {
     let extra = home.project.join(".airlock/.init-done");
     std::fs::write(&extra, "").unwrap();
 
-    let err = block_on_local(migrate(&home.context, &home.project))
-        .unwrap_err()
-        .to_string();
+    let err = block_on_local(migrate(
+        &home.context,
+        &crate::test_cfg::oci::verified_dir(&home.project),
+    ))
+    .unwrap_err()
+    .to_string();
     assert!(
         err.starts_with(".airlock directory contains extra files (.init-done), can't migrate"),
         "{err}"
     );
-    assert!(block_on_local(lock_sandbox(&home.context, &home.project, false, true)).is_err());
+    assert!(
+        block_on_local(lock_sandbox(
+            &home.context,
+            &crate::test_cfg::oci::verified_dir(&home.project),
+            false,
+            true
+        ))
+        .is_err()
+    );
 
     assert!(home.project_sandbox().join("disk.img").is_file());
     assert!(extra.is_file());
@@ -218,7 +237,7 @@ fn new_data_dir_sandbox_takes_local_config_out_of_project() {
 
     let dir = home.lock(false);
 
-    assert!(dir.starts_with(home.context.boxes_dir()));
+    assert!(dir.starts_with(home.context.data.sandboxes.given()));
     assert_eq!(read(&dir, "airlock.json"), "{}");
     assert!(!home.project.join(".airlock").exists());
 }
@@ -240,7 +259,7 @@ fn project_sandbox_without_terminal_stays_and_later_start_can_move_it() {
     assert!(!home.project_sandbox().join(KEEP_IN_PROJECT).exists());
 
     let moved = home.lock(true);
-    assert!(moved.starts_with(home.context.boxes_dir()));
+    assert!(moved.starts_with(home.context.data.sandboxes.given()));
     assert_eq!(read(&moved, "ca.json"), LEGACY_CA);
 }
 
@@ -280,9 +299,19 @@ fn kept_project_sandbox_or_project_dir_setting_is_not_moved() {
 fn running_project_sandbox_is_not_moved() {
     let home = Home::new("");
     legacy_sandbox(&home.project);
-    let _running = SandboxLock::acquire(&home.project).unwrap();
+    let _running =
+        SandboxLock::acquire(&crate::util::VerifiedPath::new_follow(&home.project, None).unwrap())
+            .unwrap();
 
-    assert!(block_on_local(lock_sandbox(&home.context, &home.project, false, true)).is_err());
+    assert!(
+        block_on_local(lock_sandbox(
+            &home.context,
+            &crate::test_cfg::oci::verified_dir(&home.project),
+            false,
+            true
+        ))
+        .is_err()
+    );
     assert!(home.project_sandbox().join("disk.img").is_file());
     assert!(
         block_on_local(registry::list(&home.context.db))

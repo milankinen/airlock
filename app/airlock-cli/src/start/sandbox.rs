@@ -4,8 +4,6 @@
 //! which tools to install. For an existing sandbox, it can ask the user about
 //! image and tool changes.
 
-use std::path::Path;
-
 use super::config_change::{self, CheckInput, Checked};
 use super::install::{self, InstallDecision};
 use super::{Exit, SandboxOptions};
@@ -25,7 +23,7 @@ use crate::project::{self, SandboxLock};
 use crate::templates::{self, Template};
 #[cfg(test)]
 use crate::test_cfg::start::{check_image, prepare_image};
-use crate::util::PinnedDir;
+use crate::util::{PinnedDir, VerifiedPath};
 use crate::{cli, messages, sandbox};
 
 /// The stored sandbox, ready for the install step.
@@ -230,7 +228,7 @@ fn tools_changed_message(plan: &Plan) -> String {
 // record changes.
 pub async fn ensure_sandbox(
     context: &Context,
-    host_cwd: &Path,
+    host_cwd: &VerifiedPath,
     packs: &PackManager,
     config: &LayeredConfig,
     resolved: ResolvedConfig,
@@ -253,13 +251,13 @@ pub async fn ensure_sandbox(
         .map_err(anyhow::Error::from)?;
     // Resolve the host paths before the compare. Thus a symlink that points
     // to an other place since the last run is a change.
-    let paths = config_change::host_paths(&resolved.values, context, host_cwd);
+    let paths = config_change::host_paths(&resolved.values, &context.home, host_cwd);
     // The config question comes before all other sandbox questions.
     let checked = config_change::check(&CheckInput {
         sandbox_dir: lock.dir(),
         resolved: &resolved,
         paths: &paths,
-        data_dir: &context.data_dir,
+        data_dir: &context.data,
         packs,
         overrides: &options.overrides,
         can_prompt: answering.can_prompt,
@@ -311,7 +309,7 @@ pub async fn ensure_sandbox(
     let values = &resolved.values;
     sandbox::report::print_preparing(lock.dir(), &values.vm.image.name);
     let prepared = prepare_image(
-        &context.roots.data_dir,
+        &context.data,
         lock.dir(),
         &values.vm.image,
         vault,
@@ -355,7 +353,7 @@ pub async fn ensure_sandbox(
     // Check the image before a tool question answer removes the disk, or
     // before anything installs.
     if !candidates.is_empty() && (recreate || !plan.pending.is_empty()) {
-        check_image(&context.roots.data_dir, &image).map_err(|e| Exit::error(2, e))?;
+        check_image(&context.data, &image).map_err(|e| Exit::error(2, e))?;
     }
     if recreate {
         project::reset_disk(&sandbox_dir)?;
@@ -393,7 +391,7 @@ pub async fn ensure_sandbox(
 /// succeeds. On drop, it removes the copy (see [`templates::seed::unseed`]).
 /// Thus after a failed first start, the next start sees a new sandbox, and
 /// the setup wizard runs again.
-struct SeedGuard(Option<crate::util::VerifiedPath>);
+struct SeedGuard(Option<VerifiedPath>);
 
 impl SeedGuard {
     /// Keep the copy: the sandbox is ready.

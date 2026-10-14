@@ -5,6 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::test_cfg::{TempDir, resolve_project_toml, temp_dir};
+use crate::util::VerifiedPath;
 use crate::vm::mount::{MountType, ResolvedMount, resolve_mounts};
 
 /// A host with a home directory and a project directory (the cwd).
@@ -54,10 +55,10 @@ impl Host {
             .collect();
         resolve_mounts(
             &mounts,
-            &self.home,
+            &VerifiedPath::new_follow(&self.home, None)?,
             "/home/user",
-            &self.project,
-            Path::new("/workdir"),
+            &VerifiedPath::new_follow(&self.project, None)?,
+            "/workdir",
             project_share,
         )
     }

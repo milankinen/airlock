@@ -4,13 +4,13 @@
 //! the user presses keys.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::cli::prompt::{self, Step};
 use crate::config::UserImage;
 use crate::config::generated::{Clipboard, Target};
+use crate::data_dir::DataDir;
 use crate::packs::{ArgKind, ArgValue, Pack, PackKind, PackManager};
 use crate::start::wizard::Answers;
 use crate::templates::{Template, TemplatePack};
@@ -140,7 +140,7 @@ impl OtherSlot {
 /// start bar ([`Row::Start`]) with its options ([`START_CHOICES`]).
 pub struct Form {
     /// Airlock data directory, for the pack mount directories.
-    data_dir: PathBuf,
+    data_dir: DataDir,
     mode: Mode,
     /// The templates, sorted by name. [`Row::Template`] indexes this list.
     templates: Vec<Template>,
@@ -184,7 +184,7 @@ impl Form {
     ///   is selected, and the args have their defaults. The config is local.
     ///   The start bar is on `start`. The focus is on the first row.
     pub fn new(
-        data_dir: &Path,
+        data_dir: &DataDir,
         packs: &PackManager,
         custom_image: Option<UserImage>,
         templates: &[Template],
@@ -205,7 +205,7 @@ impl Form {
             })
             .collect();
         let mut form = Self {
-            data_dir: data_dir.to_path_buf(),
+            data_dir: data_dir.clone(),
             mode,
             templates: templates.to_vec(),
             template: None,

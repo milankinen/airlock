@@ -99,7 +99,7 @@ fn file_and_encrypted_backends_refuse_each_others_files() {
 
     let err = file_vault(&encrypted).get_secret("TOKEN").unwrap_err();
     assert!(err.to_string().contains("encrypted vault"), "{err:#}");
-    let err = EncryptedFileStorage::new(plain, Box::new(FixedPassphrase("pw")))
+    let err = EncryptedFileStorage::new(verified(&plain), Box::new(FixedPassphrase("pw")))
         .load()
         .unwrap_err();
     assert!(err.to_string().contains("plaintext vault"), "{err:#}");

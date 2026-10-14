@@ -96,7 +96,8 @@ pub fn resolve_with(packs: &PackManager, toml: &str) -> anyhow::Result<ResolvedC
     let layers =
         LayeredConfig::from_values(vec![], None, vec![("airlock.toml", toml::from_str(toml)?)])?;
     let data = temp_dir();
-    block_on(layers.resolve(data.path(), packs, &ConfigOverrides::default()))
+    let data_dir = crate::test_cfg::oci::data_dir_at(data.path());
+    block_on(layers.resolve(&data_dir, packs, &ConfigOverrides::default()))
 }
 
 /// The install scripts of the packs that `toml` configures, in pack order.

@@ -12,10 +12,15 @@ use std::path::Path;
 use super::*;
 use crate::test_cfg::vault::FixedPassphrase;
 
+/// The verified form of the test path `path`.
+fn verified(path: &Path) -> VerifiedPath {
+    VerifiedPath::new_follow(path, None).unwrap()
+}
+
 /// A vault that keeps its data in the plaintext file `path`.
 fn file_vault(path: &Path) -> Vault {
     Vault::new_with(
-        Box::new(FileStorage::new(path.to_path_buf())),
+        Box::new(FileStorage::new(verified(path))),
         HashMap::new(),
         VaultStorageType::File,
     )
@@ -26,7 +31,7 @@ fn file_vault(path: &Path) -> Vault {
 fn encrypted_vault(path: &Path, passphrase: &'static str) -> Vault {
     Vault::new_with(
         Box::new(EncryptedFileStorage::new(
-            path.to_path_buf(),
+            verified(path),
             Box::new(FixedPassphrase(passphrase)),
         )),
         HashMap::new(),

@@ -17,12 +17,13 @@ pub mod lua_config;
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::Path;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+
+use crate::data_dir::DataDir;
 
 /// Load the known packs. At the moment these are only the built-in packs.
 pub fn init() -> anyhow::Result<PackManager> {
@@ -340,18 +341,15 @@ impl ConfiguredPack {
     ///   arg values (see [`lua_config::evaluate`]). An empty object if the
     ///   pack has no config. An error `pack <name>: …` if `config.lua` or
     ///   the pack directory fails.
-    pub fn config_values(&self, data_dir: &Path) -> anyhow::Result<Value> {
+    pub fn config_values(&self, data_dir: &DataDir) -> anyhow::Result<Value> {
         match &self.pack.0.config {
             None => Ok(Value::Object(Map::new())),
             Some(PackConfig::Static(value)) => Ok(value.clone()),
             Some(PackConfig::Lua(source)) => {
                 let metadata = self.metadata();
                 // Create the pack directory before `config.lua` runs.
-                let directory = crate::util::VerifiedPath::new_follow(data_dir, None)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|data_dir| crate::cache::pack_mounts_dir(&data_dir, &metadata.name))
-                    .and_then(|dir| Ok(dir.to_path()?.to_path_buf()))
-                    .map_err(|e| {
+                let directory =
+                    crate::cache::pack_mounts_dir(data_dir, &metadata.name).map_err(|e| {
                         anyhow::anyhow!(crate::messages::packs::pack_failed(
                             &metadata.name,
                             format!("{e:#}")

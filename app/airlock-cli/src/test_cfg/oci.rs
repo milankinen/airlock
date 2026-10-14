@@ -7,12 +7,18 @@ use std::path::Path;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 
+use crate::data_dir::DataDir;
 use crate::util::VerifiedPath;
 
 /// The directory `path` as a verified path, for example a temp dir as the
 /// data dir.
 pub fn verified_dir(path: &Path) -> VerifiedPath {
     VerifiedPath::new_follow(path, None).unwrap()
+}
+
+/// The directory `path` as the data dir.
+pub fn data_dir_at(path: &Path) -> DataDir {
+    DataDir::init(&verified_dir(path)).unwrap()
 }
 
 /// An OCI layer tarball that is built in memory, one entry at a time, in

@@ -9,6 +9,7 @@ use std::process::Command;
 
 use crate::cli::sandbox_client::find_cli_sock;
 use crate::context::Context;
+use crate::test_cfg::oci::verified_dir;
 use crate::test_cfg::sandboxes::{data_dir_sandbox, legacy_sandbox};
 use crate::test_cfg::{TempDir, block_on_local, temp_dir, test_context};
 use crate::util::VerifiedPath;
@@ -22,14 +23,14 @@ fn lookup(context: &Context, start: &Path) -> Option<std::path::PathBuf> {
 /// Get the socket path of the sandbox directory `dir`.
 fn sock_of(context: &Context, dir: &Path) -> std::path::PathBuf {
     let dir = VerifiedPath::new_follow(dir, None).unwrap();
-    let sock = crate::cache::cli_sock_path(&context.roots.data_dir, &dir).unwrap();
+    let sock = crate::cache::cli_sock_path(&context.data, &dir).unwrap();
     sock.to_path().unwrap().to_path_buf()
 }
 
 /// Run the sandbox lookup from `start`, with or without the git
 /// worktree link.
 fn lookup_with(context: &Context, start: &Path, follow: bool) -> Option<std::path::PathBuf> {
-    block_on_local(find_cli_sock(context, start, follow))
+    block_on_local(find_cli_sock(context, &verified_dir(start), follow))
         .unwrap()
         .map(|sock| sock.to_path().unwrap().to_path_buf())
 }
@@ -216,14 +217,14 @@ fn symlinked_sandbox_or_socket_is_refused() {
     let a_dir = a.join(".airlock/sandbox");
     std::fs::create_dir_all(a_dir.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(&b_dir, &a_dir).unwrap();
-    let error = block_on_local(find_cli_sock(&context, &a, false)).unwrap_err();
+    let error = block_on_local(find_cli_sock(&context, &verified_dir(&a), false)).unwrap_err();
     assert!(error.to_string().contains("is a symlink"), "{error}");
 
     std::fs::remove_file(&a_dir).unwrap();
     let a_dir = legacy_sandbox(&a);
     let a_sock = sock_of(&context, &a_dir);
     std::os::unix::fs::symlink(&b_sock, &a_sock).unwrap();
-    let error = block_on_local(find_cli_sock(&context, &a, false)).unwrap_err();
+    let error = block_on_local(find_cli_sock(&context, &verified_dir(&a), false)).unwrap_err();
     assert!(error.to_string().contains("is a symlink"), "{error}");
 
     std::fs::remove_dir_all(a.join(".airlock")).unwrap();

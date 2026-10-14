@@ -8,17 +8,17 @@
 pub mod form;
 pub mod view;
 
-use std::path::Path;
-
 use super::Exit;
 use crate::cli::prompt;
 use crate::cli::prompt::Step;
 use crate::cli::prompt::screen::{self, Screen};
 use crate::config::generated::{Clipboard, GeneratedConfig, NewEntry, Target};
 use crate::config::{self, LayeredConfig};
+use crate::data_dir::DataDir;
 use crate::packs::{ConfiguredPack, PackManager};
 use crate::start::wizard::form::{Form, Mode};
 use crate::templates::Template;
+use crate::util::VerifiedPath;
 use crate::vault::Vault;
 use crate::{cli, messages};
 
@@ -62,7 +62,7 @@ impl Answers {
     }
 
     /// Return the new config file of the answers for the project `host_cwd`.
-    pub fn config(&self, host_cwd: &Path) -> GeneratedConfig {
+    pub fn config(&self, host_cwd: &VerifiedPath) -> GeneratedConfig {
         GeneratedConfig::new(
             host_cwd,
             self.target,
@@ -77,9 +77,9 @@ impl Answers {
 /// Inputs of the wizard.
 pub(super) struct Input<'a> {
     /// Project directory on the host.
-    pub(super) host_cwd: &'a Path,
+    pub(super) host_cwd: &'a VerifiedPath,
     /// Airlock data directory, for the pack mount directories.
-    pub(super) data_dir: &'a Path,
+    pub(super) data_dir: &'a DataDir,
     /// Available packs.
     pub(super) packs: &'a PackManager,
     /// The user files (the project has no config yet). The answers must
@@ -111,9 +111,9 @@ pub(super) struct Input<'a> {
 ///   the generated project config ([`LayeredConfig::with_generated_project`]).
 ///   The caller saves it after the sandbox is stored (see [`save_config`]).
 pub async fn load_or_generate_config(
-    host_cwd: &Path,
-    data_dir: &Path,
-    local_dir: &Path,
+    host_cwd: &VerifiedPath,
+    data_dir: &DataDir,
+    local_dir: &VerifiedPath,
     has_sandbox: bool,
     packs: &PackManager,
     vault: &Vault,
@@ -127,8 +127,8 @@ pub async fn load_or_generate_config(
         cli::error!(
             "{}",
             messages::start::sandbox_without_config(
-                host_cwd.display(),
-                local_dir.join("airlock.toml").display()
+                host_cwd,
+                local_dir.given().join("airlock.toml").display()
             )
         );
         return Err(Exit::Code(2));
@@ -187,18 +187,15 @@ pub async fn load_or_generate_config(
 ///      stays valid)
 ///    * Ctrl+C: exit code 130
 pub async fn run_wizard(
-    host_cwd: &Path,
-    data_dir: &Path,
+    host_cwd: &VerifiedPath,
+    data_dir: &DataDir,
     packs: &PackManager,
     config: &LayeredConfig,
     vault: &Vault,
     templates: &[Template],
 ) -> Result<GeneratedConfig, Exit> {
     if !prompt::can_prompt() {
-        cli::error!(
-            "{}",
-            messages::start::no_config_no_terminal(host_cwd.display())
-        );
+        cli::error!("{}", messages::start::no_config_no_terminal(host_cwd));
         return Err(Exit::Code(2));
     }
     let input = Input {
@@ -233,8 +230,8 @@ pub async fn run_wizard(
 ///    * Esc or `abort`: exit code 0, or 2 after a failed check
 ///    * Ctrl+C: exit code 130
 pub async fn run_template_wizard(
-    host_cwd: &Path,
-    data_dir: &Path,
+    host_cwd: &VerifiedPath,
+    data_dir: &DataDir,
     packs: &PackManager,
     config: &LayeredConfig,
     vault: &Vault,
@@ -261,13 +258,13 @@ pub async fn run_template_wizard(
 /// [`crate::sandboxes::local_config_dir`]).
 // Report only a shareable file (`airlock.toml`). The user must not edit or
 // commit the local file.
-pub fn save_config(generated: &GeneratedConfig, local_dir: &Path) -> Result<(), Exit> {
+pub fn save_config(generated: &GeneratedConfig, local_dir: &VerifiedPath) -> Result<(), Exit> {
     generated.save(local_dir).map_err(|e| Exit::error(1, e))?;
     if generated.target == Target::Project {
         cli::log!(
             "  {} {}",
             cli::check(),
-            messages::start::config_created(generated.path.display())
+            messages::start::config_created(generated.path())
         );
     }
     Ok(())

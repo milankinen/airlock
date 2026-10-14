@@ -8,9 +8,9 @@
 use super::{CA_FILE, IMAGE_FILE, Template};
 use crate::messages;
 use crate::packs::install::state::{self as install_state, ReadState};
+use crate::util::PinnedDir;
 use crate::util::clone::clone_file;
 use crate::util::verified_path::VerifiedPath;
-use crate::util::{PinnedDir, vfs};
 use crate::vm::disk::{self, DISK_FILE};
 
 /// Copy the template `template` into the new sandbox `sandbox`.
@@ -55,7 +55,7 @@ pub fn seed(
     // the image again. The link source cannot be a symlink, because a
     // link of a symlink follows it on macOS.
     if let (Ok(src), Ok(dst)) = (template.dir.join(IMAGE_FILE), sandbox_dir.join(IMAGE_FILE)) {
-        let _ = vfs::hard_link(&src, &dst);
+        let _ = src.hard_link_to(&dst);
     }
     Ok(())
 }
@@ -100,7 +100,7 @@ pub fn unseed(sandbox_dir: &VerifiedPath) {
         CA_FILE,
     ] {
         if let Ok(path) = sandbox_dir.join(file) {
-            let _ = vfs::remove_file(&path);
+            let _ = path.remove_file();
         }
     }
 }

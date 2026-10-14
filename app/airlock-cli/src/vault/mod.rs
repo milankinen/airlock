@@ -18,7 +18,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -37,7 +36,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::messages;
 use crate::settings::Settings;
-use crate::util::{VerifiedPath, vfs};
+use crate::util::VerifiedPath;
 
 // Argon2id parameters from the OWASP 2023 "second recommendation": 19 MiB
 // memory, t=2, p=1. These values are safe and keep an interactive unlock
@@ -491,27 +490,51 @@ pub trait Storage: Send + Sync + 'static {
     ///   `None` for backends that do not need a lock (disabled, in-memory
     ///   test doubles). An error when the backend needs a lock but cannot
     ///   name its path, so a write never runs without the lock.
-    fn lock_path(&self) -> anyhow::Result<Option<PathBuf>> {
+    fn lock_path(&self) -> anyhow::Result<Option<VerifiedPath>> {
         Ok(None)
     }
 }
 
 /// Make the storage backend for the given type.
 fn boxed_storage(storage_type: VaultStorageType) -> Box<dyn Storage> {
-    match storage_type {
-        VaultStorageType::Disabled => Box::new(DisabledStorage),
-        VaultStorageType::File => Box::new(FileStorage::new(
-            Settings::dir()
-                .unwrap_or(PathBuf::from("."))
-                .join("vault.default.json"),
-        )),
-        VaultStorageType::EncryptedFile => Box::new(EncryptedFileStorage::new(
-            Settings::dir()
-                .unwrap_or(PathBuf::from("."))
-                .join("vault.default.enc.json"),
-            encrypted::interactive_passphrase(),
-        )),
-        VaultStorageType::Keyring => Box::new(KeyringStorage),
+    let made: anyhow::Result<Box<dyn Storage>> = match storage_type {
+        VaultStorageType::Disabled => Ok(Box::new(DisabledStorage)),
+        VaultStorageType::File => vault_file("vault.default.json")
+            .map(|path| Box::new(FileStorage::new(path)) as Box<dyn Storage>),
+        VaultStorageType::EncryptedFile => vault_file("vault.default.enc.json").map(|path| {
+            Box::new(EncryptedFileStorage::new(
+                path,
+                encrypted::interactive_passphrase(),
+            )) as Box<dyn Storage>
+        }),
+        VaultStorageType::Keyring => Ok(Box::new(KeyringStorage)),
+    };
+    // The vault opens on first use. Thus a path error is an error of the
+    // first use, not of the start of the process.
+    made.unwrap_or_else(|e| Box::new(UnavailableStorage(format!("{e:#}"))))
+}
+
+/// Get the path of the vault file `name` in the airlock settings
+/// directory. The directory can be a link, for example into a dotfiles
+/// repo.
+fn vault_file(name: &str) -> anyhow::Result<VerifiedPath> {
+    let dir = Settings::dir().context(messages::vault::FIND_VAULT_DIR)?;
+    Ok(dir.join(name)?)
+}
+
+/// Storage backend whose file path is not known. All uses fail with the
+/// error of the path.
+struct UnavailableStorage(String);
+
+impl Storage for UnavailableStorage {
+    fn load(&self) -> anyhow::Result<Option<String>> {
+        bail!("{}", self.0)
+    }
+    fn store(&self, _: &str) -> anyhow::Result<()> {
+        bail!("{}", self.0)
+    }
+    fn lock_path(&self) -> anyhow::Result<Option<VerifiedPath>> {
+        bail!("{}", self.0)
     }
 }
 
@@ -571,35 +594,45 @@ pub(crate) struct KdfParams {
 /// example into a dotfiles repo.
 /// Returns:
 ///   File contents, or `None` if the file does not exist.
-pub(crate) fn read_vault_file(path: &Path) -> anyhow::Result<Option<String>> {
-    match VerifiedPath::new_follow(path, None).and_then(|path| vfs::read_to_string(&path)) {
+pub(crate) fn read_vault_file(path: &VerifiedPath) -> anyhow::Result<Option<String>> {
+    let (dir, name) = vault_dir(path)?;
+    let read = dir
+        .join_follow(name, None)
+        .and_then(|file| file.read_to_string());
+    match read {
         Ok(s) => Ok(Some(s)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(anyhow!(messages::vault::read_vault_file(path.display(), e))),
+        Err(e) => Err(anyhow!(messages::vault::read_vault_file(path, e))),
     }
 }
 
-/// Split `path` into its directory and its file name. The directory
-/// follows symlinks: it is a user directory, for example `~/.airlock`.
-fn vault_dir(path: &Path) -> anyhow::Result<(VerifiedPath, &std::ffi::OsStr)> {
-    let name = path
-        .file_name()
-        .ok_or_else(|| anyhow!(messages::vault::vault_path_no_file_name(path.display())))?;
-    let parent = path.parent().unwrap_or(Path::new("."));
-    let parent = if parent.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        parent
-    };
-    Ok((VerifiedPath::new_follow(parent, None)?, name))
+/// Split `path` into its directory and its file name.
+fn vault_dir(path: &VerifiedPath) -> anyhow::Result<(VerifiedPath, &std::ffi::OsStr)> {
+    match (path.parent(), path.file_name()) {
+        (Some(dir), Some(name)) => Ok((dir, name)),
+        _ => bail!(messages::vault::vault_path_no_file_name(path)),
+    }
+}
+
+/// Get the path of the lock file of the vault file `path`: the same name
+/// with the extension `lock`.
+fn vault_lock_file(path: &VerifiedPath) -> anyhow::Result<VerifiedPath> {
+    let (dir, name) = vault_dir(path)?;
+    let name = name.to_string_lossy();
+    let stem = name
+        .rsplit_once('.')
+        .filter(|(stem, _)| !stem.is_empty())
+        .map_or(&*name, |(stem, _)| stem);
+    Ok(dir.join(format!("{stem}.lock"))?)
 }
 
 /// Take an exclusive advisory lock on `path`. The lock stays until the
 /// returned handle drops. Serializes vault writes across processes.
-fn acquire_file_lock(path: &Path) -> anyhow::Result<File> {
+fn acquire_file_lock(path: &VerifiedPath) -> anyhow::Result<File> {
     use std::os::unix::io::AsRawFd;
-    let (dir, name) = vault_dir(path)?;
-    vfs::create_dir_all(&dir).with_context(|| messages::vault::create_vault_directory(&dir))?;
+    let (dir, _) = vault_dir(path)?;
+    dir.mkdirs()
+        .with_context(|| messages::vault::create_vault_directory(&dir))?;
     // `O_NOFOLLOW`: refuse a symlink at the lock path. Do not follow it to
     // create or lock a different file.
     let mut opts = OpenOptions::new();
@@ -609,16 +642,15 @@ fn acquire_file_lock(path: &Path) -> anyhow::Result<File> {
         .truncate(false)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW);
-    let file = dir
-        .join(name)
-        .and_then(|lock| vfs::open_with(&lock, &opts))
-        .with_context(|| messages::vault::open_vault_lock(path.display()))?;
+    let file = path
+        .open_with(&opts)
+        .with_context(|| messages::vault::open_vault_lock(path))?;
     // The lock blocks (writes are short), so concurrent writers wait in a
     // queue and do not fail.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
     if rc != 0 {
         return Err(anyhow!(messages::vault::lock_vault(
-            path.display(),
+            path,
             std::io::Error::last_os_error()
         )));
     }
@@ -629,7 +661,7 @@ fn acquire_file_lock(path: &Path) -> anyhow::Result<File> {
 /// Creates the directory if it does not exist. The directory can be a
 /// link (see [`read_vault_file`]). A link at `path` is replaced, not
 /// followed.
-pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn atomic_write(path: &VerifiedPath, bytes: &[u8]) -> anyhow::Result<()> {
     let (dir, name) = vault_dir(path)?;
     atomic_write_in(&dir, name, bytes)
 }
@@ -643,7 +675,8 @@ pub(crate) fn atomic_write_in(
     bytes: &[u8],
 ) -> anyhow::Result<()> {
     let name = name.as_ref();
-    vfs::create_dir_all(dir).with_context(|| messages::vault::create_vault_directory(dir))?;
+    dir.mkdirs()
+        .with_context(|| messages::vault::create_vault_directory(dir))?;
     let path = dir.join(name)?;
     // Write to a sibling temp file and rename it, so a crash during the
     // write cannot leave a truncated file. The temp name is unique per
@@ -657,9 +690,9 @@ pub(crate) fn atomic_write_in(
     // that appears after the remove.
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true).mode(0o600);
-    let opened = match vfs::remove_file(&tmp) {
+    let opened = match tmp.remove_file() {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-        _ => vfs::open_with(&tmp, &opts),
+        _ => tmp.open_with(&opts),
     };
     let mut f: File = opened.with_context(|| messages::vault::create_vault_tempfile(&tmp))?;
     f.write_all(bytes)
@@ -667,7 +700,8 @@ pub(crate) fn atomic_write_in(
     f.sync_all()
         .with_context(|| messages::vault::fsync_vault_tempfile(&tmp))?;
     drop(f);
-    vfs::rename(&tmp, &path).with_context(|| messages::vault::rename_vault_tempfile(&path))?;
+    tmp.rename_to(&path)
+        .with_context(|| messages::vault::rename_vault_tempfile(&path))?;
     Ok(())
 }
 

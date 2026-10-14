@@ -71,8 +71,9 @@ fn resolve(user: &str, project: &str) -> ConfigValues {
     )
     .unwrap();
     let packs = crate::packs::init().unwrap();
-    let data = crate::test_cfg::temp_dir();
-    block_on(layers.resolve(data.path(), &packs, &ConfigOverrides::default()))
+    let tmp = crate::test_cfg::temp_dir();
+    let data = crate::test_cfg::oci::data_dir_at(tmp.path());
+    block_on(layers.resolve(&data, &packs, &ConfigOverrides::default()))
         .unwrap()
         .values
 }

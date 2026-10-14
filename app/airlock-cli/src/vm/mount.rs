@@ -8,14 +8,15 @@
 //! directory that the sandbox can write must stay in that directory: the
 //! sandbox can change the symlinks there.
 
+use std::ffi::OsString;
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::Components;
 
 use crate::config::config_values::{ConfigValues, Mount};
 use crate::messages;
+use crate::util::VerifiedPath;
 use crate::util::verified_path::{Refusal, refusal};
-use crate::util::{VerifiedPath, vfs};
 
 /// A mount with expanded and validated host and guest paths.
 #[derive(Debug)]
@@ -98,31 +99,30 @@ impl ResolvedMount {
 ///   that the sandbox can write and a symlink there points out of it.
 pub fn resolve_mounts(
     mounts: &[(&str, Mount)],
-    host_home: &Path,
+    host_home: &VerifiedPath,
     container_home: &str,
-    cwd: &Path,
-    guest_cwd: &Path,
+    cwd: &VerifiedPath,
+    guest_cwd: &str,
     project_share: bool,
 ) -> anyhow::Result<Vec<ResolvedMount>> {
     use crate::config::config_values::MissingAction;
 
     let found = resolve_sources(mounts, host_home, cwd)?;
-    let writable = writable_dirs(project_share.then_some(cwd), &found)?;
+    let writable = writable_dirs(project_share.then_some(cwd), &found);
 
-    let container_home = PathBuf::from(container_home);
     let mut result = Vec::new();
     let mut dir_idx: usize = 0;
     for Source {
         name,
         mount: m,
-        path,
-        resolved: source,
+        resolved,
         is_dir,
     } in found
     {
         // Check before a create, so that a create cannot go through a link
         // out of the writable directory.
-        check_stays_in(messages::vm::MOUNT_KIND_SOURCE, &path, &source, &writable)?;
+        check_stays_in(messages::vm::MOUNT_KIND_SOURCE, &resolved, &writable)?;
+        let mut source = resolved;
 
         let is_dir = match is_dir {
             Some(is_dir) => is_dir,
@@ -140,27 +140,26 @@ pub fn resolve_mounts(
                 }
                 MissingAction::Ignore => continue,
                 MissingAction::CreateDir => {
-                    vfs::create_dir_all(&source)?;
+                    source.mkdirs()?;
                     let mode = parse_mode(m.create_mode.as_deref(), 0o755)?;
-                    vfs::set_permissions(&source, std::fs::Permissions::from_mode(mode))?;
+                    source.set_permissions(std::fs::Permissions::from_mode(mode))?;
+                    // Pin the new dir before it becomes a share.
+                    source = source.reverify()?;
                     true
                 }
                 MissingAction::CreateFile => {
                     let mode = parse_mode(m.create_mode.as_deref(), 0o644)?;
                     create_file(&source, m.file_content.as_deref().unwrap_or(""), mode)?;
+                    // Pin the new file before it becomes a share.
+                    source = source.reverify()?;
                     false
                 }
             },
         };
 
-        let target = crate::util::expand_tilde(&m.target, &container_home);
         // Resolve relative target paths against guest_cwd (the same as
         // source paths against cwd).
-        let target = if target.is_relative() {
-            guest_cwd.join(&target)
-        } else {
-            target
-        };
+        let target = join_str(guest_cwd, &expand_tilde_str(&m.target, container_home));
 
         // Dir mounts get numbered tags (dir_0, dir_1, ...) in config key
         // order. File mounts use the config key as their identifier.
@@ -179,7 +178,7 @@ pub fn resolve_mounts(
             name: name.to_string(),
             given: m.source.clone(),
             source,
-            target: target.to_string_lossy().to_string(),
+            target,
             read_only: m.read_only,
         });
     }
@@ -194,9 +193,8 @@ pub(crate) struct Source<'a> {
     pub name: &'a str,
     /// The mount config.
     pub mount: &'a Mount,
-    /// Absolute path before the symlinks are resolved.
-    pub path: PathBuf,
-    /// The path with its symlinks resolved.
+    /// The source path with its symlinks resolved. Its given path is the
+    /// absolute path before the symlinks are resolved.
     pub resolved: VerifiedPath,
     /// True for a directory, `None` if the source is missing.
     pub is_dir: Option<bool>,
@@ -220,14 +218,13 @@ pub(crate) fn enabled_mounts(config: &ConfigValues) -> Vec<(&str, Mount)> {
 ///   The sources, or error if a source cannot be resolved.
 pub(crate) fn resolve_sources<'a>(
     mounts: &'a [(&'a str, Mount)],
-    host_home: &Path,
-    cwd: &Path,
+    host_home: &VerifiedPath,
+    cwd: &VerifiedPath,
 ) -> anyhow::Result<Vec<Source<'a>>> {
     let mut found = Vec::new();
     for (name, m) in mounts {
-        let path = absolute(&m.source, host_home, cwd);
-        let source = VerifiedPath::new_follow(&path, None)?;
-        let is_dir = match vfs::metadata(&source) {
+        let source = host_path(&m.source, host_home, cwd)?;
+        let is_dir = match source.metadata() {
             Ok(md) => Some(md.is_dir()),
             // A dangling symlink is a missing source. A create refuses it.
             Err(e) if is_missing(&e) => None,
@@ -236,7 +233,6 @@ pub(crate) fn resolve_sources<'a>(
         found.push(Source {
             name,
             mount: m,
-            path,
             resolved: source,
             is_dir,
         });
@@ -245,17 +241,14 @@ pub(crate) fn resolve_sources<'a>(
 }
 
 /// Get the directories that the sandbox can write: the shared project
-/// directory `project_dir` and the writable directory mounts of `sources`. A missing source
-/// with `create-dir` counts as a directory.
+/// directory `project_dir` and the writable directory mounts of
+/// `sources`. A missing source with `create-dir` counts as a directory.
 pub(crate) fn writable_dirs(
-    project_dir: Option<&Path>,
+    project_dir: Option<&VerifiedPath>,
     sources: &[Source],
-) -> io::Result<Vec<VerifiedPath>> {
+) -> Vec<VerifiedPath> {
     use crate::config::config_values::MissingAction;
-    let mut writable = Vec::new();
-    if let Some(dir) = project_dir {
-        writable.push(VerifiedPath::new_follow(dir, None)?);
-    }
+    let mut writable: Vec<_> = project_dir.into_iter().cloned().collect();
     for s in sources {
         let dir = s
             .is_dir
@@ -264,17 +257,55 @@ pub(crate) fn writable_dirs(
             writable.push(s.resolved.clone());
         }
     }
-    Ok(writable)
+    writable
 }
 
-/// Make a host path from the config absolute: expand `~` from
-/// `host_home`, and resolve a relative path from `cwd`.
-pub(crate) fn absolute(path: &str, host_home: &Path, cwd: &Path) -> PathBuf {
-    let path = crate::util::expand_tilde(path, host_home);
-    if path.is_relative() {
-        cwd.join(path)
+/// Resolve a host path from the config and follow its symlinks.
+/// Args:
+///  - `given`: Path from the config
+///  - `host_home`: Host home. `~` expands from it
+///  - `cwd`: Host project directory. A relative path resolves from it
+///
+/// Returns:
+///   The resolved path. Its given path is the absolute path before the
+///   symlinks are resolved. Error if the path cannot be resolved.
+pub(crate) fn host_path(
+    given: &str,
+    host_home: &VerifiedPath,
+    cwd: &VerifiedPath,
+) -> io::Result<VerifiedPath> {
+    if given == "~" {
+        Ok(host_home.clone())
+    } else if let Some(rest) = given.strip_prefix("~/") {
+        host_home.join_follow(rest, None)
+    } else if given.starts_with('/') {
+        VerifiedPath::new_follow(given, None)
     } else {
-        path
+        cwd.join_follow(given, None)
+    }
+}
+
+/// Expand `~` in the path text `path` from the home directory `home`.
+/// Used for guest paths, and for host paths that are only shown.
+pub(crate) fn expand_tilde_str(path: &str, home: &str) -> String {
+    if path == "~" {
+        home.to_string()
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        join_str(home, rest)
+    } else {
+        path.to_string()
+    }
+}
+
+/// Join the path text `path` to the directory `base`. An absolute `path`
+/// stays as it is.
+pub(crate) fn join_str(base: &str, path: &str) -> String {
+    if path.starts_with('/') || base.is_empty() {
+        path.to_string()
+    } else if base.ends_with('/') {
+        format!("{base}{path}")
+    } else {
+        format!("{base}/{path}")
     }
 }
 
@@ -288,11 +319,11 @@ fn is_missing(e: &io::Error) -> bool {
 fn create_file(source: &VerifiedPath, content: &str, mode: u32) -> anyhow::Result<()> {
     // The resolved path has no symlinks: its parent is the resolved parent
     // plus the missing names.
-    if let Some(parent) = source.to_path()?.parent() {
-        vfs::create_dir_all(&VerifiedPath::new_follow(parent, None)?)?;
+    if let Some(parent) = source.parent() {
+        parent.mkdirs()?;
     }
     // A new file never follows a symlink that appears at the name.
-    let mut file = vfs::create_new(source)?;
+    let mut file = source.create_new()?;
     file.write_all(content.as_bytes())?;
     file.set_permissions(std::fs::Permissions::from_mode(mode))?;
     Ok(())
@@ -305,17 +336,19 @@ fn create_file(source: &VerifiedPath, content: &str, mode: u32) -> anyhow::Resul
 /// Args:
 ///  - `kind`: Kind of the path for the error message, for example
 ///    `mount source`
-///  - `path`: Absolute path before the symlinks are resolved
-///  - `resolved`: The path with its symlinks resolved
+///  - `resolved`: The path with its symlinks resolved. Its given path is
+///    the absolute path before the symlinks are resolved
 ///  - `writable`: Directories that the sandbox can write
 ///
 /// Returns:
-///   Error if a place on the way of `path` (a directory, a symlink or the
+///   Error if a place on the way of the given path (a directory, a symlink or the
 ///   end) is in a directory of `writable`, and `resolved` is not in the
-///   deepest such directory. Also error if a symlink cannot be read.
+///   deepest such directory. Also error if the given path is relative or a
+///   symlink cannot be read.
+///
+/// The path must come from `new_follow`, `home_dir` or `current_dir` bases.
 pub(crate) fn check_stays_in(
     kind: &str,
-    path: &Path,
     resolved: &VerifiedPath,
     writable: &[VerifiedPath],
 ) -> anyhow::Result<()> {
@@ -324,7 +357,8 @@ pub(crate) fn check_stays_in(
         .iter()
         .map(VerifiedPath::to_entry_path)
         .collect::<io::Result<Vec<_>>>()?;
-    for place in visited_places(path)? {
+    for place in visited_places(resolved)? {
+        let place = place.to_entry_path()?;
         // A writable mount can be in the project. A symlink in the mount
         // must then stay in the mount.
         let Some(dir) = dirs
@@ -336,12 +370,7 @@ pub(crate) fn check_stays_in(
         };
         anyhow::ensure!(
             target.starts_with(dir),
-            messages::vm::path_leaves_writable_dir(
-                kind,
-                path.display(),
-                dir.display(),
-                target.display()
-            )
+            messages::vm::path_leaves_writable_dir(kind, resolved, dir.display(), target.display())
         );
     }
     Ok(())
@@ -350,55 +379,55 @@ pub(crate) fn check_stays_in(
 /// Most symlinks that one path can go through. Linux has the same limit.
 const MAX_HOPS: usize = 40;
 
-/// Resolve the absolute path `path` one symlink at a time.
+/// Resolve the given path of `path` one symlink at a time.
 /// Returns:
 ///   Each place on the way: each directory, each symlink and the end.
-///   Error if a symlink cannot be read or there are too many symlinks.
-fn visited_places(path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+///   Error if the given path is relative, a symlink cannot be read or there
+///   are too many symlinks.
+fn visited_places(path: &VerifiedPath) -> anyhow::Result<Vec<VerifiedPath>> {
     // The parts to resolve, the next part last. The target of a symlink
     // goes in front of the rest.
-    let parts = |p: &Path| -> Vec<PathBuf> {
-        p.components()
-            .rev()
-            .map(|c| PathBuf::from(c.as_os_str()))
-            .collect()
-    };
-    let mut todo = parts(path);
+    fn parts(components: Components<'_>) -> Vec<OsString> {
+        components.rev().map(|c| c.as_os_str().to_owned()).collect()
+    }
+    anyhow::ensure!(
+        path.given().is_absolute(),
+        messages::vm::path_not_absolute(path.given().display())
+    );
+    let root = VerifiedPath::new_follow("/", None)?;
+    let mut todo = parts(path.given().components());
     let mut places = Vec::new();
     // `current` has no symlinks: each part in it was checked.
-    let mut current = PathBuf::from("/");
+    let mut current = root.clone();
     let mut hops = 0;
     let mut missing = false;
     while let Some(part) = todo.pop() {
-        match part.components().next() {
-            Some(Component::RootDir) => current = PathBuf::from("/"),
-            Some(Component::ParentDir) => {
-                current.pop();
-            }
-            Some(Component::Normal(name)) => {
-                let next = current.join(name);
-                // From the first missing part on, there are no symlinks.
-                if !missing {
-                    let entry = VerifiedPath::new_follow(&current, None)?.join(name)?;
-                    match vfs::symlink_metadata(&entry) {
-                        Ok(md) if md.file_type().is_symlink() => {
-                            hops += 1;
-                            if hops > MAX_HOPS {
-                                return Err(io::Error::from_raw_os_error(libc::ELOOP).into());
-                            }
-                            todo.extend(parts(&vfs::read_link(&entry)?));
-                            places.push(next);
-                            continue;
+        // Any other part is a normal name.
+        if part == "/" {
+            current = root.clone();
+        } else if part == ".." {
+            current = current.parent().unwrap_or(current);
+        } else if part != "." {
+            let next = current.join(&part)?;
+            // From the first missing part on, there are no symlinks.
+            if !missing {
+                match next.symlink_metadata() {
+                    Ok(md) if md.file_type().is_symlink() => {
+                        hops += 1;
+                        if hops > MAX_HOPS {
+                            return Err(io::Error::from_raw_os_error(libc::ELOOP).into());
                         }
-                        Ok(_) => {}
-                        Err(e) if e.kind() == io::ErrorKind::NotFound => missing = true,
-                        Err(e) => return Err(e.into()),
+                        todo.extend(parts(next.read_link()?.components()));
+                        places.push(next);
+                        continue;
                     }
+                    Ok(_) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => missing = true,
+                    Err(e) => return Err(e.into()),
                 }
-                current = next;
-                places.push(current.clone());
             }
-            Some(Component::CurDir | Component::Prefix(_)) | None => {}
+            current = next;
+            places.push(current.clone());
         }
     }
     Ok(places)
@@ -458,6 +487,8 @@ pub fn check_exposure(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     /// A directory mount of `source`. `key` is `project` for the project

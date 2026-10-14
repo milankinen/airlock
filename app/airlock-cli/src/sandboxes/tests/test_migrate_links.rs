@@ -4,6 +4,7 @@ use std::os::unix::fs::symlink;
 use std::path::Path;
 
 use crate::sandboxes::{MigrateError, migrate, registry};
+use crate::test_cfg::oci::verified_dir;
 use crate::test_cfg::sandboxes::{LEGACY_CA, legacy_sandbox};
 use crate::test_cfg::{block_on_local, temp_dir, test_context};
 use crate::vault::{Vault, VaultStorageType};
@@ -42,17 +43,17 @@ fn migrate_with_planted_symlinks_is_refused_and_moves_nothing() {
 
     let linked_airlock = project(&root, "linked-airlock");
     symlink(victim.join(".airlock"), linked_airlock.join(".airlock")).unwrap();
-    assert!(block_on_local(migrate(&context, &linked_airlock)).is_err());
+    assert!(block_on_local(migrate(&context, &verified_dir(&linked_airlock))).is_err());
 
     let linked_sandbox = project(&root, "linked-sandbox");
     std::fs::create_dir_all(linked_sandbox.join(".airlock")).unwrap();
     symlink(&victim_sandbox, linked_sandbox.join(".airlock/sandbox")).unwrap();
-    assert!(block_on_local(migrate(&context, &linked_sandbox)).is_err());
+    assert!(block_on_local(migrate(&context, &verified_dir(&linked_sandbox))).is_err());
 
     let linked_config = project(&root, "linked-config");
     let own_sandbox = legacy_sandbox(&linked_config);
     symlink(&victim_config, linked_config.join(".airlock/airlock.toml")).unwrap();
-    let err = block_on_local(migrate(&context, &linked_config)).unwrap_err();
+    let err = block_on_local(migrate(&context, &verified_dir(&linked_config))).unwrap_err();
     assert!(
         matches!(&err, MigrateError::ExtraFiles { names } if names == &["airlock.toml"]),
         "{err}"

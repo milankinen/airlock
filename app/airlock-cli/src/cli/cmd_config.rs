@@ -6,14 +6,13 @@
 //! final config of the last run, after all files and packs merge.
 //! `airlock sandboxes config` gives the same output for any sandbox.
 
-use std::path::Path;
-
 use clap::Args;
 
 use super::cmd_info::find;
 use crate::config::export::{self, Format};
 use crate::context::Context;
 use crate::sandboxes::{self, Found};
+use crate::util::verified_path::VerifiedPath;
 use crate::{cli, config, messages, packs, project};
 
 /// CLI arguments for `airlock config`.
@@ -69,7 +68,7 @@ async fn document(
     // known already.
     let local_dir = match &found {
         Some(found) => sandboxes::local_config_dir(&project_dir, &found.dir)?,
-        None => project_dir.join(".airlock"),
+        None => project_dir.join(".airlock")?,
     };
     let document = config::load(&project_dir, &local_dir)?.project_document();
     // No config is not an error. The output stays a valid empty document,
@@ -78,7 +77,7 @@ async fn document(
         cli::log!(
             "{} {}",
             cli::yellow("!"),
-            messages::cli::no_project_config(project_dir.display())
+            messages::cli::no_project_config(&project_dir)
         );
         serde_json::Value::Object(serde_json::Map::new())
     }))
@@ -91,23 +90,19 @@ async fn document(
 ///   stored config or the config does not resolve any more.
 async fn resolved_document(
     context: &Context,
-    project_dir: &Path,
+    project_dir: &VerifiedPath,
     found: Option<&Found>,
 ) -> anyhow::Result<serde_json::Value> {
     let stored = found.and_then(|found| project::read_run_meta(&found.dir).last_run_config);
     let Some(stored) = stored else {
-        anyhow::bail!(messages::cli::no_last_run_config(project_dir.display()));
+        anyhow::bail!(messages::cli::no_last_run_config(project_dir));
     };
     let layered: config::LayeredConfig = serde_json::from_value(stored)?;
     // The resolve runs the `config.lua` of the packs. This can make the
     // pack directories in the data directory, as `start` does.
     let packs = packs::init()?;
     let resolved = layered
-        .resolve(
-            &context.data_dir,
-            &packs,
-            &config::ConfigOverrides::default(),
-        )
+        .resolve(&context.data, &packs, &config::ConfigOverrides::default())
         .await?;
     export::resolved_document(&resolved)
 }

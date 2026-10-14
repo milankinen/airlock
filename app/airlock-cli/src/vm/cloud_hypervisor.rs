@@ -11,7 +11,7 @@ use tracing::{debug, error};
 
 use super::config::VmConfig;
 use crate::messages;
-use crate::util::{VerifiedPath, vfs};
+use crate::util::VerifiedPath;
 
 /// Linux VM backend that uses cloud-hypervisor and virtiofsd.
 pub struct CloudHypervisorBackend {
@@ -27,7 +27,7 @@ impl CloudHypervisorBackend {
     pub fn start(config: &VmConfig) -> anyhow::Result<Self> {
         let runtime_dir = &config.runtime_dir;
         let vfs_dir = runtime_dir.join("vfs")?;
-        vfs::create_dir_all(&vfs_dir)?;
+        vfs_dir.mkdirs()?;
         let vsock_socket_path = runtime_dir.join("vsock.sock")?;
 
         cleanup_sockets(runtime_dir);
@@ -45,11 +45,11 @@ impl CloudHypervisorBackend {
             // parts of the tags are unique.
             let sock_name = share.tag.rsplit('/').next().unwrap_or(&share.tag);
             let sock_path = vfs_dir.join(format!("{sock_name}.sock"))?;
-            let _ = vfs::remove_file(&sock_path);
+            let _ = sock_path.remove_file();
 
-            let mut cmd = Command::new(&config.virtiofsd);
+            let mut cmd = Command::new(config.virtiofsd.to_path()?);
             cmd.arg("--socket-path").arg(sock_path.to_path()?);
-            cmd.arg("--shared-dir").arg(&share.host_path);
+            cmd.arg("--shared-dir").arg(share.host_path.to_path()?);
             cmd.arg("--xattr");
             cmd.arg("--sandbox").arg("none");
             cmd.arg("--translate-uid")
@@ -84,9 +84,9 @@ impl CloudHypervisorBackend {
         // Make the cloud-hypervisor command.
         let ram_mib = config.memory_bytes / (1024 * 1024);
 
-        let mut cmd = Command::new(&config.cloud_hypervisor);
-        cmd.arg("--kernel").arg(&config.kernel);
-        cmd.arg("--initramfs").arg(&config.initramfs);
+        let mut cmd = Command::new(config.cloud_hypervisor.to_path()?);
+        cmd.arg("--kernel").arg(config.kernel.to_path()?);
+        cmd.arg("--initramfs").arg(config.initramfs.to_path()?);
         cmd.arg("--cmdline").arg(&config.kernel_cmdline);
         let cpus_arg = if config.kvm {
             format!("boot={},nested=on", config.cpus)
@@ -120,13 +120,15 @@ impl CloudHypervisorBackend {
 
         // Block device for the cache disk.
         if let Some(cache_disk) = &config.cache_disk {
-            cmd.arg("--disk")
-                .arg(format!("path={},image_type=raw", cache_disk.display()));
+            cmd.arg("--disk").arg(format!(
+                "path={},image_type=raw",
+                cache_disk.to_path()?.display()
+            ));
         }
 
         let ch_log = runtime_dir.join("cloud-hypervisor.log")?;
         remove_old(&ch_log)?;
-        let log_file = vfs::create_new(&ch_log)?;
+        let log_file = ch_log.create_new()?;
         let log_file_err = log_file.try_clone()?;
 
         cmd.stdin(Stdio::null());
@@ -153,7 +155,7 @@ impl CloudHypervisorBackend {
     /// Returns:
     ///   The connected socket, or error if the `CONNECT` handshake fails.
     pub fn vsock_connect(&self, port: u32) -> anyhow::Result<OwnedFd> {
-        let mut stream = vfs::connect_unix(&self.vsock_socket_path).map_err(|e| {
+        let mut stream = self.vsock_socket_path.connect_unix().map_err(|e| {
             anyhow::anyhow!(messages::vm::vsock_socket_connect_failed(
                 &self.vsock_socket_path,
                 e
@@ -250,11 +252,11 @@ fn tie_to_airlock(cmd: &mut Command) {
 /// Remove the old entry at `path`, if any. Never follows a symlink.
 /// A directory is removed too, so a planted directory cannot block a start.
 fn remove_old(path: &VerifiedPath) -> std::io::Result<()> {
-    let is_dir = vfs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
+    let is_dir = path.symlink_metadata().is_ok_and(|m| m.is_dir());
     let result = if is_dir {
-        vfs::remove_dir_all(path)
+        path.remove_dir_all()
     } else {
-        vfs::remove_file(path)
+        path.remove_file()
     };
     match result {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
@@ -265,7 +267,7 @@ fn remove_old(path: &VerifiedPath) -> std::io::Result<()> {
 /// Wait up to 5 s until the virtiofsd socket at `path` exists.
 fn wait_for_socket(path: &VerifiedPath, tag: &str) -> anyhow::Result<()> {
     for _ in 0..100 {
-        if vfs::metadata(path).is_ok() {
+        if path.metadata().is_ok() {
             debug!("virtiofsd socket ready: {tag}");
             return Ok(());
         }
@@ -300,20 +302,20 @@ fn cleanup_sockets(dir: &VerifiedPath) {
     let supervisor = format!("vsock.sock_{}", airlock_common::SUPERVISOR_PORT);
     for name in ["vsock.sock", "ch-api.sock", supervisor.as_str()] {
         if let Ok(path) = dir.join(name) {
-            let _ = vfs::remove_file(&path);
+            let _ = path.remove_file();
         }
     }
     // Remove the virtiofsd sockets. A `vfs` symlink is refused.
     let Ok(vfs_dir) = dir.join("vfs") else {
         return;
     };
-    if let Ok(entries) = vfs::read_dir(&vfs_dir) {
+    if let Ok(entries) = vfs_dir.read_dir() {
         for entry in entries.flatten() {
             let name = entry.file_name();
             if name.to_string_lossy().ends_with(".sock")
                 && let Ok(path) = vfs_dir.join(&name)
             {
-                let _ = vfs::remove_file(&path);
+                let _ = path.remove_file();
             }
         }
     }
@@ -346,17 +348,23 @@ mod tests {
             std::os::unix::fs::symlink(&victim, runtime.join(name)).unwrap();
         }
         let roots = Roots::resolve(root, root, root).unwrap();
+        // The fake hypervisor and virtiofsd. They accept all arguments.
+        let truth = ["/usr/bin/true", "/bin/true"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .unwrap();
+        let truth = VerifiedPath::new_follow(truth, None).unwrap();
         let config = VmConfig {
             cpus: 1,
             memory_bytes: 1 << 20,
-            kernel: "Image".into(),
-            initramfs: "initramfs.gz".into(),
+            kernel: VerifiedPath::new("Image", &roots).unwrap(),
+            initramfs: VerifiedPath::new("initramfs.gz", &roots).unwrap(),
             kernel_cmdline: String::new(),
             shares: Vec::new(),
             cache_disk: None,
             runtime_dir: VerifiedPath::new(&runtime, &roots).unwrap(),
-            cloud_hypervisor: "true".into(),
-            virtiofsd: "true".into(),
+            cloud_hypervisor: truth.clone(),
+            virtiofsd: truth,
             kvm: false,
         };
 

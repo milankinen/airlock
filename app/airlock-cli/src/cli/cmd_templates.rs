@@ -12,8 +12,8 @@ use clap::{Args, Subcommand};
 use crate::cli::LogLevel;
 use crate::cli::prompt::choose;
 use crate::context::Context;
+use crate::data_dir::DataDir;
 use crate::templates::{self, CONFIG_FILE, Template};
-use crate::util::vfs;
 use crate::vm::disk::DISK_FILE;
 use crate::{cli, messages, oci, start};
 
@@ -67,11 +67,11 @@ enum TemplateCmd {
 pub async fn main(args: TemplateArgs, context: &Context) -> i32 {
     let result = match args.cmd {
         TemplateCmd::List => {
-            list(context);
+            list(&context.data);
             Ok(0)
         }
-        TemplateCmd::Info { name } => info(context, &name),
-        TemplateCmd::Remove { name, force } => remove(context, &name, force),
+        TemplateCmd::Info { name } => info(&context.data, &name),
+        TemplateCmd::Remove { name, force } => remove(&context.data, &name, force),
         TemplateCmd::Create {
             name,
             force,
@@ -101,7 +101,7 @@ async fn create(
     verbose: bool,
 ) -> Result<i32, start::Exit> {
     cli::set_verbose(verbose);
-    start::check_data_dir(&context.data_dir)?;
+    start::check_data_dir(&context.data)?;
     start::check_system_requirements();
     start::init_logging(log_level);
     Box::pin(templates::create::create(
@@ -112,8 +112,8 @@ async fn create(
 }
 
 /// Print the table of the templates.
-fn list(context: &Context) {
-    let templates = templates::list(&context.roots.data_dir);
+fn list(data: &DataDir) {
+    let templates = templates::list(data);
     if templates.is_empty() {
         cli::log!("{}", messages::cli::NO_TEMPLATES);
         return;
@@ -151,8 +151,8 @@ fn list(context: &Context) {
 }
 
 /// Print the details of the template `name`.
-fn info(context: &Context, name: &str) -> anyhow::Result<i32> {
-    let template = templates::find(&context.roots.data_dir, name)?;
+fn info(data: &DataDir, name: &str) -> anyhow::Result<i32> {
+    let template = templates::find(data, name)?;
     let config = &template.config;
     println!("{}", messages::cli::template_info_name(&template.name));
     println!("{}", messages::cli::template_info_directory(&template.dir));
@@ -213,15 +213,15 @@ fn info(context: &Context, name: &str) -> anyhow::Result<i32> {
 
 /// Remove the template `name` after a confirmation (unless `force`). Then
 /// remove the images that nothing uses.
-fn remove(context: &Context, name: &str, force: bool) -> anyhow::Result<i32> {
+fn remove(data: &DataDir, name: &str, force: bool) -> anyhow::Result<i32> {
     // Fail before the question.
-    templates::find(&context.roots.data_dir, name)?;
+    templates::find(data, name)?;
     if !force && !confirm(name) {
         cli::error!("{}", messages::cli::ABORTED);
         return Ok(0);
     }
-    templates::remove(&context.roots.data_dir, name)?;
-    oci::gc_sweep(&context.roots.data_dir);
+    templates::remove(data, name)?;
+    oci::gc_sweep(data);
     cli::log!("{}", messages::cli::template_removed(name));
     Ok(0)
 }
@@ -244,7 +244,7 @@ fn disk_used(template: &Template) -> Option<u64> {
 
 /// Return the metadata of the file `name` of `template`, if it exists.
 fn file_meta(template: &Template, name: &str) -> Option<Metadata> {
-    vfs::metadata(&template.dir.join(name).ok()?).ok()
+    template.dir.join(name).ok()?.metadata().ok()
 }
 
 /// Return the pack names of `template`, separated with commas.

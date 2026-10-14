@@ -207,10 +207,11 @@ fn project_in_home_directory_reads_local_file_as_project_file_only() {
         ".airlock/airlock.toml",
         "[packs]\npython = { version = 1 }\n",
     );
+    let project = dirs.project_dir();
     let layers = crate::config::LayeredConfig::load_from(
-        &dirs.project(),
-        &dirs.project(),
-        &dirs.project().join(".airlock"),
+        &project,
+        &project,
+        &project.join(".airlock").unwrap(),
     )
     .unwrap();
     assert!(layers.has_project_config());

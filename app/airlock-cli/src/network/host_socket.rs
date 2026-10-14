@@ -14,10 +14,9 @@
 use std::cell::Cell;
 use std::io;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
 
 use crate::messages;
-use crate::util::{VerifiedPath, vfs};
+use crate::util::VerifiedPath;
 use crate::vm::mount;
 
 /// Device and inode number of a socket.
@@ -51,18 +50,12 @@ impl HostSocket {
     ///   it.
     pub(crate) fn resolve(
         given: &str,
-        host_home: &Path,
-        cwd: &Path,
+        host_home: &VerifiedPath,
+        cwd: &VerifiedPath,
         writable: &[VerifiedPath],
     ) -> anyhow::Result<Self> {
-        let path = mount::absolute(given, host_home, cwd);
-        let resolved = VerifiedPath::new_follow(&path, None)?;
-        mount::check_stays_in(
-            messages::network::SOCKET_KIND_HOST,
-            &path,
-            &resolved,
-            writable,
-        )?;
+        let resolved = mount::host_path(given, host_home, cwd)?;
+        mount::check_stays_in(messages::network::SOCKET_KIND_HOST, &resolved, writable)?;
         let target = resolved.to_entry_path()?;
         let pinned = writable
             .iter()
@@ -111,13 +104,13 @@ impl HostSocket {
                 Some(_) => {}
             }
         }
-        vfs::connect_unix_async(&self.path).await
+        self.path.connect_unix_async().await
     }
 
     /// Get the identity and the link count of the socket that is now at the
     /// path.
     fn current_id(&self) -> io::Result<(Id, u64)> {
-        let md = vfs::metadata(&self.path)?;
+        let md = self.path.metadata()?;
         Ok(((md.dev(), md.ino()), md.nlink()))
     }
 

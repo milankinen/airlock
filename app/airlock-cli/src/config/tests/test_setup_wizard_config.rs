@@ -5,6 +5,7 @@ use crate::config::config_values::PullPolicy;
 use crate::config::generated::{Clipboard, GeneratedConfig, NewEntry, Target};
 use crate::config::{ConfigOverrides, LayeredConfig, ResolvedConfig};
 use crate::packs::ArgValue;
+use crate::test_cfg::oci::verified_dir;
 use crate::test_cfg::{ConfigDirs, resolve_layers, resolve_project_toml, temp_dir, test_template};
 
 /// Return a wizard pack entry at version 1 with the given args.
@@ -61,7 +62,7 @@ fn wizard_project_config_resolves_before_save_and_after_reload() {
 
     let slow = ArgValue::Text("slow".into());
     let generated = GeneratedConfig::new(
-        &dirs.project(),
+        &dirs.project_dir(),
         Target::Project,
         &[
             entry("claude", vec![]),
@@ -74,7 +75,7 @@ fn wizard_project_config_resolves_before_save_and_after_reload() {
         }),
         None,
     );
-    assert_eq!(generated.path, dirs.project().join("airlock.toml"));
+    assert_eq!(generated.path(), dirs.project_origin("airlock.toml"));
     assert_eq!(
         generated.toml,
         "[packs]\n\
@@ -96,21 +97,21 @@ fn wizard_project_config_resolves_before_save_and_after_reload() {
     // A second in-memory project layer is an error.
     assert!(layers.with_generated_project(generated.clone()).is_err());
 
-    let local_dir = dirs.project().join(".airlock");
+    let local_dir = dirs.project_dir().join(".airlock").unwrap();
     generated.save(&local_dir).unwrap();
     assert_eq!(
-        std::fs::read_to_string(&generated.path).unwrap(),
+        std::fs::read_to_string(generated.path()).unwrap(),
         generated.toml
     );
-    assert!(!local_dir.exists());
+    assert!(!dirs.project().join(".airlock").exists());
     assert_wizard_choices(&dirs.resolve().unwrap());
 
     // The project file exists now, so the save of a new config must fail.
-    let other = GeneratedConfig::new(&dirs.project(), Target::Project, &[], None, None, None);
+    let other = GeneratedConfig::new(&dirs.project_dir(), Target::Project, &[], None, None, None);
     let err = other.save(&local_dir).unwrap_err().to_string();
     assert!(err.contains("appeared"), "{err}");
     assert_eq!(
-        std::fs::read_to_string(&generated.path).unwrap(),
+        std::fs::read_to_string(generated.path()).unwrap(),
         generated.toml
     );
 }
@@ -128,13 +129,16 @@ fn wizard_project_config_resolves_before_save_and_after_reload() {
 #[test]
 fn wizard_local_config_goes_to_airlock_dir_or_sandbox_dir() {
     let dirs = ConfigDirs::new();
-    let generated = GeneratedConfig::new(&dirs.project(), Target::Local, &[], None, None, None);
+    let generated = GeneratedConfig::new(&dirs.project_dir(), Target::Local, &[], None, None, None);
     assert_eq!(generated.toml, "");
-    assert_eq!(generated.path, dirs.project().join(".airlock/airlock.toml"));
-    let local_dir = dirs.project().join(".airlock");
+    assert_eq!(
+        generated.path(),
+        dirs.project_origin(".airlock/airlock.toml")
+    );
+    let local_dir = dirs.project_dir().join(".airlock").unwrap();
     generated.save(&local_dir).unwrap();
     assert_eq!(
-        std::fs::read_to_string(local_dir.join(".gitignore")).unwrap(),
+        std::fs::read_to_string(dirs.project().join(".airlock/.gitignore")).unwrap(),
         "*\n"
     );
     assert!(!dirs.project().join("airlock.toml").exists());
@@ -143,11 +147,18 @@ fn wizard_local_config_goes_to_airlock_dir_or_sandbox_dir() {
 
     let boxed = ConfigDirs::new();
     let sandbox = temp_dir();
-    let generated = GeneratedConfig::new(&boxed.project(), Target::Local, &[], None, None, None);
-    let path = generated.save(sandbox.path()).unwrap();
-    assert_eq!(path, sandbox.path().join("airlock.toml"));
+    let generated =
+        GeneratedConfig::new(&boxed.project_dir(), Target::Local, &[], None, None, None);
+    let sandbox_dir = verified_dir(sandbox.path());
+    let path = generated.save(&sandbox_dir).unwrap();
+    assert_eq!(path, sandbox_dir.join("airlock.toml").unwrap());
     assert!(std::fs::read_dir(boxed.project()).unwrap().next().is_none());
-    let layers = LayeredConfig::load_from(&boxed.home(), &boxed.project(), sandbox.path()).unwrap();
+    let layers = LayeredConfig::load_from(
+        &verified_dir(&boxed.home()),
+        &boxed.project_dir(),
+        &sandbox_dir,
+    )
+    .unwrap();
     assert!(layers.has_project_config());
 }
 
@@ -174,7 +185,7 @@ fn wizard_config_from_template_keeps_template_and_adds_extra_packs() {
     );
     let dirs = ConfigDirs::new();
     let generated = GeneratedConfig::new(
-        &dirs.project(),
+        &dirs.project_dir(),
         Target::Local,
         &[entry("claude", vec![])],
         None,

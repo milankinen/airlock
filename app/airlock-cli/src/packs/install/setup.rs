@@ -4,7 +4,6 @@
 //! each pack, and shuts the VM down. A failed pack does not stop the other
 //! packs. The install state is saved after each pack.
 
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::progress::{INSTALLS_LOG, InstallProgress};
@@ -18,7 +17,7 @@ use crate::project::Project;
 use crate::sandbox::boot::{self, BootSpec};
 use crate::sandbox::vm::{ProcessSpec, Stopped, Vm};
 use crate::sandbox::{self, io};
-use crate::util::PinnedDir;
+use crate::util::{PinnedDir, VerifiedPath};
 
 /// Stop a pack install if it prints nothing for this long.
 const IDLE_TIMEOUT: Duration = Duration::from_mins(20);
@@ -292,7 +291,7 @@ async fn boot_install_vm(
 }
 
 /// Path of the install log in the sandbox directory `sandbox_dir`.
-pub fn log_path(sandbox_dir: &Path) -> std::path::PathBuf {
+pub fn log_path(sandbox_dir: &VerifiedPath) -> std::io::Result<VerifiedPath> {
     sandbox_dir.join(INSTALLS_LOG)
 }
 

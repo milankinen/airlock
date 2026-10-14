@@ -48,7 +48,10 @@ impl TempHome {
 
     /// The default airlock data directory in the temporary home.
     pub fn data_dir(&self) -> std::path::PathBuf {
-        let dir = crate::cache::default_data_dir().unwrap();
+        let dir = crate::cache::default_data_dir()
+            .unwrap()
+            .given()
+            .to_path_buf();
         assert!(dir.starts_with(self.path()), "{}", dir.display());
         dir
     }

@@ -273,9 +273,9 @@ pub fn network_in_project(toml: &str, dir: &Path) -> anyhow::Result<ConfigNetwor
     let ca = TestCa::generate();
     let project = Project {
         sandbox_dir: crate::util::VerifiedPath::new_follow(dir.join("sandbox"), None).unwrap(),
-        host_home: dir.to_path_buf(),
-        host_cwd: dir.to_path_buf(),
-        guest_cwd: dir.to_path_buf(),
+        host_home: crate::util::VerifiedPath::new_follow(dir, None).unwrap(),
+        host_cwd: crate::util::VerifiedPath::new_follow(dir, None).unwrap(),
+        guest_cwd: dir.display().to_string(),
         config,
         env: env.clone(),
         ca_cert: ca.cert_pem,

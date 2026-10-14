@@ -121,12 +121,10 @@ pub async fn install_tools(
     }
 
     if to_install.iter().any(|t| !state.is_installed(&t.pack)) {
-        let log = project
-            .sandbox_dir
-            .to_path()
-            .map(setup::log_path)
+        let log = setup::log_path(&project.sandbox_dir)
+            .map(|log| log.to_string())
             .unwrap_or_default();
-        eprint!("{}\r\n", messages::start::full_log(log.display()));
+        eprint!("{}\r\n", messages::start::full_log(log));
         return Err(Exit::Code(1));
     }
     if install {

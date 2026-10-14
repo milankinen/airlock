@@ -7,13 +7,13 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
 use std::sync::{Mutex, Once};
 
 use tracing_subscriber::EnvFilter;
 
 use super::LogLevel;
 use crate::util::PinnedDir;
+use crate::util::verified_path::VerifiedPath;
 
 /// Name of the log file in the sandbox directory.
 pub const LOG_FILE: &str = "airlock.log";
@@ -97,14 +97,14 @@ pub fn init(log_level: LogLevel) {
 /// run can call it again. If the file does not open, logging stays off and
 /// nothing fails. The file is never opened through a symlink.
 // The file is first made smaller if necessary (see [`LOG_MAX_BYTES`]).
-pub fn attach(sandbox_dir: &Path) {
+pub fn attach(sandbox_dir: &VerifiedPath) {
     attach_with(&SINK, sandbox_dir);
 }
 
 /// Do [`attach`] with the destination `sink`. Tests use their own
 /// destination, so that the order of the tests in the process has no
 /// effect.
-fn attach_with(sink: &Mutex<Sink>, sandbox_dir: &Path) {
+fn attach_with(sink: &Mutex<Sink>, sandbox_dir: &VerifiedPath) {
     let mut sink = sink
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -112,7 +112,10 @@ fn attach_with(sink: &Mutex<Sink>, sandbox_dir: &Path) {
         return;
     };
     let lines = std::mem::take(lines);
-    let opened = PinnedDir::pin(sandbox_dir).and_then(|dir| dir.open_read_write(LOG_FILE, 0o600));
+    let opened = sandbox_dir
+        .to_path()
+        .and_then(PinnedDir::pin)
+        .and_then(|dir| dir.open_read_write(LOG_FILE, 0o600));
     *sink = match opened {
         Ok(mut file) => {
             rotate_log(&mut file);
@@ -153,6 +156,7 @@ mod tests {
     //! Tests for the log file setup.
 
     use super::*;
+    use crate::test_cfg::oci::verified_dir;
     use crate::test_cfg::temp_dir;
 
     /// Test that the log setup cuts an oversized log file to its last part,
@@ -176,8 +180,8 @@ mod tests {
         // A destination of the test, not the destination of the process.
         // Thus another test that sets up the log first has no effect here.
         let sink = Mutex::new(Sink::Buffer(b"early-line\n".to_vec()));
-        attach_with(&sink, first.path());
-        attach_with(&sink, second.path());
+        attach_with(&sink, &verified_dir(first.path()));
+        attach_with(&sink, &verified_dir(second.path()));
 
         let after = std::fs::read(&path).unwrap();
         let limit = usize::try_from(LOG_MAX_BYTES).unwrap();

@@ -22,7 +22,6 @@ use crate::messages;
 use crate::network::NetworkControl;
 use crate::rpc::{Process, ProcessEvent, Supervisor};
 use crate::util::verified_path::VerifiedPath;
-use crate::util::vfs;
 
 /// Limits for the port forwards that clients add at run time.
 #[derive(Clone)]
@@ -54,7 +53,7 @@ struct SockGuard(VerifiedPath);
 
 impl Drop for SockGuard {
     fn drop(&mut self) {
-        let _ = vfs::remove_file(&self.0);
+        let _ = self.0.remove_file();
     }
 }
 
@@ -77,8 +76,8 @@ pub async fn serve(
     base_env: Vec<String>,
     forwards: ForwardRules,
 ) {
-    let _ = vfs::remove_file(&sock_path);
-    let listener = match vfs::bind_unix_async(&sock_path) {
+    let _ = sock_path.remove_file();
+    let listener = match sock_path.bind_unix_async() {
         Ok(l) => l,
         Err(e) => {
             tracing::error!("cli server bind failed: {e}");

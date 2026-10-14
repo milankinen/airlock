@@ -3,16 +3,14 @@
 //! Maps the id of each sandbox in the data directory to its project
 //! directory. Sandboxes in their project directory are not in the registry.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
 
 use heed::Database;
 use heed::types::{Bytes, Str};
 
 use crate::db::Db;
 use crate::util::verified_path::VerifiedPath;
-use crate::util::vfs;
 
 /// Name of the registry database.
 const DATABASE: &str = "sandboxes";
@@ -31,8 +29,9 @@ const ID_LEN: usize = 8;
 pub struct Entry {
     /// Sandbox id. It is also the directory name in the data directory.
     pub id: String,
-    /// Canonical project directory.
-    pub project: PathBuf,
+    /// Canonical project directory, as the registry has it. Make a
+    /// verified path of it before a file operation.
+    pub project: OsString,
 }
 
 /// Check that `id` has the form of a sandbox id. Thus an id can never name
@@ -50,7 +49,7 @@ pub async fn list(db: &Db) -> anyhow::Result<Vec<Entry>> {
             let (id, project) = item?;
             entries.push(Entry {
                 id: id.to_string(),
-                project: PathBuf::from(OsStr::from_bytes(project)),
+                project: OsStr::from_bytes(project).to_owned(),
             });
         }
         Ok(entries)
@@ -61,13 +60,13 @@ pub async fn list(db: &Db) -> anyhow::Result<Vec<Entry>> {
 /// Get the project directory of the sandbox `id`.
 /// Returns:
 ///   The project directory, or `None` if `id` is not registered.
-pub async fn get(db: &Db, id: &str) -> anyhow::Result<Option<PathBuf>> {
+pub async fn get(db: &Db, id: &str) -> anyhow::Result<Option<OsString>> {
     let table: Table = db.database(DATABASE).await?;
     let id = id.to_string();
     db.read(move |txn| {
         Ok(table
             .get(txn, &id)?
-            .map(|project| PathBuf::from(OsStr::from_bytes(project))))
+            .map(|project| OsStr::from_bytes(project).to_owned()))
     })
     .await
 }
@@ -86,13 +85,13 @@ pub async fn get(db: &Db, id: &str) -> anyhow::Result<Option<PathBuf>> {
 pub async fn find_or_register(
     db: &Db,
     boxes_dir: &VerifiedPath,
-    project: &Path,
+    project: &VerifiedPath,
 ) -> anyhow::Result<String> {
     let table: Table = db.database(DATABASE).await?;
     let boxes_dir = boxes_dir.clone();
-    let project = project.to_path_buf();
+    let project = project.to_entry_path()?.as_os_str().to_owned();
     db.write(move |txn| {
-        let key = project.as_os_str().as_bytes();
+        let key = project.as_bytes();
         for item in table.iter(txn)? {
             let (id, path) = item?;
             if path == key {
@@ -101,8 +100,8 @@ pub async fn find_or_register(
         }
         loop {
             let id = new_id()?;
-            let taken = table.get(txn, &id)?.is_some()
-                || vfs::symlink_metadata(&boxes_dir.join(&id)?).is_ok();
+            let taken =
+                table.get(txn, &id)?.is_some() || boxes_dir.join(&id)?.symlink_metadata().is_ok();
             if !taken {
                 table.put(txn, &id, key)?;
                 return Ok(id);
@@ -154,15 +153,16 @@ mod tests {
         let (home, db) = test_db();
         block_on_local(async {
             let boxes = VerifiedPath::new_follow(home.path().join("boxes"), None).unwrap();
-            let a = find_or_register(&db, &boxes, Path::new("/p/a"))
+            let project = |p: &str| VerifiedPath::new_follow(p, None).unwrap();
+            let a = find_or_register(&db, &boxes, &project("/p/a"))
                 .await
                 .unwrap();
-            let b = find_or_register(&db, &boxes, Path::new("/p/b"))
+            let b = find_or_register(&db, &boxes, &project("/p/b"))
                 .await
                 .unwrap();
             assert!(is_valid_id(&a) && is_valid_id(&b) && a != b, "{a} {b}");
             assert_eq!(
-                find_or_register(&db, &boxes, Path::new("/p/a"))
+                find_or_register(&db, &boxes, &project("/p/a"))
                     .await
                     .unwrap(),
                 a
@@ -170,7 +170,7 @@ mod tests {
 
             let all = list(&db).await.unwrap();
             assert_eq!(all.len(), 2);
-            assert_eq!(get(&db, &b).await.unwrap(), Some(PathBuf::from("/p/b")));
+            assert_eq!(get(&db, &b).await.unwrap(), Some("/p/b".into()));
 
             assert!(unregister(&db, &a).await.unwrap());
             assert!(!unregister(&db, &a).await.unwrap());

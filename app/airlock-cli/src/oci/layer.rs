@@ -5,13 +5,13 @@
 //! root file system.
 
 use std::io::{self, BufReader, Read};
-use std::path::{Component, Path};
+use std::path::{Component, Components};
 
 use flate2::read::GzDecoder;
 use indicatif::ProgressBar;
 
+use crate::data_dir::DataDir;
 use crate::util::verified_path::VerifiedPath;
-use crate::util::{is_dir, vfs};
 use crate::{cache, messages};
 
 /// OCI whiteout marker prefix (an AUFS convention that OCI also uses).
@@ -76,7 +76,7 @@ pub(super) fn download_tmp_path(layers_root: &VerifiedPath, key: &str) -> io::Re
 /// Returns:
 ///   Path of the extracted layer directory.
 pub fn ensure_layer_cached<F>(
-    data_dir: &VerifiedPath,
+    data_dir: &DataDir,
     digest: &str,
     fetch: F,
     progress: Option<&ProgressBar>,
@@ -88,7 +88,7 @@ where
     let layer_dir = cache::layer_dir(data_dir, &key)?;
     // Fast path. The directory appears only with the atomic rename at the
     // end of the extraction, so if it exists, the layer is complete.
-    if is_dir(&layer_dir) {
+    if layer_dir.is_dir() {
         return Ok(layer_dir);
     }
 
@@ -97,16 +97,16 @@ where
 
     // If `<key>.download` exists (from a previous run, or from a caller
     // that staged it, like the docker path), skip `fetch` and extract.
-    if vfs::symlink_metadata(&download).is_err() {
+    if download.symlink_metadata().is_err() {
         // Also remove an old fixed-name tmp file that an older binary left.
-        let _ = vfs::remove_file(&parent.join(format!("{key}.download.tmp"))?);
+        let _ = parent.join(format!("{key}.download.tmp"))?.remove_file();
         let download_tmp = download_tmp_path(&parent, &key)?;
         fetch(&download_tmp)?;
-        vfs::rename(&download_tmp, &download)?;
+        download_tmp.rename_to(&download)?;
     }
 
     extract_tarball_to_cache(&parent, &key, &download, progress)?;
-    let _ = vfs::remove_file(&download);
+    let _ = download.remove_file();
     if let Some(pb) = progress {
         pb.set_message(messages::oci::PROGRESS_READY);
     }
@@ -144,13 +144,13 @@ fn extract_tarball_to_cache(
         std::process::id(),
         TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ))?;
-    let _ = vfs::remove_dir_all(&tmp);
-    vfs::create_dir_all(&tmp)?;
+    let _ = tmp.remove_dir_all();
+    tmp.mkdirs()?;
 
     // Layer blobs can be gzip-compressed (OCI spec, registry pulls) or plain
     // tar (`docker image save` with the classic driver). Use the magic bytes
     // to select the decoder.
-    let file = vfs::open(tarball)?;
+    let file = tarball.open()?;
     let file: Box<dyn Read> = match progress {
         Some(pb) => {
             let total = file.metadata().map_or(0, |m| m.len());
@@ -188,10 +188,12 @@ fn extract_tarball_to_cache(
         if let Some(name) = path.file_name().and_then(|n| n.to_str())
             && let Some(target_name) = name.strip_prefix(WHITEOUT_PREFIX)
         {
-            let parent_rel = path.parent().unwrap_or_else(|| Path::new(""));
+            // The components of the parent: all but the file name.
+            let mut parent_rel = path.components();
+            parent_rel.next_back();
             if name == OPAQUE_WHITEOUT {
-                let dir = safe_join(&tmp, parent_rel)?;
-                vfs::create_dir_all(&dir)?;
+                let dir = safe_join(&tmp, &parent_rel)?;
+                dir.mkdirs()?;
                 xattr::set(dir.to_path()?, "user.overlay.opaque", b"y").map_err(|e| {
                     anyhow::anyhow!(messages::oci::set_xattr_failed(
                         "user.overlay.opaque",
@@ -206,12 +208,12 @@ fn extract_tarball_to_cache(
                 if matches!(target_name, "" | "." | "..") || target_name.contains('/') {
                     anyhow::bail!(messages::oci::unsafe_whiteout_name(path.display()));
                 }
-                let dir = safe_join(&tmp, parent_rel)?;
-                vfs::create_dir_all(&dir)?;
+                let dir = safe_join(&tmp, &parent_rel)?;
+                dir.mkdirs()?;
                 let target = dir.join(target_name)?;
-                let _ = vfs::remove_file(&target);
-                let _ = vfs::remove_dir_all(&target);
-                vfs::create_new(&target)?;
+                let _ = target.remove_file();
+                let _ = target.remove_dir_all();
+                target.create_new()?;
                 xattr::set(target.to_path()?, "user.overlay.whiteout", b"y").map_err(|e| {
                     anyhow::anyhow!(messages::oci::set_xattr_failed(
                         "user.overlay.whiteout",
@@ -252,14 +254,14 @@ fn extract_tarball_to_cache(
     // process can still read it. The other process can also publish between
     // this check and the rename. The rename then fails with ENOTEMPTY.
     // Handle that case the same way.
-    if is_dir(&layer_dir) {
-        let _ = vfs::remove_dir_all(&tmp);
+    if layer_dir.is_dir() {
+        let _ = tmp.remove_dir_all();
         return Ok(());
     }
-    match vfs::rename(&tmp, &layer_dir) {
+    match tmp.rename_to(&layer_dir) {
         Ok(()) => Ok(()),
-        Err(_) if is_dir(&layer_dir) => {
-            let _ = vfs::remove_dir_all(&tmp);
+        Err(_) if layer_dir.is_dir() => {
+            let _ = tmp.remove_dir_all();
             Ok(())
         }
         Err(e) => Err(e.into()),
@@ -278,11 +280,12 @@ fn extract_tarball_to_cache(
 /// creates or deletes any host file.
 /// Args:
 ///  - `root`: Extraction root
-///  - `rel`: Parent path of the whiteout entry, relative to `root`.
+///  - `rel`: Components of the parent path of the whiteout entry, relative
+///    to `root`.
 ///
 /// Returns:
 ///   The joined path, or error if the path is not safe.
-fn safe_join(root: &VerifiedPath, rel: &Path) -> anyhow::Result<VerifiedPath> {
+fn safe_join(root: &VerifiedPath, rel: &Components<'_>) -> anyhow::Result<VerifiedPath> {
     // Make the path again one component at a time from `root`. Accept only
     // `Normal` components (reject absolute prefixes and any `..`). Refuse
     // if an existing component on the path is a symlink. The extraction
@@ -290,18 +293,20 @@ fn safe_join(root: &VerifiedPath, rel: &Path) -> anyhow::Result<VerifiedPath> {
     // under `root`. Thus a symlink component can only come from an earlier
     // entry in the same layer.
     let mut cur = root.clone();
-    for comp in rel.components() {
+    for comp in rel.clone() {
         match comp {
             Component::Normal(c) => {
                 cur = cur.join(c)?;
-                if let Ok(md) = vfs::symlink_metadata(&cur)
+                if let Ok(md) = cur.symlink_metadata()
                     && md.file_type().is_symlink()
                 {
                     anyhow::bail!(messages::oci::whiteout_traverses_symlink(&cur));
                 }
             }
             Component::CurDir => {}
-            _ => anyhow::bail!(messages::oci::unsafe_whiteout_component(rel.display())),
+            _ => anyhow::bail!(messages::oci::unsafe_whiteout_component(
+                rel.as_path().display()
+            )),
         }
     }
     Ok(cur)

@@ -89,7 +89,7 @@ async fn run(
     extra_args: Vec<String>,
     context: Context,
 ) -> Result<i32, start::Exit> {
-    start::check_data_dir(&context.data_dir)?;
+    start::check_data_dir(&context.data)?;
     start::check_system_requirements();
     let host_cwd = start::resolve_host_cwd()?;
     start::init_logging(args.log_level);
@@ -101,17 +101,17 @@ async fn run(
     let local_dir = sandboxes::find_local_config_dir(&context, &host_cwd).await?;
     let config = Box::pin(start::wizard::load_or_generate_config(
         &host_cwd,
-        &context.data_dir,
+        &context.data,
         &local_dir,
         has_sandbox,
         &packs,
         &context.vault,
-        &crate::templates::list(&context.roots.data_dir),
+        &crate::templates::list(&context.data),
     ))
     .await?;
     let options = args.sandbox_options();
     let resolved = config
-        .resolve(&context.data_dir, &packs, &options.overrides)
+        .resolve(&context.data, &packs, &options.overrides)
         .await
         .map_err(start::Exit::config)?;
     // The terminal runtime. Bad `[monitor.keys]` values fail here.
@@ -122,7 +122,7 @@ async fn run(
     let template = config
         .generated_project()
         .and_then(|g| g.template.as_deref())
-        .map(|name| templates::find(&context.roots.data_dir, name))
+        .map(|name| templates::find(&context.data, name))
         .transpose()
         .map_err(|e| start::Exit::error(1, e))?;
     // The sandbox step can select the config of the last run.
@@ -138,7 +138,7 @@ async fn run(
     .await?;
     let resolved = &sandbox.resolved;
     // The log lines so far wait in memory. Now the log file is known.
-    cli::logging::attach(sandbox.lock.dir().to_path().map_err(anyhow::Error::from)?);
+    cli::logging::attach(sandbox.lock.dir());
     if let Some(generated) = config.generated_project() {
         let local_dir = sandboxes::local_config_dir(&host_cwd, sandbox.lock.dir())
             .map_err(anyhow::Error::from)?;

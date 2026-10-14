@@ -7,7 +7,6 @@
 //! old one. Thus a failed update keeps the old binary.
 
 use std::io::Read;
-use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context as _, bail};
@@ -16,7 +15,6 @@ use indicatif::ProgressBar;
 use sha2::{Digest, Sha256};
 
 use crate::util::verified_path::VerifiedPath;
-use crate::util::vfs;
 
 /// GitHub repository that publishes the airlock releases.
 const REPO: &str = "milankinen/airlock";
@@ -141,13 +139,13 @@ pub fn archive_name(version: &Version) -> anyhow::Result<String> {
 ///  - `client`: HTTP client from [`http_client`]
 ///  - `source`: Location of the release files
 ///  - `version`: Release to install
-///  - `target`: Path of the binary to replace
+///  - `target`: Binary to replace, with its symlinks resolved
 ///  - `progress`: Progress bar for the archive download
 pub async fn install(
     client: &reqwest::Client,
     source: &ReleaseSource,
     version: &Version,
-    target: &Path,
+    target: &VerifiedPath,
     progress: &ProgressBar,
 ) -> anyhow::Result<()> {
     let archive_name = archive_name(version)?;
@@ -219,22 +217,18 @@ fn extract_binary(archive: &[u8]) -> anyhow::Result<Vec<u8>> {
 ///
 /// Writes the new binary next to `target` and runs it with `-V` to make
 /// sure that it starts and reports `version`. Then moves it over `target`.
-fn replace_binary(target: &Path, binary: &[u8], version: &Version) -> anyhow::Result<()> {
+fn replace_binary(target: &VerifiedPath, binary: &[u8], version: &Version) -> anyhow::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
-    let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
-        bail!(crate::messages::self_update::no_parent_directory(
-            target.display()
-        ));
+    let (Some(dir), Some(_)) = (target.parent(), target.file_name()) else {
+        bail!(crate::messages::self_update::no_parent_directory(target));
     };
-    // The caller resolved the symlinks of `target`. Thus this follow does
-    // not change the directory. The new file and the rename do not follow
-    // a symlink below it.
-    let dir = VerifiedPath::new_follow(parent, None).map_err(|e| no_access_hint(e, parent))?;
-    let target = dir.join(name).map_err(|e| no_access_hint(e, parent))?;
-    // The new file must be in the same directory as the target. Then the
-    // rename is atomic and a running airlock keeps its old file.
+    let parent = &dir;
+    // The caller resolved the symlinks of `target`. The new file and the
+    // rename do not follow a symlink below its directory. The new file must
+    // be in the same directory as the target. Then the rename is atomic and
+    // a running airlock keeps its old file.
     let tmp = dir
         .join(format!(".airlock-update-{}", std::process::id()))
         .map_err(|e| no_access_hint(e, parent))?;
@@ -242,17 +236,14 @@ fn replace_binary(target: &Path, binary: &[u8], version: &Version) -> anyhow::Re
     let write = || -> std::io::Result<()> {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true).mode(0o755);
-        let mut file = vfs::open_with(&tmp.0, &opts)?;
+        let mut file = tmp.0.open_with(&opts)?;
         file.write_all(binary)?;
         file.sync_all()
     };
     write().map_err(|e| no_access_hint(e, parent))?;
 
-    let output = tmp
-        .0
-        .to_path()
-        .and_then(run_version)
-        .context(crate::messages::self_update::NEW_BINARY_RUN_FAILED)?;
+    let output =
+        run_version(&tmp.0).context(crate::messages::self_update::NEW_BINARY_RUN_FAILED)?;
     let reported = String::from_utf8_lossy(&output.stdout);
     let reported_version = reported.split_whitespace().nth(1);
     if !output.status.success() || reported_version != Some(&version.tag) {
@@ -262,7 +253,9 @@ fn replace_binary(target: &Path, binary: &[u8], version: &Version) -> anyhow::Re
         ));
     }
 
-    vfs::rename(&tmp.0, &target).map_err(|e| no_access_hint(e, parent))?;
+    tmp.0
+        .rename_to(target)
+        .map_err(|e| no_access_hint(e, parent))?;
     Ok(())
 }
 
@@ -270,10 +263,10 @@ fn replace_binary(target: &Path, binary: &[u8], version: &Version) -> anyhow::Re
 // Another thread can fork while the binary file is open for write. The
 // child then holds the write handle until it calls exec, and Linux refuses
 // to run the binary with ETXTBSY. Thus try again for a short time.
-fn run_version(binary: &Path) -> std::io::Result<std::process::Output> {
+fn run_version(binary: &VerifiedPath) -> std::io::Result<std::process::Output> {
     let mut tries = 0;
     loop {
-        match Command::new(binary).arg("-V").output() {
+        match Command::new(binary.to_path()?).arg("-V").output() {
             Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 20 => {
                 tries += 1;
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -284,13 +277,11 @@ fn run_version(binary: &Path) -> std::io::Result<std::process::Output> {
 }
 
 /// Add a hint about missing write access to `e`.
-fn no_access_hint(e: std::io::Error, dir: &Path) -> anyhow::Error {
+fn no_access_hint(e: std::io::Error, dir: &VerifiedPath) -> anyhow::Error {
     if e.kind() == std::io::ErrorKind::PermissionDenied {
-        anyhow::anyhow!(crate::messages::self_update::no_write_access(dir.display()))
+        anyhow::anyhow!(crate::messages::self_update::no_write_access(dir))
     } else {
-        anyhow::Error::new(e).context(crate::messages::self_update::write_binary_failed(
-            dir.display(),
-        ))
+        anyhow::Error::new(e).context(crate::messages::self_update::write_binary_failed(dir))
     }
 }
 
@@ -299,7 +290,7 @@ struct TempFile(VerifiedPath);
 
 impl Drop for TempFile {
     fn drop(&mut self) {
-        let _ = vfs::remove_file(&self.0);
+        let _ = self.0.remove_file();
     }
 }
 
