@@ -172,25 +172,11 @@ pub mod cli {
         format!("Failed to remove sandbox: {err}")
     }
 
-    /// Status after the removal of a sandbox, or of the `.airlock` link.
+    /// Status after the removal of a sandbox.
     pub const SANDBOX_REMOVED: &str = "Sandbox removed";
 
     /// Status when `rm` finds no sandbox to remove.
     pub const NO_SANDBOX_TO_REMOVE: &str = "No sandbox to remove";
-
-    /// Warning when `.airlock` holds user-level files, so `rm` removes only
-    /// the sandbox.
-    pub fn user_airlock_dir_warning(dir: impl Display, marker: impl Display) -> String {
-        format!(
-            "warning: {dir} holds the user-level airlock file {marker}; \
-             it is a user airlock directory, so only its sandbox goes"
-        )
-    }
-
-    /// Error when `rm` cannot remove the `.airlock` link.
-    pub fn failed_to_remove_airlock_link(err: impl Display) -> String {
-        format!("Failed to remove the .airlock link: {err}")
-    }
 
     /// Title of the `rm` confirmation prompt.
     pub const REMOVE_SANDBOX_TITLE: &str = "Remove sandbox?";
@@ -1228,6 +1214,12 @@ pub mod oci {
     pub const IMAGE_CHANGED_NEEDS_TERMINAL: &str =
         "Sandbox image has been changed. Run in a terminal or pass --yes.";
 
+    /// Error when the old image of an imported sandbox is not known, and
+    /// `--yes` would re-create the sandbox and delete its disk.
+    pub const IMPORTED_IMAGE_UNKNOWN: &str = "The old image of the imported sandbox is not known, \
+         so --yes cannot re-create it. Run in a terminal without --yes to keep the disk or make \
+         a new sandbox.";
+
     /// Error when the user aborts a question or an image download.
     pub const ABORTED_BY_USER: &str = "aborted by user";
 
@@ -2121,21 +2113,11 @@ pub mod sandboxes {
     /// Error when another airlock process uses the sandbox to move.
     pub const SANDBOX_IN_USE: &str = "the sandbox is in use by another airlock process";
 
-    /// Error when a sandbox move fails because of different file systems.
-    pub fn cross_device(from: impl Display, to: impl Display) -> String {
-        format!(
-            "cannot move {from} to {to}: they are on different file systems. Set \
-             `sandbox_type = \"project-owned\"` in the `[security]` table of \
-             ~/.airlock/settings.toml to keep the sandbox in the project, or remove it with \
-             `airlock rm`"
-        )
-    }
-
     /// Error when `.airlock` holds files that airlock does not know.
     pub fn extra_files(names: &[String]) -> String {
         format!(
-            ".airlock directory contains extra files ({}), can't migrate - remove extra files or \
-             continue using current directory",
+            ".airlock directory contains extra files ({}), can't migrate - move or remove these \
+             files, then run airlock start again",
             names.join(", ")
         )
     }
@@ -2143,6 +2125,31 @@ pub mod sandboxes {
     /// Error when the sandbox directory to move does not exist.
     pub fn does_not_exist(path: impl Display) -> String {
         format!("{path} does not exist")
+    }
+
+    /// Shows when the import copies the sandbox disk, because the old
+    /// sandbox and the data directory are on different file systems.
+    pub fn copying_disk(to: impl Display) -> String {
+        format!("copying the sandbox disk to {to} (different file system)...")
+    }
+
+    /// Error when a file of the old sandbox changed while the import moved it.
+    pub fn changed_during_import(path: impl Display) -> String {
+        format!("{path} changed during the import")
+    }
+
+    /// Error when an import failed and its disk could not go back to the old
+    /// sandbox. The new sandbox stays, because it has the only disk copy.
+    pub fn disk_kept(disk: impl Display, back: impl Display, cause: impl Display) -> String {
+        format!(
+            "the import failed ({cause}), and the disk could not move back ({back}); the disk \
+             stays in {disk}"
+        )
+    }
+
+    /// Warning when the old `.airlock` directory stays after an import.
+    pub fn remove_old_dir_failed(path: impl Display, err: impl Display) -> String {
+        format!("could not remove {path}: {err}; remove it manually")
     }
 
     /// Error when moving a path fails.
@@ -2520,25 +2527,17 @@ pub mod start {
     pub const SANDBOX_REMOVED_DURING_START: &str =
         "the sandbox was removed while airlock started it; run `airlock start` again";
 
-    /// Shows when a project sandbox cannot move because no terminal is available.
-    pub fn sandbox_data_visible(dir: impl Display) -> String {
-        format!(
-            "the sandbox data is in {dir}, where the sandbox can see it; run `airlock start` \
-             in a terminal to move it"
-        )
-    }
+    /// Shows when an old project sandbox must move but no terminal is
+    /// available for the question.
+    pub const LEGACY_SANDBOX_NO_PROMPT: &str = "Old sandbox in .airlock/sandbox. Run `airlock start` \
+                                                in a terminal, or with --yes, to move it.";
 
-    /// Choice label to move the sandbox into the data directory.
-    pub const MOVE_CHOICE_YES: &str = "Yes, migrate";
+    /// Title of the question before an old project sandbox moves into the
+    /// data directory.
+    pub const IMPORT_TITLE: &str = "Sandbox data moves to the airlock data dir for security.";
 
-    /// Choice label to keep the sandbox in the project.
-    pub const MOVE_CHOICE_NO: &str = "No, keep current";
-
-    /// Title of the question about moving the sandbox.
-    pub const MOVE_TITLE: &str = "Migrate sandbox to secure directory?";
-
-    /// Note of the question about moving the sandbox.
-    pub const MOVE_NOTE: &str = "See airlock v2026.10.1 release notes for details";
+    /// Choice label to move the old project sandbox and continue.
+    pub const IMPORT_CONTINUE: &str = "Continue";
 
     /// Shows after the sandbox moved into the data directory.
     pub fn sandbox_moved(dir: impl Display) -> String {
@@ -2575,6 +2574,11 @@ pub mod start {
     pub fn last_config_invalid(err: impl Display) -> String {
         format!("The configuration of the last run is not valid any more: {err:#}")
     }
+
+    /// Note of the config question when the sandbox has a disk but no copy
+    /// of the last config.
+    pub const LAST_CONFIG_MISSING: &str =
+        "The sandbox has a disk, but no copy of the configuration of the last run.";
 
     /// Replaces a masked `[env]` value in the config diff.
     pub fn masked_value_hash(hash: impl Display) -> String {
@@ -2944,6 +2948,11 @@ pub mod util {
     /// Shows when a path is not a regular file.
     pub fn not_regular_file(path: impl Display) -> String {
         format!("{path} is not a regular file")
+    }
+
+    /// Shows when a file has more than one hard link.
+    pub fn multiple_links(path: impl Display) -> String {
+        format!("{path} has more than one hard link")
     }
 
     /// Shows when a path is a symlink that airlock refuses to follow.

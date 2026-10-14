@@ -532,6 +532,7 @@ impl VerifiedPath {
     }
 
     /// Connect to the Unix socket.
+    #[cfg(target_os = "linux")]
     pub(crate) fn connect_unix(&self) -> io::Result<std::os::unix::net::UnixStream> {
         std::os::unix::net::UnixStream::connect(self.to_path()?)
     }

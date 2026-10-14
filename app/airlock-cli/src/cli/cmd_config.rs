@@ -67,7 +67,7 @@ async fn document(
     // Same rule as `sandboxes::find_local_config_dir`. The sandbox is
     // known already.
     let local_dir = match &found {
-        Some(found) => sandboxes::local_config_dir(&project_dir, &found.dir)?,
+        Some(found) => sandboxes::local_config_dir(&found.dir)?,
         None => project_dir.join(".airlock")?,
     };
     let document = config::load(&project_dir, &local_dir)?.project_document();

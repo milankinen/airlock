@@ -70,11 +70,9 @@ fn gc_sweep_keeps_only_images_linked_by_sandboxes_and_their_layers() {
     let live_path = real(&cache::image_path(data_dir, &live.image_id).unwrap());
     let orphan_path = real(&cache::image_path(data_dir, &orphan.image_id).unwrap());
     write_cached_image(data_dir, &orphan.image_id, &orphan).unwrap();
-    std::fs::create_dir_all(home.path().join("project/.airlock/sandbox")).unwrap();
-    let sandbox_image = data_dir
-        .root
-        .join("project/.airlock/sandbox/image")
-        .unwrap();
+    let sandbox = data_dir.sandboxes.join("box").unwrap();
+    std::fs::create_dir_all(real(&sandbox)).unwrap();
+    let sandbox_image = sandbox.join("image").unwrap();
     // The second call must see the existing link and do nothing.
     ensure_image_hardlink(data_dir, &sandbox_image, &live).unwrap();
     ensure_image_hardlink(data_dir, &sandbox_image, &live).unwrap();
@@ -98,7 +96,7 @@ fn gc_sweep_keeps_only_images_linked_by_sandboxes_and_their_layers() {
     expected.sort();
     assert_eq!(left, expected);
 
-    std::fs::remove_dir_all(home.path().join("project/.airlock")).unwrap();
+    std::fs::remove_dir_all(real(&sandbox)).unwrap();
     gc_sweep(data_dir);
 
     assert!(!live_path.exists());
@@ -162,9 +160,8 @@ fn cache_file_from_before_user_field_loads_as_legacy() {
     assert_eq!(read_cached_image(&path).unwrap().user, Some(String::new()));
 }
 
-/// Test that a symlink that the guest plants at the `image` file of its
-/// sandbox is not followed. The guest can write the sandbox dir of a
-/// project, and a followed link lets airlock read or link a host file.
+/// Test that a symlink at the `image` file of a sandbox is not followed. A
+/// followed link lets airlock read or link a host file.
 ///   1. Write a host file and put a symlink to it at the sandbox `image`
 ///   2. Check that the image read ignores the link
 ///   3. Link the sandbox to a cached image
@@ -222,4 +219,41 @@ fn gc_sweep_skips_symlink_and_fifo_in_images_dir() {
     assert!(std::fs::symlink_metadata(images.join("link")).is_ok());
     assert!(std::fs::symlink_metadata(images.join("fifo")).is_ok());
     assert!(host.exists());
+}
+
+/// Test that `--yes` never re-creates an imported sandbox with a disk and an
+/// unknown old image, because the re-create deletes the imported disk.
+///   1. Make a sandbox dir with a disk and an empty import marker
+///   2. Check that `Recreate` stops with `ImportedImageUnknown`, and that
+///      `Ask` and `Refuse` stay
+///   3. Write a known digest into the marker and check that `Recreate` stays
+///   4. Remove the disk and check that `Recreate` stays
+#[test]
+fn recreate_of_imported_sandbox_with_unknown_image_stops() {
+    let tmp = temp_dir();
+    let dir = crate::test_cfg::oci::verified_dir(tmp.path());
+    std::fs::write(tmp.path().join(crate::vm::disk::DISK_FILE), "disk").unwrap();
+    std::fs::write(tmp.path().join(IMPORT_MARKER), "").unwrap();
+
+    assert!(matches!(
+        guard_recreate(&dir, OnImageChange::Recreate),
+        Err(ImageChangeStop::ImportedImageUnknown)
+    ));
+    for mode in [OnImageChange::Ask, OnImageChange::Refuse] {
+        assert_eq!(guard_recreate(&dir, mode).unwrap(), mode);
+    }
+
+    let digest = format!("sha256:{}", "a".repeat(64));
+    std::fs::write(tmp.path().join(IMPORT_MARKER), digest).unwrap();
+    assert_eq!(
+        guard_recreate(&dir, OnImageChange::Recreate).unwrap(),
+        OnImageChange::Recreate
+    );
+
+    std::fs::write(tmp.path().join(IMPORT_MARKER), "").unwrap();
+    std::fs::remove_file(tmp.path().join(crate::vm::disk::DISK_FILE)).unwrap();
+    assert_eq!(
+        guard_recreate(&dir, OnImageChange::Recreate).unwrap(),
+        OnImageChange::Recreate
+    );
 }

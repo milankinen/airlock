@@ -1,6 +1,8 @@
 //! Tests for the extraction of layer tarballs into the layer cache:
 //! whiteouts, reuse, interrupted downloads, races and path escapes.
 
+use std::path::Path;
+
 use airlock_test_utils::temp_dir;
 
 use super::*;

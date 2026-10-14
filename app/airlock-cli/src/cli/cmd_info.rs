@@ -16,7 +16,7 @@ use crate::data_dir::DataDir;
 use crate::packs::ConfiguredPack;
 use crate::packs::install::state::{self, InstallState, PackStatus, ReadState};
 use crate::project::read_run_meta;
-use crate::sandboxes::{Found, Location, registry};
+use crate::sandboxes::{Found, registry};
 use crate::services::{self, store};
 use crate::util::PinnedDir;
 use crate::util::verified_path::VerifiedPath;
@@ -53,8 +53,7 @@ pub(super) async fn run(context: Context, id: Option<&str>, json: bool) -> i32 {
         && VerifiedPath::new(&project, &context.roots()).is_err()
         && let Ok(dir) = context.data.sandboxes.join(id)
     {
-        let location = Location::DataDir { id: id.to_string() };
-        let details = Details::read(&location, project.display().to_string(), &dir);
+        let details = Details::read(id, project.display().to_string(), &dir);
         return print_details_only(&details, json);
     }
     let (project_dir, found) = match find(&context, id).await {
@@ -65,12 +64,12 @@ pub(super) async fn run(context: Context, id: Option<&str>, json: bool) -> i32 {
         }
     };
     // Check config errors first, with the config error exit code (same as
-    // `start`). The local project config is in the sandbox directory or in
-    // the project.
+    // `start`). The local project config is in the sandbox directory. A
+    // project with no sandbox uses `.airlock` in the project.
     let resolved = if project_dir.is_dir() {
         let local_dir = match &found {
             None => project_dir.join(".airlock"),
-            Some(found) => sandboxes::local_config_dir(&project_dir, &found.dir),
+            Some(found) => sandboxes::local_config_dir(&found.dir),
         };
         let local_dir = match local_dir {
             Ok(dir) => dir,
@@ -96,7 +95,7 @@ pub(super) async fn run(context: Context, id: Option<&str>, json: bool) -> i32 {
             return 1;
         }
     };
-    let details = Details::read(&found.location, found.project.to_string(), &found.dir);
+    let details = Details::read(&found.id, found.project.to_string(), &found.dir);
     if json {
         return print_json(&details);
     }
@@ -113,9 +112,7 @@ pub(super) async fn run(context: Context, id: Option<&str>, json: bool) -> i32 {
     };
 
     println!("{}", messages::cli::info_path(project.display_cwd()));
-    if let Some(id) = &details.id {
-        println!("{}", messages::cli::info_id(id));
-    }
+    println!("{}", messages::cli::info_id(&details.id));
     println!("{}", messages::cli::info_status(status));
     println!("{}", messages::cli::info_image(&project.config.vm.image));
     println!("{}", messages::cli::info_cpus(project.config.vm.cpus));
@@ -490,7 +487,7 @@ pub(super) async fn find(
 async fn find_by_id(context: &Context, id: &str) -> anyhow::Result<Found> {
     let project = registered_project(context, id).await?;
     Ok(Found {
-        location: Location::DataDir { id: id.to_string() },
+        id: id.to_string(),
         project: VerifiedPath::new(project, &context.roots())?,
         dir: context.data.sandboxes.join(id)?,
     })
@@ -513,9 +510,9 @@ pub(super) async fn registered_project(context: &Context, id: &str) -> anyhow::R
 /// sandbox list use them.
 #[derive(Debug, Serialize)]
 pub(super) struct Details {
-    /// Registry id. `None` for a sandbox in the project directory.
-    pub(super) id: Option<String>,
-    /// `data-dir` or `project-dir`.
+    /// Registry id.
+    pub(super) id: String,
+    /// Always `data-dir`. Older versions also had `project-dir`.
     location: &'static str,
     /// Project directory.
     pub(super) project: String,
@@ -539,10 +536,10 @@ impl Details {
     /// Read the details of a sandbox. Takes no lock and writes nothing.
     /// Records that cannot be read are left out.
     /// Args:
-    ///  - `location`: Where the sandbox keeps its data
+    ///  - `id`: Registry id of the sandbox
     ///  - `project`: Project directory, for the output only
     ///  - `dir`: Sandbox directory
-    pub(super) fn read(location: &Location, project: String, dir: &VerifiedPath) -> Self {
+    pub(super) fn read(id: &str, project: String, dir: &VerifiedPath) -> Self {
         use std::os::unix::fs::MetadataExt;
         let status = if dir.symlink_metadata().is_err() {
             SandboxStatus::Missing
@@ -565,14 +562,8 @@ impl Details {
         // size.
         let disk = dir.join(disk::DISK_FILE).and_then(|p| p.metadata()).ok();
         Self {
-            id: match location {
-                Location::DataDir { id } => Some(id.clone()),
-                Location::ProjectDir => None,
-            },
-            location: match location {
-                Location::DataDir { .. } => "data-dir",
-                Location::ProjectDir => "project-dir",
-            },
+            id: id.to_string(),
+            location: "data-dir",
             project,
             dir: dir.to_string(),
             status,
@@ -624,9 +615,7 @@ fn print_details_only(details: &Details, json: bool) -> i32 {
 /// no config to show.
 fn print_sandbox_only(details: &Details) {
     println!("{}", messages::cli::info_path_missing(&details.project));
-    if let Some(id) = &details.id {
-        println!("{}", messages::cli::info_id(id));
-    }
+    println!("{}", messages::cli::info_id(&details.id));
     println!("{}", messages::cli::info_status(details.status.text()));
     if let Some(last_run) = details.last_run {
         println!(
@@ -665,13 +654,13 @@ mod tests {
         let project = temp_dir();
         let elsewhere = temp_dir();
         let sandbox = VerifiedPath::new_follow(project.path(), None)
-            .and_then(|p| p.join(".airlock/sandbox"))
+            .and_then(|p| p.join("data/boxes/0123456789abcdef"))
             .unwrap();
         assert!(matches!(open_sandbox_dir(&sandbox), Ok(None)));
 
-        std::fs::create_dir_all(project.path().join(".airlock")).unwrap();
-        std::os::unix::fs::symlink(elsewhere.path(), project.path().join(".airlock/sandbox"))
-            .unwrap();
+        let boxes = project.path().join("data/boxes");
+        std::fs::create_dir_all(&boxes).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), boxes.join("0123456789abcdef")).unwrap();
 
         assert!(open_sandbox_dir(&sandbox).is_err_and(|why| !why.is_empty()));
     }

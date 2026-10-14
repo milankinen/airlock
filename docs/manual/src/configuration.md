@@ -33,7 +33,6 @@ available:
 | Setting                    | Purpose                                         | Reference |
 |----------------------------|-------------------------------------------------|-----------|
 | `data_dir`                 | Directory for the sandboxes and the image cache | [Where airlock keeps sandbox data](./usage/managing-sandbox.md#where-airlock-keeps-sandbox-data) |
-| `security.sandbox_type`    | Location of the data of a new sandbox           | [Project-colocated sandboxes](./usage/managing-sandbox.md#project-colocated-sandboxes) |
 | `security.insecure_mounts` | Allow mounts that expose the home directory     | [Mounts](./configuration/mounts.md#mounts-that-expose-the-home-directory) |
 | `vault.storage`            | Storage backend of the secret vault             | [Secrets management](./secrets.md#choosing-a-storage-backend) |
 | `[monitor]`                | Monitor buffers and key bindings                | [Monitor dashboard](./usage/monitor.md#personal-settings) |

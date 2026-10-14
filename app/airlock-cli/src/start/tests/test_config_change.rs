@@ -40,27 +40,46 @@ fn changed_config_stops_start_until_allowed() {
     project.start(CHANGED, false).unwrap();
 }
 
-/// Test that a sandbox without a config copy starts without a question and
-/// gets a copy. Sandboxes of an older airlock have no copy.
-///   1. Start a sandbox, then remove its config copy
-///   2. Start with a changed config without a terminal and check that it
-///      starts
-///   3. Check that the copy is of the changed config: the first config now
-///      stops a start without a terminal
+/// Test that a sandbox with a disk but no config copy stops a start without
+/// a terminal. Nobody accepted the config that made the disk, for example
+/// in an imported sandbox of an older airlock.
+///   1. Start a sandbox, check that it has a disk, then remove its config
+///      copy
+///   2. Start without a terminal and check exit code 2
+///   3. Start with `--allow-configuration-changes` and check that it
+///      starts and gets a copy
+///   4. Start again without the flag and check that it starts
 #[test]
-fn sandbox_without_config_copy_starts_and_gets_copy() {
+fn sandbox_with_disk_without_config_copy_stops_start_until_allowed() {
     let project = StartProject::new(test_packs());
     project.start(FIRST, false).unwrap();
-    let run_json = project.sandbox_dir().join("run.json");
-    std::fs::remove_file(&run_json).unwrap();
+    assert!(project.sandbox_dir().join("disk.img").is_file());
+    std::fs::remove_file(project.sandbox_dir().join("run.json")).unwrap();
 
-    project.start(CHANGED, false).unwrap();
+    assert!(matches!(project.start(FIRST, false), Err(Exit::Code(2))));
+    project.start_with(FIRST, false, true).unwrap();
     assert!(
         read_run_meta(&project.sandbox().unwrap().dir)
             .last_run_config
             .is_some()
     );
-    assert!(matches!(project.start(FIRST, false), Err(Exit::Code(2))));
+    project.start(FIRST, false).unwrap();
+}
+
+/// Test that a new sandbox starts without a terminal and without a
+/// question. It has no disk yet, thus no config made its state.
+///   1. Start a new project without a terminal and check that it starts
+///   2. Check that the sandbox has a config copy and a disk now
+#[test]
+fn new_sandbox_without_disk_starts_without_question() {
+    let project = StartProject::new(test_packs());
+    project.start(FIRST, false).unwrap();
+    assert!(
+        read_run_meta(&project.sandbox().unwrap().dir)
+            .last_run_config
+            .is_some()
+    );
+    assert!(project.sandbox_dir().join("disk.img").is_file());
 }
 
 /// Test that a mount source symlink that points to an other dir since the

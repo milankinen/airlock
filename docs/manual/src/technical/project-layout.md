@@ -67,18 +67,16 @@ log (`sandbox/installs.log`) stays there.
 
 ## Sandbox directory
 
-A sandbox directory is `<data>/boxes/<id>/` (a managed sandbox). With
-`sandbox_type = "project-owned"` in the `[security]` settings, or for a
-sandbox that an older airlock made, it is `<project>/.airlock/sandbox/`. Such a sandbox is not
-in the registry. Both kinds have the same contents:
+A sandbox directory is `<data>/boxes/<id>/`. The registry in the data
+directory maps each project to its sandbox. The sandbox directory
+holds:
 
 ```
 <sandbox>/
   ca.json                        # CA certificate + key PEMs (single JSON file)
   run.json                       # last-run timestamp, guest_cwd, config files of the last start
   installs.json                  # pack install records
-  keep-in-project                # (project sandbox only) do not offer a move
-  airlock.toml                   # (data directory only) local project config
+  airlock.toml                   # local project config
   overlay/
     files/rw/{key}               # hard-linked writable file mounts
     files/ro/{key}               # hard-linked read-only file mounts
@@ -91,50 +89,82 @@ in the registry. Both kinds have the same contents:
   installs.log                   # output of the last install boot
 ```
 
+The sandbox directory is never in the project. The sandbox guest cannot
+write it.
+
 airlock writes the JSON files atomically (temp file and rename) under the
 sandbox lock. Other processes (`airlock sandboxes list`, `airlock info`)
 read them at the same time without a wait.
 
 The local project config (`airlock.<ext>`) is the file that the setup
-wizard writes when `Create airlock.toml` is off. It is in the sandbox
-directory of a sandbox in the data directory. Thus it is never in the
-repository. A project sandbox keeps it in `.airlock/`:
+wizard writes when `Create airlock.toml` is off. `airlock start` saves it
+in the sandbox directory. Thus it is never in the repository. An older
+version, or the user, can leave it in `<project>/.airlock/`. The first
+start moves it to the sandbox directory and removes `.airlock/`. If
+`.airlock/` also holds other files, the start stops with exit code 1 and
+changes nothing:
 
 ```
 <project>/
   airlock.toml                   # project config (tracked by VCS)
-  .airlock/                      # project sandbox only
-    .gitignore                   # contains "*" — auto-created
+  .airlock/                      # only from an older version or the user
     airlock.toml                 # local project config (optional)
-    airlock.log                  # tracing log (older airlock versions)
-    sandbox/                     # the sandbox (see above)
 ```
 
-A move of a project sandbox into the data directory is one `rename`.
-Thus the `image` hard link stays valid. The move also moves the local
-project config into the new sandbox directory and then removes
-`.airlock/`. If `.airlock/` holds any other file, airlock refuses the move
-and changes nothing. A new sandbox in the data directory also takes the
-local project config out of `.airlock/` in the same way. If the user
-chooses to keep a project sandbox in the project, airlock writes the
-`keep-in-project` marker, and `airlock start` does not offer the move
-again.
+`airlock rm` uses only the registry. It removes the registry entry, the
+sandbox directory and the local project config. It does not touch
+`<project>/.airlock/`. If a stale `.airlock/sandbox` exists, the next
+`airlock start` offers to import it. If the project has no sandbox, it
+prints "No sandbox to remove" and exits with 0. A running sandbox gives
+exit code 1.
 
-For a project sandbox, the guest masks `<project>/.airlock` with an
-empty read-only directory (the `boot` RPC tells the guest the sandbox
-location). A sandbox in the data directory gets no mask. Its data and its
-local project config are not in the project.
+### Import of an old sandbox
 
-`airlock rm` removes the sandbox directory of the project. For a sandbox
-in the data directory, it also removes the registry entry and the local
-project config. For a sandbox in the project, it removes the entire
-`.airlock/` directory.
-If the project is a home directory, or if `.airlock/` holds user-level
-files (vault, `settings.*`, `config.*`), `airlock rm` removes only
-`.airlock/sandbox/`. A symlinked `.airlock` is only unlinked.
+Older versions kept the sandbox in `<project>/.airlock/sandbox/`. The
+guest can write that directory, so airlock does not trust its content.
+A registered sandbox wins, and airlock then ignores `.airlock/sandbox`.
+A symlinked `.airlock` gets no import offer, and `start` makes a new
+sandbox. The import follows these rules:
 
-airlock creates `.airlock/` and the sandbox directory with mode 0700. It
-refuses a symlinked or foreign-owned `.airlock/`.
+* airlock checks in this order:
+  1. It refuses a non-directory or a symlink at `.airlock/sandbox`.
+  2. It refuses when `.airlock` holds names other than `.gitignore`,
+     `airlock.log`, `sandbox` and `airlock.<ext>`. It exits with 1 and
+     changes nothing.
+  3. It pins the directory without a link follow and checks the owner.
+  4. It takes `lock`. Only a missing `lock` lets the import go on. A held
+     lock means the sandbox is in use. A symlink or FIFO at `lock` is
+     refused.
+* airlock takes only these names: `disk.id`, `disk.img`, `installs.json`,
+  `ca.json` and the image digest from `image`. It does not take any other
+  entry.
+* airlock opens each entry without a link follow. The entry must be a
+  regular file with one link, owned by the user. It skips other entries.
+  `image` is the exception. It needs no one-link check, because airlock
+  reads only a `sha256:<64 hex>` digest from it.
+* airlock takes `disk.img` only with a valid `disk.id` (32 hex characters).
+  airlock renames the file, or on another file system it makes a sparse
+  copy.
+* airlock takes `installs.json` and `ca.json` only with the disk. They must
+  parse.
+* airlock sets `ran_session` to true in the install records. All records
+  stay. Records that are not `installed` or `kept` become `failed`.
+* airlock does not take `run.json` and the `image` file. When the image
+  is in the cache, airlock links it at once. When airlock took the disk,
+  it also writes the marker `image.imported` with the old digest, or
+  empty if the digest is unknown. The next start uses the marker as the
+  stored digest:
+  * A different digest gives the image change question.
+  * An empty marker counts as a change for all images. With a disk,
+    `--yes` does not re-create the sandbox. The start stops with exit
+    code 2 and the disk stays.
+  * airlock removes the marker after the next image step that succeeds.
+* After an error, airlock removes the new sandbox directory and puts back
+  the moved files. The old directory stays. If the disk cannot go back,
+  airlock keeps the new sandbox and its registry entry, and the error
+  names the disk path.
+* After a successful import, airlock moves the local project config and
+  removes all of `.airlock/`. A failed remove is only a warning.
 
 ## CA keypair
 

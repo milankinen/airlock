@@ -116,8 +116,8 @@ fn wizard_project_config_resolves_before_save_and_after_reload() {
     );
 }
 
-/// Test that a local wizard config of a project sandbox goes to `.airlock/`
-/// with a `.gitignore`, so that git does not see the local file. For a
+/// Test that a local wizard config of a project with no sandbox goes to
+/// `.airlock/` with a `.gitignore`, so that git does not see the local file. For a
 /// sandbox in the data directory, it goes to the sandbox directory and the
 /// project gets nothing.
 ///   1. Save an empty config for the local target in `.airlock/`

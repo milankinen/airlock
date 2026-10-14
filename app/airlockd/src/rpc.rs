@@ -296,7 +296,6 @@ impl supervisor::Server for SupervisorImpl {
                 files,
                 caches,
                 masks,
-                mask_airlock_dir: !params.get_skip_airlock_mask(),
                 ca_cert: params.get_ca_cert()?.to_vec(),
             },
             daemons,

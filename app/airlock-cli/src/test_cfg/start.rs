@@ -73,7 +73,8 @@ pub fn fake_image(name: &str) -> OciImage {
 }
 
 /// `oci::prepare` for tests. With the fakes on, the image is the
-/// [`fake_image`] of the configured name. If the sandbox had another image,
+/// [`fake_image`] of the configured name. An import marker counts as
+/// another image. If the sandbox had another image,
 /// [`OnImageChange::Recreate`] makes it again and [`OnImageChange::Refuse`]
 /// stops.
 pub async fn prepare_image(
@@ -89,8 +90,13 @@ pub async fn prepare_image(
     fake_host(|host| host.prepared += 1);
     let link = sandbox_dir.to_path()?.join("test-image");
     let name = image_cfg.name.as_str();
-    let change = match std::fs::read_to_string(&link) {
-        Ok(old) if old != name => match on_change {
+    // An imported sandbox has the old image in the import marker. A
+    // marker never names a fake image, thus it is a change.
+    let stored = std::fs::read_to_string(&link)
+        .ok()
+        .or_else(|| crate::oci::read_import_marker(sandbox_dir).map(|_| String::new()));
+    let change = match stored {
+        Some(old) if old != name => match crate::oci::guard_recreate(sandbox_dir, on_change)? {
             OnImageChange::Recreate => ImageChange::Recreate,
             OnImageChange::Refuse => return Err(ImageChangeStop::NeedsTerminal.into()),
             OnImageChange::Ask => panic!("tests have no terminal"),
@@ -98,6 +104,8 @@ pub async fn prepare_image(
         _ => ImageChange::Unchanged,
     };
     std::fs::write(&link, name)?;
+    // As `oci::prepare`, which removes the marker after the image link.
+    let _ = std::fs::remove_file(sandbox_dir.to_path()?.join("image.imported"));
     let mut image = fake_image(name);
     // A pinned digest names the image, as with a real registry.
     if let Some(digest) = image_cfg.pinned_digest() {
@@ -268,12 +276,12 @@ impl StartProject {
             allow_config_changes,
             overrides: ConfigOverrides::default(),
         };
-        let project_sandbox = self.project_dir().join(sandboxes::PROJECT_SANDBOX);
         eventually("sandbox lock is free", || {
-            // The start does not move a running project sandbox, and does
-            // not fail.
-            let dir = crate::util::VerifiedPath::new_follow(&project_sandbox, None).unwrap();
-            if project::is_running(&dir) {
+            // Wait until the lock of a registered sandbox is free.
+            if self
+                .sandbox()
+                .is_some_and(|found| project::is_running(&found.dir))
+            {
                 return None;
             }
             match self.start_once(config, &options) {

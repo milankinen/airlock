@@ -28,6 +28,7 @@ use crate::config::config_values::{ImageRef, PullPolicy};
 use crate::data_dir::DataDir;
 use crate::oci::credentials::ToRegistryAuth;
 use crate::project::Project;
+use crate::util::PinnedDir;
 use crate::util::verified_path::{self, Refusal, VerifiedPath};
 use crate::vault::Vault;
 use crate::{cache, cli, messages};
@@ -42,9 +43,14 @@ pub const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bi
 const MAX_LAYER_RECORD_FILE: u64 = 1024 * 1024;
 
 /// Largest cached image file that the host reads. Real files are a few KB.
-/// The guest can write the `image` file of a sandbox in its project, and
-/// that file is a hard link to the cache entry.
+/// Defense in depth: the cache entry can come from an old sandbox import.
 const MAX_IMAGE_FILE: u64 = 4 * 1024 * 1024;
+
+/// File in the sandbox directory with the image digest of an imported old
+/// sandbox, when its image is not in the cache. Empty if the digest is not
+/// known. [`prepare`] uses it as the stored digest, thus a different image
+/// gives the image change question.
+const IMPORT_MARKER: &str = "image.imported";
 
 /// Counter that makes the temp names of image file writes unique in a
 /// process.
@@ -133,6 +139,10 @@ pub enum ImageChangeStop {
     /// There is no terminal for the question, and no `--yes`.
     #[error("{}", crate::messages::oci::IMAGE_CHANGED_NEEDS_TERMINAL)]
     NeedsTerminal,
+    /// `--yes` would re-create an imported sandbox with an unknown old
+    /// image. This deletes the disk, thus only a terminal can choose it.
+    #[error("{}", crate::messages::oci::IMPORTED_IMAGE_UNKNOWN)]
+    ImportedImageUnknown,
     /// The user chose abort (or pressed Esc).
     #[error("{}", crate::messages::oci::ABORTED_BY_USER)]
     Aborted,
@@ -211,8 +221,11 @@ pub async fn prepare(
         return use_cached_image(data_dir, sandbox_dir, &sandbox_image, img).map(unchanged);
     }
 
-    // Read only the stored digest (if any) for change detection.
-    let stored_digest = read_cached_image(&sandbox_image).map(|i| i.image_id);
+    // Read only the stored digest (if any) for change detection. An
+    // imported sandbox without an image link has the digest in the marker.
+    let stored_digest = read_cached_image(&sandbox_image)
+        .map(|i| i.image_id)
+        .or_else(|| read_import_marker(sandbox_dir));
 
     let registry_host: String = image_name
         .parse::<oci_client::Reference>()
@@ -254,7 +267,7 @@ pub async fn prepare(
     if let Some(old_digest) = stored_digest
         && digest_changed
     {
-        change = match on_change {
+        change = match guard_recreate(sandbox_dir, on_change)? {
             OnImageChange::Ask => ask_image_changed()?,
             OnImageChange::Recreate => ImageChange::Recreate,
             OnImageChange::Refuse => return Err(ImageChangeStop::NeedsTerminal.into()),
@@ -267,9 +280,13 @@ pub async fn prepare(
             // share it, and the `image_id` describes neither image.
             // A return here makes this mismatch impossible. A digest gets to
             // `ensure_image` only from the same resolution as its source.
+            // An imported sandbox can have no valid old digest. Then the
+            // old image is gone.
             let old_digest = old_digest.trim();
-            let old_image_path = cache::image_path(data_dir, old_digest)?;
-            if let Some(mut old) = read_ready_image(data_dir, &old_image_path) {
+            let old_image = cache::image_path(data_dir, old_digest)
+                .ok()
+                .and_then(|path| read_ready_image(data_dir, &path));
+            if let Some(mut old) = old_image {
                 // Write the configured name into the kept image, so the
                 // name-keyed fast path finds it on the next start. Otherwise
                 // each later run resolves again and asks the same question.
@@ -323,6 +340,7 @@ pub async fn prepare(
     // Always do this: also when the digest did not change, a previous run
     // can have left a standalone copy instead of a hardlink.
     ensure_image_hardlink(data_dir, &sandbox_image, &oci_image)?;
+    remove_import_marker(sandbox_dir);
     sandbox_dir.join("overlay")?.mkdirs()?;
 
     Ok(PreparedImage {
@@ -349,6 +367,7 @@ fn use_cached_image(
     // prepare. A cache wipe, a cache-path migration, or an older run can
     // break the link. Then the sweep can delete the image.
     ensure_image_hardlink(data_dir, sandbox_image, &image)?;
+    remove_import_marker(sandbox_dir);
     cli::log!(
         "  {} {}",
         cli::check(),
@@ -356,6 +375,100 @@ fn use_cached_image(
     );
     sandbox_dir.join("overlay")?.mkdirs()?;
     Ok(image)
+}
+
+/// Take the image of an old sandbox into the new sandbox `sandbox_dir`.
+/// The old `image` file is not copied, because the guest could write it.
+/// Only its digest is used. If the image of that digest is in the cache,
+/// the sandbox links to it. Else, if a disk was imported, the sandbox gets
+/// a marker, and the next [`prepare`] treats the image as changed.
+/// Args:
+///  - `data_dir`: Airlock data directory
+///  - `old`: Directory of the old sandbox
+///  - `sandbox_dir`: Directory of the new sandbox
+///  - `disk_imported`: The import took the disk of the old sandbox
+///
+/// Returns:
+///   Error if the link or the marker cannot be written.
+pub fn import_image(
+    data_dir: &DataDir,
+    old: &PinnedDir,
+    sandbox_dir: &VerifiedPath,
+    disk_imported: bool,
+) -> anyhow::Result<()> {
+    let digest = old
+        .read("image", MAX_IMAGE_FILE)
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice::<CachedImage>(&bytes).ok())
+        .map(|CachedImage::V2(image)| image.image_id)
+        .filter(|digest| is_sha256_digest(digest));
+    // Use the cache file, not the old file. Only the cache file is trusted.
+    let cached = digest.as_deref().and_then(|digest| {
+        let path = cache::image_path(data_dir, digest).ok()?;
+        read_cached_image(&path).filter(|image| image.image_id == digest)
+    });
+    if let Some(image) = cached {
+        return ensure_image_hardlink(data_dir, &sandbox_dir.join("image")?, &image);
+    }
+    // Without a disk, the image of the old sandbox does not matter.
+    if disk_imported {
+        let marker = digest.unwrap_or_default();
+        sandbox_dir.join(IMPORT_MARKER)?.write(marker)?;
+    }
+    Ok(())
+}
+
+/// Get what to do about a changed image of the sandbox in `sandbox_dir`.
+/// An imported sandbox with a disk and an unknown old image gives a change
+/// for each image. A re-create without a question would delete the
+/// imported disk, thus `Recreate` stops for it.
+/// Returns:
+///   `on_change`, or [`ImageChangeStop::ImportedImageUnknown`] in place of
+///   `Recreate` for such a sandbox.
+pub(crate) fn guard_recreate(
+    sandbox_dir: &VerifiedPath,
+    on_change: OnImageChange,
+) -> Result<OnImageChange, ImageChangeStop> {
+    if on_change == OnImageChange::Recreate
+        && read_import_marker(sandbox_dir).is_some_and(|digest| digest.is_empty())
+        && crate::project::has_disk(sandbox_dir)
+    {
+        return Err(ImageChangeStop::ImportedImageUnknown);
+    }
+    Ok(on_change)
+}
+
+/// Check that `digest` has the form `sha256:<64 lowercase hex digits>`.
+fn is_sha256_digest(digest: &str) -> bool {
+    digest.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// Read the image digest of the import marker in `sandbox_dir`.
+/// Returns:
+///   The digest (empty if not known), or `None` if there is no marker.
+pub(crate) fn read_import_marker(sandbox_dir: &VerifiedPath) -> Option<String> {
+    // A digest is about 71 bytes.
+    const CAP: u64 = 256;
+    let text = sandbox_dir
+        .join(IMPORT_MARKER)
+        .ok()?
+        .read_to_string_capped(CAP)
+        .ok()?;
+    Some(text.trim().to_string())
+}
+
+/// Remove the import marker in `sandbox_dir`. The sandbox has an image
+/// link now, which gives the stored digest.
+fn remove_import_marker(sandbox_dir: &VerifiedPath) {
+    if let Ok(marker) = sandbox_dir.join(IMPORT_MARKER) {
+        let _ = marker.remove_file();
+    }
 }
 
 /// Resolve the configured image reference to a digest and find working

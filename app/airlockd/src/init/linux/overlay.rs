@@ -24,8 +24,7 @@ use crate::init::MountConfig;
 ///     - Adds the CA bundles as a tmpfs lowerdir (see
 ///       [`super::ca::prepare_overlay`]).
 ///  2. Bind-mount the directory and cache mounts on the rootfs.
-///  3. Hide `.airlock/` and the configured mask paths, so the container
-///     cannot access sandbox internals (CA keys, disk image, lock file).
+///  3. Hide the configured mask paths in the project.
 ///
 /// Args:
 ///  - `mounts`: Mount configuration from the host
@@ -183,10 +182,9 @@ pub(super) fn assemble(mounts: &MountConfig) -> anyhow::Result<()> {
         }
     }
 
-    // Hide .airlock/ (for a sandbox in the project) and all user-defined
-    // `[mask.<name>]` paths. Each mask
-    // has its own source directory under `<mask_root>/project/<name>`, so
-    // the blocks stay isolated from each other. The tree is made again at
+    // Hide all user-defined `[mask.<name>]` paths. Each mask has its own
+    // source directory under `<mask_root>/project/<name>`, so the blocks
+    // stay isolated from each other. The tree is made again at
     // each VM start, so the host config is the source of truth.
     if let Some(project_mount) = mounts.dirs.iter().find(|d| d.tag == "project") {
         let mask_root = if has_disk {
@@ -201,20 +199,6 @@ pub(super) fn assemble(mounts: &MountConfig) -> anyhow::Result<()> {
         std::fs::create_dir_all(&project_mask_root)?;
 
         let project_root = crate::util::resolve_in_root(rootfs, &project_mount.target);
-
-        // Built-in: hide the .airlock/ directory of a sandbox in the
-        // project, so the container cannot read CA keys, disk image, lock
-        // file and others. A sandbox in the data directory has nothing
-        // there, and the mount target would make an empty .airlock/ in the
-        // host project.
-        if mounts.mask_airlock_dir {
-            let src = format!("{project_mask_root}/.airlock");
-            std::fs::create_dir_all(&src)?;
-            let dst = project_root.join(".airlock");
-            std::fs::create_dir_all(&dst)?;
-            super::mount::bind(&src, &dst.to_string_lossy(), true)?;
-            info!("masked .airlock at {}", dst.display());
-        }
 
         // User-defined masks: bind-mount the empty source directory of the
         // mask over each of its paths in the project.

@@ -1,37 +1,24 @@
 //! The sandbox location step of `airlock start`.
 //!
-//! Finds or makes the sandbox of the project and takes its lock. A new
-//! sandbox goes to the location that the user settings select. For a sandbox
-//! in the project directory, the step can offer to move it into the airlock
-//! data directory, where the sandbox guest cannot see it.
+//! Finds or makes the sandbox of the project in the airlock data directory
+//! and takes its lock. A sandbox that an older version kept in the project
+//! directory moves into the data directory first, after a question.
 
 use super::Exit;
 use crate::cli::prompt::PromptError;
 use crate::cli::prompt::choose::{Choice, Choose};
 use crate::context::Context;
-use crate::project::{self, SandboxLock};
-use crate::sandboxes::{self, Found, KEEP_IN_PROJECT, Location, MigrateError, registry};
-use crate::settings::SandboxType;
-use crate::util::{PinnedDir, VerifiedPath};
+use crate::project::SandboxLock;
+use crate::sandboxes::{self, MigrateError, registry};
+use crate::util::VerifiedPath;
 use crate::{cli, messages};
-
-/// The answer to the move question.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Move {
-    /// Move the sandbox into the data directory.
-    Yes,
-    /// Keep the sandbox in the project and do not ask again.
-    No,
-    /// Nobody can answer now. Keep the sandbox and ask on a later start.
-    Later,
-}
 
 /// Find or make the sandbox of the project `host_cwd` and take its lock.
 /// Args:
 ///  - `context`: Process context (settings, registry, data directory)
 ///  - `host_cwd`: Canonical project directory
 ///  - `can_prompt`: A terminal is available for questions
-///  - `yes`: `--yes`: move a project sandbox without a question
+///  - `yes`: `--yes`: move an old project sandbox without a question
 ///
 /// Returns:
 ///   The held lock, or the exit for an error or an aborted question.
@@ -41,139 +28,81 @@ pub async fn lock_sandbox(
     can_prompt: bool,
     yes: bool,
 ) -> Result<SandboxLock, Exit> {
-    let found = sandboxes::resolve_sandbox(context, host_cwd, false, false).await?;
-    let lock = match found {
-        Some(Found {
-            location: Location::DataDir { id },
-            ..
-        }) => lock_box(context, host_cwd, &id).await?,
-        Some(found) if wants_move(context, &found) => match ask_move(&found, can_prompt, yes)? {
-            Move::Yes => move_to_data_dir(context, host_cwd).await?,
-            Move::No => {
-                let lock = SandboxLock::acquire(host_cwd)?;
-                lock.dir()
-                    .to_path()
-                    .and_then(PinnedDir::pin)
-                    .and_then(|dir| dir.write_atomic(KEEP_IN_PROJECT, b"", 0o600))
-                    .map_err(anyhow::Error::from)?;
-                lock
-            }
-            Move::Later => SandboxLock::acquire(host_cwd)?,
-        },
-        Some(_) => SandboxLock::acquire(host_cwd)?,
-        None => match context.settings.security.sandbox_type {
-            SandboxType::ProjectOwned => SandboxLock::acquire(host_cwd)?,
-            SandboxType::Managed => {
-                // A local project config in `.airlock` goes with the new
-                // sandbox. Check before anything is made.
-                sandboxes::check_local_config(host_cwd).map_err(|e| Exit::error(1, e))?;
-                let boxes = &context.data.sandboxes;
-                let id = registry::find_or_register(&context.db, boxes, host_cwd).await?;
-                let lock = lock_box(context, host_cwd, &id).await?;
-                sandboxes::adopt_local_config(host_cwd, lock.dir())
-                    .map_err(|e| Exit::error(1, e))?;
-                lock
-            }
-        },
-    };
+    // A registered sandbox wins. A stale `.airlock/sandbox` next to it
+    // stays as it is.
+    if let Some(found) = sandboxes::resolve_sandbox(context, host_cwd, false, false).await? {
+        return lock_box(context, host_cwd, &found.id).await;
+    }
+    if sandboxes::has_legacy_sandbox(host_cwd) {
+        ask_import(can_prompt, yes)?;
+        return move_to_data_dir(context, host_cwd).await;
+    }
+    // A local project config in `.airlock` goes with the new sandbox. Check
+    // before anything is made.
+    sandboxes::check_local_config(host_cwd).map_err(|e| Exit::error(1, e))?;
+    let boxes = &context.data.sandboxes;
+    let id = registry::find_or_register(&context.db, boxes, host_cwd).await?;
+    let lock = lock_box(context, host_cwd, &id).await?;
+    sandboxes::adopt_local_config(host_cwd, lock.dir()).map_err(|e| Exit::error(1, e))?;
     Ok(lock)
 }
 
 /// Take the lock of the sandbox `id` in the data directory.
-// `airlock sandboxes rm` can remove the sandbox between the registry lookup
-// and the lock. The lock then makes a new empty directory. Check the
-// registry again under the lock, and remove that directory.
 async fn lock_box(
     context: &Context,
     host_cwd: &VerifiedPath,
     id: &str,
 ) -> Result<SandboxLock, Exit> {
-    let boxes = &context.data.sandboxes;
-    let lock = SandboxLock::acquire_box(host_cwd, boxes, id)?;
-    let cwd = host_cwd.to_entry_path().map_err(anyhow::Error::from)?;
-    if registry::get(&context.db, id).await?.as_deref() != Some(cwd.as_os_str()) {
-        let dir = lock.dir().clone();
-        drop(lock);
-        let _ = dir.remove_dir_all();
-        return Err(Exit::error(
-            1,
-            messages::start::SANDBOX_REMOVED_DURING_START,
-        ));
-    }
-    Ok(lock)
+    sandboxes::lock_box(context, host_cwd, id)
+        .await?
+        .ok_or_else(|| Exit::error(1, messages::start::SANDBOX_REMOVED_DURING_START))
 }
 
-/// Check if the move question applies to the project sandbox `found`: the
-/// settings select the data directory, the user did not choose to keep the
-/// sandbox in the project, and no airlock process runs the sandbox.
-fn wants_move(context: &Context, found: &Found) -> bool {
-    if context.settings.security.sandbox_type != SandboxType::Managed
-        || project::is_running(&found.dir)
-    {
-        return false;
-    }
-    // A symlinked sandbox directory gets no question. The lock reports the
-    // problem.
-    if !found.dir.symlink_metadata().is_ok_and(|m| m.is_dir()) {
-        return false;
-    }
-    found
-        .dir
-        .join(KEEP_IN_PROJECT)
-        .and_then(|p| p.symlink_metadata())
-        .is_err()
-}
-
-/// Ask if the project sandbox `found` moves into the data directory. The
-/// answers are "Yes, migrate" (default), "No, keep current" and "Abort".
-/// Abort and Esc end the run.
-fn ask_move(found: &Found, can_prompt: bool, yes: bool) -> Result<Move, Exit> {
+/// Ask before an old project sandbox moves into the data directory. The
+/// choices are "Continue" (default) and "Abort".
+/// Returns:
+///   `Ok` to continue. The exit for Abort or Esc, or an error if no
+///   terminal is available and `yes` is not set.
+fn ask_import(can_prompt: bool, yes: bool) -> Result<(), Exit> {
     if yes {
-        return Ok(Move::Yes);
+        return Ok(());
     }
+    let no_prompt = || Exit::error(1, messages::start::LEGACY_SANDBOX_NO_PROMPT);
     if !can_prompt {
-        cli::log!(
-            "{} {}",
-            cli::yellow("!"),
-            messages::start::sandbox_data_visible(&found.dir)
-        );
-        return Ok(Move::Later);
+        return Err(no_prompt());
     }
     let choices = [
-        messages::start::MOVE_CHOICE_YES,
-        messages::start::MOVE_CHOICE_NO,
+        messages::start::IMPORT_CONTINUE,
         messages::cli::ABORT_CHOICE,
     ]
     .map(|label| Choice { label });
     let answer = Choose {
-        title: messages::start::MOVE_TITLE,
-        notes: &[messages::start::MOVE_NOTE],
+        title: messages::start::IMPORT_TITLE,
+        notes: &[],
         choices: &choices,
         default: 0,
         report: true,
     }
     .ask();
     match answer {
-        Ok(Some(0)) => Ok(Move::Yes),
-        Ok(Some(1)) => Ok(Move::No),
+        Ok(Some(0)) => Ok(()),
         // Abort and Esc end the run.
         Ok(_) => Err(Exit::aborted()),
-        Err(PromptError::NotInteractive) => Ok(Move::Later),
+        Err(PromptError::NotInteractive) => Err(no_prompt()),
         Err(e) => Err(e.into()),
     }
 }
 
-/// Move the project sandbox into the data directory and take its lock.
+/// Import the project sandbox into the data directory and take its lock.
 async fn move_to_data_dir(context: &Context, host_cwd: &VerifiedPath) -> Result<SandboxLock, Exit> {
-    let id = match sandboxes::migrate(context, host_cwd).await {
-        Ok(id) => id,
+    let lock = match sandboxes::import_legacy(context, host_cwd).await {
+        Ok(lock) => lock,
         // The same failure as a lock that a different instance holds.
         Err(MigrateError::Running) => {
             return Err(anyhow::anyhow!(messages::project::SANDBOX_IN_USE).into());
         }
         Err(e) => return Err(Exit::error(1, e)),
     };
-    let lock = lock_box(context, host_cwd, &id).await?;
     cli::log!(
         "  {} {}",
         cli::check(),

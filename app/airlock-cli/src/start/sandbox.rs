@@ -540,7 +540,9 @@ fn ask(title: &str, notes: &[&str], choices: &[(&str, ToolAnswer)]) -> Result<To
 /// Abort, Ctrl+C, or a failure.
 fn image_error(e: anyhow::Error) -> Exit {
     match e.downcast_ref::<ImageChangeStop>() {
-        Some(ImageChangeStop::NeedsTerminal) => Exit::error(2, e),
+        Some(ImageChangeStop::NeedsTerminal | ImageChangeStop::ImportedImageUnknown) => {
+            Exit::error(2, e)
+        }
         Some(ImageChangeStop::Aborted) => Exit::aborted(),
         Some(ImageChangeStop::Interrupted) => Exit::INTERRUPTED,
         None => Exit::Failed(e),

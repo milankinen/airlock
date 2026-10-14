@@ -166,10 +166,10 @@ fn presets_list_applies_below_every_file() {
     assert!(token.mask);
 }
 
-/// Test that only config files make a project config. Sandbox files in
+/// Test that only config files make a project config. Other files in
 /// `.airlock` and user files do not.
 ///   1. Check that an empty project has no project config
-///   2. Add a sandbox file and a user config file
+///   2. Add a `.gitignore` in `.airlock` and a user config file
 ///   3. Check that there is still no project config, and the user value
 ///      applies
 #[test]
@@ -177,7 +177,7 @@ fn project_without_config_files_has_no_project_config() {
     let dirs = ConfigDirs::new();
     assert!(!dirs.load().unwrap().has_project_config());
 
-    dirs.project_file(".airlock/sandbox/installs.json", "{}")
+    dirs.project_file(".airlock/.gitignore", "*\n")
         .user_file(".airlock/config.toml", "[vm]\ncpus = 3\n");
     let layers = dirs.load().unwrap();
     assert!(!layers.has_project_config());

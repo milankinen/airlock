@@ -10,7 +10,7 @@ load helpers
 #   2. Run config
 #   3. Check that the project values merge and the user value is not there
 @test "config prints merged project files without user files" {
-    mkdir -p .airlock proj/.airlock/sandbox
+    mkdir -p .airlock proj
     printf '[vm]\nimage = "user:1"\ncpus = 7\n' >.airlock/config.toml
     cd proj
     write_config '[vm]
@@ -35,7 +35,6 @@ memory = 2048'
 #   2. Run config with --format json and parse the output
 #   3. Run config with --format yaml and check the keys
 @test "config json and yaml formats parse" {
-    mkdir -p .airlock/sandbox
     write_config '[vm]
 image = "project:1"'
     run_airlock config --format json
@@ -93,7 +92,7 @@ image = "project:1"'
     make_sandbox_disk
     write_config '[vm]'
     printf '%s' '{"last_run_config":{"user":[{"origin":"u","value":{"vm":{"cpus":3}},"legacy_presets":null}],"local":null,"project":[{"origin":"p","value":{"vm":{"image":"alpine:3"},"packs":{"python":{"version":1}}},"legacy_presets":null}]}}' \
-        >.airlock/sandbox/run.json
+        >"$BOX_DIR/run.json"
     run_airlock config --resolved
     assert_success
     assert_output_contains 'cpus = 3'
@@ -107,7 +106,6 @@ image = "project:1"'
 #   2. Run config --format json with stderr dropped
 #   3. Parse stdout as JSON and check the value
 @test "config json stdout is clean without stderr" {
-    mkdir -p .airlock/sandbox
     write_config '[vm]
 image = "project:1"'
     local out

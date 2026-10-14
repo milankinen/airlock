@@ -72,8 +72,7 @@ impl SandboxClient {
 }
 
 /// Find the CLI socket of the nearest running sandbox at or above `start`.
-/// Sandboxes in the data directory and in the project both count. With
-/// `follow_git_worktree`, the search goes on from the root of a git
+/// With `follow_git_worktree`, the search goes on from the root of a git
 /// worktree to the root of its main repository.
 ///
 /// Returns:
@@ -84,9 +83,9 @@ impl SandboxClient {
 // directory. If that path is longer than the `AF_UNIX` limit, the path is a
 // hash-keyed fallback under `<data>/sock/`.
 //
-// Code in a sandbox can write its project mount. A symlink there at
-// `.airlock/sandbox` or `cli.sock` could send the command, the env values
-// and the terminal to a different sandbox. Thus never follow a symlink.
+// A symlink at the sandbox directory or at `cli.sock` could send the
+// command, the env values and the terminal to a different sandbox. Thus
+// never follow a symlink.
 pub(super) async fn find_cli_sock(
     context: &Context,
     start: &VerifiedPath,

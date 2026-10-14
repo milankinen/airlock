@@ -6,14 +6,11 @@ load helpers
 # install state. Most tests use an image that does not exist, so start
 # stops at the image pull and no VM boots.
 
-# A config with an image that does not exist. Start stops at its pull.
-BAD_IMAGE='[vm]
-image = "airlock-test.invalid/no-such-image:1"'
-
-# True if the host can run a VM: not Linux, or Linux with /dev/kvm access.
-has_kvm_or_not_linux() {
-    [[ "$(uname)" != "Linux" ]] || [[ -r /dev/kvm ]]
-}
+# A config with an image that does not exist. The lookup is in docker only,
+# so start stops at the image step without network access.
+BAD_IMAGE='[vm.image]
+name = "airlock-test.invalid/no-such-image:1"
+resolution = "docker"'
 
 # Skip each test when KVM is not available, except the tests that stop
 # before the KVM check.
@@ -29,12 +26,14 @@ setup() {
 # not make a config.
 #   1. Run start in an empty directory
 #   2. Check exit code 2 and the message
-#   3. Check that no config file exists
+#   3. Check that no config file exists and that no sandbox exists
 @test "start without config fails in non-interactive mode" {
     run_airlock start
     assert_failure 2
     assert_output_contains "No airlock config in $PWD. Run \`airlock start\` in a terminal, or create airlock.toml."
-    [[ ! -e airlock.toml && ! -e .airlock/airlock.toml ]]
+    [[ ! -e airlock.toml ]]
+    run_airlock sandboxes list
+    assert_output_contains "No sandboxes in"
 }
 
 # Test that start refuses to continue when a sandbox exists but its config
@@ -47,10 +46,10 @@ setup() {
     run_airlock start
     assert_failure 2
     assert_output_contains "A sandbox exists in $PWD, but there is no config."
-    assert_output_contains "Put the config in airlock.toml or $PWD/.airlock/airlock.toml (restore it), or run \`airlock rm\` to start over."
+    assert_output_contains "Put the config in airlock.toml or $BOX_DIR/airlock.toml (restore it), or run \`airlock rm\` to start over."
 
-    rm .airlock/sandbox/disk.*
-    echo '{}' >.airlock/sandbox/installs.json
+    rm "$BOX_DIR"/disk.*
+    echo '{}' >"$BOX_DIR/installs.json"
     run_airlock start
     assert_failure 2
     assert_output_contains "A sandbox exists in $PWD, but there is no config."
@@ -138,8 +137,8 @@ allow = ["example.com:443"]'
 # and start stops before the image pull.
 #   1. Make a sandbox disk
 #   2. Add a pack with the version as a number, then as a string
-#   3. Run start and check exit code 2, the message and that no install
-#      records exist
+#   3. Run start (it accepts the config change) and check exit code 2, the
+#      message and that no install records exist
 @test "start with pack added to existing disk and no terminal fails before image pull" {
     make_sandbox_disk
     for version in '1' '"1"'; do
@@ -147,28 +146,29 @@ allow = ["example.com:443"]'
 
 [packs]
 python = { version = $version }"
-        run_airlock start
+        run_airlock start --allow-configuration-changes
         assert_failure 2
         assert_output_contains "Tools changed in the sandbox (added: python). Run in a terminal or pass --yes."
         assert_output_not_contains "Preparing sandbox"
-        [[ ! -e .airlock/sandbox/installs.json ]]
+        [[ ! -e "$BOX_DIR/installs.json" ]]
     done
 }
 
 # Test that a pack removed from the config needs a terminal or --yes, and
 # start keeps the disk.
 #   1. Make a sandbox disk with an installed mise record
-#   2. Write a config without packs and run start
+#   2. Write a config without packs and run start (it accepts the config
+#      change)
 #   3. Check exit code 2, the message and that the disk still exists
 @test "start with pack removed from existing disk and no terminal fails before image pull" {
     make_sandbox_disk
     write_installs mise=installed
     write_config "$BAD_IMAGE"
-    run_airlock start
+    run_airlock start --allow-configuration-changes
     assert_failure 2
     assert_output_contains "Tools changed in the sandbox (removed: mise). Run in a terminal or pass --yes."
     assert_output_not_contains "Preparing sandbox"
-    [[ -e .airlock/sandbox/disk.img ]]
+    [[ -e "$BOX_DIR/disk.img" ]]
 }
 
 # Test that packs on a new sandbox need no question, so start continues
@@ -195,49 +195,74 @@ python = { version = 1 }"
     assert_output_contains "$PWD"
 }
 
-# Test that --yes moves a sandbox from the project directory into the data
-# directory, before the image pull.
-#   1. Make a sandbox disk in the project and write a config
-#   2. Run start with --yes
-#   3. Check that the move is reported and the project sandbox is gone
-#   4. Check that `sandboxes list` has the project
-@test "start with --yes moves project sandbox to data directory" {
-    make_sandbox_disk
+# Test that --yes imports a sandbox from the project directory into the
+# data directory, before the image pull. The imported sandbox has no stored
+# config, so start stops at the config check until
+# --allow-configuration-changes is set. The import takes only the known
+# files and drops run.json and the image reference.
+#   1. Make a legacy sandbox with install records, a stale run.json and an
+#      image reference, and write a config
+#   2. Run start with --yes and check exit code 2, the move message and the
+#      config question
+#   3. Check that .airlock/sandbox is gone and that `sandboxes list` has the
+#      project
+#   4. Check that the sandbox directory has the disk and its records but
+#      not run.json or image
+#   5. Run start with --yes and --allow-configuration-changes and check that
+#      the sandbox prepare starts
+@test "start with --yes imports project sandbox into data directory" {
+    make_legacy_sandbox
+    printf '{"last_run_config": null}\n' >.airlock/sandbox/run.json
+    echo 'alpine:3' >.airlock/sandbox/image
     write_config "$BAD_IMAGE"
     run_airlock start --yes
-    assert_failure
+    assert_failure 2
     assert_output_contains "sandbox moved to"
+    assert_output_contains "The sandbox configuration has changed"
     [[ ! -e .airlock/sandbox ]]
     run_airlock sandboxes list
     assert_success
     assert_output_contains "$PWD"
+    run_airlock sandboxes info --json
+    local box
+    box="$(sed -n 's/^ *"dir": "\(.*\)",$/\1/p' <<<"$output")"
+    [[ -f "$box/disk.img" && -f "$box/disk.id" ]]
+    [[ ! -e "$box/run.json" && ! -e "$box/image" ]]
+
+    run_airlock start --yes --allow-configuration-changes
+    assert_failure
+    assert_output_not_contains "configuration has changed"
+    assert_output_contains "Preparing sandbox"
 }
 
-# Test that without a terminal and without --yes, a sandbox in the project
-# directory stays there, and start tells the user how to move it.
-#   1. Make a sandbox disk in the project and write a config
+# Test that without a terminal and without --yes, start refuses to import a
+# sandbox from the project directory, and changes nothing.
+#   1. Make a legacy sandbox and write a config
 #   2. Run start
-#   3. Check the notice and that the disk stays in the project
-@test "start without terminal keeps project sandbox and tells how to move it" {
-    make_sandbox_disk
+#   3. Check exit code 1 and the hint
+#   4. Check that the old sandbox stays and that `sandboxes list` is empty
+@test "start without terminal refuses to import project sandbox" {
+    make_legacy_sandbox
     write_config "$BAD_IMAGE"
     run_airlock start
-    assert_failure
-    assert_output_contains "run \`airlock start\` in a terminal to move it"
-    [[ -e .airlock/sandbox/disk.img ]]
+    assert_failure 1
+    assert_output_contains "Old sandbox in .airlock/sandbox. Run \`airlock start\` in a terminal, or with --yes, to move it."
+    [[ -e .airlock/sandbox/disk.img && -e .airlock/sandbox/disk.id ]]
+    run_airlock sandboxes list
+    assert_output_contains "No sandboxes in"
 }
 
 # Test that a list-form preset is not a pack change, so start asks no
 # question on an existing disk.
 #   1. Make a sandbox disk and write a config with presets = ["python"]
-#   2. Run start
+#   2. Run start (it accepts the config change)
 #   3. Check that there is no question and that the sandbox prepare starts
 @test "start with list preset on existing disk installs nothing" {
     make_sandbox_disk
     write_config "presets = [\"python\"]
 
 $BAD_IMAGE"
-    run_airlock start
+    run_airlock start --allow-configuration-changes
     assert_failure
     assert_output_not_contains "Tools changed"
     assert_output_contains "Preparing sandbox"
@@ -283,13 +308,14 @@ copilot = { version = 1 }"
 
 # Test that install records that are not valid stop start when there is
 # no terminal to ask the user.
-#   1. Write a config and an installs.json that is not JSON
+#   1. Write a config, make the sandbox and write an installs.json that is
+#      not JSON
 #   2. Run start
 #   3. Check exit code 2 and the message, before the sandbox prepare
 @test "start with corrupt install state and no terminal fails" {
     write_config "$BAD_IMAGE"
-    mkdir -p .airlock/sandbox
-    echo 'not json' >.airlock/sandbox/installs.json
+    make_box
+    echo 'not json' >"$BOX_DIR/installs.json"
     run_airlock start
     assert_failure 2
     assert_output_contains "installs.json is not valid"
@@ -306,9 +332,9 @@ copilot = { version = 1 }"
 #      sandbox prepare starts
 @test "start with changed config and no terminal fails" {
     write_config "$BAD_IMAGE"
-    mkdir -p .airlock/sandbox
+    make_box
     echo '{"last_run_config": {"user": [], "local": null, "project": [{"origin": "airlock.toml", "value": {"vm": {"cpus": 1}}, "legacy_presets": null}]}}' \
-        >.airlock/sandbox/run.json
+        >"$BOX_DIR/run.json"
     run_airlock start
     assert_failure 2
     assert_output_contains "The sandbox configuration has changed since the last run."
@@ -317,5 +343,7 @@ copilot = { version = 1 }"
     assert_failure 2
     assert_output_not_contains "Preparing sandbox"
     run_airlock start --yes --allow-configuration-changes
+    assert_failure
+    assert_output_not_contains "configuration has changed"
     assert_output_contains "Preparing sandbox"
 }

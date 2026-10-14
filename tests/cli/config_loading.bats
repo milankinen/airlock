@@ -19,7 +19,7 @@ load helpers
 #   2. Run info again with an empty TOML file, a YAML file and a JSON file
 #      with null presets
 @test "missing, empty or null-presets config loads defaults" {
-    mkdir -p .airlock/sandbox
+    make_box
     run_airlock info
     assert_success
     assert_output_contains "Image:"
@@ -41,15 +41,16 @@ load helpers
 # Test that the config files apply in the correct order, so that a later
 # file overrides an earlier one.
 #   1. Write the two files in ~/.airlock and check that config.toml wins
-#   2. Add ~/.airlock.toml, the local .airlock/airlock.toml, airlock.toml
+#   2. Add ~/.airlock.toml, the local airlock.toml of the sandbox, airlock.toml
 #      and airlock.local.toml, one by one
 #   3. After each file, check that its image is used
 #   4. Check that the CPU value of the first file stays
 @test "config files of user and project apply in precedence order" {
-    mkdir -p .airlock proj/.airlock/sandbox
+    mkdir -p .airlock proj
     printf '[vm]\nimage = "user-airlock:1"\ncpus = 1\n' >.airlock/airlock.toml
     printf '[vm]\nimage = "user-config:1"\n' >.airlock/config.toml
     cd proj
+    make_box
 
     run_airlock info
     assert_success
@@ -60,7 +61,7 @@ load helpers
     run_airlock info
     assert_output_contains "Image:    user:1"
 
-    printf '[vm]\nimage = "local:1"\n' >.airlock/airlock.toml
+    printf '[vm]\nimage = "local:1"\n' >"$BOX_DIR/airlock.toml"
     run_airlock info
     assert_output_contains "Image:    local:1"
 
@@ -81,7 +82,7 @@ image = "project-local:1"'
 #   1. Write a config with four list presets
 #   2. Run info and check the claude-code rule
 @test "list presets load with their network rules" {
-    mkdir -p .airlock/sandbox
+    make_box
     write_config 'presets = ["debian", "rust", "claude-code", "copilot-cli"]'
     run_airlock info
     assert_success
@@ -94,7 +95,7 @@ image = "project-local:1"'
 #   2. Run info
 #   3. Check the rule summary and that the value is not in the output
 @test "masked env injected into network rule loads" {
-    mkdir -p .airlock/sandbox
+    make_box
     write_config '[env]
 TOKEN = { value = "static-token-value", mask = true }
 
@@ -137,9 +138,10 @@ TOKEN = { value = "x", masked = true }' "invalid configuration"
 #   2. Run info
 #   3. Check that there are no packs
 @test "leftover tools table in user or project config is ignored" {
-    mkdir -p .airlock proj/.airlock/sandbox
+    mkdir -p .airlock proj
     printf '[tools]\npython = {}\n' >.airlock/config.toml
     cd proj
+    make_box
     write_config '[tools]
 python = {}'
     run_airlock info
@@ -155,9 +157,11 @@ python = {}'
 #   3. Run info and check both packs and the preset network rule, and that
 #      the preset does not become the claude pack
 @test "packs list in one file and packs table in another both apply" {
-    mkdir -p .airlock proj/.airlock/sandbox
-    printf 'presets = ["claude-code"]\n' >.airlock/config.toml
+    mkdir -p .airlock proj
     cd proj
+    # Make the sandbox first. The preset needs a token to start.
+    make_box
+    printf 'presets = ["claude-code"]\n' >../.airlock/config.toml
     write_config '[packs]
 python = { version = "1" }
 rust = { version = 1 }'
@@ -170,13 +174,14 @@ rust = { version = 1 }'
 }
 
 # Test that a pack disabled in airlock.toml overrides the same pack in the
-# local .airlock/airlock.toml.
+# local airlock.toml of the sandbox.
 #   1. Enable python in the local config and disable it in airlock.toml
 #   2. Run info and check that python is not shown
 @test "packs entry disabled in project file overrides local file entry" {
-    mkdir -p proj/.airlock/sandbox
-    printf '[packs]\npython = { version = 1 }\n' >proj/.airlock/airlock.toml
+    mkdir proj
     cd proj
+    make_box
+    printf '[packs]\npython = { version = 1 }\n' >"$BOX_DIR/airlock.toml"
     write_config '[packs]
 python = { enabled = false }'
     run_airlock info
@@ -191,7 +196,7 @@ python = { enabled = false }'
 #   2. Run info for each
 #   3. Check exit code 2 and the message for each
 @test "invalid packs entries report config error naming entry and file" {
-    mkdir -p .airlock/sandbox
+    make_box
     local file="$PWD/airlock.toml"
 
     assert_config_error info '[packs]

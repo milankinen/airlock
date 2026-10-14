@@ -330,8 +330,8 @@ mod tests {
     use crate::util::Roots;
 
     /// Test that the VM start does not follow symlinks at the log files in
-    /// the runtime dir. The guest can put them in a sandbox in the project
-    /// to make the host write a host file.
+    /// the runtime dir. A followed link could make the host write a host
+    /// file.
     ///   1. Put symlinks to a host file at the serial and hypervisor logs
     ///   2. Start the backend with a hypervisor that exits at once
     ///   3. Check that the host file did not change and the logs are not

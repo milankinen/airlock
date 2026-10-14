@@ -14,7 +14,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -122,6 +122,97 @@ impl PinnedDir {
     ///   owner, or a file larger than `cap`.
     pub fn read(&self, name: impl AsRef<OsStr>, cap: u64) -> io::Result<Option<Vec<u8>>> {
         let name = name.as_ref();
+        let Some(file) = self.open_file(name)? else {
+            return Ok(None);
+        };
+        self.read_capped(name, file, cap).map(Some)
+    }
+
+    /// Open the regular file `name` to read it. The file must have exactly
+    /// one link, and the current user must own it. Thus a hard link to a
+    /// file in a different place is refused.
+    /// Returns:
+    ///   The open file, or `Ok(None)` if the file does not exist. Error for
+    ///   a symlink, a file that is not regular, a file of a different owner,
+    ///   or a file with more than one link.
+    pub fn open_regular(&self, name: impl AsRef<OsStr>) -> io::Result<Option<File>> {
+        let name = name.as_ref();
+        let Some(file) = self.open_file(name)? else {
+            return Ok(None);
+        };
+        if file.metadata()?.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                messages::util::multiple_links(self.display.join(name).display()),
+            ));
+        }
+        Ok(Some(file))
+    }
+
+    /// Read the regular file `name` (see [`Self::open_regular`] for the
+    /// checks).
+    /// Args:
+    ///  - `name`: File name
+    ///  - `cap`: Maximum file size in bytes
+    ///
+    /// Returns:
+    ///   The file content, or `Ok(None)` if the file does not exist. Error
+    ///   if a check fails or the file is larger than `cap`.
+    pub fn read_single(&self, name: impl AsRef<OsStr>, cap: u64) -> io::Result<Option<Vec<u8>>> {
+        let name = name.as_ref();
+        let Some(file) = self.open_regular(name)? else {
+            return Ok(None);
+        };
+        self.read_capped(name, file, cap).map(Some)
+    }
+
+    /// Take an exclusive lock on the regular file `name`. Does not wait and
+    /// creates nothing.
+    /// Returns:
+    ///   The file that holds the lock until it drops, or `Ok(None)` if the
+    ///   file does not exist. Error `WouldBlock` if a different holder has
+    ///   the lock.
+    pub fn try_lock(&self, name: impl AsRef<OsStr>) -> io::Result<Option<File>> {
+        let Some(file) = self.open_file(name.as_ref())? else {
+            return Ok(None);
+        };
+        // SAFETY: the fd is open. `flock` does not touch memory.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Some(file))
+    }
+
+    /// Move the entry `name` of this directory to `to_name` in the directory
+    /// `to`. Replaces an entry at `to_name`. Does not follow a symlink at
+    /// either name.
+    pub fn rename_into(
+        &self,
+        name: impl AsRef<OsStr>,
+        to: &PinnedDir,
+        to_name: impl AsRef<OsStr>,
+    ) -> io::Result<()> {
+        let (from, target) = (file_name(name.as_ref())?, file_name(to_name.as_ref())?);
+        // SAFETY: both fds are open and both names are valid C strings.
+        let rc = unsafe {
+            libc::renameat(
+                self.fd.as_raw_fd(),
+                from.as_ptr(),
+                to.fd.as_raw_fd(),
+                target.as_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Open the regular file `name` to read it. The current user must own it.
+    /// Returns:
+    ///   The open file, or `Ok(None)` if the file does not exist.
+    fn open_file(&self, name: &OsStr) -> io::Result<Option<File>> {
         let c = file_name(name)?;
         // O_NONBLOCK: the open of a planted FIFO must not block. The type
         // check below refuses it.
@@ -136,23 +227,30 @@ impl PinnedDir {
             Err(e) => return Err(self.context(name, &e)),
         };
         let file = File::from(fd);
-        let meta = file.metadata()?;
-        self.check_regular(name, &meta)?;
-        if meta.len() > cap {
-            return Err(io::Error::new(
+        self.check_regular(name, &file.metadata()?)?;
+        Ok(Some(file))
+    }
+
+    /// Read all of the open file `file` (the entry `name`).
+    /// Returns:
+    ///   The content, or error if the file is larger than `cap`.
+    fn read_capped(&self, name: &OsStr, file: File, cap: u64) -> io::Result<Vec<u8>> {
+        let too_large = || {
+            io::Error::new(
                 io::ErrorKind::InvalidData,
                 messages::util::file_too_large(self.display.join(name).display(), cap),
-            ));
+            )
+        };
+        let len = file.metadata()?.len();
+        if len > cap {
+            return Err(too_large());
         }
-        let mut buf = Vec::with_capacity(meta.len() as usize);
+        let mut buf = Vec::with_capacity(len as usize);
         file.take(cap + 1).read_to_end(&mut buf)?;
         if buf.len() as u64 > cap {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                messages::util::file_too_large(self.display.join(name).display(), cap),
-            ));
+            return Err(too_large());
         }
-        Ok(Some(buf))
+        Ok(buf)
     }
 
     /// Replace the file `name` atomically with `bytes`. The file gets the
@@ -280,7 +378,11 @@ impl PinnedDir {
 
     /// Write a temp file with `fill`, sync it and rename it over `name`. If a
     /// step fails, the temp file is removed.
-    fn replace_with(
+    /// Args:
+    ///  - `name`: File name
+    ///  - `mode`: Permission bits of the new file
+    ///  - `fill`: Writes the content to the new file
+    pub(crate) fn replace_with(
         &self,
         name: &OsStr,
         mode: u32,
@@ -304,6 +406,27 @@ impl PinnedDir {
                 Err(e)
             }
         }
+    }
+
+    /// Make the file `name` atomically with `make`. If `make` fails, the temp
+    /// entry is removed.
+    /// Args:
+    ///  - `name`: File name
+    ///  - `make`: Makes a new file. It gets this directory and a temp name
+    ///    that does not exist.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn make_with(
+        &self,
+        name: &OsStr,
+        make: impl FnOnce(BorrowedFd<'_>, &std::ffi::CStr) -> io::Result<()>,
+    ) -> io::Result<()> {
+        file_name(name)?;
+        let tmp = temp_name(name);
+        if let Err(e) = make(self.fd.as_fd(), &tmp) {
+            unsafe { libc::unlinkat(self.fd.as_raw_fd(), tmp.as_ptr(), 0) };
+            return Err(e);
+        }
+        self.commit_temp(&tmp, name)
     }
 
     /// Rename the temp file `tmp` over `name`. If the rename fails, remove
@@ -349,6 +472,12 @@ impl PinnedDir {
             );
         }
         io::Error::new(e.kind(), messages::util::path_error(path.display(), e))
+    }
+}
+
+impl AsFd for PinnedDir {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
     }
 }
 

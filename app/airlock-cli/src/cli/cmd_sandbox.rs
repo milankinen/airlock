@@ -3,8 +3,7 @@
 //! Lists the sandboxes in the airlock data directory, shows the details and
 //! the config of one sandbox, and removes sandboxes. Without an id, `info`
 //! and `remove` use the sandbox of the current directory, as `airlock info`
-//! and `airlock rm` do. Sandboxes in a project directory are not in the
-//! list.
+//! and `airlock rm` do.
 
 use std::ffi::OsStr;
 
@@ -15,7 +14,7 @@ use super::cmd_info::{self, Details};
 use super::cmd_rm::{self, RmArgs};
 use crate::cli::prompt::choose;
 use crate::context::Context;
-use crate::sandboxes::{self, Location, registry};
+use crate::sandboxes::{self, registry};
 use crate::util::verified_path::VerifiedPath;
 use crate::{cli, messages, oci, project};
 
@@ -96,11 +95,8 @@ async fn list(context: &Context) -> anyhow::Result<i32> {
     let roots = context.roots();
     let mut rows = Vec::new();
     for entry in entries {
-        let location = Location::DataDir {
-            id: entry.id.clone(),
-        };
         let dir = boxes.join(&entry.id)?;
-        let details = Details::read(&location, entry.project.display().to_string(), &dir);
+        let details = Details::read(&entry.id, entry.project.display().to_string(), &dir);
         let mut project = details.project.clone();
         // A path through a symlink below the trusted roots does not count.
         let is_dir = VerifiedPath::new(&entry.project, &roots).is_ok_and(|p| p.is_dir());

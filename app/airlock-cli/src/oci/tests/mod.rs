@@ -8,7 +8,7 @@ mod test_image_user;
 mod test_layer_cache;
 mod test_os_release;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use super::*;
 use crate::test_cfg::oci::{LayerTar, data_dir_at};

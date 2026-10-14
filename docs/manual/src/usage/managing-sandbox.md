@@ -124,11 +124,6 @@ the project configuration files (`airlock.toml`, `airlock.local.toml`).
 If the project has no other config, `airlock start` opens the setup
 wizard again.
 
-In your home directory, `.airlock/` also holds your user files: user
-config, vault and settings. There, `airlock rm` removes only
-`.airlock/sandbox/`. If `.airlock` is a symbolic link, `airlock rm`
-removes only the link.
-
 ## Where airlock keeps sandbox data
 
 airlock stores the sandbox data in the application data directory:
@@ -156,24 +151,45 @@ directory when it starts. If the data directory is on a different file
 system, airlock shows a warning and uses `~/.cache/airlock` as the data
 directory.
 
-## Project-colocated sandboxes
+## Sandboxes of older versions
 
 Older airlock versions kept the sandbox in `.airlock/sandbox` in the
-project directory. `airlock start` offers to move such a sandbox into the
-data directory.
+project directory. The sandbox guest can write this directory, so airlock
+no longer uses it. All sandboxes live in the data directory.
 
-To keep new sandboxes in the project directory, set `sandbox_type` in
-`~/.airlock/settings.toml`:
+When `airlock start` finds `.airlock/sandbox` in a project that has no
+registered sandbox, it asks one question: `Continue` or `Abort`.
+`Continue` moves the sandbox data to the data directory. A registered
+sandbox wins. airlock leaves a stale `.airlock/sandbox` next to it
+untouched.
 
-```toml
-[security]
-sandbox_type = "project-owned"   # default: "managed"
-```
+* With `--yes`, airlock moves the data without a question.
+* Without a terminal and without `--yes`, `airlock start` stops with a
+  hint. Run it in a terminal, or pass `--yes`.
+* If `.airlock` holds other files than `.gitignore`, `airlock.log`,
+  `sandbox` and the local config, airlock refuses the move. Move or
+  remove the files that the message lists.
 
-The guest hides the `.airlock` directory of a project-owned sandbox.
+The move takes only these items:
 
-> [!WARNING]
-> A sandbox in the project directory is less secure. The sandbox guest
-> can read the project directory, so the sandbox data (for example the CA
-> private key) is open to code in the sandbox. Keep the default and use
-> the application data directory.
+* the disk (`disk.img`) and its id (`disk.id`)
+* the install records. airlock marks them so that the question "a session
+  ran on this disk" stays on.
+* the CA (`ca.json`)
+
+airlock does not take the other files. This includes `run.json`, logs
+and sockets. airlock removes `.airlock/` after the move.
+
+The image link comes from the image cache. If the cache has the image,
+airlock links it at once. Else the next start compares the old image with
+the configured image. A different image gives the image change question.
+If the old image is unknown, each image counts as a change. Then `--yes`
+stops the start with exit code 2, and the disk stays.
+
+If airlock took a disk, the first start after the move asks the config
+change question. The stored config of the old sandbox is not taken.
+Without a terminal, or with `--yes`, and without
+`--allow-configuration-changes`, the start exits with code 2.
+
+A sandbox in the data directory that an older version made can have no
+stored config. It gets the same question one time.

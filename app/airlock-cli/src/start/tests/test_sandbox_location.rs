@@ -1,15 +1,16 @@
 //! Tests of the sandbox location step of `airlock start`: where a new
-//! sandbox goes, and the move of a sandbox from the project directory into
-//! the data directory.
+//! sandbox goes, and the import of a sandbox of an older version from the
+//! project directory into the data directory.
 
 use std::path::{Path, PathBuf};
 
 use crate::context::Context;
 use crate::project::{self, SandboxLock};
-use crate::sandboxes::{KEEP_IN_PROJECT, Location, migrate, registry};
+use crate::sandboxes::{self, import_legacy, registry};
+use crate::start::Exit;
 use crate::start::location::lock_sandbox;
 use crate::test_cfg::packs::test_packs;
-use crate::test_cfg::sandboxes::{LEGACY_CA, legacy_sandbox};
+use crate::test_cfg::sandboxes::{cached_image, legacy_ca, legacy_sandbox};
 use crate::test_cfg::start::StartProject;
 use crate::test_cfg::{TempDir, block_on_local, eventually, temp_dir, test_context};
 use crate::util::VerifiedPath;
@@ -46,6 +47,14 @@ impl Home {
         }
     }
 
+    /// Run the location step without a terminal. `yes` is `--yes`. Panics
+    /// if the step fails (see [`Self::try_lock`]).
+    /// Returns:
+    ///   The sandbox directory. The lock is released.
+    fn lock(&self, yes: bool) -> PathBuf {
+        self.try_lock(yes).unwrap_or_else(|e| panic!("{e:?}"))
+    }
+
     /// Run the location step without a terminal. `yes` is `--yes`.
     ///
     /// The lock of a previous step can stay held for a short time after it
@@ -54,25 +63,35 @@ impl Home {
     /// free, and tries again if it finds the lock held (as
     /// [`StartProject::start`] does).
     /// Returns:
-    ///   The sandbox directory. The lock is released.
-    fn lock(&self, yes: bool) -> PathBuf {
+    ///   The sandbox directory, or the exit of the step. The lock is
+    ///   released.
+    fn try_lock(&self, yes: bool) -> Result<PathBuf, Exit> {
+        let project = crate::test_cfg::oci::verified_dir(&self.project);
         eventually("sandbox lock is free", || {
-            // The step does not move a running sandbox, and does not fail.
-            let sandbox = VerifiedPath::new_follow(self.project_sandbox(), None).unwrap();
-            if project::is_running(&sandbox) {
+            // Wait until the lock of the old or the registered sandbox is
+            // free.
+            let old = VerifiedPath::new_follow(self.project_sandbox(), None).unwrap();
+            let found = block_on_local(sandboxes::resolve_sandbox(
+                &self.context,
+                &project,
+                false,
+                false,
+            ))
+            .unwrap();
+            if project::is_running(&old) || found.is_some_and(|f| project::is_running(&f.dir)) {
                 return None;
             }
-            match block_on_local(lock_sandbox(
-                &self.context,
-                &crate::test_cfg::oci::verified_dir(&self.project),
-                false,
-                yes,
-            )) {
-                Ok(lock) => Some(lock.dir().to_path().unwrap().to_path_buf()),
+            match block_on_local(lock_sandbox(&self.context, &project, false, yes)) {
+                Ok(lock) => Some(Ok(lock.dir().to_path().unwrap().to_path_buf())),
                 Err(e) if format!("{e:?}").contains("another airlock instance") => None,
-                Err(e) => panic!("{e:?}"),
+                Err(e) => Some(Err(e)),
             }
         })
+    }
+
+    /// The registered sandboxes.
+    fn registered(&self) -> Vec<registry::Entry> {
+        block_on_local(registry::list(&self.context.db)).unwrap()
     }
 
     /// The project sandbox directory.
@@ -100,9 +119,7 @@ fn new_sandbox_goes_to_data_dir_and_project_gets_no_sandbox_data() {
     project.start(ONE, false).unwrap();
 
     let found = project.sandbox().unwrap();
-    let Location::DataDir { id } = &found.location else {
-        panic!("{found:?}");
-    };
+    let id = &found.id;
     let dir = found.dir.to_path().unwrap();
     let boxes = &project.context().data.sandboxes;
     assert_eq!(found.dir, boxes.join(id).unwrap());
@@ -117,40 +134,18 @@ fn new_sandbox_goes_to_data_dir_and_project_gets_no_sandbox_data() {
     assert_eq!(&entries[0].id, id);
 }
 
-/// Test that the `project-owned` setting puts a new sandbox in the project,
-/// and keeps it out of the registry.
-///   1. Set `sandbox_type = "project-owned"` and start a project
-///   2. Check that the sandbox is in `.airlock/sandbox` and has a CA
-///   3. Check that the registry is empty
-#[test]
-fn project_dir_setting_puts_new_sandbox_in_project() {
-    let project = StartProject::with_settings(
-        test_packs(),
-        "[security]\nsandbox_type = \"project-owned\"\n",
-    );
-    project.start(ONE, false).unwrap();
-
-    let found = project.sandbox().unwrap();
-    assert_eq!(found.location, Location::ProjectDir);
-    let dir = found.dir.to_path().unwrap();
-    assert_eq!(dir, project.project_dir().join(".airlock/sandbox"));
-    assert!(dir.join("ca.json").is_file());
-    assert!(
-        block_on_local(registry::list(&project.context().db))
-            .unwrap()
-            .is_empty()
-    );
-}
-
-/// Test that `--yes` moves an older project sandbox into the data
+/// Test that `--yes` imports an older project sandbox into the data
 /// directory with its disk, records and local project config, and removes
 /// the `.airlock` directory of the project.
 ///   1. Make a sandbox with record files and a disk in the project, and a
 ///      local project config, a `.gitignore` and a log next to it
 ///   2. Run the location step with `--yes`
 ///   3. Check that the sandbox is registered and is in the data directory
-///   4. Check that the disk, the record files and the local config moved
-///   5. Check that the `.airlock` directory of the project is gone
+///   4. Check that the disk, the records and the local config moved, and
+///      that `run.json` is dropped
+///   5. Check that the sandbox has the image marker, because the old
+///      sandbox had no image
+///   6. Check that the `.airlock` directory of the project is gone
 #[test]
 fn yes_moves_project_sandbox_and_local_config_and_removes_airlock_dir() {
     let home = Home::new("");
@@ -171,11 +166,19 @@ fn yes_moves_project_sandbox_and_local_config_and_removes_airlock_dir() {
     assert_eq!(entries[0].project, home.project.as_os_str());
     assert_eq!(
         dir,
-        home.context.data.sandboxes.given().join(&entries[0].id)
+        home.context
+            .data
+            .sandboxes
+            .to_path()
+            .unwrap()
+            .join(&entries[0].id)
     );
     assert_eq!(read(&dir, "disk.img"), "disk");
-    assert_eq!(read(&dir, "ca.json"), LEGACY_CA);
-    assert!(dir.join("run.json").is_file() && dir.join("installs.json").is_file());
+    assert_eq!(read(&dir, "ca.json"), legacy_ca());
+    assert!(dir.join("installs.json").is_file());
+    assert!(!dir.join("run.json").exists());
+    assert!(!dir.join("image").exists());
+    assert_eq!(read(&dir, "image.imported"), "");
     assert_eq!(read(&dir, "airlock.toml"), "[vm]\n");
     assert!(!airlock.exists());
 }
@@ -193,12 +196,13 @@ fn move_with_extra_files_in_airlock_dir_is_refused_and_changes_nothing() {
     let extra = home.project.join(".airlock/.init-done");
     std::fs::write(&extra, "").unwrap();
 
-    let err = block_on_local(migrate(
+    let Err(err) = block_on_local(import_legacy(
         &home.context,
         &crate::test_cfg::oci::verified_dir(&home.project),
-    ))
-    .unwrap_err()
-    .to_string();
+    )) else {
+        panic!("import must fail");
+    };
+    let err = err.to_string();
     assert!(
         err.starts_with(".airlock directory contains extra files (.init-done), can't migrate"),
         "{err}"
@@ -237,57 +241,86 @@ fn new_data_dir_sandbox_takes_local_config_out_of_project() {
 
     let dir = home.lock(false);
 
-    assert!(dir.starts_with(home.context.data.sandboxes.given()));
+    assert!(dir.starts_with(home.context.data.sandboxes.to_path().unwrap()));
     assert_eq!(read(&dir, "airlock.json"), "{}");
     assert!(!home.project.join(".airlock").exists());
 }
 
 /// Test that without a terminal and without `--yes`, an older project
-/// sandbox stays in the project, and that a later start can still move it.
-///   1. Make a sandbox with record files in the project
+/// sandbox stops the start and changes nothing. A marker of the removed
+/// `keep-in-project` choice does not change this. A script must not move
+/// sandbox data without consent.
+///   1. Make a sandbox with record files and the keep marker in the project
 ///   2. Run the location step without a terminal and without `--yes`
-///   3. Check that the sandbox stays in the project, without the keep
-///      marker
+///   3. Check exit code 1, that the files in the project stay the same,
+///      and that the registry and the data directory have no sandbox
 ///   4. Run the step with `--yes` and check that the sandbox moves
 #[test]
-fn project_sandbox_without_terminal_stays_and_later_start_can_move_it() {
+fn old_sandbox_without_terminal_stops_start_and_changes_nothing() {
     let home = Home::new("");
     legacy_sandbox(&home.project);
+    std::fs::write(home.project_sandbox().join("keep-in-project"), "").unwrap();
+    let before = tree(&home.project);
 
-    assert_eq!(home.lock(false), home.project_sandbox());
-    assert_eq!(read(&home.project_sandbox(), "ca.json"), LEGACY_CA);
-    assert!(!home.project_sandbox().join(KEEP_IN_PROJECT).exists());
+    assert!(matches!(home.try_lock(false), Err(Exit::Code(1))));
+    assert_eq!(tree(&home.project), before);
+    assert!(home.registered().is_empty());
+    let boxes = home.context.data.sandboxes.to_path().unwrap();
+    assert!(std::fs::read_dir(boxes).map_or(true, |mut d| d.next().is_none()));
 
     let moved = home.lock(true);
-    assert!(moved.starts_with(home.context.data.sandboxes.given()));
-    assert_eq!(read(&moved, "ca.json"), LEGACY_CA);
+    assert!(moved.starts_with(boxes));
+    assert_eq!(read(&moved, "ca.json"), legacy_ca());
 }
 
-/// Test that a project sandbox stays in the project when the user chose to
-/// keep it there, or when the settings select the project directory.
-///   1. Mark a project sandbox as kept (the "no" answer) and run the step
-///      with `--yes`, and check that it stays
-///   2. With `sandbox_type = "project-owned"`, run the step with `--yes`
-///      on an older project sandbox, and check that it stays
-///   3. Check that the registry stays empty in both cases
-#[test]
-fn kept_project_sandbox_or_project_dir_setting_is_not_moved() {
-    let kept = Home::new("");
-    legacy_sandbox(&kept.project);
-    std::fs::write(kept.project_sandbox().join(KEEP_IN_PROJECT), "").unwrap();
-    assert_eq!(kept.lock(true), kept.project_sandbox());
-
-    let setting = Home::new("[security]\nsandbox_type = \"project-owned\"\n");
-    legacy_sandbox(&setting.project);
-    assert_eq!(setting.lock(true), setting.project_sandbox());
-
-    for home in [&kept, &setting] {
-        assert!(
-            block_on_local(registry::list(&home.context.db))
-                .unwrap()
-                .is_empty()
-        );
+/// The files under `dir`, with their content, in name order. A symlink
+/// is not followed: its content is the link target.
+fn tree(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut files = Vec::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(next) = todo.pop() {
+        for entry in std::fs::read_dir(&next).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                todo.push(path);
+            } else if kind.is_symlink() {
+                let target = std::fs::read_link(&path).unwrap();
+                files.push((path, target.as_os_str().as_bytes().to_vec()));
+            } else {
+                files.push((path.clone(), std::fs::read(&path).unwrap()));
+            }
+        }
     }
+    files.sort();
+    files
+}
+
+/// Test that a `--yes` start imports an older project sandbox and then
+/// stops at the config check. Nobody accepted the config that made the
+/// imported disk. `--allow-configuration-changes` lets the start go on.
+///   1. Make an older project sandbox with a disk and a known image
+///   2. Start with `--yes` and check exit code 2
+///   3. Check that the sandbox moved into the data directory with its disk
+///   4. Start with `--yes` and `--allow-configuration-changes` and check
+///      that it starts
+#[test]
+fn yes_start_imports_old_sandbox_and_stops_at_config_check_until_allowed() {
+    let project = StartProject::new(test_packs());
+    let old = legacy_sandbox(&project.project_dir());
+    let (_, image_json) = cached_image(project.context(), "alpine");
+    std::fs::write(old.join("image"), image_json).unwrap();
+
+    assert!(matches!(project.start("", true), Err(Exit::Code(2))));
+
+    let dir = project.sandbox_dir();
+    assert!(dir.starts_with(project.context().data.sandboxes.to_path().unwrap()));
+    assert_eq!(read(&dir, "disk.img"), "disk");
+    assert!(!project.project_dir().join(".airlock").exists());
+
+    project.start_with("", true, true).unwrap();
 }
 
 /// Test that a running project sandbox is not moved. The start fails on the
@@ -299,9 +332,9 @@ fn kept_project_sandbox_or_project_dir_setting_is_not_moved() {
 fn running_project_sandbox_is_not_moved() {
     let home = Home::new("");
     legacy_sandbox(&home.project);
-    let _running =
-        SandboxLock::acquire(&crate::util::VerifiedPath::new_follow(&home.project, None).unwrap())
-            .unwrap();
+    let project = VerifiedPath::new_follow(&home.project, None).unwrap();
+    let old = VerifiedPath::new_follow(home.project_sandbox(), None).unwrap();
+    let _running = SandboxLock::acquire_dir(&old, &project).unwrap();
 
     assert!(
         block_on_local(lock_sandbox(
@@ -318,4 +351,28 @@ fn running_project_sandbox_is_not_moved() {
             .unwrap()
             .is_empty()
     );
+}
+
+/// Test that `--yes` with `--allow-configuration-changes` does not make an
+/// imported sandbox again when its old image is not known. Each image is a
+/// change for it, and a re-create would delete the imported disk without a
+/// question.
+///   1. Make an older project sandbox with a disk and no image file
+///   2. Start with `--yes` and `--allow-configuration-changes`
+///   3. Check that the start stops with exit code 2, and that the imported
+///      disk stays
+#[test]
+fn yes_start_keeps_imported_disk_when_old_image_is_unknown() {
+    let project = StartProject::new(test_packs());
+    legacy_sandbox(&project.project_dir());
+
+    assert!(matches!(
+        project.start_with("", true, true),
+        Err(Exit::Code(2))
+    ));
+
+    let dir = project.sandbox_dir();
+    assert!(dir.starts_with(project.context().data.sandboxes.to_path().unwrap()));
+    assert_eq!(read(&dir, "disk.img"), "disk");
+    assert_eq!(read(&dir, "image.imported"), "");
 }

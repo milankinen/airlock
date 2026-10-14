@@ -75,7 +75,7 @@ depends = ["build:dev"]
 run = "exec \"${CARGO_TARGET_DIR:-{{ config_root }}/target}/debug/airlock\""
 
 [tasks."sandbox-start"]
-description = "Build airlock and start the project sandbox shell"
+description = "Build airlock and start the sandbox shell of the project"
 raw = true
 run = "mise airlock -- start"
 

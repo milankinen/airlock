@@ -17,7 +17,7 @@ At the last part of the path:
 
 * A symlink or a FIFO is refused. Sockets and devices are allowed.
 * Remove, rename and link inspection act on the link itself and do not
-  follow it. Thus `airlock rm` can remove a symlinked `.airlock`.
+  follow it.
 
 ## Links that airlock follows
 

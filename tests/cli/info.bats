@@ -26,7 +26,7 @@ load helpers
 #   3. Check the status of each pack and that the disabled pack is
 #      not shown
 @test "info lists enabled project packs" {
-    mkdir -p .airlock/sandbox
+    make_box
     write_config '[packs]
 python = { version = 1 }
 codex = { version = 1 }
@@ -46,7 +46,7 @@ alpine = { version = 1 }'
 #   2. Run info
 #   3. Check that there is no pack list and that the preset rule shows
 @test "info lists list-form presets as network rules not packs" {
-    mkdir -p .airlock/sandbox
+    make_box
     write_config 'presets = ["python"]'
     run_airlock info
     assert_success
@@ -109,13 +109,12 @@ python = { version = 1 }'
 
 # Test that info lists the network services and does not print a host
 # token.
-#   1. Write a corrupt auth file and a config that enables two services
+#   1. Make a sandbox and write a config that enables two services
 #   2. Run info with a Claude token in the host environment
 #   3. Check that both services are not signed in and that the token is
 #      not in the output
 @test "info lists enabled network services without printing host secrets" {
-    mkdir -p .airlock/sandbox
-    echo 'not json' >.airlock/sandbox/auth.json
+    make_box
     write_config '[packs]
 claude = { version = 1 }
 

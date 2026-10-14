@@ -17,15 +17,15 @@ use crate::util::VerifiedPath;
 pub enum Target {
     /// `airlock.toml`, next to the project files (under version control).
     Project,
-    /// `airlock.toml` in the local config directory: the sandbox directory
-    /// of a sandbox in the data directory, else `.airlock/` (git ignores
-    /// it). See [`crate::sandboxes::local_config_dir`].
+    /// `airlock.toml` in the local config directory: the sandbox directory,
+    /// or `.airlock/` (git ignores it) for a project with no sandbox yet.
+    /// See [`crate::sandboxes::local_config_dir`].
     Local,
 }
 
 impl Target {
     /// Path of the target file, relative to the project directory. For
-    /// [`Target::Local`], this is the place in a project sandbox.
+    /// [`Target::Local`], this is the place in `.airlock/`.
     pub fn file(self) -> &'static str {
         match self {
             Target::Project => "airlock.toml",

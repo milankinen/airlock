@@ -87,6 +87,30 @@ pub async fn find_or_register(
     boxes_dir: &VerifiedPath,
     project: &VerifiedPath,
 ) -> anyhow::Result<String> {
+    Ok(register(db, boxes_dir, project).await?.0)
+}
+
+/// Register the project `project` with a new id, if it has no entry (see
+/// [`find_or_register`] for the args).
+/// Returns:
+///   The new id, or `None` if the project has an entry already.
+pub async fn register_new(
+    db: &Db,
+    boxes_dir: &VerifiedPath,
+    project: &VerifiedPath,
+) -> anyhow::Result<Option<String>> {
+    let (id, created) = register(db, boxes_dir, project).await?;
+    Ok(created.then_some(id))
+}
+
+/// Find the entry of `project`, or add a new one, in one transaction.
+/// Returns:
+///   The id, and `true` if this call added the entry.
+async fn register(
+    db: &Db,
+    boxes_dir: &VerifiedPath,
+    project: &VerifiedPath,
+) -> anyhow::Result<(String, bool)> {
     let table: Table = db.database(DATABASE).await?;
     let boxes_dir = boxes_dir.clone();
     let project = project.to_entry_path()?.as_os_str().to_owned();
@@ -95,7 +119,7 @@ pub async fn find_or_register(
         for item in table.iter(txn)? {
             let (id, path) = item?;
             if path == key {
-                return Ok(id.to_string());
+                return Ok((id.to_string(), false));
             }
         }
         loop {
@@ -104,7 +128,7 @@ pub async fn find_or_register(
                 table.get(txn, &id)?.is_some() || boxes_dir.join(&id)?.symlink_metadata().is_ok();
             if !taken {
                 table.put(txn, &id, key)?;
-                return Ok(id);
+                return Ok((id, true));
             }
         }
     })

@@ -162,20 +162,59 @@ write_local_config() {
 
 # -- Sandbox state helpers --
 #
-# These helpers make a sandbox in the project directory, as older airlock
-# versions made it. airlock reads the record files of such a sandbox.
+# All sandboxes are in the data directory, and the registry maps each project
+# to its sandbox. Only "airlock start" makes a registry entry. These helpers
+# run start with an image that does not exist, looked up in docker only.
+# Start registers the project and stops at the image step without network
+# access, so no VM boots. Then the helpers write the
+# record files into the sandbox directory.
 
-# Make a sandbox disk in the current project, with the disk id [1, 2].
-make_sandbox_disk() {
-    mkdir -p .airlock/sandbox
-    truncate -s 1M .airlock/sandbox/disk.img
-    echo 00000000000000010000000000000002 >.airlock/sandbox/disk.id
+# True if the host can run a VM: not Linux, or Linux with /dev/kvm access.
+has_kvm_or_not_linux() {
+    [[ "$(uname)" != "Linux" ]] || [[ -r /dev/kvm ]]
 }
 
-# Write .airlock/sandbox/installs.json for the disk [1, 2], with one install
-# record for each "pack=status" argument. A "kept" record is also confirmed.
+# Make the sandbox of the current project and set $BOX_DIR to its directory.
+# Keep the sandbox if it exists. Keep airlock.toml of the project. Skip the
+# test when the host has no KVM, because start checks KVM on Linux.
+make_box() {
+    has_kvm_or_not_linux || skip "no KVM access"
+    run_airlock sandboxes info --json
+    if [[ "$status" -ne 0 ]]; then
+        local saved=""
+        if [[ -e airlock.toml ]]; then
+            saved="$(mktemp "$TEST_TEMP_DIR/config.XXXXXX")"
+            mv airlock.toml "$saved"
+        fi
+        write_config '[vm.image]
+name = "airlock-test.invalid/no-such-image:1"
+resolution = "docker"'
+        run_airlock --quiet start --allow-configuration-changes
+        rm -f airlock.toml
+        if [[ -n "$saved" ]]; then
+            mv "$saved" airlock.toml
+        fi
+        run_airlock sandboxes info --json
+        assert_success || return 1
+    fi
+    BOX_DIR="$(sed -n 's/^ *"dir": "\(.*\)",$/\1/p' <<<"$output")"
+    [[ -d "$BOX_DIR" ]]
+}
+
+# Make a sandbox disk in the sandbox of the current project, with the disk
+# id [1, 2].
+make_sandbox_disk() {
+    make_box || return 1
+    truncate -s 1M "$BOX_DIR/disk.img"
+    echo 00000000000000010000000000000002 >"$BOX_DIR/disk.id"
+}
+
+# Write installs.json of the sandbox of the current project for the disk
+# [1, 2], with one install record for each "pack=status" argument. A "kept"
+# record is also confirmed.
 write_installs() {
     local fp packs="" sep="" arg record
+    make_box || return 1
     fp="$(printf 'a%.0s' {1..64})"
     for arg in "$@"; do
         record="\"status\": \"${arg#*=}\""
@@ -185,7 +224,15 @@ write_installs() {
         packs+="$sep\"${arg%%=*}\": { $record, \"fingerprint\": \"$fp\", \"at\": 1 }"
         sep=", "
     done
-    mkdir -p .airlock/sandbox
     printf '{ "version": 1, "disk": [1, 2], "image_id": "sha256:1", "packs": { %s } }\n' "$packs" \
-        >.airlock/sandbox/installs.json
+        >"$BOX_DIR/installs.json"
+}
+
+# Make a sandbox in the project directory, as older airlock versions made
+# it, with a disk that has the disk id [1, 2]. The next start offers to
+# import it. It is not registered.
+make_legacy_sandbox() {
+    mkdir -p .airlock/sandbox
+    truncate -s 1M .airlock/sandbox/disk.img
+    echo 00000000000000010000000000000002 >.airlock/sandbox/disk.id
 }

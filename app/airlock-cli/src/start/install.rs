@@ -24,7 +24,7 @@ use crate::{cli, messages};
 /// [`super::sandbox::ensure_sandbox`] makes this decision and saves the
 /// records.
 pub struct InstallDecision {
-    /// `.airlock/sandbox/`.
+    /// The sandbox directory.
     sandbox: PinnedDir,
     /// The install records, as saved.
     state: InstallState,
@@ -35,7 +35,7 @@ pub struct InstallDecision {
 impl InstallDecision {
     /// Make the install decision.
     /// Args:
-    ///  - `sandbox`: The `.airlock/sandbox/` directory
+    ///  - `sandbox`: The sandbox directory
     ///  - `state`: Current install records
     ///  - `transitions`: Record changes to apply to `state`
     ///  - `to_install`: Installs to run, in pack order

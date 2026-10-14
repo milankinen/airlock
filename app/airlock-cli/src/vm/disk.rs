@@ -20,9 +20,9 @@ pub const DISK_FILE: &str = "disk.img";
 /// id that changes with each new image ([`read_id`]).
 pub const DISK_ID_FILE: &str = "disk.id";
 
-/// Size limit of the identity file. The guest can write a sandbox in the
-/// project.
-const DISK_ID_CAP: u64 = 64;
+/// Size limit of the identity file. Defense in depth: only airlock and the
+/// old sandbox import write the file.
+pub(crate) const DISK_ID_CAP: u64 = 64;
 
 /// Permission bits of the disk image and its identity file.
 const DISK_MODE: u32 = 0o600;
@@ -223,7 +223,7 @@ pub fn read_id(dir: &PinnedDir) -> Option<(u64, u64)> {
 }
 
 /// Parse a 32-digit hex identity into two `u64` halves.
-fn parse_id(text: &str) -> Option<(u64, u64)> {
+pub(crate) fn parse_id(text: &str) -> Option<(u64, u64)> {
     if text.len() != 32 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
@@ -256,8 +256,7 @@ mod tests {
     use crate::test_cfg::{resolve_project_toml, temp_dir};
 
     /// Test that the disk setup does not follow a symlink at the disk image.
-    /// The guest can put one in a sandbox in the project to make the host
-    /// change the size of a host file.
+    /// A followed link could make the host change the size of a host file.
     ///   1. Put a symlink to a host file at the disk image name
     ///   2. Make the disk
     ///   3. Check that it fails and the host file did not change

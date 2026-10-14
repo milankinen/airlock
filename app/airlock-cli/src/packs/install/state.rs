@@ -18,7 +18,7 @@ pub const STATE_FILE: &str = "installs.json";
 /// Current format version.
 const STATE_VERSION: u32 = 1;
 /// Maximum size of the state file to read.
-const STATE_CAP: u64 = 256 * 1024;
+pub(crate) const STATE_CAP: u64 = 256 * 1024;
 
 /// Install status of one pack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +139,21 @@ pub fn read(dir: &PinnedDir) -> ReadState {
         Ok(Some(v)) => v,
         Err(e) => return ReadState::Corrupt(format!("{e:#}")),
     };
+    from_value(value)
+}
+
+/// Parse and validate the content of a state file.
+/// Returns:
+///   The state, or why it is not valid. Never `Absent`.
+pub fn parse(bytes: &[u8]) -> ReadState {
+    match serde_json::from_slice(bytes) {
+        Ok(value) => from_value(value),
+        Err(e) => ReadState::Corrupt(e.to_string()),
+    }
+}
+
+/// Validate the parsed JSON `value` of a state file.
+fn from_value(value: serde_json::Value) -> ReadState {
     match value.get("version").and_then(serde_json::Value::as_u64) {
         Some(v) if v > u64::from(STATE_VERSION) => {
             return ReadState::TooNew(u32::try_from(v).unwrap_or(u32::MAX));

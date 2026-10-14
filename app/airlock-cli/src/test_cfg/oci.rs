@@ -70,6 +70,7 @@ impl LayerTar {
     }
 
     /// A hard link `path` to the earlier entry `target`.
+    #[cfg(target_os = "linux")]
     #[must_use]
     pub fn hard_link(mut self, path: &str, target: &str) -> Self {
         let mut header = tar::Header::new_gnu();

@@ -92,8 +92,7 @@ without rebooting the VM. The flow:
 
 1. `airlock exec` looks for a running sandbox in the current working
    directory and then in each parent directory. For each directory, it
-   checks the registered sandbox in the data directory first, and then
-   `.airlock/sandbox` in the directory. The first sandbox with a
+   looks up the registry of the data directory. The first sandbox with a
    `cli.sock` wins. Thus a command in a subdirectory finds the VM of its
    project.
 2. It connects to that socket (Cap'n Proto RPC over a Unix domain

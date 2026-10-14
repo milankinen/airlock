@@ -11,7 +11,6 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, anyhow, bail};
 pub use keys::KeyList;
-use serde::{Deserialize, Serialize};
 use smart_config::{ConfigRepository, ConfigSchema, DescribeConfig, DeserializeConfig, Json};
 
 use crate::config::de::format_error;
@@ -47,38 +46,12 @@ pub struct Settings {
 /// Settings under the `[security]` table.
 #[derive(Clone, Debug, Default, DescribeConfig, DeserializeConfig)]
 pub struct SecuritySettings {
-    /// Where `airlock start` puts the data of a new sandbox:
-    ///  * `managed` (default): in the airlock data directory, out of the
-    ///    reach of the sandbox guest
-    ///  * `project-owned`: in `.airlock/sandbox` in the project. The guest
-    ///    hides `.airlock`. Existing project sandboxes then stay there
-    ///    without a question.
-    #[config(default)]
-    pub sandbox_type: SandboxType,
     /// Allow directory mounts (also the project) that contain the home
     /// directory or the airlock data directory. Such a mount gives the
     /// sandbox all secrets in it, for example SSH keys and the vault. The
     /// default (false) refuses to start the sandbox.
     #[config(default)]
     pub insecure_mounts: bool,
-}
-
-/// Location of the data of a new sandbox. Matches
-/// `security.sandbox_type`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SandboxType {
-    /// `.airlock/sandbox` in the project directory.
-    ProjectOwned,
-    /// `boxes/<id>` in the airlock data directory.
-    #[default]
-    Managed,
-}
-
-impl smart_config::de::WellKnown for SandboxType {
-    type Deserializer =
-        smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
-    const DE: Self::Deserializer = smart_config::de::Serde;
 }
 
 /// Settings under the `[vault]` table.
@@ -255,7 +228,6 @@ mod tests {
         assert_eq!(s.vault.storage, VaultStorageType::Keyring);
         assert_eq!(s.monitor.buffers.http, 100);
         assert_eq!(s.monitor.buffers.scrollback, 1000);
-        assert_eq!(s.security.sandbox_type, SandboxType::Managed);
         assert!(!s.security.insecure_mounts);
         assert_eq!(s.data_dir, None);
 
@@ -280,14 +252,13 @@ mod tests {
             "vault.storage = \"file\"\n\
              data_dir = \"~/airlock-data\"\n\
              [monitor.buffers]\nhttp = 5\n\
-             [security]\nsandbox_type = \"project-owned\"\ninsecure_mounts = true\n",
+             [security]\ninsecure_mounts = true\n",
         )
         .unwrap();
         let s = Settings::load_from(&verified_dir(dir.path())).unwrap();
         assert_eq!(s.vault.storage, VaultStorageType::File);
         assert_eq!(s.monitor.buffers.http, 5);
         assert_eq!(s.monitor.buffers.tcp, 100);
-        assert_eq!(s.security.sandbox_type, SandboxType::ProjectOwned);
         assert!(s.security.insecure_mounts);
         assert_eq!(s.data_dir.as_deref(), Some("~/airlock-data"));
     }
@@ -301,7 +272,7 @@ mod tests {
         for content in [
             "not valid = toml =",
             "vault.storage = \"typo\"\n",
-            "security.sandbox_type = \"typo\"\n",
+            "security.insecure_mounts = \"typo\"\n",
         ] {
             let dir = temp_dir();
             std::fs::write(dir.path().join("settings.toml"), content).unwrap();
@@ -311,5 +282,22 @@ mod tests {
             );
             assert!(err.contains("settings.toml"), "{err}");
         }
+    }
+
+    /// Test that an old settings file with the removed
+    /// `security.sandbox_type` key still loads. Older versions wrote this
+    /// key, and the start must not fail for it.
+    ///   1. Write a file with `security.sandbox_type` and one other key
+    ///   2. Check that the load succeeds and the other key applies
+    #[test]
+    fn old_settings_with_sandbox_type_loads() {
+        let dir = temp_dir();
+        std::fs::write(
+            dir.path().join("settings.toml"),
+            "[security]\nsandbox_type = \"project-owned\"\ninsecure_mounts = true\n",
+        )
+        .unwrap();
+        let s = Settings::load_from(&verified_dir(dir.path())).unwrap();
+        assert!(s.security.insecure_mounts);
     }
 }

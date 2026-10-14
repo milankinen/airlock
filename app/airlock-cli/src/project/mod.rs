@@ -2,9 +2,9 @@
 //!
 //! Identifies the project that airlock runs in, and manages the sandbox data
 //! that airlock keeps for each project. The sandbox data is in the airlock
-//! data directory or in the project directory. A lock makes sure that only
-//! one airlock process at a time uses the sandbox of a project. Also resolves
-//! the environment variables that the project gives to the sandbox.
+//! data directory. A lock makes sure that only one airlock process at a time
+//! uses the sandbox of a project. Also resolves the environment variables
+//! that the project gives to the sandbox.
 
 use std::fmt::Display;
 use std::io::Write as _;
@@ -17,16 +17,18 @@ pub use self::sandbox_env::{EnvError, MaskedSecret, SandboxEnv};
 use crate::config::config_values::{ConfigValues, Disk};
 use crate::context::Context;
 use crate::messages;
-use crate::sandboxes::{Found, PROJECT_SANDBOX};
+use crate::sandboxes::Found;
 use crate::util::{PinnedDir, VerifiedPath};
 use crate::vault::Vault;
 use crate::vm::disk;
 
-/// Size limit of `run.json`. The guest can write a project sandbox.
+/// Size limit of `run.json`. Defense in depth: only airlock writes the
+/// file.
 const RUN_META_CAP: u64 = 4 * 1024 * 1024;
 
-/// Size limit of `ca.json`. The guest can write a project sandbox.
-const CA_CAP: u64 = 64 * 1024;
+/// Size limit of `ca.json`. Defense in depth: only airlock writes the
+/// file.
+pub(crate) const CA_CAP: u64 = 64 * 1024;
 
 /// A resolved project: its working directory, sandbox paths, config and CA.
 ///
@@ -63,20 +65,6 @@ pub struct Project {
 }
 
 impl Project {
-    /// Check if the sandbox data is in the project (`.airlock/sandbox`), and
-    /// not in the data directory. True also if the path check fails.
-    pub fn sandbox_in_project(&self) -> bool {
-        // Fail closed: if the check of the path fails, treat the sandbox as
-        // in the project. Then the guest still cannot see `.airlock`.
-        match (
-            self.sandbox_dir.to_entry_path(),
-            self.host_cwd.join(PROJECT_SANDBOX),
-        ) {
-            (Ok(_), Ok(in_project)) => self.sandbox_dir == in_project,
-            _ => true,
-        }
-    }
-
     /// Check if an `airlock start` process runs this project now (see
     /// [`is_running`]).
     pub fn is_running(&self) -> bool {
@@ -179,20 +167,6 @@ pub struct SandboxLock {
 }
 
 impl SandboxLock {
-    /// Create the project sandbox (`.airlock/sandbox`) of the project at
-    /// `host_cwd` and take its lock. Fails when a different airlock instance
-    /// holds the lock.
-    pub fn acquire(host_cwd: &VerifiedPath) -> anyhow::Result<Self> {
-        // Messages and the guest cwd show the resolved project path, so
-        // make it the given path too.
-        let host_cwd = VerifiedPath::new_follow(host_cwd.to_path()?, None)?;
-        ensure_cache_dir(&host_cwd)?;
-        let pinned = PinnedDir::open(host_cwd.to_path()?, PROJECT_SANDBOX.as_ref(), true)?;
-        // Join after the create, so that the path has the identities of
-        // the new dirs.
-        Self::lock(host_cwd.join(PROJECT_SANDBOX)?, host_cwd, &pinned)
-    }
-
     /// Create the sandbox `id` in the data directory and take its lock.
     /// Fails when a different airlock instance holds the lock.
     /// Args:
@@ -428,7 +402,7 @@ pub enum IdleLock {
 }
 
 /// Take the lock at `sandbox/lock` if no instance holds it. Unlike
-/// [`SandboxLock::acquire`], it creates nothing.
+/// [`SandboxLock::acquire_box`], it creates nothing.
 ///
 /// `airlock rm` holds the returned lock while it removes the sandbox. Thus
 /// a concurrent `airlock start` fails, and does not lose its sandbox
@@ -442,10 +416,9 @@ pub fn lock_if_idle(sandbox_dir: &VerifiedPath) -> IdleLock {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
 
-    // Do not follow a symlink at `sandbox_dir` or `lock`. A committed
-    // `.airlock/sandbox -> ~/.airlock/sandbox` or a `lock` symlink must not
-    // give access to the lock of a different sandbox. airlock never creates
-    // a symlinked `sandbox_dir`, so treat it as `Missing`.
+    // Do not follow a symlink at `sandbox_dir` or `lock`. A symlink must
+    // not give access to the lock of a different sandbox. airlock never
+    // creates a symlinked `sandbox_dir`, so treat it as `Missing`.
     if sandbox_dir
         .symlink_metadata()
         .is_ok_and(|m| m.file_type().is_symlink())
@@ -653,6 +626,17 @@ fn generate_ca(sandbox_dir: &VerifiedPath) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Check that `bytes` is a valid `ca.json`: a JSON object with a CA cert
+/// and its private key, both PEM data that the TLS interception can use.
+pub(crate) fn is_valid_ca(bytes: &[u8]) -> bool {
+    let Ok(ca) = serde_json::from_slice::<CaData>(bytes) else {
+        return false;
+    };
+    rcgen::KeyPair::from_pem(&ca.key)
+        .and_then(|key| rcgen::Issuer::from_ca_cert_pem(&ca.cert, key))
+        .is_ok()
+}
+
 /// Read the CA cert and key PEM strings from `ca.json`.
 fn read_ca(sandbox_dir: &VerifiedPath) -> anyhow::Result<(String, String)> {
     let json = sandbox_dir
@@ -665,7 +649,7 @@ fn read_ca(sandbox_dir: &VerifiedPath) -> anyhow::Result<(String, String)> {
 
 #[cfg(test)]
 mod tests {
-    //! Tests for the project sandbox directory: the sandbox lock, symlink
+    //! Tests for the sandbox directory: the sandbox lock, symlink
     //! safety, the CA and the sandbox disk.
 
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -682,6 +666,13 @@ mod tests {
     /// The verified form of the test path `path`.
     fn verified(path: &Path) -> VerifiedPath {
         VerifiedPath::new_follow(path, None).unwrap()
+    }
+
+    /// Make the sandbox directory `<dir>/sandbox` of the project `dir`
+    /// and take its lock.
+    fn lock_sandbox(dir: &Path) -> anyhow::Result<SandboxLock> {
+        let project = verified(dir);
+        SandboxLock::acquire_dir(&project.join("sandbox")?, &project)
     }
 
     /// Test that only one holder can have the sandbox lock, and that the
@@ -733,33 +724,34 @@ mod tests {
     ///   3. Remove the symlinks and check that the setup writes `.gitignore`
     ///      and the lock writes the process ID
     ///   4. Make `.airlock` a symlink to a directory and check the error,
-    ///      that the lock fails, and that the target stays empty
+    ///      and that the target stays empty
     #[test]
     fn cache_dir_and_lock_do_not_follow_symlinks() {
         let tmp = temp_dir();
         let dir = tmp.path().join("project");
         let victim = tmp.path().join("victim");
         std::fs::write(&victim, "host file").unwrap();
-        std::fs::create_dir_all(dir.join(".airlock/sandbox")).unwrap();
+        std::fs::create_dir_all(dir.join(".airlock")).unwrap();
+        std::fs::create_dir_all(dir.join("sandbox")).unwrap();
         symlink(&victim, dir.join(".airlock/.gitignore")).unwrap();
-        symlink(&victim, dir.join(".airlock/sandbox/lock")).unwrap();
+        symlink(&victim, dir.join("sandbox/lock")).unwrap();
 
         // The setup does not overwrite the `.gitignore` symlink. The lock
         // refuses its symlink.
         ensure_cache_dir(&verified(&dir)).unwrap();
-        assert!(SandboxLock::acquire(&verified(&dir)).is_err());
+        assert!(lock_sandbox(&dir).is_err());
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "host file");
 
         std::fs::remove_file(dir.join(".airlock/.gitignore")).unwrap();
-        std::fs::remove_file(dir.join(".airlock/sandbox/lock")).unwrap();
+        std::fs::remove_file(dir.join("sandbox/lock")).unwrap();
         ensure_cache_dir(&verified(&dir)).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join(".airlock/.gitignore")).unwrap(),
             "*\n"
         );
-        let lock = SandboxLock::acquire(&verified(&dir)).unwrap();
+        let lock = lock_sandbox(&dir).unwrap();
         assert_eq!(
-            std::fs::read_to_string(dir.join(".airlock/sandbox/lock")).unwrap(),
+            std::fs::read_to_string(dir.join("sandbox/lock")).unwrap(),
             std::process::id().to_string()
         );
         drop(lock);
@@ -769,21 +761,23 @@ mod tests {
         std::fs::remove_dir_all(dir.join(".airlock")).unwrap();
         symlink(&other, dir.join(".airlock")).unwrap();
         let err = ensure_cache_dir(&verified(&dir)).unwrap_err();
+        // The temp dir can be behind a symlink (macOS `/var`), so the
+        // resolved path can differ from the given path.
+        let real = std::fs::canonicalize(&dir).unwrap().join(".airlock");
         assert_eq!(
             err.to_string(),
             format!(
-                "refusing path {0} ({0}): {0} is a symlink",
-                dir.join(".airlock").display()
+                "refusing path {} ({1}): {1} is a symlink",
+                dir.join(".airlock").display(),
+                real.display()
             )
         );
-        assert!(SandboxLock::acquire(&verified(&dir)).is_err());
         assert!(!other.join(".gitignore").exists());
-        assert!(!other.join("sandbox").exists());
     }
 
-    /// Test that the run data and the CA never go through a symlink that
-    /// the guest put in the project sandbox. A link must not leak a host
-    /// file as the CA key or let airlock write a host file.
+    /// Test that the run data and the CA never go through a symlink in the
+    /// sandbox directory. A link must not leak a host file as the CA key or
+    /// let airlock write a host file.
     ///   1. Make `run.json`, `ca.json` and their temp files symlinks to
     ///      host files
     ///   2. Open the project
@@ -793,7 +787,7 @@ mod tests {
     fn run_data_and_ca_do_not_follow_planted_symlinks() {
         let tmp = temp_dir();
         let dir = tmp.path().join("project");
-        let sandbox = dir.join(".airlock/sandbox");
+        let sandbox = dir.join("sandbox");
         std::fs::create_dir_all(&sandbox).unwrap();
         let victim = tmp.path().join("victim");
         let secret = tmp.path().join("secret");
@@ -823,8 +817,8 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
     }
 
-    /// Test that a FIFO or a link that the guest put at the disk path is
-    /// no disk, and that the check does not block on the FIFO.
+    /// Test that a FIFO or a link at the disk path is no disk, and that the
+    /// check does not block on the FIFO.
     ///   1. Put a symlink at the disk path and check that there is no disk
     ///   2. Put a FIFO there and check that there is no disk
     #[test]
@@ -842,8 +836,8 @@ mod tests {
         assert!(!has_disk(&project.sandbox_dir));
     }
 
-    /// Test that a FIFO that the guest put at `ca.json` does not block the
-    /// open and gets a new CA, and that a directory there fails the open.
+    /// Test that a FIFO at `ca.json` does not block the open and gets a
+    /// new CA, and that a directory there fails the open.
     ///   1. Put a FIFO at `ca.json` and open the project
     ///   2. Check that `ca.json` is a regular file with a new CA
     ///   3. Put a directory at `ca.json` and check that the open fails
@@ -851,13 +845,13 @@ mod tests {
     fn ca_json_fifo_is_replaced_and_ca_json_dir_fails_open() {
         let tmp = temp_dir();
         let dir = tmp.path().join("project");
-        let sandbox = dir.join(".airlock/sandbox");
+        let sandbox = dir.join("sandbox");
         std::fs::create_dir_all(&sandbox).unwrap();
         mkfifo(&sandbox.join("ca.json"));
         // Keep one lock for both opens. A fork in a parallel test can hold a
         // copy of a released lock for a short time, so a second acquire can
         // fail.
-        let lock = SandboxLock::acquire(&verified(&dir)).unwrap();
+        let lock = lock_sandbox(&dir).unwrap();
         let open_with_lock = || {
             let config = crate::config::config_values::parse(serde_json::json!({})).unwrap();
             open(&lock, config, None, test_context(&dir, host_env_vault(&[])))
@@ -897,7 +891,7 @@ mod tests {
     /// Returns:
     ///   The project, and the sandbox directory pinned for disk resets.
     fn open_project(dir: &Path) -> (Project, PinnedDir) {
-        let sandbox_lock = SandboxLock::acquire(&verified(dir)).unwrap();
+        let sandbox_lock = lock_sandbox(dir).unwrap();
         let config = crate::config::config_values::parse(serde_json::json!({})).unwrap();
         let project = open(
             &sandbox_lock,

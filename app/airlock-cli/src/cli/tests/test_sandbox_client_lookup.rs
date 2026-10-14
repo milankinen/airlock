@@ -1,6 +1,6 @@
-//! Tests for the sandbox lookup of commands that act on a running sandbox: the nearest running
-//! sandbox wins, with sandboxes of both kinds in one directory tree. The
-//! lookup can also go from a git worktree to its main repository, but not
+//! Tests for the sandbox lookup of commands that act on a running sandbox:
+//! the nearest running sandbox in one directory tree wins. The lookup can
+//! also go from a git worktree to its main repository, but not
 //! through a forged worktree link or a symlink that code in a sandbox made.
 
 use std::os::unix::net::UnixListener;
@@ -10,7 +10,7 @@ use std::process::Command;
 use crate::cli::sandbox_client::find_cli_sock;
 use crate::context::Context;
 use crate::test_cfg::oci::verified_dir;
-use crate::test_cfg::sandboxes::{data_dir_sandbox, legacy_sandbox};
+use crate::test_cfg::sandboxes::data_dir_sandbox;
 use crate::test_cfg::{TempDir, block_on_local, temp_dir, test_context};
 use crate::util::VerifiedPath;
 use crate::vault::{Vault, VaultStorageType};
@@ -63,51 +63,32 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 /// Test that exec finds the nearest running sandbox from a directory and
-/// its parents, for each order of a sandbox in the data directory and a
-/// sandbox in the project directory.
-///   1. Make a parent project and a child project, one with a sandbox in
-///      the data directory and one with a sandbox in the project
+/// its parents.
+///   1. Make a parent project and a child project, each with a sandbox
 ///   2. Check that no socket gives no sandbox
 ///   3. Add the socket of the parent and check that the child finds it
 ///   4. Add the socket of the child and check that the child finds its own
 ///      socket and the parent still finds the parent socket
 #[test]
-fn exec_finds_nearest_running_sandbox_of_either_kind() {
-    for data_dir_parent in [true, false] {
-        // The socket path can be in the data directory, if the default path
-        // is too long (macOS temporary directories).
-        let home = temp_dir();
-        let context = test_context(
-            home.path(),
-            Vault::for_storage_type(VaultStorageType::Disabled),
-        );
-        let tree = temp_dir();
-        let parent = std::fs::canonicalize(tree.path()).unwrap();
-        let child = parent.join("child");
-        std::fs::create_dir_all(&child).unwrap();
-        let (parent_dir, child_dir) = if data_dir_parent {
-            (
-                data_dir_sandbox(&context, &parent).1,
-                legacy_sandbox(&child),
-            )
-        } else {
-            (
-                legacy_sandbox(&parent),
-                data_dir_sandbox(&context, &child).1,
-            )
-        };
-        let parent_sock = sock_of(&context, &parent_dir);
-        let child_sock = sock_of(&context, &child_dir);
+fn exec_finds_nearest_running_sandbox() {
+    // The socket path can be in the data directory, if the default path is
+    // too long (macOS temporary directories).
+    let (_home, context) = context();
+    let tree = temp_dir();
+    let parent = std::fs::canonicalize(tree.path()).unwrap();
+    let child = parent.join("child");
+    std::fs::create_dir_all(&child).unwrap();
+    let parent_sock = sock_of(&context, &data_dir_sandbox(&context, &parent).1);
+    let child_sock = sock_of(&context, &data_dir_sandbox(&context, &child).1);
 
-        assert_eq!(lookup(&context, &child), None);
+    assert_eq!(lookup(&context, &child), None);
 
-        listen(&parent_sock);
-        assert_eq!(lookup(&context, &child), Some(parent_sock.clone()));
+    listen(&parent_sock);
+    assert_eq!(lookup(&context, &child), Some(parent_sock.clone()));
 
-        listen(&child_sock);
-        assert_eq!(lookup(&context, &child), Some(child_sock));
-        assert_eq!(lookup(&context, &parent), Some(parent_sock));
-    }
+    listen(&child_sock);
+    assert_eq!(lookup(&context, &child), Some(child_sock));
+    assert_eq!(lookup(&context, &parent), Some(parent_sock));
 }
 
 /// Test that exec goes from a git worktree to the running sandbox of the
@@ -174,7 +155,7 @@ fn forged_worktree_link_does_not_reach_other_repository() {
     git(&b, &["init", "-q"]);
     git(&b, &["commit", "-q", "--allow-empty", "-m", "init"]);
     git(&b, &["worktree", "add", "-q", "../wt"]);
-    let a_sock = sock_of(&context, &legacy_sandbox(&a));
+    let a_sock = sock_of(&context, &data_dir_sandbox(&context, &a).1);
     let b_dir = data_dir_sandbox(&context, &b).1;
     let b_sock = sock_of(&context, &b_dir);
     listen(&a_sock);
@@ -193,16 +174,13 @@ fn forged_worktree_link_does_not_reach_other_repository() {
     assert_eq!(lookup_with(&context, &sub, true), Some(a_sock));
 }
 
-/// Test that exec refuses a symlinked project sandbox directory and a
-/// symlinked socket. Code in a sandbox can make them in its project to send
-/// exec to a different sandbox.
-///   1. Make project B with a running sandbox in the project
-///   2. In project A, make `.airlock/sandbox` a symlink to the sandbox of B
-///      and check that the lookup fails and names the symlink
-///   3. Make `.airlock/sandbox` a real directory with a `cli.sock` symlink
-///      to the socket of B and check that the lookup fails
-///   4. Make `.airlock` of A a symlink to `.airlock` of B and check that
-///      the lookup does not find the sandbox of B
+/// Test that exec refuses a symlinked sandbox directory and a symlinked
+/// socket. A link must not send exec to a different sandbox.
+///   1. Make project B with a running sandbox
+///   2. Make the sandbox directory of project A a symlink to the sandbox
+///      of B and check that the lookup fails and names the symlink
+///   3. Make the sandbox directory of A a real directory with a `cli.sock`
+///      symlink to the socket of B and check that the lookup fails
 #[test]
 fn symlinked_sandbox_or_socket_is_refused() {
     let (_home, context) = context();
@@ -210,24 +188,22 @@ fn symlinked_sandbox_or_socket_is_refused() {
     let root = std::fs::canonicalize(tree.path()).unwrap();
     let a = root.join("a");
     let b = root.join("b");
-    let b_dir = legacy_sandbox(&b);
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    let b_dir = data_dir_sandbox(&context, &b).1;
     let b_sock = sock_of(&context, &b_dir);
     listen(&b_sock);
 
-    let a_dir = a.join(".airlock/sandbox");
-    std::fs::create_dir_all(a_dir.parent().unwrap()).unwrap();
+    let a_dir = data_dir_sandbox(&context, &a).1;
+    std::fs::remove_dir_all(&a_dir).unwrap();
     std::os::unix::fs::symlink(&b_dir, &a_dir).unwrap();
     let error = block_on_local(find_cli_sock(&context, &verified_dir(&a), false)).unwrap_err();
     assert!(error.to_string().contains("is a symlink"), "{error}");
 
     std::fs::remove_file(&a_dir).unwrap();
-    let a_dir = legacy_sandbox(&a);
+    std::fs::create_dir(&a_dir).unwrap();
     let a_sock = sock_of(&context, &a_dir);
     std::os::unix::fs::symlink(&b_sock, &a_sock).unwrap();
     let error = block_on_local(find_cli_sock(&context, &verified_dir(&a), false)).unwrap_err();
     assert!(error.to_string().contains("is a symlink"), "{error}");
-
-    std::fs::remove_dir_all(a.join(".airlock")).unwrap();
-    std::os::unix::fs::symlink(b.join(".airlock"), a.join(".airlock")).unwrap();
-    assert_eq!(lookup(&context, &a), None);
 }

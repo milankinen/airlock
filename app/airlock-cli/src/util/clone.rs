@@ -7,8 +7,9 @@
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
 
+use super::safe_fs::PinnedDir;
 use super::verified_path::VerifiedPath;
 
 /// Size of the copy buffer.
@@ -37,7 +38,6 @@ pub(crate) enum CloneKind {
 pub(crate) fn clone_file(src: &VerifiedPath, dst: &VerifiedPath) -> io::Result<CloneKind> {
     #[cfg(target_os = "macos")]
     {
-        use std::os::unix::fs::PermissionsExt as _;
         match clonefile(src, dst) {
             Ok(()) => {
                 if let Err(e) = dst.set_permissions(std::fs::Permissions::from_mode(0o600)) {
@@ -81,6 +81,85 @@ pub(crate) fn clone_file(src: &VerifiedPath, dst: &VerifiedPath) -> io::Result<C
             Err(e)
         }
     }
+}
+
+/// Clone the open file `src` to the file `name` in `dst_dir`. Reads from
+/// the descriptor, not from a path. Replaces the file `name` atomically.
+/// Args:
+///  - `src`: Open regular file
+///  - `dst_dir`: Target directory
+///  - `name`: File name in `dst_dir`. The file gets mode 0600.
+///
+/// Returns:
+///   How the clone was made, or error if the copy fails. After a failed
+///   copy, `dst_dir` has no new entry.
+pub(crate) fn clone_from_file(
+    src: &File,
+    dst_dir: &PinnedDir,
+    name: &str,
+) -> io::Result<CloneKind> {
+    #[cfg(target_os = "macos")]
+    {
+        /// Do not follow a symlink at the source.
+        const CLONE_NOFOLLOW: u32 = 0x0001;
+
+        let cloned = dst_dir.make_with(name.as_ref(), |dir, tmp| {
+            // SAFETY: both fds are open and `tmp` is a valid C string.
+            let rc = unsafe {
+                libc::fclonefileat(
+                    src.as_raw_fd(),
+                    dir.as_raw_fd(),
+                    tmp.as_ptr(),
+                    CLONE_NOFOLLOW,
+                )
+            };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: the fd is open and `tmp` is a valid C string.
+            let rc = unsafe {
+                libc::fchmodat(
+                    dir.as_raw_fd(),
+                    tmp.as_ptr(),
+                    0o600,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+        // An error means "no clone support here". Try a copy.
+        if cloned.is_ok() {
+            return Ok(CloneKind::Reflink);
+        }
+    }
+
+    // Only the Linux reflink below changes the kind.
+    #[cfg(target_os = "linux")]
+    let mut kind = CloneKind::Copy;
+    #[cfg(not(target_os = "linux"))]
+    let kind = CloneKind::Copy;
+    dst_dir.replace_with(name.as_ref(), 0o600, |out| {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: both fds are open and valid for the whole call.
+            let rc = unsafe { libc::ioctl(out.as_raw_fd(), libc::FICLONE, src.as_raw_fd()) };
+            if rc == 0 {
+                kind = CloneKind::Reflink;
+            }
+            // Any ioctl error leads to a normal copy. The copy reports real
+            // errors, for example a read error, again.
+        }
+        if kind == CloneKind::Copy {
+            copy_sparse(src, out)?;
+        }
+        // The umask can remove bits, but never adds them. Set the mode
+        // again so that it is always 0600.
+        out.set_permissions(std::fs::Permissions::from_mode(0o600))
+    })?;
+    Ok(kind)
 }
 
 /// Create `dst` as an APFS clone of `src`.
@@ -254,6 +333,40 @@ mod tests {
         let mut z = [1u8; 100];
         f.read_exact_at(&mut z, GIB - 100).unwrap();
         assert_eq!(z, [0u8; 100]);
+    }
+
+    /// Test that a clone from an open file replaces the target, keeps the
+    /// content, stays sparse and is private. The sandbox import uses it
+    /// when the disk cannot move.
+    ///   1. Create a sparse source and an old target file
+    ///   2. Clone the open source to the target name
+    ///   3. Check mode, size, data, allocated blocks and that no temp file
+    ///      is left
+    #[test]
+    fn cloning_open_file_replaces_target_and_stays_sparse() {
+        let dir = temp_dir();
+        let (src, dst) = (dir.path().join("src"), dir.path().join("dst"));
+        sparse_source(&src);
+        std::fs::write(&dst, b"old").unwrap();
+        let pinned = PinnedDir::pin(dir.path()).unwrap();
+
+        clone_from_file(&File::open(&src).unwrap(), &pinned, "dst").unwrap();
+
+        let meta = std::fs::metadata(&dst).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(meta.len(), GIB);
+        assert!(
+            meta.blocks() * 512 < MAX_ALLOCATED,
+            "blocks: {}",
+            meta.blocks()
+        );
+        let mut c = vec![0u8; 7000];
+        File::open(&dst)
+            .unwrap()
+            .read_exact_at(&mut c, GIB / 2 + 100)
+            .unwrap();
+        assert!(c.iter().all(|b| *b == 0xcd));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
     }
 
     /// Test that the zero-skipping copy, used without `SEEK_DATA`, keeps

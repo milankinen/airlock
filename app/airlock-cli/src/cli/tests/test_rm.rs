@@ -1,18 +1,16 @@
 //! Tests for `airlock rm`: what it removes from a project, what it keeps,
-//! and how it treats a running sandbox and symlinks.
+//! and how it treats a running sandbox.
 
-use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
 use crate::cache;
-use crate::cli::cmd_rm::{RmArgs, rm_sandbox_only, run};
+use crate::cli::cmd_rm::{RmArgs, run};
 use crate::context::Context;
-use crate::project::{self, SandboxLock};
-use crate::sandboxes::{PROJECT_SANDBOX, registry};
+use crate::project::SandboxLock;
+use crate::sandboxes::registry;
 use crate::test_cfg::oci::verified_dir;
 use crate::test_cfg::sandboxes::stopped_sandbox_dir;
 use crate::test_cfg::{TempDir, block_on_local, temp_dir, test_context};
-use crate::util::VerifiedPath;
 use crate::vault::{Vault, VaultStorageType};
 
 const FORCE: RmArgs = RmArgs { force: true };
@@ -37,26 +35,18 @@ fn rm(context: &Context, dir: &Path) -> i32 {
 /// a hard link to an image in the OCI cache, as `airlock start` makes it.
 struct Project {
     dir: PathBuf,
+    id: String,
     sandbox: PathBuf,
     image: PathBuf,
 }
 
 impl Project {
-    /// Make the project `name` with a sandbox disk in the project and a
-    /// cached image.
-    fn started(home: &TempDir, context: &Context, name: &str) -> Self {
-        let dir = Self::make_dir(home, name);
-        project::ensure_cache_dir(&crate::util::VerifiedPath::new_follow(&dir, None).unwrap())
-            .unwrap();
-        let sandbox = dir.join(PROJECT_SANDBOX);
-        stopped_sandbox_dir(&sandbox);
-        Self::finish(context, dir, sandbox, name)
-    }
-
     /// Make the project `name` with a sandbox disk in the data directory
     /// and a cached image.
-    fn started_in_data_dir(home: &TempDir, context: &Context, name: &str) -> Self {
-        let dir = Self::make_dir(home, name);
+    fn started(home: &TempDir, context: &Context, name: &str) -> Self {
+        let dir = home.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(dir).unwrap();
         let boxes = &context.data.sandboxes;
         let id = block_on_local(registry::find_or_register(
             &context.db,
@@ -64,20 +54,8 @@ impl Project {
             &verified_dir(&dir),
         ))
         .unwrap();
-        let sandbox = context.data.sandboxes.given().join(id);
+        let sandbox = context.data.sandboxes.given().join(&id);
         stopped_sandbox_dir(&sandbox);
-        Self::finish(context, dir, sandbox, name)
-    }
-
-    /// Make the canonical project directory `name` in the temp home.
-    fn make_dir(home: &TempDir, name: &str) -> PathBuf {
-        let dir = home.path().join(name);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::canonicalize(dir).unwrap()
-    }
-
-    /// Add a disk and a cached image to the sandbox `sandbox` of `dir`.
-    fn finish(context: &Context, dir: PathBuf, sandbox: PathBuf, name: &str) -> Self {
         std::fs::write(sandbox.join("disk.img"), b"data").unwrap();
         let image = cache::image_path(&context.data, &format!("sha256:{name}")).unwrap();
         let image = image.to_path().unwrap().to_path_buf();
@@ -85,6 +63,7 @@ impl Project {
         std::fs::hard_link(&image, sandbox.join("image")).unwrap();
         Self {
             dir,
+            id,
             sandbox,
             image,
         }
@@ -101,31 +80,11 @@ fn exists(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
 }
 
-/// Test that rm removes all of `.airlock` and the cached image when only
-/// airlock files are in it. The project directory itself must stay.
-///   1. Start a project and add a local config and a `.gitignore`
-///   2. Run rm with force
-///   3. Check that `.airlock` and the image are gone and the project stays
-#[test]
-fn rm_of_project_removes_its_airlock_dir_and_unused_image() {
-    let home = temp_dir();
-    let context = context(&home);
-    let project = Project::started(&home, &context, "proj");
-    std::fs::write(project.airlock().join("airlock.toml"), "").unwrap();
-    std::fs::write(project.airlock().join(".gitignore"), "*\n").unwrap();
-
-    assert_eq!(rm(&context, &project.dir), 0);
-
-    assert!(!exists(&project.airlock()));
-    assert!(!project.image.exists());
-    assert!(project.dir.is_dir());
-}
-
 /// Test that rm removes a sandbox in the data directory with its registry
 /// entry, its local project config and its unused image. The `.airlock`
 /// directory of the project is not the sandbox, so it stays.
-///   1. Start a project with its sandbox in the data directory, and add a
-///      local config to the sandbox and a file to `.airlock`
+///   1. Start a project, and add a local config to the sandbox and a file
+///      to `.airlock`
 ///   2. Run rm with force
 ///   3. Check that the sandbox, its local config, the registry entry and the
 ///      image are gone
@@ -134,7 +93,7 @@ fn rm_of_project_removes_its_airlock_dir_and_unused_image() {
 fn rm_of_data_dir_sandbox_removes_it_with_local_config() {
     let home = temp_dir();
     let context = context(&home);
-    let project = Project::started_in_data_dir(&home, &context, "proj");
+    let project = Project::started(&home, &context, "proj");
     std::fs::write(project.sandbox.join("airlock.toml"), "").unwrap();
     std::fs::create_dir_all(project.airlock()).unwrap();
     std::fs::write(project.airlock().join(".init-done"), "").unwrap();
@@ -151,141 +110,23 @@ fn rm_of_data_dir_sandbox_removes_it_with_local_config() {
     assert!(project.airlock().join(".init-done").is_file());
 }
 
-/// Test that rm keeps `.airlock` when it holds user data, and removes only
-/// the sandbox. Old versions kept settings, vaults and agent data there.
-///   1. For each user file or directory, start a project and add it
-///   2. Run rm with force
-///   3. Check that the user data stays, and the sandbox and image are gone
-#[test]
-fn rm_of_airlock_dir_with_user_files_removes_only_sandbox() {
-    let home = temp_dir();
-    let context = context(&home);
-    let markers = [
-        ("settings.yaml", false),
-        ("config.json", false),
-        ("vault.default.json", false),
-        ("vault.default.enc.json", false),
-        (crate::db::DIR, true),
-        ("claude", true),
-        ("codex", true),
-        ("agents", true),
-    ];
-
-    for (marker, is_dir) in markers {
-        let project = Project::started(&home, &context, &format!("proj-{marker}"));
-        let path = project.airlock().join(marker);
-        if is_dir {
-            std::fs::create_dir_all(&path).unwrap();
-        } else {
-            std::fs::write(&path, "{}").unwrap();
-        }
-
-        assert_eq!(rm(&context, &project.dir), 0, "{marker}");
-
-        assert!(exists(&path), "{marker}");
-        assert!(!exists(&project.airlock().join("sandbox")), "{marker}");
-        assert!(!project.image.exists(), "{marker}");
-    }
-}
-
-/// Test that rm refuses to remove the sandbox of a running VM, in the
-/// project and in the data directory.
-///   1. Start a project of each kind and hold its sandbox lock, as a running
-///      VM does
+/// Test that rm refuses to remove the sandbox of a running VM.
+///   1. Start a project and hold its sandbox lock, as a running VM does
 ///   2. Run rm with force and check that it fails
 ///   3. Check that the disk and the image stay
 #[test]
 fn rm_of_running_sandbox_is_refused() {
     let home = temp_dir();
     let context = context(&home);
-    let in_project = Project::started(&home, &context, "proj");
-    let in_data_dir = Project::started_in_data_dir(&home, &context, "boxed");
-    let _running = SandboxLock::acquire(
-        &crate::util::VerifiedPath::new_follow(&in_project.dir, None).unwrap(),
-    )
-    .unwrap();
-    let id = block_on_local(registry::list(&context.db)).unwrap()[0]
-        .id
-        .clone();
-    let _running_box = SandboxLock::acquire_box(
-        &crate::util::VerifiedPath::new_follow(&in_data_dir.dir, None).unwrap(),
-        &context.data.sandboxes,
-        &id,
-    )
-    .unwrap();
-
-    for project in [&in_project, &in_data_dir] {
-        assert_eq!(rm(&context, &project.dir), 1);
-        assert!(project.sandbox.join("disk.img").is_file());
-        assert!(project.image.exists());
-    }
-}
-
-/// Test that rm removes a symlinked `.airlock` or `.airlock/sandbox` as a
-/// link only. A planted link must not let rm delete the data of a different
-/// project.
-///   1. Start a victim project with a user file
-///   2. Run rm in a project whose `.airlock` links to the victim, and check
-///      that only the link is gone
-///   3. Run rm in projects whose sandbox links to the victim, with and
-///      without user files, and check that `.airlock` stays only with them
-///   4. Check that the victim files and image stay
-#[test]
-fn rm_removes_symlinked_airlock_dir_or_sandbox_but_not_their_targets() {
-    let home = temp_dir();
-    let context = context(&home);
-    let victim = Project::started(&home, &context, "victim");
-    let victim_disk = victim.airlock().join("sandbox/disk.img");
-    std::fs::write(victim.airlock().join("settings.yaml"), "").unwrap();
-
-    let linked_airlock = home.path().join("linked-airlock");
-    std::fs::create_dir_all(&linked_airlock).unwrap();
-    symlink(victim.airlock(), linked_airlock.join(".airlock")).unwrap();
-    assert_eq!(rm(&context, &linked_airlock), 0);
-    assert!(!exists(&linked_airlock.join(".airlock")));
-
-    for user_dir in [true, false] {
-        let project = home.path().join(format!("linked-sandbox-{user_dir}"));
-        std::fs::create_dir_all(project.join(".airlock")).unwrap();
-        if user_dir {
-            std::fs::write(project.join(".airlock/settings.yaml"), "").unwrap();
-        }
-        symlink(
-            victim.airlock().join("sandbox"),
-            project.join(".airlock/sandbox"),
-        )
-        .unwrap();
-        assert_eq!(rm(&context, &project), 0);
-        assert!(!exists(&project.join(".airlock/sandbox")));
-        assert_eq!(exists(&project.join(".airlock")), user_dir);
-    }
-
-    assert!(victim.airlock().join("settings.yaml").is_file());
-    assert!(victim_disk.is_file());
-    assert!(victim.image.exists());
-}
-
-/// Test that rm refuses the removal if `.airlock` changes to a symlink
-/// after the check, for example while the prompt waits. The removal must
-/// not reach the sandbox of the link target.
-///   1. Start a victim project and a project with a user file
-///   2. Check the sandbox path of the project, then swap its `.airlock`
-///      for a symlink to the `.airlock` of the victim
-///   3. Run the sandbox removal and check that it fails
-///   4. Check that the victim sandbox and the link stay
-#[test]
-fn rm_after_airlock_dir_swapped_for_link_is_refused() {
-    let home = temp_dir();
-    let context = context(&home);
-    let victim = Project::started(&home, &context, "victim");
     let project = Project::started(&home, &context, "proj");
-    std::fs::write(project.airlock().join("settings.yaml"), "").unwrap();
-    let sandbox_dir = VerifiedPath::new_follow(&project.sandbox, None).unwrap();
+    let _running = SandboxLock::acquire_box(
+        &verified_dir(&project.dir),
+        &context.data.sandboxes,
+        &project.id,
+    )
+    .unwrap();
 
-    std::fs::rename(project.airlock(), project.dir.join("old-airlock")).unwrap();
-    symlink(victim.airlock(), project.airlock()).unwrap();
-    assert_eq!(rm_sandbox_only(&FORCE, &context.data, &sandbox_dir), 1);
-
-    assert!(victim.sandbox.join("disk.img").is_file());
-    assert!(project.airlock().symlink_metadata().unwrap().is_symlink());
+    assert_eq!(rm(&context, &project.dir), 1);
+    assert!(project.sandbox.join("disk.img").is_file());
+    assert!(project.image.exists());
 }

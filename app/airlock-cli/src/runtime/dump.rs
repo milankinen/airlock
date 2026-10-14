@@ -62,9 +62,8 @@ fn open_dump(project: &Project) -> Option<File> {
     const NAME: &str = "pty.dump";
     let shown = format!("{}/{NAME}", project.sandbox_dir);
     let created = project.sandbox_dir.join(NAME).and_then(|path| {
-        // The guest can write a sandbox in the project. Remove the old
-        // entry and make a new file, so that a symlink there is not
-        // followed.
+        // Defense in depth: remove the old entry and make a new file, so
+        // that a symlink there is not followed.
         match path.remove_file() {
             Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
             _ => {}

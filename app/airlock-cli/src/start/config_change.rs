@@ -13,9 +13,11 @@
 //! resolved. Thus a symlink that points to an other place since the last
 //! run also gives the question, also when the config text is the same.
 //!
-//! A sandbox without a copy (a new sandbox, or a sandbox of an older airlock)
-//! gets no question. The run keeps a copy for the next run. A copy of an
-//! older airlock without host paths gives no question about host paths.
+//! A new sandbox without a disk has no copy and gets no question. A sandbox
+//! with a disk but no copy (an imported sandbox, or a sandbox of an older
+//! airlock) gets the question, because nobody accepted its config. The run
+//! keeps a copy for the next run. A copy of an older airlock without host
+//! paths gives no question about host paths.
 //!
 //! The diff does not show the real values of masked `[env]` entries. A hash
 //! of each value replaces it.
@@ -94,10 +96,13 @@ async fn check_with(
     ask: impl FnOnce(&[String], Option<&str>) -> Result<Answer, Exit>,
 ) -> Result<Checked, Exit> {
     let meta = project::read_run_meta(input.sandbox_dir);
-    let Some(stored) = meta.last_run_config else {
-        return Ok(Checked::Current);
+    // `None`: there is no copy, but the disk can hold the state of a config
+    // that nobody accepted. Fail closed and ask.
+    let last = match meta.last_run_config {
+        Some(stored) => Some(resolve_last(input, stored).await),
+        None if project::has_disk(input.sandbox_dir) => None,
+        None => return Ok(Checked::Current),
     };
-    let last = resolve_last(input, stored).await;
     let current = final_values(input.resolved)?;
     let styles = Styles::new();
     // A `run.json` of an older airlock has no paths: no path change.
@@ -105,7 +110,7 @@ async fn check_with(
         .last_run_paths
         .map(|last| path_diff(&last, input.paths, &styles))
         .unwrap_or_default();
-    if let Ok((_, values)) = &last
+    if let Some(Ok((_, values))) = &last
         && *values == current
         && moved.is_empty()
     {
@@ -119,23 +124,22 @@ async fn check_with(
     if input.yes || !input.can_prompt {
         return Err(Exit::error(2, messages::start::CONFIG_CHANGED_NO_PROMPT));
     }
-    match last {
-        Ok((resolved, values)) => {
+    let note = match last {
+        Some(Ok((resolved, values))) => {
             let mut diff = diff(&to_toml(&values), &to_toml(&current), &styles);
             diff.extend(moved);
-            match ask(&diff, None)? {
+            return match ask(&diff, None)? {
                 Answer::Accept => Ok(Checked::Current),
                 Answer::Last => Ok(Checked::Last(Box::new(resolved))),
-            }
+            };
         }
-        Err(e) => {
-            let note = messages::start::last_config_invalid(e);
-            let mut diff = diff("", &to_toml(&current), &styles);
-            diff.extend(moved);
-            ask(&diff, Some(&note))?;
-            Ok(Checked::Current)
-        }
-    }
+        Some(Err(e)) => messages::start::last_config_invalid(e),
+        None => messages::start::LAST_CONFIG_MISSING.to_string(),
+    };
+    let mut diff = diff("", &to_toml(&current), &styles);
+    diff.extend(moved);
+    ask(&diff, Some(&note))?;
+    Ok(Checked::Current)
 }
 
 /// Save the config files `config` and their resolved host paths `paths` as

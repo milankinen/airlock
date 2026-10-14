@@ -1,25 +1,22 @@
 //! Sandbox locations.
 //!
-//! A sandbox keeps its data in one of two places:
-//!  * the airlock data directory, out of the reach of the sandbox guest. A
-//!    registry maps each of these sandboxes to its project.
-//!  * the `.airlock/sandbox` directory of the project. Older airlock
-//!    versions used only this place, and a user setting can still select
-//!    it. These sandboxes are not in the registry.
+//! A sandbox keeps its data in the airlock data directory, out of the reach
+//! of the sandbox guest. A registry maps each sandbox to its project.
 //!
-//! Finds the sandbox of a directory (and of its parents, if necessary) in
-//! both places. The search can also go from a git worktree to its main
-//! repository. Also moves a project sandbox into the data directory, and
-//! removes sandboxes.
+//! Finds the sandbox of a directory (and of its parents, if necessary). The
+//! search can also go from a git worktree to its main repository. Also
+//! imports a sandbox that an older airlock version kept in the project
+//! directory, and removes sandboxes.
 
 mod migrate;
 pub mod registry;
 mod remove;
 
-pub use self::migrate::{MigrateError, adopt_local_config, check_local_config, migrate};
+pub use self::migrate::{MigrateError, adopt_local_config, check_local_config, import_legacy};
 pub use self::remove::remove_box;
 use crate::context::Context;
 use crate::packs::install::state::STATE_FILE;
+use crate::project::SandboxLock;
 use crate::util::PinnedDir;
 use crate::util::verified_path::VerifiedPath;
 use crate::vm::disk;
@@ -27,27 +24,15 @@ use crate::vm::disk;
 /// Directory of the sandboxes in the data directory.
 pub const BOXES_DIR: &str = "boxes";
 
-/// Path of a project sandbox, relative to the project directory.
+/// Path of the sandbox of an older airlock version, relative to the
+/// project directory. Only the import uses it.
 pub const PROJECT_SANDBOX: &str = ".airlock/sandbox";
-
-/// Marker file in a project sandbox: the user chose to keep the sandbox in
-/// the project, so `airlock start` does not offer to move it again.
-pub const KEEP_IN_PROJECT: &str = "keep-in-project";
-
-/// Where a sandbox keeps its data.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Location {
-    /// In the data directory, with the registry id.
-    DataDir { id: String },
-    /// In the `.airlock/sandbox` directory of the project.
-    ProjectDir,
-}
 
 /// A sandbox that [`resolve_sandbox`] found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Found {
-    /// Where the sandbox keeps its data.
-    pub location: Location,
+    /// Registry id of the sandbox.
+    pub id: String,
     /// Canonical project directory.
     pub project: VerifiedPath,
     /// Sandbox directory. It can be missing for a registered sandbox whose
@@ -64,8 +49,7 @@ pub struct Found {
 ///    worktree, continue at the root of the main repository of the worktree
 ///
 /// Returns:
-///   The sandboxes, nearest directory first. For one directory, a
-///   registered sandbox comes before a project sandbox.
+///   The registered sandboxes, nearest directory first.
 pub async fn candidates(
     context: &Context,
     start: &VerifiedPath,
@@ -92,23 +76,9 @@ pub async fn candidates(
                 }
             };
             found.push(Found {
-                location: Location::DataDir {
-                    id: entry.id.clone(),
-                },
+                id: entry.id.clone(),
                 project: dir.clone(),
                 dir: sandbox_dir,
-            });
-        }
-        // Any entry at `.airlock/sandbox` counts, also a symlink. The users
-        // of the sandbox directory refuse a symlink. A symlink at `.airlock`
-        // does not count: the path is refused.
-        if let Ok(project_dir) = dir.join(PROJECT_SANDBOX)
-            && project_dir.symlink_metadata().is_ok()
-        {
-            found.push(Found {
-                location: Location::ProjectDir,
-                project: dir,
-                dir: project_dir,
             });
         }
     }
@@ -209,6 +179,30 @@ pub async fn resolve_sandbox(
         .next())
 }
 
+/// Take the lock of the registered sandbox `id` of the project `host_cwd`
+/// in the data directory.
+/// Returns:
+///   The held lock, or `None` if the sandbox left the registry before the
+///   lock. Error if the lock fails.
+pub async fn lock_box(
+    context: &Context,
+    host_cwd: &VerifiedPath,
+    id: &str,
+) -> anyhow::Result<Option<SandboxLock>> {
+    // `airlock sandboxes rm` can remove the sandbox between the registry
+    // lookup and the lock. The lock then makes a new empty directory. Check
+    // the registry again under the lock, and remove that directory.
+    let lock = SandboxLock::acquire_box(host_cwd, &context.data.sandboxes, id)?;
+    let cwd = host_cwd.to_entry_path()?;
+    if registry::get(&context.db, id).await?.as_deref() != Some(cwd.as_os_str()) {
+        let dir = lock.dir().clone();
+        drop(lock);
+        let _ = dir.remove_dir_all();
+        return Ok(None);
+    }
+    Ok(Some(lock))
+}
+
 /// Get the project directory of the current directory `work`, for the
 /// sandbox search. The registry has canonical project paths.
 /// Returns:
@@ -219,25 +213,16 @@ pub(crate) fn project_dir(work: &VerifiedPath) -> std::io::Result<VerifiedPath> 
 }
 
 /// Get the directory of the local project config (`airlock.<ext>`) of a
-/// sandbox. A sandbox in the data directory keeps it in the sandbox
-/// directory, out of the repository. A project sandbox keeps it in
-/// `<host_cwd>/.airlock`.
+/// sandbox. The sandbox keeps it in the sandbox directory, out of the
+/// repository.
 /// Args:
-///  - `host_cwd`: Canonical project directory
 ///  - `sandbox_dir`: Sandbox directory of the project
 ///
 /// Returns:
 ///   The directory, or error if a part of `sandbox_dir` changed.
-pub fn local_config_dir(
-    host_cwd: &VerifiedPath,
-    sandbox_dir: &VerifiedPath,
-) -> std::io::Result<VerifiedPath> {
+pub fn local_config_dir(sandbox_dir: &VerifiedPath) -> std::io::Result<VerifiedPath> {
     sandbox_dir.to_entry_path()?;
-    Ok(if *sandbox_dir == host_cwd.join(PROJECT_SANDBOX)? {
-        host_cwd.join(".airlock")?
-    } else {
-        sandbox_dir.clone()
-    })
+    Ok(sandbox_dir.clone())
 }
 
 /// Find the directory of the local project config of the project
@@ -249,20 +234,34 @@ pub async fn find_local_config_dir(
 ) -> anyhow::Result<VerifiedPath> {
     Ok(
         match resolve_sandbox(context, host_cwd, false, false).await? {
-            Some(found) => local_config_dir(host_cwd, &found.dir)?,
+            Some(found) => local_config_dir(&found.dir)?,
             None => host_cwd.join(".airlock")?,
         },
     )
 }
 
 /// Check if the project `host_cwd` has a sandbox with content: a disk or
-/// install records. An empty sandbox directory does not count.
+/// install records. An empty sandbox directory does not count. A sandbox
+/// of an older version in the project counts: the start imports it.
 pub async fn has_content(context: &Context, host_cwd: &VerifiedPath) -> anyhow::Result<bool> {
+    if has_legacy_sandbox(host_cwd) {
+        return Ok(true);
+    }
     let Some(found) = resolve_sandbox(context, host_cwd, false, false).await? else {
         return Ok(false);
     };
     let exists = |name: &str| found.dir.join(name).and_then(|p| p.metadata()).is_ok();
     Ok(exists(disk::DISK_FILE) || exists(STATE_FILE))
+}
+
+/// Check if the project `host_cwd` has a sandbox of an older version at
+/// `.airlock/sandbox`. Any entry counts, also a symlink: the import
+/// refuses a bad entry with an error.
+pub fn has_legacy_sandbox(host_cwd: &VerifiedPath) -> bool {
+    host_cwd
+        .join(PROJECT_SANDBOX)
+        .and_then(|p| p.symlink_metadata())
+        .is_ok()
 }
 
 #[cfg(test)]

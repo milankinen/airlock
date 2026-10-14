@@ -140,8 +140,8 @@ async fn run(
     // The log lines so far wait in memory. Now the log file is known.
     cli::logging::attach(sandbox.lock.dir());
     if let Some(generated) = config.generated_project() {
-        let local_dir = sandboxes::local_config_dir(&host_cwd, sandbox.lock.dir())
-            .map_err(anyhow::Error::from)?;
+        let local_dir =
+            sandboxes::local_config_dir(sandbox.lock.dir()).map_err(anyhow::Error::from)?;
         start::wizard::save_config(generated, &local_dir)?;
     }
     let project = project::open(
