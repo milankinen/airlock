@@ -217,6 +217,21 @@ impl AsyncWrite for RpcTransport {
     }
 }
 
+/// Make the local end of an RPC byte stream when the sink of the peer is
+/// already known.
+/// Args:
+///  - `peer`: Sink that gets the bytes that the local end writes
+///
+/// Returns:
+///   The local end, and the sink to give to the peer for the bytes in the
+///   other direction.
+pub fn rpc_pipe(peer: tcp_sink::Client) -> (RpcTransport, tcp_sink::Client) {
+    let (tx, rx) = mpsc::channel::<Bytes>(1);
+    let error: RelayError = Rc::new(RefCell::new(None));
+    let sink: tcp_sink::Client = capnp_rpc::new_client(ChannelSink::new(tx, error));
+    (RpcTransport::new(Bytes::new(), rx, peer), sink)
+}
+
 /// Error state that the relay task and [`ChannelSink`] share.
 pub type RelayError = Rc<RefCell<Option<String>>>;
 

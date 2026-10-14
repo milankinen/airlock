@@ -389,7 +389,7 @@ impl Network {
     /// The TUI gets it through [`NetworkHandle`]. The TUI uses it to change
     /// the policy without access to the `Network` internals.
     fn control(&self) -> NetworkControl {
-        NetworkControl::new(self.state.clone())
+        NetworkControl::new(self.state.clone(), self.public_only)
     }
 
     /// Get the parts of the network that stay available after the network
@@ -430,6 +430,8 @@ impl Network {
     pub fn resolve_target(&self, host: &str, port: u16) -> ResolvedTarget {
         let policy = self.policy();
 
+        // Ad-hoc guest → host forwards do the same check for each connection
+        // (see `NetworkControl::allows_port_forward`). Keep the two the same.
         if matches!(policy, Policy::DenyAlways) || (self.public_only && is_local_host(host)) {
             return denied(host, port);
         }

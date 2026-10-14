@@ -20,12 +20,14 @@ use crate::config::config_values::Policy;
 #[derive(Clone)]
 pub struct NetworkControl {
     state: Arc<RwLock<NetworkState>>,
+    /// True if the network allows only public destinations.
+    public_only: bool,
 }
 
 impl NetworkControl {
     /// Make a handle for the given shared state.
-    pub(super) fn new(state: Arc<RwLock<NetworkState>>) -> Self {
-        Self { state }
+    pub(super) fn new(state: Arc<RwLock<NetworkState>>, public_only: bool) -> Self {
+        Self { state, public_only }
     }
 
     /// Get the current top-level policy.
@@ -37,6 +39,15 @@ impl NetworkControl {
     /// connection that the network task processes.
     pub fn set_policy(&self, policy: Policy) {
         self.state.write().policy = policy;
+    }
+
+    /// Check if the network now allows guest → host port forwards. The
+    /// result can change while the sandbox runs.
+    /// Returns:
+    ///   False under `deny-always` and on a public-only network, the same as
+    ///   for the config port forwards. Otherwise true.
+    pub fn allows_port_forward(&self) -> bool {
+        !self.public_only && !matches!(self.policy(), Policy::DenyAlways)
     }
 }
 

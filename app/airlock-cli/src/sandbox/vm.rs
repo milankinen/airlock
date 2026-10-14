@@ -129,14 +129,16 @@ impl Vm {
             .await
     }
 
-    /// Serve `airlock exec` on the `cli.sock` of the sandbox until shutdown.
-    /// The shutdown removes the socket. The exec processes get the sandbox
-    /// env with the overrides of the client.
+    /// Serve `airlock exec` and `airlock network forward` on the `cli.sock`
+    /// of the sandbox until shutdown. The shutdown removes the socket. The
+    /// exec processes get the sandbox env with the overrides of the client.
     pub fn serve_cli(&mut self) -> anyhow::Result<()> {
         let sock_path =
             crate::cache::cli_sock_path(&self.project.context.data_dir, &self.project.sandbox_dir)?;
         let base_env = self.instance.env.clone();
-        let server = cli_server::serve(sock_path, self.supervisor.clone(), base_env);
+        let forwards =
+            cli_server::ForwardRules::new(&self.project.config.network, self.network.control());
+        let server = cli_server::serve(sock_path, self.supervisor.clone(), base_env, forwards);
         self.tasks.spawn_service(server);
         Ok(())
     }

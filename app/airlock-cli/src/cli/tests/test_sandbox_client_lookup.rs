@@ -1,4 +1,4 @@
-//! Tests for the sandbox lookup of `airlock exec`: the nearest running
+//! Tests for the sandbox lookup of commands that act on a running sandbox: the nearest running
 //! sandbox wins, with sandboxes of both kinds in one directory tree. The
 //! lookup can also go from a git worktree to its main repository, but not
 //! through a forged worktree link or a symlink that code in a sandbox made.
@@ -7,13 +7,13 @@ use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::process::Command;
 
-use crate::cli::cmd_exec::find_cli_sock;
+use crate::cli::sandbox_client::find_cli_sock;
 use crate::context::Context;
 use crate::test_cfg::sandboxes::{data_dir_sandbox, legacy_sandbox};
 use crate::test_cfg::{TempDir, block_on_local, temp_dir, test_context};
 use crate::vault::{Vault, VaultStorageType};
 
-/// Run the lookup of `airlock exec` from `start`.
+/// Run the sandbox lookup from `start`.
 fn lookup(context: &Context, start: &Path) -> Option<std::path::PathBuf> {
     block_on_local(find_cli_sock(context, start, false)).unwrap()
 }

@@ -187,22 +187,28 @@ where
 
 /// Relay the raw bytes of `stream` to `guest_port` on the guest loopback.
 /// The relay applies no rules, no policy and no interception, because the
-/// host is trusted. The connection goes through the `openLocalTcp` RPC of
+/// host is trusted. The connection goes through the `connectToGuestPort` RPC of
 /// the supervisor.
 async fn relay_raw(stream: TcpStream, guest_port: u16, guest: GuestNetwork) -> anyhow::Result<()> {
     let rpc_io = guest.connect(guest_port).await?;
+    relay_stream(stream, rpc_io).await;
+    Ok(())
+}
+
+/// Relay the raw bytes between a host TCP stream and a guest connection,
+/// until one side closes.
+pub async fn relay_stream(stream: TcpStream, guest: io::RpcTransport) {
     let (read, write) = stream.into_split();
     let host_transport = io::Transport {
         read: Box::new(read),
         write: Box::new(write),
         h2: false,
     };
-    let (gr, gw) = tokio::io::split(rpc_io);
+    let (gr, gw) = tokio::io::split(guest);
     let guest_transport = io::Transport {
         read: Box::new(gr),
         write: Box::new(gw),
         h2: false,
     };
     Box::pin(tcp::relay(host_transport, guest_transport)).await;
-    Ok(())
 }

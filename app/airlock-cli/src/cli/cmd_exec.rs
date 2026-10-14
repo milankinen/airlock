@@ -3,15 +3,12 @@
 //! Runs a process in the container of a running sandbox. The `airlock start`
 //! process of that sandbox does the work.
 
-use std::path::PathBuf;
-
-use airlock_common::cli_capnp::*;
 use clap::Args;
-use futures::AsyncReadExt;
 
+use crate::cli::sandbox_client::SandboxClient;
 use crate::context::Context;
 use crate::runtime::{self, RawTerminalRuntime};
-use crate::{messages, oci, rpc, sandbox, sandboxes};
+use crate::{messages, oci, rpc, sandbox};
 
 /// CLI arguments for `airlock exec`.
 #[derive(Args, Debug)]
@@ -62,38 +59,9 @@ pub async fn main(args: ExecArgs, context: &Context) -> anyhow::Result<i32> {
 
     let host_cwd = std::env::current_dir()
         .map_err(|e| anyhow::anyhow!(messages::cli::exec_get_cwd_failed(e)))?;
-    // The registry has canonical project paths.
-    let lookup_dir = std::fs::canonicalize(&host_cwd).unwrap_or_else(|_| host_cwd.clone());
-    let sock_path = find_cli_sock(context, &lookup_dir, follow_git_worktree)
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(messages::cli::exec_no_running_sandbox(host_cwd.display()))
-        })?;
-
-    let stream = tokio::net::UnixStream::connect(&sock_path)
-        .await
-        .map_err(|e| {
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) {
-                anyhow::anyhow!(messages::cli::exec_stale_cli_sock(sock_path.display()))
-            } else {
-                anyhow::anyhow!(messages::cli::exec_connect_failed(sock_path.display(), e))
-            }
-        })?;
-
-    let (reader, writer) = tokio_util::compat::TokioAsyncReadCompatExt::compat(stream).split();
-    let network = capnp_rpc::twoparty::VatNetwork::new(
-        reader,
-        writer,
-        capnp_rpc::rpc_twoparty_capnp::Side::Client,
-        capnp::message::ReaderOptions::default(),
-    );
-    let mut rpc_sys = capnp_rpc::RpcSystem::new(Box::new(network), None);
-    let cli_service: cli_service::Client =
-        rpc_sys.bootstrap(capnp_rpc::rpc_twoparty_capnp::Side::Server);
-    tokio::task::spawn_local(rpc_sys);
+    let client = SandboxClient::connect(context, &host_cwd, follow_git_worktree).await?;
+    let cli_service = client.service;
+    tokio::task::spawn_local(client.rpc_system);
 
     let raw = RawTerminalRuntime::new();
     let stdin = raw.stdin()?;
@@ -121,62 +89,4 @@ pub async fn main(args: ExecArgs, context: &Context) -> anyhow::Result<i32> {
     let mut terminal = raw.into_terminal();
     tokio::task::spawn_local(runtime::forward_signals(runtime::signals()?, proc.clone()));
     Ok(sandbox::io::drive(&proc, &mut terminal).await)
-}
-
-/// Find the CLI socket of the nearest running sandbox at or above `start`.
-/// Sandboxes in the data directory and in the project both count. With
-/// `follow_git_worktree`, the search goes on from the root of a git
-/// worktree to the root of its main repository.
-///
-/// Returns:
-///   The first socket path that exists, or `None`. Error for a sandbox
-///   directory or a socket that is a symlink.
-// A sandbox without a socket does not run. The search then goes on to the
-// parent directories. The socket path is `cli.sock` in the sandbox
-// directory. If that path is longer than the `AF_UNIX` limit, the path is a
-// hash-keyed fallback under `<data>/sock/`.
-//
-// Code in a sandbox can write its project mount. A symlink there at
-// `.airlock/sandbox` or `cli.sock` could send the command, the env values
-// and the terminal to a different sandbox. Thus never follow a symlink.
-pub(super) async fn find_cli_sock(
-    context: &Context,
-    start: &std::path::Path,
-    follow_git_worktree: bool,
-) -> anyhow::Result<Option<PathBuf>> {
-    for found in sandboxes::candidates(context, start, true, follow_git_worktree).await? {
-        let Ok(meta) = std::fs::symlink_metadata(&found.dir) else {
-            continue;
-        };
-        refuse_symlink(&found.dir, &meta)?;
-        if !meta.is_dir() {
-            continue;
-        }
-        let Ok(candidate) = crate::cache::cli_sock_path(&context.data_dir, &found.dir) else {
-            continue;
-        };
-        if let Ok(meta) = std::fs::symlink_metadata(&candidate) {
-            refuse_symlink(&candidate, &meta)?;
-            // A sandbox out of the start directory and its parents comes
-            // from a worktree link. Tell the user which sandbox it is.
-            if !start.starts_with(&found.project) {
-                crate::cli::log!(
-                    "{} {}",
-                    crate::cli::bullet(),
-                    messages::cli::attached_to_sandbox(found.project.display())
-                );
-            }
-            return Ok(Some(candidate));
-        }
-    }
-    Ok(None)
-}
-
-/// Return an error if `path`, with the metadata `meta`, is a symlink.
-fn refuse_symlink(path: &std::path::Path, meta: &std::fs::Metadata) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !meta.file_type().is_symlink(),
-        messages::cli::path_is_symlink(path.display())
-    );
-    Ok(())
 }

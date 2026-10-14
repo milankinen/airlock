@@ -133,6 +133,12 @@ impl Supervisor {
         Ok((Self { supervisor: client }, driver(rpc, "supervisor")))
     }
 
+    /// Make a handle from a supervisor client without a vsock connection.
+    #[cfg(test)]
+    pub fn from_client(supervisor: supervisor::Client) -> Self {
+        Self { supervisor }
+    }
+
     /// Get a clone of the capnp client. Components that send specific RPCs
     /// after the handshake use it, for example the deny reporter and
     /// [`crate::rpc::guest_network::GuestNetwork`].
@@ -356,6 +362,42 @@ impl Supervisor {
         }
         let response = req.send().promise.await?;
         Ok(Process::new(response.get()?.get_proc()?))
+    }
+
+    /// Open a TCP connection to `port` on the guest loopback.
+    /// Args:
+    ///  - `port`: Guest loopback port
+    ///  - `client`: Sink that gets the bytes from the guest
+    ///
+    /// Returns:
+    ///   Sink that sends bytes to the guest.
+    pub async fn connect_to_guest_port(
+        &self,
+        port: u16,
+        client: airlock_common::network_capnp::tcp_sink::Client,
+    ) -> capnp::Result<airlock_common::network_capnp::tcp_sink::Client> {
+        let mut req = self.supervisor.connect_to_guest_port_request();
+        req.get().set_port(port);
+        req.get().set_client(client);
+        let response = req.send().promise.await?;
+        response.get()?.get_server()
+    }
+
+    /// Listen on `port` on the guest loopback. The guest calls `connector`
+    /// for each accepted connection.
+    /// Returns:
+    ///   Lifetime token of the listener. The listener closes when all
+    ///   references to the token are gone.
+    pub async fn bind_host_port(
+        &self,
+        port: u16,
+        connector: local_connector::Client,
+    ) -> capnp::Result<listen_handle::Client> {
+        let mut req = self.supervisor.bind_host_port_request();
+        req.get().set_port(port);
+        req.get().set_connector(connector);
+        let response = req.send().promise.await?;
+        response.get()?.get_handle()
     }
 
     /// Read the guest CPU, memory and load for the monitor UI.

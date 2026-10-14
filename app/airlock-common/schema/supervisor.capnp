@@ -84,13 +84,13 @@ interface Supervisor {
   # tool failures that hook endpoints report.
   reportDeny @4 (epoch :UInt64) -> ();
 
-  # Host → guest TCP port forward. The host accepted a local TCP
-  # connection from a host process to a guest service. This call opens
+  # Open one connection to a guest loopback port. The host calls it once
+  # for each local TCP connection that it accepted. This call opens
   # TCP to 127.0.0.1:<port> inside the VM and relays bytes through the
   # sink pair. It is a raw relay with no rules and no interception. A
   # failed connect inside the guest gives a Cap'n Proto exception, and
   # the host then closes the accepted socket.
-  openLocalTcp @5 (port :UInt16, client :Network.TcpSink) -> (server :Network.TcpSink);
+  connectToGuestPort @5 (port :UInt16, client :Network.TcpSink) -> (server :Network.TcpSink);
 
   # Snapshot of the current state of each declared daemon. The host
   # calls it repeatedly (e.g. every 100ms) during shutdown to update the
@@ -107,7 +107,31 @@ interface Supervisor {
   # closed) cause the guest time to drift. The host calls this every
   # minute to keep the two clocks close.
   syncClock @8 (epoch :UInt64, epochNanos :UInt32) -> ();
+
+  # Bind a guest loopback port and relay each accepted connection to the
+  # host. The guest binds 127.0.0.1:<port> and calls `connector.connect` for each accepted
+  # connection. It is a raw relay with no rules and no interception. The
+  # listener and its connections close when the host releases `handle`.
+  # A failed bind (for example a port in use) gives a Cap'n Proto
+  # exception. The guest refuses port 0, and refuses this call until
+  # `boot` succeeds.
+  bindHostPort @9 (port :UInt16, connector :LocalConnector) -> (handle :ListenHandle);
 }
+
+# Host-side target of a guest listener from `Supervisor.bindHostPort`.
+interface LocalConnector {
+  # The guest accepted a connection. The host opens its side of the
+  # connection and relays bytes through the sink pair. `client` gets the
+  # bytes from the guest to the host. `server` gets the bytes from the
+  # host to the guest. An exception makes the guest close the accepted
+  # socket.
+  connect @0 (client :Network.TcpSink) -> (server :Network.TcpSink);
+}
+
+# Lifetime token of a guest listener from `Supervisor.bindHostPort`. It
+# has no methods. When the host releases it, the guest closes the listener
+# and its connections.
+interface ListenHandle {}
 
 # Host clipboard access that the host gives to the guest as a capability.
 # This object is the only path from the guest to the host clipboard. Thus

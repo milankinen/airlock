@@ -9,6 +9,7 @@
 pub mod cmd_config;
 pub mod cmd_exec;
 pub mod cmd_info;
+pub mod cmd_network;
 pub mod cmd_rm;
 pub mod cmd_sandbox;
 pub mod cmd_secret;
@@ -17,6 +18,7 @@ pub mod cmd_start;
 pub mod cmd_templates;
 pub mod logging;
 pub mod prompt;
+pub mod sandbox_client;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

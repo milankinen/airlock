@@ -237,8 +237,8 @@ pub mod cli {
         format!("get cwd: {err}")
     }
 
-    /// Error when `exec` finds no running sandbox.
-    pub fn exec_no_running_sandbox(dir: impl Display) -> String {
+    /// Error when no running sandbox serves a directory.
+    pub fn no_running_sandbox(dir: impl Display) -> String {
         format!(
             "no running sandbox for {dir} or its parent directories. \
              is 'airlock start' running in this project?"
@@ -246,16 +246,16 @@ pub mod cli {
     }
 
     /// Error when the CLI socket exists and no process listens on it.
-    pub fn exec_stale_cli_sock(path: impl Display) -> String {
+    pub fn stale_cli_sock(path: impl Display) -> String {
         format!("stale cli.sock at {path} — is 'airlock start' still running?")
     }
 
-    /// Error when `exec` cannot connect to the CLI socket.
-    pub fn exec_connect_failed(path: impl Display, err: impl Display) -> String {
+    /// Error when the CLI socket of a sandbox cannot be connected.
+    pub fn sandbox_connect_failed(path: impl Display, err: impl Display) -> String {
         format!("failed to connect to {path}: {err}")
     }
 
-    /// Status when `exec` attaches to the sandbox of another project.
+    /// Status when a command attaches to the sandbox of another project.
     pub fn attached_to_sandbox(project: impl Display) -> String {
         format!("attached to the sandbox of {project}")
     }
@@ -953,6 +953,14 @@ pub mod config {
     /// Description of a valid port mapping value.
     pub const PORT_MAPPING_EXPECTED: &str = "a port number or \"host:guest\" string";
 
+    /// Error when a port mapping has port 0.
+    pub const PORT_MAPPING_ZERO_PORT: &str = "port 0 is not valid";
+
+    /// Error when a port mapping has a port that is not a number.
+    pub fn port_mapping_bad_port(port: impl Display, err: impl Display) -> String {
+        format!("invalid port \"{port}\": {err}")
+    }
+
     /// Error when a port mapping string has no colon.
     pub const PORT_MAPPING_NEEDS_COLON: &str = "expected \"host:guest\"";
 
@@ -1089,14 +1097,14 @@ pub mod network {
         )
     }
 
-    /// Context when the IPv4 bind of a reverse port forward fails.
+    /// Context when the IPv4 bind of a host → guest port forward fails.
     pub fn reverse_forward_bind_v4(host_port: impl Display) -> String {
-        format!("bind 127.0.0.1:{host_port} for reverse port forward")
+        format!("bind 127.0.0.1:{host_port} for port forward to the sandbox")
     }
 
-    /// Context when the IPv6 bind of a reverse port forward fails.
+    /// Context when the IPv6 bind of a host → guest port forward fails.
     pub fn reverse_forward_bind_v6(host_port: impl Display) -> String {
-        format!("bind [::1]:{host_port} for reverse port forward")
+        format!("bind [::1]:{host_port} for port forward to the sandbox")
     }
 
     /// Label of a service target in a conflict report.
@@ -1137,6 +1145,75 @@ pub mod network {
     pub fn compile_middleware_failed(script: impl Display, err: impl Display) -> String {
         format!("failed to compile middleware '{script}': {err}")
     }
+}
+
+pub mod network_forward {
+    //! Texts of the `network forward` command and of its server side in
+    //! `airlock start`.
+
+    use std::fmt::Display;
+
+    /// Header of the list of forwards from the host to the sandbox.
+    pub const FORWARDING_TO_SANDBOX: &str = "Forwarding ports to the sandbox (Ctrl+C to stop):";
+
+    /// Header of the list of forwards from the sandbox to the host.
+    pub const FORWARDING_TO_HOST: &str = "Forwarding ports to the host (Ctrl+C to stop):";
+
+    /// One forward from the host to the sandbox.
+    pub fn to_sandbox_line(host_port: impl Display, guest_port: impl Display) -> String {
+        format!("localhost:{host_port} → sandbox:{guest_port}")
+    }
+
+    /// One forward from the sandbox to the host.
+    pub fn to_host_line(guest_port: impl Display, host_port: impl Display) -> String {
+        format!("sandbox localhost:{guest_port} → host:{host_port}")
+    }
+
+    /// Error when the sandbox stops while the forwards are active.
+    pub const SANDBOX_STOPPED: &str = "the sandbox stopped, and the port forwards closed";
+
+    /// Error when two forwards use the same host port.
+    pub fn duplicate_host_port(port: impl Display) -> String {
+        format!("host port {port} is in more than one forward")
+    }
+
+    /// Error when two forwards use the same sandbox port.
+    pub fn duplicate_guest_port(port: impl Display) -> String {
+        format!("sandbox port {port} is in more than one forward")
+    }
+
+    /// Error when the sandbox cannot listen on a port.
+    pub fn listen_failed(guest_port: impl Display, err: impl Display) -> String {
+        format!("listen on sandbox port {guest_port}: {err}")
+    }
+
+    /// Warning when a connection to a sandbox port fails. Shows one time
+    /// for each forward.
+    pub fn connect_failed(guest_port: impl Display, err: impl Display) -> String {
+        format!("connect to sandbox port {guest_port}: {err}")
+    }
+
+    /// Error when a forward from the host goes to a sandbox port that a
+    /// config forward sends back to the host.
+    pub fn loop_to_host(guest_port: impl Display) -> String {
+        format!(
+            "sandbox port {guest_port} forwards to the host in the config (`host` list); \
+             a forward to it makes a loop"
+        )
+    }
+
+    /// Error when a forward to the host listens on a sandbox port that a
+    /// config forward from the host uses.
+    pub fn loop_from_host(guest_port: impl Display) -> String {
+        format!(
+            "sandbox port {guest_port} gets a forward from the host in the config (`guest` list); \
+             a forward from it makes a loop"
+        )
+    }
+
+    /// Error when the network policy denies a connection of a forward to
+    /// the host (`deny-always`, or the install network).
+    pub const DENIED_BY_POLICY: &str = "the network policy denies port forwards to the host";
 }
 
 pub mod oci {

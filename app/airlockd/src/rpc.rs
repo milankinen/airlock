@@ -396,19 +396,46 @@ impl supervisor::Server for SupervisorImpl {
         Ok(())
     }
 
-    async fn open_local_tcp(
+    async fn connect_to_guest_port(
         self: Rc<Self>,
-        params: supervisor::OpenLocalTcpParams,
-        mut results: supervisor::OpenLocalTcpResults,
+        params: supervisor::ConnectToGuestPortParams,
+        mut results: supervisor::ConnectToGuestPortResults,
     ) -> Result<(), capnp::Error> {
         let params = params.get()?;
         let port = params.get_port();
         let client = params.get_client()?;
 
-        let server = net::open_local_tcp(port, client)
+        let server = net::connect_to_guest_port(port, client)
             .await
             .map_err(|e| capnp::Error::failed(format!("open 127.0.0.1:{port}: {e}")))?;
         results.get().set_server(server);
+        Ok(())
+    }
+
+    async fn bind_host_port(
+        self: Rc<Self>,
+        params: supervisor::BindHostPortParams,
+        mut results: supervisor::BindHostPortResults,
+    ) -> Result<(), capnp::Error> {
+        // Same gate as `spawn`: before boot, the config host ports are not
+        // bound yet, so a listen could take one of them.
+        if self.spawn_creds.borrow().is_none() {
+            return Err(capnp::Error::failed(
+                "bindHostPort called before boot succeeded".into(),
+            ));
+        }
+        let params = params.get()?;
+        let port = params.get_port();
+        // Port 0 binds a random port that the host cannot know.
+        if port == 0 {
+            return Err(capnp::Error::failed("bindHostPort: port 0".into()));
+        }
+        let connector = params.get_connector()?;
+
+        let handle = net::bind_host_port(port, connector)
+            .await
+            .map_err(|e| capnp::Error::failed(e.to_string()))?;
+        results.get().set_handle(handle);
         Ok(())
     }
 

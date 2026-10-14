@@ -77,3 +77,26 @@ command:
 airlock exec --login bash
 ```
 
+## Port forwarding
+
+Use `airlock network forward` to open ports between the host and a running
+sandbox without a config change. Each forward is `8080` (same port on both
+sides) or `host:guest`. The left side is always the host port.
+
+* Default (`--mode=guest`): publish sandbox ports on the host.
+* `--mode=host`: let the sandbox reach host ports.
+
+```bash
+# Open http://localhost:8000 on the host
+airlock network forward 8000
+
+# Sandbox port 3000 reaches host port 9000
+airlock network forward --mode=host 9000:3000
+```
+
+The forwards stay active while the command runs. Press Ctrl+C to stop them.
+The command exits when the sandbox stops. The command fails if a port is in
+use or conflicts with a configured forward.
+
+Ad-hoc forwards follow the same network policy as
+[configured port forwards](../configuration/network.md#port-forwarding).

@@ -53,8 +53,8 @@ pub async fn rpc_connect_tcp(
 /// Connect to `127.0.0.1:<port>` in the guest and relay the raw bytes in
 /// both directions with the host.
 ///
-/// Used by `Supervisor.openLocalTcp`: the host accepted a connection for a
-/// guest service.
+/// Used by `Supervisor.connectToGuestPort`: the host accepted a connection
+/// for a guest service.
 /// Args:
 ///  - `port`: Guest loopback port
 ///  - `client`: Host-side sink for the bytes from guest to host
@@ -63,7 +63,7 @@ pub async fn rpc_connect_tcp(
 ///   Sink that the host uses to send bytes into the guest connection. Error
 ///   if the connect fails. The caller converts it into a Cap'n Proto
 ///   exception.
-pub async fn open_local_tcp(
+pub async fn connect_to_guest_port(
     port: u16,
     client: tcp_sink::Client,
 ) -> anyhow::Result<tcp_sink::Client> {

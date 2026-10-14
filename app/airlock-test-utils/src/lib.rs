@@ -6,6 +6,7 @@ mod fs;
 #[cfg(feature = "http")]
 mod http;
 mod io;
+mod net;
 #[cfg(feature = "rpc")]
 mod rpc;
 mod runtime;
@@ -16,6 +17,7 @@ pub use fs::*;
 #[cfg(feature = "http")]
 pub use http::*;
 pub use io::*;
+pub use net::*;
 #[cfg(feature = "rpc")]
 pub use rpc::*;
 pub use runtime::*;

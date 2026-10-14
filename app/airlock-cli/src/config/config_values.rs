@@ -574,6 +574,29 @@ impl PortMapping {
     }
 }
 
+impl std::str::FromStr for PortMapping {
+    type Err = String;
+
+    /// Parse `8080` (same port on both sides) or `host:guest`. Port 0 is
+    /// not valid.
+    fn from_str(v: &str) -> Result<Self, String> {
+        fn port(text: &str) -> Result<u16, String> {
+            match text.parse::<u16>() {
+                Ok(0) => Err(crate::messages::config::PORT_MAPPING_ZERO_PORT.to_string()),
+                Ok(port) => Ok(port),
+                Err(e) => Err(crate::messages::config::port_mapping_bad_port(text, e)),
+            }
+        }
+        match v.split_once(':') {
+            Some((host, guest)) => Ok(Self {
+                host: port(host)?,
+                guest: port(guest)?,
+            }),
+            None => port(v).map(Self::same),
+        }
+    }
+}
+
 impl serde::Serialize for PortMapping {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         if self.host == self.guest {
@@ -587,6 +610,20 @@ impl serde::Serialize for PortMapping {
 impl<'de> serde::Deserialize<'de> for PortMapping {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         struct Visitor;
+        impl Visitor {
+            /// Make a same-port mapping from a converted number. Port 0 is
+            /// not valid.
+            fn from_number<E: serde::de::Error>(
+                port: Result<u16, std::num::TryFromIntError>,
+            ) -> Result<PortMapping, E> {
+                match port.map_err(serde::de::Error::custom)? {
+                    0 => Err(serde::de::Error::custom(
+                        crate::messages::config::PORT_MAPPING_ZERO_PORT,
+                    )),
+                    port => Ok(PortMapping::same(port)),
+                }
+            }
+        }
         impl serde::de::Visitor<'_> for Visitor {
             type Value = PortMapping;
 
@@ -595,22 +632,22 @@ impl<'de> serde::Deserialize<'de> for PortMapping {
             }
 
             fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<PortMapping, E> {
-                let port = u16::try_from(v).map_err(serde::de::Error::custom)?;
-                Ok(PortMapping::same(port))
+                Self::from_number(u16::try_from(v))
             }
 
             fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<PortMapping, E> {
-                let port = u16::try_from(v).map_err(serde::de::Error::custom)?;
-                Ok(PortMapping::same(port))
+                Self::from_number(u16::try_from(v))
             }
 
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<PortMapping, E> {
-                let (host, guest) = v.split_once(':').ok_or_else(|| {
-                    serde::de::Error::custom(crate::messages::config::PORT_MAPPING_NEEDS_COLON)
-                })?;
-                let host: u16 = host.parse().map_err(serde::de::Error::custom)?;
-                let guest: u16 = guest.parse().map_err(serde::de::Error::custom)?;
-                Ok(PortMapping { host, guest })
+                // A plain number in a config string stays an error. Only
+                // the CLI accepts it.
+                if !v.contains(':') {
+                    return Err(serde::de::Error::custom(
+                        crate::messages::config::PORT_MAPPING_NEEDS_COLON,
+                    ));
+                }
+                v.parse().map_err(serde::de::Error::custom)
             }
         }
         d.deserialize_any(Visitor)
@@ -1124,5 +1161,25 @@ mod tests {
         ] {
             assert_eq!(ImageRef::auto(name.clone()).pinned_digest(), None, "{name}");
         }
+    }
+
+    /// Test that port mapping specs reject port 0 and bad syntax, and that a
+    /// config string without colon stays an error.
+    ///   1. Parse valid specs with `FromStr`
+    ///   2. Check that port 0, bad numbers and extra colons fail
+    ///   3. Deserialize a config string without colon and check the error
+    #[test]
+    fn port_mapping_spec_rejects_zero_and_bad_syntax() {
+        let same: PortMapping = "8080".parse().unwrap();
+        assert_eq!((same.host, same.guest), (8080, 8080));
+        let pair: PortMapping = "9000:3000".parse().unwrap();
+        assert_eq!((pair.host, pair.guest), (9000, 3000));
+
+        for bad in ["0", "0:80", "80:0", "", "x", "70000", "1:2:3", "80:", ":80"] {
+            assert!(bad.parse::<PortMapping>().is_err(), "{bad:?}");
+        }
+
+        let value = serde::de::value::StrDeserializer::<serde::de::value::Error>::new("8080");
+        assert!(<PortMapping as serde::Deserialize>::deserialize(value).is_err());
     }
 }

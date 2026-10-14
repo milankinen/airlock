@@ -330,3 +330,6 @@ guest = ["5000:4000"]   # host :5000 → guest :4000
 Like other config entries, you can disable port forward groups with
 `enabled = false`.
 
+To forward ports for a short time without a config change, use
+[`airlock network forward`](../usage/attaching-to-running-sandbox.md#port-forwarding).
+
