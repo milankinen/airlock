@@ -476,7 +476,10 @@ fn removed_status(status: PackStatus) -> Option<&'static str> {
 /// Returns:
 ///   The project directory and its sandbox (`None` if the current directory
 ///   has none), or error for an id that is not registered.
-async fn find(context: &Context, id: Option<&str>) -> anyhow::Result<(PathBuf, Option<Found>)> {
+pub(super) async fn find(
+    context: &Context,
+    id: Option<&str>,
+) -> anyhow::Result<(PathBuf, Option<Found>)> {
     if let Some(id) = id {
         let found = find_by_id(context, id).await?;
         return Ok((found.project.clone(), Some(found)));

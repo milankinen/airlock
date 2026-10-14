@@ -363,6 +363,22 @@ pub mod cli {
         format!("No sandbox for {dir} — run `airlock start` first")
     }
 
+    /// Warning of `airlock config` when the project has no project config.
+    pub fn no_project_config(dir: impl Display) -> String {
+        format!("No project config for {dir}")
+    }
+
+    /// Error of `airlock config --resolved` when the sandbox has no
+    /// config of a last run.
+    pub fn no_last_run_config(dir: impl Display) -> String {
+        format!("No config of a last run for {dir} — run `airlock start` first")
+    }
+
+    /// Error when `airlock config` cannot export the config.
+    pub fn config_export_failed(err: impl Display) -> String {
+        format!("Cannot export config: {err}")
+    }
+
     /// Error when `info` cannot load the sandbox details.
     pub fn sandbox_details_loading_failed(err: impl Display) -> String {
         format!("Sandbox details loading failed: {err}")

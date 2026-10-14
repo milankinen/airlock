@@ -1,14 +1,16 @@
 //! The `airlock sandboxes` command.
 //!
-//! Lists the sandboxes in the airlock data directory, shows the details of
-//! one sandbox, and removes sandboxes. Without an id, `info` and `remove`
-//! use the sandbox of the current directory, as `airlock info` and
-//! `airlock rm` do. Sandboxes in a project directory are not in the list.
+//! Lists the sandboxes in the airlock data directory, shows the details and
+//! the config of one sandbox, and removes sandboxes. Without an id, `info`
+//! and `remove` use the sandbox of the current directory, as `airlock info`
+//! and `airlock rm` do. Sandboxes in a project directory are not in the
+//! list.
 
 use std::path::Path;
 
 use clap::{Args, Subcommand};
 
+use super::cmd_config::{self, ConfigArgs};
 use super::cmd_info::{self, Details, find_by_id};
 use super::cmd_rm::{self, RmArgs};
 use crate::cli::prompt::choose;
@@ -37,6 +39,13 @@ enum SandboxCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Print the config of a sandbox (see `airlock config`)
+    Config {
+        /// Sandbox id (see `airlock sandboxes list`)
+        id: String,
+        #[command(flatten)]
+        args: ConfigArgs,
+    },
     /// Remove sandboxes from the airlock data directory (default: the sandbox of the current directory)
     #[command(alias = "rm")]
     Remove {
@@ -57,6 +66,7 @@ pub async fn main(args: SandboxArgs, context: &Context) -> i32 {
         SandboxCmd::Info { id, json } => {
             Ok(cmd_info::run(context.clone(), id.as_deref(), json).await)
         }
+        SandboxCmd::Config { id, args } => Ok(cmd_config::run(context, Some(&id), &args).await),
         SandboxCmd::Remove { ids, force } if ids.is_empty() => {
             Ok(cmd_rm::main(&RmArgs { force }, context).await)
         }

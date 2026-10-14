@@ -23,6 +23,7 @@ use similar::{ChangeTag, TextDiff};
 use super::Exit;
 use crate::cli::prompt::choose::{Choice, Choose, Details};
 use crate::cli::prompt::style::Styles;
+use crate::config::export::{self, Format};
 use crate::config::{ConfigOverrides, LayeredConfig, ResolvedConfig};
 use crate::packs::PackManager;
 use crate::{messages, project};
@@ -234,25 +235,9 @@ fn ask(diff: &[String], invalid_last: Option<&str>) -> Result<Answer, Exit> {
 /// Return `config` as TOML text, which is easier to read in a diff. Use
 /// JSON if `config` has no TOML form.
 fn to_toml(config: &Value) -> String {
-    let mut config = config.clone();
-    drop_nulls(&mut config);
-    toml::to_string_pretty(&config)
-        .unwrap_or_else(|_| serde_json::to_string_pretty(&config).unwrap_or_default())
-}
-
-/// Remove the unset (null) values from `value`. TOML has no null.
-fn drop_nulls(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            map.retain(|_, v| !v.is_null());
-            map.values_mut().for_each(drop_nulls);
-        }
-        Value::Array(items) => {
-            items.retain(|v| !v.is_null());
-            items.iter_mut().for_each(drop_nulls);
-        }
-        _ => {}
-    }
+    export::render(config, Format::Toml)
+        .or_else(|_| export::render(config, Format::Json))
+        .unwrap_or_default()
 }
 
 /// Return the line changes from `last` to `new` as unified diff lines.

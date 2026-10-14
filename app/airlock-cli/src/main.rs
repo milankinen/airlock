@@ -39,7 +39,8 @@ use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::task::LocalSet;
 
 use crate::cli::{
-    cmd_exec, cmd_info, cmd_rm, cmd_sandbox, cmd_secret, cmd_self_update, cmd_start, cmd_templates,
+    cmd_config, cmd_exec, cmd_info, cmd_rm, cmd_sandbox, cmd_secret, cmd_self_update, cmd_start,
+    cmd_templates,
 };
 use crate::context::Context;
 use crate::settings::Settings;
@@ -115,6 +116,13 @@ async fn main() {
                         std::process::exit(2);
                     }
                     Ok(cli::cmd_rm::main(args, &context).await)
+                }
+                Command::Config(ref args) => {
+                    if !extra_args.is_empty() {
+                        cli::error!("{}", messages::app::DASH_ARGS_ONLY_WITH_START);
+                        std::process::exit(2);
+                    }
+                    Ok(cli::cmd_config::main(args, &context).await)
                 }
                 Command::Secrets(args) => {
                     if !extra_args.is_empty() {
@@ -196,6 +204,8 @@ enum Command {
     /// Show the sandbox of the current project
     #[command(alias = "show")]
     Info(cmd_info::InfoArgs),
+    /// Print the config of the current project
+    Config(cmd_config::ConfigArgs),
     /// Manage secrets stored in the system keyring
     #[command(alias = "secret")]
     Secrets(cmd_secret::SecretArgs),

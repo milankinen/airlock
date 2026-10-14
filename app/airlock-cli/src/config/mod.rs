@@ -4,11 +4,12 @@
 //! validated config. The config of the enabled packs merges in with the
 //! files. The rest of the program uses only the resolved config.
 //!
-//! Also handles the `[packs]` tables, the legacy `presets` lists and the
-//! new config file that the setup wizard creates.
+//! Also handles the `[packs]` tables, the legacy `presets` lists, the
+//! new config file that the setup wizard creates, and the config export.
 
 pub(crate) mod config_values;
 pub(crate) mod de;
+pub(crate) mod export;
 pub(crate) mod files;
 pub(crate) mod generated;
 pub(crate) mod legacy_presets;

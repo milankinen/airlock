@@ -81,6 +81,18 @@ The list does not show sandboxes in a project directory. `airlock info`
 shows them when you run it in their project. If the project directory of
 a sandbox is gone, `airlock sandboxes info` shows only the sandbox.
 
+## Export the config
+
+In case you want to view or export the sandbox config, use `airlock config`:
+
+```bash
+airlock config                        # Show current sandbox config
+airlock sandboxes config k3x7q2ma     # Show specific sandbox config
+airlock config > stored.toml          # Export current sandbox config to file
+airlock config --resolved             # Show fully resolved sandbox config
+airlock config --format json          # Show config in JSON format
+```
+
 ## Removing sandbox
 
 The `airlock remove` command (alias `airlock rm`) removes the sandbox of
