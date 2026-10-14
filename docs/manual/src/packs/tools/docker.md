@@ -23,4 +23,4 @@ across sessions.
 Containers in the sandbox use the same network rules as the sandbox.
 Compose service names and published ports work as usual. To reach a
 published port from the host, add a
-[host → guest port forward](../../configuration/network.md#port-forwarding).
+[published sandbox port](../../configuration/network.md#publish-sandbox-port-to-host).

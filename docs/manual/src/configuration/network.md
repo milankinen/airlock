@@ -26,8 +26,8 @@ Available policies:
 
 With `deny-by-default`, airlock permits only connections that match an
 explicit `allow` rule. This is the default policy. With `deny-always`,
-airlock blocks all network access from the guest — including guest → host
-port forwards and Unix socket forwarding. Host → guest reverse forwards are the exception (see
+airlock blocks all network access from the guest. This includes exposed host
+ports and Unix socket forwarding. Published sandbox ports still work (see
 [Port forwarding](#port-forwarding)).
 
 ## Network rules
@@ -265,57 +265,58 @@ port**, regardless of which direction the forward runs.
 A plain integer shorthand (`[5432]`, `[3000]`) means the same port on
 both sides.
 
-### Guest → host (`host = [...]`)
+### Publish sandbox port to host
 
-Some projects run supporting services on the host — a local PostgreSQL,
-a Redis, a dev-mode backend on port 3000 — and the sandboxed process
-needs to reach them. Rather than expose those services to the network,
-airlock can forward specific host TCP ports into the VM.
-`localhost:<port>` inside the sandbox then transparently reaches the
-host service, while everything else on loopback stays confined to the
-guest.
+Use `guest = [...]` to make a service in the sandbox available on the
+host. airlock listens on host `127.0.0.1:<host_port>` and sends each
+connection to `127.0.0.1:<guest_port>` in the sandbox.
+
+```toml
+[network.ports.web]
+guest = ["5000:4000"]  # host `127.0.0.1:5000` → sandbox `localhost:4000`
+```
+
+Notes:
+
+- **Loopback only.** The listeners use `127.0.0.1`. Other computers on
+  the LAN cannot connect to them.
+- **No rules, no policy.** airlock trusts the host. Rules, middleware and
+  `deny-always` do not apply to published ports.
+- **Port in use at start.** If the host port is already in use, the
+  sandbox does not start and shows an error.
+- **Same host port two times.** airlock refuses two `guest` entries
+  with the same host port.
+
+### Expose host port to sandbox
+
+Use `host = [...]` when a process in the sandbox must use a service on
+the host, for example a local PostgreSQL, Redis or a dev backend. In the
+sandbox, `localhost:<port>` then connects to the host service. All other
+loopback ports stay in the sandbox.
 
 ```toml
 [network.ports.local-services]
 host = [5432, 6379]
 ```
 
-This makes the host's PostgreSQL and Redis available at
-`localhost:5432` and `localhost:6379` inside the sandbox. Guest → host
-forwards bypass network rules entirely — they're always allowed
-regardless of `policy` (except `deny-always`, which blocks everything).
+With this config, the sandbox reaches the host's PostgreSQL and Redis on
+`localhost:5432` and `localhost:6379`. Network rules do not apply to
+exposed host ports. airlock always allows them, except with the policy
+`deny-always`.
 
-Each entry is either a plain port (same port on both sides) or a
-`"host:guest"` string:
+Each entry is a port (same port on both sides) or a `"host:guest"`
+string:
 
 ```toml
 [network.ports.dev]
-host = [8080, "9000:3000"]  # guest `localhost:3000` → host port 9000
+host = [8080, "9000:3000"]  # sandbox `localhost:3000` → host port 9000
 ```
 
-### Host → guest (`guest = [...]`)
-
-The inverse: the host can reach a service running *inside* the
-sandbox. airlock binds a listener on `127.0.0.1:<host_port>` and
-bridges every accepted connection to `127.0.0.1:<guest_port>`
-inside the guest.
-
-```toml
-[network.ports.web]
-guest = ["5000:4000"]  # host `127.0.0.1:5000` → guest `localhost:4000`
-```
-
-Notes:
-
-- **Loopback only.** Listeners bind on `127.0.0.1`. The forward is
-  not reachable from the LAN.
-- **No rules, no policy.** Host → guest traffic bypasses
-  `allow`/`deny`/middleware entirely — the host is trusted, and
-  `deny-always` does *not* block reverse forwards.
-- **Startup-time bind.** If the host port is already in use the
-  sandbox fails to start with a clear error.
-- **Host-port collisions are an error.** airlock rejects two `.guest`
-  entries that share the same host port at startup.
+> [!WARNING]
+> An exposed host port gives the sandbox all the access that the service
+> on that port gives. For example, an exposed Docker daemon or database
+> admin port lets the sandbox control that service, and possibly the
+> host. Expose only ports of services that you trust the sandbox with.
 
 ### Combined example
 
