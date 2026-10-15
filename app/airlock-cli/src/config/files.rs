@@ -4,7 +4,6 @@
 //! Config files can be TOML, JSON or YAML.
 
 use crate::util::VerifiedPath;
-use crate::util::verified_path::{self, Refusal};
 
 /// Size limit of one config file. The project files are in a directory
 /// that the guest can write.
@@ -58,10 +57,11 @@ pub(crate) fn discover_in(
     local_dir: &VerifiedPath,
 ) -> anyhow::Result<DiscoveredFiles> {
     // The home dir and the project root are trusted bases. They can be
-    // below a symlink. The user files can be links into a dotfiles repo.
-    // The project dir and `.airlock/` are guest-writable. A file in the
-    // project dir can be a link that stays in the project. A file in
-    // `.airlock/` must not be a link.
+    // below a symlink. The user files and the project files can be links to
+    // anywhere, for example into a dotfiles repo. The guest can write the
+    // project dir and can put a link there, but the config change check
+    // then shows the changed config. Airlock manages the local project file
+    // and never makes it a link, so it must not be a link.
     let home_dir = home;
     let project_dir = project_root;
     // A local dir in the project comes again from the project root, so no
@@ -92,7 +92,7 @@ pub(crate) fn discover_in(
 
     let mut project = Vec::new();
     for stem in ["airlock", "airlock.local"] {
-        project.extend(load_first(project_dir, stem, Links::Within(project_dir))?);
+        project.extend(load_first(project_dir, stem, Links::Any)?);
     }
 
     Ok(DiscoveredFiles {
@@ -145,12 +145,10 @@ pub(crate) fn local_config_names(dir: &VerifiedPath) -> Vec<String> {
 
 /// What a config file can be if it is a symlink.
 #[derive(Clone, Copy)]
-enum Links<'a> {
-    /// A link to anywhere (user files).
+enum Links {
+    /// A link to anywhere (user and project files).
     Any,
-    /// A link that stays in the given directory.
-    Within(&'a VerifiedPath),
-    /// No link.
+    /// No link (local project file).
     None,
 }
 
@@ -174,7 +172,6 @@ fn load_first(
         let path = dir.given().join(&name).display().to_string();
         let read = match links {
             Links::Any => dir.join_follow(&name, None),
-            Links::Within(root) => dir.join_follow(&name, Some(root)),
             Links::None => dir.join(&name),
         }
         .and_then(|file| file.read_to_string_capped(CONFIG_CAP));
@@ -187,13 +184,6 @@ fn load_first(
             // without a warning and uses permissive defaults.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
-                if let Links::Within(root) = links
-                    && verified_path::refusal(&e) == Some(Refusal::Outside)
-                {
-                    return Err(anyhow::anyhow!(
-                        crate::messages::config::config_link_leaves_project(&path, root)
-                    ));
-                }
                 return Err(anyhow::anyhow!(
                     crate::messages::config::read_config_failed(&path, e)
                 ));
@@ -238,51 +228,55 @@ mod tests {
     use crate::test_cfg::oci::verified_dir as verified;
     use crate::test_cfg::temp_dir;
 
-    /// Test that the config load follows user file links and project file
-    /// links that stay in the project, and refuses the others. The guest
-    /// can write the project dir and must not make airlock read a host
-    /// file. The user keeps dotfiles in a repo and links them.
+    /// Test that the config load follows user and project file links to
+    /// anywhere, and refuses a link as the local project file. The user
+    /// keeps config files in a dotfiles repo and links them. Airlock never
+    /// makes the local project file a link.
     ///   1. Link `~/.airlock/airlock.toml` to a dotfile
-    ///   2. Link the project `airlock.toml` to a host file outside the
-    ///      project and check that the load fails and names the file
-    ///   3. Link it to a file in the project and check that it loads
-    ///   4. Link `.airlock/airlock.toml` and check that the load fails
+    ///   2. Link the project `airlock.toml` and `airlock.local.toml` to host
+    ///      files outside the project and check that all files load
+    ///   3. Link `.airlock/airlock.toml` and check that the load fails and
+    ///      names the file
     #[test]
-    fn config_links_are_followed_only_where_allowed() {
+    fn config_links_are_followed_except_local_file() {
         let tmp = temp_dir();
         let home = tmp.path().join("home");
         let project = tmp.path().join("project");
         std::fs::create_dir_all(home.join(".airlock")).unwrap();
         std::fs::create_dir_all(project.join(".airlock")).unwrap();
-        let dotfile = tmp.path().join("dotfile.toml");
-        std::fs::write(&dotfile, "a = 1\n").unwrap();
-        symlink(&dotfile, home.join(".airlock/airlock.toml")).unwrap();
-        let host_file = tmp.path().join("host.toml");
-        std::fs::write(&host_file, "b = 2\n").unwrap();
-        let link = project.join("airlock.toml");
-        symlink(&host_file, &link).unwrap();
+        let dotfiles = tmp.path().join("dotfiles");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        for (name, text) in [
+            ("user.toml", "a = 1\n"),
+            ("project.toml", "b = 2\n"),
+            ("local.toml", "c = 3\n"),
+        ] {
+            std::fs::write(dotfiles.join(name), text).unwrap();
+        }
+        symlink(
+            dotfiles.join("user.toml"),
+            home.join(".airlock/airlock.toml"),
+        )
+        .unwrap();
+        symlink(dotfiles.join("project.toml"), project.join("airlock.toml")).unwrap();
+        symlink(
+            dotfiles.join("local.toml"),
+            project.join("airlock.local.toml"),
+        )
+        .unwrap();
         let local = project.join(".airlock");
         let (home_dir, project_dir) = (verified(&home), verified(&project));
         let local_dir = project_dir.join(".airlock").unwrap();
         let discover = || discover_in(&home_dir, &project_dir, &local_dir);
 
-        let err = discover().err().unwrap();
-        assert!(
-            err.to_string().contains(&link.display().to_string()),
-            "{err}"
-        );
-        assert!(err.to_string().contains("outside the project"), "{err}");
-
-        std::fs::remove_file(&link).unwrap();
-        std::fs::write(project.join("real.toml"), "c = 3\n").unwrap();
-        symlink("real.toml", &link).unwrap();
         let files = discover().unwrap();
         assert_eq!(files.user.len(), 1);
         assert_eq!(files.user[0].1["a"], 1);
-        assert_eq!(files.project.len(), 1);
-        assert_eq!(files.project[0].1["c"], 3);
+        assert_eq!(files.project.len(), 2);
+        assert_eq!(files.project[0].1["b"], 2);
+        assert_eq!(files.project[1].1["c"], 3);
 
-        symlink("../real.toml", local.join("airlock.toml")).unwrap();
+        symlink(dotfiles.join("local.toml"), local.join("airlock.toml")).unwrap();
         let err = discover().err().unwrap();
         let shown = local.join("airlock.toml").display().to_string();
         assert!(err.to_string().contains(&shown), "{err}");

@@ -733,14 +733,6 @@ pub mod config {
         format!("read config file {path}: {error}")
     }
 
-    /// Error when a project config file is a symlink that leaves the project.
-    pub fn config_link_leaves_project(path: impl Display, project: impl Display) -> String {
-        format!(
-            "config file {path} is a symlink that points outside the project {project}; \
-             only links inside the project are allowed"
-        )
-    }
-
     /// Error when a config file has an unknown extension.
     pub fn unsupported_config_format(path: impl Display) -> String {
         format!("unsupported config format: {path}")
