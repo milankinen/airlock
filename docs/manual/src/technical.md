@@ -131,7 +131,7 @@ The static picture: what runs where, and how the pieces talk.
     <text class="arch-item" x="0" y="0">• vsock :1024 / :1025 (Cap'n Proto)</text>
     <text class="arch-item" x="0" y="22">• spawns + supervises container</text>
     <text class="arch-item" x="0" y="44">• bridges guest TCP ↔ host proxy</text>
-    <text class="arch-item" x="0" y="66">• admin HTTP @ http://admin.airlock/</text>
+    <text class="arch-item" x="0" y="66">• HTTP @ admin.airlock, mcp.airlock</text>
   </g>
   <rect class="arch-box" x="412" y="308" width="322" height="60" rx="6"/>
   <text x="428" y="332" class="arch-sub">container process</text>

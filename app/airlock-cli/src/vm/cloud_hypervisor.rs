@@ -62,7 +62,7 @@ impl CloudHypervisorBackend {
             cmd.stdin(Stdio::null());
             cmd.stdout(Stdio::null());
             cmd.stderr(Stdio::piped());
-            tie_to_airlock(&mut cmd);
+            crate::util::process::tie_to_airlock(&mut cmd);
 
             debug!("virtiofsd: {:?}", cmd);
             let mut child = cmd.spawn().map_err(|e| {
@@ -134,7 +134,7 @@ impl CloudHypervisorBackend {
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::from(log_file));
         cmd.stderr(Stdio::from(log_file_err));
-        tie_to_airlock(&mut cmd);
+        crate::util::process::tie_to_airlock(&mut cmd);
 
         debug!("cloud-hypervisor: {:?}", cmd);
 
@@ -220,33 +220,6 @@ fn kill_and_reap(mut child: Child, name: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!(messages::vm::child_wait_failed(name, e)))?;
     debug!("{name} exited: {status}");
     Ok(())
-}
-
-/// Start `cmd` in its own process group, and stop it when airlock stops.
-///  * The SIGINT of the terminal (Ctrl+C in cooked mode, e.g. during the
-///    boot) goes only to airlock, not to the process. Airlock then stops the
-///    VM in the correct order (the guest sync first).
-///  * `PR_SET_PDEATHSIG` kills the process if airlock dies without a stop
-///    (SIGKILL, crash). The signal fires when the *thread* that started the
-///    process exits. The VM starts on the main thread (the current-thread
-///    runtime). The `getppid` check covers the case where airlock dies
-///    before the `prctl`.
-fn tie_to_airlock(cmd: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    let parent = libc::pid_t::try_from(std::process::id()).expect("pid fits pid_t");
-    cmd.process_group(0);
-    // Safety: only async-signal-safe calls (two syscalls) after fork.
-    unsafe {
-        cmd.pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::getppid() != parent {
-                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
-            }
-            Ok(())
-        });
-    }
 }
 
 /// Remove the old entry at `path`, if any. Never follows a symlink.
@@ -386,7 +359,7 @@ mod tests {
     fn process_tied_to_airlock_leads_its_own_process_group() {
         let mut cmd = Command::new("sleep");
         cmd.arg("10");
-        tie_to_airlock(&mut cmd);
+        crate::util::process::tie_to_airlock(&mut cmd);
         let mut child = cmd.spawn().unwrap();
         let pid = libc::pid_t::try_from(child.id()).unwrap();
         let pgid = unsafe { libc::getpgid(pid) };

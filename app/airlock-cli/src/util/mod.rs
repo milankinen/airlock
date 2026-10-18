@@ -2,9 +2,11 @@
 //!
 //! Small helpers for paths, environment variables, executables,
 //! terminal-safe text and JSON files. Also gives checked host paths with
-//! their file operations, and file access that does not follow symlinks.
+//! their file operations, file access that does not follow symlinks, and
+//! ties host child processes to the airlock process.
 
 pub(crate) mod clone;
+pub(crate) mod process;
 pub(crate) mod safe_fs;
 pub(crate) mod verified_path;
 

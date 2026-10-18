@@ -72,8 +72,8 @@ This means you can set `vm.cpus = 2` in your user config and only override
 ## Overriding with `enabled`
 
 Every named configuration entry — network rules, mounts, disk caches, and
-socket forwards — has an `enabled` flag that defaults to `true`. Combined with
-the hierarchical config loading, this gives individuals full control over
+socket forwards, daemons and [MCP servers](./configuration/mcp.md) — has
+an `enabled` flag that defaults to `true`. Combined with the hierarchical config loading, this gives individuals full control over
 shared configurations.
 
 For example, a pack in the project `airlock.toml` can define a mount and

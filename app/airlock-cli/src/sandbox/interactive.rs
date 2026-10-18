@@ -17,7 +17,7 @@ use crate::rpc::browser::Browser;
 use crate::rpc::clipboard;
 use crate::runtime::{DumpSink, HostRuntime, Runtime, Terminal};
 use crate::services::{self, Services};
-use crate::{daemon, masking, messages};
+use crate::{daemon, masking, mcp, messages};
 
 /// Run an interactive sandbox session.
 ///
@@ -67,6 +67,7 @@ pub async fn run_interactive(
     let daemons = daemon::build_specs(&project, &env)?;
     let masks = masking::build_specs(&project)?;
     let clipboard = clipboard::for_config(&project.config.clipboard);
+    let mcp = mcp::for_project(&project)?;
     let spec = BootSpec {
         project,
         image,
@@ -79,6 +80,7 @@ pub async fn run_interactive(
         network,
         browser: browser.clone(),
         clipboard,
+        mcp,
         daemons,
         masks,
     };

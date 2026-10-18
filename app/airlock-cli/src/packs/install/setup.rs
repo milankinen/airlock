@@ -258,8 +258,8 @@ pub async fn install(
 }
 
 /// Boot the install VM. It has no network services, browser, clipboard,
-/// daemons or masks, because the install config grants none of them. Its
-/// network reaches only public addresses.
+/// MCP servers, daemons or masks, because the install config grants none
+/// of them. Its network reaches only public addresses.
 async fn boot_install_vm(
     project: Project,
     image: &OciImage,
@@ -284,6 +284,7 @@ async fn boot_install_vm(
         network,
         browser: None,
         clipboard: None,
+        mcp: None,
         daemons: vec![],
         masks: vec![],
     })

@@ -12,6 +12,7 @@ mod clipboard;
 mod daemon;
 mod init;
 mod logging;
+mod mcp;
 mod net;
 mod process;
 mod rpc;
@@ -88,7 +89,7 @@ async fn airlockd() -> anyhow::Result<()> {
         net::start_host_socket_forward(&cfg.network, cfg.sockets)?;
         net::start_host_port_forward(&cfg.init_config.host_ports, cfg.network.clone()).await?;
         net::start_tcp_proxy(cfg.network.clone(), dns)?;
-        admin::start(admin_state.clone()).await?;
+        admin::start(admin_state.clone(), cfg.mcp).await?;
         clipboard::start(cfg.clipboard, cfg.uid, cfg.gid)?;
         browser::start(cfg.browser, cfg.uid, cfg.gid)?;
 

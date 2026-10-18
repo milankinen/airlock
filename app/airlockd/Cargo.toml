@@ -27,12 +27,14 @@ futures = { workspace = true }
 libc = { workspace = true }
 pty-process = { workspace = true }
 quick_cache = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 scc = { workspace = true }
 simple-dns = { workspace = true }
 smoltcp = { workspace = true }
-tokio = { workspace = true, features = ["rt", "net", "io-util", "macros", "process", "time"] }
+tokio = { workspace = true, features = ["rt", "net", "io-util", "macros", "process", "sync", "time"] }
+tower = { workspace = true, features = ["util"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["registry", "env-filter"] }

@@ -64,6 +64,9 @@ pub struct BootConfig {
     pub clipboard: crate::clipboard::ClipboardConfig,
     /// Browser grant. If the host gives no capability, the bridge is off.
     pub browser: crate::browser::BrowserConfig,
+    /// Host MCP server grant. If the host gives no capability, the
+    /// `mcp.airlock` endpoints are off.
+    pub mcp: crate::mcp::McpConfig,
     /// Sidecar daemons to start after init. The callback decides when to
     /// call [`DaemonSet::start_all`] (usually right after
     /// [`crate::init::setup`]).
@@ -261,9 +264,26 @@ impl supervisor::Server for SupervisorImpl {
             },
         };
 
+        // A host that does not set `mcp` gives the default struct: a null
+        // `host` and no names. This means "no MCP servers".
+        let mc = params.get_mcp()?;
+        let mcp = crate::mcp::McpConfig {
+            host: if mc.has_host() {
+                Some(mc.get_host()?)
+            } else {
+                None
+            },
+            names: mc
+                .get_names()?
+                .iter()
+                .map(|n| Ok(n?.to_str()?.to_string()))
+                .collect::<Result<Vec<_>, capnp::Error>>()?,
+        };
+
         let cfg = BootConfig {
             clipboard,
             browser,
+            mcp,
             log_sink: params.get_logs()?,
             log_filter: params.get_log_filter()?.to_str()?.to_string(),
             network: self.network.clone(),

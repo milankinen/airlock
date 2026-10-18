@@ -17,6 +17,7 @@ mod data_dir;
 mod db;
 mod diagnostics;
 mod masking;
+mod mcp;
 mod messages;
 
 pub(crate) mod network;

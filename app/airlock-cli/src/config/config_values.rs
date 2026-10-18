@@ -42,6 +42,11 @@ pub struct ConfigValues {
     /// processes.
     #[config(default)]
     pub daemons: BTreeMap<String, Daemon>,
+    /// Host stdio MCP servers. The guest reaches each enabled server as
+    /// an HTTP endpoint at `http://mcp.airlock/<name>`.
+    #[config(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp: BTreeMap<String, McpServer>,
     /// Subdirectories of the project mount to hide from the sandbox. An
     /// empty directory is bind-mounted over each of them. Use it to hide
     /// parts of a monorepo from AI agents in the VM.
@@ -991,6 +996,43 @@ impl WellKnown for Daemon {
     const DE: Self::Deserializer = de::nested();
 }
 
+/// Host stdio MCP server declared under `[mcp.<name>]`.
+///
+/// The server runs on the host with the rights of the user. The host
+/// starts one process for each MCP session of the guest.
+#[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
+pub struct McpServer {
+    /// Enable or disable this server
+    #[config(default_t = true)]
+    pub enabled: bool,
+    /// Program to run on the host
+    pub command: String,
+    /// Arguments of the program
+    #[config(default)]
+    pub args: Vec<String>,
+    /// Environment variables for the server process, on top of the host
+    /// environment. Values support `${VAR}` substitution from the host
+    /// environment.
+    #[config(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Idle time in seconds after which the host stops a session. A
+    /// session is idle when no message went in either direction. An open
+    /// request does not keep a session. `0` means no limit.
+    #[config(default_t = 600)]
+    pub timeout: u32,
+    /// Maximum number of sessions of this server at the same time. A new
+    /// session over the limit stops the session with the oldest activity.
+    /// Must be 1 or more.
+    #[config(default_t = 50)]
+    pub max_sessions: u32,
+}
+
+impl WellKnown for McpServer {
+    type Deserializer = de::Nested<McpServer>;
+    const DE: Self::Deserializer = de::nested();
+}
+
 /// Hides subdirectories of the project mount from the sandbox in the VM.
 /// An empty directory is put over each of them.
 ///
@@ -1044,9 +1086,56 @@ pub(crate) fn parse(merged: serde_json::Value) -> anyhow::Result<ConfigValues> {
 }
 
 /// Check a parsed config for problems that the schema cannot express (see
-/// [`validate_network`]).
+/// [`validate_network`] and [`validate_mcp`]).
 pub(crate) fn validate(config: &ConfigValues) -> anyhow::Result<()> {
-    validate_network(config)
+    let mut problems = validate_network(config);
+    problems.extend(validate_mcp(config));
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(crate::messages::config::invalid_configuration_problems(
+            problems.join("\n")
+        ));
+    }
+}
+
+/// Check the `[mcp]` entries.
+///
+/// Checks:
+///  - Name: only ASCII letters, digits, `_` and `-`. The name is one path
+///    segment of the guest endpoint URL.
+///  - Command: not empty.
+///  - Session limit: 1 or more.
+///
+/// Returns:
+///   One problem line for each problem.
+fn validate_mcp(config: &ConfigValues) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (name, server) in &config.mcp {
+        let valid_name = !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        if !valid_name {
+            problems.push(format!(
+                "* {}",
+                crate::messages::config::mcp_name_invalid(name)
+            ));
+        }
+        if server.command.trim().is_empty() {
+            problems.push(format!(
+                "* {}",
+                crate::messages::config::mcp_command_empty(name)
+            ));
+        }
+        if server.max_sessions == 0 {
+            problems.push(format!(
+                "* {}",
+                crate::messages::config::mcp_max_sessions_zero(name)
+            ));
+        }
+    }
+    problems
 }
 
 /// Do the cross-field checks of `[network]` that the schema cannot
@@ -1066,7 +1155,10 @@ pub(crate) fn validate(config: &ConfigValues) -> anyhow::Result<()> {
 ///    rule with `inject` also cannot be `passthrough`, because injection
 ///    needs interception.
 ///  - Services: each name in `[network.services]` must be a known service.
-fn validate_network(config: &ConfigValues) -> anyhow::Result<()> {
+///
+/// Returns:
+///   One problem line for each problem.
+fn validate_network(config: &ConfigValues) -> Vec<String> {
     let mut problems: Vec<String> = Vec::new();
     for name in config.network.services.keys() {
         if ServiceId::from_name(name).is_none() {
@@ -1120,13 +1212,7 @@ fn validate_network(config: &ConfigValues) -> anyhow::Result<()> {
             }
         }
     }
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        anyhow::bail!(crate::messages::config::invalid_configuration_problems(
-            problems.join("\n")
-        ));
-    }
+    problems
 }
 
 #[cfg(test)]

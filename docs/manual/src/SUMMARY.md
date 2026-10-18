@@ -11,6 +11,7 @@
     - [Mounts](./configuration/mounts.md)
     - [Network](./configuration/network.md)
     - [Daemons](./configuration/daemons.md)
+    - [MCP servers](./configuration/mcp.md)
     - [Masks](./configuration/masks.md)
     - [Clipboard](./configuration/clipboard.md)
     - [Presets (deprecated)](./configuration/presets.md)

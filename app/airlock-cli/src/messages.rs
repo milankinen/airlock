@@ -969,6 +969,22 @@ pub mod config {
     pub fn middleware_target_invalid(middleware: impl Display, error: impl Display) -> String {
         format!("`network.middleware.{middleware}.target` {error}")
     }
+
+    /// Problem when an MCP server name has characters that are not
+    /// allowed.
+    pub fn mcp_name_invalid(name: impl Display) -> String {
+        format!("`mcp.{name}` name must contain only letters, digits, `_` and `-`")
+    }
+
+    /// Problem when an MCP server allows no sessions.
+    pub fn mcp_max_sessions_zero(name: impl Display) -> String {
+        format!("`mcp.{name}.max_sessions` must be 1 or more")
+    }
+
+    /// Problem when an MCP server has an empty command.
+    pub fn mcp_command_empty(name: impl Display) -> String {
+        format!("`mcp.{name}.command` must not be empty")
+    }
 }
 
 pub mod db {
@@ -1012,6 +1028,70 @@ pub mod db {
     pub fn restrict_dir_to_owner(dir: impl Display) -> String {
         format!("restrict {dir} to its owner")
     }
+}
+
+pub mod mcp {
+    //! Texts of the `mcp` area.
+
+    use std::fmt::Display;
+
+    /// Error when an MCP server environment variable cannot be resolved.
+    pub fn env_failed(name: impl Display, key: impl Display, err: impl Display) -> String {
+        format!("mcp.{name}.env.{key}: {err}")
+    }
+
+    /// Error when the guest asks for an MCP server that the config does not
+    /// enable.
+    pub fn unknown_server(name: impl Display) -> String {
+        format!("unknown MCP server `{name}`")
+    }
+
+    /// Error when the MCP server process does not start.
+    pub fn start_failed(name: impl Display, command: impl Display, err: impl Display) -> String {
+        format!("MCP server `{name}`: cannot start `{command}`: {err}")
+    }
+
+    /// Error when the guest sends a message that has a line break.
+    pub const MESSAGE_HAS_NEWLINE: &str = "MCP message must be one line";
+
+    /// Error when the MCP server does not read the messages fast enough.
+    pub const SEND_QUEUE_FULL: &str = "MCP server does not read its input";
+
+    /// Error when the MCP server stdin is closed.
+    pub const STDIN_CLOSED: &str = "MCP server input is closed";
+
+    /// Log text when the write to the MCP server stdin fails.
+    pub fn send_failed(err: impl Display) -> String {
+        format!("MCP server stdin: {err}")
+    }
+
+    /// Close reason when the MCP server writes a line that is too long.
+    pub fn line_too_long(max: impl Display) -> String {
+        format!("MCP server wrote a line longer than {max} bytes")
+    }
+
+    /// Close reason when the read of the MCP server stdout fails.
+    pub fn read_failed(err: impl Display) -> String {
+        format!("MCP server stdout: {err}")
+    }
+
+    /// Close reason when the MCP server process stops.
+    pub fn exited(status: impl Display) -> String {
+        format!("MCP server stopped: {status}")
+    }
+
+    /// Close reason when the host stops an idle session.
+    pub fn idle_timeout(seconds: impl Display) -> String {
+        format!("MCP session idle timeout ({seconds} s)")
+    }
+
+    /// Close reason when a new session of the same server needs the room.
+    pub fn session_limit(max: impl Display) -> String {
+        format!("MCP session limit reached ({max} sessions)")
+    }
+
+    /// Close reason when the exit status of the MCP server is not known.
+    pub const EXIT_UNKNOWN: &str = "MCP server stopped";
 }
 
 pub mod network {

@@ -216,6 +216,15 @@ env = { DOCKER_HOST = "unix:///var/run/docker.sock" }
 [mask.secrets]
 paths = ["secrets", "infra/keys"]
 
+[mcp.mise]
+command = "mise"
+args = ["mcp"]
+env = { TOKEN = "${HOST_TOKEN}", FIXED = "x" }
+
+[mcp.off]
+enabled = false
+command = "off"
+
 [clipboard]
 copy = true
 copy_limit = "2 MB"

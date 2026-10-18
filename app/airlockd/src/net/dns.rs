@@ -43,11 +43,12 @@ impl DnsState {
 
     /// Return the IP for `hostname`. Allocates a new IP for a new hostname.
     /// When all IPs are in use, the new hostname gets the oldest IP, and the
-    /// old hostname of that IP is forgotten. `localhost` and `admin.airlock`
-    /// always get `127.0.0.1`.
+    /// old hostname of that IP is forgotten. `localhost`, `admin.airlock` and
+    /// `mcp.airlock` always get `127.0.0.1`.
     pub fn allocate(&self, hostname: &str) -> Ipv4Addr {
-        if hostname == "localhost" || hostname == "admin.airlock" {
-            // `admin.airlock` is reserved for the in-VM admin HTTP service.
+        if matches!(hostname, "localhost" | "admin.airlock" | "mcp.airlock") {
+            // `admin.airlock` and `mcp.airlock` are reserved for the in-VM
+            // HTTP server.
             // Loopback traffic does not go through the TCP proxy, so the
             // request goes directly to the server on `127.0.0.1:80`.
             return Ipv4Addr::LOCALHOST;

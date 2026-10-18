@@ -9,7 +9,7 @@ use crate::vault::{Vault, VaultStorageType};
 
 /// A user config that grants a bit of everything: env from the host,
 /// network rules, middleware, services, ports, sockets, mounts, daemons,
-/// masks and clipboard.
+/// masks, MCP servers and clipboard.
 const BUSY_USER: &str = r#"
 presets = ["claude-code"]
 
@@ -52,6 +52,9 @@ command = ["sleep", "1"]
 [mask.m]
 paths = ["secret"]
 
+[mcp.tool]
+command = "tool"
+
 [clipboard]
 copy = true
 paste = true
@@ -85,7 +88,7 @@ fn resolve(user: &str, project: &str) -> ConfigValues {
 ///   2. Check that only the install rule is enabled and that it allows all
 ///      targets in passthrough mode
 ///   3. Check that inject, middleware, services, ports, sockets, mounts,
-///      daemons, masks and clipboard are all off
+///      daemons, masks, MCP servers and clipboard are all off
 ///   4. Check that only the env that reads no host variables stays
 ///   5. Check that the narrowed config passes the network and env checks
 #[test]
@@ -113,6 +116,7 @@ fn install_config_opens_network_and_grants_nothing_else() {
     assert!(c.mounts.values().all(|m| !m.enabled));
     assert!(c.daemons.values().all(|d| !d.enabled));
     assert!(c.mask.values().all(|m| !m.enabled));
+    assert!(c.mcp.is_empty());
     assert!(!c.clipboard.copy && !c.clipboard.paste);
     // The claude-code preset adds this token as a masked secret.
     assert!(!c.env.contains_key("CLAUDE_CODE_OAUTH_TOKEN"));

@@ -113,3 +113,22 @@ image = "project:1"'
         RUST_BACKTRACE=0 "$AIRLOCK" config --format json 2>/dev/null </dev/null)"
     python3 -c 'import json,sys; assert json.load(sys.stdin)["vm"]["image"] == "project:1"' <<<"$out"
 }
+
+# Test that an MCP server name with a character outside letters, digits,
+# `-` and `_` is a config error. The name is one URL path segment.
+#   1. Write an [mcp."bad/name"] entry with a command
+#   2. Run info
+#   3. Check the config error that names the entry
+@test "mcp server with invalid name reports config error" {
+    assert_config_error info '[mcp."bad/name"]
+command = "mise"' "mcp.bad/name" "letters, digits"
+}
+
+# Test that an MCP server with an empty command is a config error.
+#   1. Write an [mcp.mise] entry with an empty command
+#   2. Run info
+#   3. Check the config error that names the entry
+@test "mcp server with empty command reports config error" {
+    assert_config_error info '[mcp.mise]
+command = ""' "mcp.mise.command" "must not be empty"
+}

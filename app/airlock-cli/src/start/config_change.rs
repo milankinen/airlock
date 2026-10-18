@@ -554,6 +554,19 @@ mod tests {
         assert_eq!(values(config), final_values(&overridden).unwrap());
     }
 
+    /// Test that a changed MCP server command changes the final values.
+    /// The server runs on the host, so the user must accept the change.
+    ///   1. Get the final values of two configs with different
+    ///      `[mcp.x].command`
+    ///   2. Check that the values are different
+    #[test]
+    fn changed_mcp_command_is_config_change() {
+        assert_ne!(
+            values("[mcp.x]\ncommand = \"tool\"\n"),
+            values("[mcp.x]\ncommand = \"evil\"\n")
+        );
+    }
+
     /// Test that a removed pack without config values changes the final
     /// values, so that the config question comes before the tool question.
     ///   1. Get the final values of a config with the mise pack, which has

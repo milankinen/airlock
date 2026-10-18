@@ -52,6 +52,10 @@ interface Supervisor {
     # ungranted state. Thus a host that does not set this field gives the
     # guest nothing to call.
     browser     :BrowserConfig,
+    # Host MCP server grant. The default value (null `host`) is the
+    # ungranted state. Thus a host that does not set this field gives the
+    # guest nothing to call.
+    mcp         :McpConfig,
   ) -> ();
 
   shutdown @1 () -> ();
@@ -172,6 +176,39 @@ interface Browser {
 struct BrowserConfig {
   # Null unless the host grants browser access for this boot.
   sink @0 :Browser;
+}
+
+# Host stdio MCP servers that the host gives to the guest as a capability.
+# The guest serves each of them as an HTTP endpoint at
+# `http://mcp.airlock/<name>`. This object is the only path from the
+# guest to the host MCP servers. The host checks the name on each call.
+interface McpHost {
+  # Start a new process of the server `name`. `sink` gets each message
+  # that the process writes to its stdout, and `closed` when the process
+  # stops. The host stops the process when the guest releases `session`.
+  open @0 (name :Text, sink :McpSink) -> (session :McpSession);
+}
+
+# One running process of a host MCP server.
+interface McpSession {
+  # Write one JSON-RPC message to the process stdin. `message` is one
+  # line with no newline.
+  send @0 (message :Text) -> ();
+}
+
+# Guest-side receiver of the messages from one MCP server process.
+interface McpSink {
+  # One JSON-RPC message (one stdout line, no newline).
+  message @0 (message :Text) -> ();
+  # The process stopped. No more messages follow.
+  closed  @1 (reason :Text) -> ();
+}
+
+struct McpConfig {
+  # Null unless at least one MCP server is enabled.
+  host  @0 :McpHost;
+  # Names of the enabled servers.
+  names @1 :List(Text);
 }
 
 struct MaskSpec {

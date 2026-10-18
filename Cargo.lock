@@ -175,6 +175,7 @@ dependencies = [
  "libc",
  "pty-process",
  "quick_cache",
+ "rand 0.10.2",
  "scc",
  "serde",
  "serde_json",
@@ -182,6 +183,7 @@ dependencies = [
  "smoltcp",
  "tokio",
  "tokio-util",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

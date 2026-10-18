@@ -1,17 +1,19 @@
-//! Tests for the config sections (`vm`, `clipboard`, `daemons`, `network`):
+//! Tests for the config sections (`vm`, `clipboard`, `daemons`, `mcp`,
+//! `network`):
 //! defaults, parsed values and the config errors for bad values.
 
 use smart_config::ByteSize;
 
 use crate::config::config_values::{PullPolicy, Resolution, RestartPolicy, Signal};
-use crate::test_cfg::{project_toml_error, resolve_project_toml};
+use crate::test_cfg::{ConfigDirs, project_toml_error, resolve_project_toml};
 
-/// Test that the defaults give no clipboard access, no KVM, no services and
-/// no daemons. A sandbox gets these only when the config asks for them.
+/// Test that the defaults give no clipboard access, no KVM, no services, no
+/// daemons and no MCP servers. A sandbox gets these only when the config
+/// asks for them.
 ///   1. Resolve an empty config and a config with an empty `[clipboard]`
 ///   2. Check that each access is off and the copy limit is 1 MiB
 #[test]
-fn config_without_sections_grants_no_clipboard_kvm_services_or_daemons() {
+fn config_without_sections_grants_no_clipboard_kvm_services_daemons_or_mcp() {
     for toml in ["", "[clipboard]\n"] {
         let config = resolve_project_toml(toml).unwrap().values;
         assert!(!config.clipboard.copy, "{toml}");
@@ -20,6 +22,7 @@ fn config_without_sections_grants_no_clipboard_kvm_services_or_daemons() {
         assert!(!config.vm.kvm);
         assert!(config.network.services.is_empty());
         assert!(config.daemons.is_empty());
+        assert!(config.mcp.is_empty());
     }
 }
 
@@ -273,4 +276,90 @@ fn passthrough_rule_on_enabled_service_host_is_error() {
         "{err}"
     );
     crate::network::check_passthrough(&network(false)).unwrap();
+}
+
+/// Test that `[mcp.<name>]` entries get their defaults, and that `args`
+/// from a user file and a project file concatenate, as other lists do.
+///   1. Write a user file and a project file that both set `[mcp.mise]`,
+///      and a project file entry with only `command`
+///   2. Check the defaults of the short entry
+///   3. Check the concatenated `args`, the merged `env`, `enabled` and the
+///      session limits
+#[test]
+fn mcp_servers_get_defaults_and_layered_args_concatenate() {
+    let dirs = ConfigDirs::new();
+    dirs.user_file(
+        ".airlock.toml",
+        "[mcp.mise]\ncommand = \"mise\"\nargs = [\"--quiet\"]\nenv.A = \"user\"\n",
+    )
+    .project_file(
+        "airlock.toml",
+        r#"
+        [mcp.mise]
+        enabled = false
+        args = ["mcp"]
+        env.B = "${HOST_VAR:}"
+        timeout = 0
+        max_sessions = 1
+
+        [mcp.short_name-1]
+        command = "tool"
+        "#,
+    );
+    let config = dirs.values();
+
+    let short = &config.mcp["short_name-1"];
+    assert!(short.enabled);
+    assert_eq!(short.command, "tool");
+    assert!(short.args.is_empty());
+    assert_eq!(short.timeout, 600);
+    assert_eq!(short.max_sessions, 50);
+    assert!(short.env.is_empty());
+
+    let mise = &config.mcp["mise"];
+    assert!(!mise.enabled);
+    assert_eq!(mise.command, "mise");
+    assert_eq!(mise.args, ["--quiet", "mcp"]);
+    assert_eq!(mise.env["A"], "user");
+    assert_eq!(mise.env["B"], "${HOST_VAR:}");
+    assert_eq!(mise.timeout, 0);
+    assert_eq!(mise.max_sessions, 1);
+}
+
+/// Test that bad `[mcp]` entries are config errors. The name is one path
+/// segment of the guest URL, thus only safe characters are allowed. A
+/// server without sessions has no use.
+///   1. Resolve a config with a bad name, an empty command and a zero
+///      session limit, and check that one error shows all problems
+///   2. Resolve a config without `command` and check that the error names
+///      the entry
+#[test]
+fn invalid_mcp_name_command_and_session_limit_are_config_errors() {
+    let err = project_toml_error(
+        r#"
+        [mcp."bad/name"]
+        command = "tool"
+
+        [mcp.empty]
+        command = " "
+        max_sessions = 0
+        "#,
+    );
+    let lines: Vec<&str> = err.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "invalid configuration",
+            "* `mcp.bad/name` name must contain only letters, digits, `_` and `-`",
+            "* `mcp.empty.command` must not be empty",
+            "* `mcp.empty.max_sessions` must be 1 or more",
+        ],
+        "{err}"
+    );
+
+    let err = project_toml_error("[mcp.x]\nargs = [\"a\"]\n");
+    assert_eq!(
+        err,
+        "invalid configuration\n* `mcp.x` invalid configuration\n  * `command` missing"
+    );
 }

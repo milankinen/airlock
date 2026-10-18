@@ -1,7 +1,8 @@
 //! Host-side control of the supervisor in the VM.
 //!
 //! Lets the host boot the sandbox, start processes in it, read resource
-//! statistics, control background daemons and shut the VM down.
+//! statistics, control background daemons and shut the VM down. The boot
+//! also gives the guest the host services that the config grants.
 
 use std::future::Future;
 use std::os::unix::io::OwnedFd;
@@ -12,6 +13,7 @@ use airlock_common::supervisor_capnp::{
 use capnp_rpc::rpc_twoparty_capnp;
 
 use crate::config::config_values::RestartPolicy;
+use crate::mcp::McpHostImpl;
 use crate::project::Project;
 use crate::rpc::browser::{Browser, BrowserImpl};
 use crate::rpc::clipboard::ClipboardImpl;
@@ -110,6 +112,8 @@ pub struct BootRequest<'a> {
     pub browser: Option<Browser>,
     /// Clipboard bridge. `None` grants no clipboard.
     pub clipboard: Option<ClipboardImpl>,
+    /// Host MCP servers. `None` grants no MCP server.
+    pub mcp: Option<McpHostImpl>,
 }
 
 /// Host-side handle to the in-VM supervisor. Wraps the Cap'n Proto client.
@@ -188,6 +192,7 @@ impl Supervisor {
             masks,
             browser,
             clipboard,
+            mcp,
         } = boot;
         let log_sink: log_sink::Client = capnp_rpc::new_client(LogSinkImpl);
 
@@ -313,6 +318,19 @@ impl Supervisor {
         if let Some(browser) = browser {
             let sink: browser::Client = capnp_rpc::new_client(BrowserImpl::new(browser));
             req.get().init_browser().set_sink(sink);
+        }
+
+        // MCP grant: the capability exists only when at least one server is
+        // enabled.
+        if let Some(mcp) = mcp {
+            let names = mcp.names();
+            let mut b = req.get().init_mcp();
+            let mut names_b = b.reborrow().init_names(names.len() as u32);
+            for (i, name) in names.iter().enumerate() {
+                names_b.set(i as u32, name.as_str());
+            }
+            let host: mcp_host::Client = capnp_rpc::new_client(mcp);
+            b.set_host(host);
         }
 
         req.send().promise.await?;

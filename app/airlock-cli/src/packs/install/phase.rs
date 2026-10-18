@@ -21,8 +21,8 @@ const INSTALL_RULE: &str = "airlock-install";
 ///
 /// The install boot gets nothing else that the config grants: no secrets
 /// (no masked env, no `${…}` env except `HOME`, no inject), no mounts, no
-/// project share, and no ports, sockets, daemons, masks, middleware or
-/// clipboard.
+/// project share, and no ports, sockets, daemons, masks, middleware, MCP
+/// servers or clipboard.
 /// Args:
 ///  - `config`: The resolved config
 ///
@@ -65,7 +65,7 @@ pub fn boot_options(log_level: LogLevel) -> BootOptions {
 
 /// Remove what the setup boots never get: middleware, network services,
 /// ports, sockets, secrets and host env (except a `HOME` that is not
-/// masked), mounts, daemons, masks and clipboard.
+/// masked), mounts, daemons, masks, MCP servers and clipboard.
 fn isolate(config: &mut ConfigValues) {
     let net = &mut config.network;
     net.services.clear();
@@ -93,6 +93,7 @@ fn isolate(config: &mut ConfigValues) {
     for mask in config.mask.values_mut() {
         mask.enabled = false;
     }
+    config.mcp.clear();
     config.clipboard.copy = false;
     config.clipboard.paste = false;
 }

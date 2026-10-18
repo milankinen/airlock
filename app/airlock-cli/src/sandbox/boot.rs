@@ -1,8 +1,8 @@
 //! Sandbox VM boot.
 //!
 //! Starts a VM with all the access that the configuration gives the guest:
-//! mounts, networking, daemons and port forwards. After the boot, the guest
-//! is ready, but no process runs.
+//! mounts, networking, daemons, port forwards and host services. After the
+//! boot, the guest is ready, but no process runs.
 
 use std::os::unix::io::OwnedFd;
 use std::time::Duration;
@@ -15,6 +15,7 @@ use super::report;
 use super::tasks::BootTasks;
 use super::vm::Vm;
 use crate::cli::{self, LogLevel};
+use crate::mcp::McpHostImpl;
 use crate::network::reverse_forward::BoundForward;
 use crate::network::{self, Network, NetworkHandle};
 use crate::oci::{self, OciImage};
@@ -58,6 +59,8 @@ pub struct BootSpec<'a> {
     pub browser: Option<Browser>,
     /// The clipboard bridge. `None` gives no clipboard access.
     pub clipboard: Option<ClipboardImpl>,
+    /// The host MCP servers. `None` gives no MCP access.
+    pub mcp: Option<McpHostImpl>,
     /// The daemons to start in the guest.
     pub daemons: Vec<rpc::DaemonSpec>,
     /// The directory masks to apply in the guest.
@@ -103,6 +106,7 @@ pub async fn boot(spec: BootSpec<'_>) -> anyhow::Result<Vm> {
         network,
         browser,
         clipboard,
+        mcp,
         daemons,
         masks,
     } = spec;
@@ -157,6 +161,7 @@ pub async fn boot(spec: BootSpec<'_>) -> anyhow::Result<Vm> {
             masks: &masks,
             browser,
             clipboard,
+            mcp,
         })
         .await;
     if let Err(e) = booted {
