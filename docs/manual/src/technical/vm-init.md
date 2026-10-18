@@ -86,8 +86,9 @@ has all the mounts.
    - **Bind mounts**: the stage then applies the directory mounts, the
      cache mounts and the masks inside the rootfs.
 
-6. **DNS** (`net::setup_dns`) — writes `nameserver 10.0.0.1` into the
-   composed rootfs's `/etc/resolv.conf`. Queries go to the in-VM
+6. **DNS** (`net::setup_dns`) — replaces the `/etc/resolv.conf` of the
+   composed rootfs with a new file (mode `0644`) that has
+   `nameserver 10.0.0.1`. Queries go to the in-VM
    network proxy, which resolves them on the host.
 
 7. **Container mounts** (`container::setup`) — mounts `proc`, `sys`,

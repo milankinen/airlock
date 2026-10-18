@@ -5,6 +5,8 @@
 //! traffic, and loopback listeners serve the host-published ports. Thus no
 //! firewall rules are necessary.
 
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::process::Command;
 
 use tracing::{debug, info};
@@ -34,7 +36,21 @@ pub(super) fn setup(_host_ports: &[u16]) -> anyhow::Result<()> {
 pub(super) fn setup_dns() -> anyhow::Result<()> {
     let dir = "/mnt/overlay/rootfs/etc";
     std::fs::create_dir_all(dir)?;
-    std::fs::write(format!("{dir}/resolv.conf"), "nameserver 10.0.0.1\n")?;
+    let path = format!("{dir}/resolv.conf");
+    // Remove the file of the image and make a new one. A write to the old
+    // file keeps its mode: some images have mode 0700, so users other
+    // than root cannot read it and all names fail. The old file can also
+    // be a symlink that points out of the rootfs.
+    match std::fs::remove_file(&path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(&path)?
+        .write_all(b"nameserver 10.0.0.1\n")?;
     Ok(())
 }
 

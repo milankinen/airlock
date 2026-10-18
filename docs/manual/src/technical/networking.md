@@ -65,7 +65,9 @@ before the failure, and then a normal TCP close.
 
 The container's `/etc/resolv.conf` points at `nameserver 10.0.0.1`,
 which is a minimal UDP DNS server the supervisor runs inside the VM
-on loopback. Instead of forwarding queries to the host, the supervisor
+on loopback. The server also listens on `127.0.0.1:53`. The C libraries
+use this address when `/etc/resolv.conf` is missing or cannot be read.
+Instead of forwarding queries to the host, the supervisor
 allocates a **synthetic IP** from `10.2.0.0/16` for each hostname and
 caches the bidirectional mapping. When all IPs of the range are in use,
 the next new hostname gets the oldest IP. The DNS answers have a TTL of

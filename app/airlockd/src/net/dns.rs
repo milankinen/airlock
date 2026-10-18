@@ -15,8 +15,12 @@ use simple_dns::{CLASS, Packet, PacketFlag, QTYPE, Question, ResourceRecord, TYP
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
-/// UDP listen address of the server (on loopback).
-const LISTEN_ADDR: &str = "10.0.0.1:53";
+/// UDP listen addresses of the server (on loopback). The container's
+/// `resolv.conf` names the first. The second is the default name server of
+/// the C libraries when `resolv.conf` is missing or cannot be read. Not
+/// `0.0.0.0`: a wildcard socket would hold port 53 on all addresses, and
+/// its replies can come from an address the client did not ask.
+const LISTEN_ADDRS: [&str; 2] = ["10.0.0.1:53", "127.0.0.1:53"];
 /// First IP to allocate.
 const IP_BASE: u32 = 0x0A020001; // 10.2.0.1
 /// Last IP to allocate.
@@ -75,20 +79,23 @@ impl DnsState {
     }
 }
 
-/// Bind the DNS UDP socket and start the server in a local task.
+/// Bind the DNS UDP sockets and start one server task for each.
 /// Args:
 ///  - `state`: Shared hostname/IP mapping
 ///
 /// Returns:
-///   Error if the bind fails.
+///   Error if a bind fails.
 pub async fn start(state: Rc<DnsState>) -> anyhow::Result<()> {
-    let socket = UdpSocket::bind(LISTEN_ADDR).await?;
-    info!("dns listening on {LISTEN_ADDR}");
-    tokio::task::spawn_local(async move {
-        if let Err(e) = serve(socket, state).await {
-            warn!("dns server failed: {e}");
-        }
-    });
+    for addr in LISTEN_ADDRS {
+        let socket = UdpSocket::bind(addr).await?;
+        info!("dns listening on {addr}");
+        let state = state.clone();
+        tokio::task::spawn_local(async move {
+            if let Err(e) = serve(socket, state).await {
+                warn!("dns server on {addr} failed: {e}");
+            }
+        });
+    }
     Ok(())
 }
 
