@@ -43,14 +43,10 @@ impl DnsState {
 
     /// Return the IP for `hostname`. Allocates a new IP for a new hostname.
     /// When all IPs are in use, the new hostname gets the oldest IP, and the
-    /// old hostname of that IP is forgotten. `localhost`, `admin.airlock` and
-    /// `mcp.airlock` always get `127.0.0.1`.
+    /// old hostname of that IP is forgotten. `localhost` and the `airlock`
+    /// domain with all its names always get `127.0.0.1`.
     pub fn allocate(&self, hostname: &str) -> Ipv4Addr {
-        if matches!(hostname, "localhost" | "admin.airlock" | "mcp.airlock") {
-            // `admin.airlock` and `mcp.airlock` are reserved for the in-VM
-            // HTTP server.
-            // Loopback traffic does not go through the TCP proxy, so the
-            // request goes directly to the server on `127.0.0.1:80`.
+        if is_loopback_name(hostname) {
             return Ipv4Addr::LOCALHOST;
         }
         if let Some(entry) = self.host_to_ip.get_sync(hostname) {
@@ -106,6 +102,16 @@ async fn serve(socket: UdpSocket, state: Rc<DnsState>) -> anyhow::Result<()> {
             let _ = socket.send_to(&response, addr).await;
         }
     }
+}
+
+/// True if `hostname` resolves to the guest loopback. The `airlock` domain
+/// is reserved for the in-VM HTTP server (`admin.airlock`, `mcp.airlock`).
+/// Thus no `*.airlock` name goes to the host resolver. Loopback traffic
+/// does not go through the TCP proxy, so the request goes directly to the
+/// server on `127.0.0.1:80`. DNS names do not use case.
+fn is_loopback_name(hostname: &str) -> bool {
+    let lower = hostname.to_ascii_lowercase();
+    lower == "localhost" || lower == "airlock" || lower.ends_with(".airlock")
 }
 
 /// Make the reply to one DNS query. Only the first question gets an answer,
@@ -170,5 +176,23 @@ mod tests {
         assert_eq!(dns.allocate("new.example.com"), first_ip);
         assert_eq!(dns.reverse(first_ip).as_deref(), Some("new.example.com"));
         assert_eq!(dns.allocate("h0.example.com"), Ipv4Addr::new(10, 2, 0, 2));
+    }
+
+    /// Test that all names of the `airlock` domain resolve to the guest
+    /// loopback. The in-VM HTTP server serves them, and they must never
+    /// go to the host resolver.
+    ///   1. Allocate `admin.airlock`, `mcp.airlock`, `x.airlock` and
+    ///      `MCP.Airlock`, and check that each gets `127.0.0.1`
+    ///   2. Allocate `airlock.example.com` and check that it gets a fake IP
+    #[test]
+    fn airlock_domain_names_resolve_to_loopback() {
+        let dns = DnsState::new();
+        for name in ["admin.airlock", "mcp.airlock", "x.airlock", "MCP.Airlock"] {
+            assert_eq!(dns.allocate(name), Ipv4Addr::LOCALHOST, "{name}");
+        }
+        assert_eq!(
+            dns.allocate("airlock.example.com"),
+            Ipv4Addr::new(10, 2, 0, 1)
+        );
     }
 }

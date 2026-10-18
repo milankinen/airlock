@@ -83,10 +83,11 @@ Real DNS resolution happens on the host: the synthetic IP never
 escapes the VM. The CLI gets the hostname, calls the system resolver,
 and connects to whatever that returns.
 
-The supervisor reserves two names: `admin.airlock` and `mcp.airlock`. It resolves
-them to the guest loopback address and serves them itself. They do not use a synthetic IP and never leave the VM. The
-`mcp.airlock` name serves the [MCP servers](../configuration/mcp.md)
-of the host.
+The supervisor reserves the `airlock` domain for its own services, for
+example `admin.airlock` and the [MCP servers](../configuration/mcp.md)
+at `mcp.airlock`. It resolves all `*.airlock` names to the guest
+loopback address and serves them itself. These names do not get a
+synthetic IP and never leave the VM.
 
 ## Policy evaluation
 

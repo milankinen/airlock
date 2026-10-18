@@ -34,7 +34,9 @@ agent ──HTTP──▶ mcp.airlock (airlockd) ──capnp McpHost.open──�
 - **Vhost dispatch with back-compat.** The local HTTP server on
   `127.0.0.1:80` sends only `Host: mcp.airlock` to MCP. All other hosts
   (`admin.airlock`, `localhost`, IPs) go to the admin router as before.
-  Guest DNS reserves `mcp.airlock` like `admin.airlock`.
+  Guest DNS reserves the whole `airlock` domain (any case). All
+  `*.airlock` names resolve to the guest loopback, so no such name goes to
+  the host resolver and new in-VM services need no DNS change.
 - **`!Send` bridge task.** Axum handlers are `Send`. Capnp clients are
   `Rc`. One `spawn_local` bridge task owns the capnp objects. Handlers talk
   to it with `mpsc` and `oneshot` channels. SSE bodies read from `mpsc`
