@@ -187,7 +187,7 @@ pub async fn start(
     let overlay_dir = sandbox_dir.join("overlay")?;
 
     let mounts = assemble_mounts(project, container_home, opts.project_share)?;
-    let shares = prepare_shares(&project.context.data, image, &mounts, &overlay_dir)?;
+    let shares = prepare_shares(&project.context.data, &mounts, &overlay_dir)?;
     let (disk_image, caches) = disk::prepare(
         &sandbox_dir,
         &project.config.disk,
@@ -309,7 +309,6 @@ fn assemble_mounts(
 /// `overlay/files/{rw,ro}/{key}`. Two shares give them to the guest.
 fn prepare_shares(
     data_dir: &DataDir,
-    _image: &OciImage,
     mounts: &[mount::ResolvedMount],
     overlay_dir: &VerifiedPath,
 ) -> anyhow::Result<Vec<VmShare>> {
@@ -342,10 +341,12 @@ fn prepare_shares(
 
     // Hardlink file mounts into overlay/files/{rw|ro}/{key}. Make the dirs
     // again on each boot, so old entries are removed.
+    let _ = overlay_dir.join("files/rw")?.remove_dir_all();
+    let _ = overlay_dir.join("files/ro")?.remove_dir_all();
+    // Join after the removal. A path keeps the identity of the old dir, and
+    // the check then refuses the new dir.
     let files_rw_dir = overlay_dir.join("files/rw")?;
     let files_ro_dir = overlay_dir.join("files/ro")?;
-    let _ = files_rw_dir.remove_dir_all();
-    let _ = files_ro_dir.remove_dir_all();
     let mut has_rw_files = false;
     let mut has_ro_files = false;
 

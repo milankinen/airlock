@@ -1,12 +1,15 @@
 //! Tests for the resolution of the `[mounts]` config into host sources,
-//! guest targets and mount types, and for missing sources.
+//! guest targets and mount types, for missing sources, and for the shares
+//! of file mounts.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+use crate::test_cfg::oci::{data_dir_at, verified_dir};
 use crate::test_cfg::{TempDir, resolve_project_toml, temp_dir};
 use crate::util::VerifiedPath;
 use crate::vm::mount::{MountType, ResolvedMount, resolve_mounts};
+use crate::vm::prepare_shares;
 
 /// A host with a home directory and a project directory (the cwd).
 struct Host {
@@ -388,4 +391,50 @@ fn link_chain_through_project_is_refused() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("Set the real path"), "{err}");
+}
+
+/// Test that the file mount shares are made again on each boot. The share
+/// dirs from an earlier boot must not cause a refusal.
+///   1. Configure one read-only and one read-write file mount
+///   2. Make the shares two times with the same overlay dir
+///   3. Check that the second time also gives both file shares with the
+///      linked files
+#[test]
+fn file_mount_shares_from_earlier_boot_are_recreated_without_error() {
+    let host = Host::new();
+    let root = host.project.parent().unwrap();
+    std::fs::write(host.home.join("bashrc"), "b").unwrap();
+    std::fs::write(host.home.join("notes"), "n").unwrap();
+    let data = data_dir_at(&root.join("data"));
+    std::fs::create_dir_all(root.join("overlay")).unwrap();
+    let overlay = verified_dir(&root.join("overlay"));
+    let mounts = host
+        .resolve(
+            r#"
+            [mounts.bashrc]
+            source = "~/bashrc"
+            target = "~/.bashrc"
+            read_only = true
+
+            [mounts.notes]
+            source = "~/notes"
+            target = "~/notes"
+            "#,
+        )
+        .unwrap();
+
+    for _ in 0..2 {
+        let shares = prepare_shares(&data, &mounts, &overlay).unwrap();
+        let tags: Vec<_> = shares.iter().map(|s| s.tag.as_str()).collect();
+        assert_eq!(tags, ["layers", "files/rw", "files/ro"]);
+    }
+    let files = root.join("overlay/files");
+    assert_eq!(
+        std::fs::read_to_string(files.join("ro/bashrc")).unwrap(),
+        "b"
+    );
+    assert_eq!(
+        std::fs::read_to_string(files.join("rw/notes")).unwrap(),
+        "n"
+    );
 }
