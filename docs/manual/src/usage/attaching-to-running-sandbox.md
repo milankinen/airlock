@@ -27,8 +27,9 @@ airlock exec python3 -m pytest tests/
 You can use `airlock exec` in any subdirectory of the project.
 `airlock exec` looks for a running sandbox in the current directory, then
 in each parent directory. The nearest running sandbox wins. The command
-runs in the same working directory as on the host. To use a different
-directory, use `--cwd` (or `-w`):
+runs in the same working directory as on the host. If the sandbox
+started with `--sandbox-cwd`, the command runs in the matching directory
+below that guest path. To use a different directory, use `--cwd` (or `-w`):
 
 ```bash
 # /home/example/my-project

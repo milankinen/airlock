@@ -2,12 +2,13 @@
 //! the nearest running sandbox in one directory tree wins. The lookup can
 //! also go from a git worktree to its main repository, but not
 //! through a forged worktree link or a symlink that code in a sandbox made.
+//! A host dir in the project maps to the dir in the guest.
 
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::process::Command;
 
-use crate::cli::sandbox_client::find_cli_sock;
+use crate::cli::sandbox_client::{find_running, locate};
 use crate::context::Context;
 use crate::test_cfg::oci::verified_dir;
 use crate::test_cfg::sandboxes::data_dir_sandbox;
@@ -30,9 +31,9 @@ fn sock_of(context: &Context, dir: &Path) -> std::path::PathBuf {
 /// Run the sandbox lookup from `start`, with or without the git
 /// worktree link.
 fn lookup_with(context: &Context, start: &Path, follow: bool) -> Option<std::path::PathBuf> {
-    block_on_local(find_cli_sock(context, &verified_dir(start), follow))
+    block_on_local(find_running(context, &verified_dir(start), follow))
         .unwrap()
-        .map(|sock| sock.to_path().unwrap().to_path_buf())
+        .map(|running| running.sock.to_path().unwrap().to_path_buf())
 }
 
 /// Make the socket of a running sandbox at `path`.
@@ -197,13 +198,47 @@ fn symlinked_sandbox_or_socket_is_refused() {
     let a_dir = data_dir_sandbox(&context, &a).1;
     std::fs::remove_dir_all(&a_dir).unwrap();
     std::os::unix::fs::symlink(&b_dir, &a_dir).unwrap();
-    let error = block_on_local(find_cli_sock(&context, &verified_dir(&a), false)).unwrap_err();
+    let error = block_on_local(find_running(&context, &verified_dir(&a), false)).unwrap_err();
     assert!(error.to_string().contains("is a symlink"), "{error}");
 
     std::fs::remove_file(&a_dir).unwrap();
     std::fs::create_dir(&a_dir).unwrap();
     let a_sock = sock_of(&context, &a_dir);
     std::os::unix::fs::symlink(&b_sock, &a_sock).unwrap();
-    let error = block_on_local(find_cli_sock(&context, &verified_dir(&a), false)).unwrap_err();
+    let error = block_on_local(find_running(&context, &verified_dir(&a), false)).unwrap_err();
     assert!(error.to_string().contains("is a symlink"), "{error}");
+}
+
+/// Test that a host dir maps to the guest dir below the project dir of
+/// the guest. The project dir of the guest can differ from the host path
+/// (`--sandbox-cwd`), and the host path can go through a symlink.
+///   1. Make a running sandbox with the guest project dir `/work`
+///   2. Check the guest dir of the project dir, of a sub dir, and of the
+///      sub dir through a symlink to the project
+///   3. Remove the guest project dir record and check that the host path
+///      is the guest dir
+#[test]
+fn host_dir_maps_to_guest_project_dir() {
+    let (_home, context) = context();
+    let tree = temp_dir();
+    let root = std::fs::canonicalize(tree.path()).unwrap();
+    let project = root.join("project");
+    std::fs::create_dir_all(project.join("sub")).unwrap();
+    std::os::unix::fs::symlink(&project, root.join("link")).unwrap();
+    let dir = data_dir_sandbox(&context, &project).1;
+    listen(&sock_of(&context, &dir));
+    std::fs::write(dir.join("run.json"), r#"{"guest_cwd":"/work"}"#).unwrap();
+
+    let guest_dir = |host: &Path| {
+        let host = verified_dir(host);
+        let running = block_on_local(locate(&context, &host, false)).unwrap();
+        running.guest_dir(&host).unwrap()
+    };
+    assert_eq!(guest_dir(&project), "/work");
+    assert_eq!(guest_dir(&project.join("sub")), "/work/sub");
+    assert_eq!(guest_dir(&root.join("link/sub")), "/work/sub");
+
+    std::fs::remove_file(dir.join("run.json")).unwrap();
+    let sub = project.join("sub");
+    assert_eq!(guest_dir(&sub), sub.display().to_string());
 }

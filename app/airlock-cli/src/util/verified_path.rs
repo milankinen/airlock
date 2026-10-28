@@ -276,6 +276,16 @@ impl VerifiedPath {
         self.resolved.starts_with(&base.resolved)
     }
 
+    /// Get this path relative to `base`. It compares the resolved paths as
+    /// at the check and does not touch the file system.
+    /// Returns:
+    ///   The relative path, empty if the paths are the same, or `None` if
+    ///   this path is not below `base`.
+    pub(crate) fn relative_to(&self, base: &VerifiedPath) -> Option<String> {
+        let rel = self.resolved.strip_prefix(&base.resolved).ok()?;
+        Some(rel.to_string_lossy().into_owned())
+    }
+
     /// Get the path as the user wrote it. Use it only for messages. Never
     /// use it for file operations: it is not checked.
     pub(crate) fn given(&self) -> &Path {

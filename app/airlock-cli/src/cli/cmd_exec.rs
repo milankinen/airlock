@@ -5,7 +5,7 @@
 
 use clap::Args;
 
-use crate::cli::sandbox_client::SandboxClient;
+use crate::cli::sandbox_client::{self, SandboxClient};
 use crate::context::Context;
 use crate::runtime::{self, RawTerminalRuntime};
 use crate::{oci, rpc, sandbox};
@@ -35,11 +35,12 @@ pub struct ExecArgs {
 /// Entry point for `airlock exec <cmd> [args...]`.
 /// Returns:
 ///   Exit code of the process, or error if no sandbox runs.
-// The command, the caller's cwd and the `-e KEY=VAL` overrides go to the
-// `airlock start` process. That process has the resolved sandbox environment
-// (image env and `airlock.toml` env). It merges the overrides into that env
-// and tells the supervisor to start the process. Thus `exec` never loads the
-// project or the vault. It uses only the sandbox registry of the context.
+// The command, the guest dir of the caller's cwd and the `-e KEY=VAL`
+// overrides go to the `airlock start` process. That process has the resolved
+// sandbox environment (image env and `airlock.toml` env). It merges the
+// overrides into that env and tells the supervisor to start the process.
+// Thus `exec` never loads the project or the vault. It uses only the sandbox
+// registry of the context and the run record of the sandbox.
 pub async fn main(args: ExecArgs, context: &Context) -> anyhow::Result<i32> {
     let ExecArgs {
         cmd,
@@ -55,11 +56,11 @@ pub async fn main(args: ExecArgs, context: &Context) -> anyhow::Result<i32> {
     } else {
         argv
     };
-    let (cmd, args) = argv.split_first().expect("argv holds the command");
 
-    // The current dir as the user sees it. It is the default guest cwd.
-    let host_cwd = context.work.to_string();
-    let client = SandboxClient::connect(context, follow_git_worktree).await?;
+    let running = sandbox_client::locate(context, &context.work, follow_git_worktree).await?;
+    // The guest dir of the current dir is the default guest cwd.
+    let guest_cwd = running.guest_dir(&context.work)?;
+    let client = SandboxClient::connect_sock(&running.sock).await?;
     let cli_service = client.service;
     tokio::task::spawn_local(client.rpc_system);
 
@@ -68,21 +69,15 @@ pub async fn main(args: ExecArgs, context: &Context) -> anyhow::Result<i32> {
     let pty_size = stdin.pty_size();
 
     let mut req = cli_service.exec_request();
-    req.get().set_stdin(capnp_rpc::new_client(stdin));
-    rpc::set_pty(req.get().init_pty(), pty_size);
-    req.get().set_cmd(cmd);
-    let mut args_b = req.get().init_args(args.len() as u32);
-    for (i, a) in args.iter().enumerate() {
-        args_b.set(i as u32, a.as_str());
-    }
-    let cwd = cwd.unwrap_or(host_cwd);
-    req.get().set_cwd(&cwd);
-
-    let mut env_b = req.get().init_env(env.len() as u32);
-    for (i, e) in env.iter().enumerate() {
-        env_b.set(i as u32, e.as_str());
-    }
-
+    let cwd = cwd.unwrap_or(guest_cwd);
+    rpc::fill_exec_request(
+        req.get(),
+        capnp_rpc::new_client(stdin),
+        pty_size,
+        &argv,
+        &cwd,
+        &env,
+    );
     let response = req.send().promise.await?;
     let proc = rpc::Process::new(response.get()?.get_proc()?);
 

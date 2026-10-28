@@ -24,7 +24,8 @@ use std::future::Future;
 use std::os::unix::io::{FromRawFd, IntoRawFd, OwnedFd};
 use std::pin::Pin;
 
-use airlock_common::supervisor_capnp::pty_config;
+use airlock_common::cli_capnp::cli_service;
+use airlock_common::supervisor_capnp::{self, pty_config};
 use capnp_rpc::{rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
 pub use network::serve_network;
@@ -94,6 +95,39 @@ pub fn set_pty(mut builder: pty_config::Builder<'_>, size: Option<(u16, u16)>) {
             s.set_cols(cols);
         }
         None => builder.set_none(()),
+    }
+}
+
+/// Fill a process start request of the sandbox CLI service. `airlock
+/// exec` and `airlock acp` use it.
+/// Args:
+///  - `params`: Request params to fill
+///  - `stdin`: Input of the process
+///  - `pty_size`: Terminal size `(rows, cols)` for PTY mode, or `None` for
+///    pipe mode
+///  - `argv`: Command and its arguments. Must not be empty.
+///  - `cwd`: Working directory in the guest
+///  - `env`: Extra environment variables (`KEY=VALUE`)
+pub fn fill_exec_request(
+    mut params: cli_service::exec_params::Builder<'_>,
+    stdin: supervisor_capnp::stdin::Client,
+    pty_size: Option<(u16, u16)>,
+    argv: &[String],
+    cwd: &str,
+    env: &[String],
+) {
+    params.set_stdin(stdin);
+    set_pty(params.reborrow().init_pty(), pty_size);
+    let (cmd, args) = argv.split_first().expect("argv holds the command");
+    params.set_cmd(cmd);
+    let mut args_b = params.reborrow().init_args(args.len() as u32);
+    for (i, a) in args.iter().enumerate() {
+        args_b.set(i as u32, a.as_str());
+    }
+    params.set_cwd(cwd);
+    let mut env_b = params.init_env(env.len() as u32);
+    for (i, e) in env.iter().enumerate() {
+        env_b.set(i as u32, e.as_str());
     }
 }
 
