@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::rc::Rc;
 
-use airlock_common::supervisor_capnp::{mcp_host, mcp_session, mcp_sink};
+use airlock_common::supervisor_capnp::{mcp_grant, mcp_host, mcp_session, mcp_sink};
 use airlock_test_utils::{read_until_contains, read_until_eof, rpc_loopback, serve};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::admin::AdminState;
 use crate::admin::server::app;
-use crate::mcp::McpConfig;
+use crate::mcp::{self, Routes};
 
 /// Name of the fake MCP server.
 pub(crate) const ECHO: &str = "echo";
@@ -161,15 +161,39 @@ async fn echo_server(mut stdin: mpsc::UnboundedReceiver<Value>, sink: mcp_sink::
     }
 }
 
-/// Serve all routes of the local server on a local port. The MCP routes
-/// use `host`, which grants the servers [`ECHO`] and [`BROKEN`]. `None`
-/// grants no MCP servers.
+/// Serve all routes of the local server on a local port. The boot config
+/// MCP routes use `host`, which grants the servers [`ECHO`] and [`BROKEN`].
+/// `None` grants no MCP servers.
 pub(crate) async fn serve_local(host: Option<&Rc<FakeMcpHost>>) -> SocketAddr {
-    let mcp = McpConfig {
-        host: host.map(FakeMcpHost::client),
-        names: vec![ECHO.to_string(), BROKEN.to_string()],
-    };
-    serve(app(AdminState::new(), mcp)).await
+    serve_mcp(host).await.0
+}
+
+/// Serve all routes of the local server on a local port, as
+/// [`serve_local`] does.
+///
+/// Returns:
+///   The address and the route handle that adds run-time MCP servers.
+pub(crate) async fn serve_mcp(host: Option<&Rc<FakeMcpHost>>) -> (SocketAddr, Routes) {
+    let (bridge, routes) = mcp::start();
+    if let Some(host) = host {
+        routes.add_boot(&host.client(), vec![ECHO.to_string(), BROKEN.to_string()]);
+    }
+    (serve(app(AdminState::new(), bridge)).await, routes)
+}
+
+/// Add a run-time MCP server of `host` at
+/// `http://acp.mcp.airlock/<session>/<name>`.
+///
+/// Returns:
+///   The grant through a real RPC connection, as the host gets it.
+pub(crate) async fn add_runtime(
+    routes: &Routes,
+    session: &str,
+    name: &str,
+    host: &Rc<FakeMcpHost>,
+) -> Result<mcp_grant::Client, capnp::Error> {
+    let grant = mcp::add_server(routes, session, name, host.client()).await?;
+    Ok(rpc_loopback(grant.client))
 }
 
 /// One HTTP response, with the chunked body decoded.
@@ -268,25 +292,37 @@ fn dechunk(mut body: &str) -> String {
     out
 }
 
-/// MCP client of one session on server [`ECHO`].
+/// MCP client of one session on one server.
 pub(crate) struct McpClient {
     addr: SocketAddr,
+    /// Host name of the server URL.
+    host: &'static str,
+    /// Path of the server URL.
+    path: String,
     /// Session ID from the `initialize` response.
     pub session: Option<String>,
 }
 
 impl McpClient {
-    /// Make a client with no session.
+    /// Make a client of the boot config server [`ECHO`] with no session.
     pub fn new(addr: SocketAddr) -> Self {
+        Self::at(addr, mcp::CONFIG_HOST, "/echo")
+    }
+
+    /// Make a client of the server at `http://<host><path>` with no
+    /// session.
+    pub fn at(addr: SocketAddr, host: &'static str, path: &str) -> Self {
         Self {
             addr,
+            host,
+            path: path.to_string(),
             session: None,
         }
     }
 
     /// Return the request headers: host, accepted types and session.
     fn headers(&self, accept: &'static str) -> Vec<String> {
-        let mut headers = vec!["Host: mcp.airlock".to_string(), format!("Accept: {accept}")];
+        let mut headers = vec![format!("Host: {}", self.host), format!("Accept: {accept}")];
         if let Some(sid) = &self.session {
             headers.push(format!("Mcp-Session-Id: {sid}"));
         }
@@ -307,7 +343,7 @@ impl McpClient {
     pub async fn post(&self, message: &Value) -> HttpReply {
         let headers = self.headers("application/json, text/event-stream");
         let headers: Vec<&str> = headers.iter().map(String::as_str).collect();
-        http(self.addr, "POST", "/echo", &headers, Some(message)).await
+        http(self.addr, "POST", &self.path, &headers, Some(message)).await
     }
 
     /// POST one JSON-RPC message and do not read the response.
@@ -317,7 +353,7 @@ impl McpClient {
     pub async fn post_open(&self, message: &Value) -> TcpStream {
         let headers = self.headers("application/json, text/event-stream");
         let headers: Vec<&str> = headers.iter().map(String::as_str).collect();
-        send_request(self.addr, "POST", "/echo", &headers, Some(message)).await
+        send_request(self.addr, "POST", &self.path, &headers, Some(message)).await
     }
 
     /// Open the standalone event stream and wait for the response head.
@@ -327,7 +363,7 @@ impl McpClient {
     pub async fn listen(&self) -> (TcpStream, String) {
         let headers = self.headers("text/event-stream");
         let headers: Vec<&str> = headers.iter().map(String::as_str).collect();
-        let mut stream = send_request(self.addr, "GET", "/echo", &headers, None).await;
+        let mut stream = send_request(self.addr, "GET", &self.path, &headers, None).await;
         let head = read_until_contains(&mut stream, "\r\n\r\n").await;
         (stream, head)
     }
@@ -336,13 +372,13 @@ impl McpClient {
     pub async fn listen_refused(&self) -> HttpReply {
         let headers = self.headers("text/event-stream");
         let headers: Vec<&str> = headers.iter().map(String::as_str).collect();
-        http(self.addr, "GET", "/echo", &headers, None).await
+        http(self.addr, "GET", &self.path, &headers, None).await
     }
 
     /// End the session with DELETE.
     pub async fn delete(&self) -> HttpReply {
         let headers = self.headers("*/*");
         let headers: Vec<&str> = headers.iter().map(String::as_str).collect();
-        http(self.addr, "DELETE", "/echo", &headers, None).await
+        http(self.addr, "DELETE", &self.path, &headers, None).await
     }
 }

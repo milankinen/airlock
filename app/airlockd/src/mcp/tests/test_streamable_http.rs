@@ -238,12 +238,12 @@ fn requests_that_break_transport_rules_are_refused() {
 
 /// Test that the local server picks the routes by the host name. Old admin
 /// clients that use `localhost` must keep the admin routes, and without a
-/// grant `mcp.airlock` has no routes.
+/// grant `mcp.airlock` has no servers.
 ///   1. GET `/` with the host names `admin.airlock`, `localhost`,
 ///      `MCP.AIRLOCK:80` and `mcp.airlock`
 ///   2. Check that only the `mcp.airlock` names get the server list
 ///   3. Start a server with no MCP grant and check that `mcp.airlock` gets
-///      HTTP 404 and `admin.airlock` still works
+///      an empty list and `admin.airlock` still works
 #[test]
 fn local_server_picks_routes_by_host_name() {
     block_on_local(async {
@@ -266,7 +266,8 @@ fn local_server_picks_routes_by_host_name() {
         }
 
         let addr = serve_local(None).await;
-        assert_eq!(get(addr, "mcp.airlock").await.status, 404);
+        let reply = get(addr, "mcp.airlock").await;
+        assert_eq!((reply.status, reply.body.as_str()), (200, ""));
         assert_eq!(get(addr, "admin.airlock").await.status, 200);
     });
 }

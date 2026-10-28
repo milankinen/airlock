@@ -5,6 +5,7 @@ pub mod acp;
 pub mod config;
 pub mod context;
 pub mod home;
+pub mod mcp_grant;
 pub mod network;
 pub mod oci;
 pub mod packs;

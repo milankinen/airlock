@@ -4,6 +4,8 @@
 //!  * `airlock exec` starts more processes in the running sandbox
 //!  * `airlock network forward` adds port forwards between the host and
 //!    the sandbox while it runs
+//!  * `airlock acp` serves more host MCP servers to the sandbox while it
+//!    runs
 //!
 //! Guest → host forwards obey the live network policy, the same as the
 //! config port forwards. The server refuses forwards that make a loop with a
@@ -244,6 +246,41 @@ impl cli_service::Server for CliServiceImpl {
         results.get().set_handle(handle);
         Ok(())
     }
+
+    async fn add_mcp_server(
+        self: Rc<Self>,
+        params: cli_service::AddMcpServerParams,
+        mut results: cli_service::AddMcpServerResults,
+    ) -> Result<(), capnp::Error> {
+        let params = params.get()?;
+        let session = params.get_session()?.to_str()?;
+        let name = params.get_name()?.to_str()?;
+        for (what, value) in [("session", session), ("name", name)] {
+            if !is_route_id(value) {
+                return Err(capnp::Error::failed(messages::mcp::bad_route_id(
+                    what, value,
+                )));
+            }
+        }
+        // The host cap and the grant pass unwrapped. A client disconnect
+        // drops the host cap and the grant on the supervisor connection,
+        // as with `bindHostPort`. The guest then removes the route.
+        let grant = self
+            .supervisor
+            .add_mcp_server(session, name, params.get_host()?)
+            .await?;
+        results.get().set_grant(grant);
+        Ok(())
+    }
+}
+
+/// Check a session or server name for the MCP route: 1-64 characters of
+/// `[A-Za-z0-9_-]`. The guest uses the values in URL paths.
+fn is_route_id(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// Relays guest connections to the connector of the client, if the network

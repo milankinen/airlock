@@ -1190,6 +1190,12 @@ pub mod mcp {
 
     /// Close reason when the exit status of the MCP server is not known.
     pub const EXIT_UNKNOWN: &str = "MCP server stopped";
+
+    /// Error when a session or server name of an MCP route is not valid.
+    /// `what` is "session" or "name".
+    pub fn bad_route_id(what: impl Display, value: impl Display) -> String {
+        format!("invalid MCP {what} '{value}': use 1-64 characters of A-Z, a-z, 0-9, _ and -")
+    }
 }
 
 pub mod network {

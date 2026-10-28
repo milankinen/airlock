@@ -68,41 +68,53 @@ async fn airlockd() -> anyhow::Result<()> {
 
     let admin_state = admin::AdminState::new();
     let deny_tracker = admin_state.deny_tracker.clone();
+    // Start the MCP bridge before boot. The host can add run-time MCP
+    // servers through the supervisor at any time after boot.
+    let (mcp_bridge, mcp_routes) = mcp::start();
 
-    rpc::serve(sup_conn, deny_tracker, network, async |cfg| {
-        logging::init(cfg.log_sink, &cfg.log_filter);
+    rpc::serve(
+        sup_conn,
+        deny_tracker,
+        network,
+        mcp_routes.clone(),
+        async |cfg| {
+            logging::init(cfg.log_sink, &cfg.log_filter);
 
-        info!("setup vm");
-        init::setup(
-            &cfg.init_config,
-            &cfg.mount_config,
-            &cfg.sockets,
-            cfg.nested_virt,
-        )?;
-        // Give resources back to the host at intervals. Trim the sparse
-        // disk image and drop the dentry/inode slab, so that the virtiofs
-        // proxy on the host does not collect more and more FDs.
-        init::start_periodic_maintenance();
+            info!("setup vm");
+            init::setup(
+                &cfg.init_config,
+                &cfg.mount_config,
+                &cfg.sockets,
+                cfg.nested_virt,
+            )?;
+            // Give resources back to the host at intervals. Trim the sparse
+            // disk image and drop the dentry/inode slab, so that the virtiofs
+            // proxy on the host does not collect more and more FDs.
+            init::start_periodic_maintenance();
 
-        let dns = Rc::new(net::DnsState::new());
-        net::start_dns(dns.clone()).await?;
-        net::start_host_socket_forward(&cfg.network, cfg.sockets)?;
-        net::start_host_port_forward(&cfg.init_config.host_ports, cfg.network.clone()).await?;
-        net::start_tcp_proxy(cfg.network.clone(), dns)?;
-        admin::start(admin_state.clone(), cfg.mcp).await?;
-        clipboard::start(cfg.clipboard, cfg.uid, cfg.gid)?;
-        browser::start(cfg.browser, cfg.uid, cfg.gid)?;
+            let dns = Rc::new(net::DnsState::new());
+            net::start_dns(dns.clone()).await?;
+            net::start_host_socket_forward(&cfg.network, cfg.sockets)?;
+            net::start_host_port_forward(&cfg.init_config.host_ports, cfg.network.clone()).await?;
+            net::start_tcp_proxy(cfg.network.clone(), dns)?;
+            if let Some(host) = &cfg.mcp.host {
+                mcp_routes.add_boot(host, cfg.mcp.names);
+            }
+            admin::start(admin_state.clone(), mcp_bridge.clone()).await?;
+            clipboard::start(cfg.clipboard, cfg.uid, cfg.gid)?;
+            browser::start(cfg.browser, cfg.uid, cfg.gid)?;
 
-        if !cfg.daemons.is_empty() {
-            info!("starting {} daemon(s)", cfg.daemons.len());
-            let set = daemon::DaemonSet::start_all(cfg.daemons, cfg.uid, cfg.gid);
-            *cfg.daemon_set_slot.borrow_mut() = Some(set);
-        }
+            if !cfg.daemons.is_empty() {
+                info!("starting {} daemon(s)", cfg.daemons.len());
+                let set = daemon::DaemonSet::start_all(cfg.daemons, cfg.uid, cfg.gid);
+                *cfg.daemon_set_slot.borrow_mut() = Some(set);
+            }
 
-        info!("boot complete");
+            info!("boot complete");
 
-        Ok(())
-    })
+            Ok(())
+        },
+    )
     .await?;
 
     // Keep the supervisor alive until the CLI stops the VM. PID 1 waits

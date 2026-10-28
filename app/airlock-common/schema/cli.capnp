@@ -5,9 +5,10 @@ using Supervisor = import "supervisor.capnp";
 
 # CLI server interface. `airlock start` serves it on a Unix socket for
 # clients that attach to the running sandbox: `airlock exec` (new
-# processes in the container) and `airlock network forward` (ad-hoc port
-# forwards). It is separate from the supervisor vsock RPC. It uses the
-# process I/O and port forward types of the supervisor schema.
+# processes in the container), `airlock network forward` (ad-hoc port
+# forwards) and `airlock acp` (host MCP servers for an editor agent). It
+# is separate from the supervisor vsock RPC. It uses the process I/O and
+# port forward types of the supervisor schema.
 interface CliService {
   exec @0 (
     stdin :Supervisor.Stdin,
@@ -29,4 +30,9 @@ interface CliService {
   # `Supervisor.bindHostPort`. The guest listener closes when the client
   # releases `handle` or disconnects.
   bindHostPort @2 (port :UInt16, connector :Supervisor.LocalConnector) -> (handle :Supervisor.ListenHandle);
+
+  # Serves one more host MCP server to the guest. The server checks
+  # `session` and `name` and passes the call to `Supervisor.addMcpServer`.
+  # The route closes when the client releases `grant` or disconnects.
+  addMcpServer @3 (session :Text, name :Text, host :Supervisor.McpHost) -> (grant :Supervisor.McpGrant);
 }

@@ -65,7 +65,10 @@ current. A short orientation:
   or a pack install. Other calls poll stats and daemon state, bridge
   host → guest TCP, re-sync the guest clock, report network denies,
   and drive shutdown. A second `boot` and a `spawn` before `boot` are
-  refused.
+  refused. `addMcpServer` adds a run-time MCP route at
+  `acp.mcp.airlock/<session>/<name>` and returns an `McpGrant`. The
+  call is refused before `boot`. The route ends when the host calls
+  `release` on the grant or drops it.
 - **`CliService`** — exposed by the running `airlock start` process
   over `<sandbox>/cli.sock`. `airlock exec` connects
   here. The CLI server merges the sandbox's resolved base env with

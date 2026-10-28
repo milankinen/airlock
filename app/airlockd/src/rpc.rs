@@ -6,6 +6,7 @@
 //!    `airlock exec`. Processes can run only after the boot succeeds.
 //!  * get stats and daemon states, sync the clock, report network denies and
 //!    open TCP connections to the guest
+//!  * add MCP servers at run time
 //!  * sync the filesystems before it stops the VM
 
 use std::cell::RefCell;
@@ -65,7 +66,7 @@ pub struct BootConfig {
     /// Browser grant. If the host gives no capability, the bridge is off.
     pub browser: crate::browser::BrowserConfig,
     /// Host MCP server grant. If the host gives no capability, the
-    /// `mcp.airlock` endpoints are off.
+    /// `mcp.airlock` endpoints have no servers.
     pub mcp: crate::mcp::McpConfig,
     /// Sidecar daemons to start after init. The callback decides when to
     /// call [`DaemonSet::start_all`] (usually right after
@@ -92,6 +93,7 @@ pub struct HostProcess {
 ///  - `conn_fd`: Accepted vsock connection of the supervisor channel
 ///  - `deny_tracker`: Store for the deny reports from the host
 ///  - `network`: `NetworkProxy` client of the network channel
+///  - `mcp_routes`: Route handle of the MCP bridge for `addMcpServer`
 ///  - `boot`: Callback that sets up the guest with the [`BootConfig`]
 ///
 /// Returns:
@@ -102,6 +104,7 @@ pub async fn serve<Boot: AsyncFn(BootConfig) -> anyhow::Result<()>>(
     conn_fd: OwnedFd,
     deny_tracker: Arc<DenyTracker>,
     network: network_proxy::Client,
+    mcp_routes: crate::mcp::Routes,
     boot: Boot,
 ) -> anyhow::Result<()> {
     let std_stream = unsafe { std::net::TcpStream::from_raw_fd(conn_fd.into_raw_fd()) };
@@ -126,6 +129,7 @@ pub async fn serve<Boot: AsyncFn(BootConfig) -> anyhow::Result<()>>(
         deny_tracker,
         daemon_set,
         network: network.clone(),
+        mcp_routes,
     });
     let rpc = RpcSystem::new(Box::new(transport), Some(client.client));
 
@@ -167,6 +171,8 @@ struct SupervisorImpl {
     /// into `BootConfig`, so the net modules can access the host without
     /// the supervisor channel.
     network: network_proxy::Client,
+    /// Route handle of the MCP bridge for `addMcpServer`.
+    mcp_routes: crate::mcp::Routes,
 }
 
 impl supervisor::Server for SupervisorImpl {
@@ -455,6 +461,30 @@ impl supervisor::Server for SupervisorImpl {
             .await
             .map_err(|e| capnp::Error::failed(e.to_string()))?;
         results.get().set_handle(handle);
+        Ok(())
+    }
+
+    async fn add_mcp_server(
+        self: Rc<Self>,
+        params: supervisor::AddMcpServerParams,
+        mut results: supervisor::AddMcpServerResults,
+    ) -> Result<(), capnp::Error> {
+        // Same gate as `bindHostPort`: before boot, the endpoints do not
+        // run yet.
+        if self.spawn_creds.borrow().is_none() {
+            return Err(capnp::Error::failed(
+                "addMcpServer called before boot succeeded".into(),
+            ));
+        }
+        let params = params.get()?;
+        let grant = crate::mcp::add_server(
+            &self.mcp_routes,
+            params.get_session()?.to_str()?,
+            params.get_name()?.to_str()?,
+            params.get_host()?,
+        )
+        .await?;
+        results.get().set_grant(grant);
         Ok(())
     }
 

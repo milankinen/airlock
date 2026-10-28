@@ -414,6 +414,29 @@ impl Supervisor {
         response.get()?.get_handle()
     }
 
+    /// Serve a host MCP server to the guest as a route.
+    /// Args:
+    ///  - `session`: Route group, one per client session
+    ///  - `name`: Server name in the group
+    ///  - `host`: Host object that opens the server processes
+    ///
+    /// Returns:
+    ///   Lifetime token of the route. The route closes when all references
+    ///   to the token are gone, or when the token is released.
+    pub async fn add_mcp_server(
+        &self,
+        session: &str,
+        name: &str,
+        host: mcp_host::Client,
+    ) -> capnp::Result<mcp_grant::Client> {
+        let mut req = self.supervisor.add_mcp_server_request();
+        req.get().set_session(session);
+        req.get().set_name(name);
+        req.get().set_host(host);
+        let response = req.send().promise.await?;
+        response.get()?.get_grant()
+    }
+
     /// Read the guest CPU, memory and load for the monitor UI.
     pub async fn poll_stats(&self) -> anyhow::Result<StatsSnapshot> {
         let req = self.supervisor.poll_stats_request();

@@ -115,6 +115,13 @@ interface Supervisor {
   # exception. The guest refuses port 0, and refuses this call until
   # `boot` succeeds.
   bindHostPort @9 (port :UInt16, connector :LocalConnector) -> (handle :ListenHandle);
+
+  # Serve one more host MCP server at
+  # `http://acp.mcp.airlock/<session>/<name>` while the host holds
+  # `grant`. `host` opens the server processes, as in `McpConfig.host`.
+  # The guest refuses a pair of `session` and `name` that it serves
+  # already. The guest refuses the call before boot.
+  addMcpServer @10 (session :Text, name :Text, host :McpHost) -> (grant :McpGrant);
 }
 
 # Host-side target of a guest listener from `Supervisor.bindHostPort`.
@@ -187,6 +194,13 @@ interface McpHost {
   # that the process writes to its stdout, and `closed` when the process
   # stops. The host stops the process when the guest releases `session`.
   open @0 (name :Text, sink :McpSink) -> (session :McpSession);
+}
+
+# Lifetime token of a route from `Supervisor.addMcpServer`.
+interface McpGrant {
+  # Remove the route and end the open sessions of the route. Returns when
+  # they ended. Dropping the grant does the same without waiting.
+  release @0 () -> ();
 }
 
 # One running process of a host MCP server.

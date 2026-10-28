@@ -1,9 +1,11 @@
 //! HTTP endpoints of the MCP Streamable HTTP transport.
 //!
-//! Checks the transport rules of the spec and gives the JSON-RPC messages
-//! to the bridge. Event streams send a keepalive comment at intervals. A
-//! client cannot resume a broken stream.
+//! Serves the routes of one MCP host name. Checks the transport rules of
+//! the spec and gives the JSON-RPC messages to the bridge. Event streams
+//! send a keepalive comment at intervals. A client cannot resume a broken
+//! stream.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,8 +22,8 @@ use axum::routing::get;
 use serde_json::Value;
 use tracing::warn;
 
-use super::bridge::{Bridge, BridgeError, MessageStream};
-use super::host_name;
+use super::bridge::{Bridge, BridgeError, MessageStream, Route};
+use super::{CONFIG_HOST, RUNTIME_HOST, host_name};
 
 /// HTTP header that carries the session ID.
 const SESSION_HEADER: &str = "mcp-session-id";
@@ -30,43 +32,62 @@ const SESSION_HEADER: &str = "mcp-session-id";
 const KEEPALIVE: Duration = Duration::from_secs(15);
 
 /// Origin hosts that can send requests. Other web pages cannot.
-const ALLOWED_ORIGINS: [&str; 3] = ["mcp.airlock", "localhost", "127.0.0.1"];
+const ALLOWED_ORIGINS: [&str; 4] = [CONFIG_HOST, RUNTIME_HOST, "localhost", "127.0.0.1"];
 
 /// State that all MCP handlers share.
 struct McpState {
     bridge: Bridge,
-    names: Vec<String>,
+    /// True for the run-time routes.
+    runtime: bool,
 }
 
 type AppState = Arc<McpState>;
 
-/// Make the MCP routes. The routes do not check the `Host` header. The
-/// local server sends only `mcp.airlock` requests here.
+/// Make the MCP routes of one host name. The routes do not check the
+/// `Host` header. The local server sends only the requests of the host
+/// name here.
 /// Args:
 ///  - `bridge`: Handle to the bridge task
-///  - `names`: Names of the servers that the host grants
-pub fn router(bridge: Bridge, names: Vec<String>) -> Router {
+///  - `runtime`: True for `/<session>/<name>` of the run-time servers,
+///    false for `/<name>` of the boot config servers
+pub fn router(bridge: Bridge, runtime: bool) -> Router {
+    let path = if runtime {
+        "/{session}/{name}"
+    } else {
+        "/{name}"
+    };
     Router::new()
         .route("/", get(index))
-        .route("/{name}", get(listen).post(post).delete(delete))
+        .route(path, get(listen).post(post).delete(delete))
         .layer(middleware::from_fn(check_origin))
-        .with_state(Arc::new(McpState { bridge, names }))
+        .with_state(Arc::new(McpState { bridge, runtime }))
 }
 
-/// List the server names, one on each line.
+/// List the routes of the host name, one on each line.
 async fn index(State(st): State<AppState>) -> String {
-    st.names.iter().flat_map(|n| [n.as_str(), "\n"]).collect()
+    let routes = st.bridge.list(st.runtime).await;
+    routes.iter().flat_map(|r| [r.as_str(), "\n"]).collect()
+}
+
+/// Get the route from the path parameters of the request. The router has
+/// a `session` parameter only for the run-time routes.
+fn route(mut params: HashMap<String, String>) -> Route {
+    Route {
+        session: params.remove("session"),
+        name: params.remove("name").unwrap_or_default(),
+    }
 }
 
 /// Send one JSON-RPC message from the client to the server. A request gets
 /// an event stream, other messages get HTTP 202.
 async fn post(
     State(st): State<AppState>,
-    Path(name): Path<String>,
+    Path(params): Path<HashMap<String, String>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !st.names.contains(&name) {
+    let route = route(params);
+    if !st.bridge.exists(&route).await {
         return StatusCode::NOT_FOUND.into_response();
     }
     if !accepts(&headers, &["application/json", "text/event-stream"]) {
@@ -103,13 +124,13 @@ async fn post(
                 .into_response();
         }
         (Some(sid), false) => (sid, None),
-        (None, true) => match st.bridge.open(&name).await {
+        (None, true) => match st.bridge.open(&route).await {
             Ok(sid) => (
                 sid.clone(),
                 Some(NewSession {
                     bridge: st.bridge.clone(),
                     sid,
-                    name: name.clone(),
+                    route: route.clone(),
                     handed_over: false,
                 }),
             ),
@@ -123,11 +144,11 @@ async fn post(
     // Send one line of JSON, as the stdio transport needs.
     let line = message.to_string();
     let result = match id.filter(|_| method.is_some()) {
-        Some(id) => st.bridge.request(&sid, &name, id, line).await.map(sse),
+        Some(id) => st.bridge.request(&sid, &route, id, line).await.map(sse),
         // A notification or a response to a server request.
         None => st
             .bridge
-            .send(&sid, &name, line)
+            .send(&sid, &route, line)
             .await
             .map(|()| StatusCode::ACCEPTED.into_response()),
     };
@@ -153,7 +174,7 @@ async fn post(
 struct NewSession {
     bridge: Bridge,
     sid: String,
-    name: String,
+    route: Route,
     /// True after the session ID is in the response.
     handed_over: bool,
 }
@@ -161,10 +182,8 @@ struct NewSession {
 impl Drop for NewSession {
     fn drop(&mut self) {
         if !self.handed_over {
-            self.bridge.close_later(
-                std::mem::take(&mut self.sid),
-                std::mem::take(&mut self.name),
-            );
+            self.bridge
+                .close_later(std::mem::take(&mut self.sid), self.route.clone());
         }
     }
 }
@@ -172,10 +191,11 @@ impl Drop for NewSession {
 /// Open the standalone event stream of a session.
 async fn listen(
     State(st): State<AppState>,
-    Path(name): Path<String>,
+    Path(params): Path<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    if !st.names.contains(&name) {
+    let route = route(params);
+    if !st.bridge.exists(&route).await {
         return StatusCode::NOT_FOUND.into_response();
     }
     if !accepts(&headers, &["text/event-stream"]) {
@@ -189,7 +209,7 @@ async fn listen(
         return (StatusCode::BAD_REQUEST, "Mcp-Session-Id header is missing").into_response();
     };
     st.bridge
-        .listen(&sid, &name)
+        .listen(&sid, &route)
         .await
         .map_or_else(error_response, sse)
 }
@@ -197,17 +217,18 @@ async fn listen(
 /// End a session.
 async fn delete(
     State(st): State<AppState>,
-    Path(name): Path<String>,
+    Path(params): Path<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    if !st.names.contains(&name) {
+    let route = route(params);
+    if !st.bridge.exists(&route).await {
         return StatusCode::NOT_FOUND.into_response();
     }
     let Some(sid) = session_id(&headers) else {
         return (StatusCode::BAD_REQUEST, "Mcp-Session-Id header is missing").into_response();
     };
     st.bridge
-        .close(&sid, &name)
+        .close(&sid, &route)
         .await
         .map_or_else(error_response, |()| StatusCode::OK.into_response())
 }
@@ -244,6 +265,7 @@ fn sse(rx: MessageStream) -> Response {
 /// Map a bridge error to an HTTP error response.
 fn error_response(err: BridgeError) -> Response {
     match err {
+        BridgeError::UnknownRoute => StatusCode::NOT_FOUND.into_response(),
         BridgeError::UnknownSession => (StatusCode::NOT_FOUND, "session not found").into_response(),
         BridgeError::StreamOpen => {
             (StatusCode::CONFLICT, "session already has an event stream").into_response()

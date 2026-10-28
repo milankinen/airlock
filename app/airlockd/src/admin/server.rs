@@ -2,8 +2,9 @@
 //!
 //! Starts the server with all admin endpoints. The same server also serves
 //! the host MCP servers. It picks the endpoints by the host name of the
-//! request: `mcp.airlock` gets the MCP endpoints, and all other names get
-//! the admin endpoints.
+//! request: `mcp.airlock` gets the boot config MCP servers,
+//! `acp.mcp.airlock` gets the run-time MCP servers, and all other names
+//! get the admin endpoints.
 
 use std::sync::Arc;
 
@@ -17,10 +18,7 @@ use tracing::{info, warn};
 
 use super::routes;
 use super::state::AdminState;
-use crate::mcp::{self, McpConfig, host_name};
-
-/// Host name of the MCP endpoints.
-const MCP_HOST: &str = "mcp.airlock";
+use crate::mcp::{self, Bridge, host_name};
 
 /// Listen address. Loopback traffic does not go through the TCP proxy, so
 /// container requests come here directly.
@@ -30,11 +28,11 @@ const ADMIN_ADDR: (&str, u16) = ("127.0.0.1", 80);
 /// background task.
 /// Args:
 ///  - `state`: Shared state for the admin route handlers
-///  - `mcp`: Host MCP server grant
+///  - `mcp`: Handle to the MCP bridge task
 ///
 /// Returns:
 ///   Error if the bind fails.
-pub async fn start(state: Arc<AdminState>, mcp: McpConfig) -> anyhow::Result<()> {
+pub async fn start(state: Arc<AdminState>, mcp: Bridge) -> anyhow::Result<()> {
     let listener = TcpListener::bind(ADMIN_ADDR).await?;
     info!("admin listening on {}:{}", ADMIN_ADDR.0, ADMIN_ADDR.1);
 
@@ -67,21 +65,21 @@ pub(crate) fn router(state: Arc<AdminState>) -> Router {
         .with_state(state)
 }
 
-/// All routes of the local server, without a listener. Call inside a
-/// `LocalSet`.
+/// All routes of the local server, without a listener.
 /// Args:
 ///  - `state`: Shared state for the admin route handlers
-///  - `mcp`: Host MCP server grant
-pub(crate) fn app(state: Arc<AdminState>, mcp: McpConfig) -> Router {
+///  - `mcp`: Handle to the MCP bridge task
+pub(crate) fn app(state: Arc<AdminState>, mcp: Bridge) -> Router {
     let admin = router(state);
-    let mcp = mcp::router(mcp);
+    let config = mcp::router(mcp.clone(), false);
+    let runtime = mcp::router(mcp, true);
     Router::new().fallback_service(tower::service_fn(move |req: Request| {
         // Other host names (`admin.airlock`, `localhost`, IPs) keep the
         // admin routes, as before the MCP routes existed.
-        let target = if request_host(&req) == MCP_HOST {
-            mcp.clone()
-        } else {
-            admin.clone()
+        let target = match request_host(&req).as_str() {
+            mcp::CONFIG_HOST => config.clone(),
+            mcp::RUNTIME_HOST => runtime.clone(),
+            _ => admin.clone(),
         };
         target.oneshot(req)
     }))
