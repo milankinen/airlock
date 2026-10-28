@@ -43,6 +43,9 @@ pub mod acp {
     /// Error when the agent cannot load sessions.
     pub const NO_LOAD_SESSION: &str = "the agent does not support 'session/load'";
 
+    /// Error when the agent cannot take steering requests.
+    pub const NO_STEERING: &str = "the agent does not support steering ('_session/steering')";
+
     /// Close reason that the sandbox gets for the MCP sessions of an editor
     /// session that ended.
     pub const MCP_SESSION_ENDED: &str = "the editor session of this MCP server ended";

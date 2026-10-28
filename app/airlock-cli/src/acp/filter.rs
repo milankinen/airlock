@@ -91,6 +91,10 @@ pub fn kind(msg: &Value) -> Option<Kind<'_>> {
 //
 // The proxy itself serves the editor MCP servers to the agent over HTTP.
 // Thus it can take HTTP and SSE servers also when the agent has only HTTP.
+//
+// The top-level `_meta.steering` tells JetBrains IDEs to enable "Send now".
+// Steering is an agent feature. It does not let the agent act on the host.
+// If the real agent has no steering, the proxy refuses the request later.
 pub fn initialize_result(title: &str, version: &str, proxy_mcp_servers: bool) -> Value {
     let mut result = json!({
         "protocolVersion": PROTOCOL_VERSION,
@@ -99,6 +103,7 @@ pub fn initialize_result(title: &str, version: &str, proxy_mcp_servers: bool) ->
             "promptCapabilities": { "image": true, "embeddedContext": true },
         },
         "authMethods": [],
+        "_meta": { "steering": { "supported": true } },
         "agentInfo": { "name": "airlock", "title": title, "version": version },
     });
     if proxy_mcp_servers {
@@ -214,22 +219,29 @@ pub fn check_client_request(
     if method == "session/load" && !has("/agentCapabilities/loadSession") {
         return Err((METHOD_NOT_FOUND, messages::acp::NO_LOAD_SESSION.into()));
     }
-    if method == "session/prompt" {
-        let blocks = params.get("prompt").and_then(Value::as_array);
-        for block in blocks.into_iter().flatten() {
-            let block_type = block.get("type").and_then(Value::as_str);
-            let missing = match block_type {
-                Some("image") => !has("/agentCapabilities/promptCapabilities/image"),
-                Some("audio") => !has("/agentCapabilities/promptCapabilities/audio"),
-                Some("resource") => !has("/agentCapabilities/promptCapabilities/embeddedContext"),
-                _ => false,
-            };
-            if let (true, Some(block_type)) = (missing, block_type) {
-                return Err((
-                    INVALID_PARAMS,
-                    messages::acp::missing_prompt_content(block_type),
-                ));
+    let prompt = match method {
+        "session/prompt" => params.get("prompt"),
+        "_session/steering" => {
+            if !has("/_meta/steering/supported") {
+                return Err((METHOD_NOT_FOUND, messages::acp::NO_STEERING.into()));
             }
+            params.get("prompt")
+        }
+        _ => None,
+    };
+    for block in prompt.and_then(Value::as_array).into_iter().flatten() {
+        let block_type = block.get("type").and_then(Value::as_str);
+        let missing = match block_type {
+            Some("image") => !has("/agentCapabilities/promptCapabilities/image"),
+            Some("audio") => !has("/agentCapabilities/promptCapabilities/audio"),
+            Some("resource") => !has("/agentCapabilities/promptCapabilities/embeddedContext"),
+            _ => false,
+        };
+        if let (true, Some(block_type)) = (missing, block_type) {
+            return Err((
+                INVALID_PARAMS,
+                messages::acp::missing_prompt_content(block_type),
+            ));
         }
     }
     Ok(())
