@@ -1,29 +1,37 @@
-//! Host stdio MCP servers.
+//! Host MCP servers.
 //!
-//! Gives the guest access to the MCP servers that the project config
-//! enables. The guest serves each server as an HTTP endpoint. The host
-//! runs the server program and relays the JSON-RPC messages between the
-//! guest and the program, one message for each line.
+//! Gives the guest access to MCP servers that run on the host. The servers
+//! come from two sources: the project config enables them at the sandbox
+//! start, and `airlock acp` adds them at run time for the editor sessions.
+//! The guest serves each server as an HTTP endpoint. For a stdio server,
+//! the host runs the server program and relays the JSON-RPC messages
+//! between the guest and the program, one message for each line. For a
+//! remote server, the host relays the messages to the server URL over
+//! HTTP.
 //!
-//! Each guest MCP session gets its own server process. The process stops
-//! when the guest releases the session, and the guest learns when the
-//! process stops. The host also stops sessions that are idle for too long,
-//! and the session with the oldest activity when a server has too many
-//! sessions. The guest can start only the servers that the config
-//! enables.
+//! Each guest MCP session gets its own server session. The session stops
+//! when the guest releases it, and the guest learns when the session
+//! stops. The host also stops sessions that are idle for too long, and the
+//! session with the oldest activity when a server has too many sessions.
+//! The owner of the servers can close them all at a time. Then all live
+//! sessions stop and the guest cannot open new ones. The guest can start
+//! only the servers that the host gives.
 //!
-//! The environment templates of the servers resolve on the host at the
-//! sandbox start. Their values never go to the guest.
+//! The environment values of the servers resolve on the host. Their
+//! values never go to the guest.
 
+mod remote;
 mod session;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::time::Duration;
 
-use airlock_common::supervisor_capnp::mcp_host;
+use airlock_common::supervisor_capnp::{mcp_host, mcp_session};
+use tokio::sync::Notify;
 
+pub(crate) use self::remote::{RemoteKind, RemoteSpec, deletes_done};
 use crate::config::config_values::McpServer;
 use crate::mcp::session::SessionState;
 use crate::messages;
@@ -31,25 +39,51 @@ use crate::project::Project;
 use crate::util::VerifiedPath;
 use crate::vault::Vault;
 
-/// One enabled MCP server, ready to start.
+/// One MCP server that the guest can start.
 #[derive(Debug, Clone)]
-struct ServerSpec {
-    /// Name from `[mcp.<name>]`.
-    name: String,
-    /// Program to run.
-    command: String,
-    /// Arguments of the program.
-    args: Vec<String>,
-    /// Resolved environment values, on top of the host environment.
-    env: Vec<(String, String)>,
+pub(crate) struct ServerSpec {
+    /// Name of the server in its guest route, for example from
+    /// `[mcp.<name>]`.
+    pub(crate) name: String,
+    /// How the host reaches the server.
+    pub(crate) transport: Transport,
     /// Idle time after which the host stops a session. `None`: no limit.
-    timeout: Option<Duration>,
+    pub(crate) timeout: Option<Duration>,
     /// Maximum number of live sessions, 1 or more.
-    max_sessions: usize,
+    pub(crate) max_sessions: usize,
+}
+
+/// How the host reaches one MCP server.
+#[derive(Debug, Clone)]
+pub(crate) enum Transport {
+    /// Host program that reads JSON-RPC messages from its stdin and writes
+    /// them to its stdout, one message for each line.
+    Stdio {
+        /// Program to run.
+        command: String,
+        /// Arguments of the program.
+        args: Vec<String>,
+        /// Resolved environment values, on top of the host environment.
+        env: Vec<(String, String)>,
+    },
+    /// MCP server at a URL. The host relays the messages over HTTP.
+    Remote(RemoteSpec),
 }
 
 /// Live sessions by server name.
 type Sessions = BTreeMap<String, Vec<Rc<SessionState>>>;
+
+/// State that the host and its stopper share.
+#[derive(Default)]
+struct Shared {
+    /// Live sessions of each server, to apply `max_sessions`. A session
+    /// removes itself when it ends.
+    sessions: RefCell<Sessions>,
+    /// Set when the owner closed the host. Then `open` fails.
+    closed: Cell<bool>,
+    /// Signal when the last live session ended.
+    idle: Notify,
+}
 
 /// Cap'n Proto `McpHost` server that starts the host MCP servers for the
 /// guest.
@@ -57,13 +91,56 @@ type Sessions = BTreeMap<String, Vec<Rc<SessionState>>>;
 /// Each call checks the server name again here. It does not trust
 /// anything in the sandbox.
 pub struct McpHostImpl {
-    /// Enabled servers by name.
+    /// Servers by name.
     servers: BTreeMap<String, ServerSpec>,
     /// Working directory of the server processes.
     cwd: VerifiedPath,
-    /// Live sessions of each server, to apply `max_sessions`. A session
-    /// removes itself when it ends.
-    sessions: Rc<RefCell<Sessions>>,
+    /// Live sessions and the closed flag, shared with the stoppers.
+    shared: Rc<Shared>,
+}
+
+/// Handle that closes an MCP host. It stays valid after the host moved
+/// into an RPC capability.
+pub(crate) struct HostStopper {
+    /// State of the host.
+    shared: Rc<Shared>,
+}
+
+impl HostStopper {
+    /// Close the host. Later `open` calls fail. Each live session stops,
+    /// and its guest gets `reason` as the close reason.
+    pub(crate) fn close(&self, reason: &str) {
+        self.shared.closed.set(true);
+        // Collect first: a stop must not run while the registry is
+        // borrowed.
+        let live: Vec<Rc<SessionState>> = self
+            .shared
+            .sessions
+            .borrow()
+            .values()
+            .flatten()
+            .cloned()
+            .collect();
+        for state in live {
+            state.stop_with(reason.to_string());
+        }
+    }
+
+    /// Wait until the host has no live sessions. After a close, a remote
+    /// session ends after it started its end request to the server.
+    pub(crate) async fn stopped(&self) {
+        loop {
+            let idle = self.shared.idle.notified();
+            tokio::pin!(idle);
+            // Register before the check, so that a signal between the
+            // check and the wait is not lost.
+            idle.as_mut().enable();
+            if self.shared.sessions.borrow().is_empty() {
+                return;
+            }
+            idle.await;
+        }
+    }
 }
 
 /// Make the MCP capability for the `[mcp]` config of `project`. The server
@@ -107,31 +184,48 @@ pub(crate) fn resolve(
                     Ok((key.clone(), value))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            let spec = ServerSpec {
+            Ok(ServerSpec {
                 name: name.clone(),
-                command: s.command.clone(),
-                args: s.args.clone(),
-                env,
+                transport: Transport::Stdio {
+                    command: s.command.clone(),
+                    args: s.args.clone(),
+                    env,
+                },
                 timeout: (s.timeout > 0).then(|| Duration::from_secs(s.timeout.into())),
                 max_sessions: usize::try_from(s.max_sessions).unwrap_or(usize::MAX).max(1),
-            };
-            Ok((name.clone(), spec))
+            })
         })
-        .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+        .collect::<anyhow::Result<Vec<_>>>()?;
     if servers.is_empty() {
         return Ok(None);
     }
-    Ok(Some(McpHostImpl {
-        servers,
-        cwd: cwd.clone(),
-        sessions: Rc::default(),
-    }))
+    Ok(Some(McpHostImpl::new(servers, cwd.clone())))
 }
 
 impl McpHostImpl {
-    /// Names of the enabled servers, in name order.
+    /// Make a host that serves the given servers.
+    /// Args:
+    ///  - `servers`: Servers that the guest can start. For two servers with
+    ///    the same name, the last one stays.
+    ///  - `cwd`: Working directory of the stdio server processes
+    pub(crate) fn new(servers: Vec<ServerSpec>, cwd: VerifiedPath) -> Self {
+        Self {
+            servers: servers.into_iter().map(|s| (s.name.clone(), s)).collect(),
+            cwd,
+            shared: Rc::default(),
+        }
+    }
+
+    /// Names of the servers, in name order.
     pub(crate) fn names(&self) -> Vec<String> {
         self.servers.keys().cloned().collect()
+    }
+
+    /// Make a handle that closes this host and stops its sessions.
+    pub(crate) fn stopper(&self) -> HostStopper {
+        HostStopper {
+            shared: self.shared.clone(),
+        }
     }
 }
 
@@ -147,27 +241,52 @@ impl mcp_host::Server for McpHostImpl {
             .servers
             .get(name)
             .ok_or_else(|| capnp::Error::failed(messages::mcp::unknown_server(name)))?;
+        if self.shared.closed.get() {
+            return Err(capnp::Error::failed(messages::mcp::host_closed(name)));
+        }
         let sink = params.get_sink()?;
+        // A remote server can need a connection before the session starts.
+        // After it, check the closed flag again.
+        let remote = match &spec.transport {
+            Transport::Remote(remote) => {
+                let connected = remote::connect(&spec.name, remote).await?;
+                if self.shared.closed.get() {
+                    return Err(capnp::Error::failed(messages::mcp::host_closed(name)));
+                }
+                Some(connected)
+            }
+            Transport::Stdio { .. } => None,
+        };
         // The session removes itself from the registry when it ends. The
         // registry does not keep it.
-        let registry = Rc::downgrade(&self.sessions);
-        let name = spec.name.clone();
+        let registry = Rc::downgrade(&self.shared);
         let ended: Rc<RefCell<Option<Rc<SessionState>>>> = Rc::default();
         let on_end = {
             let ended = ended.clone();
-            move || {
-                if let (Some(registry), Some(state)) = (registry.upgrade(), ended.take()) {
-                    forget(&mut registry.borrow_mut(), &name, &state);
-                }
-            }
+            let name = spec.name.clone();
+            move || forget(&registry, &name, ended.take())
         };
-        let session = session::start(spec, &self.cwd, sink, on_end)?;
-        let state = session.state();
+        // No await from the last closed check to the registration of the
+        // session. Thus a close cannot miss a session that opens now.
+        let (client, state): (mcp_session::Client, _) = match (&spec.transport, remote) {
+            (Transport::Stdio { command, args, env }, _) => {
+                let program = session::StdioProgram { command, args, env };
+                let session = session::start(spec, &program, &self.cwd, sink, on_end)?;
+                let state = session.state();
+                (capnp_rpc::new_client(session), state)
+            }
+            (Transport::Remote(_), Some(connected)) => {
+                let session = remote::start(spec, connected, sink, on_end);
+                let state = session.state();
+                (capnp_rpc::new_client(session), state)
+            }
+            (Transport::Remote(_), None) => unreachable!("remote server connected above"),
+        };
         *ended.borrow_mut() = Some(state.clone());
         // Make room only after the new session started. Thus a failed
         // start does not stop a working session.
         self.make_room(spec, state);
-        results.get().set_session(capnp_rpc::new_client(session));
+        results.get().set_session(client);
         Ok(())
     }
 }
@@ -178,7 +297,7 @@ impl McpHostImpl {
     /// activity. A busy session can also stop: else a guest could keep the
     /// limit full.
     fn make_room(&self, spec: &ServerSpec, added: Rc<SessionState>) {
-        let mut sessions = self.sessions.borrow_mut();
+        let mut sessions = self.shared.sessions.borrow_mut();
         let live = sessions.entry(spec.name.clone()).or_default();
         let added_ptr = Rc::as_ptr(&added);
         live.push(added);
@@ -200,13 +319,21 @@ impl McpHostImpl {
     }
 }
 
-/// Remove the session `state` of the server `name` from `sessions`.
-fn forget(sessions: &mut Sessions, name: &str, state: &Rc<SessionState>) {
+/// Remove the session `state` of the server `name` from the registry of
+/// the host `shared`, if both still exist.
+fn forget(shared: &Weak<Shared>, name: &str, state: Option<Rc<SessionState>>) {
+    let (Some(shared), Some(state)) = (shared.upgrade(), state) else {
+        return;
+    };
+    let mut sessions = shared.sessions.borrow_mut();
     if let Some(live) = sessions.get_mut(name) {
-        live.retain(|s| !Rc::ptr_eq(s, state));
+        live.retain(|s| !Rc::ptr_eq(s, &state));
         if live.is_empty() {
             sessions.remove(name);
         }
+    }
+    if sessions.is_empty() {
+        shared.idle.notify_waiters();
     }
 }
 

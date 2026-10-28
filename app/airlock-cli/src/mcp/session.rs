@@ -7,7 +7,8 @@
 //! the guest releases the session, or when the host stops the session.
 //!
 //! Keeps the time of the last message in either direction. Thus the host
-//! can stop a session that is idle for too long.
+//! can stop a session that is idle for too long. Other kinds of sessions
+//! use the same activity and stop state.
 
 use std::cell::{Cell, RefCell};
 use std::process::Stdio;
@@ -44,11 +45,18 @@ const SEND_QUEUE: usize = 64;
 /// After that, the session stops it.
 const EOF_GRACE: Duration = Duration::from_secs(1);
 
+/// Time that the guest has after the session stop to take a server
+/// message and the close. A guest that does not answer must not block the
+/// end of the session.
+const SINK_GRACE: Duration = Duration::from_secs(1);
+
 /// Interval of the extra exit checks, in case a child signal is lost.
 const EXIT_POLL: Duration = Duration::from_secs(1);
 
-/// Shared state of one session: activity and the stop signal.
-pub(super) struct SessionState {
+/// Shared state of one session: activity, the stop signal and the close
+/// reason. Each kind of session keeps one. The host uses it for the
+/// session limit and to stop the session.
+pub(crate) struct SessionState {
     /// Tells the wait task to stop the server. It also fires when the
     /// server stops for another reason.
     stop: CancellationToken,
@@ -59,13 +67,22 @@ pub(super) struct SessionState {
 }
 
 impl SessionState {
+    /// Make the state of a new session. The session is active now.
+    pub(crate) fn new() -> Self {
+        Self {
+            stop: CancellationToken::new(),
+            last_active: Cell::new(Instant::now()),
+            reason: RefCell::default(),
+        }
+    }
+
     /// Time of the last message in either direction.
-    pub(super) fn last_active(&self) -> Instant {
+    pub(crate) fn last_active(&self) -> Instant {
         self.last_active.get()
     }
 
     /// Check if the session stopped or got the stop signal.
-    pub(super) fn is_stopped(&self) -> bool {
+    pub(crate) fn is_stopped(&self) -> bool {
         self.stop.is_cancelled()
     }
 
@@ -73,7 +90,7 @@ impl SessionState {
     /// unless the session already stopped. The wait task fires `stop`
     /// when the server exits. Thus a stop after the exit keeps the exit
     /// status as the reason.
-    pub(super) fn stop_with(&self, reason: String) {
+    pub(crate) fn stop_with(&self, reason: String) {
         if self.stop.is_cancelled() {
             return;
         }
@@ -82,8 +99,19 @@ impl SessionState {
     }
 
     /// Record a message in either direction.
-    fn touch(&self) {
+    pub(crate) fn touch(&self) {
         self.last_active.set(Instant::now());
+    }
+
+    /// Signal that fires when the session stops. A cancel of the signal
+    /// stops the session without a reason.
+    pub(crate) fn stop_token(&self) -> CancellationToken {
+        self.stop.clone()
+    }
+
+    /// Take the close reason that a stop gave, if any.
+    pub(crate) fn take_reason(&self) -> Option<String> {
+        self.reason.borrow_mut().take()
     }
 }
 
@@ -108,18 +136,31 @@ impl McpSessionImpl {
     }
 }
 
+/// Program of a stdio server: the parts of its transport that start the
+/// process.
+pub(super) struct StdioProgram<'a> {
+    /// Program to run.
+    pub(super) command: &'a str,
+    /// Arguments of the program.
+    pub(super) args: &'a [String],
+    /// Environment values, on top of the host environment.
+    pub(super) env: &'a [(String, String)],
+}
+
 /// Start a process of the server `spec` and its relay tasks. Call inside
 /// a `LocalSet`.
 /// Args:
-///  - `spec`: Server to start
+///  - `spec`: Server to start, for its name and idle timeout
+///  - `program`: Program of the server, from the transport of `spec`
 ///  - `cwd`: Working directory of the process
 ///  - `sink`: Guest receiver of the server messages
-///  - `on_end`: Called one time after the guest got `closed`
+///  - `on_end`: Called one time after the `closed` call to the guest
 ///
 /// Returns:
 ///   Session of the new process, or error if the process does not start.
 pub(super) fn start(
     spec: &ServerSpec,
+    program: &StdioProgram<'_>,
     cwd: &VerifiedPath,
     sink: mcp_sink::Client,
     on_end: impl FnOnce() + 'static,
@@ -127,11 +168,11 @@ pub(super) fn start(
     // Check the project dir again at each start. A component can be a
     // symlink now.
     let cwd = cwd.to_path().map_err(|e| {
-        capnp::Error::failed(messages::mcp::start_failed(&spec.name, &spec.command, e))
+        capnp::Error::failed(messages::mcp::start_failed(&spec.name, program.command, e))
     })?;
-    let mut cmd = tokio::process::Command::new(&spec.command);
-    cmd.args(&spec.args)
-        .envs(spec.env.iter().map(|(k, v)| (k, v)))
+    let mut cmd = tokio::process::Command::new(program.command);
+    cmd.args(program.args)
+        .envs(program.env.iter().map(|(k, v)| (k, v)))
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -141,7 +182,7 @@ pub(super) fn start(
         .kill_on_drop(true);
     tie_to_airlock(cmd.as_std_mut());
     let mut child = cmd.spawn().map_err(|e| {
-        capnp::Error::failed(messages::mcp::start_failed(&spec.name, &spec.command, e))
+        capnp::Error::failed(messages::mcp::start_failed(&spec.name, program.command, e))
     })?;
     // A child that is not reaped yet always has an ID.
     let pid = child.id().expect("pid of running child");
@@ -153,11 +194,7 @@ pub(super) fn start(
     tracing::debug!("mcp {}: started pid {pid}", spec.name);
 
     let reaped = Rc::new(Cell::new(false));
-    let state = Rc::new(SessionState {
-        stop: CancellationToken::new(),
-        last_active: Cell::new(Instant::now()),
-        reason: RefCell::default(),
-    });
+    let state = Rc::new(SessionState::new());
     let stop = state.stop.clone();
     let (exit_tx, exit_rx) = oneshot::channel();
     let (stdin_tx, stdin_rx) = mpsc::channel(SEND_QUEUE);
@@ -211,7 +248,7 @@ impl mcp_session::Server for McpSessionImpl {
 
 /// Stop the session when no message went in either direction for
 /// `timeout`.
-async fn stop_when_idle(state: Rc<SessionState>, timeout: Duration) {
+pub(super) async fn stop_when_idle(state: Rc<SessionState>, timeout: Duration) {
     loop {
         let deadline = state.last_active() + timeout;
         if deadline <= Instant::now() {
@@ -222,6 +259,25 @@ async fn stop_when_idle(state: Rc<SessionState>, timeout: Duration) {
             () = tokio::time::sleep_until(deadline) => {}
             () = state.stop.cancelled() => return,
         }
+    }
+}
+
+/// Wait until [`SINK_GRACE`] after the stop signal `stop`. A sink call
+/// that has no answer at that time stops.
+pub(super) async fn sink_grace_over(stop: CancellationToken) {
+    stop.cancelled().await;
+    tokio::time::sleep(SINK_GRACE).await;
+}
+
+/// Tell the guest sink `sink` that the session ended with `reason`. Waits
+/// at most [`SINK_GRACE`] for the answer.
+pub(super) async fn send_closed(sink: &mcp_sink::Client, reason: &str) {
+    let mut request = sink.closed_request();
+    request.get().set_reason(reason);
+    match tokio::time::timeout(SINK_GRACE, request.send().promise).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::debug!("mcp sink closed: {e}"),
+        Err(_) => tracing::debug!("mcp sink closed: no answer"),
     }
 }
 
@@ -312,6 +368,8 @@ async fn relay_stdout(
     let stop = state.stop.clone();
     let mut reader = BufReader::new(stdout);
     let mut line = Vec::new();
+    let grace_over = sink_grace_over(stop.clone());
+    tokio::pin!(grace_over);
     let problem = loop {
         match read_line(&mut reader, &mut line, MAX_LINE).await {
             Ok(Line::Complete) => {}
@@ -328,8 +386,16 @@ async fn relay_stdout(
         let mut request = sink.message_request();
         request.get().set_message(text);
         // Wait for each call. This keeps the order, and a slow guest slows
-        // the server output instead of filling host memory.
-        if let Err(e) = request.send().promise.await {
+        // the server output instead of filling host memory. After the stop,
+        // the wait has a time limit.
+        let sent = tokio::select! {
+            sent = request.send().promise => sent,
+            () = &mut grace_over => {
+                tracing::debug!("mcp sink: no answer after the stop");
+                break None;
+            }
+        };
+        if let Err(e) = sent {
             // The guest cannot get messages any more. Thus the session has
             // no use.
             tracing::debug!("mcp sink: {e}");
@@ -355,11 +421,7 @@ async fn relay_stdout(
     // The session ended. This also tells the host to forget it.
     stop.cancel();
     let reason = state.reason.borrow_mut().take().unwrap_or(exited);
-    let mut request = sink.closed_request();
-    request.get().set_reason(&reason);
-    if let Err(e) = request.send().promise.await {
-        tracing::debug!("mcp sink closed: {e}");
-    }
+    send_closed(&sink, &reason).await;
 }
 
 /// Write each stderr line of the server to the log.

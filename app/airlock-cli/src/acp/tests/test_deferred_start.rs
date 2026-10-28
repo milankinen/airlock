@@ -12,11 +12,12 @@ use crate::test_cfg::block_on_local;
 /// only in the session request, and the agent must not get host features.
 ///   1. Send `initialize` with all client features and check the proxy
 ///      result and that no agent started
-///   2. Send `session/new` in a sub dir of sandbox `a`, with an MCP server
-///      that runs in the editor
+///   2. Send `session/new` in a sub dir of sandbox `a`, with editor MCP
+///      servers
 ///   3. Check that the agent got version 1 handshake params with only the
 ///      allowed features
-///   4. Check that the agent got the guest dir and no editor MCP server
+///   4. Check that the agent got the guest dir and no editor MCP servers:
+///      the MCP bridge is off
 ///   5. Send `initialize` again and check that the proxy answers it and
 ///      the agent does not get it
 #[test]
@@ -36,6 +37,7 @@ fn first_session_starts_agent_with_filtered_handshake() {
         });
         let result = client.initialize(caps).await;
         assert_eq!(result["protocolVersion"], 1);
+        assert!(result["agentCapabilities"].get("mcpCapabilities").is_none());
         assert_eq!(result["agentInfo"]["title"], "fake-agent (airlock)");
         assert_eq!(starts.get(), 0);
 
@@ -57,7 +59,7 @@ fn first_session_starts_agent_with_filtered_handshake() {
         );
         assert_eq!(got[1]["method"], "session/new");
         assert_eq!(got[1]["params"]["cwd"], "/work/sub");
-        assert_eq!(got[1]["params"]["mcpServers"], json!([servers[0]]));
+        assert_eq!(got[1]["params"]["mcpServers"], json!([]));
 
         let (response, _) = client.request(3, "initialize", json!({})).await;
         assert_eq!(response["result"]["agentInfo"]["name"], "airlock");

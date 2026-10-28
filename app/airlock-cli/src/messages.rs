@@ -43,10 +43,9 @@ pub mod acp {
     /// Error when the agent cannot load sessions.
     pub const NO_LOAD_SESSION: &str = "the agent does not support 'session/load'";
 
-    /// Error for an MCP server transport that the agent does not support.
-    pub fn missing_mcp_transport(transport: impl Display) -> String {
-        format!("the agent does not support '{transport}' MCP servers")
-    }
+    /// Close reason that the sandbox gets for the MCP sessions of an editor
+    /// session that ended.
+    pub const MCP_SESSION_ENDED: &str = "the editor session of this MCP server ended";
 
     /// Error for prompt content that the agent does not support.
     pub fn missing_prompt_content(content: impl Display) -> String {
@@ -1195,6 +1194,78 @@ pub mod mcp {
     /// `what` is "session" or "name".
     pub fn bad_route_id(what: impl Display, value: impl Display) -> String {
         format!("invalid MCP {what} '{value}': use 1-64 characters of A-Z, a-z, 0-9, _ and -")
+    }
+
+    /// Error when the guest opens a session after the host closed the
+    /// MCP servers.
+    pub fn host_closed(name: impl Display) -> String {
+        format!("MCP server `{name}` is closed")
+    }
+
+    /// Error when the URL of a remote MCP server is not valid.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn remote_bad_url(err: impl Display) -> String {
+        format!("invalid MCP server URL: {err}")
+    }
+
+    /// Error when the URL of a remote MCP server is not `http` or `https`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn remote_bad_scheme(scheme: impl Display) -> String {
+        format!("MCP server URL scheme `{scheme}` is not supported: use http or https")
+    }
+
+    /// Error when a header name of a remote MCP server is not valid.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn remote_bad_header_name(name: impl Display) -> String {
+        format!("invalid MCP server header name `{name}`")
+    }
+
+    /// Error when a header of a remote MCP server has a name that the
+    /// relay sets itself.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn remote_reserved_header(name: impl Display) -> String {
+        format!("MCP server header `{name}` is set by airlock")
+    }
+
+    /// Error when a header value of a remote MCP server is not valid. The
+    /// value is not shown: it can be a secret.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn remote_bad_header_value(name: impl Display) -> String {
+        format!("invalid value of MCP server header `{name}`")
+    }
+
+    /// Error when the host cannot open the event stream of a legacy SSE
+    /// MCP server. The details go to the log.
+    pub fn remote_connect_failed(name: impl Display) -> String {
+        format!("MCP server `{name}`: cannot connect, see the log")
+    }
+
+    /// JSON-RPC error message when the request to a remote MCP server
+    /// fails. The details go to the log.
+    pub const REMOTE_REQUEST_FAILED: &str = "MCP server request failed";
+
+    /// Close reason when the remote MCP server does not know the session
+    /// any more.
+    pub const REMOTE_SESSION_EXPIRED: &str = "MCP server session expired";
+
+    /// Close reason when the remote MCP server gives a session ID that is
+    /// not valid.
+    pub const REMOTE_BAD_SESSION_ID: &str = "MCP server sent an invalid session ID";
+
+    /// Close reason when the event stream of a legacy SSE MCP server ends.
+    pub const REMOTE_STREAM_ENDED: &str = "MCP server event stream ended";
+
+    /// Close reason when a remote MCP session stops with no other reason.
+    pub const REMOTE_SESSION_ENDED: &str = "MCP session ended";
+
+    /// Error when the guest sends a message to a remote MCP session that
+    /// stopped.
+    pub const REMOTE_SESSION_CLOSED: &str = "MCP session is closed";
+
+    /// Close reason when a remote MCP server sends a message that is too
+    /// long.
+    pub fn remote_too_long(max: impl Display) -> String {
+        format!("MCP server sent a message longer than {max} bytes")
     }
 }
 

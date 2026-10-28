@@ -6,6 +6,8 @@ pub mod config;
 pub mod context;
 pub mod home;
 pub mod mcp_grant;
+pub mod mcp_remote;
+pub mod mcp_session;
 pub mod network;
 pub mod oci;
 pub mod packs;

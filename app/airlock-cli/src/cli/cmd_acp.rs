@@ -10,6 +10,7 @@ use crate::context::Context;
 use crate::{acp, cli, messages, oci};
 
 /// CLI arguments for `airlock acp`.
+#[allow(clippy::struct_excessive_bools)] // independent flags
 #[derive(Args, Debug)]
 pub struct AcpArgs {
     /// Log level of the proxy log file (acp.log in the airlock data dir)
@@ -22,6 +23,10 @@ pub struct AcpArgs {
     /// In a git worktree, also look for the sandbox of the main repository
     #[arg(long)]
     pub follow_git_worktree: bool,
+    /// Give the agent the MCP servers of the editor. They run on the host,
+    /// and their tools act on the host
+    #[arg(long)]
+    pub proxy_mcp_servers: bool,
     /// Environment variables for the agent (KEY=VALUE)
     #[arg(short = 'e', long = "env")]
     pub env: Vec<String>,
@@ -53,6 +58,7 @@ pub async fn main(
         log_level,
         pass_client_capabilities,
         follow_git_worktree,
+        proxy_mcp_servers,
         env,
         login,
         cmd,
@@ -80,6 +86,7 @@ pub async fn main(
         env,
         pass_client_capabilities,
         follow_git_worktree,
+        proxy_mcp_servers,
     };
     acp::run(context, options).await
 }

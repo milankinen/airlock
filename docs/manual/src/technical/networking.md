@@ -87,7 +87,9 @@ and connects to whatever that returns.
 
 The supervisor reserves the `airlock` domain for its own services, for
 example `admin.airlock` and the [MCP servers](../configuration/mcp.md)
-at `mcp.airlock`. It resolves all `*.airlock` names to the guest
+at `mcp.airlock`. The MCP servers of an editor session
+([`airlock acp`](../tips/editor-acp.md#editor-mcp-servers)) use the
+run-time name `acp.mcp.airlock`. It resolves all `*.airlock` names to the guest
 loopback address and serves them itself. These names do not get a
 synthetic IP and never leave the VM.
 

@@ -79,6 +79,7 @@ pub fn kind(msg: &Value) -> Option<Kind<'_>> {
 /// Args:
 ///  - `title`: Name of the agent that the client shows
 ///  - `version`: Version of airlock
+///  - `proxy_mcp_servers`: The proxy bridges the editor MCP servers
 ///
 /// Returns:
 ///   The `initialize` result.
@@ -87,17 +88,23 @@ pub fn kind(msg: &Value) -> Option<Kind<'_>> {
 // reply has only features that the common agents support. When the real
 // agent runs, the proxy refuses the client requests that use a feature
 // that the agent does not have (see `check_client_request`).
-pub fn initialize_result(title: &str, version: &str) -> Value {
-    json!({
+//
+// The proxy itself serves the editor MCP servers to the agent over HTTP.
+// Thus it can take HTTP and SSE servers also when the agent has only HTTP.
+pub fn initialize_result(title: &str, version: &str, proxy_mcp_servers: bool) -> Value {
+    let mut result = json!({
         "protocolVersion": PROTOCOL_VERSION,
         "agentCapabilities": {
             "loadSession": true,
             "promptCapabilities": { "image": true, "embeddedContext": true },
-            "mcpCapabilities": { "http": true },
         },
         "authMethods": [],
         "agentInfo": { "name": "airlock", "title": title, "version": version },
-    })
+    });
+    if proxy_mcp_servers {
+        result["agentCapabilities"]["mcpCapabilities"] = json!({ "http": true, "sse": true });
+    }
+    result
 }
 
 /// Make the `initialize` params for the agent from the client params.
@@ -187,19 +194,6 @@ pub fn check_agent_message(msg: &Value) -> AgentVerdict {
     }
 }
 
-/// Remove the MCP servers that run in the client (`type` is `acp`) from
-/// the request params. Their tools act on the host.
-/// Returns:
-///   `true` if a server was removed.
-pub fn remove_client_mcp_servers(params: &mut Value) -> bool {
-    let Some(servers) = params.get_mut("mcpServers").and_then(Value::as_array_mut) else {
-        return false;
-    };
-    let before = servers.len();
-    servers.retain(|s| s.get("type").and_then(Value::as_str) != Some("acp"));
-    servers.len() != before
-}
-
 /// Check a client request against the features of the agent.
 /// Args:
 ///  - `method`: Method of the request
@@ -219,21 +213,6 @@ pub fn check_client_request(
     let has = |pointer: &str| agent.pointer(pointer).and_then(Value::as_bool) == Some(true);
     if method == "session/load" && !has("/agentCapabilities/loadSession") {
         return Err((METHOD_NOT_FOUND, messages::acp::NO_LOAD_SESSION.into()));
-    }
-    let servers = params.get("mcpServers").and_then(Value::as_array);
-    for server in servers.into_iter().flatten() {
-        let transport = server.get("type").and_then(Value::as_str);
-        let missing = match transport {
-            Some("http") => !has("/agentCapabilities/mcpCapabilities/http"),
-            Some("sse") => !has("/agentCapabilities/mcpCapabilities/sse"),
-            _ => false,
-        };
-        if let (true, Some(transport)) = (missing, transport) {
-            return Err((
-                INVALID_PARAMS,
-                messages::acp::missing_mcp_transport(transport),
-            ));
-        }
     }
     if method == "session/prompt" {
         let blocks = params.get("prompt").and_then(Value::as_array);
@@ -342,9 +321,10 @@ mod tests {
     /// Test that the proxy refuses the client requests for agent features
     /// that the real agent does not have, and lets the others go.
     ///   1. Use an agent with no features
-    ///   2. Check that session load, HTTP MCP servers, and image, audio
-    ///      and embedded prompt content are refused
-    ///   3. Check that a text prompt and a local MCP server are allowed
+    ///   2. Check that session load, and image, audio and embedded prompt
+    ///      content are refused
+    ///   3. Check that a text prompt and a session with MCP servers are
+    ///      allowed. The proxy bridges the servers itself
     #[test]
     fn client_requests_for_missing_agent_features_are_refused() {
         let agent = json!({ "protocolVersion": 1, "agentCapabilities": {} });
@@ -352,15 +332,16 @@ mod tests {
             check_client_request(method, &params, &agent).unwrap_err().0
         };
         assert_eq!(refused("session/load", json!({})), METHOD_NOT_FOUND);
-        let http = json!({ "mcpServers": [{ "type": "http", "url": "http://x" }] });
-        assert_eq!(refused("session/new", http), INVALID_PARAMS);
         for block in ["image", "audio", "resource"] {
             let prompt = json!({ "prompt": [{ "type": block }] });
             assert_eq!(refused("session/prompt", prompt), INVALID_PARAMS);
         }
         let ok = json!({
             "prompt": [{ "type": "text", "text": "hi" }],
-            "mcpServers": [{ "name": "local", "command": "x" }],
+            "mcpServers": [
+                { "name": "local", "command": "x" },
+                { "type": "sse", "name": "remote", "url": "http://x" },
+            ],
         });
         assert!(check_client_request("session/prompt", &ok, &agent).is_ok());
         assert!(check_client_request("session/new", &ok, &agent).is_ok());

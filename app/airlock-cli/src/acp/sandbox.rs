@@ -2,7 +2,8 @@
 //!
 //! Finds the running sandbox of a session dir and starts the agent there,
 //! the same as `airlock exec` does. Relays the agent input, output, exit,
-//! signals and kill over the connection to the sandbox.
+//! signals and kill over the connection to the sandbox. The same connection
+//! adds the editor MCP servers to the sandbox.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -80,10 +81,13 @@ impl AgentStarter for SandboxStarter<'_> {
         tokio::task::spawn_local(relay_events(proc.clone(), events_tx, done));
         let (control, control_rx) = mpsc::unbounded_channel();
         tokio::task::spawn_local(relay_control(proc, control_rx));
+        // The editor MCP servers go to the sandbox over the connection of
+        // the agent. They thus end at the latest when the agent exits.
         let agent = AgentProcess {
             input,
             events,
             control,
+            mcp: Some(client.service),
         };
         Ok((location, agent))
     }

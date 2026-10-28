@@ -64,11 +64,22 @@ prompts and session updates work.
 > With `--pass-client-capabilities`, the agent can run commands and
 > change files on the host. Use it only for an agent that you trust.
 
+## Editor MCP servers
+
+`--proxy-mcp-servers` gives the agent the MCP servers of the editor.
+airlock serves them from the host and the agent connects to them through
+`http://acp.mcp.airlock/<key>/<name>`. They stop when the session ends.
+
+> [!WARNING]
+> With `--proxy-mcp-servers`, the MCP tools act on the host with your
+> rights. Use it only for editor servers that you trust.
+
 ## Options
 
 | Option                       | Effect                                                    |
 |------------------------------|-----------------------------------------------------------|
 | `--pass-client-capabilities` | Give the agent all editor features                        |
+| `--proxy-mcp-servers`        | Bridge the MCP servers of the editor to the agent         |
 | `--follow-git-worktree`      | In a [git worktree](../usage/attaching-to-running-sandbox.md#git-worktrees), also use the sandbox of the main repository |
 | `-e KEY=VALUE`               | Set an environment variable for the agent, as in `airlock exec` |
 | `-l`, `--login`              | Start the agent in a login shell, as in `airlock exec`    |

@@ -6,6 +6,11 @@
 //! both directions and applies the message rules. Stops the agent when the
 //! client closes, and gives the exit code of the agent.
 //!
+//! The editor MCP servers of a session request go to the sandbox before
+//! the agent gets the request. In that time, the proxy does not read more
+//! client lines, but still relays the agent output and the signals. The
+//! client lines keep their order.
+//!
 //! The memory use has a limit. The proxy stops an agent that writes a too
 //! long line or does not read its input. A slow client slows the agent.
 //! The agent stderr never stops the proxy. When the host stderr is slow,
@@ -24,7 +29,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use super::filter::{self, AgentVerdict, Kind};
-use super::{AgentProcess, AgentStarter, Control, Location};
+use super::{AgentProcess, AgentStarter, Control, Location, mcp};
 use crate::runtime::SignalStream;
 use crate::{messages, rpc};
 
@@ -40,6 +45,12 @@ pub struct ProxyConfig {
     pub version: String,
     /// Remove the client features that let the agent act on the host.
     pub restrict: bool,
+    /// Bridge the editor MCP servers into the sandbox. If not set, the
+    /// agent gets no editor MCP servers.
+    pub proxy_mcp_servers: bool,
+    /// Maximum time to register the editor MCP servers of one session
+    /// request.
+    pub mcp_register_timeout: Duration,
     /// Maximum time from the agent start to the end of the handshake.
     pub handshake_timeout: Duration,
     /// Time that the agent has to exit after the client closes, and again
@@ -58,6 +69,10 @@ pub struct ProxyConfig {
 /// stderr. A full client queue stops the proxy until the client reads. A
 /// full stderr queue drops the agent stderr.
 const WRITER_QUEUE: usize = 4;
+
+/// Maximum number of client lines that wait for the proxy. A full queue
+/// stops the read of the client input.
+const READER_QUEUE: usize = 16;
 
 /// Agent start that runs.
 type Launch<'a> = Pin<Box<dyn Future<Output = anyhow::Result<(Location, AgentProcess)>> + 'a>>;
@@ -101,8 +116,12 @@ where
         deadline: None,
         signals: None,
         err_dropped: 0,
+        mcp: mcp::Registry::default(),
+        registration: None,
+        held: None,
     };
     let code = proxy.run().await;
+    proxy.end_mcp().await;
     if proxy.err_dropped > 0 {
         tracing::info!(bytes = proxy.err_dropped, "dropped agent stderr");
     }
@@ -140,15 +159,55 @@ impl Peer {
 }
 
 /// Log a message at the trace level, as `<from> -> <to>: <message>`.
+/// The log does not show the env and header values of the editor MCP
+/// servers in client messages.
 fn trace_message(sandbox: &str, from: Peer, to: Peer, line: &[u8]) {
+    if !tracing::enabled!(tracing::Level::TRACE) {
+        return;
+    }
     let line = line.strip_suffix(b"\n").unwrap_or(line);
+    let hidden = match from {
+        Peer::Client => hide_mcp_secrets(line),
+        Peer::Agent | Peer::Airlock => None,
+    };
     tracing::trace!(
         sandbox,
         "{} -> {}: {}",
         from.name(),
         to.name(),
-        String::from_utf8_lossy(line)
+        String::from_utf8_lossy(hidden.as_deref().unwrap_or(line))
     );
+}
+
+/// Text that replaces a secret value in the log.
+const HIDDEN: &str = "***";
+
+/// Replace the env and header values of each editor MCP server in the
+/// client message `line` with [`HIDDEN`].
+/// Returns:
+///   The changed line, or `None` if the line has no MCP server list.
+fn hide_mcp_secrets(line: &[u8]) -> Option<Vec<u8>> {
+    let mut msg: Value = serde_json::from_slice(line).ok()?;
+    let servers = msg.pointer_mut("/params/mcpServers")?.as_array_mut()?;
+    for server in servers {
+        for field in ["env", "headers"] {
+            match server.get_mut(field) {
+                Some(Value::Array(items)) => {
+                    for value in items.iter_mut().filter_map(|i| i.get_mut("value")) {
+                        *value = HIDDEN.into();
+                    }
+                }
+                // Not valid ACP, but the values can still be secrets.
+                Some(Value::Object(map)) => {
+                    for value in map.values_mut() {
+                        *value = HIDDEN.into();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Some(msg.to_string().into_bytes())
 }
 
 /// Phase of the proxy.
@@ -196,7 +255,7 @@ struct Proxy<'a, S> {
     /// Number of agent stderr bytes that the proxy dropped.
     err_dropped: u64,
     /// Lines from the client. Closes at the client end of file.
-    client: mpsc::UnboundedReceiver<Vec<u8>>,
+    client: mpsc::Receiver<Vec<u8>>,
     /// Client `initialize` params after the filter.
     init_params: Option<Value>,
     phase: Phase,
@@ -207,6 +266,15 @@ struct Proxy<'a, S> {
     deadline: Option<Instant>,
     /// Host signals from the first agent start.
     signals: Option<SignalStream>,
+    /// Editor MCP servers of the sessions.
+    mcp: mcp::Registry,
+    /// Registration of the editor MCP servers of a session request that
+    /// runs.
+    registration: Option<mcp::Registration>,
+    /// Client lines that the proxy read before a registration started,
+    /// and that come after its session request. They go to the agent after
+    /// the session request.
+    held: Option<Vec<Vec<u8>>>,
 }
 
 impl<'a, S: AgentStarter> Proxy<'a, S> {
@@ -220,13 +288,19 @@ impl<'a, S: AgentStarter> Proxy<'a, S> {
             // side must not stop the other side. Each side has one channel,
             // so the messages of one side keep their order.
             tokio::select! {
-                line = self.client.recv() => match line {
+                // A registration does not keep the new client lines. The
+                // full reader queue then stops the read of the client.
+                line = self.client.recv(), if self.registration.is_none() => match line {
                     Some(line) => self.on_client_line(line).await,
                     None => return self.on_client_end().await,
                 },
                 started = next_launch(&mut self.launch) => {
                     self.launch = None;
                     self.on_launched(started).await;
+                }
+                registered = next_registration(&mut self.registration) => {
+                    self.registration = None;
+                    self.on_registered(registered).await;
                 }
                 event = next_event(&mut self.agent) => {
                     if let Some(code) = self.on_agent_event(event).await {
@@ -248,6 +322,10 @@ impl<'a, S: AgentStarter> Proxy<'a, S> {
 
     /// Handle one line from the client.
     async fn on_client_line(&mut self, line: Vec<u8>) {
+        if let Some(held) = &mut self.held {
+            held.push(line);
+            return;
+        }
         match &mut self.phase {
             Phase::Idle => self.on_idle_line(line).await,
             // The agent gets these lines in order after the handshake.
@@ -424,7 +502,11 @@ impl<'a, S: AgentStarter> Proxy<'a, S> {
         let mut changed = false;
         let sandbox = sandbox.clone();
         let agent_init = agent_init.clone();
-        if let Some(cwd) = msg.pointer("/params/cwd").and_then(Value::as_str) {
+        let host_cwd = msg
+            .pointer("/params/cwd")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if let Some(cwd) = &host_cwd {
             match self.guest_cwd(cwd, &sandbox).await {
                 Ok(guest_cwd) => {
                     tracing::info!(method, cwd, sandbox, guest_cwd, "session request");
@@ -443,17 +525,95 @@ impl<'a, S: AgentStarter> Proxy<'a, S> {
         }
         let mut no_params = Value::Null;
         let params = msg.get_mut("params").unwrap_or(&mut no_params);
-        if self.config.restrict && filter::remove_client_mcp_servers(params) {
-            tracing::debug!(method, sandbox, "remove client MCP servers");
-            changed = true;
-        }
         if let Err(error) = filter::check_client_request(&method, params, &agent_init) {
             trace_message(&sandbox, Peer::Client, Peer::Airlock, &line);
             tracing::debug!(method, sandbox, "refuse client request: {}", error.1);
             self.reply(&id, Err(error)).await;
             return;
         }
-        self.send_agent(Peer::Client, if changed { to_line(&msg) } else { line });
+        let bridge =
+            self.config.proxy_mcp_servers && mcp::SESSION_METHODS.contains(&method.as_str());
+        if !bridge {
+            let removed = mcp::remove_all(params);
+            if removed > 0 {
+                tracing::info!(
+                    method,
+                    sandbox,
+                    removed,
+                    "remove editor MCP servers: --proxy-mcp-servers is not set"
+                );
+                changed = true;
+            }
+            if method == "session/close" {
+                self.mcp.track_close(&id, params);
+            }
+            self.send_agent(Peer::Client, if changed { to_line(&msg) } else { line });
+            return;
+        }
+        let request = mcp::SessionRequest {
+            method: &method,
+            id: &id,
+            host_cwd: host_cwd.as_deref(),
+            restrict: self.config.restrict,
+            agent_init: &agent_init,
+            registrar: self.agent.as_ref().and_then(|a| a.process.mcp.clone()),
+            timeout: self.config.mcp_register_timeout,
+            sandbox: &sandbox,
+        };
+        match self.mcp.prepare(request, msg) {
+            // The request and the later client lines wait for the end of
+            // the registration. The agent output and the signals do not.
+            // Lines that the proxy read already wait in the held list.
+            Ok(registration) => {
+                self.registration = Some(registration);
+                self.held = Some(Vec::new());
+            }
+            // The line can have env and header values. Thus the log does
+            // not show it.
+            Err(error) => {
+                tracing::warn!(method, sandbox, "refuse session request: {}", error.1);
+                self.reply(&id, Err(error)).await;
+            }
+        }
+    }
+
+    /// Send the session request with its sandbox MCP servers to the agent.
+    /// Then handle the client lines that came in the time of the
+    /// registration.
+    async fn on_registered(&mut self, registered: mcp::Registered) {
+        let msg = self.mcp.add(registered);
+        self.send_agent(Peer::Client, to_line(&msg));
+        for line in self.held.take().unwrap_or_default() {
+            self.on_client_line(line).await;
+        }
+    }
+
+    /// Release all editor MCP servers at the proxy end. Waits for the
+    /// sandbox and the remote servers in the shutdown grace. A signal
+    /// stops the wait.
+    async fn end_mcp(&mut self) {
+        // A registration that did not complete drops its servers. Its
+        // request and the held lines never go to the agent, the same as the
+        // lines that wait for the agent handshake.
+        self.registration = None;
+        for line in self.held.take().unwrap_or_default() {
+            trace_message("-", Peer::Client, Peer::Airlock, &line);
+        }
+        let releases = self.mcp.release_all();
+        let done = async {
+            releases.await;
+            crate::mcp::deletes_done().await;
+        };
+        tokio::select! {
+            result = tokio::time::timeout(self.config.shutdown_grace, done) => {
+                if result.is_err() {
+                    tracing::info!("MCP server release did not complete");
+                }
+            }
+            signum = next_signal(&mut self.signals) => {
+                tracing::info!(signum, "skip MCP server release");
+            }
+        }
     }
 
     /// Get the guest path of the session dir `cwd`.
@@ -587,6 +747,12 @@ impl<'a, S: AgentStarter> Proxy<'a, S> {
             self.on_handshake_reply(msg).await;
             return;
         }
+        // The editor MCP servers follow the session state in both modes.
+        if let Some(msg) = &parsed
+            && let Some(Kind::Response { id }) = filter::kind(msg)
+        {
+            self.mcp.on_response(id, msg);
+        }
         if !self.config.restrict {
             if let Some(mut msg) = parsed
                 && filter::add_auth_hint(&mut msg, &self.config.name)
@@ -700,6 +866,12 @@ impl<'a, S: AgentStarter> Proxy<'a, S> {
         self.control(Control::Kill);
         self.agent = None;
         self.deadline = None;
+        // Servers are registered only after the handshake. Thus no set
+        // exists here now. Release anyway, so that no set can outlive the
+        // agent of its sandbox.
+        self.registration = None;
+        self.held = None;
+        tokio::task::spawn_local(self.mcp.release_all());
         let Phase::Starting {
             request,
             id,
@@ -849,7 +1021,11 @@ impl<'a, S: AgentStarter> Proxy<'a, S> {
 
     /// The `initialize` result that the proxy gives to the client.
     fn initialize_result(&self) -> Value {
-        filter::initialize_result(&self.config.title, &self.config.version)
+        filter::initialize_result(
+            &self.config.title,
+            &self.config.version,
+            self.config.proxy_mcp_servers,
+        )
     }
 }
 
@@ -857,6 +1033,15 @@ impl<'a, S: AgentStarter> Proxy<'a, S> {
 async fn next_launch(launch: &mut Option<Launch<'_>>) -> anyhow::Result<(Location, AgentProcess)> {
     match launch {
         Some(launch) => launch.as_mut().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Wait for the end of the MCP server registration. Waits forever if no
+/// registration runs.
+async fn next_registration(registration: &mut Option<mcp::Registration>) -> mcp::Registered {
+    match registration {
+        Some(registration) => registration.as_mut().await,
         None => std::future::pending().await,
     }
 }
@@ -895,14 +1080,12 @@ async fn next_signal(signals: &mut Option<SignalStream>) -> i32 {
 }
 
 /// Read the client lines in a task. The lines keep their bytes, also when
-/// they are not UTF-8.
+/// they are not UTF-8. When [`READER_QUEUE`] lines wait, the read waits.
 /// Returns:
 ///   Receiver of the lines without their newline. It closes at the end of
 ///   the input or at a read error.
-fn spawn_reader<R: AsyncBufRead + Unpin + 'static>(
-    mut input: R,
-) -> mpsc::UnboundedReceiver<Vec<u8>> {
-    let (tx, rx) = mpsc::unbounded_channel();
+fn spawn_reader<R: AsyncBufRead + Unpin + 'static>(mut input: R) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel(READER_QUEUE);
     tokio::task::spawn_local(async move {
         loop {
             let mut line = Vec::new();
@@ -912,7 +1095,7 @@ fn spawn_reader<R: AsyncBufRead + Unpin + 'static>(
                     if line.last() == Some(&b'\n') {
                         line.pop();
                     }
-                    if tx.send(line).is_err() {
+                    if tx.send(line).await.is_err() {
                         return;
                     }
                 }
@@ -961,4 +1144,40 @@ fn with_newline(mut bytes: Vec<u8>) -> Vec<u8> {
         bytes.push(b'\n');
     }
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// Test that the trace log of a client session request does not show
+    /// the env and header values of the editor MCP servers. They can be
+    /// API keys and tokens.
+    ///   1. Make a session request with a stdio server with env and a
+    ///      remote server with headers
+    ///   2. Check that the values are hidden and the names stay
+    #[test]
+    fn session_request_trace_hides_env_and_header_values() {
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "session/new",
+            "params": {"cwd": "/p", "mcpServers": [
+                {"name": "a", "command": "x", "args": [],
+                 "env": [{"name": "API_KEY", "value": "secret-env"}]},
+                {"type": "http", "name": "b", "url": "https://h/mcp",
+                 "headers": [{"name": "Authorization", "value": "secret-header"}]},
+            ]},
+        });
+        let hidden = hide_mcp_secrets(request.to_string().as_bytes()).unwrap();
+        let text = String::from_utf8(hidden).unwrap();
+        assert!(!text.contains("secret"), "{text}");
+        let hidden: Value = serde_json::from_str(&text).unwrap();
+        let servers = &hidden["params"]["mcpServers"];
+        assert_eq!(
+            servers[0]["env"][0],
+            json!({"name": "API_KEY", "value": HIDDEN})
+        );
+        assert_eq!(servers[1]["headers"][0]["name"], "Authorization");
+    }
 }

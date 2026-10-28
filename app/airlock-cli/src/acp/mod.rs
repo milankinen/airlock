@@ -9,16 +9,22 @@
 //!
 //! By default, the proxy removes the client features that let the agent
 //! act on the host (host commands, host file access, login terminal, URL
-//! prompts, MCP servers in the editor). It lets through only the agent
-//! messages that the remaining features use, and refuses the other agent
-//! requests.
+//! prompts). It lets through only the agent messages that the remaining
+//! features use, and refuses the other agent requests.
+//!
+//! The proxy also removes the MCP servers that the editor gives for a
+//! session. If the user enables it, the proxy runs or reaches these
+//! servers on the host instead, and gives them to the agent as HTTP
+//! servers in the sandbox. Their tools then act on the host.
 
 pub mod filter;
+mod mcp;
 mod proxy;
 mod sandbox;
 
 use std::time::Duration;
 
+use airlock_common::cli_capnp::cli_service;
 pub use proxy::{ProxyConfig, serve};
 use tokio::sync::mpsc;
 
@@ -34,6 +40,10 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_mins(1);
 /// Time that the agent has to exit after the client closes, and again
 /// after the kill.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Maximum time to register the editor MCP servers of one session request
+/// in the sandbox.
+const MCP_REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum length of one agent output line. The proxy keeps a line in
 /// memory until its end. A longer line stops the agent.
@@ -59,6 +69,9 @@ pub struct Options {
     pub pass_client_capabilities: bool,
     /// In a git worktree, also look for the sandbox of the main repository.
     pub follow_git_worktree: bool,
+    /// Bridge the editor MCP servers into the sandbox. If not set, the
+    /// agent gets no editor MCP servers.
+    pub proxy_mcp_servers: bool,
 }
 
 /// The sandbox of a session dir.
@@ -88,6 +101,9 @@ pub struct AgentProcess {
     pub events: mpsc::Receiver<rpc::ProcessEvent>,
     /// Signal and kill requests.
     pub control: mpsc::UnboundedSender<Control>,
+    /// CLI service of the sandbox that adds the editor MCP servers, or
+    /// `None` if the sandbox cannot add them.
+    pub mcp: Option<cli_service::Client>,
 }
 
 /// Starts agents for session dirs.
@@ -125,6 +141,8 @@ pub async fn run(context: &Context, options: Options) -> anyhow::Result<i32> {
         name: options.name,
         argv: options.argv,
         restrict: !options.pass_client_capabilities,
+        proxy_mcp_servers: options.proxy_mcp_servers,
+        mcp_register_timeout: MCP_REGISTER_TIMEOUT,
         handshake_timeout: HANDSHAKE_TIMEOUT,
         shutdown_grace: SHUTDOWN_GRACE,
         max_line_bytes: MAX_LINE_BYTES,

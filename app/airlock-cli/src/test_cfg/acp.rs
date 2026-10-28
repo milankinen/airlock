@@ -1,5 +1,6 @@
 //! Helpers for the ACP proxy tests: a fake agent that runs as a local
-//! process, fake sandboxes, and a client that talks to the proxy.
+//! process, fake sandboxes, a fake sandbox that adds the editor MCP
+//! servers, and a client that talks to the proxy.
 
 use std::cell::{Cell, RefCell};
 use std::os::unix::process::ExitStatusExt;
@@ -7,6 +8,7 @@ use std::process::Stdio;
 use std::rc::Rc;
 use std::time::Duration;
 
+use airlock_common::cli_capnp::cli_service;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines};
 use tokio::sync::mpsc;
@@ -17,6 +19,7 @@ use crate::acp::{
 };
 use crate::rpc::ProcessEvent;
 use crate::runtime::SignalStream;
+use crate::test_cfg::mcp_grant::{FakeGrant, GrantEvent, Route};
 
 /// Fake ACP agent. It writes the lines of `$AGENT_PRE`, replies to the
 /// proxy handshake with `$AGENT_INIT` and then writes the lines of
@@ -31,6 +34,8 @@ use crate::runtime::SignalStream;
 ///    read no more input
 ///  - `AGENT_EOF`: Exit code at the end of the input, or `ignore` to wait
 ///    for the kill
+///  - `AGENT_SESSION_IDS`: Reply to `session/new` and `session/fork` with
+///    the result `{"sessionId":"s<N>"}`, where N counts from 1
 ///
 /// The notification `test/exit` makes it write a `session/update`
 /// notification with `params.last` and no newline, and exit with code 7.
@@ -59,7 +64,14 @@ while IFS= read -r line; do
       if [ -n "$AGENT_ERROR" ]; then
         printf '{"jsonrpc":"2.0","id":%s,"error":%s}\n' "$id" "$AGENT_ERROR"
       else
-        printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+        result='{}'
+        if [ -n "$AGENT_SESSION_IDS" ]; then
+          case "$line" in
+          *'"method":"session/new"'*|*'"method":"session/fork"'*)
+            n=$((${n:-0} + 1)); result="{\"sessionId\":\"s$n\"}" ;;
+          esac
+        fi
+        printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$result"
       fi ;;
     esac ;;
   esac
@@ -89,6 +101,10 @@ pub struct LocalStarter {
     env: Vec<(String, String)>,
     /// Number of agent starts.
     pub starts: Rc<Cell<usize>>,
+    /// Sandbox names and their project dirs on the host.
+    roots: Vec<(String, String)>,
+    /// Fake sandbox that adds the editor MCP servers.
+    registrar: Option<cli_service::Client>,
 }
 
 impl LocalStarter {
@@ -105,20 +121,37 @@ impl LocalStarter {
         Self {
             env,
             starts: Rc::default(),
+            roots: ["a", "b"]
+                .iter()
+                .map(|s| ((*s).into(), format!("/projects/{s}")))
+                .collect(),
+            registrar: None,
         }
+    }
+
+    /// Use the host dir `root` as the project dir of sandbox `a`.
+    pub fn with_root(mut self, root: &str) -> Self {
+        self.roots[0].1 = root.to_string();
+        self
+    }
+
+    /// Give the agents the fake sandbox `registrar` for the editor MCP
+    /// servers.
+    pub fn with_registrar(mut self, registrar: cli_service::Client) -> Self {
+        self.registrar = Some(registrar);
+        self
     }
 }
 
 impl AgentStarter for LocalStarter {
     async fn locate(&self, cwd: &str) -> anyhow::Result<Location> {
-        for sandbox in ["a", "b"] {
-            let root = format!("/projects/{sandbox}");
-            let Some(rest) = cwd.strip_prefix(&root) else {
+        for (sandbox, root) in &self.roots {
+            let Some(rest) = cwd.strip_prefix(root.as_str()) else {
                 continue;
             };
             if rest.is_empty() || rest.starts_with('/') {
                 return Ok(Location {
-                    sandbox: sandbox.into(),
+                    sandbox: sandbox.clone(),
                     guest_cwd: format!("/work{rest}"),
                 });
             }
@@ -129,7 +162,9 @@ impl AgentStarter for LocalStarter {
     async fn start(&self, cwd: &str, argv: &[String]) -> anyhow::Result<(Location, AgentProcess)> {
         let location = self.locate(cwd).await?;
         self.starts.set(self.starts.get() + 1);
-        Ok((location, spawn_agent(argv, &self.env)?))
+        let mut agent = spawn_agent(argv, &self.env)?;
+        agent.mcp = self.registrar.clone();
+        Ok((location, agent))
     }
 }
 
@@ -201,7 +236,98 @@ fn spawn_agent(argv: &[String], env: &[(String, String)]) -> anyhow::Result<Agen
         input,
         events,
         control,
+        mcp: None,
     })
+}
+
+/// Fake sandbox CLI service with only `addMcpServer`. It records the
+/// routes and reports the release and drop of each grant. The other
+/// methods fail.
+pub struct FakeRegistrar {
+    routes: mpsc::UnboundedSender<Route>,
+    events: mpsc::UnboundedSender<GrantEvent>,
+    /// Server names that never get a reply.
+    stuck: Vec<String>,
+}
+
+/// Test side of a [`FakeRegistrar`].
+pub struct Registrations {
+    routes: mpsc::UnboundedReceiver<Route>,
+    events: mpsc::UnboundedReceiver<GrantEvent>,
+}
+
+impl FakeRegistrar {
+    /// Make the fake service. The servers in `stuck` never get a reply.
+    /// Returns:
+    ///   The service for [`LocalStarter::with_registrar`], and its test
+    ///   side.
+    pub fn start(stuck: &[&str]) -> (cli_service::Client, Registrations) {
+        let (routes, routes_rx) = mpsc::unbounded_channel();
+        let (events, events_rx) = mpsc::unbounded_channel();
+        let stuck = stuck.iter().map(|s| (*s).to_string()).collect();
+        let client = capnp_rpc::new_client(Self {
+            routes,
+            events,
+            stuck,
+        });
+        let side = Registrations {
+            routes: routes_rx,
+            events: events_rx,
+        };
+        (client, side)
+    }
+}
+
+impl cli_service::Server for FakeRegistrar {
+    async fn add_mcp_server(
+        self: Rc<Self>,
+        params: cli_service::AddMcpServerParams,
+        mut results: cli_service::AddMcpServerResults,
+    ) -> Result<(), capnp::Error> {
+        let params = params.get()?;
+        let name = params.get_name()?.to_str()?.to_string();
+        if self.stuck.contains(&name) {
+            std::future::pending::<()>().await;
+        }
+        let _ = self.routes.send(Route {
+            session: params.get_session()?.to_str()?.to_string(),
+            name,
+            host: params.get_host()?,
+        });
+        results
+            .get()
+            .set_grant(capnp_rpc::new_client(FakeGrant::new(self.events.clone())));
+        Ok(())
+    }
+}
+
+impl Registrations {
+    /// The next route. Panics after 10 seconds without one.
+    pub async fn route(&mut self) -> Route {
+        tokio::time::timeout(Duration::from_secs(10), self.routes.recv())
+            .await
+            .expect("route in time")
+            .expect("open registrar")
+    }
+
+    /// The routes that came so far.
+    pub fn routes_now(&mut self) -> Vec<Route> {
+        std::iter::from_fn(|| self.routes.try_recv().ok()).collect()
+    }
+
+    /// Wait for `count` grant releases. Panics after 10 seconds.
+    pub async fn released(&mut self, count: usize) {
+        let mut seen = 0;
+        while seen < count {
+            let event = tokio::time::timeout(Duration::from_secs(10), self.events.recv())
+                .await
+                .expect("grant release in time")
+                .expect("open registrar");
+            if event == GrantEvent::Released {
+                seen += 1;
+            }
+        }
+    }
 }
 
 /// Proxy settings for the fake agent, with short time limits.
@@ -214,11 +340,31 @@ pub fn test_config(restrict: bool) -> ProxyConfig {
         title: "fake-agent (airlock)".into(),
         version: "test".into(),
         restrict,
+        proxy_mcp_servers: false,
+        mcp_register_timeout: Duration::from_secs(10),
         handshake_timeout: Duration::from_secs(10),
         shutdown_grace: Duration::from_millis(500),
         signals: Some(test_signals),
         max_line_bytes: 64 * 1024,
     }
+}
+
+/// [`test_config`] with the editor MCP bridge on.
+pub fn mcp_config(restrict: bool) -> ProxyConfig {
+    ProxyConfig {
+        proxy_mcp_servers: true,
+        ..test_config(restrict)
+    }
+}
+
+/// Key and server name of an MCP address that the agent got.
+/// Returns:
+///   The key and the name, or `None` if `url` is not an editor MCP
+///   address.
+pub fn mcp_route(url: &str) -> Option<(String, String)> {
+    let path = url.strip_prefix("http://acp.mcp.airlock/")?;
+    let (key, name) = path.split_once('/')?;
+    Some((key.to_string(), name.to_string()))
 }
 
 thread_local! {

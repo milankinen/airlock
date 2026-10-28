@@ -3,55 +3,15 @@
 //! and session limit.
 
 use std::path::Path;
-use std::rc::Rc;
 use std::time::Duration;
 
-use airlock_common::supervisor_capnp::{mcp_host, mcp_session, mcp_sink};
-use tokio::sync::mpsc;
+use airlock_common::supervisor_capnp::mcp_host;
 
+use crate::test_cfg::mcp_session::{Event, next, open, send};
 use crate::test_cfg::oci::verified_dir;
 use crate::test_cfg::{
     block_on_local, host_env_vault, resolve_project_toml, rpc_loopback, temp_dir,
 };
-
-/// What the guest sink got.
-#[derive(Debug, PartialEq, Eq)]
-enum Event {
-    Message(String),
-    Closed(String),
-}
-
-/// Guest sink that sends each call to a channel.
-struct Sink {
-    events: mpsc::UnboundedSender<Event>,
-    /// Fail each `message` call, as a guest that is gone.
-    fail: bool,
-}
-
-impl mcp_sink::Server for Sink {
-    async fn message(
-        self: Rc<Self>,
-        params: mcp_sink::MessageParams,
-        _results: mcp_sink::MessageResults,
-    ) -> Result<(), capnp::Error> {
-        let message = params.get()?.get_message()?.to_str()?.to_string();
-        let _ = self.events.send(Event::Message(message));
-        if self.fail {
-            return Err(capnp::Error::failed("guest gone".into()));
-        }
-        Ok(())
-    }
-
-    async fn closed(
-        self: Rc<Self>,
-        params: mcp_sink::ClosedParams,
-        _results: mcp_sink::ClosedResults,
-    ) -> Result<(), capnp::Error> {
-        let reason = params.get()?.get_reason()?.to_str()?.to_string();
-        let _ = self.events.send(Event::Closed(reason));
-        Ok(())
-    }
-}
 
 /// Serve the `[mcp]` servers of the project file `toml` to a guest client
 /// over RPC. The host env has `HOST_VAR=from-host`, and the servers run in
@@ -64,49 +24,6 @@ fn served(toml: &str, cwd: &Path) -> mcp_host::Client {
         .unwrap()
         .expect("enabled servers");
     rpc_loopback(capnp_rpc::new_client::<mcp_host::Client, _>(host).client)
-}
-
-/// Open a session of the server `name`. With `fail`, the sink fails each
-/// message call.
-/// Returns:
-///   The session and the receiver of the sink events, or the RPC error
-///   message.
-async fn open(
-    host: &mcp_host::Client,
-    name: &str,
-    fail: bool,
-) -> Result<(mcp_session::Client, mpsc::UnboundedReceiver<Event>), String> {
-    let (tx, rx) = mpsc::unbounded_channel();
-    let mut request = host.open_request();
-    request.get().set_name(name);
-    request
-        .get()
-        .set_sink(capnp_rpc::new_client::<mcp_sink::Client, _>(Sink {
-            events: tx,
-            fail,
-        }));
-    let response = request.send().promise.await.map_err(|e| e.to_string())?;
-    Ok((response.get().unwrap().get_session().unwrap(), rx))
-}
-
-/// Send `message` to the server. Returns the RPC error message on failure.
-async fn send(session: &mcp_session::Client, message: &str) -> Result<(), String> {
-    let mut request = session.send_request();
-    request.get().set_message(message);
-    request
-        .send()
-        .promise
-        .await
-        .map(|_| ())
-        .map_err(|e| e.to_string())
-}
-
-/// The next sink event. Panics after 10 seconds without one.
-async fn next(events: &mut mpsc::UnboundedReceiver<Event>) -> Event {
-    tokio::time::timeout(Duration::from_secs(10), events.recv())
-        .await
-        .expect("sink event in time")
-        .expect("open sink")
 }
 
 /// Check if the process `pid` runs. A zombie does not run.
@@ -497,5 +414,47 @@ fn exited_session_frees_its_place_in_limit() {
             next(&mut second_events).await,
             Event::Closed("MCP session limit reached (1 sessions)".into())
         );
+    });
+}
+
+/// Test that the close of the host stops its live sessions and refuses
+/// new ones. The owner closes the host this way after the host moved into
+/// an RPC capability.
+///   1. Open a session of a server that writes its process ID
+///   2. Close the host with its stopper
+///   3. Check that the guest gets the close with the given reason and
+///      that the process stops
+///   4. Check that a new open fails
+#[test]
+fn closed_host_stops_sessions_and_refuses_open() {
+    let dir = temp_dir();
+    block_on_local(async {
+        let config = resolve_project_toml(
+            "[mcp.pid]\ncommand = \"sh\"\nargs = [\"-c\", \"echo $$; exec cat\"]\n",
+        )
+        .unwrap()
+        .values;
+        let host =
+            crate::mcp::resolve(&config.mcp, &host_env_vault(&[]), &verified_dir(dir.path()))
+                .unwrap()
+                .expect("enabled servers");
+        let stopper = host.stopper();
+        let host = rpc_loopback(capnp_rpc::new_client::<mcp_host::Client, _>(host).client);
+        let (_session, mut events) = open(&host, "pid", false).await.unwrap();
+        let Event::Message(pid) = next(&mut events).await else {
+            panic!("no process ID");
+        };
+
+        stopper.close("editor session ended");
+        assert_eq!(
+            next(&mut events).await,
+            Event::Closed("editor session ended".into())
+        );
+        wait_stopped(&[pid.parse().unwrap()]).await;
+
+        let Err(err) = open(&host, "pid", false).await else {
+            panic!("closed host opened a session");
+        };
+        assert!(err.contains("MCP server `pid` is closed"), "{err}");
     });
 }

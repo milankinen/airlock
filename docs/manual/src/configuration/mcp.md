@@ -114,7 +114,7 @@ Set `enabled = false` to disable a server without removing the entry.
   stream after a lost connection.
 - airlock does not support JSON-RPC batches. It refuses an array body.
 - airlock refuses a request with an `Origin` header other than
-  `mcp.airlock`, `localhost` or `127.0.0.1`. It answers HTTP 403.
+  `mcp.airlock`, `acp.mcp.airlock`, `localhost` or `127.0.0.1`. It answers HTTP 403.
 - A line from the server that is longer than 16 MiB ends the session.
 - A message to the server fails when the server does not read its input.
   airlock queues up to 64 messages for each session.

@@ -12,8 +12,8 @@ use crate::test_cfg::block_on_local;
 ///      handshake
 ///   2. Do the handshake with file and terminal features and an editor
 ///      MCP server
-///   3. Check that the agent got the features in version 1 params, and
-///      the editor MCP server
+///   3. Check that the agent got the features in version 1 params, and no
+///      editor MCP server: the MCP bridge is off
 ///   4. Check that the client got the file request and the batch
 #[test]
 fn pass_mode_keeps_client_features_and_agent_requests() {
@@ -44,7 +44,7 @@ fn pass_mode_keeps_client_features_and_agent_requests() {
             seen[0]["params"],
             json!({ "protocolVersion": 1, "clientCapabilities": caps })
         );
-        assert_eq!(seen[1]["params"]["mcpServers"], servers);
+        assert_eq!(seen[1]["params"]["mcpServers"], json!([]));
         assert_eq!(seen[1]["params"]["cwd"], "/work");
     });
 }
