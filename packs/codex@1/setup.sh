@@ -26,14 +26,15 @@
 # - https://github.com/agentclientprotocol/codex-acp/blob/main/src/index.ts
 #   (CODEX_PATH, else the @openai/codex dependency. `codex-acp cli` runs
 #   Codex with the other args.)
-# - The adapter is one executable from lib.sh bun_compile (Bun from
+# - The adapter is one executable from lib.sh
+#   airlock_internal__bun_compile (Bun from
 #   https://github.com/oven-sh/bun/releases, in the scratch directory
 #   only). It has no Codex of its own. The pack config sets CODEX_PATH to
 #   the Codex of this script.
 #
 # No sha pin: the installer checks the sha256 of the package it downloads.
-# lib.sh bun_get checks Bun against the SHASUMS256.txt of the release. Bun
-# checks the registry integrity of each npm package.
+# lib.sh airlock_internal__bun_get checks Bun against the SHASUMS256.txt of
+# the release. Bun checks the registry integrity of each npm package.
 # Args: acp (AIRLOCK_PACK_ARG_ACP, true or false). Without it,
 # /usr/local/bin/codex-acp is a stub that exits 1 with an error.
 
@@ -59,28 +60,28 @@ fi
 airlock_status "installing cli"
 # curl: the installer. bubblewrap: Codex runs shell commands in a bwrap
 # sandbox and prefers bwrap on PATH to its bundled copy.
-pkg_install ca-certificates curl bubblewrap
+airlock_pkg_install ca-certificates curl bubblewrap
 
 # The package marker: a plain codex binary (the single-file asset of the
 # release) is not sufficient. The TUI needs the complete package.
 if [ -f "$_package" ] &&
     CODEX_HOME="$_check_home" "$_codex" --version </dev/null >/dev/null 2>&1 3>&-; then
-    log "Codex is already installed"
+    airlock_log "Codex is already installed"
 else
-    log "downloading the Codex installer"
-    fetch https://chatgpt.com/codex/install.sh "$PACK_TMP/codex-install.sh"
-    log "installing Codex"
+    airlock_log "downloading the Codex installer"
+    airlock_fetch https://chatgpt.com/codex/install.sh "$AIRLOCK_PACK_TMPDIR/codex-install.sh"
+    airlock_log "installing Codex"
     # CODEX_HOME is only for the installer. The package goes to a shared,
     # root-owned directory, not to ~/.codex (a host directory in airlock).
     # Codex finds its bundled rg and bwrap next to the resolved binary.
     mkdir -p "$_root"
-    run_vendor "the Codex installer" env CODEX_HOME="$_root" \
+    airlock_internal__run_vendor "the Codex installer" env CODEX_HOME="$_root" \
         CODEX_INSTALL_DIR=/usr/local/bin CODEX_NON_INTERACTIVE=1 \
-        sh "$PACK_TMP/codex-install.sh"
+        sh "$AIRLOCK_PACK_TMPDIR/codex-install.sh"
     # State from the `codex --version` check of the installer.
     rm -rf "$_root/tmp"
     [ -x "$_codex" ] && [ -f "$_package" ] ||
-        fail 12 "the Codex installer did not create $_codex"
+        airlock_fail 12 "the Codex installer did not create $_codex"
 fi
 
 # The Codex TUI starts a shared background server by default. That server
@@ -96,20 +97,20 @@ if [ ! -e /etc/codex/config.toml ]; then
 daemon_auto_start = false
 TOML
 elif ! grep -q '^[[:space:]]*daemon_auto_start' /etc/codex/config.toml; then
-    log "warning: /etc/codex/config.toml exists and does not set daemon_auto_start"
+    airlock_log "warning: /etc/codex/config.toml exists and does not set daemon_auto_start"
 fi
 
 CODEX_HOME="$_check_home" "$_codex" --version </dev/null 3>&- ||
-    fail 12 "codex --version failed"
+    airlock_fail 12 "codex --version failed"
 
 if [ "${AIRLOCK_PACK_ARG_ACP:-false}" = true ]; then
     airlock_status "installing acp"
-    bun_compile @agentclientprotocol/codex-acp codex-acp "$_acp"
-    "$_acp" --version </dev/null 3>&- || fail 12 "codex-acp --version failed"
+    airlock_internal__bun_compile @agentclientprotocol/codex-acp codex-acp "$_acp"
+    "$_acp" --version </dev/null 3>&- || airlock_fail 12 "codex-acp --version failed"
     # The adapter runs the Codex binary of this script.
     CODEX_PATH="$_codex" CODEX_HOME="$_check_home" "$_acp" cli -V </dev/null 3>&- ||
-        fail 12 "codex-acp cli -V failed"
+        airlock_fail 12 "codex-acp cli -V failed"
 else
-    acp_stub "$_acp" codex
+    airlock_internal__acp_stub "$_acp" codex
 fi
 rm -rf "$_check_home"

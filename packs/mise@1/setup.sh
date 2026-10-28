@@ -23,17 +23,17 @@ _mise=/usr/local/bin/mise
 airlock_steps 1
 airlock_status "installing mise"
 if _have=$("$_mise" version </dev/null 2>/dev/null 3>&-); then
-    log "mise is already installed: $_have"
+    airlock_log "mise is already installed: $_have"
 else
     # ca-certificates: mise downloads tools over HTTPS. musl-utils: the
     # installer picks the -musl build only when `ldd` exists. xz-utils:
     # many tool archives that mise downloads are .tar.xz.
     case "$DISTRO" in
-        alpine) pkg_install ca-certificates musl-utils ;;
-        debian) pkg_install ca-certificates xz-utils ;;
+        alpine) airlock_pkg_install ca-certificates musl-utils ;;
+        debian) airlock_pkg_install ca-certificates xz-utils ;;
     esac
-    log "downloading the mise installer"
-    fetch https://mise.run "$PACK_TMP/mise-install.sh"
+    airlock_log "downloading the mise installer"
+    airlock_fetch https://mise.run "$AIRLOCK_PACK_TMPDIR/mise-install.sh"
     if [ "$LIBC" = musl ]; then
         _musl=1
     else
@@ -48,21 +48,21 @@ else
         rm -f "$_mise"
         # The installer does not remove its scratch directories when it
         # fails. Thus each attempt gets a clean TMPDIR.
-        rm -rf "$PACK_TMP/mise"
-        mkdir "$PACK_TMP/mise"
+        rm -rf "$AIRLOCK_PACK_TMPDIR/mise"
+        mkdir "$AIRLOCK_PACK_TMPDIR/mise"
         if env MISE_INSTALL_PATH="$_mise" MISE_INSTALL_MUSL="$_musl" \
-            MISE_INSTALL_HELP=0 TMPDIR="$PACK_TMP/mise" \
-            sh "$PACK_TMP/mise-install.sh" </dev/null 3>&-; then
+            MISE_INSTALL_HELP=0 TMPDIR="$AIRLOCK_PACK_TMPDIR/mise" \
+            sh "$AIRLOCK_PACK_TMPDIR/mise-install.sh" </dev/null 3>&-; then
             break
         fi
         if [ "$_try" -ge 3 ]; then
-            fail 12 "the mise installer failed"
+            airlock_fail 12 "the mise installer failed"
         fi
         _try=$((_try + 1))
-        log "installing mise (attempt $_try of 3)"
+        airlock_log "installing mise (attempt $_try of 3)"
         sleep 3
     done
-    rm -rf "$PACK_TMP/mise"
+    rm -rf "$AIRLOCK_PACK_TMPDIR/mise"
 fi
 
 # /etc/profile resets PATH in login shells. Add the mise shims again. The
@@ -82,4 +82,4 @@ unset _p
 export PATH
 PROFILE
 
-"$_mise" version </dev/null 3>&- || fail 12 "mise version failed"
+"$_mise" version </dev/null 3>&- || airlock_fail 12 "mise version failed"

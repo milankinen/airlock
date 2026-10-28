@@ -114,23 +114,32 @@ fn status_lines_reach_stdout_only_under_pack_api() {
 #[test]
 fn lib_helpers_close_fd_3_for_external_commands() {
     let cases = [
-        ("alpine", "pkg_install pkg-a pkg-b"),
-        ("alpine", "pkg_is_installed pkg-a || :"),
-        // `_apt_ready=1` skips the apt setup, which writes to `/usr/sbin`
+        ("alpine", "airlock_pkg_install pkg-a pkg-b"),
+        ("alpine", "airlock_pkg_is_installed pkg-a || :"),
+        // `_airlock_apt_ready=1` skips the apt setup, which writes to `/usr/sbin`
         // on the host.
-        ("debian", "_apt_ready=1\npkg_install pkg-a"),
-        ("debian", "_apt_ready=1\npkg_available pkg-a || :"),
-        ("debian", "pkg_is_installed pkg-a || :"),
-        ("debian", "dpkg_repair"),
-        ("alpine", "fetch https://example.invalid/x \"$PACK_TMP/x\""),
-        ("alpine", "run_vendor vendor vendor --flag"),
+        ("debian", "_airlock_apt_ready=1\nairlock_pkg_install pkg-a"),
+        (
+            "debian",
+            "_airlock_apt_ready=1\nairlock_pkg_available pkg-a || :",
+        ),
+        ("debian", "airlock_pkg_is_installed pkg-a || :"),
+        ("debian", "airlock_internal__dpkg_repair"),
+        (
+            "alpine",
+            "airlock_fetch https://example.invalid/x \"$AIRLOCK_PACK_TMPDIR/x\"",
+        ),
+        (
+            "alpine",
+            "airlock_internal__run_vendor vendor vendor --flag",
+        ),
     ];
     for (id, body) in cases {
         let run = run(Some(&format!("ID={id}\n")), body, &[]);
         assert_eq!(run.code, Some(0), "{body}: {}", run.stderr);
         assert!(!run.stderr.contains("fd 3 is open"), "{body}");
     }
-    let installed = run(Some("ID=alpine\n"), "pkg_install pkg-a", &[]);
+    let installed = run(Some("ID=alpine\n"), "airlock_pkg_install pkg-a", &[]);
     assert!(
         installed.stderr.contains("apk add --no-cache pkg-a"),
         "{}",

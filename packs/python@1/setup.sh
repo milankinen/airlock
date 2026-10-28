@@ -34,7 +34,7 @@ _bin_dir=/usr/local/bin
 _py_dir=/usr/local/lib/uv/python
 _version=${AIRLOCK_PACK_ARG_PYTHON_VERSION:-latest}
 case "$_version" in
-    -* | *[!0-9A-Za-z.@+_-]*) fail 13 "invalid python-version: $_version" ;;
+    -* | *[!0-9A-Za-z.@+_-]*) airlock_fail 13 "invalid python-version: $_version" ;;
 esac
 
 # The config env also reaches this script. These variables can move uv
@@ -46,7 +46,7 @@ unset UV_INSTALL_DIR CARGO_DIST_FORCE_INSTALL_DIR UV_PYTHON_DOWNLOADS \
 # cache left in /root.
 UV_PYTHON_INSTALL_DIR=$_py_dir
 UV_PYTHON_BIN_DIR=$_bin_dir
-UV_CACHE_DIR=$PACK_TMP/uv-cache
+UV_CACHE_DIR=$AIRLOCK_PACK_TMPDIR/uv-cache
 export UV_PYTHON_INSTALL_DIR UV_PYTHON_BIN_DIR UV_CACHE_DIR
 
 # Steps: uv, then Python unless python-version is none.
@@ -58,19 +58,19 @@ fi
 
 airlock_status "installing uv"
 if [ -x "$_uv" ] && [ -x "$_bin_dir/uvx" ]; then
-    log "uv is already installed"
+    airlock_log "uv is already installed"
 else
-    log "downloading the uv installer"
-    fetch https://astral.sh/uv/install.sh "$PACK_TMP/uv-install.sh"
+    airlock_log "downloading the uv installer"
+    airlock_fetch https://astral.sh/uv/install.sh "$AIRLOCK_PACK_TMPDIR/uv-install.sh"
     mkdir -p "$_bin_dir"
-    run_vendor "the uv installer" env UV_UNMANAGED_INSTALL="$_bin_dir" \
-        sh "$PACK_TMP/uv-install.sh"
+    airlock_internal__run_vendor "the uv installer" env UV_UNMANAGED_INSTALL="$_bin_dir" \
+        sh "$AIRLOCK_PACK_TMPDIR/uv-install.sh"
 fi
-"$_uv" --version </dev/null 3>&- || fail 12 "uv --version failed"
+"$_uv" --version </dev/null 3>&- || airlock_fail 12 "uv --version failed"
 
 case "$_version" in
     none)
-        log "python-version is none: no Python is installed"
+        airlock_log "python-version is none: no Python is installed"
         ;;
     *)
         case "$_version" in
@@ -82,13 +82,13 @@ case "$_version" in
         # free-threaded build, pypy3 and pypy for PyPy). --compile-bytecode:
         # the directory is root-owned, thus other users cannot write .pyc
         # files. `--`: a request that starts with `-` is not an option.
-        run_vendor "uv python install $_request" "$_uv" python install \
+        airlock_internal__run_vendor "uv python install $_request" "$_uv" python install \
             --no-progress --compile-bytecode \
             --default --preview-features python-install-default -- "$_request"
         _python=$("$_uv" python find --managed-python --no-python-downloads \
             -- "$_request" </dev/null 3>&-) ||
-            fail 12 "uv python find $_request failed"
-        "$_python" --version </dev/null 3>&- || fail 12 "$_python --version failed"
+            airlock_fail 12 "uv python find $_request failed"
+        "$_python" --version </dev/null 3>&- || airlock_fail 12 "$_python --version failed"
 
         # uv exits 0 when it does not replace an executable that it does
         # not manage (it only gives a warning). Thus check the links. From
@@ -100,12 +100,12 @@ case "$_version" in
         _plain=$(printf '%s\n' "$_major" | sed 's/^\([a-z]*\)[0-9]*/\1/' 3>&-)
         for _link in "$_name" "$_major" "$_plain"; do
             if [ ! -e "$_bin_dir/$_link" ]; then
-                fail 12 "uv did not install $_bin_dir/$_link"
+                airlock_fail 12 "uv did not install $_bin_dir/$_link"
             fi
             _target=$(readlink -f "$_bin_dir/$_link" 3>&-) || _target=
             case "$_target" in
                 "$_py_dir"/*) ;;
-                *) log "warning: $_bin_dir/$_link is not from uv; it is left in place" ;;
+                *) airlock_log "warning: $_bin_dir/$_link is not from uv; it is left in place" ;;
             esac
         done
         ;;

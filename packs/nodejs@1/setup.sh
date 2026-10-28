@@ -33,7 +33,7 @@ case "$_arg" in
     lts) _node='lts/*' ;;
     latest) _node=node ;;
     none) _node= ;;
-    -* | *[!0-9A-Za-z./*_-]*) fail 13 "invalid node-version: $_arg" ;;
+    -* | *[!0-9A-Za-z./*_-]*) airlock_fail 13 "invalid node-version: $_arg" ;;
     *) _node=$_arg ;;
 esac
 
@@ -51,11 +51,11 @@ case "$DISTRO" in
         # only some x64 builds. unofficial-builds has x64 and arm64.
         NVM_NODEJS_ORG_MIRROR=https://unofficial-builds.nodejs.org/download/release
         export NVM_NODEJS_ORG_MIRROR
-        pkg_install bash ca-certificates curl tar xz gzip grep sed coreutils \
+        airlock_pkg_install bash ca-certificates curl tar xz gzip grep sed coreutils \
             libstdc++ libgcc
         ;;
     debian)
-        pkg_install bash ca-certificates curl tar xz-utils gzip libatomic1
+        airlock_pkg_install bash ca-certificates curl tar xz-utils gzip libatomic1
         ;;
 esac
 
@@ -64,17 +64,17 @@ esac
 # what it does.
 if bash -c '. "$NVM_DIR/nvm.sh" --no-use && nvm --version' \
     </dev/null >/dev/null 2>&1 3>&-; then
-    log "nvm is already installed"
+    airlock_log "nvm is already installed"
 else
-    github_latest_tag nvm-sh/nvm
-    log "installing nvm $TAG"
-    fetch "https://raw.githubusercontent.com/nvm-sh/nvm/$TAG/install.sh" \
-        "$PACK_TMP/nvm-install.sh"
+    airlock_internal__github_latest_tag nvm-sh/nvm
+    airlock_log "installing nvm $TAG"
+    airlock_fetch "https://raw.githubusercontent.com/nvm-sh/nvm/$TAG/install.sh" \
+        "$AIRLOCK_PACK_TMPDIR/nvm-install.sh"
     mkdir -p "$NVM_DIR"
-    run_vendor "the nvm installer" env PROFILE=/dev/null METHOD=script \
+    airlock_internal__run_vendor "the nvm installer" env PROFILE=/dev/null METHOD=script \
         NVM_INSTALL_VERSION="$TAG" NVM_INSTALL_GITHUB_REPO= \
-        NVM_SOURCE= NODE_VERSION= bash "$PACK_TMP/nvm-install.sh"
-    [ -s "$NVM_DIR/nvm.sh" ] || fail 12 "the nvm installer did not create $NVM_DIR/nvm.sh"
+        NVM_SOURCE= NODE_VERSION= bash "$AIRLOCK_PACK_TMPDIR/nvm-install.sh"
+    [ -s "$NVM_DIR/nvm.sh" ] || airlock_fail 12 "the nvm installer did not create $NVM_DIR/nvm.sh"
 fi
 
 # Login shells: the nvm command, and the bin directory of the default
@@ -97,12 +97,12 @@ if [ -s "$NVM_DIR/nvm.sh" ]; then
 fi
 unset -f _airlock_nvm_load
 PROFILE
-} >"$PACK_TMP/airlock-nvm.sh"
-mv -f "$PACK_TMP/airlock-nvm.sh" /etc/profile.d/airlock-nvm.sh
+} >"$AIRLOCK_PACK_TMPDIR/airlock-nvm.sh"
+mv -f "$AIRLOCK_PACK_TMPDIR/airlock-nvm.sh" /etc/profile.d/airlock-nvm.sh
 chmod 644 /etc/profile.d/airlock-nvm.sh
 
 if [ -z "$_node" ]; then
-    log "node-version is none: nvm only, no Node.js"
+    airlock_log "node-version is none: nvm only, no Node.js"
 else
     # -b: a missing binary is an error, not a long compile from source.
     # `nvm install` does nothing for an installed version. A killed
@@ -111,7 +111,7 @@ else
     # locks.
     rm -rf "$NVM_DIR/.cache/locks"
     airlock_status "installing node $_arg"
-    run_vendor "nvm install $_node" bash -c '
+    airlock_internal__run_vendor "nvm install $_node" bash -c '
         unset PREFIX NPM_CONFIG_PREFIX npm_config_prefix
         . "$NVM_DIR/nvm.sh" --no-use || exit 1
         nvm install -b --no-progress --skip-default-packages "$1" || exit 1
@@ -122,7 +122,7 @@ else
 
     _node_bin=$(bash -c '. "$NVM_DIR/nvm.sh" --no-use >/dev/null 2>&1 && nvm which default' \
         </dev/null 2>/dev/null 3>&-) || _node_bin=
-    [ -x "$_node_bin" ] || fail 12 "nvm did not install Node.js ($_arg)"
+    [ -x "$_node_bin" ] || airlock_fail 12 "nvm did not install Node.js ($_arg)"
 
     # node, npm, npx (corepack up to Node.js 24) on the default PATH of
     # each shell and user. Only links into $NVM_DIR and free names
@@ -148,6 +148,6 @@ else
         fi
     done
 
-    /usr/local/bin/node --version </dev/null 3>&- || fail 12 "node --version failed"
-    /usr/local/bin/npm --version </dev/null 3>&- || fail 12 "npm --version failed"
+    /usr/local/bin/node --version </dev/null 3>&- || airlock_fail 12 "node --version failed"
+    /usr/local/bin/npm --version </dev/null 3>&- || airlock_fail 12 "npm --version failed"
 fi

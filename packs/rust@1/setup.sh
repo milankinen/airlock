@@ -38,7 +38,7 @@ _bin="$CARGO_HOME/bin"
 
 _toolchain=${AIRLOCK_PACK_ARG_TOOLCHAIN:-stable}
 case "$_toolchain" in
-    -* | *[!A-Za-z0-9._-]*) fail 13 "invalid toolchain: $_toolchain" ;;
+    -* | *[!A-Za-z0-9._-]*) airlock_fail 13 "invalid toolchain: $_toolchain" ;;
 esac
 
 case "$DISTRO" in
@@ -59,22 +59,23 @@ airlock_status "installing rustup"
 # rustup-init from `ldd --version`. On Alpine, ldd is in musl-utils
 # (part of alpine:latest, installed here for slimmer Alpine images).
 case "$DISTRO" in
-    alpine) pkg_install build-base ca-certificates musl-utils ;;
-    debian) pkg_install build-essential ca-certificates ;;
+    alpine) airlock_pkg_install build-base ca-certificates musl-utils ;;
+    debian) airlock_pkg_install build-essential ca-certificates ;;
 esac
 
 if [ -x "$_bin/rustup" ]; then
-    log "rustup is already installed"
+    airlock_log "rustup is already installed"
 else
-    log "downloading rustup"
-    fetch https://sh.rustup.rs "$PACK_TMP/rustup-init.sh"
+    airlock_log "downloading rustup"
+    airlock_fetch https://sh.rustup.rs "$AIRLOCK_PACK_TMPDIR/rustup-init.sh"
     # -y: no prompt (stdin is closed). No toolchain here, because the next
     # step installs it, also after an interrupted earlier run. rustup
     # keeps `minimal` as the profile for toolchains that install later
     # (`rustup toolchain install`, a rust-toolchain.toml). They get no
     # clippy or rustfmt unless they ask for them (`-c clippy,rustfmt`, or
     # `components` in rust-toolchain.toml).
-    run_vendor "rustup-init" sh "$PACK_TMP/rustup-init.sh" -y --no-modify-path \
+    airlock_internal__run_vendor "rustup-init" \
+        sh "$AIRLOCK_PACK_TMPDIR/rustup-init.sh" -y --no-modify-path \
         --default-host "$_host" --default-toolchain none --profile minimal
 fi
 
@@ -97,11 +98,12 @@ if [ "$_toolchain" != none ]; then
     until "$_bin/rustup" toolchain install "$_toolchain" --profile minimal \
         --component clippy,rustfmt --no-self-update ${_downgrade:+"$_downgrade"} \
         </dev/null 3>&-; do
-        [ "$_try" -lt 3 ] || fail 12 "rustup toolchain install $_toolchain failed"
+        [ "$_try" -lt 3 ] || airlock_fail 12 "rustup toolchain install $_toolchain failed"
         _try=$((_try + 1))
-        log "rustup toolchain install failed; attempt $_try of 3"
+        airlock_log "rustup toolchain install failed; attempt $_try of 3"
     done
-    run_vendor "rustup default $_toolchain" "$_bin/rustup" default "$_toolchain"
+    airlock_internal__run_vendor "rustup default $_toolchain" \
+        "$_bin/rustup" default "$_toolchain"
 fi
 
 # A non-root sandbox user can also use the shared registry cache, `cargo
@@ -140,8 +142,8 @@ esac
 export PATH
 PROFILE
 
-"$_bin/rustup" --version </dev/null 3>&- || fail 12 "rustup --version failed"
+"$_bin/rustup" --version </dev/null 3>&- || airlock_fail 12 "rustup --version failed"
 if [ "$_toolchain" != none ]; then
-    "$_bin/rustc" --version </dev/null 3>&- || fail 12 "rustc --version failed"
-    "$_bin/cargo" --version </dev/null 3>&- || fail 12 "cargo --version failed"
+    "$_bin/rustc" --version </dev/null 3>&- || airlock_fail 12 "rustc --version failed"
+    "$_bin/cargo" --version </dev/null 3>&- || airlock_fail 12 "cargo --version failed"
 fi

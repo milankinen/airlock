@@ -50,26 +50,28 @@ fi
 # not). The run as root unpacks the package (about 180 MB) into a cache.
 # Keep that cache and all state in the scratch directory. No auto-update.
 copilot_works() {
-    mkdir -p "$PACK_TMP/home"
-    HOME="$PACK_TMP/home" XDG_CACHE_HOME="$PACK_TMP/cache" COPILOT_AUTO_UPDATE=false \
+    mkdir -p "$AIRLOCK_PACK_TMPDIR/home"
+    HOME="$AIRLOCK_PACK_TMPDIR/home" XDG_CACHE_HOME="$AIRLOCK_PACK_TMPDIR/cache" \
+        COPILOT_AUTO_UPDATE=false \
         "$_bin" --help </dev/null >/dev/null 2>&1 3>&-
 }
 
-# fetch_release <tag> <asset>: download a release asset to $PACK_TMP and
-# check it against the SHA256SUMS.txt of the release (as install.sh
-# does).
+# fetch_release <tag> <asset>: download a release asset to
+# $AIRLOCK_PACK_TMPDIR and check it against the SHA256SUMS.txt of the
+# release (as install.sh does).
 fetch_release() {
-    fetch "https://github.com/$_repo/releases/download/$1/$2" "$PACK_TMP/$2"
-    if [ ! -f "$PACK_TMP/SHA256SUMS.txt" ]; then
-        fetch "https://github.com/$_repo/releases/download/$1/SHA256SUMS.txt" \
-            "$PACK_TMP/SHA256SUMS.txt"
+    airlock_fetch "https://github.com/$_repo/releases/download/$1/$2" "$AIRLOCK_PACK_TMPDIR/$2"
+    if [ ! -f "$AIRLOCK_PACK_TMPDIR/SHA256SUMS.txt" ]; then
+        airlock_fetch "https://github.com/$_repo/releases/download/$1/SHA256SUMS.txt" \
+            "$AIRLOCK_PACK_TMPDIR/SHA256SUMS.txt"
     fi
-    _fr_want=$(awk -v f="$2" '$2 == f { print $1 }' "$PACK_TMP/SHA256SUMS.txt" 3>&-)
-    _fr_got=$(sha256sum "$PACK_TMP/$2" 3>&-) || fail 12 "sha256sum failed: $2"
+    _fr_want=$(awk -v f="$2" '$2 == f { print $1 }' "$AIRLOCK_PACK_TMPDIR/SHA256SUMS.txt" 3>&-)
+    _fr_got=$(sha256sum "$AIRLOCK_PACK_TMPDIR/$2" 3>&-) ||
+        airlock_fail 12 "sha256sum failed: $2"
     _fr_got=${_fr_got%% *}
     if [ -z "$_fr_want" ] || [ "$_fr_got" != "$_fr_want" ]; then
-        rm -f "$PACK_TMP/$2"
-        fail 12 "checksum mismatch: $2 (want ${_fr_want:-none}, got $_fr_got)"
+        rm -f "$AIRLOCK_PACK_TMPDIR/$2"
+        airlock_fail 12 "checksum mismatch: $2 (want ${_fr_want:-none}, got $_fr_got)"
     fi
 }
 
@@ -81,36 +83,36 @@ airlock_status "installing cli"
 case "$DISTRO" in
     alpine)
         if [ "$_use_node" = 1 ]; then
-            pkg_install bash ca-certificates curl nodejs
+            airlock_pkg_install bash ca-certificates curl nodejs
         else
-            pkg_install bash ca-certificates curl
+            airlock_pkg_install bash ca-certificates curl
         fi
         ;;
-    debian) pkg_install bash ca-certificates curl libstdc++6 libgcc-s1 ;;
+    debian) airlock_pkg_install bash ca-certificates curl libstdc++6 libgcc-s1 ;;
 esac
 
 if [ -x "$_bin" ] && copilot_works; then
-    log "Copilot CLI is already installed"
+    airlock_log "Copilot CLI is already installed"
 else
     # One tag for the asset and SHA256SUMS.txt.
-    github_latest_tag "$_repo"
+    airlock_internal__github_latest_tag "$_repo"
     case "$TAG" in
         v[0-9]*) ;;
-        *) fail 12 "unexpected latest Copilot CLI release: $TAG" ;;
+        *) airlock_fail 12 "unexpected latest Copilot CLI release: $TAG" ;;
     esac
     mkdir -p /usr/local/bin /usr/local/lib
     rm -f "$_bin.new"
     if [ "$_use_node" = 1 ]; then
         _asset="github-copilot-${TAG#v}-$_plat-$_arch.tgz"
-        log "downloading Copilot CLI $TAG"
+        airlock_log "downloading Copilot CLI $TAG"
         fetch_release "$TAG" "$_asset"
-        log "installing Copilot CLI $TAG"
+        airlock_log "installing Copilot CLI $TAG"
         rm -rf "$_lib.new"
         mkdir -p "$_lib.new"
-        tar -xzof "$PACK_TMP/$_asset" -C "$_lib.new" --strip-components 1 3>&- ||
-            fail 12 "could not unpack $_asset"
-        rm -f "$PACK_TMP/$_asset"
-        [ -f "$_lib.new/index.js" ] || fail 12 "$_asset has no index.js"
+        tar -xzof "$AIRLOCK_PACK_TMPDIR/$_asset" -C "$_lib.new" --strip-components 1 3>&- ||
+            airlock_fail 12 "could not unpack $_asset"
+        rm -f "$AIRLOCK_PACK_TMPDIR/$_asset"
+        [ -f "$_lib.new/index.js" ] || airlock_fail 12 "$_asset has no index.js"
         rm -rf "$_lib"
         mv "$_lib.new" "$_lib"
         cat >"$_bin.new" <<WRAPPER
@@ -121,21 +123,22 @@ exec /usr/bin/node $_lib/index.js "\$@"
 WRAPPER
     else
         _asset="copilot-$_plat-$_arch.tar.gz"
-        log "downloading Copilot CLI $TAG"
+        airlock_log "downloading Copilot CLI $TAG"
         fetch_release "$TAG" "$_asset"
-        log "installing Copilot CLI $TAG"
+        airlock_log "installing Copilot CLI $TAG"
         # The archive has one member, `copilot`, owned by uid 1001. tar as
         # root keeps that owner. Thus write a new root-owned file.
-        if ! tar -xzOf "$PACK_TMP/$_asset" copilot >"$_bin.new" 3>&-; then
+        if ! tar -xzOf "$AIRLOCK_PACK_TMPDIR/$_asset" copilot >"$_bin.new" 3>&-; then
             rm -f "$_bin.new"
-            fail 12 "could not unpack $_asset"
+            airlock_fail 12 "could not unpack $_asset"
         fi
-        rm -f "$PACK_TMP/$_asset"
+        rm -f "$AIRLOCK_PACK_TMPDIR/$_asset"
     fi
     chmod 755 "$_bin.new"
     mv -f "$_bin.new" "$_bin"
-    copilot_works || fail 12 "copilot --help failed after the install"
+    copilot_works || airlock_fail 12 "copilot --help failed after the install"
 fi
 
-HOME="$PACK_TMP/home" XDG_CACHE_HOME="$PACK_TMP/cache" COPILOT_AUTO_UPDATE=false \
-    "$_bin" --version </dev/null 3>&- || fail 12 "copilot --version failed"
+HOME="$AIRLOCK_PACK_TMPDIR/home" XDG_CACHE_HOME="$AIRLOCK_PACK_TMPDIR/cache" \
+    COPILOT_AUTO_UPDATE=false \
+    "$_bin" --version </dev/null 3>&- || airlock_fail 12 "copilot --version failed"

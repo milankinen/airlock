@@ -26,14 +26,15 @@
 #   (claudeCliPath: CLAUDE_CODE_EXECUTABLE, else the Claude Code binary
 #   from an optional dependency of @anthropic-ai/claude-agent-sdk. `--cli`
 #   runs that binary with the other args.)
-# - The adapter is one executable from lib.sh bun_compile (Bun from
+# - The adapter is one executable from lib.sh
+#   airlock_internal__bun_compile (Bun from
 #   https://github.com/oven-sh/bun/releases, in the scratch directory
 #   only). It has no Claude Code of its own. The pack config sets
 #   CLAUDE_CODE_EXECUTABLE to the wrapper of this script.
 #
 # No sha pin: the installer checks the sha256 of the binary it downloads.
-# lib.sh bun_get checks Bun against the SHASUMS256.txt of the release. Bun
-# checks the registry integrity of each npm package.
+# lib.sh airlock_internal__bun_get checks Bun against the SHASUMS256.txt of
+# the release. Bun checks the registry integrity of each npm package.
 # Args: acp (AIRLOCK_PACK_ARG_ACP, true or false). Without it,
 # /usr/local/bin/claude-agent-acp is a stub that exits 1 with an error.
 # The pack config sets USE_BUILTIN_RIPGREP=0 (the ripgrep from this
@@ -56,34 +57,34 @@ airlock_status "installing cli"
 # bash and curl: the installer. libgcc and libstdc++: the musl build.
 # ripgrep: the search tool of Claude Code.
 case "$DISTRO" in
-    alpine) pkg_install bash curl ca-certificates libgcc libstdc++ ripgrep ;;
-    debian) pkg_install bash curl ca-certificates ripgrep ;;
+    alpine) airlock_pkg_install bash curl ca-certificates libgcc libstdc++ ripgrep ;;
+    debian) airlock_pkg_install bash curl ca-certificates ripgrep ;;
 esac
 
 # The wrapper at ~/.local/bin/claude exists only after a complete install.
 if "$HOME/.local/bin/claude" --version </dev/null >/dev/null 2>&1 3>&-; then
-    log "Claude Code is already installed"
+    airlock_log "Claude Code is already installed"
 else
-    log "downloading the Claude Code installer"
-    fetch https://claude.ai/install.sh "$PACK_TMP/claude-install.sh"
-    log "installing Claude Code"
+    airlock_log "downloading the Claude Code installer"
+    airlock_fetch https://claude.ai/install.sh "$AIRLOCK_PACK_TMPDIR/claude-install.sh"
+    airlock_log "installing Claude Code"
     # A scratch HOME, because the installer writes only there. Not in /,
     # because there the installer scans the whole disk. A DISABLE_UPDATES
     # from the config env makes `claude install` do nothing and exit 0.
     # The DISABLE_INSTALLATION_CHECKS of the config is only for the
     # installed binary. Thus unset both.
-    mkdir -p "$PACK_TMP/home"
+    mkdir -p "$AIRLOCK_PACK_TMPDIR/home"
     (
         unset XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME CLAUDE_CONFIG_DIR \
             DISABLE_UPDATES DISABLE_INSTALLATION_CHECKS SUDO_USER
-        HOME=$PACK_TMP/home
+        HOME=$AIRLOCK_PACK_TMPDIR/home
         export HOME
         cd "$HOME"
-        exec bash "$PACK_TMP/claude-install.sh"
-    ) </dev/null 3>&- || fail 12 "the Claude Code installer failed"
-    _binary=$(readlink -f "$PACK_TMP/home/.local/bin/claude" 3>&-) || _binary=
+        exec bash "$AIRLOCK_PACK_TMPDIR/claude-install.sh"
+    ) </dev/null 3>&- || airlock_fail 12 "the Claude Code installer failed"
+    _binary=$(readlink -f "$AIRLOCK_PACK_TMPDIR/home/.local/bin/claude" 3>&-) || _binary=
     [ -f "$_binary" ] ||
-        fail 12 "the Claude Code installer did not create ~/.local/bin/claude"
+        airlock_fail 12 "the Claude Code installer did not create ~/.local/bin/claude"
     # Keep only the binary. The wrapper below replaces the launcher.
     chmod 755 "$_binary"
     mkdir -p "$_versions"
@@ -95,7 +96,7 @@ fi
 # itself. Claude Code copies with wl-copy only when WAYLAND_DISPLAY is
 # set. The wrapper sets it only when airlock grants clipboard copy (the
 # copy FIFO exists). Else Claude Code uses its other copy methods.
-cat >"$PACK_TMP/claude" <<'WRAPPER'
+cat >"$AIRLOCK_PACK_TMPDIR/claude" <<'WRAPPER'
 #!/bin/sh
 # Managed by airlock (claude pack): runs the newest Claude Code.
 dir=$HOME/.local/share/claude/versions
@@ -110,28 +111,28 @@ exec "$dir/$v" "$@"
 WRAPPER
 for _f in "$HOME/.local/bin/claude" "$_claude"; do
     mkdir -p "${_f%/*}"
-    cp "$PACK_TMP/claude" "$_f.new"
+    cp "$AIRLOCK_PACK_TMPDIR/claude" "$_f.new"
     chmod 755 "$_f.new"
     mv -f "$_f.new" "$_f"
 done
 
-"$_claude" --version </dev/null 3>&- || fail 12 "claude --version failed"
+"$_claude" --version </dev/null 3>&- || airlock_fail 12 "claude --version failed"
 
 # ~/.claude.json is not a host mount. Each sandbox has its own. A new
 # file skips the onboarding. An existing file stays.
 if [ ! -e "$HOME/.claude.json" ]; then
-    log "creating $HOME/.claude.json"
+    airlock_log "creating $HOME/.claude.json"
     printf '%s' '{"hasCompletedOnboarding":true}' >"$HOME/.claude.json" ||
-        fail 12 "could not create $HOME/.claude.json"
+        airlock_fail 12 "could not create $HOME/.claude.json"
 fi
 
 if [ "${AIRLOCK_PACK_ARG_ACP:-false}" = true ]; then
     airlock_status "installing acp"
-    bun_compile @agentclientprotocol/claude-agent-acp claude-agent-acp "$_acp"
-    "$_acp" --version </dev/null 3>&- || fail 12 "claude-agent-acp --version failed"
+    airlock_internal__bun_compile @agentclientprotocol/claude-agent-acp claude-agent-acp "$_acp"
+    "$_acp" --version </dev/null 3>&- || airlock_fail 12 "claude-agent-acp --version failed"
     # The adapter runs the Claude Code wrapper of this script.
     CLAUDE_CODE_EXECUTABLE="$_claude" "$_acp" --cli --version </dev/null 3>&- ||
-        fail 12 "claude-agent-acp --cli --version failed"
+        airlock_fail 12 "claude-agent-acp --cli --version failed"
 else
-    acp_stub "$_acp" claude
+    airlock_internal__acp_stub "$_acp" claude
 fi
