@@ -3,14 +3,15 @@
 //! Writes the diagnostic logs of airlock to a log file, and not to the
 //! terminal. The sandbox log goes to the sandbox directory. The logs from
 //! before the sandbox is known stay in memory, and go to the file when the
-//! sandbox directory is known. The log files do not grow without limit.
+//! sandbox directory is known. Commands that know their log file at the
+//! start can write to it at once. The log files do not grow without limit.
 //! A log file is cut to a limited tail when it opens, and again when the
 //! process wrote much data to it.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
-use std::sync::{Mutex, Once};
+use std::sync::{Arc, Mutex, Once};
 
 use tracing_subscriber::EnvFilter;
 
@@ -33,7 +34,8 @@ const LOG_MAX_BYTES: u64 = 1024 * 1024;
 /// lines are dropped.
 const BUFFER_MAX_BYTES: usize = 1024 * 1024;
 
-/// Guard for [`init`]. The subscriber can be set only once per process.
+/// Guard for [`init`] and [`init_file`]. The subscriber can be set only
+/// once per process.
 static INIT: Once = Once::new();
 
 /// Where the log lines go now.
@@ -171,6 +173,28 @@ pub fn init(log_level: LogLevel) {
     });
 }
 
+/// Send the `tracing` output to the log file `name` in `dir` at once.
+/// Args:
+///  - `dir`: Directory of the log file
+///  - `name`: File name of the log file
+///  - `log_level`: Log level for the file
+///  - `prefix`: Text at the start of each line
+///
+/// Only the first call in a process has an effect, also after [`init`].
+/// If the file does not open, logging stays off and nothing fails.
+pub fn init_file(dir: &VerifiedPath, name: &str, log_level: LogLevel, prefix: &str) {
+    INIT.call_once(|| {
+        let Ok(file) = LogFile::open(dir, name, prefix) else {
+            return;
+        };
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new(log_level.filter()))
+            .with_writer(Arc::new(file))
+            .with_ansi(false)
+            .try_init();
+    });
+}
+
 /// Send the log to `<sandbox_dir>/airlock.log`, after the lines that are in
 /// memory.
 ///
@@ -303,6 +327,7 @@ mod tests {
 
     /// Test that two writers of one log file append their lines with their
     /// prefix, and that the log file does not open through a symlink.
+    /// Several ACP proxies write to one log file at the same time.
     ///   1. Open the log file two times with different prefixes
     ///   2. Write a line with each and check that the file has both lines
     ///   3. Put a symlink at an other log name and check that the open fails

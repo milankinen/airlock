@@ -32,10 +32,10 @@ load helpers
 
 # Test that a bad command line exits with the usage error code 2.
 #   1. Run airlock with no command, an unknown command, an unknown flag,
-#      and exec without a command
+#      exec without a command and acp without a command
 #   2. Check that each run exits with code 2
 @test "missing or unknown command or flag fails with usage error" {
-    for args in "" "nonexistent" "start --bogus" "exec"; do
+    for args in "" "nonexistent" "start --bogus" "exec" "acp"; do
         run_airlock $args
         assert_failure 2
     done

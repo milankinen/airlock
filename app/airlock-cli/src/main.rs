@@ -5,6 +5,7 @@
 
 #![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_types))]
 
+mod acp;
 mod assets;
 mod cache;
 pub(crate) mod cli;
@@ -43,8 +44,8 @@ use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::task::LocalSet;
 
 use crate::cli::{
-    cmd_config, cmd_exec, cmd_info, cmd_network, cmd_rm, cmd_sandbox, cmd_secret, cmd_self_update,
-    cmd_start, cmd_templates,
+    cmd_acp, cmd_config, cmd_exec, cmd_info, cmd_network, cmd_rm, cmd_sandbox, cmd_secret,
+    cmd_self_update, cmd_start, cmd_templates,
 };
 use crate::context::Context;
 use crate::settings::Settings;
@@ -107,6 +108,7 @@ async fn main() {
                     }
                     cli::cmd_exec::main(args, &context).await
                 }
+                Command::Acp(args) => cli::cmd_acp::main(args, extra_args, &context).await,
                 Command::Info(ref args) => {
                     if !extra_args.is_empty() {
                         cli::error!("{}", messages::app::DASH_ARGS_ONLY_WITH_START);
@@ -212,6 +214,8 @@ enum Command {
     /// Execute a command inside the running sandbox VM
     #[command(alias = "x")]
     Exec(cmd_exec::ExecArgs),
+    /// Run an ACP agent for an editor in the sandbox of the editor project
+    Acp(cmd_acp::AcpArgs),
     /// Show the sandbox of the current project
     #[command(alias = "show")]
     Info(cmd_info::InfoArgs),

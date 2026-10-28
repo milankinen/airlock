@@ -1,6 +1,7 @@
 //! Test helpers of the crate. This module also re-exports the helpers of
 //! `airlock-test-utils`, which other crates use too.
 
+pub mod acp;
 pub mod config;
 pub mod context;
 pub mod home;

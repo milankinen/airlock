@@ -6,6 +6,7 @@
 //!  * text styles and colors
 //!  * Ctrl+C and SIGTERM handling, so that long steps can stop cleanly
 
+pub mod cmd_acp;
 pub mod cmd_config;
 pub mod cmd_exec;
 pub mod cmd_info;

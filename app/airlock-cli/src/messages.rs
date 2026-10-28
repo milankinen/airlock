@@ -4,13 +4,111 @@
 //! place. One submodule per area of the CLI. The texts carry no marks,
 //! indents or colors. The caller adds them.
 
+pub mod acp {
+    //! Texts of the `acp` area. The proxy sends most of them to the editor
+    //! as JSON-RPC error messages.
+
+    use std::fmt::Display;
+
+    /// Agent name that the editor shows.
+    pub fn agent_title(cmd: impl Display) -> String {
+        format!("{cmd} (airlock)")
+    }
+
+    /// Error when `airlock acp` has no agent command.
+    pub const NO_COMMAND: &str =
+        "give the agent command, for example 'airlock acp -- <agent> [args]'";
+
+    /// Error when a session request comes before the handshake.
+    pub const NO_HANDSHAKE: &str = "send 'initialize' before the session request";
+
+    /// Error for a request that needs the agent before a session starts.
+    pub const NO_SESSION_YET: &str = "airlock starts the agent in the sandbox at the first \
+         'session/new' or 'session/load'. Start a session first";
+
+    /// Error when a session dir is not an absolute path.
+    pub fn cwd_not_absolute(cwd: impl Display) -> String {
+        format!("the session dir '{cwd}' is not an absolute path")
+    }
+
+    /// Error when a session dir is in a different sandbox than the running
+    /// agent.
+    pub fn other_sandbox(cwd: impl Display) -> String {
+        format!(
+            "the session dir '{cwd}' is not in the sandbox of the running agent. \
+             Start a new agent for that project"
+        )
+    }
+
+    /// Error when the agent cannot load sessions.
+    pub const NO_LOAD_SESSION: &str = "the agent does not support 'session/load'";
+
+    /// Error for an MCP server transport that the agent does not support.
+    pub fn missing_mcp_transport(transport: impl Display) -> String {
+        format!("the agent does not support '{transport}' MCP servers")
+    }
+
+    /// Error for prompt content that the agent does not support.
+    pub fn missing_prompt_content(content: impl Display) -> String {
+        format!("the agent does not support '{content}' prompt content")
+    }
+
+    /// Error when the agent exits before the handshake completes.
+    pub const AGENT_EXITED: &str = "the agent exited before the ACP handshake completed";
+
+    /// Error when the agent writes an output line that is too long.
+    pub fn agent_line_too_long(limit: usize) -> String {
+        format!("the agent wrote an output line longer than {limit} bytes and was stopped")
+    }
+
+    /// Error when the agent does not read its input.
+    pub const AGENT_INPUT_FULL: &str = "the agent did not read its input and was stopped";
+
+    /// Error when the agent does not complete the handshake in time.
+    pub fn handshake_timeout(secs: u64) -> String {
+        format!("the agent did not complete the ACP handshake in {secs} s")
+    }
+
+    /// Error when the agent refuses the handshake.
+    pub fn agent_handshake_failed(err: impl Display) -> String {
+        format!("the agent refused the ACP handshake: {err}")
+    }
+
+    /// Error when the agent uses an ACP version that airlock does not
+    /// support.
+    pub fn unsupported_protocol_version(version: impl Display, supported: impl Display) -> String {
+        format!("the agent uses ACP version {version}, airlock supports only version {supported}")
+    }
+
+    /// Error for an agent request that airlock refuses.
+    pub fn blocked_request(method: impl Display) -> String {
+        format!(
+            "airlock refuses '{method}' because it can act on the host. \
+             Use 'airlock acp --pass-client-capabilities' to allow it"
+        )
+    }
+
+    /// Error for an agent prompt that is not a form prompt.
+    pub const REFUSED_ELICITATION: &str = "airlock allows only form prompts. \
+         Use 'airlock acp --pass-client-capabilities' to allow other prompts";
+
+    /// Agent error message with a hint to log in inside the sandbox.
+    pub fn auth_hint(message: impl Display, cmd: impl Display) -> String {
+        format!(
+            "{message}. Log in to the agent inside the sandbox, for example with \
+             'airlock exec -l {cmd}' or the login command of the agent"
+        )
+    }
+}
+
 pub mod app {
     //! Texts of the `app` area.
 
     use std::fmt::{Debug, Display};
 
-    /// Error when `--` arguments follow a command other than `start`.
-    pub const DASH_ARGS_ONLY_WITH_START: &str = "'--' args are only supported with 'start'";
+    /// Error when `--` arguments follow a command other than `start` or `acp`.
+    pub const DASH_ARGS_ONLY_WITH_START: &str =
+        "'--' args are only supported with 'start' and 'acp'";
 
     /// Error when `--` arguments follow the `exec` command.
     pub const DASH_ARGS_NOT_WITH_EXEC: &str = "'--' args are not supported with 'exec'";
