@@ -5,6 +5,7 @@ mod test_config_export;
 mod test_config_layering;
 mod test_config_sections;
 mod test_env_masking;
+mod test_pack_approval;
 mod test_pack_entries;
 mod test_presets_list;
 mod test_setup_wizard_config;

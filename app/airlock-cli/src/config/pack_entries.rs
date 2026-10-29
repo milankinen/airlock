@@ -9,14 +9,16 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value};
 
 use crate::config::legacy_presets;
-use crate::packs::{ConfiguredPack, Pack, PackManager};
+use crate::packs::id::toml_key;
+use crate::packs::{ConfiguredPack, Pack, PackManager, PackRef};
 
 /// Keys of an entry, for error messages.
 const ENTRY_KEYS: &str = "version, enabled, args";
 
 /// The entry of one file for one pack:
 /// `<name> = { version = "1", enabled = false, args = { … } }`. All keys
-/// are optional.
+/// are optional. The entry of a user pack (`"~name" = { … }`) or a project
+/// pack (`"./path" = { … }`) cannot set `version`.
 #[derive(Clone, Debug)]
 pub struct PackEntry {
     /// Pack name (the key in the `[packs]` table).
@@ -36,12 +38,13 @@ pub struct PackEntry {
 /// Args:
 ///  - `origin`: The config file, for error messages
 ///  - `value`: Config value of the file
-///  - `known`: Packs that an entry can name
+///  - `known`: Packs that an entry can name, except the project packs. The
+///    project packs load later.
 ///  - `problems`: Receives the problems with entries, one line each
 ///
 /// Returns:
-///   The entries of known packs that are tables. A field with a value
-///   that is not valid is left unset.
+///   The entries of known packs and of project packs that are tables. A
+///   field with a value that is not valid is left unset.
 pub fn read_layer_packs(
     origin: &str,
     value: &mut Value,
@@ -70,8 +73,33 @@ fn read_table(
 ) -> Vec<PackEntry> {
     let mut entries = Vec::new();
     for (name, raw) in table {
-        if !known.iter().any(|p| p.metadata().name == name) {
-            let known: Vec<&str> = known.iter().map(|p| p.metadata().name.as_str()).collect();
+        let pack_ref = PackRef::parse(&name);
+        // The messages show the key as TOML has it, for example `"~tools"`.
+        let shown = toml_key(&name);
+        if pack_ref.is_none() && name.starts_with('~') {
+            problems.push(format!(
+                "* {}",
+                crate::messages::config::user_pack_name_invalid(&shown)
+            ));
+            continue;
+        } else if pack_ref.is_none() && looks_like_path(&name) {
+            problems.push(format!(
+                "* {}",
+                crate::messages::config::project_pack_path_invalid(&shown)
+            ));
+            continue;
+        } else if !matches!(pack_ref, Some(PackRef::Project { .. }))
+            // Project packs load later (see `add_project_packs`).
+            && !known.iter().any(|p| p.metadata().id == name)
+        {
+            if let Some(PackRef::Local { .. }) = pack_ref {
+                problems.push(format!(
+                    "* {}",
+                    crate::messages::config::unknown_user_pack(&shown)
+                ));
+                continue;
+            }
+            let known: Vec<&str> = known.iter().map(|p| p.metadata().id.as_str()).collect();
             let hint = if legacy_presets::is_released_name(&name) {
                 crate::messages::config::pack_list_form_hint(&name)
             } else {
@@ -79,14 +107,14 @@ fn read_table(
             };
             problems.push(format!(
                 "* {}",
-                crate::messages::config::unknown_pack(&name, known.join(", "), hint, origin)
+                crate::messages::config::unknown_pack(&shown, known.join(", "), hint, origin)
             ));
             continue;
         }
         let Value::Object(mut entry) = raw else {
             problems.push(format!(
                 "* {}",
-                crate::messages::config::pack_entry_not_table(&name, origin)
+                crate::messages::config::pack_entry_not_table(&shown, origin)
             ));
             continue;
         };
@@ -96,18 +124,25 @@ fn read_table(
             Some(_) => {
                 problems.push(format!(
                     "* {}",
-                    crate::messages::config::pack_enabled_not_bool(&name, origin)
+                    crate::messages::config::pack_enabled_not_bool(&shown, origin)
                 ));
                 None
             }
         };
         let version = match entry.remove("version").map(|v| normalize_version(&v)) {
             None => None,
+            Some(_) if pack_ref.is_some_and(|r| !r.needs_version()) => {
+                problems.push(format!(
+                    "* {}",
+                    crate::messages::config::pack_version_not_allowed(&shown)
+                ));
+                None
+            }
             Some(Ok(version)) => Some(version),
             Some(Err(e)) => {
                 problems.push(format!(
                     "* {}",
-                    crate::messages::config::pack_version_invalid(&name, e, origin)
+                    crate::messages::config::pack_version_invalid(&shown, e, origin)
                 ));
                 None
             }
@@ -118,7 +153,7 @@ fn read_table(
             Some(_) => {
                 problems.push(format!(
                     "* {}",
-                    crate::messages::config::pack_args_not_table(&name, origin)
+                    crate::messages::config::pack_args_not_table(&shown, origin)
                 ));
                 Map::new()
             }
@@ -126,7 +161,7 @@ fn read_table(
         for key in entry.keys() {
             problems.push(format!(
                 "* {}",
-                crate::messages::config::pack_unknown_key(&name, key, ENTRY_KEYS, origin)
+                crate::messages::config::pack_unknown_key(&shown, key, ENTRY_KEYS, origin)
             ));
         }
         entries.push(PackEntry {
@@ -138,6 +173,12 @@ fn read_table(
         });
     }
     entries
+}
+
+/// Return true if a `[packs]` key that is not a valid pack id looks like a
+/// path. The error then tells the form of a project pack path.
+fn looks_like_path(name: &str) -> bool {
+    name.starts_with('.') || name.contains('/')
 }
 
 /// Convert a `version` value to a string. A string stays as it is. A whole
@@ -225,7 +266,7 @@ pub async fn configure_packs(
     let merged = merge_pack_entries(entries);
     let mut configured = Vec::new();
     for pack in known {
-        let Some(entry) = merged.iter().find(|m| m.name == pack.metadata().name) else {
+        let Some(entry) = merged.iter().find(|m| pack.metadata().id == m.name) else {
             continue;
         };
         if !entry.enabled() {
@@ -239,7 +280,8 @@ pub async fn configure_packs(
     configured
 }
 
-/// Configure a merged entry at its version.
+/// Configure a merged entry at its version. A pack with no versions (a
+/// user pack) uses the args of all files.
 ///
 /// Uses the args of the files whose entry has that version or no version.
 /// For each arg, the highest of these files wins. The value of each file
@@ -257,7 +299,18 @@ async fn configure_entry(
     packs: &PackManager,
     newest: &Pack,
 ) -> Result<ConfiguredPack, Vec<String>> {
-    let name = &newest.metadata().name;
+    let id = &newest.metadata().id;
+    let name = toml_key(id.as_str());
+    let name = name.as_ref();
+    if !id.pack_ref().needs_version() {
+        // A pack with no versions: all files give args. A `version` key is
+        // an error in `read_table`.
+        let pack = packs
+            .resolve(id, None)
+            .await
+            .unwrap_or_else(|| newest.clone());
+        return configure_args(name, entry.contributors.iter(), &pack, None);
+    }
     let Some(source) = entry.version_source() else {
         return Err(vec![format!(
             "* {}",
@@ -269,7 +322,7 @@ async fn configure_entry(
         )]);
     };
     let version = source.version.clone().expect("the source sets version");
-    let Some(pack) = packs.resolve(name, &version).await else {
+    let Some(pack) = packs.resolve(id, Some(&version)).await else {
         if version == legacy_presets::LEGACY_VERSION
             && let Some(released) = legacy_presets::released_name(name)
         {
@@ -298,20 +351,43 @@ async fn configure_entry(
             )
         )]);
     };
+    let contributors = entry.contributors.iter().filter(|c| {
+        let Some(other) = c.version.as_ref().filter(|v| **v != version) else {
+            return true;
+        };
+        if !c.args.is_empty() {
+            tracing::debug!(
+                "config: {}: the args of packs.{name} for version {other} are dropped \
+                 (the version is {version})",
+                c.file
+            );
+        }
+        false
+    });
+    configure_args(name, contributors, &pack, Some(&version))
+}
 
+/// Check the args of the entries and configure the pack with them. For
+/// each arg, the highest entry wins. The value of each entry must be valid
+/// for the arg.
+/// Args:
+///  - `name`: Pack id as a TOML key, for error messages
+///  - `contributors`: The entries that give args, lowest first
+///  - `pack`: The pack version
+///  - `version`: Pack version, for error messages. `None` for a pack with
+///    no versions.
+///
+/// Returns:
+///   The configured pack, or the problems, one line each.
+fn configure_args<'a>(
+    name: &str,
+    contributors: impl Iterator<Item = &'a PackEntry>,
+    pack: &Pack,
+    version: Option<&str>,
+) -> Result<ConfiguredPack, Vec<String>> {
     // For each arg key: each file that sets it, with its value, lowest first.
     let mut set_by: BTreeMap<&str, Vec<(&str, &Value)>> = BTreeMap::new();
-    for c in &entry.contributors {
-        if let Some(other) = c.version.as_ref().filter(|v| **v != version) {
-            if !c.args.is_empty() {
-                tracing::debug!(
-                    "config: {}: the args of packs.{name} for version {other} are dropped \
-                     (the version is {version})",
-                    c.file
-                );
-            }
-            continue;
-        }
+    for c in contributors {
         for (key, raw) in &c.args {
             set_by
                 .entry(key.as_str())
@@ -324,16 +400,21 @@ async fn configure_entry(
     for (key, sources) in set_by {
         let path = format!("`packs.{name}.args.{key}`");
         let Some(arg) = pack.args().iter().find(|arg| arg.key == key) else {
-            let files: Vec<&str> = sources.iter().map(|(file, _)| *file).collect();
-            problems.push(format!(
-                "* {}",
-                crate::messages::config::pack_unknown_arg(
-                    &path,
-                    &version,
-                    pack.known_args(),
-                    files.join(", ")
-                )
-            ));
+            let problem = match version {
+                Some(version) => {
+                    let files: Vec<&str> = sources.iter().map(|(file, _)| *file).collect();
+                    crate::messages::config::pack_unknown_arg(
+                        &path,
+                        version,
+                        pack.known_args(),
+                        files.join(", "),
+                    )
+                }
+                None => {
+                    crate::messages::config::pack_unknown_arg_no_version(&path, pack.known_args())
+                }
+            };
+            problems.push(format!("* {problem}"));
             continue;
         };
         for (file, raw) in sources {
@@ -356,14 +437,21 @@ async fn configure_entry(
 
 /// List the available versions of the pack of `newest`, newest first.
 /// Versions are the whole numbers from 1.
+///
+/// Returns:
+///   The versions. Empty for a pack with no versions: the caller must
+///   handle that case.
 async fn supported_versions(packs: &PackManager, newest: &Pack) -> Vec<String> {
     let metadata = newest.metadata();
-    let Ok(highest) = metadata.version.parse::<u64>() else {
-        return vec![metadata.version.clone()];
+    let Some(newest_version) = &metadata.version else {
+        return Vec::new();
+    };
+    let Ok(highest) = newest_version.parse::<u64>() else {
+        return vec![newest_version.clone()];
     };
     let mut versions = Vec::new();
     for version in (1..=highest).rev().map(|v| v.to_string()) {
-        if packs.resolve(&metadata.name, &version).await.is_some() {
+        if packs.resolve(&metadata.id, Some(&version)).await.is_some() {
             versions.push(version);
         }
     }

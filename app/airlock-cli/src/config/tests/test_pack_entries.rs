@@ -10,7 +10,12 @@ fn versions(resolved: &ResolvedConfig) -> Vec<(&str, &str)> {
     resolved
         .packs
         .iter()
-        .map(|p| (p.metadata().name.as_str(), p.metadata().version.as_str()))
+        .map(|p| {
+            (
+                p.metadata().id.as_str(),
+                p.metadata().version.as_deref().unwrap_or_default(),
+            )
+        })
         .collect()
 }
 
@@ -19,7 +24,7 @@ fn arg<'a>(resolved: &'a ResolvedConfig, name: &str, key: &str) -> Option<&'a Ar
     resolved
         .packs
         .iter()
-        .find(|p| p.metadata().name == name)?
+        .find(|p| p.metadata().id == name)?
         .args()
         .get(key)
 }

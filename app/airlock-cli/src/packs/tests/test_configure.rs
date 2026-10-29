@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::packs::approval::Approved;
 use crate::packs::{ArgValue, PackManager};
 use crate::test_cfg::packs::{load_packs, resolve_with, test_pack_files, test_packs};
 use crate::test_cfg::resolve_project_toml;
@@ -42,7 +43,10 @@ fn configuring_lua_pack_from_config_text_fills_defaults_and_applies_its_config()
     assert_eq!(sample.non_default_args(), [("mode", &text("turbo"))]);
     let tmp = crate::test_cfg::temp_dir();
     let data = crate::test_cfg::oci::data_dir_at(tmp.path());
-    let values = sample.config_values(&data).unwrap();
+    let values = sample
+        .config_values(&data, &Approved::for_test(sample.pack()))
+        .unwrap()
+        .0;
     assert_eq!(
         values["mounts"]["sample-dir"]["source"],
         "~/.airlock/sample"
@@ -138,4 +142,85 @@ fn install_fingerprint_follows_name_version_and_args_but_not_script() {
         fingerprint(&other_script, "[packs]\nalpha = { version = 1 }\n"),
         base
     );
+}
+
+/// Test that the install fingerprints of the built-in packs do not change.
+/// Existing sandboxes store these values. If a fingerprint changes, every
+/// sandbox with the pack counts as changed and needs a new install. A
+/// change of these values is breaking and needs a new pack version.
+///   1. Configure each built-in pack alone, with default args
+///   2. Configure python and docker with non-default args
+///   3. Check the fingerprints against the stored values
+#[test]
+fn builtin_pack_fingerprints_with_current_inputs_stay_same() {
+    let packs = crate::packs::init_builtin().unwrap();
+    let mut actual: Vec<(String, String)> = Vec::new();
+    for pack in packs.offered() {
+        let name = &pack.metadata().id;
+        let version = pack.metadata().version.as_deref().unwrap();
+        let toml = format!("[packs]\n{name} = {{ version = {version} }}\n");
+        let resolved = resolve_with(&packs, &toml).unwrap();
+        // Packs without a setup script have no fingerprint.
+        if let Some(installer) = resolved.packs[0].setup_installer() {
+            actual.push((format!("{name}@{version}"), installer.fingerprint));
+        }
+    }
+    for toml in [
+        "[packs]\npython = { version = 1, args = { python-version = \"3.12\", allow-pypi = false } }\n",
+        "[packs]\ndocker = { version = 1, args = { allow-pulls = false } }\n",
+    ] {
+        let name = toml.lines().nth(1).unwrap().split(' ').next().unwrap();
+        actual.push((format!("{name} args"), fingerprint(&packs, toml)));
+    }
+    let actual: Vec<(&str, &str)> = actual
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let expected: Vec<(&str, &str)> = vec![
+        (
+            "claude@1",
+            "6f2bbd3021e675f80ce3f11af294c91d05c79d5d8700c44846215c35f9de64ae",
+        ),
+        (
+            "codex@1",
+            "57f26c9404cafb9bc34ce76acb30bd9ebeff949f1577cab1f3b10a13b73821ae",
+        ),
+        (
+            "copilot@1",
+            "4011a95d48ce53381c6c223da455f02c3ddd2a291bf8678130a22666586d7cab",
+        ),
+        (
+            "docker@1",
+            "d83a8a78db9ee4bde96fef23733203f2e79b570d7d6ee3f38e1a1b0a5c20c196",
+        ),
+        (
+            "git@1",
+            "53d949016705f158a3afbd5e85f572934ecb4c6e92f65a6387f355151f9b9537",
+        ),
+        (
+            "mise@1",
+            "37db4a1d89fdd9d11cad4482050f3a335d32a5aaf015da9abddce563b4a99269",
+        ),
+        (
+            "nodejs@1",
+            "42c0eb421a21fa953458775fc3112191897e2b411b17141bc83ebf3ee8c22858",
+        ),
+        (
+            "python@1",
+            "ea99c7d05a342803b7683b559b56495ea5766316252575c0846c164eaf5255b2",
+        ),
+        (
+            "rust@1",
+            "3e6894db53328e5f6df7afa87946ef32f519ad289a2187b4d13d2083ffef17d0",
+        ),
+        (
+            "python args",
+            "25580728efdbd1483f9c5274b8cd90e768e181b537757a6ed51df8f00fb6e485",
+        ),
+        (
+            "docker args",
+            "258549d437f8f3d8f902fa538217be9f44fe37b25e727305ffbe44ecba238b55",
+        ),
+    ];
+    assert_eq!(actual, expected);
 }

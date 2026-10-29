@@ -62,7 +62,7 @@ fn sandbox_from_template_installs_only_extra_packs() {
 
     let beta = NewEntry {
         name: "beta",
-        version: "1",
+        version: Some("1"),
         args: vec![],
     };
     let generated = GeneratedConfig::new(

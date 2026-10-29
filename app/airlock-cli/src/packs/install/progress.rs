@@ -121,7 +121,8 @@ impl InstallProgress {
     ///  - `label`: Human-readable pack name, shown on the spinner
     pub fn begin(&mut self, id: &str, label: &str) {
         self.id = id.to_string();
-        self.label = label.to_string();
+        // A project pack can set any label.
+        self.label = crate::cli::prompt::style::escape_controls(label, false).into_owned();
         self.status = None;
         self.steps = None;
         self.step = 0;

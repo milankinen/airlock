@@ -52,7 +52,7 @@ pub(crate) fn validate_names(origin: &str, names: &[String], known: &[Pack]) -> 
     let Some(name) = names.iter().find(|name| !released.contains(&name.as_str())) else {
         return Ok(());
     };
-    let is_table_name = known.iter().any(|p| p.metadata().name == *name);
+    let is_table_name = known.iter().any(|p| p.metadata().id == **name);
     let hint = if is_table_name {
         crate::messages::config::preset_use_packs_table_hint(name)
     } else {
@@ -210,11 +210,11 @@ mod tests {
             .collect();
         expected.sort_unstable();
         assert_eq!(files, expected);
-        let packs = crate::packs::init().unwrap().builtin();
+        let packs = crate::packs::init_builtin().unwrap().offered();
         for (_, table_name) in RELEASED_NAMES {
             assert!(
                 ["arch", "fedora", "suse"].contains(&table_name)
-                    || packs.iter().any(|p| p.metadata().name == table_name),
+                    || packs.iter().any(|p| p.metadata().id == table_name),
                 "{table_name}"
             );
         }

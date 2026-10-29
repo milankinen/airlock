@@ -2,7 +2,7 @@
 //! the other grants of the project config.
 
 use crate::config::config_values::{ConfigValues, Policy};
-use crate::config::{ConfigOverrides, LayeredConfig};
+use crate::config::{ConfigOverrides, LayeredConfig, ResolveInput};
 use crate::packs::install::phase::install_config;
 use crate::test_cfg::block_on;
 use crate::vault::{Vault, VaultStorageType};
@@ -73,12 +73,18 @@ fn resolve(user: &str, project: &str) -> ConfigValues {
         vec![("airlock.toml", toml::from_str(project).unwrap())],
     )
     .unwrap();
-    let packs = crate::packs::init().unwrap();
+    let packs = crate::packs::init_builtin().unwrap();
     let tmp = crate::test_cfg::temp_dir();
     let data = crate::test_cfg::oci::data_dir_at(tmp.path());
-    block_on(layers.resolve(&data, &packs, &ConfigOverrides::default()))
-        .unwrap()
-        .values
+    block_on(layers.resolve(&ResolveInput {
+        data_dir: &data,
+        packs: &packs,
+        overrides: &ConfigOverrides::default(),
+        project_root: None,
+        approval: crate::packs::approval::ApprovalMode::APPROVE,
+    }))
+    .unwrap()
+    .values
 }
 
 /// Test that the install boot gets an open network and nothing else that

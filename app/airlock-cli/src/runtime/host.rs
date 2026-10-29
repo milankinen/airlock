@@ -135,6 +135,7 @@ mod tests {
                 keys: [("no-such-action".to_string(), KeyList(vec!["q".into()]))].into(),
             },
             security: crate::settings::SecuritySettings::default(),
+            packs: crate::settings::PackSettings::default(),
         };
         let Err(e) = HostRuntime::new(true, &settings) else {
             panic!("bad keys must be rejected");

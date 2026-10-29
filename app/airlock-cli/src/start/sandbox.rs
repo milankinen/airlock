@@ -2,13 +2,17 @@
 //!
 //! Prepares the stored sandbox (image, disk and install records) and decides
 //! which tools to install. For an existing sandbox, it can ask the user about
-//! image and tool changes.
+//! image and tool changes. For a changed pack, the question shows what
+//! changed since the install. A sandbox from a template also gets the
+//! question for changed packs.
 
+#[cfg(not(test))]
+use self::choose_changed_terminal as choose_changed;
 use super::config_change::{self, CheckInput, Checked};
 use super::install::{self, InstallDecision};
 use super::{Exit, SandboxOptions};
-use crate::cli::prompt;
-use crate::cli::prompt::choose::{Choice, Choose};
+use crate::cli::prompt::choose::{Choice, Choose, Details};
+use crate::cli::prompt::style::{self, Styles};
 use crate::config::{LayeredConfig, ResolvedConfig};
 use crate::context::Context;
 #[cfg(not(test))]
@@ -17,12 +21,14 @@ use crate::oci::{ImageChange, ImageChangeStop, OciImage, OnImageChange};
 #[cfg(not(test))]
 use crate::packs::install::facts::check as check_image;
 use crate::packs::install::plan::{self, DecideInput, Pending, Plan, Transition, Wanted, Why};
+use crate::packs::install::snapshots::{self as install_snapshots, InstallSnapshots};
 use crate::packs::install::state::{self as install_state, InstallState, ReadState};
+use crate::packs::snapshot::{self, PackSnapshot};
 use crate::packs::{InstallerScript, PackManager};
 use crate::project::{self, SandboxLock};
 use crate::templates::{self, Template};
 #[cfg(test)]
-use crate::test_cfg::start::{check_image, prepare_image};
+use crate::test_cfg::start::{check_image, choose_changed, prepare_image};
 use crate::util::{PinnedDir, VerifiedPath};
 use crate::{cli, messages, sandbox};
 
@@ -78,10 +84,49 @@ enum ToolQuestion {
 enum ToolAnswer {
     /// Re-create sandbox (all questions).
     Recreate,
+    /// Reinstall on top (changed packs).
+    Reinstall,
+    /// Keep old (changed packs).
+    KeepOld,
     /// Continue with current sandbox (removed tools).
     KeepRemoved,
     /// Install anyway (added tools).
     InstallAdded,
+}
+
+/// The answer to the changed-packs question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangedAnswer {
+    /// Re-create the sandbox: all packs install on a new disk.
+    Recreate,
+    /// Install the changed packs on top of the disk (see
+    /// [`Plan::reinstall_changed`]).
+    Reinstall,
+    /// Keep the old packs on the disk (see [`Plan::accept_changed`]).
+    KeepOld,
+}
+
+impl From<ChangedAnswer> for ToolAnswer {
+    fn from(answer: ChangedAnswer) -> Self {
+        match answer {
+            ChangedAnswer::Recreate => Self::Recreate,
+            ChangedAnswer::Reinstall => Self::Reinstall,
+            ChangedAnswer::KeepOld => Self::KeepOld,
+        }
+    }
+}
+
+/// The changed packs of a sandbox, and what airlock knows about their
+/// installs.
+pub(crate) struct ChangedPacks<'a> {
+    /// Ids of the changed packs (see [`Plan::changed`]).
+    pub changed: &'a [String],
+    /// The installers of the configured packs.
+    pub candidates: &'a [InstallerScript],
+    /// The install records of the disk.
+    pub state: &'a InstallState,
+    /// The install snapshots of the disk.
+    pub snapshots: &'a InstallSnapshots,
 }
 
 /// Return what `oci::prepare` does about a changed image.
@@ -125,11 +170,20 @@ fn added_tools_notes(change: ImageChange) -> Vec<&'static str> {
 /// Return the action for the tool changes of `plan`.
 ///
 /// Tool changes are changed packs, removed tools, and pending tools other
-/// than retries. A new disk gets its tools without a question.
-fn tool_changes(new_disk: bool, plan: &Plan, answering: Answering) -> ToolChanges {
-    let unchanged =
-        plan.changed.is_empty() && plan.removed.is_empty() && asked(&plan.pending).is_empty();
-    if new_disk || unchanged {
+/// than retries. A new disk gets its tools without a question. A new copy
+/// of a template disk gets only the changed-packs question.
+/// Args:
+///  - `new_disk`: The sandbox had no disk at the start of the run
+///  - `copied`: The disk is a new copy of a template disk
+///  - `plan`: The install plan
+///  - `answering`: How the questions get their answers
+fn tool_changes(new_disk: bool, copied: bool, plan: &Plan, answering: Answering) -> ToolChanges {
+    let unchanged = if new_disk {
+        !copied || plan.changed.is_empty()
+    } else {
+        plan.changed.is_empty() && plan.removed.is_empty() && asked(&plan.pending).is_empty()
+    };
+    if unchanged {
         ToolChanges::NoQuestion
     } else if answering.yes {
         ToolChanges::Recreate
@@ -140,36 +194,41 @@ fn tool_changes(new_disk: bool, plan: &Plan, answering: Answering) -> ToolChange
     }
 }
 
-/// Return the pending tools that need the "added" question: all except
-/// retries.
+/// Return the pending tools that need the "added" question: the new
+/// tools. Retries and changed packs need no added question.
 fn asked(pending: &[Pending]) -> Vec<&Pending> {
-    pending.iter().filter(|p| p.why != Why::Retry).collect()
+    pending.iter().filter(|p| p.why == Why::New).collect()
 }
 
 /// Return the labels of the configured packs `ids` (from their installs).
+/// The labels are safe for the terminal: a project pack can set any label.
 fn candidate_labels<'a>(
     ids: impl IntoIterator<Item = &'a str>,
     candidates: &[InstallerScript],
 ) -> Vec<String> {
     ids.into_iter()
         .map(|id| {
-            candidates
+            let label = candidates
                 .iter()
                 .find(|c| c.pack == id)
-                .map_or(id, |c| c.label.as_str())
-                .to_string()
+                .map_or(id, |c| c.label.as_str());
+            style::escape_controls(label, false).into_owned()
         })
         .collect()
 }
 
-/// Return the error text for tool changes that nobody can answer.
-fn tools_changed_message(plan: &Plan) -> String {
+/// Return the error text for tool changes that nobody can answer. With
+/// `only_changed`, the text names only the changed packs.
+fn tools_changed_message(plan: &Plan, only_changed: bool) -> String {
     let added: Vec<&str> = asked(&plan.pending).iter().map(|p| p.id.as_str()).collect();
     let mut parts = Vec::new();
     if !plan.changed.is_empty() {
         parts.push(messages::start::tools_changed_changed(
             plan.changed.join(", "),
         ));
+    }
+    if only_changed {
+        return messages::start::tools_changed(parts.join("; "));
     }
     if !added.is_empty() {
         parts.push(messages::start::tools_changed_added(added.join(", ")));
@@ -186,7 +245,9 @@ fn tools_changed_message(plan: &Plan) -> String {
 /// install.
 ///
 /// A new sandbox with `template` starts with a copy of the template (see
-/// [`templates::seed`]).
+/// [`templates::seed`]). The copy gets only the changed-packs question. A
+/// re-create answer removes the copied disk, and all packs install on a new
+/// disk.
 ///
 /// For an existing sandbox, the step can ask these questions:
 ///  * A changed config (see [`config_change::check`]). The answers are
@@ -196,7 +257,8 @@ fn tools_changed_message(plan: &Plan) -> String {
 /// The default answer of each of these is `Re-create sandbox`:
 ///  * A changed image
 ///  * Changed packs (the definition is different from the one on the disk).
-///    The only other answer is `Abort`.
+///    The question shows the changes since the install. The other answers
+///    are `Reinstall on top`, `Keep old` and `Abort`.
 ///  * Tools removed from the config
 ///  * Tools added to the config
 ///
@@ -238,7 +300,7 @@ pub async fn ensure_sandbox(
     let vault = &context.vault;
     super::env::check_env_early(&resolved.values, vault)?;
     let answering = Answering {
-        can_prompt: prompt::can_prompt(),
+        can_prompt: options.can_prompt,
         yes: options.yes,
     };
     let lock =
@@ -257,9 +319,15 @@ pub async fn ensure_sandbox(
         sandbox_dir: lock.dir(),
         resolved: &resolved,
         paths: &paths,
-        data_dir: &context.data,
-        packs,
-        overrides: &options.overrides,
+        resolve: crate::config::ResolveInput {
+            data_dir: &context.data,
+            packs,
+            overrides: &options.overrides,
+            project_root: Some(host_cwd),
+            // The first resolve of the run already asked. This resolve
+            // runs under the sandbox lock and must not wait for the user.
+            approval: crate::packs::approval::ApprovalMode::Refuse,
+        },
         can_prompt: answering.can_prompt,
         yes: answering.yes,
         allow_changes: options.allow_config_changes,
@@ -274,14 +342,18 @@ pub async fn ensure_sandbox(
     };
     // A sandbox from a template starts with a copy of the template disk.
     // It still counts as a new disk: the tools that the template does not
-    // have install without a question.
+    // have install without a question. But the template can have an older
+    // definition of a pack, so changed packs get the question.
     let new_disk = !project::has_disk(lock.dir());
     let mut seeded = SeedGuard(None);
+    let mut copied = false;
     if new_disk && let Some(template) = template {
         templates::seed::seed(template, &sandbox_dir, lock.dir())?;
         seeded.0 = Some(lock.dir().clone());
+        copied = true;
     }
     let mut state = read_state(&sandbox_dir, answering.can_prompt)?;
+    let snapshots = install_snapshots::read(&sandbox_dir);
     let candidates = install::install_candidates(&resolved.packs);
     let wanted: Vec<Wanted> = candidates
         .iter()
@@ -301,9 +373,10 @@ pub async fn ensure_sandbox(
 
     // Stop before the pull if a tool question is necessary and nobody can
     // answer it.
+    // On this exit, the seed guard removes a template copy.
     let early = decide(&state, None);
-    if tool_changes(new_disk, &early, answering) == ToolChanges::NeedsTerminal {
-        return Err(Exit::error(2, tools_changed_message(&early)));
+    if tool_changes(new_disk, copied, &early, answering) == ToolChanges::NeedsTerminal {
+        return Err(Exit::error(2, tools_changed_message(&early, new_disk)));
     }
 
     let values = &resolved.values;
@@ -325,25 +398,36 @@ pub async fn ensure_sandbox(
     }
     // The template disk belongs to the template image. With an other
     // image, start with an empty disk.
-    if seeded.0.is_some() && prepared.change != ImageChange::Unchanged {
+    if copied && prepared.change != ImageChange::Unchanged {
         project::reset_disk(&sandbox_dir)?;
         state = InstallState::default();
     }
     let mut plan = decide(&state, Some(&image.image_id));
     let mut recreate = false;
     if !image_reset {
-        match tool_changes(new_disk, &plan, answering) {
+        match tool_changes(new_disk, copied, &plan, answering) {
             ToolChanges::NoQuestion => {}
             ToolChanges::Recreate => recreate = true,
             ToolChanges::NeedsTerminal => {
-                return Err(Exit::error(2, tools_changed_message(&plan)));
+                return Err(Exit::error(2, tools_changed_message(&plan, new_disk)));
             }
             ToolChanges::Ask => {
-                recreate = answer_tool_changes(&mut plan, |question, plan| match question {
-                    ToolQuestion::Changed => ask_changed_packs(&candidates, plan),
-                    ToolQuestion::Removed => ask_removed_tools(packs, plan),
-                    ToolQuestion::Added => {
-                        ask_added_tools(&candidates, plan, &added_tools_notes(prepared.change))
+                let state = &state;
+                let snapshots = &snapshots;
+                let candidates = &candidates;
+                recreate = answer_tool_changes(&mut plan, &wanted, new_disk, |question, plan| {
+                    match question {
+                        ToolQuestion::Changed => ask_changed_packs(&ChangedPacks {
+                            changed: &plan.changed,
+                            candidates,
+                            state,
+                            snapshots,
+                        })
+                        .map(ToolAnswer::from),
+                        ToolQuestion::Removed => ask_removed_tools(packs, plan),
+                        ToolQuestion::Added => {
+                            ask_added_tools(candidates, plan, &added_tools_notes(prepared.change))
+                        }
                     }
                 })?;
             }
@@ -356,10 +440,17 @@ pub async fn ensure_sandbox(
         check_image(&context.data, &image).map_err(|e| Exit::error(2, e))?;
     }
     if recreate {
-        project::reset_disk(&sandbox_dir)?;
+        if copied {
+            // The new disk does not start from the template.
+            templates::seed::drop_disk(&sandbox_dir)?;
+            state = InstallState::default();
+            copied = false;
+        } else {
+            project::reset_disk(&sandbox_dir)?;
+        }
         plan = decide(&state, Some(&image.image_id));
     }
-    project::ensure_disk(&sandbox_dir, &values.disk, seeded.0.is_some())?;
+    project::ensure_disk(&sandbox_dir, &values.disk, copied)?;
     let to_install: Vec<InstallerScript> = candidates
         .into_iter()
         .filter(|t| plan.pending.iter().any(|p| p.id == t.pack))
@@ -415,23 +506,31 @@ impl Drop for SeedGuard {
 /// comes only if there are such packs. A re-create answer ends the questions.
 /// Args:
 ///  - `plan`: Install plan. The answers change it.
+///  - `wanted`: The configured packs of `plan`
+///  - `only_changed`: Ask only the changed-packs question (a new copy of a
+///    template disk)
 ///  - `ask`: Asks one question and returns the answer
 ///
 /// Returns:
 ///   True if the sandbox must be re-created.
 fn answer_tool_changes(
     plan: &mut Plan,
+    wanted: &[Wanted],
+    only_changed: bool,
     mut ask: impl FnMut(ToolQuestion, &Plan) -> Result<ToolAnswer, Exit>,
 ) -> Result<bool, Exit> {
     if !plan.changed.is_empty() {
         let answer = ask(ToolQuestion::Changed, plan)?;
-        if apply_tool_answer(plan, answer) {
+        if apply_tool_answer(plan, wanted, answer) {
             return Ok(true);
         }
     }
+    if only_changed {
+        return Ok(false);
+    }
     if !plan.removed.is_empty() {
         let answer = ask(ToolQuestion::Removed, plan)?;
-        if apply_tool_answer(plan, answer) {
+        if apply_tool_answer(plan, wanted, answer) {
             return Ok(true);
         }
     }
@@ -439,18 +538,30 @@ fn answer_tool_changes(
         return Ok(false);
     }
     let answer = ask(ToolQuestion::Added, plan)?;
-    Ok(apply_tool_answer(plan, answer))
+    Ok(apply_tool_answer(plan, wanted, answer))
 }
 
 /// Apply a tool answer to `plan`.
 ///
-/// "Continue with current sandbox" keeps the removed tools (recorded as
-/// `kept`).
+/// "Reinstall on top" makes the changed packs pending, "Keep old" records
+/// their new fingerprints (see [`Plan`]). "Continue with current sandbox"
+/// keeps the removed tools (recorded as `kept`).
+/// Args:
+///  - `wanted`: The configured packs of `plan`
+///
 /// Returns:
 ///   True if the sandbox must be re-created.
-fn apply_tool_answer(plan: &mut Plan, answer: ToolAnswer) -> bool {
+fn apply_tool_answer(plan: &mut Plan, wanted: &[Wanted], answer: ToolAnswer) -> bool {
     match answer {
         ToolAnswer::Recreate => true,
+        ToolAnswer::Reinstall => {
+            plan.reinstall_changed(wanted);
+            false
+        }
+        ToolAnswer::KeepOld => {
+            plan.accept_changed(wanted);
+            false
+        }
         ToolAnswer::KeepRemoved => {
             let kept = plan.removed.iter().cloned().map(Transition::Keep);
             plan.transitions.extend(kept);
@@ -460,17 +571,123 @@ fn apply_tool_answer(plan: &mut Plan, answer: ToolAnswer) -> bool {
     }
 }
 
-/// Ask about the changed packs of `plan`.
+/// Get the answer to the changed-packs question for `packs`, outside of
+/// [`ensure_sandbox`]. `--yes` re-creates without a question.
+/// Args:
+///  - `options`: Command-line options
+///  - `packs`: The changed packs
 ///
-/// Only a new sandbox installs them, so the answers are "Re-create sandbox"
-/// and "Abort".
-fn ask_changed_packs(candidates: &[InstallerScript], plan: &Plan) -> Result<ToolAnswer, Exit> {
-    let labels = candidate_labels(plan.changed.iter().map(String::as_str), candidates);
-    ask(
-        &messages::start::packs_changed(labels.join(", ")),
-        &[messages::start::PACKS_CHANGED_NOTE],
-        &[(messages::start::RECREATE_SANDBOX, ToolAnswer::Recreate)],
-    )
+/// Returns:
+///   The answer, or the exit if nobody can answer (exit code 2) or the
+///   user aborts.
+pub(crate) fn changed_packs_answer(
+    options: &super::SandboxOptions,
+    packs: &ChangedPacks<'_>,
+) -> Result<ChangedAnswer, Exit> {
+    if options.yes {
+        Ok(ChangedAnswer::Recreate)
+    } else if options.can_prompt {
+        ask_changed_packs(packs)
+    } else {
+        let parts = messages::start::tools_changed_changed(packs.changed.join(", "));
+        Err(Exit::error(2, messages::start::tools_changed(parts)))
+    }
+}
+
+/// Ask about the changed packs `packs`. A key prints the changes since the
+/// install of each pack above the question.
+fn ask_changed_packs(packs: &ChangedPacks<'_>) -> Result<ChangedAnswer, Exit> {
+    let styles = Styles::new();
+    let mut items = Vec::new();
+    let mut lines = Vec::new();
+    for id in packs.changed {
+        let Some(candidate) = packs.candidates.iter().find(|c| &c.pack == id) else {
+            let id = style::escape_controls(id, false);
+            items.push(messages::packs::pack_item(&id, &id));
+            continue;
+        };
+        items.push(messages::packs::pack_item(
+            style::escape_controls(&candidate.pack, false),
+            style::escape_controls(&candidate.label, false),
+        ));
+        let installed = packs
+            .state
+            .packs
+            .get(id)
+            .and_then(|record| packs.snapshots.get(&record.fingerprint));
+        lines.extend(changed_pack_lines(candidate, installed, &styles));
+    }
+    choose_changed(&items, &lines)
+}
+
+/// Return the lines that show the changes of the pack of `candidate` since
+/// its install: the file diff, the version and arg diff, and the names of
+/// the changed setup values. All text from the pack is made safe for the
+/// terminal.
+/// Args:
+///  - `candidate`: Installer of the current pack definition
+///  - `installed`: Snapshot of the install, if the sandbox has it
+///  - `styles`: Colors of the lines
+fn changed_pack_lines(
+    candidate: &InstallerScript,
+    installed: Option<&PackSnapshot>,
+    styles: &Styles,
+) -> Vec<String> {
+    let new = &candidate.snapshot;
+    let id = style::escape_controls(&candidate.pack, false);
+    let label = style::escape_controls(&candidate.label, false);
+    let mut lines = vec![messages::start::changed_pack_header(id, label)];
+    let Some(installed) = installed else {
+        lines.push(format!("  {}", messages::packs::CHANGES_NOT_SHOWN));
+        return lines;
+    };
+    lines.extend(snapshot::file_lines(installed, new, styles));
+    lines.extend(snapshot::args_lines(installed, new, styles));
+    let keys = snapshot::changed_env_keys(installed, new);
+    if !keys.is_empty() {
+        let keys: Vec<String> = keys
+            .iter()
+            .map(|key| style::escape_controls(key, false).into_owned())
+            .collect();
+        lines.push(messages::start::setup_values_changed(keys.join(", ")));
+    }
+    lines
+}
+
+/// Ask the changed-packs question. The default answer is `Re-create
+/// sandbox`.
+/// Args:
+///  - `items`: The list of the changed packs
+///  - `lines`: The changes, which a key shows and hides in the question
+///
+/// Returns:
+///   The answer. Abort and Esc end the run.
+pub(crate) fn choose_changed_terminal(
+    items: &[String],
+    lines: &[String],
+) -> Result<ChangedAnswer, Exit> {
+    let notes: Vec<&str> = items.iter().map(String::as_str).collect();
+    let details = Details {
+        key: 's',
+        show_hint: messages::packs::SHOW_CHANGES_HINT,
+        hide_hint: messages::packs::HIDE_CHANGES_HINT,
+        lines,
+    };
+    let answer = ask_with(
+        messages::start::PACKS_CHANGED,
+        &notes,
+        &[
+            (messages::start::RECREATE_SANDBOX, ToolAnswer::Recreate),
+            (messages::start::REINSTALL_ON_TOP, ToolAnswer::Reinstall),
+            (messages::start::KEEP_OLD_PACKS, ToolAnswer::KeepOld),
+        ],
+        Some(&details),
+    )?;
+    Ok(match answer {
+        ToolAnswer::Reinstall => ChangedAnswer::Reinstall,
+        ToolAnswer::KeepOld => ChangedAnswer::KeepOld,
+        _ => ChangedAnswer::Recreate,
+    })
 }
 
 /// Ask about the removed tools of `plan`.
@@ -515,6 +732,16 @@ fn ask_added_tools(
 /// Returns:
 ///   The selected answer. Abort and Esc end the run.
 fn ask(title: &str, notes: &[&str], choices: &[(&str, ToolAnswer)]) -> Result<ToolAnswer, Exit> {
+    ask_with(title, notes, choices, None)
+}
+
+/// [`ask`] with the optional `details` key (see [`Choose::ask_with_details`]).
+fn ask_with(
+    title: &str,
+    notes: &[&str],
+    choices: &[(&str, ToolAnswer)],
+    details: Option<&Details>,
+) -> Result<ToolAnswer, Exit> {
     let options: Vec<Choice> = choices
         .iter()
         .map(|(label, _)| *label)
@@ -528,7 +755,11 @@ fn ask(title: &str, notes: &[&str], choices: &[(&str, ToolAnswer)]) -> Result<To
         default: 0,
         report: true,
     };
-    match question.ask()? {
+    let answer = match details {
+        Some(details) => question.ask_with_details(details)?,
+        None => question.ask()?,
+    };
+    match answer {
         Some(i) if i < choices.len() => Ok(choices[i].1),
         _ => Err(Exit::aborted()),
     }
@@ -550,13 +781,14 @@ fn image_error(e: anyhow::Error) -> Exit {
 }
 
 /// Return the label of pack `id`, or `id` for a pack that airlock does not
-/// know.
+/// know. The label is safe for the terminal.
 fn label(packs: &PackManager, id: &str) -> String {
-    packs
-        .builtin()
+    let offered = packs.offered();
+    let label = offered
         .iter()
-        .find(|p| p.metadata().name == id)
-        .map_or_else(|| id.to_string(), |p| p.metadata().label.clone())
+        .find(|p| p.metadata().id == id)
+        .map_or(id, |p| p.metadata().label.as_str());
+    style::escape_controls(label, false).into_owned()
 }
 
 /// Read `installs.json`.
@@ -626,7 +858,7 @@ mod tests {
     fn questions(plan: &mut Plan, answers: &[ToolAnswer]) -> (Vec<ToolQuestion>, bool) {
         let mut asked_questions = Vec::new();
         let mut answers = answers.iter();
-        let recreate = answer_tool_changes(plan, |question, _| {
+        let recreate = answer_tool_changes(plan, &[], false, |question, _| {
             asked_questions.push(question);
             Ok(*answers.next().expect("an answer"))
         })
@@ -655,12 +887,21 @@ mod tests {
             plan(vec![], &["beta"], &[]),
             plan(vec![], &[], &["gamma"]),
         ] {
-            assert_eq!(tool_changes(false, &changed, TTY), ToolChanges::Ask);
-            assert_eq!(tool_changes(false, &changed, yes), ToolChanges::Recreate);
-            assert_eq!(tool_changes(true, &changed, TTY), ToolChanges::NoQuestion);
+            assert_eq!(tool_changes(false, false, &changed, TTY), ToolChanges::Ask);
+            assert_eq!(
+                tool_changes(false, false, &changed, yes),
+                ToolChanges::Recreate
+            );
+            assert_eq!(
+                tool_changes(true, false, &changed, TTY),
+                ToolChanges::NoQuestion
+            );
         }
         let retry = plan(vec![pending("alpha", Why::Retry)], &[], &[]);
-        assert_eq!(tool_changes(false, &retry, TTY), ToolChanges::NoQuestion);
+        assert_eq!(
+            tool_changes(false, false, &retry, TTY),
+            ToolChanges::NoQuestion
+        );
     }
 
     /// Test that the tool questions come in the order changed, removed,
@@ -765,7 +1006,7 @@ mod tests {
             &["plain"],
         );
         assert_eq!(
-            tools_changed_message(&changed),
+            tools_changed_message(&changed, false),
             "Tools changed in the sandbox (changed: plain; added: alpha; removed: gamma). Run in \
              a terminal or pass --yes."
         );
@@ -776,5 +1017,71 @@ mod tests {
         );
         assert_eq!(label(&test_packs(), "beta"), "Beta");
         assert_eq!(label(&test_packs(), "unknown"), "unknown");
+    }
+
+    /// Test that a new copy of a template disk asks only about changed
+    /// packs. The template can have an older pack, but added and removed
+    /// tools need no question on a new disk.
+    ///   1. Check the action for a copy with a changed pack, and with only
+    ///      added and removed tools
+    ///   2. Answer the questions for the copy and check that only the
+    ///      changed question comes
+    ///   3. Check that the error text names only the changed pack
+    #[test]
+    fn template_copy_asks_only_about_changed_packs() {
+        let all = || plan(vec![pending("alpha", Why::New)], &["gamma"], &["plain"]);
+        assert_eq!(tool_changes(true, true, &all(), TTY), ToolChanges::Ask);
+        let no_changed = plan(vec![pending("alpha", Why::New)], &["gamma"], &[]);
+        assert_eq!(
+            tool_changes(true, true, &no_changed, TTY),
+            ToolChanges::NoQuestion
+        );
+        let mut copy = all();
+        let mut asked_questions = Vec::new();
+        let recreate = answer_tool_changes(&mut copy, &[], true, |question, _| {
+            asked_questions.push(question);
+            Ok(ToolAnswer::Reinstall)
+        })
+        .unwrap();
+        assert!(!recreate);
+        assert_eq!(asked_questions, [ToolQuestion::Changed]);
+        assert_eq!(
+            tools_changed_message(&all(), true),
+            "Tools changed in the sandbox (changed: plain). Run in a terminal or pass --yes."
+        );
+    }
+
+    /// Test that the changed-pack lines show the file diff since the
+    /// install, and tell when the sandbox has no copy of the install.
+    ///   1. Make an installer with a changed file and its old snapshot
+    ///   2. Check that the lines show the file diff
+    ///   3. Check the lines with no install snapshot
+    #[test]
+    fn changed_pack_lines_show_file_diff_or_missing_snapshot() {
+        let mut candidate = test_installers("[packs]\nalpha = { version = 1 }\n").remove(0);
+        let installed = PackSnapshot::new("alpha", [("setup.sh", b"echo a\n".as_slice())]);
+        candidate.snapshot = PackSnapshot::new("alpha", [("setup.sh", b"echo b\n".as_slice())]);
+        let lines = |installed: Option<&PackSnapshot>| -> Vec<String> {
+            changed_pack_lines(&candidate, installed, &Styles::new())
+                .iter()
+                .map(|line| console::strip_ansi_codes(line).into_owned())
+                .collect()
+        };
+        assert_eq!(
+            lines(Some(&installed)),
+            [
+                "Changes of pack alpha (Alpha) since the install:",
+                "setup.sh",
+                "- echo a",
+                "+ echo b"
+            ]
+        );
+        assert_eq!(
+            lines(None),
+            [
+                "Changes of pack alpha (Alpha) since the install:",
+                format!("  {}", messages::packs::CHANGES_NOT_SHOWN).as_str()
+            ]
+        );
     }
 }

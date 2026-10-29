@@ -16,7 +16,7 @@ use super::context::test_context;
 use super::packs::HostExec;
 use crate::cli::LogLevel;
 use crate::config::config_values::ImageRef;
-use crate::config::{ConfigOverrides, LayeredConfig};
+use crate::config::{ConfigOverrides, LayeredConfig, ResolveInput};
 use crate::context::Context;
 use crate::data_dir::DataDir;
 use crate::oci::{ImageChange, ImageChangeStop, OciImage, OnImageChange, PreparedImage};
@@ -26,6 +26,7 @@ use crate::packs::install::state::{self, InstallState, ReadState};
 use crate::packs::{InstallerScript, PackManager};
 use crate::project::{self, Project};
 use crate::sandboxes::{self, Found};
+use crate::start::sandbox::ChangedAnswer;
 use crate::start::{Exit, SandboxOptions, config_change};
 use crate::util::PinnedDir;
 use crate::util::verified_path::VerifiedPath;
@@ -45,6 +46,12 @@ pub struct FakeHost {
     pub unsynced: bool,
     /// The fakes are on. Else the real edges run.
     pub enabled: bool,
+    /// The answer to the changed-packs question. If set, the starts have
+    /// a terminal, and [`choose_changed`] answers with it.
+    pub changed_answer: Option<ChangedAnswer>,
+    /// The lines of each changed-packs question that [`choose_changed`]
+    /// answered, with no colors.
+    pub changed_questions: Vec<Vec<String>>,
 }
 
 thread_local! {
@@ -113,6 +120,21 @@ pub async fn prepare_image(
     }
     let pin = Some(image.image_id.clone());
     Ok(PreparedImage { image, change, pin })
+}
+
+/// The changed-packs question for tests. With
+/// [`FakeHost::changed_answer`], it records the lines of the question and
+/// returns the answer. Else the real question runs.
+pub fn choose_changed(items: &[String], lines: &[String]) -> Result<ChangedAnswer, Exit> {
+    let Some(answer) = fake_host(|host| host.changed_answer) else {
+        return crate::start::sandbox::choose_changed_terminal(items, lines);
+    };
+    let plain = lines
+        .iter()
+        .map(|line| console::strip_ansi_codes(line).into_owned())
+        .collect();
+    fake_host(|host| host.changed_questions.push(plain));
+    Ok(answer)
 }
 
 /// `facts::check` for tests. With the fakes on, each image can take packs.
@@ -211,6 +233,12 @@ impl StartProject {
         }
     }
 
+    /// Use the packs `packs` in the next starts, for example after a
+    /// change of a user pack.
+    pub fn set_packs(&mut self, packs: PackManager) {
+        self.packs = packs;
+    }
+
     /// The process context of the starts.
     pub fn context(&self) -> &Context {
         &self.context
@@ -271,10 +299,13 @@ impl StartProject {
     ) -> Result<(), Exit> {
         let options = SandboxOptions {
             yes,
+            can_prompt: crate::cli::prompt::can_prompt()
+                || fake_host(|host| host.changed_answer.is_some()),
             log_level: LogLevel::Info,
             verbose: false,
             allow_config_changes,
             overrides: ConfigOverrides::default(),
+            auto_approve_packs: false,
         };
         eventually("sandbox lock is free", || {
             // Wait until the lock of a registered sandbox is free.
@@ -297,7 +328,13 @@ impl StartProject {
     fn start_once(&self, config: &LayeredConfig, options: &SandboxOptions) -> Result<(), Exit> {
         block_on_local(async {
             let resolved = config
-                .resolve(&self.context.data, &self.packs, &options.overrides)
+                .resolve(&ResolveInput {
+                    data_dir: &self.context.data,
+                    packs: &self.packs,
+                    overrides: &options.overrides,
+                    project_root: Some(&super::oci::verified_dir(&self.project_dir())),
+                    approval: crate::packs::approval::ApprovalMode::APPROVE,
+                })
                 .await
                 .map_err(Exit::config)?;
             let template = config
@@ -339,11 +376,13 @@ impl StartProject {
     pub fn accept_config(&self, toml: &str) {
         let dir = self.sandbox().expect("a sandbox").dir;
         let config = project_config(toml);
-        let resolved = block_on_local(config.resolve(
-            &self.context.data,
-            &self.packs,
-            &ConfigOverrides::default(),
-        ))
+        let resolved = block_on_local(config.resolve(&ResolveInput {
+            data_dir: &self.context.data,
+            packs: &self.packs,
+            overrides: &ConfigOverrides::default(),
+            project_root: Some(&super::oci::verified_dir(&self.project_dir())),
+            approval: crate::packs::approval::ApprovalMode::APPROVE,
+        }))
         .unwrap();
         let cwd = super::oci::verified_dir(&self.project_dir());
         let paths = config_change::host_paths(&resolved.values, &self.context.home, &cwd);
@@ -371,10 +410,12 @@ impl StartProject {
     ) -> Result<(), Exit> {
         let options = SandboxOptions {
             yes: true,
+            can_prompt: crate::cli::prompt::can_prompt(),
             log_level: LogLevel::Info,
             verbose: false,
             allow_config_changes: false,
             overrides: ConfigOverrides::default(),
+            auto_approve_packs: false,
         };
         block_on_local(crate::templates::create::build_template(
             &self.context,

@@ -17,6 +17,16 @@ const LIB: &str = include_str!("lib.sh");
 /// stderr of the exec is the install log.
 const WRAPPER: &str = "exec 3>&1 1>&2\n";
 
+/// Linux limit for one exec string, with its end NUL (MAX_ARG_STRLEN). The
+/// full install script is one argument of the exec, so it must fit.
+pub const MAX_ARG_STRLEN: usize = 128 * 1024;
+
+/// Get the maximum size of a `setup.sh` in bytes. With a larger file, the
+/// full install script does not fit in one exec argument.
+pub(in crate::packs) fn max_setup_len() -> usize {
+    MAX_ARG_STRLEN - 1 - script("").len()
+}
+
 /// Make the full install script: wrapper, `lib.sh`, then `setup`.
 /// Args:
 ///  - `setup`: The `setup.sh` of the pack

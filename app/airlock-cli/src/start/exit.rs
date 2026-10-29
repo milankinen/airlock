@@ -7,6 +7,7 @@ use std::fmt;
 
 use crate::cli;
 use crate::cli::prompt::PromptError;
+use crate::packs::approval::ApprovalAborted;
 use crate::project::EnvError;
 
 /// The reason why a step ended the run.
@@ -26,6 +27,19 @@ impl Exit {
     pub fn config(e: impl fmt::Display) -> Self {
         cli::error!("{}", crate::messages::start::config_error(e));
         Exit::Code(2)
+    }
+
+    /// Report an error of the config resolve. An aborted pack approval is
+    /// an abort, and a failed question is a failed question (see
+    /// [`From<PromptError>`]). All other errors are configuration errors.
+    pub fn resolve(e: anyhow::Error) -> Self {
+        if e.is::<ApprovalAborted>() {
+            return Exit::aborted();
+        }
+        match e.downcast::<PromptError>() {
+            Ok(e) => Exit::from(e),
+            Err(e) => Exit::config(e),
+        }
     }
 
     /// Report an error that ends the run with `code`.

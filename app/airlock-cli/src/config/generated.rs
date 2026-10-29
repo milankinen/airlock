@@ -45,10 +45,10 @@ pub struct Clipboard {
 
 /// A pack entry of a new config file.
 pub struct NewEntry<'a> {
-    /// Pack name.
+    /// Pack id (the key in the `[packs]` table).
     pub name: &'a str,
-    /// Pack version.
-    pub version: &'a str,
+    /// Pack version. `None` for a pack with no versions.
+    pub version: Option<&'a str>,
     /// Arg values to write, by key.
     pub args: Vec<(&'a str, &'a ArgValue)>,
 }
@@ -167,7 +167,9 @@ fn render(
         let mut table = toml_edit::Table::new();
         for new in entries {
             let mut entry = toml_edit::InlineTable::new();
-            entry.insert("version", new.version.into());
+            if let Some(version) = new.version {
+                entry.insert("version", version.into());
+            }
             if !new.args.is_empty() {
                 let mut values = toml_edit::InlineTable::new();
                 for (key, value) in &new.args {

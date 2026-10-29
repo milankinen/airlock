@@ -21,12 +21,12 @@ const COPY_FIFO: &str = "/run/airlock/clipboard.copy";
 ///   4. Make the copy FIFO and check that `WAYLAND_DISPLAY` is `airlock-0`
 #[test]
 fn wrapper_runs_newest_version_and_sets_wayland_display_only_with_copy() {
-    let packs = crate::packs::init().unwrap();
+    let packs = crate::packs::init_builtin().unwrap();
     let setup = packs
         .packs
         .iter()
-        .find(|p| p.metadata().name == "claude")
-        .and_then(|p| p.0.setup)
+        .find(|p| p.metadata().id == "claude")
+        .and_then(|p| p.0.setup.clone())
         .unwrap();
     let start = setup.find("<<'WRAPPER'\n").unwrap() + "<<'WRAPPER'\n".len();
     let end = start + setup[start..].find("\nWRAPPER\n").unwrap();

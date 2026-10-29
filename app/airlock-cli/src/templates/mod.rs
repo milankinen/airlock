@@ -19,6 +19,8 @@ use std::collections::BTreeMap;
 use crate::config::generated::Clipboard;
 use crate::data_dir::DataDir;
 use crate::messages;
+use crate::packs::PackRef;
+use crate::packs::install::snapshots::SNAPSHOTS_FILE;
 use crate::packs::install::state::STATE_FILE;
 use crate::util::verified_path::VerifiedPath;
 use crate::vm::disk::{DISK_FILE, DISK_ID_FILE};
@@ -34,13 +36,15 @@ pub const IMAGE_FILE: &str = "image";
 /// certificate into the CA bundles on the disk, thus a sandbox from the
 /// template must use the same CA.
 pub const CA_FILE: &str = "ca.json";
-/// The files of a template. Nothing else is kept.
-pub const FILES: [&str; 6] = [
+/// The files of a template. Nothing else is kept. A template of an older
+/// airlock has no install snapshots.
+pub const FILES: [&str; 7] = [
     CONFIG_FILE,
     IMAGE_FILE,
     DISK_FILE,
     DISK_ID_FILE,
     STATE_FILE,
+    SNAPSHOTS_FILE,
     CA_FILE,
 ];
 /// Largest config file of a template. Airlock writes it, but the user can
@@ -77,10 +81,10 @@ pub struct TemplateConfig {
 /// A `[packs]` entry of a template config.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TemplatePack {
-    /// Pack name.
+    /// Pack id (the key in the `[packs]` table).
     pub name: String,
-    /// Pack version.
-    pub version: String,
+    /// Pack version. `None` for a pack with no versions.
+    pub version: Option<String>,
     /// Arg values as the file has them, by key.
     pub args: BTreeMap<String, serde_json::Value>,
 }
@@ -89,16 +93,21 @@ impl TemplateConfig {
     /// Parse the config file text `toml` of a template.
     /// Returns:
     ///   The config, or error if the text is not valid TOML or a `[packs]`
-    ///   entry has no version.
+    ///   entry of a pack with versions has no version.
     pub fn parse(toml: &str) -> anyhow::Result<Self> {
         let value: serde_json::Value = toml::from_str(toml)?;
         let mut packs = Vec::new();
         if let Some(table) = value.get("packs").and_then(|p| p.as_object()) {
             for (name, entry) in table {
                 let version = match entry.get("version") {
-                    Some(serde_json::Value::String(v)) => v.clone(),
-                    Some(serde_json::Value::Number(n)) => n.to_string(),
-                    _ => anyhow::bail!(messages::templates::pack_has_no_version(name)),
+                    Some(serde_json::Value::String(v)) => Some(v.clone()),
+                    Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+                    // A key that is not a valid pack id fails later, when the
+                    // config resolves. Until then it needs a version too.
+                    _ if PackRef::parse(name).is_none_or(|r| r.needs_version()) => {
+                        anyhow::bail!(messages::templates::pack_has_no_version(name))
+                    }
+                    _ => None,
                 };
                 let args = entry
                     .get("args")

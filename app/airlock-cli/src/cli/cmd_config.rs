@@ -100,9 +100,16 @@ async fn resolved_document(
     let layered: config::LayeredConfig = serde_json::from_value(stored)?;
     // The resolve runs the `config.lua` of the packs. This can make the
     // pack directories in the data directory, as `start` does.
-    let packs = packs::init()?;
+    let packs = packs::init(&context.settings.packs, &context.home)?;
     let resolved = layered
-        .resolve(&context.data, &packs, &config::ConfigOverrides::default())
+        .resolve(&config::ResolveInput {
+            data_dir: &context.data,
+            packs: &packs,
+            overrides: &config::ConfigOverrides::default(),
+            project_root: Some(project_dir),
+            // Only `airlock start` asks about new or changed packs.
+            approval: crate::packs::approval::ApprovalMode::Refuse,
+        })
         .await?;
     export::resolved_document(&resolved)
 }

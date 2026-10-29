@@ -49,8 +49,8 @@ impl Answers {
             .map(|c| {
                 let metadata = c.metadata();
                 NewEntry {
-                    name: &metadata.name,
-                    version: &metadata.version,
+                    name: metadata.id.as_str(),
+                    version: metadata.version.as_deref(),
                     args: c
                         .args()
                         .iter()
@@ -284,6 +284,14 @@ enum End {
 /// [`run_template_wizard`]) and return the new
 /// config. Messages print after the terminal is restored.
 async fn ask_config(input: &Input<'_>) -> Result<GeneratedConfig, Exit> {
+    // The warnings print before the view takes the screen.
+    for id in input.packs.defaults().1 {
+        cli::log!(
+            "{} {}",
+            cli::yellow("!"),
+            messages::start::wizard_default_unknown(id)
+        );
+    }
     let mut form = Form::new(
         input.data_dir,
         input.packs,
@@ -319,7 +327,7 @@ async fn run_view(
     screen: &mut Screen,
 ) -> Result<End, prompt::PromptError> {
     loop {
-        screen.draw(|room| view::frame(form, room))?;
+        screen.draw(|room, _| view::frame(form, room))?;
         let key = match screen::next_input().await? {
             screen::Input::Key(key) => key,
             screen::Input::Resized => continue,
@@ -334,7 +342,13 @@ async fn run_view(
                 // Leave raw mode and remove the view. Then the output of the
                 // check (a vault passphrase prompt) shows as usual.
                 screen.suspend()?;
-                match check_answers(input, &answers).await {
+                // The selection of a pack is its approval. Record it before
+                // the check runs the `config.lua` of the packs.
+                let checked = match form.approve_selected() {
+                    Ok(()) => check_answers(input, &answers).await,
+                    Err(e) => Err(e),
+                };
+                match checked {
                     Ok(()) => return Ok(End::Done(Box::new(answers))),
                     Err(e) => {
                         form.check_failed(format!("{e:#}"));
@@ -347,6 +361,8 @@ async fn run_view(
 }
 
 /// Check the config of `answers` as the rest of `airlock start` uses it.
+/// The user packs of `answers` must have an approval already (see
+/// [`Form::approve_selected`]).
 ///
 /// With the user files, the config must resolve (see
 /// [`LayeredConfig::resolve`]). Each pack `config.lua` must run, and no two
@@ -359,11 +375,19 @@ pub(super) async fn check_answers(input: &Input<'_>, answers: &Answers) -> anyho
         .clone()
         .with_generated_project(answers.config(input.host_cwd))?;
     let resolved = config
-        .resolve(
-            input.data_dir,
-            input.packs,
-            &config::ConfigOverrides::default(),
-        )
+        .resolve(&config::ResolveInput {
+            data_dir: input.data_dir,
+            packs: input.packs,
+            overrides: &config::ConfigOverrides::default(),
+            // A template has no project, thus no project packs.
+            project_root: match input.mode {
+                Mode::Start => Some(input.host_cwd),
+                Mode::Template => None,
+            },
+            // The wizard approved the selected packs before this check (see
+            // `Form::approve_selected`).
+            approval: crate::packs::approval::ApprovalMode::Refuse,
+        })
         .await?;
     crate::project::resolve_env(&resolved.values, input.vault)?;
     Ok(())

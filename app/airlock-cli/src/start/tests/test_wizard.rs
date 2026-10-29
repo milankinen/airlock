@@ -6,12 +6,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::cli::prompt::Step;
 use crate::config::generated::Target;
 use crate::config::{LayeredConfig, UserImage};
-use crate::packs::{ArgValue, PackManager};
+use crate::packs::{ArgValue, PackKind, PackManager};
 use crate::start::install::install_candidates;
 use crate::start::wizard::form::{Form, Mode, Row, StartChoice};
 use crate::start::wizard::{Input, check_answers, save_config, view};
 use crate::templates::Template;
 use crate::test_cfg::oci::{data_dir_at, verified_dir};
+use crate::test_cfg::packs::load_packs;
 use crate::test_cfg::{block_on, resolve_project_toml, temp_dir, test_template};
 use crate::vault::{Vault, VaultStorageType};
 
@@ -40,7 +41,7 @@ fn press_down_until(form: &mut Form, found: impl Fn(&Form) -> bool) {
 
 /// The name of the pack of form entry `i`.
 fn pack_name(form: &Form, i: usize) -> &str {
-    &form.entries()[i].pack.metadata().name
+    form.entries()[i].pack.metadata().id.as_str()
 }
 
 /// Move the focus down to the row of pack `name`.
@@ -63,7 +64,7 @@ fn focus_arg(form: &mut Form, name: &str, key: &str) {
 fn is_selected(form: &Form, name: &str) -> bool {
     form.entries()
         .iter()
-        .any(|e| e.selected && e.pack.metadata().name == name)
+        .any(|e| e.selected && e.pack.metadata().id == name)
 }
 
 /// The value of arg `key` of pack `name`.
@@ -71,7 +72,7 @@ fn arg_value<'a>(form: &'a Form, name: &str, key: &str) -> &'a ArgValue {
     let entry = form
         .entries()
         .iter()
-        .find(|e| e.pack.metadata().name == name)
+        .find(|e| e.pack.metadata().id == name)
         .unwrap();
     &entry.values[key]
 }
@@ -208,7 +209,7 @@ fn choosing_packs_and_args_with_keys_saves_shared_config_that_resolves() {
     let names: Vec<&str> = resolved
         .packs
         .iter()
-        .map(|c| c.metadata().name.as_str())
+        .map(|c| c.metadata().id.as_str())
         .collect();
     assert_eq!(names, ["debian", "claude", "sample"]);
     assert_eq!(
@@ -279,7 +280,7 @@ fn user_image_is_preselected_until_distro_pack_is_chosen() {
     press(&mut form, KeyCode::Char(' '));
     let answers = form.answers(Target::Local);
     assert!(answers.image.is_none());
-    assert_eq!(answers.packs[0].metadata().name, "alpine");
+    assert_eq!(answers.packs[0].metadata().id, "alpine");
 }
 
 /// Test that the answer check fails when the env of the user config does
@@ -366,6 +367,55 @@ fn template_section_is_first_only_when_templates_exist() {
     assert!(text.contains("empty - No preinstalled packs"), "{text}");
 }
 
+/// Test that a pack with no kind shows in the "Other" section, after the
+/// tools. The section is only there when such a pack exists.
+///   1. Open the form with the built-in packs and the sample pack, and
+///      check that there is no
+///      "Other" section
+///   2. Open the form with a tool pack and a pack with no kind
+///   3. Check that the pack with no kind is the only row of the "Other"
+///      section, and that the section comes after the "Tools" section
+#[test]
+fn pack_without_kind_shows_in_other_section_after_tools() {
+    let data = temp_dir();
+    let lines = |form: &Form| -> Vec<String> {
+        view_text(form)
+            .lines()
+            .map(str::trim)
+            .map(String::from)
+            .collect()
+    };
+    let form = Form::new(
+        &data_dir_at(data.path()),
+        &crate::packs::init_with_sample(),
+        None,
+        &[],
+        Mode::Start,
+    );
+    assert!(!lines(&form).iter().any(|l| l == "Other"));
+
+    let packs = load_packs(vec![
+        (
+            "hammer@1/pack.toml",
+            "label = \"Hammer\"\ndescription = \"A tool\"\nkind = \"tool\"\n".into(),
+        ),
+        (
+            "misc@1/pack.toml",
+            "label = \"Misc\"\ndescription = \"No kind\"\n".into(),
+        ),
+    ]);
+    let form = Form::new(&data_dir_at(data.path()), &packs, None, &[], Mode::Start);
+    assert_eq!(
+        form.section_rows(PackKind::Other),
+        [pack_row(&form, "misc")]
+    );
+    let lines = lines(&form);
+    let at = |text: &str| lines.iter().position(|l| l.contains(text)).unwrap();
+    let title = |text: &str| lines.iter().position(|l| l == text).unwrap();
+    let order = [title("Tools"), at("Hammer"), title("Other"), at("Misc")];
+    assert!(order.is_sorted(), "{lines:?}");
+}
+
 /// Test that a template selects and locks its packs and the distro group,
 /// and that the empty template unlocks them again. The template config
 /// already has these packs, so the answers must not repeat them.
@@ -433,7 +483,7 @@ fn template_locks_its_packs_until_empty_template_is_selected() {
     let names: Vec<&str> = answers
         .packs
         .iter()
-        .map(|c| c.metadata().name.as_str())
+        .map(|c| c.metadata().id.as_str())
         .collect();
     assert_eq!(names, ["claude"]);
     let generated = answers.config(&verified_dir(data.path()));
@@ -558,4 +608,113 @@ fn template_mode_has_no_share_row_and_creates() {
         press(&mut form, KeyCode::Enter),
         Step::Done(Target::Local)
     ));
+}
+
+/// Test that the wizard offers user packs with the `(local)` marker and
+/// selects the packs of the `packs.defaults` setting. The saved config
+/// must name the user pack with a quoted key and no version.
+///   1. Load a user pack `notes` and the defaults `claude`, `~notes` and
+///      the unknown `~ghost`
+///   2. Check that `~ghost` is reported as unknown
+///   3. Open the form and check the marker and the selected packs
+///   4. Start with `Create airlock.toml` and check the saved text
+///   5. Resolve the saved text and parse it as a template config
+#[test]
+fn user_pack_shows_local_marker_and_settings_defaults_are_preselected() {
+    let tmp = temp_dir();
+    let dir = tmp.path().join("packs");
+    crate::test_cfg::packs::write_user_pack(
+        &dir,
+        "notes",
+        &[(
+            "pack.toml",
+            "label = \"Notes\"\ndescription = \"Keeps notes\"\nkind = \"tool\"\n",
+        )],
+    );
+    let (packs, _) =
+        crate::test_cfg::packs::with_user_packs(&[&dir], &["claude", "~notes", "~ghost"]).unwrap();
+    assert_eq!(packs.defaults().1, ["~ghost"]);
+
+    let data = temp_dir();
+    let mut form = Form::new(&data_dir_at(data.path()), &packs, None, &[], Mode::Start);
+    let text = view_text(&form);
+    assert!(text.lines().any(|l| l.contains("Notes (local)")), "{text}");
+    assert!(is_selected(&form, "claude"));
+    assert!(is_selected(&form, "~notes"));
+    assert!(!is_selected(&form, "sample"));
+
+    press_down_until(&mut form, |form| form.focus() == Row::ShareConfig);
+    press(&mut form, KeyCode::Char(' '));
+    press(&mut form, KeyCode::Enter);
+    let Step::Done(target) = press(&mut form, KeyCode::Enter) else {
+        panic!("the wizard did not end with a start option");
+    };
+    let project_dir = temp_dir();
+    let project = verified_dir(project_dir.path());
+    save_config(
+        &form.answers(target).config(&project),
+        &project.join(".airlock").unwrap(),
+    )
+    .unwrap();
+    let text = std::fs::read_to_string(project_dir.path().join("airlock.toml")).unwrap();
+    assert!(text.contains("\n\"~notes\" = {}\n"), "{text}");
+
+    let resolved = crate::test_cfg::packs::resolve_with(&packs, &text).unwrap();
+    assert!(resolved.packs.iter().any(|p| p.metadata().id == "~notes"));
+    let template = crate::templates::TemplateConfig::parse(&text).unwrap();
+    let notes = template.packs.iter().find(|p| p.name == "~notes").unwrap();
+    assert_eq!(notes.version, None);
+}
+
+/// Test that the selection of a user pack in the wizard is its approval.
+/// The user saw the pack in the wizard, so `airlock start` does not ask
+/// again. The answer check runs the `config.lua` of the pack, so the
+/// approval must come first.
+///   1. Load a user pack with a `config.lua` and select it with the
+///      `packs.defaults` setting
+///   2. Check the answers without the approval: check the approval error
+///   3. Record the approval of the selected packs and check the answers
+///      again: check that they pass
+#[test]
+fn wizard_selection_approves_user_pack_before_answer_check() {
+    let tmp = temp_dir();
+    let dir = tmp.path().join("packs");
+    crate::test_cfg::packs::write_user_pack(
+        &dir,
+        "notes",
+        &[
+            (
+                "pack.toml",
+                "label = \"Notes\"\ndescription = \"Keeps notes\"\nkind = \"tool\"\n",
+            ),
+            ("config.lua", "config.env = { NOTES = \"on\" }\n"),
+        ],
+    );
+    let (packs, _) = crate::test_cfg::packs::with_user_packs(&[&dir], &["~notes"]).unwrap();
+    let dir = temp_dir();
+    let data = temp_dir();
+    let vault = Vault::for_storage_type(VaultStorageType::Disabled);
+    let (host_cwd, data_dir) = (verified_dir(dir.path()), data_dir_at(data.path()));
+    let config = user_files("");
+    let input = Input {
+        host_cwd: &host_cwd,
+        data_dir: &data_dir,
+        packs: &packs,
+        config: &config,
+        vault: &vault,
+        templates: &[],
+        mode: Mode::Start,
+    };
+    let form = Form::new(&data_dir, &packs, None, &[], Mode::Start);
+    assert!(is_selected(&form, "~notes"));
+    let answers = form.answers(Target::Local);
+
+    let error = block_on(check_answers(&input, &answers)).unwrap_err();
+    assert!(
+        error.is::<crate::packs::approval::PacksNeedApproval>(),
+        "{error:#}"
+    );
+
+    form.approve_selected().unwrap();
+    block_on(check_answers(&input, &answers)).unwrap();
 }

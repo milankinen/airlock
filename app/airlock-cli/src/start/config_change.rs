@@ -25,24 +25,20 @@
 use console::Style;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use similar::{ChangeTag, TextDiff};
 
 use super::Exit;
+use crate::cli::prompt;
 use crate::cli::prompt::choose::{Choice, Choose, Details};
 use crate::cli::prompt::style::Styles;
 use crate::config::config_values::ConfigValues;
 use crate::config::export::{self, Format};
-use crate::config::{ConfigOverrides, LayeredConfig, ResolvedConfig};
-use crate::data_dir::DataDir;
-use crate::packs::PackManager;
+use crate::config::{LayeredConfig, ResolveInput, ResolvedConfig};
 use crate::project::{HostPath, HostPaths};
 use crate::util::VerifiedPath;
 use crate::{messages, project};
 
 /// The key that shows and hides the changes.
 const DIFF_KEY: char = 's';
-/// Number of unchanged lines around each change in the diff.
-const DIFF_CONTEXT: usize = 3;
 
 /// The config of the run, and how to find the config of the last run.
 pub struct CheckInput<'a> {
@@ -52,13 +48,13 @@ pub struct CheckInput<'a> {
     pub resolved: &'a ResolvedConfig,
     /// Resolved host paths of this run (see [`host_paths`])
     pub paths: &'a HostPaths,
-    /// Airlock data directory, to resolve the config of the last run
-    pub data_dir: &'a DataDir,
-    /// Known packs, to resolve the config of the last run
-    pub packs: &'a PackManager,
-    /// Command line overrides of this run. They also apply to the config of
-    /// the last run.
-    pub overrides: &'a ConfigOverrides,
+    /// What the resolve of the config of the last run needs: the data
+    /// directory, the known packs, the project root, the command line
+    /// overrides of this run, and the approval mode. The overrides also
+    /// apply to the config of the last run. Use
+    /// [`ApprovalMode::Refuse`](crate::packs::approval::ApprovalMode): a pack
+    /// without approval makes the config of the last run not valid.
+    pub resolve: ResolveInput<'a>,
     /// A terminal is available for questions
     pub can_prompt: bool,
     /// `--yes`: use the default answer (abort) without a question
@@ -126,7 +122,7 @@ async fn check_with(
     }
     let note = match last {
         Some(Ok((resolved, values))) => {
-            let mut diff = diff(&to_toml(&values), &to_toml(&current), &styles);
+            let mut diff = prompt::diff::unified(&to_toml(&values), &to_toml(&current), &styles);
             diff.extend(moved);
             return match ask(&diff, None)? {
                 Answer::Accept => Ok(Checked::Current),
@@ -136,7 +132,7 @@ async fn check_with(
         Some(Err(e)) => messages::start::last_config_invalid(e),
         None => messages::start::LAST_CONFIG_MISSING.to_string(),
     };
-    let mut diff = diff("", &to_toml(&current), &styles);
+    let mut diff = prompt::diff::unified("", &to_toml(&current), &styles);
     diff.extend(moved);
     ask(&diff, Some(&note))?;
     Ok(Checked::Current)
@@ -248,9 +244,7 @@ async fn resolve_last(
     stored: Value,
 ) -> anyhow::Result<(ResolvedConfig, Value)> {
     let config: LayeredConfig = serde_json::from_value(stored)?;
-    let resolved = config
-        .resolve(input.data_dir, input.packs, input.overrides)
-        .await?;
+    let resolved = config.resolve(&input.resolve).await?;
     let values = final_values(&resolved)?;
     Ok((resolved, values))
 }
@@ -258,7 +252,7 @@ async fn resolve_last(
 /// Return the final config values of `resolved` for the comparison and the
 /// diff. The `--network` policy is not in them, because it applies to one
 /// run only. Masked `[env]` values are replaced with a hash. The enabled
-/// packs with their versions and args are in them.
+/// packs with their versions, args and setup env keys are in them.
 fn final_values(resolved: &ResolvedConfig) -> anyhow::Result<Value> {
     let mut value = serde_json::to_value(&resolved.values)?;
     value["network"]["policy"] = serde_json::to_value(resolved.configured_policy)?;
@@ -268,11 +262,20 @@ fn final_values(resolved: &ResolvedConfig) -> anyhow::Result<Value> {
     for pack in &resolved.packs {
         let metadata = pack.metadata();
         let mut entry = serde_json::Map::new();
-        entry.insert("version".into(), metadata.version.clone().into());
+        if let Some(version) = &metadata.version {
+            entry.insert("version".into(), version.clone().into());
+        }
         for (key, arg) in pack.args() {
             entry.insert(key.clone(), serde_json::to_value(arg)?);
         }
-        packs.insert(metadata.name.clone(), entry.into());
+        // Only the setup env keys: the values can be secrets. An arg key
+        // cannot have `_`, thus this name does not clash with an arg. A
+        // changed value shows in the install fingerprint.
+        let env_keys: Vec<&str> = pack.setup_env().keys().collect();
+        if !env_keys.is_empty() {
+            entry.insert("setup_env".into(), env_keys.into());
+        }
+        packs.insert(metadata.id.to_string(), entry.into());
     }
     value["packs"] = packs.into();
     if let Some(env) = value.get_mut("env").and_then(Value::as_object_mut) {
@@ -355,30 +358,6 @@ fn to_toml(config: &Value) -> String {
         .unwrap_or_default()
 }
 
-/// Return the line changes from `last` to `new` as unified diff lines.
-/// Removed lines are red and added lines are green.
-fn diff(last: &str, new: &str, styles: &Styles) -> Vec<String> {
-    let diff = TextDiff::from_lines(last, new);
-    let mut lines = Vec::new();
-    for (i, group) in diff.grouped_ops(DIFF_CONTEXT).iter().enumerate() {
-        if i > 0 {
-            lines.push(styles.dim.apply_to("  …").to_string());
-        }
-        for op in group {
-            for change in diff.iter_changes(op) {
-                let line = change.value().trim_end_matches('\n');
-                let (style, sign) = match change.tag() {
-                    ChangeTag::Delete => (&styles.red, '-'),
-                    ChangeTag::Insert => (&styles.green, '+'),
-                    ChangeTag::Equal => (&styles.dim, ' '),
-                };
-                lines.push(style.apply_to(format!("{sign} {line}")).to_string());
-            }
-        }
-    }
-    lines
-}
-
 #[cfg(test)]
 mod tests {
     //! Tests of the final values and the diff.
@@ -386,6 +365,7 @@ mod tests {
     use airlock_test_utils::{block_on, temp_dir};
 
     use super::*;
+    use crate::config::ConfigOverrides;
     use crate::config::config_values::Policy;
     use crate::test_cfg::config::resolve_project_toml;
 
@@ -435,15 +415,19 @@ mod tests {
         let packs = crate::packs::init_with_sample();
         save(&sandbox_dir, &layers(last), last_paths).unwrap();
         let config = layers(toml);
-        let resolved =
-            block_on(config.resolve(&data_dir, &packs, &ConfigOverrides::default())).unwrap();
+        let resolve = ResolveInput {
+            data_dir: &data_dir,
+            packs: &packs,
+            overrides: &ConfigOverrides::default(),
+            project_root: None,
+            approval: crate::packs::approval::ApprovalMode::Refuse,
+        };
+        let resolved = block_on(config.resolve(&resolve)).unwrap();
         let input = CheckInput {
             sandbox_dir: &sandbox_dir,
             resolved: &resolved,
             paths,
-            data_dir: &data_dir,
-            packs: &packs,
-            overrides: &ConfigOverrides::default(),
+            resolve,
             can_prompt: true,
             yes: false,
             allow_changes: false,
@@ -599,6 +583,51 @@ mod tests {
         assert_ne!(first, second);
     }
 
+    /// Test that the final values have the setup env keys of a pack but not
+    /// the values. The values can be secrets, and the diff shows the final
+    /// values. A new key must show as a config change.
+    ///   1. Resolve a pack whose `config.lua` sets one setup env key, then
+    ///      two keys
+    ///   2. Check that the values have the sorted keys and no secret value
+    ///   3. Check that the diff shows the new key and no secret value
+    #[test]
+    fn setup_env_keys_show_in_config_diff_but_values_do_not() {
+        let text = |lua: &str| {
+            let packs = crate::test_cfg::packs::load_packs(vec![
+                (
+                    "envy@1/pack.toml",
+                    "label = \"Envy\"\ndescription = \"Env\"\n".to_string(),
+                ),
+                ("envy@1/config.lua", lua.to_string()),
+                ("envy@1/setup.sh", "true\n".to_string()),
+            ]);
+            let resolved =
+                crate::test_cfg::packs::resolve_with(&packs, "[packs]\nenvy = { version = 1 }\n")
+                    .unwrap();
+            final_values(&resolved).unwrap()
+        };
+        let one = text("setup.env.TOKEN = 'secret-one'\n");
+        let two = text("setup.env.TOKEN = 'secret-two'\nsetup.env.API_KEY = 'secret-three'\n");
+        assert_eq!(
+            two["packs"]["envy"]["setup_env"],
+            serde_json::json!(["API_KEY", "TOKEN"])
+        );
+        let lines: Vec<String> =
+            prompt::diff::unified(&to_toml(&one), &to_toml(&two), &Styles::new())
+                .iter()
+                .map(|line| console::strip_ansi_codes(line).into_owned())
+                .collect();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with('+') && line.contains("API_KEY")),
+            "{lines:?}"
+        );
+        for text in [one.to_string(), two.to_string(), lines.join("\n")] {
+            assert!(!text.contains("secret-"), "{text}");
+        }
+    }
+
     /// Test that the diff shows the changed values of two configs as TOML
     /// lines, with context.
     ///   1. Make the diff of the TOML forms of two configs with one changed
@@ -606,7 +635,7 @@ mod tests {
     ///   2. Check the removed and added lines and the context
     #[test]
     fn diff_shows_changed_config_values_as_toml() {
-        let lines: Vec<String> = diff(
+        let lines: Vec<String> = prompt::diff::unified(
             &to_toml(&values("[vm]\ncpus = 2\n")),
             &to_toml(&values("[vm]\ncpus = 3\n")),
             &Styles::new(),

@@ -14,4 +14,5 @@ pub mod phase;
 pub mod plan;
 pub mod progress;
 pub mod setup;
+pub mod snapshots;
 pub mod state;

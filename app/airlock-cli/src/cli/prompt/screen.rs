@@ -70,7 +70,8 @@ impl Screen {
 
     /// Replace the drawn frame with a new frame.
     /// Args:
-    ///  - `make`: Makes the frame for the given number of text columns
+    ///  - `make`: Makes the frame for the given number of text columns and
+    ///    the terminal height in rows
     ///
     /// The number of text columns is one less than the terminal width, so
     /// that no line wraps. Thus the screen knows how many rows it drew. If the
@@ -79,7 +80,7 @@ impl Screen {
     // If a resize made the terminal narrower than a drawn line, the terminal
     // wrapped or cut that line. Then the drawn row count is unknown, so the
     // next frame starts at the top of a cleared screen.
-    pub fn draw(&mut self, make: impl FnOnce(usize) -> Frame) -> Result<(), PromptError> {
+    pub fn draw(&mut self, make: impl FnOnce(usize, usize) -> Frame) -> Result<(), PromptError> {
         // Some ptys report 0x0. Then use a common size.
         let (columns, rows) = terminal::size()
             .ok()
@@ -87,7 +88,7 @@ impl Screen {
             .unwrap_or((80, 24));
         let room = usize::from(columns).saturating_sub(1).max(1);
         let height = usize::from(rows).max(1);
-        let frame = make(room);
+        let frame = make(room, height);
         let mut out = Vec::new();
         if self.drawn_width > room {
             queue!(

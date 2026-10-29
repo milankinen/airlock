@@ -3,6 +3,7 @@
 //! Prepares and runs a sandbox session for the current project:
 //!  * checks that the host can run sandboxes
 //!  * helps the user create a config for a new project
+//!  * asks the user to approve new or changed user and project packs
 //!  * finds `[env]` errors before the slow steps start
 //!  * asks the user to accept config changes since the last run
 //!  * prepares the sandbox and decides which tools to install
@@ -23,13 +24,18 @@ use tracing::info;
 
 use crate::cli::{self, LogLevel, logging};
 use crate::data_dir::DataDir;
+use crate::packs::approval::ApprovalMode;
 use crate::util::VerifiedPath;
 
 /// Command-line options for the sandbox step ([`sandbox::ensure_sandbox`]) and
 /// the install step ([`install::install_tools`]).
+#[allow(clippy::struct_excessive_bools)] // independent flags
 pub struct SandboxOptions {
     /// Use the default answer for every sandbox question (`--yes`).
     pub yes: bool,
+    /// A terminal is available for questions (see
+    /// [`crate::cli::prompt::can_prompt`]).
+    pub can_prompt: bool,
     /// Log level for the sandbox (`--log-level`).
     pub log_level: LogLevel,
     /// Show the install output (`--verbose`).
@@ -40,6 +46,24 @@ pub struct SandboxOptions {
     /// Config overrides (`--network`). They also apply to the config of
     /// the last run (see [`config_change::check`]).
     pub overrides: crate::config::ConfigOverrides,
+    /// Approve new or changed packs without a question
+    /// (`--auto-approve-packs`).
+    pub auto_approve_packs: bool,
+}
+
+impl SandboxOptions {
+    /// Return how the config resolve gets the approval of a new or changed
+    /// pack. `--auto-approve-packs` approves all. Else it asks only in a
+    /// terminal and without `--yes`: `--yes` never approves a pack.
+    pub fn approval_mode(&self) -> ApprovalMode {
+        if self.auto_approve_packs {
+            ApprovalMode::Auto
+        } else if self.can_prompt && !self.yes {
+            ApprovalMode::Prompt
+        } else {
+            ApprovalMode::Refuse
+        }
+    }
 }
 
 /// Check that the host can run a sandbox. On Linux, this checks KVM access.

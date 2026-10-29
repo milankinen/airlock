@@ -12,7 +12,6 @@ use serde::Serialize;
 
 use crate::config::ResolvedConfig;
 use crate::context::Context;
-use crate::data_dir::DataDir;
 use crate::packs::ConfiguredPack;
 use crate::packs::install::state::{self, InstallState, PackStatus, ReadState};
 use crate::project::read_run_meta;
@@ -78,7 +77,7 @@ pub(super) async fn run(context: Context, id: Option<&str>, json: bool) -> i32 {
                 return 1;
             }
         };
-        match resolve_config(&context.data, &project_dir, &local_dir).await {
+        match resolve_config(&context, &project_dir, &local_dir).await {
             Ok(resolved) => Some(resolved),
             Err(e) => {
                 cli::error!("{}", messages::cli::config_error(format!("{e:#}")));
@@ -270,17 +269,25 @@ fn grant_line(grant: &store::GrantSummary) -> String {
 
 /// Load and resolve the config of a project.
 /// Args:
-///  - `data_dir`: Airlock data directory
+///  - `context`: Process context: the data directory, and the settings and
+///    home directory for the user packs
 ///  - `project_dir`: Project directory
 ///  - `local_dir`: Directory of the local project config
 async fn resolve_config(
-    data_dir: &DataDir,
+    context: &Context,
     project_dir: &VerifiedPath,
     local_dir: &VerifiedPath,
 ) -> anyhow::Result<ResolvedConfig> {
-    let packs = packs::init()?;
+    let packs = packs::init(&context.settings.packs, &context.home)?;
     config::load(project_dir, local_dir)?
-        .resolve(data_dir, &packs, &config::ConfigOverrides::default())
+        .resolve(&config::ResolveInput {
+            data_dir: &context.data,
+            packs: &packs,
+            overrides: &config::ConfigOverrides::default(),
+            project_root: Some(project_dir),
+            // Only `airlock start` asks about new or changed packs.
+            approval: crate::packs::approval::ApprovalMode::Refuse,
+        })
         .await
 }
 
@@ -323,7 +330,7 @@ fn removed_packs<'a>(
         .filter(|(name, _)| {
             !packs
                 .iter()
-                .any(|p| p.metadata().name == name.as_str() && p.metadata().has_setup)
+                .any(|p| p.metadata().id == name.as_str() && p.metadata().has_setup)
         })
         .filter_map(|(name, r)| removed_status(r.status).map(|st| (name.as_str(), st)))
         .collect()
@@ -338,7 +345,7 @@ fn pack_line(pack: &ConfiguredPack) -> String {
         .map(|(key, value)| format!("{key} = {value}"))
         .collect();
     let metadata = pack.metadata();
-    let head = format!("{} {}", metadata.name, metadata.version);
+    let head = metadata.id_with_version();
     if details.is_empty() {
         head
     } else {
@@ -350,7 +357,7 @@ fn pack_line(pack: &ConfiguredPack) -> String {
 /// without a setup script. Otherwise it is the install status.
 fn pack_status(pack: &ConfiguredPack, state: Option<&InstallState>) -> &'static str {
     if pack.metadata().has_setup {
-        install_status(state, &pack.metadata().name).text()
+        install_status(state, pack.metadata().id.as_str()).text()
     } else {
         messages::cli::PACK_CONFIG_ONLY
     }

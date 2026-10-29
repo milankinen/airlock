@@ -37,6 +37,10 @@ pub struct Settings {
     /// change. The defaults are strict.
     #[config(nest)]
     pub security: SecuritySettings,
+    /// User pack settings: where the user packs are, and which packs the
+    /// setup wizard selects at the start.
+    #[config(nest)]
+    pub packs: PackSettings,
     /// Airlock data directory: the database, the sandboxes and the image
     /// cache. `~` expands to the home directory. The default is
     /// `airlock` in the user data directory of the platform.
@@ -52,6 +56,50 @@ pub struct SecuritySettings {
     /// default (false) refuses to start the sandbox.
     #[config(default)]
     pub insecure_mounts: bool,
+}
+
+/// Settings under the `[packs]` table.
+#[derive(Clone, Debug, Default, DescribeConfig, DeserializeConfig)]
+pub struct PackSettings {
+    /// Directories of the user packs (`~name` in the `[packs]` table of a
+    /// config). Each sub-directory is one pack. `~` expands to the home
+    /// directory. If not set, airlock uses `~/.airlock/packs` when it
+    /// exists.
+    pub dirs: Option<Vec<String>>,
+    /// Pack ids that the setup wizard selects at the start, for example
+    /// `["claude", "~my-tools"]`.
+    #[config(default)]
+    pub defaults: Vec<String>,
+}
+
+impl PackSettings {
+    /// Get the user pack directories.
+    /// Args:
+    ///  - `home`: Home directory of the user, for `~`
+    ///
+    /// Returns:
+    ///   Each directory with a flag that is true if the user set it in
+    ///   `dirs`. If `dirs` is not set, only the default `~/.airlock/packs`
+    ///   with the flag false. Error if a directory is not absolute after
+    ///   the `~` expansion, or if its path does not resolve.
+    pub fn user_dirs(&self, home: &VerifiedPath) -> Result<Vec<(VerifiedPath, bool)>> {
+        let Some(dirs) = &self.dirs else {
+            // The user airlock directory can be a link into a dotfiles repo.
+            let dir = home
+                .join_follow(".airlock", None)?
+                .join_follow("packs", None)?;
+            return Ok(vec![(dir, false)]);
+        };
+        dirs.iter()
+            .map(|dir| {
+                let dir = crate::util::expand_tilde(dir, home);
+                if !dir.starts_with('/') {
+                    bail!(messages::settings::pack_dir_not_absolute(&dir));
+                }
+                Ok((VerifiedPath::new_follow(dir, None)?, true))
+            })
+            .collect()
+    }
 }
 
 /// Settings under the `[vault]` table.

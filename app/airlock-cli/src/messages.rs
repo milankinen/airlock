@@ -764,6 +764,12 @@ pub mod cli {
     /// Key help line of the choice prompt.
     pub const CHOOSE_KEYS: &str = "↑↓ move · enter confirm · esc abort";
 
+    /// Gray line below the details of a choice prompt when not all of the
+    /// details fit on the screen. The numbers count from 1.
+    pub fn details_window(first: usize, last: usize, total: usize) -> String {
+        format!("lines {first}–{last} of {total} · pgup/pgdn scroll")
+    }
+
     /// Label of the abort choice in a choice prompt, in the `start` questions and
     /// in the image questions.
     pub const ABORT_CHOICE: &str = "Abort";
@@ -858,6 +864,41 @@ pub mod config {
         format!("`packs.{name}` unknown pack (known: {known}){hint} (set in: {origin})")
     }
 
+    /// Problem when a `packs` entry names a user pack that does not exist.
+    pub fn unknown_user_pack(name: impl Display) -> String {
+        format!("`packs.{name}` unknown user pack")
+    }
+
+    /// Problem when the entry of a user pack or a project pack sets
+    /// `version`.
+    pub fn pack_version_not_allowed(name: impl Display) -> String {
+        format!("`packs.{name}.version` is not allowed")
+    }
+
+    /// Problem when a `[packs]` key looks like a path but is not a valid
+    /// project pack path.
+    pub fn project_pack_path_invalid(name: impl Display) -> String {
+        format!("`packs.{name}`: not a valid project pack path, path must start with `./`")
+    }
+
+    /// Problem when a `[packs]` key starts with `~` but is not a valid user
+    /// pack name.
+    pub fn user_pack_name_invalid(name: impl Display) -> String {
+        format!(
+            "`packs.{name}`: not a valid user pack name, only lowercase letters, digits and \
+             `-` are allowed"
+        )
+    }
+
+    /// Problem when a config names a project pack, but there is no project.
+    /// Only a template build has no project.
+    pub const PROJECT_PACK_NO_PROJECT: &str = "project packs are not supported in templates";
+
+    /// Problem when the config names more project packs than the limit.
+    pub fn project_packs_too_many(max: usize) -> String {
+        format!("too many project packs: the limit is {max}")
+    }
+
     /// Problem when a `packs` entry is not a table.
     pub fn pack_entry_not_table(name: impl Display, origin: impl Display) -> String {
         format!("`packs.{name}` must be a table (set in: {origin})")
@@ -946,6 +987,12 @@ pub mod config {
         files: impl Display,
     ) -> String {
         format!("{path} unknown arg of version \"{version}\" ({known_args}) (set in: {files})")
+    }
+
+    /// Problem when a `packs` entry of a pack with no versions sets an
+    /// unknown arg.
+    pub fn pack_unknown_arg_no_version(path: impl Display, known_args: impl Display) -> String {
+        format!("{path} unknown arg ({known_args})")
     }
 
     /// Problem when a pack arg value is not valid.
@@ -1799,6 +1846,86 @@ pub mod packs {
     /// Arg error text shown when a pack has no args.
     pub const ARGS_NONE: &str = "it has no args";
 
+    /// Warning when `--auto-approve-packs` approved packs without a question.
+    /// Args:
+    ///  - `ids`: Pack ids, safe for the terminal
+    pub fn packs_auto_approved(ids: impl Display) -> String {
+        format!("Approved packs without a question: {ids}")
+    }
+
+    /// Warning when a directory of the `packs.dirs` setting does not exist.
+    pub fn user_pack_dir_missing(dir: impl Display) -> String {
+        format!("pack directory {dir} does not exist")
+    }
+
+    /// Error context when a user pack directory cannot be read.
+    pub fn user_pack_dir_unreadable(dir: impl Display) -> String {
+        format!("cannot read user pack directory {dir}")
+    }
+
+    /// Warning when a directory name in a user pack directory is not a
+    /// pack name. Airlock skips the directory.
+    pub fn user_pack_name_skipped(at: impl Display) -> String {
+        format!("{at}: skipped: not a valid pack name ([a-z][a-z0-9-]*)")
+    }
+
+    /// Warning when a user pack directory holds a link. Airlock skips the
+    /// link.
+    pub fn user_pack_link_skipped(at: impl Display) -> String {
+        format!("{at}: skipped: links are not allowed in a user pack directory")
+    }
+
+    /// Error when a user pack directory holds too many packs.
+    pub fn user_packs_too_many(dir: impl Display, max: usize) -> String {
+        format!("{dir}: more than {max} packs")
+    }
+
+    /// Error when two user pack directories have a pack with the same name.
+    pub fn user_pack_duplicate(
+        id: impl Display,
+        first: impl Display,
+        second: impl Display,
+    ) -> String {
+        format!("pack {id} is in two user pack directories: {first} and {second}")
+    }
+
+    /// Error context when the directory of a project pack cannot be read, for
+    /// example because its path has a link.
+    pub fn project_pack_unreadable(id: impl Display) -> String {
+        format!("cannot read project pack {id} (links are not allowed in the path)")
+    }
+
+    /// Error when a pack id is not a project pack id where one must be.
+    pub fn not_project_pack(id: impl Display) -> String {
+        format!("pack {id} is not a project pack")
+    }
+
+    /// Error when the directory of a project pack does not exist.
+    /// Args:
+    ///  - `dir`: Pack path as the config has it (`./path`)
+    pub fn project_pack_missing(dir: impl Display) -> String {
+        format!("project pack {dir} not found")
+    }
+
+    /// Error when the path of a project pack is not a directory, for
+    /// example a link.
+    /// Args:
+    ///  - `dir`: Pack path as the config has it (`./path`)
+    pub fn project_pack_not_dir(dir: impl Display) -> String {
+        format!("project pack {dir} is not a directory")
+    }
+
+    /// Error when a file of a pack directory is a link or not a regular
+    /// file.
+    pub fn pack_file_not_regular(at: impl Display) -> String {
+        format!("{at}: not a regular file")
+    }
+
+    /// Error when a file of a pack directory is larger than the limit.
+    pub fn pack_file_too_large(at: impl Display, max: u64) -> String {
+        format!("{at}: the file is larger than {max} bytes")
+    }
+
     /// Arg error text that lists the arg keys of a pack.
     pub fn args_known(keys: impl Display) -> String {
         format!("known: {keys}")
@@ -1827,6 +1954,91 @@ pub mod packs {
         format!("one of: {values}")
     }
 
+    /// Error shown when packs need approval and no question is possible.
+    pub fn packs_need_approval(ids: impl Display) -> String {
+        format!("some packs are new or changed and need approval ({ids})")
+    }
+
+    /// Error shown when the approval token is for another pack. This is a
+    /// program error.
+    pub fn pack_not_approved(id: impl Display) -> String {
+        format!("pack {id}: the pack is not approved")
+    }
+
+    /// Error shown when the user aborts the pack approval.
+    pub const APPROVAL_ABORTED: &str = "pack approval aborted";
+
+    /// Error context when the pack approval file cannot be read or written.
+    pub fn approvals_file_failed(path: impl Display) -> String {
+        format!("cannot use the pack approval file {path}")
+    }
+
+    /// Error context when the path of the pack directory is not available for
+    /// the approval.
+    pub fn approval_key_failed(id: impl Display) -> String {
+        format!("pack {id}: cannot find the pack directory for the approval")
+    }
+
+    /// Title of the pack approval question when all packs are new.
+    pub const APPROVAL_TITLE_NEW: &str =
+        "Sandbox contains packs that may execute code on your computer:";
+
+    /// Title of the pack approval question when a pack changed since its
+    /// approval.
+    pub const APPROVAL_TITLE_CHANGED: &str =
+        "The following sandbox packs have changed and need approval:";
+
+    /// Gray hint of a pack question while the changes of the packs are
+    /// hidden.
+    pub const SHOW_CHANGES_HINT: &str = "(press s to show changes)";
+
+    /// Gray hint of a pack question while the changes of the packs show.
+    pub const HIDE_CHANGES_HINT: &str = "(press s to hide changes)";
+
+    /// One pack in the list of a pack question.
+    pub fn pack_item(id: impl Display, label: impl Display) -> String {
+        format!("  {id} ({label})")
+    }
+
+    /// One new pack in the list of the approval question of changed packs.
+    pub fn pack_item_new(id: impl Display, label: impl Display) -> String {
+        format!("  {id} ({label}) (new)")
+    }
+
+    /// Header of the config script of a new pack in the approval changes.
+    pub fn approval_script_new(id: impl Display, label: impl Display) -> String {
+        format!("{id} ({label}): config.lua (new)")
+    }
+
+    /// Header of the config script changes of a pack in the approval
+    /// changes.
+    pub fn approval_script_changed(id: impl Display, label: impl Display) -> String {
+        format!("{id} ({label}): config.lua changed")
+    }
+
+    /// Choice label to approve a pack.
+    pub const APPROVAL_CHOICE_APPROVE: &str = "Approve";
+
+    /// Choice label to continue with new packs.
+    pub const APPROVAL_CHOICE_CONTINUE: &str = "Continue";
+
+    /// Note when the changes of a pack or of one pack file cannot show,
+    /// because the old or the new text is not available.
+    pub const CHANGES_NOT_SHOWN: &str = "The changes can't be shown";
+
+    /// Header of the version and arg changes of a pack since its install.
+    pub const SNAPSHOT_ARGS_HEADER: &str = "version and args";
+
+    /// Header of a new file in the changes of a pack.
+    pub fn snapshot_file_added(name: impl Display) -> String {
+        format!("{name} (new file)")
+    }
+
+    /// Header of a removed file in the changes of a pack.
+    pub fn snapshot_file_removed(name: impl Display) -> String {
+        format!("{name} (removed)")
+    }
+
     /// Error shown when the pack directory cannot be made or `config.lua` fails.
     pub fn pack_failed(name: impl Display, detail: impl Display) -> String {
         format!("pack {name}: {detail}")
@@ -1840,6 +2052,72 @@ pub mod packs {
     /// Error shown when `config.lua` sets `packs` or `presets`.
     pub fn lua_config_reserved_keys(name: impl Display) -> String {
         format!("pack {name}: config.lua cannot set `packs` or `presets`")
+    }
+
+    /// Error shown when a `setup.sh` is too large for the install exec.
+    pub fn setup_too_large(path: impl Display, max: usize) -> String {
+        format!("{path}: the file is too large (limit {max} bytes)")
+    }
+
+    /// Error shown when `config.lua` sets `setup` or `setup.env` to a value
+    /// that is not a table.
+    /// Args:
+    ///  - `path`: `setup` or `setup.env`
+    pub fn setup_not_table(path: impl Display) -> String {
+        format!("invalid value at `{path}`, must be a table")
+    }
+
+    /// Error shown when `config.lua` sets an unknown key in `setup`, or a
+    /// `setup.env` key is not valid.
+    /// Args:
+    ///  - `path`: Full key path, for example `setup.env.bad-key`. Escape
+    ///    the key for the terminal.
+    pub fn setup_key_invalid(path: impl Display) -> String {
+        format!("invalid key `{path}`")
+    }
+
+    /// Error shown when a pack sets `setup.env` but has no `setup.sh`.
+    pub const SETUP_ENV_WITHOUT_SETUP: &str =
+        "config.lua sets `setup.env`, but the pack has no setup.sh";
+
+    /// Error shown when a `setup.env` value is not a string.
+    /// Args:
+    ///  - `key`: The key, escaped for the terminal
+    pub fn setup_env_value_not_string(key: impl Display) -> String {
+        format!("invalid value at `setup.env.{key}`, must be a string")
+    }
+
+    /// Error shown when a `setup.env` value is not UTF-8 text or contains
+    /// a NUL byte.
+    /// Args:
+    ///  - `key`: The key, escaped for the terminal
+    pub fn setup_env_value_not_text(key: impl Display) -> String {
+        format!("invalid value at `setup.env.{key}`, must be a string without NUL bytes")
+    }
+
+    /// Error shown when one `setup.env` variable is too large.
+    pub fn setup_env_entry_too_large(key: impl Display, max: usize) -> String {
+        format!("`setup.env.{key}` is too large: the variable can have {max} bytes at most")
+    }
+
+    /// Error shown when all `setup.env` variables together are too large.
+    pub fn setup_env_too_large(max: usize) -> String {
+        format!("`setup.env` is too large: all variables can have {max} bytes at most")
+    }
+
+    /// Error shown when `setup.env` has too many keys.
+    pub fn setup_env_too_many_keys(max: usize) -> String {
+        format!("`setup.env` has too many keys: {max} is the maximum")
+    }
+
+    /// Error context when the setup env key file cannot be read or made.
+    pub fn env_key_file_failed(path: impl Display) -> String {
+        format!("cannot use the setup env key file {path}")
+    }
+
+    /// Error shown when the setup env key file is not valid.
+    pub fn env_key_file_invalid(path: impl Display) -> String {
+        format!("the setup env key file {path} is not valid")
     }
 
     /// Error shown when the pack folder holds a file that is not a pack folder.
@@ -1885,8 +2163,8 @@ pub mod packs {
     }
 
     /// Error shown when a pack version folder has more than one config file.
-    pub fn pack_config_files_many(folder: impl Display, files: impl Display) -> String {
-        format!("packs/{folder}: more than one config file: {files}")
+    pub fn pack_config_files_many(dir: impl Display, files: impl Display) -> String {
+        format!("{dir}: more than one config file: {files}")
     }
 
     /// Error shown when a pack version folder holds a file that the loader does not use.
@@ -1954,7 +2232,7 @@ pub mod packs {
 
     /// Error shown when a pack file content is not UTF-8.
     pub fn pack_file_not_utf8(path: impl Display) -> String {
-        format!("packs/{path}: not UTF-8")
+        format!("{path}: not UTF-8")
     }
 
     /// Error shown when the image does not run as root.
@@ -2732,6 +3010,11 @@ pub mod settings {
         format!("data_dir must be an absolute path: {dir}")
     }
 
+    /// A `packs.dirs` setting is not an absolute path.
+    pub fn pack_dir_not_absolute(dir: impl Display) -> String {
+        format!("packs.dirs: each directory must be an absolute path: {dir}")
+    }
+
     /// The settings file cannot be read.
     pub fn read_settings_file(path: impl Display) -> String {
         format!("read settings file {path}")
@@ -2905,12 +3188,24 @@ pub mod start {
     }
 
     /// Title of the changed-packs question.
-    pub fn packs_changed(labels: impl Display) -> String {
-        format!("Packs have changed: {labels}")
+    pub const PACKS_CHANGED: &str = "The following sandbox packs have changed:";
+
+    /// Choice label to install the changed packs over the old ones.
+    pub const REINSTALL_ON_TOP: &str = "Reinstall on top";
+
+    /// Choice label to keep the old changed packs on the disk.
+    pub const KEEP_OLD_PACKS: &str = "Keep old";
+
+    /// Header before the changes of a pack since its install.
+    pub fn changed_pack_header(id: impl Display, label: impl Display) -> String {
+        format!("Changes of pack {id} ({label}) since the install:")
     }
 
-    /// Note of the changed-packs question.
-    pub const PACKS_CHANGED_NOTE: &str = "Changed packs install only into a re-created sandbox.";
+    /// Lists the setup value keys that changed since the install. The
+    /// values do not show, because they can be secrets.
+    pub fn setup_values_changed(keys: impl Display) -> String {
+        format!("Setup values changed: {keys}")
+    }
 
     /// Choice label to re-create the sandbox. Shows in the `start` and image
     /// questions.
@@ -2989,6 +3284,15 @@ pub mod start {
     /// Wizard description of the custom image row.
     pub const WIZARD_CUSTOM_DESCRIPTION: &str = "User defined image";
 
+    /// Marker after the label of a user pack in the setup wizard.
+    pub const WIZARD_LOCAL_MARKER: &str = "(local)";
+
+    /// Warning when the `packs.defaults` setting names a pack that does not
+    /// exist.
+    pub fn wizard_default_unknown(id: impl Display) -> String {
+        format!("setting `packs.defaults`: unknown pack {id}")
+    }
+
     /// Wizard description of a template without packs.
     pub const WIZARD_NO_PACKS_DESCRIPTION: &str = "No preinstalled packs";
 
@@ -3012,6 +3316,9 @@ pub mod start {
 
     /// Wizard section title for tool packs.
     pub const WIZARD_SECTION_TOOLS: &str = "Tools";
+
+    /// Wizard section title for packs of a different kind.
+    pub const WIZARD_SECTION_OTHER: &str = "Other";
 
     /// Wizard key help while the start bar has focus.
     pub const WIZARD_KEYS_START_BAR: &str = "←→ choose · enter confirm";

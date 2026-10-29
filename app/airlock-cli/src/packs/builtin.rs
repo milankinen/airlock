@@ -3,84 +3,34 @@
 //! Embeds the packs of the repository in the binary. Loads them and checks
 //! that each pack version is valid.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use anyhow::{Context, anyhow, bail, ensure};
-use include_dir::{Dir, DirEntry, File, include_dir};
-use serde::Deserialize;
-use serde_json::Value;
+use anyhow::{Context, bail, ensure};
+use include_dir::{Dir, DirEntry, include_dir};
 
-use crate::config::files::{EXTENSIONS, parse_file};
-use crate::packs::{
-    ArgKind, Pack, PackArg, PackConfig, PackKind, PackManager, PackMetadata, PackVersionData,
-};
+use crate::packs::id::is_identifier;
+use crate::packs::loader::{PACK_FILE, is_skipped, load_pack};
+use crate::packs::{Pack, PackId, PackManager, PackVersionData};
 
 /// The `packs/` directory of the repository, embedded in the binary.
 /// Each folder `<name>@<version>/` is one pack version.
 pub static BUILTIN_PACKS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../packs");
 
-const PACK_FILE: &str = "pack.toml";
-const LUA_CONFIG_FILE: &str = "config.lua";
-const SETUP_FILE: &str = "setup.sh";
-
-/// Keys of a `[packs]` entry. No arg can use them.
-const RESERVED_ARG_KEYS: [&str; 3] = ["version", "enabled", "args"];
-
-/// `pack.toml` of a version folder.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PackFile {
-    label: String,
-    /// One-line description of the version (see
-    /// [`PackMetadata::description`]). The loader checks that it is not
-    /// empty.
-    description: String,
-    kind: PackKind,
-    #[serde(default)]
-    args: Vec<ArgEntry>,
-}
-
-/// One `[[args]]` entry of `pack.toml`.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ArgEntry {
-    key: String,
-    r#type: ArgType,
-    description: String,
-    default: Value,
-    /// Valid values of a choice arg.
-    values: Option<Vec<String>>,
-    /// For a choice arg: if true, any non-empty string is also valid.
-    other: Option<bool>,
-}
-
-/// The `type` field of an `[[args]]` entry.
-#[derive(Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum ArgType {
-    Bool,
-    Choice,
-}
-
 /// Load and validate the packs of a `packs/` directory.
 ///
-/// A version folder `<name>@<version>/` contains:
-///  * `pack.toml` (label, description, kind and args). Required.
-///  * At most one config file `config.{toml,json,yaml,yml,lua}`.
-///  * The setup script `setup.sh`.
-///
-/// Any other file is an error. Hidden files and editor backups are
+/// Each directory `<name>@<version>/` is one pack version (see
+/// [`load_pack`] for its files). Hidden files and editor backups are
 /// ignored.
 /// Args:
 ///  - `root`: The `packs/` directory, for example [`BUILTIN_PACKS`]
 ///
 /// Returns:
-///   The packs, sorted by kind (distro, agent, tool), then by name. An
-///   error if a pack is not valid.
-pub fn load(root: &'static Dir<'static>) -> anyhow::Result<PackManager> {
+///   The packs, sorted by kind (see [`crate::packs::PackKind`]), then by
+///   name. An error if a pack is not valid.
+pub fn load(root: &Dir<'_>) -> anyhow::Result<PackManager> {
     // The versions of each pack, by name.
-    let mut by_name: BTreeMap<&'static str, Vec<(u64, PackVersionData)>> = BTreeMap::new();
+    let mut by_name: BTreeMap<&str, Vec<(u64, PackVersionData)>> = BTreeMap::new();
     for entry in root.entries() {
         let file_name = file_name(entry)?;
         if is_skipped(file_name) {
@@ -102,8 +52,8 @@ pub fn load(root: &'static Dir<'static>) -> anyhow::Result<PackManager> {
     for (name, mut versions) in by_name {
         versions.sort_by_key(|(number, _)| *number);
         let first = &versions[0].1.metadata;
-        for (_, data) in &versions[1..] {
-            let at = format!("packs/{name}@{}/{PACK_FILE}", data.metadata.version);
+        for (number, data) in &versions[1..] {
+            let at = format!("packs/{name}@{number}/{PACK_FILE}");
             ensure!(
                 data.metadata.label == first.label,
                 crate::messages::packs::pack_label_differs(&at, &data.metadata.label, &first.label)
@@ -117,204 +67,45 @@ pub fn load(root: &'static Dir<'static>) -> anyhow::Result<PackManager> {
     }
     // The sort is stable, thus the names stay in order within a kind.
     groups.sort_by_key(|versions| versions[0].metadata.kind);
-    Ok(PackManager {
-        packs: groups
+    Ok(PackManager::new(
+        groups
             .into_iter()
             .flatten()
             .map(|data| Pack(Arc::new(data)))
             .collect(),
-    })
+    ))
 }
 
-/// Load and validate the folder of one pack version.
-fn load_version(
-    name: &str,
-    version: &str,
-    folder: &'static Dir<'static>,
-) -> anyhow::Result<PackVersionData> {
-    let at = |file_name: &str| format!("packs/{}/{file_name}", folder.path().display());
-    let mut files: BTreeMap<&'static str, &'static File<'static>> = BTreeMap::new();
-    for entry in folder.entries() {
+/// Read the files of the directory of one pack version and load them.
+fn load_version(name: &str, version: &str, dir: &Dir<'_>) -> anyhow::Result<PackVersionData> {
+    let at = format!("packs/{}", dir.path().display());
+    let mut files: BTreeMap<&str, &[u8]> = BTreeMap::new();
+    for entry in dir.entries() {
         let file_name = file_name(entry)?;
         if is_skipped(file_name) {
             continue;
         }
         let DirEntry::File(file) = entry else {
-            bail!(crate::messages::packs::pack_folder_unknown(at(file_name)));
+            bail!(crate::messages::packs::pack_folder_unknown(format!(
+                "{at}/{file_name}"
+            )));
         };
-        files.insert(file_name, file);
+        files.insert(file_name, file.contents());
     }
-    let mut used: HashSet<&str> = HashSet::new();
-
-    let pack_file = files
-        .get(PACK_FILE)
-        .with_context(|| crate::messages::packs::pack_file_missing(at(PACK_FILE)))?;
-    used.insert(PACK_FILE);
-    let pack_at = at(PACK_FILE);
-    let pack: PackFile = toml::from_str(utf8(pack_file)?).with_context(|| pack_at.clone())?;
-    ensure!(
-        !pack.description.trim().is_empty(),
-        crate::messages::packs::pack_description_empty(&pack_at)
-    );
-    let args = load_args(&pack_at, pack.args)?;
-
-    let config_files: Vec<&str> = files
-        .keys()
-        .copied()
-        .filter(|file_name| {
-            *file_name == LUA_CONFIG_FILE
-                || EXTENSIONS
-                    .iter()
-                    .any(|ext| *file_name == format!("config.{ext}"))
-        })
-        .collect();
-    ensure!(
-        config_files.len() <= 1,
-        crate::messages::packs::pack_config_files_many(
-            folder.path().display(),
-            config_files.join(", ")
-        )
-    );
-    let config = match config_files.first() {
-        Some(&LUA_CONFIG_FILE) => {
-            used.insert(LUA_CONFIG_FILE);
-            Some(PackConfig::Lua(utf8(files[LUA_CONFIG_FILE])?))
-        }
-        Some(&file_name) => {
-            used.insert(file_name);
-            Some(PackConfig::Static(document(files[file_name])?))
-        }
-        None => None,
-    };
-
-    let setup = match files.get(SETUP_FILE) {
-        Some(file) => {
-            used.insert(SETUP_FILE);
-            Some(utf8(file)?)
-        }
-        None => None,
-    };
-
-    if let Some(file_name) = files.keys().find(|file_name| !used.contains(*file_name)) {
-        bail!(crate::messages::packs::pack_file_unknown(at(file_name)));
-    }
-
-    Ok(PackVersionData {
-        metadata: PackMetadata {
-            name: name.to_string(),
-            version: version.to_string(),
-            label: pack.label,
-            description: pack.description,
-            kind: pack.kind,
-            has_setup: setup.is_some(),
-        },
-        args,
-        config,
-        setup,
-    })
-}
-
-/// Check the `[[args]]` entries of a `pack.toml` and convert them.
-/// Args:
-///  - `at`: Path of the file, for error messages
-///  - `entries`: The `[[args]]` entries
-///
-/// Returns:
-///   The args, or an error if a key is not valid or not unique, a field
-///   does not fit the arg type, `values` is empty or has a duplicate, or
-///   the default is not valid.
-fn load_args(at: &str, entries: Vec<ArgEntry>) -> anyhow::Result<Vec<PackArg>> {
-    let mut args: Vec<PackArg> = Vec::new();
-    for entry in entries {
-        let arg_at = crate::messages::packs::arg_at(at, &entry.key);
-        ensure!(
-            is_identifier(&entry.key) && !RESERVED_ARG_KEYS.contains(&entry.key.as_str()),
-            crate::messages::packs::arg_key_invalid(&arg_at)
-        );
-        ensure!(
-            !args.iter().any(|arg| arg.key == entry.key),
-            crate::messages::packs::arg_key_duplicate(&arg_at)
-        );
-        let kind = match (entry.r#type, entry.values) {
-            (ArgType::Bool, None) if entry.other.is_none() => ArgKind::Bool,
-            (ArgType::Bool, _) => {
-                bail!(crate::messages::packs::arg_values_only_for_choice(&arg_at))
-            }
-            (ArgType::Choice, None) => {
-                bail!(crate::messages::packs::arg_choice_needs_values(&arg_at))
-            }
-            (ArgType::Choice, Some(values)) => {
-                ensure!(
-                    !values.is_empty(),
-                    crate::messages::packs::arg_values_empty(&arg_at)
-                );
-                let mut seen = HashSet::new();
-                for value in &values {
-                    ensure!(
-                        seen.insert(value.as_str()),
-                        crate::messages::packs::arg_value_duplicate(&arg_at, value)
-                    );
-                }
-                ArgKind::Choice {
-                    values,
-                    other: entry.other.unwrap_or(false),
-                }
-            }
-        };
-        let default = kind
-            .parse(&entry.default)
-            .map_err(|e| anyhow!(crate::messages::packs::arg_default_invalid(&arg_at, e)))?;
-        args.push(PackArg {
-            key: entry.key,
-            description: entry.description,
-            kind,
-            default,
-        });
-    }
-    Ok(args)
-}
-
-/// Parse a static config file of a version folder. The file must be a
-/// table that does not set `packs` or `presets`.
-fn document(file: &'static File<'static>) -> anyhow::Result<Value> {
-    let path = format!("packs/{}", file.path().display());
-    let value = parse_file(&path, utf8(file)?)?;
-    ensure!(
-        value.is_object(),
-        crate::messages::packs::pack_config_file_not_table(&path)
-    );
-    ensure!(
-        value.get("packs").is_none() && value.get("presets").is_none(),
-        crate::messages::packs::pack_config_file_reserved_keys(&path)
-    );
-    Ok(value)
+    load_pack(
+        &at,
+        PackId::builtin(name),
+        Some(version.to_string()),
+        &files,
+    )
 }
 
 /// The file name of `entry` as UTF-8.
-fn file_name(entry: &'static DirEntry<'static>) -> anyhow::Result<&'static str> {
+fn file_name<'a>(entry: &'a DirEntry<'_>) -> anyhow::Result<&'a str> {
     let path = entry.path();
     path.file_name()
         .and_then(|name| name.to_str())
         .with_context(|| crate::messages::packs::pack_file_name_not_utf8(path.display()))
-}
-
-/// The contents of `file` as UTF-8.
-fn utf8(file: &'static File<'static>) -> anyhow::Result<&'static str> {
-    file.contents_utf8()
-        .with_context(|| crate::messages::packs::pack_file_not_utf8(file.path().display()))
-}
-
-/// Check if the file is hidden or an editor backup (`.DS_Store`,
-/// `config.toml~`). The loader ignores these files.
-fn is_skipped(file_name: &str) -> bool {
-    file_name.starts_with('.') || file_name.ends_with('~')
-}
-
-/// Check if `text` matches `^[a-z][a-z0-9-]*$`.
-fn is_identifier(text: &str) -> bool {
-    let mut chars = text.chars();
-    chars.next().is_some_and(|c| c.is_ascii_lowercase())
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 /// Check if `text` is a whole number from 1 without leading zeros.
@@ -402,7 +193,10 @@ fn fixture_entries(prefix: &str, files: Vec<(&'static str, String)>) -> Vec<DirE
                 .entry(&path[..prefix.len() + folder.len()])
                 .or_default()
                 .push((path, text)),
-            None => entries.push(DirEntry::File(File::new(path, text.leak().as_bytes()))),
+            None => entries.push(DirEntry::File(include_dir::File::new(
+                path,
+                text.leak().as_bytes(),
+            ))),
         }
     }
     for (folder, files) in folders {
@@ -417,7 +211,7 @@ mod tests {
     //! Tests of how the pack loader reads and checks a `packs/` directory.
 
     use super::*;
-    use crate::packs::ArgValue;
+    use crate::packs::{ArgValue, PackConfig, PackKind};
 
     /// A `pack.toml` of a tool pack with one choice arg `mode`.
     const PACK: &str = r#"
@@ -446,7 +240,14 @@ values = ["a", "b"]
     fn versions(packs: &[Pack]) -> Vec<String> {
         packs
             .iter()
-            .map(|p| format!("{}@{}", p.metadata().name, p.metadata().version))
+            .map(|p| {
+                let metadata = p.metadata();
+                format!(
+                    "{}@{}",
+                    metadata.id,
+                    metadata.version.as_deref().unwrap_or("-")
+                )
+            })
             .collect()
     }
 
@@ -461,9 +262,9 @@ values = ["a", "b"]
     ///   2. Check the list of newest versions
     #[test]
     fn builtin_packs_load() {
-        let packs = crate::packs::init().unwrap();
+        let packs = crate::packs::init_builtin().unwrap();
         assert_eq!(
-            versions(&packs.builtin()),
+            versions(&packs.offered()),
             [
                 "alpine@1",
                 "debian@1",
@@ -481,17 +282,21 @@ values = ["a", "b"]
     }
 
     /// Test that the loader sorts packs by kind, then name, then version,
-    /// and skips hidden and backup files.
-    ///   1. Load packs of three kinds, two versions of one pack, and hidden
-    ///      and backup files
+    /// and skips hidden and backup files. A pack with no kind is an
+    /// "other" pack and comes last.
+    ///   1. Load packs of three kinds, a pack with no kind, two versions of
+    ///      one pack, and hidden and backup files
     ///   2. Check the order of all versions
-    ///   3. Check that the built-in list has only the newest version of
+    ///   3. Check that the offered list has only the newest version of
     ///      each pack
+    ///   4. Check that the pack with no kind is an "other" pack
     #[test]
     fn loading_packs_orders_them_by_kind_then_name_and_skips_hidden_files() {
         let distro = pack_of_kind("distro");
         let agent = pack_of_kind("agent");
+        let no_kind = PACK.replace("kind = \"tool\"\n", "");
         let packs = load_files(&[
+            ("misc@1/pack.toml", &no_kind),
             (".DS_Store", "x"),
             ("zeta@1/pack.toml", PACK),
             ("demo@2/pack.toml", PACK),
@@ -504,12 +309,13 @@ values = ["a", "b"]
         .unwrap();
         assert_eq!(
             versions(&packs.packs),
-            ["os@1", "bot@1", "demo@1", "demo@2", "zeta@1"]
+            ["os@1", "bot@1", "demo@1", "demo@2", "zeta@1", "misc@1"]
         );
         assert_eq!(
-            versions(&packs.builtin()),
-            ["os@1", "bot@1", "demo@2", "zeta@1"]
+            versions(&packs.offered()),
+            ["os@1", "bot@1", "demo@2", "zeta@1", "misc@1"]
         );
+        assert_eq!(packs.packs[5].metadata().kind, PackKind::Other);
     }
 
     /// Test that the loader reads the metadata, args, config and setup
@@ -537,7 +343,7 @@ values = ["a", "b"]
             assert_eq!(demo.metadata.description, "Installs the demo");
             assert_eq!(demo.metadata.kind, PackKind::Tool);
             assert!(demo.metadata.has_setup);
-            assert_eq!(demo.setup, Some("true\n"));
+            assert_eq!(demo.setup.as_deref(), Some("true\n"));
             assert!(
                 matches!(&demo.config, Some(PackConfig::Static(value)) if value["cpus"] == 2),
                 "{file}"
@@ -552,8 +358,8 @@ values = ["a", "b"]
         .unwrap();
         let demo = &packs.packs[0].0;
         assert!(matches!(
-            demo.config,
-            Some(PackConfig::Lua("config.cpus = 2\n"))
+            &demo.config,
+            Some(PackConfig::Lua(source)) if &**source == "config.cpus = 2\n"
         ));
         assert!(!demo.metadata.has_setup && demo.setup.is_none());
     }

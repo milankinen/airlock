@@ -6,10 +6,12 @@
 
 use super::{Exit, SandboxOptions};
 use crate::cli::prompt;
+use crate::cli::prompt::style;
 use crate::config::ResolvedConfig;
 use crate::oci::OciImage;
 #[cfg(not(test))]
 use crate::packs::install::setup::install as install_boot;
+use crate::packs::install::snapshots::{self, InstallSnapshots};
 use crate::packs::install::state::{self as install_state, InstallState};
 use crate::packs::install::{compose, plan, setup};
 use crate::packs::{ConfiguredPack, InstallerScript};
@@ -28,6 +30,8 @@ pub struct InstallDecision {
     sandbox: PinnedDir,
     /// The install records, as saved.
     state: InstallState,
+    /// The install snapshots: the saved ones and the ones of `to_install`.
+    snapshots: InstallSnapshots,
     /// The installs to run now, in pack order.
     to_install: Vec<InstallerScript>,
 }
@@ -42,8 +46,9 @@ impl InstallDecision {
     ///  - `image`: Container image of the sandbox
     ///
     /// Returns:
-    ///   The decision, or error if the save fails. The records are saved if
-    ///   they changed or if something installs.
+    ///   The decision, or error if the save fails. The records and the
+    ///   install snapshots are saved if the records changed or if something
+    ///   installs.
     pub(crate) fn save(
         sandbox: PinnedDir,
         mut state: InstallState,
@@ -52,13 +57,27 @@ impl InstallDecision {
         image: &OciImage,
     ) -> anyhow::Result<Self> {
         let before = state.clone();
+        let mut snapshots = snapshots::read(&sandbox);
+        // A kept old definition stays on the disk, so its copy goes to the
+        // new fingerprint of the record.
+        for t in transitions {
+            if let plan::Transition::Accept { id, fingerprint } = t
+                && let Some(record) = before.packs.get(id)
+            {
+                snapshots.rename(&record.fingerprint, fingerprint);
+            }
+        }
+        for t in &to_install {
+            snapshots.insert(&t.fingerprint, t.snapshot.clone());
+        }
         install_state::apply(&mut state, transitions);
         if state != before || !to_install.is_empty() {
-            save_state(&sandbox, &image.image_id, &mut state)?;
+            save_state(&sandbox, &image.image_id, &mut state, &snapshots)?;
         }
         Ok(Self {
             sandbox,
             state,
+            snapshots,
             to_install,
         })
     }
@@ -96,6 +115,7 @@ pub async fn install_tools(
     let InstallDecision {
         sandbox,
         mut state,
+        snapshots,
         to_install,
     } = decision;
     let install = !to_install.is_empty();
@@ -108,7 +128,7 @@ pub async fn install_tools(
             .map_err(Exit::config)?;
         // Saved with the first record: no session ran after this install.
         state.ran_session = false;
-        let mut save = |s: &mut InstallState| save_state(&sandbox, &image.image_id, s);
+        let mut save = |s: &mut InstallState| save_state(&sandbox, &image.image_id, s, &snapshots);
         let run = run_install(
             install_project,
             image,
@@ -134,15 +154,24 @@ pub async fn install_tools(
     // [`InstallState::ran_session`]).
     if !state.ran_session && !state.packs.is_empty() {
         state.ran_session = true;
-        save_state(&sandbox, &image.image_id, &mut state)?;
+        save_state(&sandbox, &image.image_id, &mut state, &snapshots)?;
     }
     Ok(())
 }
 
-/// Save `state` with the current disk and `image_id`.
-fn save_state(sandbox: &PinnedDir, image_id: &str, state: &mut InstallState) -> anyhow::Result<()> {
+/// Save `state` with the current disk and `image_id`, and the copies of
+/// `snapshots` that have a record in `state`.
+fn save_state(
+    sandbox: &PinnedDir,
+    image_id: &str,
+    state: &mut InstallState,
+    snapshots: &InstallSnapshots,
+) -> anyhow::Result<()> {
     state.disk = project::disk_id(sandbox);
     state.image_id = Some(image_id.to_string());
+    // The snapshots go first. Thus after a crash between the two writes,
+    // each record still has its snapshot.
+    snapshots::write(sandbox, snapshots, state)?;
     install_state::write(sandbox, state)
 }
 
@@ -185,6 +214,8 @@ async fn run_install(
             .iter()
             .find(|t| &t.pack == id)
             .map_or(id.as_str(), |t| t.label.as_str());
+        // A project pack can set any label.
+        let label = style::escape_controls(label, false);
         cli::error!("{}", messages::start::install_failed(label, code));
         if let Some(hint) = compose::exit_hint(*code) {
             cli::error!("{}", messages::start::install_hint(hint));

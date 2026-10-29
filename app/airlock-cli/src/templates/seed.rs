@@ -1,12 +1,14 @@
 //! New sandboxes from templates.
 //!
-//! Gives a new sandbox the disk, the install records, the CA and the image
-//! of a template. The disk is a copy-on-write clone where the file system can
-//! do it. Otherwise it is a normal copy that keeps the disk sparse. The new
-//! disk gets its own identity, and the install records move to it.
+//! Gives a new sandbox the disk, the install records, the install
+//! snapshots, the CA and the image of a template. The disk is a
+//! copy-on-write clone where the file system can do it. Otherwise it is a
+//! normal copy that keeps the disk sparse. The new disk gets its own
+//! identity, and the install records move to it.
 
 use super::{CA_FILE, IMAGE_FILE, Template};
 use crate::messages;
+use crate::packs::install::snapshots::{SNAPSHOTS_CAP, SNAPSHOTS_FILE};
 use crate::packs::install::state::{self as install_state, ReadState};
 use crate::util::PinnedDir;
 use crate::util::clone::clone_file;
@@ -46,7 +48,9 @@ pub fn seed(
         let _ = sandbox.remove(DISK_FILE);
         return Err(e);
     }
-    let result = seed_records(template, sandbox).and_then(|()| seed_ca(template, sandbox));
+    let result = seed_records(template, sandbox)
+        .and_then(|()| copy_file(template, sandbox, SNAPSHOTS_FILE, SNAPSHOTS_CAP))
+        .and_then(|()| copy_file(template, sandbox, CA_FILE, 1024 * 1024));
     if result.is_err() {
         unseed(sandbox_dir);
         return result;
@@ -77,14 +81,30 @@ fn seed_records(template: &Template, sandbox: &PinnedDir) -> anyhow::Result<()> 
     install_state::write(sandbox, &state)
 }
 
-/// Copy the CA of `template` into `sandbox`, if the template has one.
+/// Copy the file `name` of `template` into `sandbox`, if the template has
+/// it. The copy has mode 0600.
+/// Args:
+///  - `cap`: Maximum size of the file in bytes
 // The pack installs can put the CA certificate into the CA bundles on the
-// disk. A new CA would then not be in these bundles.
-fn seed_ca(template: &Template, sandbox: &PinnedDir) -> anyhow::Result<()> {
+// disk. A new CA would then not be in these bundles. The install snapshots
+// show the changes of a pack since the install of the template.
+fn copy_file(template: &Template, sandbox: &PinnedDir, name: &str, cap: u64) -> anyhow::Result<()> {
     let source = PinnedDir::pin(template.dir.to_path()?)?;
-    if let Some(bytes) = source.read(CA_FILE, 1024 * 1024)? {
-        sandbox.write_atomic(CA_FILE, &bytes, 0o600)?;
+    if let Some(bytes) = source.read(name, cap)? {
+        sandbox.write_atomic(name, &bytes, 0o600)?;
     }
+    Ok(())
+}
+
+/// Remove the template disk, its install records and its install
+/// snapshots from the sandbox `sandbox`. The image and the CA stay. The
+/// next disk is empty, and all packs install again.
+/// Returns:
+///   Error if a remove fails.
+pub fn drop_disk(sandbox: &PinnedDir) -> anyhow::Result<()> {
+    crate::project::reset_disk(sandbox)?;
+    sandbox.remove(install_state::STATE_FILE)?;
+    sandbox.remove(SNAPSHOTS_FILE)?;
     Ok(())
 }
 
@@ -96,6 +116,7 @@ pub fn unseed(sandbox_dir: &VerifiedPath) {
         DISK_FILE,
         disk::DISK_ID_FILE,
         install_state::STATE_FILE,
+        SNAPSHOTS_FILE,
         IMAGE_FILE,
         CA_FILE,
     ] {

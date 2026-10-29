@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::config::config_values;
 use crate::network::rules::resolve_inject;
+use crate::packs::approval::Approved;
 use crate::project::resolve_env;
 use crate::test_cfg::{configured_variants, host_env_vault, resolve_project_toml};
 
@@ -14,18 +15,21 @@ fn builtin_values() -> Vec<(String, String, serde_json::Value)> {
     let mut values = Vec::new();
     let tmp = crate::test_cfg::temp_dir();
     let data = crate::test_cfg::oci::data_dir_at(tmp.path());
-    for pack in crate::packs::init().unwrap().builtin() {
+    for pack in crate::packs::init_builtin().unwrap().offered() {
         for configured in configured_variants(&pack) {
             let label = format!(
                 "{}@{} {:?}",
-                pack.metadata().name,
-                pack.metadata().version,
+                pack.metadata().id,
+                pack.metadata().version.as_deref().unwrap_or_default(),
                 configured.args()
             );
             values.push((
-                pack.metadata().name.clone(),
+                pack.metadata().id.to_string(),
                 label,
-                configured.config_values(&data).unwrap(),
+                configured
+                    .config_values(&data, &Approved::for_test(configured.pack()))
+                    .unwrap()
+                    .0,
             ));
         }
     }
@@ -55,19 +59,24 @@ fn leaves(prefix: &str, value: &serde_json::Value, out: &mut BTreeMap<String, se
 #[test]
 fn builtin_packs_have_unique_names_versions_and_valid_arg_keys() {
     let mut seen = HashSet::new();
-    for pack in crate::packs::init().unwrap().builtin() {
+    for pack in crate::packs::init_builtin().unwrap().offered() {
         let metadata = pack.metadata();
         assert!(
-            seen.insert(metadata.name.clone()),
+            seen.insert(metadata.id.to_string()),
             "duplicate {}",
-            metadata.name
+            metadata.id
         );
         assert!(!metadata.label.is_empty());
         assert!(
-            metadata.version.parse::<u64>().is_ok_and(|v| v >= 1),
+            metadata
+                .version
+                .as_deref()
+                .unwrap_or_default()
+                .parse::<u64>()
+                .is_ok_and(|v| v >= 1),
             "{}@{}",
-            metadata.name,
-            metadata.version
+            metadata.id,
+            metadata.version.as_deref().unwrap_or_default()
         );
         for arg in pack.args() {
             let key = &arg.key;
@@ -76,7 +85,7 @@ fn builtin_packs_have_unique_names_versions_and_valid_arg_keys() {
                 chars.next().is_some_and(|c| c.is_ascii_lowercase())
                     && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
                 "{}.{key}",
-                metadata.name
+                metadata.id
             );
             assert!(key != "enabled" && key != "version" && key != "args");
         }
@@ -102,12 +111,12 @@ fn every_builtin_pack_variant_is_valid_config() {
 ///   3. Check that no pack sets a path inside a leaf of the other pack
 #[test]
 fn builtin_pack_documents_merge_same_in_any_order() {
-    let distros: Vec<String> = crate::packs::init()
+    let distros: Vec<String> = crate::packs::init_builtin()
         .unwrap()
-        .builtin()
+        .offered()
         .iter()
         .filter(|p| p.metadata().kind == crate::packs::PackKind::Distro)
-        .map(|p| p.metadata().name.clone())
+        .map(|p| p.metadata().id.to_string())
         .collect();
     let documents: Vec<(String, String, BTreeMap<String, serde_json::Value>)> = builtin_values()
         .into_iter()

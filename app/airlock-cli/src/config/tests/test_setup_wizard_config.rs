@@ -12,7 +12,7 @@ use crate::test_cfg::{ConfigDirs, resolve_layers, resolve_project_toml, temp_dir
 fn entry<'a>(name: &'a str, args: Vec<(&'a str, &'a ArgValue)>) -> NewEntry<'a> {
     NewEntry {
         name,
-        version: "1",
+        version: Some("1"),
         args,
     }
 }
@@ -212,7 +212,7 @@ fn wizard_config_from_template_keeps_template_and_adds_extra_packs() {
     let names: Vec<&str> = resolved
         .packs
         .iter()
-        .map(|c| c.metadata().name.as_str())
+        .map(|c| c.metadata().id.as_str())
         .collect();
     assert_eq!(names, ["debian", "claude", "sample"]);
     assert_eq!(

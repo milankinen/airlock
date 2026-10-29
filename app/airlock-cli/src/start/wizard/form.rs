@@ -16,7 +16,12 @@ use crate::start::wizard::Answers;
 use crate::templates::{Template, TemplatePack};
 
 /// The pack kinds of the sections, in pack order. Each kind has one section.
-pub const KINDS: [PackKind; 3] = [PackKind::Distro, PackKind::Agent, PackKind::Tool];
+pub const KINDS: [PackKind; 4] = [
+    PackKind::Distro,
+    PackKind::Agent,
+    PackKind::Tool,
+    PackKind::Other,
+];
 
 /// The options of the start bar, in order.
 pub const START_CHOICES: [StartChoice; 2] = [StartChoice::Start, StartChoice::Abort];
@@ -128,7 +133,7 @@ impl OtherSlot {
 /// Then the view has one section per pack kind ([`KINDS`]):
 ///  * The distro packs are a radio group. If the user files set an image,
 ///    the first row is that image ([`Row::Custom`], no distro pack).
-///  * The agents and the tools are checkboxes.
+///  * The agents, the tools and the other packs are checkboxes.
 ///
 /// A selected pack has its args as rows below it. An unselected pack has no
 /// arg rows. An arg row shows its values ([`listed_values`]). A choice arg
@@ -173,15 +178,18 @@ impl Form {
     /// Create the start state of the view.
     /// Args:
     ///  - `data_dir`: Airlock data directory
-    ///  - `packs`: Available packs. The view offers the built-in packs.
+    ///  - `packs`: Available packs. The view offers the built-in packs and
+    ///    the user packs.
     ///  - `custom_image`: The image of the user files, if set
     ///  - `templates`: The templates, sorted by name
     ///  - `mode`: What the wizard makes
     ///
     /// Returns:
     ///   The state. The empty template is selected. The image of the user
-    ///   files is selected, or else the first distro pack. No agent or tool
-    ///   is selected, and the args have their defaults. The config is local.
+    ///   files is selected, or else the distro pack of the `packs.defaults`
+    ///   setting, or else the first distro pack. The other packs of the
+    ///   setting are selected, and the args have their defaults. The config
+    ///   is local.
     ///   The start bar is on `start`. The focus is on the first row.
     pub fn new(
         data_dir: &DataDir,
@@ -190,16 +198,26 @@ impl Form {
         templates: &[Template],
         mode: Mode,
     ) -> Self {
-        let offered = packs.builtin();
+        let offered = packs.offered();
+        let (defaults, _) = packs.defaults();
+        let is_default = |pack: &Pack| defaults.contains(&pack.metadata().id);
+        let is_distro = |pack: &Pack| pack.metadata().kind == PackKind::Distro;
+        // A distro in the defaults wins over the first distro. The user image
+        // wins over both.
         let default_distro = offered
             .iter()
-            .position(|p| p.metadata().kind == PackKind::Distro)
+            .position(|p| is_distro(p) && is_default(p))
+            .or_else(|| offered.iter().position(is_distro))
             .filter(|_| custom_image.is_none());
         let entries: Vec<Entry> = offered
             .into_iter()
             .enumerate()
             .map(|(i, pack)| Entry {
-                selected: Some(i) == default_distro,
+                selected: if is_distro(&pack) {
+                    Some(i) == default_distro
+                } else {
+                    is_default(&pack)
+                },
                 values: default_values(&pack),
                 pack,
             })
@@ -250,6 +268,19 @@ impl Form {
             target,
             template: template.cloned(),
         }
+    }
+
+    /// Record the approval of each selected pack, also the packs of the
+    /// selected template. Call this when the user confirms the answers: the
+    /// confirmed selection counts as approval (see
+    /// [`crate::packs::approval`]).
+    /// Returns:
+    ///   An error if the approval file cannot be read or written.
+    pub fn approve_selected(&self) -> anyhow::Result<()> {
+        for entry in self.entries.iter().filter(|e| e.selected) {
+            crate::packs::approval::approve_selected(&self.data_dir, &entry.pack)?;
+        }
+        Ok(())
     }
 
     /// Record that the answers did not pass the check. `error` shows below
@@ -451,12 +482,12 @@ impl Form {
     /// Return the pack of the selected template that `entries[i]` is, if
     /// any.
     fn template_pack(&self, i: usize) -> Option<&TemplatePack> {
-        let name = &self.entries[i].pack.metadata().name;
+        let id = &self.entries[i].pack.metadata().id;
         self.selected_template()?
             .config
             .packs
             .iter()
-            .find(|p| p.name == *name)
+            .find(|p| *id == p.name)
     }
 
     /// Return true if the selected template locks `entries[i]`: the
@@ -571,9 +602,10 @@ impl Form {
 
     /// Give the text of the "other" slot to its arg and close the slot.
     /// Returns:
-    ///   False if the text is empty or the pack config does not accept it.
-    ///   Then the slot stays open, with the error in the second case. True if
-    ///   the commit succeeded or there is no slot.
+    ///   False if the text is empty or the pack config does not accept it
+    ///   (checked only for a built-in or approved pack). Then the slot stays
+    ///   open, with the error in the second case. True if the commit
+    ///   succeeded or there is no slot.
     fn commit_other(&mut self) -> bool {
         let (Some(other), Row::Arg(i, a)) = (self.other.as_mut(), self.focus) else {
             return true;
@@ -587,8 +619,24 @@ impl Form {
             entry.pack.args()[a].key.clone(),
             ArgValue::Text(other.text.trim().to_string()),
         );
-        match entry.pack.configure(&values).config_values(&self.data_dir) {
-            Ok(_) => {
+        // The `config.lua` checks the value only if the pack has an
+        // approval already (or is built in). The edit of a value is not an
+        // approval: the wizard records it only when the user confirms the
+        // answers. Then the answer check runs the script (see
+        // `Form::approve_selected`).
+        let result =
+            crate::packs::approval::approved(&self.data_dir, &entry.pack).and_then(|approved| {
+                match approved {
+                    Some(approved) => entry
+                        .pack
+                        .configure(&values)
+                        .config_values(&self.data_dir, &approved)
+                        .map(drop),
+                    None => Ok(()),
+                }
+            });
+        match result {
+            Ok(()) => {
                 entry.values = values;
                 self.other = None;
                 true

@@ -7,12 +7,12 @@ use crate::packs::install::compose::script;
 use crate::test_cfg::packs::{HostShell, ShellRun, sh};
 
 /// The name and setup script of each built-in pack that has one.
-fn builtin_setups() -> Vec<(String, &'static str)> {
-    crate::packs::init()
+fn builtin_setups() -> Vec<(String, std::sync::Arc<str>)> {
+    crate::packs::init_builtin()
         .unwrap()
         .packs
         .iter()
-        .filter_map(|p| Some((p.metadata().name.clone(), p.0.setup?)))
+        .filter_map(|p| Some((p.metadata().id.to_string(), p.0.setup.clone()?)))
         .collect()
 }
 
@@ -43,7 +43,7 @@ fn builtin_setup_scripts_pass_sh_syntax_check_and_only_mise_pack_uses_mise() {
     assert!(!setups.is_empty());
     for (name, setup) in setups {
         let out = Command::new(sh())
-            .args(["-n", "-c", &script(setup)])
+            .args(["-n", "-c", &script(&setup)])
             .output()
             .unwrap();
         assert!(

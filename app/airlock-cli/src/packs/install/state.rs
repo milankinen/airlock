@@ -19,6 +19,8 @@ pub const STATE_FILE: &str = "installs.json";
 const STATE_VERSION: u32 = 1;
 /// Maximum size of the state file to read.
 pub(crate) const STATE_CAP: u64 = 256 * 1024;
+/// Longest pack id in the records. A project pack id is a path.
+const MAX_ID_LEN: usize = 256;
 
 /// Install status of one pack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,11 +183,14 @@ pub fn write(dir: &PinnedDir, state: &InstallState) -> anyhow::Result<()> {
 /// Check the fields that the terminal shows or that are compared as IDs.
 fn validate(state: &InstallState) -> Result<(), String> {
     for (id, record) in &state.packs {
-        let well_formed = !id.is_empty()
-            && id.len() <= 64
+        // A valid pack id has no control characters. Older records can
+        // have `_` in a name.
+        let plain = !id.is_empty()
             && id
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+        let well_formed =
+            id.len() <= MAX_ID_LEN && (plain || crate::packs::PackId::parse(id).is_some());
         if !well_formed {
             return Err(crate::messages::packs::state_pack_name_invalid(id));
         }
@@ -230,6 +235,11 @@ pub fn apply(state: &mut InstallState, transitions: &[Transition]) {
                     r.status = PackStatus::Kept {
                         confirmed: r.status == PackStatus::Installed,
                     };
+                }
+            }
+            Transition::Accept { id, fingerprint } => {
+                if let Some(r) = state.packs.get_mut(id) {
+                    r.fingerprint.clone_from(fingerprint);
                 }
             }
         }

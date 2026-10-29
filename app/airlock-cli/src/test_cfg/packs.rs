@@ -9,7 +9,8 @@ use std::sync::LazyLock;
 
 use airlock_test_utils::{TempDir, block_on, temp_dir};
 
-use crate::config::{ConfigOverrides, LayeredConfig, ResolvedConfig};
+use crate::config::{ConfigOverrides, LayeredConfig, ResolveInput, ResolvedConfig};
+use crate::data_dir::DataDir;
 use crate::packs::install::compose;
 use crate::packs::install::progress::InstallProgress;
 use crate::packs::install::setup::{Ended, Exec};
@@ -91,13 +92,29 @@ pub fn load_packs(files: Vec<(&'static str, String)>) -> PackManager {
 }
 
 /// Resolve one project file `airlock.toml` with the content `toml`, with
-/// the packs `packs`.
+/// the packs `packs`, in a new data directory.
 pub fn resolve_with(packs: &PackManager, toml: &str) -> anyhow::Result<ResolvedConfig> {
+    let data = temp_dir();
+    resolve_in(&crate::test_cfg::oci::data_dir_at(data.path()), packs, toml)
+}
+
+/// Resolve one project file `airlock.toml` with the content `toml`, with
+/// the packs `packs`, in the data directory `data_dir`. The setup env hash
+/// key stays the same for one data directory.
+pub fn resolve_in(
+    data_dir: &DataDir,
+    packs: &PackManager,
+    toml: &str,
+) -> anyhow::Result<ResolvedConfig> {
     let layers =
         LayeredConfig::from_values(vec![], None, vec![("airlock.toml", toml::from_str(toml)?)])?;
-    let data = temp_dir();
-    let data_dir = crate::test_cfg::oci::data_dir_at(data.path());
-    block_on(layers.resolve(&data_dir, packs, &ConfigOverrides::default()))
+    block_on(layers.resolve(&ResolveInput {
+        data_dir,
+        packs,
+        overrides: &ConfigOverrides::default(),
+        project_root: None,
+        approval: crate::packs::approval::ApprovalMode::APPROVE,
+    }))
 }
 
 /// The install scripts of the packs that `toml` configures, in pack order.
@@ -300,4 +317,39 @@ impl Exec for HostExec {
         progress.stderr(&out.stderr);
         Some(Ended::Exited(out.status.code().unwrap_or(-1)))
     }
+}
+
+/// Write the files of the user pack `name` into the user pack directory
+/// `dir`.
+/// Args:
+///  - `dir`: The user pack directory. It is created if necessary.
+///  - `name`: Directory name of the pack
+///  - `files`: `(file name, text)` of each pack file
+pub fn write_user_pack(dir: &Path, name: &str, files: &[(&str, &str)]) {
+    let pack_dir = dir.join(name);
+    std::fs::create_dir_all(&pack_dir).unwrap();
+    for (file, text) in files {
+        std::fs::write(pack_dir.join(file), text).unwrap();
+    }
+}
+
+/// Load the built-in packs, the test pack `sample@1` and the user packs of
+/// `dirs` (each set by the user, see
+/// [`PackManager::with_user_packs`]).
+/// Args:
+///  - `dirs`: User pack directories
+///  - `defaults`: Pack ids of the `packs.defaults` setting
+///
+/// Returns:
+///   The packs and the warnings, or the load error.
+pub fn with_user_packs(
+    dirs: &[&Path],
+    defaults: &[&str],
+) -> anyhow::Result<(PackManager, Vec<String>)> {
+    let dirs: Vec<_> = dirs
+        .iter()
+        .map(|dir| (crate::test_cfg::oci::verified_dir(dir), true))
+        .collect();
+    crate::packs::init_with_sample()
+        .with_user_packs(&dirs, defaults.iter().map(ToString::to_string).collect())
 }

@@ -22,10 +22,12 @@ use crate::oci::{ImageChange, ImageChangeStop, OnImageChange};
 #[cfg(not(test))]
 use crate::packs::install::facts::check as check_image;
 use crate::packs::install::plan::{self, DecideInput, Wanted};
+use crate::packs::install::snapshots;
 use crate::packs::install::state::{self as install_state, InstallState, ReadState};
 use crate::packs::{InstallerScript, PackManager};
 use crate::project::{self, SandboxLock};
 use crate::start::install::{self, InstallDecision};
+use crate::start::sandbox::{ChangedAnswer, ChangedPacks};
 use crate::start::{Exit, SandboxOptions};
 #[cfg(test)]
 use crate::test_cfg::start::{check_image, prepare_image};
@@ -69,7 +71,7 @@ pub async fn create(
     if !force {
         check_absent(&context.data, name)?;
     }
-    let packs = crate::packs::init().map_err(Exit::config)?;
+    let packs = crate::packs::init(&context.settings.packs, &context.home).map_err(Exit::config)?;
     let build = BuildDir::new(&context.data, name)?;
     let project_dir = &build.project;
     // The wizard checks the answers with the user files only. The build
@@ -91,10 +93,12 @@ pub async fn create(
         .map_err(Exit::config)?;
     let options = SandboxOptions {
         yes: true,
+        can_prompt: crate::cli::prompt::can_prompt(),
         log_level,
         verbose,
         allow_config_changes: false,
         overrides: ConfigOverrides::default(),
+        auto_approve_packs: false,
     };
     Box::pin(build_template(
         context, name, &packs, &config, &options, force,
@@ -113,8 +117,9 @@ pub async fn create(
 /// Gets the image, installs the packs of `config` on a new disk, and moves
 /// the disk, the install records, the image link and the config to the
 /// template directory. If `config` comes from an other template, the build
-/// starts with a copy of that template. The build directory is removed at
-/// the end, also on failure.
+/// starts with a copy of that template. If a pack of that template changed,
+/// the changed-packs question decides (with `--yes`, the build starts with
+/// a new disk). The build directory is removed at the end, also on failure.
 /// Args:
 ///  - `context`: Process context
 ///  - `name`: Name of the new template
@@ -165,8 +170,16 @@ async fn build_locked(
     build: &BuildDir,
     lock: &SandboxLock,
 ) -> Result<String, Exit> {
+    // A template has no project, so the config cannot name project packs.
     let resolved = config
-        .resolve(&context.data, packs, &options.overrides)
+        .resolve(&config::ResolveInput {
+            data_dir: &context.data,
+            packs,
+            overrides: &options.overrides,
+            project_root: None,
+            // The wizard approved the packs that the user selected.
+            approval: crate::packs::approval::ApprovalMode::Refuse,
+        })
         .await
         .map_err(Exit::config)?;
     start::env::check_env_early(&resolved.values, &context.vault)?;
@@ -198,14 +211,13 @@ async fn build_locked(
     let pin = prepared.pin;
     // The base template disk belongs to the base image. With an other
     // image, start with an empty disk.
-    if base.is_some() && prepared.change != ImageChange::Unchanged {
-        project::reset_disk(&sandbox)?;
-        sandbox
-            .remove(install_state::STATE_FILE)
-            .map_err(anyhow::Error::from)?;
+    let mut copied = base.is_some();
+    if copied && prepared.change != ImageChange::Unchanged {
+        super::seed::drop_disk(&sandbox)?;
+        copied = false;
     }
 
-    let state = match install_state::read(&sandbox) {
+    let mut state = match install_state::read(&sandbox) {
         ReadState::Ok(state) => state,
         _ => InstallState::default(),
     };
@@ -217,16 +229,38 @@ async fn build_locked(
             fingerprint: t.fingerprint.clone(),
         })
         .collect();
-    let mut plan = plan::decide(&DecideInput {
-        state: &state,
-        wanted: &wanted,
-        disk: project::disk_id(&sandbox),
-        image_id: Some(&image.image_id),
-    });
+    let decide = |state: &InstallState| {
+        plan::decide(&DecideInput {
+            state,
+            wanted: &wanted,
+            disk: project::disk_id(&sandbox),
+            image_id: Some(&image.image_id),
+        })
+    };
+    let mut plan = decide(&state);
+    if !plan.changed.is_empty() {
+        let snapshots = snapshots::read(&sandbox);
+        let changed = ChangedPacks {
+            changed: &plan.changed,
+            candidates: &candidates,
+            state: &state,
+            snapshots: &snapshots,
+        };
+        match start::sandbox::changed_packs_answer(options, &changed)? {
+            ChangedAnswer::Recreate => {
+                super::seed::drop_disk(&sandbox)?;
+                copied = false;
+                state = InstallState::default();
+                plan = decide(&state);
+            }
+            ChangedAnswer::Reinstall => plan.reinstall_changed(&wanted),
+            ChangedAnswer::KeepOld => plan.accept_changed(&wanted),
+        }
+    }
     if !plan.pending.is_empty() {
         check_image(&context.data, &image).map_err(|e| Exit::error(2, e))?;
     }
-    project::ensure_disk(&sandbox, &values.disk, base.is_some())?;
+    project::ensure_disk(&sandbox, &values.disk, copied)?;
     let to_install: Vec<InstallerScript> = candidates
         .into_iter()
         .filter(|t| plan.pending.iter().any(|p| p.id == t.pack))

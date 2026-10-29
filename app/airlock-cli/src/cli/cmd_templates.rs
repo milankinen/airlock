@@ -201,10 +201,11 @@ fn info(data: &DataDir, name: &str) -> anyhow::Result<i32> {
                     other => format!("{key} = {other}"),
                 })
                 .collect();
+            let head = crate::packs::id_with_version(&pack.name, pack.version.as_deref());
             if args.is_empty() {
-                println!("  {} {}", pack.name, pack.version);
+                println!("  {head}");
             } else {
-                println!("  {} {} ({})", pack.name, pack.version, args.join(", "));
+                println!("  {head} ({})", args.join(", "));
             }
         }
     }

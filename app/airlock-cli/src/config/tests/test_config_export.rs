@@ -4,7 +4,7 @@
 use serde_json::json;
 
 use crate::config::export::{self, Format};
-use crate::config::{ConfigOverrides, LayeredConfig, ResolvedConfig, files};
+use crate::config::{ConfigOverrides, LayeredConfig, ResolveInput, ResolvedConfig, files};
 use crate::test_cfg::{ConfigDirs, block_on, temp_dir};
 
 /// Test that the project document has only the merged project-level files,
@@ -90,7 +90,14 @@ fn resolved_document_in_each_format_resolves_to_same_config() {
     let data_dir = crate::test_cfg::oci::data_dir_at(data.path());
     let resolve = |layers: &LayeredConfig| -> ResolvedConfig {
         let packs = crate::packs::init_with_sample();
-        block_on(layers.resolve(&data_dir, &packs, &ConfigOverrides::default())).unwrap()
+        block_on(layers.resolve(&ResolveInput {
+            data_dir: &data_dir,
+            packs: &packs,
+            overrides: &ConfigOverrides::default(),
+            project_root: None,
+            approval: crate::packs::approval::ApprovalMode::APPROVE,
+        }))
+        .unwrap()
     };
     let user = toml::from_str("[vm]\nmemory = \"3 GB\"\n[env]\nFROM_USER = \"u\"\n").unwrap();
     let project = toml::from_str(FULL_CONFIG).unwrap();

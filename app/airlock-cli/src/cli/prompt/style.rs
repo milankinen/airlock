@@ -4,7 +4,11 @@
 //! current option of a bar are cyan. A current mark or value is green. Errors
 //! are red. Without colors (`NO_COLOR`, `CLICOLOR=0`, or a terminal without colors), a
 //! `❯` before the focused row shows the focus. Brackets show the current option
-//! (`[yes]`). Also wraps long text to the terminal width.
+//! (`[yes]`). Also wraps long text to the terminal width, and makes
+//! untrusted text safe to show.
+
+use std::borrow::Cow;
+use std::fmt::Write as _;
 
 use console::{Style, measure_text_width};
 
@@ -192,4 +196,42 @@ impl Line {
             self.push("]", &styles.plain);
         }
     }
+}
+
+/// Make untrusted text safe to show in the terminal. A control character
+/// or a bidi override character can hide text or change the terminal, so
+/// each one shows as a visible escape: `\x1b` for the C0 controls and DEL,
+/// `\u{85}` for the C1 controls, and `\u{202e}` for the bidi override and
+/// isolate characters (U+202A to U+202E, U+2066 to U+2069). A tab stays.
+/// Args:
+///  - `text`: The text, for example a line of a file from the project
+///  - `keep_newlines`: If true, `\n` stays. Else it shows as `\x0a`.
+///
+/// Returns:
+///   The text with the escapes. It is borrowed if nothing changed.
+pub fn escape_controls(text: &str, keep_newlines: bool) -> Cow<'_, str> {
+    let unsafe_char = |c: char| match c {
+        '\t' => false,
+        '\n' => !keep_newlines,
+        c => {
+            c.is_ascii_control()
+                || ('\u{80}'..='\u{9f}').contains(&c)
+                || ('\u{202a}'..='\u{202e}').contains(&c)
+                || ('\u{2066}'..='\u{2069}').contains(&c)
+        }
+    };
+    if !text.chars().any(unsafe_char) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        if !unsafe_char(c) {
+            out.push(c);
+        } else if c.is_ascii() {
+            let _ = write!(out, "\\x{:02x}", u32::from(c));
+        } else {
+            let _ = write!(out, "\\u{{{:x}}}", u32::from(c));
+        }
+    }
+    Cow::Owned(out)
 }

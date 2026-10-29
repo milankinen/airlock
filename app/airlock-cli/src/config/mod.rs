@@ -22,7 +22,8 @@ use crate::config::config_values::{ConfigValues, Policy};
 use crate::config::generated::GeneratedConfig;
 use crate::config::merge::{merge_json, normalize_env, pack_conflicts};
 use crate::data_dir::DataDir;
-use crate::packs::{ConfiguredPack, Pack, PackManager};
+use crate::packs::approval::{self, ApprovalMode, Approved};
+use crate::packs::{ConfiguredPack, Pack, PackManager, PackRef};
 use crate::util::VerifiedPath;
 
 /// Load the config files of the project `project_root`. The user files come
@@ -90,6 +91,25 @@ impl Layer {
         );
         Ok(layer)
     }
+}
+
+/// What [`LayeredConfig::resolve`] needs besides the config files.
+#[derive(Clone, Copy)]
+pub struct ResolveInput<'a> {
+    /// Airlock data directory, for the pack mount directories.
+    pub data_dir: &'a DataDir,
+    /// Known packs.
+    pub packs: &'a PackManager,
+    /// Command line overrides.
+    pub overrides: &'a ConfigOverrides,
+    /// Project root directory, for the project packs (`./path`). It is the
+    /// directory where the project files are. `None` if there is no
+    /// project, for example in a template build. Then a project pack is an
+    /// error.
+    pub project_root: Option<&'a VerifiedPath>,
+    /// How to get the approval of a new or changed user pack or project
+    /// pack (see [`approval`]).
+    pub approval: ApprovalMode,
 }
 
 /// Command line overrides for [`LayeredConfig::resolve`].
@@ -181,29 +201,51 @@ impl LayeredConfig {
     /// Thus a pack overrides the layers below its highest entry (a project
     /// pack overrides the user files). The layer of that entry overrides
     /// the pack.
+    ///
+    /// The project packs (`./path`) load from the project root on each
+    /// resolve.
+    /// A user pack or a project pack needs the approval of the user before
+    /// its `config.lua` runs (see [`approval`]).
     /// Args:
-    ///  - `data_dir`: Airlock data directory, for the pack mount directories
-    ///  - `packs`: Known packs
-    ///  - `overrides`: Command line overrides
+    ///  - `input`: Data directory, known packs, overrides, project root and
+    ///    approval mode
     ///
     /// Returns:
     ///   The validated config and the enabled packs. An error lists all
     ///   problems, for example an unknown preset name, an invalid
-    ///   `[packs]` entry, a failed `config.lua`, or two packs that set a
-    ///   value differently.
-    pub async fn resolve(
+    ///   `[packs]` entry, a missing project pack, a failed `config.lua`, or
+    ///   two packs that set a value differently. A pack without approval
+    ///   gives an approval error (see [`approval::approve`]).
+    pub async fn resolve(&self, input: &ResolveInput<'_>) -> anyhow::Result<ResolvedConfig> {
+        // The steps keep the pack files in memory. The approval covers the
+        // same text that the evaluation runs, so a file change after the
+        // approval has no effect.
+        let selected = self.select(input.packs, input.project_root).await?;
+        let approved = approval::approve(input.data_dir, &selected.packs, input.approval)?;
+        selected.evaluate(input.data_dir, *input.overrides, &approved)
+    }
+
+    /// Read the layers and their `[packs]` tables, and load the packs. No
+    /// `config.lua` runs here.
+    /// Args:
+    ///  - `packs`: Known packs
+    ///  - `project_root`: Project root directory for the project packs
+    ///
+    /// Returns:
+    ///   The layers and the configured packs, or an error that lists all
+    ///   problems.
+    async fn select(
         &self,
-        data_dir: &DataDir,
         packs: &PackManager,
-        overrides: &ConfigOverrides,
-    ) -> anyhow::Result<ResolvedConfig> {
-        let known = packs.builtin();
+        project_root: Option<&VerifiedPath>,
+    ) -> anyhow::Result<Selected> {
+        let mut known = packs.offered();
         // The names of the `presets` lists must be released names (see
         // `legacy_presets::validate_names`).
         let legacy_base = self.legacy_base(&known)?;
         let mut problems = Vec::new();
         let mut entries = Vec::new();
-        let mut plain_layers = Vec::new();
+        let mut layers = Vec::new();
         // Read the `[packs]` table of each layer separately. The entries
         // merge for each pack (see `pack_entries`).
         for layer in self.layers() {
@@ -213,31 +255,19 @@ impl LayeredConfig {
                 pack_entries::read_layer_packs(&layer.origin, &mut value, &known, &mut problems);
             let pack_names = layer_entries.iter().map(|e| e.name.clone()).collect();
             entries.extend(layer_entries);
-            plain_layers.push(PlainLayer { value, pack_names });
+            layers.push(PlainLayer { value, pack_names });
         }
+        add_project_packs(&mut known, &entries, project_root, &mut problems);
         let configured = pack_entries::configure_packs(entries, packs, &known, &mut problems).await;
         if !problems.is_empty() {
             anyhow::bail!(crate::messages::config::invalid_configuration_problems(
                 problems.join("\n")
             ));
         }
-        // A `config.lua` runs here, on each resolve. The values of the
-        // enabled packs must not conflict across all layers.
-        let pack_values = pack_configs(data_dir, &configured).map_err(|problems| {
-            anyhow::anyhow!(crate::messages::config::invalid_configuration_problems(
-                problems.join("\n")
-            ))
-        })?;
-        let mut values = merge_config(legacy_base, plain_layers, &configured, pack_values)?;
-        let configured_policy = values.network.policy;
-        if let Some(policy) = overrides.network_policy {
-            tracing::info!("network policy overridden by --network: {}", policy.label());
-            values.network.policy = policy;
-        }
-        Ok(ResolvedConfig {
-            values,
+        Ok(Selected {
+            legacy_base,
+            layers,
             packs: configured,
-            configured_policy,
         })
     }
 
@@ -305,7 +335,8 @@ impl LayeredConfig {
     }
 
     /// The config of in-memory files, each `(origin, value)`, as if they
-    /// were loaded from the user, local and project slots.
+    /// were loaded from the user, local and project slots. The project slot
+    /// files are project root files.
     #[cfg(test)]
     pub(crate) fn from_values(
         user: Vec<(&str, serde_json::Value)>,
@@ -356,33 +387,108 @@ impl ResolvedConfig {
     }
 }
 
-/// Get the config values of the packs.
+/// Maximum number of project packs that one config can name.
+const MAX_PROJECT_PACKS: usize = 32;
+
+/// Load the project packs that the entries name and add them to the known
+/// packs. Each project pack loads one time, also if more than one file
+/// names it. At most [`MAX_PROJECT_PACKS`] packs load.
+/// Args:
+///  - `known`: Packs that an entry can name. The project packs are added
+///    after the other packs of the same kind.
+///  - `entries`: Entries of all files
+///  - `project_root`: Project root directory, or `None` if there is no
+///    project
+///  - `problems`: Receives a problem for each project pack that does not
+///    load
+fn add_project_packs(
+    known: &mut Vec<Pack>,
+    entries: &[pack_entries::PackEntry],
+    project_root: Option<&VerifiedPath>,
+    problems: &mut Vec<String>,
+) {
+    let mut loaded = false;
+    let mut tried = std::collections::BTreeSet::new();
+    for entry in entries {
+        let Some(id) = crate::packs::PackId::parse(&entry.name)
+            .filter(|id| matches!(id.pack_ref(), PackRef::Project { .. }))
+        else {
+            continue;
+        };
+        if !tried.insert(id.clone()) {
+            continue;
+        }
+        // Each project pack reads files from the disk. The guest can write
+        // the project files, so limit the number.
+        if tried.len() > MAX_PROJECT_PACKS {
+            problems.push(format!(
+                "* {}",
+                crate::messages::config::project_packs_too_many(MAX_PROJECT_PACKS)
+            ));
+            break;
+        }
+        let Some(root) = project_root else {
+            problems.push(format!(
+                "* {}",
+                crate::messages::config::PROJECT_PACK_NO_PROJECT
+            ));
+            continue;
+        };
+        match crate::packs::load_project_pack(&id, root) {
+            Ok(pack) => {
+                known.push(pack);
+                loaded = true;
+            }
+            Err(e) => problems.push(format!("* {e:#}")),
+        }
+    }
+    if loaded {
+        // The sort is stable. Thus the project packs stay after the other
+        // packs of the same kind.
+        known.sort_by_key(|pack| pack.metadata().kind);
+    }
+}
+
+/// Get the config values of the packs, and set the setup env of each pack.
 /// Args:
 ///  - `data_dir`: Airlock data directory, for the pack mount directories
-///  - `packs`: Configured packs
+///    and the setup env hash key (see [`crate::packs::EnvMacKey`])
+///  - `packs`: Configured packs. Each pack gets its setup env.
+///  - `approved`: One approval token for each pack, in the same order
 ///
 /// Returns:
 ///   The config values in pack order, with normalized env (see
 ///   [`normalize_env`]). Or the problems, one line each: a pack whose
-///   `config.lua` fails, or a value that two packs set differently (see
-///   [`pack_conflicts`]).
+///   `config.lua` fails, a setup env hash key that cannot be read, or a
+///   value that two packs set differently (see [`pack_conflicts`]).
 fn pack_configs(
     data_dir: &DataDir,
-    packs: &[ConfiguredPack],
+    packs: &mut [ConfiguredPack],
+    approved: &[Approved],
 ) -> Result<Vec<serde_json::Value>, Vec<String>> {
+    debug_assert_eq!(packs.len(), approved.len(), "one token for each pack");
     let mut docs = Vec::new();
     let mut problems = Vec::new();
-    for pack in packs {
+    // Read the hash key only when a pack has a setup env. Thus configs with
+    // no setup env do not make the key file.
+    let mut key = None;
+    for (pack, approved) in packs.iter_mut().zip(approved) {
         let metadata = pack.metadata();
-        tracing::debug!(
-            "config: applying pack `{}` version {}",
-            metadata.name,
-            metadata.version
-        );
-        match pack.config_values(data_dir) {
-            Ok(mut value) => {
+        tracing::debug!("config: applying pack `{}`", metadata.id_with_version());
+        match pack.config_values(data_dir, approved) {
+            Ok((mut value, setup_env)) => {
                 normalize_env(&mut value);
-                docs.push((metadata.name.clone(), value));
+                docs.push((metadata.id.to_string(), value));
+                if !setup_env.is_empty() && key.is_none() {
+                    match crate::packs::EnvMacKey::load_or_create(data_dir) {
+                        Ok(loaded) => key = Some(loaded),
+                        Err(e) => {
+                            problems.push(format!("* {e:#}"));
+                            continue;
+                        }
+                    }
+                }
+                pack.set_setup_env(setup_env, key.as_ref());
             }
             Err(e) => problems.push(format!("* {e:#}")),
         }
@@ -409,6 +515,55 @@ struct PlainLayer {
     pack_names: Vec<String>,
 }
 
+/// The layers and the packs of a config, before any `config.lua` runs (see
+/// [`LayeredConfig::resolve`]).
+struct Selected {
+    /// Merged documents of the `presets` lists.
+    legacy_base: serde_json::Value,
+    /// Layers, lowest precedence first.
+    layers: Vec<PlainLayer>,
+    /// All enabled `[packs]` entries, in pack order.
+    packs: Vec<ConfiguredPack>,
+}
+
+impl Selected {
+    /// Run the `config.lua` of the packs and merge the result.
+    /// Args:
+    ///  - `data_dir`: Airlock data directory, for the pack mount directories
+    ///  - `overrides`: Command line overrides
+    ///  - `approved`: One approval token for each pack, in pack order
+    ///
+    /// Returns:
+    ///   The resolved config, or an error that lists the problems of the
+    ///   packs (see [`pack_configs`]) or of the merged config.
+    fn evaluate(
+        mut self,
+        data_dir: &DataDir,
+        overrides: ConfigOverrides,
+        approved: &[Approved],
+    ) -> anyhow::Result<ResolvedConfig> {
+        // A `config.lua` runs here, on each resolve. The values of the
+        // enabled packs must not conflict across all layers.
+        let pack_values =
+            pack_configs(data_dir, &mut self.packs, approved).map_err(|problems| {
+                anyhow::anyhow!(crate::messages::config::invalid_configuration_problems(
+                    problems.join("\n")
+                ))
+            })?;
+        let mut values = merge_config(self.legacy_base, self.layers, &self.packs, pack_values)?;
+        let configured_policy = values.network.policy;
+        if let Some(policy) = overrides.network_policy {
+            tracing::info!("network policy overridden by --network: {}", policy.label());
+            values.network.policy = policy;
+        }
+        Ok(ResolvedConfig {
+            values,
+            packs: self.packs,
+            configured_policy,
+        })
+    }
+}
+
 /// Merge the presets, layers and packs, then parse and validate the result.
 /// Args:
 ///  - `legacy_base`: Merged documents of the `presets` lists. It applies
@@ -430,8 +585,11 @@ fn merge_config(
     // Each configured pack has an entry, thus it has a layer.
     let mut layer_packs = vec![Vec::new(); layers.len()];
     for (pack, value) in packs.iter().zip(pack_values) {
-        let name = &pack.metadata().name;
-        if let Some(top) = layers.iter().rposition(|l| l.pack_names.contains(name)) {
+        let id = &pack.metadata().id;
+        if let Some(top) = layers
+            .iter()
+            .rposition(|l| l.pack_names.iter().any(|name| *id == *name))
+        {
             layer_packs[top].push(value);
         }
     }

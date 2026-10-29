@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use airlock_test_utils::{TempDir, block_on, temp_dir};
 
 use crate::config::config_values::ConfigValues;
-use crate::config::{ConfigOverrides, LayeredConfig, ResolvedConfig};
+use crate::config::{ConfigOverrides, LayeredConfig, ResolveInput, ResolvedConfig};
 use crate::packs::{ArgKind, ArgValue, ConfiguredPack, Pack};
 use crate::test_cfg::oci::verified_dir;
 use crate::util::VerifiedPath;
@@ -31,15 +31,31 @@ pub fn project_toml_error(toml: &str) -> String {
     }
 }
 
-/// Resolve `layers` with `overrides`. Uses the built-in packs and the test
-/// pack `sample@1`.
+/// Resolve `layers` with `overrides` and no project root. Uses the
+/// built-in packs and the test pack `sample@1`.
 pub fn resolve_layers(
     layers: &LayeredConfig,
     overrides: ConfigOverrides,
 ) -> anyhow::Result<ResolvedConfig> {
+    resolve_layers_in(layers, overrides, None)
+}
+
+/// [`resolve_layers`] with the project root `project_root`, for the
+/// project packs.
+pub fn resolve_layers_in(
+    layers: &LayeredConfig,
+    overrides: ConfigOverrides,
+    project_root: Option<&VerifiedPath>,
+) -> anyhow::Result<ResolvedConfig> {
     let data = temp_dir();
     let data_dir = crate::test_cfg::oci::data_dir_at(data.path());
-    block_on(layers.resolve(&data_dir, &crate::packs::init_with_sample(), &overrides))
+    block_on(layers.resolve(&ResolveInput {
+        data_dir: &data_dir,
+        packs: &crate::packs::init_with_sample(),
+        overrides: &overrides,
+        project_root,
+        approval: crate::packs::approval::ApprovalMode::APPROVE,
+    }))
 }
 
 /// A temporary home directory and project directory with real config
@@ -102,7 +118,11 @@ impl ConfigDirs {
 
     /// Load and resolve the config files (see [`resolve_layers`]).
     pub fn resolve(&self) -> anyhow::Result<ResolvedConfig> {
-        resolve_layers(&self.load()?, ConfigOverrides::default())
+        resolve_layers_in(
+            &self.load()?,
+            ConfigOverrides::default(),
+            Some(&self.project_dir()),
+        )
     }
 
     /// The resolved config values. Panics on a config error.

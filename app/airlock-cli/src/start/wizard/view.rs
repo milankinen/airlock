@@ -6,7 +6,7 @@ use console::measure_text_width;
 
 use crate::cli::prompt::screen::Frame;
 use crate::cli::prompt::style::{self, Line, Styles};
-use crate::packs::{ArgKind, ArgValue, PackKind};
+use crate::packs::{ArgKind, ArgValue, PackKind, PackRef};
 use crate::start::wizard::form::{self, Form, KINDS, Mode, Row, START_CHOICES, StartChoice};
 use crate::{cli, messages};
 
@@ -24,7 +24,8 @@ use crate::{cli, messages};
 ///  * The start bar
 ///
 /// A template row has a radio mark and the template name. A pack row has a
-/// radio mark (distro) or a checkbox, and a label. Its arg rows are below
+/// radio mark (distro) or a checkbox, and a label. A user pack has the
+/// gray marker `(local)` after its label. Its arg rows are below
 /// it, with more indent, as `<label>: <value>`. The value is gray (`yes` or
 /// `no` for a bool). A locked row (see [`Form::is_locked`]) is all gray. The
 /// start bar shows its current option.
@@ -116,6 +117,7 @@ fn section_title(kind: PackKind) -> &'static str {
         PackKind::Distro => messages::start::WIZARD_SECTION_BASE_IMAGE,
         PackKind::Agent => messages::start::WIZARD_SECTION_AGENTS,
         PackKind::Tool => messages::start::WIZARD_SECTION_TOOLS,
+        PackKind::Other => messages::start::WIZARD_SECTION_OTHER,
     }
 }
 
@@ -156,11 +158,7 @@ fn start_label(choice: StartChoice, mode: Mode) -> &'static str {
 /// Return the description of the template row `template`: the packs of
 /// the template that the view knows.
 fn template_description(form: &Form, template: Option<usize>) -> String {
-    let known = |name: &str| {
-        form.entries()
-            .iter()
-            .any(|e| e.pack.metadata().name == name)
-    };
+    let known = |name: &str| form.entries().iter().any(|e| e.pack.metadata().id == name);
     let packs: Vec<&str> = template.map_or(Vec::new(), |t| {
         form.templates()[t]
             .config
@@ -273,7 +271,15 @@ fn row_line(form: &Form, row: Row, focused: bool, styles: &Styles) -> Line {
             line.push(symbol, mark(entry.selected));
             line.push(" ", &styles.plain);
             line.mark_indent();
-            line.push(&entry.pack.metadata().label, label);
+            // A project pack can set any label.
+            line.push(
+                &style::escape_controls(&entry.pack.metadata().label, false),
+                label,
+            );
+            if matches!(entry.pack.metadata().id.pack_ref(), PackRef::Local { .. }) {
+                line.push(" ", &styles.plain);
+                line.push(messages::start::WIZARD_LOCAL_MARKER, &styles.dim);
+            }
         }
         Row::Custom => {
             let selected = form.selected_template().is_none() && !form.distro_selected();

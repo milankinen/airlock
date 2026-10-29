@@ -40,6 +40,9 @@ pub struct StartArgs {
     /// Accept config changes since the last run without a question
     #[arg(long)]
     pub allow_configuration_changes: bool,
+    /// Approve new or changed packs without a question
+    #[arg(long)]
+    pub auto_approve_packs: bool,
 }
 
 impl StartArgs {
@@ -47,10 +50,12 @@ impl StartArgs {
     fn sandbox_options(&self) -> start::SandboxOptions {
         start::SandboxOptions {
             yes: self.yes,
+            can_prompt: cli::prompt::can_prompt(),
             log_level: self.log_level,
             verbose: self.verbose,
             allow_config_changes: self.allow_configuration_changes,
             overrides: self.config_overrides(),
+            auto_approve_packs: self.auto_approve_packs,
         }
     }
 
@@ -94,7 +99,7 @@ async fn run(
     let host_cwd = start::resolve_host_cwd()?;
     start::init_logging(args.log_level);
 
-    let packs = packs::init().map_err(start::Exit::config)?;
+    let packs = packs::init(&context.settings.packs, &context.home).map_err(start::Exit::config)?;
     // A project without config gets the setup wizard. The generated file is
     // saved after the sandbox is stored.
     let has_sandbox = sandboxes::has_content(&context, &host_cwd).await?;
@@ -110,10 +115,18 @@ async fn run(
     ))
     .await?;
     let options = args.sandbox_options();
+    // The first resolve asks about new or changed packs, before any pack
+    // `config.lua` runs. The later resolves do not ask.
     let resolved = config
-        .resolve(&context.data, &packs, &options.overrides)
+        .resolve(&config::ResolveInput {
+            data_dir: &context.data,
+            packs: &packs,
+            overrides: &options.overrides,
+            project_root: Some(&host_cwd),
+            approval: options.approval_mode(),
+        })
         .await
-        .map_err(start::Exit::config)?;
+        .map_err(start::Exit::resolve)?;
     // The terminal runtime. Bad `[monitor.keys]` values fail here.
     let runtime =
         HostRuntime::new(args.monitor, &context.settings).map_err(|e| start::Exit::error(2, e))?;

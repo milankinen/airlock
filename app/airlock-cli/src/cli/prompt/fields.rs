@@ -71,7 +71,7 @@ impl Fields<'_> {
         };
         prompt::run(
             &mut state,
-            |state, room| self.frame(state, room),
+            |state, room, _| self.frame(state, room),
             |state, key| match state.key(key) {
                 Step::Done(()) => match check(&state.texts) {
                     Ok(()) => Step::Done(std::mem::take(&mut state.texts)),

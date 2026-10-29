@@ -3,7 +3,7 @@
 //! Compares the configured packs with the install state and decides what
 //! `airlock start` must install, and which install records change. The
 //! planning has no side effects. The caller applies the result and asks
-//! the user about removed packs.
+//! the user about changed, removed and added packs.
 
 use super::state::{InstallState, PackStatus};
 
@@ -41,6 +41,10 @@ pub enum Why {
     /// before, so it installs again without a question. After a session it
     /// is `New`, because the disk may contain code that the session left.
     Retry,
+    /// The disk has an older definition of the pack, and the user chose to
+    /// install the new definition on top of it (see
+    /// [`Plan::reinstall_changed`]).
+    Changed,
 }
 
 /// A pack to install.
@@ -65,6 +69,15 @@ pub enum Transition {
     Drop(String),
     /// The user kept a removed pack on the disk.
     Keep(String),
+    /// The user kept the old definition of a changed pack on the disk.
+    /// Record the new fingerprint and keep the status. Thus the pack does
+    /// not count as changed again.
+    Accept {
+        /// Pack id.
+        id: String,
+        /// The new fingerprint.
+        fingerprint: String,
+    },
 }
 
 /// Result of [`decide`].
@@ -73,8 +86,9 @@ pub struct Plan {
     /// Packs to install, in the order of `wanted`.
     pub pending: Vec<Pending>,
     /// Configured packs on the disk (installed, unconfirmed or kept) with a
-    /// changed definition, in the order of `wanted`. They install only into
-    /// a new sandbox.
+    /// changed definition, in the order of `wanted`. The caller asks the
+    /// user: re-create the sandbox, [`Plan::reinstall_changed`] or
+    /// [`Plan::accept_changed`].
     pub changed: Vec<String>,
     /// Installed (or unconfirmed) packs that are no longer configured.
     pub removed: Vec<String>,
@@ -82,20 +96,50 @@ pub struct Plan {
     pub transitions: Vec<Transition>,
 }
 
+impl Plan {
+    /// Install the changed packs again, on top of the disk (see
+    /// [`Why::Changed`]).
+    /// Args:
+    ///  - `wanted`: The configured packs, as given to [`decide`]. The
+    ///    pending packs stay in this order.
+    pub fn reinstall_changed(&mut self, wanted: &[Wanted]) {
+        let changed = std::mem::take(&mut self.changed);
+        self.pending.extend(changed.into_iter().map(|id| Pending {
+            id,
+            why: Why::Changed,
+        }));
+        self.pending
+            .sort_by_key(|p| wanted.iter().position(|w| w.id == p.id));
+    }
+
+    /// Keep the old definitions of the changed packs on the disk (see
+    /// [`Transition::Accept`]).
+    /// Args:
+    ///  - `wanted`: The configured packs, as given to [`decide`]
+    pub fn accept_changed(&mut self, wanted: &[Wanted]) {
+        for id in std::mem::take(&mut self.changed) {
+            if let Some(w) = wanted.iter().find(|w| w.id == id) {
+                self.transitions.push(Transition::Accept {
+                    id,
+                    fingerprint: w.fingerprint.clone(),
+                });
+            }
+        }
+    }
+}
+
 /// Compare the configured packs with the install records.
 ///
 /// A record fingerprint identifies the definition of its pack (name,
 /// version and args, see [`crate::packs::ConfiguredPack::setup_installer`]).
-/// A pack on the disk with a changed definition is "changed". Only a new
-/// sandbox installs it.
+/// A pack on the disk with a changed definition is "changed". The caller
+/// asks the user about it.
 ///
 /// Decision for each pack ("configured" means in `wanted`):
 ///
 /// | Record | Configured? | Result |
 /// |---|---|---|
-/// | any | no disk, or another disk | configured → `New`, records reset |
-/// | not `failed`, other fingerprint | yes (same disk, other image) | changed, records reset |
-/// | other | yes (same disk, other image) | `New`, records reset |
+/// | any | no disk, another disk, or another image | configured → `New`, records reset |
 /// | none | yes | `New` |
 /// | `installed`, same fingerprint | yes | nothing |
 /// | `installed`, other fingerprint | yes | changed |
@@ -124,28 +168,13 @@ pub fn decide(input: &DecideInput<'_>) -> Plan {
         if !state.packs.is_empty() {
             plan.transitions.push(Transition::Reset);
         }
-        for w in input.wanted {
-            // The disk stays with a new image (its old image is gone). The
-            // disk still has the old definition of a changed pack.
-            let changed = same_disk
-                && state.packs.get(&w.id).is_some_and(|r| {
-                    r.fingerprint != w.fingerprint
-                        && matches!(
-                            r.status,
-                            PackStatus::Installed
-                                | PackStatus::Unconfirmed
-                                | PackStatus::Kept { .. }
-                        )
-                });
-            if changed {
-                plan.changed.push(w.id.clone());
-            } else {
-                plan.pending.push(Pending {
-                    id: w.id.clone(),
-                    why: Why::New,
-                });
-            }
-        }
+        // The records do not describe the disk any more, so all packs
+        // install as new. A disk that stays with a new image (its old image
+        // is gone) gets the added-tools question.
+        plan.pending.extend(input.wanted.iter().map(|w| Pending {
+            id: w.id.clone(),
+            why: Why::New,
+        }));
         return plan;
     }
 
@@ -281,7 +310,7 @@ mod tests {
     ///   2. Check that without a known image only the disk counts
     ///   3. Check that an empty state installs all packs with no reset
     ///   4. On the same disk with another image, check that a pack with a
-    ///      changed definition is changed and a failed pack is new
+    ///      changed definition and a failed pack are both new
     #[test]
     fn other_disk_or_image_resets_records_and_installs_every_configured_pack() {
         let s = state(
@@ -328,9 +357,68 @@ mod tests {
             DISK,
             Some("sha256:2"),
         );
-        assert_eq!(plan.changed, ["a"]);
-        assert_eq!(plan.pending, new(&["b"]));
+        assert!(plan.changed.is_empty());
+        assert_eq!(plan.pending, new(&["a", "b"]));
         assert_eq!(plan.transitions, [Transition::Reset]);
+    }
+
+    /// Test the two answers to the changed-packs question that keep the
+    /// disk. A reinstall installs the changed packs on top of the disk in
+    /// pack order. "Keep old" records the new fingerprints and keeps the
+    /// status, so the packs do not count as changed again.
+    ///   1. Plan an installed, an unconfirmed and a kept pack with changed
+    ///      definitions, and a new pack between them
+    ///   2. Reinstall and check the pending packs and their reasons
+    ///   3. Plan again, accept, and apply the transitions to the records
+    ///   4. Check that the records have the new fingerprints and the old
+    ///      status, and that a new plan has no changed packs
+    #[test]
+    fn changed_packs_reinstall_on_top_or_keep_old_definition() {
+        let s = state(
+            &[
+                ("a", PackStatus::Installed, 'a'),
+                ("c", PackStatus::Unconfirmed, 'a'),
+                ("d", PackStatus::Kept { confirmed: true }, 'a'),
+            ],
+            false,
+        );
+        let w = wanted(&[("a", 'b'), ("b", 'b'), ("c", 'b'), ("d", 'b')]);
+        let mut plan = decide_on(&s, &w, DISK, Some(IMAGE));
+        assert_eq!(plan.changed, ["a", "c", "d"]);
+        plan.reinstall_changed(&w);
+        assert!(plan.changed.is_empty());
+        let pending: Vec<(&str, Why)> = plan
+            .pending
+            .iter()
+            .map(|p| (p.id.as_str(), p.why))
+            .collect();
+        assert_eq!(
+            pending,
+            [
+                ("a", Why::Changed),
+                ("b", Why::New),
+                ("c", Why::Changed),
+                ("d", Why::Changed)
+            ]
+        );
+
+        let mut plan = decide_on(&s, &w, DISK, Some(IMAGE));
+        plan.accept_changed(&w);
+        assert!(plan.changed.is_empty());
+        assert_eq!(plan.pending, new(&["b"]));
+        let mut accepted = s.clone();
+        crate::packs::install::state::apply(&mut accepted, &plan.transitions);
+        for (id, status) in [
+            ("a", PackStatus::Installed),
+            ("c", PackStatus::Unconfirmed),
+            ("d", PackStatus::Kept { confirmed: true }),
+        ] {
+            assert_eq!(accepted.packs[id].fingerprint, fp('b'), "{id}");
+            assert_eq!(accepted.packs[id].status, status, "{id}");
+        }
+        let again = decide_on(&accepted, &w, DISK, Some(IMAGE));
+        assert!(again.changed.is_empty());
+        assert_eq!(again.transitions, [Transition::Promote("d".into())]);
     }
 
     /// Test the decision for one configured pack for each kind of record,

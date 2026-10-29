@@ -11,6 +11,7 @@
 //!  * erases its view and restores the terminal on every path
 
 pub mod choose;
+pub mod diff;
 pub mod fields;
 pub mod screen;
 pub mod style;
@@ -95,15 +96,15 @@ pub fn edit_text(text: &mut String, key: KeyEvent) -> bool {
 /// Show a prompt and handle keys until the prompt ends.
 /// Args:
 ///  - `state`: Prompt state
-///  - `frame`: Makes the lines of the view from the state and the terminal
-///    width in columns
+///  - `frame`: Makes the lines of the view from the state, the number of
+///    text columns and the terminal height in rows
 ///  - `key`: Applies a key press to the state and returns the next [`Step`]
 ///
 /// Returns:
 ///   The answer, `None` on Esc, or error. The view is erased at the end.
 pub fn run<S, T>(
     state: &mut S,
-    frame: impl Fn(&S, usize) -> Frame,
+    frame: impl Fn(&S, usize, usize) -> Frame,
     mut key: impl FnMut(&mut S, KeyEvent) -> Step<T>,
 ) -> Result<Option<T>, PromptError> {
     if !can_prompt() {
@@ -114,7 +115,7 @@ pub fn run<S, T>(
     }
     let mut screen = Screen::open()?;
     let answer = loop {
-        if let Err(e) = screen.draw(|room| frame(state, room)) {
+        if let Err(e) = screen.draw(|room, height| frame(state, room, height)) {
             break Err(e);
         }
         let step = match screen::read_input() {
