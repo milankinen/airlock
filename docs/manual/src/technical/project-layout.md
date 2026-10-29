@@ -28,7 +28,9 @@ The default is `~/Library/Application Support/airlock` on macOS and
   templates/
     <name>/                      # one sandbox template (see below)
     .build-<name>/               # build directory of a template (temporary)
-  share/all/packs/<pack>/        # host side of the pack mounts
+  share/all/packs/<pack>/        # host side of the pack mounts (local.<name>, project.<hash> for user and project packs)
+  pack-approvals.json            # approved config.lua scripts of user and project packs
+  pack-env.key                   # key for the hashes of the pack setup values
   sock/<hash>.sock               # CLI socket when the default path is too long
 ```
 
@@ -36,8 +38,9 @@ User-level state stays in `~/.airlock/`:
 
 ```
 ~/.airlock/
-  settings.toml                  # application settings (vault, data_dir)
-  airlock.toml, config.toml      # user config
+  settings.toml                  # application settings (vault, data_dir, packs)
+  airlock.toml, config.toml      # user config (deprecated)
+  packs/<name>/                  # user packs (default packs.dirs)
   vault.*                        # file vault backends
 ```
 
@@ -57,6 +60,7 @@ A template directory is `<data>/templates/<name>/`. See
   disk.img                       # disk with the installed packs
   disk.id                        # identity of disk.img
   installs.json                  # pack install records
+  pack-snapshots.json            # copies of the installed pack files
   ca.json                        # CA keypair of the build sandbox
   image                          # link to the cached image
 ```
@@ -76,6 +80,7 @@ holds:
   ca.json                        # CA certificate + key PEMs (single JSON file)
   run.json                       # last-run timestamp, guest_cwd, config files of the last start
   installs.json                  # pack install records
+  pack-snapshots.json            # copies of the installed pack files
   airlock.toml                   # local project config
   overlay/
     files/rw/{key}               # hard-linked writable file mounts

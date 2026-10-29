@@ -4,9 +4,6 @@ This section collects practical patterns that occur often in day-to-day
 work with airlock. None of this is required reading, but it can save
 you some time.
 
-[Vibe coding configuration](./tips/vibe-config.md) shows how to start a
-sandbox in any directory with one command.
-
 [Pairing with mise](./tips/mise.md) shows how to use mise as a task runner
 alongside airlock — installing airlock as a mise tool, building local Docker
 images for sandboxes, and loading secrets per task.

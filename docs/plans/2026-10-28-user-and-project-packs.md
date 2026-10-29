@@ -37,7 +37,7 @@ Gaps in current code:
 | Setup data | `config.lua` passes env to `setup.sh`. Values are secret: never logged or shown, only changed key names |
 | Changed pack (disk) | Show file diff + changed setup keys. Options: Re-create (default, `--yes`) / Reinstall on top / Keep old. Existing sandboxes and template seeds |
 | Snapshots | Sandbox and template store copies of the installed pack files for the diff |
-| lib.sh | Stable `airlock_*`: log, fail, detect_distro, detect_arch, detect_libc, pkg_is_installed, pkg_install, fetch, github_latest_tag, run_vendor |
+| lib.sh | Stable `airlock_*`: log, fail, detect_distro, detect_arch, detect_libc, pkg_is_installed, pkg_available, pkg_install, fetch. Internal: `airlock_internal__*` |
 | Deprecation | Warning on `airlock start` if a user-level config file exists |
 
 ### Changes after the implementation review

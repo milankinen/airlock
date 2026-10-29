@@ -30,8 +30,8 @@ disk can run during the install, with an open network. Use it only if you
 trust the sandbox contents.
 
 For a removed pack, you can also select "Continue with current sandbox".
-Then the pack stays on the disk until you re-create the sandbox. A
-changed pack installs only into a re-created sandbox.
+Then the pack stays on the disk until you re-create the sandbox. For a
+changed pack, you can also select "Reinstall on top" or "Keep old".
 
 Pass `--yes` (`-y`) to select the default answer for all questions, for
 example in scripts. Without a terminal and without `--yes`, airlock

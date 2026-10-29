@@ -15,6 +15,12 @@ earlier ones:
 4. `airlock.toml` — project config (checked into version control)
 5. `airlock.local.toml` — local overrides (gitignored)
 
+> [!WARNING]
+> The user-level config files (1 to 3) are deprecated. `airlock start`
+> shows a warning when one of them exists. Move their config to a
+> [user pack](./packs.md#pack-sources), and add the pack to the
+> `packs.defaults` setting.
+
 This layering lets a company ship global defaults and each developer set
 personal preferences. Each project defines its own sandbox, with room for
 local tweaks that don't affect the team.
@@ -36,6 +42,22 @@ available:
 | `security.insecure_mounts` | Allow mounts that expose the home directory     | [Mounts](./configuration/mounts.md#mounts-that-expose-the-home-directory) |
 | `vault.storage`            | Storage backend of the secret vault             | [Secrets management](./secrets.md#choosing-a-storage-backend) |
 | `[monitor]`                | Monitor buffers and key bindings                | [Monitor dashboard](./usage/monitor.md#personal-settings) |
+| `packs.dirs`               | User pack directories. `~` is the home directory. Default `["~/.airlock/packs"]` | [Pack sources](./packs.md#pack-sources) |
+| `packs.defaults`           | Packs that the setup wizard selects at the start, for example `["claude", "~my-tools"]` | [Pack sources](./packs.md#pack-sources) |
+
+For example:
+
+```toml
+# ~/.airlock/settings.toml
+[packs]
+dirs = ["~/.airlock/packs", "~/dotfiles/airlock-packs"]
+defaults = ["claude", "~my-tools"]
+```
+
+Each `packs.dirs` entry must be an absolute path after the `~`
+expansion. airlock shows a warning for a `packs.dirs` directory that
+does not exist. The default `~/.airlock/packs` is optional, and airlock
+shows no warning when it does not exist.
 
 ## Minimal example
 
