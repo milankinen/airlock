@@ -26,7 +26,10 @@ done
 fn stdio_server_runs_on_host_in_session_dir() {
     block_on_local(async {
         let dir = temp_dir();
-        let root = dir.path().to_str().unwrap().to_string();
+        // The server prints the resolved dir. On macOS the temp dir is
+        // under a symlink.
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let root = root.to_str().unwrap().to_string();
         let (registrar, mut registrations) = FakeRegistrar::start(&[]);
         let starter = LocalStarter::new(&[])
             .with_root(&root)
