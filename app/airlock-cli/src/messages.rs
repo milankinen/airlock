@@ -3051,6 +3051,10 @@ pub mod start {
         )
     }
 
+    /// Shows when the config includes deprecated user-level config files.
+    pub const USER_CONFIG_FILES_DEPRECATED: &str = "User-level config files are deprecated, \
+         move them to a user pack. See v2026.10.5 release notes for more details";
+
     /// Shows when a configuration error ends the run.
     pub fn config_error(err: impl Display) -> String {
         format!("Config error: {err:#}")

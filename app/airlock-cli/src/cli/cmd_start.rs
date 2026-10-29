@@ -114,6 +114,13 @@ async fn run(
         &crate::templates::list(&context.data),
     ))
     .await?;
+    if config.has_user_files() {
+        cli::log!(
+            "{} {}",
+            cli::yellow("!"),
+            crate::messages::start::USER_CONFIG_FILES_DEPRECATED
+        );
+    }
     let options = args.sandbox_options();
     // The first resolve asks about new or changed packs, before any pack
     // `config.lua` runs. The later resolves do not ask.

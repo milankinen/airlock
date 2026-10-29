@@ -142,6 +142,11 @@ pub struct LayeredConfig {
 }
 
 impl LayeredConfig {
+    /// True if the config includes deprecated user-level config files.
+    pub fn has_user_files(&self) -> bool {
+        !self.user.is_empty()
+    }
+
     /// True if the project has its own config: a project file or the local
     /// project file. User files alone do not count.
     pub fn has_project_config(&self) -> bool {
