@@ -40,22 +40,98 @@ pub const LOGO: [&str; 4] = [
     "▝▀▘▀▘▘   ▘▝▀ ▝▀ ▘ ▘",
 ];
 
+/// Top-level commands in help sections, in the order of the help output.
+/// A command that is in no section shows in the last section.
+const COMMAND_GROUPS: [(&str, &[&str]); 3] = [
+    (
+        messages::cli::HELP_SANDBOX_TITLE,
+        &["start", "exec", "info", "config", "network", "remove"],
+    ),
+    (
+        messages::cli::HELP_MANAGEMENT_TITLE,
+        &["sandboxes", "templates", "secrets"],
+    ),
+    (
+        messages::cli::HELP_MISC_TITLE,
+        &["acp", "self-update", "help"],
+    ),
+];
+
 /// Return the help template for the top-level help. It shows an empty
-/// line and the logo in bold text above the description.
-pub fn help_template() -> String {
+/// line and the logo in bold text above the description, and the commands
+/// in sections.
+/// Args:
+///  - `cmd`: Built top-level command. The build adds the `help` command.
+pub fn help_template(cmd: &clap::Command) -> String {
     let logo = LOGO
         .iter()
         .map(|line| console::style(line).bold().to_string())
         .collect::<Vec<_>>()
         .join("\n");
+    let commands = command_sections(cmd);
+    let options_title = help_title(messages::cli::HELP_OPTIONS_TITLE);
     // Same as the default template, but with the logo in place of the
-    // "before help" text. The "before help" text always has an empty line
-    // after it, and the description must come directly below the logo.
-    // Clap removes the first line of the help when it is empty, thus the
-    // template starts with two line breaks to keep one empty line.
+    // "before help" text, and with sections of commands. The "before help"
+    // text always has an empty line after it, and the description must come
+    // directly below the logo. Clap removes the first line of the help when
+    // it is empty, thus the template starts with two line breaks to keep one
+    // empty line.
     format!(
-        "\n\n{logo}\n{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n{{all-args}}{{after-help}}"
+        "\n\n{logo}\n{{about-with-newline}}\n{{usage-heading}} {{usage}}\n\n{commands}{options_title}\n\n{{options}}{{after-help}}"
     )
+}
+
+/// Return the visible top-level commands in help sections. Each section
+/// has a title line, an empty line, one line for each command and an
+/// empty line.
+fn command_sections(cmd: &clap::Command) -> String {
+    let visible: Vec<&clap::Command> = cmd.get_subcommands().filter(|c| !c.is_hide_set()).collect();
+    let width = visible
+        .iter()
+        .map(|c| c.get_name().len())
+        .max()
+        .unwrap_or(0);
+    let line = |c: &clap::Command| {
+        let about = c.get_about().map(ToString::to_string).unwrap_or_default();
+        let name = console::style(format!("{:width$}", c.get_name())).bold();
+        format!("  {name}  {about}\n")
+    };
+    let last = COMMAND_GROUPS.len() - 1;
+    let mut out = String::new();
+    for (i, (title, names)) in COMMAND_GROUPS.iter().enumerate() {
+        let mut lines: String = names
+            .iter()
+            .filter_map(|name| visible.iter().find(|c| c.get_name() == *name))
+            .map(|c| line(c))
+            .collect();
+        if i == last {
+            lines.extend(
+                visible
+                    .iter()
+                    .filter(|c| {
+                        !COMMAND_GROUPS
+                            .iter()
+                            .any(|(_, n)| n.contains(&c.get_name()))
+                    })
+                    .map(|c| line(c)),
+            );
+        }
+        if !lines.is_empty() {
+            out.push_str(&help_title(title));
+            out.push_str("\n\n");
+            out.push_str(&lines);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Return a help section title in the style of the clap titles.
+fn help_title(title: &str) -> String {
+    console::style(format!("{title}:"))
+        .bold()
+        .underlined()
+        .to_string()
 }
 
 /// Return a "Status" section with the KVM access state for help output.

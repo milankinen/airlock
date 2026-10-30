@@ -66,11 +66,17 @@ async fn main() {
     let raw_args: Vec<String> = std::env::args().collect();
     let (airlock_args, extra_args) = split_at_separator(&raw_args);
 
-    let matches = Program::command()
+    let mut command = Program::command()
         .version(cli::version_string(true).leak() as &str)
-        .help_template(cli::help_template())
-        .after_help(cli::platform_status())
-        .get_matches_from(&airlock_args);
+        .after_help(cli::platform_status());
+    // Build first: the help template needs the list of commands with the
+    // `help` command that the build adds.
+    command.build();
+    let help_template = cli::help_template(&command);
+    let matches = command
+        .help_template(help_template)
+        .try_get_matches_from(&airlock_args)
+        .unwrap_or_else(|e| exit_with_clap_error(&e));
     let parsed = Program::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     cli::initialize(parsed.global.quiet);
 
@@ -172,6 +178,27 @@ async fn main() {
     // "[airlock] fatal signal N" marker above it.
     tracing::info!("cli exit: code={exit_code}");
     std::process::exit(exit_code);
+}
+
+/// Print the clap error or help text and exit. The help text gets an
+/// empty line at the end.
+fn exit_with_clap_error(e: &clap::Error) -> ! {
+    use clap::error::ErrorKind;
+    if matches!(
+        e.kind(),
+        ErrorKind::DisplayHelp | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+    ) {
+        // Clap removes the trailing line breaks from the help template, thus
+        // write the empty line here.
+        let _ = e.print();
+        if e.use_stderr() {
+            eprintln!();
+        } else {
+            println!();
+        }
+        std::process::exit(e.exit_code());
+    }
+    e.exit()
 }
 
 /// Load the user settings, move the cache of an older version into the

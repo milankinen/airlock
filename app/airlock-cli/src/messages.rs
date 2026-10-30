@@ -671,6 +671,19 @@ pub mod cli {
     #[cfg(target_os = "linux")]
     pub const HELP_STATUS_TITLE: &str = "Status";
 
+    /// Title of the help section for the commands of the current project.
+    pub const HELP_SANDBOX_TITLE: &str = "Sandbox";
+
+    /// Title of the help section for the commands that manage all sandboxes,
+    /// templates and secrets.
+    pub const HELP_MANAGEMENT_TITLE: &str = "Management";
+
+    /// Title of the help section for the miscellaneous commands.
+    pub const HELP_MISC_TITLE: &str = "Miscellaneous";
+
+    /// Title of the help options section.
+    pub const HELP_OPTIONS_TITLE: &str = "Options";
+
     /// Tag of a distroless build in the version string.
     pub const DISTROLESS_TAG: &str = "[distroless]";
 
