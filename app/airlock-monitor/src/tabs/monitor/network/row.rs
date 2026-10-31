@@ -117,6 +117,9 @@ pub fn format_timestamp(t: SystemTime) -> String {
     let secs = t
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
+    // libc deprecates `time_t` on musl for a future type change. It is
+    // 64-bit on the 64-bit targets already.
+    #[allow(deprecated)]
     let tt = secs as libc::time_t;
     // Convert to local time with `localtime_r` from libc.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };

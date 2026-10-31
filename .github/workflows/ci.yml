@@ -27,8 +27,9 @@ jobs:
       - uses: jdx/mise-action@v2
       - name: Install deps
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq capnproto libcapnp-dev libclang-dev
+          sudo apt-get update -qq && sudo apt-get install -y -qq capnproto libcapnp-dev libclang-dev musl-tools
           rustup component add clippy
+          rustup target add x86_64-unknown-linux-musl
           rustup toolchain install nightly --component rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: mise run lint
@@ -225,8 +226,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
-      - name: Install capnp
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq capnproto libcapnp-dev
+      # musl: a static binary runs also on distros without glibc
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq capnproto libcapnp-dev musl-tools
+          rustup target add x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
       - uses: actions/download-artifact@v4
         with:
@@ -240,11 +244,11 @@ jobs:
         with:
           name: vmm-x86_64
           path: target/vm
-      - run: cargo build --release -p airlock-cli
+      - run: cargo build --release -p airlock-cli --target x86_64-unknown-linux-musl
       - uses: actions/upload-artifact@v4
         with:
           name: airlock-linux-x86_64
-          path: target/release/airlock
+          path: target/x86_64-unknown-linux-musl/release/airlock
 
   build-cli-linux-aarch64:
     needs: [ build-kernel-aarch64, build-initramfs-aarch64, fetch-vmm-aarch64 ]
@@ -252,8 +256,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
-      - name: Install capnp
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq capnproto libcapnp-dev
+      # musl: a static binary runs also on distros without glibc
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq capnproto libcapnp-dev musl-tools
+          rustup target add aarch64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
       - uses: actions/download-artifact@v4
         with:
@@ -267,11 +274,11 @@ jobs:
         with:
           name: vmm-aarch64
           path: target/vm
-      - run: cargo build --release -p airlock-cli
+      - run: cargo build --release -p airlock-cli --target aarch64-unknown-linux-musl
       - uses: actions/upload-artifact@v4
         with:
           name: airlock-linux-aarch64
-          path: target/release/airlock
+          path: target/aarch64-unknown-linux-musl/release/airlock
 
   # ── Stage 4: VM integration tests (bats) ───────────────
   test-e2e:
@@ -334,18 +341,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
-      - name: Install capnp
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq capnproto libcapnp-dev
+      # musl: a static binary runs also on distros without glibc
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq capnproto libcapnp-dev musl-tools
+          rustup target add x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
       - uses: actions/download-artifact@v4
         with:
           name: vmm-x86_64
           path: target/vm
-      - run: cargo build --release -p airlock-cli --features distroless
+      - run: cargo build --release -p airlock-cli --features distroless --target x86_64-unknown-linux-musl
       - uses: actions/upload-artifact@v4
         with:
           name: airlock-linux-x86_64-distroless
-          path: target/release/airlock
+          path: target/x86_64-unknown-linux-musl/release/airlock
 
   build-cli-linux-aarch64-distroless:
     needs: [ lint-macos, lint-linux, test-macos, test-linux, fetch-vmm-aarch64 ]
@@ -353,15 +363,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
-      - name: Install capnp
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq capnproto libcapnp-dev
+      # musl: a static binary runs also on distros without glibc
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq capnproto libcapnp-dev musl-tools
+          rustup target add aarch64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
       - uses: actions/download-artifact@v4
         with:
           name: vmm-aarch64
           path: target/vm
-      - run: cargo build --release -p airlock-cli --features distroless
+      - run: cargo build --release -p airlock-cli --features distroless --target aarch64-unknown-linux-musl
       - uses: actions/upload-artifact@v4
         with:
           name: airlock-linux-aarch64-distroless
-          path: target/release/airlock
+          path: target/aarch64-unknown-linux-musl/release/airlock

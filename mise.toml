@@ -55,6 +55,15 @@ for f in Image initramfs.gz cloud-hypervisor virtiofsd; do
   if [[ ! -e target/vm/$f ]]; then touch "target/vm/$f"; made="$made target/vm/$f"; fi
 done
 cargo clippy -p airlock-cli -- -D warnings
+
+# The Linux release CLI is a musl build. Lint it too when the musl target
+# is installed.
+if [[ "$(uname -s)" == Linux ]]; then
+  musl="$(uname -m)-unknown-linux-musl"
+  if rustup target list --installed | grep -qx "$musl"; then
+    cargo clippy -p airlock-cli --target "$musl" -- -D warnings
+  fi
+fi
 '''
 
 [tasks."docs:build"]

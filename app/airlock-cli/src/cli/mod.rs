@@ -323,6 +323,9 @@ pub fn format_local_time(t: std::time::SystemTime) -> String {
     let secs = t
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
+    // libc deprecates `time_t` on musl for a future type change. It is
+    // 64-bit on the 64-bit targets already.
+    #[allow(deprecated)]
     let tt = secs as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let ok = unsafe { !libc::localtime_r(&raw const tt, &raw mut tm).is_null() };
