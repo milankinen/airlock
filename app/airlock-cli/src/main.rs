@@ -50,6 +50,9 @@ use crate::cli::{
 use crate::context::Context;
 use crate::settings::Settings;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     // Do this before any thread starts or reads the environment.

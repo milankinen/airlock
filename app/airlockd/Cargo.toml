@@ -25,6 +25,7 @@ capnp-rpc = { workspace = true }
 airlock-common = { workspace = true }
 futures = { workspace = true }
 libc = { workspace = true }
+mimalloc = { workspace = true }
 pty-process = { workspace = true }
 quick_cache = { workspace = true }
 rand = { workspace = true }

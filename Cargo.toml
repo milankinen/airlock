@@ -88,6 +88,7 @@ toml_edit = { version = "0.25", default-features = false, features = ["parse", "
 mlua = { version = "0.12", features = ["lua54", "vendored", "anyhow", "async", "serialize"] }
 
 # System
+mimalloc = "0.1"
 parking_lot = "0.12"
 notify = "8"
 sysinfo = { version = "0.39", features = ["system"] }

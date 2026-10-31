@@ -32,6 +32,9 @@ use futures::AsyncReadExt;
 use tokio::task::LocalSet;
 use tracing::info;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[tokio::main(flavor = "current_thread")]
 #[allow(clippy::large_futures)]
 async fn main() -> anyhow::Result<()> {
