@@ -5,6 +5,7 @@ mod test_alpn_negotiation;
 mod test_answer_scan;
 mod test_anthropic_api;
 mod test_anthropic_refresh_and_revoke;
+mod test_anthropic_remote_control;
 mod test_anthropic_sign_in;
 mod test_credential_swap;
 mod test_host_socket_forward;

@@ -86,6 +86,16 @@ with the same account, client and scopes.
   of the service, or an injected masked secret. Other values get 401
   `airlock_foreign_credential`. Thus a sandbox cannot put its own token
   into the shared credential file.
+- Exception for Anthropic Remote Control (`/remote-control`): the
+  answer of `POST /v1/code/sessions/{id}/bridge` gives a worker token to
+  Claude Code. airlock keeps this token in memory. The request must use
+  the sign-in or an injected secret. The `api_base_url` of the answer
+  must be the API host, else the answer gets 502. The worker token goes
+  upstream unchanged only on `/v1/code/sessions/{id}/worker` and the
+  paths below it, with the same session id. The answer scan applies.
+  Other tokens and routes get 401 `airlock_foreign_credential`. After an
+  airlock restart, Claude Code must get a new token. The server mode
+  `claude remote-control` does not work.
 
 The answer scan reads each API answer while it streams:
 

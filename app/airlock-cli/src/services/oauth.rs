@@ -543,7 +543,7 @@ pub fn random_account_id() -> anyhow::Result<String> {
 }
 
 /// Get the token of an `Authorization: Bearer <token>` value.
-fn bearer_token(value: &str) -> Option<&str> {
+pub fn bearer_token(value: &str) -> Option<&str> {
     let (scheme, token) = value.split_once(' ')?;
     scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
 }
@@ -1047,7 +1047,46 @@ impl Grants {
             Ok(swapped) => swapped,
             Err(refused) => return Ok(refused),
         };
-        let known = self.known_reals(&swapped, injected).await?;
+        self.forward_scanned(&swapped, req, injected, next).await
+    }
+
+    /// Forward an API request with its credential headers unchanged.
+    ///
+    /// For a credential that the upstream issued to the guest for one
+    /// route, and that the store does not know. The answer gets the same
+    /// scan as in [`Self::forward_api`].
+    /// Args:
+    ///  - `req`: The guest's request
+    ///  - `injected`: Masked secrets that the inject rules put in
+    ///  - `next`: The next step that sends the request upstream.
+    ///
+    /// Returns:
+    ///   The scanned answer.
+    pub async fn forward_unswapped(
+        &self,
+        req: Request<ResponseBody>,
+        injected: &[InjectedSecret],
+        next: Next,
+    ) -> anyhow::Result<Response<ResponseBody>> {
+        // No snapshot: `known_reals` reads the store, so the scan still
+        // knows all real tokens.
+        let swapped = Swapped {
+            credential: Credential::None,
+            snapshot: None,
+        };
+        self.forward_scanned(&swapped, req, injected, next).await
+    }
+
+    /// Send `req` upstream with an uncompressed answer, and scan the
+    /// answer for the real values of the store and of `injected`.
+    async fn forward_scanned(
+        &self,
+        swapped: &Swapped,
+        mut req: Request<ResponseBody>,
+        injected: &[InjectedSecret],
+        next: Next,
+    ) -> anyhow::Result<Response<ResponseBody>> {
+        let known = self.known_reals(swapped, injected).await?;
         req.headers_mut()
             .insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
         scan::scan_answer(next(req).await?, self.formats(), known).await

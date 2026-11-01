@@ -4,12 +4,16 @@
 //! `claude /login` with a Claude.ai subscription or an Anthropic Console
 //! account, and `claude setup-token`.
 //!
-//! The protocol details agree with Claude Code 2.1.288.
+//! The protocol details agree with Claude Code 2.1.288. The Remote
+//! Control details agree with Claude Code 2.1.312.
 
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::future::LocalBoxFuture;
+use hyper::header::{AUTHORIZATION, HeaderMap};
 use hyper::{Method, Request, Response, StatusCode};
 use serde_json::{Map, Value, json};
 
@@ -35,6 +39,15 @@ const ACCESS_PREFIX: &str = "sk-ant-oat01-airlock-";
 const REFRESH_PREFIX: &str = "sk-ant-ort01-airlock-";
 const API_KEY_PREFIX: &str = "sk-ant-api03-airlock-";
 const ID_PREFIX: &str = "airlock-id-";
+
+/// Most worker tokens kept for one Remote Control session. Claude Code
+/// gets a new token before the old one expires. Streams with the old
+/// token can stay open for a short time.
+const WORKER_TOKENS_PER_SESSION: usize = 3;
+
+/// Most Remote Control sessions with kept worker tokens. A new session
+/// removes the oldest session.
+const WORKER_SESSIONS: usize = 64;
 
 /// The scope that a refresh never asks for. Claude Code refreshes without
 /// it.
@@ -66,6 +79,90 @@ fn is_real_shape(run: &str) -> bool {
             .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
             .count()
             >= REAL_SHAPE_MIN
+}
+
+/// A Remote Control route on the API host.
+#[derive(Clone, Copy, PartialEq)]
+enum SessionRoute {
+    /// `POST /v1/code/sessions/{id}/bridge`: mints a worker token.
+    Bridge,
+    /// `/v1/code/sessions/{id}/worker` and the paths below it.
+    Worker,
+}
+
+/// Get the Remote Control route of a request and its session id.
+/// Args:
+///  - `raw`: The raw path of the request
+///  - `path`: The normalized path ([`oauth::normalize_path`]).
+///
+/// Returns:
+///   The route and the `{id}`, spelled as in `raw`, or `None` for other
+///   paths.
+fn session_route<'a>(raw: &'a str, path: &str) -> Option<(SessionRoute, &'a str)> {
+    // The raw path goes upstream, so it must be the route itself, not a
+    // path that only normalizes onto it (`..`, `%2F`). Normalizing
+    // lowercases, and session ids have uppercase letters.
+    if !raw.eq_ignore_ascii_case(path) {
+        return None;
+    }
+    let segments: Vec<&str> = path.split('/').skip(1).collect();
+    let route = match segments.as_slice() {
+        ["v1", "code", "sessions", _, "bridge"] => SessionRoute::Bridge,
+        ["v1", "code", "sessions", _, "worker", ..] => SessionRoute::Worker,
+        _ => return None,
+    };
+    // Same segments as `path`, because only the case is different.
+    raw.split('/').nth(4).map(|id| (route, id))
+}
+
+/// Get the token of the only credential of `headers`: one
+/// `Authorization: Bearer` header and no `x-api-key`.
+fn only_bearer(headers: &HeaderMap) -> Option<&str> {
+    if headers.contains_key("x-api-key") {
+        return None;
+    }
+    let mut values = headers.get_all(AUTHORIZATION).iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return None;
+    };
+    value.to_str().ok().and_then(oauth::bearer_token)
+}
+
+/// Worker tokens that Anthropic minted for Remote Control sessions in this
+/// process, by session id. The newest session is last.
+///
+/// A token has no expiry here. The upstream decides the expiry, because
+/// heartbeats can extend it.
+#[derive(Default)]
+struct WorkerTokens(RefCell<VecDeque<(String, VecDeque<String>)>>);
+
+impl WorkerTokens {
+    /// Keep `token` for `session`. Removes the oldest token of the session
+    /// and the oldest session above the limits.
+    fn add(&self, session: &str, token: String) {
+        let mut sessions = self.0.borrow_mut();
+        let mut tokens = match sessions.iter().position(|(id, _)| id == session) {
+            Some(i) => sessions.remove(i).map(|(_, t)| t).unwrap_or_default(),
+            None => VecDeque::new(),
+        };
+        tokens.retain(|t| *t != token);
+        tokens.push_back(token);
+        if tokens.len() > WORKER_TOKENS_PER_SESSION {
+            tokens.pop_front();
+        }
+        sessions.push_back((session.to_string(), tokens));
+        if sessions.len() > WORKER_SESSIONS {
+            sessions.pop_front();
+        }
+    }
+
+    /// Whether `token` is a kept worker token of `session`.
+    fn has(&self, session: &str, token: &str) -> bool {
+        self.0
+            .borrow()
+            .iter()
+            .any(|(id, tokens)| id == session && tokens.iter().any(|t| t == token))
+    }
 }
 
 /// Anthropic's token formats.
@@ -282,6 +379,16 @@ impl Provider for AnthropicOauth {
 /// (Claude Code refreshes itself). For `create_api_key`, see
 /// [`Self::create_api_key`].
 ///
+/// Exception: Remote Control (`/remote-control`).
+/// `POST /v1/code/sessions/{id}/bridge` with the user's credential gets a
+/// worker token for the session (see [`Self::bridge`]). The interceptor
+/// keeps that token. On `/v1/code/sessions/{id}/worker` and the paths
+/// below it, a request whose only credential is a kept token of the same
+/// session goes upstream unchanged, with the same answer scan. The session
+/// id must match exactly. Any other token gets
+/// [`oauth::foreign_credential`]. Thus a guest cannot use a worker token
+/// of a session in another account.
+///
 /// Any other host passes [`oauth::backstop`].
 ///
 /// Known limits:
@@ -295,6 +402,11 @@ impl Provider for AnthropicOauth {
 ///    [`super::auth_codes`]). Claude uses one verifier for both of its
 ///    pages. Otherwise the exchange gets `invalid_grant`. Without the
 ///    browser bridge, the manual sign-in does not work.
+///  * The worker tokens are kept only in memory. After an airlock restart,
+///    the worker routes refuse the old tokens until Claude Code calls
+///    `bridge` again.
+///  * The server mode of Remote Control (`claude remote-control`) does not
+///    work. Its environment and session ingress tokens are not kept.
 ///  * Claude Code also connects to `mcp-proxy.anthropic.com` at run time.
 ///    It is not verified which credential it sends there. The service
 ///    does not own that host, so a surrogate sent there stays a surrogate.
@@ -303,6 +415,7 @@ pub struct Anthropic {
     grants: Grants,
     codes: PendingCodes,
     targets: Vec<NetworkTarget>,
+    workers: WorkerTokens,
 }
 
 impl Anthropic {
@@ -326,6 +439,7 @@ impl Anthropic {
             ),
             codes,
             targets: endpoints.targets(),
+            workers: WorkerTokens::default(),
             endpoints,
         }
     }
@@ -363,6 +477,21 @@ impl Anthropic {
         if *to == self.endpoints.api {
             if method == Method::POST && path == CREATE_API_KEY_PATH {
                 return self.create_api_key(to, req, injected, next).await;
+            }
+            match session_route(req.uri().path(), &path) {
+                Some((SessionRoute::Bridge, id)) if method == Method::POST => {
+                    let id = id.to_string();
+                    return self.bridge(to, req, &id, injected, next).await;
+                }
+                Some((SessionRoute::Worker, id))
+                    if only_bearer(req.headers()).is_some_and(|t| self.workers.has(id, t)) =>
+                {
+                    // Anthropic minted the token for this session. The
+                    // store does not know it, so it goes upstream unchanged.
+                    tracing::debug!("anthropic: a worker token on {path} passes unchanged");
+                    return self.grants.forward_unswapped(req, injected, next).await;
+                }
+                _ => {}
             }
             return self
                 .grants
@@ -410,6 +539,83 @@ impl Anthropic {
                 format_args!("anthropic: a token request with grant_type {other:?}"),
             )),
         }
+    }
+
+    /// Handle `POST /v1/code/sessions/{id}/bridge` of Remote Control.
+    ///
+    /// The request gets the credential swap of [`Grants::swap_headers`],
+    /// and the answer gets the scan. If the guest sent a grant surrogate or
+    /// an injected secret, the `worker_jwt` of a 2xx answer is kept for the
+    /// session. Its `api_base_url` must be the API host. Otherwise the guest
+    /// gets a local `502` and the token is not kept.
+    /// Args:
+    ///  - `to`: The API endpoint
+    ///  - `req`: The guest's request
+    ///  - `session`: The session id of the path
+    ///  - `injected`: Masked secrets that the inject rules put in
+    ///  - `next`: The next step that sends the request upstream.
+    ///
+    /// Returns:
+    ///   The scanned answer, or a local answer if the request or the
+    ///   answer is refused.
+    async fn bridge(
+        &self,
+        to: &Endpoint,
+        mut req: Request<ResponseBody>,
+        session: &str,
+        injected: &[InjectedSecret],
+        next: Next,
+    ) -> anyhow::Result<Response<ResponseBody>> {
+        let swapped = match self
+            .grants
+            .swap_headers(to, req.headers_mut(), injected, sign_in_again)
+            .await?
+        {
+            Ok(swapped) => swapped,
+            Err(refused) => return Ok(refused),
+        };
+        let known = self.grants.known_reals(&swapped, injected).await?;
+        let (parts, bytes) = oauth::forward_buffered(req, next).await?;
+        let resp = scan::scan_answer(oauth::rebuilt(parts, bytes), &FORMATS, known).await?;
+        if !resp.status().is_success() || matches!(swapped.credential, Credential::None) {
+            return Ok(resp);
+        }
+        // The scan ends the body with an error if it finds a real value.
+        let (parts, body) = resp.into_parts();
+        let Ok(bytes) = oauth::read_body(body).await else {
+            return Ok(oauth::server_error(
+                "anthropic: a Remote Control bridge answer that the scan refused",
+            ));
+        };
+        let answer = oauth::answer_object(&parts, &bytes);
+        let field = |name| {
+            answer
+                .as_ref()
+                .and_then(|a| a.get(name))
+                .and_then(Value::as_str)
+        };
+        if let Some(token) = field("worker_jwt").filter(|t| !t.is_empty()) {
+            // Claude Code refuses a bridge answer without this field, so
+            // a missing field is also refused.
+            if !field("api_base_url").is_some_and(|u| self.is_api_base(u)) {
+                return Ok(oauth::server_error(
+                    "anthropic: a Remote Control bridge answer with an api_base_url that is \
+                     not the API host",
+                ));
+            }
+            tracing::debug!("anthropic: a worker token for Remote Control session {session}");
+            self.workers.add(session, token.to_string());
+        }
+        Ok(oauth::rebuilt(parts, bytes))
+    }
+
+    /// Whether `url` is the base URL of the API host, with or without a
+    /// trailing `/`.
+    fn is_api_base(&self, url: &str) -> bool {
+        let url = url.strip_suffix('/').unwrap_or(url);
+        // Host names are not case sensitive.
+        url.strip_prefix("https://")
+            .is_some_and(|host| host.eq_ignore_ascii_case(&self.endpoints.api.authority()))
     }
 
     /// Handle `POST /api/oauth/claude_cli/create_api_key` with a grant's
@@ -563,7 +769,8 @@ fn sign_in_again() -> Response<ResponseBody> {
 
 #[cfg(test)]
 mod tests {
-    //! Anthropic token formats: real tokens and minted surrogates.
+    //! Anthropic token formats: real tokens and minted surrogates. The
+    //! limits of the worker token table.
 
     use super::*;
 
@@ -609,5 +816,33 @@ mod tests {
             let random = URL_SAFE_NO_PAD.decode(rest).unwrap();
             assert_eq!(random.len(), tokens::SURROGATE_BYTES, "{s}");
         }
+    }
+
+    /// Test that the worker token table keeps the newest tokens and
+    /// sessions. A long Remote Control use must not grow the table without
+    /// a limit.
+    ///   1. Add one token more than the limit to a session, and add one
+    ///      token two times
+    ///   2. Check that the oldest token is gone and that the second add
+    ///      kept one copy
+    ///   3. Add one session more than the limit
+    ///   4. Check that the oldest session is gone
+    #[test]
+    fn worker_tokens_above_limits_remove_oldest_token_and_session() {
+        let workers = WorkerTokens::default();
+        for i in 0..=WORKER_TOKENS_PER_SESSION {
+            workers.add("s", format!("t{i}"));
+        }
+        workers.add("s", format!("t{WORKER_TOKENS_PER_SESSION}"));
+        assert!(!workers.has("s", "t0"));
+        assert!(workers.has("s", "t1"));
+        assert_eq!(workers.0.borrow()[0].1.len(), WORKER_TOKENS_PER_SESSION);
+
+        for i in 0..WORKER_SESSIONS {
+            workers.add(&format!("s{i}"), "t".into());
+        }
+        assert!(!workers.has("s", "t1"));
+        assert!(workers.has("s0", "t"));
+        assert_eq!(workers.0.borrow().len(), WORKER_SESSIONS);
     }
 }
