@@ -12,16 +12,27 @@ bring the worker token of a session in another account and send data to
 it through the API host, which is always allowed. Thus the service now
 keeps the worker tokens that it sees Anthropic mint:
 
-* `bridge` goes upstream with the normal swap and answer scan. If the
-  request used the sign-in or an injected secret, the service keeps the
-  `worker_jwt` of a 2xx answer for the session id of the path. The
-  `api_base_url` must be the API host, else the guest gets 502.
-* On `/v1/code/sessions/{id}/worker` and below, a kept token of the same
-  session id goes upstream unchanged. The answer scan still applies.
-  Other values keep the strict swap.
+* `bridge` goes upstream with the normal swap and answer scan. The
+  service keeps the `worker_jwt` of a 2xx answer for the session id of
+  the path. The request must use the sign-in or an injected secret, the
+  `api_base_url` must be the API host, and the token must be a JWT. Else
+  the guest gets 502.
+* The guest gets a surrogate in place of the real token. The surrogate
+  keeps the optional `sk-ant-si-` prefix, the JWT header and the claims,
+  because Claude Code reads `exp` and `session_id` from them. Only the
+  signature is random. A worker token is valid for hours. If the real
+  token leaks out of the sandbox, someone outside can act as the worker
+  for that time.
+* On `/v1/code/sessions/{id}/worker` and below, a kept surrogate of the
+  same session id goes upstream as the real token. The real token itself
+  is no credential. Other values keep the strict swap.
+* The answer scan of all API answers also searches for the kept real
+  worker tokens. This includes the `bridge` answer after the change, so
+  a copy of the real token in another field also gets 502.
 * The service keeps the last 3 tokens of a session, because a new
   `bridge` call does not stop the streams of the old token at once. It
-  keeps at most 64 sessions. Tokens do not expire in airlock, because
+  keeps at most 8 sessions. A sandbox normally runs one session, and
+  each kept real token makes the scan of each API answer slower. Tokens do not expire in airlock, because
   the heartbeat can make a token live longer. The upstream checks
   validity.
 * The tokens are only in memory. After a restart, Claude Code calls

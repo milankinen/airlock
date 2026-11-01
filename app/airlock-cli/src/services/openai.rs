@@ -327,7 +327,7 @@ impl Openai {
         if *to == self.endpoints.chatgpt {
             return self
                 .grants
-                .forward_api(to, req, injected, next, sign_in_again)
+                .forward_api(to, req, injected, Vec::new(), next, sign_in_again)
                 .await;
         }
         // Fail closed: the auth host serves only its routes. A host that
