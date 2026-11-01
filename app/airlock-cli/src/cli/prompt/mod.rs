@@ -37,6 +37,49 @@ pub enum PromptError {
     Io(std::io::Error),
 }
 
+/// The user aborted a prompt with Esc, and the caller has no answer to go
+/// on with. The text tells which prompt.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct PromptAborted(pub String);
+
+/// Kind of a user abort of a prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Abort {
+    /// Esc or an abort choice ([`PromptAborted`]).
+    Esc,
+    /// Ctrl+C ([`PromptError::Interrupted`]).
+    Interrupt,
+}
+
+impl Abort {
+    /// Make the error of this abort again, for a caller that asks after
+    /// the first abort.
+    /// Args:
+    ///  - `what`: Text for an Esc abort that tells which prompt
+    pub fn to_error(self, what: &str) -> anyhow::Error {
+        match self {
+            Abort::Esc => PromptAborted(what.to_string()).into(),
+            Abort::Interrupt => PromptError::Interrupted.into(),
+        }
+    }
+}
+
+/// Find a user abort of a prompt in `e` or in one of its causes.
+/// Returns:
+///   The kind of the abort, or `None` if `e` is not an abort.
+pub fn abort_of(e: &anyhow::Error) -> Option<Abort> {
+    e.chain().find_map(|cause| {
+        if cause.is::<PromptAborted>() {
+            Some(Abort::Esc)
+        } else if let Some(PromptError::Interrupted) = cause.downcast_ref::<PromptError>() {
+            Some(Abort::Interrupt)
+        } else {
+            None
+        }
+    })
+}
+
 /// Result of one key press on a prompt.
 pub enum Step<T> {
     /// The prompt stays open.

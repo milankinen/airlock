@@ -1763,7 +1763,7 @@ pub mod oci {
          so --yes cannot re-create it. Run in a terminal without --yes to keep the disk or make \
          a new sandbox.";
 
-    /// Error when the user aborts a question or an image download.
+    /// Error when the user aborts a question.
     pub const ABORTED_BY_USER: &str = "aborted by user";
 
     /// Status when the old image of the sandbox is not in the cache any more.

@@ -183,8 +183,8 @@ pub async fn load_or_generate_config(
 ///   the user image. With a template, the file is the template config with
 ///   the other selected packs and `[clipboard]`. Errors:
 ///    * No terminal: exit code 2
-///    * Esc or `abort`: exit code 0, or 2 after a failed check (the error
-///      stays valid)
+///    * Esc or `abort`: exit code 130, or 2 after a failed check (the
+///      error stays valid)
 ///    * Ctrl+C: exit code 130
 pub async fn run_wizard(
     host_cwd: &VerifiedPath,
@@ -227,7 +227,7 @@ pub async fn run_wizard(
 ///   The config of the new template (local target, see [`run_wizard`]).
 ///   Errors:
 ///    * No terminal: exit code 2
-///    * Esc or `abort`: exit code 0, or 2 after a failed check
+///    * Esc or `abort`: exit code 130, or 2 after a failed check
 ///    * Ctrl+C: exit code 130
 pub async fn run_template_wizard(
     host_cwd: &VerifiedPath,
@@ -314,9 +314,9 @@ async fn ask_config(input: &Input<'_>) -> Result<GeneratedConfig, Exit> {
                 Mode::Start => cli::error!("{}", messages::start::ABORTED_NO_CONFIG),
                 Mode::Template => cli::error!("{}", messages::start::ABORTED_NO_TEMPLATE),
             }
-            Err(Exit::Code(0))
+            Err(Exit::ABORTED)
         }
-        End::Interrupted => Err(Exit::INTERRUPTED),
+        End::Interrupted => Err(Exit::ABORTED),
     }
 }
 
@@ -370,6 +370,8 @@ async fn run_view(
 /// resolve (see [`crate::project::resolve_env`]): each host variable that it
 /// names must be set.
 pub(super) async fn check_answers(input: &Input<'_>, answers: &Answers) -> anyhow::Result<()> {
+    // The user can abort the vault prompt of a check and then try again.
+    input.vault.clear_abort();
     let config = input
         .config
         .clone()

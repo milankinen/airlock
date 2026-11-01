@@ -19,6 +19,7 @@ use super::{
     NONCE_BYTES, SALT_BYTES, Storage, atomic_write, decode_b64_array, read_vault_file,
     vault_lock_file,
 };
+use crate::cli::prompt::PromptAborted;
 use crate::cli::prompt::fields::{Field, Fields, Invalid};
 use crate::messages;
 use crate::util::VerifiedPath;
@@ -274,7 +275,9 @@ fn prompt_once(label: &str) -> anyhow::Result<String> {
         .ask(|texts| required(texts, 0))
         .context(messages::vault::READ_VAULT_PASSPHRASE)?;
     let Some(mut texts) = texts else {
-        bail!(messages::vault::PASSPHRASE_PROMPT_ABORTED);
+        bail!(PromptAborted(
+            messages::vault::PASSPHRASE_PROMPT_ABORTED.into()
+        ));
     };
     Ok(texts.swap_remove(0))
 }
@@ -314,7 +317,9 @@ fn prompt_create() -> anyhow::Result<String> {
         .ask(check)
         .context(messages::vault::READ_VAULT_PASSPHRASE)?;
     let Some(mut texts) = texts else {
-        bail!(messages::vault::PASSPHRASE_PROMPT_ABORTED);
+        bail!(PromptAborted(
+            messages::vault::PASSPHRASE_PROMPT_ABORTED.into()
+        ));
     };
     Ok(texts.swap_remove(0))
 }

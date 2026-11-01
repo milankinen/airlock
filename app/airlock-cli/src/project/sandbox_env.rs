@@ -13,6 +13,7 @@ use rand::rngs::ChaCha20Rng;
 use rand::{Rng, SeedableRng};
 use sha2::{Digest, Sha256};
 
+use crate::cli::prompt;
 use crate::config::config_values::EnvVar;
 use crate::messages;
 use crate::vault::Vault;
@@ -32,6 +33,9 @@ pub struct EnvError {
     pub name: String,
     /// Description of the problem.
     pub reason: String,
+    /// User abort of a prompt for the value, for example the vault
+    /// passphrase prompt. `None` for all other problems.
+    pub abort: Option<prompt::Abort>,
 }
 
 impl EnvError {
@@ -39,6 +43,15 @@ impl EnvError {
         Self {
             name: name.to_string(),
             reason: reason.to_string(),
+            abort: None,
+        }
+    }
+
+    /// Make the problem of a failed substitution. Keeps a user abort.
+    fn from_error(name: &str, e: &anyhow::Error) -> Self {
+        Self {
+            abort: prompt::abort_of(e),
+            ..Self::new(name, e)
         }
     }
 }
@@ -127,7 +140,7 @@ impl SandboxEnv {
             let real = if entry.optional {
                 let defined = vault
                     .subst_defined(&entry.value)
-                    .map_err(|e| EnvError::new(key, e))?;
+                    .map_err(|e| EnvError::from_error(key, &e))?;
                 let Some(real) = defined else {
                     omitted.insert(key.clone());
                     continue;
@@ -136,7 +149,7 @@ impl SandboxEnv {
             } else {
                 vault
                     .subst(&entry.value)
-                    .map_err(|e| EnvError::new(key, e))?
+                    .map_err(|e| EnvError::from_error(key, &e))?
             };
             if entry.mask {
                 let secret = MaskedSecret::new(key, real, &entry.keep_prefixes);

@@ -25,7 +25,7 @@ use anyhow::{Context, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 pub(crate) use disabled::DisabledStorage;
-use encrypted::EncryptedFileStorage;
+pub(crate) use encrypted::EncryptedFileStorage;
 #[cfg(test)]
 pub(crate) use encrypted::PassphraseSource;
 use file::FileStorage;
@@ -34,6 +34,7 @@ use parking_lot::{Mutex, MutexGuard};
 use rand::TryRng as _;
 use serde::{Deserialize, Serialize};
 
+use crate::cli::prompt;
 use crate::messages;
 use crate::settings::Settings;
 use crate::util::VerifiedPath;
@@ -188,6 +189,9 @@ struct VaultInner {
     /// Cached vault contents. `None` until the vault opens. Reads clone the
     /// necessary fields, so the lock is never held across foreign code.
     data: Mutex<Option<VaultData>>,
+    /// User abort of the vault unlock prompt. Later reads and writes fail
+    /// with the same abort and do not ask again, until a caller clears it.
+    aborted: Mutex<Option<prompt::Abort>>,
     /// Host environment snapshot for `${NAME}` substitution. It is fixed,
     /// so tests can inject a known env, and substitution gives the same
     /// result when other code changes `std::env` during the run.
@@ -229,6 +233,7 @@ impl Vault {
             inner: Arc::new(VaultInner {
                 storage,
                 data: Mutex::new(None),
+                aborted: Mutex::new(None),
                 env,
                 storage_type,
             }),
@@ -244,9 +249,39 @@ impl Vault {
     fn open(&self) -> anyhow::Result<OpenedVault<'_>> {
         let mut guard = self.inner.data.lock();
         if guard.is_none() {
-            *guard = Some(self.load()?);
+            if let Some(e) = self.open_abort() {
+                return Err(e);
+            }
+            *guard = Some(self.load_unlock()?);
         }
         Ok(OpenedVault(guard))
+    }
+
+    /// Read the vault, and record a user abort of the unlock prompt. One Esc
+    /// must end the unlock. Without the record, each lookup asks for the
+    /// passphrase again.
+    fn load_unlock(&self) -> anyhow::Result<VaultData> {
+        self.load().inspect_err(|e| {
+            if let Some(abort) = prompt::abort_of(e) {
+                *self.inner.aborted.lock() = Some(abort);
+            }
+        })
+    }
+
+    /// Return the error of an aborted unlock prompt, or `None` if the user
+    /// did not abort it.
+    fn open_abort(&self) -> Option<anyhow::Error> {
+        self.inner
+            .aborted
+            .lock()
+            .map(|abort| abort.to_error(messages::vault::PASSPHRASE_PROMPT_ABORTED))
+    }
+
+    /// Forget an aborted unlock prompt. The next read or write asks for the
+    /// passphrase again. For a caller that lets the user try again, for
+    /// example the check of the setup wizard.
+    pub(crate) fn clear_abort(&self) {
+        *self.inner.aborted.lock() = None;
     }
 
     /// Read the current blob from storage. "No vault yet" (no file, no
@@ -282,12 +317,16 @@ impl Vault {
     /// Returns:
     ///   Result of `f`. When `f` fails, nothing is written.
     fn mutate<R>(&self, f: impl FnOnce(&mut VaultData) -> anyhow::Result<R>) -> anyhow::Result<R> {
+        // An aborted unlock also stops writes.
+        if let Some(e) = self.open_abort() {
+            return Err(e);
+        }
         // Read the latest state under the lock. The cached snapshot can be
         // old, and a write from it can erase secrets that a concurrent
         // `airlock secrets add` wrote. While this call holds the vault lock,
         // it takes only the cache lock, for a short time at the end.
         let _lock = self.lock_storage()?;
-        let mut data = self.load()?;
+        let mut data = self.load_unlock()?;
         data.unknown.remove(RETIRED_AGENTS_SECTION);
         let result = f(&mut data)?;
         self.flush(&data)?;
@@ -422,13 +461,14 @@ impl Vault {
     ///
     /// Returns:
     ///   Expanded text, `None` if a name has no value, or an error if the
-    ///   template is not valid.
+    ///   template is not valid or the user aborted the unlock prompt.
     pub fn subst_defined(&self, template: &str) -> anyhow::Result<Option<String>> {
         // A vault that does not open has no values. This is not an error
-        // here, because the caller can do without the value.
+        // here, because the caller can do without the value. A user abort
+        // must end the run.
         match subst::substitute(template, self) {
             Ok(value) => Ok(Some(value)),
-            Err(subst::Error::NoSuchVariable(_)) => Ok(None),
+            Err(subst::Error::NoSuchVariable(_)) => self.open_abort().map_or(Ok(None), Err),
             Err(e) => Err(anyhow!("{e}")),
         }
     }

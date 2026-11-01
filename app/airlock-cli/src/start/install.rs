@@ -121,11 +121,11 @@ pub async fn install_tools(
     let install = !to_install.is_empty();
     if install {
         if cli::is_interrupted() {
-            return Err(Exit::INTERRUPTED);
+            return Err(Exit::ABORTED);
         }
         let install_project = project
             .with_config(resolved.install_config().map_err(Exit::config)?)
-            .map_err(Exit::config)?;
+            .map_err(Exit::from)?;
         // Saved with the first record: no session ran after this install.
         state.ran_session = false;
         let mut save = |s: &mut InstallState| save_state(&sandbox, &image.image_id, s, &snapshots);
@@ -197,11 +197,11 @@ async fn run_install(
     .await
     {
         Ok(r) => r,
-        Err(setup::SetupError::Interrupted) => return Err(Exit::INTERRUPTED),
+        Err(setup::SetupError::Interrupted) => return Err(Exit::ABORTED),
         Err(setup::SetupError::Failed(e)) => return Err(e.into()),
     };
     match &report.outcome.stopped {
-        Some(setup::Ended::Interrupted) => return Err(Exit::INTERRUPTED),
+        Some(setup::Ended::Interrupted) => return Err(Exit::ABORTED),
         Some(stopped) => {
             if let Some(reason) = stopped.reason() {
                 cli::error!("{reason}");

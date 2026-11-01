@@ -427,9 +427,9 @@ fn exists_error(name: &str) -> Exit {
 /// Convert a failed image preparation to the end of the build.
 fn image_error(e: anyhow::Error) -> Exit {
     match e.downcast_ref::<ImageChangeStop>() {
-        Some(ImageChangeStop::Interrupted) => Exit::INTERRUPTED,
+        Some(ImageChangeStop::Interrupted) => Exit::ABORTED,
         Some(ImageChangeStop::Aborted) => Exit::aborted(),
-        _ => Exit::Failed(e),
+        _ => Exit::from(e),
     }
 }
 

@@ -500,10 +500,10 @@ async fn resolve_with_auth(
             }
             Err(e) if registry::is_auth_error(&e) => {
                 if cli::is_interrupted() {
-                    anyhow::bail!(messages::oci::ABORTED_BY_USER);
+                    return Err(ImageChangeStop::Interrupted.into());
                 }
                 if auth == RegistryAuth::Anonymous
-                    && let Some(creds) = credentials::load(vault, registry_host)
+                    && let Some(creds) = credentials::load(vault, registry_host)?
                 {
                     auth = creds.to_auth();
                     continue;
@@ -1255,7 +1255,7 @@ async fn ensure_local_image(
         res = pipeline => res?,
         () = cli::interrupted() => {
             sp.finish_and_clear();
-            anyhow::bail!(messages::oci::ABORTED_BY_USER);
+            return Err(ImageChangeStop::Interrupted.into());
         }
     };
 
@@ -1363,7 +1363,7 @@ async fn ensure_registry_image(
             res = fetch => { res?; }
             () = cli::interrupted() => {
                 let _ = mp.clear();
-                anyhow::bail!(messages::oci::ABORTED_BY_USER);
+                return Err(ImageChangeStop::Interrupted.into());
             }
         }
         let _ = mp.clear();

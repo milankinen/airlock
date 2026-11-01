@@ -7,6 +7,7 @@
 use oci_client::secrets::RegistryAuth;
 
 use crate::cli::prompt::fields::{Field, Fields, Invalid};
+use crate::cli::prompt::{self, PromptAborted};
 use crate::messages;
 use crate::vault::{RegistryCreds, Vault};
 
@@ -26,17 +27,19 @@ impl ToRegistryAuth for RegistryCreds {
 
 /// Load the stored credentials of a registry host from the vault.
 /// Returns:
-///   The credentials, or `None` if there are none or the vault fails.
-pub fn load(vault: &Vault, registry_host: &str) -> Option<RegistryCreds> {
+///   The credentials, or `None` if there are none or the vault fails. An
+///   error only if the user aborts the vault unlock prompt.
+pub fn load(vault: &Vault, registry_host: &str) -> anyhow::Result<Option<RegistryCreds>> {
     match vault.get_registry(registry_host) {
-        Ok(found) => found,
+        Ok(found) => Ok(found),
+        Err(e) if prompt::abort_of(&e).is_some() => Err(e),
         Err(e) => {
             // Log a vault failure and treat it as "no saved credentials".
             // The caller then uses anonymous auth and asks the user on 401.
             // Thus a broken or locked vault cannot stop an image pull that
             // did not need authentication.
             tracing::debug!("vault unavailable while loading registry creds: {e:#}");
-            None
+            Ok(None)
         }
     }
 }
@@ -78,7 +81,7 @@ pub fn prompt(registry_host: &str) -> anyhow::Result<RegistryCreds> {
         None => Ok(()),
     };
     let Some(mut texts) = form.ask(required)? else {
-        anyhow::bail!(messages::oci::sign_in_aborted(registry_host));
+        anyhow::bail!(PromptAborted(messages::oci::sign_in_aborted(registry_host)));
     };
     let password = texts.pop().unwrap_or_default();
     let username = texts.pop().unwrap_or_default();

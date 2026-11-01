@@ -768,15 +768,15 @@ fn ask_with(
 /// Convert a failed image preparation to the end of the run.
 ///
 /// The cases: a changed image that nobody can answer about (exit code 2),
-/// Abort, Ctrl+C, or a failure.
+/// Abort, Ctrl+C or an aborted registry sign-in (exit code 130), or a failure.
 fn image_error(e: anyhow::Error) -> Exit {
     match e.downcast_ref::<ImageChangeStop>() {
         Some(ImageChangeStop::NeedsTerminal | ImageChangeStop::ImportedImageUnknown) => {
             Exit::error(2, e)
         }
         Some(ImageChangeStop::Aborted) => Exit::aborted(),
-        Some(ImageChangeStop::Interrupted) => Exit::INTERRUPTED,
-        None => Exit::Failed(e),
+        Some(ImageChangeStop::Interrupted) => Exit::ABORTED,
+        None => Exit::from(e),
     }
 }
 
