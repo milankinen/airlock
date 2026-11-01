@@ -150,7 +150,8 @@ fn install_fingerprint_follows_name_version_and_args_but_not_script() {
 /// change of these values is breaking and needs a new pack version.
 ///   1. Configure each built-in pack alone, with default args
 ///   2. Configure python and docker with non-default args
-///   3. Check the fingerprints against the stored values
+///   3. Configure the older pack versions that users can still pick
+///   4. Check the fingerprints against the stored values
 #[test]
 fn builtin_pack_fingerprints_with_current_inputs_stay_same() {
     let packs = crate::packs::init_builtin().unwrap();
@@ -172,14 +173,19 @@ fn builtin_pack_fingerprints_with_current_inputs_stay_same() {
         let name = toml.lines().nth(1).unwrap().split(' ').next().unwrap();
         actual.push((format!("{name} args"), fingerprint(&packs, toml)));
     }
+    // Older versions that users can still pick.
+    actual.push((
+        "claude@1".into(),
+        fingerprint(&packs, "[packs]\nclaude = { version = 1 }\n"),
+    ));
     let actual: Vec<(&str, &str)> = actual
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect();
     let expected: Vec<(&str, &str)> = vec![
         (
-            "claude@1",
-            "6f2bbd3021e675f80ce3f11af294c91d05c79d5d8700c44846215c35f9de64ae",
+            "claude@2",
+            "e992d538f2eacb79e11400e3d999525b3bf0aa7b3db8e576d2c7652f90370894",
         ),
         (
             "codex@1",
@@ -220,6 +226,10 @@ fn builtin_pack_fingerprints_with_current_inputs_stay_same() {
         (
             "docker args",
             "258549d437f8f3d8f902fa538217be9f44fe37b25e727305ffbe44ecba238b55",
+        ),
+        (
+            "claude@1",
+            "6f2bbd3021e675f80ce3f11af294c91d05c79d5d8700c44846215c35f9de64ae",
         ),
     ];
     assert_eq!(actual, expected);

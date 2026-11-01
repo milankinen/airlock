@@ -200,7 +200,7 @@ fn choosing_packs_and_args_with_keys_saves_shared_config_that_resolves() {
     assert_eq!(
         text,
         "[packs]\ndebian = { version = \"1\", args = { allow-apt = true } }\n\
-         claude = { version = \"1\", args = { acp = false } }\n\
+         claude = { version = \"2\", args = { acp = false } }\n\
          sample = { version = \"1\", args = { mode = \"turbo\", network = false } }\n\n\
          [clipboard]\ncopy = true\npaste = true\n"
     );
@@ -490,7 +490,7 @@ fn template_locks_its_packs_until_empty_template_is_selected() {
     assert_eq!(generated.template.as_deref(), Some("base"));
     assert!(
         generated.toml.contains(
-            "ghost = { version = \"1\" }\nclaude = { version = \"1\", args = { acp = false } }\n"
+            "ghost = { version = \"1\" }\nclaude = { version = \"2\", args = { acp = false } }\n"
         ),
         "{}",
         generated.toml
