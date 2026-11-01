@@ -1,0 +1,20 @@
+[package]
+name = "airlock-dialog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# Few dependencies on purpose: a pure Rust X11 client and a font rasterizer.
+# The window needs no C library at run time.
+[dependencies]
+serde = { workspace = true }
+x11rb = { version = "0.14", default-features = false, features = ["randr"] }
+fontdue = { version = "0.9", default-features = false }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+x11rb = { version = "0.14", default-features = false, features = ["randr", "xtest"] }

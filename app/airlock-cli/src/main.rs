@@ -59,6 +59,13 @@ async fn main() {
     // Do this before any thread starts or reads the environment.
     diagnostics::disable_release_backtraces();
 
+    // The approval dialog runs as a child process of this program. It needs
+    // no context, and it must not start any other part of the program.
+    #[cfg(not(target_os = "macos"))]
+    if std::env::args().nth(1).as_deref() == Some(messages::grants::DIALOG_ARG) {
+        std::process::exit(approval::dialog::child_main());
+    }
+
     // Install the panic and fatal signal handlers first. Then a panic in a
     // later init step is also visible.
     diagnostics::install_panic_hook();

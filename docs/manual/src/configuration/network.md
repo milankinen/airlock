@@ -133,6 +133,35 @@ rule_editing = "on-demand"
 
 Airlock refuses other changes at once and does not ask you.
 
+#### Approval prompt
+
+Airlock shows each request as a desktop notification with the buttons
+Allow and Deny. On macOS, a small notifier app shows the notification.
+On Linux, airlock sends it through the notification service of the
+desktop. If you do not answer in time, airlock denies the request.
+
+The notification also has the button More details. On macOS, a click on
+the notification does the same. The button opens a window that shows the
+whole request: the sandbox, the full command, the working directory, the
+extra environment, the hosts or the rule, and the time limit. For a rule
+change, the window shows the lines that change in color.
+
+On Linux, the window needs an X server. A desktop with Wayland needs
+XWayland. With no X server, the notification has no More details button.
+If the window cannot open after you select More details, the notification
+shows again without the button. The window also asks you when the
+notification cannot show, for example when the desktop has no
+notification service. If the host has no X server and no notification
+service, airlock denies the request. In the Linux window:
+
+- The Deny button is the default. No key selects Allow.
+- Escape and the close button of the window deny the request.
+- A click on a button has no effect in the first 0.6 seconds after the
+  window shows. This stops a click that you meant for another window from
+  allowing the request.
+- The mouse wheel, the arrow keys, Page Up, Page Down, Home and End
+  scroll long text.
+
 After your approval, the change applies to new connections. Open
 connections do not change. Airlock writes the change to the project
 config file, or to the local project file if the rule is there. The file

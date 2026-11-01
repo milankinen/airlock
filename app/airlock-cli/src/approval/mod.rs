@@ -11,6 +11,8 @@
 //! deny. A late answer has no effect.
 
 #[cfg(not(target_os = "macos"))]
+pub(crate) mod dialog;
+#[cfg(not(target_os = "macos"))]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;

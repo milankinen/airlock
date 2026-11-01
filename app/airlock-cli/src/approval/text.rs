@@ -405,6 +405,9 @@ pub(super) struct PromptText {
     pub title: String,
     /// Short body.
     pub body: String,
+    /// True if the body only points to the details.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub details_hint: bool,
     /// Clean sandbox name.
     pub sandbox: String,
     /// Body of the notice while the approved command runs. `None` if the
@@ -420,6 +423,7 @@ impl PromptText {
         let sandbox = cut_end(clean(&prompt.sandbox), MAX_SANDBOX);
         let mut details = vec![DetailItem::new(msg::LABEL_SANDBOX, sandbox.clone(), false)];
         let clean_name = |name: &str| cut_end(clean(name), MAX_RULE_NAME);
+        let details_hint = !matches!(prompt.request, PromptRequest::Hosts { .. });
         let (title, body, command, running) = match &prompt.request {
             PromptRequest::Hosts { hosts, command } => {
                 details.extend(command_items(command));
@@ -485,6 +489,7 @@ impl PromptText {
         Self {
             title,
             body,
+            details_hint,
             sandbox,
             running,
             details,
@@ -611,7 +616,7 @@ mod tests {
             command: command(),
         }));
         assert_eq!(text.title, "Network access requested (npm)");
-        assert_eq!(text.body, "Click for more details");
+        assert_eq!(text.body, msg::CLICK_FOR_DETAILS);
         assert_eq!(text.running.as_deref(), Some("Running...\nRule: npm"));
 
         let text = PromptText::new(&prompt(PromptRequest::RuleChange {
@@ -621,7 +626,7 @@ mod tests {
             other: vec![],
         }));
         assert_eq!(text.title, "Network rule change requested: npm");
-        assert_eq!(text.body, "Click to see changes");
+        assert_eq!(text.body, msg::CLICK_FOR_CHANGES);
         assert_eq!(text.running, None);
     }
 

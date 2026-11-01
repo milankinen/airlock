@@ -1224,9 +1224,23 @@ pub mod grants {
     }
 
     /// Body of the approval of a command with an on-demand rule.
+    #[cfg(target_os = "macos")]
     pub const CLICK_FOR_DETAILS: &str = "Click for more details";
     /// Body of the approval of a rule change.
+    #[cfg(target_os = "macos")]
     pub const CLICK_FOR_CHANGES: &str = "Click to see changes";
+    /// Body of the approval of a command with an on-demand rule. The
+    /// notification has a details button.
+    #[cfg(not(target_os = "macos"))]
+    pub const CLICK_FOR_DETAILS: &str = "Select More details to see them";
+    /// Body of the approval of a rule change. The notification has a
+    /// details button.
+    #[cfg(not(target_os = "macos"))]
+    pub const CLICK_FOR_CHANGES: &str = "Select More details to see the changes";
+    /// Body of the Linux approval of a command with an on-demand rule or of
+    /// a rule change, when the details window cannot show.
+    #[cfg(not(target_os = "macos"))]
+    pub const NO_DETAILS: &str = "The details window cannot show on this desktop";
     /// Detail label of the rule change diff.
     pub const LABEL_CHANGES: &str = "Changes";
 
@@ -1269,7 +1283,6 @@ pub mod grants {
     /// Text of the host `*`.
     pub const ALL_HOSTS: &str = "all hosts";
     /// Label of the action that shows the details window.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub const MORE_DETAILS: &str = "More details";
     /// Detail label of the sandbox name.
     pub const LABEL_SANDBOX: &str = "Sandbox";
@@ -1396,6 +1409,13 @@ pub mod grants {
     /// Error when the notification service does not answer in time.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub const NOTIFY_NO_ANSWER: &str = "the notification service did not answer";
+
+    /// Text before the seconds left in the Linux dialog.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub const COUNTDOWN: &str = "Denies in";
+    /// Argument that starts the Linux dialog process.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub const DIALOG_ARG: &str = "__approval-dialog";
 
     /// Deny reason: the host cannot show the request.
     pub fn unavailable(err: impl Display) -> String {
