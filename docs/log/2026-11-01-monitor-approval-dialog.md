@@ -33,10 +33,11 @@ With no time left, no dialog shows.
 The TUI runs on its own thread. The CLI side runs on a single-thread
 runtime with a LocalSet. A shared slot (`MonitorSlot`) holds the dialog
 sender while the TUI runs. The monitor runtime makes the slot, fills it
-at launch and clears it at exit and on drop. The approver gets the slot
-through the grant context. The raw terminal runtime gives an empty slot,
-so it falls through to deny. A small trait in airlock-cli wraps the
-sender, so the tests can use a fake dialog.
+at launch and clears it at exit and on drop. `airlock start` makes the
+approver right after it selects the runtime and gives it the slot. The
+grant context gets only the approver. The raw terminal runtime gives no
+slot, so the approver falls through to deny. A small trait in
+airlock-cli wraps the sender, so the tests can use a fake dialog.
 
 The request goes to the TUI with a oneshot reply channel. `true` allows,
 `false` denies. On timeout the CLI drops the receiver. The TUI checks the

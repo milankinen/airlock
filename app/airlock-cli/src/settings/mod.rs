@@ -41,6 +41,10 @@ pub struct Settings {
     /// setup wizard selects at the start.
     #[config(nest)]
     pub packs: PackSettings,
+    /// Approval settings: how airlock asks the user to approve requests
+    /// from the sandbox.
+    #[config(nest)]
+    pub approvals: ApprovalSettings,
     /// Airlock data directory: the database, the sandboxes and the image
     /// cache. `~` expands to the home directory. The default is
     /// `airlock` in the user data directory of the platform.
@@ -56,6 +60,43 @@ pub struct SecuritySettings {
     /// default (false) refuses to start the sandbox.
     #[config(default)]
     pub insecure_mounts: bool,
+}
+
+/// Settings under the `[approvals]` table.
+#[derive(Clone, Debug, Default, DescribeConfig, DeserializeConfig)]
+pub struct ApprovalSettings {
+    /// Where airlock asks the user to approve requests from the sandbox,
+    /// for example temporary network access:
+    ///  * `system` (default): a desktop notification, and a window or a
+    ///    system dialog of the host. The monitor TUI asks when the host
+    ///    cannot show them.
+    ///  * `monitor`: only the monitor TUI. No desktop notification and no
+    ///    window or dialog of the host show. With no monitor TUI open, the
+    ///    request is denied.
+    ///  * `none`: nowhere. No desktop notification, no window or dialog of
+    ///    the host and no monitor TUI dialog show. All requests are denied.
+    #[config(default)]
+    pub dialogs: ApprovalDialogs,
+}
+
+/// Where airlock asks the user to approve requests
+/// (`approvals.dialogs`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApprovalDialogs {
+    /// The host desktop first, then the monitor TUI.
+    #[default]
+    System,
+    /// Only the monitor TUI. No notification, window or dialog of the host.
+    Monitor,
+    /// Nowhere: deny all requests. No notification or dialog shows.
+    None,
+}
+
+impl smart_config::de::WellKnown for ApprovalDialogs {
+    type Deserializer =
+        smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
+    const DE: Self::Deserializer = smart_config::de::Serde;
 }
 
 /// Settings under the `[packs]` table.
@@ -277,6 +318,7 @@ mod tests {
         assert_eq!(s.monitor.buffers.http, 100);
         assert_eq!(s.monitor.buffers.scrollback, 1000);
         assert!(!s.security.insecure_mounts);
+        assert_eq!(s.approvals.dialogs, ApprovalDialogs::System);
         assert_eq!(s.data_dir, None);
 
         std::fs::write(
@@ -300,11 +342,13 @@ mod tests {
             "vault.storage = \"file\"\n\
              data_dir = \"~/airlock-data\"\n\
              [monitor.buffers]\nhttp = 5\n\
-             [security]\ninsecure_mounts = true\n",
+             [security]\ninsecure_mounts = true\n\
+             [approvals]\ndialogs = \"monitor\"\n",
         )
         .unwrap();
         let s = Settings::load_from(&verified_dir(dir.path())).unwrap();
         assert_eq!(s.vault.storage, VaultStorageType::File);
+        assert_eq!(s.approvals.dialogs, ApprovalDialogs::Monitor);
         assert_eq!(s.monitor.buffers.http, 5);
         assert_eq!(s.monitor.buffers.tcp, 100);
         assert!(s.security.insecure_mounts);
@@ -321,6 +365,7 @@ mod tests {
             "not valid = toml =",
             "vault.storage = \"typo\"\n",
             "security.insecure_mounts = \"typo\"\n",
+            "approvals.dialogs = \"typo\"\n",
         ] {
             let dir = temp_dir();
             std::fs::write(dir.path().join("settings.toml"), content).unwrap();

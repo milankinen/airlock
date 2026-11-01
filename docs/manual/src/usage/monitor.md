@@ -107,6 +107,9 @@ Some sandbox requests need your approval, for example temporary network
 access or a rule change. Airlock usually asks with a system notification
 or dialog. When those are not available, the monitor shows the request
 as a dialog in the middle of the screen, on top of the current tab.
+The `approvals.dialogs` user setting can make the monitor the only place
+that asks, or turn off all dialogs. See
+[Approval dialogs](../configuration/network.md#approval-dialogs).
 
 The dialog shows the same title and text as the system notification.
 It has three buttons: **accept**, **deny** and **show more**. The first

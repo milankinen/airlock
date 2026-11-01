@@ -12,7 +12,8 @@
 //! monitor TUI runs, a dialog in the TUI asks last. It gets only the time
 //! that is left. The text from the sandbox is cleaned and cut before it
 //! shows. No answer in time, or no way to ask, means deny. A late answer
-//! has no effect.
+//! has no effect. A user setting can skip the host and ask only in the
+//! monitor TUI, or deny all requests with no ask.
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) mod dialog;
@@ -42,6 +43,7 @@ use tokio::time::Instant;
 use crate::config::config_values::NetworkRule;
 use crate::data_dir::DataDir;
 use crate::messages::grants as msg;
+use crate::settings::ApprovalDialogs;
 
 /// Request that the user must approve.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -200,39 +202,100 @@ enum Asked {
     Unavailable(String),
 }
 
-/// Get the approver for this host: a desktop notification. On macOS, a
-/// system dialog when the notification cannot show. When nothing can show,
-/// the monitor TUI asks if it runs.
+/// Make the approver that the user settings select. Call it one time per
+/// sandbox session.
 /// Args:
+///  - `dialogs`: Where to ask, from `approvals.dialogs` in the user
+///    settings
 ///  - `data`: Data directory. On macOS, the notifier app installs there.
-///  - `monitor`: Place of the monitor TUI dialog. Empty when no TUI runs.
-pub(crate) fn system(data: &DataDir, monitor: MonitorSlot) -> Rc<dyn Approver> {
+///  - `monitor`: Place of the monitor TUI dialog. `None` when the session
+///    has no monitor TUI.
+///
+/// Returns:
+///   For `system`: an approver that asks on the host desktop, and in the
+///   monitor TUI when the desktop cannot show the request. For `monitor`:
+///   an approver that asks only in the monitor TUI. For `none`, or for
+///   `monitor` with no monitor TUI: an approver that denies all requests.
+pub(crate) fn for_settings(
+    dialogs: ApprovalDialogs,
+    data: &DataDir,
+    monitor: Option<MonitorSlot>,
+) -> Rc<dyn Approver> {
+    build(dialogs, || system_ask(data), monitor)
+}
+
+/// Make the approver for `dialogs`. Makes the system ask only when the
+/// approver uses it.
+fn build(
+    dialogs: ApprovalDialogs,
+    system: impl FnOnce() -> SystemAsk,
+    monitor: Option<MonitorSlot>,
+) -> Rc<dyn Approver> {
+    match (dialogs, monitor) {
+        (ApprovalDialogs::None, _) => Rc::new(DenyApprover {
+            reason: msg::DIALOGS_OFF,
+        }),
+        (ApprovalDialogs::Monitor, None) => Rc::new(DenyApprover {
+            reason: msg::MONITOR_NOT_OPEN,
+        }),
+        (ApprovalDialogs::Monitor, Some(monitor)) => Rc::new(HostApprover {
+            system: None,
+            monitor: Some(monitor),
+        }),
+        (ApprovalDialogs::System, monitor) => Rc::new(HostApprover {
+            system: Some(system()),
+            monitor,
+        }),
+    }
+}
+
+/// Make the ask on the host desktop: a desktop notification. On macOS, a
+/// system dialog when the notification cannot show.
+fn system_ask(data: &DataDir) -> SystemAsk {
     #[cfg(target_os = "macos")]
-    let system: SystemAsk = {
+    {
         let data = data.clone();
         Rc::new(move |text, timeout| -> AskFuture {
             let data = data.clone();
             Box::pin(async move { macos::ask(text, timeout, &data).await })
         })
-    };
+    }
     #[cfg(not(target_os = "macos"))]
-    let system: SystemAsk = {
+    {
         let _ = data;
         Rc::new(|text, timeout| -> AskFuture { Box::pin(linux::ask(text, timeout)) })
-    };
-    Rc::new(SystemApprover { system, monitor })
+    }
+}
+
+/// Approver that denies all requests and shows nothing.
+struct DenyApprover {
+    /// Deny reason. It names the setting that turns off the dialogs.
+    reason: &'static str,
+}
+
+impl Approver for DenyApprover {
+    fn approve(
+        &self,
+        prompt: GrantPrompt,
+        timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Approval> + 'static>> {
+        let text = log_pending(&prompt, timeout);
+        let approval = Decision::Deny(self.reason.into()).into();
+        Box::pin(std::future::ready(log_decision(&text.sandbox, approval)))
+    }
 }
 
 /// Approver that asks the user on the host desktop, and in the monitor TUI
 /// when the desktop cannot show the request.
-struct SystemApprover {
-    /// Ask on the host desktop.
-    system: SystemAsk,
-    /// Place of the monitor TUI dialog.
-    monitor: MonitorSlot,
+struct HostApprover {
+    /// Ask on the host desktop. `None` to ask only in the monitor TUI.
+    system: Option<SystemAsk>,
+    /// Place of the monitor TUI dialog. `None` when the session has no
+    /// monitor TUI.
+    monitor: Option<MonitorSlot>,
 }
 
-impl Approver for SystemApprover {
+impl Approver for HostApprover {
     fn approve(
         &self,
         prompt: GrantPrompt,
@@ -243,7 +306,8 @@ impl Approver for SystemApprover {
         Box::pin(async move {
             let text = log_pending(&prompt, timeout);
             let sandbox = text.sandbox.clone();
-            log_decision(&sandbox, decide(text, timeout, &system, &monitor).await)
+            let approval = decide(text, timeout, system.as_ref(), monitor.as_ref()).await;
+            log_decision(&sandbox, approval)
         })
     }
 }
@@ -253,7 +317,8 @@ impl Approver for SystemApprover {
 /// Args:
 ///  - `text`: Clean prompt text
 ///  - `timeout`: Maximum wait time for all asks together
-///  - `system`: Ask on the host desktop
+///  - `system`: Ask on the host desktop. `None` to ask only in the monitor
+///    TUI. The deny reason then names the `monitor` setting.
 ///  - `monitor`: Place of the monitor TUI dialog
 ///
 /// Returns:
@@ -262,19 +327,27 @@ impl Approver for SystemApprover {
 async fn decide(
     text: PromptText,
     timeout: Duration,
-    system: &SystemAsk,
-    monitor: &MonitorSlot,
+    system: Option<&SystemAsk>,
+    monitor: Option<&MonitorSlot>,
 ) -> Approval {
     let deadline = Instant::now() + timeout;
     let sandbox = text.sandbox.clone();
-    let why = match system(text.clone(), timeout).await {
-        Asked::Shown(approval) => {
-            tracing::debug!("grants: {sandbox}: the host desktop asked the user");
-            return approval;
-        }
-        Asked::Unavailable(why) => why,
+    // The deny reason when no monitor TUI runs, and the log note why the
+    // monitor TUI asks.
+    let (why, note) = match system {
+        None => (msg::MONITOR_NOT_OPEN.to_string(), String::new()),
+        Some(system) => match system(text.clone(), timeout).await {
+            Asked::Shown(approval) => {
+                tracing::debug!("grants: {sandbox}: the host desktop asked the user");
+                return approval;
+            }
+            Asked::Unavailable(why) => {
+                let note = format!("{why}; ");
+                (why, note)
+            }
+        },
     };
-    let Some(dialog) = monitor.get() else {
+    let Some(dialog) = monitor.and_then(MonitorSlot::get) else {
         return Decision::Deny(why).into();
     };
     // The monitor gets only the time that is left. With no time left, do
@@ -282,7 +355,7 @@ async fn decide(
     if Instant::now() >= deadline {
         return Decision::Deny(msg::TIMEOUT.into()).into();
     }
-    tracing::info!("grants: {sandbox}: {why}; asking in the monitor TUI");
+    tracing::info!("grants: {sandbox}: {note}asking in the monitor TUI");
     let decision = monitor::ask(&*dialog, &text, deadline).await;
     tracing::debug!("grants: {sandbox}: the monitor TUI asked the user");
     decision.into()
@@ -357,7 +430,7 @@ mod tests {
 
     /// Make a system ask that waits `delay` and then gives `asked`. Counts
     /// the calls in `calls`.
-    fn system_ask(asked: fn() -> Asked, delay: Duration, calls: Rc<Cell<u32>>) -> SystemAsk {
+    fn fake_ask(asked: fn() -> Asked, delay: Duration, calls: Rc<Cell<u32>>) -> SystemAsk {
         Rc::new(move |_, _| -> AskFuture {
             calls.set(calls.get() + 1);
             Box::pin(async move {
@@ -372,9 +445,9 @@ mod tests {
         Asked::Unavailable("no notification service".into())
     }
 
-    /// Text of a new rule request. Its details have a diff.
-    fn rule_change() -> PromptText {
-        PromptText::new(&GrantPrompt {
+    /// New rule request. Its details have a diff.
+    fn rule_change() -> GrantPrompt {
+        GrantPrompt {
             sandbox: "my-proj".into(),
             request: PromptRequest::RuleChange {
                 name: "npm".into(),
@@ -389,7 +462,19 @@ mod tests {
                 },
                 other: vec![],
             },
-        })
+        }
+    }
+
+    /// Ask for a rule change with the approver of `dialogs`.
+    async fn ask(
+        dialogs: ApprovalDialogs,
+        system: &SystemAsk,
+        monitor: Option<&MonitorSlot>,
+        timeout: Duration,
+    ) -> Approval {
+        build(dialogs, || system.clone(), monitor.cloned())
+            .approve(rule_change(), timeout)
+            .await
     }
 
     /// Test that the monitor TUI asks when the host desktop cannot show
@@ -401,9 +486,9 @@ mod tests {
     ///   4. Ask again, deny it in the dialog and check the user deny
     #[tokio::test]
     async fn unavailable_system_with_monitor_uses_monitor_answer() {
-        let system = system_ask(unavailable, Duration::ZERO, Rc::default());
+        let system = fake_ask(unavailable, Duration::ZERO, Rc::default());
         let (slot, mut requests) = monitor();
-        let text = rule_change();
+        let text = PromptText::new(&rule_change());
 
         let answer = async {
             let request = requests.recv().await.unwrap();
@@ -415,8 +500,10 @@ mod tests {
             request.reply.send(true).unwrap();
             shown
         };
-        let (approval, (title, body, details)) =
-            tokio::join!(decide(text.clone(), LONG, &system, &slot), answer);
+        let (approval, (title, body, details)) = tokio::join!(
+            ask(ApprovalDialogs::System, &system, Some(&slot), LONG),
+            answer
+        );
         assert_eq!(approval.decision, Decision::Allow);
         assert!(approval.running.is_none());
         assert_eq!(title, text.title);
@@ -434,28 +521,33 @@ mod tests {
             let request = requests.recv().await.unwrap();
             request.reply.send(false).unwrap();
         };
-        let (approval, ()) = tokio::join!(decide(text, LONG, &system, &slot), answer);
+        let (approval, ()) = tokio::join!(
+            ask(ApprovalDialogs::System, &system, Some(&slot), LONG),
+            answer
+        );
         assert_eq!(approval.decision, Decision::DeniedByUser);
     }
 
     /// Test that the request is denied with the reason of the host desktop
     /// when no monitor TUI runs or the TUI stopped.
-    ///   1. Ask with an unavailable system ask and an empty slot
-    ///   2. Check the deny with the system reason
-    ///   3. Ask again with the dialog of a stopped TUI
-    ///   4. Check the deny that tells that the TUI stopped
+    ///   1. Ask with an unavailable system ask and no monitor
+    ///   2. Ask again with an empty monitor slot
+    ///   3. Check the deny with the system reason for both
+    ///   4. Ask again with the dialog of a stopped TUI
+    ///   5. Check the deny that tells that the TUI stopped
     #[tokio::test]
     async fn unavailable_system_without_monitor_denies() {
-        let system = system_ask(unavailable, Duration::ZERO, Rc::default());
-        let approval = decide(rule_change(), LONG, &system, &MonitorSlot::default()).await;
-        assert_eq!(
-            approval.decision,
-            Decision::Deny("no notification service".into())
-        );
+        let system = fake_ask(unavailable, Duration::ZERO, Rc::default());
+        let reason = Decision::Deny("no notification service".into());
+        let approval = ask(ApprovalDialogs::System, &system, None, LONG).await;
+        assert_eq!(approval.decision, reason);
+        let empty = MonitorSlot::default();
+        let approval = ask(ApprovalDialogs::System, &system, Some(&empty), LONG).await;
+        assert_eq!(approval.decision, reason);
 
         let slot = MonitorSlot::default();
         slot.set(Rc::new(StoppedDialog));
-        let approval = decide(rule_change(), LONG, &system, &slot).await;
+        let approval = ask(ApprovalDialogs::System, &system, Some(&slot), LONG).await;
         assert_eq!(
             approval.decision,
             Decision::Deny(msg::MONITOR_STOPPED.into())
@@ -470,13 +562,13 @@ mod tests {
     #[tokio::test]
     async fn shown_system_does_not_use_monitor() {
         let calls = Rc::new(Cell::new(0));
-        let system = system_ask(
+        let system = fake_ask(
             || Asked::Shown(Decision::Deny(msg::TIMEOUT.into()).into()),
             Duration::ZERO,
             calls.clone(),
         );
         let (slot, mut requests) = monitor();
-        let approval = decide(rule_change(), LONG, &system, &slot).await;
+        let approval = ask(ApprovalDialogs::System, &system, Some(&slot), LONG).await;
         assert_eq!(approval.decision, Decision::Deny(msg::TIMEOUT.into()));
         assert_eq!(calls.get(), 1);
         assert!(requests.try_recv().is_err());
@@ -492,16 +584,64 @@ mod tests {
     ///   5. Check the timeout deny and that the dialog got no request
     #[tokio::test(start_paused = true)]
     async fn monitor_timeout_denies_and_closes_dialog() {
-        let system = system_ask(unavailable, Duration::ZERO, Rc::default());
+        let system = fake_ask(unavailable, Duration::ZERO, Rc::default());
         let (slot, mut requests) = monitor();
-        let approval = decide(rule_change(), SHORT, &system, &slot).await;
+        let approval = ask(ApprovalDialogs::System, &system, Some(&slot), SHORT).await;
         assert_eq!(approval.decision, Decision::Deny(msg::TIMEOUT.into()));
         let request = requests.try_recv().unwrap();
         assert!(request.reply.is_closed());
 
-        let slow = system_ask(unavailable, SHORT, Rc::default());
-        let approval = decide(rule_change(), SHORT, &slow, &slot).await;
+        let slow = fake_ask(unavailable, SHORT, Rc::default());
+        let approval = ask(ApprovalDialogs::System, &slow, Some(&slot), SHORT).await;
         assert_eq!(approval.decision, Decision::Deny(msg::TIMEOUT.into()));
+        assert!(requests.try_recv().is_err());
+    }
+
+    /// Test that the `monitor` setting skips the host desktop. The monitor
+    /// TUI asks if it runs. Else the request is denied with a reason that
+    /// names the setting.
+    ///   1. Ask in monitor mode with a monitor dialog and allow it there
+    ///   2. Check the allow
+    ///   3. Ask in monitor mode with an empty slot, and with no monitor
+    ///   4. Check the deny reason for both
+    ///   5. Check that the system ask was not called
+    #[tokio::test]
+    async fn monitor_setting_skips_system_ask() {
+        let calls = Rc::new(Cell::new(0));
+        let system = fake_ask(unavailable, Duration::ZERO, calls.clone());
+        let (slot, mut requests) = monitor();
+        let answer = async {
+            let request = requests.recv().await.unwrap();
+            request.reply.send(true).unwrap();
+        };
+        let (approval, ()) = tokio::join!(
+            ask(ApprovalDialogs::Monitor, &system, Some(&slot), LONG),
+            answer
+        );
+        assert_eq!(approval.decision, Decision::Allow);
+
+        let not_open = Decision::Deny(msg::MONITOR_NOT_OPEN.into());
+        let empty = MonitorSlot::default();
+        let approval = ask(ApprovalDialogs::Monitor, &system, Some(&empty), LONG).await;
+        assert_eq!(approval.decision, not_open);
+        let approval = ask(ApprovalDialogs::Monitor, &system, None, LONG).await;
+        assert_eq!(approval.decision, not_open);
+        assert_eq!(calls.get(), 0);
+    }
+
+    /// Test that the `none` setting denies all requests and shows nothing.
+    ///   1. Ask in none mode with a system ask and a monitor dialog
+    ///   2. Check the deny reason
+    ///   3. Check that the system ask was not called and that the dialog got
+    ///      no request
+    #[tokio::test]
+    async fn none_setting_denies_without_asking() {
+        let calls = Rc::new(Cell::new(0));
+        let system = fake_ask(unavailable, Duration::ZERO, calls.clone());
+        let (slot, mut requests) = monitor();
+        let approval = ask(ApprovalDialogs::None, &system, Some(&slot), LONG).await;
+        assert_eq!(approval.decision, Decision::Deny(msg::DIALOGS_OFF.into()));
+        assert_eq!(calls.get(), 0);
         assert!(requests.try_recv().is_err());
     }
 }

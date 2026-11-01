@@ -161,19 +161,6 @@ notification service. In the Linux window:
 - The mouse wheel, the arrow keys, Page Up, Page Down, Home and End
   scroll long text.
 
-Airlock asks for your approval in this order:
-
-1. The desktop notification. If the notification cannot show, a window
-   asks on Linux, and a system dialog asks on macOS.
-2. A dialog in the monitor TUI. Airlock uses it only if the host cannot
-   show the request and the sandbox runs with `airlock start --monitor`.
-   On Linux, the host cannot show the request when the notification
-   cannot show and the window cannot open. On macOS, the host cannot show
-   the request when the notification and the system dialog both fail.
-3. If nothing can show the request, airlock denies it.
-
-A late answer has no effect.
-
 After your approval, the change applies to new connections. Open
 connections do not change. Airlock writes the change to the project
 config file, or to the local project file if the rule is there. The file
@@ -188,6 +175,36 @@ different file.
 
 Deny rules, the `deny-always` policy, the hosts of network services and
 local addresses still block an on-demand rule and `hosts = ["*"]`.
+
+### Approval dialogs
+
+By default, airlock asks for your approval in this order:
+
+1. The desktop notification (see [Approval prompt](#approval-prompt)).
+   If the notification cannot show, a window asks on Linux, and a system
+   dialog asks on macOS.
+2. A dialog in the monitor TUI. Airlock uses it only if the host cannot
+   show the request and the sandbox runs with `airlock start --monitor`.
+   On Linux, the host cannot show the request when the notification
+   cannot show and the window cannot open. On macOS, the host cannot show
+   the request when the notification and the system dialog both fail.
+3. If nothing can show the request, airlock denies it.
+
+A late answer has no effect.
+
+The `approvals.dialogs` key in your user settings
+(`~/.airlock/settings.toml`) sets where airlock asks:
+
+```toml
+[approvals]
+dialogs = "system"
+```
+
+- `"system"` (default): the order above.
+- `"monitor"`: only the monitor TUI. Airlock does not show a desktop
+  notification, the Linux window or a system dialog. If the monitor TUI
+  is not open, airlock denies the request.
+- `"none"`: no dialogs. Airlock denies all requests.
 
 ### Passthrough
 

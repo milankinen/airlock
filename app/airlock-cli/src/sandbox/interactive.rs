@@ -3,12 +3,15 @@
 //! Runs the sandbox of `airlock start` on the user's terminal, with raw
 //! terminal passthrough or the monitor TUI.
 
+use std::rc::Rc;
+
 use tracing::{error, info};
 
 use super::Interrupted;
 use super::boot::{BootOptions, BootSpec, boot, guest_env};
 use super::io::drive;
 use super::vm::{ProcessSpec, Stopped, Vm};
+use crate::approval::Approver;
 use crate::cli::{self, LogLevel};
 use crate::network::{self, Network};
 use crate::oci::{self, OciImage};
@@ -32,6 +35,7 @@ use crate::{daemon, masking, mcp, messages};
 ///  - `image`: The container image
 ///  - `argv`: Command of the main process
 ///  - `runtime`: Terminal mode: raw passthrough or the monitor TUI
+///  - `approver`: Asks the user to approve requests from the sandbox
 ///  - `log_level`: Guest log level
 ///
 /// Returns:
@@ -44,6 +48,7 @@ pub async fn run_interactive(
     image: &OciImage,
     argv: Vec<String>,
     mut runtime: HostRuntime,
+    approver: Rc<dyn Approver>,
     log_level: LogLevel,
 ) -> anyhow::Result<i32> {
     let tls_client = network::native_tls_client();
@@ -63,10 +68,7 @@ pub async fn run_interactive(
         // The project dir is shared (see `project_share` below).
         true,
     )?
-    .with_grants(network::GrantContext::for_project(
-        &project,
-        runtime.approval_dialog(),
-    ));
+    .with_grants(network::GrantContext::for_project(&project, approver));
     let env = guest_env(&project, image, browser.is_some());
     let daemons = daemon::build_specs(&project, &env)?;
     let masks = masking::build_specs(&project)?;

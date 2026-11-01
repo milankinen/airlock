@@ -137,6 +137,13 @@ async fn run(
     // The terminal runtime. Bad `[monitor.keys]` values fail here.
     let runtime =
         HostRuntime::new(args.monitor, &context.settings).map_err(|e| start::Exit::error(2, e))?;
+    // Asks the user to approve requests from the sandbox. The user settings
+    // select where it asks.
+    let approver = crate::approval::for_settings(
+        context.settings.approvals.dialogs,
+        &context.data,
+        runtime.approval_dialog(),
+    );
 
     // A wizard config can name a template for the new sandbox.
     let template = config
@@ -184,6 +191,7 @@ async fn run(
         extra_args,
         &args,
         runtime,
+        approver,
     ))
     .await
 }

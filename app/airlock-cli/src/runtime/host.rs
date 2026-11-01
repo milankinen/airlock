@@ -45,11 +45,14 @@ impl HostRuntime {
     }
 
     /// Get the place of the approval dialog of the monitor TUI. It holds
-    /// the dialog while the TUI runs. With the raw terminal it stays empty.
-    pub fn approval_dialog(&self) -> MonitorSlot {
+    /// the dialog while the TUI runs.
+    ///
+    /// Returns:
+    ///   The place, or `None` for the raw terminal.
+    pub fn approval_dialog(&self) -> Option<MonitorSlot> {
         match self {
-            Self::Raw(_) => MonitorSlot::default(),
-            Self::Monitor(m) => m.approval_dialog(),
+            Self::Raw(_) => None,
+            Self::Monitor(m) => Some(m.approval_dialog()),
         }
     }
 }
@@ -146,6 +149,7 @@ mod tests {
             },
             security: crate::settings::SecuritySettings::default(),
             packs: crate::settings::PackSettings::default(),
+            approvals: crate::settings::ApprovalSettings::default(),
         };
         let Err(e) = HostRuntime::new(true, &settings) else {
             panic!("bad keys must be rejected");

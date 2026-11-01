@@ -1417,6 +1417,14 @@ pub mod grants {
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub const DIALOG_ARG: &str = "__approval-dialog";
 
+    /// Deny reason: the user settings turn off all approval dialogs.
+    pub const DIALOGS_OFF: &str =
+        "approval dialogs are off in the user settings (approvals.dialogs = \"none\")";
+    /// Deny reason: the user settings allow only the monitor TUI, and it is
+    /// not open.
+    pub const MONITOR_NOT_OPEN: &str = "the monitor is not open, and the user settings allow \
+         only monitor dialogs (approvals.dialogs = \"monitor\")";
+
     /// Deny reason: the monitor TUI stopped before the answer.
     pub const MONITOR_STOPPED: &str = "the monitor TUI stopped before an answer";
 
