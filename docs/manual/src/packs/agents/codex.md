@@ -16,26 +16,6 @@ airlock start --monitor -- codex --yolo
 |-------|---------|----------------------------------------------------|
 | `acp` | `false` | Install the ACP adapter as the `codex-acp` command. See [editor integration](../../tips/editor-acp.md). |
 
-## Airlock tools
-
-The `codex@2` pack connects Codex to the `airlock` MCP server at
-`http://admin.airlock/mcp`. Codex can then use the tools for
-[on-demand rules and temporary network access](../../configuration/network.md#on-demand-rules).
-The pack also gives the agent the tool instructions at the start of each
-session. Hooks tell the agent when the network policy blocked a connection
-during a tool call.
-
-Version 1 of the pack has no airlock tools.
-
-Codex runs shell commands in its own sandbox. That sandbox has no network
-unless you start Codex with `--yolo`. Without `--yolo`, airlock sees no
-denied connections.
-
-The pack writes `/etc/codex/config.toml` and `/etc/codex/hooks.json`. If
-these files exist without the airlock mark, the pack keeps them and logs a
-warning. The pack does not change `~/.codex`. The user config overrides the
-system config.
-
 ## Authentication
 
 ### Login in the application
@@ -63,3 +43,9 @@ airlock secrets add OPENAI_API_KEY
 
 Codex then uses it automatically. The real value stays on the host. Codex
 gets only a surrogate.
+
+## Airlock tools
+
+Since version 2, the pack configures Codex to use the `airlock` MCP
+server for advanced interactive sandbox control. See
+[Temporary network grants](../../technical/networking.md#temporary-network-grants).

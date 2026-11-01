@@ -76,143 +76,6 @@ enabled = false
 allow = ["*"]
 ```
 
-### On-demand rules
-
-An on-demand rule does not apply to normal sandbox traffic. An agent in
-the sandbox can use it for one command. You approve each use on the host.
-
-```toml
-[network.rules.npm-publish]
-enabled = "on-demand"
-description = "Publish packages to the npm registry"
-allow = ["registry.npmjs.org"]
-deny = ["*.internal.example.com"]
-```
-
-- `enabled`: `true`, `false` or `"on-demand"`. The default is `true`.
-- `description`: optional text that tells the agent the purpose of the
-  rule.
-- `allow` and `deny`: the same patterns as in other rules.
-
-The agent uses the tools of the `airlock` MCP server at
-`http://admin.airlock/mcp`. All tools are off by default. Enable them
-with `network.rule_editing` and `network.grants.enabled`:
-
-```toml
-[network]
-rule_editing = "on-demand"
-
-[network.grants]
-enabled = true
-```
-
-The tools are:
-
-- `show_rules` lists the rules that the agent can see.
-- `execute` runs one command with an on-demand rule, or with a list of
-  hosts. The rule or the hosts apply only to the connections of that
-  command. The access ends when the command ends. `hosts = ["*"]` allows
-  all public hosts. `execute` with hosts needs `network.grants.enabled =
-  true`. `execute` with a rule needs a `network.rule_editing` value other
-  than `"none"`.
-  The command gets the sandbox environment. Airlock also sets
-  `SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`,
-  `NODE_EXTRA_CA_CERTS`, `PIP_CERT`, `DENO_CERT`,
-  `GIT_SSL_CAINFO`, `AWS_CA_BUNDLE`, `CARGO_HTTP_CAINFO`,
-  `HEX_CACERTS_PATH`, `NIX_SSL_CERT_FILE` and `npm_config_cafile` to the
-  system CA bundle of the image, and `UV_NATIVE_TLS=1`. The sandbox
-  environment overrides these values.
-- `upsert_rule` adds or changes a rule. The agent gives only the values to
-  change: `enabled`, `description`, `allow` or `deny`. A new rule is
-  on demand by default.
-
-The MCP server offers only the tools of the features that you enable.
-The `claude@2`, `codex@2` and `copilot@2` packs give the agent the
-instructions for these tools at the start of each session.
-
-`network.rule_editing` sets the rules that the agent can see and change:
-
-- `"none"` (default): no rules. The MCP server does not offer `show_rules`
-  and `upsert_rule`. Airlock refuses `execute` with a rule. `execute` with
-  hosts still works if `network.grants.enabled = true`.
-- `"on-demand"`: only on-demand rules. A rule must stay on demand.
-- `"all"`: all rules. The agent can set each `enabled` value.
-
-Airlock refuses other changes at once and does not ask you.
-
-#### Approval prompt
-
-Airlock shows each request as a desktop notification with the buttons
-Allow and Deny. On macOS, a small notifier app shows the notification.
-On Linux, airlock sends it through the notification service of the
-desktop. If you do not answer in time, airlock denies the request.
-
-The notification also has the button More details. On macOS, a click on
-the notification does the same. The button opens a window that shows the
-whole request: the sandbox, the full command, the working directory, the
-extra environment, the hosts or the rule, and the time limit. For a rule
-change, the window shows the lines that change in color.
-
-On Linux, the window needs an X server. A desktop with Wayland needs
-XWayland. With no X server, the notification has no More details button.
-If the window cannot open after you select More details, the notification
-shows again without the button. The window also asks you when the
-notification cannot show, for example when the desktop has no
-notification service. In the Linux window:
-
-- The Deny button is the default. No key selects Allow.
-- Escape and the close button of the window deny the request.
-- A click on a button has no effect in the first 0.6 seconds after the
-  window shows. This stops a click that you meant for another window from
-  allowing the request.
-- The mouse wheel, the arrow keys, Page Up, Page Down, Home and End
-  scroll long text.
-
-After your approval, the change applies to new connections. Open
-connections do not change. Airlock writes the change to the project
-config file, or to the local project file if the rule is there. The file
-can be TOML, JSON or YAML. Only the changed values change. A list that
-does not fit in 80 characters gets one item on each line. The other keys
-of the rule, for example `inject` and `passthrough`, and the other
-content of the file, with its comments, stay the same. If
-the rule comes from a different config file, the change goes to the
-project file as an override. Lists from different files add together.
-Thus the new `allow` and `deny` lists must keep the patterns of the
-different file.
-
-Deny rules, the `deny-always` policy, the hosts of network services and
-local addresses still block an on-demand rule and `hosts = ["*"]`.
-
-### Approval dialogs
-
-By default, airlock asks for your approval in this order:
-
-1. The desktop notification (see [Approval prompt](#approval-prompt)).
-   If the notification cannot show, a window asks on Linux, and a system
-   dialog asks on macOS.
-2. A dialog in the monitor TUI. Airlock uses it only if the host cannot
-   show the request and the sandbox runs with `airlock start --monitor`.
-   On Linux, the host cannot show the request when the notification
-   cannot show and the window cannot open. On macOS, the host cannot show
-   the request when the notification and the system dialog both fail.
-3. If nothing can show the request, airlock denies it.
-
-A late answer has no effect.
-
-The `approvals.dialogs` key in your user settings
-(`~/.airlock/settings.toml`) sets where airlock asks:
-
-```toml
-[approvals]
-dialogs = "system"
-```
-
-- `"system"` (default): the order above.
-- `"monitor"`: only the monitor TUI. Airlock does not show a desktop
-  notification, the Linux window or a system dialog. If the monitor TUI
-  is not open, airlock denies the request.
-- `"none"`: no dialogs. Airlock denies all requests.
-
 ### Passthrough
 
 By default, airlock peeks at the first bytes of every allowed connection to
@@ -275,6 +138,59 @@ as it would on the host. airlock inserts the real token at the host boundary.
 - airlock unmasks request headers before [middleware](#middleware) runs
   and masks the response after it, so scripts see real values. The
   monitor shows surrogates.
+
+## Temporary network grants
+
+An agent in the sandbox can ask for network access to a list of hosts
+for one command. Enable this to allow temporary network access:
+
+```toml
+[network.grants]
+enabled = true
+```
+
+Airlock connects to the agent harness and gives the agent the necessary
+instructions. The `claude@2`, `codex@2` and `copilot@2` packs do this.
+
+You must approve each network access on the host. By default, airlock
+asks with a system notification. You can change this in the
+[user settings](../configuration.md#user-settings).
+
+> [!WARNING]
+> A grant applies only to one command. But while the command runs, a
+> root process in the sandbox can also use the open network. Deny rules
+> and the other host limits still apply.
+
+For the agent tools, the approval flow and all options, see
+[Temporary network grants](../technical/networking.md#temporary-network-grants).
+
+### Rule editing
+
+In addition to `true` and `false`, a rule's `enabled` accepts
+`"on-demand"`. An on-demand rule does not apply to normal sandbox
+traffic. The agent can use the rule for one command. With
+`network.rule_editing`, the agent can also add and change rules:
+
+```toml
+[network]
+rule_editing = "on-demand"
+
+[network.rules.npm-publish]
+enabled = "on-demand"
+description = "Publish packages to the npm registry"
+allow = ["registry.npmjs.org"]
+```
+
+- `"none"` (default): the agent cannot see or use rules.
+- `"on-demand"`: the agent can use, add and change on-demand rules.
+- `"all"`: the agent can change all rules.
+
+You must approve each rule change on the host. Airlock writes the
+approved change to the project config file.
+
+Use on-demand rules to automate common project tool installs, for
+example package registries. The agent harness instructions also tell the
+agent how to update these rules.
 
 ## Network services
 

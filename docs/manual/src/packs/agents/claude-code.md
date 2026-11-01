@@ -16,17 +16,6 @@ airlock start --monitor -- claude --dangerously-skip-permissions
 |-------|---------|-----------------------------------------------------------|
 | `acp` | `false` | Install the ACP adapter as the `claude-agent-acp` command. See [editor integration](../../tips/editor-acp.md). |
 
-## Airlock tools
-
-The `claude@2` pack connects Claude Code to the `airlock` MCP server at
-`http://admin.airlock/mcp`. Claude Code can then use the tools for
-[on-demand rules and temporary network access](../../configuration/network.md#on-demand-rules).
-The pack also gives the agent the tool instructions at the start of each
-session. Hooks tell the agent when the network policy blocked a connection
-during a tool call.
-
-Version 1 of the pack has no airlock tools.
-
 ## Authentication
 
 ### Login in the application
@@ -55,6 +44,12 @@ airlock secrets add CLAUDE_CODE_OAUTH_TOKEN
 
 Claude Code then uses it automatically. The real value stays on the host.
 Claude Code gets only a surrogate.
+
+## Airlock tools
+
+Since version 2, the pack configures Claude Code to use the `airlock` MCP
+server for advanced interactive sandbox control. See
+[Temporary network grants](../../technical/networking.md#temporary-network-grants).
 
 ## Clipboard
 

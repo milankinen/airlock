@@ -1,222 +1,146 @@
 # Networking
 
-All outbound network access from the VM goes through a host-side
-proxy. There is no route from the VM to the outside world except via
-two vsock RPC connections — the kernel is built without a real
-egress NIC. A userspace TCP/IP stack (smoltcp) on an in-VM TUN device
-(`airlock0`) intercepts every outbound TCP connection. The TUN is
-wired as the VM's default route, so every packet that isn't
-loopback-local reaches the proxy regardless of which netns it
-originated in (including Docker containers).
+The VM has no network card that connects to the outside. All network
+access goes through a proxy on the host. In the VM, a virtual network
+device is the default route. A small TCP/IP stack in the supervisor
+receives all outbound TCP connections from this device. This includes
+the connections from containers in the sandbox, for example Docker.
 
-The host ↔ guest RPC is split across two vsock ports so bulk network
-traffic can never head-of-line-block interactive traffic:
-
-- `SUPERVISOR_PORT` — supervisor RPC, PTY, logs, stats, daemon
-  control. Everything *except* network byte relays.
-- `NETWORK_PORT` — `NetworkProxy.connect` and its per-connection
-  byte sinks. Independent socket buffers, independent `RpcSystem`,
-  independent flow control. A slow reader on one never stalls the
-  other.
+The supervisor sends each connection to the host CLI over vsock. The
+CLI applies the policy, connects to the real server and relays the
+bytes:
 
 ```
-container socket()/connect(host, port)
-  → virtual DNS maps host → synthetic IP in 10.2.0.0/16
-  → default route sends packet to airlock0 (TUN device)
-  → smoltcp parses the SYN, creates a listener for (dst_ip, dst_port)
-  → TCP handshake completes inside smoltcp
-  → DNS reverse-lookup maps synthetic IP back to hostname
-  → supervisor.NetworkProxy.connect(host:port) over vsock
-  → CLI on host resolves host, dials real server (+ optional TLS MITM)
-  → bidirectional byte relay (smoltcp socket ↔ RPC sinks)
+process in sandbox connects to host:port
+  → virtual DNS gives a synthetic IP for the host name
+  → the packets go to the virtual network device
+  → the supervisor accepts the TCP connection
+  → the supervisor finds the host name for the synthetic IP
+  → the host CLI checks the policy and connects to the real server
+  → the CLI relays the bytes in both directions
 ```
 
-The TUN-based approach replaced an earlier iptables `REDIRECT` design.
-The fatal flaw of iptables REDIRECT is that the OUTPUT chain only
-fires for *locally originated* traffic. Packets forwarded from a
-container netns traverse PREROUTING, not OUTPUT, so they never
-matched the rule and never reached the proxy. A TUN at the default route
-catches everything — no chain-matching subtleties.
+Network traffic and the other host-guest traffic (terminal, logs,
+control) use two different vsock channels. Thus a large download does
+not slow down the terminal.
 
 ## Flow control
 
 Each connection has its own flow control in both directions. A slow
-reader stops only its own connection. Other connections on the same
-vsock continue.
+reader stops only its own connection. Other connections continue.
 
-- Guest to host: when the relay is full, the smoltcp socket keeps the
-  bytes in its receive buffer and closes the TCP window. The relay
-  wakes the smoltcp poll loop each time it forwards a chunk, so the
-  window opens again immediately.
-- Host to guest: the host sends a chunk and then waits for space in
-  the Cap'n Proto stream window (64 KiB per connection). A guest that
-  does not read stops the host from reading the remote server.
-
-When one side of a connection closes, the proxy shuts down both sides
-in parallel. During the shutdown, the proxy reads and discards the
-remaining bytes, so a blocked peer can complete. A 30-second timeout
-limits the shutdown.
-
-If the host side fails during an upload, the guest discards the rest
-of the upload. The guest still receives the data that the server sent
-before the failure, and then a normal TCP close.
+When one side of a connection closes, the proxy closes the other side
+too. A time limit stops a close that does not complete.
 
 ## Virtual DNS
 
-The container's `/etc/resolv.conf` points at `nameserver 10.0.0.1`,
-which is a minimal UDP DNS server the supervisor runs inside the VM
-on loopback. The server also listens on `127.0.0.1:53`. The C libraries
-use this address when `/etc/resolv.conf` is missing or cannot be read.
-Instead of forwarding queries to the host, the supervisor
-allocates a **synthetic IP** from `10.2.0.0/16` for each hostname and
-caches the bidirectional mapping. When all IPs of the range are in use,
-the next new hostname gets the oldest IP. The DNS answers have a TTL of
-5 minutes, so the guest has most likely forgotten the old hostname.
+The supervisor runs a DNS server in the VM. It does not send queries to
+the host. Instead, it gives each host name a synthetic IP address from a
+private range and keeps the map between the two.
 
-This matters because the proxy sees an IP, not a name. When the
-container `connect()`s to the synthetic IP, the packet routes via the
-TUN. smoltcp snoops the SYN and creates a listener for that specific
-`(dst_ip, dst_port)`. On accept, the proxy reverse-looks up the
-synthetic IP in the DNS cache and has the real hostname for policy
-evaluation and TLS SNI. This works uniformly for HTTP, HTTPS, and raw
-TCP — there is no protocol-specific logic.
+The proxy sees only the IP address of a connection. With the map, it
+finds the host name again. The host name is necessary for the policy and
+for TLS. This works for all protocols on TCP. The CLI resolves the real
+address of the host name on the host. The synthetic addresses never
+leave the VM.
 
-Real DNS resolution happens on the host: the synthetic IP never
-escapes the VM. The CLI gets the hostname, calls the system resolver,
-and connects to whatever that returns.
-
-The supervisor reserves the `airlock` domain for its own services, for
-example `admin.airlock` and the [MCP servers](../configuration/mcp.md)
-at `mcp.airlock`. The MCP servers of an editor session
-([`airlock acp`](../tips/editor-acp.md#editor-mcp-servers)) use the
-run-time name `acp.mcp.airlock`. It resolves all `*.airlock` names to the guest
-loopback address and serves them itself. These names do not get a
-synthetic IP and never leave the VM.
+The supervisor keeps the `airlock` domain for its own services, for
+example `admin.airlock` and the [MCP servers](./mcp.md) at
+`mcp.airlock`. These names point to the VM loopback, and the supervisor
+serves them itself. They never leave the VM.
 
 ## Policy evaluation
 
-Once the proxy has `(host, port)` it asks the CLI whether to allow the
-connection. The policy model is:
+For each connection, the CLI checks the host name and the port against
+the [network policy](../configuration/network.md#policy):
 
-- `allow-always`: skip rules, allow everything
-- `deny-always`: skip rules, deny everything — including guest → host
-  port forwards and socket forwarding (host → guest reverse forwards
-  are unaffected)
-- `allow-by-default`: allow unless a rule explicitly denies
-- `deny-by-default` (default): deny unless a rule explicitly allows
+- `allow-always` allows all connections. `deny-always` denies all
+  connections, also port forwards and socket forwards from the sandbox
+  to the host.
+- `allow-by-default` and `deny-by-default` use the rules:
+  1. If a `deny` pattern matches, the CLI blocks the connection.
+  2. If an `allow` pattern matches, the CLI allows the connection.
+  3. Else the policy default applies.
 
-When a rule-based policy is in effect, the decision proceeds:
+The hosts of an enabled [network service](./services.md) are allowed
+under all policies except `deny-always`. If the service is not
+available, the CLI denies its hosts. Rules from all config files and
+packs add together.
 
-1. If any `deny` pattern matches → **block** immediately (deny wins).
-2. If any `allow` pattern matches → **allow**.
-3. Otherwise → follow `policy`.
+## Temporary network grants
 
-A host of an enabled [network service](./services.md) is allowed after
-step 1 under every policy except `deny-always`. If the service is not
-available, its hosts are denied under every policy.
+A grant gives one command network access that the normal policy does not
+allow. The grant has a list of hosts or an
+[on-demand rule](../configuration/network.md#rule-editing). The agent
+asks for a grant through the [`airlock` MCP server](./mcp.md). The host
+checks the request against the config, and you approve it (see
+[Approval dialogs](./approvals.md)).
 
-Rules are additive across config files and packs. `enabled = false`
-disables a rule (including one inherited from a pack).
+The grant applies only to the connections of that command:
 
-Pattern formats (same in `allow` and `deny`):
+- The command runs in its own network namespace. Its connections have a
+  source address that is unique for the grant.
+- For connections from this address, the policy uses the grant hosts or
+  the rule in addition to the normal rules.
+- Deny rules, the `deny-always` policy, the hosts of network services and
+  local addresses still block the connection.
+- When the command ends, airlock removes the grant and closes its open
+  connections.
 
-- `host` — exact hostname, any port
-- `host:port` — exact hostname and port
-- `host:*` — exact hostname, any port (same as `host`)
-- `*:port` — any hostname on a specific port
-- `*.suffix` — subdomain wildcard
-- `*` — match all (use only for development)
-
-The port must be a number or `*`. airlock rejects anything else (`:8O80`
-with a letter O, `:https`, a trailing space) when it loads the config, so
-a typo can never silently widen a rule to every port.
+An approved rule change applies to new connections. Airlock writes it to
+the project config file and keeps the other content of the file, with
+its comments. If the rule comes from a different config file, the change
+goes to the project file as an override.
 
 ## TLS interception
 
-airlock generates a self-signed CA keypair per project and stores it
-in `ca.json` in the sandbox directory (see [Project layout](./project-layout.md#ca-keypair)).
-The `boot` RPC passes the CA certificate PEM
-to the guest, and guest init injects it into the rootfs — see
-[Mounts / CA certificate injection](./mounts.md#ca-certificate-injection).
+Each project has its own CA. The guest adds the CA certificate to the
+trust store of the sandbox (see
+[CA certificate injection](./mounts.md#ca-certificate-injection)).
 
-All TLS logic runs **in the CLI**, not in the supervisor. The
-in-VM proxy is a pure TCP relay: DNS reverse lookup + raw byte
-forwarding over vsock. The CLI then:
+The supervisor relays only raw TCP. All TLS work occurs in the host CLI:
 
-1. Incrementally reads the first bytes of the stream and uses
-   `tls-parser` to validate the TLS record header. First byte `0x16`
-   is not sufficient — any non-TLS stream starting with that byte
-   would false-positive.
-2. If the CLI recognizes a full ClientHello, it terminates TLS with a
-   freshly minted certificate (signed by the project CA, SNI-matched) and
-   opens a second TLS connection to the real server. Crucially, the
-   CLI negotiates **the same ALPN** the container negotiated — so an
-   HTTP/2 client talks to an HTTP/2 server, not an h1/h2 mismatch.
-3. If the stream is not TLS, the CLI bridges it as raw TCP.
+1. The CLI reads the first bytes of the connection and checks for a TLS
+   handshake.
+2. For TLS, the CLI ends the TLS session with a certificate from the
+   project CA. It opens a new TLS connection to the real server with the
+   same protocol (ALPN) as the client. Thus an HTTP/2 client talks to an
+   HTTP/2 server.
+3. Other traffic goes through as raw TCP.
 
-This split (TCP relay in the guest, TLS in the host CLI) exists
-because an earlier design did MITM inside the supervisor: the
-container would negotiate h1 with the supervisor while the CLI
-independently negotiated h2 with the real server, and the raw byte
-relay between them would hand h1 bytes to an h2 server that rejected
-them. Moving all TLS to the CLI means one endpoint owns the whole
-protocol stack and ALPN can be proxied faithfully.
+Because one process sees both TLS sessions, the protocol of the client
+and of the server always agree.
 
 ## Lua middleware
 
-Middleware is a top-level `[network.middleware]` section, separate
-from rules. Each entry has its own `target` patterns and a `script`.
-Middleware applies to any allowed connection whose `host:port`
-matches — regardless of which rule allowed it — so the same
-middleware can cover traffic from multiple rules without duplication.
-
-airlock compiles scripts to bytecode at startup (zero per-request
-compilation overhead) and runs them per HTTP request/response. See
-[Network scripting](../advanced/network-scripting.md) for the
-scripting API.
+[Middleware](../configuration/network.md#middleware) scripts run for
+each HTTP request and response of an allowed connection that matches
+their targets. This does not depend on the rule that allowed the
+connection. The CLI compiles the scripts at start. See
+[Network scripting](../advanced/network-scripting.md).
 
 ## Secret injection
 
-At startup the CLI resolves `[env]` once and generates a same-length
-random surrogate for each masked entry. The guest gets the surrogate,
-the host keeps the real value. Each injecting rule's allow patterns
-carry its secrets, resolved per connection like middleware.
+The guest gets a surrogate for each masked secret. The host keeps the
+real value. The surrogate has the same length as the real value.
 
-Per HTTP request the proxy does a byte-level search/replace on header
-values: surrogate → real before the Lua chain, real → surrogate after
-it. The proxy replaces longer values first so nested secrets cannot
-leak. It does not change header names, the URI or request bodies.
-
-The response body goes through the same real → surrogate replacement
-while it streams. The proxy holds back the last bytes of each chunk
-(one byte less than the longest real value), so it also finds a value
-that the server splits across two chunks. A surrogate has the same
-length as its real value, so `Content-Length` stays correct. The proxy
-sends `Accept-Encoding: identity` upstream. It answers a compressed
-response body with HTTP 502, because it cannot search compressed data.
+For hosts that a rule allows to get the secret, the proxy changes the
+surrogate to the real value in the request headers. In the response
+headers and body, it changes the real value back to the surrogate. The
+proxy also finds a value that the server splits across two chunks. It
+asks the server for uncompressed answers and refuses compressed answers,
+because it cannot search compressed data.
 
 ## Localhost port forwarding
 
-Ports declared as "host ports" in the config get a dedicated
-`TcpListener` bound by the supervisor on `127.0.0.1:<port>` before any
-user process or daemon starts — so the supervisor always wins the
-bind race. On accept, the listener opens a `NetworkProxy.connect`
-call targeted at `127.0.0.1:<port>` and relays bytes both ways. No
-iptables rules, no `SO_ORIGINAL_DST`, no shared proxy port: each
-listener already knows its port.
-
-Other localhost traffic is unaffected — it stays on `lo` and reaches
-whatever is listening on the VM's loopback.
+For each host port in the config, the supervisor listens on that port on
+the VM loopback before user processes start. It sends each connection to
+the host port through the proxy. Other loopback traffic stays in the VM.
 
 ## Unix socket forwarding
 
-airlock forwards host Unix sockets into the container. When a process in
-the container connects to the guest socket path, the supervisor sends
-the guest path to the CLI via `NetworkProxy.connect(socket=…)`. The
-CLI maps guest path → host path using a pre-built `socket_map` (with
-tilde expansion applied at setup time) and opens a connection to the
-host socket.
-
-`~` in guest paths expands to the container home directory (read
-from the image's `/etc/passwd`). `~` in host paths expands to the
-host user's home directory.
+When a process in the sandbox connects to a forwarded socket path, the
+supervisor sends the path to the CLI. The CLI finds the host socket for
+the path and connects to it. `~` in the sandbox path is the home
+directory of the container user. `~` in the host path is the home
+directory of the host user.

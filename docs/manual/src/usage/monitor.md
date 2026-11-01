@@ -101,51 +101,6 @@ Total and used bytes (reported the way `free` and `htop` do:
 | `q`             | On Monitor tab: switch back to Sandbox tab      |
 | `Ctrl+D`        | On Monitor tab: ask the sandbox process to exit |
 
-## Approval dialog
-
-Some sandbox requests need your approval, for example temporary network
-access or a rule change. Airlock usually asks with a system notification
-or dialog. When those are not available, the monitor shows the request
-as a dialog in the middle of the screen, on top of the current tab.
-The `approvals.dialogs` user setting can make the monitor the only place
-that asks, or turn off all dialogs. See
-[Approval dialogs](../configuration/network.md#approval-dialogs).
-
-The dialog shows the same title and text as the system notification.
-It has three buttons: **accept**, **deny** and **show more**. The first
-letter of each button is its key, and it has a color. Click the title or
-the text, or press `s`, to see all details of the request. The details
-are the same as in the details window of the system notification. Then
-the last button changes to **show less**.
-
-The dialog takes all input. While it shows, no key, paste or mouse
-event goes to the sandbox or to the tabs. When more requests come, the
-dialog shows them one at a time, in the order they came.
-
-| Key                              | Action                                 |
-|----------------------------------|----------------------------------------|
-| `a`                              | Accept the request                     |
-| `d`                              | Deny the request                       |
-| `s`                              | Show or hide all details               |
-| `Esc`                            | Hide the details. It does not answer.  |
-| `↑` / `↓`, `k` / `j`             | Scroll up or down                      |
-| `←` / `→`, `h` / `l`             | Scroll left or right                   |
-| `PgUp` / `PgDn`                  | Scroll a page up or down               |
-| `Home` / `End`                   | Go to the top left, or to the end      |
-
-You can also click a button. The mouse wheel scrolls up and down. A
-horizontal wheel, or `Shift` and the wheel, scroll left and right.
-
-`Enter` does nothing, so that a key that you aim at the sandbox does not
-accept a request. For the same reason, the dialog ignores answers for a
-short time after it opens. After you answer a request, the next request
-ignores answers for one second. The dialog also ignores `a` and `d` when
-they come fast after the previous key, for example when you hold a key.
-
-If you do not answer in time, airlock denies the request and the dialog
-closes. If the terminal is too small to show the request, the dialog
-shows a note and only the deny button.
-
 ## Personal settings
 
 Buffer caps, terminal scrollback, and key bindings are personal

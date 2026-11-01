@@ -15,23 +15,6 @@ airlock start --monitor -- copilot
 
 The pack has no args.
 
-## Airlock tools
-
-The `copilot@2` pack connects Copilot to the `airlock` MCP server at
-`http://admin.airlock/mcp`. Copilot can then use the tools for
-[on-demand rules and temporary network access](../../configuration/network.md#on-demand-rules).
-The pack also gives the agent the tool instructions at the start of each
-session. Hooks tell the agent when the network policy blocked a connection
-during a tool call.
-
-Version 1 of the pack has no airlock tools.
-
-The tool names start with `airlock-`, for example `airlock-execute`.
-
-The pack replaces `/usr/local/bin/copilot` with a wrapper. The wrapper adds
-the options `--additional-mcp-config` and `--allow-tool=airlock`. The hooks
-are in `/etc/github-copilot/policy.d/50-airlock.json`.
-
 ## Authentication
 
 ### GitHub token
@@ -56,3 +39,9 @@ If the token is set, the sandbox sees only a
 token types, see the [Copilot CLI authentication docs][copilot-auth].
 
 [copilot-auth]: https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/authenticate-copilot-cli#authenticating-with-environment-variables
+
+## Airlock tools
+
+Since version 2, the pack configures Copilot to use the `airlock` MCP
+server for advanced interactive sandbox control. See
+[Temporary network grants](../../technical/networking.md#temporary-network-grants).

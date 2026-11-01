@@ -35,9 +35,7 @@ changed pack, you can also select "Reinstall on top" or "Keep old".
 
 Pass `--yes` (`-y`) to select the default answer for all questions, for
 example in scripts. Without a terminal and without `--yes`, airlock
-cannot ask and stops with exit code 2. If you abort a question with
-`Abort`, Esc or Ctrl+C, airlock stops with exit code 130. Ctrl+C during
-the image download also gives exit code 130.
+cannot ask and stops with exit code 2.
 
 > [!IMPORTANT]
 > When the configuration changed since the last start, `airlock start`

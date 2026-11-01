@@ -42,7 +42,7 @@ available:
 | `security.insecure_mounts` | Allow mounts that expose the home directory     | [Mounts](./configuration/mounts.md#mounts-that-expose-the-home-directory) |
 | `vault.storage`            | Storage backend of the secret vault             | [Secrets management](./secrets.md#choosing-a-storage-backend) |
 | `[monitor]`                | Monitor buffers and key bindings                | [Monitor dashboard](./usage/monitor.md#personal-settings) |
-| `approvals.dialogs`        | Where airlock asks for your approval: `"system"` (default), `"monitor"` or `"none"` | [Approval dialogs](./configuration/network.md#approval-dialogs) |
+| `approvals.dialogs`        | Where airlock asks for your approval: `"system"` (default), `"monitor"` or `"none"` | [Approval dialogs](./technical/approvals.md#the-approvalsdialogs-setting) |
 | `packs.dirs`               | User pack directories. `~` is the home directory. Default `["~/.airlock/packs"]` | [Pack sources](./packs.md#pack-sources) |
 | `packs.defaults`           | Packs that the setup wizard selects at the start, for example `["claude", "~my-tools"]` | [Pack sources](./packs.md#pack-sources) |
 
