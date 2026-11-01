@@ -1,9 +1,14 @@
 -- Claude code development pack
 
 config.env = {
-    -- The network rules do not allow the telemetry endpoints. Thus turn
-    -- off all telemetry.
-    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1",
+    -- Claude Code has an "essential traffic" mode
+    -- (CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC) and a "no telemetry" mode
+    -- (DISABLE_TELEMETRY). The essential traffic mode turns off Remote
+    -- Control (/remote-control). The no telemetry mode turns off telemetry
+    -- and keeps Remote Control. DISABLE_ERROR_REPORTING turns off the
+    -- error reports to Sentry. The network rules do not allow these hosts.
+    DISABLE_TELEMETRY = "1",
+    DISABLE_ERROR_REPORTING = "1",
 
     -- Tell Claude Code that it runs in a sandbox.
     IS_SANDBOX = "1",
