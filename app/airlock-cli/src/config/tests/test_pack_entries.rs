@@ -165,7 +165,7 @@ fn missing_version_names_every_contributing_file() {
     let err = dirs.error();
     assert!(
         err.contains(&format!(
-            "* `packs.codex` needs `version` (set in: {}): 1",
+            "* `packs.codex` needs `version` (set in: {}): 2 or 1",
             dirs.project_origin(".airlock/airlock.toml")
         )),
         "{err}"
@@ -191,7 +191,7 @@ fn invalid_pack_entries_are_reported_together() {
         git = { version = 1, args = { node-version = "lts" } }
         mise = { version = "legacy" }
         claude = { version = "legacy" }
-        codex = { version = 2 }
+        codex = { version = 3 }
         docker = { version = 0 }
         copilot = { version = 1.5 }
         alpine = { version = true }
@@ -220,7 +220,7 @@ fn invalid_pack_entries_are_reported_together() {
          (set in: airlock.toml)",
         "* `packs.claude`: version \"legacy\" is not supported; use the list form \
          `presets = [\"claude-code\"]` (set in: airlock.toml)",
-        "* `packs.codex`: version \"2\" is not supported (supported: \"1\")",
+        "* `packs.codex`: version \"3\" is not supported (supported: \"2\", \"1\")",
         "* `packs.docker.version` must be 1 or higher (set in: airlock.toml)",
         "* `packs.copilot.version` must be a string or a whole number, not 1.5",
         "* `packs.alpine.version` must be a string or a whole number, not true",

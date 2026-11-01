@@ -9,7 +9,7 @@ use super::tool_tracker::ToolTracker;
 pub struct AdminState {
     /// Latest network deny time, from the host.
     pub deny_tracker: Arc<DenyTracker>,
-    /// Start times of running Claude Code tool calls.
+    /// Time windows of recent agent tool calls.
     pub tool_tracker: Arc<ToolTracker>,
 }
 

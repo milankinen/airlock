@@ -2,12 +2,13 @@
 //!
 //! Runs an HTTP service at `http://admin.airlock/`. Only processes inside the
 //! VM can access it. Sandbox tools use it to work with the network policy of
-//! the host. The most important users are the HTTP hooks of Claude Code. The
-//! hooks tell Claude when a network deny is the probable cause of a failed
-//! tool call. The `airlock` MCP server lets an agent run a command with
-//! extended network access and manage on-demand network rules. The user
-//! approves each request.
+//! the host. The most important users are the hooks of Claude Code, Codex
+//! and GitHub Copilot CLI. The hooks tell the agent when a network deny is
+//! the probable cause of a failed tool call. The `airlock` MCP server lets
+//! an agent run a command with extended network access and manage
+//! on-demand network rules. The user approves each request.
 
+pub mod blocked_hosts;
 pub mod capabilities;
 pub mod deny_tracker;
 pub mod mcp;

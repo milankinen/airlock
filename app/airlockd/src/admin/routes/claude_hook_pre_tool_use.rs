@@ -1,8 +1,8 @@
 //! Hook before a tool call.
 //!
-//! Claude Code calls this hook before it runs a tool. The hook records the
-//! start time of the tool call. The failure hook uses this time to decide if a
-//! network deny caused a failure.
+//! Claude Code and Codex call this hook before they run a tool. The hook
+//! records the start time of the tool call. The hooks after the call use this
+//! time to decide if a network deny caused a failure.
 
 use std::sync::Arc;
 

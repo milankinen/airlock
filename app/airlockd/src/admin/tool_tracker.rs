@@ -1,4 +1,4 @@
-//! Claude Code tool calls.
+//! Agent tool calls.
 //!
 //! Remembers the start and end time of each tool call. The hook before a tool
 //! call records the start. The hooks after the call record the end and keep
@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use quick_cache::sync::Cache;
 
-/// Maximum number of records. Claude usually has only a few tool calls
+/// Maximum number of records. An agent usually has only a few tool calls
 /// running at the same time. The limit caps the memory use if a bad client
 /// never calls the post hooks. The cache evicts old entries with the CLOCK
 /// algorithm (similar to LRU).
@@ -42,7 +42,8 @@ impl ToolWindow {
     }
 }
 
-/// Time windows of recent tool calls, by `tool_use_id`.
+/// Time windows of recent tool calls, by tool call key (`tool_use_id` or a
+/// key that the hook makes from the call).
 pub struct ToolTracker {
     calls: Cache<String, ToolWindow>,
 }

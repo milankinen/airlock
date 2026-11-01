@@ -5,7 +5,7 @@ The `claude` pack installs
 
 ```toml
 [packs]
-claude = { version = "1" }
+claude = { version = "2" }
 ```
 
 ```bash
@@ -15,6 +15,17 @@ airlock start --monitor -- claude --dangerously-skip-permissions
 | Arg   | Default | Description                                               |
 |-------|---------|-----------------------------------------------------------|
 | `acp` | `false` | Install the ACP adapter as the `claude-agent-acp` command. See [editor integration](../../tips/editor-acp.md). |
+
+## Airlock tools
+
+The `claude@2` pack connects Claude Code to the `airlock` MCP server at
+`http://admin.airlock/mcp`. Claude Code can then use the tools for
+[on-demand rules and temporary network access](../../configuration/network.md#on-demand-rules).
+The pack also gives the agent the tool instructions at the start of each
+session. Hooks tell the agent when the network policy blocked a connection
+during a tool call.
+
+Version 1 of the pack has no airlock tools.
 
 ## Authentication
 

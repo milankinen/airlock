@@ -178,6 +178,14 @@ fn builtin_pack_fingerprints_with_current_inputs_stay_same() {
         "claude@1".into(),
         fingerprint(&packs, "[packs]\nclaude = { version = 1 }\n"),
     ));
+    actual.push((
+        "codex@1".into(),
+        fingerprint(&packs, "[packs]\ncodex = { version = 1 }\n"),
+    ));
+    actual.push((
+        "copilot@1".into(),
+        fingerprint(&packs, "[packs]\ncopilot = { version = 1 }\n"),
+    ));
     let actual: Vec<(&str, &str)> = actual
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
@@ -188,12 +196,12 @@ fn builtin_pack_fingerprints_with_current_inputs_stay_same() {
             "e992d538f2eacb79e11400e3d999525b3bf0aa7b3db8e576d2c7652f90370894",
         ),
         (
-            "codex@1",
-            "57f26c9404cafb9bc34ce76acb30bd9ebeff949f1577cab1f3b10a13b73821ae",
+            "codex@2",
+            "8607ed8007509f5a0d568773550dfc06b5e0ebabd4b9594fecd6adcd09806da6",
         ),
         (
-            "copilot@1",
-            "4011a95d48ce53381c6c223da455f02c3ddd2a291bf8678130a22666586d7cab",
+            "copilot@2",
+            "bed13459892cc680f1f22fc19aae14f4d4f8152d0ba4933409a037d01b31eeae",
         ),
         (
             "docker@1",
@@ -230,6 +238,14 @@ fn builtin_pack_fingerprints_with_current_inputs_stay_same() {
         (
             "claude@1",
             "6f2bbd3021e675f80ce3f11af294c91d05c79d5d8700c44846215c35f9de64ae",
+        ),
+        (
+            "codex@1",
+            "57f26c9404cafb9bc34ce76acb30bd9ebeff949f1577cab1f3b10a13b73821ae",
+        ),
+        (
+            "copilot@1",
+            "4011a95d48ce53381c6c223da455f02c3ddd2a291bf8678130a22666586d7cab",
         ),
     ];
     assert_eq!(actual, expected);

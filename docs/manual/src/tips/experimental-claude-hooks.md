@@ -40,6 +40,9 @@ given id, the tracker eventually evicts the entry.
 
 ## Configuration
 
+The `claude@2` pack sets up these hooks. Use the steps below only for
+version 1 or for a manual setup.
+
 Add the three hooks to `.claude/settings.json` (either in your project
 or globally in `~/.claude/settings.json`):
 

@@ -85,6 +85,36 @@ pub(crate) fn router(
             "/claude/hooks/session-start",
             post(move || async move { routes::claude_hook_session_start::handle(caps) }),
         )
+        // Codex uses the same payload and output as Claude Code, except
+        // that it has no failure hook.
+        .route(
+            "/codex/hooks/pre-tool-use",
+            post(routes::claude_hook_pre_tool_use::handle),
+        )
+        .route(
+            "/codex/hooks/post-tool-use",
+            post(routes::codex_hook_post_tool_use::handle),
+        )
+        .route(
+            "/codex/hooks/session-start",
+            post(move || async move { routes::claude_hook_session_start::handle(caps) }),
+        )
+        .route(
+            "/copilot/hooks/pre-tool-use",
+            post(routes::copilot_hooks::pre_tool_use),
+        )
+        .route(
+            "/copilot/hooks/post-tool-use",
+            post(routes::copilot_hooks::post_tool_use),
+        )
+        .route(
+            "/copilot/hooks/post-tool-use-failure",
+            post(routes::copilot_hooks::post_tool_use_failure),
+        )
+        .route(
+            "/copilot/hooks/session-start",
+            post(move || async move { routes::copilot_hooks::session_start(caps) }),
+        )
         .with_state(state)
         .merge(super::mcp::router(grants, caps))
 }

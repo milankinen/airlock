@@ -1,8 +1,10 @@
 //! Hook at the start of a session.
 //!
 //! Claude Code calls this hook when a session starts, resumes, clears or
-//! compacts. The hook gives Claude the instructions for the airlock tools.
-//! The instructions describe only the features that the host enabled.
+//! compacts. Codex calls it when a session starts. The hook gives the agent
+//! the instructions for the airlock tools. Both agents use the same output
+//! format and the same MCP tool names. The instructions describe only the
+//! features that the host enabled.
 
 use axum::Json;
 use serde_json::{Value, json};

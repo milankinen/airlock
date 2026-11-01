@@ -114,8 +114,8 @@ The agent uses the tools of the `airlock` MCP server at
   on demand by default.
 
 The MCP server offers only the tools of the features that you enable.
-The `claude@2` pack gives Claude Code the instructions for these tools at
-the start of each session.
+The `claude@2`, `codex@2` and `copilot@2` packs give the agent the
+instructions for these tools at the start of each session.
 
 `network.rule_editing` sets the rules that the agent can see and change:
 

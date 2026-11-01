@@ -8,9 +8,9 @@ load helpers
 
 # The config of all packs.
 PACKS='[packs]
-claude = { version = 1 }
-codex = { version = 1 }
-copilot = { version = 1 }
+claude = { version = 2 }
+codex = { version = 2 }
+copilot = { version = 2 }
 nodejs = { version = 1 }
 python = { version = 1 }
 rust = { version = 1 }
@@ -18,8 +18,13 @@ docker = { version = 1 }
 git = { version = 1 }
 mise = { version = 1 }'
 
-# Version commands of all packs, to run in the sandbox.
+# Version commands of all packs, to run in the sandbox. The agent packs
+# also write their airlock MCP and hook files.
 VERSIONS='claude --version && codex --version && copilot --version && node --version &&
+test -s /etc/claude-code/managed-settings.d/50-airlock.json &&
+grep -q admin.airlock/mcp /etc/codex/config.toml && test -s /etc/codex/hooks.json &&
+test -s /etc/github-copilot/policy.d/50-airlock.json &&
+test -s /usr/local/share/airlock/copilot-mcp.json &&
 npm --version && python3 --version && cargo --version && rustc --version &&
 docker --version && git --version && mise version && echo ALL-PACKS-OK'
 

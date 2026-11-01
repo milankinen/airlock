@@ -5,7 +5,7 @@ The `codex` pack installs the
 
 ```toml
 [packs]
-codex = { version = "1" }
+codex = { version = "2" }
 ```
 
 ```bash
@@ -15,6 +15,26 @@ airlock start --monitor -- codex --yolo
 | Arg   | Default | Description                                        |
 |-------|---------|----------------------------------------------------|
 | `acp` | `false` | Install the ACP adapter as the `codex-acp` command. See [editor integration](../../tips/editor-acp.md). |
+
+## Airlock tools
+
+The `codex@2` pack connects Codex to the `airlock` MCP server at
+`http://admin.airlock/mcp`. Codex can then use the tools for
+[on-demand rules and temporary network access](../../configuration/network.md#on-demand-rules).
+The pack also gives the agent the tool instructions at the start of each
+session. Hooks tell the agent when the network policy blocked a connection
+during a tool call.
+
+Version 1 of the pack has no airlock tools.
+
+Codex runs shell commands in its own sandbox. That sandbox has no network
+unless you start Codex with `--yolo`. Without `--yolo`, airlock sees no
+denied connections.
+
+The pack writes `/etc/codex/config.toml` and `/etc/codex/hooks.json`. If
+these files exist without the airlock mark, the pack keeps them and logs a
+warning. The pack does not change `~/.codex`. The user config overrides the
+system config.
 
 ## Authentication
 

@@ -2,7 +2,7 @@
 //!
 //! Makes the text that tells the agent which airlock tools it has and when
 //! to use them. The text describes only the features that the host enabled.
-//! The MCP server and the Claude Code session hook give the same text.
+//! The MCP server and the session hooks of the agents give the same text.
 
 use crate::admin::capabilities::{Capabilities, RuleEditing};
 
@@ -10,7 +10,7 @@ use crate::admin::capabilities::{Capabilities, RuleEditing};
 /// Args:
 ///  - `caps`: Agent features that the host enabled
 ///  - `prefix`: Text before each tool name, for example `mcp__airlock__`
-///    for Claude Code
+///    for Claude Code and Codex, `airlock-` for Copilot
 pub(crate) fn instructions(caps: Capabilities, prefix: &str) -> String {
     let tool = |name: &str| format!("`{prefix}{name}`");
     let (execute, show, upsert) = (tool("execute"), tool("show_rules"), tool("upsert_rule"));
