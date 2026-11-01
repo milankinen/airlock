@@ -22,6 +22,9 @@ const MAX_BODY_HOSTS: usize = 5;
 const MAX_LIST: usize = 64;
 /// Maximum length of the command in the details, in characters.
 const MAX_COMMAND: usize = 4000;
+/// Maximum number of command lines in the details. Many lines can push
+/// the other details out of view.
+const MAX_COMMAND_LINES: usize = 20;
 /// Maximum length of the working directory, in characters.
 const MAX_PATH: usize = 300;
 /// Maximum number of lines of a diff in the details.
@@ -109,20 +112,29 @@ fn escape_len(rest: &str) -> usize {
     }
 }
 
-/// Tell if `c` is a format character that is not visible or that changes
-/// the text direction. Such characters can hide or reorder text.
+/// Tell if `c` is a format character that is not visible, a blank
+/// character that is not whitespace, or a character that changes the
+/// text direction. Such characters can hide or reorder text, or make
+/// lines that look empty.
 fn is_invisible(c: char) -> bool {
     matches!(
         c,
         '\u{00ad}'
             | '\u{034f}'
             | '\u{061c}'
+            | '\u{115f}'
+            | '\u{1160}'
+            | '\u{17b4}'
+            | '\u{17b5}'
             | '\u{180e}'
             | '\u{200b}'..='\u{200f}'
             | '\u{2028}'..='\u{202e}'
             | '\u{2060}'..='\u{206f}'
+            | '\u{2800}'
+            | '\u{3164}'
             | '\u{fe00}'..='\u{fe0f}'
             | '\u{feff}'
+            | '\u{ffa0}'
             | '\u{fff9}'..='\u{fffb}'
             | '\u{e0000}'..='\u{e007f}'
     )
@@ -249,9 +261,15 @@ fn other_lines(other: &[(String, String)]) -> String {
 }
 
 /// Clean untrusted text that can have more lines. Each line is cleaned as
-/// in [`clean`]. Empty lines go away. The text is cut at `max` characters.
-fn clean_lines(text: &str, max: usize) -> String {
-    let lines: Vec<String> = text.lines().map(clean).filter(|l| !l.is_empty()).collect();
+/// in [`clean`]. Empty lines go away. The text is cut at `max_lines`
+/// lines and at `max` characters.
+fn clean_lines(text: &str, max: usize, max_lines: usize) -> String {
+    let mut lines: Vec<String> = text.lines().map(clean).filter(|l| !l.is_empty()).collect();
+    if lines.len() > max_lines {
+        let more = lines.len() - max_lines;
+        lines.truncate(max_lines);
+        lines.push(msg::more_lines(more));
+    }
     cut_end(lines.join("\n"), max)
 }
 
@@ -379,7 +397,7 @@ fn command_items(command: &PromptCommand) -> Vec<DetailItem> {
     let mut items = vec![
         DetailItem::new(
             msg::LABEL_COMMAND,
-            clean_lines(&command.cmd, MAX_COMMAND),
+            clean_lines(&command.cmd, MAX_COMMAND, MAX_COMMAND_LINES),
             true,
         ),
         DetailItem::new(
@@ -426,7 +444,6 @@ impl PromptText {
         let details_hint = !matches!(prompt.request, PromptRequest::Hosts { .. });
         let (title, body, command, running) = match &prompt.request {
             PromptRequest::Hosts { hosts, command } => {
-                details.extend(command_items(command));
                 details.push(DetailItem::new(msg::LABEL_HOSTS, host_lines(hosts), true));
                 let body = host_summary(hosts);
                 let running = format!("{}\n{body}", msg::RUNNING);
@@ -442,7 +459,6 @@ impl PromptText {
                 rule,
                 command,
             } => {
-                details.extend(command_items(command));
                 details.push(DetailItem::new(
                     msg::LABEL_RULE,
                     rule_toml(name, rule),
@@ -479,12 +495,16 @@ impl PromptText {
                 )
             }
         };
+        // The access and its duration come before the command. The agent
+        // writes the command, and a long command must not push the real
+        // access out of view or show a fake access above it.
         if let Some(command) = command {
             details.push(DetailItem::new(
                 msg::LABEL_DURATION,
                 msg::duration(command.duration_secs),
                 false,
             ));
+            details.extend(command_items(command));
         }
         Self {
             title,
@@ -731,9 +751,6 @@ mod tests {
             items,
             [
                 ("Sandbox", "my-proj", false),
-                ("Command", "npm install\nnpm test", true),
-                ("Working directory", "/work", true),
-                ("Extra environment", "A='it'\\''s'\nB=''", true),
                 (
                     "Rule",
                     "[network.rules.npm]\n\
@@ -746,8 +763,54 @@ mod tests {
                     true
                 ),
                 ("Maximum duration", "1 h", false),
+                ("Command", "npm install\nnpm test", true),
+                ("Working directory", "/work", true),
+                ("Extra environment", "A='it'\\''s'\nB=''", true),
             ]
         );
+    }
+
+    /// Test that agent text in the command cannot hide the real hosts.
+    /// Otherwise a fake host list in the command can look like the real
+    /// one, and blank lines can push the real one out of view.
+    ///   1. Make a request for all hosts with a fake host list in the
+    ///      command, then many lines that look blank
+    ///   2. Check that the hosts show before the command
+    ///   3. Check that the blank lines go away and that the command is
+    ///      cut at the line limit
+    #[test]
+    fn command_text_cannot_hide_real_hosts() {
+        let blank = ["\u{2800}", "\u{3164}", "\u{115f}\u{1160}", "\u{ffa0}"];
+        let mut cmd = "npm ci\nHosts:\nregistry.npmjs.org\n".to_string();
+        for i in 0..100 {
+            cmd.push_str(blank[i % blank.len()]);
+            cmd.push('\n');
+        }
+        cmd.push_str(&"x\n".repeat(30));
+        let text = PromptText::new(&GrantPrompt {
+            sandbox: "my-proj".into(),
+            request: PromptRequest::Hosts {
+                hosts: vec!["*".into()],
+                command: PromptCommand { cmd, ..command() },
+            },
+        });
+        let labels: Vec<&str> = text.details.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Sandbox",
+                "Hosts",
+                "Maximum duration",
+                "Command",
+                "Working directory",
+                "Extra environment",
+            ]
+        );
+        assert_eq!(text.details[1].value, "all hosts");
+        let shown: Vec<&str> = text.details[3].value.lines().collect();
+        assert_eq!(shown.len(), MAX_COMMAND_LINES + 1);
+        assert_eq!(shown[..4], ["npm ci", "Hosts:", "registry.npmjs.org", "x"]);
+        assert_eq!(shown[MAX_COMMAND_LINES], "# and 13 more lines");
     }
 
     fn command() -> PromptCommand {
