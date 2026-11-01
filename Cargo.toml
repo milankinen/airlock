@@ -137,7 +137,7 @@ rmcp = { version = "3.8", default-features = false, features = ["server", "macro
 schemars = "1"
 
 # Host desktop notifications
-notify-rust = { version = "4.18", default-features = false, features = ["z-with-tokio"] }
+notify-rust = { version = "4.18", default-features = false, features = ["z"] }
 
 # Testing
 axum = "0.8"
