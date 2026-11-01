@@ -9,7 +9,8 @@
 //! permission, the system asks for it only when the app starts through the
 //! system app launcher. When the notification cannot show, a system dialog
 //! asks the user. The request text goes to the dialog script as arguments,
-//! so that the text cannot change the script.
+//! so that the text cannot change the script. When the dialog also cannot
+//! show, the request goes to the next way to ask.
 //!
 //! After the user allows a command, the notifier app can keep a notice
 //! with an abort button while the command runs. Only a direct start of the
@@ -29,7 +30,7 @@ use tokio::time::Instant;
 use self::notifier::Installed;
 use self::protocol::{ChildDecision, ChildEvent, ChildRequest, Reply, RunningNotice};
 use super::text::PromptText;
-use super::{Approval, Decision, Running, RunningControl};
+use super::{Approval, Asked, Decision, Running, RunningControl};
 use crate::data_dir::DataDir;
 use crate::messages::grants as msg;
 use crate::util::VerifiedPath;
@@ -86,18 +87,21 @@ end run"#;
 ///
 /// Returns:
 ///   Decision of the user, and the running notice if it shows. Deny on
-///   timeout or when nothing can show.
-pub(super) async fn ask(text: PromptText, timeout: Duration, data: &DataDir) -> Approval {
+///   timeout. Unavailable when nothing can show.
+pub(super) async fn ask(text: PromptText, timeout: Duration, data: &DataDir) -> Asked {
     let deadline = Instant::now() + timeout;
     match notify(&text, deadline, data).await {
-        Ok(approval) => approval,
+        Ok(approval) => Asked::Shown(approval),
         Err(e) => {
             tracing::warn!("grants: notification failed, using a dialog: {e}");
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Decision::Deny(msg::TIMEOUT.into()).into();
+                return Asked::Shown(Decision::Deny(msg::TIMEOUT.into()).into());
             }
-            dialog(&text, left).await.into()
+            match dialog(&text, left).await {
+                Ok(decision) => Asked::Shown(decision.into()),
+                Err(why) => Asked::Unavailable(why),
+            }
         }
     }
 }
@@ -457,8 +461,9 @@ impl Drop for TempDir {
 ///  - `timeout`: Maximum wait time
 ///
 /// Returns:
-///   Decision of the user. Deny on timeout or when the dialog cannot show.
-async fn dialog(text: &PromptText, timeout: Duration) -> Decision {
+///   Decision of the user, deny on timeout. Error with the deny reason
+///   when the dialog cannot show.
+async fn dialog(text: &PromptText, timeout: Duration) -> Result<Decision, String> {
     let secs = timeout.as_secs().max(1).to_string();
     // The runner reads options only up to the first argument that does
     // not start with `-`. The title always starts with `airlock:`, so the
@@ -478,22 +483,23 @@ async fn dialog(text: &PromptText, timeout: Duration) -> Decision {
         // wait.
         .kill_on_drop(true)
         .spawn();
-    let child = match child {
-        Ok(child) => child,
-        Err(e) => return Decision::Deny(msg::unavailable(e)),
-    };
+    let child = child.map_err(msg::unavailable)?;
     let out = match tokio::time::timeout(timeout + GRACE, child.wait_with_output()).await {
-        Err(_) => return Decision::Deny(msg::TIMEOUT.into()),
-        Ok(Err(e)) => return Decision::Deny(msg::unavailable(e)),
+        Err(_) => return Ok(Decision::Deny(msg::TIMEOUT.into())),
+        // The dialog can show before the wait fails, so this is a
+        // decision.
+        Ok(Err(e)) => return Ok(Decision::Deny(msg::unavailable(e))),
         Ok(Ok(out)) => out,
     };
+    // The dialog has no cancel button, so an error exit means that the
+    // dialog did not show.
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        return Decision::Deny(msg::unavailable(err.trim()));
+        return Err(msg::unavailable(err.trim()));
     }
-    match String::from_utf8_lossy(&out.stdout).trim() {
+    Ok(match String::from_utf8_lossy(&out.stdout).trim() {
         s if s == msg::ALLOW => Decision::Allow,
         s if s == msg::DENY => Decision::DeniedByUser,
         _ => Decision::Deny(msg::TIMEOUT.into()),
-    }
+    })
 }

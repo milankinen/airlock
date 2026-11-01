@@ -1417,6 +1417,9 @@ pub mod grants {
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub const DIALOG_ARG: &str = "__approval-dialog";
 
+    /// Deny reason: the monitor TUI stopped before the answer.
+    pub const MONITOR_STOPPED: &str = "the monitor TUI stopped before an answer";
+
     /// Deny reason: the host cannot show the request.
     pub fn unavailable(err: impl Display) -> String {
         format!("cannot show the approval request on the host: {err}")

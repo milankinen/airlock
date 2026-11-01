@@ -101,6 +101,9 @@ pub fn tab_header_rects(size: Rect, app: &App) -> Vec<(Tab, Rect)> {
 pub fn render(f: &mut Frame<'_>, app: &App, sink: &TuiTerminalSink) {
     let size = f.area();
     if size.height < 3 || size.width < 10 {
+        // Draw the dialog also here. Its draw keeps the click targets and
+        // the visible state up to date for the input handlers.
+        crate::approval::render_dialog(&app.approvals, size, f.buffer_mut());
         return;
     }
 
@@ -110,7 +113,10 @@ pub fn render(f: &mut Frame<'_>, app: &App, sink: &TuiTerminalSink) {
     match app.active_tab {
         Tab::Sandbox => {
             TerminalWidget::new(sink).render(body, f.buffer_mut());
-            if let Some(pos) = crate::tabs::sandbox::cursor_position(sink, body) {
+            // Hide the guest cursor when the dialog covers the screen.
+            if !app.approvals.is_open()
+                && let Some(pos) = crate::tabs::sandbox::cursor_position(sink, body)
+            {
                 f.set_cursor_position(pos);
             }
         }
@@ -122,6 +128,9 @@ pub fn render(f: &mut Frame<'_>, app: &App, sink: &TuiTerminalSink) {
 
     // Tab bar at the bottom.
     render_tab_bar(f, tab_area, app);
+
+    // Draw the approval dialog last, so it is on top of all content.
+    crate::approval::render_dialog(&app.approvals, size, f.buffer_mut());
 }
 
 fn render_tab_bar(f: &mut Frame<'_>, area: Rect, app: &App) {

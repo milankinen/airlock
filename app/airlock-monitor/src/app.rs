@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use crate::NetworkControl;
+use crate::approval::Approvals;
 use crate::settings::TuiSettings;
 use crate::tabs::monitor::MonitorTab;
 
@@ -39,6 +40,11 @@ pub struct App {
     pub guest_bracketed_paste: bool,
     /// Runtime settings from the user config.
     pub settings: TuiSettings,
+    /// True after a mouse press that went to the guest, until the release.
+    pub guest_mouse_held: bool,
+    /// Approval requests from the host. The first one shows as a modal
+    /// dialog.
+    pub approvals: Approvals,
 }
 
 impl App {
@@ -61,6 +67,8 @@ impl App {
             select_hint_at: None,
             guest_bracketed_paste: false,
             settings,
+            guest_mouse_held: false,
+            approvals: Approvals::default(),
         }
     }
 }

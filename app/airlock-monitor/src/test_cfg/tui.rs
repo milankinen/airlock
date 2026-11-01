@@ -61,12 +61,17 @@ impl Tui {
         let mut sink = TuiTerminalSink::new(80, 24, settings.scrollback);
         let body = ui::body_area(Rect::new(0, 0, cols, rows));
         sink.resize(body.height, body.width);
-        let app = App::new(
+        let mut app = App::new(
             network.clone(),
             "/work/project".into(),
             "1.2.3".into(),
             settings,
         );
+        // Tests send events faster than a user. The approval timing test
+        // turns the timing checks on again.
+        app.approvals.grace = std::time::Duration::ZERO;
+        app.approvals.answer_grace = std::time::Duration::ZERO;
+        app.approvals.key_gap = std::time::Duration::ZERO;
         let (stdin_tx, stdin_rx) = mpsc::channel(1024);
         let (sig_tx, sig_rx) = mpsc::channel(16);
         Self {
@@ -168,8 +173,10 @@ impl Tui {
         self.send(TuiEvent::Terminal(Event::Resize(cols, rows)));
     }
 
-    /// Draw the UI into the test terminal.
+    /// Remove closed approval requests, then draw the UI into the test
+    /// terminal, as each loop step of the real TUI does.
     fn draw(&mut self) {
+        self.app.approvals.drop_closed();
         let (app, sink) = (&self.app, &self.sink);
         self.terminal.draw(|f| ui::render(f, app, sink)).unwrap();
     }

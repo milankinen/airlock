@@ -1,7 +1,8 @@
 //! TUI monitor runtime.
 //!
 //! Shows the guest in the TUI monitor control panel, together with network
-//! events and guest stats.
+//! events and guest stats. While the TUI runs, it can ask the user to
+//! approve requests from the sandbox.
 
 use airlock_common::supervisor_capnp::stdin;
 use futures::StreamExt;
@@ -9,6 +10,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use super::{OutputSink, PtySize, Runtime, SignalStream, Terminal};
+use crate::approval::MonitorSlot;
 use crate::network::NetworkHandle;
 use crate::project::Project;
 use crate::rpc;
@@ -27,6 +29,8 @@ pub struct MonitorRuntime {
     /// Buffer limits, scrollback and key bindings for the TUI. The CLI
     /// makes them from the `[monitor]` section of the user settings.
     settings: airlock_monitor::TuiSettings,
+    /// Place of the approval dialog. It holds the dialog while the TUI runs.
+    approvals: MonitorSlot,
 }
 
 impl MonitorRuntime {
@@ -38,7 +42,14 @@ impl MonitorRuntime {
             sig_tx: Some(sig_tx),
             sig_rx: Some(sig_rx),
             settings,
+            approvals: MonitorSlot::default(),
         }
+    }
+
+    /// Get the place of the approval dialog of the TUI. It holds the dialog
+    /// from `launch` until the terminal exits.
+    pub fn approval_dialog(&self) -> MonitorSlot {
+        self.approvals.clone()
     }
 }
 
@@ -100,6 +111,7 @@ impl Runtime for MonitorRuntime {
             self.settings,
         );
 
+        self.approvals.set(std::rc::Rc::new(tui.tx.clone()));
         let mut tasks = JoinSet::new();
 
         // Forward network events from the broadcast channel to the TUI
@@ -142,6 +154,7 @@ impl Runtime for MonitorRuntime {
         Ok(MonitorTerminal {
             tui: Some(tui),
             _tasks: tasks,
+            approvals: self.approvals,
         })
     }
 }
@@ -152,6 +165,14 @@ pub struct MonitorTerminal {
     /// Forwarders of network events and stats. They stop when the terminal
     /// drops (after `exit`).
     _tasks: JoinSet<()>,
+    /// Place of the approval dialog. Cleared when the TUI stops.
+    approvals: MonitorSlot,
+}
+
+impl Drop for MonitorTerminal {
+    fn drop(&mut self) {
+        self.approvals.clear();
+    }
 }
 
 impl OutputSink for MonitorTerminal {
@@ -170,6 +191,8 @@ impl OutputSink for MonitorTerminal {
 
 impl Terminal for MonitorTerminal {
     fn exit(mut self, exit_code: i32) -> i32 {
+        // New requests must not go to a TUI that stops.
+        self.approvals.clear();
         let Some(tui) = self.tui.take() else {
             return exit_code;
         };

@@ -10,6 +10,7 @@ use super::raw_terminal::RawTerminal;
 use super::{
     MonitorRuntime, OutputSink, PtySize, RawTerminalRuntime, Runtime, SignalStream, Terminal,
 };
+use crate::approval::MonitorSlot;
 use crate::network::NetworkHandle;
 use crate::project::Project;
 use crate::rpc;
@@ -41,6 +42,15 @@ impl HostRuntime {
             anyhow::anyhow!(crate::messages::runtime::invalid_monitor_key_bindings(e))
         })?;
         Ok(Self::Monitor(MonitorRuntime::new(tui)))
+    }
+
+    /// Get the place of the approval dialog of the monitor TUI. It holds
+    /// the dialog while the TUI runs. With the raw terminal it stays empty.
+    pub fn approval_dialog(&self) -> MonitorSlot {
+        match self {
+            Self::Raw(_) => MonitorSlot::default(),
+            Self::Monitor(m) => m.approval_dialog(),
+        }
     }
 }
 

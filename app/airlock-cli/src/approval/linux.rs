@@ -3,10 +3,11 @@
 //! The notification also has a details button. It opens a window with all
 //! details of the request, when the desktop has an X display. If the window
 //! cannot show, the notification shows again with no details button. The
-//! same window asks the user when the notification cannot show. With no X
-//! display, the request is denied when the desktop has no notification
-//! service, or when the service cannot show buttons. After the user allows
-//! a command, a notice with an abort button stays until the command ends.
+//! same window asks the user when the notification cannot show. When the
+//! notification cannot show (no notification service, or no buttons) and
+//! the window cannot show either (no X display, or an error), the request
+//! goes to the next way to ask. After the user allows a command, a notice
+//! with an abort button stays until the command ends.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +15,7 @@ use std::time::Duration;
 use notify_rust::{Hint, Notification, NotificationResponse, Timeout, Urgency};
 
 use super::text::{PromptText, escape_markup};
-use super::{Approval, Decision, Running, RunningControl, dialog};
+use super::{Approval, Asked, Decision, Running, RunningControl, dialog};
 use crate::messages::grants as msg;
 
 /// Action ID of the allow button.
@@ -68,12 +69,15 @@ async fn capabilities(limit: Duration) -> Result<Vec<String>, String> {
 ///  - `timeout`: Maximum wait time
 ///
 /// Returns:
-///   Decision of the user. Deny on timeout or when the host cannot show
-///   the notification.
-pub(super) async fn ask(text: PromptText, timeout: Duration) -> Approval {
+///   Decision of the user, deny on timeout. Unavailable when neither the
+///   notification nor the window can show.
+pub(super) async fn ask(text: PromptText, timeout: Duration) -> Asked {
     let running = text.running.clone();
     let markup = std::cell::Cell::new(false);
-    let decision = ask_decision(&text, timeout, &markup).await;
+    let decision = match ask_decision(&text, timeout, &markup).await {
+        Ok(decision) => decision,
+        Err(why) => return Asked::Unavailable(why),
+    };
     let running = match (&decision, running) {
         (Decision::Allow, Some(body)) => {
             let body = if markup.get() {
@@ -87,7 +91,7 @@ pub(super) async fn ask(text: PromptText, timeout: Duration) -> Approval {
         }
         _ => None,
     };
-    Approval { decision, running }
+    Asked::Shown(Approval { decision, running })
 }
 
 /// Show the notice with the abort button until the command ends or the
@@ -145,11 +149,15 @@ async fn show_running(body: String, control: RunningControl) {
 /// Show the request and wait for the decision. Sets `markup` when the
 /// service shows body markup. Uses a dialog when the notification cannot
 /// show and the host has an X display.
+///
+/// Returns:
+///   Decision of the user, or the deny reason when neither the
+///   notification nor the dialog can show.
 async fn ask_decision(
     text: &PromptText,
     timeout: Duration,
     markup_out: &std::cell::Cell<bool>,
-) -> Decision {
+) -> Result<Decision, String> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut dialog = dialog::available();
     // Each pass shows the notification and then, if necessary, the dialog.
@@ -157,18 +165,18 @@ async fn ask_decision(
     // button, and it has no details button. Thus the loop ends.
     loop {
         let failed = match notify(text, deadline, dialog, markup_out).await {
-            Ok(Answer::Decision(decision)) => return decision,
+            Ok(Answer::Decision(decision)) => return Ok(decision),
             Ok(Answer::Details) => None,
             Err(why) if dialog => {
                 tracing::warn!("grants: notification failed, using a dialog: {why}");
                 Some(why)
             }
-            Err(why) => return Decision::Deny(why),
+            Err(why) => return Err(why),
         };
         match dialog::ask(text, time_left(deadline)).await {
-            Ok(decision) => return decision,
+            Ok(decision) => return Ok(decision),
             // The notification failed too. Nothing can show the request.
-            Err(e) if failed.is_some() => return Decision::Deny(msg::unavailable(e)),
+            Err(e) if failed.is_some() => return Err(msg::unavailable(e)),
             Err(e) => {
                 // The user asked for the details. Do not deny for them:
                 // show the notification again, with no details button.

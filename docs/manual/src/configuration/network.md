@@ -151,8 +151,7 @@ XWayland. With no X server, the notification has no More details button.
 If the window cannot open after you select More details, the notification
 shows again without the button. The window also asks you when the
 notification cannot show, for example when the desktop has no
-notification service. If the host has no X server and no notification
-service, airlock denies the request. In the Linux window:
+notification service. In the Linux window:
 
 - The Deny button is the default. No key selects Allow.
 - Escape and the close button of the window deny the request.
@@ -161,6 +160,19 @@ service, airlock denies the request. In the Linux window:
   allowing the request.
 - The mouse wheel, the arrow keys, Page Up, Page Down, Home and End
   scroll long text.
+
+Airlock asks for your approval in this order:
+
+1. The desktop notification. If the notification cannot show, a window
+   asks on Linux, and a system dialog asks on macOS.
+2. A dialog in the monitor TUI. Airlock uses it only if the host cannot
+   show the request and the sandbox runs with `airlock start --monitor`.
+   On Linux, the host cannot show the request when the notification
+   cannot show and the window cannot open. On macOS, the host cannot show
+   the request when the notification and the system dialog both fail.
+3. If nothing can show the request, airlock denies it.
+
+A late answer has no effect.
 
 After your approval, the change applies to new connections. Open
 connections do not change. Airlock writes the change to the project

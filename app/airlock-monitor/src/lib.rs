@@ -9,6 +9,7 @@
 //! signals to the sandbox.
 
 mod app;
+mod approval;
 pub mod input;
 pub mod keys;
 mod mouse;
@@ -23,6 +24,7 @@ use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::{Duration, SystemTime};
 
 use app::{App, Tab};
+pub use approval::{ApprovalDetail, ApprovalDiffKind, ApprovalDiffLine, ApprovalRequest};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 pub use input::{TuiInputEvent, TuiStdin};
 pub use keys::{Action, KeyBindings};
@@ -158,6 +160,8 @@ enum TuiEvent {
     Network(NetworkEvent),
     /// Guest resource snapshot for the CPU and memory widgets.
     Stats(StatsSnapshot),
+    /// Request that the user must allow or deny.
+    Approval(ApprovalRequest),
     /// Process exited with the given code.
     Exit(i32),
     /// Terminal event from crossterm.
@@ -186,6 +190,19 @@ impl TuiSender {
     /// Send a guest stats snapshot to the Monitor tab.
     pub fn send_stats(&self, snapshot: StatsSnapshot) {
         let _ = self.tx.send(TuiEvent::Stats(snapshot));
+    }
+
+    /// Show an approval dialog to the user.
+    ///
+    /// Returns:
+    ///   The request back if the TUI stopped.
+    pub fn send_approval(&self, request: ApprovalRequest) -> Result<(), ApprovalRequest> {
+        self.tx
+            .send(TuiEvent::Approval(request))
+            .map_err(|e| match e.0 {
+                TuiEvent::Approval(request) => request,
+                _ => unreachable!("the event is the approval that was sent"),
+            })
     }
 
     /// Tell the TUI that the sandbox process exited with `code`.
@@ -373,6 +390,9 @@ fn run_tui_loop(
     });
 
     loop {
+        // The host can stop the wait for an approval at any time. Remove
+        // its dialog before the next draw.
+        app.approvals.drop_closed();
         terminal.draw(|f| ui::render(f, &app, &sink))?;
 
         // Wait for the next event. Block for 16ms at most, to render at
@@ -440,9 +460,16 @@ where
         TuiEvent::Stats(snapshot) => {
             app.monitor.apply_stats(snapshot);
         }
+        TuiEvent::Approval(request) => app.approvals.push(request),
         TuiEvent::Exit(code) => {
             return Ok(Some(code));
         }
+        // The approval dialog is modal. It gets all keys and pastes, so no
+        // input goes to the guest or to the tabs while it shows.
+        TuiEvent::Terminal(Event::Key(key)) if app.approvals.is_open() => {
+            app.approvals.handle_key(key);
+        }
+        TuiEvent::Terminal(Event::Paste(_)) if app.approvals.is_open() => {}
         TuiEvent::Terminal(Event::Key(key)) => {
             if let Some(code) = handle_key(key, app, sink, stdin_tx, sig_tx, kitty_enabled) {
                 return Ok(Some(code));
@@ -685,6 +712,25 @@ where
     let size = terminal.size()?;
     let size = ratatui::layout::Rect::new(0, 0, size.width, size.height);
 
+    // The guest got the press of a held button before the dialog opened.
+    // Thus the drags and the release of that button go to the guest too.
+    // Else the guest sees a button that stays down.
+    let guest_tail = app.guest_mouse_held
+        && matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_));
+    if matches!(mouse.kind, MouseEventKind::Up(_)) {
+        app.guest_mouse_held = false;
+    }
+
+    // The approval dialog is modal. It gets all other mouse events. The
+    // release of a click that closed the dialog must not go to the guest.
+    if app.approvals.is_open() && !guest_tail {
+        app.approvals.handle_mouse(mouse);
+        return Ok(());
+    }
+    if app.approvals.is_click_tail(mouse) {
+        return Ok(());
+    }
+
     // A left click often means that the user wants to select text. Thus
     // this is the time to show the selection hint. Record the click before
     // the forwarding branch below. That branch is the usual case. A hint
@@ -713,7 +759,13 @@ where
             ui::body_area(size),
         )
     {
+        if matches!(mouse.kind, MouseEventKind::Down(_)) {
+            app.guest_mouse_held = true;
+        }
         let _ = stdin_tx.blocking_send(TuiInputEvent::Data(bytes));
+        return Ok(());
+    }
+    if app.approvals.is_open() {
         return Ok(());
     }
 

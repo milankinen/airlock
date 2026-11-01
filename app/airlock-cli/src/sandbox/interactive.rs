@@ -63,7 +63,10 @@ pub async fn run_interactive(
         // The project dir is shared (see `project_share` below).
         true,
     )?
-    .with_grants(network::GrantContext::for_project(&project));
+    .with_grants(network::GrantContext::for_project(
+        &project,
+        runtime.approval_dialog(),
+    ));
     let env = guest_env(&project, image, browser.is_some());
     let daemons = daemon::build_specs(&project, &env)?;
     let masks = masking::build_specs(&project)?;

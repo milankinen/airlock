@@ -175,13 +175,17 @@ impl GrantContext {
     }
 
     /// Make the context of `project` with the system approver.
-    pub fn for_project(project: &Project) -> Self {
+    /// Args:
+    ///  - `project`: The locked project
+    ///  - `monitor`: Place of the monitor TUI dialog. The approver uses it
+    ///    when the host desktop cannot show the request.
+    pub fn for_project(project: &Project, monitor: crate::approval::MonitorSlot) -> Self {
         Self::new(
             project.host_cwd.file_name().map_or_else(
                 || project.host_cwd.to_string(),
                 |n| n.to_string_lossy().into_owned(),
             ),
-            crate::approval::system(&project.context.data),
+            crate::approval::system(&project.context.data, monitor),
             project.host_cwd.clone(),
             project.sandbox_dir.clone(),
         )
