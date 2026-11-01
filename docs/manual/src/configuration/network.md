@@ -156,13 +156,16 @@ You must approve each network access on the host. By default, airlock
 asks with a system notification. You can change this in the
 [user settings](../configuration.md#user-settings).
 
+> [!TIP]
+> On macOS, the notification style is "Temporary" by default. A
+> temporary notification goes away after some seconds. To keep the
+> notification on the screen, open **System Settings > Notifications >
+> Airlock** and set the style to **"Persistent"**.
+
 > [!WARNING]
 > A grant applies only to one command. But while the command runs, a
 > root process in the sandbox can also use the open network. Deny rules
 > and the other host limits still apply.
-
-For the agent tools, the approval flow and all options, see
-[Temporary network grants](../technical/networking.md#temporary-network-grants).
 
 ### Rule editing
 
