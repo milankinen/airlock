@@ -13,8 +13,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::admin::AdminState;
 use crate::admin::server::app;
+use crate::admin::{AdminState, Capabilities};
 use crate::mcp::{self, Routes};
 
 /// Name of the fake MCP server.
@@ -178,7 +178,16 @@ pub(crate) async fn serve_mcp(host: Option<&Rc<FakeMcpHost>>) -> (SocketAddr, Ro
     if let Some(host) = host {
         routes.add_boot(&host.client(), vec![ECHO.to_string(), BROKEN.to_string()]);
     }
-    (serve(app(AdminState::new(), bridge)).await, routes)
+    (
+        serve(app(
+            AdminState::new(),
+            bridge,
+            None,
+            Capabilities::default(),
+        ))
+        .await,
+        routes,
+    )
 }
 
 /// Add a run-time MCP server of `host` at

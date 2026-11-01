@@ -533,6 +533,8 @@ pub mod cli {
 
     /// Suffix for a disabled item in `info`.
     pub const DISABLED_SUFFIX: &str = " (disabled)";
+    /// Suffix for an on-demand item in an info list.
+    pub const ON_DEMAND_SUFFIX: &str = " (on demand)";
 
     /// Line of `info` with the paths of one disk cache.
     pub fn info_disk_cache_entry(
@@ -792,6 +794,9 @@ pub mod config {
     //! Texts of the `config` area.
 
     use std::fmt::Display;
+
+    /// Error for a bad `enabled` value of a network rule.
+    pub const RULE_ENABLED_EXPECTED: &str = "true, false or \"on-demand\"";
 
     /// Title of the error block for config problems.
     pub const INVALID_CONFIGURATION: &str = "invalid configuration";
@@ -1141,6 +1146,11 @@ pub mod config {
         format!("`mcp.{name}.max_sessions` must be 1 or more")
     }
 
+    /// Problem when a `[network.grants]` time is zero.
+    pub fn grants_time_zero(field: impl Display) -> String {
+        format!("`network.grants.{field}` must be 1 second or more")
+    }
+
     /// Problem when an MCP server has an empty command.
     pub fn mcp_command_empty(name: impl Display) -> String {
         format!("`mcp.{name}.command` must not be empty")
@@ -1187,6 +1197,209 @@ pub mod db {
     /// The database directory cannot be restricted to its owner.
     pub fn restrict_dir_to_owner(dir: impl Display) -> String {
         format!("restrict {dir} to its owner")
+    }
+}
+
+pub mod grants {
+    //! Texts of the temporary network access approval.
+
+    use std::fmt::Display;
+
+    /// Title of the approval of a command with more network access.
+    pub const ACCESS_TITLE: &str = "Network access requested";
+    /// Title of the notice while an approved command runs.
+    pub const RUNNING_TITLE: &str = "Network access active";
+    /// First body line of the notice while an approved command runs.
+    pub const RUNNING: &str = "Running...";
+    /// Label of the abort button of the notice while a command runs.
+    pub const ABORT: &str = "Abort";
+    /// Title of the approval of a command with an on-demand rule.
+    pub fn access_rule_title(name: impl Display) -> String {
+        format!("Network access requested ({name})")
+    }
+
+    /// Title of the approval of a rule change.
+    pub fn rule_change_title(name: impl Display) -> String {
+        format!("Network rule change requested: {name}")
+    }
+
+    /// Body of the approval of a command with an on-demand rule.
+    pub const CLICK_FOR_DETAILS: &str = "Click for more details";
+    /// Body of the approval of a rule change.
+    pub const CLICK_FOR_CHANGES: &str = "Click to see changes";
+    /// Detail label of the rule change diff.
+    pub const LABEL_CHANGES: &str = "Changes";
+
+    /// Last line of a diff that is too long to show in full.
+    pub fn more_lines(count: usize) -> String {
+        format!("# and {count} more lines")
+    }
+
+    /// Body of the approval of a command with an on-demand rule.
+    pub fn rule_line(name: impl Display) -> String {
+        format!("Rule: {name}")
+    }
+
+    /// Line after a pattern list of a rule change that is too long to show
+    /// in full.
+    pub fn more_patterns(key: impl Display, count: usize) -> String {
+        format!("# {key}: and {count} more")
+    }
+
+    /// Label of the allow button.
+    pub const ALLOW: &str = "Allow";
+    /// Label of the deny button.
+    pub const DENY: &str = "Deny";
+
+    /// Suffix of a host list that is too long to show in full.
+    pub fn more_hosts(count: usize) -> String {
+        format!("and {count} more")
+    }
+
+    /// Suffix of the short host list in the notification body.
+    pub fn more_hosts_short(count: usize) -> String {
+        format!("+ {count} more")
+    }
+
+    /// Line after an environment list that is too long to show in full.
+    pub fn more_entries(count: usize) -> String {
+        format!("# and {count} more")
+    }
+
+    /// Text of the host `*`.
+    pub const ALL_HOSTS: &str = "all hosts";
+    /// Label of the action that shows the details window.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub const MORE_DETAILS: &str = "More details";
+    /// Detail label of the sandbox name.
+    pub const LABEL_SANDBOX: &str = "Sandbox";
+    /// Detail label of the command.
+    pub const LABEL_COMMAND: &str = "Command";
+    /// Detail label of the working directory.
+    pub const LABEL_CWD: &str = "Working directory";
+    /// Detail label of the extra environment.
+    pub const LABEL_ENV: &str = "Extra environment";
+    /// Detail label of the host list.
+    pub const LABEL_HOSTS: &str = "Hosts";
+    /// Detail label of the rule.
+    pub const LABEL_RULE: &str = "Rule";
+    /// Detail label of the access duration.
+    pub const LABEL_DURATION: &str = "Maximum duration";
+
+    /// Text of an access duration.
+    pub fn duration(secs: u32) -> String {
+        match secs {
+            s if s >= 3600 && s % 3600 == 0 => format!("{} h", s / 3600),
+            s if s >= 60 && s % 60 == 0 => format!("{} min", s / 60),
+            s => format!("{s} s"),
+        }
+    }
+
+    /// Line for each request that waits for the user.
+    pub fn pending(sandbox: impl Display, title: impl Display, timeout_secs: u64) -> String {
+        format!("{sandbox}: {title}. Allow or deny it in the notification ({timeout_secs} s).")
+    }
+
+    /// Deny reason: the user selected deny.
+    pub const DENIED_BY_USER: &str = "the user denied the request";
+    /// Deny reason: `network.rule_editing` is `"none"`.
+    pub const RULE_EDITING_DISABLED: &str = "rule editing is disabled";
+    /// Deny reason: a change sets `enabled` to `true` or `false` when only
+    /// on-demand rules are editable.
+    pub const ONLY_ON_DEMAND_EDITABLE: &str = "only on-demand rules can be edited";
+
+    /// Deny reason: a change names a rule that the sandbox cannot edit.
+    pub fn rule_name_taken(name: impl Display) -> String {
+        format!("rule name `{name}` is taken by non-editable rule, use other name")
+    }
+
+    /// Error of a rule change: the project file has a rule table that is
+    /// different from the table that the user approved.
+    pub fn rule_not_approved(name: impl Display, file: impl Display) -> String {
+        format!(
+            "the rule `{name}` in {file} has changes that airlock did not approve. \
+             Restart airlock to review them."
+        )
+    }
+
+    /// Error of a rule change: the file does not have the approved rule
+    /// after the write. The old text of the file is back.
+    pub fn rule_write_changed(name: impl Display, file: impl Display) -> String {
+        format!(
+            "the rule `{name}` in {file} is not the approved rule after the write. \
+             The old file is restored."
+        )
+    }
+
+    /// Error of a rule change: the new file text does not have the rule
+    /// with exactly the approved values.
+    pub fn rule_cannot_be_put(name: impl Display) -> String {
+        format!("the rule `{name}` cannot be put in the config file")
+    }
+
+    /// Error of a rule change: the rule in the file is not a table.
+    pub fn rule_not_table(name: impl Display) -> String {
+        format!("network.rules.{name} is not a table")
+    }
+
+    /// Error of a rule change: the project file is a symlink.
+    pub fn rule_file_symlink(file: impl Display) -> String {
+        format!("{file} is a symlink. Add the rule by hand.")
+    }
+
+    /// Error of a rule change: the project file is not a regular file.
+    pub fn rule_file_not_regular(file: impl Display) -> String {
+        format!("{file} is not a regular file")
+    }
+
+    /// Error of a rule change: the project file is too large.
+    pub fn rule_file_too_large(file: impl Display) -> String {
+        format!("{file} is too large")
+    }
+    /// Deny reason: the user closed the notification.
+    pub const DISMISSED: &str = "the user closed the notification without an answer";
+    /// Hint when the macOS notifications of Airlock go away by themselves.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub const ALERT_STYLE_HINT: &str = "Set the notifications of Airlock to \"Alerts\" in \
+         System Settings > Notifications > Airlock. Then the approval requests stay on the \
+         screen until you answer.";
+    /// Error when the airlock binary has no notifier app.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub const NOTIFIER_NOT_BUNDLED: &str =
+        "this airlock build has no notifier app (build it with `mise run build:notifier`)";
+    /// Error when the notifier app is not complete after the unpack.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub const NOTIFIER_INCOMPLETE: &str = "the notifier app is not complete";
+    /// Error when another airlock process replaces the notifier app for too
+    /// long.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub const NOTIFIER_BUSY: &str = "another airlock process installs the notifier app now";
+
+    /// Error when the notifier app archive has an entry that is not allowed.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn notifier_bad_entry(name: impl Display) -> String {
+        format!("the notifier app archive has an entry that is not allowed: {name}")
+    }
+
+    /// Error when the system app launcher did not start the notifier app.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn notifier_open_failed(status: impl Display, err: impl Display) -> String {
+        format!("the system app launcher did not start the notifier app ({status}): {err}")
+    }
+    /// Deny reason: no answer before the timeout.
+    pub const TIMEOUT: &str = "timeout: the user did not answer in time";
+    /// Deny reason: the notification server cannot show buttons.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub const NO_ACTIONS: &str =
+        "the desktop notification server does not support actions (buttons)";
+
+    /// Error when the notification service does not answer in time.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub const NOTIFY_NO_ANSWER: &str = "the notification service did not answer";
+
+    /// Deny reason: the host cannot show the request.
+    pub fn unavailable(err: impl Display) -> String {
+        format!("cannot show the approval request on the host: {err}")
     }
 }
 

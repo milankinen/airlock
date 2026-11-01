@@ -4,6 +4,7 @@ members = [
     "app/airlock-common",
     "app/airlockd",
     "app/airlock-monitor",
+    "app/airlock-macos-notifier",
     "app/airlock-test-utils",
 ]
 resolver = "3"
@@ -76,6 +77,8 @@ subst = "0.3"
 toml = "1"
 # Line diffs (the config change question of `airlock start`).
 similar = "2"
+jsonc-parser = { version = "0.34", default-features = false, features = ["cst"] }
+yaml-edit = { version = "0.3", default-features = false }
 # TOML documents built in code (the setup wizard's config file).
 toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
 
@@ -126,6 +129,15 @@ smoltcp = { version = "0.13", default-features = false, features = [
 
 # TLS parsing
 tls-parser = "0.12"
+# Public suffix list, for the wildcard check of network grants
+psl = "2"
+
+# MCP server in the guest admin service
+rmcp = { version = "3.8", default-features = false, features = ["server", "macros", "transport-streamable-http-server"] }
+schemars = "1"
+
+# Host desktop notifications
+notify-rust = { version = "4.18", default-features = false, features = ["z-with-tokio"] }
 
 # Testing
 axum = "0.8"

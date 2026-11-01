@@ -1,0 +1,50 @@
+#!/bin/bash
+#MISE description="Show a test notification with the macOS notifier app (arg: direct or open)"
+#MISE depends=[{task="build:notifier", env={NOTIFIER_BUNDLE_ID="io.github.milankinen.airlock.dev.notify"}}]
+#MISE raw=true
+# Shows one test notification with the notifier app of build:notifier and
+# prints the answer line and the diagnostics. macOS only.
+#   direct: run the executable of the bundle, as airlock does (default)
+#   open: start the bundle with `open`, as airlock does when the user did
+#         not decide on the notification permission yet
+set -euo pipefail
+
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "notifier:try runs only on macOS" >&2
+  exit 1
+fi
+
+mode="${1:-direct}"
+case "$mode" in
+  direct | open) ;;
+  *)
+    echo "usage: mise run notifier:try -- [direct|open]" >&2
+    exit 2
+    ;;
+esac
+
+cd "${MISE_PROJECT_ROOT:-$(dirname "$0")/../../..}"
+root="$(pwd -P)"
+app="${CARGO_TARGET_DIR:-$root/target}/notifier/AirlockNotifier.app"
+tmp="$root/.tmp/notifier-try"
+lsregister=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+
+# Register the new bundle version, so LaunchServices reads the icon again.
+"$lsregister" -f "$app"
+rm -rf "$tmp"
+mkdir -p "$tmp"
+trap 'rm -rf "$tmp"' EXIT
+printf '{"title":"Airlock test","body":"Allow or deny (%s)","timeout_ms":60000}\n' "$mode" >"$tmp/req.json"
+: >"$tmp/out.txt"
+: >"$tmp/err.txt"
+
+rc=0
+if [[ "$mode" == direct ]]; then
+  "$app/Contents/MacOS/airlock-macos-notifier" <"$tmp/req.json" >"$tmp/out.txt" 2>"$tmp/err.txt" || rc=$?
+else
+  open -n -g -W --stdin "$tmp/req.json" --stdout "$tmp/out.txt" --stderr "$tmp/err.txt" "$app" || rc=$?
+fi
+echo "exit code: $rc"
+echo "answer: $(cat "$tmp/out.txt")"
+echo "stderr:"
+sed 's/^/  /' "$tmp/err.txt"

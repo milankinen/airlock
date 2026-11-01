@@ -145,7 +145,15 @@ where
 
         let proxy = start_mock_proxy(mode);
         let dns = Rc::new(DnsState::new());
-        spawn_poll_loop(tun, Ipv4Addr::from(net.tun_ip), 24, proxy, dns).unwrap();
+        spawn_poll_loop(
+            tun,
+            Ipv4Addr::from(net.tun_ip),
+            24,
+            proxy,
+            dns,
+            super::GrantRoutes::new(),
+        )
+        .unwrap();
 
         let start = std::time::Instant::now();
         let stream = tokio::net::TcpStream::connect((Ipv4Addr::from(net.dst_ip), 80))

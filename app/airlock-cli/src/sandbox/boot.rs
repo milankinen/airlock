@@ -137,6 +137,10 @@ pub async fn boot(spec: BootSpec<'_>) -> anyhow::Result<Vm> {
     let (instance, vsock_fd) = vm::start(&project, image, &container_home, env, &options).await?;
     project.save_meta();
 
+    // Get the agent features before the network RPC server takes ownership
+    // of `Network`.
+    let agent = network.agent_access();
+
     let mut tasks = BootTasks::default();
     let (supervisor, network, socket_fwds) =
         match connect(&instance, vsock_fd, network, reverse_forwards, &mut tasks).await {
@@ -162,6 +166,7 @@ pub async fn boot(spec: BootSpec<'_>) -> anyhow::Result<Vm> {
             browser,
             clipboard,
             mcp,
+            agent,
         })
         .await;
     if let Err(e) = booted {

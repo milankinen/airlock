@@ -443,6 +443,79 @@ pub struct Network {
     #[config(default)]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub services: BTreeMap<String, bool>,
+    /// Temporary network access that the sandbox can ask for. The user
+    /// must approve each request on the host. The default is not
+    /// serialized, thus configs without `[network.grants]` serialize as
+    /// before.
+    #[config(nest)]
+    #[serde(skip_serializing_if = "Grants::is_default")]
+    pub grants: Grants,
+    /// Rules that the sandbox can see and ask to change through the airlock
+    /// MCP server: `"all"`, `"on-demand"` (default) or `"none"`. With
+    /// `"none"`, a command cannot use an on-demand rule. The default is not
+    /// serialized, thus configs without it serialize as before.
+    #[config(default)]
+    #[serde(skip_serializing_if = "RuleEditing::is_default")]
+    pub rule_editing: RuleEditing,
+}
+
+/// Rules that the sandbox can see and ask to change (`network.rule_editing`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuleEditing {
+    /// All rules. A change can set any `enabled` value.
+    All,
+    /// Only on-demand rules. A change must keep the rule on demand.
+    #[default]
+    OnDemand,
+    /// No rules. Commands cannot use on-demand rules.
+    None,
+}
+
+impl RuleEditing {
+    /// Return true if the value is the default.
+    #[expect(clippy::trivially_copy_pass_by_ref, reason = "serde gives a reference")]
+    fn is_default(&self) -> bool {
+        *self == RuleEditing::default()
+    }
+}
+
+impl WellKnown for RuleEditing {
+    type Deserializer =
+        smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
+    const DE: Self::Deserializer = smart_config::de::Serde;
+}
+
+/// Temporary network access (`[network.grants]`).
+///
+/// A process in the sandbox can ask for access to more hosts for one
+/// command. The host asks the user. The access ends when the command ends
+/// or when the duration expires.
+#[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
+pub struct Grants {
+    /// Let the sandbox ask for temporary network access.
+    #[config(default_t = true)]
+    pub enabled: bool,
+    /// Time in seconds to wait for the decision of the user. No decision in
+    /// this time means deny.
+    #[config(default_t = Grants::DEFAULT_APPROVAL_TIMEOUT)]
+    pub approval_timeout: u32,
+    /// Maximum duration of one grant in seconds. A request for a longer
+    /// duration gets this duration.
+    #[config(default_t = Grants::DEFAULT_MAX_DURATION)]
+    pub max_duration: u32,
+}
+
+impl Grants {
+    const DEFAULT_APPROVAL_TIMEOUT: u32 = 120;
+    const DEFAULT_MAX_DURATION: u32 = 900;
+
+    /// Return true if all values are the defaults.
+    fn is_default(&self) -> bool {
+        self.enabled
+            && self.approval_timeout == Self::DEFAULT_APPROVAL_TIMEOUT
+            && self.max_duration == Self::DEFAULT_MAX_DURATION
+    }
 }
 
 /// Forward a host Unix socket into the guest container.
@@ -686,11 +759,17 @@ impl WellKnown for PortMapping {
 /// sniffed. For example, the 8-byte SSLRequest of Postgres would deadlock
 /// the HTTP detector. Middleware on the same target is not compatible.
 /// Airlock reports the conflict at startup.
-#[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, DescribeConfig, DeserializeConfig)]
 pub struct NetworkRule {
-    /// Enable or disable the rule
-    #[config(default_t = true)]
-    pub enabled: bool,
+    /// `true` (default) enables the rule and `false` disables it.
+    /// `"on-demand"` keeps the rule off for normal connections. A command
+    /// that the user approves through the airlock MCP server can use it.
+    #[config(default)]
+    pub enabled: RuleEnabled,
+    /// Short text that tells what the rule is for.
+    #[config(default)]
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub description: String,
     /// Hosts/ports to allow.
     #[config(default)]
     pub allow: Vec<String>,
@@ -707,6 +786,99 @@ pub struct NetworkRule {
     /// `mask = true`. Not compatible with `passthrough`.
     #[config(default)]
     pub inject: Vec<String>,
+}
+
+impl NetworkRule {
+    /// Return true if the rule applies to all connections.
+    pub fn is_active(&self) -> bool {
+        self.enabled == RuleEnabled::On
+    }
+
+    /// Return true if the rule is on or on demand.
+    pub fn is_used(&self) -> bool {
+        self.enabled != RuleEnabled::Off
+    }
+}
+
+/// State of a network rule: `true`, `false` or `"on-demand"`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RuleEnabled {
+    /// The rule applies to all connections (`true`).
+    #[default]
+    On,
+    /// The rule is disabled (`false`).
+    Off,
+    /// The rule applies only to the connections of an approved command
+    /// (`"on-demand"`).
+    OnDemand,
+}
+
+impl RuleEnabled {
+    /// Config text of the on-demand state.
+    pub const ON_DEMAND: &str = "on-demand";
+
+    /// Read the state from its text: `true`, `false` or `on-demand`.
+    pub fn from_text(text: &str) -> Option<Self> {
+        match text {
+            "true" => Some(RuleEnabled::On),
+            "false" => Some(RuleEnabled::Off),
+            Self::ON_DEMAND => Some(RuleEnabled::OnDemand),
+            _ => None,
+        }
+    }
+
+    /// Get the text of the state: `true`, `false` or `on-demand`.
+    pub fn as_text(self) -> &'static str {
+        match self {
+            RuleEnabled::On => "true",
+            RuleEnabled::Off => "false",
+            RuleEnabled::OnDemand => Self::ON_DEMAND,
+        }
+    }
+}
+
+impl serde::Serialize for RuleEnabled {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            RuleEnabled::On => s.serialize_bool(true),
+            RuleEnabled::Off => s.serialize_bool(false),
+            RuleEnabled::OnDemand => s.serialize_str(Self::ON_DEMAND),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RuleEnabled {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = RuleEnabled;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(crate::messages::config::RULE_ENABLED_EXPECTED)
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<RuleEnabled, E> {
+                Ok(if v { RuleEnabled::On } else { RuleEnabled::Off })
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<RuleEnabled, E> {
+                if v == RuleEnabled::ON_DEMAND {
+                    Ok(RuleEnabled::OnDemand)
+                } else {
+                    Err(E::custom(crate::messages::config::RULE_ENABLED_EXPECTED))
+                }
+            }
+        }
+        d.deserialize_any(Visitor)
+    }
+}
+
+impl WellKnown for RuleEnabled {
+    type Deserializer = smart_config::de::Serde<
+        {
+            smart_config::metadata::BasicTypes::BOOL
+                .or(smart_config::metadata::BasicTypes::STRING)
+                .raw()
+        },
+    >;
+    const DE: Self::Deserializer = smart_config::de::Serde;
 }
 
 impl WellKnown for NetworkRule {
@@ -1155,11 +1327,24 @@ fn validate_mcp(config: &ConfigValues) -> Vec<String> {
 ///    rule with `inject` also cannot be `passthrough`, because injection
 ///    needs interception.
 ///  - Services: each name in `[network.services]` must be a known service.
+///  - Grants: `approval_timeout` and `max_duration` must be 1 or more.
 ///
 /// Returns:
 ///   One problem line for each problem.
 fn validate_network(config: &ConfigValues) -> Vec<String> {
     let mut problems: Vec<String> = Vec::new();
+    let grants = &config.network.grants;
+    for (field, value) in [
+        ("approval_timeout", grants.approval_timeout),
+        ("max_duration", grants.max_duration),
+    ] {
+        if value == 0 {
+            problems.push(format!(
+                "* {}",
+                crate::messages::config::grants_time_zero(field)
+            ));
+        }
+    }
     for name in config.network.services.keys() {
         if ServiceId::from_name(name).is_none() {
             let known: Vec<&str> = ServiceId::ALL.iter().map(|s| s.name()).collect();
@@ -1170,7 +1355,7 @@ fn validate_network(config: &ConfigValues) -> Vec<String> {
         }
     }
     for (rule_name, rule) in &config.network.rules {
-        if !rule.enabled {
+        if !rule.is_used() {
             continue;
         }
         for (field, patterns) in [("allow", &rule.allow), ("deny", &rule.deny)] {

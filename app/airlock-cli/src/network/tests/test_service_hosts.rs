@@ -32,14 +32,14 @@ fn service_host_is_allowed_and_intercepted_unless_denied() {
     let t = network.resolve_target("127.0.0.1", port.wrapping_add(1));
     assert!(!t.allowed && t.interceptor.is_none());
 
-    network.passthrough_targets = vec![NetworkTarget {
+    network.rules.get_mut().active.passthrough = vec![NetworkTarget {
         host: "127.0.0.1".into(),
         port: None,
     }];
     let t = network.resolve_target("127.0.0.1", port);
     assert!(t.allowed && !t.is_passthrough());
 
-    network.deny_targets = vec![NetworkTarget {
+    network.rules.get_mut().active.deny = vec![NetworkTarget {
         host: "127.0.0.1".into(),
         port: Some(port),
     }];

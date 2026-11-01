@@ -155,6 +155,7 @@ impl InjectTarget {
 /// Decision for one connection: if it is allowed, and how the proxy
 /// handles it.
 #[derive(Clone)]
+#[allow(clippy::struct_excessive_bools)] // independent flags
 pub struct ResolvedTarget {
     /// Destination host (after port forward changes).
     pub host: String,
@@ -173,6 +174,10 @@ pub struct ResolvedTarget {
     /// True if the connection is allowed. False if the policy or a deny
     /// rule denies it, or if no allow rule matches.
     pub allowed: bool,
+    /// True if the connection is denied only because no allow rule
+    /// matches under `deny-by-default`. A temporary grant can allow such a
+    /// target. False for allowed targets and for all other denies.
+    pub grantable: bool,
     /// If true, skip TLS and HTTP interception and relay the connection as
     /// plain TCP. Set for targets that match a passthrough rule and for
     /// localhost port-forwarded destinations. These may use non-HTTP

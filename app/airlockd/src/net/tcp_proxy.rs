@@ -3,6 +3,10 @@
 //! Catches all outgoing TCP connections in the VM, including connections from
 //! containers, and relays them to the host. The host then decides how to
 //! handle each connection.
+//!
+//! Connections from the address of a temporary network grant go to the
+//! network proxy of that grant. All other connections go to the default
+//! network proxy.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
@@ -28,6 +32,7 @@ use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, info};
 
 use super::dns::DnsState;
+use super::grant_ns::GrantRoutes;
 use super::rpc_bridge::{ChannelSink, rpc_connect_tcp};
 use super::tun::Tun;
 
@@ -95,10 +100,15 @@ struct Conn {
 /// Args:
 ///  - `network`: Host network proxy client
 ///  - `dns`: Virtual DNS state, to map the fake IPs back to hostnames
+///  - `grants`: Proxies of the active network grants, by source address
 ///
 /// Returns:
 ///   Error if the TUN device or interface setup fails.
-pub fn start(network: network_proxy::Client, dns: Rc<DnsState>) -> anyhow::Result<()> {
+pub fn start(
+    network: network_proxy::Client,
+    dns: Rc<DnsState>,
+    grants: GrantRoutes,
+) -> anyhow::Result<()> {
     let tun = Tun::create("airlock0")?;
     let name = tun.name().to_string();
 
@@ -116,7 +126,14 @@ pub fn start(network: network_proxy::Client, dns: Rc<DnsState>) -> anyhow::Resul
     // interface. Strict RPF would drop them.
     let _ = std::fs::write(format!("/proc/sys/net/ipv4/conf/{name}/rp_filter"), "0");
 
-    spawn_poll_loop(tun, Ipv4Addr::new(192, 168, 77, 1), 24, network, dns)
+    spawn_poll_loop(
+        tun,
+        Ipv4Addr::new(192, 168, 77, 1),
+        24,
+        network,
+        dns,
+        grants,
+    )
 }
 
 /// Make the smoltcp interface on a configured TUN device and start the poll
@@ -130,12 +147,14 @@ pub fn start(network: network_proxy::Client, dns: Rc<DnsState>) -> anyhow::Resul
 ///  - `ip`, `prefix`: Interface address and prefix length
 ///  - `network`: Host network proxy client
 ///  - `dns`: Virtual DNS state, to map the fake IPs back to hostnames
+///  - `grants`: Proxies of the active network grants, by source address
 pub(crate) fn spawn_poll_loop(
     tun: Tun,
     ip: Ipv4Addr,
     prefix: u8,
     network: network_proxy::Client,
     dns: Rc<DnsState>,
+    grants: GrantRoutes,
 ) -> anyhow::Result<()> {
     let name = tun.name().to_string();
     let iface_ip = IpCidr::new(IpAddress::Ipv4(Ipv4Address::from(ip.octets())), prefix);
@@ -207,13 +226,13 @@ pub(crate) fn spawn_poll_loop(
                     PollIngressSingleResult::None => break,
                     PollIngressSingleResult::PacketProcessed => {}
                     PollIngressSingleResult::SocketStateChanged => {
-                        run_fsm(&mut sockets, &mut tracker, &network, &dns, &wake);
+                        run_fsm(&mut sockets, &mut tracker, &network, &grants, &dns, &wake);
                     }
                 }
             }
             // One more FSM pass for timer-driven state changes and for the
             // channel progress that the wake-up signal reported.
-            run_fsm(&mut sockets, &mut tracker, &network, &dns, &wake);
+            run_fsm(&mut sockets, &mut tracker, &network, &grants, &dns, &wake);
 
             // Egress: make device tx packets from socket-buffered data.
             // `poll_egress` sends at most ONE packet per socket per call.
@@ -280,7 +299,8 @@ pub(crate) fn spawn_poll_loop(
 }
 
 /// Run the state machine of each connection:
-///  * At the first ESTABLISHED, start the RPC relay agent.
+///  * At the first ESTABLISHED, start the RPC relay agent. It uses the
+///    grant proxy of the source address, or else the default proxy.
 ///  * Move the data of the smoltcp recv buffer into the `to_host` channel.
 ///    If the agent is gone, discard the guest bytes (`discard_rx`).
 ///  * Move the data of `from_host_rx` into the smoltcp tx buffer. After a
@@ -293,6 +313,7 @@ fn run_fsm(
     sockets: &mut SocketSet<'static>,
     tracker: &mut HashMap<ConnKey, Conn>,
     network: &network_proxy::Client,
+    grants: &GrantRoutes,
     dns: &Rc<DnsState>,
     wake: &Rc<Notify>,
 ) {
@@ -308,8 +329,13 @@ fn run_fsm(
             conn.from_host_rx = from_host_rx;
             conn.agent_spawned = true;
             debug!("tcp-proxy accept: peer={} dst={}", key.0, key.1);
+            // The source address selects the proxy. Each grant namespace has
+            // its own address, see `grant_ns`.
+            let proxy = grants
+                .lookup(*key.0.ip())
+                .unwrap_or_else(|| network.clone());
             tokio::task::spawn_local(relay_agent(
-                network.clone(),
+                proxy,
                 dns.clone(),
                 key.1,
                 to_host_rx,

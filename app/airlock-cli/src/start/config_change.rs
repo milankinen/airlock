@@ -148,6 +148,29 @@ pub fn save(
     project::save_last_run_config(sandbox_dir, serde_json::to_value(config)?, paths.clone())
 }
 
+/// Put an on-demand rule that the user approved into the config of the last
+/// run. Then the next run does not ask about this change again. Other
+/// changes of the file still give the question. Does nothing if the sandbox
+/// has no config of the last run.
+/// Args:
+///  - `sandbox_dir`: Sandbox directory with the config of the last run
+///  - `origin`: Path of the changed project file
+///  - `name`: Name of the rule
+///  - `rule`: Table of the rule that the user approved
+pub fn approve_rule(
+    sandbox_dir: &VerifiedPath,
+    origin: &str,
+    name: &str,
+    rule: Value,
+) -> anyhow::Result<()> {
+    let Some(stored) = project::read_run_meta(sandbox_dir).last_run_config else {
+        return Ok(());
+    };
+    let mut config: LayeredConfig = serde_json::from_value(stored)?;
+    config.set_project_rule(origin, name, rule);
+    project::update_last_run_config(sandbox_dir, serde_json::to_value(&config)?)
+}
+
 /// Resolve the host paths of `values`: the sources of the enabled mounts,
 /// `vm.kernel`, `vm.initramfs` and the host sockets of the enabled socket
 /// forwards. Creates nothing.

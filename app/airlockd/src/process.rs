@@ -4,6 +4,8 @@
 //!  * user processes in the container, with a terminal (interactive) or
 //!    without. Their input and output go to the host CLI.
 //!  * sidecar daemons, with their output in log files
+//!  * commands that run to the end, optionally in a separate network
+//!    namespace. Their output is kept in memory, up to a limit.
 //!
 //! Also removes orphan processes after they exit.
 
@@ -153,7 +155,7 @@ pub fn spawn_user(
     // The diagnostic pipe tells which syscall failed in the pre-exec hook.
     // Error strings cannot cross the fork/exec boundary. Only the errno can.
     let (diag_r, diag_w) = open_diag_pipe();
-    let pre_exec = build_pre_exec(cwd.to_string(), uid, gid, harden, diag_w);
+    let pre_exec = build_pre_exec(cwd.to_string(), uid, gid, harden, None, true, diag_w);
 
     let result = spawn(cmd, args, env_pairs, pre_exec, pty_size);
     finish_diag_pipe(diag_r, diag_w, result)
@@ -189,7 +191,7 @@ pub fn spawn_daemon(
 
     let env_pairs = env_string_pairs(env);
     let (diag_r, diag_w) = open_diag_pipe();
-    let pre_exec = build_pre_exec(cwd.to_string(), uid, gid, harden, diag_w);
+    let pre_exec = build_pre_exec(cwd.to_string(), uid, gid, harden, None, true, diag_w);
 
     let stdout_dup = stdout_file.try_clone().context("dup daemon stdout")?;
     let stderr_dup = stderr_file.try_clone().context("dup daemon stderr")?;
@@ -213,6 +215,289 @@ pub fn spawn_daemon(
         register_own_child(pid);
     }
     result
+}
+
+/// Time to read the rest of the output after the command exited or was
+/// killed. A process outside the process group can keep the pipes open.
+const COLLECT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Command to run to the end with [`spawn_collect`].
+pub struct CollectSpec {
+    /// Shell command. Runs with `/bin/sh -c`.
+    pub cmd: String,
+    /// Full environment as `KEY=VALUE` strings. Nothing is inherited.
+    pub env: Vec<String>,
+    /// Working directory in the container. If it does not exist, the
+    /// command starts in `/`.
+    pub cwd: String,
+    /// Network namespace to run the command in. `None` uses the main
+    /// network of the VM.
+    pub netns: Option<std::os::fd::OwnedFd>,
+    /// Number of bytes to keep from the end of stdout, and the same for
+    /// stderr.
+    pub output_limit: usize,
+}
+
+/// Result of a command from [`spawn_collect`].
+#[derive(Debug)]
+pub struct CollectOutput {
+    /// Exit code, or `None` if a signal stopped the command.
+    pub exit_code: Option<i32>,
+    /// Signal that stopped the command, if any.
+    pub signal: Option<i32>,
+    /// Last bytes of stdout, as lossy UTF-8.
+    pub stdout: String,
+    /// Last bytes of stderr, as lossy UTF-8.
+    pub stderr: String,
+    /// `true` if stdout was longer than the limit.
+    pub stdout_truncated: bool,
+    /// `true` if stderr was longer than the limit.
+    pub stderr_truncated: bool,
+    /// `true` if the cancel future of [`CollectHandle::wait`] stopped the
+    /// command.
+    pub killed: bool,
+}
+
+/// A running command from [`spawn_collect`]. Drop kills its process group.
+pub struct CollectHandle {
+    child: tokio::process::Child,
+    /// Process group ID (the PID of the shell).
+    pgid: Option<i32>,
+    output_limit: usize,
+}
+
+/// Start a shell command in the container that runs to the end. stdin is
+/// `/dev/null`. stdout and stderr go to memory, see [`CollectHandle::wait`].
+/// In unit tests, the command runs as the test user outside the container,
+/// and `uid`, `gid` and `harden` have no effect.
+/// Args:
+///  - `spec`: Command, environment, cwd, network namespace and output limit
+///  - `uid`, `gid`, `harden`: Same as in [`spawn_user`]
+///
+/// Returns:
+///   Handle of the running command, or an error that tells which setup
+///   step failed.
+pub fn spawn_collect(
+    spec: CollectSpec,
+    uid: u32,
+    gid: u32,
+    harden: bool,
+) -> anyhow::Result<CollectHandle> {
+    use std::os::fd::AsRawFd;
+    use std::process::Stdio;
+
+    let CollectSpec {
+        cmd,
+        env,
+        cwd,
+        netns: netns_fd,
+        output_limit,
+    } = spec;
+    let env_pairs = env_string_pairs(&env);
+    let (diag_r, diag_w) = open_diag_pipe();
+    // The FD has O_CLOEXEC. It stays open in the child until exec, so the
+    // pre-exec hook can use it. `netns_fd` keeps it open until the spawn
+    // returns.
+    let netns = netns_fd.as_ref().map(AsRawFd::as_raw_fd);
+    // Unit tests run without root and without a container rootfs. They
+    // skip the container entry and the credential change.
+    let pre_exec = build_pre_exec(cwd, uid, gid, harden, netns, !cfg!(test), diag_w);
+
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg(&cmd)
+        .env_clear()
+        .envs(env_pairs)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Its own group, so a kill also stops the children of the shell.
+        // A child that calls setsid leaves the group and escapes the kill.
+        // The network guarantee is the deleted grant cable, not the kill.
+        .process_group(0);
+    // Safety: pre_exec runs in the child after fork. It uses only
+    // async-signal-safe calls.
+    unsafe { command.pre_exec(pre_exec) };
+    let result = command.spawn().map_err(anyhow::Error::from);
+    let child = finish_diag_pipe(diag_r, diag_w, result)?;
+    drop(netns_fd);
+    let pgid = child.id().map(|pid| pid as i32);
+    if let Some(pid) = child.id() {
+        register_own_child(pid);
+    }
+    Ok(CollectHandle {
+        child,
+        pgid,
+        output_limit,
+    })
+}
+
+impl CollectHandle {
+    /// Read the output until the command exits, or until `cancel`
+    /// completes. Then kill the remaining processes of the group.
+    /// Args:
+    ///  - `cancel`: When it completes, the command is killed. Use
+    ///    `std::future::pending()` to wait without a limit.
+    ///
+    /// Returns:
+    ///   Exit status and the last bytes of the output. Also after a cancel.
+    #[allow(clippy::large_futures)]
+    pub async fn wait(
+        mut self,
+        cancel: impl std::future::Future<Output = ()>,
+    ) -> anyhow::Result<CollectOutput> {
+        use std::os::unix::process::ExitStatusExt;
+
+        let mut stdout = self.child.stdout.take();
+        let mut stderr = self.child.stderr.take();
+        let mut out = TailBuf::new(self.output_limit);
+        let mut err = TailBuf::new(self.output_limit);
+        let mut out_buf = [0u8; 4096];
+        let mut err_buf = [0u8; 4096];
+        let mut killed = false;
+        let mut cancel = std::pin::pin!(cancel);
+
+        let status = loop {
+            tokio::select! {
+                r = read_some(&mut stdout, &mut out_buf), if stdout.is_some() => {
+                    if !out.push_read(r.ok(), &out_buf) { stdout = None; }
+                }
+                r = read_some(&mut stderr, &mut err_buf), if stderr.is_some() => {
+                    if !err.push_read(r.ok(), &err_buf) { stderr = None; }
+                }
+                () = &mut cancel, if !killed => {
+                    killed = true;
+                    kill_group(self.pgid);
+                }
+                s = self.child.wait() => break s?,
+            }
+        };
+        // The shell is gone. Stop the processes that it left behind, so
+        // they cannot use the grant later. Then read the rest of the output.
+        self.kill();
+        let drain = async {
+            while stdout.is_some() || stderr.is_some() {
+                tokio::select! {
+                    r = read_some(&mut stdout, &mut out_buf), if stdout.is_some() => {
+                        if !out.push_read(r.ok(), &out_buf) { stdout = None; }
+                    }
+                    r = read_some(&mut stderr, &mut err_buf), if stderr.is_some() => {
+                        if !err.push_read(r.ok(), &err_buf) { stderr = None; }
+                    }
+                }
+            }
+        };
+        let _ = tokio::time::timeout(COLLECT_DRAIN_TIMEOUT, drain).await;
+
+        Ok(CollectOutput {
+            exit_code: status.code(),
+            signal: status.signal(),
+            stdout_truncated: out.truncated,
+            stderr_truncated: err.truncated,
+            stdout: out.into_string(),
+            stderr: err.into_string(),
+            killed,
+        })
+    }
+
+    /// Kill all processes of the command's process group with SIGKILL.
+    pub fn kill(&self) {
+        kill_group(self.pgid);
+    }
+}
+
+/// Send SIGKILL to the process group `pgid`, if it is known.
+fn kill_group(pgid: Option<i32>) {
+    if let Some(pgid) = pgid {
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    }
+}
+
+impl Drop for CollectHandle {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Read from an optional pipe. The caller enables this branch only when the
+/// pipe is `Some`.
+async fn read_some<R: tokio::io::AsyncRead + Unpin>(
+    pipe: &mut Option<R>,
+    buf: &mut [u8],
+) -> std::io::Result<usize> {
+    match pipe {
+        Some(p) => p.read(buf).await,
+        None => Ok(0),
+    }
+}
+
+/// Keeps the last `limit` bytes of a stream.
+struct TailBuf {
+    buf: std::collections::VecDeque<u8>,
+    limit: usize,
+    /// `true` after bytes were dropped from the front.
+    truncated: bool,
+}
+
+impl TailBuf {
+    fn new(limit: usize) -> Self {
+        Self {
+            buf: std::collections::VecDeque::new(),
+            limit,
+            truncated: false,
+        }
+    }
+
+    /// Add bytes. Drop the oldest bytes above the limit.
+    fn push(&mut self, data: &[u8]) {
+        let data = if data.len() > self.limit {
+            self.truncated = true;
+            self.buf.clear();
+            &data[data.len() - self.limit..]
+        } else {
+            data
+        };
+        let over = (self.buf.len() + data.len()).saturating_sub(self.limit);
+        if over > 0 {
+            self.truncated = true;
+            self.buf.drain(..over);
+        }
+        self.buf.extend(data);
+    }
+
+    /// Add the result of one pipe read from `buf`. `None` is a read error.
+    ///
+    /// Returns:
+    ///   `false` at end of stream or on a read error.
+    fn push_read(&mut self, r: Option<usize>, buf: &[u8]) -> bool {
+        match r {
+            Some(0) | None => false,
+            Some(n) => {
+                self.push(&buf[..n]);
+                true
+            }
+        }
+    }
+
+    /// Convert to lossy UTF-8. After a cut, skip the bytes of a partial
+    /// first character, so the text does not start with a replacement
+    /// character.
+    fn into_string(self) -> String {
+        let bytes: Vec<u8> = self.buf.into();
+        let start = if self.truncated {
+            // UTF-8 continuation bytes are 0b10xx_xxxx. A character has at
+            // most 3 of them.
+            bytes
+                .iter()
+                .take(3)
+                .take_while(|b| (**b & 0xC0) == 0x80)
+                .count()
+        } else {
+            0
+        };
+        String::from_utf8_lossy(&bytes[start..]).into_owned()
+    }
 }
 
 /// Split `KEY=VALUE` strings into pairs. A string without `=` gets an empty
@@ -273,15 +558,19 @@ fn finish_diag_pipe<T>(diag_r: i32, diag_w: i32, result: anyhow::Result<T>) -> a
 
 /// Make the pre-exec hook that runs in the child after fork.
 ///
-/// Steps: enter the container rootfs (join the sandbox mount namespace, or
-/// chroot if init could not make it), harden, chdir, setgroups, setgid,
-/// setuid. On a hard failure, the hook writes a short step tag to `diag_w`,
-/// so the parent can add it to the error as context.
+/// Steps: join the network namespace `netns` (if given), enter the
+/// container rootfs (join the sandbox mount namespace, or chroot if init
+/// could not make it), harden, chdir, setgroups, setgid, setuid. If
+/// `container` is `false`, only the network namespace and chdir steps run
+/// (unit tests). On a hard failure, the hook writes a short step tag to
+/// `diag_w`, so the parent can add it to the error as context.
 fn build_pre_exec(
     cwd: String,
     uid: u32,
     gid: u32,
     harden: bool,
+    netns: Option<i32>,
+    container: bool,
     diag_w: i32,
 ) -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'static {
     // Allocate before fork. The hook can only make raw syscalls.
@@ -290,7 +579,7 @@ fn build_pre_exec(
     // Only Linux uses `harden` and `ns_fd`. They are always there, so the
     // code is the same on all platforms.
     #[cfg(not(target_os = "linux"))]
-    let _ = (harden, ns_fd);
+    let _ = (harden, ns_fd, netns);
 
     move || {
         // Save errno first, then write the step tag (write(2) can change it).
@@ -303,6 +592,21 @@ fn build_pre_exec(
                 }
                 return Err(err);
             }};
+        }
+
+        // Join the network namespace first, while the process still has
+        // all capabilities and before the mount namespace changes.
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = netns
+            && unsafe { libc::setns(fd, libc::CLONE_NEWNET) } != 0
+        {
+            fail!(b"setns(grant net ns)");
+        }
+
+        let cwd_cstr = std::ffi::CString::new(cwd.as_str()).unwrap();
+        if !container {
+            unsafe { libc::chdir(cwd_cstr.as_ptr()) };
+            return Ok(());
         }
 
         // Enter the container rootfs. Join the shared sandbox mount namespace
@@ -343,7 +647,6 @@ fn build_pre_exec(
         if !entered && unsafe { libc::chroot(rootfs.as_ptr()) } != 0 {
             fail!(b"chroot(/mnt/overlay/rootfs)");
         }
-        let cwd_cstr = std::ffi::CString::new(cwd.as_str()).unwrap();
         if unsafe { libc::chdir(cwd_cstr.as_ptr()) } != 0 {
             let root = std::ffi::CString::new("/").unwrap();
             unsafe { libc::chdir(root.as_ptr()) };
@@ -716,9 +1019,110 @@ impl process::Server for ProcessImpl {
 
 #[cfg(test)]
 mod tests {
-    //! Tests of the `/proc/<pid>/stat` parser.
+    //! Tests of the `/proc/<pid>/stat` parser and the output tail buffer.
 
-    use super::parse_stat;
+    use super::{CollectSpec, TailBuf, parse_stat, spawn_collect};
+
+    /// Make a spec for `cmd` with a minimal PATH, in `/`, with no netns.
+    fn collect_spec(cmd: &str, output_limit: usize) -> CollectSpec {
+        CollectSpec {
+            cmd: cmd.into(),
+            env: vec!["PATH=/usr/bin:/bin".into()],
+            cwd: "/".into(),
+            netns: None,
+            output_limit,
+        }
+    }
+
+    /// Test that a command that runs to the end gives its exit code and
+    /// both outputs, and that the output limit keeps only the tail.
+    ///   1. Run a command that writes to stdout and stderr and exits with 3
+    ///   2. Check the exit code and the outputs
+    ///   3. Run a command with more output than the limit
+    ///   4. Check that only the tail is kept and marked as cut
+    #[tokio::test]
+    async fn collect_command_gives_exit_code_and_output_tail() {
+        let h = spawn_collect(
+            collect_spec("echo out; echo err >&2; exit 3", 64),
+            0,
+            0,
+            false,
+        )
+        .unwrap();
+        let out = h.wait(std::future::pending()).await.unwrap();
+        assert_eq!(out.exit_code, Some(3));
+        assert_eq!(
+            (out.stdout.as_str(), out.stderr.as_str()),
+            ("out\n", "err\n")
+        );
+        assert!(!out.stdout_truncated && !out.killed);
+
+        let h = spawn_collect(collect_spec("seq 1 1000", 4), 0, 0, false).unwrap();
+        let out = h.wait(std::future::pending()).await.unwrap();
+        assert_eq!(out.stdout, "000\n");
+        assert!(out.stdout_truncated);
+    }
+
+    /// Test that the cancel future kills the whole process group, also a
+    /// background child of the shell that holds the output pipes open.
+    ///   1. Run a shell with a background sleep and a foreground sleep
+    ///   2. Cancel after a short time
+    ///   3. Check that the wait ends fast, with SIGKILL and `killed` set
+    #[tokio::test]
+    async fn collect_cancel_kills_process_group() {
+        let h = spawn_collect(
+            collect_spec("echo up; sleep 30 & sleep 30", 64),
+            0,
+            0,
+            false,
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let cancel = tokio::time::sleep(std::time::Duration::from_millis(200));
+        let out = h.wait(cancel).await.unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(out.killed);
+        assert_eq!(out.signal, Some(libc::SIGKILL));
+        assert_eq!(out.stdout, "up\n");
+    }
+
+    /// Test that the tail buffer keeps only the last bytes and marks the
+    /// cut, for small writes and for one write above the limit.
+    ///   1. Push small chunks over the limit and check the kept tail
+    ///   2. Push one chunk larger than the limit and check the kept tail
+    ///   3. Check that output under the limit is not marked as cut
+    #[test]
+    fn tail_buffer_keeps_last_bytes_and_marks_cut() {
+        let mut t = TailBuf::new(5);
+        for chunk in [&b"abc"[..], b"def", b"gh"] {
+            t.push(chunk);
+        }
+        assert!(t.truncated);
+        assert_eq!(t.into_string(), "defgh");
+
+        let mut t = TailBuf::new(4);
+        t.push(b"x");
+        t.push(b"0123456789");
+        assert!(t.truncated);
+        assert_eq!(t.into_string(), "6789");
+
+        let mut t = TailBuf::new(8);
+        t.push(b"ok");
+        assert!(!t.truncated);
+        assert_eq!(t.into_string(), "ok");
+    }
+
+    /// Test that a cut in the middle of a multi-byte character does not
+    /// give a replacement character at the start of the text.
+    ///   1. Push text with a 3-byte character and cut inside it
+    ///   2. Check that the partial character is skipped
+    #[test]
+    fn tail_buffer_cut_inside_utf8_character_skips_partial_character() {
+        let mut t = TailBuf::new(4);
+        // "€" is E2 82 AC. The limit keeps 82 AC and "ab".
+        t.push("x€ab".as_bytes());
+        assert_eq!(t.into_string(), "ab");
+    }
 
     /// Test that the parser reads the PPID and state after the last `)` of
     /// the command name. A command name can contain spaces and parentheses.

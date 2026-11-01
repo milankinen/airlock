@@ -4,7 +4,7 @@
 
 use smart_config::ByteSize;
 
-use crate::config::config_values::{PullPolicy, Resolution, RestartPolicy, Signal};
+use crate::config::config_values::{PullPolicy, Resolution, RestartPolicy, RuleEnabled, Signal};
 use crate::test_cfg::{ConfigDirs, project_toml_error, resolve_project_toml};
 
 /// Test that the defaults give no clipboard access, no KVM, no services, no
@@ -187,6 +187,7 @@ fn invalid_section_values_are_config_errors_naming_their_path() {
             "[network.services]\nanthropic = \"yes\"\n",
             "network.services",
         ),
+        ("[network.rules.r]\nenabled = \"maybe\"\n", "network.rules"),
     ] {
         let err = project_toml_error(toml);
         assert!(err.contains("invalid configuration"), "{toml}: {err}");
@@ -362,4 +363,43 @@ fn invalid_mcp_name_command_and_session_limit_are_config_errors() {
         err,
         "invalid configuration\n* `mcp.x` invalid configuration\n  * `command` missing"
     );
+}
+
+/// Test that a network rule can be on demand, with a description, and that
+/// the value stays the same when the config is written out again. An
+/// on-demand rule with a bad pattern is an error, because an approved
+/// command can use it.
+///   1. Resolve rules with `enabled` true, false and "on-demand"
+///   2. Check the states and the description
+///   3. Write the config as TOML and check the on-demand line
+///   4. Resolve an on-demand rule with a bad pattern and check the error
+#[test]
+fn on_demand_rule_with_description_resolves_and_serializes() {
+    let config = resolve_project_toml(
+        r#"
+        [network.rules.on]
+        allow = ["a.example.com"]
+
+        [network.rules.off]
+        enabled = false
+
+        [network.rules.npm]
+        enabled = "on-demand"
+        description = "npm packages"
+        allow = ["registry.npmjs.org"]
+        "#,
+    )
+    .unwrap()
+    .values;
+    let rules = &config.network.rules;
+    assert_eq!(rules["on"].enabled, RuleEnabled::On);
+    assert_eq!(rules["off"].enabled, RuleEnabled::Off);
+    assert_eq!(rules["npm"].enabled, RuleEnabled::OnDemand);
+    assert_eq!(rules["npm"].description, "npm packages");
+    let text = toml::to_string(&config.network.rules).unwrap();
+    assert!(text.contains("enabled = \"on-demand\""), "{text}");
+
+    let err =
+        project_toml_error("[network.rules.npm]\nenabled = \"on-demand\"\nallow = [\"*:8O80\"]\n");
+    assert!(err.contains("network.rules.npm.allow"), "{err}");
 }

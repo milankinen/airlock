@@ -1,6 +1,6 @@
 #!/bin/bash
 #MISE description="Build the CLI binary"
-#MISE depends=["build:initramfs", "build:kernel", "fetch:cloud-hypervisor", "build:virtiofsd"]
+#MISE depends=["build:initramfs", "build:kernel", "fetch:cloud-hypervisor", "build:virtiofsd", {task="build:notifier", env={NOTIFIER_BUNDLE_ID="io.github.milankinen.airlock.dev.notify"}}]
 #MISE sources=["app/airlock-cli/**/*", "app/airlock-common/**/*", "app/airlock-monitor/**/*", "Cargo.toml", "Cargo.lock", "target/vm/*"]
 #MISE outputs=["{{ env.CARGO_TARGET_DIR | default(value='target') }}/debug/airlock"]
 set -euo pipefail

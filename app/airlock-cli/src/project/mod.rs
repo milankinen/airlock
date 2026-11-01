@@ -290,7 +290,7 @@ pub fn open(
 ///   inject.
 pub fn resolve_env(config: &ConfigValues, vault: &Vault) -> Result<SandboxEnv, EnvError> {
     let env = SandboxEnv::resolve(&config.env, vault)?;
-    for rule in config.network.rules.values().filter(|r| r.enabled) {
+    for rule in config.network.rules.values().filter(|r| r.is_used()) {
         for name in &rule.inject {
             env.check_injectable(name)?;
         }
@@ -523,6 +523,17 @@ pub fn save_last_run_config(
     let mut meta = read_run_meta(sandbox_dir);
     meta.last_run_config = Some(config);
     meta.last_run_paths = Some(paths);
+    write_run_meta(sandbox_dir, &meta)
+}
+
+/// Replace the config of the last run in `run.json` of `sandbox_dir`. Keeps
+/// the host paths.
+pub fn update_last_run_config(
+    sandbox_dir: &VerifiedPath,
+    config: serde_json::Value,
+) -> anyhow::Result<()> {
+    let mut meta = read_run_meta(sandbox_dir);
+    meta.last_run_config = Some(config);
     write_run_meta(sandbox_dir, &meta)
 }
 

@@ -18,4 +18,5 @@ mod test_refresh_racing_sign_out;
 mod test_secret_inject;
 mod test_service_hosts;
 mod test_service_routes;
+mod test_temporary_grant;
 mod test_tls_mitm;

@@ -9,6 +9,7 @@
 mod check_target_conflicts;
 mod control;
 mod deny_reporter;
+pub(crate) mod grant;
 mod host_socket;
 pub(crate) mod http;
 pub(crate) mod interceptor;
@@ -16,6 +17,7 @@ pub(crate) mod io;
 mod matchers;
 pub(crate) mod middleware;
 pub mod reverse_forward;
+pub(crate) mod rule_file;
 pub(crate) mod rules;
 mod server;
 pub(crate) mod target;
@@ -25,6 +27,7 @@ mod tests;
 pub(crate) mod tls;
 mod traffic;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -35,6 +38,8 @@ use tokio::sync::broadcast;
 
 pub use self::control::NetworkControl;
 pub use self::deny_reporter::DenyReporter;
+use self::grant::GrantAccess;
+pub use self::grant::{AgentAccess, GrantContext};
 use self::host_socket::HostSocket;
 use crate::config::config_values::Policy;
 use crate::network::http::middleware::CompiledMiddleware;
@@ -88,9 +93,8 @@ impl Network {
     ) -> anyhow::Result<Self> {
         let net = &project.config.network;
         let log = middleware::tracing_log();
-        let rule_targets = rules::resolve(net)?;
+        let rule_set = rules::RuleSet::new(net, &project.env)?;
         let middleware_targets = rules::resolve_middleware(net, &project.context.vault, &log)?;
-        let inject_targets = rules::resolve_inject(net, &project.env)?;
 
         check_passthrough(net)?;
         check_target_conflicts::check_reverse_forward_conflicts(&labeled_reverse_forwards(net))?;
@@ -118,11 +122,11 @@ impl Network {
         tracing::debug!(
             "network: {} allow, {} deny, {} passthrough, {} middleware, {} inject targets, \
              interceptors [{}], {} denied service targets",
-            rule_targets.allow.len(),
-            rule_targets.deny.len(),
-            rule_targets.passthrough.len(),
+            rule_set.active.allow.len(),
+            rule_set.active.deny.len(),
+            rule_set.active.passthrough.len(),
             middleware_targets.len(),
-            inject_targets.len(),
+            rule_set.inject.len(),
             interceptors
                 .iter()
                 .map(|i| i.name())
@@ -135,11 +139,8 @@ impl Network {
             state: Arc::new(RwLock::new(NetworkState { policy: net.policy })),
             tls_client,
             interceptor: Rc::new(interceptor),
-            allow_targets: rule_targets.allow,
-            deny_targets: rule_targets.deny,
-            passthrough_targets: rule_targets.passthrough,
+            rules: RefCell::new(rule_set),
             middleware_targets,
-            inject_targets,
             interceptors,
             unavailable_targets: denied_targets,
             port_forwards,
@@ -148,6 +149,7 @@ impl Network {
             next_id: AtomicU64::new(0),
             deny_reporter: DenyReporter::new(),
             public_only: false,
+            grants: grant::GrantState::new(&net.grants, net.rule_editing),
         })
     }
 
@@ -158,6 +160,19 @@ impl Network {
     pub fn public_only(mut self) -> Self {
         self.public_only = true;
         self
+    }
+
+    /// Let the guest ask for temporary network access. The config
+    /// `[network.grants]` can still disable it. Without this call, each
+    /// request is denied.
+    pub fn with_grants(mut self, context: GrantContext) -> Self {
+        self.grants.attach(context);
+        self
+    }
+
+    /// Get the agent features that this network serves to the sandbox.
+    pub fn agent_access(&self) -> AgentAccess {
+        self.grants.access()
     }
 }
 
@@ -205,7 +220,8 @@ fn labeled_passthrough(
 ) -> anyhow::Result<Vec<check_target_conflicts::LabeledTarget>> {
     let mut out = Vec::new();
     for (rule_name, rule) in &net.rules {
-        if !rule.enabled || !rule.passthrough {
+        // On-demand rules count too: an approved command can use them.
+        if !rule.is_used() || !rule.passthrough {
             continue;
         }
         for allow in &rule.allow {
@@ -255,7 +271,7 @@ fn labeled_inject(
 ) -> anyhow::Result<Vec<check_target_conflicts::LabeledTarget>> {
     let mut out = Vec::new();
     for (rule_name, rule) in &net.rules {
-        if !rule.enabled || rule.inject.is_empty() {
+        if !rule.is_used() || rule.inject.is_empty() {
             continue;
         }
         for allow in &rule.allow {
@@ -342,19 +358,19 @@ pub struct Network {
     pub(crate) state: Arc<RwLock<NetworkState>>,
     pub(crate) tls_client: Arc<rustls::ClientConfig>,
     pub(crate) interceptor: Rc<tls::TlsInterceptor>,
-    /// Allow-rule targets.
-    pub(crate) allow_targets: Vec<NetworkTarget>,
-    /// Deny-rule targets. Deny wins over allow rules and service hosts.
-    /// It does not apply under `allow-always` or to port forwards.
-    pub(crate) deny_targets: Vec<NetworkTarget>,
-    /// Passthrough subset of `allow_targets`. Connections that match one of
-    /// these targets get no TLS or HTTP interception. The proxy relays the
-    /// raw bytes.
-    pub(crate) passthrough_targets: Vec<NetworkTarget>,
+    /// Compiled network rules. An approved rule change replaces them while
+    /// the sandbox runs.
+    ///  * Allow targets of the enabled rules
+    ///  * Deny targets. Deny wins over allow rules and service hosts. It
+    ///    does not apply under `allow-always` or to port forwards.
+    ///  * Passthrough subset of the allow targets. Connections that match
+    ///    one of these targets get no TLS or HTTP interception. The proxy
+    ///    relays the raw bytes.
+    ///  * Masked secrets to inject into HTTP headers, with target patterns
+    ///  * On-demand rules
+    pub(crate) rules: RefCell<rules::RuleSet>,
     /// Compiled middleware with target patterns.
     pub(crate) middleware_targets: Vec<MiddlewareTarget>,
-    /// Masked secrets to inject into HTTP headers, with target patterns.
-    pub(crate) inject_targets: Vec<InjectTarget>,
     /// Interceptors of the enabled network services. Each one owns its
     /// targets.
     pub(crate) interceptors: Vec<Rc<dyn Interceptor>>,
@@ -379,6 +395,8 @@ pub struct Network {
     /// If true, connect to public addresses only
     /// (see [`Network::public_only`]).
     pub(crate) public_only: bool,
+    /// Settings and state of temporary network grants.
+    pub(crate) grants: grant::GrantState,
 }
 
 impl Network {
@@ -411,6 +429,13 @@ impl Network {
         self.state.read().policy
     }
 
+    /// Find how to handle a connection to `host:port` with no grant.
+    /// [`Network::resolve_target_in`] has the rules.
+    #[cfg(test)]
+    pub fn resolve_target(&self, host: &str, port: u16) -> ResolvedTarget {
+        self.resolve_target_in(host, port, None)
+    }
+
     /// Find how to handle a connection to `host:port`.
     ///
     /// The rules, in order:
@@ -422,15 +447,27 @@ impl Network {
     /// 2. Host of an enabled service that cannot run: deny under every
     ///    policy.
     /// 3. `allow-always`: allow with middleware.
-    /// 4. Deny rules: deny.
+    /// 4. Deny rules (with the deny patterns of the grant rule): deny.
     /// 5. Host that a network service owns: allow and intercept.
-    /// 6. Allow rules: allow with middleware.
+    /// 6. Allow rules and the hosts of the grant: allow with middleware.
     /// 7. No match: `allow-by-default` allows, `deny-by-default` denies.
+    ///
+    /// Args:
+    ///  - `host`, `port`: Destination of the connection
+    ///  - `grant`: Access of a temporary grant: host patterns or an
+    ///    on-demand rule. They act as more rules (steps 4 and 6). All
+    ///    other steps still win. A connection that only the grant allows
+    ///    goes to public addresses only.
     ///
     /// Returns:
     ///   The resolved target with the decision and the matching middleware
     ///   and secrets.
-    pub fn resolve_target(&self, host: &str, port: u16) -> ResolvedTarget {
+    pub(crate) fn resolve_target_in(
+        &self,
+        host: &str,
+        port: u16,
+        grant: Option<&GrantAccess>,
+    ) -> ResolvedTarget {
         let policy = self.policy();
 
         // Ad-hoc guest → host forwards do the same check for each connection
@@ -462,9 +499,30 @@ impl Network {
         if !port_forwarded && interceptor.is_none() && is_service_host(&service_hosts, host) {
             return denied(host, port);
         }
-        let allowed = self.is_allowed(host, port, policy)
+        let allowed_without_grant = self.is_allowed(host, port, policy)
             || port_forwarded
             || (interceptor.is_some() && !self.is_denied_by_rule(host, port));
+        // The deny patterns of a grant rule act as more deny rules. As the
+        // config deny rules, they do not apply under `allow-always` or to
+        // port forwards.
+        let grant_denies = grant.is_some_and(|g| g.denies(host, port))
+            && !matches!(policy, Policy::AllowAlways)
+            && !port_forwarded;
+        let allowed = !grant_denies
+            && (allowed_without_grant
+                || grant
+                    .is_some_and(|g| g.allows(host, port) && !self.is_denied_by_rule(host, port)));
+        // A connection that only the grant allows goes to public addresses
+        // only. Then a name that resolves to a local address (DNS rebinding,
+        // cloud metadata names) cannot reach the host or the LAN.
+        let grant_only = allowed && !allowed_without_grant;
+        // Only a deny of the default policy can change with a grant. A deny
+        // rule, a local host and the early returns above stay denied.
+        let grantable = !allowed
+            && !grant_denies
+            && matches!(policy, Policy::DenyByDefault)
+            && !self.is_denied_by_rule(host, port)
+            && grant::is_grantable_host(host);
         let middleware = if allowed {
             self.collect_middleware(host, port)
         } else {
@@ -478,11 +536,17 @@ impl Network {
         // requests.
         let passthrough = allowed
             && (port_forwarded
-                || (interceptor.is_none() && self.is_passthrough_target(host, port)));
+                || (interceptor.is_none()
+                    && (self.is_passthrough_target(host, port)
+                        || grant.is_some_and(|g| g.passthrough(host, port)))));
 
         // Secrets are necessary only where the proxy changes headers.
         let secrets = if allowed && !passthrough {
-            self.collect_secrets(host, port)
+            let mut secrets = self.collect_secrets(host, port);
+            if let Some(g) = grant {
+                g.add_secrets(host, port, &mut secrets);
+            }
+            secrets
         } else {
             vec![]
         };
@@ -494,8 +558,9 @@ impl Network {
             secrets,
             interceptor: interceptor.filter(|_| allowed),
             allowed,
+            grantable,
             passthrough,
-            public_only: self.public_only,
+            public_only: self.public_only || (grant_only && grant::grant_needs_public_only()),
             service_hosts,
         }
     }
@@ -528,26 +593,27 @@ impl Network {
     }
 
     fn is_denied_by_rule(&self, host: &str, port: u16) -> bool {
-        self.deny_targets.iter().any(|t| t.matches(host, port))
+        self.rules
+            .borrow()
+            .active
+            .deny
+            .iter()
+            .any(|t| t.matches(host, port))
     }
 
     /// Collect the masked secrets of all inject targets that match
     /// `host:port`, with no duplicate variable names.
     fn collect_secrets(&self, host: &str, port: u16) -> Vec<InjectedSecret> {
-        // Each entry is a shared handle. Thus this clones only pointers.
         let mut out: Vec<InjectedSecret> = Vec::new();
-        for target in self.inject_targets.iter().filter(|t| t.matches(host, port)) {
-            for s in &target.secrets {
-                if !out.iter().any(|o| o.name == s.name) {
-                    out.push(s.clone());
-                }
-            }
-        }
+        add_secrets(&self.rules.borrow().inject, host, port, &mut out);
         out
     }
 
     fn is_passthrough_target(&self, host: &str, port: u16) -> bool {
-        self.passthrough_targets
+        self.rules
+            .borrow()
+            .active
+            .passthrough
             .iter()
             .any(|t| t.matches(host, port))
     }
@@ -557,12 +623,17 @@ impl Network {
         if matches!(policy, Policy::AllowAlways) {
             return true;
         }
-        // Deny rules always win.
         if self.is_denied_by_rule(host, port) {
             return false;
         }
         matches!(policy, Policy::AllowByDefault)
-            || self.allow_targets.iter().any(|t| t.matches(host, port))
+            || self
+                .rules
+                .borrow()
+                .active
+                .allow
+                .iter()
+                .any(|t| t.matches(host, port))
     }
 
     /// Return true if the policy is `deny-always`. This policy blocks all
@@ -623,6 +694,24 @@ impl Network {
     }
 }
 
+/// Add the masked secrets of all `targets` that match `host:port` to
+/// `out`, with no duplicate variable names.
+pub(crate) fn add_secrets(
+    targets: &[InjectTarget],
+    host: &str,
+    port: u16,
+    out: &mut Vec<InjectedSecret>,
+) {
+    // Each entry is a shared handle. Thus this clones only pointers.
+    for target in targets.iter().filter(|t| t.matches(host, port)) {
+        for s in &target.secrets {
+            if !out.iter().any(|o| o.name == s.name) {
+                out.push(s.clone());
+            }
+        }
+    }
+}
+
 fn denied(host: &str, port: u16) -> ResolvedTarget {
     ResolvedTarget {
         host: host.to_string(),
@@ -631,6 +720,7 @@ fn denied(host: &str, port: u16) -> ResolvedTarget {
         secrets: vec![],
         interceptor: None,
         allowed: false,
+        grantable: false,
         passthrough: false,
         public_only: false,
         service_hosts: Rc::from([]),

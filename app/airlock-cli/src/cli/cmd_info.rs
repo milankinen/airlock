@@ -11,6 +11,7 @@ use clap::Args;
 use serde::Serialize;
 
 use crate::config::ResolvedConfig;
+use crate::config::config_values::RuleEnabled;
 use crate::context::Context;
 use crate::packs::ConfiguredPack;
 use crate::packs::install::state::{self, InstallState, PackStatus, ReadState};
@@ -167,10 +168,10 @@ pub(super) async fn run(context: Context, id: Option<&str>, json: bool) -> i32 {
     if !project.config.network.rules.is_empty() {
         println!("{}", messages::cli::INFO_NETWORK_RULES);
         for (key, rule) in &project.config.network.rules {
-            let status = if rule.enabled {
-                ""
-            } else {
-                messages::cli::DISABLED_SUFFIX
+            let status = match rule.enabled {
+                RuleEnabled::On => "",
+                RuleEnabled::Off => messages::cli::DISABLED_SUFFIX,
+                RuleEnabled::OnDemand => messages::cli::ON_DEMAND_SUFFIX,
             };
             println!(
                 "  {}",

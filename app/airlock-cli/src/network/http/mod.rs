@@ -11,7 +11,7 @@
 //! Expects plaintext (TLS decrypted) traffic from both sides.
 
 pub mod body;
-mod executor;
+pub(crate) mod executor;
 pub mod inject;
 pub mod middleware;
 mod senders;
@@ -138,6 +138,7 @@ pub async fn relay(
     if !target.allowed {
         let target_host = target.host.clone();
         let target_port = target.port;
+        let grantable = target.grantable;
         let deny_reporter = deny_reporter.clone();
         let service = service_fn(move |req: Request<Incoming>| {
             let events = events.clone();
@@ -145,7 +146,7 @@ pub async fn relay(
             let deny_reporter = deny_reporter.clone();
             async move {
                 let id = emit_request_event(&events, &req, &target_host, target_port, false);
-                deny_reporter.report();
+                deny_reporter.report(&target_host, target_port, grantable);
                 let body: ResponseBody =
                     Either::Right(Full::new(Bytes::from("denied by network policy\n")));
                 let resp = Response::builder().status(403).body(body).unwrap();
@@ -216,7 +217,7 @@ pub async fn relay(
                             "denied: request names a service host on {}",
                             endpoint.host()
                         );
-                        deny_reporter.report();
+                        deny_reporter.report(endpoint.host(), endpoint.port(), false);
                         return Ok(text_response(
                             StatusCode::MISDIRECTED_REQUEST,
                             "request names a service host on a connection that the service does not handle\n",
@@ -338,7 +339,7 @@ async fn connect_upstream(
     if h2 {
         let (sender, conn): (hyper::client::conn::http2::SendRequest<ResponseBody>, _) =
             hyper::client::conn::http2::handshake(LocalExecutor, server_io).await?;
-        let task = tokio::task::spawn_local(async move {
+        let task = executor::spawn(async move {
             if let Err(e) = conn.await {
                 debug!("upstream h2 connection: {e}");
             }
@@ -349,7 +350,7 @@ async fn connect_upstream(
     }
     let (sender, mut conn): (hyper::client::conn::http1::SendRequest<ResponseBody>, _) =
         hyper::client::conn::http1::handshake(server_io).await?;
-    let task = tokio::task::spawn_local(async move {
+    let task = executor::spawn(async move {
         if let Err(e) = (&mut conn).await {
             debug!("upstream h1 connection: {e}");
         }

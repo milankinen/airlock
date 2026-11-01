@@ -213,7 +213,8 @@ where
     match result {
         Ok(resp) => Ok(resp),
         Err(ref e) if is_denied(e) => {
-            deny_reporter.report();
+            // A middleware deny is not grantable. The port is not known here.
+            deny_reporter.report(&connect_host, 0, false);
             Ok(hyper::Response::builder()
                 .status(403)
                 .extension(Denied)

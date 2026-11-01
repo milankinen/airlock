@@ -8,12 +8,14 @@ use std::future::Future;
 use std::os::unix::io::OwnedFd;
 
 use airlock_common::supervisor_capnp::{
-    DaemonState as WireDaemonState, RestartPolicy as WireRestartPolicy, *,
+    DaemonState as WireDaemonState, RestartPolicy as WireRestartPolicy,
+    RuleEditing as WireRuleEditing, *,
 };
 use capnp_rpc::rpc_twoparty_capnp;
 
-use crate::config::config_values::RestartPolicy;
+use crate::config::config_values::{RestartPolicy, RuleEditing};
 use crate::mcp::McpHostImpl;
+use crate::network::AgentAccess;
 use crate::project::Project;
 use crate::rpc::browser::{Browser, BrowserImpl};
 use crate::rpc::clipboard::ClipboardImpl;
@@ -114,6 +116,8 @@ pub struct BootRequest<'a> {
     pub clipboard: Option<ClipboardImpl>,
     /// Host MCP servers. `None` grants no MCP server.
     pub mcp: Option<McpHostImpl>,
+    /// Agent features of the guest admin service.
+    pub agent: AgentAccess,
 }
 
 /// Host-side handle to the in-VM supervisor. Wraps the Cap'n Proto client.
@@ -193,6 +197,7 @@ impl Supervisor {
             browser,
             clipboard,
             mcp,
+            agent,
         } = boot;
         let log_sink: log_sink::Client = capnp_rpc::new_client(LogSinkImpl);
 
@@ -331,6 +336,21 @@ impl Supervisor {
             }
             let host: mcp_host::Client = capnp_rpc::new_client(mcp);
             b.set_host(host);
+        }
+
+        // Agent features. The agent commands get the same env and default
+        // cwd as `airlock exec`.
+        let mut b = req.get().init_agent();
+        b.set_grants(agent.grants);
+        b.set_rule_editing(match agent.rule_editing {
+            RuleEditing::None => WireRuleEditing::None,
+            RuleEditing::OnDemand => WireRuleEditing::OnDemand,
+            RuleEditing::All => WireRuleEditing::All,
+        });
+        b.set_cwd(&vm.cwd);
+        let mut env_b = b.init_env(vm.env.len() as u32);
+        for (i, e) in vm.env.iter().enumerate() {
+            env_b.set(i as u32, e);
         }
 
         req.send().promise.await?;

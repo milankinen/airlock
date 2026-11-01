@@ -1,0 +1,75 @@
+[package]
+name = "airlock-macos-notifier"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "airlock-macos-notifier"
+path = "src/main.rs"
+
+# The message format builds on all hosts, so its tests run on Linux too.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# The system frameworks are macOS only. On other hosts the binary is a stub,
+# so the workspace builds, lints and tests on Linux.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSAttributedString",
+    "NSBundle",
+    "NSDate",
+    "NSError",
+    "NSGeometry",
+    "NSNotification",
+    "NSObjCRuntime",
+    "NSRange",
+    "NSRunLoop",
+    "NSSet",
+    "NSString",
+] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2-core-foundation",
+    "NSApplication",
+    "NSAttributedString",
+    "NSButton",
+    "NSColor",
+    "NSControl",
+    "NSEvent",
+    "NSFont",
+    "NSFontDescriptor",
+    "NSGraphics",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSScreen",
+    "NSScrollView",
+    "NSText",
+    "NSTextStorage",
+    "NSTextView",
+    "NSView",
+    "NSWindow",
+] }
+objc2-user-notifications = { version = "0.3", default-features = false, features = [
+    "std",
+    "bitflags",
+    "block2",
+    "UNNotification",
+    "UNNotificationAction",
+    "UNNotificationCategory",
+    "UNNotificationContent",
+    "UNNotificationRequest",
+    "UNNotificationResponse",
+    "UNNotificationSettings",
+    "UNNotificationSound",
+    "UNNotificationTrigger",
+    "UNUserNotificationCenter",
+] }

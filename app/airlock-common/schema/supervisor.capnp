@@ -56,6 +56,10 @@ interface Supervisor {
     # ungranted state. Thus a host that does not set this field gives the
     # guest nothing to call.
     mcp         :McpConfig,
+    # Agent features of the admin service at `http://admin.airlock/`.
+    # The default value (all features off) gives the agent no grants and
+    # no rule editing.
+    agent       :AgentConfig,
   ) -> ();
 
   shutdown @1 () -> ();
@@ -77,11 +81,11 @@ interface Supervisor {
   # first call returns zero per-core values.
   pollStats @3 () -> (snapshot :StatsSnapshot);
 
-  # Tell the guest that the host denied a network request. `epoch` is
-  # Unix-epoch milliseconds. The guest keeps the timestamp, so the admin
-  # HTTP service at `http://admin.airlock/` can match it with Claude Code
-  # tool failures that hook endpoints report.
-  reportDeny @4 (epoch :UInt64) -> ();
+  # Tell the guest that the host denied network requests. The guest
+  # keeps the entries, so the admin HTTP service at
+  # `http://admin.airlock/` can match them with Claude Code tool failures
+  # that hook endpoints report, and offer the hosts for a temporary grant.
+  reportDeny @4 (denies :List(DenyEntry)) -> ();
 
   # Open one connection to a guest loopback port. The host calls it once
   # for each local TCP connection that it accepted. This call opens
@@ -122,6 +126,17 @@ interface Supervisor {
   # The guest refuses a pair of `session` and `name` that it serves
   # already. The guest refuses the call before boot.
   addMcpServer @10 (session :Text, name :Text, host :McpHost) -> (grant :McpGrant);
+}
+
+struct DenyEntry {
+  # Unix-epoch milliseconds.
+  epoch     @0 :UInt64;
+  host      @1 :Text;
+  port      @2 :UInt16;
+  # True when the default network policy denied the request. A temporary
+  # grant can allow it. False for config deny rules, middleware denies and
+  # other denies that a grant cannot change.
+  grantable @3 :Bool;
 }
 
 # Host-side target of a guest listener from `Supervisor.bindHostPort`.
@@ -223,6 +238,25 @@ struct McpConfig {
   host  @0 :McpHost;
   # Names of the enabled servers.
   names @1 :List(Text);
+}
+
+struct AgentConfig {
+  # True if the host accepts requests for temporary network access.
+  grants      @0 :Bool;
+  # The rules that the agent can see and ask to change. It also controls
+  # the use of on-demand rules. It does not depend on `grants`.
+  ruleEditing @1 :RuleEditing;
+  # Base environment of the commands that the agent runs (`KEY=VALUE`).
+  # It is the same environment that `airlock exec` uses.
+  env         @2 :List(Text);
+  # Default working directory of the commands that the agent runs.
+  cwd         @3 :Text;
+}
+
+enum RuleEditing {
+  none     @0;
+  onDemand @1;
+  all      @2;
 }
 
 struct MaskSpec {

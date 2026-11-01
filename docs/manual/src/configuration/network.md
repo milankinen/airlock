@@ -76,6 +76,78 @@ enabled = false
 allow = ["*"]
 ```
 
+### On-demand rules
+
+An on-demand rule does not apply to normal sandbox traffic. An agent in
+the sandbox can use it for one command. You approve each use on the host.
+
+```toml
+[network.rules.npm-publish]
+enabled = "on-demand"
+description = "Publish packages to the npm registry"
+allow = ["registry.npmjs.org"]
+deny = ["*.internal.example.com"]
+```
+
+- `enabled`: `true`, `false` or `"on-demand"`. The default is `true`.
+- `description`: optional text that tells the agent the purpose of the
+  rule.
+- `allow` and `deny`: the same patterns as in other rules.
+
+The agent uses the tools of the `airlock` MCP server at
+`http://admin.airlock/mcp`:
+
+- `show_rules` lists the rules that the agent can see.
+- `execute` runs one command with an on-demand rule, or with a list of
+  hosts. The rule or the hosts apply only to the connections of that
+  command. The access ends when the command ends. `hosts = ["*"]` allows
+  all public hosts.
+  The command gets the sandbox environment. Airlock also sets
+  `SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`,
+  `NODE_EXTRA_CA_CERTS`, `PIP_CERT`, `DENO_CERT`,
+  `GIT_SSL_CAINFO`, `AWS_CA_BUNDLE`, `CARGO_HTTP_CAINFO`,
+  `HEX_CACERTS_PATH`, `NIX_SSL_CERT_FILE` and `npm_config_cafile` to the
+  system CA bundle of the image, and `UV_NATIVE_TLS=1`. The sandbox
+  environment overrides these values.
+- `upsert_rule` adds or changes a rule. The agent gives only the values to
+  change: `enabled`, `description`, `allow` or `deny`. A new rule is
+  on demand by default.
+
+The MCP server offers only the tools of the features that you enable.
+The `claude@2` pack gives Claude Code the instructions for these tools at
+the start of each session.
+
+`network.rule_editing` sets the rules that the agent can see and change:
+
+```toml
+[network]
+rule_editing = "on-demand"
+```
+
+- `"on-demand"` (default): only on-demand rules. A rule must stay on
+  demand.
+- `"all"`: all rules. The agent can set each `enabled` value.
+- `"none"`: no rules. The MCP server does not offer `show_rules` and
+  `upsert_rule`. Airlock refuses `execute` with a rule. `execute` with
+  hosts still works.
+
+Airlock refuses other changes at once and does not ask you.
+
+After your approval, the change applies to new connections. Open
+connections do not change. Airlock writes the change to the project
+config file, or to the local project file if the rule is there. The file
+can be TOML, JSON or YAML. Only the changed values change. A list that
+does not fit in 80 characters gets one item on each line. The other keys
+of the rule, for example `inject` and `passthrough`, and the other
+content of the file, with its comments, stay the same. If
+the rule comes from a different config file, the change goes to the
+project file as an override. Lists from different files add together.
+Thus the new `allow` and `deny` lists must keep the patterns of the
+different file.
+
+Deny rules, the `deny-always` policy, the hosts of network services and
+local addresses still block an on-demand rule and `hosts = ["*"]`.
+
 ### Passthrough
 
 By default, airlock peeks at the first bytes of every allowed connection to

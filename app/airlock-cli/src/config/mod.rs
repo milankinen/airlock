@@ -142,6 +142,62 @@ pub struct LayeredConfig {
 }
 
 impl LayeredConfig {
+    /// Put the network rule `name` into the project file layer `origin`.
+    /// Makes the layer if it is not there. A main project file goes before
+    /// the local project file.
+    /// Args:
+    ///  - `origin`: Path of the project file, as config discovery gives it
+    ///  - `name`: Name of the rule
+    ///  - `rule`: Table of the rule that the user approved
+    pub fn set_project_rule(&mut self, origin: &str, name: &str, rule: serde_json::Value) {
+        let index = self.project.iter().position(|l| l.origin == origin);
+        let layer = if let Some(i) = index {
+            &mut self.project[i]
+        } else {
+            let layer = Layer {
+                origin: origin.to_string(),
+                value: serde_json::json!({}),
+                legacy_presets: None,
+            };
+            let local = origin.contains("airlock.local.");
+            let at = if local { self.project.len() } else { 0 };
+            self.project.insert(at, layer);
+            &mut self.project[at]
+        };
+        if !layer.value.is_object() {
+            layer.value = serde_json::json!({});
+        }
+        let network = &mut layer.value["network"];
+        if !network.is_object() {
+            *network = serde_json::json!({});
+        }
+        let rules = &mut network["rules"];
+        if !rules.is_object() {
+            *rules = serde_json::json!({});
+        }
+        rules[name] = rule;
+    }
+
+    /// Get the network rules of each project file layer.
+    /// Returns:
+    ///   `(origin, rules)` for each project file. `rules` is the
+    ///   `network.rules` table of the file, or an empty table if the file
+    ///   has none.
+    pub fn project_rules(&self) -> Vec<(String, serde_json::Map<String, serde_json::Value>)> {
+        self.project
+            .iter()
+            .map(|layer| {
+                let rules = layer
+                    .value
+                    .pointer("/network/rules")
+                    .and_then(serde_json::Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                (layer.origin.clone(), rules)
+            })
+            .collect()
+    }
+
     /// True if the config includes deprecated user-level config files.
     pub fn has_user_files(&self) -> bool {
         !self.user.is_empty()

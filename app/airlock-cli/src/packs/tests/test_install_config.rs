@@ -105,7 +105,7 @@ fn install_config_opens_network_and_grants_nothing_else() {
         .network
         .rules
         .iter()
-        .filter(|(_, r)| r.enabled)
+        .filter(|(_, r)| r.is_active())
         .map(|(n, _)| n.as_str())
         .collect();
     assert_eq!(enabled, ["airlock-install"]);

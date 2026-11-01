@@ -55,7 +55,7 @@ pub(super) fn print_mounts_and_rules(project: &project::Project) {
         .network
         .rules
         .iter()
-        .filter(|(_, r)| r.enabled)
+        .filter(|(_, r)| r.is_active())
         .collect();
     if !enabled_rules.is_empty() {
         let policy = project.config.network.policy.label();

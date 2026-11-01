@@ -74,12 +74,16 @@ async fn airlockd() -> anyhow::Result<()> {
     // Start the MCP bridge before boot. The host can add run-time MCP
     // servers through the supervisor at any time after boot.
     let (mcp_bridge, mcp_routes) = mcp::start();
+    // The supervisor sets the credentials after a successful boot. The
+    // temporary network grants read them.
+    let spawn_creds = admin::SpawnCreds::default();
 
     rpc::serve(
         sup_conn,
         deny_tracker,
         network,
         mcp_routes.clone(),
+        spawn_creds.clone(),
         async |cfg| {
             logging::init(cfg.log_sink, &cfg.log_filter);
 
@@ -99,11 +103,25 @@ async fn airlockd() -> anyhow::Result<()> {
             net::start_dns(dns.clone()).await?;
             net::start_host_socket_forward(&cfg.network, cfg.sockets)?;
             net::start_host_port_forward(&cfg.init_config.host_ports, cfg.network.clone()).await?;
-            net::start_tcp_proxy(cfg.network.clone(), dns)?;
+            let grant_routes = net::GrantRoutes::new();
+            net::start_tcp_proxy(cfg.network.clone(), dns, grant_routes.clone())?;
             if let Some(host) = &cfg.mcp.host {
                 mcp_routes.add_boot(host, cfg.mcp.names);
             }
-            admin::start(admin_state.clone(), mcp_bridge.clone()).await?;
+            let grants = admin::GrantContext::new(
+                cfg.network.clone(),
+                grant_routes,
+                spawn_creds.clone(),
+                cfg.agent.env,
+                cfg.agent.cwd,
+            );
+            admin::start(
+                admin_state.clone(),
+                mcp_bridge.clone(),
+                grants,
+                cfg.agent.caps,
+            )
+            .await?;
             clipboard::start(cfg.clipboard, cfg.uid, cfg.gid)?;
             browser::start(cfg.browser, cfg.uid, cfg.gid)?;
 

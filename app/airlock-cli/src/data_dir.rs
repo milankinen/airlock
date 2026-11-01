@@ -3,8 +3,8 @@
 //! All sandboxes share the user's airlock data directory. It contains the
 //! database, the sandboxes that are not in their project, the templates,
 //! the VM boot assets, the OCI images and layers, the host side of the pack
-//! mounts, and fallback CLI sockets. The user settings can move the
-//! directory, also with a link.
+//! mounts, fallback CLI sockets and, on macOS, the notifier app. The user
+//! settings can move the directory, also with a link.
 //!
 //! The data directory is private: airlock makes it, the sandboxes directory
 //! and the templates directory with access for the user only. All
@@ -44,6 +44,10 @@ pub(crate) struct DataDir {
     pub packs: VerifiedPath,
     /// The fallback CLI sockets (`sock/`).
     pub sock: VerifiedPath,
+    /// Support files (`support/`). On macOS, the notifier app of the
+    /// approval requests.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub support: VerifiedPath,
 }
 
 impl DataDir {
@@ -67,6 +71,7 @@ impl DataDir {
             layers: root.join("oci/layers")?,
             packs: root.join("share/all/packs")?,
             sock: root.join("sock")?,
+            support: root.join("support")?,
             root,
         })
     }

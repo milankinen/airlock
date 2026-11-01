@@ -5,6 +5,7 @@
 //!  * a virtual DNS server that gives each hostname a fake IP
 //!  * forwarding of host-published ports (guest to host)
 //!  * forwarding of Unix sockets (guest to host)
+//!  * network namespaces for commands with a temporary network grant
 //!
 //! Also handles run-time TCP port forwards in both directions: from the host
 //! to guest ports, and from guest ports to the host.
@@ -14,6 +15,7 @@
 
 #[cfg(target_os = "linux")]
 mod dns;
+mod grant_ns;
 #[cfg(target_os = "linux")]
 mod guest_listener;
 #[cfg(target_os = "linux")]
@@ -46,6 +48,9 @@ use airlock_common::supervisor_capnp::{listen_handle, local_connector};
 pub use dns::DnsState;
 #[cfg(target_os = "linux")]
 pub use dns::start as start_dns;
+// Test builds of the admin code do not make grant namespaces.
+#[cfg_attr(test, allow(unused_imports))]
+pub use grant_ns::{GrantNet, GrantRoutes};
 #[cfg(target_os = "linux")]
 pub use guest_listener::{bind_host_port, start_host_port_forward};
 #[cfg(target_os = "linux")]
@@ -95,7 +100,11 @@ pub async fn start_host_port_forward(
 
 /// Non-Linux stub. Panics if called.
 #[cfg(not(target_os = "linux"))]
-pub fn start_tcp_proxy(_network: network_proxy::Client, _dns: Rc<DnsState>) -> anyhow::Result<()> {
+pub fn start_tcp_proxy(
+    _network: network_proxy::Client,
+    _dns: Rc<DnsState>,
+    _grants: GrantRoutes,
+) -> anyhow::Result<()> {
     unimplemented!("airlockd only runs inside the Linux VM");
 }
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 #MISE description="Build airlockd supervisor for Linux (musl)"
-#MISE sources=["app/airlockd/src/**/*.rs", "app/airlockd/Cargo.toml", "app/airlock-common/src/**/*.rs", "app/airlock-common/schema/**/*.capnp", "app/airlockd/builder.dockerfile"]
+#MISE sources=["app/airlockd/src/**/*.rs", "app/airlockd/Cargo.toml", "app/airlock-common/src/**/*.rs", "app/airlock-common/schema/**/*.capnp", "app/airlockd/builder.dockerfile", "app/airlockd/build.rs", "docs/manual/src/**/*.md"]
 #MISE outputs=["target/vm/airlockd"]
 set -euo pipefail
 

@@ -19,7 +19,7 @@ use airlock_common::supervisor_capnp::*;
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
 use futures::AsyncReadExt;
 
-use crate::admin::DenyTracker;
+use crate::admin::{Capabilities, DenyEntry, DenyTracker, SpawnCreds};
 use crate::daemon::{self, DaemonSet, DaemonSpec};
 use crate::init::{
     CacheConfig, DirMountConfig, FileMountConfig, InitConfig, MaskConfig, MountConfig,
@@ -68,6 +68,8 @@ pub struct BootConfig {
     /// Host MCP server grant. If the host gives no capability, the
     /// `mcp.airlock` endpoints have no servers.
     pub mcp: crate::mcp::McpConfig,
+    /// Agent features and command defaults of the admin service.
+    pub agent: AgentConfig,
     /// Sidecar daemons to start after init. The callback decides when to
     /// call [`DaemonSet::start_all`] (usually right after
     /// [`crate::init::setup`]).
@@ -75,6 +77,18 @@ pub struct BootConfig {
     /// Shared slot for the [`DaemonSet`]. The boot callback writes the set
     /// here, so `pollDaemons` and `shutdownDaemons` can use it later.
     pub daemon_set_slot: Rc<RefCell<Option<DaemonSet>>>,
+}
+
+/// Agent features that the host enabled, and the defaults of the
+/// commands that the agent runs.
+pub struct AgentConfig {
+    /// Agent features of the admin service.
+    pub caps: Capabilities,
+    /// Base environment of the agent commands (`KEY=VALUE`). It is the
+    /// same environment that `airlock exec` uses.
+    pub env: Vec<String>,
+    /// Default working directory of the agent commands.
+    pub cwd: String,
 }
 
 /// Host-side handles for the I/O of a single process.
@@ -94,6 +108,8 @@ pub struct HostProcess {
 ///  - `deny_tracker`: Store for the deny reports from the host
 ///  - `network`: `NetworkProxy` client of the network channel
 ///  - `mcp_routes`: Route handle of the MCP bridge for `addMcpServer`
+///  - `spawn_creds`: Slot for the credentials of the sandbox processes. It
+///    is set after `boot()` succeeds
 ///  - `boot`: Callback that sets up the guest with the [`BootConfig`]
 ///
 /// Returns:
@@ -105,6 +121,7 @@ pub async fn serve<Boot: AsyncFn(BootConfig) -> anyhow::Result<()>>(
     deny_tracker: Arc<DenyTracker>,
     network: network_proxy::Client,
     mcp_routes: crate::mcp::Routes,
+    spawn_creds: SpawnCreds,
     boot: Boot,
 ) -> anyhow::Result<()> {
     let std_stream = unsafe { std::net::TcpStream::from_raw_fd(conn_fd.into_raw_fd()) };
@@ -124,7 +141,7 @@ pub async fn serve<Boot: AsyncFn(BootConfig) -> anyhow::Result<()>>(
     let daemon_set: Rc<RefCell<Option<DaemonSet>>> = Rc::new(RefCell::new(None));
     let client: supervisor::Client = capnp_rpc::new_client(SupervisorImpl {
         boot_tx: RefCell::new(Some(boot_tx)),
-        spawn_creds: RefCell::new(None),
+        spawn_creds,
         stats: RefCell::new(Collector::new()),
         deny_tracker,
         daemon_set,
@@ -159,7 +176,7 @@ struct SupervisorImpl {
     /// `(uid, gid, harden)` for `spawn()`. Set only after `boot()` succeeds,
     /// so all container processes get the same credentials and hardening.
     /// `spawn()` fails while it is `None`.
-    spawn_creds: RefCell<Option<(u32, u32, bool)>>,
+    spawn_creds: SpawnCreds,
     /// Stats collector for `pollStats`.
     stats: RefCell<Collector>,
     /// Store for the deny reports from the host.
@@ -286,7 +303,28 @@ impl supervisor::Server for SupervisorImpl {
                 .collect::<Result<Vec<_>, capnp::Error>>()?,
         };
 
+        // A host that does not set `agent` gives the default struct: all
+        // features off.
+        let ag = params.get_agent()?;
+        let agent = AgentConfig {
+            caps: Capabilities {
+                grants: ag.get_grants(),
+                rule_editing: match ag.get_rule_editing()? {
+                    RuleEditing::None => crate::admin::RuleEditing::None,
+                    RuleEditing::OnDemand => crate::admin::RuleEditing::OnDemand,
+                    RuleEditing::All => crate::admin::RuleEditing::All,
+                },
+            },
+            env: ag
+                .get_env()?
+                .iter()
+                .map(|e| Ok(e?.to_str()?.to_string()))
+                .collect::<Result<Vec<_>, capnp::Error>>()?,
+            cwd: ag.get_cwd()?.to_str()?.to_string(),
+        };
+
         let cfg = BootConfig {
+            agent,
             clipboard,
             browser,
             mcp,
@@ -416,8 +454,14 @@ impl supervisor::Server for SupervisorImpl {
         params: supervisor::ReportDenyParams,
         _results: supervisor::ReportDenyResults,
     ) -> Result<(), capnp::Error> {
-        let epoch = params.get()?.get_epoch();
-        self.deny_tracker.record(epoch);
+        for entry in params.get()?.get_denies()? {
+            self.deny_tracker.record(DenyEntry {
+                epoch: entry.get_epoch(),
+                host: entry.get_host()?.to_string()?,
+                port: entry.get_port(),
+                grantable: entry.get_grantable(),
+            });
+        }
         Ok(())
     }
 

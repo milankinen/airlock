@@ -35,13 +35,14 @@ pub fn install_config(mut config: ConfigValues) -> anyhow::Result<ConfigValues> 
     let net = &mut config.network;
     net.policy = Policy::AllowAlways;
     for rule in net.rules.values_mut() {
-        rule.enabled = false;
+        rule.enabled = config_values::RuleEnabled::Off;
         rule.inject.clear();
     }
     net.rules.insert(
         INSTALL_RULE.to_string(),
         NetworkRule {
-            enabled: true,
+            enabled: config_values::RuleEnabled::On,
+            description: String::new(),
             allow: vec!["*".into()],
             deny: vec![],
             passthrough: true,
@@ -64,11 +65,14 @@ pub fn boot_options(log_level: LogLevel) -> BootOptions {
 }
 
 /// Remove what the setup boots never get: middleware, network services,
-/// ports, sockets, secrets and host env (except a `HOME` that is not
-/// masked), mounts, daemons, masks, MCP servers and clipboard.
+/// ports, sockets, temporary network grants, secrets and host env (except
+/// a `HOME` that is not masked), mounts, daemons, masks, MCP servers and
+/// clipboard.
 fn isolate(config: &mut ConfigValues) {
     let net = &mut config.network;
     net.services.clear();
+    // The install boot runs pack scripts with no user present. No grant.
+    net.grants.enabled = false;
     for mw in net.middleware.values_mut() {
         mw.enabled = false;
     }

@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use crate::config::config_values;
-use crate::network::rules::resolve_inject;
+use crate::network::rules::RuleSet;
 use crate::packs::approval::Approved;
 use crate::project::resolve_env;
 use crate::test_cfg::{configured_variants, host_env_vault, resolve_project_toml};
@@ -313,7 +313,7 @@ fn agent_packs_inject_host_tokens_that_exist() {
                 .unwrap()
                 .values;
             let env = resolve_env(&values, &host_env_vault(host_env)).unwrap();
-            let inject = resolve_inject(&values.network, &env).unwrap();
+            let inject = RuleSet::new(&values.network, &env).unwrap().inject;
             (env, inject)
         };
 

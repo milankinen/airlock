@@ -6,6 +6,7 @@
 #![cfg_attr(test, allow(clippy::disallowed_methods, clippy::disallowed_types))]
 
 mod acp;
+mod approval;
 mod assets;
 mod cache;
 pub(crate) mod cli;

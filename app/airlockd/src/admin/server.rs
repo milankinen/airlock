@@ -1,10 +1,10 @@
 //! Local HTTP server of the VM.
 //!
-//! Starts the server with all admin endpoints. The same server also serves
-//! the host MCP servers. It picks the endpoints by the host name of the
-//! request: `mcp.airlock` gets the boot config MCP servers,
-//! `acp.mcp.airlock` gets the run-time MCP servers, and all other names
-//! get the admin endpoints.
+//! Starts the server with all admin endpoints, including the `airlock` MCP
+//! server. The same server also serves the host MCP servers. It picks the
+//! endpoints by the host name of the request: `mcp.airlock` gets the boot
+//! config MCP servers, `acp.mcp.airlock` gets the run-time MCP servers, and
+//! all other names get the admin endpoints.
 
 use std::sync::Arc;
 
@@ -16,6 +16,8 @@ use tokio::net::TcpListener;
 use tower::ServiceExt;
 use tracing::{info, warn};
 
+use super::capabilities::Capabilities;
+use super::mcp::{GrantBridge, GrantContext};
 use super::routes;
 use super::state::AdminState;
 use crate::mcp::{self, Bridge, host_name};
@@ -29,14 +31,22 @@ const ADMIN_ADDR: (&str, u16) = ("127.0.0.1", 80);
 /// Args:
 ///  - `state`: Shared state for the admin route handlers
 ///  - `mcp`: Handle to the MCP bridge task
+///  - `grants`: What the temporary network grants need
+///  - `caps`: Agent features that the host enabled
 ///
 /// Returns:
 ///   Error if the bind fails.
-pub async fn start(state: Arc<AdminState>, mcp: Bridge) -> anyhow::Result<()> {
+pub async fn start(
+    state: Arc<AdminState>,
+    mcp: Bridge,
+    grants: GrantContext,
+    caps: Capabilities,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(ADMIN_ADDR).await?;
     info!("admin listening on {}:{}", ADMIN_ADDR.0, ADMIN_ADDR.1);
 
-    let app = app(state, mcp);
+    let grants = GrantBridge::start(grants);
+    let app = app(state, mcp, Some(grants), caps);
     tokio::task::spawn_local(async move {
         if let Err(e) = axum::serve(listener, app).await {
             warn!("admin server: {e}");
@@ -47,7 +57,16 @@ pub async fn start(state: Arc<AdminState>, mcp: Bridge) -> anyhow::Result<()> {
 }
 
 /// The admin routes, without a listener.
-pub(crate) fn router(state: Arc<AdminState>) -> Router {
+/// Args:
+///  - `state`: Shared state for the admin route handlers
+///  - `grants`: Handle to the grant task, or `None` if temporary network
+///    access is not available
+///  - `caps`: Agent features that the host enabled
+pub(crate) fn router(
+    state: Arc<AdminState>,
+    grants: Option<GrantBridge>,
+    caps: Capabilities,
+) -> Router {
     Router::new()
         .route("/", get(routes::root::handle))
         .route(
@@ -62,15 +81,28 @@ pub(crate) fn router(state: Arc<AdminState>) -> Router {
             "/claude/hooks/post-tool-use-failure",
             post(routes::claude_hook_post_tool_use_failure::handle),
         )
+        .route(
+            "/claude/hooks/session-start",
+            post(move || async move { routes::claude_hook_session_start::handle(caps) }),
+        )
         .with_state(state)
+        .merge(super::mcp::router(grants, caps))
 }
 
 /// All routes of the local server, without a listener.
 /// Args:
 ///  - `state`: Shared state for the admin route handlers
 ///  - `mcp`: Handle to the MCP bridge task
-pub(crate) fn app(state: Arc<AdminState>, mcp: Bridge) -> Router {
-    let admin = router(state);
+///  - `grants`: Handle to the grant task, or `None` if temporary network
+///    access is not available
+///  - `caps`: Agent features that the host enabled
+pub(crate) fn app(
+    state: Arc<AdminState>,
+    mcp: Bridge,
+    grants: Option<GrantBridge>,
+    caps: Capabilities,
+) -> Router {
+    let admin = router(state, grants, caps);
     let config = mcp::router(mcp.clone(), false);
     let runtime = mcp::router(mcp, true);
     Router::new().fallback_service(tower::service_fn(move |req: Request| {

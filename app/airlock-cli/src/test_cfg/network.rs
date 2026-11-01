@@ -131,7 +131,8 @@ pub fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
         rules.insert(
             "test-allow".to_string(),
             NetworkRule {
-                enabled: true,
+                enabled: config_values::RuleEnabled::On,
+                description: String::new(),
                 allow: cfg.allowed_hosts,
                 deny: vec![],
                 passthrough: false,
@@ -147,7 +148,8 @@ pub fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
         rules.insert(
             "test-allow-plain".to_string(),
             NetworkRule {
-                enabled: true,
+                enabled: config_values::RuleEnabled::On,
+                description: String::new(),
                 allow: cfg.plain_allowed_hosts,
                 deny: vec![],
                 passthrough: false,
@@ -181,15 +183,20 @@ pub fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
         ports: BTreeMap::default(),
         sockets: BTreeMap::default(),
         services: BTreeMap::default(),
+        grants: config_values::Grants {
+            enabled: true,
+            approval_timeout: 120,
+            max_duration: 3600,
+        },
+        rule_editing: config_values::RuleEditing::default(),
     };
     let (request_log, log_fn) = RequestLog::new();
-    let rule_targets = rules::resolve(&config).unwrap();
     // Tests need no real secret storage. A disabled vault gives the
     // substitution an empty backend and never asks the user.
     let vault = crate::vault::Vault::for_storage_type(crate::vault::VaultStorageType::Disabled);
     let middleware_targets = rules::resolve_middleware(&config, &vault, &log_fn).unwrap();
     let sandbox_env = SandboxEnv::from_secrets(cfg.inject);
-    let inject_targets = rules::resolve_inject(&config, &sandbox_env).unwrap();
+    let rule_set = rules::RuleSet::new(&config, &sandbox_env).unwrap();
 
     // The MITM CA of the sandbox.
     let mitm_ca = TestCa::generate();
@@ -219,11 +226,8 @@ pub fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
             })),
             tls_client: Arc::new(tls_client),
             interceptor: Rc::new(interceptor),
-            allow_targets: rule_targets.allow,
-            deny_targets: rule_targets.deny,
-            passthrough_targets: rule_targets.passthrough,
+            rules: std::cell::RefCell::new(rule_set),
             middleware_targets,
-            inject_targets,
             interceptors: cfg.interceptors,
             public_only: false,
             unavailable_targets: cfg.unavailable_targets,
@@ -234,6 +238,7 @@ pub fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
             events: tokio::sync::broadcast::channel(64).0,
             next_id: std::sync::atomic::AtomicU64::new(0),
             deny_reporter: crate::network::DenyReporter::new(),
+            grants: crate::network::grant::GrantState::new(&config.grants, config.rule_editing),
         },
     )
 }
