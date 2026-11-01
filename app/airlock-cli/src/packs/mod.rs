@@ -178,6 +178,12 @@ impl PackManager {
         reason = "remote packs resolve over the network later"
     )]
     pub async fn resolve(&self, id: &PackId, version: Option<&str>) -> Option<Pack> {
+        self.find_loaded(id, version)
+    }
+
+    /// Find a pack version in the loaded packs (see [`PackManager::resolve`]).
+    /// The setup wizard uses it to show the pack version of a template.
+    pub fn find_loaded(&self, id: &PackId, version: Option<&str>) -> Option<Pack> {
         self.packs
             .iter()
             .find(|p| p.metadata().id == *id && p.metadata().version.as_deref() == version)

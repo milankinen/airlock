@@ -9,10 +9,11 @@ use crate::config::{LayeredConfig, UserImage};
 use crate::packs::{ArgValue, PackKind, PackManager};
 use crate::start::install::install_candidates;
 use crate::start::wizard::form::{Form, Mode, Row, StartChoice};
-use crate::start::wizard::{Input, check_answers, save_config, view};
+use crate::start::wizard::{Input, check_answers, save_config};
 use crate::templates::Template;
 use crate::test_cfg::oci::{data_dir_at, verified_dir};
 use crate::test_cfg::packs::load_packs;
+use crate::test_cfg::start::view_text;
 use crate::test_cfg::{block_on, resolve_project_toml, temp_dir, test_template};
 use crate::vault::{Vault, VaultStorageType};
 
@@ -97,12 +98,6 @@ fn base_template() -> Template {
          [vm]\nimage = \"debian@sha256:0123\"\n\n\
          [clipboard]\ncopy = true\npaste = true\n",
     )
-}
-
-/// The text of the view of `form`, without colors.
-fn view_text(form: &Form) -> String {
-    let frame = view::frame(form, 200);
-    console::strip_ansi_codes(&frame.lines.join("\n")).to_string()
 }
 
 /// A layered config with only the user file `user_toml`.
@@ -440,7 +435,11 @@ fn template_locks_its_packs_until_empty_template_is_selected() {
     );
     press(&mut form, KeyCode::Down);
     assert_eq!(form.focus(), Row::Template(Some(0)));
-    assert!(view_text(&form).contains("base - packs: debian, sample"));
+    let text = view_text(&form);
+    assert!(
+        text.contains("base ! missing: ghost 1 - packs: debian, sample"),
+        "{text}"
+    );
     press(&mut form, KeyCode::Char(' '));
     assert_eq!(form.selected_template().unwrap().name, "base");
     assert!(is_selected(&form, "debian"));
@@ -717,4 +716,63 @@ fn wizard_selection_approves_user_pack_before_answer_check() {
 
     form.approve_selected().unwrap();
     block_on(check_answers(&input, &answers)).unwrap();
+}
+
+/// Test that the view shows the pack version and args that the template
+/// config pins, and a marker if a newer version exists. The sandbox from
+/// the template uses that version, not the newest.
+///   1. Load `tool@1` with the arg `old` and `tool@2` with the arg `new`
+///   2. Select the template with `tool@1`, and check the marker, the arg
+///      rows and the template arg value
+///   3. Select the template with `tool@2` and check that it has no marker
+///   4. Select the empty template and the tool, and check the newest args
+#[test]
+fn template_pack_shows_template_version_args_and_outdated_marker() {
+    let pack = |arg: &str| {
+        format!(
+            "label = \"Tool\"\ndescription = \"A tool\"\nkind = \"tool\"\n\n\
+             [[args]]\nkey = \"{arg}\"\ntype = \"choice\"\n\
+             description = \"Arg {arg}\"\ndefault = \"a\"\nvalues = [\"a\", \"b\"]\n"
+        )
+    };
+    let packs = load_packs(vec![
+        ("tool@1/pack.toml", pack("old")),
+        ("tool@2/pack.toml", pack("new")),
+    ]);
+    let data = temp_dir();
+    let templates = [
+        test_template(
+            "v1",
+            "[packs]\ntool = { version = \"1\", args = { old = \"b\" } }\n",
+        ),
+        test_template("v2", "[packs]\ntool = { version = \"2\" }\n"),
+    ];
+    let mut form = Form::new(
+        &data_dir_at(data.path()),
+        &packs,
+        None,
+        &templates,
+        Mode::Start,
+    );
+    press(&mut form, KeyCode::Down);
+    press(&mut form, KeyCode::Char(' '));
+    let text = view_text(&form);
+    assert!(text.contains("Tool ! outdated"), "{text}");
+    assert!(text.contains("Arg old: b"), "{text}");
+    assert!(!text.contains("Arg new"), "{text}");
+
+    press(&mut form, KeyCode::Down);
+    press(&mut form, KeyCode::Char(' '));
+    let text = view_text(&form);
+    assert!(!text.contains("! outdated"), "{text}");
+    assert!(text.contains("Arg new: a"), "{text}");
+
+    press_down_until(&mut form, |form| form.focus() == Row::Template(None));
+    press(&mut form, KeyCode::Char(' '));
+    focus_pack(&mut form, "tool");
+    press(&mut form, KeyCode::Char(' '));
+    let text = view_text(&form);
+    assert!(!text.contains("! outdated"), "{text}");
+    assert!(text.contains("Arg new: a"), "{text}");
+    assert!(!text.contains("Arg old"), "{text}");
 }

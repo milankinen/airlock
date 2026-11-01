@@ -432,3 +432,9 @@ impl StartProject {
         project::disk_id(&PinnedDir::pin(&self.sandbox_dir()).unwrap())
     }
 }
+
+/// The text of the setup wizard view of `form`, without colors.
+pub fn view_text(form: &crate::start::wizard::form::Form) -> String {
+    let frame = crate::start::wizard::view::frame(form, 200);
+    console::strip_ansi_codes(&frame.lines.join("\n")).to_string()
+}

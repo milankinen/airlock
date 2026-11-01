@@ -3537,6 +3537,20 @@ pub mod start {
     /// Marker after the label of a user pack in the setup wizard.
     pub const WIZARD_LOCAL_MARKER: &str = "(local)";
 
+    /// Marker after the label of a template pack in the setup wizard, when
+    /// the pack has a newer version.
+    pub const WIZARD_OUTDATED_MARKER: &str = "! outdated";
+
+    /// Marker after the label of a template pack in the setup wizard, when
+    /// the pack files changed since the template install.
+    pub const WIZARD_CHANGED_MARKER: &str = "! changed";
+
+    /// Marker after the name of a template in the setup wizard, when
+    /// airlock does not have some packs of the template.
+    pub fn wizard_missing_marker(packs: impl Display) -> String {
+        format!("! missing: {packs}")
+    }
+
     /// Warning when the `packs.defaults` setting names a pack that does not
     /// exist.
     pub fn wizard_default_unknown(id: impl Display) -> String {

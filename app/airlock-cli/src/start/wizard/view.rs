@@ -23,12 +23,16 @@ use crate::{cli, messages};
 ///  * An empty line, and the keys for the focused row (gray, see [`keys`])
 ///  * The start bar
 ///
-/// A template row has a radio mark and the template name. A pack row has a
-/// radio mark (distro) or a checkbox, and a label. A user pack has the
-/// gray marker `(local)` after its label. Its arg rows are below
-/// it, with more indent, as `<label>: <value>`. The value is gray (`yes` or
-/// `no` for a bool). A locked row (see [`Form::is_locked`]) is all gray. The
-/// start bar shows its current option.
+/// A template row has a radio mark and the template name. A template with
+/// packs that are not available has the red marker `! missing: <packs>`
+/// after its name. A pack row has a radio mark (distro) or a checkbox, and
+/// a label. A user pack has the gray marker `(local)` after its label. A
+/// pack of the selected template has the red marker `! outdated` if a
+/// newer version exists, and `! changed` if its files changed since the
+/// template install. The arg rows of a pack are below it, with more
+/// indent, as `<label>: <value>`. The value is gray (`yes` or `no` for a
+/// bool). A locked row (see [`Form::is_locked`]) is all gray. The start bar
+/// shows its current option.
 ///
 /// The focused row has a cyan label. A focused pack row has its description
 /// in gray: ` - description` after the label, or on the next lines if it does
@@ -259,6 +263,16 @@ fn row_line(form: &Form, row: Row, focused: bool, styles: &Styles) -> Line {
                 form.templates()[t].name.as_str()
             });
             line.push(name, label);
+            let missing = t.map(|t| form.missing_packs(t)).unwrap_or_default();
+            if !missing.is_empty() {
+                // The user can edit the template config, thus the ids can
+                // have any text.
+                let missing = missing.join(", ");
+                let marker =
+                    messages::start::wizard_missing_marker(style::escape_controls(&missing, false));
+                line.push(" ", &styles.plain);
+                line.push(&marker, &styles.red);
+            }
         }
         Row::Pack(i) => {
             let entry = &form.entries()[i];
@@ -279,6 +293,14 @@ fn row_line(form: &Form, row: Row, focused: bool, styles: &Styles) -> Line {
             if matches!(entry.pack.metadata().id.pack_ref(), PackRef::Local { .. }) {
                 line.push(" ", &styles.plain);
                 line.push(messages::start::WIZARD_LOCAL_MARKER, &styles.dim);
+            }
+            if entry.is_outdated() {
+                line.push(" ", &styles.plain);
+                line.push(messages::start::WIZARD_OUTDATED_MARKER, &styles.red);
+            }
+            if form.is_changed(i) {
+                line.push(" ", &styles.plain);
+                line.push(messages::start::WIZARD_CHANGED_MARKER, &styles.red);
             }
         }
         Row::Custom => {

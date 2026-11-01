@@ -20,8 +20,9 @@ use crate::config::generated::Clipboard;
 use crate::data_dir::DataDir;
 use crate::messages;
 use crate::packs::PackRef;
-use crate::packs::install::snapshots::SNAPSHOTS_FILE;
-use crate::packs::install::state::STATE_FILE;
+use crate::packs::install::snapshots::{self, SNAPSHOTS_FILE};
+use crate::packs::install::state::{self as install_state, ReadState, STATE_FILE};
+use crate::util::PinnedDir;
 use crate::util::verified_path::VerifiedPath;
 use crate::vm::disk::{DISK_FILE, DISK_ID_FILE};
 
@@ -137,6 +138,39 @@ impl TemplateConfig {
             image,
             clipboard,
         })
+    }
+}
+
+/// The SHA-256 (hex) of each file of a pack, by file name.
+pub type FileHashes = BTreeMap<String, String>;
+
+impl Template {
+    /// Read the files of the packs that the template disk has installed.
+    /// Returns:
+    ///   The file hashes of each installed pack from the disk, by pack id.
+    ///   A built-in pack has no files. Empty if the template has no install
+    ///   records or no install snapshots (a template of an older airlock).
+    pub fn installed_files(&self) -> BTreeMap<String, FileHashes> {
+        let Ok(dir) = self.dir.to_path().and_then(PinnedDir::pin) else {
+            return BTreeMap::new();
+        };
+        let ReadState::Ok(state) = install_state::read(&dir) else {
+            return BTreeMap::new();
+        };
+        let snapshots = snapshots::read(&dir);
+        state
+            .packs
+            .iter()
+            .filter_map(|(id, record)| {
+                let snapshot = snapshots.get(&record.fingerprint)?;
+                let files = snapshot
+                    .files
+                    .iter()
+                    .map(|(name, file)| (name.clone(), file.sha256.clone()))
+                    .collect::<FileHashes>();
+                (!files.is_empty()).then(|| (id.clone(), files))
+            })
+            .collect()
     }
 }
 

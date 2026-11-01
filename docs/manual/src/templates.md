@@ -55,6 +55,20 @@ The templates that you create show in the setup wizard of
 [`airlock start`](./usage/starting-sandbox.md). Select a template for the
 new sandbox. You can also select more packs for the sandbox.
 
+The wizard shows each pack of the template at the pack version of the
+template, with the args of that version. If a newer pack version exists,
+the wizard shows `! outdated` after the pack name. The sandbox uses the
+template version. To get the newer version, create the template again.
+
+The wizard also shows these markers:
+
+- `! changed` after a pack name: the files of the pack changed after
+  the template install. The new sandbox gets the
+  [changed-packs question](#changed-packs).
+- `! missing: <packs>` after a template name: airlock does not have
+  these packs or pack versions, for example a user pack that you
+  removed. A sandbox from this template does not start.
+
 ### Changed packs
 
 A template keeps the packs as they were when airlock installed them. A

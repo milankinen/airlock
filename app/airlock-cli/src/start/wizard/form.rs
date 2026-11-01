@@ -11,9 +11,9 @@ use crate::cli::prompt::{self, Step};
 use crate::config::UserImage;
 use crate::config::generated::{Clipboard, Target};
 use crate::data_dir::DataDir;
-use crate::packs::{ArgKind, ArgValue, Pack, PackKind, PackManager};
+use crate::packs::{ArgKind, ArgValue, Pack, PackId, PackKind, PackManager, id_with_version};
 use crate::start::wizard::Answers;
-use crate::templates::{Template, TemplatePack};
+use crate::templates::{FileHashes, Template, TemplatePack};
 
 /// The pack kinds of the sections, in pack order. Each kind has one section.
 pub const KINDS: [PackKind; 4] = [
@@ -70,8 +70,11 @@ pub enum StartChoice {
 
 /// A pack in the view.
 pub struct Entry {
-    /// The pack (newest version).
+    /// The shown pack version: the version of the selected template if the
+    /// template has the pack, else the newest version.
     pub pack: Pack,
+    /// The newest version of the pack.
+    newest: Pack,
     /// True if the user selected the pack.
     pub selected: bool,
     /// The value of every arg of the pack, by key (the defaults at the start).
@@ -82,6 +85,11 @@ impl Entry {
     /// Return true if the pack is a distro pack.
     pub fn is_distro(&self) -> bool {
         self.pack.metadata().kind == PackKind::Distro
+    }
+
+    /// Return true if the shown pack version is not the newest version.
+    pub fn is_outdated(&self) -> bool {
+        self.pack.metadata().version != self.newest.metadata().version
     }
 }
 
@@ -120,8 +128,9 @@ impl OtherSlot {
 ///
 /// If templates exist, the first section is a radio group of the templates
 /// ([`Row::Template`]): the empty template first (selected at the start),
-/// then the templates by name. A selected template selects its packs with
-/// its arg values, and locks them. Locked rows show in gray, the keys do
+/// then the templates by name. A selected template selects its packs at
+/// the template version, with the args of that version and the template
+/// arg values, and locks them. Locked rows show in gray, the keys do
 /// not change them, and the focus skips them. A template also locks the
 /// distro group: its distro pack (if any) is selected and the other distro
 /// rows are not. The clipboard rows get the template values, but the user
@@ -146,15 +155,20 @@ impl OtherSlot {
 pub struct Form {
     /// Airlock data directory, for the pack mount directories.
     data_dir: DataDir,
+    /// All pack versions, for the pack versions of the templates.
+    packs: PackManager,
     mode: Mode,
     /// The templates, sorted by name. [`Row::Template`] indexes this list.
     templates: Vec<Template>,
+    /// The installed pack files of each template, by pack id. Same order
+    /// as `templates`.
+    installed: Vec<BTreeMap<String, FileHashes>>,
     /// The selected template. `None` is the empty template.
     template: Option<usize>,
     /// The user state from before the template, while a template is
     /// selected.
     saved: Option<Saved>,
-    /// All offered packs (the newest version of each), in pack order.
+    /// All offered packs, in pack order.
     entries: Vec<Entry>,
     /// The image that the user files set ([`Row::Custom`]).
     custom_image: Option<UserImage>,
@@ -219,13 +233,16 @@ impl Form {
                     is_default(&pack)
                 },
                 values: default_values(&pack),
+                newest: pack.clone(),
                 pack,
             })
             .collect();
         let mut form = Self {
             data_dir: data_dir.clone(),
+            packs: packs.clone(),
             mode,
             templates: templates.to_vec(),
+            installed: templates.iter().map(Template::installed_files).collect(),
             template: None,
             saved: None,
             entries,
@@ -295,7 +312,8 @@ impl Form {
     }
 
     /// Return all offered packs, in pack order. [`Row::Pack`] and [`Row::Arg`]
-    /// are indexes into this list.
+    /// are indexes into this list. A pack of the selected template has the
+    /// template version.
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
@@ -304,6 +322,45 @@ impl Form {
     /// list.
     pub fn templates(&self) -> &[Template] {
         &self.templates
+    }
+
+    /// Return the packs of the template `templates[t]` that are not
+    /// available, as `<id> <version>`: airlock does not have the pack or the
+    /// version that the template config pins.
+    pub fn missing_packs(&self, t: usize) -> Vec<String> {
+        self.templates[t]
+            .config
+            .packs
+            .iter()
+            .filter(|p| {
+                PackId::parse(&p.name)
+                    .and_then(|id| self.packs.find_loaded(&id, p.version.as_deref()))
+                    .is_none()
+            })
+            .map(|p| id_with_version(&p.name, p.version.as_deref()))
+            .collect()
+    }
+
+    /// Return true if the selected template has the pack of `entries[i]`,
+    /// and the pack files changed since the template install. Only a pack
+    /// from the disk has files. A template of an older airlock has no copy
+    /// of the installed files, thus its packs never show as changed.
+    pub fn is_changed(&self, i: usize) -> bool {
+        let (Some(t), Some(_)) = (self.template, self.template_pack(i)) else {
+            return false;
+        };
+        let pack = &self.entries[i].pack;
+        let (Some(current), Some(installed)) = (
+            pack.snapshot(),
+            self.installed[t].get(pack.metadata().id.as_str()),
+        ) else {
+            return false;
+        };
+        current.files.len() != installed.len()
+            || current
+                .files
+                .iter()
+                .any(|(name, file)| installed.get(name) != Some(&file.sha256))
     }
 
     /// Return the index of the selected template in [`Form::templates`], or
@@ -498,19 +555,22 @@ impl Form {
 
     /// Select the template `templates[chosen]`, or the empty template.
     ///
-    /// First, the user state from before the earlier template comes back.
-    /// Then the form keeps the user state, and the packs of the new
-    /// template become selected with the template args. Its distro pack (or
-    /// no distro pack) is selected. The clipboard gets the template values,
-    /// if the template sets them.
+    /// First, the user state from before the earlier template comes back,
+    /// with the newest pack versions. Then the form saves the user state of
+    /// the template packs, the distro group and the clipboard. The packs of
+    /// the new template become selected at the template version with the
+    /// template args. Its distro pack (or no distro pack) is selected. The
+    /// clipboard gets the template values, if the template sets them.
     fn select_template(&mut self, chosen: Option<usize>) {
         if chosen == self.template {
             return;
         }
         if let Some(saved) = self.saved.take() {
             for (i, (selected, values)) in saved.entries {
-                self.entries[i].selected = selected;
-                self.entries[i].values = values;
+                let entry = &mut self.entries[i];
+                entry.selected = selected;
+                entry.values = values;
+                entry.pack = entry.newest.clone();
             }
             self.select_distro(saved.distro);
             self.clipboard = saved.clipboard;
@@ -545,11 +605,18 @@ impl Form {
                 continue;
             };
             let entry = &mut self.entries[i];
+            // The template keeps its pack version. If airlock does not know
+            // that version, the newest version shows.
+            if let Some(version) = self
+                .packs
+                .find_loaded(&entry.newest.metadata().id, pack.version.as_deref())
+            {
+                entry.pack = version;
+            }
             entry.selected = true;
             entry.values = default_values(&entry.pack);
             for arg in entry.pack.args() {
-                // A value that the newest pack does not accept keeps the
-                // default.
+                // A value that the pack does not accept keeps the default.
                 if let Some(value) = pack
                     .args
                     .get(&arg.key)
