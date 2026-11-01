@@ -17,23 +17,30 @@ pub(crate) fn instructions(caps: Capabilities, prefix: &str) -> String {
     let rules = caps.rule_editing != RuleEditing::None;
     let intro = "You run inside an airlock sandbox. If its network policy blocks network \
                  calls during a task";
+    // Each request is one approval prompt for the user.
+    let wildcard = format!(
+        "Tool managers (mise, npm, pip, cargo, apt...) and first installs use many unknown \
+         hosts. For these, give `hosts: [\"*\"]` in the first {execute} request. Do not add \
+         hosts one at a time: each request is one user prompt."
+    );
     let mut lines = match (caps.grants, rules) {
         (true, true) => vec![
             format!("{intro}, decide if the task is ad hoc or repeats:"),
             format!(
-                "- Ad hoc: run the command with the {execute} tool and give the blocked hosts."
+                "- Ad hoc, with few known hosts: run the command with the {execute} tool and \
+                 give the blocked hosts."
             ),
-            "- Many or unknown hosts: ask the user, then give `hosts: [\"*\"]`.".into(),
+            format!("- {wildcard}"),
             format!(
                 "- Repeats: list rules with {show}, then run the command with {execute} and a \
                  matching rule. If no rule matches, give the hosts, then use the `hosts` of the \
                  result to create or change a rule with {upsert}."
             ),
         ],
-        (true, false) => vec![format!(
-            "{intro}, run the command with the {execute} tool and give the blocked hosts. For \
-             many or unknown hosts, ask the user, then give `hosts: [\"*\"]`."
-        )],
+        (true, false) => vec![
+            format!("{intro}, run the command with the {execute} tool and give the blocked hosts."),
+            wildcard,
+        ],
         (false, true) => vec![format!(
             "{intro}, list rules with {show}, then create or change a rule with {upsert}."
         )],

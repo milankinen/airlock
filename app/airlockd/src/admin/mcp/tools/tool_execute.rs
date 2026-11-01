@@ -16,7 +16,8 @@ use crate::admin::mcp::bridge::{ExecOutput, ExecRequest};
 const EXECUTE: &str = "\
 Request command execution with extended network access. Requested access is \
 shown to the user for approval. Give either `hosts` (ad hoc) or the name of \
-a pre-configured `rule`. `hosts: [\"*\"]` asks for all public hosts. \
+a pre-configured `rule`. `hosts: [\"*\"]` asks for all public hosts. Use it \
+for tool managers and first installs. Do not add hosts one at a time. \
 The result `hosts` lists the hosts that the command \
 connected to and if the sandbox blocked them. `aborted` is true if the user \
 stopped the command.";
