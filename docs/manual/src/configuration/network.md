@@ -95,13 +95,26 @@ deny = ["*.internal.example.com"]
 - `allow` and `deny`: the same patterns as in other rules.
 
 The agent uses the tools of the `airlock` MCP server at
-`http://admin.airlock/mcp`:
+`http://admin.airlock/mcp`. All tools are off by default. Enable them
+with `network.rule_editing` and `network.grants.enabled`:
+
+```toml
+[network]
+rule_editing = "on-demand"
+
+[network.grants]
+enabled = true
+```
+
+The tools are:
 
 - `show_rules` lists the rules that the agent can see.
 - `execute` runs one command with an on-demand rule, or with a list of
   hosts. The rule or the hosts apply only to the connections of that
   command. The access ends when the command ends. `hosts = ["*"]` allows
-  all public hosts.
+  all public hosts. `execute` with hosts needs `network.grants.enabled =
+  true`. `execute` with a rule needs a `network.rule_editing` value other
+  than `"none"`.
   The command gets the sandbox environment. Airlock also sets
   `SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`,
   `NODE_EXTRA_CA_CERTS`, `PIP_CERT`, `DENO_CERT`,
@@ -119,17 +132,11 @@ instructions for these tools at the start of each session.
 
 `network.rule_editing` sets the rules that the agent can see and change:
 
-```toml
-[network]
-rule_editing = "on-demand"
-```
-
-- `"on-demand"` (default): only on-demand rules. A rule must stay on
-  demand.
+- `"none"` (default): no rules. The MCP server does not offer `show_rules`
+  and `upsert_rule`. Airlock refuses `execute` with a rule. `execute` with
+  hosts still works if `network.grants.enabled = true`.
+- `"on-demand"`: only on-demand rules. A rule must stay on demand.
 - `"all"`: all rules. The agent can set each `enabled` value.
-- `"none"`: no rules. The MCP server does not offer `show_rules` and
-  `upsert_rule`. Airlock refuses `execute` with a rule. `execute` with
-  hosts still works.
 
 Airlock refuses other changes at once and does not ask you.
 

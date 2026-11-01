@@ -451,7 +451,7 @@ pub struct Network {
     #[serde(skip_serializing_if = "Grants::is_default")]
     pub grants: Grants,
     /// Rules that the sandbox can see and ask to change through the airlock
-    /// MCP server: `"all"`, `"on-demand"` (default) or `"none"`. With
+    /// MCP server: `"all"`, `"on-demand"` or `"none"` (default). With
     /// `"none"`, a command cannot use an on-demand rule. The default is not
     /// serialized, thus configs without it serialize as before.
     #[config(default)]
@@ -466,9 +466,9 @@ pub enum RuleEditing {
     /// All rules. A change can set any `enabled` value.
     All,
     /// Only on-demand rules. A change must keep the rule on demand.
-    #[default]
     OnDemand,
     /// No rules. Commands cannot use on-demand rules.
+    #[default]
     None,
 }
 
@@ -493,8 +493,8 @@ impl WellKnown for RuleEditing {
 /// or when the duration expires.
 #[derive(Debug, Clone, serde::Serialize, DescribeConfig, DeserializeConfig)]
 pub struct Grants {
-    /// Let the sandbox ask for temporary network access.
-    #[config(default_t = true)]
+    /// Let the sandbox ask for temporary network access. Off by default.
+    #[config(default_t = false)]
     pub enabled: bool,
     /// Time in seconds to wait for the decision of the user. No decision in
     /// this time means deny.
@@ -512,7 +512,7 @@ impl Grants {
 
     /// Return true if all values are the defaults.
     fn is_default(&self) -> bool {
-        self.enabled
+        !self.enabled
             && self.approval_timeout == Self::DEFAULT_APPROVAL_TIMEOUT
             && self.max_duration == Self::DEFAULT_MAX_DURATION
     }

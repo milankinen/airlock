@@ -329,9 +329,14 @@ async fn endless_stream() -> (u16, oneshot::Receiver<()>) {
     (port, closed_rx)
 }
 
-const DENY_BY_DEFAULT: &str = r#"
+/// Config with deny by default, grants on and editing of on-demand rules.
+const OPTED_IN: &str = r#"
 [network]
 policy = "deny-by-default"
+rule_editing = "on-demand"
+
+[network.grants]
+enabled = true
 "#;
 
 /// Test that a granted host is allowed only through the grant proxy. The
@@ -354,7 +359,7 @@ fn granted_host_is_allowed_only_through_grant_proxy() {
     let granted = AcceptCounter::bind();
     let other = AcceptCounter::bind();
     let (granted_port, other_port) = (granted.port(), other.port());
-    let (network, approver, _dir) = grant_network(DENY_BY_DEFAULT, Decision::Allow);
+    let (network, approver, _dir) = grant_network(OPTED_IN, Decision::Allow);
     run_network(network, |proxy| async move {
         let granted_hits = granted.start();
         let other_hits = other.start();
@@ -412,6 +417,9 @@ fn config_deny_rule_wins_over_grant() {
         [network]
         policy = "deny-by-default"
 
+        [network.grants]
+        enabled = true
+
         [network.rules.block]
         deny = ["127.0.0.1:{port}"]
         "#
@@ -438,7 +446,7 @@ fn config_deny_rule_wins_over_grant() {
 ///   3. Check that the approver got no prompt
 #[test]
 fn wide_local_and_numeric_grant_hosts_are_refused_before_approval() {
-    let (network, approver, _dir) = grant_network(DENY_BY_DEFAULT, Decision::Allow);
+    let (network, approver, _dir) = grant_network(OPTED_IN, Decision::Allow);
     let long_label = format!("{}.com", "a".repeat(64));
     let long_name = format!("{}com", "abcdefghi.".repeat(26));
     run_network(network, |proxy| async move {
@@ -497,6 +505,9 @@ fn grant_of_already_allowed_hosts_is_denied_without_prompt() {
         [network]
         policy = "deny-by-default"
 
+        [network.grants]
+        enabled = true
+
         [network.rules.api]
         allow = ["api.example.com"]
         "#;
@@ -531,7 +542,7 @@ fn grant_of_already_allowed_hosts_is_denied_without_prompt() {
 ///      grants.
 #[test]
 fn grant_denied_by_user_or_config_returns_deny_text() {
-    let (network, approver, _dir) = grant_network(DENY_BY_DEFAULT, Decision::DeniedByUser);
+    let (network, approver, _dir) = grant_network(OPTED_IN, Decision::DeniedByUser);
     run_network(network, |proxy| async move {
         let err = request_grant(&proxy, &["example.com"]).await.err().unwrap();
         assert_eq!(
@@ -548,6 +559,9 @@ fn grant_denied_by_user_or_config_returns_deny_text() {
     });
 
     let toml = r#"
+        [network]
+        rule_editing = "on-demand"
+
         [network.grants]
         enabled = false
 
@@ -590,7 +604,7 @@ fn zero_grant_time_in_config_is_an_error() {
 ///   3. Check that the guest side closes and the upstream reads EOF
 #[test]
 fn released_grant_closes_live_connection() {
-    let (network, _, _dir) = grant_network(DENY_BY_DEFAULT, Decision::Allow);
+    let (network, _, _dir) = grant_network(OPTED_IN, Decision::Allow);
     run_network(network, |proxy| async move {
         let (port, eof) = echo_with_eof().await;
         let grant = request_grant(&proxy, &[&format!("127.0.0.1:{port}")])
@@ -618,7 +632,7 @@ fn released_grant_closes_live_connection() {
 ///   5. Check that a new connection through the grant proxy is denied
 #[test]
 fn expired_grant_closes_connection_and_refuses_new_ones() {
-    let toml = "[network]\npolicy = \"deny-by-default\"\n[network.grants]\nmax_duration = 1\n";
+    let toml = "[network]\npolicy = \"deny-by-default\"\n[network.grants]\nenabled = true\nmax_duration = 1\n";
     let (network, _, _dir) = grant_network(toml, Decision::Allow);
     run_network(network, |proxy| async move {
         let (port, eof) = echo_with_eof().await;
@@ -689,7 +703,7 @@ fn only_default_policy_deny_of_public_host_is_grantable() {
 ///   4. Check that the guest side closes and the upstream write fails
 #[test]
 fn released_grant_closes_streaming_http_connection() {
-    let (network, _, _dir) = grant_network(DENY_BY_DEFAULT, Decision::Allow);
+    let (network, _, _dir) = grant_network(OPTED_IN, Decision::Allow);
     run_network(network, |proxy| async move {
         let (port, closed) = endless_stream().await;
         let grant = request_grant(&proxy, &[&format!("127.0.0.1:{port}")])
@@ -764,6 +778,7 @@ fn on_demand_rule_is_inactive_until_command_with_rule_is_approved() {
         r#"
         [network]
         policy = "deny-by-default"
+        rule_editing = "on-demand"
 
         [network.rules.local]
         enabled = "on-demand"
@@ -840,6 +855,7 @@ fn approved_rule_change_is_saved_and_usable_only_through_command() {
     let toml = r#"
         [network]
         policy = "deny-by-default"
+        rule_editing = "on-demand"
 
         [network.rules.normal]
         allow = ["normal.example.com"]
@@ -911,7 +927,7 @@ fn approved_rule_change_is_saved_and_usable_only_through_command() {
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     });
 
-    let (network, _, _dir) = grant_network(DENY_BY_DEFAULT, Decision::DeniedByUser);
+    let (network, _, _dir) = grant_network(OPTED_IN, Decision::DeniedByUser);
     run_network(network, |proxy| async move {
         assert_eq!(
             upsert(&proxy, "r", &["example.com"], &[]).await,
@@ -1081,6 +1097,9 @@ fn all_hosts_grant_must_be_alone_and_keeps_deny_rules_and_public_only() {
         [network]
         policy = "deny-by-default"
 
+        [network.grants]
+        enabled = true
+
         [network.rules.block]
         deny = ["blocked.example.com"]
         "#;
@@ -1133,7 +1152,7 @@ fn all_hosts_grant_must_be_alone_and_keeps_deny_rules_and_public_only() {
 ///   5. Grant a second command, release it and check that its notice closes
 #[test]
 fn abort_from_running_notice_revokes_grant_and_closes_connection() {
-    let (network, approver, _dir) = grant_network(DENY_BY_DEFAULT, Decision::Allow);
+    let (network, approver, _dir) = grant_network(OPTED_IN, Decision::Allow);
     run_network(network, |proxy| async move {
         let (port, eof) = echo_with_eof().await;
         let grant = request_grant(&proxy, &[&format!("127.0.0.1:{port}")])
