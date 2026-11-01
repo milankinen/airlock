@@ -1,0 +1,14 @@
+name: Clean up signing certificate
+description: >
+  Delete the temporary keychain of import-signing-cert. Use with
+  "if: always()".
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        # Same path as in import-signing-cert.
+        KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+        if [ -f "$KEYCHAIN" ]; then
+          security delete-keychain "$KEYCHAIN" || true
+        fi

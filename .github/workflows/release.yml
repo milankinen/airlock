@@ -89,7 +89,7 @@ jobs:
                       airlock-macos-aarch64-distroless airlock-macos-x86_64-distroless \
                       airlock-linux-x86_64 airlock-linux-aarch64 \
                       airlock-linux-x86_64-distroless airlock-linux-aarch64-distroless \
-                      manual; do
+                      notifier-macos manual; do
             if ! awk -F'\t' -v n="$name" -v s="$GITHUB_SHA" \
                  '$1 == n && $2 == s && $3 == "false" { found = 1 } END { exit !found }' artifacts.tsv; then
               echo "::error::Artifact '$name' missing, expired or not from $GITHUB_SHA in CI run $RUN_ID"
@@ -103,6 +103,9 @@ jobs:
   sign-macos:
     needs: resolve-ci-run
     runs-on: macos-latest
+    # The signing secrets are in this environment. GitHub gives them only to
+    # main.
+    environment: macos-signing
     steps:
       - uses: actions/checkout@v4
       - name: Download macOS binaries from CI
@@ -116,28 +119,50 @@ jobs:
               --name "$name" \
               --dir "artifacts/$name"
           done
+          gh run download "${{ needs.resolve-ci-run.outputs.run_id }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name notifier-macos \
+            --dir artifacts/notifier-macos
       - name: Verify binaries are from the release commit
         run: |
           for name in airlock-macos-aarch64 airlock-macos-x86_64 \
                       airlock-macos-aarch64-distroless airlock-macos-x86_64-distroless; do
             mise/tasks/release/verify-binary "artifacts/$name/airlock" "$GITHUB_SHA"
           done
-      - name: Import Developer ID certificate
-        env:
-          CERT_B64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
-          CERT_PASS: ${{ secrets.APPLE_CERT_P12_PASSWORD }}
-          KEYCHAIN_PASS: ${{ secrets.KEYCHAIN_PASSWORD }}
+      # The CI run signs the notifier app with the Developer ID only on push.
+      # Check the signature and the production bundle id of the app, and check that each binary contains
+      # exactly this app archive.
+      - name: Verify embedded notifier app
         run: |
-          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
-          P12="$RUNNER_TEMP/cert.p12"
-          echo "$CERT_B64" | base64 --decode > "$P12"
-          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
-          security import "$P12" -k "$KEYCHAIN" -P "$CERT_PASS" -T /usr/bin/codesign
-          security list-keychain -d user -s "$KEYCHAIN" $(security list-keychain -d user | tr -d '"')
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN"
-          rm -f "$P12"
+          set -euo pipefail
+          TAR=artifacts/notifier-macos/notifier.tar
+          mkdir -p notifier-check
+          tar -xf "$TAR" -C notifier-check
+          APP=notifier-check/AirlockNotifier.app
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          INFO=$(codesign --display --verbose=2 "$APP" 2>&1)
+          echo "$INFO"
+          grep -q '^Authority=Developer ID Application: ' <<<"$INFO" \
+            || { echo "::error::Notifier app has no Developer ID signature"; exit 1; }
+          grep -q '^CodeDirectory .*flags=.*runtime' <<<"$INFO" \
+            || { echo "::error::Notifier app has no hardened runtime"; exit 1; }
+          grep -q '^Timestamp=' <<<"$INFO" \
+            || { echo "::error::Notifier app signature has no secure timestamp"; exit 1; }
+          grep -qx 'Identifier=io.github.milankinen.airlock.notify' <<<"$INFO" \
+            || { echo "::error::Notifier app does not have the production bundle id"; exit 1; }
+          for name in airlock-macos-aarch64 airlock-macos-x86_64 \
+                      airlock-macos-aarch64-distroless airlock-macos-x86_64-distroless; do
+            python3 -I -c 'import sys; sys.exit(open(sys.argv[2], "rb").read() not in open(sys.argv[1], "rb").read())' \
+              "artifacts/$name/airlock" "$TAR" \
+              || { echo "::error::$name does not contain the signed notifier app"; exit 1; }
+          done
+          rm -rf notifier-check
+      - name: Import Developer ID certificate
+        uses: ./.github/actions/import-signing-cert
+        with:
+          cert-b64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          cert-password: ${{ secrets.APPLE_CERT_P12_PASSWORD }}
+          keychain-password: ${{ secrets.KEYCHAIN_PASSWORD }}
       - name: Patch version slot and sign
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -173,11 +198,7 @@ jobs:
           done
       - name: Clean up keychain
         if: always()
-        run: |
-          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
-          if [ -f "$KEYCHAIN" ]; then
-            security delete-keychain "$KEYCHAIN" || true
-          fi
+        uses: ./.github/actions/cleanup-signing-cert
       - uses: actions/upload-artifact@v4
         with:
           name: airlock-macos-aarch64-signed

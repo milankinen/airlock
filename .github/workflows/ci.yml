@@ -171,9 +171,89 @@ jobs:
             target/vm/cloud-hypervisor
             target/vm/virtiofsd
 
+  # The notifier app for all macOS CLI builds. One universal build, so all
+  # CLI binaries contain the same signed app. Only push runs (main) get the
+  # Developer ID signature. Pull request runs sign ad hoc and never touch the
+  # signing secrets.
+  # The notifier app for the macOS CLI binaries. Two jobs make it, and only
+  # one of them runs. Push builds of main sign it with the Developer ID key
+  # from the `macos-signing` environment. GitHub gives the environment
+  # secrets only to main. All other builds sign it ad hoc and never read the
+  # signing secrets. Both jobs upload the same artifact name.
+  build-notifier-macos-signed:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [ lint-macos, lint-linux, test-macos, test-linux ]
+    runs-on: macos-latest
+    environment: macos-signing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Install Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Import Developer ID certificate
+        uses: ./.github/actions/import-signing-cert
+        with:
+          cert-b64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          cert-password: ${{ secrets.APPLE_CERT_P12_PASSWORD }}
+          keychain-password: ${{ secrets.KEYCHAIN_PASSWORD }}
+      # --force: build again also when the stamp of a cached build matches.
+      - name: Build notifier app
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          NOTIFIER_BUNDLE_ID: io.github.milankinen.airlock.notify
+        run: |
+          if [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "::error::Secret APPLE_SIGNING_IDENTITY is empty"
+            exit 1
+          fi
+          NOTIFIER_UNIVERSAL=1 NOTIFIER_SIGN_ID="$APPLE_SIGNING_IDENTITY" mise run --force build:notifier
+      - name: Clean up keychain
+        if: always()
+        uses: ./.github/actions/cleanup-signing-cert
+      - name: Show signature
+        run: |
+          APP="target/notifier/AirlockNotifier.app"
+          codesign --display --verbose=2 "$APP"
+          lipo -info "$APP/Contents/MacOS/airlock-macos-notifier"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: notifier-macos
+          path: target/vm/notifier.tar
+          if-no-files-found: error
+
+  build-notifier-macos:
+    if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+    needs: [ lint-macos, lint-linux, test-macos, test-linux ]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Install Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      # --force: build again also when the stamp of a cached build matches.
+      - name: Build notifier app (ad hoc)
+        env:
+          NOTIFIER_BUNDLE_ID: io.github.milankinen.airlock.notify
+        run: NOTIFIER_UNIVERSAL=1 mise run --force build:notifier
+      - name: Show signature
+        run: |
+          APP="target/notifier/AirlockNotifier.app"
+          codesign --display --verbose=2 "$APP"
+          lipo -info "$APP/Contents/MacOS/airlock-macos-notifier"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: notifier-macos
+          path: target/vm/notifier.tar
+          if-no-files-found: error
+
   # ── Stage 3: CLI binaries ──────────────────────────────
   build-cli-macos-aarch64:
-    needs: [ build-kernel-aarch64, build-initramfs-aarch64 ]
+    needs: [ build-kernel-aarch64, build-initramfs-aarch64, build-notifier-macos, build-notifier-macos-signed ]
+    # One of the two notifier jobs is always skipped. A skipped need skips
+    # this job by default, so check the results here.
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && (needs.build-notifier-macos.result == 'success' || needs.build-notifier-macos-signed.result == 'success') }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -189,6 +269,10 @@ jobs:
         with:
           name: initramfs-aarch64
           path: target/vm
+      - uses: actions/download-artifact@v4
+        with:
+          name: notifier-macos
+          path: target/vm
       - run: cargo build --release -p airlock-cli
       - run: codesign --entitlements entitlements.plist --force -s - target/release/airlock
       - uses: actions/upload-artifact@v4
@@ -197,7 +281,10 @@ jobs:
           path: target/release/airlock
 
   build-cli-macos-x86_64:
-    needs: [ build-kernel-x86_64, build-initramfs-x86_64 ]
+    needs: [ build-kernel-x86_64, build-initramfs-x86_64, build-notifier-macos, build-notifier-macos-signed ]
+    # One of the two notifier jobs is always skipped. A skipped need skips
+    # this job by default, so check the results here.
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && (needs.build-notifier-macos.result == 'success' || needs.build-notifier-macos-signed.result == 'success') }}
     runs-on: macos-26-intel
     steps:
       - uses: actions/checkout@v4
@@ -212,6 +299,10 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: initramfs-x86_64
+          path: target/vm
+      - uses: actions/download-artifact@v4
+        with:
+          name: notifier-macos
           path: target/vm
       - run: cargo build --release -p airlock-cli
       - run: codesign --entitlements entitlements.plist --force -s - target/release/airlock
@@ -304,7 +395,10 @@ jobs:
 
   # ── Stage 3b: distroless CLI binaries (no bundled kernel/initramfs) ────
   build-cli-macos-aarch64-distroless:
-    needs: [ lint-macos, lint-linux, test-macos, test-linux ]
+    needs: [ lint-macos, lint-linux, test-macos, test-linux, build-notifier-macos, build-notifier-macos-signed ]
+    # One of the two notifier jobs is always skipped. A skipped need skips
+    # this job by default, so check the results here.
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && (needs.build-notifier-macos.result == 'success' || needs.build-notifier-macos-signed.result == 'success') }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -312,6 +406,10 @@ jobs:
       - name: Install capnp
         run: brew install capnp
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: notifier-macos
+          path: target/vm
       - run: cargo build --release -p airlock-cli --features distroless
       - run: codesign --entitlements entitlements.plist --force -s - target/release/airlock
       - uses: actions/upload-artifact@v4
@@ -320,7 +418,10 @@ jobs:
           path: target/release/airlock
 
   build-cli-macos-x86_64-distroless:
-    needs: [ lint-macos, lint-linux, test-macos, test-linux ]
+    needs: [ lint-macos, lint-linux, test-macos, test-linux, build-notifier-macos, build-notifier-macos-signed ]
+    # One of the two notifier jobs is always skipped. A skipped need skips
+    # this job by default, so check the results here.
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && (needs.build-notifier-macos.result == 'success' || needs.build-notifier-macos-signed.result == 'success') }}
     runs-on: macos-26-intel
     steps:
       - uses: actions/checkout@v4
@@ -328,6 +429,10 @@ jobs:
       - name: Install capnp
         run: brew install capnp
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: notifier-macos
+          path: target/vm
       - run: cargo build --release -p airlock-cli --features distroless
       - run: codesign --entitlements entitlements.plist --force -s - target/release/airlock
       - uses: actions/upload-artifact@v4

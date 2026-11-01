@@ -1,0 +1,51 @@
+name: Import signing certificate
+description: >
+  Import a Developer ID certificate into a temporary keychain and add the
+  keychain to the search list of codesign. Run cleanup-signing-cert with
+  "if: always()" at the end of the job.
+inputs:
+  cert-b64:
+    description: Base64 encoded .p12 certificate
+    required: true
+  cert-password:
+    description: Password of the .p12 certificate
+    required: true
+  keychain-password:
+    description: Password for the temporary keychain
+    required: true
+outputs:
+  keychain:
+    description: Path of the temporary keychain
+    value: ${{ steps.import.outputs.keychain }}
+runs:
+  using: composite
+  steps:
+    - id: import
+      shell: bash
+      env:
+        CERT_B64: ${{ inputs.cert-b64 }}
+        CERT_PASS: ${{ inputs.cert-password }}
+        KEYCHAIN_PASS: ${{ inputs.keychain-password }}
+      run: |
+        set -euo pipefail
+        # Stop with a clear error when a secret is missing. Without this
+        # check, codesign fails later with an unclear error.
+        for var in CERT_B64 CERT_PASS KEYCHAIN_PASS; do
+          if [ -z "${!var}" ]; then
+            echo "::error::Signing secret for $var is empty"
+            exit 1
+          fi
+        done
+        KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+        P12="$RUNNER_TEMP/cert.p12"
+        # Remove the certificate file also when an import step fails.
+        trap 'rm -f "$P12"' EXIT
+        echo "$CERT_B64" | base64 --decode > "$P12"
+        security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+        security set-keychain-settings -lut 21600 "$KEYCHAIN"
+        security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
+        security import "$P12" -k "$KEYCHAIN" -P "$CERT_PASS" -T /usr/bin/codesign
+        # shellcheck disable=SC2046 # word splitting of the list is intended
+        security list-keychain -d user -s "$KEYCHAIN" $(security list-keychain -d user | tr -d '"')
+        security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN"
+        echo "keychain=$KEYCHAIN" >> "$GITHUB_OUTPUT"
