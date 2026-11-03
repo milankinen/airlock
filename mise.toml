@@ -1,7 +1,7 @@
 [tools]
 "python" = "3.13"
 "aqua:docker/cli" = "29.4.0"
-"github:rust-lang/mdBook" = "0.5.2"
+"node" = "22"
 "aqua:bats-core/bats-core" = "1.11.1"
 
 [env]
@@ -66,15 +66,27 @@ if [[ "$(uname -s)" == Linux ]]; then
 fi
 '''
 
+[tasks."docs:install"]
+quiet = true
+description = "Install documentation dependencies"
+dir = "docs/manual"
+sources = ["package.json", "package-lock.json"]
+outputs = ["node_modules/.package-lock.json"]
+run = "npm ci --no-audit --no-fund"
+
 [tasks."docs:build"]
 quiet = true
 description = "Build documentation"
-run = "mdbook build docs/manual"
+dir = "docs/manual"
+depends = ["docs:install"]
+run = "npm run build"
 
 [tasks."docs:serve"]
 description = "Serve documentation with live reload"
 raw = true
-run = "mdbook serve docs/manual"
+dir = "docs/manual"
+depends = ["docs:install"]
+run = "npm run dev"
 
 [tasks.airlock]
 description = "Build, sign, and run"

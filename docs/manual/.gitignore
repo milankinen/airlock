@@ -1,0 +1,5 @@
+/node_modules
+/.astro
+# Made from src by the import script
+/site/content
+/public/logo.png
