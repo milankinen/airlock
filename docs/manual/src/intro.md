@@ -133,39 +133,19 @@ sign in inside the sandbox, but the real tokens stay on the host.
 
 ## Similar projects
 
-There are several tools in this space, each with a different focus. Here's how
-airlock compares:
+Many tools work in this space, and each has a different focus. This is
+how airlock compares with them:
 
-* [Microsandbox](https://github.com/microsandbox/microsandbox) — the closest
-  open-source alternative. A very promising project with a very similar
-  ideology and feature set. It focuses a bit more on being an SDK for
-  programmatic usage whereas airlock focuses on a pure terminal CLI, but
-  Microsandbox has a very decent CLI as well.
-* [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) — microVM-based
-  sandboxes with a deny-by-default network proxy, per-sandbox Docker daemon,
-  and credential injection. Network policies are domain-level allowlists
-  (HTTP/HTTPS only, no raw TCP control or scripting). Configuration is per-agent
-  via CLI, not a shareable project-level config file.
-* [OpenShell](https://github.com/NVIDIA/OpenShell) — NVIDIA's sandbox for AI
-  agents using Docker containers with declarative YAML policies for filesystem,
-  network (L4 + L7), and process access. Hot-reloadable, shareable policies.
-  Requires Docker. Container-level isolation, not VM.
-* [nsjail](https://github.com/google/nsjail) — Google's lightweight process
-  sandbox using Linux namespaces and seccomp-bpf. Single binary with a BPF
-  policy language (conceptually similar to airlock's Lua scripting). Process-level
-  isolation, not VM. Config via protobuf files (shareable but verbose).
-  Linux only.
-* [Codex CLI](https://github.com/openai/codex) — OpenAI's coding agent with
-  built-in OS-level sandboxing (Seatbelt on macOS, Bubblewrap on Linux).
-  Process-level isolation, binary on/off network control. Tightly coupled to
-  the Codex agent, not a general-purpose sandbox. No shareable config.
-* [Vibe](https://github.com/lynaghk/vibe) — lightweight Rust CLI that boots
-  Debian VMs on ARM Macs using Apple Virtualization.framework. Zero-config,
-  auto-shares project directory and credential dirs via VirtioFS. macOS only,
-  Debian only (no OCI images), no network policy or shareable config.
-* [Tart](https://tart.run/) — macOS and Linux VMs on Apple Silicon using
-  Apple Virtualization.framework, OCI-compatible images. Designed for CI
-  automation, not security sandboxing — no network policy or config-as-code.
-* [Lima](https://lima-vm.io/) — launches Linux VMs on macOS with file sharing
-  and port forwarding. YAML config files (shareable). General-purpose
-  Linux-on-Mac tool, not a security sandbox — no network isolation.
+* [Microsandbox](https://github.com/superradcompany/microsandbox) — the
+  closest open-source alternative, with microVMs and a very similar
+  ideology. It focuses more on SDKs for programs, and airlock focuses on a
+  terminal CLI.
+* [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) — microVM
+  sandboxes for agents, with network rules and credential injection on the
+  host. Part of the Docker product family.
+* [Gondolin](https://github.com/earendil-works/gondolin) — experimental
+  microVM sandboxes for agents, with network policy hooks in JavaScript.
+  Mainly an SDK for programs.
+* [OpenShell](https://github.com/NVIDIA/OpenShell) — NVIDIA's runtime for
+  AI agents, with shareable YAML policies. It runs sandboxes in containers,
+  Kubernetes or microVMs.
