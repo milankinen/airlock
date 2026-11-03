@@ -43,7 +43,7 @@ and other forms.
 
 You can save values you don't want in your shell environment to the
 airlock secret vault, then reference them with the same `${VAR}` syntax.
-See the [Secrets management](../secrets.md) chapter for the full
+See the [Secrets](../secrets.md) chapter for the full
 reference — storage backends, trade-offs, and recommendations.
 
 ## Masking

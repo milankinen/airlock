@@ -1,4 +1,4 @@
-# Secrets management
+# Secrets
 
 Most projects need secrets — API tokens, deploy keys, per-environment
 passwords. The usual workaround is to export them as shell variables

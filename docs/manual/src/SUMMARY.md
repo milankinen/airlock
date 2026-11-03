@@ -32,7 +32,7 @@
         - [Rust](./packs/tools/rust.md)
     - [Authoring packs](./packs/authoring.md)
 - [Templates](./templates.md)
-- [Secrets management](./secrets.md)
+- [Secrets](./secrets.md)
 - [Tips and tricks](./tips.md)
     - [Pairing with mise](./tips/mise.md)
     - [Open-network bootstrap](./tips/init-with-open-network.md)

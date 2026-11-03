@@ -131,7 +131,7 @@ The resolution modes are:
 
 For private registries, airlock prompts for a username and password the first
 time it sees a `401 Unauthorized` response. When the vault is enabled (see
-[Secrets management](../secrets.md)), airlock saves credentials keyed by
+[Secrets](../secrets.md)), airlock saves credentials keyed by
 registry host so subsequent pulls reuse them. With the vault disabled,
 airlock prompts on every pull that requires auth.
 

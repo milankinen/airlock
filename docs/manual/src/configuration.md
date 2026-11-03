@@ -40,7 +40,7 @@ available:
 |----------------------------|-------------------------------------------------|-----------|
 | `data_dir`                 | Directory for the sandboxes and the image cache | [Where airlock keeps sandbox data](./usage/managing-sandbox.md#where-airlock-keeps-sandbox-data) |
 | `security.insecure_mounts` | Allow mounts that expose the home directory     | [Mounts](./configuration/mounts.md#mounts-that-expose-the-home-directory) |
-| `vault.storage`            | Storage backend of the secret vault             | [Secrets management](./secrets.md#choosing-a-storage-backend) |
+| `vault.storage`            | Storage backend of the secret vault             | [Secrets](./secrets.md#choosing-a-storage-backend) |
 | `[monitor]`                | Monitor buffers and key bindings                | [Monitor dashboard](./usage/monitor.md#personal-settings) |
 | `approvals.dialogs`        | Where airlock asks for your approval: `"system"` (default), `"monitor"` or `"none"` | [Approval dialogs](./technical/approvals.md#the-approvalsdialogs-setting) |
 | `packs.dirs`               | User pack directories. `~` is the home directory. Default `["~/.airlock/packs"]` | [Pack sources](./packs.md#pack-sources) |
