@@ -96,3 +96,30 @@ fn steering_request_follows_agent_steering_support() {
         assert_eq!(response["error"]["code"], -32602);
     });
 }
+
+/// Test that the proxy refuses a session request that the real agent does
+/// not have, also when the proxy offered it. Most session features are
+/// empty objects, thus the check takes objects as present.
+///   1. Use an agent with the session list and no session fork
+///   2. Start a session
+///   3. Send `session/fork` and check that it gets `METHOD_NOT_FOUND` and
+///      does not reach the agent
+///   4. Send `session/list` and check that the agent got it
+#[test]
+fn session_fork_is_refused_when_agent_lacks_it() {
+    block_on_local(async {
+        let mut init = full_agent_init();
+        init["agentCapabilities"]["sessionCapabilities"] = json!({ "list": {} });
+        let init = init.to_string();
+        let starter = LocalStarter::new(&[("AGENT_INIT", &init)]);
+        let mut client = TestClient::session(starter, test_config(true), "/projects/a").await;
+        let params = json!({ "sessionId": "s", "cwd": "/projects/a", "mcpServers": [] });
+        let (response, mut others) = client.request(3, "session/fork", params).await;
+        assert_eq!(response["error"]["code"], -32601);
+        let (response, more) = client.request(4, "session/list", json!({})).await;
+        assert!(response.get("result").is_some(), "{response}");
+        others.extend(more);
+        let ids: Vec<_> = seen(&others).iter().map(|m| m["id"].clone()).collect();
+        assert_eq!(ids, [json!(4)]);
+    });
+}

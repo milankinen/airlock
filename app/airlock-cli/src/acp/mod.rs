@@ -12,11 +12,18 @@
 //! prompts). It lets through only the agent messages that the remaining
 //! features use, and refuses the other agent requests.
 //!
+//! The handshake reply offers a set of agent features. Each common agent
+//! has a preset set, and the user can give a different set. The proxy
+//! refuses the client requests for offered features that the real agent
+//! does not have. It also changes the guest session dirs in the session
+//! list to host paths.
+//!
 //! The proxy also removes the MCP servers that the editor gives for a
 //! session. If the user enables it, the proxy runs or reaches these
 //! servers on the host instead, and gives them to the agent as HTTP
 //! servers in the sandbox. Their tools then act on the host.
 
+pub mod capabilities;
 pub mod filter;
 mod mcp;
 mod proxy;
@@ -75,6 +82,8 @@ pub struct Options {
     pub proxy_mcp_servers: bool,
     /// Log level of a sandbox process that the proxy starts.
     pub log_level: LogLevel,
+    /// Agent feature names that the handshake reply offers.
+    pub agent_capabilities: Vec<String>,
 }
 
 /// The sandbox of a session dir.
@@ -148,6 +157,7 @@ pub async fn run(context: &Context, options: Options) -> anyhow::Result<i32> {
         argv: options.argv,
         restrict: !options.pass_client_capabilities,
         proxy_mcp_servers: options.proxy_mcp_servers,
+        agent_capabilities: options.agent_capabilities,
         mcp_register_timeout: MCP_REGISTER_TIMEOUT,
         handshake_timeout: HANDSHAKE_TIMEOUT,
         shutdown_grace: SHUTDOWN_GRACE,

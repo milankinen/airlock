@@ -16,6 +16,7 @@
 //! The agent stderr never stops the proxy. When the host stderr is slow,
 //! the proxy drops the agent stderr.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -28,7 +29,8 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use super::filter::{self, AgentVerdict, Kind};
+use super::capabilities::{self, AgentVerdict};
+use super::filter::{self, Kind};
 use super::{AgentProcess, AgentStarter, Control, Location, mcp};
 use crate::runtime::SignalStream;
 use crate::sandbox::ExitedBeforeReady;
@@ -49,6 +51,8 @@ pub struct ProxyConfig {
     /// Bridge the editor MCP servers into the sandbox. If not set, the
     /// agent gets no editor MCP servers.
     pub proxy_mcp_servers: bool,
+    /// Agent feature names that the handshake reply offers.
+    pub agent_capabilities: Vec<String>,
     /// Maximum time to register the editor MCP servers of one session
     /// request.
     pub mcp_register_timeout: Duration,
@@ -120,6 +124,7 @@ where
         mcp: mcp::Registry::default(),
         registration: None,
         held: None,
+        session_lists: HashMap::new(),
     };
     let code = proxy.run().await;
     proxy.end_mcp().await;
@@ -276,6 +281,9 @@ struct Proxy<'a, S> {
     /// and that come after its session request. They go to the agent after
     /// the session request.
     held: Option<Vec<Vec<u8>>>,
+    /// Host and guest session dirs of the `session/list` requests that
+    /// wait for the agent response, by request id.
+    session_lists: HashMap<String, (String, String)>,
 }
 
 impl<'a, S: AgentStarter> Proxy<'a, S> {
@@ -349,14 +357,23 @@ impl<'a, S: AgentStarter> Proxy<'a, S> {
             return;
         };
         let id = id.clone();
+        // A session list needs a project dir, and only the agent knows the
+        // sessions. Without a dir, the client gets an empty list. Then it
+        // does not show an error before the first session.
+        if method == "session/list" && msg.pointer("/params/cwd").is_none_or(Value::is_null) {
+            trace_message("-", Peer::Client, Peer::Airlock, &line);
+            self.reply(&id, Ok(serde_json::json!({ "sessions": [] })))
+                .await;
+            return;
+        }
         if method == "initialize" {
             trace_message("-", Peer::Client, Peer::Airlock, &line);
             let client = msg
                 .pointer("/params/clientInfo/name")
                 .and_then(Value::as_str);
             tracing::info!(client, "initialize");
-            let mut params = msg.get("params").cloned().unwrap_or(Value::Null);
-            filter::prepare_initialize_params(&mut params, self.config.restrict);
+            let params = msg.get("params").cloned().unwrap_or(Value::Null);
+            let params = capabilities::prepare_initialize_params(params, self.config.restrict);
             self.init_params = Some(params);
             self.reply(&id, Ok(self.initialize_result())).await;
             return;
@@ -508,11 +525,13 @@ impl<'a, S: AgentStarter> Proxy<'a, S> {
             .pointer("/params/cwd")
             .and_then(Value::as_str)
             .map(str::to_string);
+        let mut guest = None;
         if let Some(cwd) = &host_cwd {
             match self.guest_cwd(cwd, &sandbox).await {
                 Ok(guest_cwd) => {
                     tracing::info!(method, cwd, sandbox, guest_cwd, "session request");
-                    msg["params"]["cwd"] = Value::String(guest_cwd);
+                    msg["params"]["cwd"] = Value::String(guest_cwd.clone());
+                    guest = Some(guest_cwd);
                 }
                 Err(error) => {
                     trace_message(&sandbox, Peer::Client, Peer::Airlock, &line);
@@ -527,7 +546,7 @@ impl<'a, S: AgentStarter> Proxy<'a, S> {
         }
         let mut no_params = Value::Null;
         let params = msg.get_mut("params").unwrap_or(&mut no_params);
-        if let Err(error) = filter::check_client_request(&method, params, &agent_init) {
+        if let Err(error) = capabilities::check_client_request(&method, params, &agent_init) {
             trace_message(&sandbox, Peer::Client, Peer::Airlock, &line);
             tracing::debug!(method, sandbox, "refuse client request: {}", error.1);
             self.reply(&id, Err(error)).await;
@@ -548,6 +567,12 @@ impl<'a, S: AgentStarter> Proxy<'a, S> {
             }
             if method == "session/close" {
                 self.mcp.track_close(&id, params);
+            }
+            // The rows of the response have guest session dirs.
+            if method == "session/list"
+                && let (Some(host), Some(guest)) = (host_cwd, guest)
+            {
+                self.session_lists.insert(mcp::id_text(&id), (host, guest));
             }
             self.send_agent(Peer::Client, if changed { to_line(&msg) } else { line });
             return;
@@ -749,21 +774,29 @@ impl<'a, S: AgentStarter> Proxy<'a, S> {
             self.on_handshake_reply(msg).await;
             return;
         }
-        // The editor MCP servers follow the session state in both modes.
-        if let Some(msg) = &parsed
+        let mut parsed = parsed;
+        // The editor MCP servers and the session lists follow the session
+        // state in both modes.
+        let mut mapped = false;
+        if let Some(msg) = &mut parsed
             && let Some(Kind::Response { id }) = filter::kind(msg)
         {
             self.mcp.on_response(id, msg);
+            let list = self.session_lists.remove(&mcp::id_text(id));
+            if let Some((host, guest)) = list {
+                mapped = filter::map_session_list(msg, &host, &guest);
+            }
         }
         if !self.config.restrict {
-            if let Some(mut msg) = parsed
-                && filter::add_auth_hint(&mut msg, &self.config.name)
-            {
-                self.to_client(Peer::Agent, &msg).await;
-            } else {
-                self.send_client(Peer::Agent, with_newline(line.to_vec()))
-                    .await;
+            if let Some(mut msg) = parsed {
+                let hinted = filter::add_auth_hint(&mut msg, &self.config.name);
+                if hinted || mapped {
+                    self.to_client(Peer::Agent, &msg).await;
+                    return;
+                }
             }
+            self.send_client(Peer::Agent, with_newline(line.to_vec()))
+                .await;
             return;
         }
         // Only one JSON object at a time goes to the client, and as the
@@ -782,7 +815,7 @@ impl<'a, S: AgentStarter> Proxy<'a, S> {
             .and_then(Value::as_str)
             .map(str::to_string);
         let method = method.as_deref();
-        match filter::check_agent_message(&msg) {
+        match capabilities::check_agent_message(&msg) {
             AgentVerdict::Forward => {
                 // Session updates come for each part of the agent output.
                 // Only the trace level logs them.
@@ -824,6 +857,15 @@ impl<'a, S: AgentStarter> Proxy<'a, S> {
             return;
         }
         let Some(agent) = &self.agent else { return };
+        // The log helps to keep the presets true to the real agents.
+        let missing = capabilities::missing(&self.initialize_result(), &result);
+        if !missing.is_empty() {
+            tracing::info!(
+                sandbox = agent.sandbox,
+                ?missing,
+                "the agent does not have offered features"
+            );
+        }
         let running = Phase::Running {
             sandbox: agent.sandbox.clone(),
             agent_init: result,
@@ -1036,12 +1078,16 @@ impl<'a, S: AgentStarter> Proxy<'a, S> {
         self.to_client(Peer::Airlock, &msg).await;
     }
 
-    /// The `initialize` result that the proxy gives to the client.
+    /// The `initialize` result that the proxy gives to the client. It uses
+    /// the params of the first client handshake, so that a repeated
+    /// handshake gets the same features.
     fn initialize_result(&self) -> Value {
-        filter::initialize_result(
+        capabilities::initialize_result(
             &self.config.title,
             &self.config.version,
             self.config.proxy_mcp_servers,
+            &self.config.agent_capabilities,
+            self.init_params.as_ref().unwrap_or(&Value::Null),
         )
     }
 }

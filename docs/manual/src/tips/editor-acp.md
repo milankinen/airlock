@@ -60,10 +60,20 @@ other sandboxes.
 
 ## Restrictions
 
-By default, the agent cannot use the editor features that act on the
-host: host commands, host files, terminal login, URL prompts, MCP
-servers in the editor and unknown methods. Permission prompts, form
-prompts and session updates work.
+By default, these editor features work:
+
+* permission prompts and form prompts
+* session updates, sub-agents, plans and the session list
+* terminal output (the editor only shows it)
+* the read-only features of JetBrains AIR
+
+The proxy blocks these features, because they act on the host:
+
+* host commands and host files
+* editor login features and URL prompts
+* plan files and file change reports
+* MCP servers in the editor
+* unknown features and methods
 
 `--pass-client-capabilities` gives the agent all editor features.
 
@@ -74,6 +84,48 @@ environment.
 > [!WARNING]
 > With `--pass-client-capabilities`, the agent can run commands and
 > change files on the host. Use it only for an agent that you trust.
+
+## Agent features
+
+The proxy answers the editor handshake before the agent starts. It tells
+the editor the features of the agent from a preset. The proxy selects the
+preset from the command name:
+
+| Command            | Preset                                        |
+|--------------------|-----------------------------------------------|
+| `claude-agent-acp` | Claude                                        |
+| `codex-acp`        | Codex                                         |
+| `copilot --acp`    | Copilot                                       |
+| Other              | Session load, image and embedded prompt content, steering |
+
+A launcher such as `npx` gets the default preset. For a launcher, use
+`--set-agent-capabilities`.
+
+`--set-agent-capabilities=<list>` replaces the preset. The list has
+comma-separated names. An empty list gives no features. An unknown name
+is an error, and the message lists the valid names.
+
+| Name                                                     | Feature                      |
+|----------------------------------------------------------|------------------------------|
+| `loadSession`                                            | Session load                 |
+| `promptCapabilities.image`, `.audio`, `.embeddedContext` | Prompt content types         |
+| `sessionCapabilities.list`, `.resume`, `.close`, `.delete`, `.fork` | Session actions |
+| `sessionCapabilities.additionalDirectories`, `.systemPrompt`, `.subagents` | Session options |
+| `auth.logout`, `providers`, `_meta.authStatus`           | Account features. `auth.logout` signs out all sandboxes of the agent pack |
+| `steering`                                               | Send a message to a running turn |
+| `air:goal`                                               | AIR goals                    |
+| `air:sessionFailure`, `air:nativeSubagentSessions`, `air:asyncTasks`, `air:customInstructions`, `air:recommendedValue`, `air:diffPatch`, `air:rawInputRendering`, `air:planContentDelta`, `air:backgroundSubagents`, `air:sessionIndex` | JetBrains AIR features |
+
+The editor gets the `air:` names only if it declares AIR support.
+
+Example for a custom agent that starts through `npx`:
+
+```json
+"args": ["acp", "--set-agent-capabilities=loadSession,promptCapabilities.image,sessionCapabilities.list,steering", "npx", "my-acp-agent"]
+```
+
+The proxy refuses editor requests for features that the real agent does
+not have.
 
 ## Editor MCP servers
 
@@ -90,6 +142,7 @@ airlock serves them from the host and the agent connects to them through
 | Option                       | Effect                                                    |
 |------------------------------|-----------------------------------------------------------|
 | `--pass-client-capabilities` | Give the agent all editor features                        |
+| `--set-agent-capabilities <list>` | Replace the [agent feature](#agent-features) preset. Comma-separated names, empty for none |
 | `--proxy-mcp-servers`        | Bridge the MCP servers of the editor to the agent         |
 | `--follow-git-worktree`      | In a [git worktree](../usage/running-commands.md#git-worktrees), also use the sandbox of the main repository |
 | `-e KEY=VALUE`               | Set an environment variable for the agent, as in `airlock exec` |

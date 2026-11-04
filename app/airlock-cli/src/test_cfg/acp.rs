@@ -36,6 +36,9 @@ use crate::test_cfg::mcp_grant::{FakeGrant, GrantEvent, Route};
 ///    for the kill
 ///  - `AGENT_SESSION_IDS`: Reply to `session/new` and `session/fork` with
 ///    the result `{"sessionId":"s<N>"}`, where N counts from 1
+///  - `AGENT_LIST`: Reply to `session/list` with this result
+///
+/// A request with the param `"cursor":"bad"` gets an error.
 ///
 /// The notification `test/exit` makes it write a `session/update`
 /// notification with `params.last` and no newline, and exit with code 7.
@@ -65,6 +68,12 @@ while IFS= read -r line; do
         printf '{"jsonrpc":"2.0","id":%s,"error":%s}\n' "$id" "$AGENT_ERROR"
       else
         result='{}'
+        case "$line" in
+        *'"cursor":"bad"'*)
+          printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"bad cursor"}}\n' "$id"
+          continue ;;
+        *'"method":"session/list"'*) [ -n "$AGENT_LIST" ] && result="$AGENT_LIST" ;;
+        esac
         if [ -n "$AGENT_SESSION_IDS" ]; then
           case "$line" in
           *'"method":"session/new"'*|*'"method":"session/fork"'*)
@@ -89,6 +98,9 @@ pub fn full_agent_init() -> Value {
             "loadSession": true,
             "promptCapabilities": { "image": true, "embeddedContext": true },
             "mcpCapabilities": { "http": true },
+            "sessionCapabilities": {
+                "list": {}, "resume": {}, "close": {}, "delete": {}, "fork": {},
+            },
         },
     })
 }
@@ -334,8 +346,10 @@ impl Registrations {
 /// Args:
 ///  - `restrict`: Remove the client features that act on the host
 pub fn test_config(restrict: bool) -> ProxyConfig {
+    let argv = vec!["sh".into(), "-c".into(), FAKE_AGENT.into()];
     ProxyConfig {
-        argv: vec!["sh".into(), "-c".into(), FAKE_AGENT.into()],
+        agent_capabilities: crate::acp::capabilities::preset(&argv),
+        argv,
         name: "fake-agent".into(),
         title: "fake-agent (airlock)".into(),
         version: "test".into(),

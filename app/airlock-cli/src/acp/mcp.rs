@@ -660,6 +660,6 @@ fn new_key() -> anyhow::Result<String> {
 }
 
 /// The JSON text of a request id. A response has the same id value.
-fn id_text(id: &Value) -> String {
+pub(super) fn id_text(id: &Value) -> String {
     id.to_string()
 }

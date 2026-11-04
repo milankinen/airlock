@@ -13,12 +13,13 @@ use crate::test_cfg::block_on_local;
 /// Else the agent can use host features through the editor.
 ///   1. Use an agent that sends requests for host features, an extension
 ///      request, a URL prompt, an MCP message, a batch, a line that is not
-///      JSON, a message with an id and a method that is not a string, an
-///      extension notification, a permission request and a form prompt
+///      JSON, a message with an id and a method that is not a string,
+///      extension notifications, login status and session list changes, a
+///      permission request and a form prompt
 ///   2. Start a session and send one more request, so that all agent
 ///      output is handled
-///   3. Check that the client got only the permission request and the
-///      form prompt
+///   3. Check that the client got only the login status, the session list
+///      changes, the permission request and the form prompt
 ///   4. Check the error codes that the agent got, and that the batch and
 ///      the message with the bad method got no reply
 #[test]
@@ -33,6 +34,9 @@ fn agent_messages_out_of_allowlist_never_reach_client() {
         "not json",
         r#"{"jsonrpc":"2.0","id":"t7","method":5,"result":{}}"#,
         r#"{"jsonrpc":"2.0","method":"_zed/notify","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"_claude/sdkMessage","params":{}}"#,
+        r#"{"jsonrpc":"2.0","method":"_auth/status_update","params":{"authStatus":{}}}"#,
+        r#"{"jsonrpc":"2.0","method":"_session/list/changes","params":{}}"#,
         r#"{"jsonrpc":"2.0","id":"ok1","method":"session/request_permission","params":{}}"#,
         r#"{"jsonrpc":"2.0","id":"ok2","method":"elicitation/create","params":{"mode":"form","requestedSchema":{}}}"#,
     ]
@@ -50,9 +54,13 @@ fn agent_messages_out_of_allowlist_never_reach_client() {
         let methods: Vec<&Value> = others
             .iter()
             .filter(|m| m["method"] != "session/update")
-            .map(|m| &m["id"])
+            .map(|m| m.get("id").unwrap_or(&m["method"]))
             .collect();
-        assert_eq!(methods, [&json!("ok1"), &json!("ok2")]);
+        let expected = ["_auth/status_update", "_session/list/changes", "ok1", "ok2"];
+        assert_eq!(
+            methods,
+            expected.map(|e| json!(e)).iter().collect::<Vec<_>>()
+        );
 
         let errors: BTreeMap<String, Value> = seen(&others)
             .into_iter()

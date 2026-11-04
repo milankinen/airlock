@@ -40,11 +40,16 @@ pub mod acp {
         )
     }
 
-    /// Error when the agent cannot load sessions.
-    pub const NO_LOAD_SESSION: &str = "the agent does not support 'session/load'";
+    /// Error for a client request that needs an agent feature that the
+    /// agent does not have.
+    pub fn unsupported_method(method: impl Display) -> String {
+        format!("the agent does not support '{method}'")
+    }
 
-    /// Error when the agent cannot take steering requests.
-    pub const NO_STEERING: &str = "the agent does not support steering ('_session/steering')";
+    /// Error for agent feature names that airlock does not know.
+    pub fn unknown_agent_capabilities(names: impl Display, valid: impl Display) -> String {
+        format!("unknown agent features in --set-agent-capabilities: {names}. Valid names: {valid}")
+    }
 
     /// Close reason that the sandbox gets for the MCP sessions of an editor
     /// session that ended.

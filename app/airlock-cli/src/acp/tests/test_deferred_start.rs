@@ -55,7 +55,7 @@ fn first_session_starts_agent_with_filtered_handshake() {
         assert_eq!(got[0]["params"]["protocolVersion"], 1);
         assert_eq!(
             got[0]["params"]["clientCapabilities"],
-            json!({ "auth": {}, "elicitation": { "form": {} }, "session": {} })
+            json!({ "elicitation": { "form": {} }, "session": {} })
         );
         assert_eq!(got[1]["method"], "session/new");
         assert_eq!(got[1]["params"]["cwd"], "/work/sub");
