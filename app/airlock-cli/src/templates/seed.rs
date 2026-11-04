@@ -102,7 +102,7 @@ fn copy_file(template: &Template, sandbox: &PinnedDir, name: &str, cap: u64) -> 
 /// Returns:
 ///   Error if a remove fails.
 pub fn drop_disk(sandbox: &PinnedDir) -> anyhow::Result<()> {
-    crate::project::reset_disk(sandbox)?;
+    crate::sandbox::reset_disk(sandbox)?;
     sandbox.remove(install_state::STATE_FILE)?;
     sandbox.remove(SNAPSHOTS_FILE)?;
     Ok(())

@@ -14,9 +14,8 @@ use super::cmd_info::{self, Details};
 use super::cmd_rm::{self, RmArgs};
 use crate::cli::prompt::choose;
 use crate::context::Context;
-use crate::sandboxes::{self, registry};
 use crate::util::verified_path::VerifiedPath;
-use crate::{cli, messages, oci, project};
+use crate::{cli, messages, oci, sandbox};
 
 /// CLI arguments for `airlock sandboxes`.
 #[derive(Args, Debug)]
@@ -83,32 +82,29 @@ pub async fn main(args: SandboxArgs, context: &Context) -> i32 {
 
 /// Print the table of the registered sandboxes.
 async fn list(context: &Context) -> anyhow::Result<i32> {
-    let entries = registry::list(&context.db).await?;
-    if entries.is_empty() {
+    let sandboxes = sandbox::list(context).await?;
+    if sandboxes.is_empty() {
         cli::log!(
             "{}",
             messages::cli::no_sandboxes_in(context.data.sandboxes.given().display())
         );
         return Ok(0);
     }
-    let boxes = &context.data.sandboxes;
-    let roots = context.roots();
     let mut rows = Vec::new();
-    for entry in entries {
-        let dir = boxes.join(&entry.id)?;
-        let details = Details::read(&entry.id, entry.project.display().to_string(), &dir);
+    for sandbox in sandboxes {
+        let details = Details::read(&sandbox);
         let mut project = details.project.clone();
         // A path through a symlink below the trusted roots does not count.
-        let is_dir = VerifiedPath::new(&entry.project, &roots).is_ok_and(|p| p.is_dir());
+        let is_dir = sandbox.project().is_ok_and(VerifiedPath::is_dir);
         if !is_dir {
             project.push_str(messages::cli::PROJECT_MISSING_SUFFIX);
         }
         rows.push([
-            entry.id,
+            details.id.clone(),
             details.status.text().to_string(),
             details
                 .last_run
-                .map_or_else(|| messages::cli::NEVER.to_string(), project::time_ago),
+                .map_or_else(|| messages::cli::NEVER.to_string(), sandbox::time_ago),
             details
                 .disk_used
                 .map_or_else(String::new, cli::format_bytes),
@@ -165,17 +161,17 @@ async fn remove(context: &Context, ids: &[String], force: bool) -> anyhow::Resul
 /// Returns:
 ///   `true` if the sandbox was removed, `false` if the user aborted.
 async fn remove_one(context: &Context, id: &str, force: bool) -> anyhow::Result<bool> {
-    let project = cmd_info::registered_project(context, id).await?;
-    // Fail before the question. `remove_box` checks again under the lock.
+    let sandbox = sandbox::get(context, id).await?;
+    // Fail before the question. The removal checks again under the lock.
     anyhow::ensure!(
-        !project::is_running(&context.data.sandboxes.join(id)?),
+        !sandbox.is_running(),
         messages::cli::sandbox_id_running_stop_first(id)
     );
-    if !force && !confirm(id, &project) {
+    if !force && !confirm(id, sandbox.path()) {
         cli::error!("{}", messages::cli::aborted_id(id));
         return Ok(false);
     }
-    sandboxes::remove_box(context, id).await?;
+    sandbox.remove(context).await?;
     cli::log!("{}", messages::cli::sandbox_id_removed(id));
     Ok(true)
 }

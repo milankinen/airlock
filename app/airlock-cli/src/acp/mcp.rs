@@ -18,7 +18,6 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-use airlock_common::cli_capnp::cli_service;
 use airlock_common::supervisor_capnp::{mcp_grant, mcp_host};
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
@@ -27,6 +26,7 @@ use tokio::time::Instant;
 use super::filter;
 use crate::mcp::{HostStopper, McpHostImpl, RemoteKind, RemoteSpec, ServerSpec, Transport};
 use crate::messages;
+use crate::sandbox::McpRegistrar;
 use crate::util::verified_path::VerifiedPath;
 
 /// Session requests that have MCP servers.
@@ -76,7 +76,7 @@ pub(super) struct SessionRequest<'r> {
     pub(super) agent_init: &'r Value,
     /// CLI service of the sandbox that adds the sandbox addresses, or
     /// `None` if the agent has none.
-    pub(super) registrar: Option<cli_service::Client>,
+    pub(super) registrar: Option<McpRegistrar>,
     /// Time limit of the release of an old set and the registration of
     /// all servers.
     pub(super) timeout: Duration,
@@ -580,7 +580,7 @@ fn log_name(entry: &Value) -> String {
 /// Returns:
 ///   The set of the registered servers.
 async fn register(
-    registrar: &cli_service::Client,
+    registrar: &McpRegistrar,
     key: &str,
     specs: Vec<ServerSpec>,
     host_cwd: &str,
@@ -604,17 +604,10 @@ async fn register(
     let stopper = host.stopper();
     let host: mcp_host::Client = capnp_rpc::new_client(host);
     let calls = names.iter().map(|name| {
-        let mut req = registrar.add_mcp_server_request();
-        req.get().set_session(key);
-        req.get().set_name(name);
-        req.get().set_host(host.clone());
+        let add = registrar.add(key, name, host.clone());
         async move {
-            match tokio::time::timeout_at(deadline, req.send().promise).await {
-                Ok(Ok(response)) => response
-                    .get()
-                    .and_then(cli_service::add_mcp_server_results::Reader::get_grant)
-                    .map_err(|e| e.to_string()),
-                Ok(Err(e)) => Err(e.to_string()),
+            match tokio::time::timeout_at(deadline, add).await {
+                Ok(result) => result.map_err(|e| e.to_string()),
                 Err(_) => Err("no reply in time".to_string()),
             }
         }

@@ -13,10 +13,7 @@ use crate::cli::{self, LogLevel};
 use crate::network::{self, Network};
 use crate::oci::{self, OciImage};
 use crate::packs::InstallerScript;
-use crate::project::Project;
-use crate::sandbox::boot::{self, BootSpec};
-use crate::sandbox::vm::{ProcessSpec, Stopped, Vm};
-use crate::sandbox::{self, io};
+use crate::sandbox::{self, BootSpec, ProcessSpec, Project, Stopped, Vm};
 use crate::util::{PinnedDir, VerifiedPath};
 
 /// Stop a pack install if it prints nothing for this long.
@@ -275,8 +272,8 @@ async fn boot_install_vm(
         false,
     )?
     .public_only();
-    let env = boot::guest_env(&project, image, false);
-    boot::boot(BootSpec {
+    let env = sandbox::guest_env(&project, image, false);
+    sandbox::boot(BootSpec {
         project,
         image,
         options: phase::boot_options(log_level),
@@ -325,7 +322,7 @@ impl VmExec<'_> {
             cwd: Some("/".into()),
             env: installer.env.clone(),
             unset: vec![],
-            stdin: io::closed_stdin(),
+            stdin: sandbox::closed_stdin(),
             pty: None,
         };
         let proc = match self.vm.spawn(spec).await {
@@ -343,7 +340,7 @@ impl VmExec<'_> {
                 }
             }
         };
-        let mut run = std::pin::pin!(io::drive(&proc, progress));
+        let mut run = std::pin::pin!(sandbox::drive(&proc, progress));
         let ended = tokio::select! {
             code = &mut run => return Ended::Exited(code),
             () = idle => Ended::TimedOut,

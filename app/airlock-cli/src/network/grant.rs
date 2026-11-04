@@ -45,7 +45,7 @@ use crate::approval::{
 };
 use crate::config::config_values::{Grants, NetworkRule, Policy, RuleEditing, RuleEnabled};
 use crate::messages::grants as msg;
-use crate::project::Project;
+use crate::sandbox::Project;
 use crate::util::VerifiedPath;
 
 /// Maximum number of host patterns in one request, or of new patterns in
@@ -918,9 +918,7 @@ async fn change_rule(network: &Network, change: RuleChange) -> Result<(), RuleEr
     // The user approved this change. The next start must not ask again.
     // The table is the approved table with the change, not the text that
     // the file has now.
-    if let Err(e) =
-        crate::start::config_change::approve_rule(&context.sandbox_dir, &file, &change.name, table)
-    {
+    if let Err(e) = crate::sandbox::approve_rule(&context.sandbox_dir, &file, &change.name, table) {
         warn!("rule change: cannot update the config of the last run: {e:#}");
     }
     let mut rules = network.rules.borrow_mut();

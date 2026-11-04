@@ -16,13 +16,20 @@ claude = { version = "1", args = { acp = true } }
 codex = { version = "1", args = { acp = true } }
 ```
 
-`airlock acp <command>` connects the editor to the ACP command in the
-sandbox. The editor can start it in any directory. The agent starts at
-the first session, in the running sandbox of the session directory.
+`airlock acp <command>` starts a proxy that lets the editor talk to the
+agent over the ACP protocol. When the editor starts or loads a session,
+the proxy connects to the sandbox of the session directory. If that
+sandbox is running, the proxy attaches to it. Otherwise, it starts the
+sandbox.
+
+The sandbox must first be created with `airlock start`. ACP sessions use
+the config of that sandbox, and a sandbox started by `airlock acp` never
+picks up config changes.
 
 ## Setup
 
-1. Start the sandbox in the project directory and keep it running:
+1. Start the sandbox once in the project directory, so that it has a
+   config:
 
    ```bash
    airlock start
@@ -60,6 +67,10 @@ prompts and session updates work.
 
 `--pass-client-capabilities` gives the agent all editor features.
 
+`airlock acp` cannot start a stopped sandbox when the vault is an
+encrypted file and `AIRLOCK_VAULT_PASSPHRASE` is not set in the editor's
+environment.
+
 > [!WARNING]
 > With `--pass-client-capabilities`, the agent can run commands and
 > change files on the host. Use it only for an agent that you trust.
@@ -80,7 +91,7 @@ airlock serves them from the host and the agent connects to them through
 |------------------------------|-----------------------------------------------------------|
 | `--pass-client-capabilities` | Give the agent all editor features                        |
 | `--proxy-mcp-servers`        | Bridge the MCP servers of the editor to the agent         |
-| `--follow-git-worktree`      | In a [git worktree](../usage/attaching-to-running-sandbox.md#git-worktrees), also use the sandbox of the main repository |
+| `--follow-git-worktree`      | In a [git worktree](../usage/running-commands.md#git-worktrees), also use the sandbox of the main repository |
 | `-e KEY=VALUE`               | Set an environment variable for the agent, as in `airlock exec` |
 | `-l`, `--login`              | Start the agent in a login shell, as in `airlock exec`    |
 | `--log-level <level>`        | Set the level of the log file. The default is `info`      |

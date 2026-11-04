@@ -1,7 +1,7 @@
 - [Introduction](./intro.md)
 - [Installation and usage](./usage.md)
     - [Starting a sandbox](./usage/starting-sandbox.md)
-    - [Attaching to a running sandbox](./usage/attaching-to-running-sandbox.md)
+    - [Running commands](./usage/running-commands.md)
     - [Managing sandboxes](./usage/managing-sandbox.md)
     - [Monitor dashboard](./usage/monitor.md)
 - [Configuration](./configuration.md)

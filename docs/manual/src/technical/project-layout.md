@@ -87,8 +87,9 @@ holds:
     files/ro/{key}               # hard-linked read-only file mounts
   disk.img                       # virtio-blk ext4 volume
   disk.id                        # random identity of disk.img
-  lock                           # flock: one airlock process per sandbox
-  cli.sock                       # Unix socket for `airlock exec` RPC
+  run.lock                       # flock: held while the sandbox process lives
+  startup.lock                   # flock: one starter of the sandbox process at a time
+  cli.sock                       # Unix socket of the sandbox process (CLI RPC)
   image                          # hard link to images/<digest> JSON
   airlock.log                    # tracing log of the last runs
   installs.log                   # output of the last install boot
@@ -98,7 +99,7 @@ The sandbox directory is never in the project. The sandbox guest cannot
 write it.
 
 airlock writes the JSON files atomically (temp file and rename) under the
-sandbox lock. Other processes (`airlock sandboxes list`, `airlock info`)
+sandbox locks. Other processes (`airlock sandboxes list`, `airlock info`)
 read them at the same time without a wait.
 
 The local project config (`airlock.<ext>`) is the file that the setup
@@ -120,8 +121,8 @@ changes nothing:
 sandbox directory and the local project config. It does not touch
 `<project>/.airlock/`. If a stale `.airlock/sandbox` exists, the next
 `airlock start` offers to import it. If the project has no sandbox, it
-prints "No sandbox to remove" and exits with 0. A running sandbox gives
-exit code 1.
+prints "No sandbox to remove" and exits with 0. A sandbox that runs or
+boots fails with exit code 1.
 
 ### Import of an old sandbox
 
@@ -137,8 +138,9 @@ sandbox. The import follows these rules:
      `airlock.log`, `sandbox` and `airlock.<ext>`. It exits with 1 and
      changes nothing.
   3. It pins the directory without a link follow and checks the owner.
-  4. It takes `lock`. Only a missing `lock` lets the import go on. A held
-     lock means the sandbox is in use. A symlink or FIFO at `lock` is
+  4. It checks `lock`, the lock file of older versions. The import
+     goes on only if `lock` is missing. A held lock means that an older
+     airlock process is using the sandbox. A symlink or FIFO at `lock` is
      refused.
 * airlock takes only these names: `disk.id`, `disk.img`, `installs.json`,
   `ca.json` and the image digest from `image`. It does not take any other
@@ -206,8 +208,23 @@ the digest changes, the guest resets the overlay upper layer.
 
 ## Locking
 
-`lock` holds an exclusive `flock` while `airlock start` runs, and
-contains its PID for diagnostics. A second `airlock start` on the same
-sandbox fails at once. `airlock rm` and `airlock sandboxes remove` probe
-the lock without a wait, and refuse a running sandbox. The kernel
-releases the lock when the process exits, so there are no stale locks.
+Two lock files in the sandbox directory control the use of a sandbox:
+
+* `run.lock` is held with an exclusive `flock` from the start of the
+  sandbox process until it exits, and contains its PID for diagnostics.
+  While it is held, the sandbox is booting, running or stopping.
+  `airlock rm`, `airlock sandboxes remove` and the status list check it
+  without waiting.
+* `startup.lock` makes sure that only one process at a time starts the
+  sandbox process. The starter holds it while it decides, and the
+  sandbox process keeps it until its parent client has connected.
+
+A client that finds `startup.lock` held waits for it. The kernel
+releases a lock when its last holder exits, so locks never go stale.
+
+## Sandbox process
+
+A detached sandbox process owns the VM, the network and the `cli.sock`
+socket of a sandbox. `airlock start`, `airlock exec` and `airlock acp`
+start it when the sandbox is not running. See
+[Technical implementation](../technical.md).

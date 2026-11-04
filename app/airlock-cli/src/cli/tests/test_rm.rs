@@ -6,11 +6,10 @@ use std::path::{Path, PathBuf};
 use crate::cache;
 use crate::cli::cmd_rm::{RmArgs, run};
 use crate::context::Context;
-use crate::project::SandboxLock;
-use crate::sandboxes::registry;
+use crate::sandbox::{SandboxLock, registry};
 use crate::test_cfg::oci::verified_dir;
 use crate::test_cfg::sandboxes::stopped_sandbox_dir;
-use crate::test_cfg::{TempDir, block_on_local, temp_dir, test_context};
+use crate::test_cfg::{TempDir, block_on_local, eventually, temp_dir, test_context};
 use crate::vault::{Vault, VaultStorageType};
 
 const FORCE: RmArgs = RmArgs { force: true };
@@ -80,17 +79,20 @@ fn exists(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
 }
 
-/// Test that rm removes a sandbox in the data directory with its registry
-/// entry, its local project config and its unused image. The `.airlock`
-/// directory of the project is not the sandbox, so it stays.
+/// Test that rm refuses the sandbox of a running VM, and that it removes a
+/// stopped sandbox in the data directory with its registry entry, its local
+/// project config and its unused image. The `.airlock` directory of the
+/// project is not the sandbox, so it stays.
 ///   1. Start a project, and add a local config to the sandbox and a file
 ///      to `.airlock`
-///   2. Run rm with force
-///   3. Check that the sandbox, its local config, the registry entry and the
+///   2. Hold the sandbox lock, as a running VM does, run rm with force and
+///      check that it fails and the disk and the image stay
+///   3. Release the lock and run rm with force again
+///   4. Check that the sandbox, its local config, the registry entry and the
 ///      image are gone
-///   4. Check that the `.airlock` file stays
+///   5. Check that the `.airlock` file stays
 #[test]
-fn rm_of_data_dir_sandbox_removes_it_with_local_config() {
+fn rm_refuses_running_sandbox_and_removes_stopped_one_with_local_config() {
     let home = temp_dir();
     let context = context(&home);
     let project = Project::started(&home, &context, "proj");
@@ -98,8 +100,22 @@ fn rm_of_data_dir_sandbox_removes_it_with_local_config() {
     std::fs::create_dir_all(project.airlock()).unwrap();
     std::fs::write(project.airlock().join(".init-done"), "").unwrap();
 
-    assert_eq!(rm(&context, &project.dir), 0);
+    let running = SandboxLock::acquire_box(
+        &verified_dir(&project.dir),
+        &context.data.sandboxes,
+        &project.id,
+    )
+    .unwrap();
+    assert_eq!(rm(&context, &project.dir), 1);
+    assert!(project.sandbox.join("disk.img").is_file());
+    assert!(project.image.exists());
+    drop(running);
 
+    // A fork in a parallel test can hold a copy of the lock file for a
+    // short time.
+    eventually("stopped sandbox is removed", || {
+        (rm(&context, &project.dir) == 0).then_some(())
+    });
     assert!(!exists(&project.sandbox));
     assert!(
         block_on_local(registry::list(&context.db))
@@ -108,25 +124,4 @@ fn rm_of_data_dir_sandbox_removes_it_with_local_config() {
     );
     assert!(!project.image.exists());
     assert!(project.airlock().join(".init-done").is_file());
-}
-
-/// Test that rm refuses to remove the sandbox of a running VM.
-///   1. Start a project and hold its sandbox lock, as a running VM does
-///   2. Run rm with force and check that it fails
-///   3. Check that the disk and the image stay
-#[test]
-fn rm_of_running_sandbox_is_refused() {
-    let home = temp_dir();
-    let context = context(&home);
-    let project = Project::started(&home, &context, "proj");
-    let _running = SandboxLock::acquire_box(
-        &verified_dir(&project.dir),
-        &context.data.sandboxes,
-        &project.id,
-    )
-    .unwrap();
-
-    assert_eq!(rm(&context, &project.dir), 1);
-    assert!(project.sandbox.join("disk.img").is_file());
-    assert!(project.image.exists());
 }

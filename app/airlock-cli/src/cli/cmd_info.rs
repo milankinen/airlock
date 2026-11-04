@@ -5,7 +5,6 @@
 //! `airlock sandboxes info` gives the same output for any sandbox.
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
 
 use clap::Args;
 use serde::Serialize;
@@ -15,14 +14,13 @@ use crate::config::config_values::RuleEnabled;
 use crate::context::Context;
 use crate::packs::ConfiguredPack;
 use crate::packs::install::state::{self, InstallState, PackStatus, ReadState};
-use crate::project::read_run_meta;
-use crate::sandboxes::{Found, registry};
+use crate::sandbox::{FindOpts, Sandbox, Status, read_run_meta};
 use crate::services::{self, store};
 use crate::util::PinnedDir;
 use crate::util::verified_path::VerifiedPath;
 use crate::vault::VaultStorageType;
 use crate::vm::disk;
-use crate::{cli, config, messages, packs, project, sandboxes};
+use crate::{cli, config, messages, packs, sandbox};
 
 /// CLI arguments for `airlock info`.
 #[derive(Args, Debug)]
@@ -49,12 +47,10 @@ pub(super) async fn run(context: Context, id: Option<&str>, json: bool) -> i32 {
     // A registered project path that fails the check (for example a symlink
     // in it) shows as text, like in `sandboxes ls`.
     if let Some(id) = id
-        && let Ok(project) = registered_project(&context, id).await
-        && VerifiedPath::new(&project, &context.roots()).is_err()
-        && let Ok(dir) = context.data.sandboxes.join(id)
+        && let Ok(sandbox) = sandbox::get(&context, id).await
+        && sandbox.project().is_err()
     {
-        let details = Details::read(id, project.display().to_string(), &dir);
-        return print_details_only(&details, json);
+        return print_details_only(&Details::read(&sandbox), json);
     }
     let (project_dir, found) = match find(&context, id).await {
         Ok(found) => found,
@@ -69,7 +65,7 @@ pub(super) async fn run(context: Context, id: Option<&str>, json: bool) -> i32 {
     let resolved = if project_dir.is_dir() {
         let local_dir = match &found {
             None => project_dir.join(".airlock"),
-            Some(found) => sandboxes::local_config_dir(&found.dir),
+            Some(found) => found.local_config_dir(),
         };
         let local_dir = match local_dir {
             Ok(dir) => dir,
@@ -89,13 +85,13 @@ pub(super) async fn run(context: Context, id: Option<&str>, json: bool) -> i32 {
         None
     };
     let found = match found {
-        Some(found) if found.dir.symlink_metadata().is_ok() => found,
+        Some(found) if found.dir().symlink_metadata().is_ok() => found,
         _ => {
             cli::error!("{}", messages::cli::no_sandbox_for_project(&project_dir));
             return 1;
         }
     };
-    let details = Details::read(&found.id, found.project.to_string(), &found.dir);
+    let details = Details::read(&found);
     if json {
         return print_json(&details);
     }
@@ -103,7 +99,13 @@ pub(super) async fn run(context: Context, id: Option<&str>, json: bool) -> i32 {
         print_sandbox_only(&details);
         return 0;
     };
-    let project = project::load(values, context, &found);
+    let project = match found.load(values, context) {
+        Ok(project) => project,
+        Err(e) => {
+            cli::error!("{e:#}");
+            return 1;
+        }
+    };
 
     let status = if project.is_running() {
         cli::red(messages::cli::STATUS_RUNNING)
@@ -202,7 +204,7 @@ pub(super) async fn run(context: Context, id: Option<&str>, json: bool) -> i32 {
 
 /// Print the enabled network services, each with its stored sign-ins.
 // Reads only the plain fields of the token store, so no vault key is needed.
-async fn print_services(project: &project::Project) {
+async fn print_services(project: &sandbox::Project) {
     let ids = services::enabled(&project.config.network.services);
     if ids.is_empty() {
         return;
@@ -294,7 +296,7 @@ async fn resolve_config(
 
 /// Print the enabled packs with their status. Also print the install records
 /// of packs that no longer install.
-fn print_packs(project: &project::Project, packs: &[ConfiguredPack]) {
+fn print_packs(project: &sandbox::Project, packs: &[ConfiguredPack]) {
     let state = read_install_state(project);
     let removed = state
         .as_ref()
@@ -380,7 +382,7 @@ fn open_sandbox_dir(dir: &VerifiedPath) -> Result<Option<PinnedDir>, String> {
 /// Read the install records of the current project disk, without the lock.
 /// Returns:
 ///   `None` if there are no records, or if they belong to another disk.
-fn read_install_state(project: &project::Project) -> Option<InstallState> {
+fn read_install_state(project: &sandbox::Project) -> Option<InstallState> {
     let dir = match open_sandbox_dir(&project.sandbox_dir) {
         Ok(Some(dir)) => dir,
         Ok(None) => return None,
@@ -390,7 +392,7 @@ fn read_install_state(project: &project::Project) -> Option<InstallState> {
         }
     };
     match state::read(&dir) {
-        ReadState::Ok(s) if s.disk.is_some() && s.disk == project::disk_id(&dir) => Some(s),
+        ReadState::Ok(s) if s.disk.is_some() && s.disk == sandbox::disk_id(&dir) => Some(s),
         _ => None,
     }
 }
@@ -476,42 +478,16 @@ fn removed_status(status: PackStatus) -> Option<&'static str> {
 pub(super) async fn find(
     context: &Context,
     id: Option<&str>,
-) -> anyhow::Result<(VerifiedPath, Option<Found>)> {
+) -> anyhow::Result<(VerifiedPath, Option<Sandbox>)> {
     if let Some(id) = id {
-        let found = find_by_id(context, id).await?;
-        return Ok((found.project.clone(), Some(found)));
+        let found = sandbox::get(context, id).await?;
+        return Ok((found.project()?.clone(), Some(found)));
     }
-    let cwd = sandboxes::project_dir(&context.work)?;
-    let found = sandboxes::resolve_sandbox(context, &cwd, false, false)
+    let cwd = context.work.reverify()?;
+    let found = sandbox::find(context, &cwd, FindOpts::default())
         .await
         .map_err(|e| e.context(messages::cli::SANDBOX_LOOKUP_FAILED_CONTEXT))?;
     Ok((cwd, found))
-}
-
-/// Get the registered sandbox `id`.
-/// Returns:
-///   The sandbox, or error if `id` is not registered or a part of its
-///   project path before the last is a symlink.
-async fn find_by_id(context: &Context, id: &str) -> anyhow::Result<Found> {
-    let project = registered_project(context, id).await?;
-    Ok(Found {
-        id: id.to_string(),
-        project: VerifiedPath::new(project, &context.roots())?,
-        dir: context.data.sandboxes.join(id)?,
-    })
-}
-
-/// Get the project directory of the registered sandbox `id`, as the
-/// registry has it.
-/// Returns:
-///   The project directory, or error if `id` is not registered.
-pub(super) async fn registered_project(context: &Context, id: &str) -> anyhow::Result<OsString> {
-    let project = if registry::is_valid_id(id) {
-        registry::get(&context.db, id).await?
-    } else {
-        None
-    };
-    project.ok_or_else(|| anyhow::anyhow!(messages::cli::no_sandbox_with_id(id)))
 }
 
 /// Details of one sandbox, without its config. The JSON output and the
@@ -541,20 +517,15 @@ pub(super) struct Details {
 }
 
 impl Details {
-    /// Read the details of a sandbox. Takes no lock and writes nothing.
+    /// Read the details of `sandbox`. Takes no lock and writes nothing.
     /// Records that cannot be read are left out.
-    /// Args:
-    ///  - `id`: Registry id of the sandbox
-    ///  - `project`: Project directory, for the output only
-    ///  - `dir`: Sandbox directory
-    pub(super) fn read(id: &str, project: String, dir: &VerifiedPath) -> Self {
+    pub(super) fn read(sandbox: &Sandbox) -> Self {
         use std::os::unix::fs::MetadataExt;
-        let status = if dir.symlink_metadata().is_err() {
-            SandboxStatus::Missing
-        } else if project::is_running(dir) {
-            SandboxStatus::Running
-        } else {
-            SandboxStatus::Stopped
+        let dir = sandbox.dir();
+        let status = match sandbox.status() {
+            Status::Missing => SandboxStatus::Missing,
+            Status::Running => SandboxStatus::Running,
+            Status::Stopped => SandboxStatus::Stopped,
         };
         let run = read_run_meta(dir);
         let mut packs = BTreeMap::new();
@@ -570,9 +541,9 @@ impl Details {
         // size.
         let disk = dir.join(disk::DISK_FILE).and_then(|p| p.metadata()).ok();
         Self {
-            id: id.to_string(),
+            id: sandbox.id().to_string(),
             location: "data-dir",
-            project,
+            project: sandbox.path().display().to_string(),
             dir: dir.to_string(),
             status,
             last_run: run.last_run,
@@ -628,7 +599,7 @@ fn print_sandbox_only(details: &Details) {
     if let Some(last_run) = details.last_run {
         println!(
             "{}",
-            messages::cli::info_last_run(project::time_ago(last_run))
+            messages::cli::info_last_run(sandbox::time_ago(last_run))
         );
     }
     println!("{}", messages::cli::info_sandbox(&details.dir));

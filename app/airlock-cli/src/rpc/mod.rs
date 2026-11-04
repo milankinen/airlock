@@ -9,12 +9,14 @@
 //!  * the host clipboard
 //!  * opening pages in the user's browser
 //!
-//! The host can also open connections to ports inside the VM.
+//! The host can also open connections to ports inside the VM. Also converts
+//! the messages of the monitor feed for clients of the running sandbox.
 
 pub(crate) mod browser;
 pub(crate) mod clipboard;
 pub(crate) mod guest_network;
 mod logging;
+pub(crate) mod monitor;
 mod network;
 mod process;
 mod stdin;
@@ -129,6 +131,22 @@ pub fn fill_exec_request(
     for (i, e) in env.iter().enumerate() {
         env_b.set(i as u32, e.as_str());
     }
+}
+
+/// Check if `e` is an RPC error because the connection closed, for
+/// example when the sandbox stops.
+pub fn is_disconnected(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<capnp::Error>().is_some_and(is_closed)
+}
+
+/// Check if the RPC error `e` comes from a closed connection. A peer that
+/// closes the connection before it reads a call gives an early end of
+/// file, not a disconnect.
+pub fn is_closed(e: &capnp::Error) -> bool {
+    matches!(
+        e.kind,
+        capnp::ErrorKind::Disconnected | capnp::ErrorKind::PrematureEndOfFile
+    )
 }
 
 #[cfg(test)]

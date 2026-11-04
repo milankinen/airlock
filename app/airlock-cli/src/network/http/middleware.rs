@@ -66,7 +66,7 @@ pub fn compile(
     // An undefined name fails the compile and does not become nil. Thus a
     // missing `${VAR}` in a security-sensitive script (for example a token
     // for an outbound request) cannot silently become an empty check.
-    // `[env]` in `project::resolve_env` does the same.
+    // `[env]` in `sandbox::resolve_env` does the same.
     let env_table = lua.create_table()?;
     for (key, template) in env_vars {
         let value = vault

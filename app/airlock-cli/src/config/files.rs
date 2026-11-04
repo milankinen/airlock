@@ -46,7 +46,7 @@ pub(crate) struct DiscoveredFiles {
 ///  - `local_dir`: Directory of the local project file: the sandbox
 ///    directory for a sandbox in the data directory, else
 ///    `<project_root>/.airlock` (see
-///    [`crate::sandboxes::local_config_dir`])
+///    [`crate::sandbox::local_config_dir`])
 ///
 /// Returns:
 ///   The parsed files, or an error if a file exists but is not readable or

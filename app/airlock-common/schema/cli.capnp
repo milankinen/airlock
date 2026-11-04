@@ -2,8 +2,9 @@
 
 using Network = import "network.capnp";
 using Supervisor = import "supervisor.capnp";
+using Monitor = import "monitor.capnp";
 
-# CLI server interface. `airlock start` serves it on a Unix socket for
+# CLI server interface. The sandbox process serves it on a Unix socket for
 # clients that attach to the running sandbox: `airlock exec` (new
 # processes in the container), `airlock network forward` (ad-hoc port
 # forwards) and `airlock acp` (host MCP servers for an editor agent). It
@@ -35,4 +36,33 @@ interface CliService {
   # `session` and `name` and passes the call to `Supervisor.addMcpServer`.
   # The route closes when the client releases `grant` or disconnects.
   addMcpServer @3 (session :Text, name :Text, host :Supervisor.McpHost) -> (grant :Supervisor.McpGrant);
+
+  # Removes this connection from the connection count. Each connection
+  # holds the sandbox from its accept until it closes. After this call, the
+  # connection does not hold the sandbox, and it closes at the shutdown.
+  # `stopping` is `true` if the sandbox stops, for example because this was
+  # the last connection. `airlock network forward` calls it, and `airlock
+  # start` after its main command.
+  unref @4 () -> (stopping :Bool);
+
+  # Stops the sandbox now. The shutdown closes all connections.
+  stop @5 () -> ();
+
+  # Number of connections that hold the sandbox, and `true` if the
+  # sandbox stops.
+  status @6 () -> (connections :UInt32, stopping :Bool);
+
+  # Takes the browser notices that the sandbox collected. Each call returns
+  # only the notices after the previous call.
+  notices @7 () -> (list :List(Text));
+
+  # Starts a monitor feed to `sink`: network events, guest stats and policy
+  # changes. Returns the control of the feed, the host project dir and the
+  # current policy. The feed stops when the client releases `control`,
+  # disconnects, or when a sink call fails.
+  monitor @8 (sink :Monitor.MonitorSink) -> (
+    control     :Monitor.MonitorControl,
+    projectPath :Text,
+    policy      :Monitor.Policy,
+  );
 }

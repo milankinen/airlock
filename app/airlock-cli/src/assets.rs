@@ -7,7 +7,7 @@
 
 use crate::config::config_values::Mount;
 use crate::messages;
-use crate::project::Project;
+use crate::sandbox::Project;
 use crate::util::VerifiedPath;
 use crate::vm::mount;
 
@@ -173,7 +173,7 @@ fn write_atomic(dir: &VerifiedPath, name: &str, data: &[u8]) -> anyhow::Result<(
 ///
 /// The lock blocks (and does not fail fast) because extraction is short. A
 /// second process waits, then reads the new checksum and does not extract
-/// again. Same `flock` pattern as `project::acquire_lock` and
+/// again. Same `flock` pattern as `sandbox::acquire_lock` and
 /// `vault::acquire_file_lock`.
 #[cfg(not(test))]
 fn acquire_extract_lock(path: &VerifiedPath) -> anyhow::Result<std::fs::File> {

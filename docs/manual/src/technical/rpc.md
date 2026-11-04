@@ -1,6 +1,6 @@
 # RPC protocol
 
-CLI and supervisor communicate over two vsock connections (host
+The sandbox process and the supervisor communicate over two vsock connections (host
 TCP on macOS, real vsock on Linux), both carrying
 [Cap'n Proto](https://capnproto.org/) RPC in twoparty transport mode:
 
@@ -11,7 +11,7 @@ TCP on macOS, real vsock on Linux), both carrying
   per-connection byte sinks. The split gives bulk transfers their own
   socket buffers so they cannot stall PTY or stats traffic.
 
-**Supervisor listens, CLI connects.** The CLI polls the vsock ports
+**Supervisor listens, host connects.** The sandbox process polls the vsock ports
 after VM boot until the supervisor is ready. This avoids implementing
 callback delegates in the host virtualization API.
 
@@ -53,7 +53,8 @@ console or any other sidecar transport.
 
 The authoritative interface definitions live in the repository:
 `app/airlock-common/schema/supervisor.capnp` (supervisor channel) and
-`app/airlock-common/schema/network.capnp` (network channel). The
+`app/airlock-common/schema/network.capnp` (network channel). The CLI
+socket uses `cli.capnp` and `monitor.capnp`. The
 manual does not repeat them — the schemas are commented and always
 current. A short orientation:
 
@@ -69,11 +70,28 @@ current. A short orientation:
   `acp.mcp.airlock/<session>/<name>` and returns an `McpGrant`. The
   call is refused before `boot`. The route ends when the host calls
   `release` on the grant or drops it.
-- **`CliService`** — exposed by the running `airlock start` process
-  over `<sandbox>/cli.sock`. `airlock exec` connects
-  here. The CLI server merges the sandbox's resolved base env with
+- **`CliService`** — served by the sandbox process over
+  `<sandbox>/cli.sock`. The clients `airlock start`, `exec`, `acp` and
+  `network forward` connect here. `exec` runs a process in the
+  container. The CLI server merges the sandbox's resolved base env with
   any `-e KEY=VAL` overrides and forwards the call to the in-VM
-  supervisor over the existing vsock.
+  supervisor over the existing vsock. Other calls open port forwards,
+  add MCP servers and control the sandbox:
+  * Each connection keeps the sandbox running until it closes. `unref`
+    takes a connection out of the count.
+  * `status` returns the connection count and whether the sandbox is
+    stopping.
+  * `stop` stops the sandbox right away and closes all connections.
+  * `notices` returns the browser notices that the sandbox collected.
+  * `monitor` starts the monitor feed to the `MonitorSink` of the
+    client. See below.
+- **`MonitorSink` / `MonitorControl`** — schema `monitor.capnp`. The
+  client of `airlock start --monitor` gives a `MonitorSink` to
+  `CliService.monitor`. The sandbox sends network events, guest stats and
+  policy changes to it. `approve` shows an approval request in the
+  monitor dialog and returns the answer. `MonitorControl.setPolicy`
+  changes the network policy. The feed ends when the client releases
+  the control or disconnects. See [Approval dialogs](./approvals.md).
 - **`Process` / `Stdin`** — per-process capabilities for the
   pull-based stdio protocol. The CLI polls `Process` for output and
   the exit code. The supervisor pulls keyboard data and terminal

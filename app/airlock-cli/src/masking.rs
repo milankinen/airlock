@@ -4,14 +4,14 @@
 //! that the guest supervisor uses. Also shows a summary of the masks in
 //! verbose mode.
 
-use crate::{cli, messages, project, rpc};
+use crate::{cli, messages, rpc, sandbox};
 
 /// Validate the enabled mask blocks of the project config and convert them
 /// to the wire format.
 /// Returns:
 ///   One [`rpc::MaskSpec`] for each enabled mask, or error if a path is not
 ///   a plain project-relative path.
-pub fn build_specs(project: &project::Project) -> anyhow::Result<Vec<rpc::MaskSpec>> {
+pub fn build_specs(project: &sandbox::Project) -> anyhow::Result<Vec<rpc::MaskSpec>> {
     project
         .config
         .mask
@@ -51,7 +51,7 @@ fn validate_path(name: &str, idx: usize, path: &str) -> anyhow::Result<()> {
 
 /// Print a summary of the enabled masks in verbose mode. Same format as
 /// [`crate::daemon::print_verbose`].
-pub fn print_verbose(project: &project::Project) {
+pub fn print_verbose(project: &sandbox::Project) {
     let enabled: Vec<_> = project
         .config
         .mask

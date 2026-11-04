@@ -24,11 +24,12 @@ mod sandbox;
 
 use std::time::Duration;
 
-use airlock_common::cli_capnp::cli_service;
 pub use proxy::{ProxyConfig, serve};
 use tokio::sync::mpsc;
 
+use crate::cli::LogLevel;
 use crate::context::Context;
+use crate::sandbox::McpRegistrar;
 use crate::{cli, rpc};
 
 /// Name of the proxy log file in the data dir.
@@ -72,6 +73,8 @@ pub struct Options {
     /// Bridge the editor MCP servers into the sandbox. If not set, the
     /// agent gets no editor MCP servers.
     pub proxy_mcp_servers: bool,
+    /// Log level of a sandbox process that the proxy starts.
+    pub log_level: LogLevel,
 }
 
 /// The sandbox of a session dir.
@@ -101,9 +104,9 @@ pub struct AgentProcess {
     pub events: mpsc::Receiver<rpc::ProcessEvent>,
     /// Signal and kill requests.
     pub control: mpsc::UnboundedSender<Control>,
-    /// CLI service of the sandbox that adds the editor MCP servers, or
-    /// `None` if the sandbox cannot add them.
-    pub mcp: Option<cli_service::Client>,
+    /// Adds the editor MCP servers to the sandbox, or `None` if the
+    /// sandbox cannot add them.
+    pub mcp: Option<McpRegistrar>,
 }
 
 /// Starts agents for session dirs.
@@ -134,6 +137,9 @@ pub async fn run(context: &Context, options: Options) -> anyhow::Result<i32> {
         context,
         follow_git_worktree: options.follow_git_worktree,
         env: options.env,
+        log_level: options.log_level,
+        #[cfg(test)]
+        launcher: None,
     };
     let config = ProxyConfig {
         title: crate::messages::acp::agent_title(&options.name),

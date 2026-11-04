@@ -6,6 +6,7 @@
 //!    in the VM
 //!  * network traffic between the VM and the host
 //!  * `airlock exec` access to a running sandbox
+//!  * the monitor feed of a running sandbox
 
 /// Network proxy protocol (`NetworkProxy`, `TcpSink` and connect-target
 /// types). The host serves it on [`NETWORK_PORT`]. It has its own channel, so
@@ -21,6 +22,13 @@ pub mod network_capnp {
 #[allow(clippy::all, clippy::pedantic)]
 pub mod supervisor_capnp {
     include!(concat!(env!("OUT_DIR"), "/schema/supervisor_capnp.rs"));
+}
+
+/// Monitor feed protocol (`MonitorSink`, `MonitorControl` and the event
+/// types). The TUI monitor gets its data with it from `CliService.monitor`.
+#[allow(clippy::all, clippy::pedantic)]
+pub mod monitor_capnp {
+    include!(concat!(env!("OUT_DIR"), "/schema/monitor_capnp.rs"));
 }
 
 /// CLI protocol (`CliService`) for `airlock exec` over a local Unix socket.

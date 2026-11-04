@@ -28,7 +28,7 @@ use crate::util::VerifiedPath;
 
 /// Load the config files of the project `project_root`. The user files come
 /// from the home directory of the user, and the local project file from
-/// `local_dir` (see [`crate::sandboxes::local_config_dir`]).
+/// `local_dir` (see [`crate::sandbox::local_config_dir`]).
 pub fn load(
     project_root: &VerifiedPath,
     local_dir: &VerifiedPath,
@@ -124,7 +124,7 @@ pub struct ConfigOverrides {
 ///
 /// The serialized form has the layers, without the generated project
 /// config. The config change check keeps it (see
-/// [`crate::start::config_change`]).
+/// [`crate::sandbox::start::config_change`]).
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct LayeredConfig {
     /// `~/.airlock/airlock.<ext>`, `~/.airlock/config.<ext>`,
@@ -246,7 +246,7 @@ impl LayeredConfig {
 
     /// Get the project config that [`Self::with_generated_project`] added,
     /// if any. It is not saved yet (see
-    /// [`crate::start::wizard::save_config`]).
+    /// [`crate::sandbox::start::wizard::save_config`]).
     pub fn generated_project(&self) -> Option<&GeneratedConfig> {
         self.generated.as_ref()
     }

@@ -37,6 +37,21 @@ pub trait PassphraseSource: Send + Sync + 'static {
     fn create(&self) -> anyhow::Result<String>;
 }
 
+/// Passphrase source that always gives the same passphrase. For tests.
+#[cfg(test)]
+pub struct FixedPassphrase(pub String);
+
+#[cfg(test)]
+impl PassphraseSource for FixedPassphrase {
+    fn unlock(&self) -> anyhow::Result<String> {
+        Ok(self.0.clone())
+    }
+
+    fn create(&self) -> anyhow::Result<String> {
+        Ok(self.0.clone())
+    }
+}
+
 /// Storage backend that keeps the vault as encrypted JSON in one file. The
 /// key comes from the passphrase and a per-vault salt. The user gives the
 /// passphrase one time per process.
@@ -364,7 +379,7 @@ mod tests {
             serde_json::to_string_pretty(envelope).unwrap().as_bytes(),
         )
         .unwrap();
-        EncryptedFileStorage::new(path, Box::new(FixedPassphrase(pass))).load()
+        EncryptedFileStorage::new(path, Box::new(FixedPassphrase(pass.into()))).load()
     }
 
     /// Test that the vault decrypts with the KDF parameters in the file, not
@@ -409,7 +424,8 @@ mod tests {
         let tmp = temp_dir();
         let path = VerifiedPath::new_follow(tmp.path().join("vault.enc.json"), None).unwrap();
         atomic_write(&path, serde_json::to_string(&envelope).unwrap().as_bytes()).unwrap();
-        let open = || EncryptedFileStorage::new(path.clone(), Box::new(FixedPassphrase("hunter2")));
+        let open =
+            || EncryptedFileStorage::new(path.clone(), Box::new(FixedPassphrase("hunter2".into())));
         let vault = open();
         assert_eq!(vault.load().unwrap().as_deref(), Some(plaintext));
 

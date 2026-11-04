@@ -16,12 +16,12 @@ use capnp_rpc::rpc_twoparty_capnp;
 use crate::config::config_values::{RestartPolicy, RuleEditing};
 use crate::mcp::McpHostImpl;
 use crate::network::AgentAccess;
-use crate::project::Project;
 use crate::rpc::browser::{Browser, BrowserImpl};
 use crate::rpc::clipboard::ClipboardImpl;
 use crate::rpc::logging::LogSinkImpl;
 use crate::rpc::process::Process;
 use crate::rpc::{Driver, driver, vsock_transport};
+use crate::sandbox::Project;
 use crate::vm::VmInstance;
 
 /// Snapshot of guest resource usage returned by [`Supervisor::poll_stats`].

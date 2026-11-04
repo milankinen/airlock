@@ -1,15 +1,17 @@
 //! The `airlock start` command.
 //!
-//! Reads the command-line options and starts the sandbox VM with the container
-//! in it. The steps of the command are in the `start` module.
+//! Reads the command-line options, finds the sandbox and starts the sandbox
+//! process. The sandbox process prepares the sandbox on the same terminal.
+//! Then the main command of the container runs in the sandbox.
 
 use clap::Args;
 
 use crate::cli::{self, LogLevel};
 use crate::config::config_values::Policy;
 use crate::context::Context;
+use crate::messages;
 use crate::runtime::HostRuntime;
-use crate::{config, packs, project, sandboxes, start, templates};
+use crate::sandbox::{self, Exit, ExitedBeforeReady, Interrupted, Run};
 
 /// CLI arguments for `airlock start`.
 #[derive(Args, Debug)]
@@ -46,24 +48,18 @@ pub struct StartArgs {
 }
 
 impl StartArgs {
-    /// Return the options for the sandbox and install steps.
-    fn sandbox_options(&self) -> start::SandboxOptions {
-        start::SandboxOptions {
+    /// Return the start arguments for the sandbox process.
+    /// Args:
+    ///  - `extra_args`: Arguments after `--`, for the container command
+    pub fn init_args(&self, extra_args: Vec<String>) -> sandbox::StartArgs {
+        sandbox::StartArgs {
+            args: extra_args,
+            login: self.login,
+            network: self.network,
+            sandbox_cwd: self.sandbox_cwd.clone(),
             yes: self.yes,
-            can_prompt: cli::prompt::can_prompt(),
-            log_level: self.log_level,
-            verbose: self.verbose,
             allow_config_changes: self.allow_configuration_changes,
-            overrides: self.config_overrides(),
             auto_approve_packs: self.auto_approve_packs,
-        }
-    }
-
-    /// Return the config overrides from `--network`, for
-    /// [`config::LayeredConfig::resolve`].
-    fn config_overrides(&self) -> config::ConfigOverrides {
-        config::ConfigOverrides {
-            network_policy: self.network,
         }
     }
 }
@@ -75,123 +71,63 @@ impl StartArgs {
 ///  - `context`: Shared CLI context (settings, vault and database)
 ///
 /// Returns:
-///   Exit code of the sandbox session, or error.
-// The steps: system check, setup wizard (for a project without config),
-// config, stored sandbox (image, disk, tool decisions) and tool installation
-// (an install boot, see [`crate::packs::install::setup`]). Then the sandbox
-// session runs ([`crate::start::run::run_sandbox`]).
+///   Exit code of the main process or the TUI override, the exit code of
+///   a sandbox process that stops before the sandbox is ready (for example
+///   130 after a Ctrl+C or an abort, 2 for a config error), or error if the
+///   sandbox runs or does not start.
+// The steps: system check, the terminal runtime (bad `[monitor.keys]` fail
+// early), the sandbox. Then the start waits for a sandbox that starts or
+// stops, checks that the sandbox does not run, and starts the sandbox
+// process. It does the questions, the config and the installs on the same
+// terminal, and boots the sandbox. Then the main command runs in it. After
+// the command, the browser notices show and the connection closes. If no
+// other client uses the sandbox, the start waits until the sandbox
+// stopped.
 pub async fn main(
     args: StartArgs,
     extra_args: Vec<String>,
     context: Context,
 ) -> anyhow::Result<i32> {
     cli::set_verbose(args.verbose);
-    start::Exit::into_result(Box::pin(run(args, extra_args, context)).await)
+    Exit::into_result(Box::pin(run(args, extra_args, context)).await)
 }
 
-async fn run(
-    args: StartArgs,
-    extra_args: Vec<String>,
-    context: Context,
-) -> Result<i32, start::Exit> {
-    start::check_data_dir(&context.data)?;
-    start::check_system_requirements();
-    let host_cwd = start::resolve_host_cwd()?;
-    start::init_logging(args.log_level);
-
-    let packs = packs::init(&context.settings.packs, &context.home).map_err(start::Exit::config)?;
-    // A project without config gets the setup wizard. The generated file is
-    // saved after the sandbox is stored.
-    let has_sandbox = sandboxes::has_content(&context, &host_cwd).await?;
-    let local_dir = sandboxes::find_local_config_dir(&context, &host_cwd).await?;
-    let config = Box::pin(start::wizard::load_or_generate_config(
-        &host_cwd,
-        &context.data,
-        &local_dir,
-        has_sandbox,
-        &packs,
-        &context.vault,
-        &crate::templates::list(&context.data),
-    ))
-    .await?;
-    if config.has_user_files() {
-        cli::log!(
-            "{} {}",
-            cli::yellow("!"),
-            crate::messages::start::USER_CONFIG_FILES_DEPRECATED
-        );
-    }
-    let options = args.sandbox_options();
-    // The first resolve asks about new or changed packs, before any pack
-    // `config.lua` runs. The later resolves do not ask.
-    let resolved = config
-        .resolve(&config::ResolveInput {
-            data_dir: &context.data,
-            packs: &packs,
-            overrides: &options.overrides,
-            project_root: Some(&host_cwd),
-            approval: options.approval_mode(),
-        })
-        .await
-        .map_err(start::Exit::resolve)?;
+async fn run(args: StartArgs, extra_args: Vec<String>, context: Context) -> Result<i32, Exit> {
+    sandbox::check_data_dir(&context.data)?;
+    sandbox::check_system_requirements();
+    let host_cwd = sandbox::resolve_host_cwd()?;
+    sandbox::init_logging(args.log_level);
     // The terminal runtime. Bad `[monitor.keys]` values fail here.
     let runtime =
-        HostRuntime::new(args.monitor, &context.settings).map_err(|e| start::Exit::error(2, e))?;
-    // Asks the user to approve requests from the sandbox. The user settings
-    // select where it asks.
-    let approver = crate::approval::for_settings(
-        context.settings.approvals.dialogs,
-        &context.data,
-        runtime.approval_dialog(),
-    );
-
-    // A wizard config can name a template for the new sandbox.
-    let template = config
-        .generated_project()
-        .and_then(|g| g.template.as_deref())
-        .map(|name| templates::find(&context.data, name))
-        .transpose()
-        .map_err(|e| start::Exit::error(1, e))?;
-    // The sandbox step can select the config of the last run.
-    let sandbox = Box::pin(start::sandbox::ensure_sandbox(
-        &context,
-        &host_cwd,
-        &packs,
-        &config,
-        resolved,
-        &options,
-        template.as_ref(),
-    ))
-    .await?;
-    let resolved = &sandbox.resolved;
+        HostRuntime::new(args.monitor, &context.settings).map_err(|e| Exit::error(2, e))?;
+    let sandbox = sandbox::find_or_register(&context, &host_cwd).await?;
     // The log lines so far wait in memory. Now the log file is known.
-    cli::logging::attach(sandbox.lock.dir());
-    if let Some(generated) = config.generated_project() {
-        let local_dir =
-            sandboxes::local_config_dir(sandbox.lock.dir()).map_err(anyhow::Error::from)?;
-        start::wizard::save_config(generated, &local_dir)?;
+    cli::logging::attach(sandbox.dir());
+    let run = Run::Start {
+        args: args.init_args(extra_args),
+        log_level: args.log_level,
+        verbose: args.verbose,
+        monitor: runtime.approval_dialog(),
+    };
+    let mut process = match Box::pin(sandbox.run(&context, run)).await {
+        Ok(process) => process,
+        // The sandbox process gave the reason on the terminal. It holds the
+        // run lock until its VM stopped, so the disk sync is complete.
+        Err(e) if let Some(code) = ExitedBeforeReady::code_of(&e) => return Err(Exit::Code(code)),
+        Err(e) if e.is::<Interrupted>() => return Err(Exit::ABORTED),
+        Err(e) => return Err(e.into()),
+    };
+    let code = process.exec_main(runtime).await;
+    for notice in process.notices().await {
+        cli::log!(
+            "{} {notice}",
+            cli::yellow(messages::sandbox::BROWSER_NOTICE_LABEL)
+        );
     }
-    let project = project::open(
-        &sandbox.lock,
-        resolved.values.clone(),
-        args.sandbox_cwd.clone(),
-        context,
-    )?;
-    Box::pin(start::install::install_tools(
-        &project,
-        resolved,
-        &sandbox.image,
-        sandbox.installs,
-        &options,
-    ))
-    .await?;
-    Box::pin(start::run::run_sandbox(
-        project,
-        &sandbox.image,
-        extra_args,
-        &args,
-        runtime,
-        approver,
-    ))
-    .await
+    // The connection of this process holds the sandbox. The release tells
+    // at once if the end of the hold stops the sandbox.
+    if process.release().await {
+        process.wait_stopped().await;
+    }
+    Ok(code?)
 }

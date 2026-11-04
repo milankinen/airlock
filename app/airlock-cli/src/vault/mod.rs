@@ -27,6 +27,8 @@ use base64::engine::general_purpose::STANDARD_NO_PAD;
 pub(crate) use disabled::DisabledStorage;
 pub(crate) use encrypted::EncryptedFileStorage;
 #[cfg(test)]
+pub(crate) use encrypted::FixedPassphrase;
+#[cfg(test)]
 pub(crate) use encrypted::PassphraseSource;
 use file::FileStorage;
 use keyring::KeyringStorage;
@@ -212,7 +214,7 @@ impl Vault {
     /// environment snapshot now. Does not open the storage.
     pub fn for_storage_type(storage_type: VaultStorageType) -> Self {
         Self::new_with(
-            boxed_storage(storage_type),
+            boxed_storage(storage_type, encrypted::interactive_passphrase),
             std::env::vars().collect(),
             storage_type,
         )
@@ -536,16 +538,19 @@ pub trait Storage: Send + Sync + 'static {
 }
 
 /// Make the storage backend for the given type.
-fn boxed_storage(storage_type: VaultStorageType) -> Box<dyn Storage> {
+/// Args:
+///  - `storage_type`: Backend type
+///  - `passphrase`: Makes the passphrase source of an encrypted vault
+fn boxed_storage(
+    storage_type: VaultStorageType,
+    passphrase: impl FnOnce() -> Box<dyn encrypted::PassphraseSource>,
+) -> Box<dyn Storage> {
     let made: anyhow::Result<Box<dyn Storage>> = match storage_type {
         VaultStorageType::Disabled => Ok(Box::new(DisabledStorage)),
         VaultStorageType::File => vault_file("vault.default.json")
             .map(|path| Box::new(FileStorage::new(path)) as Box<dyn Storage>),
         VaultStorageType::EncryptedFile => vault_file("vault.default.enc.json").map(|path| {
-            Box::new(EncryptedFileStorage::new(
-                path,
-                encrypted::interactive_passphrase(),
-            )) as Box<dyn Storage>
+            Box::new(EncryptedFileStorage::new(path, passphrase())) as Box<dyn Storage>
         }),
         VaultStorageType::Keyring => Ok(Box::new(KeyringStorage)),
     };

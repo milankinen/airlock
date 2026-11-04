@@ -12,7 +12,7 @@ use axum::routing::get;
 use futures::StreamExt as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::project::MaskedSecret;
+use crate::sandbox::MaskedSecret;
 use crate::test_cfg::network::*;
 use crate::test_cfg::upstream::FakeUpstream;
 use crate::test_cfg::*;

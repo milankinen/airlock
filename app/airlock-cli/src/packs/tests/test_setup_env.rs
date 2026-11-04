@@ -94,7 +94,7 @@ fn setup_env_from_config_lua_reaches_setup_script() {
     );
     let (packs, _) = with_user_packs(&[&dir], &[]).unwrap();
     let resolved = resolve_with(&packs, "[packs]\n\"~vault\" = {}\n").unwrap();
-    let installers = crate::start::install::install_candidates(&resolved.packs);
+    let installers = crate::sandbox::install_candidates(&resolved.packs);
 
     let mut exec = HostExec::new();
     let mut state = InstallState::default();

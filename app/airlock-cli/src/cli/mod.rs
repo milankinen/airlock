@@ -10,16 +10,17 @@ pub mod cmd_acp;
 pub mod cmd_config;
 pub mod cmd_exec;
 pub mod cmd_info;
+pub mod cmd_internal;
 pub mod cmd_network;
 pub mod cmd_rm;
 pub mod cmd_sandbox;
 pub mod cmd_secret;
 pub mod cmd_self_update;
 pub mod cmd_start;
+pub mod cmd_stop;
 pub mod cmd_templates;
 pub mod logging;
 pub mod prompt;
-pub mod sandbox_client;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -45,7 +46,9 @@ pub const LOGO: [&str; 4] = [
 const COMMAND_GROUPS: [(&str, &[&str]); 3] = [
     (
         messages::cli::HELP_SANDBOX_TITLE,
-        &["start", "exec", "info", "config", "network", "remove"],
+        &[
+            "start", "exec", "stop", "info", "config", "network", "remove",
+        ],
     ),
     (
         messages::cli::HELP_MANAGEMENT_TITLE,
@@ -161,7 +164,8 @@ pub fn platform_status() -> String {
 }
 
 /// Log verbosity level. See [`LogLevel::filter`] for the `tracing` filter.
-#[derive(ValueEnum, Debug, Clone, Copy)]
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum LogLevel {
     Trace,
     Debug,
@@ -280,18 +284,27 @@ pub fn initialize(quiet: bool) {
         .expect("failed to register SIGINT handler");
     let mut sigterm = tokio::signal::unix::signal(SignalKind::terminate())
         .expect("failed to register SIGTERM handler");
+    // Each signal sets the flag, also after a clear (see
+    // [`clear_interrupt`]).
     tokio::task::spawn(async move {
-        tokio::select! {
-            _ = sigint.recv() => {},
-            _ = sigterm.recv() => {}
+        loop {
+            tokio::select! {
+                _ = sigint.recv() => {},
+                _ = sigterm.recv() => {}
+            }
+            let _ = tx.send(true);
         }
-        let _ = tx.send(true);
     });
 }
 
 /// Return true if the user gave `--quiet`.
 pub fn is_silent() -> bool {
     SILENT.load(Ordering::Relaxed)
+}
+
+/// Set the quiet mode of the current process (see [`initialize`]).
+pub fn set_silent(value: bool) {
+    SILENT.store(value, Ordering::Relaxed);
 }
 
 /// Return true if the user gave `--verbose`.
@@ -348,6 +361,18 @@ pub fn is_interrupted() -> bool {
     *INTERRUPTED.1.borrow()
 }
 
+/// Stop the program as a Ctrl+C does. The sandbox process uses this when
+/// its parent process stops before the sandbox is ready.
+pub fn interrupt() {
+    let _ = INTERRUPTED.0.send(true);
+}
+
+/// Clear the interrupt flag. The parent of the sandbox process uses this
+/// after the init: a Ctrl+C during the init was for the sandbox process.
+pub fn clear_interrupt() {
+    let _ = INTERRUPTED.0.send(false);
+}
+
 /// Return a future that completes when the user interrupts the program.
 pub async fn interrupted() {
     let mut rx = INTERRUPTED.1.clone();
@@ -357,6 +382,12 @@ pub async fn interrupted() {
 /// Return true if the CLI started in interactive mode (stdin is a TTY).
 pub fn is_interactive() -> bool {
     IS_TTY.load(Ordering::Relaxed)
+}
+
+/// Set the interactive mode of the current process (see [`initialize`]).
+/// With `false`, each prompt fails at once.
+pub fn set_interactive(value: bool) {
+    IS_TTY.store(value, Ordering::Relaxed);
 }
 
 /// Print a status message to stderr, unless silent.

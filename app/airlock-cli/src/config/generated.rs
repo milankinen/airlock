@@ -8,7 +8,7 @@
 use std::io::Write;
 
 use crate::packs::ArgValue;
-use crate::project;
+use crate::sandbox;
 use crate::templates::Template;
 use crate::util::VerifiedPath;
 
@@ -19,7 +19,7 @@ pub enum Target {
     Project,
     /// `airlock.toml` in the local config directory: the sandbox directory,
     /// or `.airlock/` (git ignores it) for a project with no sandbox yet.
-    /// See [`crate::sandboxes::local_config_dir`].
+    /// See [`crate::sandbox::local_config_dir`].
     Local,
 }
 
@@ -115,7 +115,7 @@ impl GeneratedConfig {
     /// this is an error and the file is not overwritten.
     /// Args:
     ///  - `local_dir`: Local config directory of the project (see
-    ///    [`crate::sandboxes::local_config_dir`]). The local file goes
+    ///    [`crate::sandbox::local_config_dir`]). The local file goes
     ///    there. For `.airlock/`, `.airlock/.gitignore` is created first.
     ///
     /// Returns:
@@ -129,7 +129,7 @@ impl GeneratedConfig {
                 let in_project = local_dir.parent().as_ref() == Some(&self.project)
                     && local_dir.file_name().is_some_and(|name| name == ".airlock");
                 if in_project {
-                    project::ensure_cache_dir(&self.project)?;
+                    sandbox::ensure_cache_dir(&self.project)?;
                     // Join after the create, so that the path has the
                     // identity of the new `.airlock`.
                     self.project.join(Target::Local.file())?

@@ -385,7 +385,7 @@ mod tests {
 
     /// A secret with the given name, real value and surrogate.
     fn secret(name: &str, real: &str, surrogate: &str) -> InjectedSecret {
-        InjectedSecret::new(crate::project::MaskedSecret {
+        InjectedSecret::new(crate::sandbox::MaskedSecret {
             name: name.into(),
             real: real.into(),
             surrogate: surrogate.into(),

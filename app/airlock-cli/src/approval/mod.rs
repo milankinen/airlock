@@ -35,7 +35,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::time::Duration;
 
-pub(crate) use monitor::MonitorSlot;
+pub(crate) use monitor::{MonitorDialog, MonitorSlot};
 use text::PromptText;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
@@ -392,7 +392,6 @@ mod tests {
     use airlock_monitor::{ApprovalDiffKind, ApprovalRequest};
     use tokio::sync::mpsc;
 
-    use super::monitor::MonitorDialog;
     use super::*;
     use crate::config::config_values::{NetworkRule, RuleEnabled};
 
@@ -405,7 +404,7 @@ mod tests {
     struct ChannelDialog(mpsc::UnboundedSender<ApprovalRequest>);
 
     impl MonitorDialog for ChannelDialog {
-        fn show(&self, request: ApprovalRequest) -> Result<(), ApprovalRequest> {
+        fn show(&self, request: ApprovalRequest, _: Instant) -> Result<(), ApprovalRequest> {
             self.0.send(request).map_err(|e| e.0)
         }
     }
@@ -414,7 +413,7 @@ mod tests {
     struct StoppedDialog;
 
     impl MonitorDialog for StoppedDialog {
-        fn show(&self, request: ApprovalRequest) -> Result<(), ApprovalRequest> {
+        fn show(&self, request: ApprovalRequest, _: Instant) -> Result<(), ApprovalRequest> {
             Err(request)
         }
     }

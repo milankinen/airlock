@@ -3,7 +3,8 @@
 //! A runtime connects the sandbox to the user's terminal. It gives the guest
 //! its input and shows the guest output. There are two runtimes: a raw
 //! terminal, and the TUI monitor that also shows network events and guest
-//! stats. The session uses the same code for both. Also forwards host
+//! stats. The session uses the same code for both. The monitor gets its
+//! data from a source that can be in a different process. Also forwards host
 //! signals to the guest, and can write a copy of the guest output to a file.
 
 use std::pin::Pin;
@@ -13,18 +14,18 @@ use futures::{Stream, StreamExt};
 
 mod dump;
 mod host;
+mod monitor_remote;
 mod monitor_terminal;
 mod raw_terminal;
 mod signals;
 
 pub use dump::DumpSink;
 pub use host::HostRuntime;
+pub use monitor_remote::{MonitorSource, subscribe};
 pub use monitor_terminal::MonitorRuntime;
 pub use raw_terminal::RawTerminalRuntime;
 pub use signals::signals;
 
-use crate::network::NetworkHandle;
-use crate::project::Project;
 use crate::rpc;
 
 /// Guest terminal size `(rows, cols)` in PTY mode, or `None` in pipe mode.
@@ -73,12 +74,10 @@ pub trait Runtime {
     /// raw mode here, and the monitor runtime gives control to the TUI
     /// thread. The returned terminal owns the tasks that the runtime starts,
     /// and they stop with it.
-    fn launch(
-        self,
-        project: &Project,
-        network: &NetworkHandle,
-        supervisor: rpc::Supervisor,
-    ) -> anyhow::Result<Self::Terminal>;
+    /// Args:
+    ///  - `monitor`: Data of the TUI monitor. The monitor runtime needs it.
+    ///    The raw runtime ignores it.
+    fn launch(self, monitor: Option<MonitorSource>) -> anyhow::Result<Self::Terminal>;
 }
 
 /// Forward each signal from `signals` to `proc` until the stream ends. The

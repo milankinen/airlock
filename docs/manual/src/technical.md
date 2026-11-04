@@ -59,12 +59,15 @@ This shapes almost everything else:
   capabilities it was handed. That means the VM has no egress path
   of any kind: the only way out is an explicit capability the host
   chose to grant.
-- **No daemon, no hidden state.** There is no airlock daemon on the
-  host, no shared socket directory, no broker. When the `airlock
-  start` process dies, the vsock connections close, the supervisor exits, and
-  the VM shuts down. `airlock exec` is a thin client that reaches
-  the same session through a Unix-socket bridge in the running
-  `airlock start` process.
+- **One sandbox process per sandbox, no shared daemon.** A detached
+  sandbox process owns the VM, the vsock connections and the network
+  proxy of one sandbox. There is no shared daemon, socket directory or
+  broker. `airlock start`, `exec` and `acp` are thin clients: they start
+  the sandbox process when needed and connect to its `cli.sock`.
+- **The last client stops the sandbox.** When the last `start`, `exec`
+  or `acp` connection ends, the sandbox process stops the VM. If the
+  sandbox process dies, the vsock connections close, the supervisor
+  exits and the VM shuts down.
 - **Same wire on every platform.** macOS uses host TCP (the Apple
   Virtualization framework's vsock surfaces that way) and Linux uses
   real `AF_VSOCK`. The RPC schema and the code paths above it are
@@ -102,7 +105,7 @@ The static picture: what runs where, and how the pieces talk.
   <rect x="22" y="22" width="160" height="18" class="arch-label-bg"/>
   <text x="30" y="36" class="arch-title">HOST (macOS / Linux)</text>
   <rect class="arch-box" x="26" y="56" width="324" height="172" rx="6"/>
-  <text x="42" y="80" class="arch-sub">airlock start (main process)</text>
+  <text x="42" y="80" class="arch-sub">sandbox process (detached)</text>
   <g transform="translate(42, 104)">
     <text class="arch-item" x="0" y="0">• config + vault + OCI pull</text>
     <text class="arch-item" x="0" y="22">• VM boot (hypervisor API)</text>
@@ -111,7 +114,7 @@ The static picture: what runs where, and how the pieces talk.
     <text class="arch-item" x="0" y="88">• CLI server · stdio + signal relay</text>
   </g>
   <rect class="arch-box" x="26" y="256" width="324" height="112" rx="6"/>
-  <text x="42" y="280" class="arch-sub">airlock exec (sibling invocation)</text>
+  <text x="42" y="280" class="arch-sub">airlock exec (client)</text>
   <g transform="translate(42, 304)">
     <text class="arch-item" x="0" y="0">• finds the nearest sandbox cli.sock</text>
     <text class="arch-item" x="0" y="22">• sends (cmd, args, cwd, env overrides)</text>
@@ -157,15 +160,16 @@ The static picture: what runs where, and how the pieces talk.
 **Channels shown**
 
 - **vsock · RPC** — two Cap'n Proto RPC connections between the host
-  `airlock start` process and the in-VM supervisor. The supervisor
+  sandbox process and the in-VM supervisor. The supervisor
   channel (port 1024) carries the `boot` call (mount config + CA),
   `spawn` calls for the main process and `exec`, stats polling, deny
   notifications, daemon control, and stdio. The network channel
   (port 1025) carries `NetworkProxy.connect` and its per-connection
   byte sinks — the guest receives `NetworkProxy` as that channel's
   bootstrap capability.
-- **cli.sock** — Unix-domain Cap'n Proto connection from an `airlock
-  exec` invocation to the CLI server embedded in the main process.
+- **cli.sock** — Unix-domain Cap'n Proto connection from a client
+  (`airlock start`, `exec`, `acp`, `network forward`, `stop`) to the CLI
+  server in the sandbox process.
   The server merges override env onto the sandbox's resolved base env
   and forwards the call onto the existing vsock.
 - **VirtioFS** (not drawn) — the host exports each directory/file
@@ -216,7 +220,7 @@ in time.
   <line class="flow-divider" x1="0" y1="400" x2="760" y2="400"/>
   <line class="flow-divider" x1="124" y1="40" x2="124" y2="400"/>
   <text x="10" y="75"  class="flow-label">User</text>
-  <text x="10" y="135" class="flow-label">airlock (CLI)</text>
+  <text x="10" y="135" class="flow-label">sandbox process</text>
   <text x="10" y="195" class="flow-label">Hypervisor</text>
   <text x="10" y="255" class="flow-label">init</text>
   <text x="10" y="315" class="flow-label">airlockd</text>
@@ -261,7 +265,8 @@ the VM down and boots it again for the session. See
 [Packs](./technical/packs.md).
 
 Once the container is running, `airlock exec` reuses the same VM.
-The invocation finds the `cli.sock` of the nearest running sandbox and hands
+If the sandbox is not running, `airlock exec` starts it first.
+The invocation finds the `cli.sock` of the nearest sandbox and hands
 `(cmd, args, cwd, env overrides)` to the CLI server. The CLI server
 merges the overrides onto the sandbox's base env and forwards the
 call over the existing vsock to `airlockd`. `airlockd` forks a new

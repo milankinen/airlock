@@ -14,7 +14,7 @@ use super::http;
 use super::middleware::LogFn;
 use super::target::{InjectTarget, InjectedSecret, MiddlewareTarget, NetworkTarget};
 use crate::config::config_values::{Network, NetworkRule, RuleEnabled};
-use crate::project::SandboxEnv;
+use crate::sandbox::SandboxEnv;
 use crate::vault::Vault;
 
 /// Rule targets from the enabled rules.
@@ -240,7 +240,7 @@ fn rule_secrets(
     for name in &rule.inject {
         // Config loading makes sure that each name is a masked `[env]`
         // entry and that no injecting rule is `passthrough`.
-        // `project::open` and `Project::with_config` make sure that the
+        // `sandbox::open` and `Project::with_config` make sure that the
         // values are injectable. A missing entry still gives an error,
         // not a panic. An optional entry with no value has nothing to
         // inject.

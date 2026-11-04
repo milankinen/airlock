@@ -31,6 +31,7 @@ use tokio::time::Instant;
 use super::filter::{self, AgentVerdict, Kind};
 use super::{AgentProcess, AgentStarter, Control, Location, mcp};
 use crate::runtime::SignalStream;
+use crate::sandbox::ExitedBeforeReady;
 use crate::{messages, rpc};
 
 /// Settings of the proxy core.
@@ -407,7 +408,8 @@ impl<'a, S: AgentStarter> Proxy<'a, S> {
         let (location, process) = match started {
             Ok(started) => started,
             Err(e) => {
-                self.fail_start(&format!("{e:#}")).await;
+                let (message, data) = start_failure(&e);
+                self.fail_start_with(&message, data).await;
                 return;
             }
         };
@@ -860,6 +862,12 @@ impl<'a, S: AgentStarter> Proxy<'a, S> {
     /// to the session request with `message`, and handle the queued client
     /// lines as when no agent runs.
     async fn fail_start(&mut self, message: &str) {
+        self.fail_start_with(message, None).await;
+    }
+
+    /// Stop the agent that did not complete its start (see
+    /// [`Self::fail_start`]). The error reply has `data` if it is set.
+    async fn fail_start_with(&mut self, message: &str, data: Option<Value>) {
         let sandbox = self.sandbox().to_string();
         tracing::warn!(sandbox, "agent start failed: {message}");
         self.launch = None;
@@ -881,8 +889,17 @@ impl<'a, S: AgentStarter> Proxy<'a, S> {
             return;
         };
         trace_message(&sandbox, Peer::Client, Peer::Airlock, &request);
-        self.reply(&id, Err((filter::INTERNAL_ERROR, message.to_string())))
-            .await;
+        match data {
+            Some(data) => {
+                let msg =
+                    filter::error_response_with_data(&id, filter::INTERNAL_ERROR, message, &data);
+                self.to_client(Peer::Airlock, &msg).await;
+            }
+            None => {
+                self.reply(&id, Err((filter::INTERNAL_ERROR, message.to_string())))
+                    .await;
+            }
+        }
         for line in queued {
             self.on_client_line(line).await;
         }
@@ -1027,6 +1044,27 @@ impl<'a, S: AgentStarter> Proxy<'a, S> {
             self.config.proxy_mcp_servers,
         )
     }
+}
+
+/// Get the error message and data of the failed agent start `error`. A
+/// sandbox process that stopped in its init gives the last line of its
+/// error output as the message, and its exit code and output as the data. The
+/// editor can then show why the sandbox did not start.
+/// Returns:
+///   The message, and the data or `None` for other errors.
+fn start_failure(error: &anyhow::Error) -> (String, Option<Value>) {
+    let Some(exited) = error.downcast_ref::<ExitedBeforeReady>() else {
+        return (format!("{error:#}"), None);
+    };
+    let message = exited
+        .last_error
+        .clone()
+        .unwrap_or_else(|| format!("{error:#}"));
+    let data = serde_json::json!({
+        "exitCode": exited.code,
+        "output": exited.output.clone().unwrap_or_default(),
+    });
+    (message, Some(data))
 }
 
 /// Wait for the end of the agent start. Waits forever if no start runs.

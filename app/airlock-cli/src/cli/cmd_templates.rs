@@ -13,9 +13,10 @@ use crate::cli::LogLevel;
 use crate::cli::prompt::choose;
 use crate::context::Context;
 use crate::data_dir::DataDir;
+use crate::sandbox::{self, Exit};
 use crate::templates::{self, CONFIG_FILE, Template};
 use crate::vm::disk::DISK_FILE;
-use crate::{cli, messages, oci, start};
+use crate::{cli, messages, oci};
 
 /// CLI arguments for `airlock templates`.
 #[derive(Args, Debug)]
@@ -77,9 +78,7 @@ pub async fn main(args: TemplateArgs, context: &Context) -> i32 {
             force,
             log_level,
             verbose,
-        } => start::Exit::into_result(
-            Box::pin(create(context, &name, force, log_level, verbose)).await,
-        ),
+        } => Exit::into_result(Box::pin(create(context, &name, force, log_level, verbose)).await),
     };
     match result {
         Ok(code) => code,
@@ -99,11 +98,11 @@ async fn create(
     force: bool,
     log_level: LogLevel,
     verbose: bool,
-) -> Result<i32, start::Exit> {
+) -> Result<i32, Exit> {
     cli::set_verbose(verbose);
-    start::check_data_dir(&context.data)?;
-    start::check_system_requirements();
-    start::init_logging(log_level);
+    sandbox::check_data_dir(&context.data)?;
+    sandbox::check_system_requirements();
+    sandbox::init_logging(log_level);
     Box::pin(templates::create::create(
         context, name, force, log_level, verbose,
     ))

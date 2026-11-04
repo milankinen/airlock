@@ -79,7 +79,7 @@ impl DataDir {
 
 /// Get the sandboxes directory of the data directory `root`.
 fn sandboxes_dir(root: &VerifiedPath) -> anyhow::Result<VerifiedPath> {
-    let dir = root.join(crate::sandboxes::BOXES_DIR)?;
+    let dir = root.join(crate::sandbox::BOXES_DIR)?;
     // Only airlock and the user can write the data dir. Thus a link here
     // is from the user, who moved the sandboxes to an other disk. Follow
     // only this link.
@@ -87,7 +87,7 @@ fn sandboxes_dir(root: &VerifiedPath) -> anyhow::Result<VerifiedPath> {
         .symlink_metadata()
         .is_ok_and(|m| m.file_type().is_symlink())
     {
-        return Ok(root.join_follow(crate::sandboxes::BOXES_DIR, None)?);
+        return Ok(root.join_follow(crate::sandbox::BOXES_DIR, None)?);
     }
     Ok(dir)
 }

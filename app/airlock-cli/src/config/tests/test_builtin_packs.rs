@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 use crate::config::config_values;
 use crate::network::rules::RuleSet;
 use crate::packs::approval::Approved;
-use crate::project::resolve_env;
+use crate::sandbox::resolve_env;
 use crate::test_cfg::{configured_variants, host_env_vault, resolve_project_toml};
 
 /// Return the config values of each built-in pack for all combinations of

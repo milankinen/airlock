@@ -62,6 +62,7 @@ teardown_file() {
 
 # Start each test in the shared project directory of the file.
 setup() {
+    BG_PIDS=()
     cd "$FILE_TEMP_DIR/project" || return 1
 }
 
@@ -102,4 +103,88 @@ stop_host_http_server() {
 # $lines, as run_airlock does.
 run_vm() {
     run_airlock --quiet start -- "$@"
+}
+
+# -- Sandbox sessions --
+
+# Start airlock in the background with the environment of run_airlock.
+# Write its output to the file $1, and give the other arguments to
+# airlock. Set $BG_PID and add it to $BG_PIDS. Close fd 3, so that bats
+# does not wait for the process.
+airlock_bg() {
+    local out="$1"
+    shift
+    local _home="${TEST_HOME:-${TEST_TEMP_DIR:-$FILE_TEMP_DIR}}"
+    env XDG_DATA_HOME="${TEST_DATA_HOME:-$FILE_DATA_HOME}" \
+        NO_COLOR=1 \
+        HOME="$_home" \
+        RUST_BACKTRACE=0 \
+        "$AIRLOCK" "$@" </dev/null >"$out" 2>&1 3>&- &
+    BG_PID=$!
+    BG_PIDS+=("$BG_PID")
+}
+
+# Kill all background processes of airlock_bg and wait for them. Call it
+# from teardown.
+kill_bg() {
+    local pid
+    for pid in "${BG_PIDS[@]:-}"; do
+        [[ -n "$pid" ]] || continue
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    done
+    BG_PIDS=()
+}
+
+# Set $BOX_DIR to the sandbox directory of the current project. The
+# sandbox must exist.
+find_box_dir() {
+    run_airlock sandboxes info --json
+    assert_success || return 1
+    BOX_DIR="$(sed -n 's/^ *"dir": "\(.*\)",$/\1/p' <<<"$output")"
+    [[ -d "$BOX_DIR" ]]
+}
+
+# Return 0 if a sandbox process holds run.lock in $BOX_DIR: the sandbox
+# boots, runs or stops.
+sandbox_running() {
+    python3 -I -c '
+import fcntl, sys
+with open(sys.argv[1]) as f:
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit(0)
+sys.exit(1)
+' "$BOX_DIR/run.lock"
+}
+
+# Return 0 if no process holds run.lock in $BOX_DIR. A test can call it
+# as a check. A plain `! sandbox_running` does not fail a bats test.
+sandbox_stopped() {
+    ! sandbox_running
+}
+
+# Wait until the shell command $1 succeeds, for at most $2 seconds
+# (default 60).
+wait_until() {
+    local i
+    for i in $(seq $((${2:-60} * 10))); do
+        if eval "$1"; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "timeout after ${2:-60} s: $1" >&2
+    return 1
+}
+
+# Print a free TCP port on the host loopback.
+free_port() {
+    python3 -I -c '
+import socket
+with socket.socket() as s:
+    s.bind(("127.0.0.1", 0))
+    print(s.getsockname()[1])
+'
 }

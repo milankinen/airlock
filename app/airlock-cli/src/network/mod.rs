@@ -47,7 +47,7 @@ use crate::network::interceptor::Interceptor;
 use crate::network::target::{
     InjectTarget, InjectedSecret, MiddlewareTarget, NetworkTarget, ResolvedTarget,
 };
-use crate::project::Project;
+use crate::sandbox::Project;
 
 const NETWORK_EVENTS_BUFFER: usize = 10;
 

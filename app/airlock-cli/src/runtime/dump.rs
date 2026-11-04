@@ -7,7 +7,7 @@ use std::fs::File;
 use std::io::{self, Write};
 
 use super::OutputSink;
-use crate::project::Project;
+use crate::util::VerifiedPath;
 use crate::{cli, messages};
 
 /// Output sink that forwards guest output to `inner`. When a dump file is
@@ -25,12 +25,12 @@ impl<'a, S: OutputSink> DumpSink<'a, S> {
         Self { inner, file }
     }
 
-    /// Make a sink that copies the output into `pty.dump` in the sandbox
-    /// directory of `project` when `AIRLOCK_PTY_DUMP=1`. Replaces an old
-    /// file. If the file does not open, reports the error and makes no copy.
-    pub fn from_env(inner: &'a mut S, project: &Project) -> Self {
+    /// Make a sink that copies the output into `pty.dump` in
+    /// `sandbox_dir` when `AIRLOCK_PTY_DUMP=1`. Replaces an old file. If
+    /// the file does not open, reports the error and makes no copy.
+    pub fn from_env(inner: &'a mut S, sandbox_dir: &VerifiedPath) -> Self {
         let file = if std::env::var("AIRLOCK_PTY_DUMP").as_deref() == Ok("1") {
-            open_dump(project)
+            open_dump(sandbox_dir)
         } else {
             None
         };
@@ -58,10 +58,10 @@ impl<S: OutputSink> OutputSink for DumpSink<'_, S> {
 
 /// Create the dump file in the sandbox directory. Reports the result to
 /// the user.
-fn open_dump(project: &Project) -> Option<File> {
+fn open_dump(sandbox_dir: &VerifiedPath) -> Option<File> {
     const NAME: &str = "pty.dump";
-    let shown = format!("{}/{NAME}", project.sandbox_dir);
-    let created = project.sandbox_dir.join(NAME).and_then(|path| {
+    let shown = format!("{sandbox_dir}/{NAME}");
+    let created = sandbox_dir.join(NAME).and_then(|path| {
         // Defense in depth: remove the old entry and make a new file, so
         // that a symlink there is not followed.
         match path.remove_file() {

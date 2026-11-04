@@ -7,7 +7,8 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::util::VerifiedPath;
-use crate::vault::{PassphraseSource, Storage, Vault, VaultStorageType};
+pub(crate) use crate::vault::FixedPassphrase;
+use crate::vault::{Storage, Vault, VaultStorageType};
 
 /// A vault backend in memory. Clones share one blob, as two processes on
 /// one backend do. The default backend has no vault lock.
@@ -57,16 +58,4 @@ pub fn vault_with(storage: impl Storage, env: &[(&str, &str)]) -> Vault {
             .collect::<HashMap<_, _>>(),
         VaultStorageType::File,
     )
-}
-
-/// A passphrase source that always gives the same passphrase.
-pub struct FixedPassphrase(pub &'static str);
-
-impl PassphraseSource for FixedPassphrase {
-    fn unlock(&self) -> anyhow::Result<String> {
-        Ok(self.0.to_string())
-    }
-    fn create(&self) -> anyhow::Result<String> {
-        Ok(self.0.to_string())
-    }
 }

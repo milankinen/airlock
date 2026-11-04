@@ -87,6 +87,7 @@ pub async fn main(
         pass_client_capabilities,
         follow_git_worktree,
         proxy_mcp_servers,
+        log_level,
     };
     acp::run(context, options).await
 }

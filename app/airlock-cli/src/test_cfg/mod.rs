@@ -2,6 +2,7 @@
 //! `airlock-test-utils`, which other crates use too.
 
 pub mod acp;
+pub mod cli_server;
 pub mod config;
 pub mod context;
 pub mod home;

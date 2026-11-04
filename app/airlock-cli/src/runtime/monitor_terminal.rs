@@ -9,11 +9,8 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
-use super::{OutputSink, PtySize, Runtime, SignalStream, Terminal};
+use super::{MonitorSource, OutputSink, PtySize, Runtime, SignalStream, Terminal};
 use crate::approval::MonitorSlot;
-use crate::network::NetworkHandle;
-use crate::project::Project;
-use crate::rpc;
 
 /// Runtime with the TUI monitor. Call `attach_stdin` before `launch`, so
 /// the supervisor gets its channel-backed stdin client.
@@ -87,21 +84,21 @@ impl Runtime for MonitorRuntime {
         Ok(Box::pin(merged))
     }
 
-    fn launch(
-        self,
-        project: &Project,
-        network: &NetworkHandle,
-        supervisor: rpc::Supervisor,
-    ) -> anyhow::Result<MonitorTerminal> {
+    fn launch(self, monitor: Option<MonitorSource>) -> anyhow::Result<MonitorTerminal> {
         let stdin_tx = self
             .stdin_tx
             .ok_or_else(|| anyhow::anyhow!(crate::messages::runtime::ATTACH_STDIN_BEFORE_LAUNCH))?;
         let sig_tx = self
             .sig_tx
             .ok_or_else(|| anyhow::anyhow!(crate::messages::runtime::SIGNALS_BEFORE_LAUNCH))?;
-        let project_path = project.host_cwd.to_string();
-        let control: std::sync::Arc<dyn airlock_monitor::NetworkControl> =
-            std::sync::Arc::new(network.control());
+        let MonitorSource {
+            project_path,
+            control,
+            mut events,
+            mut stats,
+            tasks: source_tasks,
+        } = monitor
+            .ok_or_else(|| anyhow::anyhow!(crate::messages::runtime::MONITOR_SOURCE_MISSING))?;
         let tui = airlock_monitor::spawn(
             stdin_tx,
             sig_tx,
@@ -114,40 +111,18 @@ impl Runtime for MonitorRuntime {
         self.approvals.set(std::rc::Rc::new(tui.tx.clone()));
         let mut tasks = JoinSet::new();
 
-        // Forward network events from the broadcast channel to the TUI
+        // Forward network events and guest stats from the source to the TUI
         // thread.
         let net_tx = tui.tx.clone();
-        let mut events = network.events();
         tasks.spawn_local(async move {
-            loop {
-                match events.recv().await {
-                    Ok(ev) => net_tx.send_network(ev),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
+            while let Some(ev) = events.recv().await {
+                net_tx.send_network(ev);
             }
         });
-
-        // Poll the guest CPU and memory stats one time per second and send
-        // them to the TUI.
         let stats_tx = tui.tx.clone();
         tasks.spawn_local(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                ticker.tick().await;
-                match supervisor.poll_stats().await {
-                    Ok(snap) => stats_tx.send_stats(airlock_monitor::StatsSnapshot {
-                        per_core: snap.per_core,
-                        total_bytes: snap.total_bytes,
-                        used_bytes: snap.used_bytes,
-                        load_avg: snap.load_avg,
-                    }),
-                    Err(e) => {
-                        tracing::debug!("poll_stats failed: {e}");
-                        break;
-                    }
-                }
+            while let Some(snap) = stats.recv().await {
+                stats_tx.send_stats(snap);
             }
         });
 
@@ -155,6 +130,7 @@ impl Runtime for MonitorRuntime {
             tui: Some(tui),
             _tasks: tasks,
             approvals: self.approvals,
+            _source_tasks: source_tasks,
         })
     }
 }
@@ -165,6 +141,8 @@ pub struct MonitorTerminal {
     /// Forwarders of network events and stats. They stop when the terminal
     /// drops (after `exit`).
     _tasks: JoinSet<()>,
+    /// Tasks that feed the source. They stop with the terminal.
+    _source_tasks: JoinSet<()>,
     /// Place of the approval dialog. Cleared when the TUI stops.
     approvals: MonitorSlot,
 }

@@ -7,8 +7,9 @@ use clap::Args;
 
 use crate::cli::prompt::choose;
 use crate::context::Context;
+use crate::sandbox::{self, FindOpts, Sandbox};
 use crate::util::verified_path::VerifiedPath;
-use crate::{cli, messages, oci, project, sandboxes};
+use crate::{cli, messages, oci};
 
 /// CLI arguments for `airlock rm`.
 #[derive(Args, Debug)]
@@ -30,22 +31,15 @@ pub struct RmArgs {
 // The sandbox lock stays held until the removal is complete. Thus a parallel
 // `airlock start` cannot take the sandbox during the removal.
 pub async fn main(args: &RmArgs, context: &Context) -> i32 {
-    let host_cwd = match sandboxes::project_dir(&context.work) {
-        Ok(cwd) => cwd,
-        Err(e) => {
-            cli::error!("{}", messages::cli::cannot_determine_cwd(e));
-            return 1;
-        }
-    };
-    run(args, context, &host_cwd).await
+    run(args, context, &context.work).await
 }
 
 /// Body of [`main`], with the project directory as an argument.
 // The argument lets tests run it without a change to the current directory
 // of the process.
 pub(super) async fn run(args: &RmArgs, context: &Context, host_cwd: &VerifiedPath) -> i32 {
-    match sandboxes::resolve_sandbox(context, host_cwd, false, false).await {
-        Ok(Some(found)) => rm_box(args, context, &found.id).await,
+    match sandbox::find(context, host_cwd, FindOpts::default()).await {
+        Ok(Some(sandbox)) => rm_box(args, context, &sandbox).await,
         Ok(None) => {
             cli::log!("{}", messages::cli::NO_SANDBOX_TO_REMOVE);
             0
@@ -57,26 +51,20 @@ pub(super) async fn run(args: &RmArgs, context: &Context, host_cwd: &VerifiedPat
     }
 }
 
-/// Remove the sandbox `id` from the data directory (see
-/// [`sandboxes::remove_box`]).
+/// Remove the sandbox `sandbox` from the data directory.
 /// Returns:
 ///   Process exit code.
-async fn rm_box(args: &RmArgs, context: &Context, id: &str) -> i32 {
-    // Fail before the question. `remove_box` checks again under the lock.
-    let running = context
-        .data
-        .sandboxes
-        .join(id)
-        .is_ok_and(|dir| project::is_running(&dir));
-    if running {
-        cli::error!("{}", messages::sandboxes::SANDBOX_RUNNING_STOP_FIRST);
+async fn rm_box(args: &RmArgs, context: &Context, sandbox: &Sandbox) -> i32 {
+    // Fail before the question. The removal checks again under the lock.
+    if sandbox.is_running() {
+        cli::error!("{}", messages::sandbox::SANDBOX_RUNNING_STOP_FIRST);
         return 1;
     }
     if !confirm(args) {
         cli::error!("{}", messages::cli::ABORTED);
         return 0;
     }
-    if let Err(e) = sandboxes::remove_box(context, id).await {
+    if let Err(e) = sandbox.remove(context).await {
         cli::error!(
             "{}",
             messages::cli::failed_to_remove_sandbox(format!("{e:#}"))
@@ -87,7 +75,6 @@ async fn rm_box(args: &RmArgs, context: &Context, id: &str) -> i32 {
     cli::log!("{}", messages::cli::SANDBOX_REMOVED);
     0
 }
-
 /// Ask to confirm the removal of the sandbox. With `--force`, do not ask.
 /// Returns:
 ///   True if confirmed. Abort, Esc, no terminal or a failed prompt is "no".

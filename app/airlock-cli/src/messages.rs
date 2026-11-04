@@ -312,17 +312,60 @@ pub mod cli {
         format!("removed secret {name}")
     }
 
-    /// Error when no running sandbox serves a directory.
+    /// Error of `network forward` when no running sandbox serves a
+    /// directory.
     pub fn no_running_sandbox(dir: impl Display) -> String {
+        format!("no running sandbox for {dir} or its parent directories")
+    }
+
+    /// Error of `exec` and `acp` when no sandbox serves a directory.
+    pub fn never_started(dir: impl Display) -> String {
         format!(
-            "no running sandbox for {dir} or its parent directories. \
-             is 'airlock start' running in this project?"
+            "no sandbox for {dir} or its parent directories. \
+             run 'airlock start' first"
         )
     }
 
-    /// Error when the CLI socket exists and no process listens on it.
-    pub fn stale_cli_sock(path: impl Display) -> String {
-        format!("stale cli.sock at {path} — is 'airlock start' still running?")
+    /// Error of `exec` and `acp` when the sandbox of the project `project`
+    /// does not run and has no config of a last start.
+    pub fn sandbox_never_started(project: impl Display) -> String {
+        format!("the sandbox of {project} never started. run 'airlock start' first")
+    }
+
+    /// Status when a command waits for a sandbox that boots or stops.
+    pub const WAITING_FOR_SANDBOX: &str = "waiting for the sandbox";
+
+    /// Error when the sandbox stops while a command runs in it.
+    pub const SANDBOX_STOPPED: &str = "the sandbox stopped";
+
+    /// Status of `stop` when the sandbox does not run.
+    pub const NOT_RUNNING: &str = "the sandbox does not run";
+
+    /// Status of `stop` when the sandbox of the project `project` stopped.
+    pub fn stopped(project: impl Display) -> String {
+        format!("stopped the sandbox of {project}")
+    }
+
+    /// Error when the sandbox does not stop in `secs` seconds. Shows for
+    /// `stop` and at the end of `start`.
+    pub fn stop_timeout(secs: u64) -> String {
+        format!("the sandbox did not stop in {secs} seconds. see airlock.log of the sandbox")
+    }
+
+    /// Error of `start` when the sandbox process did not confirm the VM
+    /// stop.
+    pub const SANDBOX_STOP_FAILED: &str =
+        "the sandbox did not stop correctly. see airlock.log of the sandbox";
+
+    /// Error when the sandbox does not answer a connect in time.
+    pub fn sandbox_no_answer(secs: u64) -> String {
+        format!("the sandbox did not answer in {secs} seconds")
+    }
+
+    /// Error when the connection to a process in the sandbox fails before
+    /// the process exits.
+    pub fn process_lost(err: impl Display) -> String {
+        format!("lost the process in the sandbox: {err}")
     }
 
     /// Error when the CLI socket of a sandbox cannot be connected.
@@ -1431,6 +1474,76 @@ pub mod grants {
     /// Deny reason: the host cannot show the request.
     pub fn unavailable(err: impl Display) -> String {
         format!("cannot show the approval request on the host: {err}")
+    }
+}
+
+pub mod sandbox_process {
+    //! Texts of the `sandbox_process` area.
+
+    use std::fmt::Display;
+
+    /// Error when the sandbox process gets a lock descriptor that is not
+    /// the held lock of its sandbox.
+    pub const LOCK_FD_MISMATCH: &str = "the sandbox process did not get the lock of its sandbox";
+
+    /// Error when the init descriptor of the sandbox process is not a
+    /// socket.
+    pub const INIT_FD_NOT_SOCKET: &str = "the sandbox process did not get its init socket";
+
+    /// Error when the init data of the sandbox process has a descriptor
+    /// that is a standard stream or that is the same as another one.
+    pub const INIT_FDS_INVALID: &str = "the sandbox process got wrong descriptors in its init data";
+
+    /// Error when the parent of the sandbox process sends no init data.
+    pub const NO_INIT: &str = "the sandbox process got no init data";
+
+    /// Error when the sandbox process of `airlock start` gives no main
+    /// command in its ready message.
+    pub const NO_MAIN_COMMAND: &str = "the sandbox process gave no main command";
+
+    /// Error when the sandbox id of the init data is not a registered
+    /// sandbox.
+    pub fn not_registered(id: impl Display) -> String {
+        format!("{id} is not a registered sandbox")
+    }
+
+    /// Error when the sandbox has no complete image on disk.
+    pub const IMAGE_MISSING_RUN_START: &str =
+        "the sandbox has no prepared image — run 'airlock start' first";
+
+    /// Error when the sandbox has no disk.
+    pub const DISK_MISSING_RUN_START: &str = "the sandbox has no disk — run 'airlock start' first";
+
+    /// Error when packs need an install before the sandbox can start.
+    /// Takes the pack ids.
+    pub fn installs_pending_run_start(ids: impl Display) -> String {
+        format!("some packs need an install ({ids}) — run 'airlock start' first")
+    }
+
+    /// Error when packs of the last run config need approval.
+    pub fn approval_needed_run_start(err: impl Display) -> String {
+        format!("{err} — run 'airlock start' to approve them")
+    }
+
+    /// Error when the config of the last run does not resolve.
+    pub fn last_config_invalid_run_start(err: impl Display) -> String {
+        format!("the config of the last run is not valid: {err} — run 'airlock start'")
+    }
+
+    /// Error when the sandbox process stops before the sandbox is ready.
+    /// Takes the exit code of the sandbox process.
+    pub fn exited_before_ready(code: impl Display) -> String {
+        format!("the sandbox process stopped before the sandbox was ready (exit code {code})")
+    }
+
+    /// Error when the sandbox process does not start.
+    pub fn spawn_failed(err: impl Display) -> String {
+        format!("cannot start the sandbox process: {err}")
+    }
+
+    /// Error when a message of the init protocol is not valid.
+    pub fn bad_init_message(err: impl Display) -> String {
+        format!("the sandbox process got no valid init message: {err}")
     }
 }
 
@@ -2599,7 +2712,7 @@ pub mod project {
     }
 
     /// Error when another airlock instance holds the sandbox lock. Shows in the
-    /// project lock and in `start`.
+    /// project lock, in `start` and in the import of an old sandbox.
     pub const SANDBOX_IN_USE: &str = "another airlock instance is using this sandbox";
 
     /// Error when the sandbox lock cannot be taken.
@@ -2754,6 +2867,9 @@ pub mod runtime {
 
     /// Error text when the terminal launches before signals are set.
     pub const SIGNALS_BEFORE_LAUNCH: &str = "signals must be called before launch";
+
+    /// Error text when the monitor launches with no data source.
+    pub const MONITOR_SOURCE_MISSING: &str = "the monitor needs a data source";
 }
 
 pub mod sandbox {
@@ -2769,9 +2885,6 @@ pub mod sandbox {
 
     /// Error context when the sandbox VM fails to boot.
     pub const BOOT_SANDBOX_VM: &str = "boot the sandbox VM";
-
-    /// Error context when the main process fails to start.
-    pub const START_MAIN_PROCESS: &str = "start the main process";
 
     /// Label before a browser notice after the main process exits.
     pub const BROWSER_NOTICE_LABEL: &str = "browser:";
@@ -2861,14 +2974,8 @@ pub mod sandbox {
         format!("{key}: host :{host} \u{2192} guest :{guest}")
     }
 
-    /// Status line when the VM boot starts.
-    pub const BOOTING_VM: &str = "Booting VM...";
-}
-
-pub mod sandboxes {
-    //! Texts of the `sandboxes` area.
-
-    use std::fmt::Display;
+    /// Status line when the sandbox boot starts.
+    pub const BOOTING_SANDBOX: &str = "Booting sandbox...";
 
     /// Error when an id is not a sandbox id. Shows for `rm` and for the project
     /// lookup.
@@ -2878,7 +2985,8 @@ pub mod sandboxes {
 
     /// Error when a sandbox to remove is in use. Shows for `rm` and the sandbox
     /// removal.
-    pub const SANDBOX_RUNNING_STOP_FIRST: &str = "Sandbox is running, stop it first";
+    pub const SANDBOX_RUNNING_STOP_FIRST: &str =
+        "Sandbox is running, stop it first with `airlock stop`";
 
     /// Error when removing a path fails.
     pub fn remove_failed(path: impl Display, err: impl Display) -> String {
@@ -2894,9 +3002,6 @@ pub mod sandboxes {
     pub fn not_a_directory(path: impl Display) -> String {
         format!("{path} is not a directory")
     }
-
-    /// Error when another airlock process uses the sandbox to move.
-    pub const SANDBOX_IN_USE: &str = "the sandbox is in use by another airlock process";
 
     /// Error when `.airlock` holds files that airlock does not know.
     pub fn extra_files(names: &[String]) -> String {
@@ -3316,6 +3421,11 @@ pub mod start {
     pub fn config_error(err: impl Display) -> String {
         format!("Config error: {err:#}")
     }
+
+    /// Shows when `start` finds that the sandbox runs. A different
+    /// `start`, `exec` or `acp` uses it.
+    pub const START_ALREADY_RUNNING: &str = "the sandbox is running. attach to it with \
+         `airlock exec`, or stop it with `airlock stop` and run `airlock start` again";
 
     /// Shows when the sandbox is removed between lookup and lock.
     pub const SANDBOX_REMOVED_DURING_START: &str =

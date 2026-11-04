@@ -6,7 +6,7 @@
 
 use crate::cli::LogLevel;
 use crate::config::config_values::{self, ConfigValues, NetworkRule, Policy};
-use crate::sandbox::boot::BootOptions;
+use crate::sandbox::BootOptions;
 
 /// Name of the install boot network rule. The rule allows all targets
 /// in passthrough mode.

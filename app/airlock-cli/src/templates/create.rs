@@ -25,15 +25,14 @@ use crate::packs::install::plan::{self, DecideInput, Wanted};
 use crate::packs::install::snapshots;
 use crate::packs::install::state::{self as install_state, InstallState, ReadState};
 use crate::packs::{InstallerScript, PackManager};
-use crate::project::{self, SandboxLock};
-use crate::start::install::{self, InstallDecision};
-use crate::start::sandbox::{ChangedAnswer, ChangedPacks};
-use crate::start::{Exit, SandboxOptions};
+use crate::sandbox::{
+    self, ChangedAnswer, ChangedPacks, Exit, InstallDecision, SandboxLock, SandboxOptions,
+};
 #[cfg(test)]
 use crate::test_cfg::start::{check_image, prepare_image};
 use crate::util::PinnedDir;
 use crate::util::verified_path::VerifiedPath;
-use crate::{cli, messages, start};
+use crate::{cli, messages};
 
 /// Prefix of the build directory of a template. A template name cannot
 /// start with `.`, thus the template list does not show the build, staging
@@ -79,7 +78,7 @@ pub async fn create(
     let local_dir = project_dir.join(".airlock").map_err(anyhow::Error::from)?;
     let config = config::load(project_dir, &local_dir).map_err(Exit::config)?;
     let templates = super::list(&context.data);
-    let generated = Box::pin(start::wizard::run_template_wizard(
+    let generated = Box::pin(sandbox::run_template_wizard(
         project_dir,
         &context.data,
         &packs,
@@ -182,7 +181,7 @@ async fn build_locked(
         })
         .await
         .map_err(Exit::config)?;
-    start::env::check_env_early(&resolved.values, &context.vault)?;
+    sandbox::check_env_early(&resolved.values, &context.vault)?;
     build.project.mkdirs().map_err(anyhow::Error::from)?;
     let sandbox = PinnedDir::pin(lock.dir().to_path().map_err(anyhow::Error::from)?)
         .map_err(anyhow::Error::from)?;
@@ -221,7 +220,7 @@ async fn build_locked(
         ReadState::Ok(state) => state,
         _ => InstallState::default(),
     };
-    let candidates = install::install_candidates(&resolved.packs);
+    let candidates = sandbox::install_candidates(&resolved.packs);
     let wanted: Vec<Wanted> = candidates
         .iter()
         .map(|t| Wanted {
@@ -233,7 +232,7 @@ async fn build_locked(
         plan::decide(&DecideInput {
             state,
             wanted: &wanted,
-            disk: project::disk_id(&sandbox),
+            disk: sandbox::disk_id(&sandbox),
             image_id: Some(&image.image_id),
         })
     };
@@ -246,7 +245,7 @@ async fn build_locked(
             state: &state,
             snapshots: &snapshots,
         };
-        match start::sandbox::changed_packs_answer(options, &changed)? {
+        match sandbox::changed_packs_answer(options, &changed)? {
             ChangedAnswer::Recreate => {
                 super::seed::drop_disk(&sandbox)?;
                 copied = false;
@@ -260,15 +259,15 @@ async fn build_locked(
     if !plan.pending.is_empty() {
         check_image(&context.data, &image).map_err(|e| Exit::error(2, e))?;
     }
-    project::ensure_disk(&sandbox, &values.disk, copied)?;
+    sandbox::ensure_disk(&sandbox, &values.disk, copied)?;
     let to_install: Vec<InstallerScript> = candidates
         .into_iter()
         .filter(|t| plan.pending.iter().any(|p| p.id == t.pack))
         .collect();
     let transitions = std::mem::take(&mut plan.transitions);
     let installs = InstallDecision::save(sandbox, state, &transitions, to_install, &image)?;
-    let project = project::open(lock, values.clone(), None, context.clone())?;
-    Box::pin(install::install_tools(
+    let project = sandbox::open(lock, values.clone(), None, context.clone())?;
+    Box::pin(sandbox::install_tools(
         &project, &resolved, &image, installs, options,
     ))
     .await?;

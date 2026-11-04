@@ -23,7 +23,7 @@ use crate::network::interceptor::Interceptor;
 use crate::network::middleware::LogFn;
 use crate::network::tls::TlsInterceptor;
 use crate::network::{Network, NetworkState, rules};
-use crate::project::{MaskedSecret, Project, SandboxEnv};
+use crate::sandbox::{MaskedSecret, Project, SandboxEnv};
 
 /// Keeps the messages of Lua `log()` calls, for test checks.
 #[derive(Clone)]
@@ -274,7 +274,7 @@ pub fn network_in_project(toml: &str, dir: &Path) -> anyhow::Result<ConfigNetwor
         dir,
         crate::vault::Vault::for_storage_type(crate::vault::VaultStorageType::Disabled),
     );
-    let env = crate::project::resolve_env(&config, &context.vault)?;
+    let env = crate::sandbox::resolve_env(&config, &context.vault)?;
     let ca = TestCa::generate();
     let project = Project {
         sandbox_dir: crate::util::VerifiedPath::new_follow(dir.join("sandbox"), None).unwrap(),

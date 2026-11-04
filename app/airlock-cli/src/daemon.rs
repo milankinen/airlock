@@ -14,12 +14,12 @@ use std::time::Duration;
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::config::config_values::RestartPolicy;
-use crate::{cli, messages, project, rpc};
+use crate::{cli, messages, rpc, sandbox};
 
 /// Convert the enabled daemons of the project config to the wire format.
 /// Args:
 ///  - `project`: Project with the daemon config and the vault
-///  - `image_env`: Sandbox env (see [`crate::sandbox::boot::guest_env`]),
+///  - `image_env`: Sandbox env (see [`crate::sandbox::process::vm::boot::guest_env`]),
 ///    as `KEY=VALUE` items
 ///
 /// Returns:
@@ -27,7 +27,7 @@ use crate::{cli, messages, project, rpc};
 ///   `${VAR}` template in a daemon env does not resolve. Daemon env values
 ///   override the sandbox env.
 pub fn build_specs(
-    project: &project::Project,
+    project: &sandbox::Project,
     image_env: &[String],
 ) -> anyhow::Result<Vec<rpc::DaemonSpec>> {
     project
@@ -63,7 +63,7 @@ pub fn build_specs(
 }
 
 /// Print a summary of the enabled daemons in verbose mode.
-pub fn print_verbose(project: &project::Project) {
+pub fn print_verbose(project: &sandbox::Project) {
     let enabled: Vec<_> = project
         .config
         .daemons

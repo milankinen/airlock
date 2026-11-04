@@ -35,7 +35,7 @@ pub(crate) use self::remote::{RemoteKind, RemoteSpec, deletes_done};
 use crate::config::config_values::McpServer;
 use crate::mcp::session::SessionState;
 use crate::messages;
-use crate::project::Project;
+use crate::sandbox::Project;
 use crate::util::VerifiedPath;
 use crate::vault::Vault;
 

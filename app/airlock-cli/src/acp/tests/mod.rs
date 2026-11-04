@@ -14,4 +14,5 @@ mod test_mcp_stdio_bridge;
 mod test_other_sandbox;
 mod test_output_limit;
 mod test_pass_mode;
+mod test_sandbox_start_failure;
 mod test_signals;

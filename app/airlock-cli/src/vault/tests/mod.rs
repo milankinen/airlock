@@ -32,7 +32,7 @@ fn encrypted_vault(path: &Path, passphrase: &'static str) -> Vault {
     Vault::new_with(
         Box::new(EncryptedFileStorage::new(
             verified(path),
-            Box::new(FixedPassphrase(passphrase)),
+            Box::new(FixedPassphrase(passphrase.into())),
         )),
         HashMap::new(),
         VaultStorageType::EncryptedFile,

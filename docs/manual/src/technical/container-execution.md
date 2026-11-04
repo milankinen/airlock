@@ -90,20 +90,20 @@ with that code. When a signal kills the child, the exit code becomes
 `airlock exec` attaches a new process to an already-running container
 without rebooting the VM. The flow:
 
-1. `airlock exec` looks for a running sandbox in the current working
-   directory and then in each parent directory. For each directory, it
-   looks up the registry of the data directory. The first sandbox with a
-   `cli.sock` wins. Thus a command in a subdirectory finds the VM of its
-   project.
+1. `airlock exec` looks up the current working directory, and then each
+   parent directory, in the sandbox registry of the data directory. It
+   uses the first registered sandbox, so a command in a subdirectory
+   finds the VM of its project. If that sandbox is not running,
+   `airlock exec` starts it.
 2. It connects to that socket (Cap'n Proto RPC over a Unix domain
    socket) and calls `CliService.exec(cmd, args, cwd, env)`. `env`
    carries only the `-e KEY=VAL` overrides the user passed on the
    command line — no project load, no vault unlock.
-3. The CLI server — running inside the `airlock start` process, next
+3. The CLI server — running inside the sandbox process, next
    to the live `VmInstance` — merges the overrides onto the sandbox's
    resolved base env (image env + `airlock.toml` env resolved once at
-   start) and forwards the call to the in-VM supervisor over the
-   existing vsock.
+   the start of the sandbox process) and forwards the call to the
+   in-VM supervisor over the existing vsock.
 4. The supervisor forks a new process inside the sandbox mount namespace
    and relays stdio back to the `airlock exec` terminal through a
    bridge that translates between the Unix-socket RPC and the vsock
@@ -116,8 +116,8 @@ The CLI server sits in the same process that holds the authoritative
 
 - `airlock exec` never loads the project, unlocks the vault, or
   re-resolves anything — it's a tiny socket client.
-- airlock resolves the base env exactly once, at `airlock start`, not
-  once per `exec`.
+- airlock resolves the base env exactly once, when the sandbox process
+  starts, not once per `exec`.
 - Processes attached via `exec` inherit the same environment the main
   container process started with, which matches the user
   expectation of "start a shell inside my running sandbox with the

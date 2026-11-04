@@ -1,7 +1,7 @@
 //! Tests for `[env]` entries: layered values, masking with surrogates, and
 //! the config errors for bad entries and bad `inject` lists.
 
-use crate::project::resolve_env;
+use crate::sandbox::resolve_env;
 use crate::test_cfg::{ConfigDirs, host_env_vault, project_toml_error, resolve_project_toml};
 
 /// Test that the guest sees a masked value only as a surrogate, also when

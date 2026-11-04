@@ -20,9 +20,9 @@ By default, airlock asks in this order:
    If the notification cannot show, a window asks on Linux, and a system
    dialog asks on macOS.
 2. A dialog in the [monitor TUI](../usage/monitor.md). Airlock uses it
-   only if the host cannot show the request and the sandbox runs with
-   `airlock start --monitor`. The monitor dialog gets only the rest of the
-   time limit.
+   only if the host cannot show the request and a client of
+   `airlock start --monitor` is attached. The monitor dialog gets only
+   the rest of the time limit.
 3. If nothing can show the request, airlock denies it.
 
 On Linux, the host cannot show the request when the notification cannot
@@ -56,7 +56,7 @@ dialogs = "system"
 - `"system"` (default): the order above.
 - `"monitor"`: only the monitor TUI. Airlock does not show a desktop
   notification, the Linux window or a system dialog. If the monitor TUI
-  is not open, airlock denies the request.
+  is not attached, airlock denies the request.
 - `"none"`: no dialogs. Airlock denies all requests.
 
 ## macOS

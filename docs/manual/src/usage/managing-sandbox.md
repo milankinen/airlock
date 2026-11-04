@@ -93,6 +93,18 @@ airlock config --resolved             # Show fully resolved sandbox config
 airlock config --format json          # Show config in JSON format
 ```
 
+## Stopping sandbox
+
+A sandbox stops by itself when its last command, shell or ACP session
+ends. To stop it right away, use `airlock stop`. This is useful, for
+example, when an editor is connected and you want to apply config
+changes: run `airlock stop` and then `airlock start`. The editor
+usually reconnects its session.
+
+```bash
+airlock stop
+```
+
 ## Removing sandbox
 
 The `airlock remove` command (alias `airlock rm`) removes the sandbox of
@@ -116,7 +128,7 @@ airlock sandboxes remove k3x7q2ma x5bq7d2c   # Remove more than one
 
 Both commands ask you to confirm before they remove anything. To skip the
 confirmation prompt (for example in scripts), pass `--force`. airlock
-refuses to remove a running sandbox.
+does not remove a sandbox that is running or booting, so stop it first.
 
 After removal, `airlock start` makes a new sandbox: a new disk, a new CA
 certificate, and a new image pull if necessary. Removal does not change

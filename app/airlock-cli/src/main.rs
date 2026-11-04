@@ -10,7 +10,6 @@ mod approval;
 mod assets;
 mod cache;
 pub(crate) mod cli;
-mod cli_server;
 mod config;
 mod constants;
 mod context;
@@ -25,15 +24,12 @@ mod messages;
 pub(crate) mod network;
 mod oci;
 mod packs;
-mod project;
 mod rpc;
 mod runtime;
 mod sandbox;
-mod sandboxes;
 mod self_update;
 pub(crate) mod services;
 mod settings;
-mod start;
 mod templates;
 #[cfg(test)]
 mod test_cfg;
@@ -45,8 +41,8 @@ use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::task::LocalSet;
 
 use crate::cli::{
-    cmd_acp, cmd_config, cmd_exec, cmd_info, cmd_network, cmd_rm, cmd_sandbox, cmd_secret,
-    cmd_self_update, cmd_start, cmd_templates,
+    cmd_acp, cmd_config, cmd_exec, cmd_info, cmd_internal, cmd_network, cmd_rm, cmd_sandbox,
+    cmd_secret, cmd_self_update, cmd_start, cmd_stop, cmd_templates,
 };
 use crate::context::Context;
 use crate::settings::Settings;
@@ -133,6 +129,13 @@ async fn main() {
                     }
                     Ok(cli::cmd_info::main(args, context).await)
                 }
+                Command::Stop(ref args) => {
+                    if !extra_args.is_empty() {
+                        cli::error!("{}", messages::app::DASH_ARGS_ONLY_WITH_START);
+                        std::process::exit(2);
+                    }
+                    cli::cmd_stop::main(args, &context).await
+                }
                 Command::Remove(ref args) => {
                     if !extra_args.is_empty() {
                         cli::error!("{}", messages::app::DASH_ARGS_ONLY_WITH_START);
@@ -174,6 +177,13 @@ async fn main() {
                         std::process::exit(2);
                     }
                     Ok(cli::cmd_templates::main(args, &context).await)
+                }
+                Command::Internal(args) => {
+                    if !extra_args.is_empty() {
+                        cli::error!("{}", messages::app::DASH_ARGS_ONLY_WITH_START);
+                        std::process::exit(2);
+                    }
+                    Ok(Box::pin(cli::cmd_internal::main(args, context)).await)
                 }
                 Command::SelfUpdate(_) => unreachable!("self-update runs before the context"),
             };
@@ -246,10 +256,12 @@ struct GlobalArgs {
 enum Command {
     /// Start the sandbox VM for the current project directory
     Start(cmd_start::StartArgs),
+    /// Stop the sandbox of the current project and end its sessions
+    Stop(cmd_stop::StopArgs),
     /// Remove the sandbox of the current project
     #[command(alias = "rm")]
     Remove(cmd_rm::RmArgs),
-    /// Execute a command inside the running sandbox VM
+    /// Execute a command in the sandbox VM (starts the sandbox if it does not run)
     #[command(alias = "x")]
     Exec(cmd_exec::ExecArgs),
     /// Run an ACP agent for an editor in the sandbox of the editor project
@@ -272,6 +284,9 @@ enum Command {
     Templates(cmd_templates::TemplateArgs),
     /// Update airlock to the latest release
     SelfUpdate(cmd_self_update::SelfUpdateArgs),
+    /// Internal commands (only airlock starts them)
+    #[command(hide = true)]
+    Internal(cmd_internal::InternalArgs),
 }
 
 /// Split argv at the first "--".

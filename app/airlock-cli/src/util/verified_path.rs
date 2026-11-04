@@ -161,7 +161,14 @@ impl VerifiedPath {
         no_empty(path)?;
         let (base, known, rel) = roots.split(path);
         let rel = lexical(path, rel)?;
-        Self::verified(path.to_path_buf(), base.join(rel), known)
+        // A join of an empty path adds a "/" at the end. A path that is a
+        // root must have the same form as the root, also as text.
+        let resolved = if rel.as_os_str().is_empty() {
+            base.to_path_buf()
+        } else {
+            base.join(rel)
+        };
+        Self::verified(path.to_path_buf(), resolved, known)
     }
 
     /// Resolve a path that the user picks and follow its symlinks. Use it
@@ -763,6 +770,19 @@ mod tests {
         for path in &paths {
             assert!(path.to_path().is_ok(), "{path}");
         }
+    }
+
+    /// Test that a path that is a root keeps the text form of the root.
+    /// The registry compares project paths as text, so a "/" at the end
+    /// made the project of a sandbox not match its registry entry.
+    ///   1. Make a path from the absolute form of the work root
+    ///   2. Check that its entry path is the root path, also as text
+    #[test]
+    fn root_path_has_no_slash_at_end() {
+        let (_dir, roots) = roots();
+        let root = roots.work.to_entry_path().unwrap().to_path_buf();
+        let path = VerifiedPath::new(&root, &roots).unwrap();
+        assert_eq!(path.to_entry_path().unwrap().as_os_str(), root.as_os_str());
     }
 
     /// Test that `..` is refused in the checked forms and that `join`

@@ -85,8 +85,7 @@ pub fn require_kvm() {
 use crate::assets::Assets;
 use crate::cli::LogLevel;
 use crate::oci::OciImage;
-use crate::project::Project;
-use crate::sandbox::boot::BootOptions;
+use crate::sandbox::{BootOptions, Project};
 use crate::vm::config::VmShare;
 use crate::{cli, messages};
 
@@ -110,7 +109,7 @@ pub struct VmInstance {
     pub caches: Vec<disk::CacheEntry>,
     /// Resolved guest home directory.
     pub container_home: String,
-    /// The sandbox env (see [`crate::sandbox::boot::guest_env`]).
+    /// The sandbox env (see [`crate::sandbox::process::vm::boot::guest_env`]).
     pub env: Vec<String>,
     /// Working directory in the guest.
     pub cwd: String,
@@ -168,7 +167,7 @@ impl VmInstance {
 ///  - `container_home`: Resolved guest home, see
 ///    [`crate::oci::effective_container_home`]. Used for `~/...` expansion
 ///    of mount, cache and socket-forward paths
-///  - `env`: The sandbox env ([`crate::sandbox::boot::guest_env`])
+///  - `env`: The sandbox env ([`crate::sandbox::process::vm::boot::guest_env`])
 ///  - `opts`: Boot options. If `project_share` is false, there is no project
 ///    mount and the guest runs in `/`. `quiet` skips the VM resources summary.
 ///

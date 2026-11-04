@@ -3,9 +3,11 @@
 //! Small helpers for paths, environment variables, executables,
 //! terminal-safe text and JSON files. Also gives checked host paths with
 //! their file operations, file access that does not follow symlinks, and
-//! ties host child processes to the airlock process.
+//! ties host child processes to the airlock process. Also gives open
+//! descriptors from a parent process to its child.
 
 pub(crate) mod clone;
+pub(crate) mod fd;
 pub(crate) mod process;
 pub(crate) mod safe_fs;
 pub(crate) mod verified_path;
@@ -68,6 +70,26 @@ fn has_key(entry: &str, key: &str) -> bool {
     entry
         .strip_prefix(key)
         .is_some_and(|rest| rest.starts_with('='))
+}
+
+/// Connect stdin, stdout and stderr of this process to `/dev/null`. A
+/// detached process uses this when the process that started it can stop.
+/// Then a later write cannot fail or stop this process.
+/// Returns:
+///   Error if `/dev/null` does not open or a stream does not change.
+pub(crate) fn stdio_to_null() -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    let null = VerifiedPath::new_follow("/dev/null", None)?
+        .open_with(std::fs::OpenOptions::new().read(true).write(true))?;
+    for fd in 0..=2 {
+        // SAFETY: `null` is open. `dup2` closes the old stream and keeps
+        // the number.
+        if unsafe { libc::dup2(null.as_raw_fd(), fd) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 /// Return `true` if `program` is an executable file on `PATH`.

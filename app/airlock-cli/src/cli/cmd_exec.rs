@@ -1,14 +1,15 @@
 //! The `airlock exec` command.
 //!
-//! Runs a process in the container of a running sandbox. The `airlock start`
-//! process of that sandbox does the work.
+//! Runs a process in the container of a sandbox. Starts the sandbox with
+//! the config of the last `airlock start` if it does not run. The sandbox
+//! process does the work.
 
 use clap::Args;
 
-use crate::cli::sandbox_client::{self, SandboxClient};
 use crate::context::Context;
-use crate::runtime::{self, RawTerminalRuntime};
-use crate::{oci, rpc, sandbox};
+use crate::runtime::RawTerminalRuntime;
+use crate::sandbox::{self, ExecRequest, ExitedBeforeReady, FindOpts, Interrupted, Run};
+use crate::{messages, oci};
 
 /// CLI arguments for `airlock exec`.
 #[derive(Args, Debug)]
@@ -34,13 +35,15 @@ pub struct ExecArgs {
 
 /// Entry point for `airlock exec <cmd> [args...]`.
 /// Returns:
-///   Exit code of the process, or error if no sandbox runs.
+///   Exit code of the process, 130 after a Ctrl+C during the sandbox
+///   start, or error if the sandbox cannot start.
 // The command, the guest dir of the caller's cwd and the `-e KEY=VAL`
-// overrides go to the `airlock start` process. That process has the resolved
-// sandbox environment (image env and `airlock.toml` env). It merges the
-// overrides into that env and tells the supervisor to start the process.
-// Thus `exec` never loads the project or the vault. It uses only the sandbox
-// registry of the context and the run record of the sandbox.
+// overrides go to the sandbox process. The sandbox process has the
+// resolved sandbox environment (image env and `airlock.toml` env). It
+// merges the overrides into that env and tells the supervisor to start the
+// process. Thus `exec` never loads the project and never opens the vault.
+// It uses only the sandbox registry of the context and the run record of
+// the sandbox.
 pub async fn main(args: ExecArgs, context: &Context) -> anyhow::Result<i32> {
     let ExecArgs {
         cmd,
@@ -57,31 +60,32 @@ pub async fn main(args: ExecArgs, context: &Context) -> anyhow::Result<i32> {
         argv
     };
 
-    let running = sandbox_client::locate(context, &context.work, follow_git_worktree).await?;
-    // The guest dir of the current dir is the default guest cwd.
-    let guest_cwd = running.guest_dir(&context.work)?;
-    let client = SandboxClient::connect_sock(&running.sock).await?;
-    let cli_service = client.service;
-    tokio::task::spawn_local(client.rpc_system);
-
-    let raw = RawTerminalRuntime::new();
-    let stdin = raw.stdin()?;
-    let pty_size = stdin.pty_size();
-
-    let mut req = cli_service.exec_request();
-    let cwd = cwd.unwrap_or(guest_cwd);
-    rpc::fill_exec_request(
-        req.get(),
-        capnp_rpc::new_client(stdin),
-        pty_size,
-        &argv,
-        &cwd,
-        &env,
-    );
-    let response = req.send().promise.await?;
-    let proc = rpc::Process::new(response.get()?.get_proc()?);
-
-    let mut terminal = raw.into_terminal();
-    tokio::task::spawn_local(runtime::forward_signals(runtime::signals()?, proc.clone()));
-    Ok(sandbox::io::drive(&proc, &mut terminal).await)
+    let opts = FindOpts {
+        parents: true,
+        follow_git_worktree,
+    };
+    let Some(sandbox) = sandbox::find(context, &context.work, opts).await? else {
+        anyhow::bail!(messages::cli::never_started(&context.work));
+    };
+    // The connection holds the sandbox until this command ends.
+    let mut process = match sandbox.run(context, Run::Exec).await {
+        Ok(process) => process,
+        Err(e) if e.is::<Interrupted>() => return Ok(130), // 128 + SIGINT
+        // The sandbox process gave the reason on the terminal.
+        Err(e) if let Some(code) = ExitedBeforeReady::code_of(&e) => return Ok(code),
+        Err(e) => return Err(e),
+    };
+    // The guest dir of the current dir is the default guest cwd. Get it
+    // after the connect: a start that ran at the same time can change the
+    // guest cwd.
+    let cwd = match cwd {
+        Some(cwd) => cwd,
+        None => process.guest_dir(&context.work)?,
+    };
+    let request = ExecRequest {
+        argv: &argv,
+        cwd: &cwd,
+        env: &env,
+    };
+    process.exec(RawTerminalRuntime::new(), &request).await
 }

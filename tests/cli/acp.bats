@@ -2,16 +2,17 @@
 
 load helpers
 
-# The acp command when no sandbox runs.
+# The acp command when no sandbox exists.
 
 # Test that the ACP proxy replies to a session request with a JSON-RPC
-# error when no sandbox runs. Stdout is the protocol channel, so it must
-# have only protocol lines. The proxy log must have the requests.
+# error when no sandbox exists that it can start. Stdout is the protocol
+# channel, so it must have only protocol lines. The proxy log must have
+# the requests.
 #   1. Send initialize and session/new for the test dir to airlock acp
 #   2. Check the exit code and that each stdout line is a JSON-RPC message
 #   3. Check the initialize result and the error for session/new
 #   4. Check that the proxy log has the requests with the process id
-@test "acp without running sandbox replies error to session/new" {
+@test "acp without started sandbox replies error to session/new" {
     local input stdout
     input='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}
 {"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"'"$TEST_TEMP_DIR"'","mcpServers":[]}}'
@@ -44,7 +45,7 @@ load helpers
     output="$stdout"
     assert_output_contains '"protocolVersion":1'
     assert_output_contains '"id":2'
-    assert_output_contains "no running sandbox"
+    assert_output_contains "run 'airlock start' first"
 
     local log
     log="$(find "$TEST_DATA_HOME" -name acp.log)"

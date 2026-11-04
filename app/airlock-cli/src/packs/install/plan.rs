@@ -23,7 +23,7 @@ pub struct DecideInput<'a> {
     pub state: &'a InstallState,
     /// The configured packs, in pack order (by kind, then by name).
     pub wanted: &'a [Wanted],
-    /// Current [`crate::project::disk_id`].
+    /// Current [`crate::sandbox::disk_id`].
     pub disk: Option<(u64, u64)>,
     /// ID of the prepared image. `None` before the image is known (the
     /// early check). Then [`decide`] compares only the disk.

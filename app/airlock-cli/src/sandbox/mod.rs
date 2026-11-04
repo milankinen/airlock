@@ -1,99 +1,70 @@
-//! Sandbox lifecycle.
+//! Sandboxes.
 //!
-//! Runs a sandbox VM for a locked project:
-//!  * boots a VM with all the access that the configuration gives the guest
-//!  * starts processes in the VM and relays their input and output
-//!  * shows the progress of the preparation and boot
-//!  * runs the interactive sandbox of `airlock start`
-//!  * stops the VM in the correct order
+//! A sandbox keeps its data in the airlock data directory, out of the
+//! reach of the sandbox guest. A registry maps each sandbox to its
+//! project. Capabilities:
+//!  * find the registered sandbox of a directory, its parents or the main
+//!    repository of a git worktree, and register a new one
+//!  * get the sandbox process of a sandbox: connect to a sandbox that
+//!    runs, or start it. Then run processes in it, show the monitor, add
+//!    port forwards and MCP servers, and release or stop it
+//!  * the start work of `airlock start`: config, questions, installs and
+//!    boot, in the sandbox process
+//!  * the sandbox data: locks, run record, disk, CA and project config
+//!  * remove a sandbox, and import a sandbox of an older version
 //!
-//! If a step fails, it removes what it built. Thus a caller must stop only
-//! what it holds.
+//! Only one process at a time starts a sandbox, and the kernel frees its
+//! locks when the process exits.
 
-pub mod boot;
-pub mod interactive;
-pub mod io;
-pub mod report;
-mod tasks;
-pub mod vm;
-
-use crate::oci::{self, OciImage};
-
-/// Error: a boot step got the user's Ctrl+C or SIGTERM and stopped. The step
-/// already removed what it built. Commands map this error to exit code 130.
-#[derive(Debug, thiserror::Error)]
-#[error("{}", crate::messages::cli::PROMPT_INTERRUPTED)]
-pub struct Interrupted;
-
-/// Get the argv of the main process.
-/// Args:
-///  - `args`: The command after `--`. If empty, the image command is used.
-///  - `login`: If `true`, run the command in a login shell
-///  - `image`: Image with the default command
-///
-/// Returns:
-///   The argv of the main process.
-pub fn main_argv(args: Vec<String>, login: bool, image: &OciImage) -> Vec<String> {
-    let cmd = if args.is_empty() {
-        image.cmd.clone()
-    } else {
-        args
-    };
-    if login {
-        oci::apply_login_shell(cmd)
-    } else {
-        cmd
-    }
+/// Declare submodules with the visibility `$vis`. Tests can reach them
+/// from all of the crate.
+macro_rules! submodules {
+    ($vis:vis $($name:ident),* $(,)?) => {$(
+        #[cfg(not(test))]
+        $vis mod $name;
+        #[cfg(test)]
+        pub(crate) mod $name;
+    )*};
 }
 
+submodules!(
+    disk,
+    env,
+    first_start,
+    load,
+    lock,
+    lookup,
+    meta,
+    migrate,
+    process,
+    registry,
+    remove,
+    start,
+);
+
+pub use self::disk::{disk_id, ensure_disk, has_disk, reset_disk};
+pub use self::env::{EnvError, MaskedSecret, SandboxEnv};
+pub use self::load::{Project, ensure_cache_dir, open, resolve_env};
+pub use self::lock::SandboxLock;
+pub use self::lookup::{BOXES_DIR, FindOpts, Sandbox, Status, find, get, list};
+pub use self::meta::{read_run_meta, time_ago};
+pub use self::process::init::StartArgs;
+pub use self::process::vm::Interrupted;
+pub use self::process::vm::boot::{BootOptions, BootSpec, boot, guest_env};
+pub use self::process::vm::io::{closed_stdin, drive};
+pub use self::process::vm::machine::{ProcessSpec, Stopped, Vm};
+pub use self::process::{
+    ExecRequest, ExitedBeforeReady, ForwardMode, ForwardReport, McpRegistrar, Run, STOP_WAIT_SECS,
+    SandboxProcess, StopResult, run_sandbox_process,
+};
+pub use self::start::check_env::check_env_early;
+pub use self::start::config_change::approve_rule;
+pub use self::start::ensure::{ChangedAnswer, ChangedPacks, changed_packs_answer};
+pub use self::start::install::{InstallDecision, install_candidates, install_tools};
+pub use self::start::location::find_or_register;
+pub use self::start::wizard::run_template_wizard;
+pub use self::start::{
+    Exit, SandboxOptions, check_data_dir, check_system_requirements, init_logging, resolve_host_cwd,
+};
 #[cfg(test)]
-mod tests {
-    //! Tests for the command of the main guest process.
-
-    use super::*;
-
-    /// The `args` as owned strings.
-    fn argv(args: &[&str]) -> Vec<String> {
-        args.iter().map(ToString::to_string).collect()
-    }
-
-    /// An image whose default command is `cmd`.
-    fn image(cmd: &[&str]) -> OciImage {
-        OciImage {
-            image_id: "sha256:test".into(),
-            name: "test".into(),
-            image_layers: vec![],
-            container_home: "/root".into(),
-            uid: 0,
-            gid: 0,
-            cmd: argv(cmd),
-            env: vec![],
-            user: None,
-        }
-    }
-
-    /// Test that the main command is the user command or else the image
-    /// command, and that a login shell wraps it when asked.
-    ///   1. Check that no args give the image command
-    ///   2. Check that args replace the image command
-    ///   3. Check that a login shell with no args runs the image shell with
-    ///      `-l`
-    ///   4. Check that a login shell with args runs them through `exec` in
-    ///      `bash -l -c`, with each arg kept as one word
-    #[test]
-    fn main_command_is_args_or_image_command_optionally_in_login_shell() {
-        assert_eq!(main_argv(vec![], false, &image(&["/bin/sh"])), ["/bin/sh"]);
-        assert_eq!(
-            main_argv(argv(&["cat", "-n"]), false, &image(&["/bin/sh"])),
-            ["cat", "-n"]
-        );
-        assert_eq!(
-            main_argv(vec![], true, &image(&["/bin/bash"])),
-            ["/bin/bash", "-l"]
-        );
-        assert_eq!(
-            main_argv(argv(&["claude", "--yolo"]), true, &image(&["/bin/bash"])),
-            ["bash", "-l", "-c", r#"exec "$0" "$@""#, "claude", "--yolo"]
-        );
-    }
-}
+mod tests;

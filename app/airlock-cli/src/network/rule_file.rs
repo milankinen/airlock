@@ -533,7 +533,7 @@ impl ApprovedRules {
         sandbox_dir: &VerifiedPath,
         project_dir: &VerifiedPath,
     ) -> anyhow::Result<Self> {
-        if let Some(stored) = crate::project::read_run_meta(sandbox_dir).last_run_config {
+        if let Some(stored) = crate::sandbox::read_run_meta(sandbox_dir).last_run_config {
             let config: crate::config::LayeredConfig = serde_json::from_value(stored)?;
             return Ok(Self {
                 files: config.project_rules().into_iter().collect(),

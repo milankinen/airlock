@@ -10,7 +10,7 @@ use std::rc::Rc;
 use super::http::middleware::CompiledMiddleware;
 use super::interceptor::Interceptor;
 use super::matchers;
-use crate::project::MaskedSecret;
+use crate::sandbox::MaskedSecret;
 
 /// One `host[:port]` pattern, parsed at startup from the `allow` or `deny`
 /// list of a rule.

@@ -18,6 +18,18 @@ load helpers
     assert_output_matches "^airlock [0-9]"
 }
 
+# Test that the top-level help lists the stop command and hides the
+# internal commands, so that users see only their commands.
+#   1. Run airlock --help
+#   2. Check that stop is in the output and the internal commands are not
+@test "help lists stop and hides internal commands" {
+    run_airlock --help
+    assert_success
+    assert_output_matches "^  stop "
+    assert_output_not_contains "Internal commands"
+    assert_output_not_contains "sandbox-process"
+}
+
 # Test that the help of start shows the --network flag and its policy
 # values.
 #   1. Run airlock start --help

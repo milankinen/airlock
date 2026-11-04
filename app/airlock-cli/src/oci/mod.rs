@@ -27,7 +27,7 @@ use crate::cli::prompt::choose::{Choice, Choose};
 use crate::config::config_values::{ImageRef, PullPolicy};
 use crate::data_dir::DataDir;
 use crate::oci::credentials::ToRegistryAuth;
-use crate::project::Project;
+use crate::sandbox::Project;
 use crate::util::PinnedDir;
 use crate::util::verified_path::{self, Refusal, VerifiedPath};
 use crate::vault::Vault;
@@ -432,7 +432,7 @@ pub(crate) fn guard_recreate(
 ) -> Result<OnImageChange, ImageChangeStop> {
     if on_change == OnImageChange::Recreate
         && read_import_marker(sandbox_dir).is_some_and(|digest| digest.is_empty())
-        && crate::project::has_disk(sandbox_dir)
+        && crate::sandbox::has_disk(sandbox_dir)
     {
         return Err(ImageChangeStop::ImportedImageUnknown);
     }
@@ -558,7 +558,7 @@ fn read_cached_image(path: &VerifiedPath) -> Option<OciImage> {
 /// Returns:
 ///   The image, or `None` if the file is missing or a sweep removed a layer.
 ///   In both cases the caller must resolve the image again.
-fn read_ready_image(data_dir: &DataDir, path: &VerifiedPath) -> Option<OciImage> {
+pub(crate) fn read_ready_image(data_dir: &DataDir, path: &VerifiedPath) -> Option<OciImage> {
     let image = read_cached_image(path)?;
     if image.image_layers.is_empty() {
         return None;
@@ -568,6 +568,24 @@ fn read_ready_image(data_dir: &DataDir, path: &VerifiedPath) -> Option<OciImage>
         .iter()
         .all(|k| cache::layer_dir(data_dir, k).is_ok_and(|p| p.is_dir()))
         .then_some(image)
+}
+
+/// Get the image that the last `airlock start` prepared for a sandbox. Uses
+/// no network and changes nothing.
+/// Args:
+///  - `data_dir`: Airlock data directory
+///  - `sandbox_dir`: Directory of the sandbox
+///
+/// Returns:
+///   The image, or `None` if the sandbox has no complete image on disk, or
+///   if its user is not checked yet. Then `airlock start` must prepare it.
+pub(crate) fn load_sandbox_image(
+    data_dir: &DataDir,
+    sandbox_dir: &VerifiedPath,
+) -> Option<OciImage> {
+    let path = sandbox_dir.join("image").ok()?;
+    // An image without `user` needs the check in `prepare`.
+    read_ready_image(data_dir, &path).filter(|image| image.user.is_some())
 }
 
 /// Make sure that `sandbox_image` is a hardlink to `images/<digest>`. The
@@ -728,7 +746,7 @@ pub fn effective_container_home(project: &Project, image: &OciImage) -> String {
     // to `~` form do not match the real mount.
     //
     // `SandboxEnv::resolve` already did the `${VAR}` substitution (in
-    // `project::open` or `Project::with_config`).
+    // `sandbox::open` or `Project::with_config`).
     project
         .env
         .guest_value("HOME")

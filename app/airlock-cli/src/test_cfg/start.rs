@@ -24,10 +24,10 @@ use crate::packs::install::progress::InstallProgress;
 use crate::packs::install::setup::{self, Ended, Report, Save, SetupError};
 use crate::packs::install::state::{self, InstallState, ReadState};
 use crate::packs::{InstallerScript, PackManager};
-use crate::project::{self, Project};
-use crate::sandboxes::{self, Found};
-use crate::start::sandbox::ChangedAnswer;
-use crate::start::{Exit, SandboxOptions, config_change};
+use crate::sandbox::first_start::FirstStart;
+use crate::sandbox::start::ensure::ChangedAnswer;
+use crate::sandbox::start::{Exit, SandboxOptions, config_change, location};
+use crate::sandbox::{self, FindOpts, Project, Sandbox, SandboxLock};
 use crate::util::PinnedDir;
 use crate::util::verified_path::VerifiedPath;
 use crate::vault::{Vault, VaultStorageType};
@@ -127,7 +127,7 @@ pub async fn prepare_image(
 /// returns the answer. Else the real question runs.
 pub fn choose_changed(items: &[String], lines: &[String]) -> Result<ChangedAnswer, Exit> {
     let Some(answer) = fake_host(|host| host.changed_answer) else {
-        return crate::start::sandbox::choose_changed_terminal(items, lines);
+        return crate::sandbox::start::ensure::choose_changed_terminal(items, lines);
     };
     let plain = lines
         .iter()
@@ -181,6 +181,47 @@ pub async fn install_boot(
     fake_host(|host| host.ran.extend(exec.ran));
     setup::finish(state, synced, &outcome.succeeded, save).map_err(SetupError::Failed)?;
     Ok(Report { outcome, synced })
+}
+
+/// Find or register the sandbox of the project `host_cwd` as the `start`
+/// client does, and take its locks as the sandbox process holds them.
+/// Returns:
+///   The held sandbox locks, or the exit of a step.
+pub async fn lock_sandbox(context: &Context, host_cwd: &VerifiedPath) -> Result<SandboxLock, Exit> {
+    let sandbox = location::find_or_register(context, host_cwd).await?;
+    Ok(SandboxLock::acquire_box(
+        host_cwd,
+        &context.data.sandboxes,
+        sandbox.id(),
+    )?)
+}
+
+/// Run the location steps of `airlock start` for the project `host_cwd`:
+/// the client takes the locks, and the sandbox process fills a new sandbox.
+/// A failed fill removes a new sandbox, as in the sandbox process.
+/// Args:
+///  - `context`: Process context
+///  - `host_cwd`: Canonical project directory
+///  - `can_prompt`: A terminal is available for questions
+///  - `yes`: `--yes`
+///
+/// Returns:
+///   The held sandbox locks, or the exit of a step.
+pub async fn locate_sandbox(
+    context: &Context,
+    host_cwd: &VerifiedPath,
+    can_prompt: bool,
+    yes: bool,
+) -> Result<SandboxLock, Exit> {
+    let lock = lock_sandbox(context, host_cwd).await?;
+    let mut first = FirstStart::check(&lock);
+    if let Err(e) = location::fill_new_sandbox(context, &lock, &mut first, can_prompt, yes) {
+        first
+            .remove(&context.db, &lock, &super::sandboxes::lock_id(&lock))
+            .await;
+        return Err(e);
+    }
+    Ok(lock)
 }
 
 /// The config with one project file `airlock.toml` with the content `toml`.
@@ -250,19 +291,18 @@ impl StartProject {
     }
 
     /// The sandbox of the project, if it has one.
-    pub fn sandbox(&self) -> Option<Found> {
-        block_on_local(sandboxes::resolve_sandbox(
+    pub fn sandbox(&self) -> Option<Sandbox> {
+        block_on_local(sandbox::find(
             &self.context,
             &super::oci::verified_dir(&self.project_dir()),
-            false,
-            false,
+            FindOpts::default(),
         ))
         .unwrap()
     }
 
     /// The sandbox directory of the project. Panics if there is no sandbox.
     pub fn sandbox_dir(&self) -> PathBuf {
-        let dir = self.sandbox().expect("a sandbox").dir;
+        let dir = self.sandbox().expect("a sandbox").dir().clone();
         dir.to_path().unwrap().to_path_buf()
     }
 
@@ -309,14 +349,17 @@ impl StartProject {
         };
         eventually("sandbox lock is free", || {
             // Wait until the lock of a registered sandbox is free.
-            if self
-                .sandbox()
-                .is_some_and(|found| project::is_running(&found.dir))
-            {
+            if self.sandbox().is_some_and(|found| found.is_running()) {
                 return None;
             }
             match self.start_once(config, &options) {
-                Err(Exit::Failed(e)) if e.to_string().starts_with("another airlock instance") => {
+                Err(Exit::Failed(e))
+                    if [
+                        crate::messages::start::START_ALREADY_RUNNING,
+                        crate::messages::project::SANDBOX_IN_USE,
+                    ]
+                    .contains(&e.to_string().as_str()) =>
+                {
                     None
                 }
                 result => Some(result),
@@ -341,40 +384,62 @@ impl StartProject {
                 .generated_project()
                 .and_then(|g| g.template.as_deref())
                 .map(|name| crate::templates::find(&self.context.data, name).unwrap());
-            let sandbox = crate::start::sandbox::ensure_sandbox(
-                &self.context,
-                &super::oci::verified_dir(&self.project_dir()),
-                &self.packs,
-                config,
-                resolved,
-                options,
-                template.as_ref(),
-            )
-            .await?;
-            let resolved = &sandbox.resolved;
-            let project = project::open(
-                &sandbox.lock,
-                resolved.values.clone(),
-                None,
-                self.context.clone(),
-            )?;
-            crate::start::install::install_tools(
-                &project,
-                resolved,
-                &sandbox.image,
-                sandbox.installs,
-                options,
-            )
-            .await
+            // As in `airlock start`: the client takes the locks, and the
+            // sandbox process removes a new sandbox after a failed start.
+            let host_cwd = super::oci::verified_dir(&self.project_dir());
+            let lock = lock_sandbox(&self.context, &host_cwd).await?;
+            let mut first = FirstStart::check(&lock);
+            let result = self
+                .prepare_locked(&lock, &mut first, config, resolved, options, template)
+                .await;
+            if result.is_err() {
+                let id = super::sandboxes::lock_id(&lock);
+                first.remove(&self.context.db, &lock, &id).await;
+            }
+            result
         })
+    }
+
+    /// The steps of [`Self::start_once`] in the sandbox process, under the
+    /// held locks `lock`.
+    async fn prepare_locked(
+        &self,
+        lock: &SandboxLock,
+        first: &mut FirstStart,
+        config: &LayeredConfig,
+        resolved: crate::config::ResolvedConfig,
+        options: &SandboxOptions,
+        template: Option<crate::templates::Template>,
+    ) -> Result<(), Exit> {
+        location::fill_new_sandbox(&self.context, lock, first, options.can_prompt, options.yes)?;
+        let sandbox = crate::sandbox::start::ensure::ensure_sandbox(
+            &self.context,
+            lock,
+            &self.packs,
+            config,
+            resolved,
+            options,
+            template.as_ref(),
+        )
+        .await?;
+        let resolved = &sandbox.resolved;
+        let project = sandbox::open(lock, resolved.values.clone(), None, self.context.clone())?;
+        crate::sandbox::start::install::install_tools(
+            &project,
+            resolved,
+            &sandbox.image,
+            sandbox.installs,
+            options,
+        )
+        .await
     }
 
     /// Save the config of the project file `toml` as the config of the
     /// last start. Thus the next start with `toml` gets no config question
-    /// (see [`crate::start::config_change`]). Panics if there is no
+    /// (see [`crate::sandbox::start::config_change`]). Panics if there is no
     /// sandbox.
     pub fn accept_config(&self, toml: &str) {
-        let dir = self.sandbox().expect("a sandbox").dir;
+        let dir = self.sandbox().expect("a sandbox").dir().clone();
         let config = project_config(toml);
         let resolved = block_on_local(config.resolve(&ResolveInput {
             data_dir: &self.context.data,
@@ -429,12 +494,12 @@ impl StartProject {
 
     /// The identity of the sandbox disk.
     pub fn disk_id(&self) -> Option<(u64, u64)> {
-        project::disk_id(&PinnedDir::pin(&self.sandbox_dir()).unwrap())
+        sandbox::disk_id(&PinnedDir::pin(&self.sandbox_dir()).unwrap())
     }
 }
 
 /// The text of the setup wizard view of `form`, without colors.
-pub fn view_text(form: &crate::start::wizard::form::Form) -> String {
-    let frame = crate::start::wizard::view::frame(form, 200);
+pub fn view_text(form: &crate::sandbox::start::wizard::form::Form) -> String {
+    let frame = crate::sandbox::start::wizard::view::frame(form, 200);
     console::strip_ansi_codes(&frame.lines.join("\n")).to_string()
 }

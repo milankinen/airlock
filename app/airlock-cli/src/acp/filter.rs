@@ -287,6 +287,13 @@ pub fn error_response(id: &Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
+/// Make a JSON-RPC error response with the error `data`.
+pub fn error_response_with_data(id: &Value, code: i64, message: &str, data: &Value) -> Value {
+    let mut msg = error_response(id, code, message);
+    msg["error"]["data"] = data.clone();
+    msg
+}
+
 #[cfg(test)]
 mod tests {
     //! Tests for the client feature rules.

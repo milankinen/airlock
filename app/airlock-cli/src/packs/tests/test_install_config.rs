@@ -130,7 +130,7 @@ fn install_config_opens_network_and_grants_nothing_else() {
     assert!(!c.env.contains_key("DEFAULTED"));
     assert_eq!(c.env["PLAIN"].value, "1");
     crate::network::check_passthrough(&c.network).unwrap();
-    crate::project::resolve_env(&c, &Vault::for_storage_type(VaultStorageType::Disabled)).unwrap();
+    crate::sandbox::resolve_env(&c, &Vault::for_storage_type(VaultStorageType::Disabled)).unwrap();
 }
 
 /// Test that the install boot keeps a `HOME` that reads host variables,

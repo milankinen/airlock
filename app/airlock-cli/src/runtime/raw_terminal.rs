@@ -7,9 +7,7 @@ use std::io::Write;
 
 use airlock_common::supervisor_capnp::stdin;
 
-use super::{OutputSink, PtySize, Runtime, SignalStream, Terminal};
-use crate::network::NetworkHandle;
-use crate::project::Project;
+use super::{MonitorSource, OutputSink, PtySize, Runtime, SignalStream, Terminal};
 use crate::rpc;
 
 /// Runtime that controls raw mode on the host terminal and gives the stdin
@@ -101,12 +99,7 @@ impl Runtime for RawTerminalRuntime {
         super::signals()
     }
 
-    fn launch(
-        self,
-        _project: &Project,
-        _network: &NetworkHandle,
-        _supervisor: rpc::Supervisor,
-    ) -> anyhow::Result<RawTerminal> {
+    fn launch(self, _monitor: Option<MonitorSource>) -> anyhow::Result<RawTerminal> {
         Ok(self.into_terminal())
     }
 }

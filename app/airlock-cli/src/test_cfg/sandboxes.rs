@@ -7,7 +7,10 @@ use airlock_test_utils::block_on_local;
 
 use super::start::fake_image;
 use crate::context::Context;
-use crate::sandboxes::registry;
+use crate::sandbox::first_start::FirstStart;
+use crate::sandbox::migrate::MigrateError;
+use crate::sandbox::{self, SandboxLock, registry};
+use crate::util::VerifiedPath;
 
 /// The `ca.json` of a legacy sandbox: a valid CA, the same in each call.
 pub fn legacy_ca() -> &'static str {
@@ -58,15 +61,16 @@ pub fn cached_image(context: &Context, name: &str) -> (String, String) {
     (image.image_id, text)
 }
 
-/// Make the directory `dir` of a stopped sandbox, with the lock file that a
-/// run leaves.
+/// Make the directory `dir` of a stopped sandbox, with the lock files that
+/// a run leaves.
 ///
 /// Takes no lock. A lock that the test takes and releases can stay held for
 /// a short time, because a `fork` in a parallel test copies the open lock
 /// file.
 pub fn stopped_sandbox_dir(dir: &Path) {
     std::fs::create_dir_all(dir).unwrap();
-    std::fs::write(dir.join("lock"), b"").unwrap();
+    std::fs::write(dir.join("run.lock"), b"").unwrap();
+    std::fs::write(dir.join("startup.lock"), b"").unwrap();
 }
 
 /// Make a stopped sandbox of the project `project` in the data directory of
@@ -84,4 +88,39 @@ pub fn data_dir_sandbox(context: &Context, project: &Path) -> (String, PathBuf) 
     let dir = context.data.sandboxes.given().join(&id);
     stopped_sandbox_dir(&dir);
     (id, dir)
+}
+
+/// Get the registry id of the sandbox that `lock` holds: the name of its
+/// directory.
+pub fn lock_id(lock: &SandboxLock) -> String {
+    lock.dir()
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Import the project sandbox of `project` into a new sandbox, as `airlock
+/// start` does: register and lock the new sandbox, import into it, and
+/// remove the new sandbox again if the import fails (see [`FirstStart`]).
+/// Returns:
+///   The held locks of the sandbox, or the import error.
+pub async fn import_into_new(
+    context: &Context,
+    project: &VerifiedPath,
+) -> Result<SandboxLock, MigrateError> {
+    let boxes = &context.data.sandboxes;
+    let id = registry::find_or_register(&context.db, boxes, project).await?;
+    let lock = SandboxLock::acquire_box(project, &context.data.sandboxes, &id)?;
+    let mut first = FirstStart::check(&lock);
+    let result = sandbox::migrate::import_legacy(context, &lock);
+    first.after_import(&result);
+    match result {
+        Ok(()) => Ok(lock),
+        Err(e) => {
+            first.remove(&context.db, &lock, &id).await;
+            Err(e)
+        }
+    }
 }

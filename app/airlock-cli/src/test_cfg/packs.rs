@@ -121,7 +121,7 @@ pub fn resolve_in(
 /// Uses [`test_packs`].
 pub fn test_installers(toml: &str) -> Vec<InstallerScript> {
     let resolved = resolve_with(&test_packs(), toml).unwrap();
-    crate::start::install::install_candidates(&resolved.packs)
+    crate::sandbox::install_candidates(&resolved.packs)
 }
 
 /// The shell that runs install scripts on the host: `dash` if it exists

@@ -8,12 +8,10 @@ use airlock_common::supervisor_capnp::stdin;
 use super::monitor_terminal::MonitorTerminal;
 use super::raw_terminal::RawTerminal;
 use super::{
-    MonitorRuntime, OutputSink, PtySize, RawTerminalRuntime, Runtime, SignalStream, Terminal,
+    MonitorRuntime, MonitorSource, OutputSink, PtySize, RawTerminalRuntime, Runtime, SignalStream,
+    Terminal,
 };
 use crate::approval::MonitorSlot;
-use crate::network::NetworkHandle;
-use crate::project::Project;
-use crate::rpc;
 use crate::settings::Settings;
 
 /// One of the host runtimes, selected one time per command. One concrete
@@ -45,7 +43,8 @@ impl HostRuntime {
     }
 
     /// Get the place of the approval dialog of the monitor TUI. It holds
-    /// the dialog while the TUI runs.
+    /// the dialog while the TUI runs. A monitor runtime needs a
+    /// [`MonitorSource`] for [`Runtime::launch`].
     ///
     /// Returns:
     ///   The place, or `None` for the raw terminal.
@@ -74,15 +73,10 @@ impl Runtime for HostRuntime {
         }
     }
 
-    fn launch(
-        self,
-        project: &Project,
-        network: &NetworkHandle,
-        supervisor: rpc::Supervisor,
-    ) -> anyhow::Result<HostTerminal> {
+    fn launch(self, monitor: Option<MonitorSource>) -> anyhow::Result<HostTerminal> {
         Ok(match self {
-            Self::Raw(r) => HostTerminal::Raw(r.launch(project, network, supervisor)?),
-            Self::Monitor(m) => HostTerminal::Monitor(m.launch(project, network, supervisor)?),
+            Self::Raw(r) => HostTerminal::Raw(r.launch(monitor)?),
+            Self::Monitor(m) => HostTerminal::Monitor(m.launch(monitor)?),
         })
     }
 }

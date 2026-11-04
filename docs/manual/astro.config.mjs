@@ -15,8 +15,12 @@ export default defineConfig({
   outDir: '../../target/manual',
   // Pages are "foo.html", as with the old manual, so old links stay valid.
   build: { format: 'file' },
-  // Old mdBook pages that the new site does not have.
-  redirects: { '/intro': BASE, '/print': BASE },
+  // Old pages that the site does not have any more.
+  redirects: {
+    '/intro': BASE,
+    '/print': BASE,
+    '/usage/attaching-to-running-sandbox': `${BASE}/usage/running-commands`,
+  },
   markdown: { remarkPlugins: [remarkGithubAlerts] },
   integrations: [
     manualPages(),

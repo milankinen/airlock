@@ -1,11 +1,17 @@
 # Starting a sandbox
 
-The `airlock start` command starts a sandbox VM in the current project
-directory.
+The `airlock start` command starts the sandbox of the current project
+and opens a shell in it.
 
 ```bash
 airlock start
 ```
+
+You use `airlock start` to create the sandbox and to apply config
+changes. If the sandbox is already running, stop it first with
+[`airlock stop`](./managing-sandbox.md#stopping-sandbox). To run more
+commands in a sandbox that already exists, use
+[`airlock exec`](./running-commands.md).
 
 On the first start, airlock shows a setup wizard. The wizard lets you
 customize the sandbox with [packs](../packs.md). To keep the config in
@@ -63,7 +69,7 @@ All configuration options are covered in the [Configuration](../configuration.md
 chapter. For now, the most important thing to know is that the `[vm]` section
 controls the image and resource allocation.
 
-## Running commands
+## Running a command
 
 By default, `airlock start` opens an interactive shell inside the VM. You can
 also pass a command after `--` to run it directly:
@@ -103,14 +109,12 @@ airlock start --sandbox-cwd /tmp
 
 ## Image pulling and caching
 
-airlock pulls OCI images and caches them locally under `oci/` in the
-airlock data directory (see [Managing sandboxes](./managing-sandbox.md#where-airlock-keeps-sandbox-data)).
-Image metadata lives in `oci/images/<digest>` (one JSON file per image) and
-the underlying layer trees in a shared `oci/layers/` cache that
-deduplicates across images. On subsequent runs, airlock reuses the cached
-image without contacting the registry at all — a tag that has since moved
-goes unnoticed. Set `pull-policy = "if-changed"` (see [VM
-options](../configuration/vm.md)) to check for a newer image on every start.
+airlock pulls OCI images and caches them in the airlock data directory
+(see [Managing sandboxes](./managing-sandbox.md#where-airlock-keeps-sandbox-data)).
+On later runs, airlock uses the cached image without contacting the
+registry, so it does not notice if a tag has moved. Set
+`pull-policy = "if-changed"` (see [VM options](../configuration/vm.md))
+to check for a newer image on every start.
 
 By default, airlock searches Docker first, then Podman, and then pulls from
 the OCI registry. Control this with the `resolution` field in the config:

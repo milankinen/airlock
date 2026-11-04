@@ -57,7 +57,7 @@ pub struct Record {
 pub struct InstallState {
     /// Format version of the file.
     pub version: u32,
-    /// [`crate::project::disk_id`] of the disk that the records describe.
+    /// [`crate::sandbox::disk_id`] of the disk that the records describe.
     #[serde(default)]
     pub disk: Option<(u64, u64)>,
     /// Image that the packs were installed on.

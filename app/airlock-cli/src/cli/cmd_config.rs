@@ -11,9 +11,9 @@ use clap::Args;
 use super::cmd_info::find;
 use crate::config::export::{self, Format};
 use crate::context::Context;
-use crate::sandboxes::{self, Found};
+use crate::sandbox::{self, Sandbox};
 use crate::util::verified_path::VerifiedPath;
-use crate::{cli, config, messages, packs, project};
+use crate::{cli, config, messages, packs};
 
 /// CLI arguments for `airlock config`.
 #[derive(Args, Debug)]
@@ -64,10 +64,9 @@ async fn document(
     if resolved {
         return resolved_document(context, &project_dir, found.as_ref()).await;
     }
-    // Same rule as `sandboxes::find_local_config_dir`. The sandbox is
-    // known already.
+    // A project without a sandbox keeps its local config in `.airlock`.
     let local_dir = match &found {
-        Some(found) => sandboxes::local_config_dir(&found.dir)?,
+        Some(found) => found.local_config_dir()?,
         None => project_dir.join(".airlock")?,
     };
     let document = config::load(&project_dir, &local_dir)?.project_document();
@@ -91,9 +90,9 @@ async fn document(
 async fn resolved_document(
     context: &Context,
     project_dir: &VerifiedPath,
-    found: Option<&Found>,
+    found: Option<&Sandbox>,
 ) -> anyhow::Result<serde_json::Value> {
-    let stored = found.and_then(|found| project::read_run_meta(&found.dir).last_run_config);
+    let stored = found.and_then(|found| sandbox::read_run_meta(found.dir()).last_run_config);
     let Some(stored) = stored else {
         anyhow::bail!(messages::cli::no_last_run_config(project_dir));
     };

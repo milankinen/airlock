@@ -104,7 +104,7 @@ pub struct LocalStarter {
     /// Sandbox names and their project dirs on the host.
     roots: Vec<(String, String)>,
     /// Fake sandbox that adds the editor MCP servers.
-    registrar: Option<cli_service::Client>,
+    registrar: Option<crate::sandbox::McpRegistrar>,
 }
 
 impl LocalStarter {
@@ -138,7 +138,7 @@ impl LocalStarter {
     /// Give the agents the fake sandbox `registrar` for the editor MCP
     /// servers.
     pub fn with_registrar(mut self, registrar: cli_service::Client) -> Self {
-        self.registrar = Some(registrar);
+        self.registrar = Some(crate::sandbox::McpRegistrar::from_client(registrar));
         self
     }
 }
@@ -156,7 +156,7 @@ impl AgentStarter for LocalStarter {
                 });
             }
         }
-        anyhow::bail!("no running sandbox for {cwd}")
+        anyhow::bail!(crate::messages::cli::never_started(cwd))
     }
 
     async fn start(&self, cwd: &str, argv: &[String]) -> anyhow::Result<(Location, AgentProcess)> {
@@ -407,7 +407,7 @@ pub struct TestClient {
 impl TestClient {
     /// Run the proxy with `starter` and `config` in a task. Call inside a
     /// `LocalSet`.
-    pub fn start(starter: LocalStarter, config: ProxyConfig) -> Self {
+    pub fn start(starter: impl AgentStarter + 'static, config: ProxyConfig) -> Self {
         let (input, proxy_input) = tokio::io::duplex(1 << 20);
         let (proxy_output, output) = tokio::io::duplex(1 << 20);
         let (proxy_stderr, stderr) = tokio::io::duplex(64 * 1024);

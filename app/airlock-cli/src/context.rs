@@ -13,7 +13,7 @@ use crate::vault::Vault;
 /// User settings, vault and database of the process.
 ///
 /// `main` creates it once with [`Context::new`] and gives it to the
-/// commands. A [`crate::project::Project`] holds it, and the project modules
+/// commands. A [`crate::sandbox::Project`] holds it, and the project modules
 /// take what they need from there. Clones are cheap because the vault and the
 /// database are shared handles.
 #[derive(Clone)]
