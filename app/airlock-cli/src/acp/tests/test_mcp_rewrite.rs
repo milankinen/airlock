@@ -3,7 +3,7 @@
 use serde_json::{Value, json};
 
 use crate::test_cfg::acp::{
-    FakeRegistrar, LocalStarter, Registrations, TestClient, mcp_config, mcp_route, seen,
+    FakeRegistrar, LocalProcessLauncher, Registrations, TestClient, mcp_config, mcp_route, seen,
     test_config,
 };
 use crate::test_cfg::block_on_local;
@@ -15,8 +15,8 @@ use crate::test_cfg::block_on_local;
 ///   result of the proxy.
 async fn bridged(restrict: bool, env: &[(&str, &str)]) -> (TestClient, Registrations, Value) {
     let (registrar, registrations) = FakeRegistrar::start(&[]);
-    let starter = LocalStarter::new(env).with_registrar(registrar);
-    let mut client = TestClient::start(starter, mcp_config(restrict));
+    let launcher = LocalProcessLauncher::new(env).with_registrar(registrar);
+    let mut client = TestClient::start(launcher, mcp_config(restrict));
     let init = client.initialize(json!({})).await;
     (client, registrations, init)
 }
@@ -54,7 +54,8 @@ fn routes(servers: &Value) -> Vec<(String, String)> {
 fn proxy_without_flag_gives_agent_no_mcp_servers() {
     block_on_local(async {
         for restrict in [true, false] {
-            let mut client = TestClient::start(LocalStarter::new(&[]), test_config(restrict));
+            let mut client =
+                TestClient::start(LocalProcessLauncher::new(&[]), test_config(restrict));
             let init = client.initialize(json!({})).await;
             assert!(init["agentCapabilities"].get("mcpCapabilities").is_none());
             let servers = json!([

@@ -3,7 +3,7 @@
 use axum::http::Method;
 use serde_json::json;
 
-use crate::test_cfg::acp::{FakeRegistrar, LocalStarter, TestClient, mcp_config, seen};
+use crate::test_cfg::acp::{FakeRegistrar, LocalProcessLauncher, TestClient, mcp_config, seen};
 use crate::test_cfg::mcp_remote::{SESSION_ID, streamable_server};
 use crate::test_cfg::{block_on_local, mcp_session};
 
@@ -23,8 +23,8 @@ fn http_server_is_relayed_and_deleted_at_client_close() {
     block_on_local(async {
         let (fake, url) = streamable_server().await;
         let (registrar, mut registrations) = FakeRegistrar::start(&[]);
-        let starter = LocalStarter::new(&[]).with_registrar(registrar);
-        let mut client = TestClient::start(starter, mcp_config(true));
+        let launcher = LocalProcessLauncher::new(&[]).with_registrar(registrar);
+        let mut client = TestClient::start(launcher, mcp_config(true));
         client.initialize(json!({})).await;
         let server = json!({
             "type": "http",

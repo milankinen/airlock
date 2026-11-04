@@ -22,23 +22,46 @@ pub mod acp {
     /// Error when a session request comes before the handshake.
     pub const NO_HANDSHAKE: &str = "send 'initialize' before the session request";
 
-    /// Error for a request that needs the agent before a session starts.
-    pub const NO_SESSION_YET: &str = "airlock starts the agent in the sandbox at the first \
-         'session/new' or 'session/load'. Start a session first";
+    /// Error for a session request without a session dir.
+    pub const NO_SESSION_DIR: &str = "the session request has no session dir ('cwd')";
 
     /// Error when a session dir is not an absolute path.
     pub fn cwd_not_absolute(cwd: impl Display) -> String {
         format!("the session dir '{cwd}' is not an absolute path")
     }
 
-    /// Error when a session dir is in a different sandbox than the running
-    /// agent.
+    /// Error when a session dir is in a different sandbox than the agent
+    /// of the session.
     pub fn other_sandbox(cwd: impl Display) -> String {
-        format!(
-            "the session dir '{cwd}' is not in the sandbox of the running agent. \
-             Start a new agent for that project"
-        )
+        format!("the session dir '{cwd}' is not in the sandbox of this session")
     }
+
+    /// Error for a request with a session id that no agent has.
+    pub fn unknown_session(id: impl Display) -> String {
+        format!("the session '{id}' is not known. Start or load it first")
+    }
+
+    /// Error for a request to a session whose agent stopped.
+    pub const SESSION_AGENT_EXITED: &str =
+        "the agent of this session stopped. Load the session again";
+
+    /// Error for a request that needs a session but has none.
+    pub fn no_session_method(method: impl Display) -> String {
+        format!("airlock does not support '{method}' without a session")
+    }
+
+    /// Error text for a client method that the proxy never supports.
+    pub fn unsupported_client_method(method: impl Display) -> String {
+        format!("airlock does not support '{method}'")
+    }
+
+    /// Error when an agent gives a session id that another agent has.
+    pub fn session_id_conflict(id: impl Display) -> String {
+        format!("the agent gave the session id '{id}' that another agent has")
+    }
+
+    /// Error for a session request when airlock stops the agents.
+    pub const SHUTTING_DOWN: &str = "airlock stops the agents and does not start new ones";
 
     /// Error for a client request that needs an agent feature that the
     /// agent does not have.
@@ -62,6 +85,26 @@ pub mod acp {
 
     /// Error when the agent exits before the handshake completes.
     pub const AGENT_EXITED: &str = "the agent exited before the ACP handshake completed";
+
+    /// Error for a request that was open when its agent exited.
+    pub fn agent_exited(sandbox: impl Display, code: i32) -> String {
+        format!("the agent in sandbox '{sandbox}' exited (code {code})")
+    }
+
+    /// Error for a request that was open when the proxy ended its session.
+    /// The agent process keeps its other sessions.
+    pub const SESSION_DETACHED: &str = "the session ended before the agent replied";
+
+    /// Title of the session message when the agent of the session exits.
+    pub const AGENT_STOPPED: &str = "The agent stopped";
+
+    /// Session message when the agent of the session exits.
+    pub fn agent_stopped_detail(sandbox: impl Display, code: i32) -> String {
+        format!(
+            "The agent in sandbox '{sandbox}' exited (code {code}). \
+             Load the session again or start a new one."
+        )
+    }
 
     /// Error when the agent writes an output line that is too long.
     pub fn agent_line_too_long(limit: usize) -> String {

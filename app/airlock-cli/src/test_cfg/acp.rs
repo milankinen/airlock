@@ -3,19 +3,24 @@
 //! servers, and a client that talks to the proxy.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
 use std::rc::Rc;
 use std::time::Duration;
 
 use airlock_common::cli_capnp::cli_service;
+use futures::future::LocalBoxFuture;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::acp::{
-    AGENT_EVENTS, AGENT_INPUT_LINES, AgentProcess, AgentStarter, Control, Location, ProxyConfig,
+    AGENT_EVENTS, AGENT_INPUT_LINES, AgentProcess, AgentProcessLauncher, Claim, Config, Control,
+    HandleId, HandleMessage, Location, SessionContext, SessionFactory, SessionFactoryInit,
+    SessionHandle,
 };
 use crate::rpc::ProcessEvent;
 use crate::runtime::SignalStream;
@@ -24,10 +29,12 @@ use crate::test_cfg::mcp_grant::{FakeGrant, GrantEvent, Route};
 /// Fake ACP agent. It writes the lines of `$AGENT_PRE`, replies to the
 /// proxy handshake with `$AGENT_INIT` and then writes the lines of
 /// `$AGENT_SAY`. For each other input line, it writes a `session/update`
-/// notification with the line in `params.seen`. It replies to each request
-/// with a numeric id with an empty result, or with the error
-/// `$AGENT_ERROR`. Other settings:
+/// notification with the line in `params.seen` and its sandbox in
+/// `params.from`. It replies to each request with a numeric id with an
+/// empty result, or with the error `$AGENT_ERROR`. Other settings:
+///  - `AGENT_SANDBOX`: Sandbox of the agent. The launcher sets it.
 ///  - `AGENT_NO_INIT`: Never reply to the handshake
+///  - `AGENT_INIT_DELAY`: Seconds to wait before the handshake reply
 ///  - `AGENT_STDERR`: Number of bytes to write to stderr before the
 ///    handshake reply
 ///  - `AGENT_FLOOD`: After the handshake, write one line without end and
@@ -35,22 +42,36 @@ use crate::test_cfg::mcp_grant::{FakeGrant, GrantEvent, Route};
 ///  - `AGENT_EOF`: Exit code at the end of the input, or `ignore` to wait
 ///    for the kill
 ///  - `AGENT_SESSION_IDS`: Reply to `session/new` and `session/fork` with
-///    the result `{"sessionId":"s<N>"}`, where N counts from 1
+///    the result `{"sessionId":"<prefix><N>"}`, where N counts from 1.
+///    If not set, the session id is `<sandbox>-<pid>-<N>`.
+///  - `AGENT_SESSION_PREFIX`: The prefix of the session ids, `s` if not set
 ///  - `AGENT_LIST`: Reply to `session/list` with this result
+///  - `AGENT_ASK`: For each `session/prompt`, send a
+///    `session/request_permission` with this JSON id and the session of the
+///    prompt before the reply
+///  - `AGENT_HOLD`: Requests with this method get no reply, `test/hold` if
+///    not set. For each one, the agent writes the lines of `$AGENT_ON_HOLD`.
+///  - `AGENT_DIE`: Exit after this number of seconds from the start
+///  - `AGENT_TRAP`: At `SIGUSR1`, wait 200 ms and exit with this code
 ///
 /// A request with the param `"cursor":"bad"` gets an error.
 ///
-/// The notification `test/exit` makes it write a `session/update`
-/// notification with `params.last` and no newline, and exit with code 7.
-/// At the end of its input, it writes the same notification.
+/// The message `test/exit` makes it write a `session/update` notification
+/// with `params.last` and no newline, and exit with the code
+/// `$AGENT_EXIT_CODE`, 7 if not set. A `test/exit` request gets no reply.
+/// At the end of its input, the agent writes the same notification.
 pub const FAKE_AGENT: &str = r#"
 last() { printf '{"jsonrpc":"2.0","method":"session/update","params":{"last":true}}'; }
-seen() { printf '{"jsonrpc":"2.0","method":"session/update","params":{"seen":%s}}\n' "$1"; }
+seen() { printf '{"jsonrpc":"2.0","method":"session/update","params":{"seen":%s,"from":"%s"}}\n' "$1" "$AGENT_SANDBOX"; }
+hold=${AGENT_HOLD:-test/hold}
+[ -n "$AGENT_TRAP" ] && trap 'sleep 0.2; exit "$AGENT_TRAP"' USR1
+[ -n "$AGENT_DIE" ] && (sleep "$AGENT_DIE"; kill $$) >/dev/null 2>&1 &
 while IFS= read -r line; do
   case "$line" in
   *'"id":"airlock-acp-initialize"'*)
     [ -n "$AGENT_PRE" ] && printf '%s\n' "$AGENT_PRE"
     [ -n "$AGENT_NO_INIT" ] && continue
+    [ -n "$AGENT_INIT_DELAY" ] && sleep "$AGENT_INIT_DELAY"
     [ -n "$AGENT_STDERR" ] && head -c "$AGENT_STDERR" /dev/zero >&2
     printf '{"jsonrpc":"2.0","id":"airlock-acp-initialize","result":%s}\n' "$AGENT_INIT"
     [ -n "$AGENT_SAY" ] && printf '%s\n' "$AGENT_SAY"
@@ -58,12 +79,22 @@ while IFS= read -r line; do
       while :; do printf %s xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done
     fi
     seen "$line" ;;
-  *'"method":"test/exit"'*) last; exit 7 ;;
+  *'"method":"test/exit"'*) last; exit "${AGENT_EXIT_CODE:-7}" ;;
+  *"\"method\":\"$hold\""*)
+    seen "$line"
+    [ -n "$AGENT_ON_HOLD" ] && printf '%s\n' "$AGENT_ON_HOLD" ;;
   *)
     seen "$line"
     case "$line" in
     *'"method"'*'"id":'[0-9]*|*'"id":'[0-9]*'"method"'*)
       id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      case "$line" in
+      *'"method":"session/prompt"'*)
+        if [ -n "$AGENT_ASK" ]; then
+          sid=$(printf '%s\n' "$line" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
+          printf '{"jsonrpc":"2.0","id":%s,"method":"session/request_permission","params":{"sessionId":"%s","options":[],"toolCall":{}}}\n' "$AGENT_ASK" "$sid"
+        fi ;;
+      esac
       if [ -n "$AGENT_ERROR" ]; then
         printf '{"jsonrpc":"2.0","id":%s,"error":%s}\n' "$id" "$AGENT_ERROR"
       else
@@ -74,12 +105,13 @@ while IFS= read -r line; do
           continue ;;
         *'"method":"session/list"'*) [ -n "$AGENT_LIST" ] && result="$AGENT_LIST" ;;
         esac
-        if [ -n "$AGENT_SESSION_IDS" ]; then
-          case "$line" in
-          *'"method":"session/new"'*|*'"method":"session/fork"'*)
-            n=$((${n:-0} + 1)); result="{\"sessionId\":\"s$n\"}" ;;
-          esac
-        fi
+        case "$line" in
+        *'"method":"session/new"'*|*'"method":"session/fork"'*)
+          n=$((${n:-0} + 1))
+          sid="${AGENT_SANDBOX}-$$-$n"
+          [ -n "$AGENT_SESSION_IDS" ] && sid="${AGENT_SESSION_PREFIX:-s}$n"
+          result="{\"sessionId\":\"$sid\"}" ;;
+        esac
         printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$result"
       fi ;;
     esac ;;
@@ -105,77 +137,128 @@ pub fn full_agent_init() -> Value {
     })
 }
 
-/// Agent starter for tests. Runs the agent as a local process. Has two
-/// fake running sandboxes: `a` for `/projects/a` and `b` for
-/// `/projects/b`, both with the guest project dir `/work`.
-pub struct LocalStarter {
-    /// Environment variables of the agent.
-    env: Vec<(String, String)>,
-    /// Number of agent starts.
-    pub starts: Rc<Cell<usize>>,
-    /// Sandbox names and their project dirs on the host.
-    roots: Vec<(String, String)>,
+/// Fake running sandbox of [`LocalProcessLauncher`].
+struct FakeSandbox {
+    /// Name of the sandbox.
+    name: String,
+    /// Project dir on the host.
+    host_root: String,
+    /// Project dir in the guest.
+    guest_root: String,
     /// Fake sandbox that adds the editor MCP servers.
     registrar: Option<crate::sandbox::McpRegistrar>,
 }
 
-impl LocalStarter {
-    /// Make a starter that gives the agent the environment `env`. The
+/// Agent process launcher for tests. Runs the agent as a local process. Has two
+/// fake running sandboxes: `a` for `/projects/a` and `b` for
+/// `/projects/b`, both with the guest project dir `/work`.
+pub struct LocalProcessLauncher {
+    /// Environment variables of the agent.
+    env: Vec<(String, String)>,
+    /// Number of agent launches.
+    pub launches: Rc<Cell<usize>>,
+    /// Sandbox of each agent launch, in order.
+    pub launched: Rc<RefCell<Vec<String>>>,
+    /// The fake sandboxes.
+    sandboxes: Vec<FakeSandbox>,
+}
+
+impl LocalProcessLauncher {
+    /// Make a launcher that gives the agent the environment `env`. The
     /// agent gets the [`full_agent_init`] if `env` has no `AGENT_INIT`.
     pub fn new(env: &[(&str, &str)]) -> Self {
-        let mut env: Vec<(String, String)> = env
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
+        let mut env = pairs(env);
         if !env.iter().any(|(k, _)| k == "AGENT_INIT") {
             env.push(("AGENT_INIT".into(), full_agent_init().to_string()));
         }
         Self {
             env,
-            starts: Rc::default(),
-            roots: ["a", "b"]
+            launches: Rc::default(),
+            launched: Rc::default(),
+            sandboxes: ["a", "b"]
                 .iter()
-                .map(|s| ((*s).into(), format!("/projects/{s}")))
+                .map(|s| FakeSandbox {
+                    name: (*s).into(),
+                    host_root: format!("/projects/{s}"),
+                    guest_root: "/work".into(),
+                    registrar: None,
+                })
                 .collect(),
-            registrar: None,
         }
     }
 
     /// Use the host dir `root` as the project dir of sandbox `a`.
-    pub fn with_root(mut self, root: &str) -> Self {
-        self.roots[0].1 = root.to_string();
+    pub fn with_root(self, root: &str) -> Self {
+        self.with_sandbox_root("a", root)
+    }
+
+    /// Use the host dir `root` as the project dir of `sandbox`.
+    pub fn with_sandbox_root(mut self, sandbox: &str, root: &str) -> Self {
+        self.sandbox_mut(sandbox).host_root = root.to_string();
         self
     }
 
     /// Give the agents the fake sandbox `registrar` for the editor MCP
-    /// servers.
+    /// servers, in all sandboxes.
     pub fn with_registrar(mut self, registrar: cli_service::Client) -> Self {
-        self.registrar = Some(crate::sandbox::McpRegistrar::from_client(registrar));
+        let registrar = crate::sandbox::McpRegistrar::from_client(registrar);
+        let (last, others) = self.sandboxes.split_last_mut().expect("sandboxes");
+        for sandbox in others {
+            sandbox.registrar = Some(registrar.clone());
+        }
+        last.registrar = Some(registrar);
         self
     }
-}
 
-impl AgentStarter for LocalStarter {
-    async fn locate(&self, cwd: &str) -> anyhow::Result<Location> {
-        for (sandbox, root) in &self.roots {
-            let Some(rest) = cwd.strip_prefix(root.as_str()) else {
+    /// Get the fake sandbox `name`. Panics if it does not exist.
+    fn sandbox_mut(&mut self, name: &str) -> &mut FakeSandbox {
+        self.sandboxes
+            .iter_mut()
+            .find(|s| s.name == name)
+            .expect("known sandbox")
+    }
+
+    /// Find the fake sandbox of the dir `cwd`.
+    fn find(&self, cwd: &str) -> anyhow::Result<(&FakeSandbox, Location)> {
+        for sandbox in &self.sandboxes {
+            let Some(rest) = cwd.strip_prefix(sandbox.host_root.as_str()) else {
                 continue;
             };
             if rest.is_empty() || rest.starts_with('/') {
-                return Ok(Location {
-                    sandbox: sandbox.clone(),
-                    guest_cwd: format!("/work{rest}"),
-                });
+                let guest = format!("{}{rest}", sandbox.guest_root.trim_end_matches('/'));
+                let location = Location {
+                    sandbox: sandbox.name.clone(),
+                    guest_cwd: if guest.is_empty() { "/".into() } else { guest },
+                    host_root: sandbox.host_root.clone(),
+                    guest_root: sandbox.guest_root.clone(),
+                };
+                return Ok((sandbox, location));
             }
         }
         anyhow::bail!(crate::messages::cli::never_started(cwd))
     }
+}
 
-    async fn start(&self, cwd: &str, argv: &[String]) -> anyhow::Result<(Location, AgentProcess)> {
-        let location = self.locate(cwd).await?;
-        self.starts.set(self.starts.get() + 1);
-        let mut agent = spawn_agent(argv, &self.env)?;
-        agent.mcp = self.registrar.clone();
+/// Make owned environment pairs.
+fn pairs(env: &[(&str, &str)]) -> Vec<(String, String)> {
+    env.iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect()
+}
+
+impl AgentProcessLauncher for LocalProcessLauncher {
+    async fn locate(&self, cwd: &str) -> anyhow::Result<Location> {
+        Ok(self.find(cwd)?.1)
+    }
+
+    async fn launch(&self, cwd: &str, argv: &[String]) -> anyhow::Result<(Location, AgentProcess)> {
+        let (sandbox, location) = self.find(cwd)?;
+        self.launches.set(self.launches.get() + 1);
+        self.launched.borrow_mut().push(sandbox.name.clone());
+        let mut env = self.env.clone();
+        env.push(("AGENT_SANDBOX".into(), sandbox.name.clone()));
+        let mut agent = spawn_agent(argv, &env)?;
+        agent.mcp = sandbox.registrar.clone();
         Ok((location, agent))
     }
 }
@@ -235,12 +318,9 @@ fn spawn_agent(argv: &[String], env: &[(String, String)]) -> anyhow::Result<Agen
     let (control, mut control_rx) = mpsc::unbounded_channel();
     tokio::task::spawn_local(async move {
         while let Some(request) = control_rx.recv().await {
-            let signum = match request {
-                Control::Kill => libc::SIGKILL,
-                Control::Signal(signum) => signum,
-            };
+            let Control::Kill = request;
             // SAFETY: sends a signal to the child process only.
-            unsafe { libc::kill(pid, signum) };
+            unsafe { libc::kill(pid, libc::SIGKILL) };
         }
     });
 
@@ -250,6 +330,197 @@ fn spawn_agent(argv: &[String], env: &[(String, String)]) -> anyhow::Result<Agen
         control,
         mcp: None,
     })
+}
+
+/// Session factory for the proxy routing tests. Its session handles run in
+/// memory, and the test plays their agents.
+struct FakeSessionsInit {
+    created: mpsc::UnboundedSender<FakeSession>,
+}
+
+impl SessionFactoryInit for FakeSessionsInit {
+    fn init(self: Box<Self>, context: SessionContext) -> Rc<dyn SessionFactory> {
+        Rc::new(FakeSessions {
+            created: self.created,
+            messages: context.messages,
+            next_id: Cell::new(0),
+            session_dirs: Rc::default(),
+        })
+    }
+}
+
+/// Factory that [`FakeSessionsInit`] makes.
+struct FakeSessions {
+    created: mpsc::UnboundedSender<FakeSession>,
+    messages: mpsc::Sender<(HandleId, HandleMessage)>,
+    next_id: Cell<HandleId>,
+    /// Host session dir of each listed session.
+    session_dirs: Rc<RefCell<HashMap<String, String>>>,
+}
+
+impl SessionFactory for FakeSessions {
+    fn create(&self, cwd: String, first: Value) -> (HandleId, Box<dyn SessionHandle>) {
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        let cancel = CancellationToken::new();
+        let (inbox_tx, inbox) = mpsc::unbounded_channel();
+        let (exit_tx, exit) = oneshot::channel();
+        let stop_code = Rc::new(Cell::new(0));
+        let linger = Rc::new(Cell::new(false));
+        let _ = self.created.send(FakeSession {
+            id,
+            cwd,
+            first,
+            inbox,
+            messages: self.messages.clone(),
+            exit: Some(exit_tx),
+            stop_code: stop_code.clone(),
+            linger: linger.clone(),
+            cancel: cancel.clone(),
+            session_dirs: self.session_dirs.clone(),
+        });
+        let proxy = FakeHandle {
+            inbox: inbox_tx,
+            exit,
+            cancel,
+            stop_code,
+            linger,
+        };
+        (id, Box::new(proxy))
+    }
+
+    fn session_dir(&self, sid: &str) -> Option<String> {
+        self.session_dirs.borrow().get(sid).cloned()
+    }
+}
+
+/// Proxy side of a [`FakeSession`].
+struct FakeHandle {
+    inbox: mpsc::UnboundedSender<Value>,
+    exit: oneshot::Receiver<i32>,
+    cancel: CancellationToken,
+    stop_code: Rc<Cell<i32>>,
+    linger: Rc<Cell<bool>>,
+}
+
+impl SessionHandle for FakeHandle {
+    fn send(&self, msg: Value) -> bool {
+        self.inbox.send(msg).is_ok()
+    }
+
+    fn shutdown(self: Box<Self>) -> LocalBoxFuture<'static, i32> {
+        let FakeHandle {
+            mut exit,
+            cancel,
+            stop_code,
+            linger,
+            ..
+        } = *self;
+        cancel.cancel();
+        Box::pin(async move {
+            // An agent that exited already gives its own exit code.
+            tokio::select! {
+                biased;
+                code = &mut exit => return code.unwrap_or(0),
+                () = cancel.cancelled() => {}
+            }
+            if linger.get() {
+                return exit.await.unwrap_or(0);
+            }
+            stop_code.get()
+        })
+    }
+}
+
+/// Test side of an in-memory fake session handle. The test plays its agent.
+/// When the proxy stops the handle, it ends with its stop code, or at
+/// [`FakeSession::exit`] if it lingers.
+pub struct FakeSession {
+    /// Identity of the handle in the proxy.
+    pub id: HandleId,
+    /// Host session dir of the session request.
+    pub cwd: String,
+    /// The session request that started the handle.
+    pub first: Value,
+    inbox: mpsc::UnboundedReceiver<Value>,
+    messages: mpsc::Sender<(HandleId, HandleMessage)>,
+    exit: Option<oneshot::Sender<i32>>,
+    stop_code: Rc<Cell<i32>>,
+    linger: Rc<Cell<bool>>,
+    cancel: CancellationToken,
+    session_dirs: Rc<RefCell<HashMap<String, String>>>,
+}
+
+impl FakeSession {
+    /// Make the factory give the host session dir `cwd` for the session
+    /// `sid`, or no dir if `cwd` is `None`. The factory does this for a
+    /// list or a delete.
+    pub fn set_session_dir(&self, sid: &str, cwd: Option<&str>) {
+        let mut dirs = self.session_dirs.borrow_mut();
+        match cwd {
+            Some(cwd) => dirs.insert(sid.to_string(), cwd.to_string()),
+            None => dirs.remove(sid),
+        };
+    }
+
+    /// Wait until the proxy stops the handle. Panics after 10 seconds.
+    pub async fn stopped(&self) {
+        tokio::time::timeout(Duration::from_secs(10), self.cancel.cancelled())
+            .await
+            .expect("agent stop in time");
+    }
+
+    /// Do not end when the proxy stops the handle. End only at
+    /// [`FakeSession::exit`].
+    pub fn set_linger(&self) {
+        self.linger.set(true);
+    }
+
+    /// Send the message `msg` to the client.
+    pub async fn say(&self, msg: Value) {
+        self.send(HandleMessage::Client { msg, claim: None }).await;
+    }
+
+    /// Complete the handshake and reply to the session request with the
+    /// session `sid`.
+    pub async fn open_session(&self, sid: &str) {
+        self.send(HandleMessage::Ready).await;
+        let req_id = &self.first["id"];
+        let msg = crate::acp::rpc::result_response(req_id, &json!({ "sessionId": sid }));
+        let claim = Claim {
+            session: sid.to_string(),
+            replace: false,
+        };
+        let claim = Some(claim);
+        self.send(HandleMessage::Client { msg, claim }).await;
+    }
+
+    /// The next client message for the handle. Panics after 10 seconds.
+    pub async fn recv(&mut self) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), self.inbox.recv())
+            .await
+            .expect("agent message in time")
+            .expect("open agent inbox")
+    }
+
+    /// Use `code` as the exit code when the proxy stops the handle.
+    pub fn set_stop_code(&self, code: i32) {
+        self.stop_code.set(code);
+    }
+
+    /// End with the exit code `code`. The handle takes no more messages.
+    pub async fn exit(&mut self, code: i32) {
+        self.inbox.close();
+        if let Some(exit) = self.exit.take() {
+            let _ = exit.send(code);
+        }
+        self.send(HandleMessage::Ended).await;
+    }
+
+    // The proxy can have stopped its handle side.
+    async fn send(&self, message: HandleMessage) {
+        let _ = self.messages.send((self.id, message)).await;
+    }
 }
 
 /// Fake sandbox CLI service with only `addMcpServer`. It records the
@@ -271,7 +542,7 @@ pub struct Registrations {
 impl FakeRegistrar {
     /// Make the fake service. The servers in `stuck` never get a reply.
     /// Returns:
-    ///   The service for [`LocalStarter::with_registrar`], and its test
+    ///   The service for [`LocalProcessLauncher::with_registrar`], and its test
     ///   side.
     pub fn start(stuck: &[&str]) -> (cli_service::Client, Registrations) {
         let (routes, routes_rx) = mpsc::unbounded_channel();
@@ -345,9 +616,9 @@ impl Registrations {
 /// Proxy settings for the fake agent, with short time limits.
 /// Args:
 ///  - `restrict`: Remove the client features that act on the host
-pub fn test_config(restrict: bool) -> ProxyConfig {
+pub fn test_config(restrict: bool) -> Config {
     let argv = vec!["sh".into(), "-c".into(), FAKE_AGENT.into()];
-    ProxyConfig {
+    Config {
         agent_capabilities: crate::acp::capabilities::preset(&argv),
         argv,
         name: "fake-agent".into(),
@@ -364,8 +635,8 @@ pub fn test_config(restrict: bool) -> ProxyConfig {
 }
 
 /// [`test_config`] with the editor MCP bridge on.
-pub fn mcp_config(restrict: bool) -> ProxyConfig {
-    ProxyConfig {
+pub fn mcp_config(restrict: bool) -> Config {
+    Config {
         proxy_mcp_servers: true,
         ..test_config(restrict)
     }
@@ -416,27 +687,53 @@ pub struct TestClient {
     /// ignores the stderr.
     _stderr: DuplexStream,
     proxy: JoinHandle<i32>,
+    /// Session id of the session that [`TestClient::session`] started.
+    pub sid: String,
 }
 
 impl TestClient {
-    /// Run the proxy with `starter` and `config` in a task. Call inside a
+    /// Run the proxy with `launcher` and `config` in a task. Call inside a
     /// `LocalSet`.
-    pub fn start(starter: impl AgentStarter + 'static, config: ProxyConfig) -> Self {
+    pub fn start(launcher: impl AgentProcessLauncher + 'static, config: Config) -> Self {
         let (input, proxy_input) = tokio::io::duplex(1 << 20);
         let (proxy_output, output) = tokio::io::duplex(1 << 20);
         let (proxy_stderr, stderr) = tokio::io::duplex(64 * 1024);
         let proxy = tokio::task::spawn_local(async move {
             let input = BufReader::new(proxy_input);
-            crate::acp::serve(&starter, &config, input, proxy_output, proxy_stderr)
-                .await
-                .unwrap()
+            crate::acp::serve(launcher, config, input, proxy_output, proxy_stderr).await
         });
         Self {
             input: Some(input),
             output: BufReader::new(output).lines(),
             _stderr: stderr,
             proxy,
+            sid: String::new(),
         }
+    }
+
+    /// Run the proxy core with in-memory fake session handles in a task. Call
+    /// inside a `LocalSet`.
+    /// Returns:
+    ///   The client, and the receiver of the fake handles in their start
+    ///   order.
+    pub fn start_fake(config: Config) -> (Self, mpsc::UnboundedReceiver<FakeSession>) {
+        let (created, agents) = mpsc::unbounded_channel();
+        let (input, proxy_input) = tokio::io::duplex(1 << 20);
+        let (proxy_output, output) = tokio::io::duplex(1 << 20);
+        let (_, stderr) = tokio::io::duplex(1);
+        let proxy = tokio::task::spawn_local(async move {
+            let factory = FakeSessionsInit { created };
+            let input = BufReader::new(proxy_input);
+            crate::acp::route(Box::new(factory), &config.proxy(), input, proxy_output).await
+        });
+        let client = Self {
+            input: Some(input),
+            output: BufReader::new(output).lines(),
+            _stderr: stderr,
+            proxy,
+            sid: String::new(),
+        };
+        (client, agents)
     }
 
     /// Send the bytes `data` to the proxy.
@@ -461,27 +758,67 @@ impl TestClient {
         serde_json::from_str(&line).unwrap()
     }
 
+    /// Send the notification `method` with `params` to the proxy.
+    pub async fn notify(&mut self, method: &str, params: Value) {
+        let msg = json!({ "jsonrpc": "2.0", "method": method, "params": params });
+        self.send(&msg).await;
+    }
+
+    /// Send the request `method` with the id `req_id` and `params` to the
+    /// proxy, and do not wait for the response.
+    pub async fn send_request(&mut self, req_id: i64, method: &str, params: Value) {
+        let msg = json!({ "jsonrpc": "2.0", "id": req_id, "method": method, "params": params });
+        self.send(&msg).await;
+    }
+
+    /// Send a prompt with the id `req_id` to `sid` and wait for its
+    /// response.
+    /// Returns:
+    ///   The response, and the other messages that came before it.
+    pub async fn prompt(&mut self, req_id: i64, sid: &str) -> (Value, Vec<Value>) {
+        let params = json!({ "sessionId": sid, "prompt": [] });
+        self.request(req_id, "session/prompt", params).await
+    }
+
+    /// Send a prompt with the id `req_id` to `sid`, and do not wait for
+    /// the response.
+    pub async fn send_prompt(&mut self, req_id: i64, sid: &str) {
+        let params = json!({ "sessionId": sid, "prompt": [] });
+        self.send_request(req_id, "session/prompt", params).await;
+    }
+
     /// Send a request and wait for its response.
     /// Returns:
     ///   The response, and the other messages that came before it.
-    pub async fn request(&mut self, id: i64, method: &str, params: Value) -> (Value, Vec<Value>) {
-        let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        self.send(&msg).await;
-        self.response(id).await
+    pub async fn request(
+        &mut self,
+        req_id: i64,
+        method: &str,
+        params: Value,
+    ) -> (Value, Vec<Value>) {
+        self.send_request(req_id, method, params).await;
+        self.response(req_id).await
     }
 
-    /// Wait for the response to the request `id`.
+    /// Wait for the response to the request `req_id`.
     /// Returns:
     ///   The response, and the other messages that came before it.
-    pub async fn response(&mut self, id: i64) -> (Value, Vec<Value>) {
+    pub async fn response(&mut self, req_id: i64) -> (Value, Vec<Value>) {
         let mut others = Vec::new();
         loop {
             let msg = self.recv().await;
-            if msg.get("method").is_none() && msg["id"] == json!(id) {
+            if msg.get("method").is_none() && msg["id"] == json!(req_id) {
                 return (msg, others);
             }
             others.push(msg);
         }
+    }
+
+    /// Send the message `msg` with the session id of
+    /// [`TestClient::session`] in its params.
+    pub async fn send_in_session(&mut self, mut msg: Value) {
+        msg["params"]["sessionId"] = json!(self.sid);
+        self.send(&msg).await;
     }
 
     /// Do the client handshake with the client features `caps`.
@@ -493,29 +830,46 @@ impl TestClient {
         response["result"].clone()
     }
 
-    /// Start the proxy with `starter` and `config`, do the client handshake
-    /// and start a session in `cwd`. Panics if the session fails.
-    pub async fn session(starter: LocalStarter, config: ProxyConfig, cwd: &str) -> Self {
-        let mut client = Self::start(starter, config);
+    /// Start the proxy with `launcher` and `config`, do the client handshake
+    /// and start a session in `cwd`. Panics if the session fails. The
+    /// session id goes to [`TestClient::sid`].
+    pub async fn session(launcher: LocalProcessLauncher, config: Config, cwd: &str) -> Self {
+        let mut client = Self::start(launcher, config);
         client.initialize(json!({})).await;
-        let params = json!({ "cwd": cwd, "mcpServers": [] });
-        let (response, _) = client.request(2, "session/new", params).await;
-        assert!(response.get("result").is_some(), "{response}");
+        client.sid = client.new_session(2, cwd).await;
         client
     }
 
-    /// Send `session/new` with the id `id` in `cwd`, and get the error of
+    /// Start a session with the request id `req_id` in `cwd`. Panics if the
+    /// session fails or has no session id.
+    /// Returns:
+    ///   The session id.
+    pub async fn new_session(&mut self, req_id: i64, cwd: &str) -> String {
+        let params = json!({ "cwd": cwd, "mcpServers": [] });
+        let (response, _) = self.request(req_id, "session/new", params).await;
+        response["result"]["sessionId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{response}"))
+            .to_string()
+    }
+
+    /// Send `session/new` with the id `req_id` in `cwd`, and get the error of
     /// the response. Panics if the response has no error.
     /// Returns:
     ///   The error code and message.
-    pub async fn session_error(&mut self, id: i64, cwd: &str) -> (i64, String) {
+    pub async fn session_error(&mut self, req_id: i64, cwd: &str) -> (i64, String) {
         let params = json!({ "cwd": cwd, "mcpServers": [] });
-        let (response, _) = self.request(id, "session/new", params).await;
+        let (response, _) = self.request(req_id, "session/new", params).await;
         let error = &response["error"];
         let code = error["code"]
             .as_i64()
             .unwrap_or_else(|| panic!("{response}"));
         (code, error["message"].as_str().unwrap().to_string())
+    }
+
+    /// Check if the proxy still runs.
+    pub fn proxy_runs(&self) -> bool {
+        !self.proxy.is_finished()
     }
 
     /// Close the input of the proxy, as an editor that exits.
@@ -549,5 +903,22 @@ impl TestClient {
 pub fn seen(msgs: &[Value]) -> Vec<Value> {
     msgs.iter()
         .filter_map(|m| m.pointer("/params/seen").cloned())
+        .collect()
+}
+
+/// Get the messages that the fake agent in `sandbox` got, from the client
+/// messages `msgs`.
+pub fn seen_from(msgs: &[Value], sandbox: &str) -> Vec<Value> {
+    msgs.iter()
+        .filter(|m| m.pointer("/params/from").and_then(Value::as_str) == Some(sandbox))
+        .filter_map(|m| m.pointer("/params/seen").cloned())
+        .collect()
+}
+
+/// Get the ids of the client requests in `seen` messages, in order.
+pub fn request_ids(seen: &[Value]) -> Vec<Value> {
+    seen.iter()
+        .filter(|m| m.get("method").is_some() && m["id"].is_i64())
+        .map(|m| m["id"].clone())
         .collect()
 }

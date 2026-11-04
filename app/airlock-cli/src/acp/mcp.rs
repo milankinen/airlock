@@ -11,7 +11,8 @@
 //! The servers of one session make a set with a random key. The key is
 //! part of the sandbox addresses, thus the sessions of all proxies stay
 //! apart. A set ends when the editor closes the session, loads it again,
-//! or when the session request fails. All sets end with the proxy.
+//! or when the session request fails. All sets of an agent end with the
+//! agent.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -23,7 +24,7 @@ use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use super::filter;
+use super::rpc;
 use crate::mcp::{HostStopper, McpHostImpl, RemoteKind, RemoteSpec, ServerSpec, Transport};
 use crate::messages;
 use crate::sandbox::McpRegistrar;
@@ -138,7 +139,7 @@ enum Pending {
     },
 }
 
-/// Server sets of the ACP sessions of one proxy.
+/// Server sets of the ACP sessions of one agent.
 #[derive(Default)]
 pub(super) struct Registry {
     /// Key of each known ACP session.
@@ -173,7 +174,7 @@ impl Registry {
         let known = session.as_ref().and_then(|s| self.sessions.get(s)).cloned();
         let key = match known {
             Some(key) => key,
-            None => new_key().map_err(|e| (filter::INTERNAL_ERROR, format!("{e:#}")))?,
+            None => new_key().map_err(|e| (rpc::INTERNAL_ERROR, format!("{e:#}")))?,
         };
         // A load or resume of a known session keeps its addresses. The old
         // set goes first: the new set uses the same addresses.
@@ -237,7 +238,7 @@ impl Registry {
     /// Remember the session request `id` until its response. A client
     /// should not use an id two times. If it does, the last request wins.
     fn track(&mut self, id: &Value, pending: Pending) {
-        if self.pending.insert(id_text(id), pending).is_some() {
+        if self.pending.insert(rpc::key(id), pending).is_some() {
             tracing::warn!(id = %id, "two session requests with the same id");
         }
     }
@@ -264,7 +265,7 @@ impl Registry {
     /// Handle an agent response: map a new session to its key, or release
     /// the set of a failed or closed session.
     pub(super) fn on_response(&mut self, id: &Value, msg: &Value) {
-        let Some(pending) = self.pending.remove(&id_text(id)) else {
+        let Some(pending) = self.pending.remove(&rpc::key(id)) else {
             return;
         };
         let ok = msg.get("error").is_none();
@@ -657,9 +658,4 @@ fn rewrite(mut msg: Value, slots: Vec<Slot>, key: &str, set: &ServerSet) -> Valu
 /// Make a new random session key: 16 hex characters.
 fn new_key() -> anyhow::Result<String> {
     Ok(hex::encode(crate::services::store::random_bytes::<8>()?))
-}
-
-/// The JSON text of a request id. A response has the same id value.
-pub(super) fn id_text(id: &Value) -> String {
-    id.to_string()
 }

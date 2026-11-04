@@ -23,7 +23,6 @@ pub(super) const FEATURES: &[&str] = &[
     "sessionCapabilities.additionalDirectories",
     "sessionCapabilities.systemPrompt",
     "sessionCapabilities.subagents",
-    "providers",
     "_meta.authStatus",
     "steering",
     "air:goal",

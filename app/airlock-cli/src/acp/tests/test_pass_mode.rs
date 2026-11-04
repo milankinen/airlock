@@ -2,7 +2,7 @@
 
 use serde_json::json;
 
-use crate::test_cfg::acp::{LocalStarter, TestClient, seen, test_config};
+use crate::test_cfg::acp::{LocalProcessLauncher, TestClient, seen, test_config};
 use crate::test_cfg::block_on_local;
 
 /// Test that with `--pass-client-capabilities` the agent gets all client
@@ -23,8 +23,8 @@ fn pass_mode_keeps_client_features_and_agent_requests() {
     ]
     .join("\n");
     block_on_local(async {
-        let starter = LocalStarter::new(&[("AGENT_SAY", &say)]);
-        let mut client = TestClient::start(starter, test_config(false));
+        let launcher = LocalProcessLauncher::new(&[("AGENT_SAY", &say)]);
+        let mut client = TestClient::start(launcher, test_config(false));
 
         let caps = json!({ "fs": { "readTextFile": true }, "terminal": true });
         let params =

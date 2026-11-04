@@ -3,7 +3,7 @@
 
 use serde_json::json;
 
-use crate::test_cfg::acp::{LocalStarter, TestClient, seen, test_config};
+use crate::test_cfg::acp::{LocalProcessLauncher, TestClient, seen, test_config};
 use crate::test_cfg::block_on_local;
 
 /// Test that the proxy answers the handshake before the agent runs, and
@@ -20,12 +20,14 @@ use crate::test_cfg::block_on_local;
 ///      the MCP bridge is off
 ///   5. Send `initialize` again and check that the proxy answers it and
 ///      the agent does not get it
+///   6. Send a prompt to the session and check that the same agent gets
+///      it
 #[test]
 fn first_session_starts_agent_with_filtered_handshake() {
     block_on_local(async {
-        let starter = LocalStarter::new(&[]);
-        let starts = starter.starts.clone();
-        let mut client = TestClient::start(starter, test_config(true));
+        let launcher = LocalProcessLauncher::new(&[]);
+        let launches = launcher.launches.clone();
+        let mut client = TestClient::start(launcher, test_config(true));
 
         let caps = json!({
             "fs": { "readTextFile": true, "writeTextFile": true },
@@ -39,7 +41,7 @@ fn first_session_starts_agent_with_filtered_handshake() {
         assert_eq!(result["protocolVersion"], 1);
         assert!(result["agentCapabilities"].get("mcpCapabilities").is_none());
         assert_eq!(result["agentInfo"]["title"], "fake-agent (airlock)");
-        assert_eq!(starts.get(), 0);
+        assert_eq!(launches.get(), 0);
 
         let servers = json!([
             { "name": "local", "command": "tool", "args": [], "env": [] },
@@ -47,8 +49,11 @@ fn first_session_starts_agent_with_filtered_handshake() {
         ]);
         let params = json!({ "cwd": "/projects/a/sub", "mcpServers": servers });
         let (response, others) = client.request(2, "session/new", params).await;
-        assert_eq!(response["result"], json!({}));
-        assert_eq!(starts.get(), 1);
+        let sid = response["result"]["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(launches.get(), 1);
 
         let got = seen(&others);
         assert_eq!(got.len(), 2, "{got:?}");
@@ -63,68 +68,69 @@ fn first_session_starts_agent_with_filtered_handshake() {
 
         let (response, _) = client.request(3, "initialize", json!({})).await;
         assert_eq!(response["result"]["agentInfo"]["name"], "airlock");
-        let prompt = json!({ "sessionId": "s", "prompt": [] });
-        let (_, others) = client.request(4, "session/prompt", prompt).await;
+        let (_, others) = client.prompt(4, &sid).await;
         let got = seen(&others);
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0]["method"], "session/prompt");
-        assert_eq!(starts.get(), 1);
+        assert_eq!(launches.get(), 1);
     });
 }
 
 /// Test that a request before a session gets an error and starts no
 /// agent. The agent can start only when the session dir is known.
 ///   1. Send a session request before `initialize` and check the error
-///   2. Send `initialize`, then a prompt, and check the error
+///   2. Send `initialize`, then a prompt to an unknown session, and check
+///      the error
 ///   3. Check that no agent started
 #[test]
 fn request_before_session_is_refused() {
     block_on_local(async {
-        let starter = LocalStarter::new(&[]);
-        let starts = starter.starts.clone();
-        let mut client = TestClient::start(starter, test_config(true));
+        let launcher = LocalProcessLauncher::new(&[]);
+        let launches = launcher.launches.clone();
+        let mut client = TestClient::start(launcher, test_config(true));
 
         let params = json!({ "cwd": "/projects/a", "mcpServers": [] });
         let (response, _) = client.request(1, "session/new", params).await;
         assert_eq!(response["error"]["code"], -32600);
 
         client.initialize(json!({})).await;
-        let prompt = json!({ "sessionId": "s", "prompt": [] });
-        let (response, _) = client.request(2, "session/prompt", prompt).await;
-        assert_eq!(response["error"]["code"], -32600);
-        assert_eq!(starts.get(), 0);
+        let (response, _) = client.prompt(2, "s").await;
+        assert_eq!(response["error"]["code"], -32602);
+        assert_eq!(launches.get(), 0);
         assert_eq!(client.exit_code().await, 0);
     });
 }
 
 /// Test that an agent response with the handshake id after the handshake
-/// goes to the client as any other response. Only the first reply
-/// completes the handshake. A later one must not change the agent state.
+/// is handled as any other response. Only the first reply completes the
+/// handshake. A later one must not change the agent state.
 ///   1. Use an agent that sends a second response with the handshake id
 ///      after the handshake
-///   2. Start a session and check that the client got that response
+///   2. Start a session and check that the client did not get that
+///      response: the client sent no request with that id
 ///   3. Send a prompt and check that the same agent answers it
 #[test]
 fn agent_response_with_handshake_id_after_handshake_goes_to_client() {
     let say = r#"{"jsonrpc":"2.0","id":"airlock-acp-initialize","result":{"again":true}}"#;
     block_on_local(async {
-        let starter = LocalStarter::new(&[("AGENT_SAY", say)]);
-        let starts = starter.starts.clone();
-        let mut client = TestClient::start(starter, test_config(true));
+        let launcher = LocalProcessLauncher::new(&[("AGENT_SAY", say)]);
+        let launches = launcher.launches.clone();
+        let mut client = TestClient::start(launcher, test_config(true));
         client.initialize(json!({})).await;
         let params = json!({ "cwd": "/projects/a", "mcpServers": [] });
         let (response, others) = client.request(2, "session/new", params).await;
-        assert!(response.get("result").is_some(), "{response}");
+        let sid = response["result"]["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
         let again: Vec<_> = others
             .iter()
             .filter(|m| m["id"] == "airlock-acp-initialize")
             .collect();
-        assert_eq!(again.len(), 1, "{others:?}");
-        assert_eq!(again[0]["result"], json!({ "again": true }));
+        assert!(again.is_empty(), "{others:?}");
 
-        let prompt = json!({ "sessionId": "s", "prompt": [] });
-        let (response, _) = client.request(3, "session/prompt", prompt).await;
+        let (response, _) = client.prompt(3, &sid).await;
         assert!(response.get("result").is_some(), "{response}");
-        assert_eq!(starts.get(), 1);
+        assert_eq!(launches.get(), 1);
     });
 }

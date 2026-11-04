@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 
-use crate::test_cfg::acp::{LocalStarter, TestClient, seen, test_config};
+use crate::test_cfg::acp::{LocalProcessLauncher, TestClient, seen, test_config};
 use crate::test_cfg::block_on_local;
 
 /// Client features of a JetBrains IDE, with host features, a hostile AIR
@@ -42,7 +42,7 @@ fn idea_caps() -> Value {
 /// Returns:
 ///   The client features that the agent got.
 async fn agent_caps(restrict: bool, caps: Value) -> Value {
-    let mut client = TestClient::start(LocalStarter::new(&[]), test_config(restrict));
+    let mut client = TestClient::start(LocalProcessLauncher::new(&[]), test_config(restrict));
     client.initialize(caps).await;
     let params = json!({ "cwd": "/projects/a", "mcpServers": [] });
     let (_, others) = client.request(2, "session/new", params).await;

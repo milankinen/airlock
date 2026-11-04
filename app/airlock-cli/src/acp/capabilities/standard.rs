@@ -7,7 +7,7 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::acp::filter::{INVALID_PARAMS, PROTOCOL_VERSION};
+use crate::acp::rpc::{INVALID_PARAMS, PROTOCOL_VERSION};
 use crate::messages;
 
 /// Features that are `true` in the agent features of the reply.
@@ -28,8 +28,6 @@ const OBJECTS: &[&str] = &[
     "sessionCapabilities.additionalDirectories",
     "sessionCapabilities.systemPrompt",
     "sessionCapabilities.subagents",
-    "auth.logout",
-    "providers",
     "_meta.authStatus",
 ];
 
@@ -189,8 +187,6 @@ pub(super) fn required(method: &str) -> Option<&'static str> {
         "session/close" => "sessionCapabilities.close",
         "session/delete" => "sessionCapabilities.delete",
         "session/fork" => "sessionCapabilities.fork",
-        "logout" => "auth.logout",
-        m if m.starts_with("providers/") => "providers",
         _ => return None,
     })
 }

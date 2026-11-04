@@ -119,6 +119,21 @@ impl Sandbox {
         local_config_dir(&self.dir)
     }
 
+    /// Get the project dir in the guest: the guest cwd of the last
+    /// `airlock start`.
+    /// Returns:
+    ///   The guest dir, or error if the registered path fails the path
+    ///   check.
+    // A sandbox of an older airlock has no guest cwd record and uses the
+    // host path.
+    pub fn guest_root(&self) -> anyhow::Result<String> {
+        let project = self.project()?;
+        Ok(read_run_meta(&self.dir)
+            .guest_cwd
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| project.to_string()))
+    }
+
     /// Get the guest dir of the host dir `host`.
     /// Returns:
     ///   For a dir in the project, the same dir below the project dir of
@@ -127,16 +142,11 @@ impl Sandbox {
     // The project mount of the guest is at the guest cwd of `airlock
     // start`, which can differ from the host path (`--sandbox-cwd`). A dir
     // out of the project, for example a git worktree of the project, has
-    // no project mount. A user mount at the same path can have it. A
-    // sandbox of an older airlock has no guest cwd record and uses the
-    // host path.
+    // no project mount. A user mount at the same path can have it.
     pub fn guest_dir(&self, host: &VerifiedPath) -> anyhow::Result<String> {
         let project = self.project()?;
         let host = host.reverify()?;
-        let root = read_run_meta(&self.dir)
-            .guest_cwd
-            .filter(|p| !p.is_empty())
-            .unwrap_or_else(|| project.to_string());
+        let root = self.guest_root()?;
         Ok(match host.relative_to(project) {
             Some(rel) if rel.is_empty() => root,
             Some(rel) => format!("{}/{rel}", root.trim_end_matches('/')),

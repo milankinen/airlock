@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use crate::test_cfg::acp::{FAKE_AGENT, LocalStarter, TestClient, test_config};
+use crate::test_cfg::acp::{FAKE_AGENT, LocalProcessLauncher, TestClient, test_config};
 use crate::test_cfg::block_on_local;
 
 /// Test that the proxy stops an agent that writes a line over the limit,
@@ -13,28 +13,27 @@ use crate::test_cfg::block_on_local;
 ///   1. Use an agent that writes a long line before the handshake
 ///   2. Check that the session fails with the line limit error
 ///   3. Use an agent that writes a line without end after the handshake
-///   4. Check that the proxy stops with the kill exit code, also when the
-///      client stays open
+///   4. Check that the session request gets an error, and that the proxy
+///      gives the kill exit code at the client end
 #[test]
 fn agent_output_line_over_limit_stops_agent() {
     let long = "x".repeat(70 * 1024);
     block_on_local(async {
         for restrict in [true, false] {
-            let starter = LocalStarter::new(&[("AGENT_PRE", &long)]);
-            let mut client = TestClient::start(starter, test_config(restrict));
+            let launcher = LocalProcessLauncher::new(&[("AGENT_PRE", &long)]);
+            let mut client = TestClient::start(launcher, test_config(restrict));
             client.initialize(json!({})).await;
             let (code, message) = client.session_error(2, "/projects/a").await;
             assert_eq!(code, -32603);
             assert!(message.contains("longer than 65536 bytes"), "{message}");
 
-            let starter = LocalStarter::new(&[("AGENT_FLOOD", "1")]);
-            let mut client = TestClient::start(starter, test_config(restrict));
+            let launcher = LocalProcessLauncher::new(&[("AGENT_FLOOD", "1")]);
+            let mut client = TestClient::start(launcher, test_config(restrict));
             client.initialize(json!({})).await;
             let params = json!({ "cwd": "/projects/a", "mcpServers": [] });
-            let msg =
-                json!({ "jsonrpc": "2.0", "id": 2, "method": "session/new", "params": params });
-            client.send(&msg).await;
-            assert_eq!(client.proxy_end().await, 128 + libc::SIGKILL);
+            let (response, _) = client.request(2, "session/new", params).await;
+            assert_eq!(response["error"]["code"], -32603, "{response}");
+            assert_eq!(client.exit_code().await, 128 + libc::SIGKILL);
         }
     });
 }
@@ -61,7 +60,7 @@ printf '\"}}}}\\n'
     config.argv = vec!["sh".into(), "-c".into(), script];
     config.max_line_bytes = 16 * 1024 * 1024;
     block_on_local(async {
-        let mut client = TestClient::start(LocalStarter::new(&[]), config);
+        let mut client = TestClient::start(LocalProcessLauncher::new(&[]), config);
         client.initialize(json!({})).await;
         let started = Instant::now();
         let params = json!({ "cwd": "/projects/a", "mcpServers": [] });

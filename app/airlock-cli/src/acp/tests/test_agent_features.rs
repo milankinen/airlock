@@ -3,7 +3,7 @@
 use serde_json::{Value, json};
 
 use crate::acp::capabilities;
-use crate::test_cfg::acp::{LocalStarter, TestClient, test_config};
+use crate::test_cfg::acp::{LocalProcessLauncher, TestClient, test_config};
 use crate::test_cfg::block_on_local;
 
 /// Client features with a JetBrains AIR part.
@@ -17,11 +17,11 @@ fn air_client(names: &[&str]) -> Value {
 /// Returns:
 ///   The `initialize` result of the proxy.
 async fn reply(features: Vec<String>, caps: Value) -> Value {
-    let config = crate::acp::ProxyConfig {
+    let config = crate::acp::Config {
         agent_capabilities: features,
         ..test_config(true)
     };
-    let mut client = TestClient::start(LocalStarter::new(&[]), config);
+    let mut client = TestClient::start(LocalProcessLauncher::new(&[]), config);
     client.initialize(caps).await
 }
 

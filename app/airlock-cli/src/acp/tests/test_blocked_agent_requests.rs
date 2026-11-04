@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
-use crate::test_cfg::acp::{LocalStarter, TestClient, seen, test_config};
+use crate::test_cfg::acp::{LocalProcessLauncher, TestClient, seen, test_config};
 use crate::test_cfg::block_on_local;
 
 /// Test that in the default mode the client gets only the allowed agent
@@ -42,13 +42,16 @@ fn agent_messages_out_of_allowlist_never_reach_client() {
     ]
     .join("\n");
     block_on_local(async {
-        let starter = LocalStarter::new(&[("AGENT_SAY", &say)]);
-        let mut client = TestClient::start(starter, test_config(true));
+        let launcher = LocalProcessLauncher::new(&[("AGENT_SAY", &say)]);
+        let mut client = TestClient::start(launcher, test_config(true));
         client.initialize(json!({})).await;
         let params = json!({ "cwd": "/projects/a", "mcpServers": [] });
-        let (_, mut others) = client.request(2, "session/new", params).await;
-        let prompt = json!({ "sessionId": "s", "prompt": [] });
-        let (_, more) = client.request(3, "session/prompt", prompt).await;
+        let (response, mut others) = client.request(2, "session/new", params).await;
+        let sid = response["result"]["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (_, more) = client.prompt(3, &sid).await;
         others.extend(more);
 
         let methods: Vec<&Value> = others
@@ -56,7 +59,12 @@ fn agent_messages_out_of_allowlist_never_reach_client() {
             .filter(|m| m["method"] != "session/update")
             .map(|m| m.get("id").unwrap_or(&m["method"]))
             .collect();
-        let expected = ["_auth/status_update", "_session/list/changes", "ok1", "ok2"];
+        let expected = [
+            "_auth/status_update",
+            "_session/list/changes",
+            "0-\"ok1\"",
+            "0-\"ok2\"",
+        ];
         assert_eq!(
             methods,
             expected.map(|e| json!(e)).iter().collect::<Vec<_>>()
@@ -103,8 +111,8 @@ fn agent_messages_before_handshake_are_filtered() {
     ]
     .join("\n");
     block_on_local(async {
-        let starter = LocalStarter::new(&[("AGENT_PRE", &pre)]);
-        let mut client = TestClient::start(starter, test_config(true));
+        let launcher = LocalProcessLauncher::new(&[("AGENT_PRE", &pre)]);
+        let mut client = TestClient::start(launcher, test_config(true));
         client.initialize(json!({})).await;
         let params = json!({ "cwd": "/projects/a", "mcpServers": [] });
         let (response, others) = client.request(2, "session/new", params).await;
@@ -115,7 +123,7 @@ fn agent_messages_before_handshake_are_filtered() {
             .filter(|m| m["method"] != "session/update")
             .map(|m| &m["id"])
             .collect();
-        assert_eq!(ids, [&json!("ok1")]);
+        assert_eq!(ids, [&json!("0-\"ok1\"")]);
         let errors: Vec<(Value, Value)> = seen(&others)
             .into_iter()
             .filter(|m| m.get("error").is_some())

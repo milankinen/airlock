@@ -4,26 +4,34 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use crate::test_cfg::acp::{LocalStarter, TestClient, test_config};
+use crate::test_cfg::acp::{LocalProcessLauncher, TestClient, test_config};
 use crate::test_cfg::block_on_local;
 
-/// Test that the proxy stops with the exit code of the agent when the
-/// agent exits, and that the last agent message without a newline gets to
-/// the client. The editor sees the agent exit as the proxy exit.
+/// Test that an agent exit does not stop the proxy, that the last agent
+/// message without a newline gets to the client, and that the proxy gives
+/// the exit code of the agent at the end. The editor can use the proxy for
+/// other sessions after one agent exits.
 ///   1. Start a session
 ///   2. Make the agent write a message without a newline and exit with
 ///      code 7, and keep the client open
 ///   3. Check that the client gets the message
-///   4. Check that the proxy stops with code 7
+///   4. Check that the proxy still answers, and that it stops with code 7
+///      at the client end
 #[test]
 fn agent_exit_code_is_proxy_exit_code() {
     block_on_local(async {
-        let mut client =
-            TestClient::session(LocalStarter::new(&[]), test_config(true), "/projects/a").await;
+        let mut client = TestClient::session(
+            LocalProcessLauncher::new(&[]),
+            test_config(true),
+            "/projects/a",
+        )
+        .await;
         client
-            .send(&json!({ "jsonrpc": "2.0", "method": "test/exit" }))
+            .send_in_session(json!({ "jsonrpc": "2.0", "method": "test/exit", "params": {} }))
             .await;
         while client.recv().await.pointer("/params/last").is_none() {}
+        let (response, _) = client.request(3, "session/list", json!({})).await;
+        assert!(response.get("result").is_some(), "{response}");
         assert_eq!(client.exit_code().await, 7);
     });
 }
@@ -40,7 +48,7 @@ fn agent_exit_code_is_proxy_exit_code() {
 fn client_end_closes_agent_input() {
     block_on_local(async {
         let mut client = TestClient::session(
-            LocalStarter::new(&[("AGENT_EOF", "5")]),
+            LocalProcessLauncher::new(&[("AGENT_EOF", "5")]),
             test_config(true),
             "/projects/a",
         )
@@ -62,7 +70,7 @@ fn client_end_closes_agent_input() {
 fn agent_that_ignores_client_end_is_killed() {
     block_on_local(async {
         let client = TestClient::session(
-            LocalStarter::new(&[("AGENT_EOF", "ignore")]),
+            LocalProcessLauncher::new(&[("AGENT_EOF", "ignore")]),
             test_config(true),
             "/projects/a",
         )

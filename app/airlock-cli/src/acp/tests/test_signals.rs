@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use crate::test_cfg::acp::{LocalStarter, TestClient, signal_sender, test_config};
+use crate::test_cfg::acp::{LocalProcessLauncher, TestClient, signal_sender, test_config};
 use crate::test_cfg::block_on_local;
 
 /// Test that a signal during the agent start stops the agent and the
@@ -17,14 +17,14 @@ use crate::test_cfg::block_on_local;
 fn signal_during_start_stops_proxy() {
     block_on_local(async {
         let signals = signal_sender();
-        let starter = LocalStarter::new(&[("AGENT_NO_INIT", "1")]);
-        let starts = starter.starts.clone();
-        let mut client = TestClient::start(starter, test_config(true));
+        let launcher = LocalProcessLauncher::new(&[("AGENT_NO_INIT", "1")]);
+        let launches = launcher.launches.clone();
+        let mut client = TestClient::start(launcher, test_config(true));
         client.initialize(json!({})).await;
         let params = json!({ "cwd": "/projects/a", "mcpServers": [] });
         let msg = json!({ "jsonrpc": "2.0", "id": 2, "method": "session/new", "params": params });
         client.send(&msg).await;
-        while starts.get() == 0 {
+        while launches.get() == 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let started = Instant::now();
@@ -34,19 +34,22 @@ fn signal_during_start_stops_proxy() {
     });
 }
 
-/// Test that the agent gets the signals after the handshake. The agent
-/// then decides what to do.
-///   1. Start a session
-///   2. Send `SIGUSR1`, which stops the fake agent
-///   3. Check that the proxy stops with the exit code of the agent
+/// Test that a signal after the handshake stops all agents as the client
+/// end does: their input closes, and they can save their state. The
+/// proxy then stops with the agent exit code.
+///   1. Start sessions in sandboxes `a` and `b` with agents that exit with
+///      code 5 at the end of their input
+///   2. Send `SIGTERM` and keep the client open
+///   3. Check that the proxy stops with code 5
 #[test]
-fn signal_after_handshake_goes_to_agent() {
+fn signal_after_handshake_stops_all_agents() {
     block_on_local(async {
         let signals = signal_sender();
-        let starter = LocalStarter::new(&[]);
-        let client = TestClient::session(starter, test_config(true), "/projects/a").await;
-        signals.send(libc::SIGUSR1).unwrap();
-        assert_eq!(client.proxy_end().await, 128 + libc::SIGUSR1);
+        let launcher = LocalProcessLauncher::new(&[("AGENT_EOF", "5")]);
+        let mut client = TestClient::session(launcher, test_config(true), "/projects/a").await;
+        client.new_session(3, "/projects/b").await;
+        signals.send(libc::SIGTERM).unwrap();
+        assert_eq!(client.proxy_end().await, 5);
     });
 }
 
@@ -61,10 +64,10 @@ fn signal_after_handshake_goes_to_agent() {
 fn signal_during_shutdown_kills_agent() {
     block_on_local(async {
         let signals = signal_sender();
-        let starter = LocalStarter::new(&[("AGENT_EOF", "ignore")]);
+        let launcher = LocalProcessLauncher::new(&[("AGENT_EOF", "ignore")]);
         let mut config = test_config(true);
         config.shutdown_grace = Duration::from_secs(5);
-        let mut client = TestClient::session(starter, config, "/projects/a").await;
+        let mut client = TestClient::session(launcher, config, "/projects/a").await;
         let started = Instant::now();
         client.close();
         // Let the proxy see the client end first. Else it sends the signal

@@ -24,7 +24,7 @@ mod standard;
 
 use serde_json::Value;
 
-use crate::acp::filter::{self, Kind};
+use crate::acp::rpc::{self, Kind};
 use crate::messages;
 
 /// Features of the preset for other agents.
@@ -50,8 +50,9 @@ fn known() -> impl Iterator<Item = String> {
 // The match uses the last name of the command. A launcher such as `npx`
 // gets the preset for other agents.
 //
-// The presets have no logout. A logout in one sandbox revokes the shared
-// sign-in of all sandboxes that use the agent pack.
+// No feature set has logout or model providers, because the proxy refuses
+// these methods. A logout in one sandbox would revoke the shared sign-in of
+// all sandboxes that use the agent pack.
 pub fn preset(argv: &[String]) -> Vec<String> {
     agent_claude::preset(argv)
         .or_else(|| agent_codex::preset(argv))
@@ -236,13 +237,13 @@ pub enum AgentVerdict {
 /// Returns:
 ///   What the proxy does with the message.
 pub fn check_agent_message(msg: &Value) -> AgentVerdict {
-    match filter::kind(msg) {
-        Some(Kind::Response { .. }) => AgentVerdict::Forward,
+    match rpc::kind(msg) {
+        Some(Kind::Response { .. } | Kind::CancelRequest { .. }) => AgentVerdict::Forward,
         Some(Kind::Request { method, .. }) => match standard::check_agent_request(method, msg) {
             Some(Ok(())) => AgentVerdict::Forward,
             Some(Err((code, message))) => AgentVerdict::Refuse { code, message },
             None => AgentVerdict::Refuse {
-                code: filter::METHOD_NOT_FOUND,
+                code: rpc::METHOD_NOT_FOUND,
                 message: messages::acp::blocked_request(method),
             },
         },
@@ -285,7 +286,7 @@ pub fn check_client_request(
         && !present(agent, feature)
     {
         return Err((
-            filter::METHOD_NOT_FOUND,
+            rpc::METHOD_NOT_FOUND,
             messages::acp::unsupported_method(method),
         ));
     }
@@ -301,7 +302,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::acp::filter::{INVALID_PARAMS, METHOD_NOT_FOUND};
+    use crate::acp::rpc::{INVALID_PARAMS, METHOD_NOT_FOUND};
 
     /// Test that the presence test takes `true` and objects, and that the
     /// offered features that the agent does not have are found. Most agent

@@ -2,7 +2,7 @@
 
 use serde_json::json;
 
-use crate::test_cfg::acp::{LocalStarter, TestClient, test_config};
+use crate::test_cfg::acp::{LocalProcessLauncher, TestClient, test_config};
 use crate::test_cfg::block_on_local;
 
 /// Test that the client gets a login hint when the agent needs a login.
@@ -16,8 +16,8 @@ use crate::test_cfg::block_on_local;
 fn auth_required_error_gets_login_hint() {
     block_on_local(async {
         let error = json!({ "code": -32000, "message": "Authentication required" }).to_string();
-        let starter = LocalStarter::new(&[("AGENT_ERROR", &error)]);
-        let mut client = TestClient::start(starter, test_config(true));
+        let launcher = LocalProcessLauncher::new(&[("AGENT_ERROR", &error)]);
+        let mut client = TestClient::start(launcher, test_config(true));
         client.initialize(json!({})).await;
         let params = json!({ "cwd": "/projects/a", "mcpServers": [] });
         let (response, _) = client.request(2, "session/new", params).await;

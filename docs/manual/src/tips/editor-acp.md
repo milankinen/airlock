@@ -18,9 +18,9 @@ codex = { version = "1", args = { acp = true } }
 
 `airlock acp <command>` starts a proxy that lets the editor talk to the
 agent over the ACP protocol. When the editor starts or loads a session,
-the proxy connects to the sandbox of the session directory. If that
-sandbox is running, the proxy attaches to it. Otherwise, it starts the
-sandbox.
+or lists the sessions of a directory, the proxy connects to the sandbox
+of that directory. If that sandbox is running, the proxy attaches to it.
+Otherwise, it starts the sandbox.
 
 The sandbox must first be created with `airlock start`. ACP sessions use
 the config of that sandbox, and a sandbox started by `airlock acp` never
@@ -55,8 +55,41 @@ picks up config changes.
 
 3. Select the agent in the editor.
 
-One `airlock acp` process serves one sandbox. It refuses sessions in
-other sandboxes.
+## Many projects
+
+An editor can use one `airlock acp` process for many projects.
+
+* The first session in a sandbox starts one agent process there. All
+  sessions in that sandbox share the process.
+* Each session is separate. A session gets only its own messages. The
+  agent request IDs are unique for the editor.
+* When the last session in a sandbox ends, the agent stops.
+* The agent process keeps its sandbox running. When the agent stops, the
+  sandbox stops if no other airlock command uses it.
+* A `session/close` response ends the session. A load or resume of an
+  open session stops the old session first.
+* When an agent exits, its sessions end. Open requests get an error. A
+  session gets a notice, or an agent message if the editor shows no
+  notices.
+* A new session, or a session load, in that project starts the agent
+  again.
+* The proxy runs until the editor closes it.
+* A request that needs a session but has none gets "not supported".
+* A signal stops all agents and the proxy waits for them. A second signal
+  kills them. The exit code is the first exit code of an agent that is
+  not 0.
+
+## Session list and delete
+
+* A `session/list` with a directory runs in the sandbox of that
+  directory. If no agent runs there, airlock starts one for the list
+  and stops it after the list. If the sandbox does not run, airlock
+  starts it for the list too. The session paths in the rows are host
+  paths.
+* A `session/list` without a directory gives an empty list.
+* A request for a session that a list named, for example `session/delete`,
+  runs the same way in the directory of that list.
+* `authenticate`, `logout` and `providers/*` get "not supported".
 
 ## Restrictions
 
@@ -67,13 +100,19 @@ By default, these editor features work:
 * terminal output (the editor only shows it)
 * the read-only features of JetBrains AIR
 
-The proxy blocks these features, because they act on the host:
+The proxy blocks these editor features, because they act on the host:
 
-* host commands and host files
-* editor login features and URL prompts
-* plan files and file change reports
+* host commands (`terminal`) and host files (`fs`)
+* editor login (`auth`, `terminal-auth`) and URL prompts
+  (`elicitation.url`)
+* plan files (`planFile`) and file change reports
+  (`agentFileChangeReport`)
 * MCP servers in the editor
 * unknown features and methods
+
+The proxy lets through only the names of JetBrains AIR features that are
+safe. It refuses the other agent requests. It drops the other agent
+notifications.
 
 `--pass-client-capabilities` gives the agent all editor features.
 
@@ -96,7 +135,7 @@ preset from the command name:
 | `claude-agent-acp` | Claude                                        |
 | `codex-acp`        | Codex                                         |
 | `copilot --acp`    | Copilot                                       |
-| Other              | Session load, image and embedded prompt content, steering |
+| Other              | `loadSession`, `promptCapabilities.image`, `promptCapabilities.embeddedContext`, `steering` |
 
 A launcher such as `npx` gets the default preset. For a launcher, use
 `--set-agent-capabilities`.
@@ -111,7 +150,7 @@ is an error, and the message lists the valid names.
 | `promptCapabilities.image`, `.audio`, `.embeddedContext` | Prompt content types         |
 | `sessionCapabilities.list`, `.resume`, `.close`, `.delete`, `.fork` | Session actions |
 | `sessionCapabilities.additionalDirectories`, `.systemPrompt`, `.subagents` | Session options |
-| `auth.logout`, `providers`, `_meta.authStatus`           | Account features. `auth.logout` signs out all sandboxes of the agent pack |
+| `_meta.authStatus`                                       | Login status of the agent    |
 | `steering`                                               | Send a message to a running turn |
 | `air:goal`                                               | AIR goals                    |
 | `air:sessionFailure`, `air:nativeSubagentSessions`, `air:asyncTasks`, `air:customInstructions`, `air:recommendedValue`, `air:diffPatch`, `air:rawInputRendering`, `air:planContentDelta`, `air:backgroundSubagents`, `air:sessionIndex` | JetBrains AIR features |
@@ -124,8 +163,8 @@ Example for a custom agent that starts through `npx`:
 "args": ["acp", "--set-agent-capabilities=loadSession,promptCapabilities.image,sessionCapabilities.list,steering", "npx", "my-acp-agent"]
 ```
 
-The proxy refuses editor requests for features that the real agent does
-not have.
+When the real agent starts, the proxy refuses editor requests for
+features that it does not have.
 
 ## Editor MCP servers
 
@@ -151,8 +190,9 @@ airlock serves them from the host and the agent connects to them through
 
 ## Agent login
 
-The login buttons of the editor do not work. Log in to the agent in the
-sandbox, for example with `airlock exec`. See the
+The login buttons of the editor do not work. The proxy refuses
+`authenticate` and `logout`. Log in to the agent in the sandbox, for
+example with `airlock exec`. See the
 [agent pack](../packs/agents/claude-code.md) documentation.
 
 ## ACP debugging
@@ -169,16 +209,21 @@ editor and start the agent again:
 "args": ["acp", "--log-level", "debug", "claude-agent-acp"]
 ```
 
-* `info` (default): shows sessions, sandboxes, agent start and exit.
-  Use it to find why the agent does not start.
-* `debug`: also shows other methods and refused messages. Use it when
-  an editor feature does not work.
-* `trace`: also shows each full message as `<from> -> <to>: <message>`,
-  for example `client -> agent`. `airlock` is the proxy. Use it to see
-  the full ACP traffic.
+* `info` (default): shows the editor features as sent and after the
+  filter, sessions, sandboxes, agent start and exit. The lines name the
+  sandbox of each agent. Use it to find why an agent does not start or
+  which agent exited.
+* `debug`: also shows the methods of dropped and refused agent messages,
+  and refused editor requests. Use it when an editor feature does not
+  work.
+* `trace`: also shows each full message between airlock and an agent as
+  `<from>: <message>` with the sandbox name. `agent` is a message from
+  the agent. `airlock` is a message from airlock to the agent. Airlock
+  hides the values of MCP server `env` and headers. The log has no
+  messages between the editor and airlock.
 
 airlock cuts the file to its last 1 MiB when it grows.
 
 > [!WARNING]
 > The `trace` level logs prompts and file content. After debugging, set
-> the level back and remove the log.
+> the level back and delete the log.

@@ -2,7 +2,7 @@
 
 use serde_json::json;
 
-use crate::test_cfg::acp::{FakeRegistrar, LocalStarter, TestClient, mcp_config};
+use crate::test_cfg::acp::{FakeRegistrar, LocalProcessLauncher, TestClient, mcp_config};
 use crate::test_cfg::mcp_session::{self, Event};
 use crate::test_cfg::{block_on_local, temp_dir};
 
@@ -31,10 +31,10 @@ fn stdio_server_runs_on_host_in_session_dir() {
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let root = root.to_str().unwrap().to_string();
         let (registrar, mut registrations) = FakeRegistrar::start(&[]);
-        let starter = LocalStarter::new(&[])
+        let launcher = LocalProcessLauncher::new(&[])
             .with_root(&root)
             .with_registrar(registrar);
-        let mut client = TestClient::start(starter, mcp_config(true));
+        let mut client = TestClient::start(launcher, mcp_config(true));
         client.initialize(json!({})).await;
         let server = json!({
             "name": "local",

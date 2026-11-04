@@ -4,26 +4,26 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::test_cfg::acp::{LocalStarter, TestClient, test_config};
+use crate::test_cfg::acp::{LocalProcessLauncher, TestClient, test_config};
 use crate::test_cfg::block_on_local;
 
 /// Test that the proxy stops an agent that does not complete the handshake
-/// in time, and handles the client requests of that time when no agent
-/// runs. The editor must get a reply, not wait without end.
+/// in time. The editor must get a reply, not wait without end.
 ///   1. Use an agent that never replies to the handshake, and a short time
 ///      limit
-///   2. Send `session/new`, and a prompt before the time ends
-///   3. Check the time limit error of the session and the no session error
-///      of the prompt
+///   2. Send `session/new`, and a prompt to an unknown session before the
+///      time ends
+///   3. Check the unknown session error of the prompt and the time limit
+///      error of the session
 ///   4. Check that a new session starts a new agent
 #[test]
 fn handshake_timeout_fails_session_and_handles_queued_requests() {
     block_on_local(async {
-        let starter = LocalStarter::new(&[("AGENT_NO_INIT", "1")]);
-        let starts = starter.starts.clone();
+        let launcher = LocalProcessLauncher::new(&[("AGENT_NO_INIT", "1")]);
+        let launches = launcher.launches.clone();
         let mut config = test_config(true);
         config.handshake_timeout = Duration::from_millis(300);
-        let mut client = TestClient::start(starter, config);
+        let mut client = TestClient::start(launcher, config);
         client.initialize(json!({})).await;
 
         let session = json!({ "cwd": "/projects/a", "mcpServers": [] });
@@ -32,15 +32,15 @@ fn handshake_timeout_fails_session_and_handles_queued_requests() {
         let prompt = json!({ "sessionId": "s", "prompt": [] });
         client.send(&msg(3, "session/prompt", &prompt)).await;
 
+        let (response, _) = client.response(3).await;
+        assert_eq!(response["error"]["code"], -32602);
         let (response, _) = client.response(2).await;
         let message = response["error"]["message"].as_str().unwrap();
         assert!(message.contains("did not complete"), "{message}");
-        let (response, _) = client.response(3).await;
-        assert_eq!(response["error"]["code"], -32600);
 
         client.send(&msg(4, "session/new", &session)).await;
         client.response(4).await;
-        assert_eq!(starts.get(), 2);
+        assert_eq!(launches.get(), 2);
     });
 }
 
@@ -52,8 +52,8 @@ fn handshake_timeout_fails_session_and_handles_queued_requests() {
 fn agent_with_other_protocol_version_fails_session() {
     block_on_local(async {
         let init = json!({ "protocolVersion": 2 }).to_string();
-        let starter = LocalStarter::new(&[("AGENT_INIT", &init)]);
-        let mut client = TestClient::start(starter, test_config(true));
+        let launcher = LocalProcessLauncher::new(&[("AGENT_INIT", &init)]);
+        let mut client = TestClient::start(launcher, test_config(true));
         client.initialize(json!({})).await;
         let (code, message) = client.session_error(2, "/projects/a").await;
         assert_eq!(code, -32603);
@@ -69,7 +69,7 @@ fn agent_exit_before_handshake_fails_session() {
     block_on_local(async {
         let mut config = test_config(true);
         config.argv = vec!["sh".into(), "-c".into(), "exit 3".into()];
-        let mut client = TestClient::start(LocalStarter::new(&[]), config);
+        let mut client = TestClient::start(LocalProcessLauncher::new(&[]), config);
         client.initialize(json!({})).await;
         let (code, message) = client.session_error(2, "/projects/a").await;
         assert_eq!(code, -32603);
@@ -85,8 +85,8 @@ fn agent_exit_before_handshake_fails_session() {
 #[test]
 fn client_end_during_start_stops_proxy() {
     block_on_local(async {
-        let starter = LocalStarter::new(&[("AGENT_NO_INIT", "1")]);
-        let mut client = TestClient::start(starter, test_config(true));
+        let launcher = LocalProcessLauncher::new(&[("AGENT_NO_INIT", "1")]);
+        let mut client = TestClient::start(launcher, test_config(true));
         client.initialize(json!({})).await;
         let session = json!({ "cwd": "/projects/a", "mcpServers": [] });
         let msg = json!({ "jsonrpc": "2.0", "id": 2, "method": "session/new", "params": session });

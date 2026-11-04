@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 
-use crate::test_cfg::acp::{LocalStarter, TestClient, test_config};
+use crate::test_cfg::acp::{LocalProcessLauncher, TestClient, test_config};
 use crate::test_cfg::block_on_local;
 
 /// Session rows of the fake agent, with guest session dirs.
@@ -35,38 +35,40 @@ fn dirs(response: &Value) -> Vec<&str> {
 #[test]
 fn session_list_before_agent_start_is_empty() {
     block_on_local(async {
-        let starter = LocalStarter::new(&[]);
-        let starts = starter.starts.clone();
-        let mut client = TestClient::start(starter, test_config(true));
+        let launcher = LocalProcessLauncher::new(&[]);
+        let launches = launcher.launches.clone();
+        let mut client = TestClient::start(launcher, test_config(true));
         client.initialize(json!({})).await;
         let (response, _) = client.request(1, "session/list", json!({})).await;
         assert_eq!(response["result"], json!({ "sessions": [] }));
-        assert_eq!(starts.get(), 0);
+        assert_eq!(launches.get(), 0);
     });
 }
 
-/// Test that the session dirs in a session list change from guest paths
-/// to host paths, in both modes. The guest project dir is not the host
-/// dir, and the editor shows only the sessions of its dir.
+/// Test that a session list with a session dir runs in a one-shot agent of
+/// that sandbox, and that its session dirs change from guest paths to host
+/// paths by the project dirs, in both modes. The editor lists sessions
+/// before it opens one, and shows only the sessions of its dir.
 ///   1. Use an agent that lists sessions in the guest dir, in a sub dir,
 ///      in a dir with the same prefix, with `..` and in another dir
-///   2. Send `session/list` in the project dir and check that only the
-///      rows in the guest dir change
-///   3. Send a second page in the sub dir and check that the page uses
-///      its own dir
-///   4. Send a list that gets an error, and then a list with the same id
-///      and no dir. Check that the rows of the second list do not change
+///   2. Send `session/list` in the project dir with no open session
+///   3. Check that only the rows in the guest project dir change, and that
+///      one agent launched
+///   4. Send a list that gets an error and check the error
+///   5. Check that the second list launched a new agent, because the
+///      first agent stopped after its list
 #[test]
-fn session_list_dirs_map_to_host_paths() {
+fn session_list_runs_in_one_shot_agent_with_host_paths() {
     let list = rows().to_string();
     for restrict in [true, false] {
         block_on_local(async {
-            let starter = LocalStarter::new(&[("AGENT_LIST", &list)]);
-            let mut client =
-                TestClient::session(starter, test_config(restrict), "/projects/a").await;
+            let launcher = LocalProcessLauncher::new(&[("AGENT_LIST", &list)]);
+            let launches = launcher.launches.clone();
+            let mut client = TestClient::start(launcher, test_config(restrict));
+            client.initialize(json!({})).await;
 
             let params = json!({ "cwd": "/projects/a" });
-            let (response, _) = client.request(3, "session/list", params).await;
+            let (response, _) = client.request(1, "session/list", params).await;
             assert_eq!(
                 dirs(&response),
                 [
@@ -77,25 +79,12 @@ fn session_list_dirs_map_to_host_paths() {
                     "/other"
                 ]
             );
+            assert_eq!(launches.get(), 1);
 
-            let params = json!({ "cwd": "/projects/a/sub", "cursor": "c2" });
-            let (response, _) = client.request(4, "session/list", params).await;
-            assert_eq!(
-                dirs(&response),
-                [
-                    "/work",
-                    "/projects/a/sub",
-                    "/work2",
-                    "/work/../etc",
-                    "/other"
-                ]
-            );
-
-            let params = json!({ "cwd": "/projects/a", "cursor": "bad" });
-            let (response, _) = client.request(5, "session/list", params).await;
-            assert!(response.get("error").is_some(), "{response}");
-            let (response, _) = client.request(5, "session/list", json!({})).await;
-            assert_eq!(response["result"], rows());
+            let params = json!({ "cwd": "/projects/a/sub", "cursor": "bad" });
+            let (failed, _) = client.request(2, "session/list", params).await;
+            assert!(failed.get("error").is_some(), "{failed}");
+            assert_eq!(launches.get(), 2);
         });
     }
 }

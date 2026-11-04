@@ -1,1161 +1,822 @@
-//! Message relay between the client and the agent.
+//! Message routing between the client and the sessions.
 //!
-//! Reads the client messages line by line and answers the handshake before
-//! the agent runs. Starts the agent at the first session request and does
-//! the agent handshake with the client params. Then relays the messages in
-//! both directions and applies the message rules. Stops the agent when the
-//! client closes, and gives the exit code of the agent.
+//! Answers the client handshake itself. Starts one session handle for each
+//! session request, and sends the later messages of a session to its
+//! handle. The handle connects the session to its agent. Gives the agent
+//! requests ids that are unique for the client, and gives each client
+//! answer to its handle with the original id. A handle gets only the
+//! messages of its own sessions. The end of a handle ends only that
+//! handle. A session close stops the handle of the session, and a load of
+//! an open session stops its old handle. The proxy runs until the client
+//! closes or a host signal comes. Then it stops all handles and waits for
+//! them.
 //!
-//! The editor MCP servers of a session request go to the sandbox before
-//! the agent gets the request. In that time, the proxy does not read more
-//! client lines, but still relays the agent output and the signals. The
-//! client lines keep their order.
-//!
-//! The memory use has a limit. The proxy stops an agent that writes a too
-//! long line or does not read its input. A slow client slows the agent.
-//! The agent stderr never stops the proxy. When the host stderr is slow,
-//! the proxy drops the agent stderr.
+//! A session list with a session dir also starts a handle, as a session
+//! request does. A request for a session that a list named and that has no
+//! handle starts a handle in the session dir of the list.
 
-use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
-use std::time::Duration;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use futures::StreamExt;
-use serde_json::Value;
+use futures::future::LocalBoxFuture;
+use futures::stream::FuturesUnordered;
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
-use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
-use super::capabilities::{self, AgentVerdict};
-use super::filter::{self, Kind};
-use super::{AgentProcess, AgentStarter, Control, Location, mcp};
+use super::capabilities;
+use super::rpc::{self, Kind, RequestId, SessionId, key, session_id, to_line};
+use crate::messages;
 use crate::runtime::SignalStream;
-use crate::sandbox::ExitedBeforeReady;
-use crate::{messages, rpc};
 
-/// Settings of the proxy core.
+/// Settings of the router.
 pub struct ProxyConfig {
-    /// Agent command and its arguments.
-    pub argv: Vec<String>,
-    /// Agent command as the user gave it, for messages.
-    pub name: String,
     /// Agent name that the client shows.
     pub title: String,
     /// Version of airlock.
     pub version: String,
     /// Remove the client features that let the agent act on the host.
     pub restrict: bool,
-    /// Bridge the editor MCP servers into the sandbox. If not set, the
-    /// agent gets no editor MCP servers.
+    /// The agents bridge the editor MCP servers into the sandbox.
     pub proxy_mcp_servers: bool,
     /// Agent feature names that the handshake reply offers.
     pub agent_capabilities: Vec<String>,
-    /// Maximum time to register the editor MCP servers of one session
-    /// request.
-    pub mcp_register_timeout: Duration,
-    /// Maximum time from the agent start to the end of the handshake.
-    pub handshake_timeout: Duration,
-    /// Time that the agent has to exit after the client closes, and again
-    /// after the kill.
-    pub shutdown_grace: Duration,
     /// Source of the host signals, or `None` to not watch them. The proxy
-    /// watches them from the first agent start. Before the handshake
-    /// completes, a signal stops the agent and the proxy. After it, the
-    /// agent gets the signals.
+    /// watches them from the first handle start. A signal stops all
+    /// handles and the proxy. A second signal kills the agents.
     pub signals: Option<fn() -> anyhow::Result<SignalStream>>,
-    /// Maximum length of one agent output line.
-    pub max_line_bytes: usize,
 }
 
-/// Maximum number of parts that wait for the client output or the host
-/// stderr. A full client queue stops the proxy until the client reads. A
-/// full stderr queue drops the agent stderr.
+/// Identity of one session handle in the proxy.
+pub type HandleId = u64;
+
+/// Message from a session handle to the proxy.
+pub enum HandleMessage {
+    /// A message for the client.
+    Client {
+        /// The JSON-RPC message.
+        msg: Value,
+        /// The session that the message starts, if it is the OK response
+        /// to the session request of the handle.
+        claim: Option<Claim>,
+    },
+    /// The agent completed its handshake and got its session request. A
+    /// signal then lets the agent save the session.
+    Ready,
+    /// The handle ended. This is the last message of the handle.
+    Ended,
+}
+
+/// Session that a handle starts with its session request.
+pub struct Claim {
+    /// The ACP session id.
+    pub session: String,
+    /// The client asked for this session id (load or resume). The handle
+    /// then gets the session also if another handle has it.
+    pub replace: bool,
+}
+
+/// One session, or one one-shot request, as the proxy sees it.
+pub trait SessionHandle {
+    /// Give the client message `msg` to the agent of the handle.
+    /// Returns:
+    ///   `false` if the handle ended and takes no more messages.
+    fn send(&self, msg: Value) -> bool;
+
+    /// Stop the handle and release its MCP servers. Takes the handle. A
+    /// handle that ended already only gives its exit code.
+    /// Returns:
+    ///   A future of the exit code of the agent, 0 if it did not complete
+    ///   its handshake.
+    fn shutdown(self: Box<Self>) -> LocalBoxFuture<'static, i32>;
+}
+
+/// Fixed settings of all session handles of one proxy run.
+pub struct SessionContext {
+    /// Client `initialize` params after the filter.
+    pub init_params: Value,
+    /// `initialize` result that the proxy gave to the client.
+    pub offered: Value,
+    /// Destination of the handle messages.
+    pub messages: mpsc::Sender<(HandleId, HandleMessage)>,
+    /// Kills the agents at once in their stop.
+    pub kill: CancellationToken,
+}
+
+/// Makes the session factory when the client handshake gives the init
+/// params.
+pub trait SessionFactoryInit {
+    /// Make the factory.
+    /// Args:
+    ///  - `context`: Fixed settings of all handles
+    fn init(self: Box<Self>, context: SessionContext) -> Rc<dyn SessionFactory>;
+}
+
+/// Starts the session handles.
+pub trait SessionFactory {
+    /// Start the handle of one session request. The factory gives the
+    /// handle its identity. A failed start comes later as an error response
+    /// and an end message of the handle.
+    /// Args:
+    ///  - `cwd`: Session dir of the session request on the host
+    ///  - `first`: The session request. The agent gets it after its
+    ///    handshake.
+    ///
+    /// Returns:
+    ///   The identity and the new handle.
+    fn create(&self, cwd: String, first: Value) -> (HandleId, Box<dyn SessionHandle>);
+
+    /// Get the host session dir of a session that a list response of this
+    /// factory named. A delete of the session removes it.
+    /// Returns:
+    ///   The session dir, or `None` if no recent list named the session.
+    fn session_dir(&self, sid: &str) -> Option<String>;
+}
+
+/// Factory of a proxy run.
+enum FactoryState {
+    /// Waits for the client handshake. Has the sender for the handle
+    /// messages.
+    Pending(
+        Box<dyn SessionFactoryInit>,
+        mpsc::Sender<(HandleId, HandleMessage)>,
+    ),
+    /// Made at the client handshake.
+    Ready(Rc<dyn SessionFactory>),
+    /// The proxy stops. No new handle starts.
+    Closed,
+}
+
+/// Maximum number of parts that wait for the client output. A full queue
+/// stops the proxy until the client reads.
 const WRITER_QUEUE: usize = 4;
 
 /// Maximum number of client lines that wait for the proxy. A full queue
 /// stops the read of the client input.
 const READER_QUEUE: usize = 16;
 
-/// Agent start that runs.
-type Launch<'a> = Pin<Box<dyn Future<Output = anyhow::Result<(Location, AgentProcess)>> + 'a>>;
+/// Maximum number of handle messages that wait for the proxy.
+const HANDLE_MESSAGES: usize = 16;
 
-/// Run the proxy between a client and the agent.
+/// Run the proxy between a client and its session handles.
 /// Args:
-///  - `starter`: Starts the agent at the first session request
+///  - `factory`: Makes the factory that starts a handle for each session
+///    request, at the client handshake
 ///  - `config`: Proxy settings
 ///  - `input`: Client messages, one per line
 ///  - `output`: Destination of the messages to the client
-///  - `errors`: Destination of the agent stderr
 ///
 /// Returns:
-///   Exit code of the agent, or 0 if the client closed before an agent
-///   ran.
-pub async fn serve<S, R, W, E>(
-    starter: &S,
+///   The first exit code that is not 0 of the handles, else 0. 128 + the
+///   signal number if a signal came before a handle sent
+///   [`HandleMessage::Ready`].
+pub async fn run<R, W>(
+    factory: Box<dyn SessionFactoryInit>,
     config: &ProxyConfig,
     input: R,
     output: W,
-    errors: E,
-) -> anyhow::Result<i32>
+) -> i32
 where
-    S: AgentStarter,
     R: AsyncBufRead + Unpin + 'static,
     W: AsyncWrite + Unpin + 'static,
-    E: AsyncWrite + Unpin + 'static,
 {
     let (out, out_task) = spawn_writer(output);
-    let (err, mut err_task) = spawn_writer(errors);
-    let mut proxy = Proxy {
-        starter,
+    let (messages, handle_messages) = mpsc::channel(HANDLE_MESSAGES);
+    let proxy = Proxy {
+        factory: RefCell::new(FactoryState::Pending(factory, messages)),
         config,
         out,
-        err,
-        client: spawn_reader(input),
-        init_params: None,
-        phase: Phase::Idle,
-        agent: None,
-        launch: None,
-        deadline: None,
-        signals: None,
-        err_dropped: 0,
-        mcp: mcp::Registry::default(),
-        registration: None,
-        held: None,
-        session_lists: HashMap::new(),
+        kill: CancellationToken::new(),
+        ended: CancellationToken::new(),
+        stopping: RefCell::default(),
+        stopped: Notify::new(),
+        closing: Cell::new(false),
+        handshake: RefCell::default(),
+        started: Cell::new(false),
+        handles: RefCell::default(),
+        sessions: RefCell::default(),
+        former: RefCell::default(),
+        agent_requests: RefCell::default(),
+        client_requests: RefCell::default(),
+        ready: Cell::new(false),
+        failed: Cell::new(None),
     };
-    let code = proxy.run().await;
-    proxy.end_mcp().await;
-    if proxy.err_dropped > 0 {
-        tracing::info!(bytes = proxy.err_dropped, "dropped agent stderr");
-    }
+    let (code, (), ()) = tokio::join!(
+        proxy.to_handles(spawn_reader(input)),
+        proxy.to_client(handle_messages),
+        proxy.reap()
+    );
     // Write all messages before the exit.
     drop(proxy);
     let _ = out_task.await;
-    // A stderr that nobody reads must not stop the exit.
-    if tokio::time::timeout(config.shutdown_grace, &mut err_task)
-        .await
-        .is_err()
-    {
-        tracing::warn!("stderr write did not complete");
-        err_task.abort();
-    }
-    Ok(code)
+    code
 }
 
-/// Sender or receiver of a message, for the log.
-#[derive(Clone, Copy)]
-enum Peer {
-    Client,
-    Agent,
-    Airlock,
-}
-
-impl Peer {
-    /// Name of the peer in the log.
-    fn name(self) -> &'static str {
-        match self {
-            Peer::Client => "client",
-            Peer::Agent => "agent",
-            Peer::Airlock => "airlock",
-        }
-    }
-}
-
-/// Log a message at the trace level, as `<from> -> <to>: <message>`.
-/// The log does not show the env and header values of the editor MCP
-/// servers in client messages.
-fn trace_message(sandbox: &str, from: Peer, to: Peer, line: &[u8]) {
-    if !tracing::enabled!(tracing::Level::TRACE) {
-        return;
-    }
-    let line = line.strip_suffix(b"\n").unwrap_or(line);
-    let hidden = match from {
-        Peer::Client => hide_mcp_secrets(line),
-        Peer::Agent | Peer::Airlock => None,
-    };
-    tracing::trace!(
-        sandbox,
-        "{} -> {}: {}",
-        from.name(),
-        to.name(),
-        String::from_utf8_lossy(hidden.as_deref().unwrap_or(line))
-    );
-}
-
-/// Text that replaces a secret value in the log.
-const HIDDEN: &str = "***";
-
-/// Replace the env and header values of each editor MCP server in the
-/// client message `line` with [`HIDDEN`].
-/// Returns:
-///   The changed line, or `None` if the line has no MCP server list.
-fn hide_mcp_secrets(line: &[u8]) -> Option<Vec<u8>> {
-    let mut msg: Value = serde_json::from_slice(line).ok()?;
-    let servers = msg.pointer_mut("/params/mcpServers")?.as_array_mut()?;
-    for server in servers {
-        for field in ["env", "headers"] {
-            match server.get_mut(field) {
-                Some(Value::Array(items)) => {
-                    for value in items.iter_mut().filter_map(|i| i.get_mut("value")) {
-                        *value = HIDDEN.into();
-                    }
-                }
-                // Not valid ACP, but the values can still be secrets.
-                Some(Value::Object(map)) => {
-                    for value in map.values_mut() {
-                        *value = HIDDEN.into();
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    Some(msg.to_string().into_bytes())
-}
-
-/// Phase of the proxy.
-enum Phase {
-    /// No agent runs.
-    Idle,
-    /// The agent starts, or it runs and the handshake is not complete.
-    Starting {
-        /// Session request that started the agent.
-        request: Vec<u8>,
-        /// Id of the session request.
-        id: Value,
-        /// Client lines that came during the start.
-        queued: Vec<Vec<u8>>,
-    },
-    /// The agent runs after a complete handshake.
-    Running {
-        /// Sandbox of the agent.
-        sandbox: String,
-        /// `initialize` result of the agent.
-        agent_init: Value,
-    },
-}
-
-/// Running agent process and its partial output line.
-struct Agent {
-    process: AgentProcess,
-    /// Stdout bytes after the last complete line. They have no newline.
-    partial: Vec<u8>,
-    /// Sandbox of the agent.
-    sandbox: String,
-    /// The proxy killed the agent for a limit. Its output and input are
-    /// dropped until it exits.
-    stopping: bool,
-}
-
-/// State of one proxy run.
-struct Proxy<'a, S> {
-    starter: &'a S,
+/// State of one proxy run. The client side and the handle side run at the
+/// same time in one task. They never keep a borrow across an await.
+struct Proxy<'a> {
+    factory: RefCell<FactoryState>,
     config: &'a ProxyConfig,
     /// Lines to the client.
     out: mpsc::Sender<Vec<u8>>,
-    /// Agent stderr to the host stderr.
-    err: mpsc::Sender<Vec<u8>>,
-    /// Number of agent stderr bytes that the proxy dropped.
-    err_dropped: u64,
-    /// Lines from the client. Closes at the client end of file.
-    client: mpsc::Receiver<Vec<u8>>,
-    /// Client `initialize` params after the filter.
-    init_params: Option<Value>,
-    phase: Phase,
-    agent: Option<Agent>,
-    /// Agent start that runs.
-    launch: Option<Launch<'a>>,
-    /// End of the time for the agent start and handshake.
-    deadline: Option<Instant>,
-    /// Host signals from the first agent start.
-    signals: Option<SignalStream>,
-    /// Editor MCP servers of the sessions.
-    mcp: mcp::Registry,
-    /// Registration of the editor MCP servers of a session request that
-    /// runs.
-    registration: Option<mcp::Registration>,
-    /// Client lines that the proxy read before a registration started,
-    /// and that come after its session request. They go to the agent after
-    /// the session request.
-    held: Option<Vec<Vec<u8>>>,
-    /// Host and guest session dirs of the `session/list` requests that
-    /// wait for the agent response, by request id.
-    session_lists: HashMap<String, (String, String)>,
+    /// Kills all agents in their stop.
+    kill: CancellationToken,
+    /// All handles ended. The handle side then handles the waiting messages
+    /// and stops.
+    ended: CancellationToken,
+    /// Ends of the handles that stop. They are not in `handles`.
+    stopping: RefCell<FuturesUnordered<LocalBoxFuture<'static, i32>>>,
+    /// Wakes the reaper when a handle starts to stop.
+    stopped: Notify,
+    /// The proxy stops. The reaper ends when no handle is left.
+    closing: Cell<bool>,
+    /// `initialize` result of the first client handshake.
+    handshake: RefCell<Option<Value>>,
+    /// A handle started.
+    started: Cell<bool>,
+    handles: RefCell<HashMap<HandleId, Box<dyn SessionHandle>>>,
+    /// Handle of each ACP session.
+    sessions: RefCell<HashMap<SessionId, HandleId>>,
+    /// ACP sessions of the handles that stop. Their last agent output in
+    /// these sessions still goes to the client.
+    former: RefCell<HashMap<HandleId, HashSet<SessionId>>>,
+    /// Agent requests by their id for the client, with their handle and
+    /// original id.
+    agent_requests: RefCell<HashMap<RequestId, (HandleId, Value)>>,
+    /// Handle of each open client request, by request id. The flag is set
+    /// for a `session/close` request.
+    client_requests: RefCell<HashMap<RequestId, (HandleId, bool)>>,
+    /// A handle sent [`HandleMessage::Ready`].
+    ready: Cell<bool>,
+    /// First exit code that is not 0.
+    failed: Cell<Option<i32>>,
 }
 
-impl<'a, S: AgentStarter> Proxy<'a, S> {
-    /// Relay the messages until the agent exits or the client closes.
+impl Proxy<'_> {
+    /// Handle the client lines until the client closes or a signal comes.
+    /// Then stop all handles.
     /// Returns:
-    ///   The exit code.
-    async fn run(&mut self) -> i32 {
+    ///   The exit code of the proxy.
+    async fn to_handles(&self, mut client: mpsc::Receiver<Vec<u8>>) -> i32 {
+        let mut signals = None;
+        let mut signal_code = None;
         loop {
-            // Each branch borrows a different field. A branch that is not
-            // active waits forever. The branches are not biased: a busy
-            // side must not stop the other side. Each side has one channel,
-            // so the messages of one side keep their order.
             tokio::select! {
-                // A registration does not keep the new client lines. The
-                // full reader queue then stops the read of the client.
-                line = self.client.recv(), if self.registration.is_none() => match line {
-                    Some(line) => self.on_client_line(line).await,
-                    None => return self.on_client_end().await,
-                },
-                started = next_launch(&mut self.launch) => {
-                    self.launch = None;
-                    self.on_launched(started).await;
+                line = client.recv() => {
+                    let Some(line) = line else {
+                        tracing::info!("client closed");
+                        break;
+                    };
+                    self.on_client_line(&line).await;
                 }
-                registered = next_registration(&mut self.registration) => {
-                    self.registration = None;
-                    self.on_registered(registered).await;
-                }
-                event = next_event(&mut self.agent) => {
-                    if let Some(code) = self.on_agent_event(event).await {
-                        return code;
+                signum = next_signal(&mut signals) => {
+                    tracing::info!(signum, "signal: stop the agents");
+                    // Handles without a session have nothing to save.
+                    if !self.ready.get() {
+                        signal_code = Some(128 + signum);
+                        self.kill.cancel();
                     }
+                    break;
                 }
-                () = wait_until(self.deadline) => {
-                    let secs = self.config.handshake_timeout.as_secs();
-                    self.fail_start(&messages::acp::handshake_timeout(secs)).await;
-                }
-                signum = next_signal(&mut self.signals) => {
-                    if let Some(code) = self.on_signal(signum).await {
-                        return code;
-                    }
+            }
+            // Before the first handle start, a signal stops the proxy as
+            // usual.
+            if signals.is_none() && self.started.get() {
+                signals = Some(watch_signals(self.config.signals));
+            }
+        }
+        self.shutdown(&mut signals).await;
+        signal_code.or(self.failed.get()).unwrap_or(0)
+    }
+
+    /// Stop all handles and wait for them, also for the handles that stopped
+    /// before. A signal kills them at once.
+    async fn shutdown(&self, signals: &mut Option<SignalStream>) {
+        *self.factory.borrow_mut() = FactoryState::Closed;
+        let mut handles: Vec<HandleId> = self.handles.borrow().keys().copied().collect();
+        handles.sort_unstable();
+        for hid in handles {
+            self.stop_handle(hid);
+        }
+        self.closing.set(true);
+        self.stopped.notify_one();
+        loop {
+            tokio::select! {
+                () = self.ended.cancelled() => return,
+                signum = next_signal(signals) => {
+                    tracing::info!(signum, "signal: kill the agents");
+                    self.kill.cancel();
                 }
             }
         }
     }
 
-    /// Handle one line from the client.
-    async fn on_client_line(&mut self, line: Vec<u8>) {
-        if let Some(held) = &mut self.held {
-            held.push(line);
+    /// Take the handle `hid` out of the routing and start its stop. Its
+    /// open client requests stay until the handle ends. The agent can still
+    /// answer them.
+    fn stop_handle(&self, hid: HandleId) {
+        let mut owned = HashSet::new();
+        self.sessions.borrow_mut().retain(|sid, owner| {
+            if *owner == hid {
+                owned.insert(sid.clone());
+            }
+            *owner != hid
+        });
+        self.agent_requests
+            .borrow_mut()
+            .retain(|_, (owner, _)| *owner != hid);
+        // The handle ends anyway. Its close response must not stop it again.
+        for (owner, close) in self.client_requests.borrow_mut().values_mut() {
+            if *owner == hid {
+                *close = false;
+            }
+        }
+        let Some(proxy) = self.handles.borrow_mut().remove(&hid) else {
             return;
-        }
-        match &mut self.phase {
-            Phase::Idle => self.on_idle_line(line).await,
-            // The agent gets these lines in order after the handshake.
-            Phase::Starting { queued, .. } => queued.push(line),
-            Phase::Running { .. } => self.on_running_line(line).await,
-        }
+        };
+        tracing::info!(handle = hid, "stop the session handle");
+        self.former.borrow_mut().insert(hid, owned);
+        self.stopping.borrow_mut().push(proxy.shutdown());
+        self.stopped.notify_one();
     }
 
-    /// Handle one client line when no agent runs. Only requests get a
-    /// reply. Notifications and responses have no target yet.
-    async fn on_idle_line(&mut self, line: Vec<u8>) {
-        let Ok(msg) = serde_json::from_slice::<Value>(&line) else {
-            trace_message("-", Peer::Client, Peer::Airlock, &line);
+    /// Wait for the end of each handle that stops, and keep its exit code.
+    /// Ends when the proxy stops and no handle is left.
+    async fn reap(&self) {
+        loop {
+            // A new handle in the set does not wake the set. The notify does.
+            let next = std::future::poll_fn(|cx| self.stopping.borrow_mut().poll_next_unpin(cx));
+            let next = tokio::select! {
+                next = next => next,
+                () = self.stopped.notified() => continue,
+            };
+            match next {
+                Some(code) => {
+                    tracing::info!(code, "session handle ended");
+                    self.record(code);
+                }
+                None if self.closing.get() => break,
+                None => self.stopped.notified().await,
+            }
+        }
+        self.ended.cancel();
+    }
+
+    /// Handle one client line.
+    async fn on_client_line(&self, line: &[u8]) {
+        let Ok(msg) = serde_json::from_slice::<Value>(line) else {
             tracing::debug!("drop client line that is not JSON");
             return;
         };
-        let Some(Kind::Request { id, method }) = filter::kind(&msg) else {
-            trace_message("-", Peer::Client, Peer::Airlock, &line);
-            tracing::debug!("drop client message before the agent start");
-            return;
-        };
-        let id = id.clone();
-        // A session list needs a project dir, and only the agent knows the
-        // sessions. Without a dir, the client gets an empty list. Then it
-        // does not show an error before the first session.
-        if method == "session/list" && msg.pointer("/params/cwd").is_none_or(Value::is_null) {
-            trace_message("-", Peer::Client, Peer::Airlock, &line);
-            self.reply(&id, Ok(serde_json::json!({ "sessions": [] })))
-                .await;
-            return;
+        match rpc::kind(&msg) {
+            Some(Kind::Request { id: req_id, method }) => {
+                let (req_id, method) = (req_id.clone(), method.to_string());
+                self.on_client_request(req_id, &method, msg).await;
+            }
+            Some(Kind::Response { id: req_id }) => {
+                let Some((hid, original)) = self.agent_requests.borrow_mut().remove(&key(req_id))
+                else {
+                    tracing::debug!(id = %req_id, "drop client response without a request");
+                    return;
+                };
+                let mut msg = msg;
+                msg["id"] = original;
+                self.deliver(hid, msg);
+            }
+            Some(Kind::CancelRequest { req_id }) => {
+                // A cancel without a request id has no target.
+                let hid = req_id.and_then(|req_id| {
+                    self.client_requests.borrow().get(&key(req_id)).map(|r| r.0)
+                });
+                if let Some(hid) = hid {
+                    self.deliver(hid, msg);
+                } else {
+                    tracing::debug!("drop client cancel without a target");
+                }
+            }
+            Some(Kind::Notification { method }) => {
+                let hid = session_id(&msg).and_then(|sid| self.sessions.borrow().get(sid).copied());
+                if let Some(hid) = hid {
+                    self.deliver(hid, msg);
+                } else {
+                    tracing::debug!(method, "drop client notification without a target");
+                }
+            }
+            None => tracing::debug!("drop client message that is not JSON-RPC"),
         }
-        if method == "initialize" {
-            trace_message("-", Peer::Client, Peer::Airlock, &line);
-            let client = msg
-                .pointer("/params/clientInfo/name")
-                .and_then(Value::as_str);
-            tracing::info!(client, "initialize");
-            let params = msg.get("params").cloned().unwrap_or(Value::Null);
-            let params = capabilities::prepare_initialize_params(params, self.config.restrict);
-            self.init_params = Some(params);
-            self.reply(&id, Ok(self.initialize_result())).await;
-            return;
-        }
-        let Some(cwd) = msg.pointer("/params/cwd").and_then(Value::as_str) else {
-            trace_message("-", Peer::Client, Peer::Airlock, &line);
-            tracing::debug!(method, "refuse client request before the agent start");
-            let error = (
-                filter::INVALID_REQUEST,
-                messages::acp::NO_SESSION_YET.into(),
-            );
-            self.reply(&id, Err(error)).await;
-            return;
-        };
-        if self.init_params.is_none() {
-            trace_message("-", Peer::Client, Peer::Airlock, &line);
-            let error = (filter::INVALID_REQUEST, messages::acp::NO_HANDSHAKE.into());
-            self.reply(&id, Err(error)).await;
-            return;
-        }
-        if !cwd.starts_with('/') {
-            trace_message("-", Peer::Client, Peer::Airlock, &line);
-            let error = (filter::INVALID_PARAMS, messages::acp::cwd_not_absolute(cwd));
-            self.reply(&id, Err(error)).await;
-            return;
-        }
-        tracing::info!(method, cwd, "start the agent");
-        // The log shows the request when the proxy sends it after the
-        // handshake, or when the proxy refuses it.
-        self.watch_signals();
-        // The start can take long. The proxy handles the client and the
-        // signals in that time.
-        let (starter, config): (&'a S, &'a ProxyConfig) = (self.starter, self.config);
-        let cwd = cwd.to_string();
-        self.launch = Some(Box::pin(
-            async move { starter.start(&cwd, &config.argv).await },
-        ));
-        self.deadline = Some(Instant::now() + config.handshake_timeout);
-        self.phase = Phase::Starting {
-            request: line,
-            id,
-            queued: Vec::new(),
-        };
     }
 
-    /// Handle the end of the agent start: send the agent handshake, or
-    /// fail the session request.
-    async fn on_launched(&mut self, started: anyhow::Result<(Location, AgentProcess)>) {
-        let (location, process) = match started {
-            Ok(started) => started,
-            Err(e) => {
-                let (message, data) = start_failure(&e);
-                self.fail_start_with(&message, data).await;
+    /// Handle one client request: answer it, start a handle for it or
+    /// send it to the handle of its session.
+    async fn on_client_request(&self, req_id: Value, method: &str, msg: Value) {
+        match method {
+            "initialize" => self.handle_initialize(&req_id, &msg).await,
+            "session/new" | "session/fork" => self.handle_session_new(req_id, method, msg).await,
+            "session/load" | "session/resume" => {
+                self.handle_session_reopen(req_id, method, msg).await;
+            }
+            // The handle of the session stops when the agent answers.
+            "session/close" => self.delegate_to_session(req_id, method, msg, true).await,
+            "session/list" => self.handle_session_list(req_id, method, msg).await,
+            "authenticate" | "logout" => self.reply_not_supported(&req_id, method).await,
+            m if m.starts_with("providers/") => self.reply_not_supported(&req_id, method).await,
+            _ => self.delegate_to_session(req_id, method, msg, false).await,
+        }
+    }
+
+    /// Handle `initialize`: keep the first params for the agents and answer
+    /// with the capabilities of the proxy.
+    async fn handle_initialize(&self, req_id: &Value, msg: &Value) {
+        let client = msg
+            .pointer("/params/clientInfo/name")
+            .and_then(Value::as_str);
+        let caps = msg
+            .pointer("/params/clientCapabilities")
+            .cloned()
+            .unwrap_or_default();
+        tracing::info!(client, %caps, "initialize");
+        // The agents do their handshake with the first params. A second
+        // handshake must not change them.
+        let known = self.handshake.borrow().clone();
+        let result = known.unwrap_or_else(|| self.first_handshake(msg));
+        self.reply(req_id, Ok(result)).await;
+    }
+
+    /// Filter the client params of the first `initialize` request `msg` for
+    /// the agents, and make the factory with them.
+    /// Returns:
+    ///   The `initialize` result for the client.
+    fn first_handshake(&self, msg: &Value) -> Value {
+        let params = msg.get("params").cloned().unwrap_or(Value::Null);
+        let params = capabilities::prepare_initialize_params(params, self.config.restrict);
+        let caps = params
+            .get("clientCapabilities")
+            .cloned()
+            .unwrap_or_default();
+        tracing::info!(%caps, "client features for the agents");
+        let result = self.initialize_result(&params);
+        *self.handshake.borrow_mut() = Some(result.clone());
+        self.init_factory(params, result.clone());
+        result
+    }
+
+    /// Make the factory with the init `params` and the `offered` result,
+    /// unless the proxy stops.
+    fn init_factory(&self, params: Value, offered: Value) {
+        let mut state = self.factory.borrow_mut();
+        let FactoryState::Pending(init, messages) =
+            std::mem::replace(&mut *state, FactoryState::Closed)
+        else {
+            return;
+        };
+        *state = FactoryState::Ready(init.init(SessionContext {
+            init_params: params,
+            offered,
+            messages,
+            kill: self.kill.clone(),
+        }));
+    }
+
+    /// Handle `session/new` and `session/fork`: start a handle for the
+    /// session, or refuse the request.
+    async fn handle_session_new(&self, req_id: Value, method: &str, msg: Value) {
+        let cwd = msg.pointer("/params/cwd").and_then(Value::as_str);
+        let cwd = cwd.map(str::to_string);
+        if let Err(error) = self.start_handle(&req_id, cwd, msg) {
+            tracing::info!(method, "refuse session request: {}", error.1);
+            self.reply(&req_id, Err(error)).await;
+        }
+    }
+
+    /// Handle `session/load` and `session/resume`: stop the old handle of
+    /// the session, then start a new handle for it.
+    async fn handle_session_reopen(&self, req_id: Value, method: &str, msg: Value) {
+        let old = session_id(&msg).and_then(|sid| self.sessions.borrow().get(sid).copied());
+        if let Some(old) = old {
+            self.stop_handle(old);
+        }
+        self.handle_session_new(req_id, method, msg).await;
+    }
+
+    /// Handle `session/list`: a handle in the sandbox of the session dir
+    /// answers. Without a session dir, the client gets an empty list and no
+    /// error. The proxy does not know the sandbox then, and an error makes
+    /// the editor show a failure.
+    async fn handle_session_list(&self, req_id: Value, method: &str, msg: Value) {
+        if msg.pointer("/params/cwd").is_some_and(Value::is_string) {
+            self.handle_session_new(req_id, method, msg).await;
+        } else {
+            self.reply(&req_id, Ok(json!({ "sessions": [] }))).await;
+        }
+    }
+
+    /// Refuse the client request `method`. The login and model provider
+    /// methods act on the whole agent, not on one session.
+    async fn reply_not_supported(&self, req_id: &Value, method: &str) {
+        tracing::debug!(
+            method,
+            "refuse client request that the proxy does not support"
+        );
+        let error = (
+            rpc::METHOD_NOT_FOUND,
+            messages::acp::unsupported_client_method(method),
+        );
+        self.reply(req_id, Err(error)).await;
+    }
+
+    /// Send the client request `msg` to the handle of its session. Refuse
+    /// the request if it has no known session.
+    /// Args:
+    ///  - `closes`: The request closes the session
+    async fn delegate_to_session(&self, req_id: Value, method: &str, msg: Value, closes: bool) {
+        let Some(sid) = session_id(&msg) else {
+            tracing::debug!(method, "refuse client request without a session");
+            let error = (
+                rpc::METHOD_NOT_FOUND,
+                messages::acp::no_session_method(method),
+            );
+            self.reply(&req_id, Err(error)).await;
+            return;
+        };
+        let hid = self.sessions.borrow().get(sid).copied();
+        let Some(hid) = hid else {
+            // A listed session can have no handle. A handle in the sandbox
+            // of the list then answers.
+            let dir = match &*self.factory.borrow() {
+                FactoryState::Ready(factory) => factory.session_dir(sid),
+                _ => None,
+            };
+            if let Some(cwd) = dir {
+                if let Err(error) = self.start_handle(&req_id, Some(cwd), msg) {
+                    tracing::info!(method, "refuse client request: {}", error.1);
+                    self.reply(&req_id, Err(error)).await;
+                }
                 return;
             }
-        };
-        // The arguments can hold secrets. Only the trace level logs them.
-        tracing::info!(
-            sandbox = location.sandbox,
-            guest_cwd = location.guest_cwd,
-            cmd = self.config.argv.first(),
-            "agent started"
-        );
-        tracing::trace!(argv = ?self.config.argv, "agent command");
-        self.agent = Some(Agent {
-            process,
-            partial: Vec::new(),
-            sandbox: location.sandbox,
-            stopping: false,
-        });
-        let params = self.init_params.clone().unwrap_or(Value::Null);
-        let init = filter::request(filter::INIT_ID, "initialize", &params);
-        self.send_agent(Peer::Airlock, to_line(&init));
-    }
-
-    /// Watch the host signals, if the config asks for it and the proxy
-    /// does not watch them yet.
-    // The proxy watches the signals only from the first agent start. Before
-    // that, a signal stops the proxy as usual.
-    fn watch_signals(&mut self) {
-        let Some(source) = self.config.signals else {
+            let error = (rpc::INVALID_PARAMS, messages::acp::unknown_session(sid));
+            self.reply(&req_id, Err(error)).await;
             return;
         };
-        if self.signals.is_some() {
-            return;
-        }
-        match source() {
-            Ok(signals) => self.signals = Some(signals),
-            Err(e) => tracing::warn!("no signal watch: {e}"),
+        let entry = (hid, closes);
+        self.client_requests
+            .borrow_mut()
+            .insert(key(&req_id), entry);
+        if !self.deliver(hid, msg) {
+            self.client_requests.borrow_mut().remove(&key(&req_id));
+            let error = (
+                rpc::INTERNAL_ERROR,
+                messages::acp::SESSION_AGENT_EXITED.into(),
+            );
+            self.reply(&req_id, Err(error)).await;
         }
     }
 
-    /// Handle one host signal. After the handshake, send it to the agent.
-    /// Before it, stop the agent and the proxy.
+    /// Start the handle of the client request `msg` with the id `req_id`.
+    /// Args:
+    ///  - `cwd`: Host session dir that selects the sandbox, or `None` if
+    ///    the request has none
+    ///
     /// Returns:
-    ///   The exit code when the proxy must stop.
-    async fn on_signal(&mut self, signum: i32) -> Option<i32> {
-        if matches!(self.phase, Phase::Running { .. }) {
-            tracing::debug!(sandbox = self.sandbox(), signum, "forward signal");
-            self.control(Control::Signal(signum));
-            return None;
+    ///   The error code and message if the request is not valid or the
+    ///   proxy stops.
+    fn start_handle(
+        &self,
+        req_id: &Value,
+        cwd: Option<String>,
+        msg: Value,
+    ) -> Result<(), (i64, String)> {
+        if matches!(*self.factory.borrow(), FactoryState::Pending(..)) {
+            return Err((rpc::INVALID_REQUEST, messages::acp::NO_HANDSHAKE.into()));
         }
-        tracing::info!(
-            sandbox = self.sandbox(),
-            signum,
-            "signal before the handshake"
-        );
-        self.launch = None;
-        if self.agent.is_some() {
-            self.control(Control::Kill);
-            self.wait_exit(self.config.shutdown_grace).await;
-        }
-        Some(128 + signum)
-    }
-
-    /// Handle one client line when the agent runs: check it, map the
-    /// session dir to the guest and send it to the agent.
-    async fn on_running_line(&mut self, line: Vec<u8>) {
-        let Phase::Running {
-            sandbox,
-            agent_init,
-        } = &self.phase
-        else {
-            return;
+        let Some(cwd) = cwd else {
+            return Err((rpc::INVALID_PARAMS, messages::acp::NO_SESSION_DIR.into()));
         };
-        // The client is trusted. Lines that are not one JSON object go to
-        // the agent as they are.
-        let Ok(mut msg) = serde_json::from_slice::<Value>(&line) else {
-            self.send_agent(Peer::Client, line);
-            return;
-        };
-        let Some(Kind::Request { id, method }) = filter::kind(&msg) else {
-            self.send_agent(Peer::Client, line);
-            return;
-        };
-        let (id, method) = (id.clone(), method.to_string());
-        // The agent did its handshake with the first params. A second
-        // handshake must not change them.
-        if method == "initialize" {
-            trace_message(sandbox, Peer::Client, Peer::Airlock, &line);
-            tracing::info!(sandbox, "repeated initialize");
-            self.reply(&id, Ok(self.initialize_result())).await;
-            return;
-        }
-        let mut changed = false;
-        let sandbox = sandbox.clone();
-        let agent_init = agent_init.clone();
-        let host_cwd = msg
-            .pointer("/params/cwd")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let mut guest = None;
-        if let Some(cwd) = &host_cwd {
-            match self.guest_cwd(cwd, &sandbox).await {
-                Ok(guest_cwd) => {
-                    tracing::info!(method, cwd, sandbox, guest_cwd, "session request");
-                    msg["params"]["cwd"] = Value::String(guest_cwd.clone());
-                    guest = Some(guest_cwd);
-                }
-                Err(error) => {
-                    trace_message(&sandbox, Peer::Client, Peer::Airlock, &line);
-                    tracing::info!(method, cwd, sandbox, "refuse session request: {}", error.1);
-                    self.reply(&id, Err(error)).await;
-                    return;
-                }
-            }
-            changed = true;
-        } else {
-            tracing::debug!(method, sandbox, "client request");
-        }
-        let mut no_params = Value::Null;
-        let params = msg.get_mut("params").unwrap_or(&mut no_params);
-        if let Err(error) = capabilities::check_client_request(&method, params, &agent_init) {
-            trace_message(&sandbox, Peer::Client, Peer::Airlock, &line);
-            tracing::debug!(method, sandbox, "refuse client request: {}", error.1);
-            self.reply(&id, Err(error)).await;
-            return;
-        }
-        let bridge =
-            self.config.proxy_mcp_servers && mcp::SESSION_METHODS.contains(&method.as_str());
-        if !bridge {
-            let removed = mcp::remove_all(params);
-            if removed > 0 {
-                tracing::info!(
-                    method,
-                    sandbox,
-                    removed,
-                    "remove editor MCP servers: --proxy-mcp-servers is not set"
-                );
-                changed = true;
-            }
-            if method == "session/close" {
-                self.mcp.track_close(&id, params);
-            }
-            // The rows of the response have guest session dirs.
-            if method == "session/list"
-                && let (Some(host), Some(guest)) = (host_cwd, guest)
-            {
-                self.session_lists.insert(mcp::id_text(&id), (host, guest));
-            }
-            self.send_agent(Peer::Client, if changed { to_line(&msg) } else { line });
-            return;
-        }
-        let request = mcp::SessionRequest {
-            method: &method,
-            id: &id,
-            host_cwd: host_cwd.as_deref(),
-            restrict: self.config.restrict,
-            agent_init: &agent_init,
-            registrar: self.agent.as_ref().and_then(|a| a.process.mcp.clone()),
-            timeout: self.config.mcp_register_timeout,
-            sandbox: &sandbox,
-        };
-        match self.mcp.prepare(request, msg) {
-            // The request and the later client lines wait for the end of
-            // the registration. The agent output and the signals do not.
-            // Lines that the proxy read already wait in the held list.
-            Ok(registration) => {
-                self.registration = Some(registration);
-                self.held = Some(Vec::new());
-            }
-            // The line can have env and header values. Thus the log does
-            // not show it.
-            Err(error) => {
-                tracing::warn!(method, sandbox, "refuse session request: {}", error.1);
-                self.reply(&id, Err(error)).await;
-            }
-        }
-    }
-
-    /// Send the session request with its sandbox MCP servers to the agent.
-    /// Then handle the client lines that came in the time of the
-    /// registration.
-    async fn on_registered(&mut self, registered: mcp::Registered) {
-        let msg = self.mcp.add(registered);
-        self.send_agent(Peer::Client, to_line(&msg));
-        for line in self.held.take().unwrap_or_default() {
-            self.on_client_line(line).await;
-        }
-    }
-
-    /// Release all editor MCP servers at the proxy end. Waits for the
-    /// sandbox and the remote servers in the shutdown grace. A signal
-    /// stops the wait.
-    async fn end_mcp(&mut self) {
-        // A registration that did not complete drops its servers. Its
-        // request and the held lines never go to the agent, the same as the
-        // lines that wait for the agent handshake.
-        self.registration = None;
-        for line in self.held.take().unwrap_or_default() {
-            trace_message("-", Peer::Client, Peer::Airlock, &line);
-        }
-        let releases = self.mcp.release_all();
-        let done = async {
-            releases.await;
-            crate::mcp::deletes_done().await;
-        };
-        tokio::select! {
-            result = tokio::time::timeout(self.config.shutdown_grace, done) => {
-                if result.is_err() {
-                    tracing::info!("MCP server release did not complete");
-                }
-            }
-            signum = next_signal(&mut self.signals) => {
-                tracing::info!(signum, "skip MCP server release");
-            }
-        }
-    }
-
-    /// Get the guest path of the session dir `cwd`.
-    /// Returns:
-    ///   The guest path, or the error code and message if `cwd` is not an
-    ///   absolute path or is not in the sandbox `sandbox`.
-    async fn guest_cwd(&self, cwd: &str, sandbox: &str) -> Result<String, (i64, String)> {
         if !cwd.starts_with('/') {
-            return Err((filter::INVALID_PARAMS, messages::acp::cwd_not_absolute(cwd)));
+            return Err((rpc::INVALID_PARAMS, messages::acp::cwd_not_absolute(&cwd)));
         }
-        let location = self
-            .starter
-            .locate(cwd)
-            .await
-            .map_err(|e| (filter::INTERNAL_ERROR, format!("{e:#}")))?;
-        // One agent runs in one sandbox. It cannot see the files of an
-        // other sandbox.
-        if location.sandbox != sandbox {
-            return Err((filter::INVALID_PARAMS, messages::acp::other_sandbox(cwd)));
-        }
-        Ok(location.guest_cwd)
+        let FactoryState::Ready(factory) = &*self.factory.borrow() else {
+            return Err((rpc::INTERNAL_ERROR, messages::acp::SHUTTING_DOWN.into()));
+        };
+        let factory = factory.clone();
+        tracing::info!(cwd, "start a session handle");
+        self.started.set(true);
+        let (hid, proxy) = factory.create(cwd, msg);
+        let entry = (hid, false);
+        self.client_requests.borrow_mut().insert(key(req_id), entry);
+        self.handles.borrow_mut().insert(hid, proxy);
+        Ok(())
     }
 
-    /// Handle one agent event.
+    /// Give the client message `msg` to the handle `hid`.
     /// Returns:
-    ///   The exit code when the proxy must stop.
-    async fn on_agent_event(&mut self, event: rpc::ProcessEvent) -> Option<i32> {
-        match event {
-            rpc::ProcessEvent::Stdout(data) => {
-                let max = self.config.max_line_bytes;
-                let agent = self.agent.as_mut()?;
-                if agent.stopping {
-                    return None;
-                }
-                // The partial line has no newline. Thus only the new bytes
-                // need a search, and the time stays linear for long lines.
-                let end = data
-                    .iter()
-                    .rposition(|&b| b == b'\n')
-                    .map(|pos| agent.partial.len() + pos);
-                agent.partial.extend_from_slice(&data);
-                let Some(end) = end else {
-                    return self.check_partial(max).await;
-                };
-                let complete: Vec<u8> = agent.partial.drain(..=end).collect();
-                for line in complete[..end].split(|&b| b == b'\n') {
-                    if line.len() > max {
-                        self.stop_agent(&messages::acp::agent_line_too_long(max))
-                            .await;
-                        return None;
-                    }
-                    self.on_agent_line(line).await;
-                    // The line can stop the agent. Then the next lines
-                    // have no target.
-                    if self.agent.as_ref().is_none_or(|a| a.stopping) {
-                        return None;
-                    }
-                }
-                self.check_partial(max).await
-            }
-            rpc::ProcessEvent::Stderr(data) => {
-                self.relay_stderr(data);
-                None
-            }
-            rpc::ProcessEvent::Exit(code) => {
-                tracing::info!(sandbox = self.sandbox(), code, "agent exited");
-                self.flush_partial().await;
-                if matches!(self.phase, Phase::Starting { .. }) {
-                    self.fail_start(messages::acp::AGENT_EXITED).await;
-                    return None;
-                }
-                self.agent = None;
-                Some(code)
-            }
-        }
+    ///   `false` if the handle does not run.
+    fn deliver(&self, hid: HandleId, msg: Value) -> bool {
+        self.handles
+            .borrow()
+            .get(&hid)
+            .is_some_and(|proxy| proxy.send(msg))
     }
 
-    /// Stop the agent if its partial output line is longer than `max`.
-    /// Returns:
-    ///   Always `None`, as the agent event handler.
-    async fn check_partial(&mut self, max: usize) -> Option<i32> {
-        // A line without its end must not fill the memory.
-        if self.agent.as_ref().is_some_and(|a| a.partial.len() > max) {
-            self.stop_agent(&messages::acp::agent_line_too_long(max))
-                .await;
-        }
-        None
-    }
-
-    /// Handle the last agent output line when it has no newline. Call it
-    /// at each agent exit.
-    async fn flush_partial(&mut self) {
-        let Some(agent) = &mut self.agent else {
-            return;
-        };
-        if agent.stopping || agent.partial.is_empty() {
-            return;
-        }
-        let line = std::mem::take(&mut agent.partial);
-        self.on_agent_line(&line).await;
-    }
-
-    /// Send agent stderr to the host stderr. Drop it if the stderr queue is
-    /// full.
-    // The proxy must not wait for the host stderr. An editor that does not
-    // read it would stop the relay and the signal handling.
-    fn relay_stderr(&mut self, data: Vec<u8>) {
-        let len = data.len() as u64;
-        if let Err(TrySendError::Full(_)) = self.err.try_send(data) {
-            if self.err_dropped == 0 {
-                tracing::warn!(
-                    sandbox = self.sandbox(),
-                    "drop agent stderr: stderr is full"
-                );
-            }
-            self.err_dropped += len;
-        }
-    }
-
-    /// Handle one line of agent output, without its newline.
-    async fn on_agent_line(&mut self, line: &[u8]) {
-        let parsed = serde_json::from_slice::<Value>(line).ok();
-        // Only the handshake request of the proxy has this id. After the
-        // handshake, the id goes to the client as any other.
-        if let (Phase::Starting { .. }, Some(msg)) = (&self.phase, &parsed)
-            && let Some(Kind::Response { id }) = filter::kind(msg)
-            && id.as_str() == Some(filter::INIT_ID)
-        {
-            trace_message(self.sandbox(), Peer::Agent, Peer::Airlock, line);
-            let msg = msg.clone();
-            self.on_handshake_reply(msg).await;
-            return;
-        }
-        let mut parsed = parsed;
-        // The editor MCP servers and the session lists follow the session
-        // state in both modes.
-        let mut mapped = false;
-        if let Some(msg) = &mut parsed
-            && let Some(Kind::Response { id }) = filter::kind(msg)
-        {
-            self.mcp.on_response(id, msg);
-            let list = self.session_lists.remove(&mcp::id_text(id));
-            if let Some((host, guest)) = list {
-                mapped = filter::map_session_list(msg, &host, &guest);
-            }
-        }
-        if !self.config.restrict {
-            if let Some(mut msg) = parsed {
-                let hinted = filter::add_auth_hint(&mut msg, &self.config.name);
-                if hinted || mapped {
-                    self.to_client(Peer::Agent, &msg).await;
-                    return;
-                }
-            }
-            self.send_client(Peer::Agent, with_newline(line.to_vec()))
-                .await;
-            return;
-        }
-        // Only one JSON object at a time goes to the client, and as the
-        // proxy encodes it. Thus the client cannot read a message that the
-        // proxy did not check, for example in a batch.
-        let Some(mut msg) = parsed.filter(Value::is_object) else {
-            trace_message(self.sandbox(), Peer::Agent, Peer::Airlock, line);
-            tracing::debug!(
-                sandbox = self.sandbox(),
-                "drop agent line that is not one JSON object"
-            );
-            return;
-        };
-        let method = msg
-            .get("method")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let method = method.as_deref();
-        match capabilities::check_agent_message(&msg) {
-            AgentVerdict::Forward => {
-                // Session updates come for each part of the agent output.
-                // Only the trace level logs them.
-                if method.is_some_and(|m| m != "session/update") {
-                    tracing::debug!(method, sandbox = self.sandbox(), "agent message");
-                }
-                filter::add_auth_hint(&mut msg, &self.config.name);
-                self.to_client(Peer::Agent, &msg).await;
-            }
-            AgentVerdict::Refuse { code, message } => {
-                trace_message(self.sandbox(), Peer::Agent, Peer::Airlock, line);
-                tracing::debug!(method, sandbox = self.sandbox(), "refuse agent request");
-                let id = msg.get("id").cloned().unwrap_or(Value::Null);
-                let reply = filter::error_response(&id, code, &message);
-                self.send_agent(Peer::Airlock, to_line(&reply));
-            }
-            AgentVerdict::Drop => {
-                trace_message(self.sandbox(), Peer::Agent, Peer::Airlock, line);
-                tracing::debug!(method, sandbox = self.sandbox(), "drop agent message");
-            }
-        }
-    }
-
-    /// Complete the agent handshake with the agent reply. Then send the
-    /// session request and the queued client lines to the agent.
-    async fn on_handshake_reply(&mut self, reply: Value) {
-        if let Some(err) = reply.get("error") {
-            self.fail_start(&messages::acp::agent_handshake_failed(err))
-                .await;
-            return;
-        }
-        let result = reply.get("result").cloned().unwrap_or(Value::Null);
-        let version = result.get("protocolVersion").and_then(Value::as_u64);
-        if version != Some(filter::PROTOCOL_VERSION) {
-            let version = result.get("protocolVersion").unwrap_or(&Value::Null);
-            let message =
-                messages::acp::unsupported_protocol_version(version, filter::PROTOCOL_VERSION);
-            self.fail_start(&message).await;
-            return;
-        }
-        let Some(agent) = &self.agent else { return };
-        // The log helps to keep the presets true to the real agents.
-        let missing = capabilities::missing(&self.initialize_result(), &result);
-        if !missing.is_empty() {
-            tracing::info!(
-                sandbox = agent.sandbox,
-                ?missing,
-                "the agent does not have offered features"
-            );
-        }
-        let running = Phase::Running {
-            sandbox: agent.sandbox.clone(),
-            agent_init: result,
-        };
-        let Phase::Starting {
-            request, queued, ..
-        } = std::mem::replace(&mut self.phase, running)
-        else {
-            return;
-        };
-        self.deadline = None;
-        tracing::info!(sandbox = self.sandbox(), "agent handshake complete");
-        self.on_running_line(request).await;
-        for line in queued {
-            self.on_client_line(line).await;
-        }
-    }
-
-    /// Kill the agent because it went over a limit. Before the handshake
-    /// completes, fail the start with `message`. After it, the agent exit
-    /// stops the proxy.
-    async fn stop_agent(&mut self, message: &str) {
-        if matches!(self.phase, Phase::Starting { .. }) {
-            self.fail_start(message).await;
-            return;
-        }
-        tracing::warn!(sandbox = self.sandbox(), "stop the agent: {message}");
-        self.control(Control::Kill);
-        if let Some(agent) = &mut self.agent {
-            agent.stopping = true;
-            agent.partial = Vec::new();
-        }
-    }
-
-    /// Stop the agent that did not complete its start or handshake. Reply
-    /// to the session request with `message`, and handle the queued client
-    /// lines as when no agent runs.
-    async fn fail_start(&mut self, message: &str) {
-        self.fail_start_with(message, None).await;
-    }
-
-    /// Stop the agent that did not complete its start (see
-    /// [`Self::fail_start`]). The error reply has `data` if it is set.
-    async fn fail_start_with(&mut self, message: &str, data: Option<Value>) {
-        let sandbox = self.sandbox().to_string();
-        tracing::warn!(sandbox, "agent start failed: {message}");
-        self.launch = None;
-        self.control(Control::Kill);
-        self.agent = None;
-        self.deadline = None;
-        // Servers are registered only after the handshake. Thus no set
-        // exists here now. Release anyway, so that no set can outlive the
-        // agent of its sandbox.
-        self.registration = None;
-        self.held = None;
-        tokio::task::spawn_local(self.mcp.release_all());
-        let Phase::Starting {
-            request,
-            id,
-            queued,
-        } = std::mem::replace(&mut self.phase, Phase::Idle)
-        else {
-            return;
-        };
-        trace_message(&sandbox, Peer::Client, Peer::Airlock, &request);
-        match data {
-            Some(data) => {
-                let msg =
-                    filter::error_response_with_data(&id, filter::INTERNAL_ERROR, message, &data);
-                self.to_client(Peer::Airlock, &msg).await;
-            }
-            None => {
-                self.reply(&id, Err((filter::INTERNAL_ERROR, message.to_string())))
-                    .await;
-            }
-        }
-        for line in queued {
-            self.on_client_line(line).await;
-        }
-    }
-
-    /// Stop after the client closed.
-    /// Returns:
-    ///   Exit code of the agent, 0 if no agent completed its handshake, or
-    ///   1 if the agent did not exit after the kill.
-    async fn on_client_end(&mut self) -> i32 {
-        tracing::info!(sandbox = self.sandbox(), "client closed");
-        // The agent never gets the lines that wait for the handshake.
-        if let Phase::Starting {
-            request, queued, ..
-        } = &self.phase
-        {
-            for line in std::iter::once(request).chain(queued) {
-                trace_message(self.sandbox(), Peer::Client, Peer::Airlock, line);
-            }
-        }
-        let Some(agent) = &mut self.agent else {
-            return 0;
-        };
-        let starting = matches!(self.phase, Phase::Starting { .. });
-        // An agent without a session has nothing to save. Kill it now.
-        if starting {
-            self.control(Control::Kill);
-        } else {
-            // The agent exits at the end of its input.
-            let (closed, _) = mpsc::channel(1);
-            drop(std::mem::replace(&mut agent.process.input, closed));
-        }
-        let grace = self.config.shutdown_grace;
-        let mut code = self.wait_exit(grace).await;
-        if code.is_none() {
-            tracing::info!(sandbox = self.sandbox(), "kill the agent");
-            self.control(Control::Kill);
-            code = self.wait_exit(grace).await;
-        }
-        if starting { 0 } else { code.unwrap_or(1) }
-    }
-
-    /// Wait for the agent exit and handle its output in that time.
-    /// Returns:
-    ///   The exit code, or `None` if the agent did not exit in `limit`.
-    async fn wait_exit(&mut self, limit: Duration) -> Option<i32> {
-        let deadline = Instant::now() + limit;
+    /// Handle the handle messages until the proxy stopped all handles.
+    async fn to_client(&self, mut handle_messages: mpsc::Receiver<(HandleId, HandleMessage)>) {
         loop {
             tokio::select! {
-                event = next_event(&mut self.agent) => {
-                    if let rpc::ProcessEvent::Exit(code) = event {
-                        tracing::info!(sandbox = self.sandbox(), code, "agent exited");
-                        self.flush_partial().await;
-                        self.agent = None;
-                        return Some(code);
-                    }
-                    if let Some(code) = self.on_agent_event(event).await {
-                        return Some(code);
-                    }
-                }
-                () = tokio::time::sleep_until(deadline) => return None,
-                // The user wants the proxy to stop now.
-                signum = next_signal(&mut self.signals) => {
-                    tracing::info!(sandbox = self.sandbox(), signum, "kill the agent");
-                    self.control(Control::Kill);
-                }
+                next = handle_messages.recv() => match next {
+                    Some((hid, message)) => self.on_handle(hid, message).await,
+                    None => return,
+                },
+                () = self.ended.cancelled() => break,
             }
         }
-    }
-
-    /// Send a control request to the agent, if it runs.
-    fn control(&self, request: Control) {
-        if let Some(agent) = &self.agent {
-            let _ = agent.process.control.send(request);
+        // The last messages of the handles can still wait.
+        handle_messages.close();
+        while let Some((hid, message)) = handle_messages.recv().await {
+            self.on_handle(hid, message).await;
         }
     }
 
-    /// Send a line to the agent, if it runs. Kills the agent if its input
-    /// queue is full.
-    /// Args:
-    ///  - `from`: Sender of the line, for the log
-    ///  - `line`: The line, with or without its newline
-    fn send_agent(&mut self, from: Peer, line: Vec<u8>) {
-        let Some(agent) = &mut self.agent else {
-            return;
+    /// Handle one message of the handle `hid`.
+    async fn on_handle(&self, hid: HandleId, message: HandleMessage) {
+        match message {
+            HandleMessage::Client { msg, claim } => self.on_handle_message(hid, msg, claim).await,
+            HandleMessage::Ready => self.ready.set(true),
+            HandleMessage::Ended => self.on_handle_end(hid),
+        }
+    }
+
+    /// Send one agent message of the handle `hid` to the client. Rename the
+    /// id of an agent request, and keep the handle to its own sessions.
+    async fn on_handle_message(&self, hid: HandleId, mut msg: Value, claim: Option<Claim>) {
+        let mut close = false;
+        match rpc::kind(&msg) {
+            Some(Kind::Response { id: req_id }) => {
+                let req_id = req_id.clone();
+                let mut requests = self.client_requests.borrow_mut();
+                let Some(&(_, closes)) = requests.get(&key(&req_id)).filter(|r| r.0 == hid) else {
+                    tracing::debug!(handle = hid, id = %req_id, "drop agent response without a request");
+                    return;
+                };
+                requests.remove(&key(&req_id));
+                drop(requests);
+                close = closes;
+                if let Some(claim) = claim
+                    && !self.claim(hid, &claim)
+                {
+                    let message = messages::acp::session_id_conflict(&claim.session);
+                    tracing::warn!(handle = hid, "refuse session: {message}");
+                    msg = rpc::error_response(&req_id, rpc::INTERNAL_ERROR, &message);
+                }
+            }
+            Some(Kind::Request { id: req_id, method }) => {
+                if !self.owns(hid, &msg) {
+                    tracing::debug!(
+                        handle = hid,
+                        method,
+                        "drop agent request for another session"
+                    );
+                    return;
+                }
+                // Two handles can use the same id. The client must see
+                // different ids.
+                let proxy_req_id = Value::String(format!("{hid}-{}", key(req_id)));
+                let entry = (hid, req_id.clone());
+                self.agent_requests
+                    .borrow_mut()
+                    .insert(key(&proxy_req_id), entry);
+                msg["id"] = proxy_req_id;
+            }
+            Some(Kind::CancelRequest { .. }) if !self.owns(hid, &msg) => {
+                tracing::debug!(handle = hid, "drop agent cancel for another session");
+                return;
+            }
+            Some(Kind::Notification { method }) if !self.owns(hid, &msg) => {
+                tracing::debug!(
+                    handle = hid,
+                    method,
+                    "drop agent message for another session"
+                );
+                return;
+            }
+            // Only the pass mode lets messages without a kind through, for
+            // example a batch.
+            Some(Kind::CancelRequest { .. } | Kind::Notification { .. }) | None => {}
+        }
+        let _ = self.out.send(to_line(&msg)).await;
+        // The handle ran only for the closed session.
+        if close {
+            self.stop_handle(hid);
+        }
+    }
+
+    /// Give the session of `claim` to `hid`. A handle that stops gets no
+    /// session.
+    /// Returns:
+    ///   `false` if another handle has the session and the client did not
+    ///   ask for it.
+    fn claim(&self, hid: HandleId, claim: &Claim) -> bool {
+        if !self.handles.borrow().contains_key(&hid) {
+            return true;
+        }
+        let mut sessions = self.sessions.borrow_mut();
+        if let Some(&owner) = sessions.get(&claim.session)
+            && owner != hid
+            && !claim.replace
+        {
+            return false;
+        }
+        sessions.insert(claim.session.clone(), hid);
+        true
+    }
+
+    /// Check that the session of the agent message `msg` is a session of
+    /// `hid`. A new session id becomes a session of `hid`, for example
+    /// the session of a sub agent. A handle that stops keeps only the
+    /// sessions that it had at its stop, and gets no new session.
+    // A load of an open session stops the old handle and gives the session
+    // to a new handle. The last output of the old handle must not take the
+    // session back before the new handle claims it.
+    fn owns(&self, hid: HandleId, msg: &Value) -> bool {
+        let Some(sid) = session_id(msg) else {
+            return true;
         };
-        if agent.stopping {
-            return;
+        if !self.handles.borrow().contains_key(&hid) {
+            let former = self.former.borrow();
+            return former.get(&hid).is_some_and(|owned| owned.contains(sid));
         }
-        let line = with_newline(line);
-        trace_message(&agent.sandbox, from, Peer::Agent, &line);
-        // The proxy does not wait for the agent. An agent that does not
-        // read its input must not make the proxy keep lines without limit.
-        // A full queue thus stops the agent. The exit then fails the start
-        // or stops the proxy.
-        if let Err(TrySendError::Full(_)) = agent.process.input.try_send(line) {
-            tracing::warn!(
-                sandbox = agent.sandbox,
-                "stop the agent: {}",
-                messages::acp::AGENT_INPUT_FULL
-            );
-            agent.stopping = true;
-            agent.partial = Vec::new();
-            let _ = agent.process.control.send(Control::Kill);
+        *self
+            .sessions
+            .borrow_mut()
+            .entry(sid.to_string())
+            .or_insert(hid)
+            == hid
+    }
+
+    /// Forget a handle that ended. The reaper gets its exit code.
+    fn on_handle_end(&self, hid: HandleId) {
+        self.client_requests
+            .borrow_mut()
+            .retain(|_, (owner, _)| *owner != hid);
+        // A stopped handle is already out of the routing.
+        self.stop_handle(hid);
+        self.former.borrow_mut().remove(&hid);
+    }
+
+    /// Keep the agent exit code `code` if it is the first that is not 0.
+    fn record(&self, code: i32) {
+        if code != 0 && self.failed.get().is_none() {
+            self.failed.set(Some(code));
         }
-    }
-
-    /// Send a message from `from` to the client.
-    async fn to_client(&self, from: Peer, msg: &Value) {
-        self.send_client(from, to_line(msg)).await;
-    }
-
-    /// Send a line, with its newline, to the client. Waits while the
-    /// client output queue is full.
-    async fn send_client(&self, from: Peer, line: Vec<u8>) {
-        trace_message(self.sandbox(), from, Peer::Client, &line);
-        let _ = self.out.send(line).await;
-    }
-
-    /// The sandbox of the agent for the log, or `-` if no agent runs.
-    fn sandbox(&self) -> &str {
-        self.agent.as_ref().map_or("-", |a| a.sandbox.as_str())
     }
 
     /// Send a response to the client.
     /// Args:
-    ///  - `id`: Id of the client request
+    ///  - `req_id`: Id of the client request
     ///  - `result`: Result, or the error code and message
-    async fn reply(&self, id: &Value, result: Result<Value, (i64, String)>) {
+    async fn reply(&self, req_id: &Value, result: Result<Value, (i64, String)>) {
         let msg = match result {
-            Ok(result) => filter::result_response(id, &result),
-            Err((code, message)) => filter::error_response(id, code, &message),
+            Ok(result) => rpc::result_response(req_id, &result),
+            Err((code, message)) => rpc::error_response(req_id, code, &message),
         };
-        self.to_client(Peer::Airlock, &msg).await;
+        let _ = self.out.send(to_line(&msg)).await;
     }
 
-    /// The `initialize` result that the proxy gives to the client. It uses
-    /// the params of the first client handshake, so that a repeated
-    /// handshake gets the same features.
-    fn initialize_result(&self) -> Value {
+    /// The `initialize` result that the proxy gives to the client.
+    /// Args:
+    ///  - `params`: Client `initialize` params after the filter
+    fn initialize_result(&self, params: &Value) -> Value {
         capabilities::initialize_result(
             &self.config.title,
             &self.config.version,
             self.config.proxy_mcp_servers,
             &self.config.agent_capabilities,
-            self.init_params.as_ref().unwrap_or(&Value::Null),
+            params,
         )
     }
 }
 
-/// Get the error message and data of the failed agent start `error`. A
-/// sandbox process that stopped in its init gives the last line of its
-/// error output as the message, and its exit code and output as the data. The
-/// editor can then show why the sandbox did not start.
+/// Start the watch of the host signals.
 /// Returns:
-///   The message, and the data or `None` for other errors.
-fn start_failure(error: &anyhow::Error) -> (String, Option<Value>) {
-    let Some(exited) = error.downcast_ref::<ExitedBeforeReady>() else {
-        return (format!("{error:#}"), None);
-    };
-    let message = exited
-        .last_error
-        .clone()
-        .unwrap_or_else(|| format!("{error:#}"));
-    let data = serde_json::json!({
-        "exitCode": exited.code,
-        "output": exited.output.clone().unwrap_or_default(),
-    });
-    (message, Some(data))
-}
-
-/// Wait for the end of the agent start. Waits forever if no start runs.
-async fn next_launch(launch: &mut Option<Launch<'_>>) -> anyhow::Result<(Location, AgentProcess)> {
-    match launch {
-        Some(launch) => launch.as_mut().await,
-        None => std::future::pending().await,
-    }
-}
-
-/// Wait for the end of the MCP server registration. Waits forever if no
-/// registration runs.
-async fn next_registration(registration: &mut Option<mcp::Registration>) -> mcp::Registered {
-    match registration {
-        Some(registration) => registration.as_mut().await,
-        None => std::future::pending().await,
-    }
-}
-
-/// Wait for the next agent event. Waits forever if no agent runs.
-async fn next_event(agent: &mut Option<Agent>) -> rpc::ProcessEvent {
-    let Some(agent) = agent else {
-        return std::future::pending().await;
-    };
-    // A relay that ends without the exit event lost the agent.
-    agent
-        .process
-        .events
-        .recv()
-        .await
-        .unwrap_or(rpc::ProcessEvent::Exit(1))
-}
-
-/// Wait until `deadline`. Waits forever if there is none.
-async fn wait_until(deadline: Option<Instant>) {
-    match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline).await,
-        None => std::future::pending().await,
+///   The signals, or a stream without signals if the watch fails or the
+///   config has no source.
+fn watch_signals(source: Option<fn() -> anyhow::Result<SignalStream>>) -> SignalStream {
+    match source.map(|source| source()) {
+        Some(Ok(signals)) => signals,
+        Some(Err(e)) => {
+            tracing::warn!("no signal watch: {e}");
+            Box::pin(futures::stream::pending())
+        }
+        None => Box::pin(futures::stream::pending()),
     }
 }
 
 /// Wait for the next host signal. Waits forever if there are no signals.
 async fn next_signal(signals: &mut Option<SignalStream>) -> i32 {
-    match signals.as_mut().map(|s| s.next()) {
-        Some(next) => match next.await {
+    match signals {
+        Some(signals) => match signals.next().await {
             Some(signum) => signum,
             None => std::future::pending().await,
         },
@@ -1163,8 +824,8 @@ async fn next_signal(signals: &mut Option<SignalStream>) -> i32 {
     }
 }
 
-/// Read the client lines in a task. The lines keep their bytes, also when
-/// they are not UTF-8. When [`READER_QUEUE`] lines wait, the read waits.
+/// Read the client lines in a task. When [`READER_QUEUE`] lines wait, the
+/// read waits.
 /// Returns:
 ///   Receiver of the lines without their newline. It closes at the end of
 ///   the input or at a read error.
@@ -1197,11 +858,10 @@ fn spawn_reader<R: AsyncBufRead + Unpin + 'static>(mut input: R) -> mpsc::Receiv
 /// Returns:
 ///   Sender of the data, and the task. The task ends when all senders drop
 ///   and the data is written.
-// One task writes all data. Thus the messages do not mix, and the async
-// code never blocks on a full pipe. The queue has a small limit. A reader
-// that is slow thus makes the proxy wait, and the data does not collect in
-// memory.
-fn spawn_writer<W: AsyncWrite + Unpin + 'static>(
+// One task writes all data. Thus the messages do not mix. The queue has a
+// small limit. A slow reader thus makes the writers wait, and the data does
+// not collect in memory.
+pub(super) fn spawn_writer<W: AsyncWrite + Unpin + 'static>(
     mut output: W,
 ) -> (mpsc::Sender<Vec<u8>>, JoinHandle<()>) {
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(WRITER_QUEUE);
@@ -1215,53 +875,4 @@ fn spawn_writer<W: AsyncWrite + Unpin + 'static>(
         }
     });
     (tx, task)
-}
-
-/// Encode a JSON-RPC message as one line.
-fn to_line(msg: &Value) -> Vec<u8> {
-    with_newline(msg.to_string().into_bytes())
-}
-
-/// Add a newline to the end of `bytes` if it has none.
-fn with_newline(mut bytes: Vec<u8>) -> Vec<u8> {
-    if bytes.last() != Some(&b'\n') {
-        bytes.push(b'\n');
-    }
-    bytes
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::*;
-
-    /// Test that the trace log of a client session request does not show
-    /// the env and header values of the editor MCP servers. They can be
-    /// API keys and tokens.
-    ///   1. Make a session request with a stdio server with env and a
-    ///      remote server with headers
-    ///   2. Check that the values are hidden and the names stay
-    #[test]
-    fn session_request_trace_hides_env_and_header_values() {
-        let request = json!({
-            "jsonrpc": "2.0", "id": 1, "method": "session/new",
-            "params": {"cwd": "/p", "mcpServers": [
-                {"name": "a", "command": "x", "args": [],
-                 "env": [{"name": "API_KEY", "value": "secret-env"}]},
-                {"type": "http", "name": "b", "url": "https://h/mcp",
-                 "headers": [{"name": "Authorization", "value": "secret-header"}]},
-            ]},
-        });
-        let hidden = hide_mcp_secrets(request.to_string().as_bytes()).unwrap();
-        let text = String::from_utf8(hidden).unwrap();
-        assert!(!text.contains("secret"), "{text}");
-        let hidden: Value = serde_json::from_str(&text).unwrap();
-        let servers = &hidden["params"]["mcpServers"];
-        assert_eq!(
-            servers[0]["env"][0],
-            json!({"name": "API_KEY", "value": HIDDEN})
-        );
-        assert_eq!(servers[1]["headers"][0]["name"], "Authorization");
-    }
 }

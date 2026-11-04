@@ -317,6 +317,12 @@ impl SandboxProcess {
         self.sandbox.guest_dir(host)
     }
 
+    /// Get the project dir in the guest (see [`Sandbox::guest_root`]).
+    /// Call it after the connect, as for [`Self::guest_dir`].
+    pub fn guest_root(&self) -> anyhow::Result<String> {
+        self.sandbox.guest_root()
+    }
+
     /// Run `request` in the sandbox and connect it to the terminal of
     /// `runtime` until the process exits.
     /// Returns:

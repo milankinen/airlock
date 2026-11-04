@@ -4,7 +4,7 @@ use std::ffi::OsString;
 
 use serde_json::json;
 
-use crate::acp::sandbox::SandboxStarter;
+use crate::acp::agent::launcher::SandboxProcessLauncher;
 use crate::cli::LogLevel;
 use crate::sandbox::process::client::{LaunchOpts, ProcessLauncher};
 use crate::sandbox::process::init::Mode;
@@ -47,8 +47,6 @@ fn sandbox_process_failure_reply_has_captured_output() {
         crate::sandbox::meta::HostPaths::default(),
     )
     .unwrap();
-    // The proxy task needs a starter with no borrow.
-    let context = Box::leak(Box::new(context));
     let opts = LaunchOpts {
         log_level: LogLevel::Info,
         verbose: false,
@@ -56,17 +54,18 @@ fn sandbox_process_failure_reply_has_captured_output() {
         mode: Mode::Acp,
     };
     let args: Vec<OsString> = vec!["-c".into(), FAILING_SANDBOX_PROCESS.into(), "bash".into()];
-    let launcher = ProcessLauncher::with_program(opts, verified_dir("/bin/bash".as_ref()), args);
-    let starter = SandboxStarter {
+    let process_launcher =
+        ProcessLauncher::with_program(opts, verified_dir("/bin/bash".as_ref()), args);
+    let launcher = SandboxProcessLauncher {
         context,
         follow_git_worktree: false,
         env: vec![],
         log_level: LogLevel::Info,
-        launcher: Some(launcher),
+        launcher: Some(process_launcher),
     };
 
     block_on_local(async {
-        let mut client = TestClient::start(starter, test_config(true));
+        let mut client = TestClient::start(launcher, test_config(true));
         client.initialize(json!({})).await;
         let params = json!({ "cwd": project.to_str().unwrap(), "mcpServers": [] });
         let (response, _) = client.request(2, "session/new", params).await;
