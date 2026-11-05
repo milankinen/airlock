@@ -174,6 +174,11 @@ pub struct Location {
     pub guest_root: String,
 }
 
+/// Error: no sandbox serves the session dir.
+#[derive(Debug, thiserror::Error)]
+#[error("{}", crate::messages::cli::never_started(.0))]
+pub struct NoSandbox(pub String);
+
 /// Control request for a running agent.
 pub enum Control {
     /// Kill the agent.
@@ -203,7 +208,8 @@ pub struct AgentProcess {
 pub trait AgentProcessLauncher {
     /// Find the sandbox of the session dir `cwd`. Does not start it.
     /// Returns:
-    ///   The sandbox, or error if `cwd` has no sandbox.
+    ///   The sandbox, or error if `cwd` has no sandbox. The error is
+    ///   [`NoSandbox`] if no sandbox serves `cwd`.
     async fn locate(&self, cwd: &str) -> anyhow::Result<Location>;
 
     /// Launch the agent process `argv` in the sandbox of the session dir

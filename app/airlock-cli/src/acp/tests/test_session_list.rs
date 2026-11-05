@@ -88,3 +88,29 @@ fn session_list_runs_in_one_shot_agent_with_host_paths() {
         });
     }
 }
+
+/// Test that a session list in a dir with no sandbox gets an empty list,
+/// and that other requests there still get an error. Editors list the
+/// sessions of old dirs, for example removed git worktrees. An error makes
+/// the editor show a failure.
+///   1. Send `session/list` in a dir with no sandbox
+///   2. Check the empty list and that no agent started
+///   3. Send `session/new` in the same dir and check the error
+#[test]
+fn session_list_in_dir_without_sandbox_is_empty() {
+    block_on_local(async {
+        let launcher = LocalProcessLauncher::new(&[]);
+        let launches = launcher.launches.clone();
+        let mut client = TestClient::start(launcher, test_config(true));
+        client.initialize(json!({})).await;
+
+        let params = json!({ "cwd": "/gone/worktree" });
+        let (response, _) = client.request(1, "session/list", params).await;
+        assert_eq!(response["result"], json!({ "sessions": [] }), "{response}");
+        assert_eq!(launches.get(), 0);
+
+        let params = json!({ "cwd": "/gone/worktree", "mcpServers": [] });
+        let (failed, _) = client.request(2, "session/new", params).await;
+        assert!(failed.get("error").is_some(), "{failed}");
+    });
+}

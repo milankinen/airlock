@@ -17,7 +17,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use futures::future::LocalBoxFuture;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -25,7 +25,7 @@ use self::shared::Link;
 use super::proxy::{
     HandleId, HandleMessage, SessionContext, SessionFactory, SessionFactoryInit, SessionHandle,
 };
-use super::{AgentProcessLauncher, Location, rpc};
+use super::{AgentProcessLauncher, Location, NoSandbox, rpc};
 
 /// Settings of the agents.
 pub struct AgentConfig {
@@ -270,10 +270,20 @@ async fn attach<S: AgentProcessLauncher + 'static>(
     let location = match located {
         Ok(location) => location,
         Err(e) => {
+            let method = first.get("method").and_then(Value::as_str).unwrap_or("-");
+            let req_id = first.get("id").unwrap_or(&Value::Null);
+            // Editors list the sessions of old dirs, for example removed
+            // git worktrees. These dirs have no sandbox, thus they have
+            // no sessions. An error makes the editor show a failure.
+            if method == "session/list" && e.downcast_ref::<NoSandbox>().is_some() {
+                tracing::debug!(handle = hid, "empty session list: {e:#}");
+                let msg = rpc::result_response(req_id, &json!({ "sessions": [] }));
+                end_early(&pool, hid, msg, &state).await;
+                return;
+            }
             let message = format!("{e:#}");
             // Log the first request to show which client call wants the
             // sandbox. Cut long params, for example prompt text.
-            let method = first.get("method").and_then(Value::as_str).unwrap_or("-");
             let mut params = first
                 .get("params")
                 .map(Value::to_string)
@@ -288,15 +298,8 @@ async fn attach<S: AgentProcessLauncher + 'static>(
                 params,
                 "agent start failed: {message}"
             );
-            *state.borrow_mut() = HandleState::Ended;
-            let req_id = first.get("id").unwrap_or(&Value::Null);
             let msg = rpc::error_response(req_id, rpc::INTERNAL_ERROR, &message);
-            let claim = None;
-            let _ = pool
-                .messages
-                .send((hid, HandleMessage::Client { msg, claim }))
-                .await;
-            let _ = pool.messages.send((hid, HandleMessage::Ended)).await;
+            end_early(&pool, hid, msg, &state).await;
             return;
         }
     };
@@ -308,6 +311,18 @@ async fn attach<S: AgentProcessLauncher + 'static>(
     if let HandleState::Pending(queued) = state {
         link.attach(hid, location, cwd, first, queued);
     }
+}
+
+/// End the session `hid` before it attaches to an agent. Send the
+/// response `msg` to the first request.
+async fn end_early<S>(pool: &Pool<S>, hid: HandleId, msg: Value, state: &RefCell<HandleState>) {
+    *state.borrow_mut() = HandleState::Ended;
+    let claim = None;
+    let _ = pool
+        .messages
+        .send((hid, HandleMessage::Client { msg, claim }))
+        .await;
+    let _ = pool.messages.send((hid, HandleMessage::Ended)).await;
 }
 
 /// State of a session handle.

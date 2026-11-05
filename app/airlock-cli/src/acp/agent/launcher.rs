@@ -10,7 +10,7 @@
 
 use tokio::sync::mpsc;
 
-use crate::acp::{AgentProcess, AgentProcessLauncher, Control, Location};
+use crate::acp::{AgentProcess, AgentProcessLauncher, Control, Location, NoSandbox};
 use crate::cli::LogLevel;
 use crate::context::Context;
 use crate::rpc;
@@ -46,7 +46,7 @@ impl SandboxProcessLauncher {
             follow_git_worktree: self.follow_git_worktree,
         };
         let Some(sandbox) = sandbox::find(&self.context, &work, opts).await? else {
-            anyhow::bail!(crate::messages::cli::never_started(&work));
+            return Err(NoSandbox(work.to_string()).into());
         };
         Ok((sandbox, work))
     }

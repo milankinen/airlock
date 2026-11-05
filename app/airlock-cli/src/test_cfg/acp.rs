@@ -264,7 +264,7 @@ impl LocalProcessLauncher {
                 return Ok((sandbox, location));
             }
         }
-        anyhow::bail!(crate::messages::cli::never_started(cwd))
+        Err(crate::acp::NoSandbox(cwd.to_string()).into())
     }
 }
 
