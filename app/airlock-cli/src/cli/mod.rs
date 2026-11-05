@@ -7,6 +7,7 @@
 //!  * Ctrl+C and SIGTERM handling, so that long steps can stop cleanly
 
 pub mod cmd_acp;
+pub mod cmd_completions;
 pub mod cmd_config;
 pub mod cmd_exec;
 pub mod cmd_info;
@@ -56,7 +57,7 @@ const COMMAND_GROUPS: [(&str, &[&str]); 3] = [
     ),
     (
         messages::cli::HELP_MISC_TITLE,
-        &["acp", "self-update", "help"],
+        &["acp", "completions", "self-update", "help"],
     ),
 ];
 

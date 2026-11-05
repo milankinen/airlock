@@ -41,8 +41,8 @@ use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use tokio::task::LocalSet;
 
 use crate::cli::{
-    cmd_acp, cmd_config, cmd_exec, cmd_info, cmd_internal, cmd_network, cmd_rm, cmd_sandbox,
-    cmd_secret, cmd_self_update, cmd_start, cmd_stop, cmd_templates,
+    cmd_acp, cmd_completions, cmd_config, cmd_exec, cmd_info, cmd_internal, cmd_network, cmd_rm,
+    cmd_sandbox, cmd_secret, cmd_self_update, cmd_start, cmd_stop, cmd_templates,
 };
 use crate::context::Context;
 use crate::settings::Settings;
@@ -54,6 +54,13 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 async fn main() {
     // Do this before any thread starts or reads the environment.
     diagnostics::disable_release_backtraces();
+
+    // A shell completion request answers and exits here. The shell calls
+    // airlock for each request, so it must not start other parts of the
+    // program or write other output.
+    clap_complete::CompleteEnv::with_factory(Program::command)
+        .var(cli::cmd_completions::ENV_VAR)
+        .complete();
 
     // The approval dialog runs as a child process of this program. It needs
     // no context, and it must not start any other part of the program.
@@ -86,6 +93,15 @@ async fn main() {
         .unwrap_or_else(|e| exit_with_clap_error(&e));
     let parsed = Program::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     cli::initialize(parsed.global.quiet);
+
+    // Completions do not need the context.
+    if let Command::Completions(ref args) = parsed.command {
+        if !extra_args.is_empty() {
+            cli::error!("{}", messages::app::DASH_ARGS_ONLY_WITH_START);
+            std::process::exit(2);
+        }
+        std::process::exit(cli::cmd_completions::main(args));
+    }
 
     // Self-update does not need the context. Thus a bad settings file or
     // data directory cannot block an update that can fix it.
@@ -186,6 +202,7 @@ async fn main() {
                     Ok(Box::pin(cli::cmd_internal::main(args, context)).await)
                 }
                 Command::SelfUpdate(_) => unreachable!("self-update runs before the context"),
+                Command::Completions(_) => unreachable!("completions run before the context"),
             };
             result.unwrap_or_else(|e| {
                 cli::error!("{}", messages::app::command_failed(&e));
@@ -284,6 +301,8 @@ enum Command {
     Templates(cmd_templates::TemplateArgs),
     /// Update airlock to the latest release
     SelfUpdate(cmd_self_update::SelfUpdateArgs),
+    /// Print or install shell completions
+    Completions(cmd_completions::CompletionsArgs),
     /// Internal commands (only airlock starts them)
     #[command(hide = true)]
     Internal(cmd_internal::InternalArgs),

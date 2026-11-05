@@ -8,9 +8,10 @@ use std::fs::Metadata;
 use std::os::unix::fs::MetadataExt;
 
 use clap::{Args, Subcommand};
+use clap_complete::ArgValueCandidates;
 
-use crate::cli::LogLevel;
 use crate::cli::prompt::choose;
+use crate::cli::{LogLevel, cmd_completions};
 use crate::context::Context;
 use crate::data_dir::DataDir;
 use crate::sandbox::{self, Exit};
@@ -34,6 +35,7 @@ enum TemplateCmd {
     /// Show the details of a template
     Info {
         /// Template name (see `airlock templates list`)
+        #[arg(add = ArgValueCandidates::new(cmd_completions::template_names))]
         name: String,
     },
     /// Create a template with the setup wizard
@@ -54,6 +56,7 @@ enum TemplateCmd {
     #[command(alias = "rm")]
     Remove {
         /// Template name (see `airlock templates list`)
+        #[arg(add = ArgValueCandidates::new(cmd_completions::template_names))]
         name: String,
         /// Do not ask for confirmation
         #[arg(short = 'f', long)]

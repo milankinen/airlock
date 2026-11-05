@@ -8,7 +8,9 @@
 use std::ffi::OsStr;
 
 use clap::{Args, Subcommand};
+use clap_complete::ArgValueCandidates;
 
+use super::cmd_completions;
 use super::cmd_config::{self, ConfigArgs};
 use super::cmd_info::{self, Details};
 use super::cmd_rm::{self, RmArgs};
@@ -33,6 +35,7 @@ enum SandboxCmd {
     /// Show the details of a sandbox (default: the sandbox of the current directory)
     Info {
         /// Sandbox id (see `airlock sandboxes list`)
+        #[arg(add = ArgValueCandidates::new(cmd_completions::sandbox_ids))]
         id: Option<String>,
         /// Print the details as JSON
         #[arg(long)]
@@ -41,6 +44,7 @@ enum SandboxCmd {
     /// Print the config of a sandbox (see `airlock config`)
     Config {
         /// Sandbox id (see `airlock sandboxes list`)
+        #[arg(add = ArgValueCandidates::new(cmd_completions::sandbox_ids))]
         id: String,
         #[command(flatten)]
         args: ConfigArgs,
@@ -49,6 +53,7 @@ enum SandboxCmd {
     #[command(alias = "rm")]
     Remove {
         /// Sandbox ids (see `airlock sandboxes list`)
+        #[arg(add = ArgValueCandidates::new(cmd_completions::sandbox_ids))]
         ids: Vec<String>,
         /// Do not ask for confirmation
         #[arg(short = 'f', long)]

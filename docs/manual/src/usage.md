@@ -37,6 +37,36 @@ airlock self-update --check   # Only check for a newer release
 
 The update keeps your variant (bundled or distroless).
 
+## Shell completions
+
+Airlock can complete commands, options, template names and sandbox ids
+in bash, zsh and fish. To add the completions to the startup file of
+your shell, run:
+
+```bash
+airlock completions install        # The shell in $SHELL
+airlock completions install zsh    # A specific shell
+```
+
+The command adds one line to the startup file:
+
+| Shell | Startup file                                 |
+|-------|----------------------------------------------|
+| bash  | `~/.bashrc`                                  |
+| zsh   | `$ZDOTDIR/.zshrc`, or `~/.zshrc`             |
+| fish  | `$XDG_CONFIG_HOME/fish/completions/airlock.fish`, or `~/.config/fish/completions/airlock.fish` |
+
+The install is idempotent. Open a new shell to use the completions.
+
+To set up the completions yourself, load the completion script in the
+startup file:
+
+```bash
+eval "$(airlock completions script bash)"    # ~/.bashrc
+eval "$(airlock completions script zsh)"     # ~/.zshrc
+airlock completions script fish | source     # fish
+```
+
 ## Quick overview
 
 After installation, the basic workflow is:

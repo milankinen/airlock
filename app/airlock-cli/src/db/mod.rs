@@ -58,6 +58,7 @@ impl Db {
         let db = self.clone();
         let name = name.to_string();
         blocking(move || {
+            let _open = lock_open();
             let mut txn = db.0.write_txn()?;
             let database =
                 db.0.create_database(&mut txn, Some(&name))
@@ -77,6 +78,7 @@ impl Db {
         let db = self.clone();
         let name = name.to_string();
         blocking(move || {
+            let _open = lock_open();
             let mut txn = db.0.write_txn()?;
             let Some(database) =
                 db.0.open_database::<heed::types::Bytes, heed::types::Bytes>(&txn, Some(&name))?
@@ -108,6 +110,35 @@ impl Db {
         .await
     }
 
+    /// Run `body` in a read transaction with the database `name`. Does not
+    /// create the database, so a read never waits for a writer.
+    /// Returns:
+    ///   The result of `body`, or `None` if the database does not exist.
+    pub async fn read_existing<K, V, T>(
+        &self,
+        name: &str,
+        body: impl FnOnce(&RoTxn<'_, WithoutTls>, Database<K, V>) -> anyhow::Result<T> + Send + 'static,
+    ) -> anyhow::Result<Option<T>>
+    where
+        K: Send + 'static,
+        V: Send + 'static,
+        T: Send + 'static,
+    {
+        let db = self.clone();
+        let name = name.to_string();
+        blocking(move || {
+            let _open = lock_open();
+            let txn = db.0.read_txn().context(messages::db::BEGIN_TRANSACTION)?;
+            // The handle is valid only in this transaction, because a read
+            // transaction does not commit it.
+            let Some(database) = db.0.open_database::<K, V>(&txn, Some(&name))? else {
+                return Ok(None);
+            };
+            body(&txn, database).map(Some)
+        })
+        .await
+    }
+
     /// Run `body` in a write transaction. Commits if `body` succeeds, and
     /// aborts if it fails. Waits while another process writes.
     /// Returns:
@@ -129,6 +160,7 @@ impl Db {
     /// Whether the database `name` exists. Blocks.
     #[cfg(test)]
     pub fn has_database(&self, name: &str) -> bool {
+        let _open = lock_open();
         let txn = self.0.read_txn().unwrap();
         self.0
             .open_database::<heed::types::Bytes, heed::types::Bytes>(&txn, Some(name))
@@ -140,12 +172,24 @@ impl Db {
     /// exist). Blocks.
     #[cfg(test)]
     pub fn database_len(&self, name: &str) -> u64 {
+        let _open = lock_open();
         let txn = self.0.read_txn().unwrap();
         self.0
             .open_database::<heed::types::Bytes, heed::types::Bytes>(&txn, Some(name))
             .unwrap()
             .map_or(0, |db| db.len(&txn).unwrap())
     }
+}
+
+/// Lock the opens of named databases in this process. LMDB does not allow
+/// a database open in two transactions at the same time, and the
+/// transaction must end before the next open. Hold the lock until the
+/// transaction of the open ends.
+fn lock_open() -> std::sync::MutexGuard<'static, ()> {
+    static OPEN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // The lock guards no data, so a panic in a holder does not matter.
+    OPEN.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Run `op` on a blocking thread. LMDB transactions block and belong to

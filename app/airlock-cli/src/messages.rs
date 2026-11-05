@@ -881,6 +881,41 @@ pub mod cli {
     pub const ABORT_CHOICE: &str = "Abort";
 }
 
+pub mod completions {
+    //! Texts of the `completions` area.
+
+    use std::fmt::Display;
+
+    /// Comment above the line that `airlock completions install` adds to
+    /// the startup file of the shell.
+    pub const RC_COMMENT: &str = "# Airlock shell completions";
+
+    /// Error when airlock does not know the shell.
+    pub fn unknown_shell(shell: impl Display) -> String {
+        format!("unknown shell \"{shell}\", give one of: bash, zsh, fish")
+    }
+
+    /// Error when the read of the startup file fails.
+    pub fn read_failed(file: impl Display, err: impl Display) -> String {
+        format!("cannot read {file}: {err}")
+    }
+
+    /// Error when the write of the startup file fails.
+    pub fn write_failed(file: impl Display, err: impl Display) -> String {
+        format!("cannot write {file}: {err}")
+    }
+
+    /// Shows when the startup file has the completions already.
+    pub fn already_installed(file: impl Display) -> String {
+        format!("Completions are already in {file}")
+    }
+
+    /// Shows after the completions were added to the startup file.
+    pub fn installed(file: impl Display) -> String {
+        format!("Added completions to {file}. Open a new shell to use them.")
+    }
+}
+
 pub mod config {
     //! Texts of the `config` area.
 

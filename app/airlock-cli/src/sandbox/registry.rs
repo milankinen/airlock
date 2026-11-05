@@ -40,21 +40,23 @@ pub fn is_valid_id(id: &str) -> bool {
     id.len() == ID_LEN && id.bytes().all(|b| ID_ALPHABET.contains(&b))
 }
 
-/// Get all registered sandboxes, ordered by id.
+/// Get all registered sandboxes, ordered by id. Does not write, so shell
+/// completions can use it while another process writes.
 pub async fn list(db: &Db) -> anyhow::Result<Vec<Entry>> {
-    let table: Table = db.database(DATABASE).await?;
-    db.read(move |txn| {
-        let mut entries = Vec::new();
-        for item in table.iter(txn)? {
-            let (id, project) = item?;
-            entries.push(Entry {
-                id: id.to_string(),
-                project: OsStr::from_bytes(project).to_owned(),
-            });
-        }
-        Ok(entries)
-    })
-    .await
+    let entries = db
+        .read_existing(DATABASE, |txn, table: Table| {
+            let mut entries = Vec::new();
+            for item in table.iter(txn)? {
+                let (id, project) = item?;
+                entries.push(Entry {
+                    id: id.to_string(),
+                    project: OsStr::from_bytes(project).to_owned(),
+                });
+            }
+            Ok(entries)
+        })
+        .await?;
+    Ok(entries.unwrap_or_default())
 }
 
 /// Get the project directory of the sandbox `id`.
