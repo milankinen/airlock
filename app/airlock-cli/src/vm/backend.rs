@@ -53,6 +53,19 @@ pub trait VmHandle {
     fn stop(&mut self) -> HandleFuture<'_, anyhow::Result<()>>;
 }
 
+/// Error of a VM handle when the VM stopped without a stop request. The
+/// boot does not try again after it.
+#[derive(Debug)]
+pub struct VmStopped(pub String);
+
+impl std::fmt::Display for VmStopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for VmStopped {}
+
 /// Load the VM backend `vmm`.
 /// Returns:
 ///   The backend, or error if the host cannot run it.

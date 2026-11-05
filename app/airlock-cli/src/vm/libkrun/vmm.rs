@@ -1,10 +1,11 @@
 //! libkrun VM process.
 //!
 //! Reads the VM description from its input, loads the libkrun library,
-//! builds the VM, locks itself in the Seatbelt sandbox and runs the VM. The
+//! locks itself in the Seatbelt sandbox, then builds and runs the VM. The
 //! process stops when the guest stops, or when its input closes (airlock
-//! stopped). It writes the libkrun log with the guest console, and its
-//! errors, to its error output. The log has a size limit.
+//! stopped). It writes the libkrun log and its errors to its error output.
+//! The log has a size limit. The VM has no console device, so no guest text
+//! goes to the log.
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::io::{BufRead, Read, Write};
@@ -113,12 +114,8 @@ const LOG_STYLE_NEVER: u32 = 2;
 const LOG_OPTIONS_NO_ENV: u32 = 1;
 /// Guest vsock CID.
 const GUEST_CID: u64 = 3;
-/// Value for "no file descriptor". The C API maps a negative fd to `None`
-/// for its optional fd arguments (`Option<BorrowedFd>` in libkrun). The
-/// libkrun examples give -1 to `krun_init_log` for the same reason.
-const NO_FD: i32 = -1;
-/// Maximum size of the log that the VM process writes. The log also has the
-/// guest console, so the guest controls how much it gets.
+/// Maximum size of the log that the VM process writes. The guest can make
+/// libkrun write log lines, for example with bad device requests.
 const LOG_LIMIT: u64 = 16 * 1024 * 1024;
 
 /// A loaded dynamic library. It stays loaded until the process ends.
@@ -206,9 +203,6 @@ krun_api! {
     krun_balloon_device_new: fn(ErrOut) -> Handle;
     krun_balloon_device_set_free_page_reporting_mode: fn(Handle, u32);
     krun_rng_device_new: fn(ErrOut) -> Handle;
-    krun_console_device_builder: fn() -> Handle;
-    krun_console_builder_add_default_console: fn(Handle, i32, i32, i32, ErrOut) -> u64;
-    krun_console_builder_build: fn(Handle, ErrOut) -> Handle;
     krun_payload_load_external: fn(KrunStr, u32, KrunStr, KrunStr, ErrOut) -> Handle;
     krun_vmm_builder_new: fn() -> Handle;
     krun_vmm_builder_vcpus: fn(*mut Handle, u8, ErrOut) -> u64;
@@ -303,18 +297,22 @@ unsafe extern "C" fn push_to_string(data: *mut c_void, s: KrunStr) -> bool {
 
 /// Entry point of the VM process. Never returns.
 pub fn main() -> ! {
+    // Keep no file of airlock open in the process that runs the guest.
+    if let Err(e) = close_inherited_fds() {
+        eprintln!("libkrun: {e}");
+        exit_now(1);
+    }
     let mut line = String::new();
     let config = std::io::stdin()
         .lock()
         .read_line(&mut line)
         .map_err(|e| e.to_string())
         .and_then(|_| serde_json::from_str::<VmmConfig>(&line).map_err(|e| e.to_string()));
-    let config = config.and_then(resolve_paths);
     let config = match config {
         Ok(config) => config,
         Err(e) => {
             eprintln!("libkrun: bad VM description: {e}");
-            std::process::exit(1);
+            exit_now(1);
         }
     };
 
@@ -322,17 +320,58 @@ pub fn main() -> ! {
     // it runs, so an end of input means that airlock stopped.
     std::thread::spawn(|| {
         let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
-        // SAFETY: stop at once. The VM threads of libkrun do not stop on a
-        // normal exit.
-        unsafe { libc::_exit(0) }
+        exit_now(0);
     });
 
     let Err(e) = run(&config);
     eprintln!("libkrun: {e}");
-    std::process::exit(1);
+    exit_now(1);
 }
 
-/// Build the VM from `config`, apply the sandbox and run the VM.
+/// Stop the process at once with `code`. A normal exit runs exit handlers
+/// and waits for nothing, but the VM threads of libkrun keep the guest
+/// running while they do.
+fn exit_now(code: i32) -> ! {
+    // SAFETY: `_exit` ends the process without any cleanup.
+    unsafe { libc::_exit(code) }
+}
+
+/// Close all file descriptors except the standard input, output and error.
+/// The process can get open descriptors of airlock that are not marked
+/// close-on-exec.
+/// Returns:
+///   Error if the list of open descriptors is not available.
+fn close_inherited_fds() -> Result<(), String> {
+    let fail = || format!("list open fds: {}", std::io::Error::last_os_error());
+    let entry = size_of::<libc::proc_fdinfo>();
+    // SAFETY: a null buffer asks only for the size of the list.
+    let size =
+        unsafe { libc::proc_pidinfo(libc::getpid(), libc::PROC_PIDLISTFDS, 0, ptr::null_mut(), 0) };
+    let size = usize::try_from(size).map_err(|_| fail())?;
+    // Space for some descriptors that open between the two calls.
+    let mut fds: Vec<libc::proc_fdinfo> = Vec::with_capacity(size / entry + 16);
+    let capacity = i32::try_from(fds.capacity() * entry).map_err(|_| fail())?;
+    // SAFETY: the buffer has space for `capacity` bytes.
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDLISTFDS,
+            0,
+            fds.as_mut_ptr().cast(),
+            capacity,
+        )
+    };
+    let filled = usize::try_from(filled).map_err(|_| fail())?;
+    // SAFETY: the kernel wrote `filled` bytes of whole entries.
+    unsafe { fds.set_len(filled / entry) };
+    for fd in fds.iter().map(|f| f.proc_fd).filter(|fd| *fd > 2) {
+        // SAFETY: nothing in this process uses these descriptors.
+        unsafe { libc::close(fd) };
+    }
+    Ok(())
+}
+
+/// Apply the sandbox, then build the VM from `config` and run it.
 /// Returns:
 ///   Only an error. On success, libkrun ends the process when the guest
 ///   stops.
@@ -356,6 +395,11 @@ fn run(config: &VmmConfig) -> Result<std::convert::Infallible, String> {
             e,
         )
     })?;
+
+    // Apply the sandbox before libkrun opens any VM file. The build below
+    // starts the guest at once, so the guest never runs without the
+    // sandbox. An error stops the process before the build.
+    seatbelt::apply(&policy(config))?;
 
     let devices = not_null("devices", unsafe { (api.krun_mmio_device_manager_new)() })?;
     let add = |device: Handle| unsafe { (api.krun_mmio_device_manager_add)(devices, device) };
@@ -413,18 +457,9 @@ fn run(config: &VmmConfig) -> Result<std::convert::Infallible, String> {
     let rng = api.object("rng", |e| unsafe { (api.krun_rng_device_new)(e) })?;
     add(rng);
 
-    // Port 0 of the virtio console is `hvc0` in the guest. Without host
-    // fds, libkrun writes its output to the log, one line for each guest
-    // line. libkrun makes `hvc0` a console only for this port or for a
-    // terminal. `NO_FD` for all streams adds no extra ports.
-    let console = not_null("console", unsafe { (api.krun_console_device_builder)() })?;
-    api.call("console port", |e| unsafe {
-        (api.krun_console_builder_add_default_console)(console, NO_FD, NO_FD, NO_FD, e)
-    })?;
-    let console = api.object("console", |e| unsafe {
-        (api.krun_console_builder_build)(console, e)
-    })?;
-    add(console);
+    // No console device: airlock never reads the guest console, and the
+    // supervisor sends its logs and the kernel messages over vsock. Without
+    // it, the guest has no text output to the host and one device less.
 
     let payload = api.object("payload", |e| unsafe {
         (api.krun_payload_load_external)(
@@ -454,41 +489,23 @@ fn run(config: &VmmConfig) -> Result<std::convert::Infallible, String> {
         (api.krun_vmm_builder_build)(&raw mut builder, e)
     })?;
 
-    // Apply the sandbox as late as possible, but before the guest runs.
-    // libkrun has loaded the library and opened the boot files and the disk
-    // image, so the sandbox can deny all that the running VM does not need.
-    // Never run the guest without it.
-    seatbelt::apply(&policy(config))?;
-
     // libkrun ends the process when the guest stops.
     unsafe { (api.krun_vmm_run)(vmm) };
     Err("libkrun VM run returned".to_string())
 }
 
-/// Resolve the symlinks in the share and socket paths of `config`. libkrun
-/// uses these paths after the sandbox applies, and the sandbox denies an
-/// access through a symlink.
-/// Returns:
-///   The config with resolved paths, or error if a path does not resolve.
-fn resolve_paths(mut config: VmmConfig) -> Result<VmmConfig, String> {
-    for share in &mut config.shares {
-        share.path = seatbelt::resolve(&share.path)?;
-    }
-    for (_, path) in &mut config.vsock_ports {
-        *path = seatbelt::resolve(path)?;
-    }
-    Ok(config)
-}
-
-/// Make the sandbox policy for the VM of `config`: the shares and the
-/// vsock sockets. The disk image, the kernel and the initramfs need no
-/// rule, because libkrun opens them before the apply.
+/// Make the sandbox policy for the VM of `config`: the shares, the kernel,
+/// the initramfs, the disk image and the vsock sockets. The policy uses the
+/// same path strings as the libkrun calls, and the apply refuses paths that
+/// are not real paths.
 fn policy(config: &VmmConfig) -> seatbelt::Policy {
     let (ro, rw): (Vec<_>, Vec<_>) = config.shares.iter().partition(|s| s.read_only);
     let paths = |shares: Vec<&VmmShare>| shares.into_iter().map(|s| s.path.clone()).collect();
     seatbelt::Policy {
         read_only: paths(ro),
         read_write: paths(rw),
+        ro_files: vec![config.kernel.clone(), config.initramfs.clone()],
+        rw_files: config.disk.iter().cloned().collect(),
         unix_sockets: config.vsock_ports.iter().map(|(_, p)| p.clone()).collect(),
     }
 }

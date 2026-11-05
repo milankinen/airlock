@@ -91,6 +91,8 @@ impl VmInstance {
         for _ in 0..MAX_ATTEMPTS {
             match self.vm_handle.vsock_connect(port).await {
                 Ok(fd) => return Ok(fd),
+                // A VM that stopped never answers.
+                Err(e) if e.is::<backend::VmStopped>() => return Err(e),
                 Err(e) => {
                     last_err = Some(e);
                     tokio::time::sleep(DELAY).await;
@@ -354,7 +356,8 @@ fn prepare_shares(
 ///  - `console`: Console part of the command line from the VM backend
 ///  - `log_level`: Log level of the boot
 fn build_kernel_cmdline(console: &str, log_level: LogLevel) -> String {
-    let mut cmdline = format!("{console} rdinit=/init");
+    // A backend without a console gives an empty console part.
+    let mut cmdline = format!("{console} rdinit=/init").trim_start().to_string();
     if !matches!(log_level, LogLevel::Trace | LogLevel::Debug) {
         cmdline.push_str(" quiet loglevel=3");
     }

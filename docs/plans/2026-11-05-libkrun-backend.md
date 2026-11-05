@@ -37,9 +37,11 @@ default. libkrun stays pinned to the libkrun 2.0 commit of the PoC.
 - **VMM process:** `airlock internal vmm-libkrun` (in `cli/cmd_internal.rs`).
 - **Hardening:** Seatbelt through the C API (`sandbox_init_with_parameters`
   with `extern "C"`). Deny by default. Allow: read for the read-only
-  shares, read and write for the read-write shares and the disk image,
-  bind and accept on the vsock Unix sockets that the sandbox process
-  connects to. Paths go in as profile parameters, not as profile text.
+  shares, the kernel and the initramfs, read and write for the read-write
+  shares and the disk image, bind on the vsock Unix sockets that the
+  sandbox process connects to. The VM process applies the policy before
+  the VM build, because the build starts the guest. Paths go in as profile
+  parameters, not as profile text.
 
 ## Work units
 

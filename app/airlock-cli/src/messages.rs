@@ -4682,6 +4682,11 @@ pub mod libkrun {
         format!("vsock connect to {path}: {err}")
     }
 
+    /// Error when the vsock socket of the VM is missing or is not a socket.
+    pub fn vsock_socket_missing(path: impl Display) -> String {
+        format!("vsock socket {path} is missing or is not a socket")
+    }
+
     /// Error when the guest closes a new vsock connection at once, because
     /// no guest process listens on the port yet.
     pub fn vsock_refused(port: u32) -> String {

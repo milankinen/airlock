@@ -7,7 +7,7 @@
 //! contains the libkrun library. The backend extracts it before the boot.
 //!
 //! When the VM process stops without a stop request, the errors give the
-//! end of its log, which has the guest console and the libkrun errors.
+//! end of its log, which has the libkrun errors.
 
 use std::io::{Read, Seek, Write};
 use std::os::unix::io::{AsRawFd, OwnedFd};
@@ -20,7 +20,7 @@ use super::vmm::{VmmConfig, VmmShare};
 use crate::messages;
 use crate::settings::Vmm;
 use crate::util::VerifiedPath;
-use crate::vm::backend::{HandleFuture, VmHandle, VmmBackend};
+use crate::vm::backend::{HandleFuture, VmHandle, VmStopped, VmmBackend};
 use crate::vm::config::VmConfig;
 
 /// VM backend that runs libkrun in a child process.
@@ -29,6 +29,12 @@ pub struct Libkrun;
 impl VmmBackend for Libkrun {
     fn kind(&self) -> Vmm {
         Vmm::Libkrun
+    }
+
+    // The VM has no console device. The guest init opens its standard
+    // files on `/dev/null` when the kernel has no console for it.
+    fn kernel_console(&self) -> &'static str {
+        ""
     }
 
     fn boot_vm<'a>(
@@ -121,6 +127,9 @@ impl LibkrunVm {
         let mut vsock_ports = Vec::new();
         for port in PORTS {
             let path = socket_path(runtime_dir, port)?;
+            // An old socket file from an earlier run blocks the bind. Remove
+            // it first: the path check below refuses a symlink there.
+            crate::vm::remove_old(&path)?;
             let path_str = utf8(&path)?;
             // libkrun only logs a bind error, and the connects then fail
             // without a clear reason. Stop here.
@@ -130,8 +139,6 @@ impl LibkrunVm {
                     MAX_SOCKET_PATH
                 ));
             }
-            // An old socket file from an earlier run blocks the bind.
-            crate::vm::remove_old(&path)?;
             vsock_ports.push((port, path_str));
         }
         let vmm_config = VmmConfig {
@@ -160,8 +167,7 @@ impl LibkrunVm {
         let mut input = serde_json::to_vec(&vmm_config)?;
         input.push(b'\n');
 
-        // The VM process writes the libkrun log and the guest console to its
-        // error output. It limits the size. Remove an old entry first, so
+        // The VM process writes the libkrun log to its error output. It limits the size. Remove an old entry first, so
         // that the create does not fail.
         let log = runtime_dir.join("libkrun.log")?;
         crate::vm::remove_old(&log)?;
@@ -214,9 +220,18 @@ impl LibkrunVm {
         if let Some(child) = &self.child
             && crate::util::process::exited_unreaped(child.id())
         {
-            anyhow::bail!(self.stopped_error());
+            return Err(VmStopped(self.stopped_error()).into());
         }
         let path = socket_path(&self.runtime_dir, port)?;
+        // The VM process can create an entry at the socket path. The
+        // connect must never follow a symlink there to an other socket of
+        // the host, so connect only to a socket file.
+        if !path
+            .symlink_metadata()
+            .is_ok_and(|m| std::os::unix::fs::FileTypeExt::is_socket(&m.file_type()))
+        {
+            anyhow::bail!(messages::libkrun::vsock_socket_missing(&path));
+        }
         let stream = path.connect_unix_async().await.map_err(|e| {
             anyhow::anyhow!(messages::libkrun::vsock_socket_connect_failed(&path, e))
         })?;
@@ -303,9 +318,12 @@ impl LibkrunVm {
     }
 
     /// Make the error for a VM process that stopped without a request. It
-    /// has the log path and the end of the log.
+    /// has the log path and the end of the log. The guest can put text in
+    /// the log (for example a device name), so the text has no control
+    /// characters.
     fn stopped_error(&self) -> String {
-        messages::libkrun::stopped(&self.log, log_tail(&self.log).trim_end())
+        let tail = crate::util::strip_controls(log_tail(&self.log).as_bytes());
+        messages::libkrun::stopped(&self.log, tail.trim_end())
     }
 }
 
@@ -356,6 +374,8 @@ fn socket_path(dir: &VerifiedPath, port: u32) -> std::io::Result<VerifiedPath> {
 }
 
 /// Get `path` as a UTF-8 string. The libkrun API accepts only UTF-8 paths.
+/// The path has no symlink in any part, so it is a real path, as the
+/// sandbox of the VM process needs (it checks this again).
 fn utf8(path: &VerifiedPath) -> anyhow::Result<String> {
     path.to_path()?
         .to_str()
