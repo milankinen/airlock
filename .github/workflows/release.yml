@@ -89,7 +89,7 @@ jobs:
                       airlock-macos-aarch64-distroless airlock-macos-x86_64-distroless \
                       airlock-linux-x86_64 airlock-linux-aarch64 \
                       airlock-linux-x86_64-distroless airlock-linux-aarch64-distroless \
-                      notifier-macos manual; do
+                      notifier-macos libkrun-macos manual; do
             if ! awk -F'\t' -v n="$name" -v s="$GITHUB_SHA" \
                  '$1 == n && $2 == s && $3 == "false" { found = 1 } END { exit !found }' artifacts.tsv; then
               echo "::error::Artifact '$name' missing, expired or not from $GITHUB_SHA in CI run $RUN_ID"
@@ -123,6 +123,10 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --name notifier-macos \
             --dir artifacts/notifier-macos
+          gh run download "${{ needs.resolve-ci-run.outputs.run_id }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name libkrun-macos \
+            --dir artifacts/libkrun-macos
       - name: Verify binaries are from the release commit
         run: |
           for name in airlock-macos-aarch64 airlock-macos-x86_64 \
@@ -157,6 +161,26 @@ jobs:
               || { echo "::error::$name does not contain the signed notifier app"; exit 1; }
           done
           rm -rf notifier-check
+      # The CI run signs the libkrun library only on push. Check the
+      # signature and that each aarch64 binary contains exactly this library.
+      - name: Verify embedded libkrun library
+        run: |
+          set -euo pipefail
+          LIB=artifacts/libkrun-macos/libkrun.dylib
+          codesign --verify --strict --verbose=2 "$LIB"
+          INFO=$(codesign --display --verbose=2 "$LIB" 2>&1)
+          echo "$INFO"
+          grep -q '^Authority=Developer ID Application: ' <<<"$INFO" \
+            || { echo "::error::libkrun library has no Developer ID signature"; exit 1; }
+          grep -q '^CodeDirectory .*flags=.*runtime' <<<"$INFO" \
+            || { echo "::error::libkrun library has no hardened runtime"; exit 1; }
+          grep -q '^Timestamp=' <<<"$INFO" \
+            || { echo "::error::libkrun library signature has no secure timestamp"; exit 1; }
+          for name in airlock-macos-aarch64 airlock-macos-aarch64-distroless; do
+            python3 -I -c 'import sys; sys.exit(open(sys.argv[2], "rb").read() not in open(sys.argv[1], "rb").read())' \
+              "artifacts/$name/airlock" "$LIB" \
+              || { echo "::error::$name does not contain the signed libkrun library"; exit 1; }
+          done
       - name: Import Developer ID certificate
         uses: ./.github/actions/import-signing-cert
         with:
