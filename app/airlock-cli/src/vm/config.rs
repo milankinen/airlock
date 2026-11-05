@@ -13,8 +13,8 @@ pub struct VmShare {
     pub host_path: VerifiedPath,
     /// If `true`, the guest cannot write to the share.
     pub read_only: bool,
-    /// If `true`, the host does not change the files while the VM runs.
-    /// A backend can then let the guest keep file data in its cache.
+    /// If `true`, the host does not change the files while the VM runs, so
+    /// the guest can cache file data.
     // Only the libkrun backend reads it.
     #[cfg_attr(not(vm_libkrun), allow(dead_code))]
     pub immutable: bool,
@@ -39,8 +39,7 @@ pub struct VmConfig {
     pub cache_disk: Option<VerifiedPath>,
     /// Directory for runtime files (e.g., vsock UNIX sockets).
     pub runtime_dir: VerifiedPath,
-    /// Directory of the extracted VM assets. A backend extracts its own
-    /// assets here.
+    /// Directory for the extracted VM assets.
     pub asset_dir: VerifiedPath,
     /// Enable nested virtualization and give the guest access to KVM.
     pub kvm: bool,

@@ -2,62 +2,51 @@
 //!
 //! libkrun has no sandbox of its own, and its shared directory server does
 //! not keep the guest in the shared directories. This module locks the VM
-//! process to the files and sockets that the VM needs, so that a guest
-//! that escapes a share still cannot get to other host files.
+//! process to the files and sockets that the VM needs. A guest that escapes
+//! a share still cannot reach other host files.
 //!
-//! The policy denies all operations by default. It allows only:
-//!  * read access to the read-only shares and to the kernel and initramfs
-//!  * read and write access to the read-write shares and the disk image
-//!  * the creation of the vsock sockets. These sockets are the only
-//!    connection between the guest and airlock. The VM process gets no
-//!    other network access.
+//! The policy denies all by default. It allows only:
+//!  * read access to read-only shares, kernel and initramfs
+//!  * read and write access to read-write shares and the disk image
+//!  * the vsock sockets, the only connection to airlock
 //!
-//! The sandbox applies to the full process and cannot be removed. Apply it
-//! after the VM process loaded all libraries, and before libkrun builds the
-//! VM: the build starts the guest at once. Files that are open stay usable.
+//! The sandbox cannot be removed. Apply it after the libraries load and
+//! before libkrun builds the VM. Open files stay usable.
 //!
-//! All paths must be real paths, without symlinks. The sandbox denies an
-//! access through a symlink, and a rule matches only the real path.
-//!
-//! Host paths go to the policy only as parameters, never as policy text, so
-//! that a path cannot change the policy.
+//! All paths must be real paths, without symlinks.
 
 use std::ffi::{CStr, CString, c_char, c_int};
 
 use crate::util::VerifiedPath;
 
-/// Host paths that the VM process can use after the sandbox applies. All
-/// paths must be absolute.
+/// Host paths that the VM process can use. All paths must be absolute.
 #[derive(Debug, Default, Clone)]
 pub struct Policy {
-    /// Directories with read access to all of their contents.
+    /// Directories with read access.
     pub read_only: Vec<String>,
-    /// Directories with read and write access to all of their contents.
+    /// Directories with read and write access.
     pub read_write: Vec<String>,
-    /// Files with read access, for example the kernel.
+    /// Files with read access.
     pub ro_files: Vec<String>,
-    /// Files with read and write access, for example the disk image.
+    /// Files with read and write access.
     pub rw_files: Vec<String>,
-    /// Unix sockets that the VM process makes and accepts connections on.
-    /// The parent directory must exist. The socket itself can be missing.
+    /// Unix sockets that the VM process creates. The parent directory must
+    /// exist.
     pub unix_sockets: Vec<String>,
 }
 
-/// Seatbelt `sandbox_init_with_parameters` flag value for policy text. The
-/// other flag (`SANDBOX_NAMED`) selects a built-in policy by name.
+/// Flag value of `sandbox_init_with_parameters` for policy text.
 const PROFILE_TEXT: u64 = 0;
 
-// The functions are in libSystem (`libsystem_sandbox`), which each macOS
-// program links, so no link attribute is necessary. Chromium declares the
-// same functions in the same way. Apple marks the API as deprecated, but
-// Chromium, WebKit and the system services still use it.
+// libSystem has these functions, so no link attribute is necessary. Apple
+// marks the API as deprecated, but Chromium and WebKit still use it.
 unsafe extern "C" {
     /// Apply the policy `profile` to the current process.
     /// Args:
     ///  - `profile`: Policy text
     ///  - `flags`: `PROFILE_TEXT`
-    ///  - `parameters`: Names and values in turns, with a null at the end
-    ///  - `errorbuf`: Gets the error text on failure. Free it with
+    ///  - `parameters`: Names and values in turns, null at the end
+    ///  - `errorbuf`: Error text on failure. Free it with
     ///    `sandbox_free_error`.
     ///
     /// Returns:
@@ -73,13 +62,10 @@ unsafe extern "C" {
     fn sandbox_free_error(errorbuf: *mut c_char);
 }
 
-/// Apply the sandbox with `policy` to the current process. The sandbox
-/// stays until the process stops. Files and sockets that are already open
-/// stay usable.
+/// Apply the sandbox with `policy` to the current process.
 /// Returns:
-///   Error if a path does not resolve, has a null byte or is not UTF-8, or
-///   if Seatbelt refuses the policy. Then the process has no sandbox, and
-///   the caller must stop it.
+///   Error if a path is not valid or Seatbelt refuses the policy. Then the
+///   process has no sandbox and the caller must stop it.
 pub fn apply(policy: &Policy) -> Result<(), String> {
     check_real(policy)?;
     let (text, params) = profile(policy);
@@ -89,13 +75,12 @@ pub fn apply(policy: &Policy) -> Result<(), String> {
         .flat_map(|(name, value)| [name, value])
         .map(|s| CString::new(s).map_err(|e| format!("sandbox parameter: {e}")))
         .collect::<Result<Vec<_>, _>>()?;
-    // The parameter list must end with a null.
     let mut ptrs: Vec<*const c_char> = params.iter().map(|s| s.as_ptr()).collect();
     ptrs.push(std::ptr::null());
 
     let mut err: *mut c_char = std::ptr::null_mut();
-    // SAFETY: the policy text and all parameters are null-terminated and
-    // live until the call ends. The list ends with a null.
+    // SAFETY: text and parameters are null-terminated and live until the
+    // call ends. The list ends with a null.
     let rc = unsafe {
         sandbox_init_with_parameters(text.as_ptr(), PROFILE_TEXT, ptrs.as_ptr(), &raw mut err)
     };
@@ -105,8 +90,7 @@ pub fn apply(policy: &Policy) -> Result<(), String> {
     let reason = if err.is_null() {
         "no reason given".to_string()
     } else {
-        // SAFETY: Seatbelt gives a null-terminated text. It is not used
-        // after the free.
+        // SAFETY: Seatbelt gives a null-terminated text. No use after free.
         unsafe {
             let reason = CStr::from_ptr(err).to_string_lossy().into_owned();
             sandbox_free_error(err);
@@ -116,12 +100,10 @@ pub fn apply(policy: &Policy) -> Result<(), String> {
     Err(format!("sandbox apply: {reason}"))
 }
 
-/// Check that all paths of `policy` are real paths. The caller gives the
-/// same paths to libkrun, so a rule then matches each file that libkrun
-/// uses, and no access goes through a symlink.
+/// Check that all paths of `policy` are real paths. A rule matches only the
+/// real path, so a symlink would break the rule or hide the target.
 /// Returns:
-///   Error if a path does not resolve, is not UTF-8, or is not the same as
-///   its real path.
+///   Error if a path is not UTF-8 or differs from its real path.
 fn check_real(policy: &Policy) -> Result<(), String> {
     let all = [
         &policy.read_only,
@@ -141,10 +123,10 @@ fn check_real(policy: &Policy) -> Result<(), String> {
     Ok(())
 }
 
-/// Resolve the symlinks of `path`. A missing name at the end stays as it
-/// is (a socket before the bind).
+/// Resolve the symlinks of `path`. A missing last name stays as it is
+/// (a socket before the bind).
 /// Returns:
-///   The resolved path, or error if it does not resolve or is not UTF-8.
+///   The resolved path, or error.
 fn resolve(path: &str) -> Result<String, String> {
     let fail = |e: &dyn std::fmt::Display| format!("sandbox path {path}: {e}");
     if !path.starts_with('/') {
@@ -157,33 +139,26 @@ fn resolve(path: &str) -> Result<String, String> {
         .ok_or_else(|| fail(&"not UTF-8"))
 }
 
-/// Make the Seatbelt policy text for `policy`. Use real paths.
+/// Make the policy text for `policy`.
 /// Returns:
-///   The policy text and its parameters (name, value). The text refers to
-///   each path only by its parameter name.
+///   The text and its parameters (name, value). Paths go only to
+///   parameters, so a path cannot change the policy.
 fn profile(policy: &Policy) -> (String, Vec<(String, String)>) {
     let mut b = Builder::default();
     b.line("(version 1)");
-    // Deny all that the rules below do not allow. This also denies all
-    // network access except the vsock sockets, process start (exec, fork),
-    // signals to other processes, system services (mach-lookup) and
-    // hardware access (iokit).
+    // This also denies other network, exec, fork, signals, mach-lookup and
+    // iokit.
     b.line("(deny default)");
 
-    // A rule without filters allows the operation on all objects. Thus
-    // each rule below must have a filter. `Builder::rule` adds no rule for
-    // an empty list.
+    // A rule without filter allows all objects. Each rule below needs a
+    // filter.
 
-    // The hypervisor library reads this system value when libkrun builds
-    // the VM.
+    // The hypervisor library reads this value at the VM build.
     b.line("(allow sysctl-read (sysctl-name \"kern.hv_vmm_present\"))");
 
-    // Shares: libkrun opens the share roots when the guest starts to use
-    // them. Then it opens the files of a share with
-    // `/.vol/<dev>/<ino>` paths. Seatbelt checks the real path of the
-    // file, not the `/.vol` text, so the share rules apply, and `/.vol`
-    // needs no rule. A `/.vol` path to a file outside the shares, or `..`
-    // from a share root, gets a deny.
+    // Shares: libkrun opens share files with `/.vol/<dev>/<ino>` paths.
+    // Seatbelt checks the real path, so `/.vol` needs no rule. `/.vol` paths
+    // outside the shares, or `..` from a share root, get a deny.
     b.rule("file-read*", "(subpath {})", "RO_DIR", &policy.read_only);
     b.rule(
         "file-read* file-write*",
@@ -192,8 +167,8 @@ fn profile(policy: &Policy) -> (String, Vec<(String, String)>) {
         &policy.read_write,
     );
 
-    // Boot files and the disk image: libkrun opens them when it builds the
-    // VM, after the apply. `literal` matches only the file itself.
+    // Boot files and disk image: libkrun opens them at the VM build, after
+    // the apply.
     b.rule("file-read*", "(literal {})", "RO_FILE", &policy.ro_files);
     b.rule(
         "file-read* file-write*",
@@ -202,10 +177,8 @@ fn profile(policy: &Policy) -> (String, Vec<(String, String)>) {
         &policy.rw_files,
     );
 
-    // libkrun makes one listening Unix socket for each vsock port when the
-    // guest starts the vsock device. The bind needs
-    // `network-bind` on the socket and `file-write-create` for the socket
-    // file. The accept and the reads and writes need no rule.
+    // libkrun binds one Unix socket for each vsock port. The bind needs
+    // both rules. Accept, read and write need none.
     b.rule(
         "network-bind",
         "(local unix-socket (path-literal {}))",
@@ -220,16 +193,12 @@ fn profile(policy: &Policy) -> (String, Vec<(String, String)>) {
     );
 
     // No rule for these, by intent:
-    //  * Hypervisor: the VM calls go to the kernel through traps, which
-    //    Seatbelt does not filter. The process has the hypervisor
-    //    entitlement. The hypervisor library asks for the privileged host
-    //    port at the vCPU start and gets a deny. A process without root
-    //    cannot get this port, and the VM runs without it.
-    //  * Threads and guest memory: thread start, anonymous memory maps and
-    //    random numbers (getentropy) have no Seatbelt check.
-    //  * Libraries: the VM process loads libkrun before the apply.
-    //  * Log and input: reads and writes on open file descriptors (pipes,
-    //    the disk image, the share roots) have no check.
+    //  * Hypervisor: VM calls are traps that Seatbelt does not filter. The
+    //    library asks for the privileged host port at vCPU start and gets a
+    //    deny. The VM runs without it.
+    //  * Threads, anonymous memory, getentropy: no Seatbelt check.
+    //  * Libraries: loaded before the apply.
+    //  * Open file descriptors: reads and writes have no check.
     (b.text, b.params)
 }
 
@@ -249,15 +218,14 @@ impl Builder {
         self.text.push('\n');
     }
 
-    /// Add one rule that allows `ops` on all `paths`. Adds no rule if
-    /// `paths` is empty, because a rule without filters allows all.
+    /// Add one rule that allows `ops` on all `paths`. Adds no rule for an
+    /// empty list, because a rule without filter allows all.
     /// Args:
     ///  - `ops`: Operations, separated by spaces
     ///  - `filter`: Filter with `{}` in the place of the path, for
     ///    example `(subpath {})`
-    ///  - `prefix`: Parameter name prefix. The name gets the index of the
-    ///    path at the end.
-    ///  - `paths`: Path values for the parameters
+    ///  - `prefix`: Parameter name prefix, followed by the path index
+    ///  - `paths`: Parameter values
     fn rule(&mut self, ops: &str, filter: &str, prefix: &str, paths: &[String]) {
         if paths.is_empty() {
             return;
@@ -279,8 +247,7 @@ mod tests {
 
     use super::*;
 
-    /// Path with characters that would change the policy if it were in the
-    /// policy text.
+    /// Path with policy syntax.
     const EVIL: &str = "/tmp/a\") (allow default) (\"";
 
     /// Make a policy with one path for each class.

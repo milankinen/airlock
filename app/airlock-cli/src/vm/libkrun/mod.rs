@@ -17,8 +17,6 @@ mod tests;
 #[cfg(vm_libkrun)]
 mod vmm;
 
-use std::rc::Rc;
-
 #[cfg(vm_libkrun)]
 pub use self::vmm::main as vmm_main;
 use super::backend::VmmBackend;
@@ -28,10 +26,10 @@ use super::backend::VmmBackend;
 ///   The backend, or error if the host is not macOS on Apple silicon.
 // All loaders have the same signature, also when they cannot fail.
 #[allow(clippy::unnecessary_wraps)]
-pub fn load() -> anyhow::Result<Rc<dyn VmmBackend>> {
+pub fn load() -> anyhow::Result<&'static dyn VmmBackend> {
     #[cfg(vm_libkrun)]
     {
-        Ok(Rc::new(libkrun::Libkrun))
+        Ok(&libkrun::Libkrun)
     }
     #[cfg(not(vm_libkrun))]
     {

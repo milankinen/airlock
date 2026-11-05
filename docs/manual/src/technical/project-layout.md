@@ -17,7 +17,8 @@ The default is `~/Library/Application Support/airlock` on macOS and
     initramfs.gz                 # initramfs
     cloud-hypervisor             # (Cloud Hypervisor backend) hypervisor binary
     virtiofsd                    # (Cloud Hypervisor backend) VirtioFS daemon
-    checksum-<group>             # checksum of one asset group, extracts it again after binary update
+    libkrun.dylib                # (libkrun backend) VM library
+    <file>.checksum              # checksum of one asset file, extracts it again after binary update
     lock                         # serializes the extraction across processes
   oci/
     images/<digest>              # schema-tagged JSON: the fully-baked OciImage

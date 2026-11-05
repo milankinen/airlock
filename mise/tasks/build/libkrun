@@ -1,16 +1,13 @@
 #!/bin/bash
 #MISE description="Build the libkrun dynamic library (macOS arm64 only)"
-# The macOS arm64 airlock binary embeds the library and extracts it at
-# runtime. Other hosts get an empty file.
+# The macOS arm64 airlock binary embeds the library. Other hosts get an
+# empty file.
 #
-# Signing: with APPLE_SIGNING_IDENTITY set, the task signs the library with
-# the Developer ID, the hardened runtime and a secure timestamp. Without it,
-# the task signs ad hoc. The hardened runtime of the airlock binary loads only
-# libraries with the same Team ID (library validation), so the release build
-# must sign the library before it is embedded. The signature is part of the
-# Mach-O file, so the extracted copy keeps it.
-# The task cannot see a change of the signing identity. Use `--force` to sign
-# again.
+# Signing: with APPLE_SIGNING_IDENTITY set, the task signs with the
+# Developer ID, hardened runtime and timestamp. Otherwise it signs ad hoc.
+# Library validation loads only libraries with the same Team ID, so the
+# library must be signed before the embed.
+# The task does not see a change of identity. Use `--force` to sign again.
 #MISE sources=["mise/tasks/build/libkrun", "app/vm-libkrun/*"]
 #MISE outputs=["target/vm/libkrun.dylib"]
 set -euo pipefail
@@ -25,13 +22,12 @@ if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
   exit 0
 fi
 
-# One build for each version of the build script, shared by all worktrees.
-# The build tree stays in the cache, so a rebuild after a failure resumes.
-# The cache keeps the unsigned library: the signature is added below.
+# One build for each build script version, shared by all worktrees. The
+# cache keeps the build tree and the unsigned library.
 KEY=$(shasum -a 256 app/vm-libkrun/build.sh | cut -c1-16)
 CACHE="${AIRLOCK_DEV_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/airlock-dev}/libkrun/${KEY}"
 mkdir -p "$CACHE"
-# macOS has no flock(1). mkdir is atomic, so it is the lock.
+# macOS has no flock(1). mkdir is atomic.
 until mkdir "$CACHE/lock" 2>/dev/null; do
   echo "Waiting for the libkrun build of another worktree (${CACHE}/lock)..."
   sleep 5

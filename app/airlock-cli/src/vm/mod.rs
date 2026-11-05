@@ -129,7 +129,7 @@ pub async fn start(
     env: Vec<String>,
     opts: &BootOptions,
 ) -> anyhow::Result<(VmInstance, OwnedFd)> {
-    let backend = &*opts.vmm;
+    let backend = opts.vmm;
     tracing::debug!("vm backend: {}", backend.kind());
     let boot_files = assets::boot_files(project)?;
     let sandbox_dir = project.sandbox_dir.clone();
@@ -150,7 +150,7 @@ pub async fn start(
     };
 
     if !opts.quiet {
-        log_config(project, opts.vmm.kind());
+        log_config(project);
     }
     for share in &shares {
         tracing::debug!(
@@ -364,13 +364,8 @@ fn build_kernel_cmdline(console: &str, log_level: LogLevel) -> String {
     cmdline
 }
 
-/// Print the VM resources summary (backend, cpus, memory, disk).
-fn log_config(project: &Project, vmm: crate::settings::Vmm) {
-    cli::log!(
-        "  {} {}",
-        cli::bullet(),
-        messages::vm::config_vmm(cli::dim(vmm.name()))
-    );
+/// Print the VM resources summary (cpus, memory, disk).
+fn log_config(project: &Project) {
     cli::log!(
         "  {} {}",
         cli::bullet(),

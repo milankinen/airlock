@@ -1,11 +1,9 @@
 //! libkrun VM process.
 //!
-//! Reads the VM description from its input, loads the libkrun library,
-//! locks itself in the Seatbelt sandbox, then builds and runs the VM. The
-//! process stops when the guest stops, or when its input closes (airlock
-//! stopped). It writes the libkrun log and its errors to its error output.
-//! The log has a size limit. The VM has no console device, so no guest text
-//! goes to the log.
+//! Reads the VM description from its input, locks itself in the Seatbelt
+//! sandbox, then builds and runs the VM. The process stops when the guest
+//! stops or when airlock stops. It writes a size-limited libkrun log and
+//! its errors to its error output.
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::io::{BufRead, Read, Write};
@@ -60,7 +58,7 @@ type Handle = *mut c_void;
 /// Place where a libkrun call puts its error. Null after a successful call.
 type ErrOut = *mut Handle;
 
-/// libkrun string: UTF-8 bytes and their length (no null at the end).
+/// libkrun string: UTF-8 bytes and length, no null at the end.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct KrunStr {
@@ -78,7 +76,7 @@ impl KrunStr {
     }
 }
 
-/// Temporary handle of an object that the caller implements (`KrunVtableHandle`).
+/// `KrunVtableHandle`: object that the caller implements.
 #[repr(C)]
 struct VtableHandle {
     type_tag: u32,
@@ -88,23 +86,22 @@ struct VtableHandle {
     vtable_size: u16,
 }
 
-/// Functions of a string writer (`KrunPushStrVtable`).
+/// `KrunPushStrVtable`: functions of a string writer.
 #[repr(C)]
 struct PushStrVtable {
     drop: Option<unsafe extern "C" fn(*mut c_void)>,
     push: unsafe extern "C" fn(*mut c_void, KrunStr) -> bool,
 }
 
-/// Type tag of a string writer (`KRUN_PUSH_STR_TYPE_TAG`).
+/// `KRUN_PUSH_STR_TYPE_TAG`.
 const PUSH_STR_TYPE_TAG: u32 = 16_777_228;
 /// `KRUN_KERNEL_FORMAT_RAW`: uncompressed arm64 `Image`.
 const KERNEL_FORMAT_RAW: u32 = 1;
 /// `KRUN_DISK_FORMAT_RAW`.
 const DISK_FORMAT_RAW: u32 = 0;
-/// `KRUN_FREE_PAGE_REPORTING_MODE_REPLACE`: give the memory of free guest
-/// pages back to macOS.
+/// `KRUN_FREE_PAGE_REPORTING_MODE_REPLACE`: free guest pages go back to macOS.
 const FREE_PAGE_REPORTING_REPLACE: u32 = 1;
-/// `KRUN_CACHE_POLICY_ALWAYS`: the guest keeps file data across opens.
+/// `KRUN_CACHE_POLICY_ALWAYS`.
 const CACHE_POLICY_ALWAYS: u32 = 2;
 /// `KRUN_LOG_LEVEL_WARN`.
 const LOG_LEVEL_WARN: u32 = 2;
@@ -114,20 +111,19 @@ const LOG_STYLE_NEVER: u32 = 2;
 const LOG_OPTIONS_NO_ENV: u32 = 1;
 /// Guest vsock CID.
 const GUEST_CID: u64 = 3;
-/// Maximum size of the log that the VM process writes. The guest can make
-/// libkrun write log lines, for example with bad device requests.
+/// Maximum log size. The guest can make libkrun write log lines.
 const LOG_LIMIT: u64 = 16 * 1024 * 1024;
 
 /// A loaded dynamic library. It stays loaded until the process ends.
 struct Library(*mut c_void);
 
 impl Library {
-    /// Load the library at `path` and bind all its symbols now. Then no
-    /// later call needs a file access, which the sandbox can deny.
+    /// Load the library at `path`. `RTLD_NOW` avoids file access after the
+    /// sandbox applies.
     fn open(path: &str) -> Result<Self, String> {
         let c_path = CString::new(path).map_err(|e| format!("load {path}: {e}"))?;
         // SAFETY: `c_path` is null-terminated. The library is the libkrun
-        // build that airlock contains. Its load runs no airlock code.
+        // build of airlock.
         let handle = unsafe { libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
         if handle.is_null() {
             return Err(format!("load {path}: {}", dl_error()));
@@ -160,8 +156,7 @@ fn dl_error() -> String {
     }
 }
 
-/// Declare the libkrun functions that the VM process uses, and a loader that
-/// finds them in the library.
+/// Declare the used libkrun functions and a loader for them.
 macro_rules! krun_api {
     ($($name:ident: fn($($arg:ty),*) $(-> $ret:ty)?;)*) => {
         /// libkrun functions.
@@ -171,12 +166,10 @@ macro_rules! krun_api {
 
         impl Api {
             /// Find all functions in `lib`.
-            /// SAFETY: `lib` must be libkrun with the C API that this file
-            /// declares.
+            /// SAFETY: `lib` must be libkrun with the declared C API.
             unsafe fn load(lib: &Library) -> Result<Self, String> {
                 Ok(Self {
-                    // SAFETY: the symbol is a function with this signature
-                    // (see above).
+                    // SAFETY: see the function docs.
                     $($name: unsafe {
                         std::mem::transmute::<*mut c_void, unsafe extern "C" fn($($arg),*) $(-> $ret)?>(
                             lib.symbol(&CString::new(stringify!($name)).expect("no null in name"))?,
@@ -264,11 +257,10 @@ fn not_null(what: &str, handle: Handle) -> Result<Handle, String> {
     }
 }
 
-/// Make a pipe for the libkrun log. A thread copies the log to the error
-/// output (fd 2) until `LOG_LIMIT`, then drops the rest. libkrun never
-/// waits on a full log.
+/// Make a pipe for the libkrun log. A thread copies it to the error output
+/// until `LOG_LIMIT`, then drops the rest, so libkrun never blocks.
 /// Returns:
-///   The write end of the pipe. It stays open until the process ends.
+///   The write end of the pipe.
 fn limited_log() -> Result<i32, String> {
     let (mut reader, writer) = std::io::pipe().map_err(|e| format!("log pipe: {e}"))?;
     std::thread::spawn(move || {
@@ -283,7 +275,7 @@ fn limited_log() -> Result<i32, String> {
     Ok(writer.into_raw_fd())
 }
 
-/// String writer for libkrun error texts. Adds `s` to the `String` at `data`.
+/// String writer for libkrun error texts. Appends `s` to the `String` at `data`.
 unsafe extern "C" fn push_to_string(data: *mut c_void, s: KrunStr) -> bool {
     // SAFETY: `data` is the `String` of `Api::call`, and libkrun gives
     // `s.len` bytes at `s.data`.
@@ -297,7 +289,7 @@ unsafe extern "C" fn push_to_string(data: *mut c_void, s: KrunStr) -> bool {
 
 /// Entry point of the VM process. Never returns.
 pub fn main() -> ! {
-    // Keep no file of airlock open in the process that runs the guest.
+    // The guest must not reach any file of airlock.
     if let Err(e) = close_inherited_fds() {
         eprintln!("libkrun: {e}");
         exit_now(1);
@@ -316,8 +308,7 @@ pub fn main() -> ! {
         }
     };
 
-    // macOS has no parent death signal. airlock keeps the input open while
-    // it runs, so an end of input means that airlock stopped.
+    // macOS has no parent death signal. End of input means airlock stopped.
     std::thread::spawn(|| {
         let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
         exit_now(0);
@@ -328,19 +319,17 @@ pub fn main() -> ! {
     exit_now(1);
 }
 
-/// Stop the process at once with `code`. A normal exit runs exit handlers
-/// and waits for nothing, but the VM threads of libkrun keep the guest
-/// running while they do.
+/// Stop the process at once with `code`. A normal exit runs handlers while
+/// the VM threads of libkrun still run the guest.
 fn exit_now(code: i32) -> ! {
     // SAFETY: `_exit` ends the process without any cleanup.
     unsafe { libc::_exit(code) }
 }
 
-/// Close all file descriptors except the standard input, output and error.
-/// The process can get open descriptors of airlock that are not marked
-/// close-on-exec.
+/// Close all file descriptors except stdin, stdout and stderr. The process
+/// can inherit airlock descriptors that are not close-on-exec.
 /// Returns:
-///   Error if the list of open descriptors is not available.
+///   Error if the list of descriptors is not available.
 fn close_inherited_fds() -> Result<(), String> {
     let fail = || format!("list open fds: {}", std::io::Error::last_os_error());
     let entry = size_of::<libc::proc_fdinfo>();
@@ -348,7 +337,7 @@ fn close_inherited_fds() -> Result<(), String> {
     let size =
         unsafe { libc::proc_pidinfo(libc::getpid(), libc::PROC_PIDLISTFDS, 0, ptr::null_mut(), 0) };
     let size = usize::try_from(size).map_err(|_| fail())?;
-    // Space for some descriptors that open between the two calls.
+    // Spare room for descriptors that open between the calls.
     let mut fds: Vec<libc::proc_fdinfo> = Vec::with_capacity(size / entry + 16);
     let capacity = i32::try_from(fds.capacity() * entry).map_err(|_| fail())?;
     // SAFETY: the buffer has space for `capacity` bytes.
@@ -373,19 +362,16 @@ fn close_inherited_fds() -> Result<(), String> {
 
 /// Apply the sandbox, then build the VM from `config` and run it.
 /// Returns:
-///   Only an error. On success, libkrun ends the process when the guest
-///   stops.
+///   Only an error. On success, libkrun ends the process.
 fn run(config: &VmmConfig) -> Result<std::convert::Infallible, String> {
     let lib = Library::open(&config.libkrun)?;
-    // SAFETY: the library is the libkrun build that airlock contains. It
-    // stays loaded, because `Library` never closes it.
+    // SAFETY: the library is the libkrun build of airlock. `Library` never
+    // closes it.
     let api = unsafe { Api::load(&lib) }?;
 
-    // libkrun writes its log through a size limit to the error output.
     let log_fd = limited_log()?;
-    // SAFETY (all calls below): the handles come from libkrun, and each
-    // string lives in `config` or in a local until the call ends. Device and
-    // payload handles move to libkrun on the add calls.
+    // SAFETY (all calls below): handles come from libkrun and strings live
+    // until the call ends. Device and payload handles move to libkrun on add.
     api.call("init log", |e| unsafe {
         (api.krun_init_log)(
             log_fd,
@@ -396,9 +382,8 @@ fn run(config: &VmmConfig) -> Result<std::convert::Infallible, String> {
         )
     })?;
 
-    // Apply the sandbox before libkrun opens any VM file. The build below
-    // starts the guest at once, so the guest never runs without the
-    // sandbox. An error stops the process before the build.
+    // The build starts the guest at once, so the sandbox must come first.
+    // An error stops the process before the build.
     seatbelt::apply(&policy(config))?;
 
     let devices = not_null("devices", unsafe { (api.krun_mmio_device_manager_new)() })?;
@@ -413,8 +398,7 @@ fn run(config: &VmmConfig) -> Result<std::convert::Infallible, String> {
         let fs = api.object(&format!("share {}", share.tag), |e| unsafe {
             new(KrunStr::new(&share.tag), KrunStr::new(&share.path), e)
         })?;
-        // The default cache policy drops the cached data of a file on each
-        // open, because the host can change the file.
+        // The default policy drops cached file data on each open.
         if share.immutable {
             api.call(&format!("cache policy {}", share.tag), |e| unsafe {
                 (api.krun_fs_device_set_cache_policy)(fs, CACHE_POLICY_ALWAYS, e)
@@ -435,8 +419,7 @@ fn run(config: &VmmConfig) -> Result<std::convert::Infallible, String> {
         add(block);
     }
 
-    // No TSI: the guest has no network through vsock. libkrun listens on a
-    // Unix socket for each port and connects the host to the guest port.
+    // No TSI, so the guest has no network through vsock.
     let vsock = api.object("vsock", |e| unsafe {
         (api.krun_vsock_device_new)(GUEST_CID, 0, e)
     })?;
@@ -457,9 +440,7 @@ fn run(config: &VmmConfig) -> Result<std::convert::Infallible, String> {
     let rng = api.object("rng", |e| unsafe { (api.krun_rng_device_new)(e) })?;
     add(rng);
 
-    // No console device: airlock never reads the guest console, and the
-    // supervisor sends its logs and the kernel messages over vsock. Without
-    // it, the guest has no text output to the host and one device less.
+    // No console device. The supervisor sends logs over vsock.
 
     let payload = api.object("payload", |e| unsafe {
         (api.krun_payload_load_external)(
@@ -494,10 +475,8 @@ fn run(config: &VmmConfig) -> Result<std::convert::Infallible, String> {
     Err("libkrun VM run returned".to_string())
 }
 
-/// Make the sandbox policy for the VM of `config`: the shares, the kernel,
-/// the initramfs, the disk image and the vsock sockets. The policy uses the
-/// same path strings as the libkrun calls, and the apply refuses paths that
-/// are not real paths.
+/// Make the sandbox policy for `config`. It uses the same path strings as
+/// the libkrun calls.
 fn policy(config: &VmmConfig) -> seatbelt::Policy {
     let (ro, rw): (Vec<_>, Vec<_>) = config.shares.iter().partition(|s| s.read_only);
     let paths = |shares: Vec<&VmmShare>| shares.into_iter().map(|s| s.path.clone()).collect();

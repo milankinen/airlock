@@ -33,8 +33,8 @@ default. libkrun stays pinned to the libkrun 2.0 commit of the PoC.
 - **Assets:** each backend embeds and extracts its own assets
   (cloud-hypervisor + virtiofsd, libkrun dylib) in `boot_vm`. `vm::start`
   extracts and resolves the kernel and initramfs. Shared extraction code
-  (lock, atomic write, checksum per asset group) lives in `vm/assets.rs`.
-- **VMM process:** `airlock internal vmm-libkrun` (in `cli/cmd_internal.rs`).
+  (lock, atomic write, checksum per asset file) lives in `vm/assets.rs`.
+- **VMM process:** `airlock internal vm-libkrun` (in `cli/cmd_internal.rs`).
 - **Hardening:** Seatbelt through the C API (`sandbox_init_with_parameters`
   with `extern "C"`). Deny by default. Allow: read for the read-only
   shares, the kernel and the initramfs, read and write for the read-write

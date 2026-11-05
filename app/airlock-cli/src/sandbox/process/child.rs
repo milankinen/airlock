@@ -60,7 +60,7 @@ struct Target {
 }
 
 /// Run the sandbox process until the sandbox stops (see `airlock internal
-/// sandbox-process`).
+/// vmm`).
 /// Args:
 ///  - `init_fd`: Inherited descriptor of the init socket
 ///  - `context`: Process context
@@ -400,7 +400,7 @@ async fn serve(
     context: Context,
     handshake: Handshake,
     rpc: std::os::unix::net::UnixStream,
-    vmm: Rc<dyn VmmBackend>,
+    vmm: &'static dyn VmmBackend,
 ) -> Result<i32, Exit> {
     let (project, image, main_argv) = match &init.mode {
         Mode::Start { args } => {
@@ -410,7 +410,7 @@ async fn serve(
                 first,
                 args,
                 init.log.log_level,
-                vmm.clone(),
+                vmm,
             ))
             .await?;
             (prepared.project, prepared.image, Some(prepared.main_argv))

@@ -41,7 +41,7 @@ pub struct HostedOptions {
     /// first connection of the CLI server.
     pub first_client: Option<std::os::unix::net::UnixStream>,
     /// The VM backend that boots the VM.
-    pub vmm: Rc<dyn VmmBackend>,
+    pub vmm: &'static dyn VmmBackend,
 }
 
 /// Run the hosted sandbox until it stops.

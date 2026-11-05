@@ -4,8 +4,6 @@
 //! open access to the public internet, but no secrets, mounts or other
 //! grants of the config.
 
-use std::rc::Rc;
-
 use crate::cli::LogLevel;
 use crate::config::config_values::{self, ConfigValues, NetworkRule, Policy};
 use crate::sandbox::BootOptions;
@@ -62,7 +60,7 @@ pub fn install_config(mut config: ConfigValues) -> anyhow::Result<ConfigValues> 
 /// Args:
 ///  - `log_level`: Log level of the boot
 ///  - `vmm`: The VM backend that boots the VM
-pub fn boot_options(log_level: LogLevel, vmm: Rc<dyn VmmBackend>) -> BootOptions {
+pub fn boot_options(log_level: LogLevel, vmm: &'static dyn VmmBackend) -> BootOptions {
     BootOptions {
         log_level,
         quiet: true,

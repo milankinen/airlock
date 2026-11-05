@@ -2,12 +2,11 @@
 //!
 //! The `airlock` binary contains the files that boot the sandbox VM: the
 //! guest kernel and initramfs, and the files of the VM backend, for example
-//! the hypervisor. The files come in groups. This module extracts a group to
-//! the cache on the host when its content changes. Each VM backend extracts
-//! its own group. The `[vm]` config can replace the bundled kernel and
+//! the hypervisor. This module extracts each file to the cache on the host
+//! when its content changes. Each VM backend extracts its own files. The `[vm]` config can replace the bundled kernel and
 //! initramfs with custom files.
 
-// Builds with no bundled kernel and no backend group do not extract.
+// Builds with no bundled kernel and no backend files do not extract.
 #![cfg_attr(
     all(feature = "distroless", not(target_os = "linux")),
     allow(dead_code)
@@ -30,13 +29,15 @@ pub struct BootFiles {
     pub initramfs: VerifiedPath,
 }
 
-/// One file of an asset group.
+/// One bundled asset file.
 #[cfg(not(test))]
 pub struct AssetFile {
     /// File name in the asset directory.
     pub name: &'static str,
     /// Content of the file.
     pub data: &'static [u8],
+    /// Checksum of the content, from the build script.
+    pub checksum: &'static str,
     /// Permission bits of the file, for example `0o755` for an executable.
     pub mode: u32,
 }
@@ -56,19 +57,19 @@ pub fn boot_files(project: &Project) -> anyhow::Result<BootFiles> {
 
     #[cfg(not(feature = "distroless"))]
     let (bundled_kernel, bundled_initramfs) = {
-        extract_group(
+        extract(
             &dir,
-            "kernel",
-            env!("AIRLOCK_KERNEL_CHECKSUM"),
             &[
                 AssetFile {
                     name: "Image",
                     data: include_bytes!("../../../../target/vm/Image"),
+                    checksum: env!("AIRLOCK_CHECKSUM_IMAGE"),
                     mode: 0o644,
                 },
                 AssetFile {
                     name: "initramfs.gz",
                     data: include_bytes!("../../../../target/vm/initramfs.gz"),
+                    checksum: env!("AIRLOCK_CHECKSUM_INITRAMFS_GZ"),
                     mode: 0o644,
                 },
             ],
@@ -103,24 +104,12 @@ pub fn boot_files(_project: &Project) -> anyhow::Result<BootFiles> {
     anyhow::bail!("vm::assets::boot_files not supported in tests")
 }
 
-/// Extract the asset group `group` to `dir` if its checksum changed.
-/// Args:
-///  - `dir`: The asset directory
-///  - `group`: Name of the group. The checksum of the group goes to the
-///    file `checksum-<group>`
-///  - `checksum`: Checksum of the bundled group, from the build script
-///  - `files`: The files of the group
-///
+/// Extract each file of `files` to `dir` if its checksum changed. The
+/// checksum of a file goes to `<name>.checksum` next to it.
 /// Returns:
-///   `Ok` when the files of the group are in place, or error if the
-///   extraction fails.
+///   `Ok` when the files are in place, or error if the extraction fails.
 #[cfg(not(test))]
-pub fn extract_group(
-    dir: &VerifiedPath,
-    group: &str,
-    checksum: &str,
-    files: &[AssetFile],
-) -> anyhow::Result<()> {
+pub fn extract(dir: &VerifiedPath, files: &[AssetFile]) -> anyhow::Result<()> {
     // Serialize the checksum check and extraction across processes. Take a
     // blocking exclusive lock before the checksum read. Then two concurrent
     // first runs (for example after an upgrade) cannot both write the
@@ -128,13 +117,18 @@ pub fn extract_group(
     // process writes it. The lock releases when `_lock` drops.
     let _lock = acquire_extract_lock(&dir.join("lock")?)?;
 
-    let checksum_file = dir.join(format!("checksum-{group}"))?;
-    let cached_checksum = checksum_file.read_to_string().unwrap_or_default();
-    if cached_checksum.trim() != checksum {
-        for file in files {
+    for file in files {
+        // The checksum goes in place after the file. A crash between the two
+        // writes makes the next run extract the file again.
+        let checksum_name = format!("{}.checksum", file.name);
+        let cached = dir
+            .join(&checksum_name)?
+            .read_to_string()
+            .unwrap_or_default();
+        if cached.trim() != file.checksum {
             write_atomic(dir, file.name, file.data, file.mode)?;
+            write_atomic(dir, &checksum_name, file.checksum.as_bytes(), 0o644)?;
         }
-        checksum_file.write(checksum)?;
     }
     Ok(())
 }
@@ -173,7 +167,7 @@ fn write_atomic(dir: &VerifiedPath, name: &str, data: &[u8], mode: u32) -> anyho
 
 /// Get a blocking exclusive advisory lock on `path`. The lock stays until the
 /// returned handle drops. It serializes the checksum check and extraction in
-/// [`extract_group`] across processes.
+/// [`extract`] across processes.
 ///
 /// The lock blocks (and does not fail fast) because extraction is short. A
 /// second process waits, then reads the new checksum and does not extract

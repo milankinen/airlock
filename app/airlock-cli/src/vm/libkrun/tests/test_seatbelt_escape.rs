@@ -1,8 +1,6 @@
 //! Escape tests for the Seatbelt sandbox of the libkrun VM process.
 //!
-//! The sandbox cannot be removed from a process, so the test runs the
-//! checks in a child process: the test binary starts itself again with an
-//! environment flag. The child applies the policy and tries the escapes.
+//! The sandbox cannot be removed, so the checks run in a child process.
 
 use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt;
@@ -13,13 +11,11 @@ use std::process::Command;
 use super::super::seatbelt::{Policy, apply};
 use crate::test_cfg::temp_dir;
 
-/// Environment variable with the test root dir. Its presence makes the test
-/// run as the child.
+/// Test root dir. Its presence makes the test run as the child.
 const CHILD_ENV: &str = "AIRLOCK_TEST_SEATBELT_ROOT";
 
-/// Test that the VM process sandbox keeps the process in its shares and
-/// sockets. libkrun opens share files with `/.vol/<dev>/<ino>` paths and has
-/// no checks of its own, so the sandbox must deny each way out.
+/// Test that the sandbox keeps the VM process in its shares and sockets.
+/// libkrun has no checks of its own.
 ///   1. Make a read-only share, a file outside it, links in the share to
 ///      the outside file and a socket dir
 ///   2. Start the test binary again as a child that applies the policy
@@ -33,8 +29,7 @@ fn vm_process_sandbox_denies_escapes_from_shares_and_sockets() {
     }
 
     let tmp = temp_dir();
-    // The VM process gives libkrun resolved paths. The temp dir on macOS is
-    // below the `/var` link.
+    // The temp dir on macOS is below the `/var` link.
     let root = &std::fs::canonicalize(tmp.path()).unwrap();
     let share = root.join("share");
     std::fs::create_dir_all(share.join("sub")).unwrap();
@@ -44,7 +39,6 @@ fn vm_process_sandbox_denies_escapes_from_shares_and_sockets() {
     std::os::unix::fs::symlink(root.join("outside.txt"), share.join("abs")).unwrap();
     std::os::unix::fs::symlink("../outside.txt", share.join("rel")).unwrap();
 
-    // The test path without the crate name, for the harness filter.
     let module = module_path!().split_once("::").unwrap().1;
     let name = format!("{module}::vm_process_sandbox_denies_escapes_from_shares_and_sockets");
     let out = Command::new(std::env::current_exe().unwrap())
@@ -64,10 +58,9 @@ fn vm_process_sandbox_denies_escapes_from_shares_and_sockets() {
     );
 }
 
-/// Run the checks in the child. All file data that the checks need comes
-/// before the apply.
+/// Run the checks in the child.
 /// Returns:
-///   The exit code: 0 if all checks pass.
+///   Exit code, 0 if all checks pass.
 fn child(root: &Path) -> i32 {
     let share = root.join("share");
     let outside = root.join("outside.txt");
@@ -80,8 +73,7 @@ fn child(root: &Path) -> i32 {
     let vol_inside = vol(&share.join("inside.txt"));
     let vol_outside = vol(&outside);
     let vol_share_parent = vol(&share).join("..");
-    // A TCP listener from before the apply. A failed connect then comes
-    // from the sandbox, not from a closed port.
+    // Listener from before the apply, so a failed connect is a sandbox deny.
     let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let tcp_addr = tcp.local_addr().unwrap();
 

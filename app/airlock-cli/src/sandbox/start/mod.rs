@@ -24,7 +24,6 @@ pub mod prepare;
 pub mod wizard;
 
 pub use exit::Exit;
-use std::rc::Rc;
 
 use tracing::info;
 
@@ -57,7 +56,7 @@ pub struct SandboxOptions {
     /// (`--auto-approve-packs`).
     pub auto_approve_packs: bool,
     /// The VM backend of the install boot.
-    pub vmm: Rc<dyn VmmBackend>,
+    pub vmm: &'static dyn VmmBackend,
 }
 
 impl SandboxOptions {

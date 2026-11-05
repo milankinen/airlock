@@ -5,7 +5,6 @@
 //! boot, the guest is ready, but no process runs.
 
 use std::os::unix::io::OwnedFd;
-use std::rc::Rc;
 use std::time::Duration;
 
 use airlock_common::BROWSER_SHIM;
@@ -42,7 +41,7 @@ pub struct BootOptions {
     /// the project is not shared and the guest works in `/`.
     pub project_share: bool,
     /// The VM backend that boots the VM.
-    pub vmm: Rc<dyn VmmBackend>,
+    pub vmm: &'static dyn VmmBackend,
 }
 
 /// All that one boot gives the guest. The caller builds it. [`boot`] only

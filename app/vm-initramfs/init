@@ -5,8 +5,8 @@
 mount -t proc none /proc 2>/dev/null
 mount -t sysfs none /sys 2>/dev/null
 mount -t devtmpfs none /dev 2>/dev/null
-# Without a console (libkrun), the kernel starts init with fds 0-2 closed.
-# Open them on /dev/null, so that later files do not take these numbers.
+# Without a console (libkrun), fds 0-2 start closed. Fill them, so that
+# later files do not take these numbers.
 [ -e /proc/self/fd/0 ] || exec 0</dev/null
 [ -e /proc/self/fd/1 ] || exec 1>/dev/null
 [ -e /proc/self/fd/2 ] || exec 2>/dev/null

@@ -79,17 +79,16 @@ const LOG_TAIL_BYTES: u64 = 2048;
 ///   The path of the library, or error if the extraction fails.
 #[cfg(not(test))]
 fn extract_library(dir: &VerifiedPath) -> anyhow::Result<VerifiedPath> {
-    use crate::vm::assets::{AssetFile, extract_group};
+    use crate::vm::assets::{AssetFile, extract};
 
     // A running VM process keeps its mapped copy of the old library, so
     // the rename in the extraction is safe.
-    extract_group(
+    extract(
         dir,
-        "libkrun",
-        env!("AIRLOCK_LIBKRUN_CHECKSUM"),
         &[AssetFile {
             name: "libkrun.dylib",
             data: include_bytes!("../../../../../target/vm/libkrun.dylib"),
+            checksum: env!("AIRLOCK_CHECKSUM_LIBKRUN_DYLIB"),
             mode: 0o644,
         }],
     )?;

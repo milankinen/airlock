@@ -1,8 +1,8 @@
 //! The hidden `airlock internal` commands.
 //!
-//! Only airlock starts these commands. `sandbox-process` runs the sandbox
-//! process of one sandbox. Its parent gives it the init socket and the held
-//! sandbox locks. `vmm-libkrun` runs the libkrun VM of one sandbox. It
+//! Only airlock starts these commands. `vmm` runs the sandbox process of
+//! one sandbox. Its parent gives it the init socket and the held sandbox
+//! locks. `vm-libkrun` runs the libkrun VM of one sandbox. It
 //! starts before all other parts of the program.
 
 use clap::{Args, Subcommand};
@@ -21,6 +21,7 @@ pub struct InternalArgs {
 #[derive(Subcommand, Debug)]
 pub enum InternalCommand {
     /// Run the sandbox process of one sandbox
+    #[command(name = SANDBOX_PROCESS_ARGS[1])]
     SandboxProcess(SandboxProcessArgs),
     /// Run the libkrun VM process of one sandbox (VM description on stdin)
     #[cfg(vm_libkrun)]
@@ -28,9 +29,12 @@ pub enum InternalCommand {
     VmmLibkrun,
 }
 
+/// Arguments that start the sandbox process.
+pub const SANDBOX_PROCESS_ARGS: [&str; 2] = ["internal", "vmm"];
+
 /// Arguments that start the libkrun VM process.
 #[cfg(vm_libkrun)]
-pub const VMM_LIBKRUN_ARGS: [&str; 2] = ["internal", "vmm-libkrun"];
+pub const VMM_LIBKRUN_ARGS: [&str; 2] = ["internal", "vm-libkrun"];
 
 /// Check if the arguments of this process start the libkrun VM process.
 /// The VM process must start before the context, the logs and the
@@ -40,7 +44,7 @@ pub fn is_vmm_libkrun() -> bool {
     std::env::args_os().skip(1).eq(VMM_LIBKRUN_ARGS)
 }
 
-/// CLI arguments for `airlock internal sandbox-process`.
+/// CLI arguments for `airlock internal vmm`.
 #[derive(Args, Debug)]
 pub struct SandboxProcessArgs {
     /// Descriptor of the init socket

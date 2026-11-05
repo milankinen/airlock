@@ -5,8 +5,7 @@
 #   <output-file>: Path of the built libkrun.dylib.
 set -euo pipefail
 
-# libkrun 2.0 (unreleased) is pinned to a commit: the free page reporting
-# mode that gives guest memory back to macOS exists only on main.
+# Pinned unreleased 2.0 commit: free page reporting exists only on main.
 LIBKRUN_REPO="https://github.com/containers/libkrun.git"
 LIBKRUN_COMMIT="a0375321bb1e6e51312e022af53e9e7668d3a07e"
 
@@ -21,10 +20,8 @@ if [[ "$(git -C "$SRC" rev-parse HEAD)" != "$(git -C "$SRC" rev-parse "${LIBKRUN
   git -C "$SRC" checkout --quiet --detach "$LIBKRUN_COMMIT"
 fi
 
-# Build only the VMM library with the C API. `make` also builds the guest
-# init library of libkrun, which airlock does not use.
-# No --target: the caller makes sure that the host is arm64 macOS, as for
-# airlock. The default deployment target of rustc is the same as for airlock.
+# Build only the VMM library. `make` also builds the unused guest init.
+# No --target: the caller makes sure that the host is arm64 macOS.
 (
   cd "$SRC"
   CARGO_TARGET_DIR="$PWD/target" cargo build --release -p libkrun --features ffi,blk

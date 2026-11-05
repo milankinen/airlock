@@ -232,7 +232,7 @@ async fn run_install(
         to_install,
         state,
         save,
-        phase::boot_options(options.log_level, options.vmm.clone()),
+        phase::boot_options(options.log_level, options.vmm),
         options.verbose,
     ))
     .await

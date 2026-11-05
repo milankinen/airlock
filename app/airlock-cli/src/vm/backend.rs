@@ -7,7 +7,6 @@
 //! early.
 
 use std::os::unix::io::OwnedFd;
-use std::rc::Rc;
 
 use super::config::VmConfig;
 use crate::messages;
@@ -69,7 +68,7 @@ impl std::error::Error for VmStopped {}
 /// Load the VM backend `vmm`.
 /// Returns:
 ///   The backend, or error if the host cannot run it.
-pub fn load_backend(vmm: Vmm) -> anyhow::Result<Rc<dyn VmmBackend>> {
+pub fn load_backend(vmm: Vmm) -> anyhow::Result<&'static dyn VmmBackend> {
     match vmm {
         Vmm::AppleVirt => super::apple_virt::load(),
         Vmm::CloudHypervisor => super::cloud_hypervisor::load(),

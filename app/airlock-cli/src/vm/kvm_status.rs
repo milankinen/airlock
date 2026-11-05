@@ -1,7 +1,7 @@
 //! KVM access check.
 //!
-//! Checks if the current user can use the KVM device of the host, and tells
-//! the reason when the user cannot use it.
+//! Checks if the current user can use the KVM device and tells the reason
+//! when not.
 
 use crate::util::VerifiedPath;
 use crate::{cli, messages};
@@ -25,10 +25,9 @@ pub fn kvm_status() -> KvmStatus {
 
 /// Check if the current user can open the KVM device at `path`.
 fn kvm_status_at(path: impl AsRef<std::ffi::OsStr>) -> KvmStatus {
-    // The device path is fixed. On some systems it is a symlink.
+    // On some systems the device is a symlink.
     let opened = VerifiedPath::new_follow(path.as_ref(), None).and_then(|path| {
-        // Open the file instead of reading the mode bits, so the kernel
-        // also applies ACLs.
+        // Open instead of reading mode bits, so ACLs apply.
         path.open_with(std::fs::OpenOptions::new().read(true).write(true))
     });
     match opened {
@@ -70,8 +69,8 @@ mod tests {
     use super::{KvmStatus, kvm_status_at};
     use crate::test_cfg::temp_dir;
 
-    /// Test that the KVM status follows the result of an open of the device
-    /// file, so that the user gets the correct reason when KVM is not usable.
+    /// Test that the KVM status follows the result of opening the device, so
+    /// the user gets the correct reason.
     ///   1. Check that a missing device gives "not found"
     ///   2. Create the device file and check that it gives "available"
     ///   3. Make the file read-only, then write-only, and check "no permission"
@@ -85,7 +84,7 @@ mod tests {
         std::fs::write(&path, b"").unwrap();
         assert!(matches!(kvm_status_at(&path), KvmStatus::Available));
 
-        // Root can open the file with any mode, so skip this part as root.
+        // Root can open any mode.
         if unsafe { libc::geteuid() } != 0 {
             for mode in [0o400, 0o200] {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -93,7 +92,7 @@ mod tests {
             }
         }
 
-        // A directory cannot open read-write, which is a different error.
+        // A directory cannot open read-write.
         assert!(matches!(
             kvm_status_at(dir.path()),
             KvmStatus::Unavailable(_)

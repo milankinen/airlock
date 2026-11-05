@@ -18,7 +18,7 @@ vm/libkrun/tests/        escape test of the Seatbelt sandbox
 ```
 
 `build.rs` sets `vm_libkrun` for macOS aarch64 targets and gives the
-checksum of the `libkrun` asset group. There is no cargo feature: all macOS
+checksum of `libkrun.dylib`. There is no cargo feature: all macOS
 arm64 builds contain libkrun. `mise run build:libkrun` (a thin wrapper of
 `app/vm-libkrun/build.sh`) makes `target/vm/libkrun.dylib`. The dev and
 release builds depend on it.
@@ -26,10 +26,13 @@ release builds depend on it.
 ## Changes from the PoC
 
 * Backend selection by the `vmm` setting, not `AIRLOCK_VM_BACKEND`.
-* The library is its own asset group. The backend extracts it in
+* Each asset file has its own checksum file (`<file>.checksum`), so a
+  file extracts again only when it changes. The backend extracts the
+  library in
   `boot_vm`. The `include_bytes!` is not in test builds, so `cargo test` on
   macOS works without the dylib.
-* VM process entry: `airlock internal vmm-libkrun` (hidden clap
+* Sandbox process command renamed to `airlock internal vmm`.
+* VM process entry: `airlock internal vm-libkrun` (hidden clap
   subcommand). `main` starts it before all other init (completions,
   panic hook, context, logs). Same as the PoC: config JSON on stdin, exit
   on stdin EOF, empty env, log pipe with a 16 MiB cap.

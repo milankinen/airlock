@@ -6,7 +6,6 @@
 //! stored sandbox, installs the tools and opens the project. The result is
 //! ready for the boot.
 
-use std::rc::Rc;
 
 use super::{Exit, SandboxOptions, ensure, install, location, wizard};
 use crate::cli::{self, LogLevel};
@@ -49,7 +48,7 @@ pub async fn prepare(
     first: &mut FirstStart,
     args: &StartArgs,
     log_level: LogLevel,
-    vmm: Rc<dyn VmmBackend>,
+    vmm: &'static dyn VmmBackend,
 ) -> Result<Prepared, Exit> {
     let options = SandboxOptions {
         yes: args.yes,

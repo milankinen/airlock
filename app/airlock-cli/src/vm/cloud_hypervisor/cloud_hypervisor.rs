@@ -47,26 +47,26 @@ struct Binaries {
 }
 
 /// Extract the bundled `cloud-hypervisor` and `virtiofsd` to the asset
-/// directory `dir` if their checksum changed.
+/// directory `dir` if their checksums changed.
 /// Returns:
 ///   The paths of the executables, or error if the extraction fails.
 #[cfg(not(test))]
 fn extract_binaries(dir: &VerifiedPath) -> anyhow::Result<Binaries> {
-    use crate::vm::assets::{AssetFile, extract_group};
+    use crate::vm::assets::{AssetFile, extract};
 
-    extract_group(
+    extract(
         dir,
-        "cloud-hypervisor",
-        env!("AIRLOCK_CLOUD_HYPERVISOR_CHECKSUM"),
         &[
             AssetFile {
                 name: "cloud-hypervisor",
                 data: include_bytes!("../../../../../target/vm/cloud-hypervisor"),
+                checksum: env!("AIRLOCK_CHECKSUM_CLOUD_HYPERVISOR"),
                 mode: 0o755,
             },
             AssetFile {
                 name: "virtiofsd",
                 data: include_bytes!("../../../../../target/vm/virtiofsd"),
+                checksum: env!("AIRLOCK_CHECKSUM_VIRTIOFSD"),
                 mode: 0o755,
             },
         ],

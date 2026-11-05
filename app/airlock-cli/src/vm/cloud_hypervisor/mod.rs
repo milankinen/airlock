@@ -9,8 +9,6 @@
 #[allow(clippy::module_inception)]
 mod cloud_hypervisor;
 
-use std::rc::Rc;
-
 use super::backend::VmmBackend;
 
 /// Load the Cloud Hypervisor backend.
@@ -18,10 +16,10 @@ use super::backend::VmmBackend;
 ///   The backend, or error if the host is not Linux.
 // All loaders have the same signature, also when they cannot fail.
 #[allow(clippy::unnecessary_wraps)]
-pub fn load() -> anyhow::Result<Rc<dyn VmmBackend>> {
+pub fn load() -> anyhow::Result<&'static dyn VmmBackend> {
     #[cfg(target_os = "linux")]
     {
-        Ok(Rc::new(cloud_hypervisor::CloudHypervisor))
+        Ok(&cloud_hypervisor::CloudHypervisor)
     }
     #[cfg(not(target_os = "linux"))]
     {

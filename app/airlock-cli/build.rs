@@ -1,6 +1,6 @@
 //! Build script for the airlock CLI.
 //!
-//! Makes the checksum of each bundled VM asset group and the git commit
+//! Makes the checksum of each bundled VM asset file and the git commit
 //! hash available to the CLI at compile time. Turns on the libkrun VM
 //! backend on hosts that can run it. Gives the macOS notifier app to the
 //! CLI. Rebuilds the CLI when the VM assets, the notifier app or the
@@ -14,16 +14,15 @@ use std::hash::Hasher;
 fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
-    // One checksum for each asset group. A group extracts again only when
-    // its own checksum changes. Add a group here for new bundled assets.
+    // One checksum for each asset file. A file extracts again only when
+    // its own checksum changes. Add new bundled assets here.
     if std::env::var("CARGO_FEATURE_DISTROLESS").is_err() {
-        emit_checksum("AIRLOCK_KERNEL_CHECKSUM", &["Image", "initramfs.gz"]);
+        emit_checksum("Image");
+        emit_checksum("initramfs.gz");
     }
     if target_os == "linux" {
-        emit_checksum(
-            "AIRLOCK_CLOUD_HYPERVISOR_CHECKSUM",
-            &["cloud-hypervisor", "virtiofsd"],
-        );
+        emit_checksum("cloud-hypervisor");
+        emit_checksum("virtiofsd");
     }
 
     // The libkrun VM backend: only on macOS arm64, because libkrun supports
@@ -32,7 +31,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(vm_libkrun)");
     if target_os == "macos" && std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64") {
         println!("cargo:rustc-cfg=vm_libkrun");
-        emit_checksum("AIRLOCK_LIBKRUN_CHECKSUM", &["libkrun.dylib"]);
+        emit_checksum("libkrun.dylib");
     }
 
     // The notifier app of macOS. A build without it gets an empty archive:
@@ -63,15 +62,26 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/refs/heads/");
 }
 
-/// Make the checksum of the asset group `files` in `target/vm` available to
-/// the CLI as the compile-time env var `var`. A missing file counts as
-/// empty.
-fn emit_checksum(var: &str, files: &[&str]) {
+/// Make the checksum of the asset `file` in `target/vm` available to the
+/// CLI as the compile-time env var `AIRLOCK_CHECKSUM_<FILE>`, for example
+/// `AIRLOCK_CHECKSUM_INITRAMFS_GZ`. A missing file counts as empty.
+fn emit_checksum(file: &str) {
+    let path = format!("../../target/vm/{file}");
     let mut hasher = DefaultHasher::new();
-    for file in files {
-        let path = format!("../../target/vm/{file}");
-        hasher.write(&std::fs::read(&path).unwrap_or_default());
-        println!("cargo:rerun-if-changed={path}");
-    }
-    println!("cargo:rustc-env={var}={:016x}", hasher.finish());
+    hasher.write(&std::fs::read(&path).unwrap_or_default());
+    println!("cargo:rerun-if-changed={path}");
+    let var: String = file
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    println!(
+        "cargo:rustc-env=AIRLOCK_CHECKSUM_{var}={:016x}",
+        hasher.finish()
+    );
 }

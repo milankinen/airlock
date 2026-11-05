@@ -114,7 +114,7 @@ impl ExitedBeforeReady {
 }
 
 /// Get the program and the arguments of the sandbox process: the binary of
-/// this process with `internal sandbox-process`.
+/// this process with `internal vmm`.
 /// Returns:
 ///   The program and its arguments, or error if the binary is not found.
 pub fn sandbox_process_program() -> anyhow::Result<(VerifiedPath, [OsString; 2])> {
@@ -123,7 +123,7 @@ pub fn sandbox_process_program() -> anyhow::Result<(VerifiedPath, [OsString; 2])
     let exe = std::env::current_exe()
         .and_then(|exe| VerifiedPath::new_follow(exe, None))
         .map_err(|e| anyhow::anyhow!(messages::cli::cannot_find_binary(e)))?;
-    Ok((exe, ["internal".into(), "sandbox-process".into()]))
+    Ok((exe, crate::cli::cmd_internal::SANDBOX_PROCESS_ARGS.map(Into::into)))
 }
 
 /// Start `program` as the sandbox process, wait until its sandbox is

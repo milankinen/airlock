@@ -574,11 +574,6 @@ pub mod cli {
         format!("Image:    {image}")
     }
 
-    /// Line of `info` with the VM backend (value of the `vmm` setting).
-    pub fn info_vmm(vmm: impl Display) -> String {
-        format!("VMM:      {vmm}")
-    }
-
     /// Line of `info` with the CPU count.
     pub fn info_cpus(cpus: impl Display) -> String {
         format!("CPUs:     {cpus}")
@@ -4383,11 +4378,6 @@ pub mod vm {
     /// Error context when a file mount fails to link.
     pub fn file_mount_failed(source: impl Display) -> String {
         format!("file mount {source}")
-    }
-
-    /// VM backend line in the start summary.
-    pub fn config_vmm(vmm: impl Display) -> String {
-        format!("vmm:    {vmm}")
     }
 
     /// VM cpu count line in the start summary.
