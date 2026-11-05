@@ -1574,8 +1574,7 @@ pub mod sandbox_process {
         "The project configuration has changed from the last `airlock start`";
 
     /// Last notice of a full notice log.
-    pub const NOTICE_LIMIT: &str =
-        "The sandbox has too many notices and does not show more. The sandbox log has them.";
+    pub const NOTICE_LIMIT: &str = "Too many notices. The sandbox log has the rest.";
 
     /// Error when the sandbox process gets a lock descriptor that is not
     /// the held lock of its sandbox.
@@ -1890,11 +1889,7 @@ pub mod network {
     /// that was there at the start or at the first connection, or has more
     /// than one hard link.
     pub fn host_socket_replaced(path: impl Display) -> String {
-        format!(
-            "host socket {path} is not the socket of the start, or it has more \
-             than one link. Airlock refuses connections to it. If the host \
-             service restarted, restart the sandbox"
-        )
+        format!("host socket {path} changed after the start. Restart the sandbox to use it")
     }
 }
 
@@ -3230,12 +3225,11 @@ pub mod services {
         are: impl Display,
         reason: impl Display,
         their: impl Display,
-        agents: impl Display,
         opt_out: impl Display,
     ) -> String {
         format!(
-            "the network {services} {names} {are} unavailable ({reason}), so airlock denies {their} \
-             hosts; to let the {agents} sign in without airlock, set {opt_out}"
+            "network {services} {names} {are} unavailable ({reason}) and {their} hosts are \
+             blocked. To sign in without airlock, set {opt_out}"
         )
     }
 
@@ -4379,8 +4373,7 @@ pub mod vm {
     /// directory.
     pub fn file_mount_cross_device(source: impl Display) -> String {
         format!(
-            "file mount {source}: cross-device hard link failed, falling back to copy \
-             (writes inside the VM will NOT sync back to the host)"
+            "file mount {source} is a copy: changes in the sandbox do not sync back to the host"
         )
     }
 

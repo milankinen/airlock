@@ -292,10 +292,10 @@ fn unavailable_warning(ids: &[ServiceId], reason: &str) -> String {
         .iter()
         .map(|id| crate::messages::services::service_opt_out_setting(id.name()))
         .collect();
-    let (services, are, their, agents) = if ids.len() == 1 {
-        ("service", "is", "its", "agent")
+    let (services, are, their) = if ids.len() == 1 {
+        ("service", "is", "its")
     } else {
-        ("services", "are", "their", "agents")
+        ("services", "are", "their")
     };
     crate::messages::services::services_unavailable(
         services,
@@ -303,7 +303,6 @@ fn unavailable_warning(ids: &[ServiceId], reason: &str) -> String {
         are,
         reason,
         their,
-        agents,
         opt_out.join(" and "),
     )
 }
