@@ -60,8 +60,7 @@ pub fn load_backend(vmm: Vmm) -> anyhow::Result<Rc<dyn VmmBackend>> {
     match vmm {
         Vmm::AppleVirt => super::apple_virt::load(),
         Vmm::CloudHypervisor => super::cloud_hypervisor::load(),
-        // TODO: load the libkrun backend when it is available.
-        Vmm::Libkrun => Err(unsupported(vmm)),
+        Vmm::Libkrun => super::libkrun::load(),
     }
 }
 

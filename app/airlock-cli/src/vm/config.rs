@@ -13,6 +13,11 @@ pub struct VmShare {
     pub host_path: VerifiedPath,
     /// If `true`, the guest cannot write to the share.
     pub read_only: bool,
+    /// If `true`, the host does not change the files while the VM runs.
+    /// A backend can then let the guest keep file data in its cache.
+    // Only the libkrun backend reads it.
+    #[cfg_attr(not(vm_libkrun), allow(dead_code))]
+    pub immutable: bool,
 }
 
 /// Full VM configuration for the VM backend.

@@ -51,6 +51,13 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // The libkrun VM runs in a child process of this program. It needs no
+    // context, and it must not start any other part of the program.
+    #[cfg(vm_libkrun)]
+    if cli::cmd_internal::is_vmm_libkrun() {
+        vm::libkrun::vmm_main();
+    }
+
     // Do this before any thread starts or reads the environment.
     diagnostics::disable_release_backtraces();
 

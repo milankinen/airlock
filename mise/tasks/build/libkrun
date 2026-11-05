@@ -11,14 +11,9 @@
 # Mach-O file, so the extracted copy keeps it.
 # The task cannot see a change of the signing identity. Use `--force` to sign
 # again.
-#MISE sources=["mise/tasks/build/libkrun"]
+#MISE sources=["mise/tasks/build/libkrun", "app/vm-libkrun/*"]
 #MISE outputs=["target/vm/libkrun.dylib"]
 set -euo pipefail
-
-# libkrun 2.0 (unreleased) is pinned to a commit: the free page reporting
-# mode that gives guest memory back to macOS exists only on main.
-LIBKRUN_REPO="https://github.com/containers/libkrun.git"
-LIBKRUN_COMMIT="a0375321bb1e6e51312e022af53e9e7668d3a07e"
 
 mkdir -p target/vm
 OUTPUT="target/vm/libkrun.dylib"
@@ -30,24 +25,26 @@ if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
   exit 0
 fi
 
-SRC="target/libkrun-src"
-if [[ ! -d "$SRC/.git" ]]; then
-  git clone --quiet "$LIBKRUN_REPO" "$SRC"
+# One build for each version of the build script, shared by all worktrees.
+# The build tree stays in the cache, so a rebuild after a failure resumes.
+# The cache keeps the unsigned library: the signature is added below.
+KEY=$(shasum -a 256 app/vm-libkrun/build.sh | cut -c1-16)
+CACHE="${AIRLOCK_DEV_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/airlock-dev}/libkrun/${KEY}"
+mkdir -p "$CACHE"
+# macOS has no flock(1). mkdir is atomic, so it is the lock.
+until mkdir "$CACHE/lock" 2>/dev/null; do
+  echo "Waiting for the libkrun build of another worktree (${CACHE}/lock)..."
+  sleep 5
+done
+trap 'rmdir "$CACHE/lock"' EXIT
+if [[ -f "$CACHE/libkrun.dylib" ]]; then
+  echo "Using cached libkrun (${KEY})"
+else
+  echo "Building libkrun (${KEY}) in ${CACHE}..."
+  app/vm-libkrun/build.sh "$CACHE/src" "$CACHE/libkrun.dylib.part"
+  mv "$CACHE/libkrun.dylib.part" "$CACHE/libkrun.dylib"
 fi
-if [[ "$(git -C "$SRC" rev-parse HEAD)" != "$(git -C "$SRC" rev-parse "${LIBKRUN_COMMIT}^{commit}" 2>/dev/null)" ]]; then
-  git -C "$SRC" fetch --quiet origin
-  git -C "$SRC" checkout --quiet --detach "$LIBKRUN_COMMIT"
-fi
-
-# Build only the VMM library with the C API. `make` also builds the guest
-# init library of libkrun, which airlock does not use.
-(
-  cd "$SRC"
-  # No --target: the host is arm64 macOS (checked above), as for airlock.
-  # The default deployment target of rustc is the same as for airlock.
-  CARGO_TARGET_DIR="$PWD/target" cargo build --release -p libkrun --features ffi,blk
-)
-cp "$SRC/target/release/libkrun.dylib" "$OUTPUT"
+cp "$CACHE/libkrun.dylib" "$OUTPUT"
 
 if [[ -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
   codesign --force --sign "$APPLE_SIGNING_IDENTITY" --identifier libkrun \

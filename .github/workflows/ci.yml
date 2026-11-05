@@ -271,8 +271,8 @@ jobs:
       - uses: jdx/mise-action@v2
       - uses: actions/cache@v4
         with:
-          path: target/libkrun-src
-          key: libkrun-macos-aarch64-${{ hashFiles('mise/tasks/build/libkrun') }}
+          path: ~/.cache/airlock-dev/libkrun
+          key: libkrun-macos-aarch64-${{ hashFiles('mise/tasks/build/libkrun', 'app/vm-libkrun/*') }}
       - name: Import Developer ID certificate
         uses: ./.github/actions/import-signing-cert
         with:
@@ -311,8 +311,8 @@ jobs:
       - uses: jdx/mise-action@v2
       - uses: actions/cache@v4
         with:
-          path: target/libkrun-src
-          key: libkrun-macos-aarch64-${{ hashFiles('mise/tasks/build/libkrun') }}
+          path: ~/.cache/airlock-dev/libkrun
+          key: libkrun-macos-aarch64-${{ hashFiles('mise/tasks/build/libkrun', 'app/vm-libkrun/*') }}
       - name: Build libkrun (ad hoc)
         run: mise run --force build:libkrun
       - name: Show signature

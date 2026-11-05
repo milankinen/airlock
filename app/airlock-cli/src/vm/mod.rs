@@ -15,79 +15,22 @@ mod cloud_hypervisor;
 mod config;
 pub(crate) mod disk;
 mod file_sync;
+#[cfg(target_os = "linux")]
+mod kvm_status;
+pub mod libkrun;
 pub mod mount;
 
 use std::os::unix::io::OwnedFd;
 
 use self::backend::VmHandle;
 pub use self::backend::{VmmBackend, load_backend};
-use crate::data_dir::DataDir;
-use crate::util::VerifiedPath;
-
-/// Result of the KVM access check.
 #[cfg(target_os = "linux")]
-pub enum KvmStatus {
-    /// `/dev/kvm` can be opened for read and write.
-    Available,
-    /// `/dev/kvm` does not exist.
-    NotFound,
-    /// The user has no permission to open `/dev/kvm`.
-    NoPermission,
-    /// `/dev/kvm` cannot be opened for a different reason.
-    Unavailable(std::io::Error),
-}
-
-/// Check if the current user can use `/dev/kvm`.
-#[cfg(target_os = "linux")]
-pub fn kvm_status() -> KvmStatus {
-    kvm_status_at("/dev/kvm")
-}
-
-/// Check if the current user can open the KVM device at `path`.
-#[cfg(target_os = "linux")]
-fn kvm_status_at(path: impl AsRef<std::ffi::OsStr>) -> KvmStatus {
-    // The device path is fixed. On some systems it is a symlink.
-    let opened = VerifiedPath::new_follow(path.as_ref(), None).and_then(|path| {
-        // Open the file instead of reading the mode bits, so the kernel
-        // also applies ACLs.
-        path.open_with(std::fs::OpenOptions::new().read(true).write(true))
-    });
-    match opened {
-        Ok(_) => KvmStatus::Available,
-        Err(err) => match err.kind() {
-            std::io::ErrorKind::NotFound => KvmStatus::NotFound,
-            std::io::ErrorKind::PermissionDenied => KvmStatus::NoPermission,
-            _ => KvmStatus::Unavailable(err),
-        },
-    }
-}
-
-/// Make sure that KVM is available. If not, show the reason and exit the
-/// process.
-#[cfg(target_os = "linux")]
-pub fn require_kvm() {
-    match kvm_status() {
-        KvmStatus::Available => {}
-        KvmStatus::NotFound => {
-            cli::error!("{}", messages::vm::KVM_NOT_FOUND);
-            cli::error!("{}", messages::vm::KVM_ENABLE_HINT);
-            std::process::exit(1);
-        }
-        KvmStatus::NoPermission => {
-            cli::error!("{}", messages::vm::KVM_NO_PERMISSION);
-            cli::error!("{}", messages::vm::KVM_PERMISSION_HINT);
-            std::process::exit(1);
-        }
-        KvmStatus::Unavailable(err) => {
-            cli::error!("{}", messages::vm::kvm_open_failed(err));
-            std::process::exit(1);
-        }
-    }
-}
-
+pub use self::kvm_status::{KvmStatus, kvm_status, require_kvm};
 use crate::cli::LogLevel;
+use crate::data_dir::DataDir;
 use crate::oci::OciImage;
 use crate::sandbox::{BootOptions, Project};
+use crate::util::VerifiedPath;
 use crate::vm::config::VmShare;
 use crate::{cli, messages};
 
@@ -205,7 +148,7 @@ pub async fn start(
     };
 
     if !opts.quiet {
-        log_config(project);
+        log_config(project, opts.vmm.kind());
     }
     for share in &shares {
         tracing::debug!(
@@ -320,6 +263,8 @@ fn prepare_shares(
         tag: "layers".to_string(),
         host_path: crate::cache::layers_root(data_dir)?,
         read_only: true,
+        // A layer dir never changes after the download.
+        immutable: true,
     }];
 
     for m in mounts
@@ -337,6 +282,7 @@ fn prepare_shares(
             tag: m.key().into(),
             host_path: m.source.clone(),
             read_only: m.read_only,
+            immutable: false,
         });
     }
 
@@ -388,6 +334,7 @@ fn prepare_shares(
             tag: "files/rw".to_string(),
             host_path: files_rw_dir.reverify()?,
             read_only: false,
+            immutable: false,
         });
     }
     if has_ro_files {
@@ -395,6 +342,7 @@ fn prepare_shares(
             tag: "files/ro".to_string(),
             host_path: files_ro_dir.reverify()?,
             read_only: true,
+            immutable: false,
         });
     }
 
@@ -413,8 +361,13 @@ fn build_kernel_cmdline(console: &str, log_level: LogLevel) -> String {
     cmdline
 }
 
-/// Print the VM resources summary (cpus, memory, disk).
-fn log_config(project: &Project) {
+/// Print the VM resources summary (backend, cpus, memory, disk).
+fn log_config(project: &Project, vmm: crate::settings::Vmm) {
+    cli::log!(
+        "  {} {}",
+        cli::bullet(),
+        messages::vm::config_vmm(cli::dim(vmm.name()))
+    );
     cli::log!(
         "  {} {}",
         cli::bullet(),
@@ -430,6 +383,22 @@ fn log_config(project: &Project) {
         cli::bullet(),
         messages::vm::config_disk(cli::dim(&project.config.disk.size.to_string()))
     );
+}
+
+/// Remove the old entry at `path`, if any. Never follows a symlink.
+/// A directory is removed too, so a planted directory cannot block a start.
+#[cfg(any(target_os = "linux", vm_libkrun))]
+fn remove_old(path: &VerifiedPath) -> std::io::Result<()> {
+    let is_dir = path.symlink_metadata().is_ok_and(|m| m.is_dir());
+    let result = if is_dir {
+        path.remove_dir_all()
+    } else {
+        path.remove_file()
+    };
+    match result {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]

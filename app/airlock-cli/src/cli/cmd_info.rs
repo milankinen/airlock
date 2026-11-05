@@ -117,6 +117,10 @@ pub(super) async fn run(context: Context, id: Option<&str>, json: bool) -> i32 {
     println!("{}", messages::cli::info_id(&details.id));
     println!("{}", messages::cli::info_status(status));
     println!("{}", messages::cli::info_image(&project.config.vm.image));
+    println!(
+        "{}",
+        messages::cli::info_vmm(project.context.settings.vmm.name())
+    );
     println!("{}", messages::cli::info_cpus(project.config.vm.cpus));
     println!("{}", messages::cli::info_memory(project.config.vm.memory));
 

@@ -6,16 +6,16 @@
 //! that escapes a share still cannot get to other host files.
 //!
 //! The policy denies all operations by default. It allows only:
-//!  * read access to the read-only shares and files
-//!  * read and write access to the read-write shares and files (for
-//!    example the disk image)
-//!  * bind and accept on the vsock sockets. These sockets are the only
+//!  * read access to the read-only shares
+//!  * read and write access to the read-write shares
+//!  * the creation of the vsock sockets. These sockets are the only
 //!    connection between the guest and airlock. The VM process gets no
 //!    other network access.
-//!  * a small set of system values that the VM threads read
 //!
 //! The sandbox applies to the full process and cannot be removed. Apply it
-//! after the VM process loaded all libraries and before the guest runs.
+//! after the VM process loaded all libraries and opened the boot files and
+//! the disk image, and before the guest runs. Files that are open stay
+//! usable.
 //!
 //! Host paths go to the policy only as parameters, never as policy text, so
 //! that a path cannot change the policy.
@@ -32,11 +32,6 @@ pub struct Policy {
     pub read_only: Vec<String>,
     /// Directories with read and write access to all of their contents.
     pub read_write: Vec<String>,
-    /// Files with read access, for example the kernel if libkrun opens it
-    /// after the sandbox applies.
-    pub ro_files: Vec<String>,
-    /// Files with read and write access, for example the disk image.
-    pub rw_files: Vec<String>,
     /// Unix sockets that the VM process makes and accepts connections on.
     /// The parent directory must exist. The socket itself can be missing.
     pub unix_sockets: Vec<String>,
@@ -45,34 +40,6 @@ pub struct Policy {
 /// Seatbelt `sandbox_init_with_parameters` flag value for policy text. The
 /// other flag (`SANDBOX_NAMED`) selects a built-in policy by name.
 const PROFILE_TEXT: u64 = 0;
-
-/// System values (sysctl) that the VM process can read. Each name has a
-/// reason. A missing name gives a deny in the system log and an error in
-/// the caller, not a crash.
-// TODO(verify on macOS): get the real list from the deny lines in the
-// system log after a boot and a long session. Remove names that nothing
-// reads.
-const SYSCTL_NAMES: [&str; 8] = [
-    // CPU count. The Rust runtime and libkrun use it for thread counts.
-    "hw.ncpu",
-    "hw.activecpu",
-    "hw.logicalcpu",
-    // Page size. libkrun aligns guest memory and free page reports to it.
-    "hw.pagesize",
-    "hw.pagesize_compat",
-    // Cache line size. Memory copy code can read it.
-    "hw.cachelinesize",
-    // Hypervisor support. The hypervisor library can read it at VM start.
-    "kern.hv_support",
-    // OS version. libkrun and the hypervisor library can select features
-    // by the version.
-    "kern.osproductversion",
-];
-
-/// System value prefixes that the VM process can read. The Rust runtime
-/// reads the CPU feature flags (`hw.optional.arm.FEAT_*`) to select fast
-/// code paths.
-const SYSCTL_PREFIXES: [&str; 1] = ["hw.optional."];
 
 // The functions are in libSystem (`libsystem_sandbox`), which each macOS
 // program links, so no link attribute is necessary. Chromium declares the
@@ -158,17 +125,19 @@ fn resolved(policy: &Policy) -> Result<Policy, String> {
     Ok(Policy {
         read_only: all(&policy.read_only)?,
         read_write: all(&policy.read_write)?,
-        ro_files: all(&policy.ro_files)?,
-        rw_files: all(&policy.rw_files)?,
         unix_sockets: all(&policy.unix_sockets)?,
     })
 }
 
 /// Resolve the symlinks of `path`. A missing name at the end stays as it
 /// is (a socket before the bind).
+///
+/// Give libkrun the resolved paths too. An access through a symlink, for
+/// example `/var` on macOS, also reads the symlink, and the sandbox denies
+/// that read.
 /// Returns:
 ///   The resolved path, or error if it does not resolve or is not UTF-8.
-fn resolve(path: &str) -> Result<String, String> {
+pub(super) fn resolve(path: &str) -> Result<String, String> {
     let fail = |e: &dyn std::fmt::Display| format!("sandbox path {path}: {e}");
     if !path.starts_with('/') {
         return Err(fail(&"not absolute"));
@@ -194,29 +163,15 @@ fn profile(policy: &Policy) -> (String, Vec<(String, String)>) {
     b.line("(deny default)");
 
     // A rule without filters allows the operation on all objects. Thus
-    // each rule below must have a filter, also when its list is empty.
-    let mut sysctl: Vec<String> = SYSCTL_NAMES
-        .iter()
-        .map(|n| format!("(sysctl-name \"{n}\")"))
-        .collect();
-    sysctl.extend(
-        SYSCTL_PREFIXES
-            .iter()
-            .map(|p| format!("(sysctl-name-prefix \"{p}\")")),
-    );
-    b.line(&format!("(allow sysctl-read {})", sysctl.join(" ")));
+    // each rule below must have a filter. `Builder::rule` adds no rule for
+    // an empty list.
 
-    // Shares: libkrun opens the files of a share with `/.vol/<dev>/<ino>`
-    // paths. Seatbelt checks the real path of the file, not the `/.vol`
-    // text, so the share rules apply and `/.vol` needs no rule.
-    // TODO(verify on macOS): check that an open of `/.vol/<dev>/<ino>` of
-    // a file in a share is allowed, and of a file outside is denied. If
-    // the lookup of `/.vol` itself gets a deny, allow only
-    // `file-read-metadata` on the literal `/.vol`, never a subpath.
-    // TODO(verify on macOS): an open through `/.vol` can give the
-    // data volume form of the path (`/System/Volumes/Data/Users/...`).
-    // If the system log shows denies with this form, add a second rule
-    // with this form for each path.
+    // Shares: libkrun opens the share roots when the guest starts to use
+    // them, after the apply. Then it opens the files of a share with
+    // `/.vol/<dev>/<ino>` paths. Seatbelt checks the real path of the
+    // file, not the `/.vol` text, so the share rules apply, and `/.vol`
+    // needs no rule. A `/.vol` path to a file outside the shares, or `..`
+    // from a share root, gets a deny.
     b.rule("file-read*", "(subpath {})", "RO_DIR", &policy.read_only);
     b.rule(
         "file-read* file-write*",
@@ -224,54 +179,38 @@ fn profile(policy: &Policy) -> (String, Vec<(String, String)>) {
         "RW_DIR",
         &policy.read_write,
     );
-    // Single files: `literal` matches only the file itself.
-    b.rule("file-read*", "(literal {})", "RO_FILE", &policy.ro_files);
-    b.rule(
-        "file-read* file-write*",
-        "(literal {})",
-        "RW_FILE",
-        &policy.rw_files,
-    );
 
-    if !policy.unix_sockets.is_empty() {
-        // libkrun makes one listening Unix socket for each vsock port.
-        // TODO(verify on macOS): check that libkrun makes the sockets
-        // after the sandbox applies. If it makes them before, remove these
-        // rules (accept on an open socket needs no rule).
-        b.line("(allow system-socket (socket-domain AF_UNIX))");
-        b.rule(
-            "network-bind network-inbound",
-            "(local unix-socket (path-literal {}))",
-            "SOCKET",
-            &policy.unix_sockets,
-        );
-        // The bind makes the socket file. A stop or a new bind can remove
-        // an old one.
-        // TODO(verify on macOS): check if the bind needs
-        // `file-write-create`, and if libkrun removes old sockets. Remove
-        // the operations that nothing uses.
-        b.rule(
-            "file-read-metadata file-write-create file-write-unlink",
-            "(literal {})",
-            "SOCKET_FILE",
-            &policy.unix_sockets,
-        );
-    }
+    // libkrun makes one listening Unix socket for each vsock port when the
+    // guest starts the vsock device, after the apply. The bind needs
+    // `network-bind` on the socket and `file-write-create` for the socket
+    // file. The accept and the reads and writes need no rule.
+    b.rule(
+        "network-bind",
+        "(local unix-socket (path-literal {}))",
+        "SOCKET",
+        &policy.unix_sockets,
+    );
+    b.rule(
+        "file-write-create",
+        "(literal {})",
+        "SOCKET_FILE",
+        &policy.unix_sockets,
+    );
 
     // No rule for these, by intent:
     //  * Hypervisor: the VM calls go to the kernel through traps, which
     //    Seatbelt does not filter. The process has the hypervisor
-    //    entitlement.
+    //    entitlement. The hypervisor library asks for the privileged host
+    //    port at the vCPU start and gets a deny. A process without root
+    //    cannot get this port, and the VM runs without it.
     //  * Threads and guest memory: thread start, anonymous memory maps and
     //    random numbers (getentropy) have no Seatbelt check.
-    //  * Libraries: the VM process loads libkrun and all its libraries
-    //    before the apply. A later library load gets a deny.
+    //  * Libraries and boot files: the VM process loads libkrun and opens
+    //    the kernel, the initramfs and the disk image before the apply.
+    //  * System values (sysctl): the VM process reads them only before the
+    //    apply.
     //  * Log and input: reads and writes on open file descriptors (pipes,
     //    the disk image, the share roots) have no check.
-    // TODO(verify on macOS): boot a VM, run a long session and check the
-    // system log for Sandbox denies of the VM process
-    // (`log stream --predicate 'sender == "Sandbox"'`). Check especially
-    // `mach-lookup` and `iokit-open` from the hypervisor library.
     (b.text, b.params)
 }
 
@@ -330,8 +269,6 @@ mod tests {
         Policy {
             read_only: vec!["/ro".into()],
             read_write: vec!["/rw".into(), EVIL.into()],
-            ro_files: vec!["/kernel".into()],
-            rw_files: vec!["/disk.img".into()],
             unix_sockets: vec!["/run/k1.sock".into()],
         }
     }
@@ -345,7 +282,7 @@ mod tests {
     fn paths_with_policy_syntax_go_only_to_parameters() {
         let policy = one_of_each();
         let (text, params) = profile(&policy);
-        for path in ["/ro", "/rw", EVIL, "/kernel", "/disk.img", "/run/k1.sock"] {
+        for path in ["/ro", "/rw", EVIL, "/run/k1.sock"] {
             assert!(!text.contains(path), "{path} in policy text:\n{text}");
             assert!(params.iter().any(|(_, v)| v == path), "{path} not a param");
         }
@@ -375,26 +312,20 @@ mod tests {
         let rw = rule_of(EVIL, "(subpath");
         assert!(rw.starts_with("(allow file-read* file-write* (subpath"));
         assert!(rw.contains("(param \"RW_DIR_0\")"));
-        let kernel = rule_of("/kernel", "(literal");
-        assert!(kernel.starts_with("(allow file-read* (literal"));
-        let disk = rule_of("/disk.img", "(literal");
-        assert!(disk.starts_with("(allow file-read* file-write* (literal"));
         let sock = rule_of("/run/k1.sock", "(local unix-socket (path-literal");
-        assert!(sock.starts_with("(allow network-bind network-inbound "));
-        assert!(text.contains("(param \"SOCKET_FILE_0\")"));
+        assert!(sock.starts_with("(allow network-bind (local"));
+        assert!(text.contains("(allow file-write-create (literal (param \"SOCKET_FILE_0\")))"));
     }
 
     /// Test that an empty policy allows no file or network access. A rule
     /// without filters would allow all objects.
     ///   1. Make the policy text for an empty policy
-    ///   2. Check that it denies by default and has only the sysctl rule
+    ///   2. Check that it denies by default and has no allow rule
     #[test]
     fn empty_policy_allows_no_files_or_sockets() {
         let (text, params) = profile(&Policy::default());
         assert!(params.is_empty());
         assert!(text.contains("(deny default)"));
-        let allows: Vec<_> = text.lines().filter(|l| l.starts_with("(allow")).collect();
-        assert_eq!(allows.len(), 1, "{text}");
-        assert!(allows[0].starts_with("(allow sysctl-read (sysctl-name"));
+        assert!(!text.contains("(allow"), "{text}");
     }
 }

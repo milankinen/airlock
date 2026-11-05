@@ -1,8 +1,9 @@
 //! Build script for the airlock CLI.
 //!
 //! Makes the checksum of each bundled VM asset group and the git commit
-//! hash available to the CLI at compile time. Gives the macOS notifier app
-//! to the CLI. Rebuilds the CLI when the VM assets, the notifier app or the
+//! hash available to the CLI at compile time. Turns on the libkrun VM
+//! backend on hosts that can run it. Gives the macOS notifier app to the
+//! CLI. Rebuilds the CLI when the VM assets, the notifier app or the
 //! built-in packs change.
 
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -23,6 +24,15 @@ fn main() {
             "AIRLOCK_CLOUD_HYPERVISOR_CHECKSUM",
             &["cloud-hypervisor", "virtiofsd"],
         );
+    }
+
+    // The libkrun VM backend: only on macOS arm64, because libkrun supports
+    // the macOS hypervisor on arm64 only. The `vm_libkrun` cfg marks all
+    // code of this backend.
+    println!("cargo::rustc-check-cfg=cfg(vm_libkrun)");
+    if target_os == "macos" && std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64") {
+        println!("cargo:rustc-cfg=vm_libkrun");
+        emit_checksum("AIRLOCK_LIBKRUN_CHECKSUM", &["libkrun.dylib"]);
     }
 
     // The notifier app of macOS. A build without it gets an empty archive:

@@ -24,6 +24,7 @@ Path:     /Users/me/my-project
 ID:       k3x7q2ma
 Status:   running
 Image:    debian:stable-slim
+VMM:      cloud-hypervisor
 CPUs:     4
 Memory:   2.0 GB
 Last run: 2 minutes ago

@@ -104,7 +104,7 @@ async fn create(
 ) -> Result<i32, Exit> {
     cli::set_verbose(verbose);
     sandbox::check_data_dir(&context.data)?;
-    sandbox::check_system_requirements();
+    sandbox::check_system_requirements(context.settings.vmm)?;
     sandbox::init_logging(log_level);
     Box::pin(templates::create::create(
         context, name, force, log_level, verbose,

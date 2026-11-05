@@ -75,12 +75,21 @@ impl SandboxOptions {
     }
 }
 
-/// Check that the host can run a sandbox. On Linux, this checks KVM access.
-/// On failure, the process exits with code 1.
+/// Check that the host can run a sandbox with the VM backend `vmm`. The
+/// backend must be supported on this host. Cloud Hypervisor also needs KVM
+/// access: without it, the process exits with code 1.
+/// Returns:
+///   Exit with code 1 if the host does not support the backend.
 // Call this before anything is read or written.
-pub fn check_system_requirements() {
+pub fn check_system_requirements(vmm: crate::settings::Vmm) -> Result<(), Exit> {
+    // The sandbox process loads the backend again. This early check shows
+    // the error before the sandbox is registered.
+    crate::vm::load_backend(vmm).map_err(|e| Exit::error(1, e))?;
     #[cfg(target_os = "linux")]
-    crate::vm::require_kvm();
+    if vmm == crate::settings::Vmm::CloudHypervisor {
+        crate::vm::require_kvm();
+    }
+    Ok(())
 }
 
 /// Check that the data directory `data_dir` is short enough for the Unix

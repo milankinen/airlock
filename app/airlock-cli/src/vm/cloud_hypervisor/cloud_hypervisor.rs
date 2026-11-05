@@ -16,6 +16,7 @@ use crate::settings::Vmm;
 use crate::util::VerifiedPath;
 use crate::vm::backend::{HandleFuture, VmHandle, VmmBackend};
 use crate::vm::config::VmConfig;
+use crate::vm::remove_old;
 
 /// VM backend that uses cloud-hypervisor and virtiofsd.
 pub struct CloudHypervisor;
@@ -302,21 +303,6 @@ fn kill_and_reap(mut child: Child, name: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!(messages::vm::child_wait_failed(name, e)))?;
     debug!("{name} exited: {status}");
     Ok(())
-}
-
-/// Remove the old entry at `path`, if any. Never follows a symlink.
-/// A directory is removed too, so a planted directory cannot block a start.
-fn remove_old(path: &VerifiedPath) -> std::io::Result<()> {
-    let is_dir = path.symlink_metadata().is_ok_and(|m| m.is_dir());
-    let result = if is_dir {
-        path.remove_dir_all()
-    } else {
-        path.remove_file()
-    };
-    match result {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-        _ => Ok(()),
-    }
 }
 
 /// Wait up to 5 s until the virtiofsd socket at `path` exists.

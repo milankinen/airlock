@@ -45,14 +45,18 @@ pub(crate) fn tie_to_airlock(cmd: &mut Command) {
 /// leader must be a process that [`tie_to_airlock`] started and that is
 /// not reaped yet, so that the group ID is still in use. An error (for
 /// example no process left in the group) is only logged.
-pub(crate) fn kill_group(leader: u32) {
+/// Returns:
+///   `true` if the signal was sent.
+pub(crate) fn kill_group(leader: u32) -> bool {
     let Ok(pgid) = libc::pid_t::try_from(leader) else {
-        return;
+        return false;
     };
     // SAFETY: plain syscall without memory arguments.
     if unsafe { libc::killpg(pgid, libc::SIGKILL) } != 0 {
         tracing::debug!("killpg {pgid}: {}", std::io::Error::last_os_error());
+        return false;
     }
+    true
 }
 
 /// Check if the child process `pid` stopped. Does not reap it. Thus the

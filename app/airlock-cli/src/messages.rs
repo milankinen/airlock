@@ -574,6 +574,11 @@ pub mod cli {
         format!("Image:    {image}")
     }
 
+    /// Line of `info` with the VM backend (value of the `vmm` setting).
+    pub fn info_vmm(vmm: impl Display) -> String {
+        format!("VMM:      {vmm}")
+    }
+
     /// Line of `info` with the CPU count.
     pub fn info_cpus(cpus: impl Display) -> String {
         format!("CPUs:     {cpus}")
@@ -4380,6 +4385,11 @@ pub mod vm {
         format!("file mount {source}")
     }
 
+    /// VM backend line in the start summary.
+    pub fn config_vmm(vmm: impl Display) -> String {
+        format!("vmm:    {vmm}")
+    }
+
     /// VM cpu count line in the start summary.
     pub fn config_cpus(cpus: impl Display) -> String {
         format!("cpus:   {cpus}")
@@ -4636,5 +4646,57 @@ pub mod vm {
     #[cfg(target_os = "macos")]
     pub fn vsock_connect_failed(err: impl Display) -> String {
         format!("vsock connect failed: {err}")
+    }
+}
+
+#[cfg(vm_libkrun)]
+pub mod libkrun {
+    //! Texts of the libkrun VM backend.
+
+    use std::fmt::Display;
+
+    /// Error when the libkrun VM process does not start.
+    pub fn start_failed(err: impl Display) -> String {
+        format!("failed to start the libkrun VM process: {err}")
+    }
+
+    /// Error when the libkrun VM process stopped without a stop request.
+    /// Args:
+    ///  - `log`: Log file of the VM process
+    ///  - `tail`: Last lines of the log
+    pub fn stopped(log: impl Display, tail: &str) -> String {
+        if tail.is_empty() {
+            format!("the libkrun VM process stopped. Log: {log}")
+        } else {
+            format!("the libkrun VM process stopped. Log: {log}\nLast log lines:\n{tail}")
+        }
+    }
+
+    /// Error when the wait for the libkrun VM process fails.
+    pub fn wait_failed(err: impl Display) -> String {
+        format!("libkrun VM process wait: {err}")
+    }
+
+    /// Error when the vsock socket of the VM does not open.
+    pub fn vsock_socket_connect_failed(path: impl Display, err: impl Display) -> String {
+        format!("vsock connect to {path}: {err}")
+    }
+
+    /// Error when the guest closes a new vsock connection at once, because
+    /// no guest process listens on the port yet.
+    pub fn vsock_refused(port: u32) -> String {
+        format!("vsock port {port}: the guest closed the connection")
+    }
+
+    /// Error when a vsock socket path is longer than the macOS limit.
+    pub fn socket_path_too_long(path: impl Display, max: usize) -> String {
+        format!(
+            "socket path is longer than {max} bytes: {path}. Set a shorter data_dir in ~/.airlock/settings.toml"
+        )
+    }
+
+    /// Error when a VM file path is not valid UTF-8.
+    pub fn path_not_utf8(path: impl Display) -> String {
+        format!("path is not valid UTF-8: {path}")
     }
 }
