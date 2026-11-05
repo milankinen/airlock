@@ -2,7 +2,11 @@
 //!
 //! Runs a process in the container of a sandbox. Starts the sandbox with
 //! the config of the last `airlock start` if it does not run. The sandbox
-//! process does the work.
+//! process does the work. The start shows no progress, only the vault
+//! question and errors. The start does not apply changes of the project
+//! config: a notice of the sandbox tells about them. After the connect,
+//! the command prints all notices of the sandbox as warnings, also when
+//! the sandbox already ran.
 
 use clap::Args;
 
@@ -75,6 +79,9 @@ pub async fn main(args: ExecArgs, context: &Context) -> anyhow::Result<i32> {
         Err(e) if let Some(code) = ExitedBeforeReady::code_of(&e) => return Ok(code),
         Err(e) => return Err(e),
     };
+    // Show the notices of the sandbox before the process takes the
+    // terminal.
+    process.show_notices(0).await;
     // The guest dir of the current dir is the default guest cwd. Get it
     // after the connect: a start that ran at the same time can change the
     // guest cwd.

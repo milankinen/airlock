@@ -24,6 +24,7 @@ use crate::acp::{
 };
 use crate::rpc::ProcessEvent;
 use crate::runtime::SignalStream;
+use crate::sandbox::{NoticeLog, NoticeReader};
 use crate::test_cfg::mcp_grant::{FakeGrant, GrantEvent, Route};
 
 /// Fake ACP agent. It writes the lines of `$AGENT_PRE`, replies to the
@@ -161,6 +162,8 @@ pub struct LocalProcessLauncher {
     pub launched: Rc<RefCell<Vec<String>>>,
     /// The fake sandboxes.
     sandboxes: Vec<FakeSandbox>,
+    /// Notices of the sandbox start for each launch.
+    notices: Option<NoticeReader>,
 }
 
 impl LocalProcessLauncher {
@@ -184,7 +187,33 @@ impl LocalProcessLauncher {
                     registrar: None,
                 })
                 .collect(),
+            notices: None,
         }
+    }
+
+    /// Give the agents a fake sandbox with the notices `log`, in all
+    /// sandboxes. The test can add notices to `log` later.
+    pub fn with_notices(self, log: &NoticeLog) -> Self {
+        self.with_fake_notices(log, None)
+    }
+
+    /// Give the agents a fake sandbox with the notices `log` (see
+    /// [`Self::with_notices`]). The first notice read waits for a gate.
+    /// Returns:
+    ///   The launcher, and the sender that opens the gate.
+    pub fn with_held_notices(self, log: &NoticeLog) -> (Self, oneshot::Sender<()>) {
+        let (open, gate) = oneshot::channel();
+        (self.with_fake_notices(log, Some(gate)), open)
+    }
+
+    /// Give the agents the fake notice sandbox with `log` and `gate`.
+    fn with_fake_notices(mut self, log: &NoticeLog, gate: Option<oneshot::Receiver<()>>) -> Self {
+        let service = capnp_rpc::new_client(FakeNotices {
+            log: log.clone(),
+            gate: RefCell::new(gate),
+        });
+        self.notices = Some(NoticeReader::from_client(service));
+        self
     }
 
     /// Use the host dir `root` as the project dir of sandbox `a`.
@@ -259,6 +288,7 @@ impl AgentProcessLauncher for LocalProcessLauncher {
         env.push(("AGENT_SANDBOX".into(), sandbox.name.clone()));
         let mut agent = spawn_agent(argv, &env)?;
         agent.mcp = sandbox.registrar.clone();
+        agent.notices = self.notices.clone();
         Ok((location, agent))
     }
 }
@@ -329,6 +359,7 @@ fn spawn_agent(argv: &[String], env: &[(String, String)]) -> anyhow::Result<Agen
         events,
         control,
         mcp: None,
+        notices: None,
     })
 }
 
@@ -580,6 +611,36 @@ impl cli_service::Server for FakeRegistrar {
         results
             .get()
             .set_grant(capnp_rpc::new_client(FakeGrant::new(self.events.clone())));
+        Ok(())
+    }
+}
+
+/// Fake sandbox that gives its notice log, all notices since the boot.
+// The fake CLI server of a full sandbox needs a network and a guest. The
+// proxy uses only the notice log. Thus this fake serves only that.
+struct FakeNotices {
+    log: NoticeLog,
+    /// The first read waits until this gate opens or drops.
+    gate: RefCell<Option<oneshot::Receiver<()>>>,
+}
+
+impl cli_service::Server for FakeNotices {
+    async fn notices(
+        self: Rc<Self>,
+        _params: cli_service::NoticesParams,
+        mut results: cli_service::NoticesResults,
+    ) -> Result<(), capnp::Error> {
+        let gate = self.gate.borrow_mut().take();
+        if let Some(gate) = gate {
+            let _ = gate.await;
+        }
+        let log = self.log.all();
+        let mut list = results.get().init_notices(log.len() as u32);
+        for (i, item) in log.iter().enumerate() {
+            let mut notice = list.reborrow().get(i as u32);
+            notice.set_seqno(item.seqno);
+            notice.set_text(&item.text);
+        }
         Ok(())
     }
 }

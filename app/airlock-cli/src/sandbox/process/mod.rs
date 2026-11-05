@@ -32,6 +32,7 @@ use self::client::{Located, Session, StartedProcess};
 pub use self::forward::{ForwardMode, ForwardReport};
 use self::init::{Mode, StartArgs};
 pub use self::launch::ExitedBeforeReady;
+pub use self::server::notices::NoticeLog;
 use super::lock::{self, LockKind};
 use super::start::location::check_registered;
 use super::{Interrupted, Sandbox};
@@ -49,7 +50,12 @@ const EXIT_WAIT: Duration = Duration::from_secs(2);
 /// What a client does with a sandbox (see [`Sandbox::run`]).
 pub enum Run {
     /// `airlock exec`: connect, or start with the config of the last
-    /// `airlock start`.
+    /// `airlock start`. The start does not apply changes of the project
+    /// config. If the project config is different from the config of the
+    /// last start, the start adds a warning to the notice log of the
+    /// sandbox. `airlock exec` prints all notices of the log after the
+    /// connect, also when the sandbox already ran. The start shows no
+    /// progress, only the vault question and errors.
     Exec,
     /// `airlock acp`: as [`Run::Exec`], but with no questions. The output
     /// of a sandbox process that fails before it is ready goes into the
@@ -397,26 +403,33 @@ impl SandboxProcess {
         McpRegistrar(self.session.service.clone())
     }
 
-    /// Get the browser notices of the sandbox.
+    /// Get all notices of the sandbox since its boot, oldest first.
     /// Returns:
     ///   The notices. A failure gives no notices and goes only to the log.
-    pub async fn notices(&self) -> Vec<String> {
-        let response = match self.session.service.notices_request().send().promise.await {
-            Ok(response) => response,
-            Err(e) => {
-                info!("browser notices: {e}");
-                return Vec::new();
+    pub async fn notices(&self) -> Vec<Notice> {
+        self.notice_reader().read().await
+    }
+
+    /// Print the notices of the sandbox with a number above `after` as
+    /// warnings on the error output, oldest first.
+    /// Returns:
+    ///   The highest number of the printed notices, or `after` if no notice
+    ///   is new. Give it as `after` to the next call.
+    pub async fn show_notices(&self, after: u64) -> u64 {
+        let mut last = after;
+        for notice in self.notices().await {
+            if notice.seqno > after {
+                cli::log!("{} {}", cli::yellow("!"), notice.text);
+                last = last.max(notice.seqno);
             }
-        };
-        let Ok(list) = response
-            .get()
-            .and_then(cli_service::notices_results::Reader::get_list)
-        else {
-            return Vec::new();
-        };
-        list.iter()
-            .filter_map(|n| Some(n.ok()?.to_str().ok()?.to_string()))
-            .collect()
+        }
+        last
+    }
+
+    /// Get the reader of the sandbox notices over this connection. Its
+    /// reads give no notices after the connection closed.
+    pub fn notice_reader(&self) -> NoticeReader {
+        NoticeReader(self.session.service.clone())
     }
 
     /// Give up the hold of this connection on the sandbox. The connection
@@ -499,6 +512,59 @@ impl SandboxProcess {
             warn!("sandbox process exit code {code}");
             cli::error!("{}", messages::cli::SANDBOX_STOP_FAILED);
         }
+    }
+}
+
+/// A message of the sandbox for the user, for example a warning of the
+/// start. The sandbox keeps all its notices until it stops.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    /// Number of the notice. It grows by one for each notice of the
+    /// sandbox, from its boot.
+    pub seqno: u64,
+    /// Text for the user.
+    pub text: String,
+}
+
+/// Reads the notices of a sandbox.
+#[derive(Clone)]
+pub struct NoticeReader(cli_service::Client);
+
+impl NoticeReader {
+    /// Make the reader on the CLI service `service`. Tests give the service
+    /// of a fake sandbox.
+    #[cfg(test)]
+    pub fn from_client(service: cli_service::Client) -> Self {
+        Self(service)
+    }
+
+    /// Get all notices of the sandbox since its boot, oldest first.
+    /// Returns:
+    ///   The notices. A failure gives no notices and goes only to the log.
+    // A sandbox process of an older airlock gives a list of texts. The
+    // read of that list fails, and then the client shows no notices.
+    pub async fn read(&self) -> Vec<Notice> {
+        let response = match self.0.notices_request().send().promise.await {
+            Ok(response) => response,
+            Err(e) => {
+                info!("notices: {e}");
+                return Vec::new();
+            }
+        };
+        let Ok(list) = response
+            .get()
+            .and_then(cli_service::notices_results::Reader::get_notices)
+        else {
+            return Vec::new();
+        };
+        list.iter()
+            .filter_map(|n| {
+                Some(Notice {
+                    seqno: n.get_seqno(),
+                    text: n.get_text().ok()?.to_str().ok()?.to_string(),
+                })
+            })
+            .collect()
     }
 }
 

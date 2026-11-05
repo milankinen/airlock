@@ -21,6 +21,11 @@
 //!
 //! The diff does not show the real values of masked `[env]` entries. A hash
 //! of each value replaces it.
+//!
+//! `airlock exec` and `airlock acp` start a stopped sandbox with the config
+//! of the last run and ask no question. They only find out if the current
+//! project config is different from that config, with the same rule. A
+//! current config that does not load or resolve also counts as a change.
 
 use console::Style;
 use serde_json::Value;
@@ -104,14 +109,9 @@ async fn check_with(
     };
     let current = final_values(input.resolved)?;
     let styles = Styles::new();
-    // A `run.json` of an older airlock has no paths: no path change.
-    let moved = meta
-        .last_run_paths
-        .map(|last| path_diff(&last, input.paths, &styles))
-        .unwrap_or_default();
+    let moved = moved_paths(meta.last_run_paths.as_ref(), input.paths, &styles);
     if let Some(Ok((_, values))) = &last
-        && *values == current
-        && moved.is_empty()
+        && unchanged(values, &current, &moved)
     {
         return Ok(Checked::Current);
     }
@@ -231,6 +231,24 @@ pub fn host_paths(values: &ConfigValues, home: &VerifiedPath, cwd: &VerifiedPath
         .collect()
 }
 
+/// The rule of the compare: the config did not change if the final values
+/// are equal and no host path moved.
+/// Args:
+///  - `last`: Final values of the last run (see [`final_values`])
+///  - `current`: Final values of this run
+///  - `moved`: Host path changes (see [`moved_paths`])
+fn unchanged(last: &Value, current: &Value, moved: &[String]) -> bool {
+    last == current && moved.is_empty()
+}
+
+/// Return the host path changes since the last run as diff lines (see
+/// [`path_diff`]). `last` is `None` for a copy of an older airlock without
+/// host paths: then no path changed.
+fn moved_paths(last: Option<&HostPaths>, new: &HostPaths, styles: &Styles) -> Vec<String> {
+    last.map(|last| path_diff(last, new, styles))
+        .unwrap_or_default()
+}
+
 /// Return the host paths that `new` resolves to an other place than
 /// `last`, also the added and removed ones, as diff lines. Empty if no
 /// path changed.
@@ -261,8 +279,9 @@ fn path_diff(last: &HostPaths, new: &HostPaths, styles: &Styles) -> Vec<String> 
     lines
 }
 
-/// What the resolve of the config of the last run needs outside of the
-/// check, for example in the sandbox process.
+/// What the resolve of the config of the last run, or of the current
+/// config without a question, needs outside of the check. For example in
+/// the sandbox process.
 pub struct LastRunInput<'a> {
     /// Sandbox directory with the config of the last run
     pub sandbox_dir: &'a VerifiedPath,
@@ -276,14 +295,27 @@ pub struct LastRunInput<'a> {
     pub overrides: &'a ConfigOverrides,
 }
 
+/// The resolved config of the last run, with the data for the compare with
+/// the current config (see [`current_differs`]).
+pub struct LastRunConfig {
+    /// Resolved config of the last run
+    pub resolved: ResolvedConfig,
+    /// Final values of the resolved config (see [`final_values`])
+    values: Value,
+    /// Resolved host paths of the last run. `None` for a copy of an older
+    /// airlock without host paths.
+    paths: Option<HostPaths>,
+}
+
 /// Resolve the config of the last run of a sandbox without a question. A
 /// new or changed pack without approval is an error
 /// ([`PacksNeedApproval`](crate::packs::approval::PacksNeedApproval)).
 /// Returns:
-///   The resolved config, `None` if the sandbox has no config of a last
-///   run, or an error if the config does not resolve any more.
-pub async fn resolve_last_run(input: &LastRunInput<'_>) -> anyhow::Result<Option<ResolvedConfig>> {
-    let Some(stored) = meta::read_run_meta(input.sandbox_dir).last_run_config else {
+///   The config of the last run, `None` if the sandbox has no config of a
+///   last run, or an error if the config does not resolve any more.
+pub async fn resolve_last_run(input: &LastRunInput<'_>) -> anyhow::Result<Option<LastRunConfig>> {
+    let meta = meta::read_run_meta(input.sandbox_dir);
+    let Some(stored) = meta.last_run_config else {
         return Ok(None);
     };
     let resolve = ResolveInput {
@@ -293,8 +325,82 @@ pub async fn resolve_last_run(input: &LastRunInput<'_>) -> anyhow::Result<Option
         project_root: Some(input.project_root),
         approval: ApprovalMode::Refuse,
     };
-    let (resolved, _) = resolve_last(&resolve, stored).await?;
-    Ok(Some(resolved))
+    let (resolved, values) = resolve_last(&resolve, stored).await?;
+    Ok(Some(LastRunConfig {
+        resolved,
+        values,
+        paths: meta.last_run_paths,
+    }))
+}
+
+/// Check if the current project config is different from the config of
+/// the last run, with the rule of [`check`]. Asks no question. A current
+/// config that does not load or resolve counts as a change, also a pack
+/// without approval and a project without config. The reason goes to the
+/// log.
+/// Args:
+///  - `input`: What the resolve of the current config needs. The project
+///    and local config files load from its dirs
+///  - `home`: Home dir of the user, for the user config files and `~`
+///  - `last`: Config of the last run (see [`resolve_last_run`])
+///
+/// Returns:
+///   `true` if the config changed or the check failed.
+pub async fn current_differs(
+    input: &LastRunInput<'_>,
+    home: &VerifiedPath,
+    last: &LastRunConfig,
+) -> bool {
+    let (current, paths) = match resolve_current(input, home).await {
+        Ok(Some(current)) => current,
+        Ok(None) => {
+            tracing::info!("config check: the project has no config");
+            return true;
+        }
+        Err(e) => {
+            tracing::info!("config check: the project config does not resolve: {e:#}");
+            return true;
+        }
+    };
+    let moved = moved_paths(last.paths.as_ref(), &paths, &Styles::new());
+    if unchanged(&last.values, &current, &moved) {
+        return false;
+    }
+    tracing::info!(
+        "config check: the project config changed (values: {}, host paths: {})",
+        last.values != current,
+        !moved.is_empty()
+    );
+    true
+}
+
+/// Load and resolve the current project config, as `airlock start` does
+/// without the setup wizard. Refuses a pack without approval.
+/// Returns:
+///   The final values (see [`final_values`]) and the host paths (see
+///   [`host_paths`]), `None` if the project has no config, or an error if
+///   the config does not load or resolve.
+async fn resolve_current(
+    input: &LastRunInput<'_>,
+    home: &VerifiedPath,
+) -> anyhow::Result<Option<(Value, HostPaths)>> {
+    let local_dir = sandbox::lookup::local_config_dir(input.sandbox_dir)?;
+    let config = LayeredConfig::load_from(home, input.project_root, &local_dir)?;
+    if !config.has_project_config() {
+        return Ok(None);
+    }
+    let resolved = config
+        .resolve(&ResolveInput {
+            data_dir: input.data_dir,
+            packs: input.packs,
+            overrides: input.overrides,
+            project_root: Some(input.project_root),
+            // The check must never wait for the user.
+            approval: ApprovalMode::Refuse,
+        })
+        .await?;
+    let paths = host_paths(&resolved.values, home, input.project_root);
+    Ok(Some((final_values(&resolved)?, paths)))
 }
 
 /// Resolve the stored config files of the last run.

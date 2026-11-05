@@ -120,7 +120,12 @@ impl HostSocket {
         let text = messages::network::host_socket_replaced(path.display());
         tracing::warn!("{text}");
         if !self.warned.replace(true) {
-            crate::cli::log!("{} {}", crate::cli::bullet(), crate::cli::yellow(&text));
+            crate::cli::warn!(
+                text,
+                "{} {}",
+                crate::cli::bullet(),
+                crate::cli::yellow(&text)
+            );
         }
         io::Error::new(io::ErrorKind::PermissionDenied, text)
     }

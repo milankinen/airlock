@@ -98,6 +98,9 @@ pub mod acp {
     /// Title of the session message when the agent of the session exits.
     pub const AGENT_STOPPED: &str = "The agent stopped";
 
+    /// Title of the session message that shows a notice of the sandbox.
+    pub const SANDBOX_NOTICE: &str = "Sandbox notice";
+
     /// Session message when the agent of the session exits.
     pub fn agent_stopped_detail(sandbox: impl Display, code: i32) -> String {
         format!(
@@ -1565,6 +1568,15 @@ pub mod sandbox_process {
 
     use std::fmt::Display;
 
+    /// Notice when `airlock exec` or `airlock acp` started the sandbox and
+    /// the project config is different from the last `airlock start`.
+    pub const CONFIG_CHANGED: &str =
+        "The project configuration has changed from the last `airlock start`";
+
+    /// Last notice of a full notice log.
+    pub const NOTICE_LIMIT: &str =
+        "The sandbox has too many notices and does not show more. The sandbox log has them.";
+
     /// Error when the sandbox process gets a lock descriptor that is not
     /// the held lock of its sandbox.
     pub const LOCK_FD_MISMATCH: &str = "the sandbox process did not get the lock of its sandbox";
@@ -2893,9 +2905,9 @@ pub mod rpc {
         format!("{place}: the URL has characters airlock refuses")
     }
 
-    /// Notice that shows how many open requests the notice queue dropped.
-    pub fn browser_more_requests_refused(dropped: impl Display) -> String {
-        format!("{dropped} more requests to open a page were refused")
+    /// Notice of the browser bridge for the user, with its source.
+    pub fn browser_notice(text: impl Display) -> String {
+        format!("browser: {text}")
     }
 
     /// Notice when the host has no browser program.
@@ -2968,9 +2980,6 @@ pub mod sandbox {
 
     /// Error context when the sandbox VM fails to boot.
     pub const BOOT_SANDBOX_VM: &str = "boot the sandbox VM";
-
-    /// Label before a browser notice after the main process exits.
-    pub const BROWSER_NOTICE_LABEL: &str = "browser:";
 
     /// Error context when the VM stop fails after a boot error.
     pub fn boot_failed(error: impl Display) -> String {

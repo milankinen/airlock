@@ -36,6 +36,7 @@ use crate::sandbox::process::init::Ready;
 use crate::sandbox::process::launch::SandboxProcessChild;
 use crate::sandbox::process::server::connections::{ConnectionTracker, Hold};
 use crate::sandbox::process::server::monitor::MonitorFeed;
+use crate::sandbox::process::server::notices::NoticeLog;
 use crate::sandbox::process::server::{self as cli_server, ExecDefaults, ForwardRules};
 use crate::sandbox::{ForwardMode, ForwardReport, Sandbox};
 use crate::util::verified_path::VerifiedPath;
@@ -444,6 +445,8 @@ pub struct CliSandbox {
     pub events: broadcast::Sender<NetworkEvent>,
     /// Place of the monitor dialog of the sandbox process.
     pub approvals: MonitorSlot,
+    /// Notice log of the sandbox. Tests add notices to it.
+    pub notices: NoticeLog,
 }
 
 impl CliSandbox {
@@ -499,6 +502,7 @@ impl CliSandbox {
             }
         });
         let approvals = MonitorSlot::default();
+        let notices = NoticeLog::new();
         let defaults = ExecDefaults {
             env: vec![],
             cwd: SANDBOX_CWD.to_string(),
@@ -509,7 +513,7 @@ impl CliSandbox {
             defaults,
             rules,
             tracker.clone(),
-            cli_server::no_notices(),
+            notices.clone(),
             MonitorFeed {
                 network: handle,
                 project_path: PROJECT_PATH.to_string(),
@@ -530,6 +534,7 @@ impl CliSandbox {
             tracker,
             keeper: None,
             approvals,
+            notices,
         }
     }
 

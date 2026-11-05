@@ -8,8 +8,15 @@
 //!  * `airlock start`: all prepare steps with their questions, the
 //!    installs and the boot. A failed first start removes the new sandbox
 //!  * `airlock exec`: the boot with the config of the last start. Only the
-//!    vault can ask a question
+//!    vault can ask a question. The start work shows no progress, only
+//!    errors. A changed project config does not apply: it adds a notice
 //!  * `airlock acp`: as `airlock exec`, but with no questions at all
+//!
+//! The sandbox process keeps one notice log for its run. The start work
+//! and the sandbox add notices to it, and the clients read it. The
+//! warnings of the process go to the log when the process has no terminal
+//! for them: in `exec` and `acp` mode from the start, and in all modes
+//! after the detach.
 //!
 //! The parent has the first client connection on a socket that it gives at
 //! the start. After the parent attached, the sandbox process detaches from
@@ -34,7 +41,8 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::oneshot;
 
 use super::init::{
-    INIT_CAP, Init, MESSAGE_CAP, Mode, Ready, ToChild, ToParent, read_message, write_message,
+    INIT_CAP, Init, MESSAGE_CAP, Mode, Ready, ToChild, ToParent, read_message,
+    write_message,
 };
 use crate::cli::{self, logging};
 use crate::config::ConfigOverrides;
@@ -46,7 +54,7 @@ use crate::sandbox::lock::{HeldLock, SandboxLock};
 use crate::sandbox::process::vm::hosted::{HostedOptions, run_hosted};
 use crate::sandbox::start::config_change::{self, LastRunInput};
 use crate::sandbox::start::{Exit, install, prepare};
-use crate::sandbox::{self, Interrupted, Project, registry};
+use crate::sandbox::{self, Interrupted, NoticeLog, Project, registry};
 use crate::util::{self, PinnedDir, VerifiedPath};
 use crate::{messages, oci, packs};
 
@@ -393,6 +401,14 @@ async fn serve(
     handshake: Handshake,
     rpc: std::os::unix::net::UnixStream,
 ) -> Result<i32, Exit> {
+    // The start work can add notices before the boot.
+    let notices = NoticeLog::new();
+    // `exec` and `acp` start quiet: their warnings go to the notice log
+    // from the start. `airlock start` shows its warnings on the terminal
+    // until the detach.
+    if !matches!(init.mode, Mode::Start { .. }) {
+        send_warnings_to(&notices);
+    }
     let (project, image, main_argv) = match &init.mode {
         Mode::Start { args } => {
             let prepared = Box::pin(prepare::prepare(
@@ -406,7 +422,8 @@ async fn serve(
             (prepared.project, prepared.image, Some(prepared.main_argv))
         }
         Mode::Exec | Mode::Acp => {
-            let (project, image) = Box::pin(prepare_last_run(target, lock, context)).await?;
+            let (project, image) =
+                Box::pin(prepare_last_run(target, lock, context, &notices)).await?;
             (project, image, None)
         }
     };
@@ -414,28 +431,43 @@ async fn serve(
     if cli::is_interrupted() {
         return Err(Exit::ABORTED);
     }
+    let after_detach = notices.clone();
     let options = HostedOptions {
         log_level: init.log.log_level,
         quiet: cli::is_silent(),
         first_client: Some(rpc),
+        notices,
     };
     let ready = Ready { main_argv };
     Ok(
         Box::pin(run_hosted(project, &image, options, async move || {
-            handshake.detach(ready).await
+            handshake.detach(ready).await?;
+            // After the detach, the process has no terminal. Later
+            // warnings, for example of the network, go to the notice log.
+            send_warnings_to(&after_detach);
+            Ok(())
         }))
         .await?,
     )
 }
 
+/// Send the warnings of this process to the notice log `notices` from now
+/// on, in place of the terminal.
+fn send_warnings_to(notices: &NoticeLog) {
+    let notices = notices.clone();
+    cli::set_notice_sink(move |text| notices.push(text));
+}
+
 /// Prepare the sandbox for `airlock exec` and `airlock acp`: the config of
 /// the last `airlock start` with the prepared image and disk. Asks no
-/// question about the config. A missing part tells the user to run
-/// `airlock start`.
+/// question about the config and does not apply changes of the project
+/// config. A changed project config adds a notice to `notices`. A missing
+/// part tells the user to run `airlock start`.
 /// Args:
 ///  - `target`: The checked sandbox
 ///  - `lock`: The held sandbox locks
 ///  - `context`: Process context
+///  - `notices`: Notice log of the run
 ///
 /// Returns:
 ///   The opened project and the image, or error.
@@ -443,25 +475,23 @@ async fn prepare_last_run(
     target: &Target,
     lock: &SandboxLock,
     context: Context,
+    notices: &NoticeLog,
 ) -> anyhow::Result<(Project, OciImage)> {
     let sandbox_dir = lock.dir();
     let packs = packs::init(&context.settings.packs, &context.home)?;
-    let resolved = config_change::resolve_last_run(&LastRunInput {
+    let input = LastRunInput {
         sandbox_dir,
         data_dir: &context.data,
         packs: &packs,
         project_root: &target.project,
         // Only `airlock start --network` changes the network policy.
         overrides: &ConfigOverrides::default(),
-    })
-    .await
-    .map_err(|e| match e.downcast_ref::<PacksNeedApproval>() {
-        Some(_) => anyhow::anyhow!(messages::sandbox_process::approval_needed_run_start(&e)),
-        None => anyhow::anyhow!(messages::sandbox_process::last_config_invalid_run_start(
-            format!("{e:#}")
-        )),
-    })?
-    .ok_or_else(|| anyhow::anyhow!(messages::cli::no_last_run_config(&target.project)))?;
+    };
+    let last = config_change::resolve_last_run(&input)
+        .await
+        .map_err(|e| last_run_error(&e))?
+        .ok_or_else(|| anyhow::anyhow!(messages::cli::no_last_run_config(&target.project)))?;
+    let resolved = &last.resolved;
 
     let image_cfg = &resolved.values.vm.image;
     let image = oci::load_sandbox_image(&context.data, sandbox_dir)
@@ -480,6 +510,10 @@ async fn prepare_last_run(
         ));
     }
 
+    if config_change::current_differs(&input, &context.home, &last).await {
+        notices.push(messages::sandbox_process::CONFIG_CHANGED.to_string());
+    }
+
     // A signal during the checks stops the process before the slow steps.
     if cli::is_interrupted() {
         return Err(Interrupted.into());
@@ -488,8 +522,20 @@ async fn prepare_last_run(
     let guest_cwd = sandbox::read_run_meta(sandbox_dir)
         .guest_cwd
         .filter(|cwd| !cwd.is_empty());
-    let project = sandbox::open(lock, resolved.values, guest_cwd, context)?;
+    let project = sandbox::open(lock, last.resolved.values, guest_cwd, context)?;
     Ok((project, image))
+}
+
+/// Make the error of a last-run config that does not resolve: a pack
+/// without approval, or another resolve error. Both tell the user to run
+/// `airlock start`.
+fn last_run_error(e: &anyhow::Error) -> anyhow::Error {
+    match e.downcast_ref::<PacksNeedApproval>() {
+        Some(_) => anyhow::anyhow!(messages::sandbox_process::approval_needed_run_start(e)),
+        None => anyhow::anyhow!(messages::sandbox_process::last_config_invalid_run_start(
+            format!("{e:#}")
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -580,7 +626,7 @@ mod tests {
             let lock =
                 SandboxLock::acquire_box(&target.project, &context.data.sandboxes, &id).unwrap();
 
-            let err = prepare_last_run(&target, &lock, context.clone())
+            let err = prepare_last_run(&target, &lock, context.clone(), &NoticeLog::new())
                 .await
                 .err()
                 .unwrap();
@@ -615,7 +661,7 @@ mod tests {
 
             let prepared = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                prepare_last_run(&target, &lock, context),
+                prepare_last_run(&target, &lock, context, &NoticeLog::new()),
             )
             .await
             .expect("prepare asked a question");

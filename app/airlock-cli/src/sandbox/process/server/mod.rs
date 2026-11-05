@@ -11,8 +11,8 @@
 //! connection closes, or when a client requests a stop. After the stop
 //! decision, the server closes new connections at once. A port forward
 //! gives up its hold, so it does not keep the sandbox. The server also
-//! gives the connection count, the stop state and the browser notices of
-//! the sandbox. A monitor client
+//! gives the connection count, the stop state and the notice log of the
+//! sandbox. A monitor client
 //! gets the network events, the guest stats and the policy changes, and can
 //! change the policy.
 //!
@@ -22,6 +22,7 @@
 
 pub mod connections;
 pub mod monitor;
+pub mod notices;
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -34,6 +35,7 @@ use tokio::task::JoinSet;
 
 use self::connections::{ConnectionTracker, Hold};
 use self::monitor::MonitorFeed;
+use self::notices::NoticeLog;
 use crate::config::config_values::Network as NetworkConfig;
 use crate::messages;
 use crate::network::NetworkControl;
@@ -76,15 +78,6 @@ pub struct ExecDefaults {
     pub cwd: String,
 }
 
-/// Source of the browser notices for the `notices` call. Each call takes
-/// the notices that the browser collected after the previous call.
-pub type NoticeSource = Rc<dyn Fn() -> Vec<String>>;
-
-/// Make a notice source that has no notices.
-pub fn no_notices() -> NoticeSource {
-    Rc::new(Vec::new)
-}
-
 /// The first client connection of the server: the connection of the parent
 /// of the sandbox process, which does not go through the socket file.
 pub struct FirstClient {
@@ -111,7 +104,7 @@ impl Drop for SockGuard {
 ///  - `forwards`: Limits for the port forwards of the clients
 ///  - `tracker`: Connection count of the sandbox. The owner of the sandbox
 ///    waits on it for the stop
-///  - `notices`: Source of the browser notices
+///  - `notices`: Notice log of the sandbox
 ///  - `monitor`: Sources of the monitor feed
 ///  - `first`: A client connection that the server serves before the
 ///    socket file exists
@@ -128,7 +121,7 @@ pub async fn serve(
     defaults: ExecDefaults,
     forwards: ForwardRules,
     tracker: Rc<ConnectionTracker>,
-    notices: NoticeSource,
+    notices: NoticeLog,
     monitor: MonitorFeed,
     first: Option<FirstClient>,
 ) {
@@ -218,7 +211,7 @@ struct Shared {
     defaults: ExecDefaults,
     forwards: ForwardRules,
     tracker: Rc<ConnectionTracker>,
-    notices: NoticeSource,
+    notices: NoticeLog,
     monitor: MonitorFeed,
 }
 
@@ -400,11 +393,12 @@ impl cli_service::Server for CliServiceImpl {
         _params: cli_service::NoticesParams,
         mut results: cli_service::NoticesResults,
     ) -> Result<(), capnp::Error> {
-        let notices = (self.notices)();
-        let len = u32::try_from(notices.len()).map_err(|e| capnp::Error::failed(e.to_string()))?;
-        let mut list = results.get().init_list(len);
-        for (i, notice) in (0..len).zip(&notices) {
-            list.set(i, notice);
+        let notices = self.notices.all();
+        let mut list = results.get().init_notices(list_len(notices.len())?);
+        for (i, notice) in (0..).zip(&notices) {
+            let mut item = list.reborrow().get(i);
+            item.set_seqno(notice.seqno);
+            item.set_text(&notice.text);
         }
         Ok(())
     }
@@ -422,6 +416,11 @@ impl cli_service::Server for CliServiceImpl {
         out.set_policy(crate::rpc::monitor::policy_to_rpc(policy));
         Ok(())
     }
+}
+
+/// Convert the length `len` of a result list to the RPC list length.
+fn list_len(len: usize) -> Result<u32, capnp::Error> {
+    u32::try_from(len).map_err(|e| capnp::Error::failed(e.to_string()))
 }
 
 /// Check a session or server name for the MCP route: 1-64 characters of

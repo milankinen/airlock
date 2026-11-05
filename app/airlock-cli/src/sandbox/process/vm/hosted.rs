@@ -5,10 +5,10 @@
 //! processes over the CLI socket and hold the sandbox with their
 //! connections. The sandbox stops when the last connection closes, when a
 //! client requests a stop, when no connection comes in time, or on
-//! SIGTERM. Browser notices go to the clients. The user approves requests
-//! from the sandbox on the host desktop, or in the monitor of a client.
+//! SIGTERM. The notice log of the run goes to the clients. The user
+//! approves requests from the sandbox on the host desktop, or in the
+//! monitor of a client.
 
-use std::rc::Rc;
 use std::time::Duration;
 
 use tracing::{error, info};
@@ -21,9 +21,7 @@ use crate::approval::{self, MonitorSlot};
 use crate::cli::{self, LogLevel};
 use crate::messages;
 use crate::oci::OciImage;
-use crate::rpc::browser::Browser;
-use crate::sandbox::Project;
-use crate::sandbox::process::server as cli_server;
+use crate::sandbox::{NoticeLog, Project};
 use crate::sandbox::process::server::connections::ConnectionTracker;
 
 /// Time limit for the first connection after the detach. The parent
@@ -39,6 +37,8 @@ pub struct HostedOptions {
     /// Connected socket of the parent of the sandbox process. It is the
     /// first connection of the CLI server.
     pub first_client: Option<std::os::unix::net::UnixStream>,
+    /// Notice log of the run. It can have notices of the start work.
+    pub notices: NoticeLog,
 }
 
 /// Run the hosted sandbox until it stops.
@@ -73,11 +73,7 @@ pub async fn run_hosted(
         &project.context.data,
         Some(approvals.clone()),
     );
-    let SessionBoot {
-        spec,
-        services,
-        browser,
-    } = session_boot(
+    let SessionBoot { spec, services } = session_boot(
         project,
         image,
         BootOptions {
@@ -86,6 +82,7 @@ pub async fn run_hosted(
             project_share: true,
         },
         approver,
+        options.notices.clone(),
     )?;
     let mut vm = match Box::pin(boot(spec)).await {
         Ok(vm) => vm,
@@ -95,8 +92,12 @@ pub async fn run_hosted(
     services.attach(&vm.guest_network());
 
     let tracker = ConnectionTracker::new();
-    let notices = notice_source(browser.as_ref());
-    if let Err(e) = vm.serve_cli(tracker.clone(), notices, approvals, options.first_client) {
+    if let Err(e) = vm.serve_cli(
+        tracker.clone(),
+        options.notices,
+        approvals,
+        options.first_client,
+    ) {
         return Err(shut_down_after(vm, &services, e).await);
     }
     info!("sandbox ready");
@@ -122,12 +123,6 @@ pub async fn run_hosted(
     }
 
     services.detach().await;
-    // No client takes the notices after the stop. Keep them in the log.
-    if let Some(browser) = &browser {
-        for notice in browser.take_notices() {
-            info!("browser notice not shown: {notice}");
-        }
-    }
     match Box::pin(vm.shutdown()).await {
         Ok(Stopped { project, synced }) => {
             info!("sandbox stopped (guest sync confirmed: {synced})");
@@ -140,14 +135,5 @@ pub async fn run_hosted(
             error!("sandbox shutdown: {e:#}");
             Ok(1)
         }
-    }
-}
-
-/// Make the source of the browser notices for the clients. Each call takes
-/// the new notices of `browser`.
-fn notice_source(browser: Option<&Browser>) -> cli_server::NoticeSource {
-    match browser.cloned() {
-        Some(browser) => Rc::new(move || browser.take_notices()),
-        None => cli_server::no_notices(),
     }
 }

@@ -165,11 +165,8 @@ pub fn import_legacy(context: &Context, lock: &SandboxLock) -> Result<(), Migrat
     // The import is done. A left `.airlock` directory does no harm: the
     // registry has the project now.
     if let Err(e) = airlock.remove_dir_all() {
-        cli::log!(
-            "{} {}",
-            cli::yellow("!"),
-            messages::sandbox::remove_old_dir_failed(&airlock, e)
-        );
+        let text = messages::sandbox::remove_old_dir_failed(&airlock, e);
+        cli::warn!(text, "{} {text}", cli::yellow("!"));
     }
     Ok(())
 }

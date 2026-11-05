@@ -2,9 +2,11 @@
 //!
 //! Each session has its own identity for the proxy. It keeps its open
 //! client requests, its editor MCP servers, its session dir in the guest
-//! and its client messages that wait. When the session ends, the client
-//! gets an error for each open request, and a message in the session if
-//! the agent exited.
+//! and its client messages that wait. A session that starts an ACP session
+//! shows all notices of the sandbox in it. When the session ends, the
+//! client gets an error for each open request, and a message in the
+//! session if the agent exited. The client shows these messages as session
+//! notices if it can, else as agent text.
 //!
 //! A session that does not start with a session request is one-shot. It
 //! runs only its first request and owns no ACP sessions.
@@ -20,6 +22,7 @@ use super::super::{AgentProcessLauncher, Location, mcp};
 use super::Listed;
 use super::shared::StartFailure;
 use crate::messages;
+use crate::sandbox::NoticeReader;
 
 /// One session of a shared agent process.
 pub(super) struct Session {
@@ -269,21 +272,43 @@ impl Session {
         let (Some(sid), Some((sandbox, code))) = (self.claimed.clone(), notify) else {
             return;
         };
-        let title = messages::acp::AGENT_STOPPED;
         let detail = messages::acp::agent_stopped_detail(sandbox, code);
-        let update = if self.notices {
-            json!({
-                "sessionUpdate": "notice", "severity": "error",
-                "title": title, "description": detail,
-            })
-        } else {
-            json!({
-                "sessionUpdate": "agent_message_chunk",
-                "content": { "type": "text", "text": format!("{title}: {detail}") },
-            })
+        self.notice(&sid, "error", messages::acp::AGENT_STOPPED, &detail)
+            .await;
+    }
+
+    /// Tell the client about all notices of the sandbox, one warning for
+    /// each, in the ACP session that the session request started. Does
+    /// nothing if the session has no ACP session.
+    /// Args:
+    ///  - `reader`: Reader of the sandbox notices
+    pub(super) fn show_notices(&self, reader: NoticeReader) {
+        let Some(sid) = self.claimed.clone() else {
+            return;
         };
-        let params = json!({ "sessionId": sid, "update": update });
-        let msg = json!({ "jsonrpc": "2.0", "method": "session/update", "params": params });
+        let (hid, tx, notices) = (self.hid, self.messages.clone(), self.notices);
+        // The read goes to the sandbox. The other sessions of the agent
+        // must not wait for it. The warnings come after the response,
+        // because the response is in the queue before the read starts.
+        tokio::task::spawn_local(async move {
+            for notice in reader.read().await {
+                let msg = notice_message(
+                    notices,
+                    &sid,
+                    "warning",
+                    messages::acp::SANDBOX_NOTICE,
+                    &notice.text,
+                );
+                let claim = None;
+                let _ = tx.send((hid, HandleMessage::Client { msg, claim })).await;
+            }
+        });
+    }
+
+    /// Send a message to the client in the ACP session `sid` (see
+    /// [`notice_message`]).
+    async fn notice(&self, sid: &str, severity: &str, title: &str, detail: &str) {
+        let msg = notice_message(self.notices, sid, severity, title, detail);
         self.to_client(msg, None).await;
     }
 
@@ -302,4 +327,25 @@ impl Session {
     pub(super) async fn send(&self, message: HandleMessage) {
         let _ = self.messages.send((self.hid, message)).await;
     }
+}
+
+/// Make a message to the client in the ACP session `sid`: a session notice
+/// with `severity` if the client shows notices, else agent text.
+/// Args:
+///  - `notices`: The client shows session notices
+///  - `title`, `detail`: Title and text of the message
+fn notice_message(notices: bool, sid: &str, severity: &str, title: &str, detail: &str) -> Value {
+    let update = if notices {
+        json!({
+            "sessionUpdate": "notice", "severity": severity,
+            "title": title, "description": detail,
+        })
+    } else {
+        json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": format!("{title}: {detail}") },
+        })
+    };
+    let params = json!({ "sessionId": sid, "update": update });
+    json!({ "jsonrpc": "2.0", "method": "session/update", "params": params })
 }

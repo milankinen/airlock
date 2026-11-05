@@ -131,11 +131,9 @@ pub fn resolve_mounts(
                     anyhow::bail!(messages::vm::mount_source_missing(&source));
                 }
                 MissingAction::Warn => {
-                    crate::cli::log!(
-                        "  {} {}",
-                        crate::cli::bullet(),
-                        messages::vm::mount_skipped_not_found(crate::cli::dim(&source.to_string()))
-                    );
+                    let text =
+                        messages::vm::mount_skipped_not_found(crate::cli::dim(&source.to_string()));
+                    crate::cli::warn!(text, "  {} {text}", crate::cli::bullet());
                     continue;
                 }
                 MissingAction::Ignore => continue,

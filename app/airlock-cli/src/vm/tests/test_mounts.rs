@@ -225,6 +225,45 @@ fn missing_mount_source_fails_unless_skipped() {
     assert!(!host.home.join(".nope").exists());
 }
 
+/// Removes the warning receiver of the process when it drops.
+struct SinkGuard;
+
+impl Drop for SinkGuard {
+    fn drop(&mut self) {
+        crate::cli::clear_notice_sink();
+    }
+}
+
+/// Test that the warning of a skipped mount goes to the notice log as plain
+/// text when the process has a notice receiver, as in the quiet start of
+/// `airlock exec`. The user must see the warning after the connect.
+///   1. Send the warnings of the process to a notice log
+///   2. Resolve a missing mount with `missing = "warn"`
+///   3. Remove the receiver, then check that the log has the warning with
+///      the source path and no color codes
+#[test]
+fn skipped_mount_warning_goes_to_notice_log() {
+    let host = Host::new();
+    let source = host.project.join("missing-for-notice");
+    let log = crate::sandbox::NoticeLog::new();
+    let sink = log.clone();
+    crate::cli::set_notice_sink(move |text| sink.push(text));
+    // Remove the receiver also after a panic. Other tests must print their
+    // warnings as before.
+    let guard = SinkGuard;
+    let mounts = host.resolve(&format!(
+        "[mounts.warned]\nsource = \"{}\"\ntarget = \"/b\"\nmissing = \"warn\"\n",
+        source.display()
+    ));
+    drop(guard);
+
+    assert!(mounts.unwrap().is_empty());
+    // Other tests can warn at the same time. Find the warning of this test.
+    let texts: Vec<String> = log.all().into_iter().map(|n| n.text).collect();
+    let expected = crate::messages::vm::mount_skipped_not_found(source.display());
+    assert!(texts.contains(&expected), "{texts:?}");
+}
+
 /// Test that the `create-dir` and `create-file` options create a missing
 /// source with the correct type, content and mode.
 ///   1. Resolve mounts that create nested directories and files, some with

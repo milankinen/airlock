@@ -54,8 +54,8 @@ pub use self::process::vm::boot::{BootOptions, BootSpec, boot, guest_env};
 pub use self::process::vm::io::{closed_stdin, drive};
 pub use self::process::vm::machine::{ProcessSpec, Stopped, Vm};
 pub use self::process::{
-    ExecRequest, ExitedBeforeReady, ForwardMode, ForwardReport, McpRegistrar, Run, STOP_WAIT_SECS,
-    SandboxProcess, StopResult, run_sandbox_process,
+    ExecRequest, ExitedBeforeReady, ForwardMode, ForwardReport, McpRegistrar, NoticeLog,
+    NoticeReader, Run, STOP_WAIT_SECS, SandboxProcess, StopResult, run_sandbox_process,
 };
 pub use self::registry::list as list_entries;
 pub use self::start::check_env::check_env_early;

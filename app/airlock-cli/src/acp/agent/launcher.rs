@@ -4,7 +4,8 @@
 //! same as `airlock exec` does. Starts the sandbox if it does not run. The
 //! agent process holds the sandbox until it exits. Relays the agent input,
 //! output, exit and kill over the connection to the sandbox. The same
-//! connection adds the editor MCP servers to the sandbox. Never writes to
+//! connection adds the editor MCP servers to the sandbox and reads the
+//! notices of the sandbox. Never writes to
 //! the standard output, because it has the protocol.
 
 use tokio::sync::mpsc;
@@ -125,6 +126,7 @@ impl AgentProcessLauncher for SandboxProcessLauncher {
         // The editor MCP servers go to the sandbox over the connection of
         // the agent. They thus end at the latest when the agent exits.
         let mcp = Some(process.mcp_registrar());
+        let notices = Some(process.notice_reader());
         let (events_tx, events) = mpsc::channel(crate::acp::AGENT_EVENTS);
         // The connection holds the sandbox until the agent exits. A failed
         // launch drops it. All sessions of the sandbox share this agent, so
@@ -137,6 +139,7 @@ impl AgentProcessLauncher for SandboxProcessLauncher {
             events,
             control,
             mcp,
+            notices,
         };
         Ok((location, agent))
     }

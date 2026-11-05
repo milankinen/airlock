@@ -125,7 +125,7 @@ impl Vm {
     /// of the client.
     /// Args:
     ///  - `tracker`: Connection count of the sandbox
-    ///  - `notices`: Source of the browser notices for the clients
+    ///  - `notices`: Notice log of the sandbox for the clients
     ///  - `approvals`: Place of the monitor dialog for approval requests.
     ///    It holds the dialog of the attached monitor client.
     ///  - `first`: Connected socket of the first client. It counts at once,
@@ -133,7 +133,7 @@ impl Vm {
     pub fn serve_cli(
         &mut self,
         tracker: Rc<ConnectionTracker>,
-        notices: cli_server::NoticeSource,
+        notices: crate::sandbox::NoticeLog,
         approvals: MonitorSlot,
         first: Option<std::os::unix::net::UnixStream>,
     ) -> anyhow::Result<()> {

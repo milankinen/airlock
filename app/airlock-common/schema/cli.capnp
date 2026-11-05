@@ -52,9 +52,10 @@ interface CliService {
   # sandbox stops.
   status @6 () -> (connections :UInt32, stopping :Bool);
 
-  # Takes the browser notices that the sandbox collected. Each call returns
-  # only the notices after the previous call.
-  notices @7 () -> (list :List(Text));
+  # All notices of the sandbox since its boot, oldest first. The sandbox
+  # never removes a notice. Thus each call returns the full list, and a
+  # client finds the new notices by their `seqno`.
+  notices @7 () -> (notices :List(Notice));
 
   # Starts a monitor feed to `sink`: network events, guest stats and policy
   # changes. Returns the control of the feed, the host project dir and the
@@ -65,4 +66,14 @@ interface CliService {
     projectPath :Text,
     policy      :Monitor.Policy,
   );
+
+}
+
+# A message of the sandbox for the user, for example a warning of the
+# start or a refused browser request.
+struct Notice {
+  # Number of the notice. The first notice has 1, and each next notice has
+  # one more.
+  seqno @0 :UInt64;
+  text  @1 :Text;
 }

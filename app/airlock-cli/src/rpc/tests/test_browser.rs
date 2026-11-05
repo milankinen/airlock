@@ -9,6 +9,7 @@ use airlock_common::supervisor_capnp::browser;
 use url::Url;
 
 use crate::rpc::browser::{Browser, BrowserGrant, BrowserImpl, GrantAnswer, RateLimit};
+use crate::sandbox::NoticeLog;
 use crate::test_cfg::{block_on_local, rpc_loopback};
 
 /// A real Claude sign-in URL. Its query has `state=`, which must not show
@@ -35,12 +36,14 @@ impl BrowserGrant for ClaudeGrant {
 ///  - `opener`: `false` makes a host without a browser program
 ///
 /// Returns:
-///   The client, the host browser and the URLs that the host opener got.
+///   The client, the notice log of the host browser and the URLs that the
+///   host opener got.
 fn guest_browser(
     max_opens: usize,
     window: Duration,
     opener: bool,
-) -> (browser::Client, Browser, Rc<RefCell<Vec<String>>>) {
+) -> (browser::Client, NoticeLog, Rc<RefCell<Vec<String>>>) {
+    let notices = NoticeLog::new();
     let opened = Rc::new(RefCell::new(Vec::new()));
     let log = opened.clone();
     let browser = Browser::with_opener(
@@ -52,11 +55,17 @@ fn guest_browser(
             })
         }),
         RateLimit { max_opens, window },
+        notices.clone(),
     );
     let client = rpc_loopback(
         capnp_rpc::new_client::<browser::Client, _>(BrowserImpl::new(browser.clone())).client,
     );
-    (client, browser, opened)
+    (client, notices, opened)
+}
+
+/// Get the texts of all notices in `log`, oldest first.
+fn texts(log: &NoticeLog) -> Vec<String> {
+    log.all().into_iter().map(|n| n.text).collect()
 }
 
 /// Ask the host to open `url`. Returns the RPC error message on refusal.
@@ -82,7 +91,7 @@ async fn open(client: &browser::Client, url: &str) -> Result<(), String> {
 #[test]
 fn guest_opens_granted_page_and_others_are_refused() {
     block_on_local(async {
-        let (client, browser, opened) = guest_browser(10, Duration::from_mins(1), true);
+        let (client, log, opened) = guest_browser(10, Duration::from_mins(1), true);
 
         open(&client, CLAUDE_URL).await.unwrap();
         let refused = CLAUDE_URL.replace("claude.com", "refused.example");
@@ -97,7 +106,7 @@ fn guest_opens_granted_page_and_others_are_refused() {
         assert!(err.contains("characters airlock refuses"), "{err}");
 
         assert_eq!(*opened.borrow(), [CLAUDE_URL]);
-        let notices = browser.take_notices();
+        let notices = texts(&log);
         assert_eq!(notices.len(), 3, "{notices:?}");
         assert!(notices.iter().all(|n| !n.contains("state=")), "{notices:?}");
     });
@@ -112,17 +121,12 @@ fn guest_opens_granted_page_and_others_are_refused() {
 #[test]
 fn guest_opens_are_rate_limited_per_window() {
     block_on_local(async {
-        let (client, browser, opened) = guest_browser(3, Duration::from_millis(100), true);
+        let (client, log, opened) = guest_browser(3, Duration::from_millis(100), true);
 
         let results = futures::future::join_all((0..6).map(|_| open(&client, CLAUDE_URL))).await;
         assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 3);
         assert_eq!(opened.borrow().len(), 3);
-        assert!(
-            browser
-                .take_notices()
-                .iter()
-                .all(|n| n.contains("too many pages"))
-        );
+        assert!(texts(&log).iter().all(|n| n.contains("too many pages")));
 
         // Wait a bit longer than the 100 ms window, so the 3 earlier opens
         // expire.
@@ -140,11 +144,11 @@ fn guest_opens_are_rate_limited_per_window() {
 #[test]
 fn granted_page_without_host_browser_program_asks_user_to_open_it() {
     block_on_local(async {
-        let (client, browser, _) = guest_browser(3, Duration::from_mins(1), false);
+        let (client, log, _) = guest_browser(3, Duration::from_mins(1), false);
 
         open(&client, CLAUDE_URL).await.unwrap();
 
-        let notices = browser.take_notices();
+        let notices = texts(&log);
         assert_eq!(notices.len(), 1);
         assert!(notices[0].contains("no browser program"), "{notices:?}");
         assert!(notices[0].contains("claude.com/cai/oauth/authorize"));

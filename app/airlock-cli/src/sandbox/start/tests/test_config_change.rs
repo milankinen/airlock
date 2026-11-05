@@ -305,3 +305,132 @@ fn rule_change_with_keys_planted_in_project_file_is_refused() {
         );
     }
 }
+
+/// Write the project file `airlock.toml` of `project` with `toml` and start
+/// a sandbox with the file from the disk, as `airlock start` does.
+fn start_from_file(project: &StartProject, toml: &str) {
+    use crate::config::LayeredConfig;
+    use crate::test_cfg::oci::verified_dir;
+    use crate::test_cfg::temp_dir;
+
+    std::fs::write(project.project_dir().join("airlock.toml"), toml).unwrap();
+    // The local project file dir is outside the project and empty.
+    let local = temp_dir();
+    let config = LayeredConfig::load_from(
+        &project.context().home,
+        &verified_dir(&project.project_dir()),
+        &verified_dir(local.path()),
+    )
+    .unwrap();
+    project.start_config(&config, false, false).unwrap();
+}
+
+/// Check the current project config of `project` against the config of its
+/// last start, as `airlock exec` and `airlock acp` do.
+/// Returns:
+///   `true` if the check finds a change.
+fn current_config_differs(project: &StartProject) -> bool {
+    use crate::config::ConfigOverrides;
+    use crate::sandbox::start::config_change::{LastRunInput, current_differs, resolve_last_run};
+    use crate::test_cfg::block_on_local;
+    use crate::test_cfg::oci::verified_dir;
+
+    let sandbox_dir = project.sandbox().unwrap().dir;
+    let project_dir = verified_dir(&project.project_dir());
+    let packs = test_packs();
+    let input = LastRunInput {
+        sandbox_dir: &sandbox_dir,
+        data_dir: &project.context().data,
+        packs: &packs,
+        project_root: &project_dir,
+        overrides: &ConfigOverrides::default(),
+    };
+    block_on_local(async {
+        let last = resolve_last_run(&input).await.unwrap().unwrap();
+        current_differs(&input, &project.context().home, &last).await
+    })
+}
+
+/// Test that the check of `airlock exec` and `airlock acp` finds an edited,
+/// a broken and a removed project config file. These commands start with
+/// the config of the last start and must tell the user that the current
+/// config does not apply.
+///   1. Write the project file and start a sandbox
+///   2. Check the same file and check that it gives no change
+///   3. Edit a value in the file and check that it gives a change
+///   4. Write a file that does not parse and check that it gives a change
+///   5. Remove the file and check that it gives a change
+#[test]
+fn current_config_check_finds_edited_broken_and_removed_project_file() {
+    let project = StartProject::new(test_packs());
+    start_from_file(&project, FIRST);
+    let path = project.project_dir().join("airlock.toml");
+
+    assert!(!current_config_differs(&project));
+    std::fs::write(&path, CHANGED).unwrap();
+    assert!(current_config_differs(&project));
+    std::fs::write(&path, "[vm\n").unwrap();
+    assert!(current_config_differs(&project));
+    std::fs::remove_file(&path).unwrap();
+    assert!(current_config_differs(&project));
+}
+
+/// Test that the check of `airlock exec` and `airlock acp` finds a mount
+/// source symlink that points to an other dir since the last start, also
+/// when the config text is the same. Code in the sandbox can change the
+/// symlink in the project dir.
+///   1. Make the dirs `a` and `b` and the symlink `data` to `a`, and start
+///      with a mount of `data`
+///   2. Check that the same config gives no change
+///   3. Change the symlink to `b` and check that it gives a change
+#[test]
+fn current_config_check_finds_retargeted_mount_source_symlink() {
+    let project = StartProject::new(test_packs());
+    let dir = project.project_dir();
+    std::fs::create_dir(dir.join("a")).unwrap();
+    std::fs::create_dir(dir.join("b")).unwrap();
+    std::os::unix::fs::symlink("a", dir.join("data")).unwrap();
+    start_from_file(
+        &project,
+        "[mounts.data]\nsource = \"./data\"\ntarget = \"/data\"\n",
+    );
+
+    assert!(!current_config_differs(&project));
+    std::fs::remove_file(dir.join("data")).unwrap();
+    std::os::unix::fs::symlink("b", dir.join("data")).unwrap();
+    assert!(current_config_differs(&project));
+}
+
+/// Test that the check of `airlock exec` and `airlock acp` gives a change
+/// for a new project pack without approval, and that the `config.lua` of
+/// the pack does not run. The check must never ask about packs.
+///   1. Start a sandbox with a project file without packs
+///   2. Write a project pack whose `config.lua` makes a marker file, and
+///      add the pack to the project file
+///   3. Check that it gives a change, and that the marker file is missing
+#[test]
+fn current_config_check_gives_change_for_pack_without_approval() {
+    let project = StartProject::new(test_packs());
+    start_from_file(&project, FIRST);
+    let dir = project.project_dir();
+    let marker = dir.join("marker");
+    crate::test_cfg::packs::write_user_pack(
+        &dir.join("packs"),
+        "marker",
+        &[
+            (
+                "pack.toml",
+                "label = \"Marker\"\ndescription = \"Marker\"\n",
+            ),
+            (
+                "config.lua",
+                &format!("assert(io.open({:?}, \"w\")):close()\n", marker.display().to_string()),
+            ),
+        ],
+    );
+    let toml = format!("{FIRST}\n[packs]\n\"./packs/marker\" = {{}}\n");
+    std::fs::write(dir.join("airlock.toml"), toml).unwrap();
+
+    assert!(current_config_differs(&project));
+    assert!(!marker.exists());
+}

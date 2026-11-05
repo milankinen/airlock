@@ -368,7 +368,8 @@ fn prepare_shares(
         let link_path = dir.join(m.key())?;
         if let Err(e) = m.source.hard_link_to(&link_path) {
             if e.kind() == std::io::ErrorKind::CrossesDevices {
-                cli::log!("{}", messages::vm::file_mount_cross_device(&m.source));
+                let text = messages::vm::file_mount_cross_device(&m.source);
+                cli::warn!(text, "{text}");
                 m.source.copy_to(&link_path)?;
             } else {
                 return Err(

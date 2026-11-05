@@ -308,14 +308,14 @@ fn unavailable_warning(ids: &[ServiceId], reason: &str) -> String {
     )
 }
 
-/// Print `msg` as a warning, only the first time.
+/// Show `msg` as a warning (see [`cli::warn`]), only the first time.
 /// Returns:
-///   `true` if this call printed the warning.
+///   `true` if this call showed the warning.
 fn warn_once(warned: &AtomicBool, msg: &str) -> bool {
     if warned.swap(true, Ordering::Relaxed) {
         return false;
     }
-    cli::log!("{} {msg}", cli::yellow("warning:"));
+    cli::warn!(msg, "{} {msg}", cli::yellow("warning:"));
     true
 }
 

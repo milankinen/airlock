@@ -54,7 +54,7 @@ pub fn init(settings: &PackSettings, home: &VerifiedPath) -> anyhow::Result<Pack
     let (manager, warnings) = builtin::load(&builtin::BUILTIN_PACKS)?
         .with_user_packs(&dirs, settings.defaults.clone())?;
     for warning in warnings {
-        crate::cli::log!("{} {warning}", crate::cli::yellow("!"));
+        crate::cli::warn!(warning, "{} {warning}", crate::cli::yellow("!"));
     }
     Ok(manager)
 }

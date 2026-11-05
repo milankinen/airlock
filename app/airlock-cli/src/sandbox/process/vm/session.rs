@@ -14,7 +14,7 @@ use crate::network::{self, Network};
 use crate::oci::{self, OciImage};
 use crate::rpc::browser::Browser;
 use crate::rpc::clipboard;
-use crate::sandbox::Project;
+use crate::sandbox::{NoticeLog, Project};
 use crate::services::{self, Services};
 use crate::{daemon, masking, mcp};
 
@@ -25,8 +25,6 @@ pub struct SessionBoot<'a> {
     /// The network services. Attach them after the boot, and detach them
     /// before the shutdown.
     pub services: Services,
-    /// The browser bridge, for its notices. `None` gives no browser access.
-    pub browser: Option<Browser>,
 }
 
 /// Build the boot of a session with all access that the config of
@@ -36,6 +34,7 @@ pub struct SessionBoot<'a> {
 ///  - `image`: The container image
 ///  - `options`: Output and log options. The project share is always on.
 ///  - `approver`: Asks the user to approve requests from the sandbox
+///  - `notices`: Notice log of the sandbox, for the browser messages
 ///
 /// Returns:
 ///   The boot spec and the parts that the caller keeps, or error if a part
@@ -45,6 +44,7 @@ pub fn session_boot(
     image: &OciImage,
     mut options: BootOptions,
     approver: Rc<dyn Approver>,
+    notices: NoticeLog,
 ) -> anyhow::Result<SessionBoot<'_>> {
     // The network config below expects the shared project dir.
     options.project_share = true;
@@ -54,7 +54,7 @@ pub fn session_boot(
         &project.context,
         &tls_client,
     );
-    let browser = Browser::new(services.browser_grants());
+    let browser = Browser::new(services.browser_grants(), notices);
     let container_home = oci::effective_container_home(&project, image);
     let network = Network::new(
         &project,
@@ -76,17 +76,13 @@ pub fn session_boot(
         options,
         env,
         network,
-        browser: browser.clone(),
+        browser,
         clipboard,
         mcp,
         daemons,
         masks,
     };
-    Ok(SessionBoot {
-        spec,
-        services,
-        browser,
-    })
+    Ok(SessionBoot { spec, services })
 }
 
 /// Detach `services` and stop `vm` after `error`.

@@ -117,8 +117,9 @@ pub struct LaunchOpts {
 
 impl LaunchOpts {
     /// Get the options for a sandbox process that `exec` or `acp` starts:
-    /// the log level from `AIRLOCK_LOG_LEVEL` or `fallback`, and quiet if
-    /// the command is quiet.
+    /// the log level from `AIRLOCK_LOG_LEVEL` or `fallback`, and always
+    /// quiet. The start shows no status and no progress, only questions
+    /// and errors. Its warnings go to the notice log of the sandbox.
     /// Args:
     ///  - `fallback`: Log level without `AIRLOCK_LOG_LEVEL`
     ///  - `mode`: [`Mode::Exec`] or [`Mode::Acp`]
@@ -130,7 +131,7 @@ impl LaunchOpts {
         Self {
             log_level,
             verbose: false,
-            quiet: cli::is_silent(),
+            quiet: true,
             mode,
         }
     }
@@ -245,8 +246,9 @@ impl Launcher for ProcessLauncher {
 }
 
 /// Get a session in `sandbox`. Starts its sandbox process if the sandbox
-/// does not run. The notices "waiting for the sandbox" and "starting
-/// sandbox" go to the error output, also for `acp`.
+/// does not run. The notice "waiting for the sandbox" goes to the error
+/// output, also for `acp`. It shows only while another process starts or
+/// stops the sandbox.
 /// Args:
 ///  - `sandbox`: The sandbox
 ///  - `launcher`: Starts the sandbox process when no sandbox runs
@@ -270,6 +272,8 @@ pub async fn ensure_with(
     if let Some(session) = try_attach(&sandbox.sock, try_timeout).await? {
         return Ok((session, None));
     }
+    // The notice shows only when another process starts or stops the
+    // sandbox. A normal start shows nothing.
     let notice = waiting_notice();
     let dir = &sandbox.sandbox.dir;
     let startup = lock::wait_lock(dir, LockKind::Startup, &notice).await?;

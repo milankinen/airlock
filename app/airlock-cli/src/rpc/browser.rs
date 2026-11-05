@@ -15,9 +15,7 @@ use airlock_common::BROWSER_URL_MAX;
 use airlock_common::supervisor_capnp::browser;
 use url::Url;
 
-/// Maximum number of notices kept per session. Later notices are counted,
-/// not stored.
-const MAX_NOTICES: usize = 8;
+use crate::sandbox::NoticeLog;
 
 /// Maximum number of open requests per [`SESSION_OPEN_WINDOW`]. The limit
 /// also counts requests that the URL checks or the grants refuse later. A
@@ -133,23 +131,23 @@ fn spawn_opener(program: &str, url: &str) -> std::io::Result<()> {
 }
 
 /// Opens a checked URL on the host.
-pub(super) type OpenFn = Box<dyn Fn(&str) -> std::io::Result<()>>;
+pub(crate) type OpenFn = Box<dyn Fn(&str) -> std::io::Result<()>>;
 
 /// Rate limit: a maximum of `max_opens` open requests per `window`.
-pub(super) struct RateLimit {
+pub(crate) struct RateLimit {
     /// Maximum number of open requests in one window.
-    pub(super) max_opens: usize,
+    pub(crate) max_opens: usize,
     /// Length of the window.
-    pub(super) window: Duration,
+    pub(crate) window: Duration,
 }
 
 /// Host side of the browser bridge for one boot. Cheap to clone. All
 /// clones share the state.
 ///
-/// Messages for the user wait in a queue ([`Browser::take_notices`]), and
-/// the caller shows them after the session: output into a running
-/// full-screen tool would corrupt its screen. Each refusal is also logged
-/// (warn) when it occurs.
+/// Messages for the user go into the notice log of the sandbox. The clients
+/// show them when they connect, and `airlock start` also after its main
+/// command: output into a running full-screen tool would corrupt its
+/// screen. Each message is also logged (warn) when it occurs.
 #[derive(Clone)]
 pub struct Browser(Rc<BrowserInner>);
 
@@ -160,15 +158,8 @@ struct BrowserInner {
     limit: RateLimit,
     /// Arrival times of the requests in the rate window. Runtime state.
     recent: RefCell<VecDeque<Instant>>,
-    /// Messages for the user after the session. Runtime state.
-    notices: RefCell<Notices>,
-}
-
-/// Queue of messages for the user, and the count of dropped messages.
-#[derive(Default)]
-struct Notices {
-    items: Vec<String>,
-    dropped: usize,
+    /// Notice log of the sandbox, for the messages for the user.
+    notices: NoticeLog,
 }
 
 impl Browser {
@@ -176,54 +167,44 @@ impl Browser {
     /// browser program of the host.
     /// Args:
     ///  - `grants`: Grants that decide which pages can open
+    ///  - `notices`: Notice log of the sandbox, for the messages for the
+    ///    user
     ///
     /// Returns:
     ///   Browser, or `None` if there are no grants. Then the guest gets no
     ///   browser.
-    pub fn new(grants: Vec<Rc<dyn BrowserGrant>>) -> Option<Self> {
+    pub fn new(grants: Vec<Rc<dyn BrowserGrant>>, notices: NoticeLog) -> Option<Self> {
         let opener = detect_opener()
             .map(|program| -> OpenFn { Box::new(move |url: &str| spawn_opener(program, url)) });
         let limit = RateLimit {
             max_opens: SESSION_MAX_OPENS,
             window: SESSION_OPEN_WINDOW,
         };
-        (!grants.is_empty()).then(|| Self::with_opener(grants, opener, limit))
+        (!grants.is_empty()).then(|| Self::with_opener(grants, opener, limit, notices))
     }
 
     /// Make a browser with an explicit opener (`None`: no browser program).
-    pub(super) fn with_opener(
+    pub(crate) fn with_opener(
         grants: Vec<Rc<dyn BrowserGrant>>,
         opener: Option<OpenFn>,
         limit: RateLimit,
+        notices: NoticeLog,
     ) -> Self {
         Self(Rc::new(BrowserInner {
             grants,
             opener,
             limit,
             recent: RefCell::new(VecDeque::new()),
-            notices: RefCell::new(Notices::default()),
+            notices,
         }))
     }
 
-    /// Get the queued messages for the user, oldest first. Clears the
-    /// queue.
-    pub fn take_notices(&self) -> Vec<String> {
-        let Notices { mut items, dropped } = self.0.notices.take();
-        if dropped > 0 {
-            items.push(crate::messages::rpc::browser_more_requests_refused(dropped));
-        }
-        items
-    }
-
-    /// Queue `msg` for after the session, and log it now.
-    fn notice(&self, msg: String) {
+    /// Add `msg` to the notice log of the sandbox, and log it now.
+    fn notice(&self, msg: &str) {
         tracing::warn!("browser: {msg}");
-        let mut n = self.0.notices.borrow_mut();
-        if n.items.len() < MAX_NOTICES {
-            n.items.push(msg);
-        } else {
-            n.dropped += 1;
-        }
+        self.0
+            .notices
+            .push(crate::messages::rpc::browser_notice(msg));
     }
 
     /// Handle one open request from the guest: check it, let the grants
@@ -233,17 +214,17 @@ impl Browser {
     ///
     /// Returns:
     ///   Error message if the request is refused or the browser does not
-    ///   start. When the host has no browser program, it queues a notice
+    ///   start. When the host has no browser program, it adds a notice
     ///   and returns `Ok`.
     pub fn open(&self, raw: &str) -> Result<(), String> {
         // No await occurs between the rate limit and the grant answers.
         // Thus concurrent requests cannot pass either check in parallel.
         let url = self.admit(raw).inspect_err(|msg| {
-            self.notice(msg.clone());
+            self.notice(msg);
         })?;
         let page = place_of(&url);
         let Some(opener) = &self.0.opener else {
-            self.notice(crate::messages::rpc::browser_no_program(&page));
+            self.notice(&crate::messages::rpc::browser_no_program(&page));
             return Ok(());
         };
         match opener(url.as_str()) {
@@ -253,7 +234,7 @@ impl Browser {
             }
             Err(e) => {
                 let msg = crate::messages::rpc::browser_start_failed(e);
-                self.notice(msg.clone());
+                self.notice(&msg);
                 Err(msg)
             }
         }

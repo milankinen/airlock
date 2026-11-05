@@ -151,11 +151,8 @@ pub fn for_config(config: &Clipboard) -> Option<ClipboardImpl> {
         return None;
     }
     let Some(tool) = detect() else {
-        crate::cli::log!(
-            "  {} {}",
-            crate::cli::bullet(),
-            crate::messages::rpc::CLIPBOARD_DISABLED_NO_PROGRAM
-        );
+        let text = crate::messages::rpc::CLIPBOARD_DISABLED_NO_PROGRAM;
+        crate::cli::warn!(text, "  {} {text}", crate::cli::bullet());
         return None;
     };
     Some(ClipboardImpl {

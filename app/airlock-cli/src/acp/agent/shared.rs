@@ -13,6 +13,10 @@
 //! without an ACP session goes to the oldest session. No agent message
 //! goes to a one-shot session, only the response to its request.
 //!
+//! Each session shows all notices of the sandbox as warnings, after the OK
+//! response to its session request. A session whose session request fails
+//! and a one-shot session show none.
+//!
 //! A one-shot session ends by itself after its response. When the agent
 //! exits, all its sessions end. When the last session ends, the agent input
 //! closes. An agent that does not exit in the grace time is killed.
@@ -759,7 +763,13 @@ impl<S: AgentProcessLauncher + 'static> SharedAgent<S> {
             return;
         };
         if let Some(session) = self.sessions.get(&hid) {
+            let claimed = claim.is_some();
             session.to_client(msg, claim).await;
+            // The client knows the ACP session only after the response.
+            let reader = self.pipe.process.as_ref().and_then(|p| p.notices.clone());
+            if claimed && let Some(reader) = reader {
+                session.show_notices(reader);
+            }
         }
         self.end_one_shot(hid).await;
     }

@@ -2,14 +2,15 @@
 //!
 //! Reads the command-line options, finds the sandbox and starts the sandbox
 //! process. The sandbox process prepares the sandbox on the same terminal.
-//! Then the main command of the container runs in the sandbox.
+//! Then the main command of the container runs in the sandbox. The notices
+//! of the sandbox show before the main command, and the new notices after
+//! it.
 
 use clap::Args;
 
 use crate::cli::{self, LogLevel};
 use crate::config::config_values::Policy;
 use crate::context::Context;
-use crate::messages;
 use crate::runtime::HostRuntime;
 use crate::sandbox::{self, Exit, ExitedBeforeReady, Interrupted, Run};
 
@@ -79,10 +80,10 @@ impl StartArgs {
 // early), the sandbox. Then the start waits for a sandbox that starts or
 // stops, checks that the sandbox does not run, and starts the sandbox
 // process. It does the questions, the config and the installs on the same
-// terminal, and boots the sandbox. Then the main command runs in it. After
-// the command, the browser notices show and the connection closes. If no
-// other client uses the sandbox, the start waits until the sandbox
-// stopped.
+// terminal, and boots the sandbox. Then the main command runs in it. The
+// notices of the sandbox show before the command, and the new notices
+// after it. Then the connection closes. If no other client uses the
+// sandbox, the start waits until the sandbox stopped.
 pub async fn main(
     args: StartArgs,
     extra_args: Vec<String>,
@@ -117,13 +118,11 @@ async fn run(args: StartArgs, extra_args: Vec<String>, context: Context) -> Resu
         Err(e) if e.is::<Interrupted>() => return Err(Exit::ABORTED),
         Err(e) => return Err(e.into()),
     };
+    // Show the notices before the main command takes the terminal, and
+    // after it only the new ones.
+    let shown = process.show_notices(0).await;
     let code = process.exec_main(runtime).await;
-    for notice in process.notices().await {
-        cli::log!(
-            "{} {notice}",
-            cli::yellow(messages::sandbox::BROWSER_NOTICE_LABEL)
-        );
-    }
+    process.show_notices(shown).await;
     // The connection of this process holds the sandbox. The release tells
     // at once if the end of the hold stops the sandbox.
     if process.release().await {

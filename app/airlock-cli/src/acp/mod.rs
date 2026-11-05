@@ -8,7 +8,9 @@
 //! the sandbox of the session dir. All sessions in a sandbox share its
 //! agent. An agent sees only the messages of its own sessions. An agent
 //! exit ends only that agent and its sessions. The proxy gives the agents
-//! the session dirs as guest paths.
+//! the session dirs as guest paths. Each new or loaded session shows all
+//! notices of its sandbox as warnings, for example a project config that
+//! changed after the last `airlock start`.
 //!
 //! By default, the proxy removes the client features that let the agent
 //! act on the host (host commands, host file access, login terminal, URL
@@ -48,7 +50,7 @@ use crate::cli::LogLevel;
 use crate::context::Context;
 use crate::rpc::ProcessEvent;
 use crate::runtime::SignalStream;
-use crate::sandbox::McpRegistrar;
+use crate::sandbox::{McpRegistrar, NoticeReader};
 
 /// Name of the proxy log file in the data dir.
 pub const LOG_FILE: &str = "acp.log";
@@ -191,6 +193,9 @@ pub struct AgentProcess {
     /// Adds the editor MCP servers to the sandbox, or `None` if the
     /// sandbox cannot add them.
     pub mcp: Option<McpRegistrar>,
+    /// Reads the notices of the sandbox, or `None` if the launcher cannot
+    /// read them.
+    pub notices: Option<NoticeReader>,
 }
 
 /// Finds the sandbox of a session dir and launches agent processes there.

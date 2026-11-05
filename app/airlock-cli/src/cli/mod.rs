@@ -313,6 +313,45 @@ pub fn set_silent(value: bool) {
     SILENT.store(value, Ordering::Relaxed);
 }
 
+/// Receiver of the warnings of this process, in place of the terminal.
+type NoticeSink = Box<dyn Fn(String) + Send>;
+
+/// The installed receiver of the warnings (see [`set_notice_sink`]).
+static NOTICE_SINK: std::sync::Mutex<Option<NoticeSink>> = std::sync::Mutex::new(None);
+
+/// Send the warnings of this process to `sink` from now on, in place of
+/// the terminal (see [`warn`]). The sandbox process uses it for its notice
+/// log.
+pub fn set_notice_sink(sink: impl Fn(String) + Send + 'static) {
+    *NOTICE_SINK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(sink));
+}
+
+/// Remove the receiver of the warnings. Then they go to the terminal again.
+#[cfg(test)]
+pub fn clear_notice_sink() {
+    *NOTICE_SINK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+/// Give the warning `text` to the installed receiver (see
+/// [`set_notice_sink`]). The receiver removes the colors.
+/// Returns:
+///   `false` if no receiver is installed. Then the caller prints the
+///   warning.
+pub fn to_notice_sink(text: &str) -> bool {
+    let sink = NOTICE_SINK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(sink) = sink.as_ref() else {
+        return false;
+    };
+    sink(text.to_string());
+    true
+}
+
 /// Return true if the user gave `--verbose`.
 pub fn is_verbose() -> bool {
     VERBOSE.load(Ordering::Relaxed)
@@ -406,6 +445,17 @@ macro_rules! _log {
     };
 }
 
+/// Show a warning: give the text (first argument) to the notice receiver
+/// of the process if it has one (see [`set_notice_sink`]). Else print the
+/// line (the other arguments, with marks and colors) as [`log`] does.
+macro_rules! _warn {
+    ($text:expr, $($line:tt)*) => {
+        if !$crate::cli::to_notice_sink(&$text) {
+            $crate::cli::log!($($line)*);
+        }
+    };
+}
+
 /// Print an error message in red to stderr. Silent mode does not apply.
 macro_rules! _error {
     ($($arg:tt)*) => {
@@ -425,6 +475,7 @@ macro_rules! _verbose {
 pub(crate) use _error as error;
 pub(crate) use _log as log;
 pub(crate) use _verbose as verbose;
+pub(crate) use _warn as warn;
 
 /// Create a `MultiProgress` container that shows many bars at the same time.
 /// In silent mode, the container is hidden.

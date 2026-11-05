@@ -65,14 +65,11 @@ pub fn ensure(cache_dir: &PinnedDir, config: &Disk, copied: bool) -> anyhow::Res
                     messages::vm::disk_recreated(cli::dim(&format_size(bytes)))
                 );
             } else {
-                cli::log!(
-                    "  {} {}",
-                    cli::yellow("!"),
-                    messages::vm::disk_kept(
-                        cli::dim(&format_size(current_size)),
-                        cli::dim(&format_size(bytes))
-                    )
+                let text = messages::vm::disk_kept(
+                    cli::dim(&format_size(current_size)),
+                    cli::dim(&format_size(bytes)),
                 );
+                cli::warn!(text, "  {} {text}", cli::yellow("!"));
             }
         } else {
             let grown = current_size < bytes;
