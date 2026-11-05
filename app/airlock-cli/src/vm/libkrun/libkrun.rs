@@ -167,8 +167,9 @@ impl LibkrunVm {
         let mut input = serde_json::to_vec(&vmm_config)?;
         input.push(b'\n');
 
-        // The VM process writes the libkrun log to its error output. It limits the size. Remove an old entry first, so
-        // that the create does not fail.
+        // The VM process writes the libkrun log to its error output. It
+        // limits the size. Remove an old entry first, so that the create
+        // does not fail.
         let log = runtime_dir.join("libkrun.log")?;
         crate::vm::remove_old(&log)?;
 
