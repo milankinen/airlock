@@ -51,6 +51,12 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // The VM process needs no context and must start nothing else.
+    #[cfg(vm_libkrun)]
+    if cli::cmd_internal::is_vmm_libkrun() {
+        vm::libkrun::vmm_main();
+    }
+
     // Do this before any thread starts or reads the environment.
     diagnostics::disable_release_backtraces();
 

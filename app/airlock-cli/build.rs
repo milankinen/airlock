@@ -25,6 +25,10 @@ fn main() {
 
     // libkrun runs only on macOS arm64. The `vm_libkrun` cfg marks its code.
     println!("cargo::rustc-check-cfg=cfg(vm_libkrun)");
+    if target_os == "macos" && std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64") {
+        println!("cargo:rustc-cfg=vm_libkrun");
+        emit_checksum("libkrun.dylib");
+    }
 
     // The notifier app of macOS. A build without it gets an empty archive:
     // then airlock asks with a dialog.
