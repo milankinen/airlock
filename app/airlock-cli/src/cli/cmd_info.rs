@@ -108,9 +108,9 @@ pub(super) async fn run(context: Context, id: Option<&str>, json: bool) -> i32 {
     };
 
     let status = if project.is_running() {
-        cli::red(messages::cli::STATUS_RUNNING)
+        cli::green(messages::cli::STATUS_RUNNING)
     } else {
-        cli::dim(messages::cli::STATUS_STOPPED)
+        cli::red(messages::cli::STATUS_STOPPED)
     };
 
     println!("{}", messages::cli::info_path(project.display_cwd()));
