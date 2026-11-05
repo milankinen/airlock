@@ -52,7 +52,7 @@ fn listen(path: &Path) {
 fn context() -> (TempDir, Context) {
     let home = temp_dir();
     let context = test_context(
-        home.path(),
+        &std::fs::canonicalize(home.path()).unwrap(),
         Vault::for_storage_type(VaultStorageType::Disabled),
     );
     (home, context)

@@ -294,7 +294,8 @@ mod tests {
     #[tokio::test]
     async fn sandbox_ids_in_runtime_list_registered_sandboxes() {
         let home = temp_dir();
-        let root = VerifiedPath::new_follow(home.path(), None).unwrap();
+        let home_path = std::fs::canonicalize(home.path()).unwrap();
+        let root = VerifiedPath::new_follow(&home_path, None).unwrap();
         let data = DataDir::init(&root).unwrap();
         drop(Db::open(&data.db).unwrap());
 
