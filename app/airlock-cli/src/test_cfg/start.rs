@@ -27,7 +27,7 @@ use crate::packs::{InstallerScript, PackManager};
 use crate::sandbox::first_start::FirstStart;
 use crate::sandbox::start::ensure::ChangedAnswer;
 use crate::sandbox::start::{Exit, SandboxOptions, config_change, location};
-use crate::sandbox::{self, FindOpts, Project, Sandbox, SandboxLock};
+use crate::sandbox::{self, BootOptions, FindOpts, Project, Sandbox, SandboxLock};
 use crate::util::PinnedDir;
 use crate::util::verified_path::VerifiedPath;
 use crate::vault::{Vault, VaultStorageType};
@@ -155,11 +155,11 @@ pub async fn install_boot(
     installers: &[InstallerScript],
     state: &mut InstallState,
     save: &mut Save<'_>,
-    log_level: LogLevel,
+    boot: BootOptions,
     verbose: bool,
 ) -> Result<Report, SetupError> {
     if !fake_host(|host| host.enabled) {
-        return setup::install(project, image, installers, state, save, log_level, verbose).await;
+        return setup::install(project, image, installers, state, save, boot, verbose).await;
     }
     let log = File::create(
         setup::log_path(&project.sandbox_dir)
@@ -346,6 +346,7 @@ impl StartProject {
             allow_config_changes,
             overrides: ConfigOverrides::default(),
             auto_approve_packs: false,
+            vmm: crate::vm::load_backend(crate::settings::Vmm::HOST_DEFAULT).unwrap(),
         };
         eventually("sandbox lock is free", || {
             // Wait until the lock of a registered sandbox is free.
@@ -481,6 +482,7 @@ impl StartProject {
             allow_config_changes: false,
             overrides: ConfigOverrides::default(),
             auto_approve_packs: false,
+            vmm: crate::vm::load_backend(crate::settings::Vmm::HOST_DEFAULT).unwrap(),
         };
         block_on_local(crate::templates::create::build_template(
             &self.context,

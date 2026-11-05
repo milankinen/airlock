@@ -1,8 +1,8 @@
 //! Build script for the airlock CLI.
 //!
-//! Makes the checksum of the bundled VM assets and the git commit hash
-//! available to the CLI at compile time. Gives the macOS notifier app to the
-//! CLI. Rebuilds the CLI when the VM assets, the notifier app or the
+//! Makes the checksum of each bundled VM asset group and the git commit
+//! hash available to the CLI at compile time. Gives the macOS notifier app
+//! to the CLI. Rebuilds the CLI when the VM assets, the notifier app or the
 //! built-in packs change.
 
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -11,31 +11,23 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 
 fn main() {
-    let mut hasher = DefaultHasher::new();
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
-    let distroless = std::env::var("CARGO_FEATURE_DISTROLESS").is_ok();
-    if !distroless {
-        let kernel = std::fs::read("../../target/vm/Image").unwrap_or_default();
-        let initramfs = std::fs::read("../../target/vm/initramfs.gz").unwrap_or_default();
-        hasher.write(&kernel);
-        hasher.write(&initramfs);
-        println!("cargo:rerun-if-changed=../../target/vm/Image");
-        println!("cargo:rerun-if-changed=../../target/vm/initramfs.gz");
+    // One checksum for each asset group. A group extracts again only when
+    // its own checksum changes. Add a group here for new bundled assets.
+    if std::env::var("CARGO_FEATURE_DISTROLESS").is_err() {
+        emit_checksum("AIRLOCK_KERNEL_CHECKSUM", &["Image", "initramfs.gz"]);
     }
-
-    #[cfg(target_os = "linux")]
-    {
-        let ch = std::fs::read("../../target/vm/cloud-hypervisor").unwrap_or_default();
-        let vfs = std::fs::read("../../target/vm/virtiofsd").unwrap_or_default();
-        hasher.write(&ch);
-        hasher.write(&vfs);
-        println!("cargo:rerun-if-changed=../../target/vm/cloud-hypervisor");
-        println!("cargo:rerun-if-changed=../../target/vm/virtiofsd");
+    if target_os == "linux" {
+        emit_checksum(
+            "AIRLOCK_CLOUD_HYPERVISOR_CHECKSUM",
+            &["cloud-hypervisor", "virtiofsd"],
+        );
     }
 
     // The notifier app of macOS. A build without it gets an empty archive:
     // then airlock asks with a dialog.
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+    if target_os == "macos" {
         let tar = std::fs::read("../../target/vm/notifier.tar").unwrap_or_default();
         let out = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("notifier.tar");
         std::fs::write(out, tar).unwrap();
@@ -49,9 +41,6 @@ fn main() {
     // `src/config/legacy_presets.rs`).
     println!("cargo:rerun-if-changed=src/config/presets");
 
-    let checksum = format!("{:016x}", hasher.finish());
-    println!("cargo:rustc-env=AIRLOCK_ASSETS_CHECKSUM={checksum}");
-
     // Embed the git commit hash for the version string.
     let hash = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
@@ -62,4 +51,17 @@ fn main() {
     println!("cargo:rustc-env=GIT_HASH={hash}");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs/heads/");
+}
+
+/// Make the checksum of the asset group `files` in `target/vm` available to
+/// the CLI as the compile-time env var `var`. A missing file counts as
+/// empty.
+fn emit_checksum(var: &str, files: &[&str]) {
+    let mut hasher = DefaultHasher::new();
+    for file in files {
+        let path = format!("../../target/vm/{file}");
+        hasher.write(&std::fs::read(&path).unwrap_or_default());
+        println!("cargo:rerun-if-changed={path}");
+    }
+    println!("cargo:rustc-env={var}={:016x}", hasher.finish());
 }

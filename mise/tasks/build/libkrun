@@ -1,0 +1,59 @@
+#!/bin/bash
+#MISE description="Build the libkrun dynamic library (macOS arm64 only)"
+# The macOS arm64 airlock binary embeds the library and extracts it at
+# runtime. Other hosts get an empty file.
+#
+# Signing: with APPLE_SIGNING_IDENTITY set, the task signs the library with
+# the Developer ID, the hardened runtime and a secure timestamp. Without it,
+# the task signs ad hoc. The hardened runtime of the airlock binary loads only
+# libraries with the same Team ID (library validation), so the release build
+# must sign the library before it is embedded. The signature is part of the
+# Mach-O file, so the extracted copy keeps it.
+# The task cannot see a change of the signing identity. Use `--force` to sign
+# again.
+#MISE sources=["mise/tasks/build/libkrun"]
+#MISE outputs=["target/vm/libkrun.dylib"]
+set -euo pipefail
+
+# libkrun 2.0 (unreleased) is pinned to a commit: the free page reporting
+# mode that gives guest memory back to macOS exists only on main.
+LIBKRUN_REPO="https://github.com/containers/libkrun.git"
+LIBKRUN_COMMIT="a0375321bb1e6e51312e022af53e9e7668d3a07e"
+
+mkdir -p target/vm
+OUTPUT="target/vm/libkrun.dylib"
+
+# libkrun supports macOS only on Apple silicon.
+if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
+  echo "Skipping libkrun (not macOS arm64)"
+  touch "$OUTPUT"
+  exit 0
+fi
+
+SRC="target/libkrun-src"
+if [[ ! -d "$SRC/.git" ]]; then
+  git clone --quiet "$LIBKRUN_REPO" "$SRC"
+fi
+if [[ "$(git -C "$SRC" rev-parse HEAD)" != "$(git -C "$SRC" rev-parse "${LIBKRUN_COMMIT}^{commit}" 2>/dev/null)" ]]; then
+  git -C "$SRC" fetch --quiet origin
+  git -C "$SRC" checkout --quiet --detach "$LIBKRUN_COMMIT"
+fi
+
+# Build only the VMM library with the C API. `make` also builds the guest
+# init library of libkrun, which airlock does not use.
+(
+  cd "$SRC"
+  # No --target: the host is arm64 macOS (checked above), as for airlock.
+  # The default deployment target of rustc is the same as for airlock.
+  CARGO_TARGET_DIR="$PWD/target" cargo build --release -p libkrun --features ffi,blk
+)
+cp "$SRC/target/release/libkrun.dylib" "$OUTPUT"
+
+if [[ -n "${APPLE_SIGNING_IDENTITY:-}" ]]; then
+  codesign --force --sign "$APPLE_SIGNING_IDENTITY" --identifier libkrun \
+    --options runtime --timestamp "$OUTPUT"
+else
+  codesign --force --sign - "$OUTPUT"
+fi
+codesign --verify --strict "$OUTPUT"
+echo "libkrun: $OUTPUT ($(du -h "$OUTPUT" | cut -f1))"

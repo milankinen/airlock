@@ -6,14 +6,14 @@
 
 use std::time::{Duration, Instant};
 
+use super::compose;
 use super::progress::{INSTALLS_LOG, InstallProgress};
 use super::state::{self, InstallState, PackStatus};
-use super::{compose, phase};
-use crate::cli::{self, LogLevel};
+use crate::cli;
 use crate::network::{self, Network};
 use crate::oci::{self, OciImage};
 use crate::packs::InstallerScript;
-use crate::sandbox::{self, BootSpec, ProcessSpec, Project, Stopped, Vm};
+use crate::sandbox::{self, BootOptions, BootSpec, ProcessSpec, Project, Stopped, Vm};
 use crate::util::{PinnedDir, VerifiedPath};
 
 /// Stop a pack install if it prints nothing for this long.
@@ -210,12 +210,12 @@ pub struct Report {
 /// ends the loop. The output goes to a spinner and to [`INSTALLS_LOG`].
 /// For each failed pack, the last log lines go to stderr.
 /// Args:
-///  - `project`: Project, configured with [`phase::install_config`]
+///  - `project`: Project, configured with [`super::phase::install_config`]
 ///  - `image`: Prepared image
 ///  - `installers`: Installers to run, in order
 ///  - `state`: Install state to update
 ///  - `save`: Saves `state` after each change
-///  - `log_level`: Log level of the boot
+///  - `boot`: Boot options, see [`super::phase::boot_options`]
 ///  - `verbose`: Show the last log lines under the spinner
 ///
 /// Returns:
@@ -226,12 +226,12 @@ pub async fn install(
     installers: &[InstallerScript],
     state: &mut InstallState,
     save: &mut Save<'_>,
-    log_level: LogLevel,
+    boot: BootOptions,
     verbose: bool,
 ) -> Result<Report, SetupError> {
     let log = open_log(&project);
     let mut progress = InstallProgress::new(cli::spinner(""), log, verbose);
-    let vm = match Box::pin(boot_install_vm(project, image, log_level)).await {
+    let vm = match Box::pin(boot_install_vm(project, image, boot)).await {
         Ok(vm) => vm,
         Err(e) => {
             progress.finish();
@@ -260,7 +260,7 @@ pub async fn install(
 async fn boot_install_vm(
     project: Project,
     image: &OciImage,
-    log_level: LogLevel,
+    options: BootOptions,
 ) -> anyhow::Result<Vm> {
     let container_home = oci::effective_container_home(&project, image);
     let network = Network::new(
@@ -276,7 +276,7 @@ async fn boot_install_vm(
     sandbox::boot(BootSpec {
         project,
         image,
-        options: phase::boot_options(log_level),
+        options,
         env,
         network,
         browser: None,

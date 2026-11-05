@@ -1,7 +1,9 @@
-//! Cloud Hypervisor VM backend (Linux).
+//! Cloud Hypervisor VM backend.
 //!
 //! Starts and stops the sandbox VM and its file sharing on Linux, and opens
-//! connections from the host to the guest.
+//! connections from the host to the guest. The `airlock` binary contains the
+//! hypervisor and the file sharing daemon. The backend extracts them before
+//! the boot.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::io::OwnedFd;
@@ -9,22 +11,92 @@ use std::process::{Child, Command, Stdio};
 
 use tracing::{debug, error};
 
-use super::config::VmConfig;
 use crate::messages;
+use crate::settings::Vmm;
 use crate::util::VerifiedPath;
+use crate::vm::backend::{HandleFuture, VmHandle, VmmBackend};
+use crate::vm::config::VmConfig;
 
-/// Linux VM backend that uses cloud-hypervisor and virtiofsd.
-pub struct CloudHypervisorBackend {
+/// VM backend that uses cloud-hypervisor and virtiofsd.
+pub struct CloudHypervisor;
+
+impl VmmBackend for CloudHypervisor {
+    fn kind(&self) -> Vmm {
+        Vmm::CloudHypervisor
+    }
+
+    fn boot_vm<'a>(
+        &'a self,
+        config: &'a VmConfig,
+    ) -> HandleFuture<'a, anyhow::Result<Box<dyn VmHandle>>> {
+        Box::pin(async move {
+            let binaries = extract_binaries(&config.asset_dir)?;
+            let vm = CloudHypervisorVm::start(config, &binaries)?;
+            Ok(Box::new(vm) as Box<dyn VmHandle>)
+        })
+    }
+}
+
+/// Paths of the executables of the backend.
+struct Binaries {
+    /// `cloud-hypervisor` executable.
+    cloud_hypervisor: VerifiedPath,
+    /// `virtiofsd` executable.
+    virtiofsd: VerifiedPath,
+}
+
+/// Extract the bundled `cloud-hypervisor` and `virtiofsd` to the asset
+/// directory `dir` if their checksum changed.
+/// Returns:
+///   The paths of the executables, or error if the extraction fails.
+#[cfg(not(test))]
+fn extract_binaries(dir: &VerifiedPath) -> anyhow::Result<Binaries> {
+    use crate::vm::assets::{AssetFile, extract_group};
+
+    extract_group(
+        dir,
+        "cloud-hypervisor",
+        env!("AIRLOCK_CLOUD_HYPERVISOR_CHECKSUM"),
+        &[
+            AssetFile {
+                name: "cloud-hypervisor",
+                data: include_bytes!("../../../../../target/vm/cloud-hypervisor"),
+                mode: 0o755,
+            },
+            AssetFile {
+                name: "virtiofsd",
+                data: include_bytes!("../../../../../target/vm/virtiofsd"),
+                mode: 0o755,
+            },
+        ],
+    )?;
+    Ok(Binaries {
+        cloud_hypervisor: dir.join("cloud-hypervisor")?,
+        virtiofsd: dir.join("virtiofsd")?,
+    })
+}
+
+/// Test stub. Tests do not extract the VM assets, so this always fails.
+#[cfg(test)]
+fn extract_binaries(_dir: &VerifiedPath) -> anyhow::Result<Binaries> {
+    anyhow::bail!("cloud_hypervisor::extract_binaries not supported in tests")
+}
+
+/// A running cloud-hypervisor VM with its virtiofsd processes.
+struct CloudHypervisorVm {
     ch_child: Option<Child>,
     virtiofsd_children: Vec<Child>,
     vsock_socket_path: VerifiedPath,
     runtime_dir: VerifiedPath,
 }
 
-impl CloudHypervisorBackend {
+impl CloudHypervisorVm {
     /// Start one virtiofsd process for each VirtioFS share, then start
     /// cloud-hypervisor with vsock support.
-    pub fn start(config: &VmConfig) -> anyhow::Result<Self> {
+    /// Args:
+    ///  - `config`: The VM to boot
+    ///  - `binaries`: The executables to start
+    fn start(config: &VmConfig, binaries: &Binaries) -> anyhow::Result<Self> {
         let runtime_dir = &config.runtime_dir;
         let vfs_dir = runtime_dir.join("vfs")?;
         vfs_dir.mkdirs()?;
@@ -47,7 +119,7 @@ impl CloudHypervisorBackend {
             let sock_path = vfs_dir.join(format!("{sock_name}.sock"))?;
             let _ = sock_path.remove_file();
 
-            let mut cmd = Command::new(config.virtiofsd.to_path()?);
+            let mut cmd = Command::new(binaries.virtiofsd.to_path()?);
             cmd.arg("--socket-path").arg(sock_path.to_path()?);
             cmd.arg("--shared-dir").arg(share.host_path.to_path()?);
             cmd.arg("--xattr");
@@ -84,7 +156,7 @@ impl CloudHypervisorBackend {
         // Make the cloud-hypervisor command.
         let ram_mib = config.memory_bytes / (1024 * 1024);
 
-        let mut cmd = Command::new(config.cloud_hypervisor.to_path()?);
+        let mut cmd = Command::new(binaries.cloud_hypervisor.to_path()?);
         cmd.arg("--kernel").arg(config.kernel.to_path()?);
         cmd.arg("--initramfs").arg(config.initramfs.to_path()?);
         cmd.arg("--cmdline").arg(&config.kernel_cmdline);
@@ -154,7 +226,7 @@ impl CloudHypervisorBackend {
     /// cloud-hypervisor vsock socket.
     /// Returns:
     ///   The connected socket, or error if the `CONNECT` handshake fails.
-    pub fn vsock_connect(&self, port: u32) -> anyhow::Result<OwnedFd> {
+    fn vsock_connect(&self, port: u32) -> anyhow::Result<OwnedFd> {
         let mut stream = self.vsock_socket_path.connect_unix().map_err(|e| {
             anyhow::anyhow!(messages::vm::vsock_socket_connect_failed(
                 &self.vsock_socket_path,
@@ -177,13 +249,13 @@ impl CloudHypervisorBackend {
     }
 }
 
-impl CloudHypervisorBackend {
+impl CloudHypervisorVm {
     /// Kill cloud-hypervisor and all virtiofsd processes, and reap each one.
     /// A second call has nothing to stop.
     /// Returns:
     ///   `Ok` if all processes were reaped. Otherwise the first failure,
     ///   after all processes were handled.
-    pub fn stop(&mut self) -> anyhow::Result<()> {
+    fn stop(&mut self) -> anyhow::Result<()> {
         let mut result = Ok(());
         if let Some(child) = self.ch_child.take() {
             result = kill_and_reap(child, "cloud-hypervisor");
@@ -199,7 +271,17 @@ impl CloudHypervisorBackend {
     }
 }
 
-impl Drop for CloudHypervisorBackend {
+impl VmHandle for CloudHypervisorVm {
+    fn vsock_connect(&self, port: u32) -> HandleFuture<'_, anyhow::Result<OwnedFd>> {
+        Box::pin(async move { CloudHypervisorVm::vsock_connect(self, port) })
+    }
+
+    fn stop(&mut self) -> HandleFuture<'_, anyhow::Result<()>> {
+        Box::pin(async move { CloudHypervisorVm::stop(self) })
+    }
+}
+
+impl Drop for CloudHypervisorVm {
     fn drop(&mut self) {
         if let Err(e) = self.stop() {
             error!("{e:#}");
@@ -336,12 +418,15 @@ mod tests {
             shares: Vec::new(),
             cache_disk: None,
             runtime_dir: VerifiedPath::new(&runtime, &roots).unwrap(),
-            cloud_hypervisor: truth.clone(),
-            virtiofsd: truth,
+            asset_dir: VerifiedPath::new(root, &roots).unwrap(),
             kvm: false,
         };
+        let binaries = Binaries {
+            cloud_hypervisor: truth.clone(),
+            virtiofsd: truth,
+        };
 
-        drop(CloudHypervisorBackend::start(&config).unwrap());
+        drop(CloudHypervisorVm::start(&config, &binaries).unwrap());
         assert_eq!(std::fs::read(&victim).unwrap(), b"data");
         for name in ["serial.log", "cloud-hypervisor.log"] {
             let md = std::fs::symlink_metadata(runtime.join(name));

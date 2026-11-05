@@ -25,12 +25,13 @@ use crate::rpc::browser::Browser;
 use crate::sandbox::Project;
 use crate::sandbox::process::server as cli_server;
 use crate::sandbox::process::server::connections::ConnectionTracker;
+use crate::vm::VmmBackend;
 
 /// Time limit for the first connection after the detach. The parent
 /// connects before the detach, so this is only a safety net.
 const FIRST_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Output options of the hosted sandbox.
+/// Output and VM backend options of the hosted sandbox.
 pub struct HostedOptions {
     /// Guest log level.
     pub log_level: LogLevel,
@@ -39,6 +40,8 @@ pub struct HostedOptions {
     /// Connected socket of the parent of the sandbox process. It is the
     /// first connection of the CLI server.
     pub first_client: Option<std::os::unix::net::UnixStream>,
+    /// The VM backend that boots the VM.
+    pub vmm: Rc<dyn VmmBackend>,
 }
 
 /// Run the hosted sandbox until it stops.
@@ -84,6 +87,7 @@ pub async fn run_hosted(
             log_level: options.log_level,
             quiet: options.quiet,
             project_share: true,
+            vmm: options.vmm,
         },
         approver,
     )?;

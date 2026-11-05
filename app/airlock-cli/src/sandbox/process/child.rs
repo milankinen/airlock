@@ -48,6 +48,7 @@ use crate::sandbox::start::config_change::{self, LastRunInput};
 use crate::sandbox::start::{Exit, install, prepare};
 use crate::sandbox::{self, Interrupted, Project, registry};
 use crate::util::{self, PinnedDir, VerifiedPath};
+use crate::vm::{self, VmmBackend};
 use crate::{messages, oci, packs};
 
 /// The checked sandbox of the sandbox process.
@@ -95,6 +96,12 @@ pub async fn run(init_fd: RawFd, context: Context) -> i32 {
     let rpc = match util::fd::take_socket(init.rpc_fd) {
         Ok(rpc) => rpc,
         Err(e) => return fail(&e.into()),
+    };
+    // Load the VM backend before other work. A backend that the host cannot
+    // run stops the start before the questions and the slow steps.
+    let vmm = match vm::load_backend(context.settings.vmm) {
+        Ok(vmm) => vmm,
+        Err(e) => return fail(&e),
     };
     let target = match locate(&init.sandbox_id, &context).await {
         Ok(target) => target,
@@ -144,7 +151,7 @@ pub async fn run(init_fd: RawFd, context: Context) -> i32 {
 
     let db = context.db.clone();
     let result = Box::pin(serve(
-        &init, &target, &lock, &mut first, context, handshake, rpc,
+        &init, &target, &lock, &mut first, context, handshake, rpc, vmm,
     ))
     .await;
     let code = match result {
@@ -381,9 +388,10 @@ async fn locate(sandbox_id: &str, context: &Context) -> anyhow::Result<Target> {
 }
 
 /// Do the start work for the mode of `init` and run the sandbox (see
-/// [`run`]).
+/// [`run`]). `vmm` boots the VMs.
 /// Returns:
 ///   The exit code, or the exit for a failed or aborted start.
+#[allow(clippy::too_many_arguments)]
 async fn serve(
     init: &Init,
     target: &Target,
@@ -392,6 +400,7 @@ async fn serve(
     context: Context,
     handshake: Handshake,
     rpc: std::os::unix::net::UnixStream,
+    vmm: Rc<dyn VmmBackend>,
 ) -> Result<i32, Exit> {
     let (project, image, main_argv) = match &init.mode {
         Mode::Start { args } => {
@@ -401,6 +410,7 @@ async fn serve(
                 first,
                 args,
                 init.log.log_level,
+                vmm.clone(),
             ))
             .await?;
             (prepared.project, prepared.image, Some(prepared.main_argv))
@@ -418,6 +428,7 @@ async fn serve(
         log_level: init.log.log_level,
         quiet: cli::is_silent(),
         first_client: Some(rpc),
+        vmm,
     };
     let ready = Ready { main_argv };
     Ok(

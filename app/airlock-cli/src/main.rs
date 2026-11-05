@@ -7,7 +7,6 @@
 
 mod acp;
 mod approval;
-mod assets;
 mod cache;
 pub(crate) mod cli;
 mod config;

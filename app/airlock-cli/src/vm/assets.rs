@@ -1,9 +1,17 @@
 //! VM boot assets.
 //!
 //! The `airlock` binary contains the files that boot the sandbox VM: the
-//! kernel, the initramfs and, on Linux, the hypervisor. This module extracts
-//! them to the cache on the host when they change. The `[vm]` config can
-//! replace the bundled kernel and initramfs with custom files.
+//! guest kernel and initramfs, and the files of the VM backend, for example
+//! the hypervisor. The files come in groups. This module extracts a group to
+//! the cache on the host when its content changes. Each VM backend extracts
+//! its own group. The `[vm]` config can replace the bundled kernel and
+//! initramfs with custom files.
+
+// Builds with no bundled kernel and no backend group do not extract.
+#![cfg_attr(
+    all(feature = "distroless", not(target_os = "linux")),
+    allow(dead_code)
+)]
 
 use crate::config::config_values::Mount;
 use crate::messages;
@@ -11,132 +19,129 @@ use crate::sandbox::Project;
 use crate::util::VerifiedPath;
 use crate::vm::mount;
 
-/// Paths to the extracted VM boot assets.
-pub struct Assets {
+/// Paths of the VM boot files.
+pub struct BootFiles {
+    /// Directory of the extracted assets. VM backends extract their own
+    /// assets here.
+    pub dir: VerifiedPath,
     /// Kernel image.
     pub kernel: VerifiedPath,
     /// Initramfs archive.
     pub initramfs: VerifiedPath,
-    /// `cloud-hypervisor` executable.
-    #[cfg(target_os = "linux")]
-    pub cloud_hypervisor: VerifiedPath,
-    /// `virtiofsd` executable.
-    #[cfg(target_os = "linux")]
-    pub virtiofsd: VerifiedPath,
 }
 
-impl Assets {
-    /// Get the VM asset paths for the project.
-    ///
-    /// Extracts the embedded assets to the cache directory if their checksum
-    /// changed. The custom kernel and initramfs paths of the project config
-    /// replace the bundled files. With the `distroless` feature, the binary
-    /// does not contain a kernel and initramfs, so the project config must
-    /// set `vm.kernel` and `vm.initramfs`.
-    /// Returns:
-    ///   The asset paths, or error if extraction fails or an asset is missing.
-    #[cfg(not(test))]
-    pub fn init(project: &Project) -> anyhow::Result<Assets> {
-        const CHECKSUM: &str = env!("AIRLOCK_ASSETS_CHECKSUM");
+/// One file of an asset group.
+#[cfg(not(test))]
+pub struct AssetFile {
+    /// File name in the asset directory.
+    pub name: &'static str,
+    /// Content of the file.
+    pub data: &'static [u8],
+    /// Permission bits of the file, for example `0o755` for an executable.
+    pub mode: u32,
+}
 
-        let dir = crate::data_dir::make_dir(&project.context.data.vm)?;
+/// Get the VM boot files for the project.
+///
+/// Extracts the bundled kernel and initramfs to the asset directory if
+/// their checksum changed. The custom kernel and initramfs paths of the
+/// project config replace the bundled files. With the `distroless` feature,
+/// the binary does not contain a kernel and initramfs, so the project config
+/// must set `vm.kernel` and `vm.initramfs`.
+/// Returns:
+///   The file paths, or error if extraction fails or a file is missing.
+#[cfg(not(test))]
+pub fn boot_files(project: &Project) -> anyhow::Result<BootFiles> {
+    let dir = crate::data_dir::make_dir(&project.context.data.vm)?;
 
-        // Serialize the checksum check and extraction across processes. Take
-        // a blocking exclusive lock before the checksum read. Then two
-        // concurrent first runs (for example after an upgrade) cannot both
-        // write the boot assets. Also, the hypervisor never memory-maps a
-        // file while another process writes it. The lock releases when
-        // `_lock` drops.
-        let _lock = acquire_extract_lock(&dir.join("lock")?)?;
-
-        let checksum_file = dir.join("checksum")?;
-        let cached_checksum = checksum_file.read_to_string().unwrap_or_default();
-        if cached_checksum.trim() != CHECKSUM {
-            #[cfg(not(feature = "distroless"))]
-            {
-                // Write through a temp file and rename, so a reader (or a second
-                // process) never sees a partly written Image or initramfs.
-                write_atomic(&dir, "Image", include_bytes!("../../../target/vm/Image"))?;
-                write_atomic(
-                    &dir,
-                    "initramfs.gz",
-                    include_bytes!("../../../target/vm/initramfs.gz"),
-                )?;
-            }
-
-            #[cfg(target_os = "linux")]
-            {
-                // Write to temp files first, then rename. This prevents ETXTBSY
-                // if a previous virtiofsd/cloud-hypervisor process still runs.
-                write_executable(
-                    &dir,
-                    "cloud-hypervisor",
-                    include_bytes!("../../../target/vm/cloud-hypervisor"),
-                )?;
-                write_executable(
-                    &dir,
-                    "virtiofsd",
-                    include_bytes!("../../../target/vm/virtiofsd"),
-                )?;
-            }
-
-            checksum_file.write(CHECKSUM)?;
-        }
-
-        #[cfg(not(feature = "distroless"))]
-        let bundled_kernel = Some(dir.join("Image")?);
-        #[cfg(feature = "distroless")]
-        let bundled_kernel = None;
-
-        #[cfg(not(feature = "distroless"))]
-        let bundled_initramfs = Some(dir.join("initramfs.gz")?);
-        #[cfg(feature = "distroless")]
-        let bundled_initramfs = None;
-
-        let kernel = resolve_asset(
-            project.config.vm.kernel.as_deref(),
-            project,
-            bundled_kernel,
+    #[cfg(not(feature = "distroless"))]
+    let (bundled_kernel, bundled_initramfs) = {
+        extract_group(
+            &dir,
             "kernel",
+            env!("AIRLOCK_KERNEL_CHECKSUM"),
+            &[
+                AssetFile {
+                    name: "Image",
+                    data: include_bytes!("../../../../target/vm/Image"),
+                    mode: 0o644,
+                },
+                AssetFile {
+                    name: "initramfs.gz",
+                    data: include_bytes!("../../../../target/vm/initramfs.gz"),
+                    mode: 0o644,
+                },
+            ],
         )?;
-        let initramfs = resolve_asset(
-            project.config.vm.initramfs.as_deref(),
-            project,
-            bundled_initramfs,
-            "initramfs",
-        )?;
+        (Some(dir.join("Image")?), Some(dir.join("initramfs.gz")?))
+    };
+    #[cfg(feature = "distroless")]
+    let (bundled_kernel, bundled_initramfs) = (None, None);
 
-        Ok(Assets {
-            kernel,
-            initramfs,
-            #[cfg(target_os = "linux")]
-            cloud_hypervisor: dir.join("cloud-hypervisor")?,
-            #[cfg(target_os = "linux")]
-            virtiofsd: dir.join("virtiofsd")?,
-        })
-    }
-
-    /// Test stub. Tests do not extract the VM assets, so this always fails.
-    #[cfg(test)]
-    pub fn init(_project: &Project) -> anyhow::Result<Assets> {
-        anyhow::bail!("Assets::init not supported in tests")
-    }
+    let kernel = resolve_asset(
+        project.config.vm.kernel.as_deref(),
+        project,
+        bundled_kernel,
+        "kernel",
+    )?;
+    let initramfs = resolve_asset(
+        project.config.vm.initramfs.as_deref(),
+        project,
+        bundled_initramfs,
+        "initramfs",
+    )?;
+    Ok(BootFiles {
+        dir,
+        kernel,
+        initramfs,
+    })
 }
 
-/// Write an executable to `dir/name` through a temp file and rename. This
-/// prevents ETXTBSY if the old executable still runs.
-#[cfg(all(target_os = "linux", not(test)))]
-fn write_executable(dir: &VerifiedPath, name: &str, data: &[u8]) -> anyhow::Result<()> {
-    let tmp = dir.join(format!(".{name}.tmp"))?;
-    write_new(&tmp, data, 0o755)?;
-    tmp.rename_to(&dir.join(name)?)?;
+/// Test stub. Tests do not extract the VM assets, so this always fails.
+#[cfg(test)]
+pub fn boot_files(_project: &Project) -> anyhow::Result<BootFiles> {
+    anyhow::bail!("vm::assets::boot_files not supported in tests")
+}
+
+/// Extract the asset group `group` to `dir` if its checksum changed.
+/// Args:
+///  - `dir`: The asset directory
+///  - `group`: Name of the group. The checksum of the group goes to the
+///    file `checksum-<group>`
+///  - `checksum`: Checksum of the bundled group, from the build script
+///  - `files`: The files of the group
+///
+/// Returns:
+///   `Ok` when the files of the group are in place, or error if the
+///   extraction fails.
+#[cfg(not(test))]
+pub fn extract_group(
+    dir: &VerifiedPath,
+    group: &str,
+    checksum: &str,
+    files: &[AssetFile],
+) -> anyhow::Result<()> {
+    // Serialize the checksum check and extraction across processes. Take a
+    // blocking exclusive lock before the checksum read. Then two concurrent
+    // first runs (for example after an upgrade) cannot both write the
+    // assets. Also, the hypervisor never memory-maps a file while another
+    // process writes it. The lock releases when `_lock` drops.
+    let _lock = acquire_extract_lock(&dir.join("lock")?)?;
+
+    let checksum_file = dir.join(format!("checksum-{group}"))?;
+    let cached_checksum = checksum_file.read_to_string().unwrap_or_default();
+    if cached_checksum.trim() != checksum {
+        for file in files {
+            write_atomic(dir, file.name, file.data, file.mode)?;
+        }
+        checksum_file.write(checksum)?;
+    }
     Ok(())
 }
 
 /// Write `data` to the new file `path` with the permission bits `mode`.
 /// Removes an old file at `path` first. The create never follows a
 /// symlink at `path`.
-#[cfg(any(all(target_os = "linux", not(test)), not(feature = "distroless")))]
 fn write_new(path: &VerifiedPath, data: &[u8], mode: u32) -> anyhow::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
@@ -152,24 +157,23 @@ fn write_new(path: &VerifiedPath, data: &[u8], mode: u32) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Write `data` to `dir/name` through a sibling temp file and rename. A
-/// reader never sees a partly written file, and a concurrent process cannot
-/// boot from it. Used for `Image` and `initramfs.gz`. Unlike
-/// `write_executable`, it works on all platforms and does not set the
-/// executable bit.
-#[cfg(not(feature = "distroless"))]
-fn write_atomic(dir: &VerifiedPath, name: &str, data: &[u8]) -> anyhow::Result<()> {
+/// Write `data` to `dir/name` with the permission bits `mode`, through a
+/// sibling temp file and rename. A reader never sees a partly written file,
+/// and a concurrent process cannot boot from it. The rename also prevents
+/// ETXTBSY if an old executable at `dir/name` still runs, for example a
+/// virtiofsd or hypervisor process of a previous version.
+fn write_atomic(dir: &VerifiedPath, name: &str, data: &[u8], mode: u32) -> anyhow::Result<()> {
     // The temp name contains the pid, so a stray temp file of another
     // process never goes into place.
     let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()))?;
-    write_new(&tmp, data, 0o644)?;
+    write_new(&tmp, data, mode)?;
     tmp.rename_to(&dir.join(name)?)?;
     Ok(())
 }
 
 /// Get a blocking exclusive advisory lock on `path`. The lock stays until the
 /// returned handle drops. It serializes the checksum check and extraction in
-/// [`Assets::init`] across processes.
+/// [`extract_group`] across processes.
 ///
 /// The lock blocks (and does not fail fast) because extraction is short. A
 /// second process waits, then reads the new checksum and does not extract
@@ -309,7 +313,6 @@ mod tests {
     ///   1. Write an asset, then write it again with longer content
     ///   2. Check that the file has the new content
     ///   3. Check that the directory has only the asset file
-    #[cfg(not(feature = "distroless"))]
     #[test]
     fn asset_write_replaces_file_and_leaves_no_temp_file() {
         use super::write_atomic;
@@ -320,8 +323,8 @@ mod tests {
         let roots = Roots::resolve(dir, dir, dir).unwrap();
         let verified = VerifiedPath::new(dir, &roots).unwrap();
 
-        write_atomic(&verified, "Image", b"kernel-bytes").unwrap();
-        write_atomic(&verified, "Image", b"newer-and-longer-bytes").unwrap();
+        write_atomic(&verified, "Image", b"kernel-bytes", 0o644).unwrap();
+        write_atomic(&verified, "Image", b"newer-and-longer-bytes", 0o644).unwrap();
 
         assert_eq!(
             std::fs::read(dir.join("Image")).unwrap(),

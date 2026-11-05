@@ -39,6 +39,7 @@ available:
 | Setting                    | Purpose                                         | Reference |
 |----------------------------|-------------------------------------------------|-----------|
 | `data_dir`                 | Directory for the sandboxes and the image cache | [Where airlock keeps sandbox data](./usage/managing-sandbox.md#where-airlock-keeps-sandbox-data) |
+| `vmm`                      | VM backend: `"apple-virt"` (default on macOS), `"cloud-hypervisor"` (default on Linux) or `"libkrun"`. The start stops with an error if the host cannot run the backend | [Virtualization](./technical/virtualization.md) |
 | `security.insecure_mounts` | Allow mounts that expose the home directory     | [Mounts](./configuration/mounts.md#mounts-that-expose-the-home-directory) |
 | `vault.storage`            | Storage backend of the secret vault             | [Secrets](./secrets.md#choosing-a-storage-backend) |
 | `[monitor]`                | Monitor buffers and key bindings                | [Monitor dashboard](./usage/monitor.md#personal-settings) |

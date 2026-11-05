@@ -24,12 +24,15 @@ pub mod prepare;
 pub mod wizard;
 
 pub use exit::Exit;
+use std::rc::Rc;
+
 use tracing::info;
 
 use crate::cli::{self, LogLevel, logging};
 use crate::data_dir::DataDir;
 use crate::packs::approval::ApprovalMode;
 use crate::util::VerifiedPath;
+use crate::vm::VmmBackend;
 
 /// Command-line options for the sandbox step ([`ensure::ensure_sandbox`]) and
 /// the install step ([`install::install_tools`]).
@@ -53,6 +56,8 @@ pub struct SandboxOptions {
     /// Approve new or changed packs without a question
     /// (`--auto-approve-packs`).
     pub auto_approve_packs: bool,
+    /// The VM backend of the install boot.
+    pub vmm: Rc<dyn VmmBackend>,
 }
 
 impl SandboxOptions {

@@ -67,6 +67,9 @@ pub async fn create(
     verbose: bool,
 ) -> Result<(), Exit> {
     super::check_name(name).map_err(|e| Exit::error(2, e))?;
+    // Load the VM backend first. A backend that the host cannot run stops
+    // the build before the wizard.
+    let vmm = crate::vm::load_backend(context.settings.vmm)?;
     if !force {
         check_absent(&context.data, name)?;
     }
@@ -98,6 +101,7 @@ pub async fn create(
         allow_config_changes: false,
         overrides: ConfigOverrides::default(),
         auto_approve_packs: false,
+        vmm,
     };
     Box::pin(build_template(
         context, name, &packs, &config, &options, force,

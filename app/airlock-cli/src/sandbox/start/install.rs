@@ -13,7 +13,7 @@ use crate::oci::OciImage;
 use crate::packs::install::setup::install as install_boot;
 use crate::packs::install::snapshots::{self, InstallSnapshots};
 use crate::packs::install::state::{self as install_state, InstallState};
-use crate::packs::install::{compose, plan, setup};
+use crate::packs::install::{compose, phase, plan, setup};
 use crate::packs::{ConfiguredPack, InstallerScript};
 use crate::sandbox::{self, Project};
 #[cfg(test)]
@@ -232,7 +232,7 @@ async fn run_install(
         to_install,
         state,
         save,
-        options.log_level,
+        phase::boot_options(options.log_level, options.vmm.clone()),
         options.verbose,
     ))
     .await

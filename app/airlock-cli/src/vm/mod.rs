@@ -1,15 +1,16 @@
 //! VM lifecycle support.
 //!
 //! Configures, boots and controls the sandbox VM, and connects to the
-//! supervisor in the VM. Also resolves the configured mounts and manages the
-//! persistent sandbox disk. On Linux, it checks that the user can use KVM.
+//! supervisor in the VM. Also resolves the configured mounts, extracts the
+//! VM boot assets and manages the persistent sandbox disk. On Linux, it
+//! checks that the user can use KVM.
 //!
-//! On macOS, the VM uses the Apple Virtualization framework. On Linux, it
-//! uses Cloud Hypervisor and virtiofsd.
+//! The `vmm` setting selects the VM backend: the Apple Virtualization
+//! framework (macOS), Cloud Hypervisor with virtiofsd (Linux) or libkrun.
 
-#[cfg(target_os = "macos")]
-mod apple;
-#[cfg(target_os = "linux")]
+mod apple_virt;
+mod assets;
+mod backend;
 mod cloud_hypervisor;
 mod config;
 pub(crate) mod disk;
@@ -18,6 +19,8 @@ pub mod mount;
 
 use std::os::unix::io::OwnedFd;
 
+use self::backend::VmHandle;
+pub use self::backend::{VmmBackend, load_backend};
 use crate::data_dir::DataDir;
 use crate::util::VerifiedPath;
 
@@ -82,7 +85,6 @@ pub fn require_kvm() {
     }
 }
 
-use crate::assets::Assets;
 use crate::cli::LogLevel;
 use crate::oci::OciImage;
 use crate::sandbox::{BootOptions, Project};
@@ -168,8 +170,9 @@ impl VmInstance {
 ///    [`crate::oci::effective_container_home`]. Used for `~/...` expansion
 ///    of mount, cache and socket-forward paths
 ///  - `env`: The sandbox env ([`crate::sandbox::process::vm::boot::guest_env`])
-///  - `opts`: Boot options. If `project_share` is false, there is no project
-///    mount and the guest runs in `/`. `quiet` skips the VM resources summary.
+///  - `opts`: Boot options. `vmm` boots the VM. If `project_share` is false,
+///    there is no project mount and the guest runs in `/`. `quiet` skips the
+///    VM resources summary.
 ///
 /// Returns:
 ///   The [`VmInstance`] (it cleans up on drop) and the vsock fd that is
@@ -181,7 +184,9 @@ pub async fn start(
     env: Vec<String>,
     opts: &BootOptions,
 ) -> anyhow::Result<(VmInstance, OwnedFd)> {
-    let assets = Assets::init(project)?;
+    let backend = &*opts.vmm;
+    tracing::debug!("vm backend: {}", backend.kind());
+    let boot_files = assets::boot_files(project)?;
     let sandbox_dir = project.sandbox_dir.clone();
     let overlay_dir = sandbox_dir.join("overlay")?;
 
@@ -214,20 +219,17 @@ pub async fn start(
     let vm_config = config::VmConfig {
         cpus: project.config.vm.cpus,
         memory_bytes: project.config.vm.memory.0,
-        kernel: assets.kernel,
-        initramfs: assets.initramfs,
-        kernel_cmdline: build_kernel_cmdline(opts.log_level),
+        kernel: boot_files.kernel,
+        initramfs: boot_files.initramfs,
+        kernel_cmdline: build_kernel_cmdline(backend.kernel_console(), opts.log_level),
         shares,
         cache_disk: Some(disk_image.clone()),
         runtime_dir: sandbox_dir,
-        #[cfg(target_os = "linux")]
-        cloud_hypervisor: assets.cloud_hypervisor,
-        #[cfg(target_os = "linux")]
-        virtiofsd: assets.virtiofsd,
+        asset_dir: boot_files.dir,
         kvm: project.config.vm.kvm,
     };
 
-    let vm_handle = boot_backend(&vm_config).await?;
+    let vm_handle = backend.boot_vm(&vm_config).await?;
     let sync_handle = file_sync::start(&mounts, &overlay_dir);
 
     let vm = VmInstance {
@@ -400,8 +402,11 @@ fn prepare_shares(
 }
 
 /// Build the kernel command line string.
-fn build_kernel_cmdline(log_level: LogLevel) -> String {
-    let mut cmdline = "console=hvc0 console=ttyS0 rdinit=/init".to_string();
+/// Args:
+///  - `console`: Console part of the command line from the VM backend
+///  - `log_level`: Log level of the boot
+fn build_kernel_cmdline(console: &str, log_level: LogLevel) -> String {
+    let mut cmdline = format!("{console} rdinit=/init");
     if !matches!(log_level, LogLevel::Trace | LogLevel::Debug) {
         cmdline.push_str(" quiet loglevel=3");
     }
@@ -425,67 +430,6 @@ fn log_config(project: &Project) {
         cli::bullet(),
         messages::vm::config_disk(cli::dim(&project.config.disk.size.to_string()))
     );
-}
-
-/// Start the platform-specific VM backend. The caller must wait until a
-/// vsock port is ready, see [`VmInstance::vsock_connect`].
-#[cfg_attr(not(target_os = "macos"), allow(clippy::unused_async))]
-async fn boot_backend(vm_config: &config::VmConfig) -> anyhow::Result<Box<dyn VmHandle>> {
-    #[cfg(target_os = "macos")]
-    {
-        let mut backend = apple::AppleVmBackend::new(vm_config)?;
-        backend.start().await?;
-        Ok(Box::new(backend))
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let backend = cloud_hypervisor::CloudHypervisorBackend::start(vm_config)?;
-        Ok(Box::new(backend))
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = vm_config;
-        Err(anyhow::anyhow!(messages::vm::UNSUPPORTED_PLATFORM))
-    }
-}
-
-/// Future returned by the object-safe [`VmHandle`] methods.
-type HandleFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>;
-
-/// Trait for VM backends. Dropping the handle kills the VM.
-trait VmHandle {
-    /// Open a new vsock connection to the given guest port. Used for the
-    /// supervisor channel and for later channels, for example the network
-    /// proxy.
-    fn vsock_connect(&self, port: u32) -> HandleFuture<'_, anyhow::Result<OwnedFd>>;
-
-    /// Stop the VM and wait until the backend confirms the stop. A drop of
-    /// the handle after this does not stop the VM again.
-    fn stop(&mut self) -> HandleFuture<'_, anyhow::Result<()>>;
-}
-
-#[cfg(target_os = "macos")]
-impl VmHandle for apple::AppleVmBackend {
-    fn vsock_connect(&self, port: u32) -> HandleFuture<'_, anyhow::Result<OwnedFd>> {
-        Box::pin(apple::AppleVmBackend::vsock_connect(self, port))
-    }
-
-    fn stop(&mut self) -> HandleFuture<'_, anyhow::Result<()>> {
-        Box::pin(apple::AppleVmBackend::stop(self))
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl VmHandle for cloud_hypervisor::CloudHypervisorBackend {
-    fn vsock_connect(&self, port: u32) -> HandleFuture<'_, anyhow::Result<OwnedFd>> {
-        Box::pin(async move { cloud_hypervisor::CloudHypervisorBackend::vsock_connect(self, port) })
-    }
-
-    fn stop(&mut self) -> HandleFuture<'_, anyhow::Result<()>> {
-        Box::pin(async move { cloud_hypervisor::CloudHypervisorBackend::stop(self) })
-    }
 }
 
 #[cfg(test)]

@@ -143,6 +143,7 @@ mod tests {
             },
             security: crate::settings::SecuritySettings::default(),
             packs: crate::settings::PackSettings::default(),
+            vmm: crate::settings::Vmm::HOST_DEFAULT,
             approvals: crate::settings::ApprovalSettings::default(),
         };
         let Err(e) = HostRuntime::new(true, &settings) else {

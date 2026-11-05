@@ -1,4 +1,4 @@
-//! Apple Virtualization framework VM backend (macOS).
+//! Apple Virtualization framework VM backend.
 //!
 //! Creates, starts and stops the sandbox VM on macOS, and opens connections
 //! from the host to the guest.
@@ -16,8 +16,10 @@ use objc2_foundation::{NSArray, NSError, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::*;
 use tracing::{debug, error, info};
 
-use super::config::VmConfig;
 use crate::messages;
+use crate::settings::Vmm;
+use crate::vm::backend::{HandleFuture, VmHandle, VmmBackend};
+use crate::vm::config::VmConfig;
 
 /// Read and write ends of a Unix pipe.
 struct PipeEnds {
@@ -64,13 +66,33 @@ fn create_pipe() -> anyhow::Result<PipeEnds> {
     })
 }
 
-/// macOS VM backend that uses the Apple Virtualization.framework.
+/// VM backend that uses the Apple Virtualization framework.
+pub struct AppleVirt;
+
+impl VmmBackend for AppleVirt {
+    fn kind(&self) -> Vmm {
+        Vmm::AppleVirt
+    }
+
+    fn boot_vm<'a>(
+        &'a self,
+        config: &'a VmConfig,
+    ) -> HandleFuture<'a, anyhow::Result<Box<dyn VmHandle>>> {
+        Box::pin(async move {
+            let mut vm = AppleVirtVm::new(config)?;
+            vm.start().await?;
+            Ok(Box::new(vm) as Box<dyn VmHandle>)
+        })
+    }
+}
+
+/// A VM of the Apple Virtualization framework.
 ///
 /// The `VZVirtualMachine` runs on a serial dispatch queue. All VM method
 /// calls go to this queue, and oneshot channels send the results back to
 /// async code.
 #[allow(dead_code, clippy::used_underscore_binding)]
-pub struct AppleVmBackend {
+pub struct AppleVirtVm {
     /// Pointer to the VM object. `Drop` sets it to null before `_vm`
     /// releases the retain. Each dispatch-queue callback loads it
     /// atomically and stops on null. Thus a callback that was queued
@@ -92,9 +114,9 @@ pub struct AppleVmBackend {
 // (current_thread runtime). All VM method calls go to the serial VM queue,
 // which synchronizes access. Because of the `AtomicPtr` check in each
 // callback, a dispatched callback cannot see a freed VM.
-unsafe impl Send for AppleVmBackend {}
+unsafe impl Send for AppleVirtVm {}
 
-impl AppleVmBackend {
+impl AppleVirtVm {
     /// Create a new VM (not started) with the given configuration.
     pub fn new(config: &VmConfig) -> anyhow::Result<Self> {
         let host_to_guest = create_pipe()?;
@@ -294,7 +316,7 @@ impl AppleVmBackend {
     }
 }
 
-impl Drop for AppleVmBackend {
+impl Drop for AppleVirtVm {
     fn drop(&mut self) {
         // Take the pointer out of the atomic *before* all other steps. A
         // callback that was queued earlier and did not run yet sees null on
@@ -327,7 +349,7 @@ impl Drop for AppleVmBackend {
     }
 }
 
-impl AppleVmBackend {
+impl AppleVirtVm {
     /// Boot the VM asynchronously through the dispatch queue.
     pub async fn start(&mut self) -> anyhow::Result<()> {
         info!("starting VM...");
@@ -514,5 +536,15 @@ impl AppleVmBackend {
             .map_err(|e| anyhow::anyhow!(messages::vm::vsock_connect_failed(e)))?;
 
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+impl VmHandle for AppleVirtVm {
+    fn vsock_connect(&self, port: u32) -> HandleFuture<'_, anyhow::Result<OwnedFd>> {
+        Box::pin(AppleVirtVm::vsock_connect(self, port))
+    }
+
+    fn stop(&mut self) -> HandleFuture<'_, anyhow::Result<()>> {
+        Box::pin(AppleVirtVm::stop(self))
     }
 }

@@ -254,12 +254,83 @@ jobs:
           path: target/vm/notifier.tar
           if-no-files-found: error
 
+  # The libkrun library for the macOS arm64 CLI binaries. Same pattern as the
+  # notifier app: push builds of main sign the library with the Developer ID,
+  # because the hardened runtime of the signed CLI binary loads only
+  # libraries with the same Team ID. All other builds sign ad hoc and never
+  # read the signing secrets. Both jobs upload the same artifact name. The
+  # cache holds the libkrun sources and the cargo build output. It does not
+  # hold the signed library: the task signs it again in each run.
+  build-libkrun-macos-signed:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [ lint-macos, lint-linux, test-macos, test-linux ]
+    runs-on: macos-latest
+    environment: macos-signing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - uses: actions/cache@v4
+        with:
+          path: target/libkrun-src
+          key: libkrun-macos-aarch64-${{ hashFiles('mise/tasks/build/libkrun') }}
+      - name: Import Developer ID certificate
+        uses: ./.github/actions/import-signing-cert
+        with:
+          cert-b64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          cert-password: ${{ secrets.APPLE_CERT_P12_PASSWORD }}
+          keychain-password: ${{ secrets.KEYCHAIN_PASSWORD }}
+      # --force: build again also when the stamp of a cached build matches.
+      - name: Build and sign libkrun
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          if [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "::error::Secret APPLE_SIGNING_IDENTITY is empty"
+            exit 1
+          fi
+          mise run --force build:libkrun
+      - name: Clean up keychain
+        if: always()
+        uses: ./.github/actions/cleanup-signing-cert
+      - name: Show signature
+        run: |
+          codesign --display --verbose=2 target/vm/libkrun.dylib
+          lipo -info target/vm/libkrun.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libkrun-macos
+          path: target/vm/libkrun.dylib
+          if-no-files-found: error
+
+  build-libkrun-macos:
+    if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+    needs: [ lint-macos, lint-linux, test-macos, test-linux ]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - uses: actions/cache@v4
+        with:
+          path: target/libkrun-src
+          key: libkrun-macos-aarch64-${{ hashFiles('mise/tasks/build/libkrun') }}
+      - name: Build libkrun (ad hoc)
+        run: mise run --force build:libkrun
+      - name: Show signature
+        run: |
+          codesign --display --verbose=2 target/vm/libkrun.dylib
+          lipo -info target/vm/libkrun.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libkrun-macos
+          path: target/vm/libkrun.dylib
+          if-no-files-found: error
+
   # ── Stage 3: CLI binaries ──────────────────────────────
   build-cli-macos-aarch64:
-    needs: [ build-kernel-aarch64, build-initramfs-aarch64, build-notifier-macos, build-notifier-macos-signed ]
+    needs: [ build-kernel-aarch64, build-initramfs-aarch64, build-notifier-macos, build-notifier-macos-signed, build-libkrun-macos, build-libkrun-macos-signed ]
     # One of the two notifier jobs is always skipped. A skipped need skips
     # this job by default, so check the results here.
-    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && (needs.build-notifier-macos.result == 'success' || needs.build-notifier-macos-signed.result == 'success') }}
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && (needs.build-notifier-macos.result == 'success' || needs.build-notifier-macos-signed.result == 'success') && (needs.build-libkrun-macos.result == 'success' || needs.build-libkrun-macos-signed.result == 'success') }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -278,6 +349,10 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: notifier-macos
+          path: target/vm
+      - uses: actions/download-artifact@v4
+        with:
+          name: libkrun-macos
           path: target/vm
       - run: cargo build --release -p airlock-cli
       - run: codesign --entitlements entitlements.plist --force -s - target/release/airlock
@@ -401,10 +476,10 @@ jobs:
 
   # ── Stage 3b: distroless CLI binaries (no bundled kernel/initramfs) ────
   build-cli-macos-aarch64-distroless:
-    needs: [ lint-macos, lint-linux, test-macos, test-linux, build-notifier-macos, build-notifier-macos-signed ]
+    needs: [ lint-macos, lint-linux, test-macos, test-linux, build-notifier-macos, build-notifier-macos-signed, build-libkrun-macos, build-libkrun-macos-signed ]
     # One of the two notifier jobs is always skipped. A skipped need skips
     # this job by default, so check the results here.
-    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && (needs.build-notifier-macos.result == 'success' || needs.build-notifier-macos-signed.result == 'success') }}
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && (needs.build-notifier-macos.result == 'success' || needs.build-notifier-macos-signed.result == 'success') && (needs.build-libkrun-macos.result == 'success' || needs.build-libkrun-macos-signed.result == 'success') }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -415,6 +490,10 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: notifier-macos
+          path: target/vm
+      - uses: actions/download-artifact@v4
+        with:
+          name: libkrun-macos
           path: target/vm
       - run: cargo build --release -p airlock-cli --features distroless
       - run: codesign --entitlements entitlements.plist --force -s - target/release/airlock
