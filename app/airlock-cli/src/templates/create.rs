@@ -67,8 +67,7 @@ pub async fn create(
     verbose: bool,
 ) -> Result<(), Exit> {
     super::check_name(name).map_err(|e| Exit::error(2, e))?;
-    // Load the VM backend first. A backend that the host cannot run stops
-    // the build before the wizard.
+    // Load first: an unsupported backend then stops the build early.
     let vmm = crate::vm::load_backend(context.settings.vmm)?;
     if !force {
         check_absent(&context.data, name)?;

@@ -1,10 +1,9 @@
 //! VM boot assets.
 //!
-//! The `airlock` binary contains the files that boot the sandbox VM: the
-//! guest kernel and initramfs, and the files of the VM backend, for example
-//! the hypervisor. This module extracts each file to the cache on the host
-//! when its content changes. Each VM backend extracts its own files. The `[vm]` config can replace the bundled kernel and
-//! initramfs with custom files.
+//! The `airlock` binary contains the guest kernel, the initramfs and the
+//! files of the VM backends. This module extracts each file to the host
+//! cache when its content changes. The `[vm]` config can replace the kernel
+//! and initramfs with custom files.
 
 // Builds with no bundled kernel and no backend files do not extract.
 #![cfg_attr(
@@ -20,8 +19,7 @@ use crate::vm::mount;
 
 /// Paths of the VM boot files.
 pub struct BootFiles {
-    /// Directory of the extracted assets. VM backends extract their own
-    /// assets here.
+    /// Directory of the extracted assets.
     pub dir: VerifiedPath,
     /// Kernel image.
     pub kernel: VerifiedPath,
@@ -42,13 +40,9 @@ pub struct AssetFile {
     pub mode: u32,
 }
 
-/// Get the VM boot files for the project.
-///
-/// Extracts the bundled kernel and initramfs to the asset directory if
-/// their checksum changed. The custom kernel and initramfs paths of the
-/// project config replace the bundled files. With the `distroless` feature,
-/// the binary does not contain a kernel and initramfs, so the project config
-/// must set `vm.kernel` and `vm.initramfs`.
+/// Get the VM boot files for the project. Custom kernel and initramfs paths
+/// of the project config replace the bundled files. With the `distroless`
+/// feature, the config must set both paths.
 /// Returns:
 ///   The file paths, or error if extraction fails or a file is missing.
 #[cfg(not(test))]
@@ -110,16 +104,12 @@ pub fn boot_files(_project: &Project) -> anyhow::Result<BootFiles> {
 ///   `Ok` when the files are in place, or error if the extraction fails.
 #[cfg(not(test))]
 pub fn extract(dir: &VerifiedPath, files: &[AssetFile]) -> anyhow::Result<()> {
-    // Serialize the checksum check and extraction across processes. Take a
-    // blocking exclusive lock before the checksum read. Then two concurrent
-    // first runs (for example after an upgrade) cannot both write the
-    // assets. Also, the hypervisor never memory-maps a file while another
-    // process writes it. The lock releases when `_lock` drops.
+    // Lock before the checksum read. Two concurrent first runs then cannot
+    // both write, and no process maps a file while another writes it.
     let _lock = acquire_extract_lock(&dir.join("lock")?)?;
 
     for file in files {
-        // The checksum goes in place after the file. A crash between the two
-        // writes makes the next run extract the file again.
+        // Checksum last: a crash between the writes forces a new extraction.
         let checksum_name = format!("{}.checksum", file.name);
         let cached = dir
             .join(&checksum_name)?
@@ -133,9 +123,8 @@ pub fn extract(dir: &VerifiedPath, files: &[AssetFile]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Write `data` to the new file `path` with the permission bits `mode`.
-/// Removes an old file at `path` first. The create never follows a
-/// symlink at `path`.
+/// Write `data` to the new file `path` with permission bits `mode`. Removes
+/// an old file first. The create never follows a symlink.
 fn write_new(path: &VerifiedPath, data: &[u8], mode: u32) -> anyhow::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
@@ -151,28 +140,20 @@ fn write_new(path: &VerifiedPath, data: &[u8], mode: u32) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Write `data` to `dir/name` with the permission bits `mode`, through a
-/// sibling temp file and rename. A reader never sees a partly written file,
-/// and a concurrent process cannot boot from it. The rename also prevents
-/// ETXTBSY if an old executable at `dir/name` still runs, for example a
-/// virtiofsd or hypervisor process of a previous version.
+/// Write `data` to `dir/name` through a temp file and rename. A reader never
+/// sees a partial file. The rename also prevents ETXTBSY when an old
+/// executable at `dir/name` still runs.
 fn write_atomic(dir: &VerifiedPath, name: &str, data: &[u8], mode: u32) -> anyhow::Result<()> {
-    // The temp name contains the pid, so a stray temp file of another
-    // process never goes into place.
+    // The pid in the name keeps temp files of other processes apart.
     let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()))?;
     write_new(&tmp, data, mode)?;
     tmp.rename_to(&dir.join(name)?)?;
     Ok(())
 }
 
-/// Get a blocking exclusive advisory lock on `path`. The lock stays until the
-/// returned handle drops. It serializes the checksum check and extraction in
-/// [`extract`] across processes.
-///
-/// The lock blocks (and does not fail fast) because extraction is short. A
-/// second process waits, then reads the new checksum and does not extract
-/// again. Same `flock` pattern as `sandbox::acquire_lock` and
-/// `vault::acquire_file_lock`.
+/// Get a blocking exclusive lock on `path` until the handle drops. It
+/// serializes the checksum check and extraction in [`extract`] across
+/// processes. A second process waits, then sees the new checksum.
 #[cfg(not(test))]
 fn acquire_extract_lock(path: &VerifiedPath) -> anyhow::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -251,9 +232,8 @@ fn resolve_custom(
 ) -> anyhow::Result<VerifiedPath> {
     // The user can pick a symlink, for example to the current kernel build.
     let resolved = mount::host_path(raw, host_home, cwd)?;
-    // The sandbox can write the project dir and the writable dir mounts,
-    // and put symlinks there. The project share is not known here, so the
-    // project dir counts as writable.
+    // The sandbox can put symlinks in the project dir and in writable
+    // mounts. The project dir counts as writable, as the share is unknown.
     let sources = mount::resolve_sources(mounts, host_home, cwd)?;
     let writable = mount::writable_dirs(Some(cwd), &sources);
     mount::check_stays_in(&messages::vm::custom_asset_kind(name), &resolved, &writable)?;

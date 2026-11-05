@@ -81,8 +81,8 @@ impl SandboxOptions {
 ///   Exit with code 1 if the host does not support the backend.
 // Call this before anything is read or written.
 pub fn check_system_requirements(vmm: crate::settings::Vmm) -> Result<(), Exit> {
-    // The sandbox process loads the backend again. This early check shows
-    // the error before the sandbox is registered.
+    // The sandbox process loads it again. This check fails before the
+    // sandbox registers.
     crate::vm::load_backend(vmm).map_err(|e| Exit::error(1, e))?;
     #[cfg(target_os = "linux")]
     if vmm == crate::settings::Vmm::CloudHypervisor {

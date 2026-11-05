@@ -161,11 +161,8 @@ jobs:
               || { echo "::error::$name does not contain the signed notifier app"; exit 1; }
           done
           rm -rf notifier-check
-      # The CI run signs the libkrun library with the Developer ID only on
-      # push. The hardened runtime of the signed CLI binary loads only
-      # libraries of the same Team ID. The binary extracts the library as
-      # is, so the signature stays valid. Check the signature and check that
-      # each aarch64 binary contains exactly this library.
+      # The CI run signs the libkrun library only on push. Check the
+      # signature and that each aarch64 binary contains exactly this library.
       - name: Verify embedded libkrun library
         run: |
           set -euo pipefail

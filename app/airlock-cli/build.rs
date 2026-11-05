@@ -1,10 +1,9 @@
 //! Build script for the airlock CLI.
 //!
-//! Makes the checksum of each bundled VM asset file and the git commit
-//! hash available to the CLI at compile time. Turns on the libkrun VM
-//! backend on hosts that can run it. Gives the macOS notifier app to the
-//! CLI. Rebuilds the CLI when the VM assets, the notifier app or the
-//! built-in packs change.
+//! Makes the checksum of each bundled VM asset and the git commit hash
+//! available at compile time. Turns on the libkrun backend on hosts that
+//! can run it. Gives the macOS notifier app to the CLI. Rebuilds the CLI
+//! when the VM assets, the notifier app or the built-in packs change.
 
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
@@ -14,8 +13,7 @@ use std::hash::Hasher;
 fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
-    // One checksum for each asset file. A file extracts again only when
-    // its own checksum changes. Add new bundled assets here.
+    // One checksum for each asset. Add new bundled assets here.
     if std::env::var("CARGO_FEATURE_DISTROLESS").is_err() {
         emit_checksum("Image");
         emit_checksum("initramfs.gz");
@@ -25,9 +23,7 @@ fn main() {
         emit_checksum("virtiofsd");
     }
 
-    // The libkrun VM backend: only on macOS arm64, because libkrun supports
-    // the macOS hypervisor on arm64 only. The `vm_libkrun` cfg marks all
-    // code of this backend.
+    // libkrun runs only on macOS arm64. The `vm_libkrun` cfg marks its code.
     println!("cargo::rustc-check-cfg=cfg(vm_libkrun)");
     if target_os == "macos" && std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64") {
         println!("cargo:rustc-cfg=vm_libkrun");
@@ -62,9 +58,9 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/refs/heads/");
 }
 
-/// Make the checksum of the asset `file` in `target/vm` available to the
-/// CLI as the compile-time env var `AIRLOCK_CHECKSUM_<FILE>`, for example
-/// `AIRLOCK_CHECKSUM_INITRAMFS_GZ`. A missing file counts as empty.
+/// Set the env var `AIRLOCK_CHECKSUM_<FILE>` (for example
+/// `..._INITRAMFS_GZ`) to the checksum of `file` in `target/vm`. A missing
+/// file counts as empty.
 fn emit_checksum(file: &str) {
     let path = format!("../../target/vm/{file}");
     let mut hasher = DefaultHasher::new();

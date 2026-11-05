@@ -97,8 +97,7 @@ pub async fn run(init_fd: RawFd, context: Context) -> i32 {
         Ok(rpc) => rpc,
         Err(e) => return fail(&e.into()),
     };
-    // Load the VM backend before other work. A backend that the host cannot
-    // run stops the start before the questions and the slow steps.
+    // Load first: an unsupported backend then stops the start early.
     let vmm = match vm::load_backend(context.settings.vmm) {
         Ok(vmm) => vmm,
         Err(e) => return fail(&e),

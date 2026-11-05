@@ -1,13 +1,10 @@
 //! libkrun VM backend.
 //!
-//! Runs the sandbox VM with libkrun in a separate process of the airlock
-//! program, because libkrun stops its process when the guest stops. Opens
-//! connections from the host to the guest, and stops the VM. The VM process
-//! also stops when airlock dies without a clean stop. The `airlock` binary
-//! contains the libkrun library. The backend extracts it before the boot.
-//!
-//! When the VM process stops without a stop request, the errors give the
-//! end of its log, which has the libkrun errors.
+//! Runs the sandbox VM with libkrun in a separate VM process, because
+//! libkrun stops its process when the guest stops. Opens connections from
+//! the host to the guest and stops the VM. The VM process also stops when
+//! airlock dies. The backend extracts the bundled libkrun library before
+//! the boot. If the VM process stops early, the errors show its log tail.
 
 use std::io::{Read, Seek, Write};
 use std::os::unix::io::{AsRawFd, OwnedFd};
@@ -57,12 +54,8 @@ const PORTS: [u32; 2] = [
 
 /// Time to wait for the guest to close a new vsock connection. libkrun
 /// accepts the host connection before the guest answers. If no guest
-/// process listens on the port, the guest refuses and libkrun closes the
-/// host socket soon after.
-///
-/// The host connects only two times for each VM, both at boot. On the
-/// network port, the guest sends first, so the wait ends at once. Only the
-/// supervisor connect waits the full time, one time for each boot.
+/// process listens, libkrun closes the host socket soon after. Only the
+/// supervisor connect waits the full time, once for each boot.
 const REFUSE_WAIT: Duration = Duration::from_millis(200);
 
 /// Maximum length of a Unix socket path on macOS, without the null at the
@@ -81,8 +74,7 @@ const LOG_TAIL_BYTES: u64 = 2048;
 fn extract_library(dir: &VerifiedPath) -> anyhow::Result<VerifiedPath> {
     use crate::vm::assets::{AssetFile, extract};
 
-    // A running VM process keeps its mapped copy of the old library, so
-    // the rename in the extraction is safe.
+    // A running VM process keeps its mapped old copy, so the rename is safe.
     extract(
         dir,
         &[AssetFile {
@@ -126,12 +118,11 @@ impl LibkrunVm {
         let mut vsock_ports = Vec::new();
         for port in PORTS {
             let path = socket_path(runtime_dir, port)?;
-            // An old socket file from an earlier run blocks the bind. Remove
-            // it first: the path check below refuses a symlink there.
+            // An old socket file blocks the bind. `remove_old` never follows
+            // a symlink.
             crate::vm::remove_old(&path)?;
             let path_str = utf8(&path)?;
-            // libkrun only logs a bind error, and the connects then fail
-            // without a clear reason. Stop here.
+            // libkrun only logs a bind error. Stop here for a clear error.
             if path_str.len() > MAX_SOCKET_PATH {
                 anyhow::bail!(messages::libkrun::socket_path_too_long(
                     &path_str,
@@ -166,17 +157,15 @@ impl LibkrunVm {
         let mut input = serde_json::to_vec(&vmm_config)?;
         input.push(b'\n');
 
-        // The VM process writes the libkrun log to its error output. It
-        // limits the size. Remove an old entry first, so that the create
-        // does not fail.
+        // The VM process writes the libkrun log to its error output.
+        // `create_new` needs the old entry removed.
         let log = runtime_dir.join("libkrun.log")?;
         crate::vm::remove_old(&log)?;
 
         let exe = VerifiedPath::new_follow(std::env::current_exe()?, None)?;
         let mut cmd = Command::new(exe.to_path()?);
         cmd.args(crate::cli::cmd_internal::VMM_LIBKRUN_ARGS);
-        // The VM process needs no environment. This keeps secrets and
-        // `DYLD_*` variables out of it. libkrun ignores `RUST_LOG`.
+        // Keep secrets and `DYLD_*` variables out of the VM process.
         cmd.env_clear();
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::null());
@@ -187,8 +176,8 @@ impl LibkrunVm {
             .spawn()
             .map_err(|e| anyhow::anyhow!(messages::libkrun::start_failed(e)))?;
 
-        // Keep the input open after the write. macOS has no parent death
-        // signal, so the VM process stops when its input closes.
+        // Keep the input open. macOS has no parent death signal, so the VM
+        // process stops when its input closes.
         let written = child
             .stdin
             .as_mut()
@@ -223,9 +212,7 @@ impl LibkrunVm {
             return Err(VmStopped(self.stopped_error()).into());
         }
         let path = socket_path(&self.runtime_dir, port)?;
-        // The VM process can create an entry at the socket path. The
-        // connect must never follow a symlink there to an other socket of
-        // the host, so connect only to a socket file.
+        // The guest can plant a symlink here. Connect only to a socket file.
         if !path
             .symlink_metadata()
             .is_ok_and(|m| std::os::unix::fs::FileTypeExt::is_socket(&m.file_type()))
@@ -236,8 +223,8 @@ impl LibkrunVm {
             anyhow::anyhow!(messages::libkrun::vsock_socket_connect_failed(&path, e))
         })?;
 
-        // A connection that the guest refuses gets an end of file. A
-        // connection that the guest accepts gets data or nothing.
+        // A refused connection gets end of file. An accepted one gets data
+        // or nothing.
         if let Ok(ready) = tokio::time::timeout(REFUSE_WAIT, stream.readable()).await {
             ready?;
             let mut byte = 0u8;
@@ -261,8 +248,7 @@ impl LibkrunVm {
                 }
             }
         }
-        // The tokio stream is non-blocking. Give the same blocking mode as
-        // the other backends. The RPC transports set their own mode.
+        // Blocking mode, like the other backends.
         let stream = stream.into_std()?;
         stream.set_nonblocking(false)?;
         Ok(OwnedFd::from(stream))
@@ -274,8 +260,8 @@ impl LibkrunVm {
     ///   request (for example a guest crash or a sandbox deny), or if the
     ///   wait fails, because then the stop is not confirmed.
     fn stop(&mut self) -> anyhow::Result<()> {
-        // libkrun ends the process with exit code 0 when the guest powers
-        // off. Other exits before the request are failures.
+        // Exit code 0 before the request is a guest power off. Other codes
+        // are failures.
         let stopped_before = self
             .child
             .as_ref()
@@ -298,8 +284,8 @@ impl LibkrunVm {
         let Some(mut child) = self.child.take() else {
             return Ok(None);
         };
-        // If the group kill fails, kill at least the VM process, so that
-        // the wait cannot block.
+        // Kill at least the VM process if the group kill fails, so the wait
+        // cannot block.
         if !crate::util::process::kill_group(child.id())
             && let Err(e) = child.kill()
         {
@@ -317,10 +303,8 @@ impl LibkrunVm {
         Ok(Some(status))
     }
 
-    /// Make the error for a VM process that stopped without a request. It
-    /// has the log path and the end of the log. The guest can put text in
-    /// the log (for example a device name), so the text has no control
-    /// characters.
+    /// Make the error for a VM process that stopped without a request. The
+    /// guest can write to the log, so the text has no control characters.
     fn stopped_error(&self) -> String {
         let tail = crate::util::strip_controls(log_tail(&self.log).as_bytes());
         messages::libkrun::stopped(&self.log, tail.trim_end())
@@ -373,9 +357,8 @@ fn socket_path(dir: &VerifiedPath, port: u32) -> std::io::Result<VerifiedPath> {
     dir.join(format!("k{port}.sock"))
 }
 
-/// Get `path` as a UTF-8 string. The libkrun API accepts only UTF-8 paths.
-/// The path has no symlink in any part, so it is a real path, as the
-/// sandbox of the VM process needs (it checks this again).
+/// Get `path` as a UTF-8 string, as the libkrun API needs. The path has no
+/// symlink, as the VM process sandbox needs.
 fn utf8(path: &VerifiedPath) -> anyhow::Result<String> {
     path.to_path()?
         .to_str()

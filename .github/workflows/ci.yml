@@ -254,13 +254,10 @@ jobs:
           path: target/vm/notifier.tar
           if-no-files-found: error
 
-  # The libkrun library for the macOS arm64 CLI binaries. Same pattern as the
-  # notifier app: push builds of main sign the library with the Developer ID,
-  # because the hardened runtime of the signed CLI binary loads only
-  # libraries with the same Team ID. All other builds sign ad hoc and never
-  # read the signing secrets. Both jobs upload the same artifact name. The
-  # cache holds the libkrun sources and the cargo build output. It does not
-  # hold the signed library: the task signs it again in each run.
+  # libkrun library for the macOS arm64 CLI. Same pattern as the notifier
+  # app: pushes to main sign it with the Developer ID, because the hardened
+  # runtime loads only libraries with the same Team ID. Other builds sign ad
+  # hoc and never read the secrets. The cache holds no signed library.
   build-libkrun-macos-signed:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [ lint-macos, lint-linux, test-macos, test-linux ]
