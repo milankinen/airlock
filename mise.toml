@@ -51,7 +51,7 @@ made=""
 cleanup() { if [[ -n "$made" ]]; then rm -f $made; fi; }
 trap cleanup EXIT
 mkdir -p target/vm
-for f in Image initramfs.gz cloud-hypervisor virtiofsd; do
+for f in Image initramfs.gz cloud-hypervisor virtiofsd libkrun.dylib; do
   if [[ ! -e target/vm/$f ]]; then touch "target/vm/$f"; made="$made target/vm/$f"; fi
 done
 cargo clippy -p airlock-cli -- -D warnings

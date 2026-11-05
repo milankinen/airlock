@@ -1,7 +1,7 @@
 //! Platform-independent VM configuration.
 //!
 //! Describes the VM to boot, including its resources and the host
-//! directories that it shares. All platform VM backends use this description.
+//! directories that it shares. All VM backends use this description.
 
 use crate::util::VerifiedPath;
 
@@ -13,9 +13,14 @@ pub struct VmShare {
     pub host_path: VerifiedPath,
     /// If `true`, the guest cannot write to the share.
     pub read_only: bool,
+    /// If `true`, the host does not change the files while the VM runs, so
+    /// the guest can cache file data.
+    // Only the libkrun backend reads it.
+    #[cfg_attr(not(vm_libkrun), allow(dead_code))]
+    pub immutable: bool,
 }
 
-/// Full VM configuration for the platform-specific backend.
+/// Full VM configuration for the VM backend.
 #[allow(dead_code)]
 pub struct VmConfig {
     /// Number of virtual CPUs.
@@ -34,12 +39,8 @@ pub struct VmConfig {
     pub cache_disk: Option<VerifiedPath>,
     /// Directory for runtime files (e.g., vsock UNIX sockets).
     pub runtime_dir: VerifiedPath,
-    /// Path to cloud-hypervisor binary (Linux only).
-    #[cfg(target_os = "linux")]
-    pub cloud_hypervisor: VerifiedPath,
-    /// Path to virtiofsd binary (Linux only).
-    #[cfg(target_os = "linux")]
-    pub virtiofsd: VerifiedPath,
+    /// Directory for the extracted VM assets.
+    pub asset_dir: VerifiedPath,
     /// Enable nested virtualization and give the guest access to KVM.
     pub kvm: bool,
 }

@@ -7,6 +7,7 @@
 use crate::cli::LogLevel;
 use crate::config::config_values::{self, ConfigValues, NetworkRule, Policy};
 use crate::sandbox::BootOptions;
+use crate::vm::VmmBackend;
 
 /// Name of the install boot network rule. The rule allows all targets
 /// in passthrough mode.
@@ -56,11 +57,15 @@ pub fn install_config(mut config: ConfigValues) -> anyhow::Result<ConfigValues> 
 
 /// Get the boot options of the setup boots. The boots are quiet because
 /// they print their own progress. They have no project share.
-pub fn boot_options(log_level: LogLevel) -> BootOptions {
+/// Args:
+///  - `log_level`: Log level of the boot
+///  - `vmm`: The VM backend that boots the VM
+pub fn boot_options(log_level: LogLevel, vmm: &'static dyn VmmBackend) -> BootOptions {
     BootOptions {
         log_level,
         quiet: true,
         project_share: false,
+        vmm,
     }
 }
 

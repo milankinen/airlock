@@ -56,6 +56,7 @@ use crate::sandbox::start::config_change::{self, LastRunInput};
 use crate::sandbox::start::{Exit, install, prepare};
 use crate::sandbox::{self, Interrupted, NoticeLog, Project, registry};
 use crate::util::{self, PinnedDir, VerifiedPath};
+use crate::vm::{self, VmmBackend};
 use crate::{messages, oci, packs};
 
 /// The checked sandbox of the sandbox process.
@@ -67,7 +68,7 @@ struct Target {
 }
 
 /// Run the sandbox process until the sandbox stops (see `airlock internal
-/// sandbox-process`).
+/// vmm`).
 /// Args:
 ///  - `init_fd`: Inherited descriptor of the init socket
 ///  - `context`: Process context
@@ -103,6 +104,11 @@ pub async fn run(init_fd: RawFd, context: Context) -> i32 {
     let rpc = match util::fd::take_socket(init.rpc_fd) {
         Ok(rpc) => rpc,
         Err(e) => return fail(&e.into()),
+    };
+    // Load first: an unsupported backend then stops the start early.
+    let vmm = match vm::load_backend(context.settings.vmm) {
+        Ok(vmm) => vmm,
+        Err(e) => return fail(&e),
     };
     let target = match locate(&init.sandbox_id, &context).await {
         Ok(target) => target,
@@ -152,7 +158,7 @@ pub async fn run(init_fd: RawFd, context: Context) -> i32 {
 
     let db = context.db.clone();
     let result = Box::pin(serve(
-        &init, &target, &lock, &mut first, context, handshake, rpc,
+        &init, &target, &lock, &mut first, context, handshake, rpc, vmm,
     ))
     .await;
     let code = match result {
@@ -389,9 +395,10 @@ async fn locate(sandbox_id: &str, context: &Context) -> anyhow::Result<Target> {
 }
 
 /// Do the start work for the mode of `init` and run the sandbox (see
-/// [`run`]).
+/// [`run`]). `vmm` boots the VMs.
 /// Returns:
 ///   The exit code, or the exit for a failed or aborted start.
+#[allow(clippy::too_many_arguments)]
 async fn serve(
     init: &Init,
     target: &Target,
@@ -400,6 +407,7 @@ async fn serve(
     context: Context,
     handshake: Handshake,
     rpc: std::os::unix::net::UnixStream,
+    vmm: &'static dyn VmmBackend,
 ) -> Result<i32, Exit> {
     // The start work can add notices before the boot.
     let notices = NoticeLog::new();
@@ -417,6 +425,7 @@ async fn serve(
                 first,
                 args,
                 init.log.log_level,
+                vmm,
             ))
             .await?;
             (prepared.project, prepared.image, Some(prepared.main_argv))
@@ -437,6 +446,7 @@ async fn serve(
         quiet: cli::is_silent(),
         first_client: Some(rpc),
         notices,
+        vmm,
     };
     let ready = Ready { main_argv };
     Ok(

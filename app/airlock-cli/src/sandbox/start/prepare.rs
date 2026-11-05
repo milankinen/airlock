@@ -15,6 +15,7 @@ use crate::sandbox::first_start::FirstStart;
 use crate::sandbox::lock::SandboxLock;
 use crate::sandbox::process::init::StartArgs;
 use crate::sandbox::{self, Project};
+use crate::vm::VmmBackend;
 use crate::{messages, packs, templates};
 
 /// A prepared sandbox, ready for the boot.
@@ -36,6 +37,7 @@ pub struct Prepared {
 ///    keeps the sandbox
 ///  - `args`: The start arguments
 ///  - `log_level`: Log level for the install boot (`--log-level`)
+///  - `vmm`: The VM backend of the install boot
 ///
 /// Returns:
 ///   The prepared sandbox, or the exit for an error or an aborted question.
@@ -45,6 +47,7 @@ pub async fn prepare(
     first: &mut FirstStart,
     args: &StartArgs,
     log_level: LogLevel,
+    vmm: &'static dyn VmmBackend,
 ) -> Result<Prepared, Exit> {
     let options = SandboxOptions {
         yes: args.yes,
@@ -57,6 +60,7 @@ pub async fn prepare(
             network_policy: args.network,
         },
         auto_approve_packs: args.auto_approve_packs,
+        vmm,
     };
     let host_cwd = lock.host_cwd();
     let packs = packs::init(&context.settings.packs, &context.home).map_err(Exit::config)?;

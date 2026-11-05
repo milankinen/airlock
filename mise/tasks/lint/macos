@@ -1,0 +1,42 @@
+#!/bin/bash
+#MISE description="Lint the macOS arm64 build of airlock-cli from Linux (no link)"
+set -euo pipefail
+
+# Clippy does not link, so fake compiler and archiver tools are enough.
+TARGET="aarch64-apple-darwin"
+if ! rustup target list --installed | grep -qx "$TARGET"; then
+  rustup target add "$TARGET"
+fi
+
+tools="$PWD/.tmp/lint-macos-tools"
+made=""
+cleanup() {
+  rm -rf "$tools"
+  if [[ -n "$made" ]]; then rm -f $made; fi
+}
+trap cleanup EXIT
+
+mkdir -p "$tools"
+cat >"$tools/cc" <<'CC'
+#!/bin/bash
+out=""; prev=""
+for a in "$@"; do [[ "$prev" == "-o" ]] && out="$a"; prev="$a"; done
+[[ -n "$out" ]] && : >"$out"
+exit 0
+CC
+cat >"$tools/ar" <<'AR'
+#!/bin/bash
+for a in "$@"; do if [[ "$a" == *.a ]]; then printf '!<arch>\n' >"$a"; break; fi; done
+exit 0
+AR
+chmod +x "$tools/cc" "$tools/ar"
+
+# The binary embeds the VM assets. Use empty files for the missing ones.
+mkdir -p target/vm
+for f in Image initramfs.gz libkrun.dylib notifier.tar; do
+  if [[ ! -e target/vm/$f ]]; then touch "target/vm/$f"; made="$made target/vm/$f"; fi
+done
+
+export CC_aarch64_apple_darwin="$tools/cc" CXX_aarch64_apple_darwin="$tools/cc" AR_aarch64_apple_darwin="$tools/ar"
+cargo clippy -p airlock-cli --target "$TARGET" "$@" -- -D warnings
+cargo clippy -p airlock-cli --target "$TARGET" --tests "$@" -- -D warnings

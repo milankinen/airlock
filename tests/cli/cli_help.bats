@@ -27,7 +27,7 @@ load helpers
     assert_success
     assert_output_matches "^  stop "
     assert_output_not_contains "Internal commands"
-    assert_output_not_contains "sandbox-process"
+    assert_output_not_contains "  internal "
 }
 
 # Test that the help of start shows the --network flag and its policy

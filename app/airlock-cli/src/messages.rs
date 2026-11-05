@@ -4397,9 +4397,10 @@ pub mod vm {
         format!("disk:   {disk}")
     }
 
-    /// Error when the platform has no VM backend.
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    pub const UNSUPPORTED_PLATFORM: &str = "unsupported platform";
+    /// Error when the host cannot run the VM backend of the `vmm` setting.
+    pub fn vmm_unsupported(vmm: impl Display, os: impl Display, arch: impl Display) -> String {
+        format!("VM backend {vmm} is not supported on this host ({os} {arch})")
+    }
 
     /// Error when the mount source is missing and the mount must exist.
     pub fn mount_source_missing(source: impl Display) -> String {

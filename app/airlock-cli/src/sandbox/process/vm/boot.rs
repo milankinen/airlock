@@ -23,13 +23,13 @@ use crate::rpc::browser::Browser;
 use crate::rpc::clipboard::ClipboardImpl;
 use crate::rpc::guest_network::GuestNetwork;
 use crate::sandbox::Project;
-use crate::vm::{self, VmInstance};
+use crate::vm::{self, VmInstance, VmmBackend};
 use crate::{messages, rpc};
 
 /// Interval of the host wall clock sync to the guest.
 const CLOCK_SYNC_INTERVAL: Duration = Duration::from_mins(1);
 
-/// Output and sharing options of one boot.
+/// Output, sharing and VM backend options of one boot.
 pub struct BootOptions {
     /// Guest kernel verbosity and the guest `tracing` filter.
     pub log_level: LogLevel,
@@ -40,6 +40,8 @@ pub struct BootOptions {
     /// Mount the project directory and start processes in it. If `false`,
     /// the project is not shared and the guest works in `/`.
     pub project_share: bool,
+    /// The VM backend that boots the VM.
+    pub vmm: &'static dyn VmmBackend,
 }
 
 /// All that one boot gives the guest. The caller builds it. [`boot`] only

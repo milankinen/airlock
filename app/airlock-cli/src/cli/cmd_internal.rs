@@ -1,8 +1,8 @@
 //! The hidden `airlock internal` commands.
 //!
-//! Only airlock starts these commands. `sandbox-process` runs the sandbox
-//! process of one sandbox. Its parent gives it the init socket and the held
-//! sandbox locks.
+//! Only airlock starts these commands. `vmm` runs the sandbox process of
+//! one sandbox. Its parent gives it the init socket and the held sandbox
+//! locks.
 
 use clap::{Args, Subcommand};
 
@@ -20,10 +20,14 @@ pub struct InternalArgs {
 #[derive(Subcommand, Debug)]
 pub enum InternalCommand {
     /// Run the sandbox process of one sandbox
+    #[command(name = SANDBOX_PROCESS_ARGS[1])]
     SandboxProcess(SandboxProcessArgs),
 }
 
-/// CLI arguments for `airlock internal sandbox-process`.
+/// Arguments that start the sandbox process.
+pub const SANDBOX_PROCESS_ARGS: [&str; 2] = ["internal", "vmm"];
+
+/// CLI arguments for `airlock internal vmm`.
 #[derive(Args, Debug)]
 pub struct SandboxProcessArgs {
     /// Descriptor of the init socket

@@ -15,9 +15,11 @@ The default is `~/Library/Application Support/airlock` on macOS and
   vm/
     Image                        # Linux kernel (extracted on first run)
     initramfs.gz                 # initramfs
-    cloud-hypervisor             # (Linux only) hypervisor binary
-    virtiofsd                    # (Linux only) VirtioFS daemon
-    checksum                     # triggers re-extraction after binary update
+    cloud-hypervisor             # (Cloud Hypervisor backend) hypervisor binary
+    virtiofsd                    # (Cloud Hypervisor backend) VirtioFS daemon
+    libkrun.dylib                # (libkrun backend) VM library
+    <file>.checksum              # checksum of one asset file, extracts it again after binary update
+    lock                         # serializes the extraction across processes
   oci/
     images/<digest>              # schema-tagged JSON: the fully-baked OciImage
     layers/<digest>/             # extracted layer tree (whiteouts as xattrs)

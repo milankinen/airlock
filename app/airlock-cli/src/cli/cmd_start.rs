@@ -95,7 +95,7 @@ pub async fn main(
 
 async fn run(args: StartArgs, extra_args: Vec<String>, context: Context) -> Result<i32, Exit> {
     sandbox::check_data_dir(&context.data)?;
-    sandbox::check_system_requirements();
+    sandbox::check_system_requirements(context.settings.vmm)?;
     let host_cwd = sandbox::resolve_host_cwd()?;
     sandbox::init_logging(args.log_level);
     // The terminal runtime. Bad `[monitor.keys]` values fail here.

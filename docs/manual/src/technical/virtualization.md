@@ -1,5 +1,16 @@
 # Virtualization
 
+The `vmm` setting in `~/.airlock/settings.toml` selects the VM backend:
+
+| Value              | Backend                         | Default on |
+|--------------------|---------------------------------|------------|
+| `apple-virt`       | Apple Virtualization framework  | macOS      |
+| `cloud-hypervisor` | Cloud Hypervisor and KVM        | Linux      |
+| `libkrun`          | libkrun                         | -          |
+
+If the host cannot run the selected backend, the sandbox start stops
+with an error.
+
 ## macOS: Apple Virtualization framework
 
 airlock uses the native `com.apple.Virtualization` framework via Rust
@@ -38,7 +49,9 @@ deployments straightforward.
   and a minimal init script. Built inside Docker as a gzipped cpio
   archive.
 - airlock extracts both to `vm/` in the airlock data directory on first run. A
-  checksum check re-extracts them if the binary is updated.
+  checksum check re-extracts them if the binary is updated. Each VM
+  backend extracts its own files in the same way, with a checksum of
+  its own.
 
 The [distroless build variant](../advanced/custom-kernel.md) omits
 the embedded kernel and initramfs. The user provides them via

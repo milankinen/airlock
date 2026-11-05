@@ -49,6 +49,60 @@ pub struct Settings {
     /// cache. `~` expands to the home directory. The default is
     /// `airlock` in the user data directory of the platform.
     pub data_dir: Option<String>,
+    /// VM backend that runs the sandbox VM:
+    ///  * `apple-virt` (default on macOS): the Apple Virtualization
+    ///    framework
+    ///  * `cloud-hypervisor` (default on Linux): Cloud Hypervisor and
+    ///    virtiofsd
+    ///  * `libkrun`: libkrun
+    ///
+    /// All values parse on all hosts. The sandbox start fails if the host
+    /// cannot run the backend.
+    #[config(default_t = Vmm::HOST_DEFAULT)]
+    pub vmm: Vmm,
+}
+
+/// VM backend that runs the sandbox VM (`vmm`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Vmm {
+    /// Apple Virtualization framework (macOS).
+    AppleVirt,
+    /// Cloud Hypervisor with virtiofsd (Linux).
+    CloudHypervisor,
+    /// libkrun.
+    Libkrun,
+}
+
+impl Vmm {
+    /// Default backend of the host: `apple-virt` on macOS, else
+    /// `cloud-hypervisor`.
+    pub const HOST_DEFAULT: Self = if cfg!(target_os = "macos") {
+        Self::AppleVirt
+    } else {
+        Self::CloudHypervisor
+    };
+
+    /// Get the setting value of the backend, for example `apple-virt`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::AppleVirt => "apple-virt",
+            Self::CloudHypervisor => "cloud-hypervisor",
+            Self::Libkrun => "libkrun",
+        }
+    }
+}
+
+impl std::fmt::Display for Vmm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl smart_config::de::WellKnown for Vmm {
+    type Deserializer =
+        smart_config::de::Serde<{ smart_config::metadata::BasicTypes::STRING.raw() }>;
+    const DE: Self::Deserializer = smart_config::de::Serde;
 }
 
 /// Settings under the `[security]` table.
@@ -320,6 +374,7 @@ mod tests {
         assert!(!s.security.insecure_mounts);
         assert_eq!(s.approvals.dialogs, ApprovalDialogs::System);
         assert_eq!(s.data_dir, None);
+        assert_eq!(s.vmm, Vmm::HOST_DEFAULT);
 
         std::fs::write(
             dir.path().join("settings.yml"),
@@ -341,6 +396,7 @@ mod tests {
             dir.path().join("settings.toml"),
             "vault.storage = \"file\"\n\
              data_dir = \"~/airlock-data\"\n\
+             vmm = \"libkrun\"\n\
              [monitor.buffers]\nhttp = 5\n\
              [security]\ninsecure_mounts = true\n\
              [approvals]\ndialogs = \"monitor\"\n",
@@ -349,6 +405,7 @@ mod tests {
         let s = Settings::load_from(&verified_dir(dir.path())).unwrap();
         assert_eq!(s.vault.storage, VaultStorageType::File);
         assert_eq!(s.approvals.dialogs, ApprovalDialogs::Monitor);
+        assert_eq!(s.vmm, Vmm::Libkrun);
         assert_eq!(s.monitor.buffers.http, 5);
         assert_eq!(s.monitor.buffers.tcp, 100);
         assert!(s.security.insecure_mounts);
@@ -366,6 +423,7 @@ mod tests {
             "vault.storage = \"typo\"\n",
             "security.insecure_mounts = \"typo\"\n",
             "approvals.dialogs = \"typo\"\n",
+            "vmm = \"typo\"\n",
         ] {
             let dir = temp_dir();
             std::fs::write(dir.path().join("settings.toml"), content).unwrap();

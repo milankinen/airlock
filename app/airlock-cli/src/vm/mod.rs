@@ -1,91 +1,36 @@
 //! VM lifecycle support.
 //!
 //! Configures, boots and controls the sandbox VM, and connects to the
-//! supervisor in the VM. Also resolves the configured mounts and manages the
-//! persistent sandbox disk. On Linux, it checks that the user can use KVM.
+//! supervisor in the VM. Also resolves the configured mounts, extracts the
+//! VM boot assets and manages the persistent sandbox disk. On Linux, it
+//! checks that the user can use KVM.
 //!
-//! On macOS, the VM uses the Apple Virtualization framework. On Linux, it
-//! uses Cloud Hypervisor and virtiofsd.
+//! The `vmm` setting selects the VM backend: the Apple Virtualization
+//! framework (macOS), Cloud Hypervisor with virtiofsd (Linux) or libkrun.
 
-#[cfg(target_os = "macos")]
-mod apple;
-#[cfg(target_os = "linux")]
+mod apple_virt;
+mod assets;
+mod backend;
 mod cloud_hypervisor;
 mod config;
 pub(crate) mod disk;
 mod file_sync;
+#[cfg(target_os = "linux")]
+mod kvm_status;
+pub mod libkrun;
 pub mod mount;
 
 use std::os::unix::io::OwnedFd;
 
-use crate::data_dir::DataDir;
-use crate::util::VerifiedPath;
-
-/// Result of the KVM access check.
+use self::backend::VmHandle;
+pub use self::backend::{VmmBackend, load_backend};
 #[cfg(target_os = "linux")]
-pub enum KvmStatus {
-    /// `/dev/kvm` can be opened for read and write.
-    Available,
-    /// `/dev/kvm` does not exist.
-    NotFound,
-    /// The user has no permission to open `/dev/kvm`.
-    NoPermission,
-    /// `/dev/kvm` cannot be opened for a different reason.
-    Unavailable(std::io::Error),
-}
-
-/// Check if the current user can use `/dev/kvm`.
-#[cfg(target_os = "linux")]
-pub fn kvm_status() -> KvmStatus {
-    kvm_status_at("/dev/kvm")
-}
-
-/// Check if the current user can open the KVM device at `path`.
-#[cfg(target_os = "linux")]
-fn kvm_status_at(path: impl AsRef<std::ffi::OsStr>) -> KvmStatus {
-    // The device path is fixed. On some systems it is a symlink.
-    let opened = VerifiedPath::new_follow(path.as_ref(), None).and_then(|path| {
-        // Open the file instead of reading the mode bits, so the kernel
-        // also applies ACLs.
-        path.open_with(std::fs::OpenOptions::new().read(true).write(true))
-    });
-    match opened {
-        Ok(_) => KvmStatus::Available,
-        Err(err) => match err.kind() {
-            std::io::ErrorKind::NotFound => KvmStatus::NotFound,
-            std::io::ErrorKind::PermissionDenied => KvmStatus::NoPermission,
-            _ => KvmStatus::Unavailable(err),
-        },
-    }
-}
-
-/// Make sure that KVM is available. If not, show the reason and exit the
-/// process.
-#[cfg(target_os = "linux")]
-pub fn require_kvm() {
-    match kvm_status() {
-        KvmStatus::Available => {}
-        KvmStatus::NotFound => {
-            cli::error!("{}", messages::vm::KVM_NOT_FOUND);
-            cli::error!("{}", messages::vm::KVM_ENABLE_HINT);
-            std::process::exit(1);
-        }
-        KvmStatus::NoPermission => {
-            cli::error!("{}", messages::vm::KVM_NO_PERMISSION);
-            cli::error!("{}", messages::vm::KVM_PERMISSION_HINT);
-            std::process::exit(1);
-        }
-        KvmStatus::Unavailable(err) => {
-            cli::error!("{}", messages::vm::kvm_open_failed(err));
-            std::process::exit(1);
-        }
-    }
-}
-
-use crate::assets::Assets;
+pub use self::kvm_status::{KvmStatus, kvm_status, require_kvm};
 use crate::cli::LogLevel;
+use crate::data_dir::DataDir;
 use crate::oci::OciImage;
 use crate::sandbox::{BootOptions, Project};
+use crate::util::VerifiedPath;
 use crate::vm::config::VmShare;
 use crate::{cli, messages};
 
@@ -146,6 +91,8 @@ impl VmInstance {
         for _ in 0..MAX_ATTEMPTS {
             match self.vm_handle.vsock_connect(port).await {
                 Ok(fd) => return Ok(fd),
+                // A VM that stopped never answers.
+                Err(e) if e.is::<backend::VmStopped>() => return Err(e),
                 Err(e) => {
                     last_err = Some(e);
                     tokio::time::sleep(DELAY).await;
@@ -168,8 +115,9 @@ impl VmInstance {
 ///    [`crate::oci::effective_container_home`]. Used for `~/...` expansion
 ///    of mount, cache and socket-forward paths
 ///  - `env`: The sandbox env ([`crate::sandbox::process::vm::boot::guest_env`])
-///  - `opts`: Boot options. If `project_share` is false, there is no project
-///    mount and the guest runs in `/`. `quiet` skips the VM resources summary.
+///  - `opts`: Boot options. `vmm` boots the VM. If `project_share` is false,
+///    there is no project mount and the guest runs in `/`. `quiet` skips the
+///    VM resources summary.
 ///
 /// Returns:
 ///   The [`VmInstance`] (it cleans up on drop) and the vsock fd that is
@@ -181,7 +129,9 @@ pub async fn start(
     env: Vec<String>,
     opts: &BootOptions,
 ) -> anyhow::Result<(VmInstance, OwnedFd)> {
-    let assets = Assets::init(project)?;
+    let backend = opts.vmm;
+    tracing::debug!("vm backend: {}", backend.kind());
+    let boot_files = assets::boot_files(project)?;
     let sandbox_dir = project.sandbox_dir.clone();
     let overlay_dir = sandbox_dir.join("overlay")?;
 
@@ -214,20 +164,17 @@ pub async fn start(
     let vm_config = config::VmConfig {
         cpus: project.config.vm.cpus,
         memory_bytes: project.config.vm.memory.0,
-        kernel: assets.kernel,
-        initramfs: assets.initramfs,
-        kernel_cmdline: build_kernel_cmdline(opts.log_level),
+        kernel: boot_files.kernel,
+        initramfs: boot_files.initramfs,
+        kernel_cmdline: build_kernel_cmdline(backend.kernel_console(), opts.log_level),
         shares,
         cache_disk: Some(disk_image.clone()),
         runtime_dir: sandbox_dir,
-        #[cfg(target_os = "linux")]
-        cloud_hypervisor: assets.cloud_hypervisor,
-        #[cfg(target_os = "linux")]
-        virtiofsd: assets.virtiofsd,
+        asset_dir: boot_files.dir,
         kvm: project.config.vm.kvm,
     };
 
-    let vm_handle = boot_backend(&vm_config).await?;
+    let vm_handle = backend.boot_vm(&vm_config).await?;
     let sync_handle = file_sync::start(&mounts, &overlay_dir);
 
     let vm = VmInstance {
@@ -318,6 +265,8 @@ fn prepare_shares(
         tag: "layers".to_string(),
         host_path: crate::cache::layers_root(data_dir)?,
         read_only: true,
+        // A layer dir never changes after the download.
+        immutable: true,
     }];
 
     for m in mounts
@@ -335,6 +284,7 @@ fn prepare_shares(
             tag: m.key().into(),
             host_path: m.source.clone(),
             read_only: m.read_only,
+            immutable: false,
         });
     }
 
@@ -387,6 +337,7 @@ fn prepare_shares(
             tag: "files/rw".to_string(),
             host_path: files_rw_dir.reverify()?,
             read_only: false,
+            immutable: false,
         });
     }
     if has_ro_files {
@@ -394,6 +345,7 @@ fn prepare_shares(
             tag: "files/ro".to_string(),
             host_path: files_ro_dir.reverify()?,
             read_only: true,
+            immutable: false,
         });
     }
 
@@ -401,8 +353,12 @@ fn prepare_shares(
 }
 
 /// Build the kernel command line string.
-fn build_kernel_cmdline(log_level: LogLevel) -> String {
-    let mut cmdline = "console=hvc0 console=ttyS0 rdinit=/init".to_string();
+/// Args:
+///  - `console`: Console part of the command line from the VM backend
+///  - `log_level`: Log level of the boot
+fn build_kernel_cmdline(console: &str, log_level: LogLevel) -> String {
+    // A backend without a console gives an empty console part.
+    let mut cmdline = format!("{console} rdinit=/init").trim_start().to_string();
     if !matches!(log_level, LogLevel::Trace | LogLevel::Debug) {
         cmdline.push_str(" quiet loglevel=3");
     }
@@ -428,64 +384,19 @@ fn log_config(project: &Project) {
     );
 }
 
-/// Start the platform-specific VM backend. The caller must wait until a
-/// vsock port is ready, see [`VmInstance::vsock_connect`].
-#[cfg_attr(not(target_os = "macos"), allow(clippy::unused_async))]
-async fn boot_backend(vm_config: &config::VmConfig) -> anyhow::Result<Box<dyn VmHandle>> {
-    #[cfg(target_os = "macos")]
-    {
-        let mut backend = apple::AppleVmBackend::new(vm_config)?;
-        backend.start().await?;
-        Ok(Box::new(backend))
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let backend = cloud_hypervisor::CloudHypervisorBackend::start(vm_config)?;
-        Ok(Box::new(backend))
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        let _ = vm_config;
-        Err(anyhow::anyhow!(messages::vm::UNSUPPORTED_PLATFORM))
-    }
-}
-
-/// Future returned by the object-safe [`VmHandle`] methods.
-type HandleFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>;
-
-/// Trait for VM backends. Dropping the handle kills the VM.
-trait VmHandle {
-    /// Open a new vsock connection to the given guest port. Used for the
-    /// supervisor channel and for later channels, for example the network
-    /// proxy.
-    fn vsock_connect(&self, port: u32) -> HandleFuture<'_, anyhow::Result<OwnedFd>>;
-
-    /// Stop the VM and wait until the backend confirms the stop. A drop of
-    /// the handle after this does not stop the VM again.
-    fn stop(&mut self) -> HandleFuture<'_, anyhow::Result<()>>;
-}
-
-#[cfg(target_os = "macos")]
-impl VmHandle for apple::AppleVmBackend {
-    fn vsock_connect(&self, port: u32) -> HandleFuture<'_, anyhow::Result<OwnedFd>> {
-        Box::pin(apple::AppleVmBackend::vsock_connect(self, port))
-    }
-
-    fn stop(&mut self) -> HandleFuture<'_, anyhow::Result<()>> {
-        Box::pin(apple::AppleVmBackend::stop(self))
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl VmHandle for cloud_hypervisor::CloudHypervisorBackend {
-    fn vsock_connect(&self, port: u32) -> HandleFuture<'_, anyhow::Result<OwnedFd>> {
-        Box::pin(async move { cloud_hypervisor::CloudHypervisorBackend::vsock_connect(self, port) })
-    }
-
-    fn stop(&mut self) -> HandleFuture<'_, anyhow::Result<()>> {
-        Box::pin(async move { cloud_hypervisor::CloudHypervisorBackend::stop(self) })
+/// Remove the old entry at `path`, if any. Never follows a symlink.
+/// A directory is removed too, so a planted directory cannot block a start.
+#[cfg(any(target_os = "linux", vm_libkrun))]
+fn remove_old(path: &VerifiedPath) -> std::io::Result<()> {
+    let is_dir = path.symlink_metadata().is_ok_and(|m| m.is_dir());
+    let result = if is_dir {
+        path.remove_dir_all()
+    } else {
+        path.remove_file()
+    };
+    match result {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
     }
 }
 

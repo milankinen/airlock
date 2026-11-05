@@ -24,12 +24,14 @@ pub mod prepare;
 pub mod wizard;
 
 pub use exit::Exit;
+
 use tracing::info;
 
 use crate::cli::{self, LogLevel, logging};
 use crate::data_dir::DataDir;
 use crate::packs::approval::ApprovalMode;
 use crate::util::VerifiedPath;
+use crate::vm::VmmBackend;
 
 /// Command-line options for the sandbox step ([`ensure::ensure_sandbox`]) and
 /// the install step ([`install::install_tools`]).
@@ -53,6 +55,8 @@ pub struct SandboxOptions {
     /// Approve new or changed packs without a question
     /// (`--auto-approve-packs`).
     pub auto_approve_packs: bool,
+    /// The VM backend of the install boot.
+    pub vmm: &'static dyn VmmBackend,
 }
 
 impl SandboxOptions {
@@ -70,12 +74,21 @@ impl SandboxOptions {
     }
 }
 
-/// Check that the host can run a sandbox. On Linux, this checks KVM access.
-/// On failure, the process exits with code 1.
+/// Check that the host can run a sandbox with the VM backend `vmm`. The
+/// backend must be supported on this host. Cloud Hypervisor also needs KVM
+/// access: without it, the process exits with code 1.
+/// Returns:
+///   Exit with code 1 if the host does not support the backend.
 // Call this before anything is read or written.
-pub fn check_system_requirements() {
+pub fn check_system_requirements(vmm: crate::settings::Vmm) -> Result<(), Exit> {
+    // The sandbox process loads it again. This check fails before the
+    // sandbox registers.
+    crate::vm::load_backend(vmm).map_err(|e| Exit::error(1, e))?;
     #[cfg(target_os = "linux")]
-    crate::vm::require_kvm();
+    if vmm == crate::settings::Vmm::CloudHypervisor {
+        crate::vm::require_kvm();
+    }
+    Ok(())
 }
 
 /// Check that the data directory `data_dir` is short enough for the Unix
