@@ -251,6 +251,9 @@ impl Listed {
     }
 }
 
+/// Maximum number of request params characters in the start failure log.
+const MAX_LOGGED_PARAMS: usize = 500;
+
 /// Find the sandbox of the session request `first` and attach the session
 /// `hid` to the agent there.
 async fn attach<S: AgentProcessLauncher + 'static>(
@@ -268,7 +271,23 @@ async fn attach<S: AgentProcessLauncher + 'static>(
         Ok(location) => location,
         Err(e) => {
             let message = format!("{e:#}");
-            tracing::warn!(handle = hid, "agent start failed: {message}");
+            // Log the first request to show which client call wants the
+            // sandbox. Cut long params, for example prompt text.
+            let method = first.get("method").and_then(Value::as_str).unwrap_or("-");
+            let mut params = first
+                .get("params")
+                .map(Value::to_string)
+                .unwrap_or_default();
+            if let Some((cut, _)) = params.char_indices().nth(MAX_LOGGED_PARAMS) {
+                params.truncate(cut);
+                params.push('…');
+            }
+            tracing::warn!(
+                handle = hid,
+                method,
+                params,
+                "agent start failed: {message}"
+            );
             *state.borrow_mut() = HandleState::Ended;
             let req_id = first.get("id").unwrap_or(&Value::Null);
             let msg = rpc::error_response(req_id, rpc::INTERNAL_ERROR, &message);
