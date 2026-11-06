@@ -1,7 +1,7 @@
 [packs]
 debian = { version = "1", args = { allow-apt = true } }
-claude = { version = "1", args = { acp = true } }
-codex = { version = "1", args = { acp = true } }
+claude = { version = "2", args = { acp = true } }
+codex = { version = "2", args = { acp = true } }
 docker = { version = "1" }
 git = { version = "1" }
 mise = { version = "1" }
@@ -14,6 +14,10 @@ SUPERVISOR_BUILD_HOST = "true"
 WAYLAND_DISPLAY = "airlock-0"
 # Worktrees live inside the main checkout: trust its mise configs too
 MISE_TRUSTED_CONFIG_PATHS = "/"
+
+[network]
+grants.enabled = true
+rule_editing = "all"
 
 # Downloads of the VM asset builds (mise build:*)
 [network.rules.vm-build]
