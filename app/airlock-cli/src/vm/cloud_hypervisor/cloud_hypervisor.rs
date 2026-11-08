@@ -246,6 +246,10 @@ impl CloudHypervisorVm {
         let ram_mib = config.memory_bytes / (1024 * 1024);
         cmd.arg("--memory")
             .arg(format!("size={ram_mib}M,shared=on"));
+        // The guest reports its free pages, and cloud-hypervisor gives them
+        // back to the host. The balloon does not inflate (size 0), so the
+        // guest can always use all of its memory again.
+        cmd.arg("--balloon").arg("size=0,free_page_reporting=on");
         cmd.arg("--console").arg("off");
         // The serial output goes to the standard output, and a thread copies
         // it to the log with a size limit.

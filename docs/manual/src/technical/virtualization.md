@@ -74,7 +74,7 @@ the embedded kernel and initramfs. The user provides them via
 |-----------------|-------------------------------------------------------|
 | Serial console  | Kernel debug output                                   |
 | Entropy         | `/dev/urandom` in guest                               |
-| Memory balloon  | Future: reclaim unused guest memory                   |
+| Memory balloon  | Gives free guest memory back to the host (Cloud Hypervisor, libkrun) |
 | vsock           | Host ↔ guest RPC (ports 1024 and 1025)                |
 | [VirtioFS](https://virtio-fs.gitlab.io/) | Shared filesystems (image layers, dir/file mounts) |
 | Block (ext4)    | Per-project persistent disk                           |
