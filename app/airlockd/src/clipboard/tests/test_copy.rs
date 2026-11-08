@@ -7,7 +7,7 @@ use std::rc::Rc;
 use super::Clipboard;
 use crate::bridge::in_rootfs;
 use crate::clipboard::{BIN_DIR, COPY_FIFO, ClipboardConfig, PASTE_FIFO, copy_loop, start};
-use crate::test_cfg::{HostClipboard, eventually_async, run_bridge, run_shim};
+use crate::test_cfg::{HostClipboard, eventually_async, run_bridge, run_shim, run_shim_cycle};
 
 /// Start the copy loop for `clipboard` with the byte limit `limit`.
 fn serve(clipboard: &Clipboard, host: &Rc<HostClipboard>, limit: u64) {
@@ -32,7 +32,13 @@ fn copy_through_every_tool_name_reaches_host_clipboard() {
             ("xclip", &["-selection", "clipboard"][..]),
             ("xsel", &["--clipboard", "--input"][..]),
         ] {
-            let run = run_shim(&clipboard.tool(tool), args, tool.as_bytes()).await;
+            let run = run_shim_cycle(
+                &clipboard.copy_fifo,
+                &clipboard.tool(tool),
+                args,
+                tool.as_bytes(),
+            )
+            .await;
             assert_eq!(run.code, 0, "{tool}: {run:?}");
         }
 
@@ -71,7 +77,8 @@ fn copy_over_limit_or_empty_is_dropped_and_bridge_keeps_serving() {
             b"",
             b"after",
         ] {
-            assert_eq!(run_shim(&wl_copy, &[], payload).await.code, 0);
+            let run = run_shim_cycle(&clipboard.copy_fifo, &wl_copy, &[], payload).await;
+            assert_eq!(run.code, 0);
         }
 
         eventually_async("two copies", async || {
@@ -95,8 +102,8 @@ fn copy_refused_by_host_does_not_stop_bridge() {
         serve(&clipboard, &host, 1024);
         let wl_copy = clipboard.tool("wl-copy");
 
-        run_shim(&wl_copy, &[], b"refused").await;
-        run_shim(&wl_copy, &[], b"accepted").await;
+        run_shim_cycle(&clipboard.copy_fifo, &wl_copy, &[], b"refused").await;
+        run_shim_cycle(&clipboard.copy_fifo, &wl_copy, &[], b"accepted").await;
 
         eventually_async("one copy", async || {
             (host.copies.borrow().len() == 1).then_some(())

@@ -137,15 +137,33 @@ pub(crate) async fn write_fifo(fifo: &Path, data: Vec<u8>) {
 
 /// Write `data` to the bridge FIFO `fifo` as one operation, and wait until
 /// the read loop took it.
+pub(crate) async fn write_fifo_cycle(fifo: &Path, data: Vec<u8>) {
+    fifo_cycle(fifo, write_fifo(fifo, data)).await;
+}
+
+/// Run `shim` as in [`run_shim`] as one operation on the bridge FIFO
+/// `fifo`, and wait until the read loop took it.
+pub(crate) async fn run_shim_cycle(
+    fifo: &Path,
+    shim: &Path,
+    args: &[&str],
+    stdin: &[u8],
+) -> ShimRun {
+    fifo_cycle(fifo, run_shim(shim, args, stdin)).await
+}
+
+/// Run `op` as one operation on the bridge FIFO `fifo`, and wait until the
+/// read loop took it.
 ///
 /// The read loop renews the FIFO when it opens it. A fast writer that comes
 /// next can open the old FIFO before the renew, and then its data mixes into
 /// this operation. Thus wait for the new FIFO.
-pub(crate) async fn write_fifo_cycle(fifo: &Path, data: Vec<u8>) {
+async fn fifo_cycle<T>(fifo: &Path, op: impl Future<Output = T>) -> T {
     let old = std::fs::metadata(fifo).unwrap().ino();
-    write_fifo(fifo, data).await;
+    let out = op.await;
     eventually_async("the read loop renews the fifo", async || {
         (std::fs::metadata(fifo).ok()?.ino() != old).then_some(())
     })
     .await;
+    out
 }
