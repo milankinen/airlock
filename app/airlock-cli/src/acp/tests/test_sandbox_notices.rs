@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 
-use crate::messages::acp::SANDBOX_NOTICE;
+use crate::messages::acp::{SANDBOX_NOTICE, from_airlock};
 use crate::sandbox::NoticeLog;
 use crate::test_cfg::acp::{LocalProcessLauncher, TestClient, test_config};
 use crate::test_cfg::block_on_local;
@@ -50,7 +50,7 @@ async fn session_messages(client: &mut TestClient, sid: &str, count: usize) -> V
 fn warning(text: &str) -> Value {
     json!({
         "sessionUpdate": "notice", "severity": "warning",
-        "title": SANDBOX_NOTICE, "description": text,
+        "title": from_airlock(SANDBOX_NOTICE), "description": text,
     })
 }
 
@@ -122,7 +122,7 @@ fn sandbox_notice_without_notice_feature_is_agent_text() {
 
         let sid = client.new_session(1, "/projects/a").await;
         let got = session_messages(&mut client, &sid, 1).await;
-        let text = format!("{SANDBOX_NOTICE}: config changed");
+        let text = format!("{}: config changed", from_airlock(SANDBOX_NOTICE));
         let expected = json!({
             "sessionUpdate": "agent_message_chunk",
             "content": { "type": "text", "text": text },

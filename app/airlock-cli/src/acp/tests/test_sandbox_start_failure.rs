@@ -71,7 +71,7 @@ fn sandbox_process_failure_reply_has_captured_output() {
         let (response, _) = client.request(2, "session/new", params).await;
         let error = &response["error"];
         assert_eq!(error["code"], -32603, "{response}");
-        assert_eq!(error["message"], "error: the vault is locked");
+        assert_eq!(error["message"], "airlock: error: the vault is locked");
         assert_eq!(error["data"]["exitCode"], 4);
         let output = error["data"]["output"].as_str().unwrap();
         assert!(output.contains("loading the last config"), "{output}");

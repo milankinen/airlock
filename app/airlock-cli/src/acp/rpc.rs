@@ -299,12 +299,17 @@ pub fn result_response(id: &Value, result: &Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
-/// Make a JSON-RPC error response.
+/// Make a JSON-RPC error response of the proxy. The message gets the
+/// `airlock: ` prefix.
+// The agent can show the errors that it gets to the user. The prefix
+// tells the user that the error is from airlock.
 pub fn error_response(id: &Value, code: i64, message: &str) -> Value {
+    let message = messages::acp::from_airlock(message);
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-/// Make a JSON-RPC error response with the error `data`.
+/// Make a JSON-RPC error response of the proxy with the error `data` (see
+/// [`error_response`]).
 pub fn error_response_with_data(id: &Value, code: i64, message: &str, data: &Value) -> Value {
     let mut msg = error_response(id, code, message);
     msg["error"]["data"] = data.clone();

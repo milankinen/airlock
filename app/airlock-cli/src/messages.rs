@@ -10,6 +10,13 @@ pub mod acp {
 
     use std::fmt::Display;
 
+    /// Add the `airlock: ` prefix to a text that the client gets from the
+    /// proxy. The prefix tells the user that the text is not from the
+    /// agent.
+    pub fn from_airlock(text: impl Display) -> String {
+        format!("airlock: {text}")
+    }
+
     /// Agent name that the editor shows.
     pub fn agent_title(cmd: impl Display) -> String {
         format!("{cmd} (airlock)")
@@ -39,7 +46,7 @@ pub mod acp {
     /// Error for a request that waited for the reopen of its session,
     /// when the reopen failed.
     pub fn session_reopen_failed(id: impl Display, detail: impl Display) -> String {
-        format!("airlock could not reopen the session '{id}' after its agent stopped: {detail}")
+        format!("could not reopen the session '{id}' after its agent stopped: {detail}")
     }
 
     /// Error for a request to a session whose agent stopped, when the
@@ -49,7 +56,7 @@ pub mod acp {
 
     /// Error detail when airlock refuses its own reopen request, for
     /// example for a session dir that is no longer in the sandbox.
-    pub const REOPEN_REFUSED: &str = "airlock refused the reopen request";
+    pub const REOPEN_REFUSED: &str = "the reopen request was refused";
 
     /// Error for a client message with a session id of another project.
     pub fn other_project_session(id: impl Display) -> String {
@@ -81,12 +88,12 @@ pub mod acp {
 
     /// Error for a request that needs a session but has none.
     pub fn no_session_method(method: impl Display) -> String {
-        format!("airlock does not support '{method}' without a session")
+        format!("'{method}' is not supported without a session")
     }
 
     /// Error text for a client method that the proxy never supports.
     pub fn unsupported_client_method(method: impl Display) -> String {
-        format!("airlock does not support '{method}'")
+        format!("'{method}' is not supported")
     }
 
     /// Error when an agent gives a session id that another agent has.
@@ -95,7 +102,7 @@ pub mod acp {
     }
 
     /// Error for a session request when airlock stops the agents.
-    pub const SHUTTING_DOWN: &str = "airlock stops the agents and does not start new ones";
+    pub const SHUTTING_DOWN: &str = "the agents stop. New agents do not start";
 
     /// Error for a client request that needs an agent feature that the
     /// agent does not have.
@@ -173,13 +180,13 @@ pub mod acp {
     /// Error for an agent request that airlock refuses.
     pub fn blocked_request(method: impl Display) -> String {
         format!(
-            "airlock refuses '{method}' because it can act on the host. \
+            "'{method}' is refused because it can act on the host. \
              Use 'airlock acp --pass-client-capabilities' to allow it"
         )
     }
 
     /// Error for an agent prompt that is not a form prompt.
-    pub const REFUSED_ELICITATION: &str = "airlock allows only form prompts. \
+    pub const REFUSED_ELICITATION: &str = "only form prompts are allowed. \
          Use 'airlock acp --pass-client-capabilities' to allow other prompts";
 
     /// Agent error message with a hint to log in inside the sandbox.

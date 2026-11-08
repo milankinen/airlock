@@ -6,7 +6,9 @@ use serde_json::{Value, json};
 
 use crate::acp::Config;
 use crate::acp::rpc::CANCEL_REQUEST;
-use crate::messages::acp::{REOPEN_NOT_SUPPORTED, REOPEN_QUEUE_FULL, reopen_timeout};
+use crate::messages::acp::{
+    AGENT_STOPPED, REOPEN_NOT_SUPPORTED, REOPEN_QUEUE_FULL, from_airlock, reopen_timeout,
+};
 use crate::sandbox::NoticeLog;
 use crate::test_cfg::acp::{
     LocalProcessLauncher, TestClient, capture_logs, full_agent_init, test_config,
@@ -48,7 +50,7 @@ async fn session_after_agent_exit_in(
         let text = msg
             .pointer("/params/update/content/text")
             .and_then(Value::as_str);
-        if text.is_some_and(|t| t.starts_with("The agent stopped")) {
+        if text.is_some_and(|t| t.starts_with(&from_airlock(AGENT_STOPPED))) {
             break;
         }
     }
@@ -308,7 +310,7 @@ fn request_over_reopen_queue_limit_is_refused() {
                 continue;
             }
             responses += 1;
-            if msg["error"]["message"] == REOPEN_QUEUE_FULL {
+            if msg["error"]["message"] == from_airlock(REOPEN_QUEUE_FULL) {
                 refused.push(msg["id"].clone());
             }
         }

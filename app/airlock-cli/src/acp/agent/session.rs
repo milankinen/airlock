@@ -1203,11 +1203,13 @@ async fn registration(registering: &mut Registering) -> mcp::Registered {
 }
 
 /// Make a message to the client in the ACP session `sid`: a session notice
-/// with `severity` if the client shows notices, else agent text.
+/// with `severity` if the client shows notices, else agent text. The title
+/// gets the `airlock: ` prefix.
 /// Args:
 ///  - `notices`: The client shows session notices
 ///  - `title`, `detail`: Title and text of the message
 fn notice_message(notices: bool, sid: &str, severity: &str, title: &str, detail: &str) -> Value {
+    let title = messages::acp::from_airlock(title);
     let update = if notices {
         json!({
             "sessionUpdate": "notice", "severity": severity,

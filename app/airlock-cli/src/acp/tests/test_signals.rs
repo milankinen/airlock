@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
+use crate::messages::acp::{AGENT_STOPPED, from_airlock};
 use crate::test_cfg::acp::{LocalProcessLauncher, TestClient, signal_sender, test_config};
 use crate::test_cfg::block_on_local;
 
@@ -123,7 +124,7 @@ fn signal_while_session_has_no_agent_stops_proxy_at_once() {
             let text = msg
                 .pointer("/params/update/content/text")
                 .and_then(|t| t.as_str());
-            if text.is_some_and(|t| t.starts_with("The agent stopped")) {
+            if text.is_some_and(|t| t.starts_with(&from_airlock(AGENT_STOPPED))) {
                 break;
             }
         }
