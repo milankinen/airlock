@@ -125,7 +125,7 @@ fn has(init: &Value, pointer: &str) -> bool {
 
 /// Test if the feature `name` is present in an `initialize` result. Also
 /// takes the AIR names of the session index extras.
-fn present(init: &Value, name: &str) -> bool {
+pub(super) fn present(init: &Value, name: &str) -> bool {
     client_jetbrains::present(init, name)
         .or_else(|| standard::present(init, name))
         .unwrap_or(false)

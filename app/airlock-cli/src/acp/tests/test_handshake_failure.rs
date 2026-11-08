@@ -16,6 +16,8 @@ use crate::test_cfg::block_on_local;
 ///   3. Check the unknown session error of the prompt and the time limit
 ///      error of the session
 ///   4. Check that a new session starts a new agent
+///   5. Close the client and check the exit code 0: the failed agent did
+///      not complete its handshake
 #[test]
 fn handshake_timeout_fails_session_and_handles_queued_requests() {
     block_on_local(async {
@@ -41,13 +43,15 @@ fn handshake_timeout_fails_session_and_handles_queued_requests() {
         client.send(&msg(4, "session/new", &session)).await;
         client.response(4).await;
         assert_eq!(launches.get(), 2);
+        assert_eq!(client.exit_code().await, 0);
     });
 }
 
-/// Test that the proxy refuses an agent with an other ACP version. The
+/// Test that the proxy refuses an agent with another ACP version. The
 /// proxy told the client that the agent uses version 1.
 ///   1. Use an agent that replies with version 2
 ///   2. Check the session error
+///   3. Close the client and check the exit code 0
 #[test]
 fn agent_with_other_protocol_version_fails_session() {
     block_on_local(async {
@@ -58,12 +62,15 @@ fn agent_with_other_protocol_version_fails_session() {
         let (code, message) = client.session_error(2, "/projects/a").await;
         assert_eq!(code, -32603);
         assert!(message.contains("ACP version 2"), "{message}");
+        assert_eq!(client.exit_code().await, 0);
     });
 }
 
 /// Test that an agent that exits before the handshake fails the session.
-///   1. Use an agent command that exits at once
+///   1. Use an agent command that exits at once with code 3
 ///   2. Check the session error
+///   3. Close the client and check the exit code 0: the agent did not
+///      complete its handshake
 #[test]
 fn agent_exit_before_handshake_fails_session() {
     block_on_local(async {
@@ -74,6 +81,7 @@ fn agent_exit_before_handshake_fails_session() {
         let (code, message) = client.session_error(2, "/projects/a").await;
         assert_eq!(code, -32603);
         assert!(message.contains("exited before"), "{message}");
+        assert_eq!(client.exit_code().await, 0);
     });
 }
 

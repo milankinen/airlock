@@ -129,8 +129,8 @@ impl AgentProcessLauncher for SandboxProcessLauncher {
         let notices = Some(process.notice_reader());
         let (events_tx, events) = mpsc::channel(crate::acp::AGENT_EVENTS);
         // The connection holds the sandbox until the agent exits. A failed
-        // launch drops it. All sessions of the sandbox share this agent, so
-        // the sandbox runs while one of them is open.
+        // launch drops it. Each session has its own agent, so the sandbox
+        // runs while one of them is open.
         tokio::task::spawn_local(relay_events(proc.clone(), events_tx, process));
         let (control, control_rx) = mpsc::unbounded_channel();
         tokio::task::spawn_local(relay_control(proc, control_rx));

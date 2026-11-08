@@ -1,15 +1,19 @@
 //! Agents of the sessions in their sandboxes.
 //!
-//! Runs one agent process for each sandbox. All sessions with a session
-//! dir in the same sandbox share that process. The proxy sees each session
-//! as its own session handle, with its own identity. A session in a
-//! sandbox that has no running agent launches a new one. When the last
-//! session of an agent ends, the agent stops. When the agent exits, all its
-//! sessions end.
+//! Each session runs its own agent process in the sandbox of its session
+//! dir, also a one-shot request such as a session list. The proxy sees
+//! each session as its own session handle, with its own identity. The
+//! handle gives the client messages to the session in order. Its stop
+//! stops the agent of the session after the earlier messages.
+//!
+//! Also keeps the host session dirs of the sessions in the latest session
+//! lists. A request for such a session can then start in the correct
+//! sandbox.
 
 pub(super) mod launcher;
+mod output;
+mod process;
 mod session;
-mod shared;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -17,15 +21,16 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use futures::future::LocalBoxFuture;
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
-use self::shared::Link;
+use super::AgentProcessLauncher;
 use super::proxy::{
     HandleId, HandleMessage, SessionContext, SessionFactory, SessionFactoryInit, SessionHandle,
 };
-use super::{AgentProcessLauncher, Location, NoSandbox, rpc};
 
 /// Settings of the agents.
 pub struct AgentConfig {
@@ -76,6 +81,7 @@ pub(super) fn factory<S: AgentProcessLauncher + 'static>(
 }
 
 /// Agent stderr to the host stderr.
+#[derive(Clone)]
 struct Stderr {
     tx: mpsc::Sender<Vec<u8>>,
     /// Number of agent stderr bytes that were dropped.
@@ -105,7 +111,6 @@ impl<S: AgentProcessLauncher + 'static> SessionFactoryInit for SandboxAgentsInit
             kill: context.kill,
             notices,
             next_id: Cell::new(0),
-            agents: RefCell::default(),
             listed: RefCell::default(),
         };
         Rc::new(SandboxAgents {
@@ -114,7 +119,7 @@ impl<S: AgentProcessLauncher + 'static> SessionFactoryInit for SandboxAgentsInit
     }
 }
 
-/// Settings and running agents of all sessions.
+/// Settings of all sessions.
 struct Pool<S> {
     launcher: S,
     config: Rc<AgentConfig>,
@@ -131,39 +136,11 @@ struct Pool<S> {
     notices: bool,
     /// Identity of the next session.
     next_id: Cell<HandleId>,
-    /// The agent of each sandbox.
-    agents: RefCell<HashMap<String, Rc<Link>>>,
     /// Host session dirs of the sessions in the latest session lists.
     listed: RefCell<Listed>,
 }
 
-impl<S: AgentProcessLauncher + 'static> Pool<S> {
-    /// Get the agent of `location` that takes new sessions, or launch a
-    /// new one there.
-    /// Args:
-    ///  - `cwd`: Host session dir, for the launch
-    fn agent(self: &Rc<Self>, location: &Location, cwd: &str) -> Rc<Link> {
-        let mut agents = self.agents.borrow_mut();
-        if let Some(link) = agents.get(&location.sandbox)
-            && link.accepting()
-        {
-            return link.clone();
-        }
-        let link = shared::spawn(self.clone(), location.sandbox.clone(), cwd.to_string());
-        agents.insert(location.sandbox.clone(), link.clone());
-        link
-    }
-
-    /// Forget the agent `link` of `sandbox` when it ended.
-    fn forget(&self, sandbox: &str, link: &Rc<Link>) {
-        let mut agents = self.agents.borrow_mut();
-        if agents.get(sandbox).is_some_and(|l| Rc::ptr_eq(l, link)) {
-            agents.remove(sandbox);
-        }
-    }
-}
-
-/// Gives each session its own handle on the agent of its sandbox.
+/// Starts a session task with its own agent for each session.
 struct SandboxAgents<S> {
     pool: Rc<Pool<S>>,
 }
@@ -173,9 +150,13 @@ impl<S: AgentProcessLauncher + 'static> SessionFactory for SandboxAgents<S> {
         let hid = self.pool.next_id.get();
         self.pool.next_id.set(hid + 1);
         tracing::info!(handle = hid, cwd, "new session");
-        let state = Rc::new(RefCell::new(HandleState::Pending(Vec::new())));
-        tokio::task::spawn_local(attach(self.pool.clone(), hid, cwd, first, state.clone()));
-        (hid, Box::new(Handle { hid, state }))
+        let (tx, inbox) = mpsc::unbounded_channel();
+        let run = session::run_session(self.pool.clone(), hid, cwd, first, inbox);
+        // All logs of the session, also of its agent and sandbox start,
+        // show the handle.
+        let span = tracing::info_span!("session", handle = hid);
+        let task = tokio::task::spawn_local(run.instrument(span));
+        (hid, Box::new(Handle { tx, task }))
     }
 
     fn session_dir(&self, sid: &str) -> Option<String> {
@@ -251,112 +232,24 @@ impl Listed {
     }
 }
 
-/// Maximum number of request params characters in the start failure log.
-const MAX_LOGGED_PARAMS: usize = 500;
-
-/// Find the sandbox of the session request `first` and attach the session
-/// `hid` to the agent there.
-async fn attach<S: AgentProcessLauncher + 'static>(
-    pool: Rc<Pool<S>>,
-    hid: HandleId,
-    cwd: String,
-    first: Value,
-    state: Rc<RefCell<HandleState>>,
-) {
-    let located = pool.launcher.locate(&cwd).await;
-    if matches!(*state.borrow(), HandleState::Ended) {
-        return;
-    }
-    let location = match located {
-        Ok(location) => location,
-        Err(e) => {
-            let method = first.get("method").and_then(Value::as_str).unwrap_or("-");
-            let req_id = first.get("id").unwrap_or(&Value::Null);
-            // Editors list the sessions of old dirs, for example removed
-            // git worktrees. These dirs have no sandbox, thus they have
-            // no sessions. An error makes the editor show a failure.
-            if method == "session/list" && e.downcast_ref::<NoSandbox>().is_some() {
-                tracing::debug!(handle = hid, "empty session list: {e:#}");
-                let msg = rpc::result_response(req_id, &json!({ "sessions": [] }));
-                end_early(&pool, hid, msg, &state).await;
-                return;
-            }
-            let message = format!("{e:#}");
-            // Log the first request to show which client call wants the
-            // sandbox. Cut long params, for example prompt text.
-            let mut params = first
-                .get("params")
-                .map(Value::to_string)
-                .unwrap_or_default();
-            if let Some((cut, _)) = params.char_indices().nth(MAX_LOGGED_PARAMS) {
-                params.truncate(cut);
-                params.push('…');
-            }
-            tracing::warn!(
-                handle = hid,
-                method,
-                params,
-                "agent start failed: {message}"
-            );
-            let msg = rpc::error_response(req_id, rpc::INTERNAL_ERROR, &message);
-            end_early(&pool, hid, msg, &state).await;
-            return;
-        }
-    };
-    let link = pool.agent(&location, &cwd);
-    let state = std::mem::replace(
-        &mut *state.borrow_mut(),
-        HandleState::Attached(link.clone()),
-    );
-    if let HandleState::Pending(queued) = state {
-        link.attach(hid, location, cwd, first, queued);
-    }
-}
-
-/// End the session `hid` before it attaches to an agent. Send the
-/// response `msg` to the first request.
-async fn end_early<S>(pool: &Pool<S>, hid: HandleId, msg: Value, state: &RefCell<HandleState>) {
-    *state.borrow_mut() = HandleState::Ended;
-    let claim = None;
-    let _ = pool
-        .messages
-        .send((hid, HandleMessage::Client { msg, claim }))
-        .await;
-    let _ = pool.messages.send((hid, HandleMessage::Ended)).await;
-}
-
-/// State of a session handle.
-enum HandleState {
-    /// The sandbox lookup runs. The client messages wait here.
-    Pending(Vec<Value>),
-    /// The session is in the agent of its sandbox.
-    Attached(Rc<Link>),
-    /// The session ended.
-    Ended,
-}
-
 /// Proxy side of one session.
 struct Handle {
-    hid: HandleId,
-    state: Rc<RefCell<HandleState>>,
+    /// Client messages for the session task. The drop stops the task.
+    tx: mpsc::UnboundedSender<Value>,
+    /// The session task. It gives the exit code of the session.
+    task: JoinHandle<i32>,
 }
 
 impl SessionHandle for Handle {
     fn send(&self, msg: Value) -> bool {
-        match &mut *self.state.borrow_mut() {
-            HandleState::Pending(queued) => {
-                queued.push(msg);
-                true
-            }
-            HandleState::Attached(link) => link.send(self.hid, msg),
-            HandleState::Ended => false,
-        }
+        self.tx.send(msg).is_ok()
     }
 
     fn shutdown(self: Box<Self>) -> LocalBoxFuture<'static, i32> {
-        match self.state.replace(HandleState::Ended) {
-            HandleState::Attached(link) => link.detach(self.hid),
-            HandleState::Pending(_) | HandleState::Ended => Box::pin(std::future::ready(0)),
-        }
+        let Self { tx, task } = *self;
+        // The task stops the session after the messages that came before.
+        drop(tx);
+        // A task that panicked is a failure.
+        Box::pin(async move { task.await.unwrap_or(1) })
     }
 }

@@ -31,8 +31,9 @@ use crate::test_cfg::mcp_grant::{FakeGrant, GrantEvent, Route};
 /// proxy handshake with `$AGENT_INIT` and then writes the lines of
 /// `$AGENT_SAY`. For each other input line, it writes a `session/update`
 /// notification with the line in `params.seen` and its sandbox in
-/// `params.from`. It replies to each request with a numeric id with an
-/// empty result, or with the error `$AGENT_ERROR`. Other settings:
+/// `params.from`. It replies to each request with a numeric id or a proxy
+/// reopen id with an empty result, or with the error `$AGENT_ERROR`. Other
+/// settings:
 ///  - `AGENT_SANDBOX`: Sandbox of the agent. The launcher sets it.
 ///  - `AGENT_NO_INIT`: Never reply to the handshake
 ///  - `AGENT_INIT_DELAY`: Seconds to wait before the handshake reply
@@ -54,6 +55,10 @@ use crate::test_cfg::mcp_grant::{FakeGrant, GrantEvent, Route};
 ///    not set. For each one, the agent writes the lines of `$AGENT_ON_HOLD`.
 ///  - `AGENT_DIE`: Exit after this number of seconds from the start
 ///  - `AGENT_TRAP`: At `SIGUSR1`, wait 200 ms and exit with this code
+///  - `AGENT_REPLAY`: For each `session/load`, send a `session/update`
+///    with `params.update.replay` in the loaded session before the reply
+///  - `AGENT_REOPEN_FAIL`: Path of a file. If the file exists, the agent
+///    removes it and replies to a proxy reopen request with an error
 ///
 /// A request with the param `"cursor":"bad"` gets an error.
 ///
@@ -87,16 +92,25 @@ while IFS= read -r line; do
   *)
     seen "$line"
     case "$line" in
-    *'"method"'*'"id":'[0-9]*|*'"id":'[0-9]*'"method"'*)
-      id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    *'"method"'*'"id":'[0-9]*|*'"id":'[0-9]*'"method"'*|*'"id":"airlock-acp-reopen-'*)
+      id=$(printf '%s\n' "$line" | sed -n -e 's/.*"id":\([0-9][0-9]*\).*/\1/p' -e 's/.*"id":\("airlock-acp-reopen-[0-9]*"\).*/\1/p')
       case "$line" in
+      *'"method":"session/load"'*)
+        if [ -n "$AGENT_REPLAY" ]; then
+          sid=$(printf '%s\n' "$line" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
+          printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"replay":true}}}\n' "$sid"
+        fi ;;
       *'"method":"session/prompt"'*)
         if [ -n "$AGENT_ASK" ]; then
           sid=$(printf '%s\n' "$line" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
           printf '{"jsonrpc":"2.0","id":%s,"method":"session/request_permission","params":{"sessionId":"%s","options":[],"toolCall":{}}}\n' "$AGENT_ASK" "$sid"
         fi ;;
       esac
-      if [ -n "$AGENT_ERROR" ]; then
+      if [ -n "$AGENT_REOPEN_FAIL" ] && [ -e "$AGENT_REOPEN_FAIL" ] &&
+         case "$line" in *'"id":"airlock-acp-reopen-'*) true ;; *) false ;; esac; then
+        rm -f "$AGENT_REOPEN_FAIL"
+        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32002,"message":"Resource not found"}}\n' "$id"
+      elif [ -n "$AGENT_ERROR" ]; then
         printf '{"jsonrpc":"2.0","id":%s,"error":%s}\n' "$id" "$AGENT_ERROR"
       else
         result='{}'
@@ -160,6 +174,8 @@ pub struct LocalProcessLauncher {
     pub launches: Rc<Cell<usize>>,
     /// Sandbox of each agent launch, in order.
     pub launched: Rc<RefCell<Vec<String>>>,
+    /// Number of agent processes that exited.
+    pub exited: Rc<Cell<usize>>,
     /// The fake sandboxes.
     sandboxes: Vec<FakeSandbox>,
     /// Notices of the sandbox start for each launch.
@@ -177,6 +193,7 @@ impl LocalProcessLauncher {
         Self {
             env,
             launches: Rc::default(),
+            exited: Rc::default(),
             launched: Rc::default(),
             sandboxes: ["a", "b"]
                 .iter()
@@ -286,7 +303,7 @@ impl AgentProcessLauncher for LocalProcessLauncher {
         self.launched.borrow_mut().push(sandbox.name.clone());
         let mut env = self.env.clone();
         env.push(("AGENT_SANDBOX".into(), sandbox.name.clone()));
-        let mut agent = spawn_agent(argv, &env)?;
+        let mut agent = spawn_agent(argv, &env, self.exited.clone())?;
         agent.mcp = sandbox.registrar.clone();
         agent.notices = self.notices.clone();
         Ok((location, agent))
@@ -294,7 +311,12 @@ impl AgentProcessLauncher for LocalProcessLauncher {
 }
 
 /// Start `argv` as a local process with the extra environment `env`.
-fn spawn_agent(argv: &[String], env: &[(String, String)]) -> anyhow::Result<AgentProcess> {
+/// `exited` counts up when the process exits.
+fn spawn_agent(
+    argv: &[String],
+    env: &[(String, String)],
+    exited: Rc<Cell<usize>>,
+) -> anyhow::Result<AgentProcess> {
     let mut child = tokio::process::Command::new(&argv[0])
         .args(&argv[1..])
         .envs(env.iter().cloned())
@@ -339,6 +361,7 @@ fn spawn_agent(argv: &[String], env: &[(String, String)]) -> anyhow::Result<Agen
             }
         }
         let status = child.wait().await.unwrap();
+        exited.set(exited.get() + 1);
         let code = status
             .code()
             .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
@@ -963,15 +986,6 @@ impl TestClient {
 /// `msgs`.
 pub fn seen(msgs: &[Value]) -> Vec<Value> {
     msgs.iter()
-        .filter_map(|m| m.pointer("/params/seen").cloned())
-        .collect()
-}
-
-/// Get the messages that the fake agent in `sandbox` got, from the client
-/// messages `msgs`.
-pub fn seen_from(msgs: &[Value], sandbox: &str) -> Vec<Value> {
-    msgs.iter()
-        .filter(|m| m.pointer("/params/from").and_then(Value::as_str) == Some(sandbox))
         .filter_map(|m| m.pointer("/params/seen").cloned())
         .collect()
 }

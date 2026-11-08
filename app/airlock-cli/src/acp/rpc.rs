@@ -11,6 +11,13 @@ use crate::messages;
 /// JSON-RPC id of the handshake request that the proxy sends to the agent.
 pub const INIT_ID: &str = "airlock-acp-initialize";
 
+/// Get the JSON-RPC id of the request that opens the ACP session of the
+/// session handle `hid` again in a new agent. The client does not see it.
+// The string form keeps it apart from the numeric ids of the editors.
+pub fn reopen_id(hid: u64) -> String {
+    format!("airlock-acp-reopen-{hid}")
+}
+
 /// ACP protocol version that the proxy supports.
 pub const PROTOCOL_VERSION: u64 = 1;
 

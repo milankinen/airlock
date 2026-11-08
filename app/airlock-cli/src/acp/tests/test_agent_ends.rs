@@ -6,9 +6,9 @@ use serde_json::json;
 use crate::test_cfg::acp::{TestClient, test_config};
 use crate::test_cfg::block_on_local;
 
-/// Test that one agent exit ends only its sessions. The proxy keeps
-/// running for the other sessions and for new sessions, and gives the exit
-/// code of the agent at the end.
+/// Test that one agent exit ends only the session of that agent. The
+/// proxy keeps running for the other sessions and for new sessions, and
+/// gives the exit code of the agent at the end.
 ///   1. Open sessions `sa` and `sb` in two agents
 ///   2. Make agent `a` exit with code 3
 ///   3. Check that a prompt to `sa` gets an error and a prompt to `sb`

@@ -36,6 +36,26 @@ pub mod acp {
         format!("the session dir '{cwd}' is not in the sandbox of this session")
     }
 
+    /// Error for a request that waited for the reopen of its session,
+    /// when the reopen failed.
+    pub fn session_reopen_failed(id: impl Display, detail: impl Display) -> String {
+        format!("airlock could not reopen the session '{id}' after its agent stopped: {detail}")
+    }
+
+    /// Error for a request to a session whose agent stopped, when the
+    /// new agent can not open the session again.
+    pub const REOPEN_NOT_SUPPORTED: &str =
+        "the agent can not load or resume sessions. Start a new session";
+
+    /// Error detail when airlock refuses its own reopen request, for
+    /// example for a session dir that is no longer in the sandbox.
+    pub const REOPEN_REFUSED: &str = "airlock refused the reopen request";
+
+    /// Error for a request when too many messages wait for the reopen of
+    /// its session.
+    pub const REOPEN_QUEUE_FULL: &str =
+        "too many messages wait for the reopen of this session. Send it again later";
+
     /// Error for a request with a session id that no agent has.
     pub fn unknown_session(id: impl Display) -> String {
         format!("the session '{id}' is not known. Start or load it first")
@@ -91,10 +111,6 @@ pub mod acp {
         format!("the agent in sandbox '{sandbox}' exited (code {code})")
     }
 
-    /// Error for a request that was open when the proxy ended its session.
-    /// The agent process keeps its other sessions.
-    pub const SESSION_DETACHED: &str = "the session ended before the agent replied";
-
     /// Title of the session message when the agent of the session exits.
     pub const AGENT_STOPPED: &str = "The agent stopped";
 
@@ -105,7 +121,8 @@ pub mod acp {
     pub fn agent_stopped_detail(sandbox: impl Display, code: i32) -> String {
         format!(
             "The agent in sandbox '{sandbox}' exited (code {code}). \
-             Load the session again or start a new one."
+             The next request in this session tries to open it again \
+             in a new agent."
         )
     }
 

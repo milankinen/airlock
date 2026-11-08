@@ -64,8 +64,8 @@ pub enum HandleMessage {
         /// to the session request of the handle.
         claim: Option<Claim>,
     },
-    /// The agent completed its handshake and got its session request. A
-    /// signal then lets the agent save the session.
+    /// The agent completed its handshake. A signal then lets the agent
+    /// save the session.
     Ready,
     /// The handle ended. This is the last message of the handle.
     Ended,

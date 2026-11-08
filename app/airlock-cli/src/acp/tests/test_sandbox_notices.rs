@@ -61,8 +61,8 @@ fn warning(text: &str) -> Value {
 ///   2. Do the client handshake with the session notice feature
 ///   3. Start a session and check that the two warnings follow the response
 ///   4. Add a third notice to the sandbox
-///   5. Start a second session in the same agent and check that it gets all
-///      three warnings after its response
+///   5. Start a second session in the same sandbox, which launches its own
+///      agent, and check that it gets all three warnings after its response
 ///   6. Send a prompt to the first session and check that it got no more
 ///      warnings
 #[test]
@@ -93,7 +93,7 @@ fn each_session_shows_all_sandbox_notices_after_response() {
             warning("later notice"),
         ];
         assert_eq!(got, expected);
-        assert_eq!(launches.get(), 1);
+        assert_eq!(launches.get(), 2);
 
         let (response, others) = client.prompt(3, &first).await;
         assert!(response.get("result").is_some(), "{response}");

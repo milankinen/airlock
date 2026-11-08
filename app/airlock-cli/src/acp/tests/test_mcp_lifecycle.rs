@@ -111,7 +111,8 @@ fn failed_session_request_releases_servers() {
 /// Test that `session/fork` gives the new session its own key and keeps
 /// the servers of the source session.
 ///   1. Start a session with server `a`
-///   2. Fork the session with server `b`
+///   2. Fork the session with server `b`, and check that the fork runs in
+///      its own agent with its own handshake
 ///   3. Check that `b` has a new key and `a` still opens sessions
 ///   4. Close the fork and check that only its server ends
 #[test]
@@ -124,8 +125,13 @@ fn fork_keeps_source_servers() {
             .unwrap()
             .to_string();
         let source = registrations.route().await;
-        let (response, _) = session(&mut client, &dir, 3, "session/fork", &sid, &["b"]).await;
+        let (response, others) = session(&mut client, &dir, 3, "session/fork", &sid, &["b"]).await;
         let fork_sid = response["result"]["sessionId"].clone();
+        let inits = seen(&others)
+            .iter()
+            .filter(|m| m["method"] == "initialize")
+            .count();
+        assert_eq!(inits, 1, "{others:?}");
         assert_ne!(fork_sid, json!(sid));
         let fork = registrations.route().await;
         assert_ne!(fork.session, source.session);
@@ -141,7 +147,7 @@ fn fork_keeps_source_servers() {
 }
 
 /// Test that the agent exit ends the servers of its session, and only
-/// them. Each sandbox has its own agent.
+/// them. Each session has its own agent.
 ///   1. Start sessions in sandboxes `a` and `b` with one server each
 ///   2. Make the agent of the first session exit
 ///   3. Check that its grant is released and the other server still opens

@@ -4,13 +4,14 @@
 //! the client (editor) opens. The client can start the proxy in any
 //! directory, and one proxy can serve many projects. The project dir comes
 //! only in the session requests. Thus the proxy replies to the handshake
-//! itself and starts one agent for each sandbox, at the first session in
-//! the sandbox of the session dir. All sessions in a sandbox share its
-//! agent. An agent sees only the messages of its own sessions. An agent
-//! exit ends only that agent and its sessions. The proxy gives the agents
-//! the session dirs as guest paths. Each new or loaded session shows all
-//! notices of its sandbox as warnings, for example a project config that
-//! changed after the last `airlock start`.
+//! itself and starts one agent for each session, in the sandbox of the
+//! session dir. An agent sees only the messages of its own session. An
+//! agent exit, for example at a sandbox stop, ends only that agent. Its
+//! session stays open for the client. The next request in the session
+//! starts a new agent and opens the session there again. The proxy gives
+//! the agents the session dirs as guest paths. Each new or loaded session
+//! shows all notices of its sandbox as warnings, for example a project
+//! config that changed after the last `airlock start`.
 //!
 //! By default, the proxy removes the client features that let the agent
 //! act on the host (host commands, host file access, login terminal, URL

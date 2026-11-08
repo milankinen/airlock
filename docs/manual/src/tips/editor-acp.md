@@ -59,20 +59,20 @@ picks up config changes.
 
 An editor can use one `airlock acp` process for many projects.
 
-* The first session in a sandbox starts one agent process there. All
-  sessions in that sandbox share the process.
+* Each session starts its own agent process in the sandbox of its
+  directory. Two sessions in one sandbox use two agent processes.
 * Each session is separate. A session gets only its own messages. The
   agent request IDs are unique for the editor.
-* When the last session in a sandbox ends, the agent stops.
-* The agent process keeps its sandbox running. When the agent stops, the
-  sandbox stops if no other airlock command uses it.
+* When a session ends, its agent stops.
+* An agent process keeps its sandbox running. When the last agent in a
+  sandbox stops, the sandbox stops if no other airlock command uses it.
 * A `session/close` response ends the session. A load or resume of an
   open session stops the old session first.
-* When an agent exits, its sessions end. Open requests get an error. A
-  session gets a notice, or an agent message if the editor shows no
+* When an agent exits, the open requests of its session get an error.
+  The session gets a notice, or an agent message if the editor shows no
   notices.
-* A new session, or a session load, in that project starts the agent
-  again.
+* The next request in that session starts a new agent and opens the
+  session again.
 * The proxy runs until the editor closes it.
 * A request that needs a session but has none gets "not supported".
 * A signal stops all agents and the proxy waits for them. A second signal
@@ -82,10 +82,9 @@ An editor can use one `airlock acp` process for many projects.
 ## Session list and delete
 
 * A `session/list` with a directory runs in the sandbox of that
-  directory. If no agent runs there, airlock starts one for the list
-  and stops it after the list. If the sandbox does not run, airlock
-  starts it for the list too. The session paths in the rows are host
-  paths.
+  directory. airlock starts a short agent process for the list and stops
+  it after the list. If the sandbox does not run, airlock starts it for
+  the list too. The session paths in the rows are host paths.
 * A `session/list` without a directory gives an empty list.
 * A request for a session that a list named, for example `session/delete`,
   runs the same way in the directory of that list.

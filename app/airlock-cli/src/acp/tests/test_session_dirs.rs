@@ -12,8 +12,8 @@ use crate::test_cfg::block_on_local;
 ///      each launched an agent in its sandbox
 ///   2. Send session requests in a dir without a sandbox and in a relative
 ///      dir, and check the errors
-///   3. Load a session in a sub dir of sandbox `a` and check that the
-///      running agent of `a` got the guest dir
+///   3. Load a session in a sub dir of sandbox `a` and check that its new
+///      agent in `a` got the guest dir
 #[test]
 fn session_requests_use_agents_in_sandbox_of_session_dir() {
     block_on_local(async {
@@ -39,6 +39,6 @@ fn session_requests_use_agents_in_sandbox_of_session_dir() {
             .find(|m| m["id"] == 5)
             .expect("load request");
         assert_eq!(load["params"]["cwd"], "/work/sub");
-        assert_eq!(*launched.borrow(), ["a", "b"]);
+        assert_eq!(*launched.borrow(), ["a", "b", "a"]);
     });
 }
