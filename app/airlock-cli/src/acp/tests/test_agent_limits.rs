@@ -37,7 +37,7 @@ fn agent_gets_limited_number_of_new_sessions() {
             .filter_map(|m| m.pointer("/params/sessionId").and_then(Value::as_str))
             .collect();
         assert_eq!(sessions.len(), 64, "{sessions:?}");
-        assert!(sessions.iter().all(|s| s.starts_with("a:child-")));
+        assert!(sessions.iter().all(|s| s.starts_with("child-")));
     });
 }
 

@@ -26,11 +26,6 @@
 //! error, and the next request tries again. A close of such a session needs
 //! no agent.
 //!
-//! The client sees each ACP session id with the sandbox as prefix, as
-//! `<sandbox>:<id>`. Thus the agents of two projects cannot use the
-//! sessions of each other. A client message with a session id of another
-//! sandbox, or without the prefix, gets an error.
-//!
 //! A load or a resume opens only the session that the client asked for.
 //! The agent cannot select a different session in its answer. An OK close
 //! of that session ends the session.
@@ -550,8 +545,8 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
     ) -> Option<AgentEnd> {
         let first = msg.get("id").map(key).as_ref() == Some(&self.first_key);
         let sent = self.prepare(agent, registering, msg).await;
-        // The load passed the session id checks. The session is now this
-        // session, also if another handle had it.
+        // The proxy accepted the load. The session is now this session,
+        // also if another handle had it.
         if first
             && sent
             && self.first == First::Reload
@@ -578,19 +573,6 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
     ) -> bool {
         // A close of the session of the session request ends the session.
         let closes = session_id(&msg) == self.claimed.as_deref();
-        if let Err(sid) = rpc::strip_session_prefix(&mut msg, agent.sandbox()) {
-            let error = (
-                rpc::INVALID_PARAMS,
-                messages::acp::other_project_session(sid),
-            );
-            tracing::debug!("refuse client message: {:?}", error.1);
-            if let Some(Kind::Request { id: req_id, .. }) = rpc::kind(&msg) {
-                let req_id = req_id.clone();
-                self.reply(&req_id, error).await;
-                return false;
-            }
-            return true;
-        }
         let Some(Kind::Request { id: req_id, method }) = rpc::kind(&msg) else {
             if let Some(Kind::CancelRequest {
                 req_id: Some(req_id),
@@ -746,7 +728,7 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
             tracing::debug!("drop agent line that is not one JSON object");
             return None;
         };
-        if !rpc::add_session_prefix(&mut msg, agent.sandbox()) {
+        if !rpc::session_ids_are_strings(&msg) {
             tracing::debug!("drop agent message with a session id that is not a string");
             return None;
         }

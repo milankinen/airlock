@@ -341,7 +341,7 @@ fn refused_load_claims_no_session() {
         client
             .initialize(json!({ "session": { "notices": {} } }))
             .await;
-        let params = json!({ "sessionId": "a:x", "cwd": "/projects/a", "mcpServers": [] });
+        let params = json!({ "sessionId": "x", "cwd": "/projects/a", "mcpServers": [] });
         let (response, mut others) = client.request(2, "session/load", params).await;
         assert_eq!(response["error"]["code"], -32002, "{response}");
 
@@ -352,7 +352,7 @@ fn refused_load_claims_no_session() {
         })
         .await
         .expect("agent exit in time");
-        let (response, more) = client.prompt(3, "a:x").await;
+        let (response, more) = client.prompt(3, "x").await;
         assert_eq!(response["error"]["code"], -32602, "{response}");
         others.extend(more);
         assert!(

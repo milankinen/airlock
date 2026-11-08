@@ -47,7 +47,7 @@ fn refused_session_request_stops_agent() {
             let exited = launcher.exited.clone();
             let mut client = TestClient::start(launcher, test_config(true));
             client.initialize(json!({})).await;
-            let params = json!({ "sessionId": "a:x", "cwd": "/projects/a", "mcpServers": [] });
+            let params = json!({ "sessionId": "x", "cwd": "/projects/a", "mcpServers": [] });
             let (response, _) = client.request(1, method, params).await;
             assert!(response.get("error").is_some(), "{method}: {response}");
             wait_exited(&exited, 1).await;
@@ -61,7 +61,7 @@ fn refused_session_request_stops_agent() {
 ///   1. Use agents that give each new session the id `s1`
 ///   2. Start two sessions in sandbox `a`
 ///   3. Check that the second one gets an error and its agent exits
-///   4. Check that a prompt to `a:s1` still gets its answer
+///   4. Check that a prompt to `s1` still gets its answer
 #[test]
 fn session_id_conflict_stops_new_agent() {
     block_on_local(async {
@@ -69,12 +69,12 @@ fn session_id_conflict_stops_new_agent() {
         let exited = launcher.exited.clone();
         let mut client = TestClient::start(launcher, test_config(true));
         client.initialize(json!({})).await;
-        assert_eq!(client.new_session(1, "/projects/a").await, "a:s1");
+        assert_eq!(client.new_session(1, "/projects/a").await, "s1");
         let (_, message) = client.session_error(2, "/projects/a/x").await;
-        assert!(message.contains("a:s1"), "{message}");
+        assert!(message.contains("s1"), "{message}");
         wait_exited(&exited, 1).await;
 
-        let (response, _) = client.prompt(3, "a:s1").await;
+        let (response, _) = client.prompt(3, "s1").await;
         assert_eq!(response["result"], json!({}), "{response}");
     });
 }

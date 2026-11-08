@@ -75,74 +75,15 @@ pub fn session_id(msg: &Value) -> Option<&str> {
     msg.pointer("/params/sessionId").and_then(Value::as_str)
 }
 
-/// Add the sandbox prefix `<sandbox>:` to the ACP session ids in the
-/// params and the result of the agent message `msg`, at any depth (see
-/// [`map_session_ids`]). The client sees only these ids.
+/// Check that the session ids in `params.sessionId` and
+/// `result.sessionId` of the agent message `msg` are strings.
 /// Returns:
-///   `false` if `params.sessionId` or `result.sessionId` is not a string.
-///   The message is then not valid for the client.
-// The agents of two projects can know the same session ids, for example
-// from a shared agent config. The prefix keeps the projects apart.
-pub fn add_session_prefix(msg: &mut Value, sandbox: &str) -> bool {
-    for part in ["params", "result"] {
-        let Some(value) = msg.get_mut(part) else {
-            continue;
-        };
-        if value.get("sessionId").is_some_and(|sid| !sid.is_string()) {
-            return false;
-        }
-        map_session_ids(value, &|sid| Some(format!("{sandbox}:{sid}")));
-    }
-    true
-}
-
-/// Remove the sandbox prefix `<sandbox>:` from the ACP session ids in the
-/// params of the client message `msg`. Nested ids without this prefix
-/// stay as they are.
-/// Returns:
-///   `params.sessionId` as an error if it has no prefix of `sandbox` or
-///   is not a string. The message is then not valid for the agent.
-pub fn strip_session_prefix(msg: &mut Value, sandbox: &str) -> Result<(), String> {
-    let strip = |sid: &str| Some(sid.strip_prefix(sandbox)?.strip_prefix(':')?.to_string());
-    let Some(params) = msg.get_mut("params") else {
-        return Ok(());
-    };
-    if let Some(sid) = params.get("sessionId")
-        && sid.as_str().and_then(strip).is_none()
-    {
-        return Err(sid.as_str().map_or_else(|| sid.to_string(), str::to_string));
-    }
-    map_session_ids(params, &strip);
-    Ok(())
-}
-
-/// Change each string session id in `value`, at any depth, with `change`.
-/// A session id is the value of a key `sessionId`, or of a key that ends
-/// in `SessionId`, for example `parentSessionId`. Other values, and the
-/// ids that `change` does not change, stay as they are.
-// Tool input and output can have such keys with values of any type.
-fn map_session_ids(value: &mut Value, change: &impl Fn(&str) -> Option<String>) {
-    match value {
-        Value::Object(map) => {
-            for (name, item) in map.iter_mut() {
-                let is_id = name == "sessionId" || name.ends_with("SessionId");
-                match item {
-                    Value::String(sid) if is_id => {
-                        if let Some(changed) = change(sid) {
-                            *sid = changed;
-                        }
-                    }
-                    _ => map_session_ids(item, change),
-                }
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                map_session_ids(item, change);
-            }
-        }
-        _ => {}
-    }
+///   `false` if one of them is not a string. The message is then not
+///   valid for the client.
+pub fn session_ids_are_strings(msg: &Value) -> bool {
+    ["/params/sessionId", "/result/sessionId"]
+        .iter()
+        .all(|path| msg.pointer(path).is_none_or(Value::is_string))
 }
 
 /// Encode a JSON-RPC message as one line with its newline.

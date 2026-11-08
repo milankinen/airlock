@@ -58,11 +58,6 @@ pub mod acp {
     /// example for a session dir that is no longer in the sandbox.
     pub const REOPEN_REFUSED: &str = "the reopen request was refused";
 
-    /// Error for a client message with a session id of another project.
-    pub fn other_project_session(id: impl Display) -> String {
-        format!("the session '{id}' is not a session of this project")
-    }
-
     /// Error for an agent request in a session of another agent.
     pub const OTHER_SESSION_REQUEST: &str = "the request is for a session of another agent";
 

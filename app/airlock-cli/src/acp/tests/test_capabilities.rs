@@ -26,7 +26,7 @@ fn requests_for_missing_agent_features_are_refused() {
         let sid = client.new_session(2, "/projects/a").await;
 
         // A load of the open session would stop its agent.
-        let params = json!({ "sessionId": "a:other", "cwd": "/projects/a", "mcpServers": [] });
+        let params = json!({ "sessionId": "other", "cwd": "/projects/a", "mcpServers": [] });
         let (response, mut others) = client.request(3, "session/load", params).await;
         assert_eq!(response["error"]["code"], -32601);
         let image = json!({ "type": "image", "data": "", "mimeType": "image/png" });

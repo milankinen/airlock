@@ -63,10 +63,6 @@ An editor can use one `airlock acp` process for many projects.
   directory.
 * Each session is separate. A session gets only its own messages. The
   agent request IDs are unique for the editor.
-* The editor sees each session ID as `<sandbox id>:<id>`. The sandbox ID
-  keeps the sessions of two projects apart. The editor must list the
-  sessions again to load a session that it kept from an older airlock
-  version.
 * When a session ends, its agent stops.
 * An agent process keeps its sandbox running. When the last agent in a
   sandbox stops, the sandbox stops if no other airlock command uses it.
@@ -84,6 +80,12 @@ An editor can use one `airlock acp` process for many projects.
   kills them. The exit code is the first exit code of an agent that is
   not 0. If no agent with an open session runs when the signal comes,
   the exit code is 128 + the signal number.
+
+> [!WARNING]
+> The sandboxes of one `airlock acp` process share session IDs. Normal
+> agents use unique IDs, but an untrusted agent can use a session ID of
+> another project. For such an agent, use one `airlock acp` process for
+> each sandbox.
 
 ## Session list and delete
 
