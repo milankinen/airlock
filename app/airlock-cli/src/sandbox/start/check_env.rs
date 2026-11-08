@@ -35,7 +35,7 @@ mod tests {
     use super::*;
     use crate::cli::prompt::{PromptAborted, PromptError};
     use crate::test_cfg::vault::FixedPassphrase;
-    use crate::test_cfg::{resolve_project_toml, temp_dir};
+    use crate::test_cfg::{host_env_vault, resolve_project_toml, temp_dir};
     use crate::util::VerifiedPath;
     use crate::vault::{EncryptedFileStorage, PassphraseSource, VaultStorageType};
 
@@ -47,7 +47,8 @@ mod tests {
     ///   3. Check that the error names the missing variable
     #[test]
     fn early_env_check_fails_only_on_missing_env_variables() {
-        let vault = Vault::for_storage_type(VaultStorageType::Disabled);
+        // An empty host env, so that host variables do not change the result.
+        let vault = host_env_vault(&[]);
         let toml = "[packs]\nclaude = { version = 1 }\ncodex = { version = 1 }\n";
         let values = resolve_project_toml(toml).unwrap().values;
         check_env_early(&values, &vault).unwrap();
