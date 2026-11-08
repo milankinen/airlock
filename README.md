@@ -9,10 +9,9 @@
 
 ---
 
-Let AI agents (or any untrusted binary) roam freely inside a lightweight
-sandbox VM that boots in seconds, has scriptable network control, and can run
-any Linux-based OCI image. A single self-contained, daemonless binary — no
-Docker required. Works on both macOS and Linux.
+Let AI agents roam freely inside a lightweight sandbox VM that boots in seconds, has
+scriptable network control, and can run any Linux-based OCI image. A single self-contained,
+daemonless binary — no Docker required. Works on both macOS and Linux.
 
 ![Demo](docs/manual/src/demo.svg)
 
