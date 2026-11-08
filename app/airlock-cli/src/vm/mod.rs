@@ -80,31 +80,42 @@ impl VmInstance {
     }
 
     /// Open a vsock connection to the given guest port. Tries again every
-    /// 200 ms for up to approximately 12 s.
+    /// 200 ms for up to 30 s in total.
     /// Returns:
-    ///   The connected socket, or error if all attempts fail.
+    ///   The connected socket, or error if no attempt works in time.
     pub async fn vsock_connect(&self, port: u32) -> anyhow::Result<OwnedFd> {
         // Retries are necessary because the guest can still be in boot
         // (first call), or can have only just started to listen on a new
         // port after the initial handshake (later calls).
-        const MAX_ATTEMPTS: u32 = 60;
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
         const DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+        // One deadline for all attempts. A backend can wait some seconds in
+        // one attempt, so a count of attempts does not limit the time.
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        let mut attempts = 0u32;
         let mut last_err = None;
-        for _ in 0..MAX_ATTEMPTS {
-            match self.vm_handle.vsock_connect(port).await {
-                Ok(fd) => return Ok(fd),
+        loop {
+            attempts += 1;
+            match tokio::time::timeout_at(deadline, self.vm_handle.vsock_connect(port)).await {
+                Ok(Ok(fd)) => return Ok(fd),
                 // A VM that stopped never answers.
-                Err(e) if e.is::<backend::VmStopped>() => return Err(e),
-                Err(e) => {
-                    last_err = Some(e);
-                    tokio::time::sleep(DELAY).await;
-                }
+                Ok(Err(e)) if e.is::<backend::VmStopped>() => return Err(e),
+                Ok(Err(e)) => last_err = Some(e),
+                Err(_) => {}
             }
+            if tokio::time::Instant::now() + DELAY >= deadline {
+                break;
+            }
+            tokio::time::sleep(DELAY).await;
         }
-        Err(anyhow::anyhow!(messages::vm::vsock_connect_retries_failed(
+        Err(anyhow::anyhow!(messages::vm::vsock_connect_timeout(
             port,
-            MAX_ATTEMPTS,
-            last_err.expect("at least one attempt")
+            attempts,
+            TIMEOUT.as_secs(),
+            last_err.map_or_else(
+                || messages::vm::VSOCK_NO_ANSWER.to_string(),
+                |e| format!("{e:#}")
+            )
         )))
     }
 }

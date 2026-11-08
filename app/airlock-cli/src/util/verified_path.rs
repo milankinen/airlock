@@ -553,12 +553,6 @@ impl VerifiedPath {
         fs::copy(self.to_path()?, to.to_path()?)
     }
 
-    /// Connect to the Unix socket.
-    #[cfg(target_os = "linux")]
-    pub(crate) fn connect_unix(&self) -> io::Result<std::os::unix::net::UnixStream> {
-        std::os::unix::net::UnixStream::connect(self.to_path()?)
-    }
-
     /// Bind an async Unix socket listener.
     pub(crate) fn bind_unix_async(&self) -> io::Result<tokio::net::UnixListener> {
         tokio::net::UnixListener::bind(self.to_path()?)

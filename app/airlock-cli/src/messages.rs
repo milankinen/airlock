@@ -4328,14 +4328,18 @@ pub mod vm {
         format!("cannot open /dev/kvm: {err}")
     }
 
-    /// Error when the VM does not accept a vsock connection after all retries.
-    pub fn vsock_connect_retries_failed(
+    /// Error when the VM does not accept a vsock connection in time.
+    pub fn vsock_connect_timeout(
         port: impl Display,
         attempts: impl Display,
+        secs: impl Display,
         err: impl Display,
     ) -> String {
-        format!("vsock connect to port {port} failed after {attempts} attempts: {err}")
+        format!("vsock connect to port {port} failed after {attempts} attempts in {secs}s: {err}")
     }
+
+    /// Cause of a failed vsock connection when the guest never answered.
+    pub const VSOCK_NO_ANSWER: &str = "no answer from the guest";
 
     /// Name of the home directory in the mount exposure check.
     pub const HOME_DIRECTORY: &str = "home directory";
@@ -4516,6 +4520,38 @@ pub mod vm {
     pub fn vsock_handshake_failed(response: impl Display) -> String {
         format!("vsock CONNECT failed: {response}")
     }
+
+    /// Error when the vsock `CONNECT` handshake gets no answer in time.
+    #[cfg(target_os = "linux")]
+    pub fn vsock_handshake_timeout(port: u32) -> String {
+        format!("vsock CONNECT to port {port}: no answer in time")
+    }
+
+    /// Error when a cloud-hypervisor VM process stopped without a request.
+    #[cfg(target_os = "linux")]
+    pub fn cloud_hypervisor_stopped(log: impl Display, tail: &str) -> String {
+        if tail.is_empty() {
+            format!("the VM stopped. Log: {log}")
+        } else {
+            format!("the VM stopped. Log: {log}\nLast log lines:\n{tail}")
+        }
+    }
+
+    /// Error when the virtiofsd of a share stopped without a request.
+    #[cfg(target_os = "linux")]
+    pub fn virtiofsd_exited(tag: impl Display) -> String {
+        format!("the file sharing for {tag} stopped. Run with --log-level debug to see its log")
+    }
+
+    /// Error when virtiofsd stops before its socket is ready.
+    #[cfg(target_os = "linux")]
+    pub fn virtiofsd_stopped(tag: impl Display) -> String {
+        format!("virtiofsd stopped before its socket for {tag} was ready")
+    }
+
+    /// Last line of a VM log file that reached its size limit.
+    #[cfg(target_os = "linux")]
+    pub const LOG_LIMIT_REACHED: &str = "airlock: log limit reached, more output is dropped";
 
     /// Error when waiting for a child process fails.
     #[cfg(target_os = "linux")]

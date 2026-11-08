@@ -34,6 +34,17 @@ extracts them on first run. KVM requires read and write access to
 `/dev/kvm`. At startup, `airlock` opens the device to check this access.
 If the device does not open, `airlock` shows the cause and stops.
 
+airlock uses the [Landlock](https://docs.kernel.org/userspace-api/landlock.html)
+security module of the host kernel to limit the file access of
+`virtiofsd` and `cloud-hypervisor`. Each `virtiofsd` process can reach
+only its shared directory, its socket directory and the system
+libraries. When `airlock` runs as root, `virtiofsd` can also read
+`/proc`. `cloud-hypervisor` can reach only the files of its VM
+configuration. Thus a bug in one of these programs does not give the
+guest access to the other files of the host user. Landlock needs Linux
+6.2 or later. On an older kernel, or when Landlock is off, the programs
+run without these limits, and airlock writes a warning to its log.
+
 ## Kernel and initramfs
 
 The build compiles the kernel and initramfs from source and embeds them

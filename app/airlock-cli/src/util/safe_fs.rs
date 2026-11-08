@@ -368,10 +368,13 @@ impl PinnedDir {
 
     /// Replace the file `name` atomically with the current content of the
     /// open file `src`. The copy reads from the descriptor, not from a path.
-    /// The file gets the permission bits `mode`.
+    /// The file gets exactly the permission bits `mode`, also with a umask.
     pub fn copy_from(&self, src: &File, name: impl AsRef<OsStr>, mode: u32) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
         let mut src = src;
         self.replace_with(name.as_ref(), mode, |out| {
+            // The create mode goes through the umask. Set the bits again.
+            out.set_permissions(std::fs::Permissions::from_mode(mode))?;
             io::copy(&mut src, out).map(|_| ())
         })
     }

@@ -128,3 +128,33 @@ EOF
     assert_success
     assert_output_contains "started"
 }
+
+# Test that the project files show as owned by the container user, and
+# that the user can write them. Else git refuses the project as "dubious
+# ownership". The image runs as the non-root user `curl_user`.
+#   1. Make a project with the image and a host file
+#   2. Check that the file and the project dir show as the container user
+#      and group
+#   3. Check that the user can write in the project dir and that the host
+#      user owns the new file
+@test "project files show as owned by non-root container user" {
+    mkdir -p nonroot
+    cd nonroot
+    printf '[vm]\nimage = "curlimages/curl:latest"\n' >airlock.toml
+    echo host-data >host.txt
+    run_vm sh -c 'id -u -n; id -g -n; stat -c %U:%G "$PWD/host.txt" "$PWD"
+        echo x >"$PWD/guest.txt" && echo write-ok'
+    local owner
+    owner="$(stat -c %u guest.txt 2>/dev/null || stat -f %u guest.txt)"
+    cd ..
+    rm -rf nonroot
+    assert_success
+    local user group
+    user="$(echo "$output" | sed -n 1p)"
+    group="$(echo "$output" | sed -n 2p)"
+    [[ "$user" != root ]] || false
+    [[ "$(echo "$output" | sed -n 3p)" == "$user:$group" ]] || false
+    [[ "$(echo "$output" | sed -n 4p)" == "$user:$group" ]] || false
+    assert_output_contains "write-ok"
+    [[ "$owner" == "$(id -u)" ]] || false
+}

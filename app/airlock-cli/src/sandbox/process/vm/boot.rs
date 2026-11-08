@@ -209,7 +209,7 @@ async fn connect(
     reverse_forwards: Vec<BoundForward>,
     tasks: &mut BootTasks,
 ) -> anyhow::Result<(rpc::Supervisor, NetworkHandle, Vec<(String, String)>)> {
-    // A Ctrl+C during boot (the vsock connect can retry for ~12s) sets the
+    // A Ctrl+C during boot (the vsock connect can retry for up to 30 s) sets the
     // interrupt flag, but the boot path does not monitor it. Check it here,
     // before the supervisor setup. Then the caller stops the new VM and does
     // not boot a sandbox that the user already cancelled.

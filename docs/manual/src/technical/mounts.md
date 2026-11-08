@@ -20,6 +20,19 @@ The full set of shares present at boot:
 airlock creates `files/rw` / `files/ro` only when the project has at
 least one file mount of that kind.
 
+### File owners
+
+The host user owns all shared files on the host. The guest sees these
+files with the owners that follow:
+
+- **Image files (`layers`)**: With libkrun, the guest sees the owners
+  and the setuid and setgid bits from the image. With Cloud Hypervisor,
+  root owns all image files. With the Apple Virtualization framework,
+  the guest user that reads a file owns it. With these two backends,
+  the image files have no setuid or setgid bits.
+- **Other shares**: The container user owns the files. Thus tools such
+  as git accept the project as owned by the user.
+
 ## Project directory
 
 airlock always mounts the project directory at the same absolute path

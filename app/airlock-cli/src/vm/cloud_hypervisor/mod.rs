@@ -1,13 +1,16 @@
 //! Cloud Hypervisor VM backend.
 //!
 //! Runs the sandbox VM with Cloud Hypervisor and shares host directories
-//! with virtiofsd. Only Linux hosts can run this backend.
+//! with virtiofsd. Only Linux hosts can run this backend. Landlock limits
+//! the file access of the helper processes, if the kernel supports it.
 
 // All backends use the same layout: the implementation file has the name of
 // the backend.
 #[cfg(target_os = "linux")]
 #[allow(clippy::module_inception)]
 mod cloud_hypervisor;
+#[cfg(target_os = "linux")]
+mod landlock;
 
 use super::backend::VmmBackend;
 

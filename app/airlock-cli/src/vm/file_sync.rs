@@ -6,9 +6,9 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::fs::File;
+use std::fs::{File, Permissions};
 use std::io;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
@@ -30,12 +30,19 @@ struct SyncDest {
     basename: OsString,
     /// Original full path. Only for logs, never given to a syscall.
     display: String,
+    /// Permission bits of the source file at sandbox start. A sync of a
+    /// file that the guest replaced sets these bits. A guest chmod of a
+    /// linked file changes the host file at once, and the sync does not
+    /// see or undo it.
+    mode: u32,
 }
 
 impl SyncDest {
-    /// Pin the parent directory of `source` and keep its file name.
+    /// Pin the parent directory of `source` and keep its file name and
+    /// permission bits.
     fn open(source: &VerifiedPath) -> io::Result<Self> {
         let path = source.to_path()?;
+        let mode = source.metadata()?.mode() & 0o777;
         let parent = source.parent().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -55,6 +62,7 @@ impl SyncDest {
             parent: PinnedDir::pin(parent.to_path()?)?,
             basename,
             display: path.display().to_string(),
+            mode,
         })
     }
 }
@@ -255,9 +263,10 @@ fn sync_file(overlay_path: &VerifiedPath, dest: &SyncDest) {
     //     (a symlink already failed the `O_NOFOLLOW` open with `ELOOP`).
     //  2. Same inode at the destination (no-follow): the hardlink is
     //     intact, nothing to do.
-    //  3. Make the hardlink again atomically (`PinnedDir::link_from`,
+    //  3. Set the permission bits of the source on the overlay file.
+    //  4. Make the hardlink again atomically (`PinnedDir::link_from`,
     //     Linux), so later direct writes go back without a new sync event.
-    //  4. Use an FD-based copy (`PinnedDir::copy_from`) if a link is not
+    //  5. Use an FD-based copy (`PinnedDir::copy_from`) if a link is not
     //     possible (cross-device, not Linux).
     let overlay_file = match open_nofollow(overlay_path) {
         Ok(f) => f,
@@ -286,12 +295,22 @@ fn sync_file(overlay_path: &VerifiedPath, dest: &SyncDest) {
         return;
     }
 
+    // The link makes the guest file the host file. Set the source bits
+    // first, so the new host file starts with them. The guest can still
+    // change the bits after this, as for every linked file.
+    if let Err(e) = overlay_file.set_permissions(Permissions::from_mode(dest.mode)) {
+        tracing::warn!("file sync chmod {overlay_path}: {e}");
+        return;
+    }
     if dest.parent.link_from(&overlay_file, &dest.basename).is_ok() {
         tracing::debug!("file sync (hard-link): {} → {}", overlay_path, dest.display);
         return;
     }
 
-    match dest.parent.copy_from(&overlay_file, &dest.basename, 0o600) {
+    match dest
+        .parent
+        .copy_from(&overlay_file, &dest.basename, dest.mode)
+    {
         Ok(()) => tracing::debug!("file sync (copy): {} → {}", overlay_path, dest.display),
         Err(e) => tracing::warn!("file sync {}: {e}", dest.display),
     }
@@ -357,5 +376,33 @@ mod tests {
             fs::read_to_string(safe_real.join(".bashrc")).unwrap(),
             "PAYLOAD\n"
         );
+    }
+
+    /// Test that the sync of a file that the guest replaced keeps the
+    /// permission bits of the host file. The guest can give its new copy
+    /// other bits, for example make it executable for all users.
+    ///   1. Pin the destination of a mounted file with mode 0640
+    ///   2. Sync a guest copy with mode 0777
+    ///   3. Check that the host file has the new content and mode 0640
+    #[test]
+    fn sync_of_guest_file_with_other_mode_keeps_source_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = temp_dir();
+        let root = tmp.path();
+        let source = root.join(".bashrc");
+        fs::write(&source, b"ORIGINAL\n").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o640)).unwrap();
+        let roots = Roots::resolve(root, root, root).unwrap();
+        let dest = SyncDest::open(&VerifiedPath::new(&source, &roots).unwrap()).unwrap();
+        let overlay_path = root.join("mount_key");
+        fs::write(&overlay_path, b"PAYLOAD\n").unwrap();
+        fs::set_permissions(&overlay_path, fs::Permissions::from_mode(0o777)).unwrap();
+
+        sync_file(&VerifiedPath::new(&overlay_path, &roots).unwrap(), &dest);
+
+        assert_eq!(fs::read_to_string(&source).unwrap(), "PAYLOAD\n");
+        let mode = fs::metadata(&source).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
     }
 }
