@@ -320,3 +320,34 @@ fn compressed_answer_with_injected_secrets_is_refused() {
         assert!(resp.contains("compressed answer"), "{resp}");
     });
 }
+
+/// Test that the proxy swaps surrogates inside HTTP Basic credentials. A
+/// client sends the user name and password only in base64 form.
+///   1. Send `Authorization: Basic` with the surrogates as user and
+///      password
+///   2. Check that the upstream got the encoded real credentials
+#[test]
+fn surrogates_in_basic_auth_credentials_are_swapped() {
+    use base64::Engine as _;
+    let encode = |user: &str, password: &str| {
+        base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
+    };
+    let real = encode(OTHER_REAL, REAL);
+    let surrogate = encode(OTHER_SURROGATE, SURROGATE);
+    run_with_config(injecting(vec![]), |proxy, _, _| async move {
+        let (app, upstream_sent) = echo_app();
+        let port = serve(app).await.port();
+        let req = format!(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Basic {surrogate}\r\n\
+             Connection: close\r\n\r\n"
+        );
+        TestConnection::local(&proxy, port)
+            .await
+            .roundtrip(&req)
+            .await;
+        assert_eq!(
+            *upstream_sent.lock().unwrap(),
+            format!("authorization: Basic {real}\n")
+        );
+    });
+}

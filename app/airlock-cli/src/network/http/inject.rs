@@ -6,34 +6,74 @@
 //! surrogate in response headers, response bodies and other text. Thus the
 //! real secret never goes into the VM.
 //!
+//! HTTP Basic credentials are base64 encoded. The proxy decodes them,
+//! replaces the surrogates in the user name and password, and encodes them
+//! again.
+//!
 //! Known limits:
 //!
 //! - The body replacement does not see into compressed bodies. Thus the
 //!   proxy asks the upstream for an uncompressed answer, and refuses a
 //!   compressed answer.
-//! - The replacement does not find an encoded form of a real value (a JSON
-//!   `\u` escape, base64, URL encoding).
+//! - The masking does not find an encoded form of a real value (a JSON `\u`
+//!   escape, base64, URL encoding).
 //! - The replacement does not check the bytes after a protocol upgrade.
 
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Either};
 use hyper::body::{Body, Frame};
-use hyper::header::{ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, HeaderMap, HeaderValue};
+use hyper::header::{
+    ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, Entry, HeaderMap, HeaderValue,
+};
 use hyper::{Response, StatusCode};
 
 use crate::network::http::{BoxError, ResponseBody, text_response};
 use crate::network::target::InjectedSecret;
 
-/// Replace surrogates with real values in all request header values.
+/// Replace surrogates with real values in all request header values, and
+/// in the decoded credentials of `Authorization: Basic` headers.
 /// Call it before Lua middleware runs.
 /// Returns:
 ///   Error if a changed value is not a valid header value.
 pub fn unmask_request(headers: &mut HeaderMap, secrets: &[InjectedSecret]) -> anyhow::Result<()> {
-    rewrite_headers(headers, &unmask_pairs(secrets))
+    let pairs = unmask_pairs(secrets);
+    rewrite_headers(headers, &pairs)?;
+    rewrite_basic_auth(headers, &pairs)?;
+    Ok(())
+}
+
+/// Replace each `from` with its `to` in the decoded credentials of each
+/// `Authorization: Basic` header. A value that is not valid base64, or
+/// that has no match, stays as it is.
+/// Returns:
+///   Error if a changed value is not a valid header value.
+fn rewrite_basic_auth(headers: &mut HeaderMap, pairs: &[(&[u8], &[u8])]) -> anyhow::Result<()> {
+    let Entry::Occupied(mut entry) = headers.entry(AUTHORIZATION) else {
+        return Ok(());
+    };
+    for value in entry.iter_mut() {
+        let Some((scheme, token)) = value.as_bytes().split_at_checked(6) else {
+            continue;
+        };
+        if !scheme.eq_ignore_ascii_case(b"basic ") {
+            continue;
+        }
+        let Ok(decoded) = BASE64.decode(token.trim_ascii()) else {
+            continue;
+        };
+        let rewritten = replace_all(&decoded, pairs);
+        if rewritten != decoded {
+            // Base64 text is always a valid header value.
+            *value = HeaderValue::from_str(&format!("Basic {}", BASE64.encode(rewritten)))?;
+        }
+    }
+    Ok(())
 }
 
 /// Replace real values with surrogates in all response header values.
@@ -273,8 +313,14 @@ impl Body for MaskBody {
 /// body of an error response can quote a request header that was already
 /// unmasked.
 pub fn mask_text(text: &str, secrets: &[InjectedSecret]) -> String {
-    let mut current = text.as_bytes().to_vec();
-    for (from, to) in mask_pairs(secrets) {
+    String::from_utf8_lossy(&replace_all(text.as_bytes(), &mask_pairs(secrets))).into_owned()
+}
+
+/// Replace each `from` with its `to` in `text`, in the given order. Empty
+/// `from` needles are skipped.
+fn replace_all(text: &[u8], pairs: &[(&[u8], &[u8])]) -> Vec<u8> {
+    let mut current = text.to_vec();
+    for (from, to) in pairs {
         if from.is_empty() {
             continue;
         }
@@ -282,7 +328,7 @@ pub fn mask_text(text: &str, secrets: &[InjectedSecret]) -> String {
             current = replaced;
         }
     }
-    String::from_utf8_lossy(&current).into_owned()
+    current
 }
 
 fn unmask_pairs(secrets: &[InjectedSecret]) -> Vec<(&[u8], &[u8])> {
