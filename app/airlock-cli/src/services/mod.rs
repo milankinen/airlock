@@ -292,19 +292,7 @@ fn unavailable_warning(ids: &[ServiceId], reason: &str) -> String {
         .iter()
         .map(|id| crate::messages::services::service_opt_out_setting(id.name()))
         .collect();
-    let (services, are, their) = if ids.len() == 1 {
-        ("service", "is", "its")
-    } else {
-        ("services", "are", "their")
-    };
-    crate::messages::services::services_unavailable(
-        services,
-        names.join(", "),
-        are,
-        reason,
-        their,
-        opt_out.join(" and "),
-    )
+    crate::messages::services::services_unavailable(names.join(", "), reason, opt_out.join(" and "))
 }
 
 /// Show `msg` as a warning (see [`cli::warn`]), only the first time.

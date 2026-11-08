@@ -92,7 +92,7 @@ boot_id_in() {
 
     run_vm true
     assert_failure 1
-    assert_output_contains "the sandbox is running"
+    assert_output_contains "sandbox is running"
     assert_output_contains "airlock stop"
     kill -0 "$exec_pid"
 }
@@ -157,7 +157,7 @@ boot_id_in() {
 #   2. Check exit code 0 and "does not run"
 #   3. In a new project directory, run stop and exec
 #   4. Check that stop tells that the sandbox does not run
-#   5. Check that exec fails and says "run 'airlock start' first"
+#   5. Check that exec fails and says "'airlock start' first"
 @test "stop with stopped sandbox and exec without start" {
     run_vm true
     assert_success
@@ -172,7 +172,7 @@ boot_id_in() {
     assert_output_contains "the sandbox does not run"
     run_airlock exec true
     assert_failure
-    assert_output_contains "run 'airlock start' first"
+    assert_output_contains "'airlock start' first"
 }
 
 # Test that a port forward does not hold the sandbox. The sandbox stops

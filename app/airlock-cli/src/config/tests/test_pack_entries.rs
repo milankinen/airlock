@@ -213,14 +213,13 @@ fn invalid_pack_entries_are_reported_together() {
         "* `packs.sample.args.model` unknown arg of version \"1\" (known: mode, network) \
          (set in: airlock.toml)",
         "* `packs.nodejs.enabled` must be true or false (set in: airlock.toml)",
-        "* `packs.nodejs.node-version` unknown key (known: version, enabled, args; args go in \
-         `args = { node-version = … }`) (set in: airlock.toml)",
+        "* `packs.nodejs.node-version`: unknown key (known: version, enabled, args). Put args in `args` (set in: airlock.toml)",
         "* `packs.git.args.node-version` unknown arg of version \"1\" (it has no args)",
-        "* `packs.mise`: version \"legacy\" is not supported (supported: \"1\") \
+        "* `packs.mise`: version \"legacy\" not supported, use \"1\" \
          (set in: airlock.toml)",
-        "* `packs.claude`: version \"legacy\" is not supported; use the list form \
-         `presets = [\"claude-code\"]` (set in: airlock.toml)",
-        "* `packs.codex`: version \"3\" is not supported (supported: \"2\", \"1\")",
+        "* `packs.claude`: version \"legacy\" not supported, use `presets = [\"claude-code\"]` \
+         (set in: airlock.toml)",
+        "* `packs.codex`: version \"3\" not supported, use \"2\", \"1\"",
         "* `packs.docker.version` must be 1 or higher (set in: airlock.toml)",
         "* `packs.copilot.version` must be a string or a whole number, not 1.5",
         "* `packs.alpine.version` must be a string or a whole number, not true",

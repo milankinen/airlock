@@ -368,7 +368,7 @@ pub(crate) fn check_stays_in(
         };
         anyhow::ensure!(
             target.starts_with(dir),
-            messages::vm::path_leaves_writable_dir(kind, resolved, dir.display(), target.display())
+            messages::vm::path_leaves_writable_dir(kind, resolved, target.display())
         );
     }
     Ok(())

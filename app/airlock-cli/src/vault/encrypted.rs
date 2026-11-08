@@ -276,7 +276,7 @@ impl PassphraseSource for InteractivePassphrase {
 ///  - `label`: Label of the input row
 fn prompt_once(label: &str) -> anyhow::Result<String> {
     if !crate::cli::is_interactive() {
-        bail!(messages::vault::no_tty_for_unlock(PASSPHRASE_ENV));
+        bail!(messages::vault::no_tty_for_passphrase(PASSPHRASE_ENV));
     }
     let form = Fields {
         title: None,
@@ -301,7 +301,7 @@ fn prompt_once(label: &str) -> anyhow::Result<String> {
 /// input.
 fn prompt_create() -> anyhow::Result<String> {
     if !crate::cli::is_interactive() {
-        bail!(messages::vault::no_tty_for_create(PASSPHRASE_ENV));
+        bail!(messages::vault::no_tty_for_passphrase(PASSPHRASE_ENV));
     }
     let form = Fields {
         title: Some(messages::vault::NEW_PASSPHRASE_TITLE),

@@ -150,7 +150,7 @@ fn granted_page_without_host_browser_program_asks_user_to_open_it() {
 
         let notices = texts(&log);
         assert_eq!(notices.len(), 1);
-        assert!(notices[0].contains("no browser program"), "{notices:?}");
+        assert!(notices[0].contains("no browser found"), "{notices:?}");
         assert!(notices[0].contains("claude.com/cai/oauth/authorize"));
     });
 }

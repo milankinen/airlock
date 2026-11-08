@@ -155,7 +155,7 @@ fn project_pack_in_local_file_resolves_and_in_user_file_is_refused() {
     dirs.user_file(".airlock/airlock.toml", toml);
     let error = format!("{:#}", dirs.load().err().unwrap());
     assert!(
-        error.contains("`[packs]` is allowed only in project config files"),
+        error.contains("`[packs]` is allowed only in project config"),
         "{error}"
     );
 

@@ -163,7 +163,7 @@ fn user_pack_entry_with_version_bad_name_or_missing_pack_is_refused() {
     );
 
     let error = resolve_error(&packs, "[packs]\n\"~../hello\" = {}\n");
-    assert!(error.contains("not a valid user pack name"), "{error}");
+    assert!(error.contains("invalid user pack name"), "{error}");
 
     let toml = "[packs]\n\"~nope\" = {}\n";
     let error = resolve_error(&packs, toml);

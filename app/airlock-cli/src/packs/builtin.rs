@@ -478,7 +478,7 @@ values = ["a", "b"]
             cases.push((
                 format!("{folder}/pack.toml").leak(),
                 Some(PACK.into()),
-                format!("packs/{folder}: the folder name must be <name>@<version>"),
+                format!("packs/{folder}: folder name must be <name>@<version>"),
             ));
         }
 

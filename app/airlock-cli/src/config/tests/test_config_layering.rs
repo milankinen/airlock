@@ -234,8 +234,7 @@ fn packs_table_in_user_file_is_error() {
     assert_eq!(
         err,
         format!(
-            "`[packs]` is allowed only in project config files (airlock.toml or the local \
-             project config); remove it from {}",
+            "`[packs]` is allowed only in project config. Remove it from {}",
             dirs.home().join(".airlock/config.toml").display()
         )
     );

@@ -128,7 +128,10 @@ fn symlink_out_of_project_dir_is_refused_at_start() {
     let Err(e) = network_in_project(&config("./link.sock"), dir.path()) else {
         panic!("the network accepts the symlink");
     };
-    assert!(format!("{e:#}").contains("sandbox can write"), "{e:#}");
+    assert!(
+        format!("{e:#}").contains("symlink that the sandbox can change"),
+        "{e:#}"
+    );
 }
 
 /// Test that a symlink that appears at the socket path after the start is

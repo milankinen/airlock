@@ -141,9 +141,7 @@ pub mod acp {
     /// Session message when the agent of the session exits.
     pub fn agent_stopped_detail(sandbox: impl Display, code: i32) -> String {
         format!(
-            "The agent in sandbox '{sandbox}' exited (code {code}). \
-             The next request in this session tries to open it again \
-             in a new agent."
+            "Agent in sandbox '{sandbox}' exited (code {code}). Next request starts a new agent."
         )
     }
 
@@ -180,21 +178,17 @@ pub mod acp {
     /// Error for an agent request that airlock refuses.
     pub fn blocked_request(method: impl Display) -> String {
         format!(
-            "'{method}' is refused because it can act on the host. \
-             Use 'airlock acp --pass-client-capabilities' to allow it"
+            "'{method}' is refused: it can act on the host. Allow with --pass-client-capabilities"
         )
     }
 
     /// Error for an agent prompt that is not a form prompt.
-    pub const REFUSED_ELICITATION: &str = "only form prompts are allowed. \
-         Use 'airlock acp --pass-client-capabilities' to allow other prompts";
+    pub const REFUSED_ELICITATION: &str =
+        "only form prompts are allowed. Allow others with --pass-client-capabilities";
 
     /// Agent error message with a hint to log in inside the sandbox.
     pub fn auth_hint(message: impl Display, cmd: impl Display) -> String {
-        format!(
-            "{message}. Log in to the agent inside the sandbox, for example with \
-             'airlock exec -l {cmd}' or the login command of the agent"
-        )
+        format!("{message}. Log in inside the sandbox, e.g. with 'airlock exec -l {cmd}'")
     }
 }
 
@@ -260,27 +254,13 @@ pub mod app {
         format!("mask.{name}.paths[{idx}]: empty path")
     }
 
-    /// Error when a mask path is absolute.
-    pub fn mask_path_absolute(name: impl Display, idx: impl Display, path: impl Display) -> String {
-        format!(
-            "mask.{name}.paths[{idx}]: absolute paths are not allowed (got `{path}`); paths must be project-relative"
-        )
-    }
-
-    /// Error when a mask path starts with `~`.
-    pub fn mask_path_home_relative(
+    /// Error when a mask path is absolute, home-relative or has `..`.
+    pub fn mask_path_not_relative(
         name: impl Display,
         idx: impl Display,
         path: impl Display,
     ) -> String {
-        format!(
-            "mask.{name}.paths[{idx}]: home-relative paths are not allowed (got `{path}`); paths must be project-relative"
-        )
-    }
-
-    /// Error when a mask path has a `..` segment.
-    pub fn mask_path_dotdot(name: impl Display, idx: impl Display, path: impl Display) -> String {
-        format!("mask.{name}.paths[{idx}]: `..` is not allowed in mask paths (got `{path}`)")
+        format!("mask.{name}.paths[{idx}]: `{path}` must be project-relative")
     }
 
     /// Verbose line with the number of enabled masks.
@@ -415,10 +395,7 @@ pub mod cli {
 
     /// Error of `exec` and `acp` when no sandbox serves a directory.
     pub fn never_started(dir: impl Display) -> String {
-        format!(
-            "no sandbox for {dir} or its parent directories. \
-             run 'airlock start' first"
-        )
+        format!("no sandbox for {dir} or its parents. Run 'airlock start' first")
     }
 
     /// Error of `exec` and `acp` when the sandbox of the project `project`
@@ -733,8 +710,7 @@ pub mod cli {
     /// and tells that the service hosts are denied.
     pub fn service_unavailable(name: impl Display, reason: impl Display) -> String {
         format!(
-            "{name}: unavailable ({reason}); its hosts are denied \
-             (`[network.services] {name} = false` to sign in without airlock)"
+            "{name}: unavailable ({reason}), hosts blocked. Opt out: `[network.services] {name} = false`"
         )
     }
 
@@ -981,10 +957,7 @@ pub mod config {
 
     /// Error when a user config file has a `packs` table.
     pub fn packs_only_in_project_files(origin: impl Display) -> String {
-        format!(
-            "`[packs]` is allowed only in project config files (airlock.toml or the local \
-             project config); remove it from {origin}"
-        )
+        format!("`[packs]` is allowed only in project config. Remove it from {origin}")
     }
 
     /// Error when the setup wizard finds a project config file already.
@@ -1075,10 +1048,7 @@ pub mod config {
     /// Problem when a `[packs]` key starts with `~` but is not a valid user
     /// pack name.
     pub fn user_pack_name_invalid(name: impl Display) -> String {
-        format!(
-            "`packs.{name}`: not a valid user pack name, only lowercase letters, digits and \
-             `-` are allowed"
-        )
+        format!("`packs.{name}`: invalid user pack name, use a-z, 0-9 and -")
     }
 
     /// Problem when a config names a project pack, but there is no project.
@@ -1122,8 +1092,7 @@ pub mod config {
         origin: impl Display,
     ) -> String {
         format!(
-            "`packs.{name}.{key}` unknown key (known: {known_keys}; args go in \
-             `args = {{ {key} = … }}`) (set in: {origin})"
+            "`packs.{name}.{key}`: unknown key (known: {known_keys}). Put args in `args` (set in: {origin})"
         )
     }
 
@@ -1152,8 +1121,7 @@ pub mod config {
         files: impl Display,
     ) -> String {
         format!(
-            "`packs.{name}`: version \"{version}\" is not supported; use the list \
-             form `presets = [\"{released}\"]` (set in: {files})"
+            "`packs.{name}`: version \"{version}\" not supported, use `presets = [\"{released}\"]` (set in: {files})"
         )
     }
 
@@ -1165,8 +1133,7 @@ pub mod config {
         files: impl Display,
     ) -> String {
         format!(
-            "`packs.{name}`: version \"{version}\" is not supported (supported: {supported}) \
-             (set in: {files})"
+            "`packs.{name}`: version \"{version}\" not supported, use {supported} (set in: {files})"
         )
     }
 
@@ -1203,26 +1170,17 @@ pub mod config {
 
     /// Hint to use the `packs` table for a known pack name.
     pub fn preset_use_packs_table_hint(name: impl Display) -> String {
-        format!(
-            "; newer packs use the [packs] table of a project config file, for example \
-             `[packs] {name} = {{ version = 1 }}`"
-        )
+        format!("; for newer packs use `[packs] {name} = {{ version = 1 }}` in project config")
     }
 
     /// Error when a `presets` list has an entry that is not a string.
     pub fn presets_entry_not_string(origin: impl Display, entry: impl Display) -> String {
-        format!(
-            "{origin}: `presets` list entries must be preset names (strings), \
-             not {entry}"
-        )
+        format!("{origin}: `presets` entries must be strings, not {entry}")
     }
 
     /// Error when `presets` is a table.
     pub fn presets_is_table(origin: impl Display) -> String {
-        format!(
-            "{origin}: `presets` must be a list of preset names; use a [packs] table in a \
-             project config file for versioned, installable packs"
-        )
+        format!("{origin}: `presets` must be a list. Use a [packs] table for versioned packs")
     }
 
     /// Error when `presets` is not a list.
@@ -1502,19 +1460,13 @@ pub mod grants {
     /// Error of a rule change: the project file has a rule table that is
     /// different from the table that the user approved.
     pub fn rule_not_approved(name: impl Display, file: impl Display) -> String {
-        format!(
-            "the rule `{name}` in {file} has changes that airlock did not approve. \
-             Restart airlock to review them."
-        )
+        format!("rule `{name}` in {file} has unapproved changes. Restart airlock to review them")
     }
 
     /// Error of a rule change: the file does not have the approved rule
     /// after the write. The old text of the file is back.
     pub fn rule_write_changed(name: impl Display, file: impl Display) -> String {
-        format!(
-            "the rule `{name}` in {file} is not the approved rule after the write. \
-             The old file is restored."
-        )
+        format!("rule `{name}` in {file} changed during write. Old file restored")
     }
 
     /// Error of a rule change: the new file text does not have the rule
@@ -1546,9 +1498,7 @@ pub mod grants {
     pub const DISMISSED: &str = "the user closed the notification without an answer";
     /// Hint when the macOS notifications of Airlock go away by themselves.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub const ALERT_STYLE_HINT: &str = "Set the notifications of Airlock to \"Alerts\" in \
-         System Settings > Notifications > Airlock. Then the approval requests stay on the \
-         screen until you answer.";
+    pub const ALERT_STYLE_HINT: &str = "Tip: set Airlock notifications to \"Alerts\" in System Settings so that they stay on screen.";
     /// Error when the airlock binary has no notifier app.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub const NOTIFIER_NOT_BUNDLED: &str =
@@ -1595,8 +1545,8 @@ pub mod grants {
         "approval dialogs are off in the user settings (approvals.dialogs = \"none\")";
     /// Deny reason: the user settings allow only the monitor TUI, and it is
     /// not open.
-    pub const MONITOR_NOT_OPEN: &str = "the monitor is not open, and the user settings allow \
-         only monitor dialogs (approvals.dialogs = \"monitor\")";
+    pub const MONITOR_NOT_OPEN: &str =
+        "monitor is not open, and approvals.dialogs = \"monitor\" allows no other dialogs";
 
     /// Deny reason: the monitor TUI stopped before the answer.
     pub const MONITOR_STOPPED: &str = "the monitor TUI stopped before an answer";
@@ -1871,9 +1821,7 @@ pub mod network {
 
     /// Error when passthrough targets overlap intercepting targets. Takes the report lines.
     pub fn passthrough_intercept_conflict(conflicts: impl Display) -> String {
-        format!(
-            "network config: passthrough target(s) overlap intercepting (middleware/inject) target(s):\n  {conflicts}"
-        )
+        format!("network: passthrough targets overlap middleware/inject targets:\n  {conflicts}")
     }
 
     /// Context when the IPv4 bind of a host → guest port forward fails.
@@ -1986,19 +1934,13 @@ pub mod network_forward {
     /// Error when a forward from the host goes to a sandbox port that a
     /// config forward sends back to the host.
     pub fn loop_to_host(guest_port: impl Display) -> String {
-        format!(
-            "sandbox port {guest_port} forwards to the host in the config (`host` list); \
-             a forward to it makes a loop"
-        )
+        format!("sandbox port {guest_port} is a `host` forward. A connection to it makes a loop")
     }
 
     /// Error when a forward to the host listens on a sandbox port that a
     /// config forward from the host uses.
     pub fn loop_from_host(guest_port: impl Display) -> String {
-        format!(
-            "sandbox port {guest_port} gets a forward from the host in the config (`guest` list); \
-             a forward from it makes a loop"
-        )
+        format!("sandbox port {guest_port} gets a `guest` forward. A listener on it makes a loop")
     }
 
     /// Error when the network policy denies a connection of a forward to
@@ -2017,9 +1959,7 @@ pub mod oci {
 
     /// Error when the old image of an imported sandbox is not known, and
     /// `--yes` would re-create the sandbox and delete its disk.
-    pub const IMPORTED_IMAGE_UNKNOWN: &str = "The old image of the imported sandbox is not known, \
-         so --yes cannot re-create it. Run in a terminal without --yes to keep the disk or make \
-         a new sandbox.";
+    pub const IMPORTED_IMAGE_UNKNOWN: &str = "Image of the imported sandbox is unknown, --yes cannot re-create it. Run in a terminal without --yes";
 
     /// Error when the user aborts a question.
     pub const ABORTED_BY_USER: &str = "aborted by user";
@@ -2046,8 +1986,7 @@ pub mod oci {
         err: impl Display,
     ) -> String {
         format!(
-            "failed to hardlink image ref {image_path} → {sandbox_image}: {err} \
-             (both paths must live on the same filesystem)"
+            "cannot hardlink {image_path} to {sandbox_image}: {err}. Both must be on one filesystem"
         )
     }
 
@@ -2103,9 +2042,7 @@ pub mod oci {
         digest: impl Display,
         pinned: impl Display,
     ) -> String {
-        format!(
-            "registry resolved {image_ref} to digest {digest}, which does not match the pinned {pinned}"
-        )
+        format!("{image_ref}: registry digest {digest} does not match pinned {pinned}")
     }
 
     /// Status when the registry resolved the image. `reference` is the short reference.
@@ -2143,10 +2080,7 @@ pub mod oci {
 
     /// Error when the export of a local engine lacks a layer of the manifest.
     pub fn save_stream_missing_layer(engine: impl Display, digest: impl Display) -> String {
-        format!(
-            "{engine} save stream did not include blob for layer {digest} \
-             (manifest referenced a layer that was not in the export)"
-        )
+        format!("{engine} save output has no layer {digest}")
     }
 
     /// Status after the export from a local engine.
@@ -2599,10 +2533,7 @@ pub mod packs {
 
     /// Error shown when a pack folder name does not match `<name>@<version>`.
     pub fn pack_folder_name_invalid(file_name: impl Display) -> String {
-        format!(
-            "packs/{file_name}: the folder name must be <name>@<version> \
-             (name: [a-z][a-z0-9-]*, version: a whole number from 1)"
-        )
+        format!("packs/{file_name}: folder name must be <name>@<version>, e.g. my-pack@1")
     }
 
     /// Error shown when two versions of a pack have different labels.
@@ -2709,9 +2640,7 @@ pub mod packs {
 
     /// Error shown when the image does not run as root.
     pub fn image_uid_not_root(name: impl Display, uid: impl Display) -> String {
-        format!(
-            "image {name} runs as uid {uid}; packs install only into an image that runs as root"
-        )
+        format!("image {name} runs as uid {uid}: packs need an image that runs as root")
     }
 
     /// Error shown when the image has no `/etc/os-release`.
@@ -2721,7 +2650,7 @@ pub mod packs {
 
     /// Error shown when the image distribution does not support packs.
     pub fn image_os_unsupported(name: impl Display, id: impl Display) -> String {
-        format!("image {name} is {id}; packs install only into Alpine- and Debian-based images")
+        format!("image {name} is {id}: packs need an Alpine or Debian image")
     }
 
     /// Reason shown when the install script prints nothing for too long.
@@ -2780,8 +2709,8 @@ pub mod packs {
     pub const EXIT_HINT_PACKAGE_FAILED: &str = "a package could not be installed; see the log";
 
     /// Hint shown when the install script exits with code 12.
-    pub const EXIT_HINT_DOWNLOAD_FAILED: &str = "a download failed; check the network (GitHub rate limits show as HTTP 403) \
-         and run `airlock start` again";
+    pub const EXIT_HINT_DOWNLOAD_FAILED: &str =
+        "download failed. Check the network (HTTP 403 can be a GitHub rate limit)";
 
     /// Hint shown when the install script exits with code 13.
     pub const EXIT_HINT_ARG_INVALID: &str =
@@ -2840,8 +2769,8 @@ pub mod project {
     }
 
     /// Reason when an injected env value has bytes that an HTTP header does not allow.
-    pub const ENV_INJECT_BAD_BYTES: &str = "injected value contains bytes that are not allowed in an HTTP header \
-         (a newline or control character, perhaps a trailing newline)";
+    pub const ENV_INJECT_BAD_BYTES: &str =
+        "injected value has bytes not allowed in an HTTP header (newline or control char)";
 }
 
 pub mod rpc {
@@ -2919,10 +2848,7 @@ pub mod rpc {
 
     /// Notice when the host has no browser program.
     pub fn browser_no_program(page: impl Display) -> String {
-        format!(
-            "no browser program found on this computer; open the sign-in link \
-             for {page} yourself"
-        )
+        format!("no browser found. Open the sign-in link for {page} manually")
     }
 
     /// Notice when the host browser program fails to start.
@@ -3105,8 +3031,7 @@ pub mod sandbox {
     /// Error when `.airlock` holds files that airlock does not know.
     pub fn extra_files(names: &[String]) -> String {
         format!(
-            ".airlock directory contains extra files ({}), can't migrate - move or remove these \
-             files, then run airlock start again",
+            ".airlock has extra files ({}), cannot migrate. Remove them and run `airlock start` again",
             names.join(", ")
         )
     }
@@ -3130,10 +3055,7 @@ pub mod sandbox {
     /// Error when an import failed and its disk could not go back to the old
     /// sandbox. The new sandbox stays, because it has the only disk copy.
     pub fn disk_kept(disk: impl Display, back: impl Display, cause: impl Display) -> String {
-        format!(
-            "the import failed ({cause}), and the disk could not move back ({back}); the disk \
-             stays in {disk}"
-        )
+        format!("import failed ({cause}), disk move back failed ({back}). Disk is in {disk}")
     }
 
     /// Warning when the old `.airlock` directory stays after an import.
@@ -3232,16 +3154,12 @@ pub mod services {
 
     /// Warning when enabled services cannot run, with the reason and the opt-out.
     pub fn services_unavailable(
-        services: impl Display,
         names: impl Display,
-        are: impl Display,
         reason: impl Display,
-        their: impl Display,
         opt_out: impl Display,
     ) -> String {
         format!(
-            "network {services} {names} {are} unavailable ({reason}) and {their} hosts are \
-             blocked. To sign in without airlock, set {opt_out}"
+            "{names} unavailable ({reason}), hosts blocked. To sign in without airlock, set {opt_out}"
         )
     }
 
@@ -3319,10 +3237,7 @@ pub mod services {
 
     /// Message when the sign-in callback port is in use on the host.
     pub fn sign_in_port_in_use(port: impl Display) -> String {
-        format!(
-            "port {port} is in use on this computer, so the browser cannot \
-             reach the sign-in in the sandbox"
-        )
+        format!("port {port} is in use. Browser cannot reach the sign-in in the sandbox")
     }
 
     /// Message when the host cannot listen on the sign-in callback port.
@@ -3505,15 +3420,12 @@ pub mod start {
         settings_path: impl Display,
     ) -> String {
         format!(
-            "The data directory path {path} is too long ({len} bytes, the limit is \
-             {max}). Set a shorter data directory in {settings_path}, for example: \
-             data_dir = \"~/airlock-data\""
+            "data dir path too long ({len}/{max} bytes): {path}. Set a shorter data_dir in {settings_path}"
         )
     }
 
     /// Shows when the config includes deprecated user-level config files.
-    pub const USER_CONFIG_FILES_DEPRECATED: &str = "User-level config files are deprecated, \
-         move them to a user pack. See v2026.10.5 release notes for more details";
+    pub const USER_CONFIG_FILES_DEPRECATED: &str = "User-level config files are deprecated. Move them to a user pack (see v2026.10.5 release notes)";
 
     /// Shows when a configuration error ends the run.
     pub fn config_error(err: impl Display) -> String {
@@ -3522,8 +3434,8 @@ pub mod start {
 
     /// Shows when `start` finds that the sandbox runs. A different
     /// `start`, `exec` or `acp` uses it.
-    pub const START_ALREADY_RUNNING: &str = "the sandbox is running. attach to it with \
-         `airlock exec`, or stop it with `airlock stop` and run `airlock start` again";
+    pub const START_ALREADY_RUNNING: &str =
+        "sandbox is running. Use `airlock exec`, or `airlock stop` and start again";
 
     /// Shows when the sandbox is removed between lookup and lock.
     pub const SANDBOX_REMOVED_DURING_START: &str =
@@ -3565,12 +3477,11 @@ pub mod start {
     }
 
     /// Shows when the install VM did not confirm its disk write.
-    pub const INSTALL_DISK_UNCONFIRMED: &str = "The install VM did not confirm that its disk was written; the packs \
-         install again on the next start";
+    pub const INSTALL_DISK_UNCONFIRMED: &str =
+        "Install VM did not confirm the disk write. Packs install again on next start";
 
     /// Shows when the config changed and no question is possible.
-    pub const CONFIG_CHANGED_NO_PROMPT: &str = "The sandbox configuration has changed since the last run. Run in a terminal \
-         without --yes to see the changes, or pass --allow-configuration-changes.";
+    pub const CONFIG_CHANGED_NO_PROMPT: &str = "Sandbox config changed. Run in a terminal to review, or pass --allow-configuration-changes";
 
     /// Note of the config question when the last config does not resolve.
     pub fn last_config_invalid(err: impl Display) -> String {
@@ -3626,12 +3537,11 @@ pub mod start {
 
     /// Note of the added-tools question when the old image is gone.
     pub const OLD_IMAGE_GONE_NOTE: &str =
-        "The old image is not available any more, so the tools install again for the new image.";
+        "Old image is gone. Tools install again for the new image.";
 
     /// Note of the added-tools question about internet access.
-    pub const ADDED_TOOLS_NOTE_INTERNET: &str = "The install reaches the public internet without limits (local and private addresses \
-         are blocked) inside the existing sandbox; code already in the sandbox can run during \
-         it.";
+    pub const ADDED_TOOLS_NOTE_INTERNET: &str =
+        "The install has full internet access. Code in the sandbox can run during it.";
 
     /// Note of the added-tools question about a clean install.
     pub const ADDED_TOOLS_NOTE_RECREATE: &str = "Re-create the sandbox for a clean install.";
@@ -3703,29 +3613,24 @@ pub mod start {
     /// Shows when the install records come from a newer airlock.
     pub fn state_too_new(path: impl Display, version: impl Display) -> String {
         format!(
-            "{path} was written by a newer airlock (format {version}); update airlock, or run \
-             `airlock rm` to start over"
+            "{path} is from a newer airlock (format {version}). Update airlock, or run `airlock rm`"
         )
     }
 
     /// Shows when the install records are corrupt and the run ignores them.
     pub fn state_corrupt_ignored(path: impl Display, why: impl Display) -> String {
-        format!("{path} is not valid ({why}); treating every pack as not installed")
+        format!("{path} is not valid ({why}): all packs install again")
     }
 
     /// Shows when the install records are corrupt and no terminal is available.
     pub fn state_corrupt(path: impl Display, why: impl Display) -> String {
-        format!(
-            "{path} is not valid ({why}); run `airlock start` in a terminal, or `airlock rm` \
-             to start over"
-        )
+        format!("{path} is not valid ({why}). Run `airlock start` in a terminal, or `airlock rm`")
     }
 
     /// Shows when a sandbox exists but the project config is missing.
     pub fn sandbox_without_config(dir: impl Display, config_path: impl Display) -> String {
         format!(
-            "A sandbox exists in {dir}, but there is no config. Put the config in airlock.toml or \
-             {config_path} (restore it), or run `airlock rm` to start over."
+            "Sandbox in {dir} has no config. Restore airlock.toml or {config_path}, or run `airlock rm`"
         )
     }
 
@@ -3901,10 +3806,7 @@ pub mod templates {
 
     /// Shows when the template to create exists already.
     pub fn template_exists(name: impl Display) -> String {
-        format!(
-            "Template {name} exists. Re-create it with `airlock templates create --force {name}`, \
-             or use a different name."
-        )
+        format!("Template {name} exists. Use --force to re-create it")
     }
 
     /// Shows when a pack entry in the template config has no version.
@@ -3915,8 +3817,7 @@ pub mod templates {
     /// Shows when a template name is not valid.
     pub fn invalid_name(name: impl Display, max_len: impl Display) -> String {
         format!(
-            "`{name}` is not a valid template name (use 1 to {max_len} letters, digits, `-`, \
-             `_` or `.`, and start with a letter or a digit)"
+            "invalid template name `{name}`: use letters, digits, -, _, . (max {max_len}), start with letter or digit"
         )
     }
 
@@ -4154,8 +4055,7 @@ pub mod vault {
     /// The vault file has a plaintext vault, but settings select encrypted storage.
     pub fn plaintext_vault_but_encrypted_storage(path: impl Display) -> String {
         format!(
-            "{path} is a plaintext vault, but vault.storage = \"encrypted-file\" in settings. \
-             Set vault.storage = \"file\" (or delete the file to re-create encrypted)."
+            "{path} is a plaintext vault, but settings use \"encrypted-file\". Set vault.storage = \"file\" or delete the file"
         )
     }
 
@@ -4200,12 +4100,9 @@ pub mod vault {
         format!("{env} is empty")
     }
 
-    /// The unlock prompt needs a terminal and none exists.
-    pub fn no_tty_for_unlock(env: impl Display) -> String {
-        format!(
-            "no TTY available to prompt for the vault passphrase — set {env} \
-             or run from an interactive terminal"
-        )
+    /// The vault passphrase prompt needs a terminal and none exists.
+    pub fn no_tty_for_passphrase(env: impl Display) -> String {
+        format!("no TTY for the vault passphrase. Set {env} or run in a terminal")
     }
 
     /// Key help of the unlock prompt.
@@ -4216,14 +4113,6 @@ pub mod vault {
 
     /// The user aborts the vault passphrase prompt.
     pub const PASSPHRASE_PROMPT_ABORTED: &str = "vault passphrase prompt aborted";
-
-    /// The create prompt needs a terminal and none exists.
-    pub fn no_tty_for_create(env: impl Display) -> String {
-        format!(
-            "no TTY available to set a new vault passphrase — set {env} \
-             or run from an interactive terminal"
-        )
-    }
 
     /// Title of the prompt for a new vault passphrase.
     pub const NEW_PASSPHRASE_TITLE: &str = "Set a vault passphrase";
@@ -4247,31 +4136,15 @@ pub mod vault {
     /// Message for commands that must store a secret while the vault is disabled.
     pub fn vault_disabled(settings_path: impl Display) -> String {
         format!(
-            "the airlock vault is disabled. Enable it to store user \
-             secrets and registry credentials.\n\n\
-             Edit {settings_path} and set:\n\n  \
-             vault.storage = \"keyring\"         # system keychain / Secret Service (default), or\n  \
-             vault.storage = \"encrypted-file\"  # passphrase-encrypted, or\n  \
-             vault.storage = \"file\"            # plain 0600 JSON\n"
+            "vault is disabled. Set vault.storage = \"keyring\" in {settings_path} to store secrets"
         )
     }
 
     /// Warning that the plaintext vault backend stores secrets as cleartext.
-    pub const PLAINTEXT_VAULT_WARNING: &str = concat!(
-        "Your vault backend is \"file\" — secrets will be written as plaintext\n",
-        "JSON to ~/.airlock/vault.default.json (mode 0600). Anyone with read access to\n",
-        "that file can recover them. For stronger at-rest protection, set one of\n",
-        "these in ~/.airlock/settings.toml:\n",
-        "\n",
-        "# RECOMMENDED: Keychain (macOS) / Secret Service (Linux)\n",
-        "vault.storage = \"keyring\"\n",
-        "# AEAD-encrypted, passphrase on first use (AIRLOCK_VAULT_PASSPHRASE for non-interactive)\n",
-        "vault.storage = \"encrypted-file\"\n",
-    );
+    pub const PLAINTEXT_VAULT_WARNING: &str = "Vault is \"file\": secrets are stored as plaintext. For encryption, switch storage to \"keyring\" or \"encrypted-file\"";
 
     /// The plaintext vault needs a confirmation but the shell is not interactive.
-    pub const PLAINTEXT_VAULT_NEEDS_YES: &str = "vault is \"file\" (plaintext). Re-run with --yes to confirm, or switch to \
-         \"encrypted-file\" / \"keyring\" in ~/.airlock/settings.toml.";
+    pub const PLAINTEXT_VAULT_NEEDS_YES: &str = "vault is plaintext (\"file\"). Pass --yes to confirm, or change vault.storage in settings.toml";
 
     /// Question that asks if the user wants to use the plaintext vault.
     pub const PROCEED_PLAINTEXT_VAULT_QUESTION: &str = "Proceed with the plaintext vault?";
@@ -4321,8 +4194,7 @@ pub mod vault {
     /// The vault file has an encrypted vault, but settings select plain file storage.
     pub fn encrypted_vault_but_file_storage(path: impl Display) -> String {
         format!(
-            "{path} is an encrypted vault, but vault.storage = \"file\" in settings. \
-             Set vault.storage = \"encrypted-file\" (or delete the file to start fresh)."
+            "{path} is an encrypted vault, but settings use \"file\". Set vault.storage = \"encrypted-file\" or delete the file"
         )
     }
 
@@ -4461,13 +4333,10 @@ pub mod vm {
     pub fn path_leaves_writable_dir(
         kind: impl Display,
         given: impl Display,
-        dir: impl Display,
         resolved: impl Display,
     ) -> String {
         format!(
-            "the {kind} {given} goes through {dir}, which the sandbox can write, to \
-             {resolved} outside of it. The sandbox can change the symlinks there.\n\
-             Set the real path {resolved} in the config."
+            "{kind} {given} goes through a symlink that the sandbox can change. Use the real path {resolved}"
         )
     }
 
@@ -4479,9 +4348,7 @@ pub mod vm {
         dir: impl Display,
     ) -> String {
         format!(
-            "the {kind} {source} is or contains the {name} {dir}. The sandbox could read all \
-             secrets in it.\nUse a directory below it, or set `insecure_mounts = true` \
-             in the `[security]` table of ~/.airlock/settings.toml."
+            "{kind} {source} exposes secrets of {name} {dir}. Mount a subdirectory, or set security.insecure_mounts = true in settings.toml"
         )
     }
 
@@ -4492,7 +4359,7 @@ pub mod vm {
 
     /// Status line when the user keeps the larger disk.
     pub fn disk_kept(current: impl Display, configured: impl Display) -> String {
-        format!("disk kept at {current} (configured {configured} is smaller; data preserved)")
+        format!("disk stays at {current}, not shrunk to {configured} (data kept)")
     }
 
     /// Status line after the disk grows.
@@ -4742,7 +4609,7 @@ pub mod libkrun {
     /// Error when a vsock socket path is longer than the macOS limit.
     pub fn socket_path_too_long(path: impl Display, max: usize) -> String {
         format!(
-            "socket path is longer than {max} bytes: {path}. Set a shorter data_dir in ~/.airlock/settings.toml"
+            "socket path too long (max {max} bytes): {path}. Set a shorter data_dir in settings.toml"
         )
     }
 

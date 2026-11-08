@@ -299,7 +299,7 @@ mod tests {
         let err = resolve_custom("Image", &home, &cwd, &[], "kernel")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("Set the real path"), "{err}");
+        assert!(err.contains("Use the real path"), "{err}");
         let real = kernel.to_str().unwrap();
         let resolved = resolve_custom(real, &home, &cwd, &[], "kernel").unwrap();
         assert_eq!(resolved.to_path().unwrap(), kernel);

@@ -45,14 +45,14 @@ setup() {
     make_sandbox_disk
     run_airlock start
     assert_failure 2
-    assert_output_contains "A sandbox exists in $PWD, but there is no config."
-    assert_output_contains "Put the config in airlock.toml or $BOX_DIR/airlock.toml (restore it), or run \`airlock rm\` to start over."
+    assert_output_contains "Sandbox in $PWD has no config."
+    assert_output_contains "Restore airlock.toml or $BOX_DIR/airlock.toml, or run \`airlock rm\`"
 
     rm "$BOX_DIR"/disk.*
     echo '{}' >"$BOX_DIR/installs.json"
     run_airlock start
     assert_failure 2
-    assert_output_contains "A sandbox exists in $PWD, but there is no config."
+    assert_output_contains "Sandbox in $PWD has no config."
 }
 
 # Test that start reports config errors and does not change the config
@@ -114,8 +114,8 @@ codex = { version = 1, auth = "api-key" }' ]]
     run_airlock start
     TEST_DATA_HOME="$data_home"
     assert_failure 1
-    assert_output_contains "is too long"
-    assert_output_contains "data_dir = \"~/airlock-data\""
+    assert_output_contains "too long"
+    assert_output_contains "Set a shorter data_dir"
 }
 
 # Test that --network replaces the network policy of the config.
@@ -218,7 +218,7 @@ python = { version = 1 }"
     run_airlock start --yes
     assert_failure 2
     assert_output_contains "sandbox moved to"
-    assert_output_contains "The sandbox configuration has changed"
+    assert_output_contains "Sandbox config changed"
     [[ ! -e .airlock/sandbox ]]
     run_airlock sandboxes list
     assert_success
@@ -231,7 +231,7 @@ python = { version = 1 }"
 
     run_airlock start --yes --allow-configuration-changes
     assert_failure
-    assert_output_not_contains "configuration has changed"
+    assert_output_not_contains "config changed"
     assert_output_contains "Preparing sandbox"
 }
 
@@ -337,13 +337,13 @@ copilot = { version = 1 }"
         >"$BOX_DIR/run.json"
     run_airlock start
     assert_failure 2
-    assert_output_contains "The sandbox configuration has changed since the last run."
+    assert_output_contains "Sandbox config changed."
     assert_output_not_contains "Preparing sandbox"
     run_airlock start --yes
     assert_failure 2
     assert_output_not_contains "Preparing sandbox"
     run_airlock start --yes --allow-configuration-changes
     assert_failure
-    assert_output_not_contains "configuration has changed"
+    assert_output_not_contains "config changed"
     assert_output_contains "Preparing sandbox"
 }

@@ -45,7 +45,7 @@ load helpers
     output="$stdout"
     assert_output_contains '"protocolVersion":1'
     assert_output_contains '"id":2'
-    assert_output_contains "run 'airlock start' first"
+    assert_output_contains "'airlock start' first"
 
     local log
     log="$(find "$TEST_DATA_HOME" -name acp.log)"

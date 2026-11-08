@@ -11,10 +11,10 @@ load helpers
 @test "exec without started sandbox fails with or without config" {
     run_airlock exec bash
     assert_failure
-    assert_output_contains "run 'airlock start' first"
+    assert_output_contains "'airlock start' first"
 
     write_config '[vm]'
     run_airlock exec bash
     assert_failure
-    assert_output_contains "run 'airlock start' first"
+    assert_output_contains "'airlock start' first"
 }

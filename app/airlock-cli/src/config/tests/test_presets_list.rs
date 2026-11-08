@@ -522,13 +522,12 @@ fn unknown_presets_list_names_are_errors_with_hints() {
         project_toml_error("presets = [\"claude\"]\n"),
         "airlock.toml: unknown preset `claude` (known: claude-code, openai-codex, \
          copilot-cli, nodejs, python, rust, docker, alpine, arch, debian, fedora, suse); \
-         newer packs use the [packs] table of a project config file, for example \
-         `[packs] claude = { version = 1 }`"
+         for newer packs use `[packs] claude = { version = 1 }` in project config"
     );
-    assert!(project_toml_error("presets = [\"mise\"]\n").ends_with(
-        "; newer packs use the [packs] table of a project config file, for example \
-             `[packs] mise = { version = 1 }`"
-    ));
+    assert!(
+        project_toml_error("presets = [\"mise\"]\n")
+            .ends_with("; for newer packs use `[packs] mise = { version = 1 }` in project config")
+    );
     let err = project_toml_error("presets = [\"nonexistent\"]\n");
     assert!(
         err.starts_with("airlock.toml: unknown preset `nonexistent` (known: claude-code,"),
@@ -544,13 +543,10 @@ fn unknown_presets_list_names_are_errors_with_hints() {
 #[test]
 fn presets_value_that_is_not_list_of_names_fails_load() {
     for (yaml, text) in [
-        (
-            "presets: [1]\n",
-            "`presets` list entries must be preset names (strings), not 1",
-        ),
+        ("presets: [1]\n", "`presets` entries must be strings, not 1"),
         (
             "presets: [python, 1]\n",
-            "`presets` list entries must be preset names (strings), not 1",
+            "`presets` entries must be strings, not 1",
         ),
         (
             "presets: true\n",
@@ -562,8 +558,7 @@ fn presets_value_that_is_not_list_of_names_fails_load() {
         ),
         (
             "presets:\n  python: 1\n",
-            "`presets` must be a list of preset names; use a [packs] table in a project \
-             config file for versioned, installable packs",
+            "`presets` must be a list. Use a [packs] table for versioned packs",
         ),
     ] {
         let dirs = ConfigDirs::new();

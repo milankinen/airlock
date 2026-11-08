@@ -35,16 +35,8 @@ fn validate_path(name: &str, idx: usize, path: &str) -> anyhow::Result<()> {
     if path.is_empty() {
         anyhow::bail!(messages::app::mask_path_empty(name, idx));
     }
-    if path.starts_with('/') {
-        anyhow::bail!(messages::app::mask_path_absolute(name, idx, path));
-    }
-    if path.starts_with('~') {
-        anyhow::bail!(messages::app::mask_path_home_relative(name, idx, path));
-    }
-    for seg in path.split('/') {
-        if seg == ".." {
-            anyhow::bail!(messages::app::mask_path_dotdot(name, idx, path));
-        }
+    if path.starts_with('/') || path.starts_with('~') || path.split('/').any(|seg| seg == "..") {
+        anyhow::bail!(messages::app::mask_path_not_relative(name, idx, path));
     }
     Ok(())
 }

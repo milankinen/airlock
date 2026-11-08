@@ -123,7 +123,7 @@ check_removed_pack() {
     sed -i.bak '/^mise = { version = 1 }$/d' airlock.toml
     run_airlock start -- sh -c 'echo NOT-REACHED'
     [[ "$status" -eq 2 ]]
-    assert_output_contains "The sandbox configuration has changed since the last run."
+    assert_output_contains "Sandbox config changed."
     assert_output_not_contains "Preparing sandbox"
     assert_output_not_contains "NOT-REACHED"
 

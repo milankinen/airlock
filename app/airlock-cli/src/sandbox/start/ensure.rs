@@ -975,14 +975,14 @@ mod tests {
         }
         assert_eq!(
             added_tools_notes(ImageChange::OldImageGone)[0],
-            "The old image is not available any more, so the tools install again for the new image."
+            "Old image is gone. Tools install again for the new image."
         );
         for change in [
             ImageChange::Unchanged,
             ImageChange::KeepOld,
             ImageChange::Recreate,
         ] {
-            assert!(!added_tools_notes(change).contains(&"The old image is not available any more, so the tools install again for the new image."));
+            assert!(!added_tools_notes(change).contains(&"Old image is gone. Tools install again for the new image."));
         }
     }
 

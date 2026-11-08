@@ -198,7 +198,7 @@ fn move_with_extra_files_in_airlock_dir_is_refused_and_changes_nothing() {
     };
     let err = err.to_string();
     assert!(
-        err.starts_with(".airlock directory contains extra files (.init-done), can't migrate"),
+        err.starts_with(".airlock has extra files (.init-done), cannot migrate"),
         "{err}"
     );
     assert!(
