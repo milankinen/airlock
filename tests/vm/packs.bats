@@ -63,8 +63,8 @@ pack_status() {
 check_install() {
     run_airlock start -- sh -c "$VERSIONS"
     assert_success
-    assert_output_contains "disk created"
-    [[ "$output" == *"disk created"*"Installing packs..."* ]]
+    assert_output_contains "Disk created"
+    [[ "$output" == *"Disk created"*"Installing packs..."* ]]
     assert_output_not_contains "(network:"
     assert_output_not_contains "Starting the install VM"
     assert_output_contains "ALL-PACKS-OK"
@@ -98,7 +98,7 @@ check_rerun() {
     # The earlier starts ran sessions, so this is not a retry.
     run_airlock start -- sh -c 'echo NOT-REACHED'
     [[ "$status" -eq 2 ]]
-    assert_output_contains "Tools changed in the sandbox (added: claude, codex, copilot"
+    assert_output_contains "tools changed in the sandbox (added: claude, codex, copilot"
     assert_output_not_contains "NOT-REACHED"
 
     sed -i.bak 's/"ran_session": true/"ran_session": false/' "$state"
@@ -106,7 +106,7 @@ check_rerun() {
     grep -q '"ran_session": false' "$state"
     run_airlock start -- sh -c "$VERSIONS"
     assert_success
-    assert_output_not_contains "disk created"
+    assert_output_not_contains "Disk created"
     assert_output_contains "Installing packs"
     assert_output_not_contains "failed (exit code"
     assert_output_contains "ALL-PACKS-OK"
@@ -123,14 +123,14 @@ check_removed_pack() {
     sed -i.bak '/^mise = { version = 1 }$/d' airlock.toml
     run_airlock start -- sh -c 'echo NOT-REACHED'
     [[ "$status" -eq 2 ]]
-    assert_output_contains "Sandbox config changed."
+    assert_output_contains "sandbox config changed."
     assert_output_not_contains "Preparing sandbox"
     assert_output_not_contains "NOT-REACHED"
 
     run_airlock start --yes --allow-configuration-changes -- sh -c 'echo RECREATED-OK'
     mv airlock.toml.bak airlock.toml
     assert_success
-    assert_output_contains "disk created"
+    assert_output_contains "Disk created"
     assert_output_contains "RECREATED-OK"
     ! grep -q '"mise"' "$(sandbox_dir)/installs.json"
     for id in claude codex copilot nodejs python rust docker git; do

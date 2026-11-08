@@ -213,7 +213,7 @@ fn invalid_pack_entries_are_reported_together() {
         "* `packs.sample.args.model` unknown arg of version \"1\" (known: mode, network) \
          (set in: airlock.toml)",
         "* `packs.nodejs.enabled` must be true or false (set in: airlock.toml)",
-        "* `packs.nodejs.node-version`: unknown key (known: version, enabled, args). Put args in `args` (set in: airlock.toml)",
+        "* `packs.nodejs.node-version`: unknown key (known: version, enabled, args), put args in `args` (set in: airlock.toml)",
         "* `packs.git.args.node-version` unknown arg of version \"1\" (it has no args)",
         "* `packs.mise`: version \"legacy\" not supported, use \"1\" \
          (set in: airlock.toml)",

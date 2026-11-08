@@ -138,7 +138,7 @@ boot_id_in() {
 
     run_airlock stop
     assert_success
-    assert_output_contains "stopped the sandbox"
+    assert_output_contains "Stopped the sandbox"
     sandbox_stopped
 
     local code=0
@@ -148,7 +148,7 @@ boot_id_in() {
 
     run_airlock stop
     assert_success
-    assert_output_contains "the sandbox does not run"
+    assert_output_contains "The sandbox does not run"
 }
 
 # Test that stop succeeds when the sandbox does not run, and that exec
@@ -163,13 +163,13 @@ boot_id_in() {
     assert_success
     run_airlock stop
     assert_success
-    assert_output_contains "the sandbox does not run"
+    assert_output_contains "The sandbox does not run"
 
     mkdir -p "$FILE_TEMP_DIR/never-started"
     cd "$FILE_TEMP_DIR/never-started"
     run_airlock stop
     assert_success
-    assert_output_contains "the sandbox does not run"
+    assert_output_contains "The sandbox does not run"
     run_airlock exec true
     assert_failure
     assert_output_contains "'airlock start' first"

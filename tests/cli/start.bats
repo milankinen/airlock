@@ -30,7 +30,7 @@ setup() {
 @test "start without config fails in non-interactive mode" {
     run_airlock start
     assert_failure 2
-    assert_output_contains "No airlock config in $PWD. Run \`airlock start\` in a terminal, or create airlock.toml."
+    assert_output_contains "no airlock config in $PWD, run \`airlock start\` in a terminal, or create airlock.toml"
     [[ ! -e airlock.toml ]]
     run_airlock sandboxes list
     assert_output_contains "No sandboxes in"
@@ -45,14 +45,14 @@ setup() {
     make_sandbox_disk
     run_airlock start
     assert_failure 2
-    assert_output_contains "Sandbox in $PWD has no config."
+    assert_output_contains "sandbox in $PWD has no config."
     assert_output_contains "Restore airlock.toml or $BOX_DIR/airlock.toml, or run \`airlock rm\`"
 
     rm "$BOX_DIR"/disk.*
     echo '{}' >"$BOX_DIR/installs.json"
     run_airlock start
     assert_failure 2
-    assert_output_contains "Sandbox in $PWD has no config."
+    assert_output_contains "sandbox in $PWD has no config."
 }
 
 # Test that start reports config errors and does not change the config
@@ -62,7 +62,7 @@ setup() {
 #   2. Check exit code 2 and each error message
 #   3. Check that airlock.toml is not changed
 @test "start with invalid config fails without touching config" {
-    assert_config_error start 'not valid toml [' "Config error"
+    assert_config_error start 'not valid toml [' "config error"
     assert_config_error start 'presets = ["does-not-exist"]' "unknown preset"
     assert_config_error start 'presets = true' \
         "$PWD/airlock.toml: \`presets\` must be a list of preset names, not true"
@@ -129,7 +129,7 @@ policy = "deny-by-default"
 [network.rules.example]
 allow = ["example.com:443"]'
     run_airlock start --verbose --network allow-always
-    assert_output_not_contains "Config error"
+    assert_output_not_contains "config error"
     assert_output_contains "(policy: allow-always)"
 }
 
@@ -148,7 +148,7 @@ allow = ["example.com:443"]'
 python = { version = $version }"
         run_airlock start --allow-configuration-changes
         assert_failure 2
-        assert_output_contains "Tools changed in the sandbox (added: python). Run in a terminal or pass --yes."
+        assert_output_contains "tools changed in the sandbox (added: python), run in a terminal or pass --yes"
         assert_output_not_contains "Preparing sandbox"
         [[ ! -e "$BOX_DIR/installs.json" ]]
     done
@@ -166,7 +166,7 @@ python = { version = $version }"
     write_config "$BAD_IMAGE"
     run_airlock start --allow-configuration-changes
     assert_failure 2
-    assert_output_contains "Tools changed in the sandbox (removed: mise). Run in a terminal or pass --yes."
+    assert_output_contains "tools changed in the sandbox (removed: mise), run in a terminal or pass --yes"
     assert_output_not_contains "Preparing sandbox"
     [[ -e "$BOX_DIR/disk.img" ]]
 }
@@ -187,7 +187,7 @@ python = { version = $version }"
 python = { version = 1 }"
     run_airlock start
     assert_failure
-    assert_output_not_contains "Tools changed"
+    assert_output_not_contains "tools changed"
     assert_output_contains "Preparing sandbox"
     [[ ! -e .airlock ]]
     run_airlock sandboxes list
@@ -217,8 +217,8 @@ python = { version = 1 }"
     write_config "$BAD_IMAGE"
     run_airlock start --yes
     assert_failure 2
-    assert_output_contains "sandbox moved to"
-    assert_output_contains "Sandbox config changed"
+    assert_output_contains "Sandbox moved to"
+    assert_output_contains "sandbox config changed"
     [[ ! -e .airlock/sandbox ]]
     run_airlock sandboxes list
     assert_success
@@ -246,7 +246,7 @@ python = { version = 1 }"
     write_config "$BAD_IMAGE"
     run_airlock start
     assert_failure 1
-    assert_output_contains "Old sandbox in .airlock/sandbox. Run \`airlock start\` in a terminal, or with --yes, to move it."
+    assert_output_contains "old sandbox in .airlock/sandbox, run \`airlock start\` in a terminal, or with --yes, to move it"
     [[ -e .airlock/sandbox/disk.img && -e .airlock/sandbox/disk.id ]]
     run_airlock sandboxes list
     assert_output_contains "No sandboxes in"
@@ -264,7 +264,7 @@ python = { version = 1 }"
 $BAD_IMAGE"
     run_airlock start --allow-configuration-changes
     assert_failure
-    assert_output_not_contains "Tools changed"
+    assert_output_not_contains "tools changed"
     assert_output_contains "Preparing sandbox"
 }
 
@@ -280,7 +280,7 @@ $BAD_IMAGE"
 $BAD_IMAGE"
     run_airlock start
     assert_failure 2
-    assert_output_contains "Config error: env.CLAUDE_CODE_OAUTH_TOKEN"
+    assert_output_contains "config error: env.CLAUDE_CODE_OAUTH_TOKEN"
     assert_output_not_contains "Preparing sandbox"
 }
 
@@ -301,7 +301,7 @@ codex = { version = 1 }
 copilot = { version = 1 }"
     run_airlock start
     assert_failure
-    assert_output_not_contains "Config error"
+    assert_output_not_contains "config error"
     assert_output_not_contains "Signing in"
     assert_output_contains "Preparing sandbox"
 }
@@ -337,7 +337,7 @@ copilot = { version = 1 }"
         >"$BOX_DIR/run.json"
     run_airlock start
     assert_failure 2
-    assert_output_contains "Sandbox config changed."
+    assert_output_contains "sandbox config changed."
     assert_output_not_contains "Preparing sandbox"
     run_airlock start --yes
     assert_failure 2

@@ -348,7 +348,7 @@ fn mount_source_through_project_link_to_outside_is_refused() {
         "[mounts.x]\nsource = \"./out/new\"\ntarget = \"/x\"\nmissing = \"create-dir\"\n",
     ] {
         let err = host.resolve(toml).unwrap_err().to_string();
-        assert!(err.contains("Use the real path"), "{err}");
+        assert!(err.contains("use the real path"), "{err}");
         assert!(err.contains(&outside.display().to_string()), "{err}");
     }
     assert!(!outside.join("new").exists());
@@ -404,7 +404,7 @@ fn link_in_nested_writable_mount_must_stay_in_mount() {
         )
         .unwrap_err()
         .to_string();
-    assert!(err.contains("Use the real path"), "{err}");
+    assert!(err.contains("use the real path"), "{err}");
 
     std::os::unix::fs::symlink(&host.home, host.project.join("out")).unwrap();
     host.resolve_shared("[mounts.x]\nsource = \"out\"\ntarget = \"/x\"\n", false)
@@ -429,7 +429,7 @@ fn link_chain_through_project_is_refused() {
         .resolve("[mounts.x]\nsource = \"~/dot\"\ntarget = \"/x\"\n")
         .unwrap_err()
         .to_string();
-    assert!(err.contains("Use the real path"), "{err}");
+    assert!(err.contains("use the real path"), "{err}");
 }
 
 /// Test that the file mount shares are made again on each boot. The share

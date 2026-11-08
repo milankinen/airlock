@@ -52,7 +52,7 @@ pub mod acp {
     /// Error for a request to a session whose agent stopped, when the
     /// new agent can not open the session again.
     pub const REOPEN_NOT_SUPPORTED: &str =
-        "the agent can not load or resume sessions. Start a new session";
+        "the agent can not load or resume sessions, start a new session";
 
     /// Error detail when airlock refuses its own reopen request, for
     /// example for a session dir that is no longer in the sandbox.
@@ -75,16 +75,16 @@ pub mod acp {
     /// Error for a request when too many messages wait for the reopen of
     /// its session.
     pub const REOPEN_QUEUE_FULL: &str =
-        "too many messages wait for the reopen of this session. Send it again later";
+        "too many messages wait for the reopen of this session, send it again later";
 
     /// Error for a request with a session id that no agent has.
     pub fn unknown_session(id: impl Display) -> String {
-        format!("the session '{id}' is not known. Start or load it first")
+        format!("the session '{id}' is not known, start or load it first")
     }
 
     /// Error for a request to a session whose agent stopped.
     pub const SESSION_AGENT_EXITED: &str =
-        "the agent of this session stopped. Load the session again";
+        "the agent of this session stopped, load the session again";
 
     /// Error for a request that needs a session but has none.
     pub fn no_session_method(method: impl Display) -> String {
@@ -102,7 +102,7 @@ pub mod acp {
     }
 
     /// Error for a session request when airlock stops the agents.
-    pub const SHUTTING_DOWN: &str = "the agents stop. New agents do not start";
+    pub const SHUTTING_DOWN: &str = "the agents stop, new agents do not start";
 
     /// Error for a client request that needs an agent feature that the
     /// agent does not have.
@@ -112,7 +112,7 @@ pub mod acp {
 
     /// Error for agent feature names that airlock does not know.
     pub fn unknown_agent_capabilities(names: impl Display, valid: impl Display) -> String {
-        format!("unknown agent features in --set-agent-capabilities: {names}. Valid names: {valid}")
+        format!("unknown agent features in --set-agent-capabilities: {names} (valid: {valid})")
     }
 
     /// Close reason that the sandbox gets for the MCP sessions of an editor
@@ -178,17 +178,17 @@ pub mod acp {
     /// Error for an agent request that airlock refuses.
     pub fn blocked_request(method: impl Display) -> String {
         format!(
-            "'{method}' is refused: it can act on the host. Allow with --pass-client-capabilities"
+            "'{method}' is refused because it can act on the host, allow with --pass-client-capabilities"
         )
     }
 
     /// Error for an agent prompt that is not a form prompt.
     pub const REFUSED_ELICITATION: &str =
-        "only form prompts are allowed. Allow others with --pass-client-capabilities";
+        "only form prompts are allowed, allow others with --pass-client-capabilities";
 
     /// Agent error message with a hint to log in inside the sandbox.
     pub fn auth_hint(message: impl Display, cmd: impl Display) -> String {
-        format!("{message}. Log in inside the sandbox, e.g. with 'airlock exec -l {cmd}'")
+        format!("{message}, log in inside the sandbox, e.g. with 'airlock exec -l {cmd}'")
     }
 }
 
@@ -232,15 +232,15 @@ pub mod app {
 
     /// Spinner text while a daemon shuts down.
     pub fn daemon_shutting_down(name: impl Display) -> String {
-        format!("daemon {name}: shutting down...")
+        format!("Daemon {name}: shutting down...")
     }
 
     /// Error when the user presses Ctrl+C while daemons shut down.
-    pub const KILLED_BY_USER: &str = "Killed by user";
+    pub const KILLED_BY_USER: &str = "killed by user";
 
     /// Status when a daemon ends. `label` tells how it ended.
     pub fn daemon_ended(name: impl Display, label: impl Display) -> String {
-        format!("daemon {name}: {label}")
+        format!("Daemon {name}: {label}")
     }
 
     /// Label of a daemon that got SIGKILL.
@@ -299,7 +299,7 @@ pub mod app {
         to: impl Display,
         err: impl Display,
     ) -> String {
-        format!("{warning} cannot move {from} to {to}: {err}. Using {from}.")
+        format!("{warning} cannot move {from} to {to}: {err}, using {from}")
     }
 
     /// Error when the VM asset cache lock fails.
@@ -330,7 +330,7 @@ pub mod cli {
     /// Error when the current directory is unknown. Shows for `start`, `rm` and
     /// `info`.
     pub fn cannot_determine_cwd(err: impl Display) -> String {
-        format!("Cannot determine current directory: {err}")
+        format!("cannot determine current directory: {err}")
     }
 
     /// Error when the sandbox lookup fails.
@@ -344,7 +344,7 @@ pub mod cli {
 
     /// Error when the sandbox removal fails.
     pub fn failed_to_remove_sandbox(err: impl Display) -> String {
-        format!("Failed to remove sandbox: {err}")
+        format!("failed to remove sandbox: {err}")
     }
 
     /// Status after the removal of a sandbox.
@@ -379,12 +379,12 @@ pub mod cli {
 
     /// Status after `secrets add` stores a secret.
     pub fn secret_stored(name: impl Display) -> String {
-        format!("stored secret {name}")
+        format!("Stored secret {name}")
     }
 
     /// Status after `secrets remove` removes a secret.
     pub fn secret_removed(name: impl Display) -> String {
-        format!("removed secret {name}")
+        format!("Removed secret {name}")
     }
 
     /// Error of `network forward` when no running sandbox serves a
@@ -395,39 +395,39 @@ pub mod cli {
 
     /// Error of `exec` and `acp` when no sandbox serves a directory.
     pub fn never_started(dir: impl Display) -> String {
-        format!("no sandbox for {dir} or its parents. Run 'airlock start' first")
+        format!("no sandbox for {dir} or its parents, run 'airlock start' first")
     }
 
     /// Error of `exec` and `acp` when the sandbox of the project `project`
     /// does not run and has no config of a last start.
     pub fn sandbox_never_started(project: impl Display) -> String {
-        format!("the sandbox of {project} never started. run 'airlock start' first")
+        format!("the sandbox of {project} never started, run 'airlock start' first")
     }
 
     /// Status when a command waits for a sandbox that boots or stops.
-    pub const WAITING_FOR_SANDBOX: &str = "waiting for the sandbox";
+    pub const WAITING_FOR_SANDBOX: &str = "Waiting for the sandbox";
 
     /// Error when the sandbox stops while a command runs in it.
     pub const SANDBOX_STOPPED: &str = "the sandbox stopped";
 
     /// Status of `stop` when the sandbox does not run.
-    pub const NOT_RUNNING: &str = "the sandbox does not run";
+    pub const NOT_RUNNING: &str = "The sandbox does not run";
 
     /// Status of `stop` when the sandbox of the project `project` stopped.
     pub fn stopped(project: impl Display) -> String {
-        format!("stopped the sandbox of {project}")
+        format!("Stopped the sandbox of {project}")
     }
 
     /// Error when the sandbox does not stop in `secs` seconds. Shows for
     /// `stop` and at the end of `start`.
     pub fn stop_timeout(secs: u64) -> String {
-        format!("the sandbox did not stop in {secs} seconds. see airlock.log of the sandbox")
+        format!("the sandbox did not stop in {secs} seconds, see airlock.log of the sandbox")
     }
 
     /// Error of `start` when the sandbox process did not confirm the VM
     /// stop.
     pub const SANDBOX_STOP_FAILED: &str =
-        "the sandbox did not stop correctly. see airlock.log of the sandbox";
+        "the sandbox did not stop correctly, see airlock.log of the sandbox";
 
     /// Error when the sandbox does not answer a connect in time.
     pub fn sandbox_no_answer(secs: u64) -> String {
@@ -447,7 +447,7 @@ pub mod cli {
 
     /// Status when a command attaches to the sandbox of another project.
     pub fn attached_to_sandbox(project: impl Display) -> String {
-        format!("attached to the sandbox of {project}")
+        format!("Attached to the sandbox of {project}")
     }
 
     /// Status when `secrets remove` finds no secret with this name.
@@ -460,16 +460,16 @@ pub mod cli {
 
     /// Error when the self-update fails.
     pub fn self_update_failed(err: impl Display) -> String {
-        format!("Self-update failed: {err}")
+        format!("self-update failed: {err}")
     }
 
     /// Error when a development build runs `self-update`.
     pub fn dev_build_cannot_update(version: impl Display) -> String {
-        format!("this is a development build ({version}). Only release builds can update")
+        format!("this is a development build ({version}), only release builds can update")
     }
 
     /// Spinner text while `self-update` looks for a new release.
-    pub const CHECKING_FOR_UPDATES: &str = "checking for updates";
+    pub const CHECKING_FOR_UPDATES: &str = "Checking for updates";
 
     /// Status when the installed version is the latest.
     pub fn already_latest_version(current: impl Display) -> String {
@@ -515,7 +515,7 @@ pub mod cli {
 
     /// Error when a sandbox of the given id runs.
     pub fn sandbox_id_running_stop_first(id: impl Display) -> String {
-        format!("Sandbox {id} is running, stop it first")
+        format!("sandbox {id} is running, stop it first")
     }
 
     /// Message when the user aborts the removal of a sandbox with this id.
@@ -540,28 +540,28 @@ pub mod cli {
 
     /// Error when `info` cannot read the config.
     pub fn config_error(err: impl Display) -> String {
-        format!("Config error: {err}")
+        format!("config error: {err}")
     }
 
     /// Error when `info` finds no sandbox for the project.
     pub fn no_sandbox_for_project(dir: impl Display) -> String {
-        format!("No sandbox for {dir} — run `airlock start` first")
+        format!("no sandbox for {dir} — run `airlock start` first")
     }
 
     /// Warning of `airlock config` when the project has no project config.
     pub fn no_project_config(dir: impl Display) -> String {
-        format!("No project config for {dir}")
+        format!("no project config for {dir}")
     }
 
     /// Error of `airlock config --resolved` when the sandbox has no
     /// config of a last run.
     pub fn no_last_run_config(dir: impl Display) -> String {
-        format!("No config of a last run for {dir} — run `airlock start` first")
+        format!("no config of a last run for {dir} — run `airlock start` first")
     }
 
     /// Error when `airlock config` cannot export the config.
     pub fn config_export_failed(err: impl Display) -> String {
-        format!("Cannot export config: {err}")
+        format!("cannot export config: {err}")
     }
 
     /// Status text of a running sandbox.
@@ -710,7 +710,7 @@ pub mod cli {
     /// and tells that the service hosts are denied.
     pub fn service_unavailable(name: impl Display, reason: impl Display) -> String {
         format!(
-            "{name}: unavailable ({reason}), hosts blocked. Opt out: `[network.services] {name} = false`"
+            "{name}: unavailable ({reason}), hosts blocked (opt out: `[network.services] {name} = false`)"
         )
     }
 
@@ -757,11 +757,11 @@ pub mod cli {
     pub const PACK_KEPT_REMOVED: &str = "kept, removed from config";
 
     /// Context of the error when the sandbox lookup fails.
-    pub const SANDBOX_LOOKUP_FAILED_CONTEXT: &str = "Sandbox lookup failed";
+    pub const SANDBOX_LOOKUP_FAILED_CONTEXT: &str = "sandbox lookup failed";
 
     /// Error when no sandbox has this id.
     pub fn no_sandbox_with_id(id: impl Display) -> String {
-        format!("No sandbox {id} (see `airlock sandboxes list`)")
+        format!("no sandbox {id} (see `airlock sandboxes list`)")
     }
 
     /// Line of the help status section when KVM access works.
@@ -822,7 +822,7 @@ pub mod cli {
     pub const UNKNOWN_TIME: &str = "----/--/-- --:--:--";
 
     /// Progress bar message of a layer download.
-    pub const DOWNLOADING: &str = "downloading";
+    pub const DOWNLOADING: &str = "Downloading";
 
     /// Status when no template exists.
     pub const NO_TEMPLATES: &str =
@@ -957,7 +957,7 @@ pub mod config {
 
     /// Error when a user config file has a `packs` table.
     pub fn packs_only_in_project_files(origin: impl Display) -> String {
-        format!("`[packs]` is allowed only in project config. Remove it from {origin}")
+        format!("`[packs]` is allowed only in project config, remove it from {origin}")
     }
 
     /// Error when the setup wizard finds a project config file already.
@@ -1092,7 +1092,7 @@ pub mod config {
         origin: impl Display,
     ) -> String {
         format!(
-            "`packs.{name}.{key}`: unknown key (known: {known_keys}). Put args in `args` (set in: {origin})"
+            "`packs.{name}.{key}`: unknown key (known: {known_keys}), put args in `args` (set in: {origin})"
         )
     }
 
@@ -1180,7 +1180,7 @@ pub mod config {
 
     /// Error when `presets` is a table.
     pub fn presets_is_table(origin: impl Display) -> String {
-        format!("{origin}: `presets` must be a list. Use a [packs] table for versioned packs")
+        format!("{origin}: `presets` must be a list, use a [packs] table for versioned packs")
     }
 
     /// Error when `presets` is not a list.
@@ -1460,13 +1460,13 @@ pub mod grants {
     /// Error of a rule change: the project file has a rule table that is
     /// different from the table that the user approved.
     pub fn rule_not_approved(name: impl Display, file: impl Display) -> String {
-        format!("rule `{name}` in {file} has unapproved changes. Restart airlock to review them")
+        format!("rule `{name}` in {file} has unapproved changes, restart airlock to review them")
     }
 
     /// Error of a rule change: the file does not have the approved rule
     /// after the write. The old text of the file is back.
     pub fn rule_write_changed(name: impl Display, file: impl Display) -> String {
-        format!("rule `{name}` in {file} changed during write. Old file restored")
+        format!("rule `{name}` in {file} changed during write, old file restored")
     }
 
     /// Error of a rule change: the new file text does not have the rule
@@ -1482,7 +1482,7 @@ pub mod grants {
 
     /// Error of a rule change: the project file is a symlink.
     pub fn rule_file_symlink(file: impl Display) -> String {
-        format!("{file} is a symlink. Add the rule by hand.")
+        format!("{file} is a symlink, add the rule by hand")
     }
 
     /// Error of a rule change: the project file is not a regular file.
@@ -1881,7 +1881,7 @@ pub mod network {
     /// that was there at the start or at the first connection, or has more
     /// than one hard link.
     pub fn host_socket_replaced(path: impl Display) -> String {
-        format!("host socket {path} changed after the start. Restart the sandbox to use it")
+        format!("host socket {path} changed after the start, restart the sandbox to use it")
     }
 }
 
@@ -1955,25 +1955,25 @@ pub mod oci {
 
     /// Error when the image changed and the process has no terminal for the question.
     pub const IMAGE_CHANGED_NEEDS_TERMINAL: &str =
-        "Sandbox image has been changed. Run in a terminal or pass --yes.";
+        "sandbox image has been changed, run in a terminal or pass --yes";
 
     /// Error when the old image of an imported sandbox is not known, and
     /// `--yes` would re-create the sandbox and delete its disk.
-    pub const IMPORTED_IMAGE_UNKNOWN: &str = "Image of the imported sandbox is unknown, --yes cannot re-create it. Run in a terminal without --yes";
+    pub const IMPORTED_IMAGE_UNKNOWN: &str = "image of the imported sandbox is unknown and --yes cannot re-create it, run in a terminal without --yes";
 
     /// Error when the user aborts a question.
     pub const ABORTED_BY_USER: &str = "aborted by user";
 
     /// Status when the old image of the sandbox is not in the cache any more.
     pub const OLD_IMAGE_UNAVAILABLE: &str =
-        "the old image is not available any more — using the new image";
+        "The old image is not available any more — using the new image";
 
     /// Status after airlock removes the old environment of the sandbox.
-    pub const OLD_ENVIRONMENT_ERASED: &str = "old environment erased";
+    pub const OLD_ENVIRONMENT_ERASED: &str = "Old environment erased";
 
     /// Status when the image comes from the cache. `id` is the short image ID.
     pub fn image_cached(id: impl Display) -> String {
-        format!("image cached {id}")
+        format!("Image cached {id}")
     }
 
     /// Error line when the registry refuses the credentials.
@@ -1986,7 +1986,7 @@ pub mod oci {
         err: impl Display,
     ) -> String {
         format!(
-            "cannot hardlink {image_path} to {sandbox_image}: {err}. Both must be on one filesystem"
+            "cannot hardlink {image_path} to {sandbox_image}: {err}, both must be on one filesystem"
         )
     }
 
@@ -2047,7 +2047,7 @@ pub mod oci {
 
     /// Status when the registry resolved the image. `reference` is the short reference.
     pub fn image_resolved(reference: impl Display) -> String {
-        format!("image resolved {reference}")
+        format!("Image resolved {reference}")
     }
 
     /// Reason when the local image does not match the pinned digest.
@@ -2070,12 +2070,12 @@ pub mod oci {
 
     /// Status when a local engine resolved the image. `id` is the short image ID.
     pub fn image_resolved_via(engine: impl Display, id: impl Display) -> String {
-        format!("image resolved via {engine} {id}")
+        format!("Image resolved via {engine} {id}")
     }
 
     /// Spinner text while airlock exports the image from a local engine.
     pub fn exporting_from(engine: impl Display) -> String {
-        format!("exporting from {engine}...")
+        format!("Exporting from {engine}...")
     }
 
     /// Error when the export of a local engine lacks a layer of the manifest.
@@ -2085,7 +2085,7 @@ pub mod oci {
 
     /// Status after the export from a local engine.
     pub fn exported_from(engine: impl Display) -> String {
-        format!("exported from {engine}")
+        format!("Exported from {engine}")
     }
 
     /// Status when some layers of a registry image are in the cache.
@@ -2098,7 +2098,7 @@ pub mod oci {
 
     /// Status after the download of layers. `summary` is the layer count and size.
     pub fn downloaded(summary: impl Display) -> String {
-        format!("downloaded {summary}")
+        format!("Downloaded {summary}")
     }
 
     /// Summary of the downloaded layers.
@@ -2256,7 +2256,7 @@ pub mod packs {
     /// Args:
     ///  - `ids`: Pack ids, safe for the terminal
     pub fn packs_auto_approved(ids: impl Display) -> String {
-        format!("Approved packs without a question: {ids}")
+        format!("approved packs without a question: {ids}")
     }
 
     /// Warning when a directory of the `packs.dirs` setting does not exist.
@@ -2710,7 +2710,7 @@ pub mod packs {
 
     /// Hint shown when the install script exits with code 12.
     pub const EXIT_HINT_DOWNLOAD_FAILED: &str =
-        "download failed. Check the network (HTTP 403 can be a GitHub rate limit)";
+        "download failed, check the network (HTTP 403 can be a GitHub rate limit)";
 
     /// Hint shown when the install script exits with code 13.
     pub const EXIT_HINT_ARG_INVALID: &str =
@@ -2848,7 +2848,7 @@ pub mod rpc {
 
     /// Notice when the host has no browser program.
     pub fn browser_no_program(page: impl Display) -> String {
-        format!("no browser found. Open the sign-in link for {page} manually")
+        format!("no browser found, open the sign-in link for {page} manually")
     }
 
     /// Notice when the host browser program fails to start.
@@ -2882,7 +2882,7 @@ pub mod runtime {
 
     /// Error line when the PTY dump file cannot open.
     pub fn pty_dump_open_failed(path: impl Display, error: impl Display) -> String {
-        format!("Failed to open PTY dump {path}: {error}")
+        format!("failed to open PTY dump {path}: {error}")
     }
 
     /// Error text when the monitor key bindings are not valid.
@@ -3011,7 +3011,7 @@ pub mod sandbox {
     /// Error when a sandbox to remove is in use. Shows for `rm` and the sandbox
     /// removal.
     pub const SANDBOX_RUNNING_STOP_FIRST: &str =
-        "Sandbox is running, stop it first with `airlock stop`";
+        "sandbox is running, stop it first with `airlock stop`";
 
     /// Error when removing a path fails.
     pub fn remove_failed(path: impl Display, err: impl Display) -> String {
@@ -3031,7 +3031,7 @@ pub mod sandbox {
     /// Error when `.airlock` holds files that airlock does not know.
     pub fn extra_files(names: &[String]) -> String {
         format!(
-            ".airlock has extra files ({}), cannot migrate. Remove them and run `airlock start` again",
+            ".airlock has extra files ({}), cannot migrate, remove them and run `airlock start` again",
             names.join(", ")
         )
     }
@@ -3044,7 +3044,7 @@ pub mod sandbox {
     /// Shows when the import copies the sandbox disk, because the old
     /// sandbox and the data directory are on different file systems.
     pub fn copying_disk(to: impl Display) -> String {
-        format!("copying the sandbox disk to {to} (different file system)...")
+        format!("Copying the sandbox disk to {to} (different file system)...")
     }
 
     /// Error when a file of the old sandbox changed while the import moved it.
@@ -3055,7 +3055,7 @@ pub mod sandbox {
     /// Error when an import failed and its disk could not go back to the old
     /// sandbox. The new sandbox stays, because it has the only disk copy.
     pub fn disk_kept(disk: impl Display, back: impl Display, cause: impl Display) -> String {
-        format!("import failed ({cause}), disk move back failed ({back}). Disk is in {disk}")
+        format!("import failed ({cause}) and disk move back failed ({back}), disk is in {disk}")
     }
 
     /// Warning when the old `.airlock` directory stays after an import.
@@ -3138,7 +3138,7 @@ pub mod self_update {
 
     /// Error when the user cannot write to the binary directory.
     pub fn no_write_access(dir: impl Display) -> String {
-        format!("no write access to {dir}. Run the update as a user that can write there")
+        format!("no write access to {dir}, run the update as a user that can write there")
     }
 
     /// Error when writing the new binary fails.
@@ -3159,7 +3159,7 @@ pub mod services {
         opt_out: impl Display,
     ) -> String {
         format!(
-            "{names} unavailable ({reason}), hosts blocked. To sign in without airlock, set {opt_out}"
+            "{names} unavailable ({reason}), hosts blocked (to sign in without airlock, set {opt_out})"
         )
     }
 
@@ -3237,7 +3237,7 @@ pub mod services {
 
     /// Message when the sign-in callback port is in use on the host.
     pub fn sign_in_port_in_use(port: impl Display) -> String {
-        format!("port {port} is in use. Browser cannot reach the sign-in in the sandbox")
+        format!("port {port} is in use, browser cannot reach the sign-in in the sandbox")
     }
 
     /// Message when the host cannot listen on the sign-in callback port.
@@ -3420,22 +3420,22 @@ pub mod start {
         settings_path: impl Display,
     ) -> String {
         format!(
-            "data dir path too long ({len}/{max} bytes): {path}. Set a shorter data_dir in {settings_path}"
+            "data dir path too long ({len}/{max} bytes): {path}, set a shorter data_dir in {settings_path}"
         )
     }
 
     /// Shows when the config includes deprecated user-level config files.
-    pub const USER_CONFIG_FILES_DEPRECATED: &str = "User-level config files are deprecated. Move them to a user pack (see v2026.10.5 release notes)";
+    pub const USER_CONFIG_FILES_DEPRECATED: &str = "user-level config files are deprecated, move them to a user pack (see v2026.10.5 release notes)";
 
     /// Shows when a configuration error ends the run.
     pub fn config_error(err: impl Display) -> String {
-        format!("Config error: {err:#}")
+        format!("config error: {err:#}")
     }
 
     /// Shows when `start` finds that the sandbox runs. A different
     /// `start`, `exec` or `acp` uses it.
     pub const START_ALREADY_RUNNING: &str =
-        "sandbox is running. Use `airlock exec`, or `airlock stop` and start again";
+        "sandbox is running, use `airlock exec`, or `airlock stop` and start again";
 
     /// Shows when the sandbox is removed between lookup and lock.
     pub const SANDBOX_REMOVED_DURING_START: &str =
@@ -3443,8 +3443,8 @@ pub mod start {
 
     /// Shows when an old project sandbox must move but no terminal is
     /// available for the question.
-    pub const LEGACY_SANDBOX_NO_PROMPT: &str = "Old sandbox in .airlock/sandbox. Run `airlock start` \
-                                                in a terminal, or with --yes, to move it.";
+    pub const LEGACY_SANDBOX_NO_PROMPT: &str = "old sandbox in .airlock/sandbox, run `airlock start` \
+                                                in a terminal, or with --yes, to move it";
 
     /// Title of the question before an old project sandbox moves into the
     /// data directory.
@@ -3455,7 +3455,7 @@ pub mod start {
 
     /// Shows after the sandbox moved into the data directory.
     pub fn sandbox_moved(dir: impl Display) -> String {
-        format!("sandbox moved to {dir}")
+        format!("Sandbox moved to {dir}")
     }
 
     /// Shows when an install fails, with the path of the install log.
@@ -3478,10 +3478,10 @@ pub mod start {
 
     /// Shows when the install VM did not confirm its disk write.
     pub const INSTALL_DISK_UNCONFIRMED: &str =
-        "Install VM did not confirm the disk write. Packs install again on next start";
+        "install VM did not confirm the disk write, packs install again on next start";
 
     /// Shows when the config changed and no question is possible.
-    pub const CONFIG_CHANGED_NO_PROMPT: &str = "Sandbox config changed. Run in a terminal to review, or pass --allow-configuration-changes";
+    pub const CONFIG_CHANGED_NO_PROMPT: &str = "sandbox config changed, run in a terminal to review, or pass --allow-configuration-changes";
 
     /// Note of the config question when the last config does not resolve.
     pub fn last_config_invalid(err: impl Display) -> String {
@@ -3563,7 +3563,7 @@ pub mod start {
 
     /// Shows when tools changed and nobody can answer the question.
     pub fn tools_changed(parts: impl Display) -> String {
-        format!("Tools changed in the sandbox ({parts}). Run in a terminal or pass --yes.")
+        format!("tools changed in the sandbox ({parts}), run in a terminal or pass --yes")
     }
 
     /// Title of the changed-packs question.
@@ -3613,7 +3613,7 @@ pub mod start {
     /// Shows when the install records come from a newer airlock.
     pub fn state_too_new(path: impl Display, version: impl Display) -> String {
         format!(
-            "{path} is from a newer airlock (format {version}). Update airlock, or run `airlock rm`"
+            "{path} is from a newer airlock (format {version}), update airlock, or run `airlock rm`"
         )
     }
 
@@ -3624,20 +3624,20 @@ pub mod start {
 
     /// Shows when the install records are corrupt and no terminal is available.
     pub fn state_corrupt(path: impl Display, why: impl Display) -> String {
-        format!("{path} is not valid ({why}). Run `airlock start` in a terminal, or `airlock rm`")
+        format!("{path} is not valid ({why}), run `airlock start` in a terminal, or `airlock rm`")
     }
 
     /// Shows when a sandbox exists but the project config is missing.
     pub fn sandbox_without_config(dir: impl Display, config_path: impl Display) -> String {
         format!(
-            "Sandbox in {dir} has no config. Restore airlock.toml or {config_path}, or run `airlock rm`"
+            "sandbox in {dir} has no config, restore airlock.toml or {config_path}, or run `airlock rm`"
         )
     }
 
     /// Shows when the project has no config and no terminal is available.
     pub fn no_config_no_terminal(dir: impl Display) -> String {
         format!(
-            "No airlock config in {dir}. Run `airlock start` in a terminal, or create airlock.toml."
+            "no airlock config in {dir}, run `airlock start` in a terminal, or create airlock.toml"
         )
     }
 
@@ -3646,7 +3646,7 @@ pub mod start {
 
     /// Shows after the wizard wrote a shareable config file.
     pub fn config_created(path: impl Display) -> String {
-        format!("created {path}")
+        format!("Created {path}")
     }
 
     /// Shows when the user aborts the setup wizard.
@@ -3788,7 +3788,7 @@ pub mod templates {
 
     /// Shows after `airlock templates create` made the template.
     pub fn template_created(name: impl Display) -> String {
-        format!("template {name} created")
+        format!("Template {name} created")
     }
 
     /// Shows when the build of a template starts.
@@ -3806,7 +3806,7 @@ pub mod templates {
 
     /// Shows when the template to create exists already.
     pub fn template_exists(name: impl Display) -> String {
-        format!("Template {name} exists. Use --force to re-create it")
+        format!("template {name} exists, use --force to re-create it")
     }
 
     /// Shows when a pack entry in the template config has no version.
@@ -4055,7 +4055,7 @@ pub mod vault {
     /// The vault file has a plaintext vault, but settings select encrypted storage.
     pub fn plaintext_vault_but_encrypted_storage(path: impl Display) -> String {
         format!(
-            "{path} is a plaintext vault, but settings use \"encrypted-file\". Set vault.storage = \"file\" or delete the file"
+            "{path} is a plaintext vault, but settings use \"encrypted-file\", set vault.storage = \"file\" or delete the file"
         )
     }
 
@@ -4102,7 +4102,7 @@ pub mod vault {
 
     /// The vault passphrase prompt needs a terminal and none exists.
     pub fn no_tty_for_passphrase(env: impl Display) -> String {
-        format!("no TTY for the vault passphrase. Set {env} or run in a terminal")
+        format!("no TTY for the vault passphrase, set {env} or run in a terminal")
     }
 
     /// Key help of the unlock prompt.
@@ -4136,15 +4136,15 @@ pub mod vault {
     /// Message for commands that must store a secret while the vault is disabled.
     pub fn vault_disabled(settings_path: impl Display) -> String {
         format!(
-            "vault is disabled. Set vault.storage = \"keyring\" in {settings_path} to store secrets"
+            "vault is disabled, set vault.storage = \"keyring\" in {settings_path} to store secrets"
         )
     }
 
     /// Warning that the plaintext vault backend stores secrets as cleartext.
-    pub const PLAINTEXT_VAULT_WARNING: &str = "Vault is \"file\": secrets are stored as plaintext. For encryption, switch storage to \"keyring\" or \"encrypted-file\"";
+    pub const PLAINTEXT_VAULT_WARNING: &str = "vault is \"file\" and stores secrets as plaintext, switch storage to \"keyring\" or \"encrypted-file\" for encryption";
 
     /// The plaintext vault needs a confirmation but the shell is not interactive.
-    pub const PLAINTEXT_VAULT_NEEDS_YES: &str = "vault is plaintext (\"file\"). Pass --yes to confirm, or change vault.storage in settings.toml";
+    pub const PLAINTEXT_VAULT_NEEDS_YES: &str = "vault is plaintext (\"file\"), pass --yes to confirm, or change vault.storage in settings.toml";
 
     /// Question that asks if the user wants to use the plaintext vault.
     pub const PROCEED_PLAINTEXT_VAULT_QUESTION: &str = "Proceed with the plaintext vault?";
@@ -4194,7 +4194,7 @@ pub mod vault {
     /// The vault file has an encrypted vault, but settings select plain file storage.
     pub fn encrypted_vault_but_file_storage(path: impl Display) -> String {
         format!(
-            "{path} is an encrypted vault, but settings use \"file\". Set vault.storage = \"encrypted-file\" or delete the file"
+            "{path} is an encrypted vault, but settings use \"file\", set vault.storage = \"encrypted-file\" or delete the file"
         )
     }
 
@@ -4336,7 +4336,7 @@ pub mod vm {
         resolved: impl Display,
     ) -> String {
         format!(
-            "{kind} {given} goes through a symlink that the sandbox can change. Use the real path {resolved}"
+            "{kind} {given} goes through a symlink that the sandbox can change, use the real path {resolved}"
         )
     }
 
@@ -4348,13 +4348,13 @@ pub mod vm {
         dir: impl Display,
     ) -> String {
         format!(
-            "{kind} {source} exposes secrets of {name} {dir}. Mount a subdirectory, or set security.insecure_mounts = true in settings.toml"
+            "{kind} {source} exposes secrets of {name} {dir}, mount a subdirectory, or set security.insecure_mounts = true in settings.toml"
         )
     }
 
     /// Status line after the disk is recreated at a smaller size.
     pub fn disk_recreated(size: impl Display) -> String {
-        format!("disk recreated {size} (previous data erased)")
+        format!("Disk recreated {size} (previous data erased)")
     }
 
     /// Status line when the user keeps the larger disk.
@@ -4364,17 +4364,17 @@ pub mod vm {
 
     /// Status line after the disk grows.
     pub fn disk_grown(size: impl Display) -> String {
-        format!("disk grown to {size}")
+        format!("Disk grown to {size}")
     }
 
     /// Status line after the disk of a template is in the new sandbox.
     pub fn disk_copied(size: impl Display) -> String {
-        format!("disk copied from template {size}")
+        format!("Disk copied from template {size}")
     }
 
     /// Status line after a new disk is created.
     pub fn disk_created(size: impl Display) -> String {
-        format!("disk created {size}")
+        format!("Disk created {size}")
     }
 
     /// Disk size in whole gigabytes.
@@ -4442,16 +4442,16 @@ pub mod vm {
     #[cfg(target_os = "linux")]
     pub fn cloud_hypervisor_stopped(log: impl Display, tail: &str) -> String {
         if tail.is_empty() {
-            format!("the VM stopped. Log: {log}")
+            format!("the VM stopped (log: {log})")
         } else {
-            format!("the VM stopped. Log: {log}\nLast log lines:\n{tail}")
+            format!("the VM stopped (log: {log})\nLast log lines:\n{tail}")
         }
     }
 
     /// Error when the virtiofsd of a share stopped without a request.
     #[cfg(target_os = "linux")]
     pub fn virtiofsd_exited(tag: impl Display) -> String {
-        format!("the file sharing for {tag} stopped. Run with --log-level debug to see its log")
+        format!("the file sharing for {tag} stopped, run with --log-level debug to see its log")
     }
 
     /// Error when virtiofsd stops before its socket is ready.
@@ -4579,9 +4579,9 @@ pub mod libkrun {
     ///  - `tail`: Last lines of the log
     pub fn stopped(log: impl Display, tail: &str) -> String {
         if tail.is_empty() {
-            format!("the libkrun VM process stopped. Log: {log}")
+            format!("the libkrun VM process stopped (log: {log})")
         } else {
-            format!("the libkrun VM process stopped. Log: {log}\nLast log lines:\n{tail}")
+            format!("the libkrun VM process stopped (log: {log})\nLast log lines:\n{tail}")
         }
     }
 
@@ -4609,7 +4609,7 @@ pub mod libkrun {
     /// Error when a vsock socket path is longer than the macOS limit.
     pub fn socket_path_too_long(path: impl Display, max: usize) -> String {
         format!(
-            "socket path too long (max {max} bytes): {path}. Set a shorter data_dir in settings.toml"
+            "socket path too long (max {max} bytes): {path}, set a shorter data_dir in settings.toml"
         )
     }
 

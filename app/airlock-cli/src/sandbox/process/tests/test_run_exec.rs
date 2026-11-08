@@ -53,14 +53,14 @@ fn exec_starts_only_prepared_sandbox_and_gives_exit_code_of_failed_start() {
         };
 
         let error = run().await.err().unwrap().to_string();
-        assert!(error.contains("run 'airlock start' first"), "{error}");
+        assert!(error.contains("'airlock start' first"), "{error}");
         let dir = located.sandbox.dir();
         dir.join(crate::vm::disk::DISK_FILE)
             .unwrap()
             .write(b"")
             .unwrap();
         let error = run().await.err().unwrap().to_string();
-        assert!(error.contains("run 'airlock start' first"), "{error}");
+        assert!(error.contains("'airlock start' first"), "{error}");
 
         let paths = crate::sandbox::meta::HostPaths::default();
         crate::sandbox::meta::save_last_run_config(dir, json!({}), paths).unwrap();

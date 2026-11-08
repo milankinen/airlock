@@ -558,7 +558,7 @@ fn presets_value_that_is_not_list_of_names_fails_load() {
         ),
         (
             "presets:\n  python: 1\n",
-            "`presets` must be a list. Use a [packs] table for versioned packs",
+            "`presets` must be a list, use a [packs] table for versioned packs",
         ),
     ] {
         let dirs = ConfigDirs::new();

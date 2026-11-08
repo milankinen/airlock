@@ -132,11 +132,11 @@ fn enabled_services_without_vault_are_unavailable_and_their_hosts_denied() {
 fn unavailable_warning_names_services_reason_and_opt_out() {
     assert_eq!(
         unavailable_warning(&ServiceId::ALL, "the vault is disabled"),
-        "anthropic, openai unavailable (the vault is disabled), hosts blocked. To sign in without airlock, set \
-         `[network.services] anthropic = false` and `[network.services] openai = false`"
+        "anthropic, openai unavailable (the vault is disabled), hosts blocked (to sign in without airlock, set \
+         `[network.services] anthropic = false` and `[network.services] openai = false`)"
     );
     assert_eq!(
         unavailable_warning(&[ServiceId::Anthropic], "the vault is disabled"),
-        "anthropic unavailable (the vault is disabled), hosts blocked. To sign in without airlock, set `[network.services] anthropic = false`"
+        "anthropic unavailable (the vault is disabled), hosts blocked (to sign in without airlock, set `[network.services] anthropic = false`)"
     );
 }

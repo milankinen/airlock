@@ -1001,8 +1001,8 @@ mod tests {
         );
         assert_eq!(
             tools_changed_message(&changed, false),
-            "Tools changed in the sandbox (changed: plain; added: alpha; removed: gamma). Run in \
-             a terminal or pass --yes."
+            "tools changed in the sandbox (changed: plain; added: alpha; removed: gamma), run in \
+             a terminal or pass --yes"
         );
         let installers = test_installers("[packs]\nalpha = { version = 1 }\n");
         assert_eq!(
@@ -1041,7 +1041,7 @@ mod tests {
         assert_eq!(asked_questions, [ToolQuestion::Changed]);
         assert_eq!(
             tools_changed_message(&all(), true),
-            "Tools changed in the sandbox (changed: plain). Run in a terminal or pass --yes."
+            "tools changed in the sandbox (changed: plain), run in a terminal or pass --yes"
         );
     }
 

@@ -24,7 +24,7 @@ fn auth_required_error_gets_login_hint() {
         assert_eq!(response["error"]["code"], -32000);
         let message = response["error"]["message"].as_str().unwrap();
         assert!(
-            message.starts_with("Authentication required. "),
+            message.starts_with("Authentication required, "),
             "{message}"
         );
         assert!(message.contains("airlock exec -l fake-agent"), "{message}");

@@ -70,15 +70,15 @@ setup() {
 @test "sandboxes info and remove of missing sandbox fail" {
     run_airlock sandboxes info
     assert_failure 1
-    assert_output_contains "No sandbox for $PWD"
+    assert_output_contains "no sandbox for $PWD"
 
     for id in abcdefgh ../etc; do
         run_airlock sandboxes info "$id"
         assert_failure 1
-        assert_output_contains "No sandbox $id"
+        assert_output_contains "no sandbox $id"
 
         run_airlock sandboxes remove -f "$id"
         assert_failure 1
-        assert_output_contains "No sandbox $id"
+        assert_output_contains "no sandbox $id"
     done
 }

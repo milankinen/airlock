@@ -11,12 +11,12 @@ load helpers
 @test "info without sandbox fails with or without config" {
     run_airlock info
     assert_failure 1
-    assert_output_contains "No sandbox for $PWD"
+    assert_output_contains "no sandbox for $PWD"
 
     write_config '[vm]'
     run_airlock info
     assert_failure 1
-    assert_output_contains "No sandbox for $PWD"
+    assert_output_contains "no sandbox for $PWD"
 }
 
 # Test that info lists only the enabled packs of the config. A pack that

@@ -13,10 +13,10 @@ load helpers
 @test "stop without running sandbox prints not running" {
     run_airlock stop
     assert_success
-    assert_output_contains "the sandbox does not run"
+    assert_output_contains "The sandbox does not run"
 
     write_config '[vm]'
     run_airlock stop
     assert_success
-    assert_output_contains "the sandbox does not run"
+    assert_output_contains "The sandbox does not run"
 }

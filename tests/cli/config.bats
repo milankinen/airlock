@@ -57,7 +57,7 @@ image = "project:1"'
     out="$(env XDG_DATA_HOME="$TEST_DATA_HOME" NO_COLOR=1 HOME="$TEST_TEMP_DIR" \
         RUST_BACKTRACE=0 "$AIRLOCK" config --format json 2>"$err" </dev/null)"
     [ "$out" = "{}" ]
-    grep -q "No project config for $PWD" "$err"
+    grep -q "no project config for $PWD" "$err"
 }
 
 # Test that config --resolved fails when the sandbox has no stored last run.
@@ -69,8 +69,8 @@ image = "project:1"'
     write_config '[vm]'
     run_airlock config --resolved
     assert_failure 1
-    assert_output_contains "Cannot export config:"
-    assert_output_contains "No config of a last run for $PWD — run \`airlock start\` first"
+    assert_output_contains "cannot export config:"
+    assert_output_contains "no config of a last run for $PWD — run \`airlock start\` first"
 }
 
 # Test that sandboxes config fails for an id that does not exist.
@@ -79,7 +79,7 @@ image = "project:1"'
 @test "sandboxes config with unknown id fails" {
     run_airlock sandboxes config nosuchid
     assert_failure 1
-    assert_output_contains "Cannot export config:"
+    assert_output_contains "cannot export config:"
 }
 
 # Test that config --resolved prints the merged config of the last run,
