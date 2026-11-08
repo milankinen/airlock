@@ -8,8 +8,8 @@
 //! without the exit, the agent exit code is 1.
 //!
 //! The agent stderr goes to the host stderr. The agent never waits for the
-//! host stderr. When the host stderr is slow, the agent stderr is dropped
-//! and counted.
+//! host stderr. When the host stderr is slow, the agent stderr is dropped,
+//! and the debug log tells it.
 
 use std::collections::VecDeque;
 
@@ -82,12 +82,9 @@ pub(super) fn output(
 // The agent must not wait for the host stderr. An editor that does not
 // read it would stop the relay.
 pub(super) fn relay_stderr(stderr: &Stderr, sandbox: &str, data: Vec<u8>) {
-    let len = data.len() as u64;
-    if let Err(TrySendError::Full(_)) = stderr.tx.try_send(data) {
-        if stderr.dropped.get() == 0 {
-            tracing::warn!(sandbox, "drop agent stderr: stderr is full");
-        }
-        stderr.dropped.set(stderr.dropped.get() + len);
+    let bytes = data.len();
+    if let Err(TrySendError::Full(_)) = stderr.try_send(data) {
+        tracing::debug!(sandbox, bytes, "drop agent stderr: stderr is full");
     }
 }
 
@@ -165,8 +162,6 @@ impl Framer {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-    use std::rc::Rc;
 
     use super::*;
 
@@ -174,7 +169,6 @@ mod tests {
     struct Run {
         items: Vec<Output>,
         stderr: mpsc::Receiver<Vec<u8>>,
-        dropped: Rc<Cell<u64>>,
     }
 
     /// Run the output stream over the agent events `events`. The relay
@@ -185,18 +179,9 @@ mod tests {
             tx.try_send(event).unwrap();
         }
         drop(tx);
-        let (stderr_tx, stderr) = mpsc::channel(stderr_cap);
-        let dropped = Rc::new(Cell::new(0));
-        let sink = Stderr {
-            tx: stderr_tx,
-            dropped: dropped.clone(),
-        };
+        let (sink, stderr) = mpsc::channel(stderr_cap);
         let items = output(rx, max, sink, "sb".into()).collect().await;
-        Run {
-            items,
-            stderr,
-            dropped,
-        }
+        Run { items, stderr }
     }
 
     /// Make a stdout event with the text `data`.
@@ -291,13 +276,12 @@ mod tests {
     }
 
     /// Test that agent stderr goes to the host stderr, and that stderr over
-    /// a full queue is dropped and counted. The agent must not wait for
-    /// the host stderr.
+    /// a full queue is dropped. The agent must not wait for the host
+    /// stderr.
     ///   1. Send two stderr chunks to a stderr queue with space for one
-    ///   2. Check that the first chunk is in the queue and the bytes of
-    ///      the second are counted
+    ///   2. Check that only the first chunk is in the queue
     #[tokio::test]
-    async fn stderr_over_full_queue_is_dropped_and_counted() {
+    async fn stderr_over_full_queue_is_dropped() {
         let events = vec![
             ProcessEvent::Stderr(b"aa".to_vec()),
             ProcessEvent::Stderr(b"bbb".to_vec()),
@@ -306,6 +290,6 @@ mod tests {
         let mut run = run(events, 64, 1).await;
         assert_eq!(run.items, vec![Output::Exit(0)]);
         assert_eq!(run.stderr.try_recv().unwrap(), b"aa");
-        assert_eq!(run.dropped.get(), 3);
+        assert!(run.stderr.try_recv().is_err());
     }
 }

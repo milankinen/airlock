@@ -18,8 +18,8 @@ use crate::test_cfg::block_on_local;
 ///      permission request and a form prompt
 ///   2. Start a session and send one more request, so that all agent
 ///      output is handled
-///   3. Check that the client got only the login status, the session list
-///      changes, the permission request and the form prompt
+///   3. Check that the client got only the login status, the permission
+///      request and the form prompt
 ///   4. Check the error codes that the agent got, and that the batch and
 ///      the message with the bad method got no reply
 #[test]
@@ -59,12 +59,7 @@ fn agent_messages_out_of_allowlist_never_reach_client() {
             .filter(|m| m["method"] != "session/update")
             .map(|m| m.get("id").unwrap_or(&m["method"]))
             .collect();
-        let expected = [
-            "_auth/status_update",
-            "_session/list/changes",
-            "0-\"ok1\"",
-            "0-\"ok2\"",
-        ];
+        let expected = ["_auth/status_update", "0.0", "0.1"];
         assert_eq!(
             methods,
             expected.map(|e| json!(e)).iter().collect::<Vec<_>>()
@@ -123,7 +118,7 @@ fn agent_messages_before_handshake_are_filtered() {
             .filter(|m| m["method"] != "session/update")
             .map(|m| &m["id"])
             .collect();
-        assert_eq!(ids, [&json!("0-\"ok1\"")]);
+        assert_eq!(ids, [&json!("0.0")]);
         let errors: Vec<(Value, Value)> = seen(&others)
             .into_iter()
             .filter(|m| m.get("error").is_some())

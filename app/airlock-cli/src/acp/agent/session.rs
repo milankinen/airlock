@@ -9,7 +9,8 @@
 //!
 //! A session that does not start with a session request is one-shot. It
 //! runs only its first request, gets no other agent messages, and stops
-//! its agent after the response.
+//! its agent after the response. A session request that starts no session
+//! also stops the agent and ends the session.
 //!
 //! A session shows all notices of the sandbox as warnings, after the OK
 //! response to its session request.
@@ -20,9 +21,26 @@
 //! next client request launches a new agent and opens the ACP session there
 //! again, with a resume or else a load. The client does not see this
 //! request, its response, or the history that a load sends. The other
-//! client messages wait until the session is open. If the reopen fails,
-//! the waiting requests get an error, and the next request tries again. A
-//! close of such a session needs no agent.
+//! client messages wait until the session is open. The reopen has the time
+//! limit of the handshake. If the reopen fails, the waiting requests get an
+//! error, and the next request tries again. A close of such a session needs
+//! no agent.
+//!
+//! The client sees each ACP session id with the sandbox as prefix, as
+//! `<sandbox>:<id>`. Thus the agents of two projects cannot use the
+//! sessions of each other. A client message with a session id of another
+//! sandbox, or without the prefix, gets an error.
+//!
+//! A load or a resume opens only the session that the client asked for.
+//! The agent cannot select a different session in its answer. An OK close
+//! of that session ends the session.
+//!
+//! The agent requests get ids that are unique for the client, also over
+//! the agents of the session, and name the session. The number of open
+//! agent requests and the length of their ids have a limit. An agent can
+//! cancel only its own open requests. When an agent ends, its open requests
+//! end, and the client gets a cancel for each. A late client answer to them
+//! does not reach the next agent.
 //!
 //! When the proxy stops the session, the agent input closes. An agent that
 //! does not exit in the grace time is killed. The memory use has a limit.
@@ -40,12 +58,12 @@ use tokio::time::Instant;
 use tracing::Instrument;
 
 use super::super::capabilities::{self, AgentVerdict};
-use super::super::proxy::{Claim, HandleId, HandleMessage};
+use super::super::proxy::{Claim, HandleId, HandleMessage, SessionContext};
 use super::super::rpc::{self, Kind, RequestId, SessionId, key, session_id};
 use super::super::{AgentProcessLauncher, Location, NoSandbox, mcp};
 use super::Pool;
 use super::output::Output;
-use super::process::{Agent, StartFailure, check_handshake, reopen_method};
+use super::process::{Agent, StartFailure, check_handshake, hide_mcp_secrets, reopen_method};
 use crate::messages;
 use crate::sandbox::NoticeReader;
 
@@ -55,6 +73,9 @@ const MAX_LOGGED_PARAMS: usize = 500;
 /// Maximum number of client messages that wait for the reopen of the
 /// session.
 const MAX_REOPEN_WAITING: usize = 64;
+
+/// Maximum number of open agent requests. The proxy keeps them in memory.
+const MAX_AGENT_REQUESTS: usize = 64;
 
 /// Client messages of the session, in order.
 type Inbox = mpsc::UnboundedReceiver<Value>;
@@ -75,30 +96,35 @@ type Registering = Option<mcp::Registration>;
 ///   0.
 pub(super) async fn run_session<S: AgentProcessLauncher + 'static>(
     pool: Rc<Pool<S>>,
+    context: Rc<SessionContext>,
     hid: HandleId,
     cwd: String,
     first: Value,
     mut inbox: Inbox,
 ) -> i32 {
-    let mut session = Session::new(pool, hid, cwd, &first);
+    let mut session = Session::new(pool, context, hid, cwd, &first);
     let mut waiting = VecDeque::from([first]);
     loop {
-        let reopening = session.reopen_key.is_some();
-        match session.run_agent(&mut inbox, &mut waiting).await {
+        let reopening = session.reopening;
+        let end = session.run_agent(&mut inbox, &mut waiting).await;
+        session.cancel_agent_requests().await;
+        match end {
             AgentEnd::Stopped => break,
             AgentEnd::StartFailed(failure) if !reopening => {
                 session.fail_start(&mut waiting, &failure).await;
                 break;
             }
-            AgentEnd::StartFailed(failure) => {
-                session.fail_reopen(&mut waiting, &failure.message).await;
+            AgentEnd::StartFailed(failure) => session.fail_reopen(&mut waiting, &failure).await,
+            AgentEnd::ReopenFailed(detail) => {
+                let failure = StartFailure::from_message(&detail);
+                session.fail_reopen(&mut waiting, &failure).await;
             }
-            AgentEnd::ReopenFailed(detail) => session.fail_reopen(&mut waiting, &detail).await,
             AgentEnd::Lost => {}
         }
         if session.claimed.is_none() {
             break;
         }
+        session.send(HandleMessage::Idle).await;
         // The servers of the session were in the sandbox of the agent.
         session.release_mcp().await;
         let Some(trigger) = session.next_request(&mut inbox).await else {
@@ -126,33 +152,36 @@ enum AgentEnd {
 /// State of one session across its agents.
 struct Session<S> {
     pool: Rc<Pool<S>>,
+    /// Settings of the proxy run.
+    context: Rc<SessionContext>,
+    /// The client shows session notices.
+    notices: bool,
     /// Identity of the session for the proxy.
     hid: HandleId,
     /// Session dir of the first request on the host.
     cwd: String,
     /// Map key of the id of the first request.
     first_key: RequestId,
-    /// Method of the first request.
-    first_method: String,
+    /// Kind of the first request.
+    first: First,
     /// Session id in the params of the first request, if it has one.
     first_sid: Option<SessionId>,
-    /// The first request loads or resumes a session.
-    reload: bool,
-    /// The first request is not a session request. The session ends after
-    /// its response and owns no ACP sessions.
-    one_shot: bool,
     /// Editor MCP servers of the session request, as the client gave them.
     /// They stay in memory only and are never logged.
     mcp_servers: Value,
     /// The ACP session that the session request started.
     claimed: Option<SessionId>,
-    /// Map key of the reopen request while it has no response. The client
-    /// does not see it, and the client messages wait for it.
-    reopen_key: Option<RequestId>,
+    /// The reopen request has no response yet. The client does not see
+    /// it, and the client messages wait for it.
+    reopening: bool,
     /// The client requests in the agent without a response, by map key:
-    /// the request id, and if the request is a `session/list`. A list
-    /// response has guest session dirs.
-    open: HashMap<RequestId, (Value, bool)>,
+    /// the request id and its kind.
+    open: HashMap<RequestId, (Value, OpenKind)>,
+    /// Number of agent requests so far, over all agents of the session.
+    agent_requests_seen: u64,
+    /// The open agent requests of the current agent: the original id, by
+    /// the id for the client.
+    agent_requests: HashMap<String, Value>,
     /// Editor MCP servers of the session.
     mcp: mcp::Registry,
     /// First exit code that is not 0 of the agents.
@@ -161,30 +190,42 @@ struct Session<S> {
 
 impl<S: AgentProcessLauncher + 'static> Session<S> {
     /// Make the session of the first request `first`.
-    fn new(pool: Rc<Pool<S>>, hid: HandleId, cwd: String, first: &Value) -> Self {
+    fn new(
+        pool: Rc<Pool<S>>,
+        context: Rc<SessionContext>,
+        hid: HandleId,
+        cwd: String,
+        first: &Value,
+    ) -> Self {
+        let notices = context
+            .init_params
+            .pointer("/clientCapabilities/session/notices")
+            .is_some();
         let method = first.get("method").and_then(Value::as_str);
-        let one_shot = !matches!(
-            method,
-            Some("session/new" | "session/load" | "session/resume" | "session/fork")
-        );
-        let reload = matches!(method, Some("session/load" | "session/resume"));
+        let kind = match method {
+            Some("session/new" | "session/fork") => First::New,
+            Some("session/load" | "session/resume") => First::Reload,
+            _ => First::OneShot(method.unwrap_or_default().to_string()),
+        };
         let mcp_servers = first
             .pointer("/params/mcpServers")
             .cloned()
             .unwrap_or_else(|| json!([]));
         Self {
             pool,
+            context,
+            notices,
             hid,
             cwd,
             first_key: key(first.get("id").unwrap_or(&Value::Null)),
-            first_method: method.unwrap_or_default().to_string(),
+            first: kind,
             first_sid: session_id(first).map(str::to_string),
-            reload,
-            one_shot,
             mcp_servers,
             claimed: None,
-            reopen_key: None,
+            reopening: false,
             open: HashMap::new(),
+            agent_requests_seen: 0,
+            agent_requests: HashMap::new(),
             mcp: mcp::Registry::default(),
             code: 0,
         }
@@ -214,7 +255,7 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
                         let Some(msg) = msg else {
                             // The launch drops with the stop.
                             let text = messages::acp::SESSION_AGENT_EXITED;
-                            self.fail_all(waiting, text).await;
+                            self.fail_all(waiting, &StartFailure::from_message(text)).await;
                             return AgentEnd::Stopped;
                         };
                         self.wait(waiting, msg).await;
@@ -239,20 +280,23 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
         tracing::trace!(argv = ?config.argv, "agent command");
         let stderr = pool.stderr.clone();
         let mut agent = Agent::new(location, process, config.max_line_bytes, stderr);
-        let init = rpc::request(rpc::INIT_ID, "initialize", &pool.init_params);
+        let init = rpc::request(rpc::INIT_ID, "initialize", &self.context.init_params);
         agent.send(&init);
         let mut registering: Registering = None;
-        let mut reopen_due = self.reopen_key.is_some();
+        let mut reopen_due = self.reopening;
+        // After the handshake, the deadline is for the reopen.
+        let mut deadline = deadline;
         loop {
             if agent.init.is_some() && registering.is_none() && reopen_due {
                 reopen_due = false;
+                deadline = Instant::now() + config.handshake_timeout;
                 if let Some(end) = self.send_reopen(&mut agent, &mut registering).await {
                     return self.end_agent(agent, waiting, end).await;
                 }
             }
             while agent.init.is_some()
                 && registering.is_none()
-                && self.reopen_key.is_none()
+                && !self.reopening
                 && let Some(msg) = waiting.pop_front()
             {
                 if let Some(end) = self.forward(&mut agent, &mut registering, msg).await {
@@ -261,6 +305,12 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
             }
             tokio::select! {
                 msg = inbox.recv() => match msg {
+                    // The answers to the agent requests do not wait for the
+                    // reopen or an MCP registration. The agent waits for
+                    // them.
+                    Some(msg) if agent.init.is_some() && self.answers_agent(&msg) => {
+                        self.prepare(&mut agent, &mut registering, msg).await;
+                    }
                     Some(msg) => self.wait(waiting, msg).await,
                     None => return self.end_agent(agent, waiting, AgentEnd::Stopped).await,
                 },
@@ -280,8 +330,15 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
                         return self.end_agent(agent, waiting, end).await;
                     }
                 }
-                () = tokio::time::sleep_until(deadline), if agent.init.is_none() => {
-                    let end = AgentEnd::StartFailed(StartFailure::from_message(&timeout));
+                () = tokio::time::sleep_until(deadline),
+                    if agent.init.is_none() || self.reopening =>
+                {
+                    let end = if agent.init.is_none() {
+                        AgentEnd::StartFailed(StartFailure::from_message(&timeout))
+                    } else {
+                        let secs = config.handshake_timeout.as_secs();
+                        AgentEnd::ReopenFailed(messages::acp::reopen_timeout(secs))
+                    };
                     return self.end_agent(agent, waiting, end).await;
                 }
             }
@@ -295,7 +352,7 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
         waiting: &mut VecDeque<Value>,
         error: &anyhow::Error,
     ) -> AgentEnd {
-        let list = self.first_method == "session/list";
+        let list = matches!(&self.first, First::OneShot(method) if method == "session/list");
         // Editors list the sessions of old dirs, for example removed git
         // worktrees. These dirs have no sandbox, thus they have no
         // sessions. An error makes the editor show a failure.
@@ -313,7 +370,7 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
     /// Keep the client message `msg` until the agent can take it. Refuse
     /// it if too many messages wait for the reopen.
     async fn wait(&mut self, waiting: &mut VecDeque<Value>, msg: Value) {
-        if self.reopen_key.is_some() && waiting.len() >= MAX_REOPEN_WAITING {
+        if self.reopening && waiting.len() >= MAX_REOPEN_WAITING {
             tracing::debug!("refuse client message: reopen queue full");
             if let Some(Kind::Request { id: req_id, .. }) = rpc::kind(&msg) {
                 let error = (rpc::INTERNAL_ERROR, messages::acp::REOPEN_QUEUE_FULL.into());
@@ -334,16 +391,23 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
         waiting: &mut VecDeque<Value>,
         end: AgentEnd,
     ) -> AgentEnd {
+        // The output of an agent whose reopen failed is not for the client,
+        // also a late OK answer to the reopen.
+        if matches!(end, AgentEnd::ReopenFailed(_)) {
+            self.reopening = false;
+            agent.mute();
+        }
         let code = self.stop(&mut agent).await;
         // A one-shot agent stops after its response. Its stop code is not
         // a failure of the session.
-        if !self.one_shot {
+        if !self.one_shot() {
             self.record(code);
         }
         // The other ends give their own error to the requests.
         if matches!(end, AgentEnd::Stopped) {
             let text = messages::acp::agent_exited(agent.sandbox(), code);
-            self.fail_all(waiting, &text).await;
+            self.fail_all(waiting, &StartFailure::from_message(&text))
+                .await;
         }
         end
     }
@@ -357,10 +421,11 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
         self.record(code);
         let sandbox = agent.sandbox();
         let text = messages::acp::agent_exited(sandbox, code);
-        if self.reopen_key.is_some() {
+        if self.reopening {
             return AgentEnd::ReopenFailed(text);
         }
-        self.fail_all(waiting, &text).await;
+        self.fail_all(waiting, &StartFailure::from_message(&text))
+            .await;
         if let Some(sid) = self.claimed.clone() {
             let detail = messages::acp::agent_stopped_detail(sandbox, code);
             self.notice(&sid, "error", messages::acp::AGENT_STOPPED, &detail)
@@ -404,7 +469,7 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
         // An agent without a handshake has no output for the client.
         let relay = agent.init.is_some();
         let deadline = Instant::now() + limit;
-        let kill = self.pool.kill.clone();
+        let kill = self.context.kill.clone();
         let mut killed = false;
         loop {
             tokio::select! {
@@ -434,7 +499,7 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
     /// Returns:
     ///   The start failure if the handshake did not complete.
     fn too_long(&self, agent: &mut Agent) -> Option<AgentEnd> {
-        if agent.limited() {
+        if agent.muted() {
             return None;
         }
         let message = messages::acp::agent_line_too_long(self.pool.config.max_line_bytes);
@@ -485,9 +550,18 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
     ) -> Option<AgentEnd> {
         let first = msg.get("id").map(key).as_ref() == Some(&self.first_key);
         let sent = self.prepare(agent, registering, msg).await;
-        // The proxy can refuse the one-shot request before it goes out.
-        // The client then has its response.
-        (self.one_shot && first && !sent).then_some(AgentEnd::Stopped)
+        // The load passed the session id checks. The session is now this
+        // session, also if another handle had it.
+        if first
+            && sent
+            && self.first == First::Reload
+            && let Some(sid) = self.first_sid.clone()
+        {
+            self.send(HandleMessage::Opening { session: sid }).await;
+        }
+        // The proxy can refuse the first request before it goes out. The
+        // client then has its response, and the agent has nothing to do.
+        (first && !sent && self.claimed.is_none()).then_some(AgentEnd::Stopped)
     }
 
     /// Check the message `msg`, map its session dir to the guest and send
@@ -502,7 +576,40 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
         registering: &mut Registering,
         mut msg: Value,
     ) -> bool {
+        // A close of the session of the session request ends the session.
+        let closes = session_id(&msg) == self.claimed.as_deref();
+        if let Err(sid) = rpc::strip_session_prefix(&mut msg, agent.sandbox()) {
+            let error = (
+                rpc::INVALID_PARAMS,
+                messages::acp::other_project_session(sid),
+            );
+            tracing::debug!("refuse client message: {:?}", error.1);
+            if let Some(Kind::Request { id: req_id, .. }) = rpc::kind(&msg) {
+                let req_id = req_id.clone();
+                self.reply(&req_id, error).await;
+                return false;
+            }
+            return true;
+        }
         let Some(Kind::Request { id: req_id, method }) = rpc::kind(&msg) else {
+            if let Some(Kind::CancelRequest {
+                req_id: Some(req_id),
+            }) = rpc::kind(&msg)
+                && let Some(original) = req_id.as_str().and_then(|id| self.agent_requests.get(id))
+            {
+                msg["params"]["requestId"] = original.clone();
+            }
+            if let Some(Kind::Response { id: req_id }) = rpc::kind(&msg) {
+                let original = req_id
+                    .as_str()
+                    .and_then(|id| self.agent_requests.remove(id));
+                // The request was of an agent that ended.
+                let Some(original) = original else {
+                    tracing::debug!(id = %req_id, "drop client response without an agent request");
+                    return true;
+                };
+                msg["id"] = original;
+            }
             agent.send(&msg);
             return true;
         };
@@ -512,7 +619,7 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
             .and_then(Value::as_str)
             .map(str::to_string);
         if let Some(cwd) = &host_cwd {
-            match self.guest_cwd(&agent.location, cwd).await {
+            match self.guest_cwd(&agent.location, cwd) {
                 Ok(guest) => {
                     tracing::info!(
                         method,
@@ -555,7 +662,7 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
             // values. Thus the log does not show it.
             return match self.mcp.prepare(request, msg) {
                 Ok(registration) => {
-                    self.open.insert(key(&req_id), (req_id, false));
+                    self.track(req_id, OpenKind::Plain);
                     *registering = Some(registration);
                     true
                 }
@@ -574,13 +681,36 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
                 "remove editor MCP servers: --proxy-mcp-servers is not set"
             );
         }
-        if method == "session/close" {
-            self.mcp.track_close(&req_id, params);
-        }
-        let list = method == "session/list";
-        self.open.insert(key(&req_id), (req_id, list));
+        let kind = match method.as_str() {
+            "session/list" => OpenKind::List,
+            "session/close" if closes => OpenKind::Close,
+            _ => OpenKind::Plain,
+        };
+        self.track(req_id, kind);
         agent.send(&msg);
         true
+    }
+
+    /// Check if the client message `msg` answers or cancels an agent
+    /// request.
+    fn answers_agent(&self, msg: &Value) -> bool {
+        match rpc::kind(msg) {
+            Some(Kind::Response { .. }) => true,
+            Some(Kind::CancelRequest {
+                req_id: Some(req_id),
+            }) => req_id
+                .as_str()
+                .is_some_and(|id| self.agent_requests.contains_key(id)),
+            _ => false,
+        }
+    }
+
+    /// Keep the client request `req_id` of the kind `kind` until its
+    /// response. The reopen request is not a client request.
+    fn track(&mut self, req_id: Value, kind: OpenKind) {
+        if !self.is_reopen(&req_id) {
+            self.open.insert(key(&req_id), (req_id, kind));
+        }
     }
 
     /// Get the guest path of the session dir `cwd`.
@@ -588,27 +718,16 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
     ///  - `location`: Sandbox of the agent
     ///
     /// Returns:
-    ///   The guest path, or the error code and message if `cwd` is not an
-    ///   absolute path or is not in the sandbox of the agent.
-    async fn guest_cwd(&self, location: &Location, cwd: &str) -> Result<String, (i64, String)> {
-        if cwd == self.cwd {
-            return Ok(location.guest_cwd.clone());
+    ///   The guest path, or the error code and message if `cwd` is not the
+    ///   session dir.
+    // The proxy starts a new session for each request with a session dir.
+    // Thus only the first request and the reopen have one, and it is the
+    // session dir.
+    fn guest_cwd(&self, location: &Location, cwd: &str) -> Result<String, (i64, String)> {
+        if cwd != self.cwd {
+            return Err((rpc::INVALID_PARAMS, messages::acp::other_session_dir(cwd)));
         }
-        if !cwd.starts_with('/') {
-            return Err((rpc::INVALID_PARAMS, messages::acp::cwd_not_absolute(cwd)));
-        }
-        let found = self
-            .pool
-            .launcher
-            .locate(cwd)
-            .await
-            .map_err(|e| (rpc::INTERNAL_ERROR, format!("{e:#}")))?;
-        // One agent runs in one sandbox. It cannot see the files of another
-        // sandbox.
-        if found.sandbox != location.sandbox {
-            return Err((rpc::INVALID_PARAMS, messages::acp::other_sandbox(cwd)));
-        }
-        Ok(found.guest_cwd)
+        Ok(location.guest_cwd.clone())
     }
 
     /// Handle one line of agent output, without its newline.
@@ -617,13 +736,20 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
     async fn on_line(&mut self, agent: &mut Agent, line: &[u8]) -> Option<AgentEnd> {
         // The output of an agent that went over a limit is not for the
         // client.
-        if agent.limited() {
+        if agent.muted() {
             return None;
         }
-        let Ok(mut msg) = serde_json::from_slice::<Value>(line) else {
-            tracing::debug!("drop agent line that is not JSON");
+        // Only one JSON object at a time goes to the client, as the proxy
+        // encodes it. Thus the client cannot read a message that the proxy
+        // did not check, for example in a batch.
+        let Ok(mut msg @ Value::Object(_)) = serde_json::from_slice::<Value>(line) else {
+            tracing::debug!("drop agent line that is not one JSON object");
             return None;
         };
+        if !rpc::add_session_prefix(&mut msg, agent.sandbox()) {
+            tracing::debug!("drop agent message with a session id that is not a string");
+            return None;
+        }
         let mut claim = None;
         let mut done = false;
         if let Some(Kind::Response { id: req_id }) = rpc::kind(&msg) {
@@ -632,28 +758,36 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
                 return self.on_handshake(agent, &msg).await;
             }
             let req_id = req_id.clone();
+            if self.is_reopen(&req_id) {
+                self.mcp.on_response(&req_id, &msg);
+                return self.on_reopened(agent, &msg);
+            }
             let id_key = key(&req_id);
-            let Some((_, list)) = self.open.remove(&id_key) else {
+            let Some((_, kind)) = self.open.remove(&id_key) else {
                 tracing::debug!(id = %req_id, "drop agent response without a request");
                 return None;
             };
             self.mcp.on_response(&req_id, &msg);
-            if list {
+            // The session ran only for the closed ACP session.
+            done = kind == OpenKind::Close && msg.get("result").is_some();
+            if kind == OpenKind::List {
                 let location = &agent.location;
                 rpc::map_session_list(&mut msg, &location.host_root, &location.guest_root);
             }
-            if self.reopen_key.as_ref() == Some(&id_key) {
-                return self.on_reopened(agent, &msg);
-            }
-            if id_key == self.first_key && self.one_shot {
+            if id_key == self.first_key
+                && let First::OneShot(method) = &self.first
+            {
                 let mut listed = self.pool.listed.borrow_mut();
                 let sid = self.first_sid.as_deref();
-                listed.record(&self.first_method, &self.cwd, sid, &msg);
+                listed.record(method, &self.cwd, sid, &msg);
                 done = true;
             } else if id_key == self.first_key && self.claimed.is_none() {
                 claim = self.claim(&msg);
+                // A session request that starts no session leaves the agent
+                // nothing to do.
+                done = claim.is_none();
             }
-        } else if self.one_shot {
+        } else if self.one_shot() {
             tracing::debug!("drop agent message of a one-shot session");
             return None;
         }
@@ -663,6 +797,9 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
         rpc::add_auth_hint(&mut msg, &self.pool.config.name);
         // The client has the history of a session that opens again.
         if self.hides(&msg) {
+            return None;
+        }
+        if !self.map_agent_ids(agent, &mut msg) {
             return None;
         }
         let claimed = claim.is_some();
@@ -678,36 +815,100 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
     /// Returns:
     ///   The start failure if the agent refused the handshake.
     async fn on_handshake(&mut self, agent: &mut Agent, reply: &Value) -> Option<AgentEnd> {
-        match check_handshake(reply, &self.pool.offered, agent.sandbox()) {
+        match check_handshake(reply, &self.context.offered, agent.sandbox()) {
             Ok(result) => agent.init = Some(result),
             Err(failure) => return Some(AgentEnd::StartFailed(failure)),
         }
         // The session request, or the reopen request, goes out next. A
         // one-shot session has nothing to save at a signal.
-        if !self.one_shot {
+        if !self.one_shot() {
             self.send(HandleMessage::Ready).await;
         }
         None
     }
 
+    /// Give the agent request or cancel `msg` the request id that the
+    /// client knows. Keep the original id of a request until its answer.
+    /// Refuse a request with a too long id, or over the limit of open
+    /// requests.
+    /// Returns:
+    ///   `false` if the request was refused, or if `msg` cancels no open
+    ///   request of the agent.
+    fn map_agent_ids(&mut self, agent: &mut Agent, msg: &mut Value) -> bool {
+        match rpc::kind(msg) {
+            Some(Kind::Request { id: req_id, .. }) => {
+                let original = req_id.clone();
+                let refused = if key(&original).len() > rpc::MAX_ID_BYTES {
+                    Some(messages::acp::AGENT_REQUEST_ID_TOO_LONG)
+                } else if self.agent_requests.len() >= MAX_AGENT_REQUESTS {
+                    Some(messages::acp::AGENT_REQUESTS_FULL)
+                } else {
+                    None
+                };
+                if let Some(text) = refused {
+                    tracing::debug!("refuse agent request: {text}");
+                    agent.send(&rpc::error_response(&original, rpc::INVALID_REQUEST, text));
+                    return false;
+                }
+                let n = self.agent_requests_seen;
+                self.agent_requests_seen += 1;
+                let id = rpc::agent_request_id(self.hid, n);
+                self.agent_requests.insert(id.clone(), original);
+                msg["id"] = Value::String(id);
+            }
+            Some(Kind::CancelRequest { req_id }) => {
+                let open = self
+                    .agent_requests
+                    .iter()
+                    .find(|(_, original)| Some(*original) == req_id)
+                    .map(|(id, _)| id.clone());
+                let Some(id) = open else {
+                    tracing::debug!("drop agent cancel without an open request");
+                    return false;
+                };
+                // A late client answer to the request is dropped.
+                self.agent_requests.remove(&id);
+                msg["params"]["requestId"] = Value::String(id);
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// End the open requests of the agent that ended, and send the client a
+    /// cancel for each.
+    async fn cancel_agent_requests(&mut self) {
+        for run_id in std::mem::take(&mut self.agent_requests).into_keys() {
+            let params = json!({ "requestId": run_id });
+            let msg = json!({ "jsonrpc": "2.0", "method": rpc::CANCEL_REQUEST, "params": params });
+            self.to_client(msg, None).await;
+        }
+    }
+
     /// Get the ACP session that the response `msg` to the session request
-    /// starts, and keep it.
+    /// starts, and keep it. A load or a resume gets the session that the
+    /// client asked for.
     /// Returns:
     ///   The session, or `None` if `msg` is an error or has no session.
     fn claim(&mut self, msg: &Value) -> Option<Claim> {
         if msg.get("error").is_some() {
             return None;
         }
-        let sid = msg
-            .pointer("/result/sessionId")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| self.first_sid.clone().filter(|_| self.reload))?;
+        let answered = msg.pointer("/result/sessionId").and_then(Value::as_str);
+        let reload = self.first == First::Reload;
+        let sid = if reload {
+            // The agent is not trusted. Its answer must not take the open
+            // session of another handle.
+            let sid = self.first_sid.clone()?;
+            if let Some(answered) = answered.filter(|a| *a != sid) {
+                tracing::debug!(sid, answered, "ignore other session id in reopen answer");
+            }
+            sid
+        } else {
+            answered?.to_string()
+        };
         self.claimed = Some(sid.clone());
-        Some(Claim {
-            session: sid,
-            replace: self.reload,
-        })
+        Some(Claim { session: sid })
     }
 
     /// Handle the agent response `msg` to the reopen request. The client
@@ -724,7 +925,7 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
             return Some(AgentEnd::ReopenFailed(detail));
         }
         tracing::info!(sandbox = agent.sandbox(), "session reopened");
-        self.reopen_key = None;
+        self.reopening = false;
         if let Some(reader) = agent.notices.clone() {
             self.show_notices(reader);
         }
@@ -732,22 +933,25 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
     }
 
     /// Check if the agent message `msg` is history of the ACP session that
-    /// opens again. The client has it already.
+    /// opens again, or of its sub agent sessions. The client has it
+    /// already.
     fn hides(&self, msg: &Value) -> bool {
-        self.reopen_key.is_some()
+        // A load sends the history of its sub agent sessions too.
+        self.reopening
             && matches!(
                 rpc::kind(msg),
                 Some(Kind::Notification {
                     method: "session/update"
                 })
             )
-            && session_id(msg).is_some_and(|sid| self.claimed.as_deref() == Some(sid))
+            && session_id(msg).is_some()
     }
 
     /// Wait for the next client request of a session whose agent is gone.
     /// A close gets its reply at once. Other messages are dropped.
     /// Returns:
-    ///   The request, or `None` if the proxy stopped the session.
+    ///   The request, or `None` if the proxy stopped the session or the
+    ///   client closed its ACP session.
     async fn next_request(&mut self, inbox: &mut Inbox) -> Option<Value> {
         loop {
             let msg = inbox.recv().await?;
@@ -757,8 +961,12 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
                     id: req_id,
                     method: "session/close",
                 }) => {
+                    let closed = session_id(&msg) == self.claimed.as_deref();
                     let msg = rpc::result_response(req_id, &json!({}));
                     self.to_client(msg, None).await;
+                    if closed {
+                        return None;
+                    }
                 }
                 Some(Kind::Request { .. }) => return Some(msg),
                 _ => tracing::debug!("drop client message: the agent is gone"),
@@ -770,12 +978,17 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
     /// messages.
     fn start_reopen(&mut self) {
         tracing::info!(sid = ?self.claimed, "reopen the session");
-        self.reopen_key = Some(key(&Value::from(rpc::reopen_id(self.hid))));
+        self.reopening = true;
     }
 
     /// Check if `req_id` is the reopen request that has no response yet.
     fn is_reopen(&self, req_id: &Value) -> bool {
-        self.reopen_key.as_ref() == Some(&key(req_id))
+        self.reopening && req_id.as_str() == Some(&rpc::reopen_id(self.hid))
+    }
+
+    /// Check if the session runs only its first request.
+    fn one_shot(&self) -> bool {
+        matches!(self.first, First::OneShot(_))
     }
 
     /// Keep the exit code `code` if it is the first that is not 0.
@@ -793,7 +1006,11 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
         let first = waiting
             .iter()
             .find(|m| m.get("id").map(key).as_ref() == Some(&self.first_key));
+        // The env and header values of the editor MCP servers can be
+        // secrets.
+        let first = first.map(hide_mcp_secrets);
         let mut params = first
+            .as_ref()
             .and_then(|m| m.get("params"))
             .map(Value::to_string)
             .unwrap_or_default();
@@ -801,47 +1018,39 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
             params.truncate(cut);
             params.push('…');
         }
-        tracing::warn!(
-            method = self.first_method,
-            params,
-            "agent start failed: {}",
-            failure.message
-        );
+        let method = first.as_ref().and_then(|m| m.get("method"));
+        let method = method.and_then(Value::as_str);
+        tracing::warn!(method, params, "agent start failed: {}", failure.message);
         let ids = request_ids(waiting.drain(..));
         self.answer(ids, |req_id| failure.response(req_id)).await;
     }
 
     /// Give the open and waiting requests the error of the failed reopen
-    /// with `detail`.
-    async fn fail_reopen(&mut self, waiting: &mut VecDeque<Value>, detail: &str) {
-        tracing::warn!("session reopen failed: {detail}");
+    /// `failure`, with its error data.
+    async fn fail_reopen(&mut self, waiting: &mut VecDeque<Value>, failure: &StartFailure) {
+        // The detail can come from the agent. The debug form escapes its
+        // control characters, so that it cannot fake log lines.
+        tracing::warn!("session reopen failed: {:?}", failure.message);
         let sid = self.claimed.clone().unwrap_or_default();
-        let text = messages::acp::session_reopen_failed(sid, detail);
-        self.fail_all(waiting, &text).await;
-        self.reopen_key = None;
+        let text = messages::acp::session_reopen_failed(sid, &failure.message);
+        self.fail_all(waiting, &failure.with_message(text)).await;
+        self.reopening = false;
     }
 
-    /// Give each open and waiting request the error `text`. Drop the other
-    /// waiting messages.
-    async fn fail_all(&mut self, waiting: &mut VecDeque<Value>, text: &str) {
+    /// Give each open and waiting request the error of `failure`. Drop the
+    /// other waiting messages.
+    async fn fail_all(&mut self, waiting: &mut VecDeque<Value>, failure: &StartFailure) {
         let open = std::mem::take(&mut self.open)
             .into_values()
             .map(|(id, _)| id);
         let ids: Vec<Value> = open.chain(request_ids(waiting.drain(..))).collect();
-        self.answer(ids, |req_id| {
-            rpc::error_response(req_id, rpc::INTERNAL_ERROR, text)
-        })
-        .await;
+        self.answer(ids, |req_id| failure.response(req_id)).await;
     }
 
     /// Send the response that `response` makes to each request in `ids`.
-    /// The reopen request gets no response, because the client did not
-    /// send it.
     async fn answer(&self, ids: Vec<Value>, response: impl Fn(&Value) -> Value) {
         for req_id in ids {
-            if !self.is_reopen(&req_id) {
-                self.to_client(response(&req_id), None).await;
-            }
+            self.to_client(response(&req_id), None).await;
         }
     }
 
@@ -884,7 +1093,7 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
         let Some(sid) = self.claimed.clone() else {
             return;
         };
-        let (hid, tx, notices) = (self.hid, self.pool.messages.clone(), self.pool.notices);
+        let (hid, tx, notices) = (self.hid, self.context.messages.clone(), self.notices);
         // The read goes to the sandbox. The agent output must not wait for
         // it. The warnings come after the response, because the response
         // is in the queue before the read starts.
@@ -907,17 +1116,14 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
     /// Send a message to the client in the ACP session `sid` (see
     /// [`notice_message`]).
     async fn notice(&self, sid: &str, severity: &str, title: &str, detail: &str) {
-        let msg = notice_message(self.pool.notices, sid, severity, title, detail);
+        let msg = notice_message(self.notices, sid, severity, title, detail);
         self.to_client(msg, None).await;
     }
 
-    /// Send the error `error` for the client request `req_id`. The client
-    /// does not get the error for the reopen request.
+    /// Send the error `error` for the client request `req_id`. The proxy
+    /// drops the error of the reopen request, because the client did not
+    /// send it.
     async fn reply(&self, req_id: &Value, error: (i64, String)) {
-        if self.is_reopen(req_id) {
-            tracing::info!("refuse reopen request: {}", error.1);
-            return;
-        }
         let msg = rpc::error_response(req_id, error.0, &error.1);
         self.to_client(msg, None).await;
     }
@@ -929,27 +1135,44 @@ impl<S: AgentProcessLauncher + 'static> Session<S> {
 
     /// Send a message about the session to the proxy.
     async fn send(&self, message: HandleMessage) {
-        let _ = self.pool.messages.send((self.hid, message)).await;
+        let _ = self.context.messages.send((self.hid, message)).await;
     }
+}
+
+/// Kind of the first request of a session.
+#[derive(PartialEq, Eq)]
+enum First {
+    /// `session/new` or `session/fork`. The agent answer gives the session.
+    New,
+    /// `session/load` or `session/resume`. The client gives the session.
+    Reload,
+    /// Another request, with its method. The session runs only this
+    /// request, gets no other agent messages, and owns no ACP sessions.
+    OneShot(String),
+}
+
+/// Kind of an open client request, for the handling of its response.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenKind {
+    /// No special handling.
+    Plain,
+    /// A `session/list`. Its response has guest session dirs.
+    List,
+    /// A `session/close` of the ACP session of the session request. Its OK
+    /// response ends the session.
+    Close,
 }
 
 /// Apply the restrict rules to the agent message `msg`. Refuse an agent
 /// request that the rules do not let through.
 /// Returns:
 ///   `true` if the message goes to the client.
-// Only one JSON object at a time goes to the client, as the proxy
-// encodes it. Thus the client cannot read a message that the proxy did
-// not check, for example in a batch.
 fn allowed(agent: &mut Agent, msg: &Value) -> bool {
-    if !msg.is_object() {
-        tracing::debug!("drop agent line that is not one object");
-        return false;
-    }
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("-");
     match capabilities::check_agent_message(msg) {
         AgentVerdict::Forward => true,
         AgentVerdict::Refuse { code, message } => {
-            tracing::debug!(method, "refuse agent request: {message}");
+            tracing::debug!(method, "refuse agent request: {message:?}");
             let req_id = msg.get("id").cloned().unwrap_or(Value::Null);
             agent.send(&rpc::error_response(&req_id, code, &message));
             false

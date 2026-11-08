@@ -10,11 +10,9 @@
 //!
 //! The servers of one session make a set with a random key. The key is
 //! part of the sandbox addresses, thus the sessions of all proxies stay
-//! apart. A set ends when the editor closes the session, loads it again,
-//! or when the session request fails. All sets of an agent end with the
-//! agent.
+//! apart. A set ends when the session request fails, and with the agent or
+//! the session.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -57,8 +55,6 @@ pub(super) type Registration = Pin<Box<dyn Future<Output = Registered>>>;
 pub(super) struct Registered {
     /// The request for the agent, with the sandbox addresses.
     pub(super) msg: Value,
-    /// Key of the session.
-    key: String,
     /// The servers that the sandbox serves.
     set: ServerSet,
 }
@@ -78,14 +74,14 @@ pub(super) struct SessionRequest<'r> {
     /// CLI service of the sandbox that adds the sandbox addresses, or
     /// `None` if the agent has none.
     pub(super) registrar: Option<McpRegistrar>,
-    /// Time limit of the release of an old set and the registration of
-    /// all servers.
+    /// Time limit of the registration of all servers.
     pub(super) timeout: Duration,
     /// Sandbox of the agent, for the log.
     pub(super) sandbox: &'r str,
 }
 
 /// MCP servers in the sandbox for one ACP session.
+#[derive(Default)]
 struct ServerSet {
     /// Stops the server sessions on the host.
     stopper: Option<HostStopper>,
@@ -122,38 +118,23 @@ impl ServerSet {
     }
 }
 
-/// What a pending session request does at its response.
-enum Pending {
-    /// A request that made the set `key`. An OK response maps the session
-    /// to the key. An error releases the key.
-    Open {
-        /// Key of the set.
-        key: String,
-        /// Session of a load or resume. `None`: the response gives it.
-        session: Option<String>,
-    },
-    /// A close of a session. An OK response releases its set.
-    Close {
-        /// The ACP session id.
-        session: String,
-    },
-}
-
-/// Server sets of the ACP sessions of one agent.
+/// Server set of one session. The session has at most one set: the set of
+/// its session request, or of the reopen in its current agent.
 #[derive(Default)]
 pub(super) struct Registry {
-    /// Key of each known ACP session.
-    sessions: HashMap<String, String>,
-    /// Server set of each key.
-    sets: HashMap<String, ServerSet>,
-    /// Session requests by the JSON text of their id.
-    pending: HashMap<String, Pending>,
-    /// Releases that run in the background. The proxy end waits for them.
+    /// The server set, if one is registered.
+    set: Option<ServerSet>,
+    /// Map key of the id of the request that made the set, until its
+    /// response.
+    pending: Option<String>,
+    /// Releases that run in the background. The session end waits for
+    /// them.
     background: Vec<JoinHandle<()>>,
 }
 
 impl Registry {
-    /// Prepare a session request: give it a key and register its servers.
+    /// Prepare a session request: give it a new key and register its
+    /// servers.
     /// Args:
     ///  - `request`: The session request
     ///  - `msg`: The request message for the agent
@@ -166,26 +147,8 @@ impl Registry {
         request: SessionRequest<'_>,
         msg: Value,
     ) -> Result<Registration, (i64, String)> {
-        let reload = matches!(request.method, "session/load" | "session/resume");
-        let session = reload
-            .then(|| msg.pointer("/params/sessionId").and_then(Value::as_str))
-            .flatten()
-            .map(str::to_string);
-        let known = session.as_ref().and_then(|s| self.sessions.get(s)).cloned();
-        let key = match known {
-            Some(key) => key,
-            None => new_key().map_err(|e| (rpc::INTERNAL_ERROR, format!("{e:#}")))?,
-        };
-        // A load or resume of a known session keeps its addresses. The old
-        // set goes first: the new set uses the same addresses.
-        let old = self.sets.remove(&key).map(ServerSet::release);
-        self.track(
-            request.id,
-            Pending::Open {
-                key: key.clone(),
-                session,
-            },
-        );
+        let key = new_key().map_err(|e| (rpc::INTERNAL_ERROR, format!("{e:#}")))?;
+        self.pending = Some(rpc::key(request.id));
         let (slots, specs) = plan(&request, &msg);
         let names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
         tracing::info!(
@@ -196,29 +159,19 @@ impl Registry {
             "register MCP servers"
         );
         let registrar = request.registrar;
-        // One time limit for the release of the old set and the new
-        // registrations. Thus the client waits at most this time.
         let deadline = Instant::now() + request.timeout;
         let cwd = request.host_cwd.map(str::to_string);
         Ok(Box::pin(async move {
-            if let Some(old) = old
-                && tokio::time::timeout_at(deadline, old).await.is_err()
-            {
-                tracing::debug!(key, "old MCP servers did not end in time");
-            }
             let set = match (registrar, cwd) {
                 (Some(registrar), Some(cwd)) if !specs.is_empty() => {
                     register(&registrar, &key, specs, &cwd, deadline).await
                 }
-                _ => ServerSet {
-                    stopper: None,
-                    routes: Vec::new(),
-                },
+                _ => ServerSet::default(),
             };
             let msg = rewrite(msg, slots, &key, &set);
             let names: Vec<&str> = set.routes.iter().map(|(n, _)| n.as_str()).collect();
             tracing::info!(key, names = ?names, "MCP servers registered");
-            Registered { msg, key, set }
+            Registered { msg, set }
         }))
     }
 
@@ -226,116 +179,51 @@ impl Registry {
     /// Returns:
     ///   The request for the agent.
     pub(super) fn add(&mut self, registered: Registered) -> Value {
-        let Registered { msg, key, set } = registered;
-        // A key has one set. An old one can come from a second request
-        // with the same key.
-        if let Some(old) = self.sets.insert(key, set) {
-            self.spawn_release(old);
-        }
+        let Registered { msg, set } = registered;
+        // A session registers its servers once for each agent.
+        debug_assert!(self.set.is_none());
+        self.set = Some(set);
         msg
     }
 
-    /// Remember the session request `id` until its response. A client
-    /// should not use an id two times. If it does, the last request wins.
-    fn track(&mut self, id: &Value, pending: Pending) {
-        if self.pending.insert(rpc::key(id), pending).is_some() {
-            tracing::warn!(id = %id, "two session requests with the same id");
-        }
-    }
-
-    /// Release `set` in a task. The proxy end waits for the task.
+    /// Release `set` in a task. The session end waits for the task.
     fn spawn_release(&mut self, set: ServerSet) {
         self.background.retain(|task| !task.is_finished());
         self.background
             .push(tokio::task::spawn_local(set.release()));
     }
 
-    /// Remember a `session/close` request, to release the set of the
-    /// session at the OK response.
-    pub(super) fn track_close(&mut self, id: &Value, params: &Value) {
-        let Some(session) = params.get("sessionId").and_then(Value::as_str) else {
-            return;
-        };
-        if self.sessions.contains_key(session) {
-            let session = session.to_string();
-            self.track(id, Pending::Close { session });
-        }
-    }
-
-    /// Handle an agent response: map a new session to its key, or release
-    /// the set of a failed or closed session.
+    /// Handle an agent response: an error to the request that made the set
+    /// releases the set.
     pub(super) fn on_response(&mut self, id: &Value, msg: &Value) {
-        let Some(pending) = self.pending.remove(&rpc::key(id)) else {
+        if self.pending.as_deref() != Some(rpc::key(id).as_str()) {
             return;
-        };
-        let ok = msg.get("error").is_none();
-        match pending {
-            Pending::Open { key, session } => {
-                let session = session.or_else(|| {
-                    msg.pointer("/result/sessionId")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                });
-                match (ok, session) {
-                    (true, Some(session)) => {
-                        if let Some(old) = self.sessions.insert(session, key.clone())
-                            && old != key
-                        {
-                            self.release(&old);
-                        }
-                    }
-                    // The agent did not give the session id. The set then
-                    // stays until the proxy ends.
-                    (true, None) => {
-                        tracing::debug!(key, "no session id in the response");
-                    }
-                    (false, session) => {
-                        tracing::debug!(key, "release MCP servers of failed request");
-                        // A failed load or resume ends the known session.
-                        if let Some(session) = session
-                            && self.sessions.get(&session) == Some(&key)
-                        {
-                            self.sessions.remove(&session);
-                        }
-                        self.release(&key);
-                    }
-                }
-            }
-            Pending::Close { session } if ok => {
-                if let Some(key) = self.sessions.remove(&session) {
-                    tracing::info!(key, "release MCP servers of closed session");
-                    self.release(&key);
-                }
-            }
-            Pending::Close { .. } => {}
         }
-    }
-
-    /// Release the set `key` in the background, if it exists.
-    fn release(&mut self, key: &str) {
-        if let Some(set) = self.sets.remove(key) {
+        self.pending = None;
+        if msg.get("error").is_some()
+            && let Some(set) = self.set.take()
+        {
+            tracing::debug!("release MCP servers of failed request");
             self.spawn_release(set);
         }
     }
 
-    /// Release all sets and forget all sessions.
+    /// Release the set.
     /// Returns:
     ///   Future that completes when all releases, also the ones in the
     ///   background, are done or reached their time limit.
     pub(super) fn release_all(&mut self) -> impl Future<Output = ()> + 'static {
-        self.sessions.clear();
-        self.pending.clear();
-        if !self.sets.is_empty() {
-            tracing::info!(sets = self.sets.len(), "release all MCP servers");
-        }
-        let releases: Vec<_> = self.sets.drain().map(|(_, s)| s.release()).collect();
+        self.pending = None;
+        let release = self.set.take().map(|set| {
+            tracing::info!("release MCP servers");
+            set.release()
+        });
         let background = std::mem::take(&mut self.background);
         async move {
-            futures::future::join(
-                futures::future::join_all(releases),
-                futures::future::join_all(background),
-            )
-            .await;
+            if let Some(release) = release {
+                release.await;
+            }
+            futures::future::join_all(background).await;
         }
     }
 }
@@ -587,17 +475,13 @@ async fn register(
     host_cwd: &str,
     deadline: Instant,
 ) -> ServerSet {
-    let empty = || ServerSet {
-        stopper: None,
-        routes: Vec::new(),
-    };
     // The client picks the session dir, the same as for the agent start.
     // Thus symlinks in it are followed.
     let cwd = match VerifiedPath::new_follow(host_cwd, None) {
         Ok(cwd) => cwd,
         Err(e) => {
             tracing::warn!(key, "drop all bridged MCP servers: session dir: {e}");
-            return empty();
+            return ServerSet::default();
         }
     };
     let names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();

@@ -22,7 +22,7 @@ mod client_jetbrains;
 mod client_zed;
 mod standard;
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::acp::rpc::{self, Kind};
 use crate::messages;
@@ -66,6 +66,14 @@ pub fn preset(argv: &[String]) -> Vec<String> {
 fn command_name(argv: &[String]) -> &str {
     argv.first()
         .map_or("", |cmd| cmd.rsplit('/').next().unwrap_or(""))
+}
+
+/// Copy the client `_meta` features `names` that `meta` has.
+fn keep_names(meta: &Map<String, Value>, names: &[&str]) -> Map<String, Value> {
+    names
+        .iter()
+        .filter_map(|name| Some(((*name).to_string(), meta.get(*name)?.clone())))
+        .collect()
 }
 
 /// Make a list of feature names from static names.
@@ -145,7 +153,6 @@ fn required(method: &str) -> Option<&'static str> {
 ///  - `agent`: `initialize` result of the real agent
 pub fn missing(offered: &Value, agent: &Value) -> Vec<String> {
     known()
-        .chain(client_jetbrains::extra_names())
         .filter(|name| present(offered, name) && !present(agent, name))
         .collect()
 }
@@ -183,9 +190,9 @@ fn restrict_client_capabilities(mut params: Value) -> Value {
     };
     let mut kept = standard::keep_caps(caps);
     if let Some(meta) = caps.get("_meta").and_then(Value::as_object) {
-        let mut kept_meta = client_zed::keep_meta(meta);
+        let mut kept_meta = keep_names(meta, client_zed::META_NAMES);
+        kept_meta.extend(keep_names(meta, agent_claude::META_NAMES));
         kept_meta.extend(client_jetbrains::keep_meta(meta));
-        kept_meta.extend(agent_claude::keep_meta(meta));
         if !kept_meta.is_empty() {
             kept.insert("_meta".into(), Value::Object(kept_meta));
         }
@@ -259,8 +266,6 @@ fn is_agent_notification(method: &str) -> bool {
     [
         standard::AGENT_NOTIFICATIONS,
         agent_claude::AGENT_NOTIFICATIONS,
-        agent_codex::AGENT_NOTIFICATIONS,
-        client_jetbrains::AGENT_NOTIFICATIONS,
     ]
     .iter()
     .any(|list| list.contains(&method))

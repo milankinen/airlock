@@ -26,17 +26,15 @@ async fn reply(features: Vec<String>, caps: Value) -> Value {
 }
 
 /// Test that the Claude preset offers the session, login and sub-agent
-/// features, and the AIR features only to an AIR client. The session index
-/// extras come only when the client has the session index, the same as
-/// from the real agent. JetBrains IDEs show these parts only when the
-/// agent offers them.
+/// features, and the AIR features only to an AIR client. JetBrains IDEs
+/// show these parts only when the agent offers them. The preset does not
+/// offer the session index: its requests have no session id, and each
+/// session has its own agent.
 ///   1. Do the handshake with the Claude preset and an AIR client with the
 ///      session index
 ///   2. Check the session features, the login and the AIR list with the
-///      extras and the goal
-///   3. Do it again with an AIR client without the session index, and
-///      check that the extras are not in the list
-///   4. Do it again with a client without AIR, and check that the reply
+///      goal, and without the session index and its extras
+///   3. Do it again with a client without AIR, and check that the reply
 ///      has no AIR part
 #[test]
 fn claude_preset_offers_air_features_only_to_air_client() {
@@ -54,23 +52,10 @@ fn claude_preset_offers_air_features_only_to_air_client() {
         let air = &result["_meta"]["jetbrains"]["air"];
         assert_eq!(air["goal"]["controlMethod"], "_session/goal");
         let names = air["capabilities"].as_array().unwrap();
-        for name in [
-            "backgroundSubagents",
-            "sessionIndex",
-            "sessionRename",
-            "sessionWorktrees",
-        ] {
-            assert!(names.contains(&json!(name)), "{name}: {air}");
+        assert!(names.contains(&json!("backgroundSubagents")), "{air}");
+        for name in ["sessionIndex", "sessionRename"] {
+            assert!(!names.contains(&json!(name)), "{name}: {air}");
         }
-
-        let result = reply(claude.clone(), air_client(&["diffPatch"])).await;
-        let names = result["_meta"]["jetbrains"]["air"]["capabilities"]
-            .as_array()
-            .unwrap()
-            .clone();
-        assert!(names.contains(&json!("diffPatch")));
-        assert!(!names.contains(&json!("sessionIndex")));
-        assert!(!names.contains(&json!("sessionRename")));
 
         let result = reply(claude, json!({})).await;
         assert!(result["_meta"].get("jetbrains").is_none(), "{result}");

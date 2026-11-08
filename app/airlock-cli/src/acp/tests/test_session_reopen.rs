@@ -4,10 +4,13 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::acp::Config;
 use crate::acp::rpc::CANCEL_REQUEST;
-use crate::messages::acp::{REOPEN_NOT_SUPPORTED, REOPEN_QUEUE_FULL};
+use crate::messages::acp::{REOPEN_NOT_SUPPORTED, REOPEN_QUEUE_FULL, reopen_timeout};
 use crate::sandbox::NoticeLog;
-use crate::test_cfg::acp::{LocalProcessLauncher, TestClient, full_agent_init, test_config};
+use crate::test_cfg::acp::{
+    LocalProcessLauncher, TestClient, capture_logs, full_agent_init, test_config,
+};
 use crate::test_cfg::{block_on_local, temp_dir};
 
 /// Start a session with an agent that gets `env`, and make the agent exit.
@@ -17,9 +20,25 @@ use crate::test_cfg::{block_on_local, temp_dir};
 async fn session_after_agent_exit(
     env: &[(&str, &str)],
 ) -> (TestClient, std::rc::Rc<std::cell::Cell<usize>>) {
-    let launcher = LocalProcessLauncher::new(env);
+    session_after_agent_exit_with(env, test_config(true)).await
+}
+
+/// [`session_after_agent_exit`] with the proxy settings `config`.
+async fn session_after_agent_exit_with(
+    env: &[(&str, &str)],
+    config: Config,
+) -> (TestClient, std::rc::Rc<std::cell::Cell<usize>>) {
+    session_after_agent_exit_in(LocalProcessLauncher::new(env), config).await
+}
+
+/// [`session_after_agent_exit`] with the agent launcher `launcher` and the
+/// proxy settings `config`.
+async fn session_after_agent_exit_in(
+    launcher: LocalProcessLauncher,
+    config: Config,
+) -> (TestClient, std::rc::Rc<std::cell::Cell<usize>>) {
     let launches = launcher.launches.clone();
-    let mut client = TestClient::session(launcher, test_config(true), "/projects/a").await;
+    let mut client = TestClient::session(launcher, config, "/projects/a").await;
     client
         .send_in_session(json!({ "jsonrpc": "2.0", "method": "test/exit", "params": {} }))
         .await;
@@ -204,7 +223,7 @@ fn close_after_agent_exit_starts_no_agent() {
 
 /// Test that each request that comes while a reopen fails gets exactly one
 /// response, and that a later request opens the session. A request that
-/// gets no response makes the editor wait for ever.
+/// gets no response makes the editor wait forever.
 ///   1. Start a session with an agent that refuses the first reopen
 ///   2. Make the agent exit
 ///   3. Send two prompts at once. The first one starts the reopen
@@ -320,7 +339,7 @@ fn refused_load_claims_no_session() {
         client
             .initialize(json!({ "session": { "notices": {} } }))
             .await;
-        let params = json!({ "sessionId": "x", "cwd": "/projects/a", "mcpServers": [] });
+        let params = json!({ "sessionId": "a:x", "cwd": "/projects/a", "mcpServers": [] });
         let (response, mut others) = client.request(2, "session/load", params).await;
         assert_eq!(response["error"]["code"], -32002, "{response}");
 
@@ -331,7 +350,7 @@ fn refused_load_claims_no_session() {
         })
         .await
         .expect("agent exit in time");
-        let (response, more) = client.prompt(3, "x").await;
+        let (response, more) = client.prompt(3, "a:x").await;
         assert_eq!(response["error"]["code"], -32602, "{response}");
         others.extend(more);
         assert!(
@@ -339,5 +358,189 @@ fn refused_load_claims_no_session() {
             "{others:?}"
         );
         assert_eq!(launches.get(), 1);
+    });
+}
+
+/// Test that a reopen that the agent does not answer fails after the
+/// handshake time limit, and that the next request tries again. Else the
+/// waiting requests of the session wait forever.
+///   1. Start a session with an agent that never answers a resume, with a
+///      time limit of 1 s
+///   2. Make the agent exit
+///   3. Send a prompt and check that it gets the time limit error
+///   4. Send a second prompt and check that a third agent starts for it
+#[test]
+fn reopen_without_answer_fails_after_time_limit() {
+    block_on_local(async {
+        let config = Config {
+            handshake_timeout: Duration::from_secs(1),
+            ..test_config(true)
+        };
+        let env = [("AGENT_HOLD", "session/resume")];
+        let (mut client, launches) = session_after_agent_exit_with(&env, config).await;
+        let sid = client.sid.clone();
+        let (response, others) = client.prompt(3, &sid).await;
+        let message = response["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains(&reopen_timeout(1)), "{response}");
+        assert_no_other_response(&others);
+
+        let (response, _) = client.prompt(4, &sid).await;
+        assert_eq!(response["error"]["code"], -32603, "{response}");
+        assert_eq!(launches.get(), 3);
+    });
+}
+
+/// Get the first `session/request_permission` in `msgs`. Panics if there
+/// is none.
+fn permission_request(msgs: &[Value]) -> Value {
+    msgs.iter()
+        .find(|m| m["method"] == "session/request_permission")
+        .unwrap_or_else(|| panic!("{msgs:?}"))
+        .clone()
+}
+
+/// Test that the open request of an agent that exited ends, and that a
+/// late client answer to it does not reach the next agent. Else an "allow"
+/// in an old permission dialog approves a new tool call.
+///   1. Start a session with an agent that asks for a permission with the
+///      same id at each prompt, and send a prompt
+///   2. Make the agent exit, and check that the client gets a cancel of the
+///      open permission request
+///   3. Send a prompt. A new agent opens the session and asks again
+///   4. Check that the new request has a new id
+///   5. Answer the old request and then the new request, and check that the
+///      new agent gets only the answer of the new request
+#[test]
+fn agent_request_of_exited_agent_ends_and_its_answer_is_dropped() {
+    block_on_local(async {
+        let launcher = LocalProcessLauncher::new(&[("AGENT_ASK", "5")]);
+        let mut client = TestClient::session(launcher, test_config(true), "/projects/a").await;
+        let sid = client.sid.clone();
+        let (_, others) = client.prompt(3, &sid).await;
+        let old = permission_request(&others);
+
+        client
+            .notify("test/exit", json!({ "sessionId": sid }))
+            .await;
+        let cancel = loop {
+            let msg = client.recv().await;
+            if msg["method"] == CANCEL_REQUEST {
+                break msg;
+            }
+        };
+        assert_eq!(cancel["params"]["requestId"], old["id"], "{cancel}");
+
+        let (_, others) = client.prompt(4, &sid).await;
+        let new = permission_request(&others);
+        assert_ne!(new["id"], old["id"]);
+
+        for (ask, option) in [(&old, "old"), (&new, "new")] {
+            let result = json!({ "outcome": { "outcome": "selected", "optionId": option } });
+            let answer = json!({ "jsonrpc": "2.0", "id": ask["id"], "result": result });
+            client.send(&answer).await;
+        }
+        let answer = loop {
+            let msg = client.recv().await;
+            if let Some(seen) = msg.pointer("/params/seen")
+                && seen.get("result").is_some()
+            {
+                break seen.clone();
+            }
+        };
+        assert_eq!(answer["id"], 5, "{answer}");
+        assert_eq!(answer["result"]["outcome"]["optionId"], "new", "{answer}");
+    });
+}
+
+/// Test that the reopen error text of the agent cannot fake a line in the
+/// log. The agent is not trusted, and the user reads the log.
+///   1. Start a session with an agent that refuses the first reopen with
+///      an error text with a newline
+///   2. Make the agent exit and send a prompt
+///   3. Check that the log has the reopen failure, and the newline only in
+///      escaped form
+#[test]
+fn reopen_error_of_agent_cannot_fake_log_line() {
+    block_on_local(async {
+        let logs = capture_logs();
+        let dir = temp_dir();
+        let flag = dir.path().join("fail");
+        std::fs::write(&flag, "").unwrap();
+        let flag = flag.to_str().unwrap();
+        let error = r#"{"code":-32002,"message":"bad\nFAKE LOG LINE"}"#;
+        let env = [("AGENT_REOPEN_FAIL", flag), ("AGENT_REOPEN_ERROR", error)];
+        let (mut client, _) = session_after_agent_exit(&env).await;
+        let sid = client.sid.clone();
+        let (response, _) = client.prompt(3, &sid).await;
+        assert!(response.get("error").is_some(), "{response}");
+        let text = logs.text();
+        assert!(text.contains("session reopen failed"), "{text}");
+        assert!(!text.contains("\nFAKE LOG LINE"), "{text}");
+    });
+}
+
+/// Test that a reopen whose sandbox does not start gives the waiting
+/// request the error data of the sandbox process. The editor shows only
+/// the reply, so the reason must be in it.
+///   1. Start a session, with an agent launcher whose later launches fail
+///      as a sandbox process that stops in its start
+///   2. Make the agent exit and send a prompt
+///   3. Check that the error has the reopen failure and the exit code and
+///      output of the sandbox process
+#[test]
+fn failed_reopen_start_keeps_error_data() {
+    block_on_local(async {
+        let launcher = LocalProcessLauncher::new(&[]).with_good_launches(1);
+        let (mut client, _) = session_after_agent_exit_in(launcher, test_config(true)).await;
+        let sid = client.sid.clone();
+        let (response, _) = client.prompt(3, &sid).await;
+        let error = &response["error"];
+        let message = error["message"].as_str().unwrap_or_default();
+        assert!(message.contains("the vault is locked"), "{response}");
+        assert_eq!(error["data"]["exitCode"], 4, "{response}");
+        assert_eq!(error["data"]["output"], "sandbox output", "{response}");
+    });
+}
+
+/// Test that the client answer and cancel of an agent request reach the
+/// agent while the reopen waits. The agent can wait for the answer before
+/// it answers the reopen.
+///   1. Start a session with an agent that never answers a resume, and
+///      sends a permission request when it gets the resume
+///   2. Make the agent exit and send a prompt. A new agent gets the resume
+///   3. Cancel and then answer the permission request
+///   4. Check that the agent gets the cancel and the answer with its own id
+#[test]
+fn answer_of_agent_request_does_not_wait_for_reopen() {
+    block_on_local(async {
+        let ask = r#"{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{}}"#;
+        let env = [("AGENT_HOLD", "session/resume"), ("AGENT_ON_HOLD", ask)];
+        let (mut client, _) = session_after_agent_exit(&env).await;
+        let sid = client.sid.clone();
+        client.send_prompt(3, &sid).await;
+        let ask = loop {
+            let msg = client.recv().await;
+            if msg["method"] == "session/request_permission" {
+                break msg;
+            }
+        };
+        client
+            .notify(CANCEL_REQUEST, json!({ "requestId": ask["id"] }))
+            .await;
+        let answer = json!({ "jsonrpc": "2.0", "id": ask["id"], "result": {} });
+        client.send(&answer).await;
+        let mut got = Vec::new();
+        while got.len() < 2 {
+            let msg = client.recv().await;
+            let Some(seen) = msg.pointer("/params/seen") else {
+                continue;
+            };
+            if seen["method"] == CANCEL_REQUEST {
+                got.push(seen["params"]["requestId"].clone());
+            } else if seen.get("result").is_some() {
+                got.push(seen["id"].clone());
+            }
+        }
+        assert_eq!(got, [json!(7), json!(7)]);
     });
 }

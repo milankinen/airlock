@@ -2,10 +2,8 @@
 //!
 //! Tells which features the proxy offers for the Claude ACP agent. The
 //! Codex agent shares most of these features. Also tells the agent
-//! messages that only this agent sends, and the client feature that only
-//! this agent reads.
-
-use serde_json::{Map, Value};
+//! messages that only this agent and the Codex agent send, and the client
+//! feature that only this agent reads.
 
 use super::{command_name, names};
 
@@ -43,13 +41,15 @@ pub(super) const FEATURES: &[&str] = &[
 pub(super) fn preset(argv: &[String]) -> Option<Vec<String>> {
     (command_name(argv) == "claude-agent-acp").then(|| {
         let mut list = names(FEATURES);
-        list.extend(names(&["air:backgroundSubagents", "air:sessionIndex"]));
+        // Not in the list: the session index. Its requests have no session
+        // id, and each session has its own agent.
+        list.extend(names(&["air:backgroundSubagents"]));
         list
     })
 }
 
-/// Agent notifications of this agent that the client gets in restrict
-/// mode.
+/// Agent notifications of this agent and of the Codex agent that the
+/// client gets in restrict mode.
 // The login status is data for the display only.
 pub(super) const AGENT_NOTIFICATIONS: &[&str] = &["_auth/status_update"];
 
@@ -57,21 +57,4 @@ pub(super) const AGENT_NOTIFICATIONS: &[&str] = &["_auth/status_update"];
 /// restrict mode.
 // The sub-agent transcript makes the agent put the sub-agent text in the
 // parent session.
-const META_NAMES: &[&str] = &["subagent-transcript"];
-
-/// Copy the safe features that this agent reads from the client `_meta` to
-/// the kept `_meta`.
-/// Args:
-///  - `meta`: Client `_meta` features
-///
-/// Returns:
-///   The kept `_meta` features.
-pub(super) fn keep_meta(meta: &Map<String, Value>) -> Map<String, Value> {
-    let mut kept = Map::new();
-    for name in META_NAMES {
-        if let Some(value) = meta.get(*name) {
-            kept.insert((*name).into(), value.clone());
-        }
-    }
-    kept
-}
+pub(super) const META_NAMES: &[&str] = &["subagent-transcript"];

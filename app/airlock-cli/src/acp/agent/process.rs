@@ -7,14 +7,15 @@
 //! keeps the errors of a failed agent start.
 //!
 //! The trace log shows the messages in both directions. It does not show
-//! the secret values of the editor MCP servers.
+//! the secret values of the editor MCP servers. The start failure log also
+//! hides these values.
 
 use futures::stream::LocalBoxStream;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{mpsc, oneshot};
 
-use super::super::{AgentProcess, Control, Location, capabilities, rpc};
+use super::super::{AgentProcess, Location, capabilities, rpc};
 use super::Stderr;
 use super::output::{self, Output};
 use crate::messages;
@@ -26,7 +27,8 @@ pub(super) struct Agent {
     pub(super) location: Location,
     /// Agent input, or `None` after the input closed.
     input: Option<mpsc::Sender<Vec<u8>>>,
-    control: mpsc::UnboundedSender<Control>,
+    /// Kills the agent, or `None` after a kill request.
+    kill: Option<oneshot::Sender<()>>,
     /// Adds the editor MCP servers to the sandbox, or `None` if the
     /// sandbox cannot add them.
     pub(super) mcp: Option<McpRegistrar>,
@@ -37,11 +39,9 @@ pub(super) struct Agent {
     pub(super) output: LocalBoxStream<'static, Output>,
     /// `initialize` result of the agent, after the handshake.
     pub(super) init: Option<Value>,
-    /// A kill request went to the agent.
-    killed: bool,
-    /// The agent was killed for a limit. Its output and input are dropped
-    /// until it exits.
-    limited: bool,
+    /// The output and input of the agent are dropped until it exits: it
+    /// went over a limit, or its reopen failed.
+    muted: bool,
 }
 
 impl Agent {
@@ -66,13 +66,12 @@ impl Agent {
         Self {
             location,
             input: Some(process.input),
-            control: process.control,
+            kill: Some(process.kill),
             mcp: process.mcp,
             notices: process.notices,
             output,
             init: None,
-            killed: false,
-            limited: false,
+            muted: false,
         }
     }
 
@@ -81,16 +80,20 @@ impl Agent {
         &self.location.sandbox
     }
 
-    /// Check if the agent was killed for a limit. Its output is then not
-    /// for the client.
-    pub(super) fn limited(&self) -> bool {
-        self.limited
+    /// Check if the output of the agent is not for the client.
+    pub(super) fn muted(&self) -> bool {
+        self.muted
+    }
+
+    /// Drop the later output and input of the agent.
+    pub(super) fn mute(&mut self) {
+        self.muted = true;
     }
 
     /// Send the message `msg` to the agent. Does nothing after a limit or
     /// after the input closed. Kills the agent if its input queue is full.
     pub(super) fn send(&mut self, msg: &Value) {
-        if self.limited {
+        if self.muted {
             return;
         }
         let Some(input) = &self.input else {
@@ -113,9 +116,8 @@ impl Agent {
 
     /// Kill the agent. Does nothing if a kill request went to it before.
     pub(super) fn kill(&mut self) {
-        if !self.killed {
-            self.killed = true;
-            let _ = self.control.send(Control::Kill);
+        if let Some(kill) = self.kill.take() {
+            let _ = kill.send(());
         }
     }
 
@@ -125,7 +127,7 @@ impl Agent {
     ///  - `message`: Error text of the limit, for the log
     pub(super) fn kill_for_limit(&mut self, message: &str) {
         tracing::warn!(sandbox = self.sandbox(), "stop the agent: {message}");
-        self.limited = true;
+        self.muted = true;
         self.kill();
     }
 
@@ -196,6 +198,14 @@ pub(super) struct StartFailure {
 }
 
 impl StartFailure {
+    /// Get a copy of the failure with the error message `message`.
+    pub(super) fn with_message(&self, message: String) -> Self {
+        Self {
+            message,
+            data: self.data.clone(),
+        }
+    }
+
     /// Get the failure with the error message `message` and no data.
     pub(super) fn from_message(message: &str) -> Self {
         Self {
@@ -244,7 +254,9 @@ impl StartFailure {
 /// sandbox as a field.
 pub(super) fn trace(sandbox: &str, from: &str, line: &[u8]) {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
-    tracing::trace!(sandbox, "{from}: {}", String::from_utf8_lossy(line));
+    // The line can have control characters. The debug form escapes them,
+    // so that the line cannot fake log lines.
+    tracing::trace!(sandbox, "{from}: {:?}", String::from_utf8_lossy(line));
 }
 
 /// Text that replaces a secret value in the log.
@@ -252,7 +264,7 @@ const HIDDEN: &str = "***";
 
 /// Get a copy of `msg` where the env and header values of each editor MCP
 /// server are [`HIDDEN`].
-fn hide_mcp_secrets(msg: &Value) -> Value {
+pub(super) fn hide_mcp_secrets(msg: &Value) -> Value {
     let mut msg = msg.clone();
     let Some(servers) = msg
         .pointer_mut("/params/mcpServers")

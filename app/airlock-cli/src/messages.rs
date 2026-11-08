@@ -30,10 +30,10 @@ pub mod acp {
         format!("the session dir '{cwd}' is not an absolute path")
     }
 
-    /// Error when a session dir is in a different sandbox than the agent
-    /// of the session.
-    pub fn other_sandbox(cwd: impl Display) -> String {
-        format!("the session dir '{cwd}' is not in the sandbox of this session")
+    /// Error when a request in a session has a different session dir than
+    /// the session.
+    pub fn other_session_dir(cwd: impl Display) -> String {
+        format!("the session dir '{cwd}' is not the dir of this session")
     }
 
     /// Error for a request that waited for the reopen of its session,
@@ -50,6 +50,20 @@ pub mod acp {
     /// Error detail when airlock refuses its own reopen request, for
     /// example for a session dir that is no longer in the sandbox.
     pub const REOPEN_REFUSED: &str = "airlock refused the reopen request";
+
+    /// Error for a client message with a session id of another project.
+    pub fn other_project_session(id: impl Display) -> String {
+        format!("the session '{id}' is not a session of this project")
+    }
+
+    /// Error for an agent request in a session of another agent.
+    pub const OTHER_SESSION_REQUEST: &str = "the request is for a session of another agent";
+
+    /// Error for an agent request with a too long id.
+    pub const AGENT_REQUEST_ID_TOO_LONG: &str = "the request id is too long";
+
+    /// Error for an agent request when too many agent requests are open.
+    pub const AGENT_REQUESTS_FULL: &str = "too many agent requests wait for an answer";
 
     /// Error for a request when too many messages wait for the reopen of
     /// its session.
@@ -137,6 +151,12 @@ pub mod acp {
     /// Error when the agent does not complete the handshake in time.
     pub fn handshake_timeout(secs: u64) -> String {
         format!("the agent did not complete the ACP handshake in {secs} s")
+    }
+
+    /// Error when the agent does not answer the reopen of a session in
+    /// time.
+    pub fn reopen_timeout(secs: u64) -> String {
+        format!("the agent did not answer the reopen in {secs} s")
     }
 
     /// Error when the agent refuses the handshake.

@@ -35,7 +35,8 @@ async fn open(
 /// Test that a session close stops the agent of the session after its
 /// answer. The agent ran only for that session.
 ///   1. Open sessions `sa` and `sb`
-///   2. Close `sa` and make its agent answer with an error
+///   2. Close `sa`, and make its agent answer and end, as the session
+///      does at the close of its session
 ///   3. Check that the client gets the answer and the agent stops
 ///   4. Check that a prompt to `sa` gets the unknown session error, and a
 ///      prompt to `sb` reaches its agent
@@ -46,12 +47,12 @@ fn session_close_stops_agent_of_session() {
         let params = json!({ "sessionId": "sa" });
         client.send_request(10, "session/close", params).await;
         assert_eq!(opened[0].recv().await["method"], "session/close");
-        let error = json!({ "code": -32603, "message": "no" });
         opened[0]
-            .say(json!({ "jsonrpc": "2.0", "id": 10, "error": error }))
+            .say(json!({ "jsonrpc": "2.0", "id": 10, "result": {} }))
             .await;
         let (response, _) = client.response(10).await;
-        assert_eq!(response["error"]["message"], "no");
+        assert_eq!(response["result"], json!({}));
+        opened[0].exit(0).await;
         opened[0].stopped().await;
 
         let (response, _) = client.prompt(11, "sa").await;
@@ -61,28 +62,30 @@ fn session_close_stops_agent_of_session() {
     });
 }
 
-/// Test that the last output of the old agent of a loaded session does not
-/// take the session back. The new agent replays the session before its
-/// load response, and the client must get the replay.
+/// Test that a load gives the session to the new agent at once. The last
+/// output of the old agent must not reach the session, and the client
+/// must get the replay of the new agent before its load response.
 ///   1. Open session `sa`
 ///   2. Load `sa` again and wait until the old agent stops
 ///   3. Make the old agent send an update in `sa`, and then the new agent
 ///      send a replay update in `sa` and its load response
-///   4. Check that the client gets both updates and an OK response
+///   4. Check that the client gets only the update of the new agent and an
+///      OK response
 #[test]
 fn old_agent_output_does_not_take_back_loaded_session() {
     block_on_local(async {
         let (mut client, mut handles, opened) = open(&["sa"]).await;
         let params = json!({ "sessionId": "sa", "cwd": "/projects/a", "mcpServers": [] });
         client.send_request(5, "session/load", params).await;
-        opened[0].stopped().await;
         let new = handles.recv().await.unwrap();
+        new.accept_load("sa").await;
+        opened[0].stopped().await;
         opened[0].say(update("sa", "old")).await;
         new.say(update("sa", "new")).await;
         new.open_session("sa").await;
         let (response, others) = client.response(5).await;
         assert!(response.get("result").is_some(), "{response}");
-        assert_eq!(update_sources(&others), ["old", "new"]);
+        assert_eq!(update_sources(&others), ["new"]);
     });
 }
 
@@ -141,9 +144,10 @@ fn load_of_open_session_stops_old_agent() {
         let (mut client, mut handles, opened) = open(&["sa"]).await;
         let params = json!({ "sessionId": "sa", "cwd": "/projects/a", "mcpServers": [] });
         client.send_request(5, "session/load", params).await;
-        opened[0].stopped().await;
         let mut new = handles.recv().await.unwrap();
         assert_eq!(new.first["method"], "session/load");
+        new.accept_load("sa").await;
+        opened[0].stopped().await;
         new.open_session("sa").await;
         client.response(5).await;
 
@@ -156,22 +160,19 @@ fn load_of_open_session_stops_old_agent() {
 /// started to stop before, and gives the first exit code that is not 0.
 ///   1. Open sessions `sa` and `sb`, with an agent for `sa` that does not
 ///      end at its stop
-///   2. Close `sa`, and then close the client
+///   2. Load `sa` again, which stops its first agent, and then close the
+///      client
 ///   3. Check that the proxy still runs
 ///   4. Make the agent of `sa` exit with code 9 and check the exit code 9
 #[test]
 fn client_end_waits_for_agents_that_stop() {
     block_on_local(async {
-        let (mut client, _handles, mut opened) = open(&["sa", "sb"]).await;
+        let (mut client, mut handles, mut opened) = open(&["sa", "sb"]).await;
         opened[0].set_linger();
-        client
-            .send_request(10, "session/close", json!({ "sessionId": "sa" }))
-            .await;
-        opened[0].recv().await;
-        opened[0]
-            .say(json!({ "jsonrpc": "2.0", "id": 10, "result": {} }))
-            .await;
-        client.response(10).await;
+        let params = json!({ "sessionId": "sa", "cwd": "/projects/a", "mcpServers": [] });
+        client.send_request(10, "session/load", params).await;
+        let loaded = handles.recv().await.unwrap();
+        loaded.accept_load("sa").await;
         opened[0].stopped().await;
 
         client.close();
@@ -180,5 +181,53 @@ fn client_end_waits_for_agents_that_stop() {
         assert!(client.proxy_runs());
         opened[0].exit(9).await;
         assert_eq!(client.proxy_end().await, 9);
+    });
+}
+
+/// Test that of two loads of one session that run at the same time, the
+/// later accepted load stops the agent of the earlier one. Else the
+/// earlier agent runs without a session until the proxy ends.
+///   1. Load the session `s` two times, before any answer
+///   2. Make the first and then the second agent accept the load
+///   3. Check that the first agent stops, and that after the answers a
+///      prompt to `s` reaches the second agent
+#[test]
+fn second_accepted_load_stops_first_agent() {
+    block_on_local(async {
+        let (mut client, mut handles) = TestClient::start_fake(test_config(true));
+        client.initialize(json!({})).await;
+        let params = json!({ "sessionId": "s", "cwd": "/projects/a", "mcpServers": [] });
+        client.send_request(1, "session/load", params.clone()).await;
+        client.send_request(2, "session/load", params).await;
+        let first = handles.recv().await.unwrap();
+        let mut second = handles.recv().await.unwrap();
+        first.accept_load("s").await;
+        second.accept_load("s").await;
+        first.stopped().await;
+        first.open_session("s").await;
+        client.response(1).await;
+        second.open_session("s").await;
+        client.response(2).await;
+
+        client.send_prompt(3, "s").await;
+        assert_eq!(second.recv().await["id"], 3);
+    });
+}
+
+/// Test that a refused load of an open session keeps the old agent of the
+/// session. A load with a bad session dir must not end a session that
+/// works.
+///   1. Open session `sa`
+///   2. Load `sa` with a relative session dir and check the error
+///   3. Send a prompt to `sa` and check that the old agent gets it
+#[test]
+fn refused_load_keeps_old_agent() {
+    block_on_local(async {
+        let (mut client, _handles, mut opened) = open(&["sa"]).await;
+        let params = json!({ "sessionId": "sa", "cwd": "projects/a", "mcpServers": [] });
+        let (response, _) = client.request(5, "session/load", params).await;
+        assert_eq!(response["error"]["code"], -32602, "{response}");
+        client.send_prompt(6, "sa").await;
+        assert_eq!(opened[0].recv().await["id"], 6);
     });
 }

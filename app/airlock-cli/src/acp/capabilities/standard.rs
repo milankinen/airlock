@@ -127,8 +127,7 @@ pub(super) fn offer_mcp(mut result: Value, proxy_mcp_servers: bool) -> Value {
 pub(super) const PROMPT_METHODS: &[&str] = &["session/prompt"];
 
 /// Agent notifications that the client gets in restrict mode.
-pub(super) const AGENT_NOTIFICATIONS: &[&str] =
-    &["session/update", "elicitation/complete", "$/cancel_request"];
+pub(super) const AGENT_NOTIFICATIONS: &[&str] = &["session/update", "elicitation/complete"];
 
 /// Check an agent request in restrict mode. A form prompt is allowed. Any
 /// other kind of prompt is refused.
@@ -156,8 +155,17 @@ pub(super) fn check_agent_request(method: &str, msg: &Value) -> Option<Result<()
     }
 }
 
+/// Client features with the sub-features that do not let the agent act on
+/// the host.
+const SAFE_NESTED: &[(&str, &[&str])] = &[
+    ("session", &["configOptions", "notices"]),
+    ("subagents", &[]),
+    ("plan", &[]),
+];
+
 /// Copy the standard client features that do not let the agent act on the
-/// host: form prompts, session, sub-agent and plan features.
+/// host: form prompts, and the known parts of the session, sub-agent and
+/// plan features.
 /// Args:
 ///  - `caps`: Client features
 ///
@@ -168,9 +176,14 @@ pub(super) fn keep_caps(caps: &Map<String, Value>) -> Map<String, Value> {
     if let Some(form) = caps.get("elicitation").and_then(|e| e.get("form")) {
         kept.insert("elicitation".into(), json!({ "form": form }));
     }
-    for name in ["session", "subagents", "plan"] {
-        if let Some(value) = caps.get(name) {
-            kept.insert(name.into(), value.clone());
+    for (name, safe) in SAFE_NESTED {
+        if let Some(Value::Object(value)) = caps.get(*name) {
+            let value: Map<String, Value> = value
+                .iter()
+                .filter(|(sub, _)| safe.contains(&sub.as_str()))
+                .map(|(sub, v)| (sub.clone(), v.clone()))
+                .collect();
+            kept.insert((*name).into(), Value::Object(value));
         }
     }
     kept

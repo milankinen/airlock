@@ -49,7 +49,10 @@ async fn session(
 ) -> (Value, Vec<Value>) {
     let servers: Vec<Value> = servers.iter().map(|n| server(n)).collect();
     let cwd = dir.path().to_str().unwrap();
-    let params = json!({ "sessionId": session, "cwd": cwd, "mcpServers": servers });
+    let mut params = json!({ "cwd": cwd, "mcpServers": servers });
+    if !session.is_empty() {
+        params["sessionId"] = json!(session);
+    }
     client.request(id, method, params).await
 }
 
@@ -239,19 +242,19 @@ fn stuck_registration_keeps_proxy_responsive_and_times_out() {
 /// Test that `session/load` of an unknown session gets a new key, and the
 /// proxy maps the session at the OK response. A later close must find the
 /// servers.
-///   1. Load the unknown session `x` with server `a`
-///   2. Close `x` and check that the grant is released
+///   1. Load the unknown session `a:x` with server `a`
+///   2. Close `a:x` and check that the grant is released
 #[test]
 fn load_of_unknown_session_gets_new_key_and_close_releases_it() {
     block_on_local(async {
         let (mut client, mut registrations, dir) = bridged(&[]).await;
-        let (response, _) = session(&mut client, &dir, 2, "session/load", "x", &["a"]).await;
+        let (response, _) = session(&mut client, &dir, 2, "session/load", "a:x", &["a"]).await;
         assert!(response.get("result").is_some(), "{response}");
         let route = registrations.route().await;
         assert_eq!(route.session.len(), 16);
 
         client
-            .request(3, "session/close", json!({ "sessionId": "x" }))
+            .request(3, "session/close", json!({ "sessionId": "a:x" }))
             .await;
         registrations.released(1).await;
         assert!(!opens(&route.host, &route.name).await);

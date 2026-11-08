@@ -78,3 +78,56 @@ fn signal_during_shutdown_kills_agent() {
         assert!(started.elapsed() < Duration::from_secs(5));
     });
 }
+
+/// Test that a signal after the end of all agents with a session stops the
+/// proxy at once with the signal exit code. No agent is left to save a
+/// session, and the user must not wait.
+///   1. Start a fake session that completes its handshake and then ends
+///   2. Send `SIGTERM` and keep the client open
+///   3. Check that the proxy stops with code 143
+#[test]
+fn signal_after_end_of_all_sessions_stops_proxy_at_once() {
+    block_on_local(async {
+        let signals = signal_sender();
+        let (mut client, mut handles) = TestClient::start_fake(test_config(true));
+        client.initialize(json!({})).await;
+        let params = json!({ "cwd": "/projects/a", "mcpServers": [] });
+        client.send_request(1, "session/new", params).await;
+        let mut session = handles.recv().await.unwrap();
+        session.open_session("sa").await;
+        client.response(1).await;
+        session.exit(0).await;
+        session.stopped().await;
+        signals.send(libc::SIGTERM).unwrap();
+        assert_eq!(client.proxy_end().await, 128 + libc::SIGTERM);
+    });
+}
+
+/// Test that a signal while a session has no agent stops the proxy at once
+/// with the signal exit code. The agent of the session exited, and no agent
+/// is left to save a session.
+///   1. Start a session and make its agent exit with code 7
+///   2. Send `SIGTERM` and keep the client open
+///   3. Check that the proxy stops with code 143
+#[test]
+fn signal_while_session_has_no_agent_stops_proxy_at_once() {
+    block_on_local(async {
+        let signals = signal_sender();
+        let launcher = LocalProcessLauncher::new(&[]);
+        let mut client = TestClient::session(launcher, test_config(true), "/projects/a").await;
+        client
+            .send_in_session(json!({ "jsonrpc": "2.0", "method": "test/exit", "params": {} }))
+            .await;
+        loop {
+            let msg = client.recv().await;
+            let text = msg
+                .pointer("/params/update/content/text")
+                .and_then(|t| t.as_str());
+            if text.is_some_and(|t| t.starts_with("The agent stopped")) {
+                break;
+            }
+        }
+        signals.send(libc::SIGTERM).unwrap();
+        assert_eq!(client.proxy_end().await, 128 + libc::SIGTERM);
+    });
+}

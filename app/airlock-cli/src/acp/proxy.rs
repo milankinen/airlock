@@ -2,14 +2,15 @@
 //!
 //! Answers the client handshake itself. Starts one session handle for each
 //! session request, and sends the later messages of a session to its
-//! handle. The handle connects the session to its agent. Gives the agent
-//! requests ids that are unique for the client, and gives each client
-//! answer to its handle with the original id. A handle gets only the
-//! messages of its own sessions. The end of a handle ends only that
-//! handle. A session close stops the handle of the session, and a load of
-//! an open session stops its old handle. The proxy runs until the client
-//! closes or a host signal comes. Then it stops all handles and waits for
-//! them.
+//! handle. The handle connects the session to its agent. The ids of the
+//! agent requests name their handle. A client answer goes to that handle.
+//! A handle gets only the messages of its own sessions. An agent request
+//! in another session gets an error. The number of new sessions of a
+//! handle has a limit. The end of a handle ends only that handle. A load of
+//! an open session gives the session to a new handle when the new handle
+//! accepts the load, and then stops the old handle. The proxy runs until
+//! the client closes or a host signal comes. Then it stops all handles and
+//! waits for them.
 //!
 //! A session list with a session dir also starts a handle, as a session
 //! request does. A request for a session that a list named and that has no
@@ -28,28 +29,10 @@ use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::capabilities;
 use super::rpc::{self, Kind, RequestId, SessionId, key, session_id, to_line};
+use super::{Config, capabilities};
 use crate::messages;
 use crate::runtime::SignalStream;
-
-/// Settings of the router.
-pub struct ProxyConfig {
-    /// Agent name that the client shows.
-    pub title: String,
-    /// Version of airlock.
-    pub version: String,
-    /// Remove the client features that let the agent act on the host.
-    pub restrict: bool,
-    /// The agents bridge the editor MCP servers into the sandbox.
-    pub proxy_mcp_servers: bool,
-    /// Agent feature names that the handshake reply offers.
-    pub agent_capabilities: Vec<String>,
-    /// Source of the host signals, or `None` to not watch them. The proxy
-    /// watches them from the first handle start. A signal stops all
-    /// handles and the proxy. A second signal kills the agents.
-    pub signals: Option<fn() -> anyhow::Result<SignalStream>>,
-}
 
 /// Identity of one session handle in the proxy.
 pub type HandleId = u64;
@@ -67,6 +50,16 @@ pub enum HandleMessage {
     /// The agent completed its handshake. A signal then lets the agent
     /// save the session.
     Ready,
+    /// The session request of the handle, a load or a resume of `session`,
+    /// passed the checks of the handle and goes to the agent. The handle
+    /// gets the session now, and the old handle of the session stops.
+    Opening {
+        /// The ACP session id.
+        session: SessionId,
+    },
+    /// The agent of the handle ended, and the handle waits without an
+    /// agent for its next request. A signal has no agent to let save.
+    Idle,
     /// The handle ended. This is the last message of the handle.
     Ended,
 }
@@ -75,9 +68,6 @@ pub enum HandleMessage {
 pub struct Claim {
     /// The ACP session id.
     pub session: String,
-    /// The client asked for this session id (load or resume). The handle
-    /// then gets the session also if another handle has it.
-    pub replace: bool,
 }
 
 /// One session, or one one-shot request, as the proxy sees it.
@@ -95,7 +85,8 @@ pub trait SessionHandle {
     fn shutdown(self: Box<Self>) -> LocalBoxFuture<'static, i32>;
 }
 
-/// Fixed settings of all session handles of one proxy run.
+/// Fixed settings of all session handles of one proxy run. The proxy makes
+/// them at the client handshake.
 pub struct SessionContext {
     /// Client `initialize` params after the filter.
     pub init_params: Value,
@@ -107,48 +98,31 @@ pub struct SessionContext {
     pub kill: CancellationToken,
 }
 
-/// Makes the session factory when the client handshake gives the init
-/// params.
-pub trait SessionFactoryInit {
-    /// Make the factory.
-    /// Args:
-    ///  - `context`: Fixed settings of all handles
-    fn init(self: Box<Self>, context: SessionContext) -> Rc<dyn SessionFactory>;
-}
-
 /// Starts the session handles.
 pub trait SessionFactory {
     /// Start the handle of one session request. The factory gives the
     /// handle its identity. A failed start comes later as an error response
     /// and an end message of the handle.
     /// Args:
+    ///  - `context`: Fixed settings of all handles
     ///  - `cwd`: Session dir of the session request on the host
     ///  - `first`: The session request. The agent gets it after its
     ///    handshake.
     ///
     /// Returns:
     ///   The identity and the new handle.
-    fn create(&self, cwd: String, first: Value) -> (HandleId, Box<dyn SessionHandle>);
+    fn create(
+        &self,
+        context: &Rc<SessionContext>,
+        cwd: String,
+        first: Value,
+    ) -> (HandleId, Box<dyn SessionHandle>);
 
     /// Get the host session dir of a session that a list response of this
     /// factory named. A delete of the session removes it.
     /// Returns:
     ///   The session dir, or `None` if no recent list named the session.
     fn session_dir(&self, sid: &str) -> Option<String>;
-}
-
-/// Factory of a proxy run.
-enum FactoryState {
-    /// Waits for the client handshake. Has the sender for the handle
-    /// messages.
-    Pending(
-        Box<dyn SessionFactoryInit>,
-        mpsc::Sender<(HandleId, HandleMessage)>,
-    ),
-    /// Made at the client handshake.
-    Ready(Rc<dyn SessionFactory>),
-    /// The proxy stops. No new handle starts.
-    Closed,
 }
 
 /// Maximum number of parts that wait for the client output. A full queue
@@ -159,24 +133,27 @@ const WRITER_QUEUE: usize = 4;
 /// stops the read of the client input.
 const READER_QUEUE: usize = 16;
 
+/// Maximum number of ACP sessions of one handle. The agent makes new
+/// sessions, for example for sub agents.
+const MAX_HANDLE_SESSIONS: usize = 64;
+
 /// Maximum number of handle messages that wait for the proxy.
 const HANDLE_MESSAGES: usize = 16;
 
 /// Run the proxy between a client and its session handles.
 /// Args:
-///  - `factory`: Makes the factory that starts a handle for each session
-///    request, at the client handshake
+///  - `factory`: Starts a handle for each session request
 ///  - `config`: Proxy settings
 ///  - `input`: Client messages, one per line
 ///  - `output`: Destination of the messages to the client
 ///
 /// Returns:
 ///   The first exit code that is not 0 of the handles, else 0. 128 + the
-///   signal number if a signal came before a handle sent
+///   signal number if a signal came when no live handle had sent
 ///   [`HandleMessage::Ready`].
 pub async fn run<R, W>(
-    factory: Box<dyn SessionFactoryInit>,
-    config: &ProxyConfig,
+    factory: Box<dyn SessionFactory>,
+    config: &Config,
     input: R,
     output: W,
 ) -> i32
@@ -187,7 +164,9 @@ where
     let (out, out_task) = spawn_writer(output);
     let (messages, handle_messages) = mpsc::channel(HANDLE_MESSAGES);
     let proxy = Proxy {
-        factory: RefCell::new(FactoryState::Pending(factory, messages)),
+        factory,
+        messages,
+        context: RefCell::default(),
         config,
         out,
         kill: CancellationToken::new(),
@@ -195,14 +174,11 @@ where
         stopping: RefCell::default(),
         stopped: Notify::new(),
         closing: Cell::new(false),
-        handshake: RefCell::default(),
         started: Cell::new(false),
         handles: RefCell::default(),
         sessions: RefCell::default(),
-        former: RefCell::default(),
-        agent_requests: RefCell::default(),
         client_requests: RefCell::default(),
-        ready: Cell::new(false),
+        ready: RefCell::default(),
         failed: Cell::new(None),
     };
     let (code, (), ()) = tokio::join!(
@@ -219,8 +195,12 @@ where
 /// State of one proxy run. The client side and the handle side run at the
 /// same time in one task. They never keep a borrow across an await.
 struct Proxy<'a> {
-    factory: RefCell<FactoryState>,
-    config: &'a ProxyConfig,
+    factory: Box<dyn SessionFactory>,
+    /// Destination of the handle messages, for the handle settings.
+    messages: mpsc::Sender<(HandleId, HandleMessage)>,
+    /// Settings of the handles, after the client handshake.
+    context: RefCell<Option<Rc<SessionContext>>>,
+    config: &'a Config,
     /// Lines to the client.
     out: mpsc::Sender<Vec<u8>>,
     /// Kills all agents in their stop.
@@ -234,24 +214,15 @@ struct Proxy<'a> {
     stopped: Notify,
     /// The proxy stops. The reaper ends when no handle is left.
     closing: Cell<bool>,
-    /// `initialize` result of the first client handshake.
-    handshake: RefCell<Option<Value>>,
     /// A handle started.
     started: Cell<bool>,
     handles: RefCell<HashMap<HandleId, Box<dyn SessionHandle>>>,
     /// Handle of each ACP session.
     sessions: RefCell<HashMap<SessionId, HandleId>>,
-    /// ACP sessions of the handles that stop. Their last agent output in
-    /// these sessions still goes to the client.
-    former: RefCell<HashMap<HandleId, HashSet<SessionId>>>,
-    /// Agent requests by their id for the client, with their handle and
-    /// original id.
-    agent_requests: RefCell<HashMap<RequestId, (HandleId, Value)>>,
-    /// Handle of each open client request, by request id. The flag is set
-    /// for a `session/close` request.
-    client_requests: RefCell<HashMap<RequestId, (HandleId, bool)>>,
-    /// A handle sent [`HandleMessage::Ready`].
-    ready: Cell<bool>,
+    /// Handle of each open client request, by request id.
+    client_requests: RefCell<HashMap<RequestId, HandleId>>,
+    /// The handles that sent [`HandleMessage::Ready`] and did not end.
+    ready: RefCell<HashSet<HandleId>>,
     /// First exit code that is not 0.
     failed: Cell<Option<i32>>,
 }
@@ -276,7 +247,7 @@ impl Proxy<'_> {
                 signum = next_signal(&mut signals) => {
                     tracing::info!(signum, "signal: stop the agents");
                     // Handles without a session have nothing to save.
-                    if !self.ready.get() {
+                    if self.ready.borrow().is_empty() {
                         signal_code = Some(128 + signum);
                         self.kill.cancel();
                     }
@@ -296,7 +267,6 @@ impl Proxy<'_> {
     /// Stop all handles and wait for them, also for the handles that stopped
     /// before. A signal kills them at once.
     async fn shutdown(&self, signals: &mut Option<SignalStream>) {
-        *self.factory.borrow_mut() = FactoryState::Closed;
         let mut handles: Vec<HandleId> = self.handles.borrow().keys().copied().collect();
         handles.sort_unstable();
         for hid in handles {
@@ -315,31 +285,14 @@ impl Proxy<'_> {
         }
     }
 
-    /// Take the handle `hid` out of the routing and start its stop. Its
-    /// open client requests stay until the handle ends. The agent can still
-    /// answer them.
+    /// Start the stop of the handle `hid`. Its sessions and open client
+    /// requests stay until the handle ends. The agent can still answer
+    /// them, but the handle takes no new client messages.
     fn stop_handle(&self, hid: HandleId) {
-        let mut owned = HashSet::new();
-        self.sessions.borrow_mut().retain(|sid, owner| {
-            if *owner == hid {
-                owned.insert(sid.clone());
-            }
-            *owner != hid
-        });
-        self.agent_requests
-            .borrow_mut()
-            .retain(|_, (owner, _)| *owner != hid);
-        // The handle ends anyway. Its close response must not stop it again.
-        for (owner, close) in self.client_requests.borrow_mut().values_mut() {
-            if *owner == hid {
-                *close = false;
-            }
-        }
         let Some(proxy) = self.handles.borrow_mut().remove(&hid) else {
             return;
         };
         tracing::info!(handle = hid, "stop the session handle");
-        self.former.borrow_mut().insert(hid, owned);
         self.stopping.borrow_mut().push(proxy.shutdown());
         self.stopped.notify_one();
     }
@@ -378,19 +331,18 @@ impl Proxy<'_> {
                 self.on_client_request(req_id, &method, msg).await;
             }
             Some(Kind::Response { id: req_id }) => {
-                let Some((hid, original)) = self.agent_requests.borrow_mut().remove(&key(req_id))
-                else {
-                    tracing::debug!(id = %req_id, "drop client response without a request");
+                let Some(hid) = rpc::agent_request_handle(req_id) else {
+                    tracing::debug!(id = %req_id, "drop client response without a handle");
                     return;
                 };
-                let mut msg = msg;
-                msg["id"] = original;
                 self.deliver(hid, msg);
             }
             Some(Kind::CancelRequest { req_id }) => {
-                // A cancel without a request id has no target.
+                // A cancel without a request id has no target. A cancel of
+                // an agent request goes to the handle of the agent.
                 let hid = req_id.and_then(|req_id| {
-                    self.client_requests.borrow().get(&key(req_id)).map(|r| r.0)
+                    let client = self.client_requests.borrow().get(&key(req_id)).copied();
+                    client.or_else(|| rpc::agent_request_handle(req_id))
                 });
                 if let Some(hid) = hid {
                     self.deliver(hid, msg);
@@ -415,16 +367,15 @@ impl Proxy<'_> {
     async fn on_client_request(&self, req_id: Value, method: &str, msg: Value) {
         match method {
             "initialize" => self.handle_initialize(&req_id, &msg).await,
-            "session/new" | "session/fork" => self.handle_session_new(req_id, method, msg).await,
-            "session/load" | "session/resume" => {
-                self.handle_session_reopen(req_id, method, msg).await;
+            // A load or resume gets the session when its handle accepts
+            // it (see `HandleMessage::Opening`).
+            "session/new" | "session/fork" | "session/load" | "session/resume" => {
+                self.handle_session_new(req_id, method, msg).await;
             }
-            // The handle of the session stops when the agent answers.
-            "session/close" => self.delegate_to_session(req_id, method, msg, true).await,
             "session/list" => self.handle_session_list(req_id, method, msg).await,
             "authenticate" | "logout" => self.reply_not_supported(&req_id, method).await,
             m if m.starts_with("providers/") => self.reply_not_supported(&req_id, method).await,
-            _ => self.delegate_to_session(req_id, method, msg, false).await,
+            _ => self.delegate_to_session(req_id, method, msg).await,
         }
     }
 
@@ -441,13 +392,13 @@ impl Proxy<'_> {
         tracing::info!(client, %caps, "initialize");
         // The agents do their handshake with the first params. A second
         // handshake must not change them.
-        let known = self.handshake.borrow().clone();
+        let known = self.context.borrow().as_ref().map(|c| c.offered.clone());
         let result = known.unwrap_or_else(|| self.first_handshake(msg));
         self.reply(req_id, Ok(result)).await;
     }
 
     /// Filter the client params of the first `initialize` request `msg` for
-    /// the agents, and make the factory with them.
+    /// the agents, and make the handle settings with them.
     /// Returns:
     ///   The `initialize` result for the client.
     fn first_handshake(&self, msg: &Value) -> Value {
@@ -459,30 +410,17 @@ impl Proxy<'_> {
             .unwrap_or_default();
         tracing::info!(%caps, "client features for the agents");
         let result = self.initialize_result(&params);
-        *self.handshake.borrow_mut() = Some(result.clone());
-        self.init_factory(params, result.clone());
+        *self.context.borrow_mut() = Some(Rc::new(SessionContext {
+            init_params: params,
+            offered: result.clone(),
+            messages: self.messages.clone(),
+            kill: self.kill.clone(),
+        }));
         result
     }
 
-    /// Make the factory with the init `params` and the `offered` result,
-    /// unless the proxy stops.
-    fn init_factory(&self, params: Value, offered: Value) {
-        let mut state = self.factory.borrow_mut();
-        let FactoryState::Pending(init, messages) =
-            std::mem::replace(&mut *state, FactoryState::Closed)
-        else {
-            return;
-        };
-        *state = FactoryState::Ready(init.init(SessionContext {
-            init_params: params,
-            offered,
-            messages,
-            kill: self.kill.clone(),
-        }));
-    }
-
-    /// Handle `session/new` and `session/fork`: start a handle for the
-    /// session, or refuse the request.
+    /// Handle a session request (new, fork, load or resume): start a
+    /// handle for the session, or refuse the request.
     async fn handle_session_new(&self, req_id: Value, method: &str, msg: Value) {
         let cwd = msg.pointer("/params/cwd").and_then(Value::as_str);
         let cwd = cwd.map(str::to_string);
@@ -490,16 +428,6 @@ impl Proxy<'_> {
             tracing::info!(method, "refuse session request: {}", error.1);
             self.reply(&req_id, Err(error)).await;
         }
-    }
-
-    /// Handle `session/load` and `session/resume`: stop the old handle of
-    /// the session, then start a new handle for it.
-    async fn handle_session_reopen(&self, req_id: Value, method: &str, msg: Value) {
-        let old = session_id(&msg).and_then(|sid| self.sessions.borrow().get(sid).copied());
-        if let Some(old) = old {
-            self.stop_handle(old);
-        }
-        self.handle_session_new(req_id, method, msg).await;
     }
 
     /// Handle `session/list`: a handle in the sandbox of the session dir
@@ -530,9 +458,7 @@ impl Proxy<'_> {
 
     /// Send the client request `msg` to the handle of its session. Refuse
     /// the request if it has no known session.
-    /// Args:
-    ///  - `closes`: The request closes the session
-    async fn delegate_to_session(&self, req_id: Value, method: &str, msg: Value, closes: bool) {
+    async fn delegate_to_session(&self, req_id: Value, method: &str, msg: Value) {
         let Some(sid) = session_id(&msg) else {
             tracing::debug!(method, "refuse client request without a session");
             let error = (
@@ -546,11 +472,7 @@ impl Proxy<'_> {
         let Some(hid) = hid else {
             // A listed session can have no handle. A handle in the sandbox
             // of the list then answers.
-            let dir = match &*self.factory.borrow() {
-                FactoryState::Ready(factory) => factory.session_dir(sid),
-                _ => None,
-            };
-            if let Some(cwd) = dir {
+            if let Some(cwd) = self.factory.session_dir(sid) {
                 if let Err(error) = self.start_handle(&req_id, Some(cwd), msg) {
                     tracing::info!(method, "refuse client request: {}", error.1);
                     self.reply(&req_id, Err(error)).await;
@@ -561,10 +483,7 @@ impl Proxy<'_> {
             self.reply(&req_id, Err(error)).await;
             return;
         };
-        let entry = (hid, closes);
-        self.client_requests
-            .borrow_mut()
-            .insert(key(&req_id), entry);
+        self.client_requests.borrow_mut().insert(key(&req_id), hid);
         if !self.deliver(hid, msg) {
             self.client_requests.borrow_mut().remove(&key(&req_id));
             let error = (
@@ -589,24 +508,22 @@ impl Proxy<'_> {
         cwd: Option<String>,
         msg: Value,
     ) -> Result<(), (i64, String)> {
-        if matches!(*self.factory.borrow(), FactoryState::Pending(..)) {
-            return Err((rpc::INVALID_REQUEST, messages::acp::NO_HANDSHAKE.into()));
+        if self.closing.get() {
+            return Err((rpc::INTERNAL_ERROR, messages::acp::SHUTTING_DOWN.into()));
         }
+        let Some(context) = self.context.borrow().clone() else {
+            return Err((rpc::INVALID_REQUEST, messages::acp::NO_HANDSHAKE.into()));
+        };
         let Some(cwd) = cwd else {
             return Err((rpc::INVALID_PARAMS, messages::acp::NO_SESSION_DIR.into()));
         };
         if !cwd.starts_with('/') {
             return Err((rpc::INVALID_PARAMS, messages::acp::cwd_not_absolute(&cwd)));
         }
-        let FactoryState::Ready(factory) = &*self.factory.borrow() else {
-            return Err((rpc::INTERNAL_ERROR, messages::acp::SHUTTING_DOWN.into()));
-        };
-        let factory = factory.clone();
         tracing::info!(cwd, "start a session handle");
         self.started.set(true);
-        let (hid, proxy) = factory.create(cwd, msg);
-        let entry = (hid, false);
-        self.client_requests.borrow_mut().insert(key(req_id), entry);
+        let (hid, proxy) = self.factory.create(&context, cwd, msg);
+        self.client_requests.borrow_mut().insert(key(req_id), hid);
         self.handles.borrow_mut().insert(hid, proxy);
         Ok(())
     }
@@ -643,7 +560,13 @@ impl Proxy<'_> {
     async fn on_handle(&self, hid: HandleId, message: HandleMessage) {
         match message {
             HandleMessage::Client { msg, claim } => self.on_handle_message(hid, msg, claim).await,
-            HandleMessage::Ready => self.ready.set(true),
+            HandleMessage::Ready => {
+                self.ready.borrow_mut().insert(hid);
+            }
+            HandleMessage::Opening { session } => self.on_opening(hid, session),
+            HandleMessage::Idle => {
+                self.ready.borrow_mut().remove(&hid);
+            }
             HandleMessage::Ended => self.on_handle_end(hid),
         }
     }
@@ -651,80 +574,75 @@ impl Proxy<'_> {
     /// Send one agent message of the handle `hid` to the client. Rename the
     /// id of an agent request, and keep the handle to its own sessions.
     async fn on_handle_message(&self, hid: HandleId, mut msg: Value, claim: Option<Claim>) {
-        let mut close = false;
+        let mut refused = false;
         match rpc::kind(&msg) {
             Some(Kind::Response { id: req_id }) => {
                 let req_id = req_id.clone();
                 let mut requests = self.client_requests.borrow_mut();
-                let Some(&(_, closes)) = requests.get(&key(&req_id)).filter(|r| r.0 == hid) else {
+                if requests.get(&key(&req_id)) != Some(&hid) {
                     tracing::debug!(handle = hid, id = %req_id, "drop agent response without a request");
                     return;
-                };
+                }
                 requests.remove(&key(&req_id));
                 drop(requests);
-                close = closes;
                 if let Some(claim) = claim
                     && !self.claim(hid, &claim)
                 {
                     let message = messages::acp::session_id_conflict(&claim.session);
-                    tracing::warn!(handle = hid, "refuse session: {message}");
+                    // The session id comes from the agent. The debug form
+                    // escapes its control characters.
+                    tracing::warn!(handle = hid, "refuse session: {message:?}");
                     msg = rpc::error_response(&req_id, rpc::INTERNAL_ERROR, &message);
+                    refused = true;
                 }
             }
-            Some(Kind::Request { id: req_id, method }) => {
-                if !self.owns(hid, &msg) {
-                    tracing::debug!(
-                        handle = hid,
-                        method,
-                        "drop agent request for another session"
-                    );
-                    return;
+            Some(kind) if !self.owns(hid, &msg) => {
+                tracing::debug!(handle = hid, "drop agent message for another session");
+                // The agent must not wait for an answer that never comes.
+                if let Kind::Request { id: req_id, .. } = kind {
+                    let text = messages::acp::OTHER_SESSION_REQUEST;
+                    self.deliver(hid, rpc::error_response(req_id, rpc::INVALID_PARAMS, text));
                 }
-                // Two handles can use the same id. The client must see
-                // different ids.
-                let proxy_req_id = Value::String(format!("{hid}-{}", key(req_id)));
-                let entry = (hid, req_id.clone());
-                self.agent_requests
-                    .borrow_mut()
-                    .insert(key(&proxy_req_id), entry);
-                msg["id"] = proxy_req_id;
-            }
-            Some(Kind::CancelRequest { .. }) if !self.owns(hid, &msg) => {
-                tracing::debug!(handle = hid, "drop agent cancel for another session");
                 return;
             }
-            Some(Kind::Notification { method }) if !self.owns(hid, &msg) => {
-                tracing::debug!(
-                    handle = hid,
-                    method,
-                    "drop agent message for another session"
-                );
+            Some(_) => {}
+            None => {
+                tracing::debug!(handle = hid, "drop agent message that is not JSON-RPC");
                 return;
             }
-            // Only the pass mode lets messages without a kind through, for
-            // example a batch.
-            Some(Kind::CancelRequest { .. } | Kind::Notification { .. }) | None => {}
         }
         let _ = self.out.send(to_line(&msg)).await;
-        // The handle ran only for the closed session.
-        if close {
+        // The handle has no session.
+        if refused {
             self.stop_handle(hid);
         }
     }
 
+    /// Give the session `sid` to `hid` at the start of its load, and stop
+    /// the old handle of the session. The last output of the old handle
+    /// then cannot reach the session.
+    fn on_opening(&self, hid: HandleId, sid: SessionId) {
+        if !self.handles.borrow().contains_key(&hid) {
+            return;
+        }
+        let old = self.sessions.borrow_mut().insert(sid, hid);
+        if let Some(old) = old.filter(|old| *old != hid) {
+            self.stop_handle(old);
+        }
+    }
+
     /// Give the session of `claim` to `hid`. A handle that stops gets no
-    /// session.
+    /// session. A load or resume has the session already from its start.
     /// Returns:
-    ///   `false` if another handle has the session and the client did not
-    ///   ask for it.
+    ///   `false` if another handle has the session.
     fn claim(&self, hid: HandleId, claim: &Claim) -> bool {
         if !self.handles.borrow().contains_key(&hid) {
             return true;
         }
         let mut sessions = self.sessions.borrow_mut();
-        if let Some(&owner) = sessions.get(&claim.session)
-            && owner != hid
-            && !claim.replace
+        if sessions
+            .get(&claim.session)
+            .is_some_and(|owner| *owner != hid)
         {
             return false;
         }
@@ -734,35 +652,45 @@ impl Proxy<'_> {
 
     /// Check that the session of the agent message `msg` is a session of
     /// `hid`. A new session id becomes a session of `hid`, for example
-    /// the session of a sub agent. A handle that stops keeps only the
-    /// sessions that it had at its stop, and gets no new session.
-    // A load of an open session stops the old handle and gives the session
-    // to a new handle. The last output of the old handle must not take the
-    // session back before the new handle claims it.
+    /// the session of a sub agent, up to [`MAX_HANDLE_SESSIONS`] and with
+    /// at most [`rpc::MAX_ID_BYTES`]. A handle that stops keeps its
+    /// sessions until it ends, and gets no new session.
+    // A load gives the session to its new handle when the handle accepts
+    // the load. The last output of the old handle then cannot take it back.
     fn owns(&self, hid: HandleId, msg: &Value) -> bool {
-        let Some(sid) = session_id(msg) else {
-            return true;
+        let sid = match msg.pointer("/params/sessionId") {
+            None => return true,
+            Some(Value::String(sid)) => sid,
+            // A session id that is not a string names no session.
+            Some(_) => return false,
         };
-        if !self.handles.borrow().contains_key(&hid) {
-            let former = self.former.borrow();
-            return former.get(&hid).is_some_and(|owned| owned.contains(sid));
+        let mut sessions = self.sessions.borrow_mut();
+        if let Some(owner) = sessions.get(sid) {
+            return *owner == hid;
         }
-        *self
-            .sessions
-            .borrow_mut()
-            .entry(sid.to_string())
-            .or_insert(hid)
-            == hid
+        if !self.handles.borrow().contains_key(&hid) {
+            return false;
+        }
+        // The agent is not trusted. Its new sessions must not fill the
+        // memory.
+        let count = sessions.values().filter(|owner| **owner == hid).count();
+        if sid.len() > rpc::MAX_ID_BYTES || count >= MAX_HANDLE_SESSIONS {
+            tracing::debug!(handle = hid, count, "refuse new agent session");
+            return false;
+        }
+        sessions.insert(sid.clone(), hid);
+        true
     }
 
     /// Forget a handle that ended. The reaper gets its exit code.
     fn on_handle_end(&self, hid: HandleId) {
         self.client_requests
             .borrow_mut()
-            .retain(|_, (owner, _)| *owner != hid);
-        // A stopped handle is already out of the routing.
+            .retain(|_, owner| *owner != hid);
+        self.ready.borrow_mut().remove(&hid);
         self.stop_handle(hid);
-        self.former.borrow_mut().remove(&hid);
+        // A load can have given a session of the handle to a new handle.
+        self.sessions.borrow_mut().retain(|_, owner| *owner != hid);
     }
 
     /// Keep the agent exit code `code` if it is the first that is not 0.

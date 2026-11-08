@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use airlock_common::cli_capnp::cli_service;
@@ -18,9 +19,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::acp::{
-    AGENT_EVENTS, AGENT_INPUT_LINES, AgentProcess, AgentProcessLauncher, Claim, Config, Control,
-    HandleId, HandleMessage, Location, SessionContext, SessionFactory, SessionFactoryInit,
-    SessionHandle,
+    AGENT_EVENTS, AGENT_INPUT_LINES, AgentProcess, AgentProcessLauncher, Claim, Config, HandleId,
+    HandleMessage, Location, SessionContext, SessionFactory, SessionHandle,
 };
 use crate::rpc::ProcessEvent;
 use crate::runtime::SignalStream;
@@ -48,6 +48,8 @@ use crate::test_cfg::mcp_grant::{FakeGrant, GrantEvent, Route};
 ///    If not set, the session id is `<sandbox>-<pid>-<N>`.
 ///  - `AGENT_SESSION_PREFIX`: The prefix of the session ids, `s` if not set
 ///  - `AGENT_LIST`: Reply to `session/list` with this result
+///  - `AGENT_LOAD_SID`: Reply to `session/load` with the result
+///    `{"sessionId":"$AGENT_LOAD_SID"}`
 ///  - `AGENT_ASK`: For each `session/prompt`, send a
 ///    `session/request_permission` with this JSON id and the session of the
 ///    prompt before the reply
@@ -56,9 +58,14 @@ use crate::test_cfg::mcp_grant::{FakeGrant, GrantEvent, Route};
 ///  - `AGENT_DIE`: Exit after this number of seconds from the start
 ///  - `AGENT_TRAP`: At `SIGUSR1`, wait 200 ms and exit with this code
 ///  - `AGENT_REPLAY`: For each `session/load`, send a `session/update`
-///    with `params.update.replay` in the loaded session before the reply
+///    with `params.update.replay` in the loaded session and in the session
+///    `sub` before the reply
 ///  - `AGENT_REOPEN_FAIL`: Path of a file. If the file exists, the agent
 ///    removes it and replies to a proxy reopen request with an error
+///  - `AGENT_REOPEN_ERROR`: The error of that reply, a not found error if
+///    not set
+///  - `AGENT_INPUT_LOG`: Path of a file. The agent adds each input line to
+///    it. The test can read the input as the agent got it.
 ///
 /// A request with the param `"cursor":"bad"` gets an error.
 ///
@@ -73,6 +80,7 @@ hold=${AGENT_HOLD:-test/hold}
 [ -n "$AGENT_TRAP" ] && trap 'sleep 0.2; exit "$AGENT_TRAP"' USR1
 [ -n "$AGENT_DIE" ] && (sleep "$AGENT_DIE"; kill $$) >/dev/null 2>&1 &
 while IFS= read -r line; do
+  [ -n "$AGENT_INPUT_LOG" ] && printf '%s\n' "$line" >> "$AGENT_INPUT_LOG"
   case "$line" in
   *'"id":"airlock-acp-initialize"'*)
     [ -n "$AGENT_PRE" ] && printf '%s\n' "$AGENT_PRE"
@@ -98,7 +106,9 @@ while IFS= read -r line; do
       *'"method":"session/load"'*)
         if [ -n "$AGENT_REPLAY" ]; then
           sid=$(printf '%s\n' "$line" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
-          printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"replay":true}}}\n' "$sid"
+          for s in "$sid" sub; do
+            printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"replay":true}}}\n' "$s"
+          done
         fi ;;
       *'"method":"session/prompt"'*)
         if [ -n "$AGENT_ASK" ]; then
@@ -109,7 +119,9 @@ while IFS= read -r line; do
       if [ -n "$AGENT_REOPEN_FAIL" ] && [ -e "$AGENT_REOPEN_FAIL" ] &&
          case "$line" in *'"id":"airlock-acp-reopen-'*) true ;; *) false ;; esac; then
         rm -f "$AGENT_REOPEN_FAIL"
-        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32002,"message":"Resource not found"}}\n' "$id"
+        err='{"code":-32002,"message":"Resource not found"}'
+        [ -n "$AGENT_REOPEN_ERROR" ] && err=$AGENT_REOPEN_ERROR
+        printf '{"jsonrpc":"2.0","id":%s,"error":%s}\n' "$id" "$err"
       elif [ -n "$AGENT_ERROR" ]; then
         printf '{"jsonrpc":"2.0","id":%s,"error":%s}\n' "$id" "$AGENT_ERROR"
       else
@@ -126,6 +138,8 @@ while IFS= read -r line; do
           sid="${AGENT_SANDBOX}-$$-$n"
           [ -n "$AGENT_SESSION_IDS" ] && sid="${AGENT_SESSION_PREFIX:-s}$n"
           result="{\"sessionId\":\"$sid\"}" ;;
+        *'"method":"session/load"'*)
+          [ -n "$AGENT_LOAD_SID" ] && result="{\"sessionId\":\"$AGENT_LOAD_SID\"}" ;;
         esac
         printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$result"
       fi ;;
@@ -180,6 +194,9 @@ pub struct LocalProcessLauncher {
     sandboxes: Vec<FakeSandbox>,
     /// Notices of the sandbox start for each launch.
     notices: Option<NoticeReader>,
+    /// Number of launches that start. The later launches fail as a sandbox
+    /// process that stops in its start.
+    good_launches: Option<usize>,
 }
 
 impl LocalProcessLauncher {
@@ -205,6 +222,7 @@ impl LocalProcessLauncher {
                 })
                 .collect(),
             notices: None,
+            good_launches: None,
         }
     }
 
@@ -230,6 +248,13 @@ impl LocalProcessLauncher {
             gate: RefCell::new(gate),
         });
         self.notices = Some(NoticeReader::from_client(service));
+        self
+    }
+
+    /// Make the launches after the first `count` fail, as a sandbox process
+    /// that stops in its start with the exit code 4.
+    pub fn with_good_launches(mut self, count: usize) -> Self {
+        self.good_launches = Some(count);
         self
     }
 
@@ -293,13 +318,20 @@ fn pairs(env: &[(&str, &str)]) -> Vec<(String, String)> {
 }
 
 impl AgentProcessLauncher for LocalProcessLauncher {
-    async fn locate(&self, cwd: &str) -> anyhow::Result<Location> {
-        Ok(self.find(cwd)?.1)
-    }
-
     async fn launch(&self, cwd: &str, argv: &[String]) -> anyhow::Result<(Location, AgentProcess)> {
         let (sandbox, location) = self.find(cwd)?;
         self.launches.set(self.launches.get() + 1);
+        if self
+            .good_launches
+            .is_some_and(|count| self.launches.get() > count)
+        {
+            return Err(crate::sandbox::ExitedBeforeReady {
+                code: 4,
+                output: Some("sandbox output".into()),
+                last_error: Some("error: the vault is locked".into()),
+            }
+            .into());
+        }
         self.launched.borrow_mut().push(sandbox.name.clone());
         let mut env = self.env.clone();
         env.push(("AGENT_SANDBOX".into(), sandbox.name.clone()));
@@ -368,10 +400,9 @@ fn spawn_agent(
         let _ = events_tx.send(ProcessEvent::Exit(code)).await;
     });
 
-    let (control, mut control_rx) = mpsc::unbounded_channel();
+    let (kill, kill_rx) = oneshot::channel();
     tokio::task::spawn_local(async move {
-        while let Some(request) = control_rx.recv().await {
-            let Control::Kill = request;
+        if kill_rx.await.is_ok() {
             // SAFETY: sends a signal to the child process only.
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
@@ -380,7 +411,7 @@ fn spawn_agent(
     Ok(AgentProcess {
         input,
         events,
-        control,
+        kill,
         mcp: None,
         notices: None,
     })
@@ -388,32 +419,20 @@ fn spawn_agent(
 
 /// Session factory for the proxy routing tests. Its session handles run in
 /// memory, and the test plays their agents.
-struct FakeSessionsInit {
-    created: mpsc::UnboundedSender<FakeSession>,
-}
-
-impl SessionFactoryInit for FakeSessionsInit {
-    fn init(self: Box<Self>, context: SessionContext) -> Rc<dyn SessionFactory> {
-        Rc::new(FakeSessions {
-            created: self.created,
-            messages: context.messages,
-            next_id: Cell::new(0),
-            session_dirs: Rc::default(),
-        })
-    }
-}
-
-/// Factory that [`FakeSessionsInit`] makes.
 struct FakeSessions {
     created: mpsc::UnboundedSender<FakeSession>,
-    messages: mpsc::Sender<(HandleId, HandleMessage)>,
     next_id: Cell<HandleId>,
     /// Host session dir of each listed session.
     session_dirs: Rc<RefCell<HashMap<String, String>>>,
 }
 
 impl SessionFactory for FakeSessions {
-    fn create(&self, cwd: String, first: Value) -> (HandleId, Box<dyn SessionHandle>) {
+    fn create(
+        &self,
+        context: &Rc<SessionContext>,
+        cwd: String,
+        first: Value,
+    ) -> (HandleId, Box<dyn SessionHandle>) {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
         let cancel = CancellationToken::new();
@@ -426,7 +445,7 @@ impl SessionFactory for FakeSessions {
             cwd,
             first,
             inbox,
-            messages: self.messages.clone(),
+            messages: context.messages.clone(),
             exit: Some(exit_tx),
             stop_code: stop_code.clone(),
             linger: linger.clone(),
@@ -543,10 +562,16 @@ impl FakeSession {
         let msg = crate::acp::rpc::result_response(req_id, &json!({ "sessionId": sid }));
         let claim = Claim {
             session: sid.to_string(),
-            replace: false,
         };
         let claim = Some(claim);
         self.send(HandleMessage::Client { msg, claim }).await;
+    }
+
+    /// Accept the load or resume of the session `sid`, as the session does
+    /// when the load passed its checks.
+    pub async fn accept_load(&self, sid: &str) {
+        let session = sid.to_string();
+        self.send(HandleMessage::Opening { session }).await;
     }
 
     /// The next client message for the handle. Panics after 10 seconds.
@@ -806,9 +831,13 @@ impl TestClient {
         let (proxy_output, output) = tokio::io::duplex(1 << 20);
         let (_, stderr) = tokio::io::duplex(1);
         let proxy = tokio::task::spawn_local(async move {
-            let factory = FakeSessionsInit { created };
+            let factory = FakeSessions {
+                created,
+                next_id: Cell::new(0),
+                session_dirs: Rc::default(),
+            };
             let input = BufReader::new(proxy_input);
-            crate::acp::route(Box::new(factory), &config.proxy(), input, proxy_output).await
+            crate::acp::route(Box::new(factory), &config, input, proxy_output).await
         });
         let client = Self {
             input: Some(input),
@@ -982,6 +1011,16 @@ impl TestClient {
     }
 }
 
+/// Get the input messages of the fake agent from its `AGENT_INPUT_LOG`
+/// file `path`.
+pub fn input_log(path: &std::path::Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
 /// Get the messages that the fake agent got, from the client messages
 /// `msgs`.
 pub fn seen(msgs: &[Value]) -> Vec<Value> {
@@ -996,4 +1035,53 @@ pub fn request_ids(seen: &[Value]) -> Vec<Value> {
         .filter(|m| m.get("method").is_some() && m["id"].is_i64())
         .map(|m| m["id"].clone())
         .collect()
+}
+
+/// Logs of the test thread, from [`capture_logs`].
+pub struct Logs {
+    text: Arc<Mutex<Vec<u8>>>,
+    _guard: tracing::subscriber::DefaultGuard,
+}
+
+impl Logs {
+    /// Get the logs so far as text.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.text.lock().unwrap()).into_owned()
+    }
+}
+
+/// Keep the logs of the info level and up of this test thread, until the
+/// result drops.
+pub fn capture_logs() -> Logs {
+    // With only one live dispatcher, tracing treats it as the global one.
+    // Another test thread then caches "never" for a log site that it hits
+    // first, and this thread loses the event. A second dispatcher that
+    // stays alive prevents this.
+    static SECOND: OnceLock<tracing::Dispatch> = OnceLock::new();
+    SECOND.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+    let text = Arc::new(Mutex::new(Vec::new()));
+    let sink = text.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || LogWriter(sink.clone()))
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    Logs {
+        text,
+        _guard: guard,
+    }
+}
+
+/// Writes the logs of [`capture_logs`] to memory.
+struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }

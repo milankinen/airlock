@@ -1,8 +1,8 @@
 //! JetBrains specific client features.
 //!
 //! Handles the JetBrains AIR features, the steering feature and the
-//! JetBrains terminal output feature. Also tells the agent messages and
-//! client requests that these features use. For the agent, keeps only the
+//! JetBrains terminal output feature. Also tells the client requests that
+//! these features use. For the agent, keeps only the
 //! AIR client features that are safe. For the client, adds the AIR
 //! features of the agent feature set to the handshake reply, and finds
 //! them in the reply of the real agent.
@@ -26,25 +26,13 @@ pub(super) const AGENT_NAMES: &[&str] = &[
     "rawInputRendering",
     "planContentDelta",
     "backgroundSubagents",
-    "sessionIndex",
-];
-
-/// AIR name of the session index.
-const SESSION_INDEX: &str = "sessionIndex";
-
-/// AIR names that come with the session index.
-const SESSION_INDEX_EXTRAS: &[&str] = &[
-    "sessionBatchGet",
-    "sessionArchive",
-    "sessionRename",
-    "sessionListSubscribe",
-    "sessionWorktrees",
 ];
 
 /// JetBrains AIR client features that the agent gets in restrict mode.
 // Not in the list: `planFile` makes the client read the plan from a guest
 // path on the host, and `agentFileChangeReport` lets the client act on
-// host paths.
+// host paths. The session index has requests without a session id, and
+// each session has its own agent.
 const AIR_CLIENT_NAMES: &[&str] = &[
     "diffPatch",
     "rawInputRendering",
@@ -54,7 +42,6 @@ const AIR_CLIENT_NAMES: &[&str] = &[
     "nativeSubagentSessions",
     "loadReplayEnd",
     "planContentDelta",
-    "sessionIndex",
     "asyncTasks",
     "customInstructions",
 ];
@@ -65,10 +52,6 @@ pub(super) const STEERING: &str = "steering";
 /// Client request methods that have a prompt with content blocks.
 pub(super) const PROMPT_METHODS: &[&str] = &["_session/steering"];
 
-/// Agent notifications that the client gets in restrict mode.
-// The session list changes are data for the display only.
-pub(super) const AGENT_NOTIFICATIONS: &[&str] = &["_session/list/changes"];
-
 /// Get the agent feature that a JetBrains client request needs.
 /// Returns:
 ///   The feature name, or `None` if the request needs no such feature.
@@ -77,10 +60,6 @@ pub(super) fn required(method: &str) -> Option<&'static str> {
         "_session/steering" => STEERING,
         "_session/goal" => GOAL,
         "_session/async_task/stop" => "air:asyncTasks",
-        "_session/rename" => "air:sessionRename",
-        "_session/archive" | "_session/unarchive" => "air:sessionArchive",
-        "_session/batch_get" => "air:sessionBatchGet",
-        "_session/list/subscribe" | "_session/list/unsubscribe" => "air:sessionListSubscribe",
         _ => return None,
     })
 }
@@ -99,12 +78,6 @@ pub(super) fn known() -> impl Iterator<Item = String> {
         .chain(AGENT_NAMES.iter().map(|n| format!("{PREFIX}{n}")))
 }
 
-/// AIR feature names that the reply has with the session index. They are
-/// not in a feature set.
-pub(super) fn extra_names() -> impl Iterator<Item = String> {
-    SESSION_INDEX_EXTRAS.iter().map(|n| format!("{PREFIX}{n}"))
-}
-
 /// Copy the safe JetBrains features from the client `_meta` to the kept
 /// `_meta`.
 /// Args:
@@ -113,12 +86,7 @@ pub(super) fn extra_names() -> impl Iterator<Item = String> {
 /// Returns:
 ///   The kept `_meta` features.
 pub(super) fn keep_meta(meta: &Map<String, Value>) -> Map<String, Value> {
-    let mut kept = Map::new();
-    for name in META_NAMES {
-        if let Some(value) = meta.get(*name) {
-            kept.insert((*name).into(), value.clone());
-        }
-    }
+    let mut kept = super::keep_names(meta, META_NAMES);
     if let Some(air) = meta
         .get("jetbrains")
         .and_then(|j| j.get("air"))
@@ -158,17 +126,12 @@ fn restrict_air(air: &Map<String, Value>) -> Value {
 ///
 /// Returns:
 ///   The `initialize` result with the JetBrains features added.
-// The real agents add the AIR features only for a client that has AIR,
-// and the session index extras only for a client that has the session
-// index. The proxy does the same.
+// The real agents add the AIR features only for a client that has AIR. The
+// proxy does the same.
 pub(super) fn offer(mut result: Value, names: &[String], client: &Value) -> Value {
     let client_air = client
         .pointer("/clientCapabilities/_meta/jetbrains/air")
         .filter(|air| air.is_object());
-    let client_index = client_air
-        .and_then(|air| air.get("capabilities"))
-        .and_then(Value::as_array)
-        .is_some_and(|caps| caps.iter().any(|c| c == SESSION_INDEX));
     let mut air = Vec::new();
     let mut goal = false;
     for name in names {
@@ -177,12 +140,7 @@ pub(super) fn offer(mut result: Value, names: &[String], client: &Value) -> Valu
         } else if name == GOAL {
             goal = true;
         } else if let Some(air_name) = name.strip_prefix(PREFIX) {
-            if air_name != SESSION_INDEX {
-                air.push(air_name);
-            } else if client_index {
-                air.push(air_name);
-                air.extend(SESSION_INDEX_EXTRAS);
-            }
+            air.push(air_name);
         }
     }
     if client_air.is_none() || (air.is_empty() && !goal) {

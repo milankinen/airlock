@@ -13,8 +13,8 @@ fn idea_caps() -> Value {
         "terminal": true,
         "auth": { "terminal": true, "_meta": { "gateway": true } },
         "elicitation": { "form": {}, "url": {} },
-        "session": { "configOptions": {}, "notices": {} },
-        "subagents": {},
+        "session": { "configOptions": {}, "notices": {}, "hostFiles": {} },
+        "subagents": { "future": true },
         "plan": {},
         "_meta": {
             "terminal_output": true,
@@ -55,8 +55,8 @@ async fn agent_caps(restrict: bool, caps: Value) -> Value {
 /// features. The AIR plan file and file change report make the IDE act on
 /// host paths.
 ///   1. Start a session with the IDE features in the default mode
-///   2. Check that the agent got the form prompts, the session, sub-agent
-///      and plan features, the terminal output display, the sub-agent
+///   2. Check that the agent got the form prompts, the known parts of the
+///      session, sub-agent and plan features, the terminal output display, the sub-agent
 ///      transcript and the safe AIR names
 ///   3. Start a session with the same features in the pass mode
 ///   4. Check that the agent got all features
@@ -75,7 +75,7 @@ fn ide_client_features_reach_agent_only_when_safe() {
                     "terminal_output_delta": true,
                     "subagent-transcript": true,
                     "jetbrains": {
-                        "air": { "version": 1, "capabilities": ["diffPatch", "sessionIndex"] },
+                        "air": { "version": 1, "capabilities": ["diffPatch"] },
                     },
                 },
             })

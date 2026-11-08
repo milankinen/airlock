@@ -173,3 +173,22 @@ fn delete_of_listed_session_runs_in_agent_of_list_dir() {
         assert_eq!(response["error"]["code"], -32602);
     });
 }
+
+/// Test that an agent request in the session of another agent gets an
+/// error. The agent must not wait for an answer that never comes.
+///   1. Open sessions `sa` and `sb` in two agents
+///   2. Make agent `b` send a permission request in `sa`
+///   3. Check that agent `b` gets an error response for the request
+#[test]
+fn agent_request_for_other_session_gets_error() {
+    block_on_local(async {
+        let (_client, _a, mut b) = two_sessions().await;
+        let params = json!({ "sessionId": "sa", "options": [], "toolCall": {} });
+        b.say(json!({ "jsonrpc": "2.0", "id": 7,
+                      "method": "session/request_permission", "params": params }))
+            .await;
+        let answer = b.recv().await;
+        assert_eq!(answer["id"], 7, "{answer}");
+        assert_eq!(answer["error"]["code"], -32602, "{answer}");
+    });
+}

@@ -35,16 +35,15 @@ mod mcp;
 mod proxy;
 pub mod rpc;
 
+use std::rc::Rc;
 use std::time::Duration;
 
-use proxy::ProxyConfig;
 #[cfg(test)]
 pub(crate) use proxy::{
-    Claim, HandleId, HandleMessage, SessionContext, SessionFactory, SessionFactoryInit,
-    SessionHandle, run as route,
+    Claim, HandleId, HandleMessage, SessionContext, SessionFactory, SessionHandle, run as route,
 };
 use tokio::io::{AsyncBufRead, AsyncWrite};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::cli;
 use crate::cli::LogLevel;
@@ -56,7 +55,8 @@ use crate::sandbox::{McpRegistrar, NoticeReader};
 /// Name of the proxy log file in the data dir.
 pub const LOG_FILE: &str = "acp.log";
 
-/// Maximum time from the agent start to the end of the agent handshake.
+/// Maximum time from the agent start, with the sandbox start, to the end
+/// of the agent handshake. A reopen of a session has the same time.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Time that the agent has to exit after the client closes, and again
@@ -120,46 +120,19 @@ pub struct Config {
     /// Maximum time to register the editor MCP servers of one session
     /// request.
     pub mcp_register_timeout: Duration,
-    /// Maximum time from the agent start to the end of the handshake.
+    /// Maximum time from the agent start, with the sandbox start, to the
+    /// end of the handshake. The answer to the reopen of a session has the
+    /// same time.
     pub handshake_timeout: Duration,
     /// Time that an agent has to exit after the proxy closes its input,
     /// and again after the kill.
     pub shutdown_grace: Duration,
-    /// Source of the host signals, or `None` to not watch them.
+    /// Source of the host signals, or `None` to not watch them. The proxy
+    /// watches them from the first handle start. A signal stops all
+    /// handles and the proxy. A second signal kills the agents.
     pub signals: Option<fn() -> anyhow::Result<SignalStream>>,
     /// Maximum length of one agent output line.
     pub max_line_bytes: usize,
-}
-
-impl Config {
-    /// Split the settings into the router part and the agent part.
-    fn split(self) -> (ProxyConfig, agent::AgentConfig) {
-        let proxy = ProxyConfig {
-            title: self.title,
-            version: self.version,
-            restrict: self.restrict,
-            proxy_mcp_servers: self.proxy_mcp_servers,
-            agent_capabilities: self.agent_capabilities,
-            signals: self.signals,
-        };
-        let agent = agent::AgentConfig {
-            argv: self.argv,
-            name: self.name,
-            restrict: self.restrict,
-            proxy_mcp_servers: self.proxy_mcp_servers,
-            mcp_register_timeout: self.mcp_register_timeout,
-            handshake_timeout: self.handshake_timeout,
-            shutdown_grace: self.shutdown_grace,
-            max_line_bytes: self.max_line_bytes,
-        };
-        (proxy, agent)
-    }
-
-    /// Get the router part of the settings.
-    #[cfg(test)]
-    pub(crate) fn proxy(self) -> ProxyConfig {
-        self.split().0
-    }
 }
 
 /// The sandbox of a session dir.
@@ -180,12 +153,6 @@ pub struct Location {
 #[error("{}", crate::messages::cli::never_started(.0))]
 pub struct NoSandbox(pub String);
 
-/// Control request for a running agent.
-pub enum Control {
-    /// Kill the agent.
-    Kill,
-}
-
 /// Handle of a started agent process.
 pub struct AgentProcess {
     /// Bytes for the agent stdin, at most [`AGENT_INPUT_LINES`] parts. The
@@ -194,8 +161,8 @@ pub struct AgentProcess {
     /// Output and exit of the agent, at most [`AGENT_EVENTS`] parts. The
     /// exit is the last event.
     pub events: mpsc::Receiver<ProcessEvent>,
-    /// Kill requests.
-    pub control: mpsc::UnboundedSender<Control>,
+    /// Kills the agent when it gets a value. Its drop does nothing.
+    pub kill: oneshot::Sender<()>,
     /// Adds the editor MCP servers to the sandbox, or `None` if the
     /// sandbox cannot add them.
     pub mcp: Option<McpRegistrar>,
@@ -207,12 +174,6 @@ pub struct AgentProcess {
 /// Finds the sandbox of a session dir and launches agent processes there.
 #[allow(async_fn_in_trait)]
 pub trait AgentProcessLauncher {
-    /// Find the sandbox of the session dir `cwd`. Does not start it.
-    /// Returns:
-    ///   The sandbox, or error if `cwd` has no sandbox. The error is
-    ///   [`NoSandbox`] if no sandbox serves `cwd`.
-    async fn locate(&self, cwd: &str) -> anyhow::Result<Location>;
-
     /// Launch the agent process `argv` in the sandbox of the session dir
     /// `cwd`. Starts the sandbox if it does not run.
     /// Returns:
@@ -275,14 +236,11 @@ where
     W: AsyncWrite + Unpin + 'static,
     E: AsyncWrite + Unpin + 'static,
 {
-    let (proxy_config, agent_config) = config.split();
-    let grace = agent_config.shutdown_grace;
+    let config = Rc::new(config);
+    let grace = config.shutdown_grace;
     let (err, mut err_task) = proxy::spawn_writer(errors);
-    let (factory, dropped) = agent::factory(launcher, agent_config, err);
-    let code = proxy::run(factory, &proxy_config, input, output).await;
-    if dropped.get() > 0 {
-        tracing::info!(bytes = dropped.get(), "dropped agent stderr");
-    }
+    let factory = agent::factory(launcher, config.clone(), err);
+    let code = proxy::run(factory, &config, input, output).await;
     if tokio::time::timeout(grace, crate::mcp::deletes_done())
         .await
         .is_err()

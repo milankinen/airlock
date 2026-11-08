@@ -60,24 +60,30 @@ picks up config changes.
 An editor can use one `airlock acp` process for many projects.
 
 * Each session starts its own agent process in the sandbox of its
-  directory. Two sessions in one sandbox use two agent processes.
+  directory.
 * Each session is separate. A session gets only its own messages. The
   agent request IDs are unique for the editor.
+* The editor sees each session ID as `<sandbox id>:<id>`. The sandbox ID
+  keeps the sessions of two projects apart. The editor must list the
+  sessions again to load a session that it kept from an older airlock
+  version.
 * When a session ends, its agent stops.
 * An agent process keeps its sandbox running. When the last agent in a
   sandbox stops, the sandbox stops if no other airlock command uses it.
-* A `session/close` response ends the session. A load or resume of an
-  open session stops the old session first.
-* When an agent exits, the open requests of its session get an error.
-  The session gets a notice, or an agent message if the editor shows no
-  notices.
+* An OK `session/close` response for the session ends the session. A
+  close of a sub-agent session does not end it.
+* A load or resume of an open session stops the old session when the new
+  session accepts the request.
+* If an agent exits prematurely, the open requests of its session get an
+  error.
 * The next request in that session starts a new agent and opens the
   session again.
 * The proxy runs until the editor closes it.
 * A request that needs a session but has none gets "not supported".
 * A signal stops all agents and the proxy waits for them. A second signal
   kills them. The exit code is the first exit code of an agent that is
-  not 0.
+  not 0. If no agent with an open session runs when the signal comes,
+  the exit code is 128 + the signal number.
 
 ## Session list and delete
 
@@ -95,7 +101,8 @@ An editor can use one `airlock acp` process for many projects.
 By default, these editor features work:
 
 * permission prompts and form prompts
-* session updates, sub-agents, plans and the session list
+* session updates, sub-agents, plans and the session list (only their
+  known parts)
 * terminal output (the editor only shows it)
 * the read-only features of JetBrains AIR
 
@@ -152,7 +159,7 @@ is an error, and the message lists the valid names.
 | `_meta.authStatus`                                       | Login status of the agent    |
 | `steering`                                               | Send a message to a running turn |
 | `air:goal`                                               | AIR goals                    |
-| `air:sessionFailure`, `air:nativeSubagentSessions`, `air:asyncTasks`, `air:customInstructions`, `air:recommendedValue`, `air:diffPatch`, `air:rawInputRendering`, `air:planContentDelta`, `air:backgroundSubagents`, `air:sessionIndex` | JetBrains AIR features |
+| `air:sessionFailure`, `air:nativeSubagentSessions`, `air:asyncTasks`, `air:customInstructions`, `air:recommendedValue`, `air:diffPatch`, `air:rawInputRendering`, `air:planContentDelta`, `air:backgroundSubagents` | JetBrains AIR features |
 
 The editor gets the `air:` names only if it declares AIR support.
 

@@ -8,7 +8,7 @@ use crate::acp::agent::launcher::SandboxProcessLauncher;
 use crate::cli::LogLevel;
 use crate::sandbox::process::client::{LaunchOpts, ProcessLauncher};
 use crate::sandbox::process::init::Mode;
-use crate::test_cfg::acp::{TestClient, test_config};
+use crate::test_cfg::acp::{LocalProcessLauncher, TestClient, capture_logs, test_config};
 use crate::test_cfg::oci::verified_dir;
 use crate::test_cfg::sandboxes::data_dir_sandbox;
 use crate::test_cfg::{block_on_local, temp_dir, test_context};
@@ -76,5 +76,34 @@ fn sandbox_process_failure_reply_has_captured_output() {
         let output = error["data"]["output"].as_str().unwrap();
         assert!(output.contains("loading the last config"), "{output}");
         assert!(output.contains("error: the vault is locked"), "{output}");
+    });
+}
+
+/// Test that the log of a failed agent start does not show the env and
+/// header values of the editor MCP servers. They can be API keys and
+/// tokens.
+///   1. Send `session/new` with MCP servers with env and header values, in
+///      a dir without a sandbox
+///   2. Check the error response
+///   3. Check that the log has the start failure, but not the values
+#[test]
+fn start_failure_log_hides_mcp_secrets() {
+    block_on_local(async {
+        let logs = capture_logs();
+        let mut client = TestClient::start(LocalProcessLauncher::new(&[]), test_config(true));
+        client.initialize(json!({})).await;
+        let servers = json!([
+            { "name": "x", "command": "x", "args": [],
+              "env": [{ "name": "API_KEY", "value": "secret-env" }] },
+            { "type": "http", "name": "y", "url": "https://h/mcp",
+              "headers": [{ "name": "Authorization", "value": "secret-header" }] },
+        ]);
+        let params = json!({ "cwd": "/nowhere", "mcpServers": servers });
+        let (response, _) = client.request(1, "session/new", params).await;
+        assert!(response.get("error").is_some(), "{response}");
+        let text = logs.text();
+        assert!(text.contains("agent start failed"), "{text}");
+        assert!(text.contains("API_KEY"), "{text}");
+        assert!(!text.contains("secret"), "{text}");
     });
 }

@@ -8,9 +8,9 @@
 //! notices of the sandbox. Never writes to
 //! the standard output, because it has the protocol.
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
-use crate::acp::{AgentProcess, AgentProcessLauncher, Control, Location, NoSandbox};
+use crate::acp::{AgentProcess, AgentProcessLauncher, Location, NoSandbox};
 use crate::cli::LogLevel;
 use crate::context::Context;
 use crate::rpc;
@@ -93,16 +93,6 @@ fn location(
 }
 
 impl AgentProcessLauncher for SandboxProcessLauncher {
-    async fn locate(&self, cwd: &str) -> anyhow::Result<Location> {
-        let (sandbox, work) = self.find(cwd).await?;
-        location(
-            sandbox.id().to_string(),
-            sandbox.project()?,
-            sandbox.guest_dir(&work)?,
-            sandbox.guest_root()?,
-        )
-    }
-
     async fn launch(&self, cwd: &str, argv: &[String]) -> anyhow::Result<(Location, AgentProcess)> {
         let (sandbox, work) = self.find(cwd).await?;
         let id = sandbox.id().to_string();
@@ -132,12 +122,18 @@ impl AgentProcessLauncher for SandboxProcessLauncher {
         // launch drops it. Each session has its own agent, so the sandbox
         // runs while one of them is open.
         tokio::task::spawn_local(relay_events(proc.clone(), events_tx, process));
-        let (control, control_rx) = mpsc::unbounded_channel();
-        tokio::task::spawn_local(relay_control(proc, control_rx));
+        let (kill, kill_rx) = oneshot::channel();
+        tokio::task::spawn_local(async move {
+            if kill_rx.await.is_ok()
+                && let Err(e) = proc.kill().await
+            {
+                tracing::debug!("agent kill: {e}");
+            }
+        });
         let agent = AgentProcess {
             input,
             events,
-            control,
+            kill,
             mcp,
             notices,
         };
@@ -175,18 +171,6 @@ async fn relay_events(
         }
         if exit {
             return;
-        }
-    }
-}
-
-/// Do the kill requests of the proxy.
-async fn relay_control(proc: rpc::Process, mut control: mpsc::UnboundedReceiver<Control>) {
-    while let Some(request) = control.recv().await {
-        let result = match request {
-            Control::Kill => proc.kill().await,
-        };
-        if let Err(e) = result {
-            tracing::debug!("agent control: {e}");
         }
     }
 }

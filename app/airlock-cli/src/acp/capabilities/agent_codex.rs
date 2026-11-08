@@ -1,7 +1,7 @@
 //! Feature preset of the Codex agent.
 //!
-//! Tells which features the proxy offers for the Codex ACP agent, and the
-//! agent messages that only this agent sends.
+//! Tells which features the proxy offers for the Codex ACP agent. Its
+//! agent messages are the same as those of the Claude agent.
 
 use super::agent_claude::FEATURES;
 use super::{command_name, names};
@@ -15,17 +15,9 @@ use super::{command_name, names};
 pub(super) fn preset(argv: &[String]) -> Option<Vec<String>> {
     (command_name(argv) == "codex-acp").then(|| {
         let mut list = names(FEATURES);
-        list.extend(names(&[
-            "air:sessionIndex",
-            "air:rawInputRendering",
-            "air:planContentDelta",
-        ]));
+        // Not in the list: the session index. Its requests have no session
+        // id, and each session has its own agent.
+        list.extend(names(&["air:rawInputRendering", "air:planContentDelta"]));
         list
     })
 }
-
-/// Agent notifications of this agent that the client gets in restrict
-/// mode.
-// The Codex adapter sends the login status too. It is data for the display
-// only.
-pub(super) const AGENT_NOTIFICATIONS: &[&str] = &["_auth/status_update"];

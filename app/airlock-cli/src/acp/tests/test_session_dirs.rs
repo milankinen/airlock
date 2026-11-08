@@ -31,7 +31,7 @@ fn session_requests_use_agents_in_sandbox_of_session_dir() {
             assert_eq!(got, code, "{cwd}");
         }
 
-        let params = json!({ "sessionId": "old", "cwd": "/projects/a/sub", "mcpServers": [] });
+        let params = json!({ "sessionId": "a:old", "cwd": "/projects/a/sub", "mcpServers": [] });
         let (response, others) = client.request(5, "session/load", params).await;
         assert!(response.get("result").is_some(), "{response}");
         let load = seen(&others)

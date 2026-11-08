@@ -25,7 +25,7 @@ async fn bridged(restrict: bool, env: &[(&str, &str)]) -> (TestClient, Registrat
 /// Returns:
 ///   The `mcpServers` list that the agent got.
 async fn agent_servers(client: &mut TestClient, id: i64, method: &str, servers: Value) -> Value {
-    let params = json!({ "sessionId": "s", "cwd": "/projects/a", "mcpServers": servers });
+    let params = json!({ "sessionId": "a:s", "cwd": "/projects/a", "mcpServers": servers });
     let (response, others) = client.request(id, method, params).await;
     assert!(response.get("result").is_some(), "{response}");
     let got = seen(&others);

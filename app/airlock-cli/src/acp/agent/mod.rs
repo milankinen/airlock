@@ -16,124 +16,48 @@ mod process;
 mod session;
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
-use std::time::Duration;
 
 use futures::future::LocalBoxFuture;
+use quick_cache::unsync::Cache;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
-use super::AgentProcessLauncher;
-use super::proxy::{
-    HandleId, HandleMessage, SessionContext, SessionFactory, SessionFactoryInit, SessionHandle,
-};
-
-/// Settings of the agents.
-pub struct AgentConfig {
-    /// Agent command and its arguments.
-    pub argv: Vec<String>,
-    /// Agent command as the user gave it, for messages.
-    pub name: String,
-    /// Remove the client features that let the agent act on the host.
-    pub restrict: bool,
-    /// Bridge the editor MCP servers into the sandbox. If not set, the
-    /// agent gets no editor MCP servers.
-    pub proxy_mcp_servers: bool,
-    /// Maximum time to register the editor MCP servers of one session
-    /// request.
-    pub mcp_register_timeout: Duration,
-    /// Maximum time from the agent start to the end of the handshake.
-    pub handshake_timeout: Duration,
-    /// Time that an agent has to exit after the proxy closes its input,
-    /// and again after the kill.
-    pub shutdown_grace: Duration,
-    /// Maximum length of one agent output line.
-    pub max_line_bytes: usize,
-}
+use super::proxy::{HandleId, SessionContext, SessionFactory, SessionHandle};
+use super::{AgentProcessLauncher, Config, rpc};
 
 /// Make the factory of the agents that `launcher` launches.
 /// Args:
 ///  - `launcher`: Launches the agent processes in their sandboxes
 ///  - `config`: Agent settings
 ///  - `stderr`: Destination of the agent stderr
-///
-/// Returns:
-///   The factory, and the number of agent stderr bytes that were dropped.
 pub(super) fn factory<S: AgentProcessLauncher + 'static>(
     launcher: S,
-    config: AgentConfig,
-    stderr: mpsc::Sender<Vec<u8>>,
-) -> (Box<dyn SessionFactoryInit>, Rc<Cell<u64>>) {
-    let dropped = Rc::new(Cell::new(0));
-    let init = SandboxAgentsInit {
+    config: Rc<Config>,
+    stderr: Stderr,
+) -> Box<dyn SessionFactory> {
+    let pool = Pool {
         launcher,
-        config: Rc::new(config),
-        stderr: Stderr {
-            tx: stderr,
-            dropped: dropped.clone(),
-        },
+        config,
+        stderr,
+        next_id: Cell::new(0),
+        listed: RefCell::default(),
     };
-    (Box::new(init), dropped)
+    Box::new(SandboxAgents {
+        pool: Rc::new(pool),
+    })
 }
 
 /// Agent stderr to the host stderr.
-#[derive(Clone)]
-struct Stderr {
-    tx: mpsc::Sender<Vec<u8>>,
-    /// Number of agent stderr bytes that were dropped.
-    dropped: Rc<Cell<u64>>,
-}
+type Stderr = mpsc::Sender<Vec<u8>>;
 
-/// Makes the [`SandboxAgents`] at the client handshake.
-struct SandboxAgentsInit<S> {
-    launcher: S,
-    config: Rc<AgentConfig>,
-    stderr: Stderr,
-}
-
-impl<S: AgentProcessLauncher + 'static> SessionFactoryInit for SandboxAgentsInit<S> {
-    fn init(self: Box<Self>, context: SessionContext) -> Rc<dyn SessionFactory> {
-        let notices = context
-            .init_params
-            .pointer("/clientCapabilities/session/notices")
-            .is_some();
-        let pool = Pool {
-            launcher: self.launcher,
-            config: self.config,
-            stderr: self.stderr,
-            init_params: context.init_params,
-            offered: context.offered,
-            messages: context.messages,
-            kill: context.kill,
-            notices,
-            next_id: Cell::new(0),
-            listed: RefCell::default(),
-        };
-        Rc::new(SandboxAgents {
-            pool: Rc::new(pool),
-        })
-    }
-}
-
-/// Settings of all sessions.
+/// Settings and state of all sessions.
 struct Pool<S> {
     launcher: S,
-    config: Rc<AgentConfig>,
+    config: Rc<Config>,
     stderr: Stderr,
-    /// Client `initialize` params after the filter.
-    init_params: Value,
-    /// `initialize` result that the proxy gave to the client.
-    offered: Value,
-    /// Destination of the session messages.
-    messages: mpsc::Sender<(HandleId, HandleMessage)>,
-    /// Kills the agents at once in their stop.
-    kill: CancellationToken,
-    /// The client shows session notices.
-    notices: bool,
     /// Identity of the next session.
     next_id: Cell<HandleId>,
     /// Host session dirs of the sessions in the latest session lists.
@@ -146,12 +70,18 @@ struct SandboxAgents<S> {
 }
 
 impl<S: AgentProcessLauncher + 'static> SessionFactory for SandboxAgents<S> {
-    fn create(&self, cwd: String, first: Value) -> (HandleId, Box<dyn SessionHandle>) {
+    fn create(
+        &self,
+        context: &Rc<SessionContext>,
+        cwd: String,
+        first: Value,
+    ) -> (HandleId, Box<dyn SessionHandle>) {
         let hid = self.pool.next_id.get();
         self.pool.next_id.set(hid + 1);
         tracing::info!(handle = hid, cwd, "new session");
         let (tx, inbox) = mpsc::unbounded_channel();
-        let run = session::run_session(self.pool.clone(), hid, cwd, first, inbox);
+        let pool = self.pool.clone();
+        let run = session::run_session(pool, context.clone(), hid, cwd, first, inbox);
         // All logs of the session, also of its agent and sandbox start,
         // show the handle.
         let span = tracing::info_span!("session", handle = hid);
@@ -164,16 +94,23 @@ impl<S: AgentProcessLauncher + 'static> SessionFactory for SandboxAgents<S> {
     }
 }
 
-/// Maximum number of listed sessions that the factory keeps.
+/// Maximum number of listed sessions that the factory keeps, and of the
+/// rows of one list that it reads.
 const MAX_LISTED: usize = 4096;
 
-/// Host session dirs of the listed sessions. When the map is full, a new
-/// session removes the oldest one.
-#[derive(Default)]
+/// Host session dirs of the listed sessions. When the cache is full, a new
+/// session takes the place of an old one. The agent is not trusted, and a
+/// list can be long.
 pub(super) struct Listed {
-    dirs: HashMap<String, String>,
-    /// The session ids, the oldest first.
-    order: VecDeque<String>,
+    dirs: Cache<String, String>,
+}
+
+impl Default for Listed {
+    fn default() -> Self {
+        Self {
+            dirs: Cache::new(MAX_LISTED),
+        }
+    }
 }
 
 impl Listed {
@@ -196,38 +133,19 @@ impl Listed {
                 let sids = rows
                     .into_iter()
                     .flatten()
-                    .filter_map(|row| row.get("sessionId").and_then(Value::as_str));
+                    .take(MAX_LISTED)
+                    .filter_map(|row| row.get("sessionId").and_then(Value::as_str))
+                    .filter(|sid| sid.len() <= rpc::MAX_ID_BYTES);
                 for sid in sids {
-                    self.insert(sid, cwd);
+                    self.dirs.insert(sid.to_string(), cwd.to_string());
                 }
             }
             "session/delete" => {
                 if let Some(sid) = sid {
-                    self.remove(sid);
+                    self.dirs.remove(sid);
                 }
             }
             _ => {}
-        }
-    }
-
-    /// Keep the session `sid` with the host session dir `cwd`, as the
-    /// newest session.
-    fn insert(&mut self, sid: &str, cwd: &str) {
-        if self.dirs.insert(sid.to_string(), cwd.to_string()).is_some() {
-            self.order.retain(|s| s != sid);
-        }
-        self.order.push_back(sid.to_string());
-        while self.order.len() > MAX_LISTED {
-            if let Some(oldest) = self.order.pop_front() {
-                self.dirs.remove(&oldest);
-            }
-        }
-    }
-
-    /// Forget the session `sid`.
-    fn remove(&mut self, sid: &str) {
-        if self.dirs.remove(sid).is_some() {
-            self.order.retain(|s| s != sid);
         }
     }
 }
@@ -251,5 +169,40 @@ impl SessionHandle for Handle {
         drop(tx);
         // A task that panicked is a failure.
         Box::pin(async move { task.await.unwrap_or(1) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// Test that a session list with too many rows or too long ids does not
+    /// grow the cache without limit, and that a delete forgets its
+    /// session. The agent is not trusted.
+    ///   1. Record a list with a too long id and more than the maximum rows
+    ///   2. Check that the cache has at most the maximum rows, without the
+    ///      long id
+    ///   3. Record a list with a new id and a delete of that id, and check
+    ///      that the id is gone
+    #[test]
+    fn listed_sessions_have_a_limit() {
+        let long = "x".repeat(rpc::MAX_ID_BYTES + 1);
+        let mut rows = vec![json!({ "sessionId": long })];
+        rows.extend((0..MAX_LISTED + 10).map(|i| json!({ "sessionId": format!("s{i}") })));
+        let list = |rows: Vec<Value>| json!({ "result": { "sessions": rows } });
+        let mut listed = Listed::default();
+        listed.record("session/list", "/p", None, &list(rows));
+        assert!(listed.dirs.len() <= MAX_LISTED);
+        assert!(listed.dirs.get(&long).is_none());
+
+        let new = list(vec![json!({ "sessionId": "new" })]);
+        listed.record("session/list", "/p", None, &new);
+        assert_eq!(listed.dirs.get("new").map(String::as_str), Some("/p"));
+        let deleted = json!({ "result": {} });
+        listed.record("session/delete", "/p", Some("new"), &deleted);
+        assert!(listed.dirs.get("new").is_none());
+        assert!(listed.dirs.len() <= MAX_LISTED);
     }
 }
