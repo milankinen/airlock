@@ -60,6 +60,8 @@ interface Supervisor {
     # The default value (all features off) gives the agent no grants and
     # no rule editing.
     agent       :AgentConfig,
+    # Id maps that guest init puts on the shares. Null: no maps.
+    idMaps      :IdMaps,
   ) -> ();
 
   shutdown @1 () -> ();
@@ -257,6 +259,22 @@ enum RuleEditing {
   none     @0;
   onDemand @1;
   all      @2;
+}
+
+# Id maps of the shares.
+struct IdMaps {
+  # Image layers.
+  image    @0 :IdMap;
+  # Project, directory and file mounts.
+  userData @1 :IdMap;
+}
+
+# Swap of the host uid and gid with guest ids. All other ids stay.
+struct IdMap {
+  hostUid  @0 :UInt32;
+  hostGid  @1 :UInt32;
+  guestUid @2 :UInt32;
+  guestGid @3 :UInt32;
 }
 
 struct MaskSpec {

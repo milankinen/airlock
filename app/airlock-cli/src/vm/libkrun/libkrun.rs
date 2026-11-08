@@ -17,7 +17,7 @@ use super::vmm::{VmmConfig, VmmShare};
 use crate::messages;
 use crate::settings::Vmm;
 use crate::util::VerifiedPath;
-use crate::vm::backend::{HandleFuture, VmHandle, VmStopped, VmmBackend};
+use crate::vm::backend::{HandleFuture, IdMap, VmHandle, VmStopped, VmmBackend};
 use crate::vm::config::VmConfig;
 
 /// VM backend that runs libkrun in a child process.
@@ -32,6 +32,20 @@ impl VmmBackend for Libkrun {
     // files on `/dev/null` when the kernel has no console for it.
     fn kernel_console(&self) -> &'static str {
         ""
+    }
+
+    // libkrun shows the host owner as is. Map it to root in the image
+    // layers and to the container user in the other shares.
+    fn id_map(&self, container_uid: u32, container_gid: u32) -> Option<(IdMap, IdMap)> {
+        // SAFETY: `getuid` and `getgid` cannot fail.
+        let (host_uid, host_gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let map = |guest_uid, guest_gid| IdMap {
+            host_uid,
+            host_gid,
+            guest_uid,
+            guest_gid,
+        };
+        Some((map(0, 0), map(container_uid, container_gid)))
     }
 
     fn boot_vm<'a>(

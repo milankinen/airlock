@@ -2017,6 +2017,11 @@ pub mod oci {
         format!("no user {user} found in any layer /etc/passwd")
     }
 
+    /// Error when the image user has the invalid id 4294967295.
+    pub fn invalid_user_id(user: impl Display) -> String {
+        format!("image user {user} has the invalid id 4294967295")
+    }
+
     /// Error when the image group is not in any layer `/etc/group`.
     pub fn group_not_found(group: impl Display) -> String {
         format!("no group {group} found in any layer /etc/group")

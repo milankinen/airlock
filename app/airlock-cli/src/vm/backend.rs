@@ -22,9 +22,16 @@ pub trait VmmBackend {
     fn kind(&self) -> Vmm;
 
     /// Get the console part of the guest kernel command line.
-    fn kernel_console(&self) -> &'static str {
-        "console=hvc0 console=ttyS0"
-    }
+    fn kernel_console(&self) -> &'static str;
+
+    /// Get the id maps that guest init puts on the shares.
+    /// Args:
+    ///  - `container_uid`, `container_gid`: Ids of the container user
+    ///
+    /// Returns:
+    ///   The maps for the image layers and for the other shares, or `None`
+    ///   if the share server maps the owners itself.
+    fn id_map(&self, container_uid: u32, container_gid: u32) -> Option<(IdMap, IdMap)>;
 
     /// Extract the assets of the backend and boot the VM. The caller must
     /// wait until a vsock port is ready, see
@@ -38,6 +45,20 @@ pub trait VmmBackend {
         &'a self,
         config: &'a VmConfig,
     ) -> HandleFuture<'a, anyhow::Result<Box<dyn VmHandle>>>;
+}
+
+/// Id map for a share: swaps the host uid and gid with guest ids and keeps
+/// all other ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdMap {
+    /// Host uid of the shared files.
+    pub host_uid: u32,
+    /// Host gid of the shared files.
+    pub host_gid: u32,
+    /// Guest uid that the host uid shows as.
+    pub guest_uid: u32,
+    /// Guest gid that the host gid shows as.
+    pub guest_gid: u32,
 }
 
 /// Handle of a running VM. Dropping the handle kills the VM.

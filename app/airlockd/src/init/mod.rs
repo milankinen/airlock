@@ -95,6 +95,23 @@ pub struct MountConfig {
     /// it mounts the overlayfs rootfs. Thus TLS clients in the container
     /// trust the MITM proxy of the sandbox, with no host-side overlay layer.
     pub ca_cert: Vec<u8>,
+    /// Id maps of the image layers and the other shares. `None`: no maps.
+    pub id_maps: Option<(IdMap, IdMap)>,
+}
+
+/// Id map for a share: swaps the host uid and gid with guest ids and keeps
+/// all other ids.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdMap {
+    /// Host uid of the shared files.
+    pub host_uid: u32,
+    /// Host gid of the shared files.
+    pub host_gid: u32,
+    /// Guest uid that the host uid shows as.
+    pub guest_uid: u32,
+    /// Guest gid that the host gid shows as.
+    pub guest_gid: u32,
 }
 
 #[cfg(target_os = "linux")]

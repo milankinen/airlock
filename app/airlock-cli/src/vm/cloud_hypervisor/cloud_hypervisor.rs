@@ -14,7 +14,7 @@ use tracing::{debug, error};
 use crate::messages;
 use crate::settings::Vmm;
 use crate::util::VerifiedPath;
-use crate::vm::backend::{HandleFuture, VmHandle, VmmBackend};
+use crate::vm::backend::{HandleFuture, IdMap, VmHandle, VmmBackend};
 use crate::vm::config::VmConfig;
 use crate::vm::remove_old;
 
@@ -24,6 +24,15 @@ pub struct CloudHypervisor;
 impl VmmBackend for CloudHypervisor {
     fn kind(&self) -> Vmm {
         Vmm::CloudHypervisor
+    }
+
+    fn kernel_console(&self) -> &'static str {
+        "console=hvc0 console=ttyS0"
+    }
+
+    // virtiofsd maps the owner (`--translate-uid`).
+    fn id_map(&self, _container_uid: u32, _container_gid: u32) -> Option<(IdMap, IdMap)> {
+        None
     }
 
     fn boot_vm<'a>(

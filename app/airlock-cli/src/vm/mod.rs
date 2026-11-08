@@ -23,7 +23,7 @@ pub mod mount;
 use std::os::unix::io::OwnedFd;
 
 use self::backend::VmHandle;
-pub use self::backend::{VmmBackend, load_backend};
+pub use self::backend::{IdMap, VmmBackend, load_backend};
 #[cfg(target_os = "linux")]
 pub use self::kvm_status::{KvmStatus, kvm_status, require_kvm};
 use crate::cli::LogLevel;
@@ -62,6 +62,8 @@ pub struct VmInstance {
     pub uid: u32,
     /// Container gid.
     pub gid: u32,
+    /// Id maps of the image layers and the other shares. `None`: no maps.
+    pub id_map: Option<(IdMap, IdMap)>,
 }
 
 impl VmInstance {
@@ -190,6 +192,7 @@ pub async fn start(
         cwd,
         uid: image.uid,
         gid: image.gid,
+        id_map: backend.id_map(image.uid, image.gid),
     };
     // Wait until the in-VM supervisor listens. All later vsock connections
     // use the same retry loop.

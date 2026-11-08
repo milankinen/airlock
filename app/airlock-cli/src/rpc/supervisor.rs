@@ -22,7 +22,7 @@ use crate::rpc::logging::LogSinkImpl;
 use crate::rpc::process::Process;
 use crate::rpc::{Driver, driver, vsock_transport};
 use crate::sandbox::Project;
-use crate::vm::VmInstance;
+use crate::vm::{IdMap, VmInstance};
 
 /// Snapshot of guest resource usage returned by [`Supervisor::poll_stats`].
 #[derive(Debug, Clone, Default)]
@@ -236,6 +236,11 @@ impl Supervisor {
             layers_b.set(i as u32, d);
         }
         req.get().set_ca_cert(project.ca_cert.as_bytes());
+        if let Some((image, user_data)) = vm.id_map {
+            let mut maps = req.get().init_id_maps();
+            set_id_map(maps.reborrow().init_image(), image);
+            set_id_map(maps.init_user_data(), user_data);
+        }
 
         let dirs: Vec<_> = vm
             .mounts
@@ -525,4 +530,12 @@ fn now() -> (u64, u32) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     (now.as_secs(), now.subsec_nanos())
+}
+
+/// Write the id map `map` into the RPC struct `b`.
+fn set_id_map(mut b: id_map::Builder<'_>, map: IdMap) {
+    b.set_host_uid(map.host_uid);
+    b.set_host_gid(map.host_gid);
+    b.set_guest_uid(map.guest_uid);
+    b.set_guest_gid(map.guest_gid);
 }

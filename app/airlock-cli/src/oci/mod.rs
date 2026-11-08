@@ -872,6 +872,11 @@ fn resolve_user(
         None | Some("") => primary_gid.unwrap_or(0),
         Some(g) => resolve_group(data_dir, layer_keys, g)?,
     };
+    // 4294967295 is not a valid id: the kernel refuses it in id maps.
+    anyhow::ensure!(
+        uid != u32::MAX && gid != u32::MAX,
+        messages::oci::invalid_user_id(user)
+    );
 
     Ok((uid, gid))
 }

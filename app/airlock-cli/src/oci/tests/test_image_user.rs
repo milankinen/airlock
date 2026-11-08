@@ -63,11 +63,12 @@ fn image_user_resolves_through_image_passwd_and_group() {
     );
 }
 
-/// Test that an unknown user or group is an error, not a silent fallback to
-/// root.
+/// Test that an unknown user or group, or the invalid id 4294967295, is an
+/// error, not a silent fallback to root.
 ///   1. Cache a layer that declares root and the `node` user
 ///   2. Build images with an unknown user or group in each position
 ///   3. Check that each error names the unknown value
+///   4. Check that the invalid id is an error
 #[test]
 fn unknown_image_user_or_group_is_error_not_root() {
     let tmp = temp_dir();
@@ -77,6 +78,12 @@ fn unknown_image_user_or_group_is_error_not_root() {
     for user in ["ghost", "ghost:node", "node:ghost", "1000:ghost"] {
         assert!(
             build_err(data_dir, &layers, user).contains("ghost"),
+            "USER {user:?}"
+        );
+    }
+    for user in ["4294967295", "node:4294967295"] {
+        assert!(
+            build_err(data_dir, &layers, user).contains("4294967295"),
             "USER {user:?}"
         );
     }

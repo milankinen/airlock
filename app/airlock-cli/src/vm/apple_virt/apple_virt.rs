@@ -18,7 +18,7 @@ use tracing::{debug, error, info};
 
 use crate::messages;
 use crate::settings::Vmm;
-use crate::vm::backend::{HandleFuture, VmHandle, VmmBackend};
+use crate::vm::backend::{HandleFuture, IdMap, VmHandle, VmmBackend};
 use crate::vm::config::VmConfig;
 
 /// Read and write ends of a Unix pipe.
@@ -72,6 +72,15 @@ pub struct AppleVirt;
 impl VmmBackend for AppleVirt {
     fn kind(&self) -> Vmm {
         Vmm::AppleVirt
+    }
+
+    fn kernel_console(&self) -> &'static str {
+        "console=hvc0 console=ttyS0"
+    }
+
+    // The share shows each file as owned by the caller.
+    fn id_map(&self, _container_uid: u32, _container_gid: u32) -> Option<(IdMap, IdMap)> {
+        None
     }
 
     fn boot_vm<'a>(

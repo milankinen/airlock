@@ -22,7 +22,7 @@ use futures::AsyncReadExt;
 use crate::admin::{Capabilities, DenyEntry, DenyTracker, SpawnCreds};
 use crate::daemon::{self, DaemonSet, DaemonSpec};
 use crate::init::{
-    CacheConfig, DirMountConfig, FileMountConfig, InitConfig, MaskConfig, MountConfig,
+    CacheConfig, DirMountConfig, FileMountConfig, IdMap, InitConfig, MaskConfig, MountConfig,
 };
 use crate::net;
 use crate::process::spawn_user;
@@ -361,6 +361,12 @@ impl supervisor::Server for SupervisorImpl {
                 caches,
                 masks,
                 ca_cert: params.get_ca_cert()?.to_vec(),
+                id_maps: if params.has_id_maps() {
+                    let maps = params.get_id_maps()?;
+                    Some((id_map(maps.get_image()?), id_map(maps.get_user_data()?)))
+                } else {
+                    None
+                },
             },
             daemons,
             daemon_set_slot: Rc::clone(&self.daemon_set),
@@ -597,5 +603,15 @@ impl supervisor::Server for SupervisorImpl {
         let params = params.get()?;
         crate::init::set_clock(params.get_epoch(), params.get_epoch_nanos());
         Ok(())
+    }
+}
+
+/// Read an id map from the boot RPC.
+fn id_map(map: id_map::Reader<'_>) -> IdMap {
+    IdMap {
+        host_uid: map.get_host_uid(),
+        host_gid: map.get_host_gid(),
+        guest_uid: map.get_guest_uid(),
+        guest_gid: map.get_guest_gid(),
     }
 }

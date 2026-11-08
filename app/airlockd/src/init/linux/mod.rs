@@ -3,6 +3,8 @@
 //! Runs the initialization stages in the correct order. Also contains the
 //! Linux implementation of clock sync and periodic resource maintenance.
 
+use mount::IdMapNs;
+
 use super::{InitConfig, MountConfig};
 use crate::rpc::SocketForwardConfig;
 
@@ -47,21 +49,27 @@ pub fn setup(
 ) -> anyhow::Result<()> {
     clock::set(config.epoch, config.epoch_nanos);
 
+    // Without the id maps git refuses repos as "dubious ownership".
+    let (image_idmap, user_idmap) = match mounts.id_maps {
+        Some((image, user_data)) => (IdMapNs::new(image)?, IdMapNs::new(user_data)?),
+        None => (None, None),
+    };
+
     // 1. Mount well-known VirtioFS shares
-    mount::virtiofs("layers")?;
+    mount::virtiofs("layers", image_idmap.as_ref())?;
 
     // 2. Mount user dir shares (includes "project" and "dir_N" mounts)
     for dir in &mounts.dirs {
-        mount::virtiofs(&dir.tag)?;
+        mount::virtiofs(&dir.tag, user_idmap.as_ref())?;
     }
 
     // 3. Mount file-mount VirtioFS shares (these exist only if the config
     //    has file mounts)
     if mounts.files.iter().any(|f| !f.read_only) {
-        mount::virtiofs("files/rw")?;
+        mount::virtiofs("files/rw", user_idmap.as_ref())?;
     }
     if mounts.files.iter().any(|f| f.read_only) {
-        mount::virtiofs("files/ro")?;
+        mount::virtiofs("files/ro", user_idmap.as_ref())?;
     }
 
     // Create a local directory for the overlayfs mount point (it is not a
