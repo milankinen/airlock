@@ -111,6 +111,9 @@ const LOG_STYLE_NEVER: u32 = 2;
 const LOG_OPTIONS_NO_ENV: u32 = 1;
 /// Guest vsock CID.
 const GUEST_CID: u64 = 3;
+/// Maximum soft limit of open fds. The guest controls the fd count, and one
+/// VM must not take much of the shared `kern.maxfiles` table (245760).
+const FD_LIMIT: libc::rlim_t = 65_536;
 /// Maximum log size. The guest can make libkrun write log lines.
 const LOG_LIMIT: u64 = 16 * 1024 * 1024;
 
@@ -294,6 +297,10 @@ pub fn main() -> ! {
         eprintln!("libkrun: {e}");
         exit_now(1);
     }
+    // Not fatal: the VM runs with a low limit too.
+    if let Err(e) = raise_fd_limit() {
+        eprintln!("libkrun: {e}");
+    }
     let mut line = String::new();
     let config = std::io::stdin()
         .lock()
@@ -356,6 +363,50 @@ fn close_inherited_fds() -> Result<(), String> {
     for fd in fds.iter().map(|f| f.proc_fd).filter(|fd| *fd > 2) {
         // SAFETY: nothing in this process uses these descriptors.
         unsafe { libc::close(fd) };
+    }
+    Ok(())
+}
+
+/// Raise the soft fd limit to `FD_LIMIT`, capped by the hard limit and
+/// `kern.maxfilesperproc`. Each open guest file on a share holds a host fd,
+/// and the macOS default of 256 is too low.
+fn raise_fd_limit() -> Result<(), String> {
+    let fail = |what: &str| format!("{what}: {}", std::io::Error::last_os_error());
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid place for the result.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
+        return Err(fail("read fd limit"));
+    }
+    let mut per_proc: libc::c_int = 0;
+    let mut size = size_of::<libc::c_int>();
+    // SAFETY: the name is null-terminated, and `per_proc` has `size` bytes.
+    let res = unsafe {
+        libc::sysctlbyname(
+            c"kern.maxfilesperproc".as_ptr(),
+            (&raw mut per_proc).cast(),
+            &raw mut size,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    if res != 0 {
+        return Err(fail("read kern.maxfilesperproc"));
+    }
+    // macOS refuses a soft limit above `kern.maxfilesperproc`.
+    let target = limit
+        .rlim_max
+        .min(libc::rlim_t::try_from(per_proc).unwrap_or(libc::rlim_t::MAX))
+        .min(FD_LIMIT);
+    if target <= limit.rlim_cur {
+        return Ok(());
+    }
+    limit.rlim_cur = target;
+    // SAFETY: `limit` holds the new limits.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) } != 0 {
+        return Err(fail("set fd limit"));
     }
     Ok(())
 }
