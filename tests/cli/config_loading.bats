@@ -244,13 +244,13 @@ claude-code = { version = 1 }' \
 
     assert_config_error info 'presets = ["claude"]' \
         "$file: unknown preset \`claude\` (known: claude-code," \
-        "; newer packs use the [packs] table of a project config file, for example \`[packs] claude = { version = 1 }\`"
+        "; for newer packs use \`[packs] claude = { version = 1 }\` in project config"
 
     assert_config_error info 'presets = ["mise"]' \
-        "; newer packs use the [packs] table of a project config file, for example \`[packs] mise = { version = 1 }\`"
+        "; for newer packs use \`[packs] mise = { version = 1 }\` in project config"
 
     assert_config_error info 'presets = [1]' \
-        "$file: \`presets\` list entries must be preset names (strings), not 1"
+        "$file: \`presets\` entries must be strings, not 1"
 
     assert_config_error info 'presets = true' \
         "$file: \`presets\` must be a list of preset names, not true"

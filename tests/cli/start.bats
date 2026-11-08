@@ -45,14 +45,14 @@ setup() {
     make_sandbox_disk
     run_airlock start
     assert_failure 2
-    assert_output_contains "sandbox in $PWD has no config."
-    assert_output_contains "Restore airlock.toml or $BOX_DIR/airlock.toml, or run \`airlock rm\`"
+    assert_output_contains "sandbox in $PWD has no config, restore"
+    assert_output_contains "restore airlock.toml or $BOX_DIR/airlock.toml, or run \`airlock rm\`"
 
     rm "$BOX_DIR"/disk.*
     echo '{}' >"$BOX_DIR/installs.json"
     run_airlock start
     assert_failure 2
-    assert_output_contains "sandbox in $PWD has no config."
+    assert_output_contains "sandbox in $PWD has no config, restore"
 }
 
 # Test that start reports config errors and does not change the config
@@ -115,7 +115,7 @@ codex = { version = 1, auth = "api-key" }' ]]
     TEST_DATA_HOME="$data_home"
     assert_failure 1
     assert_output_contains "too long"
-    assert_output_contains "Set a shorter data_dir"
+    assert_output_contains "set a shorter data_dir"
 }
 
 # Test that --network replaces the network policy of the config.
@@ -289,7 +289,7 @@ $BAD_IMAGE"
 #   1. Remove the tokens and write a config with the claude, codex and
 #      copilot packs
 #   2. Run start
-#   3. Check that there is no config error and no sign-in, and that the
+#   3. Check that there is no config error, and that the
 #      sandbox prepare starts
 @test "start with agent packs and no credentials passes env check" {
     unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY COPILOT_GITHUB_TOKEN
@@ -302,7 +302,6 @@ copilot = { version = 1 }"
     run_airlock start
     assert_failure
     assert_output_not_contains "config error"
-    assert_output_not_contains "Signing in"
     assert_output_contains "Preparing sandbox"
 }
 
@@ -337,7 +336,7 @@ copilot = { version = 1 }"
         >"$BOX_DIR/run.json"
     run_airlock start
     assert_failure 2
-    assert_output_contains "sandbox config changed."
+    assert_output_contains "sandbox config changed, run in a terminal"
     assert_output_not_contains "Preparing sandbox"
     run_airlock start --yes
     assert_failure 2

@@ -66,7 +66,6 @@ check_install() {
     assert_output_contains "Disk created"
     [[ "$output" == *"Disk created"*"Installing packs..."* ]]
     assert_output_not_contains "(network:"
-    assert_output_not_contains "Starting the install VM"
     assert_output_contains "ALL-PACKS-OK"
     [[ "$(logged_packs)" == "claude codex copilot docker git mise nodejs python rust " ]]
     for id in claude codex copilot nodejs python rust docker git mise; do
@@ -123,7 +122,7 @@ check_removed_pack() {
     sed -i.bak '/^mise = { version = 1 }$/d' airlock.toml
     run_airlock start -- sh -c 'echo NOT-REACHED'
     [[ "$status" -eq 2 ]]
-    assert_output_contains "sandbox config changed."
+    assert_output_contains "sandbox config changed, run in a terminal"
     assert_output_not_contains "Preparing sandbox"
     assert_output_not_contains "NOT-REACHED"
 

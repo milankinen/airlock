@@ -37,7 +37,7 @@ setup() {
     printf 'not [valid\n' > airlock.toml
     run_airlock rm -f
     assert_success
-    assert_output_not_contains "could not be loaded"
+    assert_output_not_contains "config error"
     assert_output_contains "Sandbox removed"
     [[ ! -e "$BOX_DIR" ]]
 }
