@@ -223,23 +223,27 @@ fn owned_fd(ret: libc::c_long) -> Option<OwnedFd> {
 pub(super) fn bind(src: &str, dst: &str, read_only: bool) -> anyhow::Result<()> {
     let src_cstr = std::ffi::CString::new(src).unwrap();
     let dst_cstr = std::ffi::CString::new(dst).unwrap();
-    let flags = if read_only {
-        libc::MS_BIND | libc::MS_RDONLY
-    } else {
-        libc::MS_BIND
+    let bind = |flags| {
+        // SAFETY: the strings are null-terminated.
+        let ret = unsafe {
+            libc::mount(
+                src_cstr.as_ptr(),
+                dst_cstr.as_ptr(),
+                std::ptr::null(),
+                flags,
+                std::ptr::null(),
+            )
+        };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            anyhow::bail!("failed to bind-mount {src} → {dst}: {err}");
+        }
+        Ok(())
     };
-    let ret = unsafe {
-        libc::mount(
-            src_cstr.as_ptr(),
-            dst_cstr.as_ptr(),
-            std::ptr::null(),
-            flags,
-            std::ptr::null(),
-        )
-    };
-    if ret != 0 {
-        let err = std::io::Error::last_os_error();
-        anyhow::bail!("failed to bind-mount {src} → {dst}: {err}");
+    bind(libc::MS_BIND)?;
+    // A new bind mount ignores `MS_RDONLY`. Only a remount sets it.
+    if read_only {
+        bind(libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY)?;
     }
     Ok(())
 }

@@ -56,14 +56,20 @@ fn deliver_err<T>(
 
 /// Create a Unix pipe and return both ends as owned file descriptors.
 fn create_pipe() -> anyhow::Result<PipeEnds> {
-    let mut fds = [0i32; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return Err(anyhow::anyhow!(std::io::Error::last_os_error()));
-    }
+    let (read, write) = std::io::pipe()?;
     Ok(PipeEnds {
-        read: unsafe { OwnedFd::from_raw_fd(fds[0]) },
-        write: unsafe { OwnedFd::from_raw_fd(fds[1]) },
+        read: read.into(),
+        write: write.into(),
     })
+}
+
+/// Duplicate `fd` with close-on-exec, so host child processes do not get
+/// the copy.
+/// Returns:
+///   The new fd, or -1 on error.
+fn dup_cloexec(fd: libc::c_int) -> libc::c_int {
+    // SAFETY: `fcntl` with `F_DUPFD_CLOEXEC` only makes a new fd.
+    unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) }
 }
 
 /// VM backend that uses the Apple Virtualization framework.
@@ -116,7 +122,6 @@ pub struct AppleVirtVm {
     _vm: Option<Retained<VZVirtualMachine>>,
     vm_queue: dispatch2::DispatchRetained<DispatchQueue>,
     host_to_guest_write: OwnedFd,
-    guest_to_host_read: OwnedFd,
 }
 
 // Safety: the struct moves only between tokio tasks on the same thread
@@ -161,17 +166,19 @@ impl AppleVirtVm {
         let vm_raw = (&raw const *vm).cast_mut();
 
         // Drop the guest-side pipe ends on the host. The VM has its own
-        // duplicated copies through NSFileHandle. When the VM stops and
-        // closes them, read() on guest_to_host_read gets EOF.
+        // duplicated copies through NSFileHandle.
         drop(host_to_guest.read);
         drop(guest_to_host.write);
+        // Drain the console output. A full pipe blocks the guest console
+        // writes. The read gets EOF when the VM closes its copy.
+        let mut console = std::io::PipeReader::from(guest_to_host.read);
+        std::thread::spawn(move || std::io::copy(&mut console, &mut std::io::sink()));
 
         Ok(Self {
             vm: std::sync::Arc::new(AtomicPtr::new(vm_raw)),
             _vm: Some(vm),
             vm_queue,
             host_to_guest_write: host_to_guest.write,
-            guest_to_host_read: guest_to_host.read,
         })
     }
 
@@ -222,8 +229,8 @@ impl AppleVirtVm {
             // Duplicate the fds for NSFileHandle with closeOnDealloc:true, so
             // the VM owns its copies. When the VM stops, these close, and the
             // host relay gets EOF.
-            let guest_read_fd = libc::dup(host_to_guest.read.as_raw_fd());
-            let guest_write_fd = libc::dup(guest_to_host.write.as_raw_fd());
+            let guest_read_fd = dup_cloexec(host_to_guest.read.as_raw_fd());
+            let guest_write_fd = dup_cloexec(guest_to_host.write.as_raw_fd());
             let read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
                 NSFileHandle::alloc(),
                 guest_read_fd,
@@ -512,7 +519,7 @@ impl AppleVirtVm {
                                     let conn = &*conn_ptr;
                                     // Duplicate the fd, so it stays open after
                                     // the connection is closed.
-                                    let fd = libc::dup(conn.fileDescriptor());
+                                    let fd = dup_cloexec(conn.fileDescriptor());
                                     if fd < 0 {
                                         Err(messages::vm::VSOCK_DUP_FAILED.into())
                                     } else {

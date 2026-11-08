@@ -115,8 +115,9 @@ pub fn extract(dir: &VerifiedPath, files: &[AssetFile]) -> anyhow::Result<()> {
         if stamp(&path, file.checksum).is_none_or(|s| s != cached.trim()) {
             write_atomic(dir, file.name, file.data, file.mode)?;
             // Stamp last: a crash between the writes forces a new extraction.
-            let stamp = stamp(&path, file.checksum)
-                .ok_or_else(|| anyhow::anyhow!("{path}: missing after extraction"))?;
+            let stamp = stamp(&path, file.checksum).ok_or_else(|| {
+                anyhow::anyhow!(messages::vm::asset_missing_after_extraction(&path))
+            })?;
             write_atomic(dir, &stamp_name, stamp.as_bytes(), 0o644)?;
         }
     }

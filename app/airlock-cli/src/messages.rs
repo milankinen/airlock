@@ -4294,6 +4294,12 @@ pub mod vm {
 
     use std::fmt::Display;
 
+    /// Error when an extracted VM asset is missing right after its write.
+    #[cfg(not(test))]
+    pub fn asset_missing_after_extraction(path: impl Display) -> String {
+        format!("{path}: missing after extraction")
+    }
+
     /// Error when a file sync source path has no parent directory.
     pub const SYNC_SOURCE_NO_PARENT: &str = "source has no parent dir";
 

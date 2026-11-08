@@ -114,6 +114,7 @@ impl CloudHypervisorVm {
 
         cleanup_sockets(runtime_dir);
 
+        // SAFETY: `getuid` and `getgid` cannot fail.
         let host_uid = unsafe { libc::getuid() };
         let host_gid = unsafe { libc::getgid() };
 

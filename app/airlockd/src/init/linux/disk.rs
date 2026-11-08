@@ -13,6 +13,30 @@ use tracing::{debug, info, warn};
 
 use crate::init::CacheConfig;
 
+/// Check if the disk `dev` is new. airlock makes a new disk as a sparse
+/// file of zeros, and guest init formats it. A disk with other data has a
+/// filesystem, or it is damaged. A format would erase its data.
+/// Returns:
+///   `true` for a new disk, `false` for ext4, or error for other data or a
+///   read error.
+fn needs_format(dev: &str) -> anyhow::Result<bool> {
+    use std::io::Read;
+    // The ext4 superblock starts at byte 1024. Its magic 0xEF53 is at
+    // byte 56 of it, little-endian.
+    const MAGIC_AT: usize = 1024 + 56;
+    let mut head = vec![0u8; 64 * 1024];
+    std::fs::File::open(dev)
+        .and_then(|mut f| f.read_exact(&mut head))
+        .map_err(|e| anyhow::anyhow!("read disk {dev}: {e}"))?;
+    if head[MAGIC_AT..MAGIC_AT + 2] == [0x53, 0xEF] {
+        return Ok(false);
+    }
+    if head.iter().all(|b| *b == 0) {
+        return Ok(true);
+    }
+    anyhow::bail!("disk {dev} has no ext4 filesystem and is not empty; not formatting it")
+}
+
 /// Mount the project disk at `/mnt/disk` (overlay upper layer and caches).
 ///
 /// Formats `/dev/vda` as ext4 on the first boot. Later boots only mount the
@@ -26,24 +50,7 @@ pub(super) fn setup(cache_mounts: &[CacheConfig]) -> anyhow::Result<()> {
         anyhow::bail!("disk {dev} not found");
     }
 
-    let blkid = Command::new("/sbin/blkid").arg(dev).output();
-    let needs_format = match &blkid {
-        Ok(o) => {
-            let out = String::from_utf8_lossy(&o.stdout);
-            debug!("blkid {dev}: {out}");
-            !out.contains("ext4")
-        }
-        Err(e) => {
-            // The disk state is unknown. A format here would erase an
-            // existing filesystem, with the overlay upper layer and all
-            // caches. Thus "unknown" means "do not format". If the disk
-            // really has no filesystem, the mount below fails with an error.
-            // This is better than data loss without an error.
-            warn!("blkid exec failed ({e}); not formatting to avoid data loss");
-            false
-        }
-    };
-
+    let needs_format = needs_format(dev)?;
     if needs_format {
         info!("formatting disk {dev}");
         let output = Command::new("/sbin/mkfs.ext4")
@@ -187,4 +194,36 @@ fn trim_once(path: &str) -> std::io::Result<u64> {
 /// and keeps the page cache.
 fn drop_slab_caches() -> std::io::Result<()> {
     std::fs::write("/proc/sys/vm/drop_caches", "2")
+}
+
+#[cfg(test)]
+mod tests {
+    use airlock_test_utils::temp_dir;
+
+    use super::needs_format;
+
+    /// Test that only an all-zero disk is formatted. A format of a disk with
+    /// data would erase the overlay upper layer and the caches.
+    ///   1. Check that a zero disk needs a format
+    ///   2. Check that a disk with the ext4 magic does not
+    ///   3. Check that other data and a too short disk are errors
+    #[test]
+    fn only_zero_disk_is_formatted() {
+        let tmp = temp_dir();
+        let disk = |name: &str, data: &[(usize, u8)], len: usize| {
+            let mut bytes = vec![0u8; len];
+            for (at, b) in data {
+                bytes[*at] = *b;
+            }
+            let path = tmp.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        let mib = 1024 * 1024;
+
+        assert!(needs_format(&disk("zero", &[], mib)).unwrap());
+        assert!(!needs_format(&disk("ext4", &[(1080, 0x53), (1081, 0xEF)], mib)).unwrap());
+        assert!(needs_format(&disk("data", &[(5000, 1)], mib)).is_err());
+        assert!(needs_format(&disk("short", &[], 100)).is_err());
+    }
 }
