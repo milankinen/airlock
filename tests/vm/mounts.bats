@@ -121,10 +121,12 @@ EOF
     assert_failure
     assert_output_contains "insecure_mounts"
 
-    mkdir -p .airlock
-    printf '[security]\ninsecure_mounts = true\n' >.airlock/settings.toml
+    # Keep the settings of the file and put them back after the test.
+    cp .airlock/settings.toml .airlock/settings.toml.bak
+    printf '[security]\ninsecure_mounts = true\n' >>.airlock/settings.toml
     run_vm echo started
-    rm .airlock/settings.toml airlock.toml
+    mv .airlock/settings.toml.bak .airlock/settings.toml
+    rm airlock.toml
     assert_success
     assert_output_contains "started"
 }
@@ -138,6 +140,9 @@ EOF
 #   3. Check that the user can write in the project dir and that the host
 #      user owns the new file
 @test "project files show as owned by non-root container user" {
+    if [[ "$(uname)" == "Darwin" ]]; then
+        skip "Apple Virtualization shows the project dir as root, see docs/known-issues/apple-virt-share-root-owner.md"
+    fi
     mkdir -p nonroot
     cd nonroot
     printf '[vm]\nimage = "curlimages/curl:latest"\n' >airlock.toml

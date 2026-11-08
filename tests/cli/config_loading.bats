@@ -204,7 +204,7 @@ nope = { version = 1 }' "invalid configuration" "packs.nope" "$file"
 
     assert_config_error info '[packs]
 codex = { version = 1, auth = "api-key" }' \
-        "\`packs.codex.auth\` unknown key (known: version, enabled, args; args go in \`args = { auth = … }\`) (set in: $file)"
+        "\`packs.codex.auth\`: unknown key (known: version, enabled, args), put args in \`args\` (set in: $file)"
 
     assert_config_error info '[packs]
 python = { version = 1.5 }' \
@@ -215,14 +215,14 @@ python = {}' "\`packs.python\` needs \`version\` (set in: $file): 1"
 
     assert_config_error info '[packs]
 python = { version = "7" }' \
-        "\`packs.python\`: version \"7\" is not supported (supported: \"1\")" "$file"
+        "\`packs.python\`: version \"7\" not supported, use \"1\"" "$file"
 
     assert_config_error info '[packs]
 python = { version = "legacy" }' \
-        "\`packs.python\`: version \"legacy\" is not supported; use the list form \`presets = [\"python\"]\` (set in: $file)"
+        "\`packs.python\`: version \"legacy\" not supported, use \`presets = [\"python\"]\` (set in: $file)"
 
     assert_config_error info '[packs]
-mise = { version = "legacy" }' "\`packs.mise\`: version \"legacy\" is not supported (supported: \"1\")"
+mise = { version = "legacy" }' "\`packs.mise\`: version \"legacy\" not supported, use \"1\""
 
     assert_config_error info '[packs]
 claude-code = { version = 1 }' \

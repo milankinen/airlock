@@ -88,6 +88,19 @@ run_airlock() {
     IFS=$'\n' read -r -d '' -a lines <<< "$output" || true
 }
 
+# Write to stdout the airlock data directory that run_airlock uses. The VM
+# tests set it in the user settings. Else macOS ignores XDG_DATA_HOME and
+# uses a directory in HOME.
+data_dir() {
+    if [[ -n "${FILE_DATA_HOME:-}" ]]; then
+        echo "$FILE_DATA_HOME/airlock"
+    elif [[ "$(uname)" == "Darwin" ]]; then
+        echo "${TEST_HOME:-${TEST_TEMP_DIR:-$FILE_TEMP_DIR}}/Library/Application Support/airlock"
+    else
+        echo "${TEST_DATA_HOME:-$FILE_DATA_HOME}/airlock"
+    fi
+}
+
 # -- Assertions --
 
 # Fail if the last command did not exit with 0.
@@ -163,24 +176,29 @@ write_local_config() {
 # -- Sandbox state helpers --
 #
 # All sandboxes are in the data directory, and the registry maps each project
-# to its sandbox. Only "airlock start" makes a registry entry. These helpers
+# to its sandbox. Only "airlock start" makes a registry entry. A failed first
+# start removes a new sandbox, but it keeps a sandbox that it imported from
+# the project directory. Thus these helpers make an old project sandbox and
 # run start with an image that does not exist, looked up in docker only.
-# Start registers the project and stops at the image step without network
-# access, so no VM boots. Then the helpers write the
-# record files into the sandbox directory.
+# Start imports and registers the sandbox and stops at the image step
+# without network access, so no VM boots. Then the helpers write the record
+# files into the sandbox directory.
 
 # True if the host can run a VM: not Linux, or Linux with /dev/kvm access.
 has_kvm_or_not_linux() {
     [[ "$(uname)" != "Linux" ]] || [[ -r /dev/kvm ]]
 }
 
-# Make the sandbox of the current project and set $BOX_DIR to its directory.
-# Keep the sandbox if it exists. Keep airlock.toml of the project. Skip the
-# test when the host has no KVM, because start checks KVM on Linux.
+# Make the sandbox of the current project, with no disk, and set $BOX_DIR to
+# its directory. Keep the sandbox if it exists. Keep airlock.toml of the
+# project. Skip the test when the host has no KVM, because start checks KVM
+# on Linux.
 make_box() {
     has_kvm_or_not_linux || skip "no KVM access"
+    local imported=""
     run_airlock sandboxes info --json
     if [[ "$status" -ne 0 ]]; then
+        imported=1
         local saved=""
         if [[ -e airlock.toml ]]; then
             saved="$(mktemp "$TEST_TEMP_DIR/config.XXXXXX")"
@@ -189,8 +207,11 @@ make_box() {
         write_config '[vm.image]
 name = "airlock-test.invalid/no-such-image:1"
 resolution = "docker"'
-        run_airlock --quiet start --allow-configuration-changes
+        make_legacy_sandbox
+        run_airlock --quiet start --yes --allow-configuration-changes
         rm -f airlock.toml
+        # Remove the .airlock directory if the import left it empty.
+        rmdir .airlock 2>/dev/null || true
         if [[ -n "$saved" ]]; then
             mv "$saved" airlock.toml
         fi
@@ -198,7 +219,11 @@ resolution = "docker"'
         assert_success || return 1
     fi
     BOX_DIR="$(sed -n 's/^ *"dir": "\(.*\)",$/\1/p' <<<"$output")"
-    [[ -d "$BOX_DIR" ]]
+    [[ -d "$BOX_DIR" ]] || return 1
+    # The imported disk is not part of a new box. make_sandbox_disk adds it.
+    if [[ -n "$imported" ]]; then
+        rm -f "$BOX_DIR"/disk.*
+    fi
 }
 
 # Make a sandbox disk in the sandbox of the current project, with the disk

@@ -24,7 +24,10 @@ require_vm_support() {
 # stays between tests. Each test boots a new VM but uses the same sandbox
 # state again. The temp directory has the home directory and the project
 # side by side, because airlock refuses a project that contains the home.
-# Also make one data home directory for all tests of the file.
+# Also make one data home directory for all tests of the file, and set it
+# as the data directory in the user settings. macOS ignores XDG_DATA_HOME,
+# and it limits Unix socket paths to 104 bytes. The data home has a short
+# path, and the sockets of the sandbox go below it.
 # Call this from setup_file, then write the config.
 
 vm_setup_file() {
@@ -39,7 +42,8 @@ vm_setup_file() {
     TEST_HOME="$FILE_TEMP_DIR/home"
     FILE_DATA_HOME="$(make_data_home)"
     export FILE_TEMP_DIR TEST_HOME FILE_DATA_HOME
-    mkdir -p "$TEST_HOME" "$FILE_TEMP_DIR/project"
+    mkdir -p "$TEST_HOME/.airlock" "$FILE_TEMP_DIR/project"
+    printf 'data_dir = "%s/airlock"\n' "$FILE_DATA_HOME" >"$TEST_HOME/.airlock/settings.toml"
     cd "$FILE_TEMP_DIR/project" || return 1
 }
 

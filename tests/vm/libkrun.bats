@@ -10,11 +10,8 @@ setup_file() {
         skip "libkrun runs only on macOS arm64"
     fi
     vm_setup_file
-    mkdir -p "$TEST_HOME/.airlock" ro_dir
-    # macOS limits Unix socket paths to 104 bytes. The data home has a
-    # short path, and the vsock sockets go below it.
-    printf 'vmm = "libkrun"\ndata_dir = "%s/airlock"\n' "$FILE_DATA_HOME" \
-        > "$TEST_HOME/.airlock/settings.toml"
+    mkdir -p ro_dir
+    printf 'vmm = "libkrun"\n' >>"$TEST_HOME/.airlock/settings.toml"
     echo "ro-content" > ro_dir/file.txt
     write_config '[vm]
 

@@ -48,7 +48,7 @@ load helpers
     assert_output_contains "'airlock start' first"
 
     local log
-    log="$(find "$TEST_DATA_HOME" -name acp.log)"
+    log="$(find "$(data_dir)" -name acp.log)"
     [[ -n "$log" ]]
     output="$(cat "$log")"
     assert_output_contains "initialize"

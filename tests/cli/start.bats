@@ -68,7 +68,7 @@ setup() {
         "$PWD/airlock.toml: \`presets\` must be a list of preset names, not true"
     assert_config_error start '[packs]
 codex = { version = 1, auth = "api-key" }' \
-        "\`packs.codex.auth\` unknown key (known: version, enabled, args; args go in \`args = { auth = … }\`) (set in: $PWD/airlock.toml)"
+        "\`packs.codex.auth\`: unknown key (known: version, enabled, args), put args in \`args\` (set in: $PWD/airlock.toml)"
     [[ "$(cat airlock.toml)" == '[packs]
 codex = { version = 1, auth = "api-key" }' ]]
 }

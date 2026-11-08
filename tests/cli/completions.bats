@@ -28,8 +28,8 @@ bash_complete() {
 
 # Make a template with the name $1 in the data directory.
 make_template() {
-    mkdir -p "$TEST_DATA_HOME/airlock/templates/$1"
-    touch "$TEST_DATA_HOME/airlock/templates/$1/airlock.toml"
+    mkdir -p "$(data_dir)/templates/$1"
+    touch "$(data_dir)/templates/$1/airlock.toml"
 }
 
 # Test that the bash completion script completes the commands and the names
@@ -64,7 +64,7 @@ make_template() {
     bash_complete templates info x
     assert_success
     [[ -z "$output" ]]
-    [[ ! -e "$TEST_DATA_HOME/airlock" ]]
+    [[ ! -e "$(data_dir)" ]]
 }
 
 # Test that the completion request completes the ids of the sandboxes, with
