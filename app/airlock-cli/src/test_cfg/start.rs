@@ -75,7 +75,7 @@ pub fn fake_image(name: &str) -> OciImage {
         gid: 0,
         cmd: vec![],
         env: vec![],
-        user: Some(String::new()),
+        user: String::new(),
     }
 }
 

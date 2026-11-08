@@ -69,7 +69,7 @@ mod tests {
             gid: 0,
             cmd: argv(cmd),
             env: vec![],
-            user: None,
+            user: String::new(),
         }
     }
 

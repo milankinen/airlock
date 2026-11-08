@@ -70,7 +70,7 @@ mod tests {
             gid: 0,
             cmd: vec![],
             env: vec![],
-            user: Some(String::new()),
+            user: String::new(),
         }
     }
 

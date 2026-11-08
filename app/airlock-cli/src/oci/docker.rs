@@ -99,25 +99,6 @@ pub fn image_arch(engine: &str, image_id: &str) -> Option<String> {
     if arch.is_empty() { None } else { Some(arch) }
 }
 
-/// Return the `USER` from the config of a local image (`""` if none).
-/// Fails if the engine cannot give it, because the caller must not guess.
-pub fn image_user(engine: &str, image_id: &str) -> anyhow::Result<String> {
-    let output = Command::new(engine)
-        .args(["image", "inspect", "--format", "{{.Config.User}}", image_id])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| anyhow::anyhow!(messages::oci::run_inspect_failed(engine, e)))?;
-    if !output.status.success() {
-        anyhow::bail!(messages::oci::inspect_failed(
-            engine,
-            image_id,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
 /// Return the registry digests that the engine recorded for a local image.
 /// These are the `RepoDigests` entries without their `<repo>@` prefix.
 ///

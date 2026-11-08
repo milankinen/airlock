@@ -66,6 +66,6 @@ fn image(digest: &str, layers: Vec<String>) -> OciImage {
         gid: 0,
         cmd: vec!["/bin/sh".to_string()],
         env: vec![],
-        user: Some(String::new()),
+        user: String::new(),
     }
 }

@@ -24,7 +24,7 @@ use oci_client::secrets::RegistryAuth;
 
 use crate::cli::prompt::PromptError;
 use crate::cli::prompt::choose::{Choice, Choose};
-use crate::config::config_values::{ImageRef, PullPolicy};
+use crate::config::config_values::{ImageRef, PullPolicy, Resolution};
 use crate::data_dir::DataDir;
 use crate::oci::credentials::ToRegistryAuth;
 use crate::sandbox::Project;
@@ -94,13 +94,8 @@ pub struct OciImage {
     /// Has no `[env]` overrides (`vm::start` adds them from `SandboxEnv`).
     pub env: Vec<String>,
     /// The raw `USER` string from the image config (`""` if the image sets
-    /// none). `None` marks a file written before airlock resolved named users
-    /// through the image's `/etc/passwd`
-    /// (<https://github.com/milankinen/airlock/pull/12>). Such a file can
-    /// contain root `uid`/`gid` for an image that asked for a non-root user,
-    /// so [`prepare`] checks it again against a new resolution before use.
-    #[serde(default)]
-    pub user: Option<String>,
+    /// none).
+    pub user: String,
 }
 
 /// What [`prepare`] does when the configured image resolves to a digest
@@ -200,11 +195,6 @@ pub async fn prepare(
     let cached = read_ready_image(data_dir, &sandbox_image)
         .filter(|img| img.name == *image_name || pinned == Some(img.image_id.as_str()));
 
-    // A file without `user` is older than named-USER resolution and can
-    // contain a wrong uid/gid. The code below must check it again, so it
-    // never takes the fast path and is never a digest-keyed cache hit.
-    let legacy = cached.as_ref().is_some_and(|img| img.user.is_none());
-
     // Fast path: use the cached image and skip the network request that
     // resolves the tag to a digest.
     //
@@ -213,7 +203,6 @@ pub async fn prepare(
     // the fast path: it names one immutable image, so a matching name means
     // a matching digest and there is nothing to detect.
     if let Some(img) = cached.clone()
-        && !legacy
         && (image_cfg.pull_policy == PullPolicy::IfNotPresent
             || image_cfg.pinned_digest().is_some())
     {
@@ -223,15 +212,29 @@ pub async fn prepare(
 
     // Read only the stored digest (if any) for change detection. An
     // imported sandbox without an image link has the digest in the marker.
-    let stored_digest = read_cached_image(&sandbox_image)
-        .map(|i| i.image_id)
+    let stored_digest = read_image_json(&sandbox_image)
+        .and_then(|json| stored_image_id(json.as_bytes()))
         .or_else(|| read_import_marker(sandbox_dir));
 
     let registry_host: String = image_name
         .parse::<oci_client::Reference>()
         .map_or_else(|_| image_name.clone(), |r| r.resolve_registry().to_string());
 
-    let (mut image, auth) = match resolve_with_auth(vault, image_cfg, &registry_host).await {
+    // The pinned try never asks for credentials and falls back to the tag:
+    // a local image stores its image ID, which no registry knows.
+    let resolved = match stored_pin(image_cfg, stored_digest.as_deref()) {
+        Some(pinned_cfg) => {
+            match resolve_with_auth(vault, &pinned_cfg, &registry_host, false).await {
+                Err(e) if !cli::is_interrupted() => {
+                    tracing::debug!("stored digest not available, resolving the tag: {e:#}");
+                    resolve_with_auth(vault, image_cfg, &registry_host, true).await
+                }
+                res => res,
+            }
+        }
+        None => resolve_with_auth(vault, image_cfg, &registry_host, true).await,
+    };
+    let (mut image, auth) = match resolved {
         Ok(resolved) => resolved,
         Err(e) => {
             // With `if-changed`, airlock contacted the source only to ask if
@@ -247,16 +250,6 @@ pub async fn prepare(
             return use_cached_image(data_dir, sandbox_dir, &sandbox_image, img).map(unchanged);
         }
     };
-
-    // Same digest, but the old `USER` resolution made the cached metadata.
-    // Find uid/gid again from the new config. Mark the file as verified, or
-    // refuse to start the sandbox if it ran as the wrong user.
-    if let Some(img) = cached
-        .as_ref()
-        .filter(|i| i.user.is_none() && i.image_id == image.digest)
-    {
-        verify_legacy_user(data_dir, img, &image)?;
-    }
 
     // Check for an image change before the download.
     let digest_changed = stored_digest
@@ -400,8 +393,7 @@ pub fn import_image(
         .read("image", MAX_IMAGE_FILE)
         .ok()
         .flatten()
-        .and_then(|bytes| serde_json::from_slice::<CachedImage>(&bytes).ok())
-        .map(|CachedImage::V2(image)| image.image_id)
+        .and_then(|bytes| stored_image_id(&bytes))
         .filter(|digest| is_sha256_digest(digest));
     // Use the cache file, not the old file. Only the cache file is trusted.
     let cached = digest.as_deref().and_then(|digest| {
@@ -476,7 +468,8 @@ fn remove_import_marker(sandbox_dir: &VerifiedPath) {
 /// Args:
 ///  - `vault`: Vault that stores the registry credentials
 ///  - `image_cfg`: Configured image reference
-///  - `registry_host`: Registry host for the credential lookup.
+///  - `registry_host`: Registry host for the credential lookup
+///  - `may_prompt`: Ask the user for credentials
 ///
 /// Returns:
 ///   The resolved image and the auth that worked, so the caller can use the
@@ -485,6 +478,7 @@ async fn resolve_with_auth(
     vault: &Vault,
     image_cfg: &ImageRef,
     registry_host: &str,
+    may_prompt: bool,
 ) -> anyhow::Result<(ResolvedImage, RegistryAuth)> {
     // Try anonymous first, then the credentials in the vault, then ask the
     // user. Try again until resolution succeeds or the user interrupts.
@@ -508,6 +502,9 @@ async fn resolve_with_auth(
                     auth = creds.to_auth();
                     continue;
                 }
+                if !may_prompt {
+                    return Err(e);
+                }
                 cli::error!("{}", messages::oci::AUTH_FAILED_RETRY);
                 let creds = credentials::prompt(registry_host)?;
                 updated_creds = Some(creds.clone());
@@ -519,15 +516,15 @@ async fn resolve_with_auth(
 }
 
 /// On-disk wrapper for a cached [`OciImage`]. Internally tagged, so the JSON
-/// has `"schema":"v2"` next to the image fields. The schema version changes
+/// has `"schema":"v3"` next to the image fields. The schema version changes
 /// together with [`crate::cache::LAYER_FORMAT`]. Thus after a layer format
 /// change, all old image JSON files fail to deserialize, which causes a
 /// clean pull.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(tag = "schema")]
 enum CachedImage {
-    #[serde(rename = "v2")]
-    V2(OciImage),
+    #[serde(rename = "v3")]
+    V3(OciImage),
 }
 
 /// Read a cached image JSON file.
@@ -538,6 +535,42 @@ fn read_image_json(path: &VerifiedPath) -> Option<String> {
     path.read_to_string_capped(MAX_IMAGE_FILE).ok()
 }
 
+/// Pin the stored digest of a sandbox that has no ready cache entry (after
+/// a format change or a sweep). With `if-not-present`, a moved tag must not
+/// give an image change.
+/// Args:
+///  - `image_cfg`: Configured image
+///  - `stored_digest`: Digest of the last start
+///
+/// Returns:
+///   The pinned reference, or `None` if no pin applies. Local engines get
+///   none: they store an image ID, not a registry digest.
+fn stored_pin(image_cfg: &ImageRef, stored_digest: Option<&str>) -> Option<ImageRef> {
+    let digest = stored_digest?.trim();
+    let pin = image_cfg.pull_policy == PullPolicy::IfNotPresent
+        && image_cfg.pinned_digest().is_none()
+        && matches!(
+            image_cfg.resolution,
+            Resolution::Auto | Resolution::Registry
+        )
+        && is_sha256_digest(digest);
+    pin.then(|| ImageRef {
+        name: format!("{}@{digest}", image_cfg.name),
+        ..image_cfg.clone()
+    })
+}
+
+/// Get the image digest from image JSON of the current or an older schema,
+/// for the image change check after a schema change.
+fn stored_image_id(json: &[u8]) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_slice(json).ok()?;
+    // The digest has the same place in all known schemas.
+    if !matches!(json["schema"].as_str(), Some("v2" | "v3")) {
+        return None;
+    }
+    json["image_id"].as_str().map(String::from)
+}
+
 /// Read a cached image JSON file and unwrap it into an [`OciImage`].
 /// Returns:
 ///   The image, or `None` if the file is missing, cannot be read, or has an
@@ -545,7 +578,7 @@ fn read_image_json(path: &VerifiedPath) -> Option<String> {
 fn read_cached_image(path: &VerifiedPath) -> Option<OciImage> {
     let data = read_image_json(path)?;
     let wrapped: CachedImage = serde_json::from_str(&data).ok()?;
-    let CachedImage::V2(image) = wrapped;
+    let CachedImage::V3(image) = wrapped;
     Some(image)
 }
 
@@ -577,15 +610,14 @@ pub(crate) fn read_ready_image(data_dir: &DataDir, path: &VerifiedPath) -> Optio
 ///  - `sandbox_dir`: Directory of the sandbox
 ///
 /// Returns:
-///   The image, or `None` if the sandbox has no complete image on disk, or
-///   if its user is not checked yet. Then `airlock start` must prepare it.
+///   The image, or `None` if the sandbox has no complete image on disk.
+///   Then `airlock start` must prepare it.
 pub(crate) fn load_sandbox_image(
     data_dir: &DataDir,
     sandbox_dir: &VerifiedPath,
 ) -> Option<OciImage> {
     let path = sandbox_dir.join("image").ok()?;
-    // An image without `user` needs the check in `prepare`.
-    read_ready_image(data_dir, &path).filter(|image| image.user.is_some())
+    read_ready_image(data_dir, &path)
 }
 
 /// Make sure that `sandbox_image` is a hardlink to `images/<digest>`. The
@@ -648,7 +680,7 @@ fn write_cached_image(data_dir: &DataDir, digest: &str, image: &OciImage) -> any
         std::process::id(),
         IMAGE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ))?;
-    let bytes = serde_json::to_vec_pretty(&CachedImage::V2(image.clone()))?;
+    let bytes = serde_json::to_vec_pretty(&CachedImage::V3(image.clone()))?;
     let written = tmp
         .create_new()
         .and_then(|mut file| io::Write::write_all(&mut file, &bytes))
@@ -724,7 +756,7 @@ fn build_oci_image(
         container_home,
         uid,
         gid,
-        user: Some(user.to_string()),
+        user: user.to_string(),
         cmd,
         env,
     })
@@ -925,104 +957,12 @@ fn prompt_resolution_failed(err: &anyhow::Error) -> anyhow::Result<bool> {
     }
 }
 
-/// Result of a new check of the uid/gid of a legacy cache file against a new
-/// resolution of the image's `USER`.
-#[derive(Debug, PartialEq, Eq)]
-enum LegacyUser {
-    /// The stored uid/gid are the same as the fixed resolution gives.
-    Verified,
-    /// Same uid, different primary group (`USER 1000` used to get gid 0).
-    /// Existing files still have the same owner, so airlock repairs the
-    /// cache entry and keeps the sandbox.
-    GidOnly { gid: u32 },
-    /// The sandbox ran as the wrong user (usually root for `USER node`), and
-    /// its disk contains state that this user owns.
-    UidMismatch { uid: u32, gid: u32 },
-}
-
-/// Find uid/gid again for a legacy cache file (one without `user`). Uses
-/// the current `USER` string and the layers that the file refers to.
-fn check_legacy_user(
-    data_dir: &DataDir,
-    stored: &OciImage,
-    user: &str,
-) -> anyhow::Result<LegacyUser> {
-    let (uid, gid) = resolve_user(data_dir, &stored.image_layers, user)?;
-    Ok(if uid != stored.uid {
-        LegacyUser::UidMismatch { uid, gid }
-    } else if gid != stored.gid {
-        LegacyUser::GidOnly { gid }
-    } else {
-        LegacyUser::Verified
-    })
-}
-
-/// Get the `USER` string of a newly resolved image. Registry resolution
-/// already has the config. Local resolution gets the config only at the
-/// export, so ask the engine directly.
-fn resolved_user(resolved: &ResolvedImage) -> anyhow::Result<String> {
-    match &resolved.source {
-        ImageSource::Registry(_) => Ok(resolved
-            .config
-            .config
-            .as_ref()
-            .and_then(|c| c.user.clone())
-            .unwrap_or_default()),
-        ImageSource::Local { engine, .. } => docker::image_user(engine, &resolved.digest),
-    }
-}
-
-/// Check the uid/gid of a legacy cached image against the fixed `USER`
-/// resolution.
-/// Args:
-///  - `data_dir`: Airlock data directory
-///  - `stored`: Cached image of this sandbox, written before named `USER`
-///    resolution existed. It has the same digest as `resolved`
-///  - `resolved`: The newly resolved image.
-///
-/// Returns:
-///   `Ok` after it marks the file as verified or repairs its gid. Error that
-///   tells the user to run `airlock rm` if the uid is wrong.
-fn verify_legacy_user(
-    data_dir: &DataDir,
-    stored: &OciImage,
-    resolved: &ResolvedImage,
-) -> anyhow::Result<()> {
-    let user = resolved_user(resolved)?;
-    let mut fixed = stored.clone();
-    fixed.user = Some(user.clone());
-    match check_legacy_user(data_dir, stored, &user)? {
-        LegacyUser::Verified => {}
-        LegacyUser::GidOnly { gid } => {
-            cli::log!(
-                "  {} {}",
-                cli::bullet(),
-                messages::oci::container_gid_corrected(stored.gid, gid)
-            );
-            fixed.gid = gid;
-        }
-        LegacyUser::UidMismatch { uid, gid } => {
-            // After `airlock rm`, the next start finds no sandbox image, and
-            // `ensure_image` makes the shared entry again instead of using
-            // the legacy one.
-            anyhow::bail!(messages::oci::legacy_uid_mismatch(
-                user, stored.uid, stored.gid, uid, gid
-            ));
-        }
-    }
-    // Write the shared cache entry again. `prepare` links the sandbox copy
-    // to the new file with `ensure_image_hardlink`.
-    write_cached_image(data_dir, &stored.image_id, &fixed)
-}
-
 /// Resolve the configured image to a digest and config. Tries the local
 /// engines first (as `resolution` allows), then the registry.
 async fn resolve_image(
     image_cfg: &crate::config::config_values::ImageRef,
     auth: &RegistryAuth,
 ) -> anyhow::Result<ResolvedImage> {
-    use crate::config::config_values::Resolution;
-
     let image_ref = image_cfg.name.as_str();
     let pinned = image_cfg.pinned_digest();
 
@@ -1202,7 +1142,7 @@ async fn ensure_image(
     // and all its layers are still on disk. Skip the pull. Write the current
     // name, so the per-sandbox fast path in `prepare()` (which matches on
     // name) sees the current tag.
-    if let Some(mut cached) = read_ready_image(data_dir, &image_path).filter(|c| c.user.is_some()) {
+    if let Some(mut cached) = read_ready_image(data_dir, &image_path) {
         if cached.name != image_name {
             cached.name = image_name.to_string();
             write_cached_image(data_dir, &resolved.digest, &cached)?;

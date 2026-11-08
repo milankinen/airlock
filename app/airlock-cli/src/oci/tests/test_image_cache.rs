@@ -127,39 +127,6 @@ fn sandbox_image_link_is_restored_when_cache_entry_was_wiped() {
     );
 }
 
-/// Test that a cache entry from before the `user` field loads with no user,
-/// so that airlock knows to resolve the user again.
-///   1. Write a cache entry without the `user` field
-///   2. Check that it loads with no user
-///   3. Write a current entry and check that it has a user
-#[test]
-fn cache_file_from_before_user_field_loads_as_legacy() {
-    let tmp = temp_dir();
-    let data_dir = &data_dir_at(tmp.path());
-    let path = cache::image_path(data_dir, "sha256:legacy").unwrap();
-    let legacy = serde_json::json!({
-        "schema": "v2",
-        "image_id": "sha256:legacy",
-        "name": "node:22",
-        "image_layers": [cache::layer_key("sha256:L1")],
-        "container_home": "/root",
-        "uid": 0,
-        "gid": 0,
-        "cmd": ["/bin/sh"],
-        "env": [],
-    });
-    std::fs::write(real(&path), serde_json::to_vec(&legacy).unwrap()).unwrap();
-    assert_eq!(read_cached_image(&path).unwrap().user, None);
-
-    write_cached_image(
-        data_dir,
-        "sha256:legacy",
-        &image("sha256:legacy", vec![cache::layer_key("sha256:L1")]),
-    )
-    .unwrap();
-    assert_eq!(read_cached_image(&path).unwrap().user, Some(String::new()));
-}
-
 /// Test that a symlink at the `image` file of a sandbox is not followed. A
 /// followed link lets airlock read or link a host file.
 ///   1. Write a host file and put a symlink to it at the sandbox `image`
@@ -175,7 +142,7 @@ fn planted_sandbox_image_symlink_is_not_followed() {
     let data_dir = &data_dir_at(home.path());
     let victim = home.path().join("victim.json");
     let live = image("sha256:live", vec![small_layer(data_dir, "sha256:L1")]);
-    let json = serde_json::to_vec(&CachedImage::V2(live.clone())).unwrap();
+    let json = serde_json::to_vec(&CachedImage::V3(live.clone())).unwrap();
     std::fs::write(&victim, &json).unwrap();
     std::os::unix::fs::symlink(&victim, home.path().join("image")).unwrap();
     let sandbox_image = data_dir.root.join("image").unwrap();
@@ -204,7 +171,7 @@ fn gc_sweep_skips_symlink_and_fifo_in_images_dir() {
     let data_dir = &data_dir_at(home.path());
     let layer = small_layer(data_dir, "sha256:L1");
     let host = home.path().join("host.json");
-    let json = serde_json::to_vec(&CachedImage::V2(image("sha256:x", vec![layer.clone()])));
+    let json = serde_json::to_vec(&CachedImage::V3(image("sha256:x", vec![layer.clone()])));
     std::fs::write(&host, json.unwrap()).unwrap();
     let images = real(&cache::images_root(data_dir).unwrap());
     std::os::unix::fs::symlink(&host, images.join("link")).unwrap();
@@ -256,4 +223,34 @@ fn recreate_of_imported_sandbox_with_unknown_image_stops() {
         guard_recreate(&dir, OnImageChange::Recreate).unwrap(),
         OnImageChange::Recreate
     );
+}
+
+/// Test that only an `if-not-present` tag with a registry source pins the
+/// stored digest.
+///   1. Check that an `if-not-present` tag gets the pin
+///   2. Check that `if-changed`, a pinned name, local-only resolution and a
+///      missing or bad digest give no pin
+#[test]
+fn stored_digest_is_pinned_only_for_if_not_present_tag_with_registry_source() {
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let tag = ImageRef::auto("alpine:3");
+    assert_eq!(
+        stored_pin(&tag, Some(&format!("{digest}\n"))).map(|r| r.name),
+        Some(format!("alpine:3@{digest}"))
+    );
+
+    let if_changed = ImageRef {
+        pull_policy: PullPolicy::IfChanged,
+        ..tag.clone()
+    };
+    let pinned = ImageRef::auto(format!("alpine:3@sha256:{}", "b".repeat(64)));
+    let docker = ImageRef {
+        resolution: Resolution::Docker,
+        ..tag.clone()
+    };
+    for cfg in [&if_changed, &pinned, &docker] {
+        assert!(stored_pin(cfg, Some(&digest)).is_none(), "{cfg:?}");
+    }
+    assert!(stored_pin(&tag, None).is_none());
+    assert!(stored_pin(&tag, Some("sha256:short")).is_none());
 }

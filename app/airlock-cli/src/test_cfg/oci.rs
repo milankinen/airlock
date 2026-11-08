@@ -44,6 +44,37 @@ impl LayerTar {
         self
     }
 
+    /// A regular file `path` with `content`, owner `uid:gid` and `mode`.
+    #[must_use]
+    pub fn file_owned(mut self, path: &str, content: &str, uid: u64, gid: u64, mode: u32) -> Self {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_uid(uid);
+        header.set_gid(gid);
+        header.set_mode(mode);
+        header.set_cksum();
+        self.0
+            .append_data(&mut header, path, content.as_bytes())
+            .unwrap();
+        self
+    }
+
+    /// A directory `path` with owner `uid:gid` and mode 0755.
+    #[must_use]
+    pub fn dir_owned(mut self, path: &str, uid: u64, gid: u64) -> Self {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        header.set_uid(uid);
+        header.set_gid(gid);
+        header.set_mode(0o755);
+        header.set_cksum();
+        self.0
+            .append_data(&mut header, path, std::io::empty())
+            .unwrap();
+        self
+    }
+
     /// A directory `path`.
     #[must_use]
     pub fn dir(mut self, path: &str) -> Self {

@@ -54,7 +54,7 @@ pub fn legacy_sandbox(project: &Path) -> PathBuf {
 pub fn cached_image(context: &Context, name: &str) -> (String, String) {
     let image = fake_image(name);
     let mut json = serde_json::to_value(&image).unwrap();
-    json["schema"] = "v2".into();
+    json["schema"] = "v3".into();
     let text = json.to_string();
     let path = crate::cache::image_path(&context.data, &image.image_id).unwrap();
     std::fs::write(path.to_path().unwrap(), &text).unwrap();

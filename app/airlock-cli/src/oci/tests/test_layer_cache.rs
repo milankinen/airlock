@@ -1,5 +1,5 @@
 //! Tests for the extraction of layer tarballs into the layer cache:
-//! whiteouts, reuse, interrupted downloads, races and path escapes.
+//! whiteouts, owners, reuse, races and path escapes.
 
 use std::path::Path;
 
@@ -80,31 +80,54 @@ fn layer_tarball_extracts_with_whiteouts_as_overlay_xattrs_and_is_reused() {
     assert_eq!(real(&again), layer);
 }
 
-/// Test that a partial download from an earlier run is discarded and the
-/// layer is fetched again.
-///   1. Write a partial download file for the layer
-///   2. Cache the layer
-///   3. Check the layer contents and that no staging entry is left
+/// Test that a layer keeps image owners and special mode bits in the owner
+/// xattr for libkrun.
+///   1. Cache a layer with non-root, setuid, read-only, root and symlinked
+///      entries, and a directory with two entries
+///   2. Check the xattr values (owner 0 is empty)
+///   3. Check that root and symlinked entries have none, and the read-only
+///      mode stays
+///   4. Check that the later root entry of a directory removed its xattr
 #[test]
-fn interrupted_download_is_discarded_and_fetched_again() {
+fn layer_keeps_image_owners_and_mode_bits_in_owner_xattr() {
+    use std::os::unix::fs::PermissionsExt;
     let tmp = temp_dir();
     let data_dir = &data_dir_at(tmp.path());
-    let key = cache::layer_key("sha256:interrupted");
-    let stale = real(&cache::layers_root(data_dir).unwrap()).join(format!("{key}.download.tmp"));
-    std::fs::write(&stale, b"partial garbage").unwrap();
+    let tar = LayerTar::default()
+        .dir_owned("home/node", 1000, 1000)
+        .file_owned("home/node/.profile", "p", 1000, 1000, 0o644)
+        .file_owned("usr/bin/sudo", "s", 0, 0, 0o4755)
+        .file_owned("home/node/ro", "r", 1000, 1000, 0o444)
+        .file("etc/hello", "world")
+        .dir("usr/lib")
+        .symlink("lib", "usr/lib")
+        .file_owned("lib/x", "x", 1000, 1000, 0o644)
+        .dir_owned("opt/later", 1000, 1000)
+        .dir_owned("opt/later", 0, 0)
+        .gz();
+    let key = cache_layer(data_dir, "sha256:owners", &tar);
+    let layer = real(&cache::layer_dir(data_dir, &key).unwrap());
+    let owner = |rel: &str| xattr_of(&layer.join(rel), "user.containers.override_stat");
 
-    cache_layer(
-        data_dir,
-        "sha256:interrupted",
-        &LayerTar::default().file("ok", "yes").gz(),
+    assert_eq!(owner("home/node").as_deref(), Some(&b"1000:1000:755"[..]));
+    assert_eq!(
+        owner("home/node/.profile").as_deref(),
+        Some(&b"1000:1000:644"[..])
     );
-
-    assert!(
-        real(&cache::layer_dir(data_dir, &key).unwrap())
-            .join("ok")
-            .is_file()
+    assert_eq!(owner("usr/bin/sudo").as_deref(), Some(&b"::4755"[..]));
+    assert_eq!(
+        owner("home/node/ro").as_deref(),
+        Some(&b"1000:1000:444"[..])
     );
-    assert!(staging_entries(data_dir).is_empty());
+    let ro_mode = std::fs::metadata(layer.join("home/node/ro"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(ro_mode & 0o777, 0o444);
+    assert_eq!(owner("etc/hello"), None);
+    assert!(layer.join("usr/lib/x").is_file());
+    assert_eq!(owner("usr/lib/x"), None);
+    assert_eq!(owner("opt/later"), None);
 }
 
 /// Test that a layer that another process publishes during the download is

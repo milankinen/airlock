@@ -98,8 +98,6 @@ where
     // If `<key>.download` exists (from a previous run, or from a caller
     // that staged it, like the docker path), skip `fetch` and extract.
     if download.symlink_metadata().is_err() {
-        // Also remove an old fixed-name tmp file that an older binary left.
-        let _ = parent.join(format!("{key}.download.tmp"))?.remove_file();
         let download_tmp = download_tmp_path(&parent, &key)?;
         fetch(&download_tmp)?;
         download_tmp.rename_to(&download)?;
@@ -146,6 +144,9 @@ fn extract_tarball_to_cache(
     ))?;
     let _ = tmp.remove_dir_all();
     tmp.mkdirs()?;
+    // macOS files inherit the dir group. The libkrun id map needs ours.
+    // SAFETY: `getgid` cannot fail.
+    tmp.set_group(unsafe { libc::getgid() })?;
 
     // Layer blobs can be gzip-compressed (OCI spec, registry pulls) or plain
     // tar (`docker image save` with the classic driver). Use the magic bytes
@@ -245,7 +246,16 @@ fn extract_tarball_to_cache(
         // `unpack_in` resolves the entry path relative to the extraction
         // root. It also keeps hardlink targets in the root, so a hardlink
         // to an absolute host path cannot occur.
-        entry.unpack_in(tmp.to_path()?)?;
+        let owner = owner_xattr(entry.header());
+        // A later entry of an existing directory keeps its xattrs, so it
+        // must remove an older owner.
+        let is_dir = entry.header().entry_type() == tar::EntryType::Directory;
+        if !entry.unpack_in(tmp.to_path()?)? {
+            continue;
+        }
+        if owner.is_some() || is_dir {
+            set_owner_xattr(&tmp, &path.components(), owner.as_deref())?;
+        }
     }
 
     // Commit with an atomic rename. If `<key>/` exists now, a concurrent
@@ -265,6 +275,103 @@ fn extract_tarball_to_cache(
             Ok(())
         }
         Err(e) => Err(e.into()),
+    }
+}
+
+/// libkrun reads the guest owner and mode from this xattr:
+/// `<uid>:<gid>:<octal mode>`. An empty field keeps the host value.
+const OWNER_XATTR: &str = "user.containers.override_stat";
+
+/// Make the owner xattr value for a tar entry. The extraction drops the
+/// owner and the mode bits above `0o777`. Owner 0 stays empty, because the
+/// guest maps the host owner to root.
+/// Returns:
+///   The value, or `None` if the entry needs none.
+fn owner_xattr(header: &tar::Header) -> Option<String> {
+    // Hard links share the inode of their target. Symlink owners do nothing.
+    if !matches!(
+        header.entry_type(),
+        tar::EntryType::Regular | tar::EntryType::Continuous | tar::EntryType::Directory
+    ) {
+        return None;
+    }
+    // A bad owner field must not stop the extraction. It counts as root.
+    let (uid, gid) = (header.uid().unwrap_or(0), header.gid().unwrap_or(0));
+    let mode = header.mode().ok()?;
+    if uid == 0 && gid == 0 && mode & 0o7000 == 0 {
+        return None;
+    }
+    let id = |id: u64| {
+        if id == 0 {
+            String::new()
+        } else {
+            id.to_string()
+        }
+    };
+    Some(format!("{}:{}:{:o}", id(uid), id(gid), mode & 0o7777))
+}
+
+/// Set or remove the owner xattr on the extracted entry `path`. Skips
+/// entries through symlinks and filesystems without user xattrs.
+/// Args:
+///  - `root`: Extraction root
+///  - `path`: Components of the tar entry path
+///  - `value`: Value from [`owner_xattr`]. `None` removes the xattr.
+fn set_owner_xattr(
+    root: &VerifiedPath,
+    path: &Components<'_>,
+    value: Option<&str>,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    // A change through a symlink can reach a host file. `join` refuses
+    // symlinks before the last name.
+    let names: Option<Vec<&str>> = path
+        .clone()
+        .filter(|c| matches!(c, Component::Normal(_)))
+        .map(|c| c.as_os_str().to_str())
+        .collect();
+    let Some(rel) = names.map(|names| names.join("/")) else {
+        tracing::debug!("no owner xattr for {path:?}: name is not UTF-8");
+        return Ok(());
+    };
+    // The layer root (`./`).
+    if rel.is_empty() {
+        return Ok(());
+    }
+    let Ok(target) = root.join(&rel) else {
+        tracing::debug!("no owner xattr for {rel}: path has a symlink");
+        return Ok(());
+    };
+    let md = target.symlink_metadata()?;
+    if md.file_type().is_symlink() {
+        tracing::debug!("no owner xattr for {rel}: entry is a symlink");
+        return Ok(());
+    }
+    let fail = |e: std::io::Error| {
+        anyhow::anyhow!(messages::oci::set_xattr_failed(OWNER_XATTR, &target, e))
+    };
+    // Most root-owned directories have no xattr to remove.
+    if value.is_none() && !matches!(xattr::get(target.to_path()?, OWNER_XATTR), Ok(Some(_))) {
+        return Ok(());
+    }
+    let perm = md.permissions();
+    let read_only = perm.mode() & 0o200 == 0;
+    if read_only {
+        target.set_permissions(std::fs::Permissions::from_mode(perm.mode() | 0o200))?;
+    }
+    let res = match value {
+        Some(value) => xattr::set(target.to_path()?, OWNER_XATTR, value.as_bytes()),
+        None => xattr::remove(target.to_path()?, OWNER_XATTR),
+    };
+    if read_only {
+        target.set_permissions(perm)?;
+    }
+    match res {
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            tracing::debug!("no owner xattr for {rel}: {e}");
+            Ok(())
+        }
+        res => res.map_err(fail),
     }
 }
 

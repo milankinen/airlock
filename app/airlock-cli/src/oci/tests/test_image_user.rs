@@ -54,7 +54,7 @@ fn image_user_resolves_through_image_passwd_and_group() {
         let image = build(data_dir, &layers, user).unwrap();
         assert_eq!((image.uid, image.gid), (1000, 1000), "USER {user:?}");
         assert_eq!(image.container_home, "/home/node", "USER {user:?}");
-        assert_eq!(image.user.as_deref(), Some(user));
+        assert_eq!(image.user, user);
     }
     let root = build(data_dir, &layers, "").unwrap();
     assert_eq!(
@@ -250,49 +250,4 @@ fn passwd_linked_inside_layer_is_followed() {
             "/home/node"
         );
     }
-}
-
-/// Test that the uid and gid of a cache entry without a `user` field are
-/// checked against the image passwd, so that airlock finds a sandbox that
-/// ran as the wrong user.
-///   1. Make a legacy entry with uid and gid 0
-///   2. Check that an empty `USER` and `root` are verified
-///   3. Check that `node` gives a uid mismatch
-///   4. Fix the uid and check that only the gid differs
-///   5. Fix the gid and check that the entry is verified
-#[test]
-fn legacy_cache_entry_user_is_checked_against_image_passwd() {
-    let tmp = temp_dir();
-    let data_dir = &data_dir_at(tmp.path());
-    let mut stored = image(
-        "sha256:legacy",
-        vec![passwd_layer(data_dir, "sha256:passwd")],
-    );
-    stored.user = None;
-
-    assert_eq!(
-        check_legacy_user(data_dir, &stored, "").unwrap(),
-        LegacyUser::Verified
-    );
-    assert_eq!(
-        check_legacy_user(data_dir, &stored, "root").unwrap(),
-        LegacyUser::Verified
-    );
-    assert_eq!(
-        check_legacy_user(data_dir, &stored, "node").unwrap(),
-        LegacyUser::UidMismatch {
-            uid: 1000,
-            gid: 1000
-        }
-    );
-    stored.uid = 1000;
-    assert_eq!(
-        check_legacy_user(data_dir, &stored, "1000").unwrap(),
-        LegacyUser::GidOnly { gid: 1000 }
-    );
-    stored.gid = 1000;
-    assert_eq!(
-        check_legacy_user(data_dir, &stored, "1000").unwrap(),
-        LegacyUser::Verified
-    );
 }

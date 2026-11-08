@@ -531,6 +531,11 @@ impl VerifiedPath {
         fs::rename(self.to_entry_path()?, to.to_entry_path()?)
     }
 
+    /// Set the group of this entry to `gid`. Does not follow a symlink.
+    pub(crate) fn set_group(&self, gid: u32) -> io::Result<()> {
+        std::os::unix::fs::lchown(self.to_entry_path()?, None, Some(gid))
+    }
+
     /// Set the permissions to `perm`.
     pub(crate) fn set_permissions(&self, perm: Permissions) -> io::Result<()> {
         fs::set_permissions(self.to_path()?, perm)

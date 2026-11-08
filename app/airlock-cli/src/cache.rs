@@ -19,7 +19,7 @@ use crate::util::VerifiedPath;
 /// has the prefix `{LAYER_FORMAT}.`. Increase the image JSON schema version
 /// at the same time. Then new runs ignore stale caches and do not use bad
 /// data from them.
-pub const LAYER_FORMAT: u32 = 2;
+pub const LAYER_FORMAT: u32 = 3;
 
 /// Lock for tests that change the process-wide `HOME` env var. Each test
 /// that sets `HOME` to move the cache must hold this lock. Thus tests that

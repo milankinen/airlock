@@ -2038,29 +2038,6 @@ pub mod oci {
     /// Choice to use the cached image after a failed resolution.
     pub const CONTINUE_WITH_CACHED_IMAGE: &str = "Continue with the cached image";
 
-    /// Status when airlock repairs the gid of an old sandbox.
-    pub fn container_gid_corrected(old_gid: impl Display, new_gid: impl Display) -> String {
-        format!("container gid corrected {old_gid} → {new_gid}")
-    }
-
-    /// Error when an old sandbox runs with the wrong uid.
-    pub fn legacy_uid_mismatch(
-        user: impl Display,
-        stored_uid: impl Display,
-        stored_gid: impl Display,
-        uid: impl Display,
-        gid: impl Display,
-    ) -> String {
-        format!(
-            "This sandbox was created by an airlock version that resolved the \
-             image's `USER {user}` to uid {stored_uid}, gid {stored_gid} instead of uid {uid}, gid {gid}, \
-             so everything inside it has been running as the wrong user. That bug \
-             is fixed (https://github.com/milankinen/airlock/pull/12), but the \
-             sandbox's disk already holds state owned by the wrong user, so the \
-             sandbox must be re-created: run `airlock rm` and start again."
-        )
-    }
-
     /// Status when a local engine cannot use the image and airlock tries the next source.
     pub fn local_image_unusable_trying_next(reason: impl Display) -> String {
         format!("{reason} — trying next")
@@ -2221,20 +2198,6 @@ pub mod oci {
     /// Error when the user aborts the registry sign-in.
     pub fn sign_in_aborted(host: impl Display) -> String {
         format!("sign-in to {host} aborted")
-    }
-
-    /// Error when the engine cannot run the image inspect command.
-    pub fn run_inspect_failed(engine: impl Display, err: impl Display) -> String {
-        format!("failed to run {engine} image inspect: {err}")
-    }
-
-    /// Error when the image inspect command of the engine fails.
-    pub fn inspect_failed(
-        engine: impl Display,
-        image_id: impl Display,
-        stderr: impl Display,
-    ) -> String {
-        format!("{engine} image inspect {image_id} failed: {stderr}")
     }
 
     /// Error when a blob of the docker export has a wrong digest.
