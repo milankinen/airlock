@@ -9,7 +9,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use airlock_dialog::{Answer, DiffKind, DiffLine, Error, Item, Request, show_on};
+use airlock_linux_dialog::{Answer, DiffKind, DiffLine, Error, Item, Request, show_on};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, ImageFormat, Window};
 use x11rb::protocol::xtest::ConnectionExt as _;

@@ -43,7 +43,7 @@ name = "airlock-cli"
 version = "0.1.0"
 dependencies = [
  "airlock-common",
- "airlock-dialog",
+ "airlock-linux-dialog",
  "airlock-monitor",
  "airlock-test-utils",
  "anyhow",
@@ -129,7 +129,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "airlock-dialog"
+name = "airlock-linux-dialog"
 version = "0.1.0"
 dependencies = [
  "fontdue",

@@ -5,7 +5,7 @@ members = [
     "app/airlockd",
     "app/airlock-monitor",
     "app/airlock-macos-notifier",
-    "app/airlock-dialog",
+    "app/airlock-linux-dialog",
     "app/airlock-test-utils",
 ]
 resolver = "3"

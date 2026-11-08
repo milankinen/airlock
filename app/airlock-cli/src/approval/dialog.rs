@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::process::Stdio;
 use std::time::Duration;
 
-use airlock_dialog::{Answer, DiffKind, DiffLine, Item, Request};
+use airlock_linux_dialog::{Answer, DiffKind, DiffLine, Item, Request};
 use tokio::io::AsyncWriteExt;
 
 use super::Decision;
@@ -150,7 +150,8 @@ pub(crate) fn child_main() -> i32 {
         .read_to_end(&mut input)
         .map_err(|e| e.to_string())
         .and_then(|_| serde_json::from_slice::<Request>(&input).map_err(|e| e.to_string()));
-    let answer = read.and_then(|request| airlock_dialog::show(request).map_err(|e| e.to_string()));
+    let answer =
+        read.and_then(|request| airlock_linux_dialog::show(request).map_err(|e| e.to_string()));
     match answer {
         Ok(answer) => {
             let json = serde_json::to_string(&answer).unwrap_or_default();

@@ -111,7 +111,7 @@ next dialog. The notification has critical urgency and stays until you
 answer. Airlock removes the notification after the answer or the
 timeout.
 
-The details window comes from `airlock-dialog`. It is an X11 window and
+The details window comes from `airlock-linux-dialog`. It is an X11 window and
 it has no C library dependency. Thus the same build runs on all Linux
 hosts. The window needs an X server. A desktop with Wayland needs
 XWayland. The window runs in a child process of airlock, so that a
