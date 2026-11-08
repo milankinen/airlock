@@ -45,6 +45,7 @@ impl LayerTar {
     }
 
     /// A regular file `path` with `content`, owner `uid:gid` and `mode`.
+    #[cfg(target_os = "linux")]
     #[must_use]
     pub fn file_owned(mut self, path: &str, content: &str, uid: u64, gid: u64, mode: u32) -> Self {
         let mut header = tar::Header::new_gnu();
@@ -60,6 +61,7 @@ impl LayerTar {
     }
 
     /// A directory `path` with owner `uid:gid` and mode 0755.
+    #[cfg(target_os = "linux")]
     #[must_use]
     pub fn dir_owned(mut self, path: &str, uid: u64, gid: u64) -> Self {
         let mut header = tar::Header::new_gnu();
