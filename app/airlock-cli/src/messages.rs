@@ -3424,6 +3424,10 @@ pub mod start {
         )
     }
 
+    /// Shows when the user gives the deprecated `--sandbox-cwd` option.
+    pub const SANDBOX_CWD_DEPRECATED: &str =
+        "--sandbox-cwd is deprecated and will be removed in a future release";
+
     /// Shows when the config includes deprecated user-level config files.
     pub const USER_CONFIG_FILES_DEPRECATED: &str = "user-level config files are deprecated, move them to a user pack (see v2026.10.5 release notes)";
 

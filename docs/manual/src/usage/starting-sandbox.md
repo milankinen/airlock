@@ -94,18 +94,12 @@ airlock start --login
 ## Project directory and working directory
 
 airlock automatically mounts the host project directory into the VM at the
-same path. The working directory inside the container defaults to the host's
+same path. The working directory inside the container is the host's
 current directory, so files are right where you'd expect them.
 
 airlock does not start a sandbox in your home directory, or in a parent
 of it. The sandbox would see all secrets in the home directory. See
 [Mounts that expose the home directory](../configuration/mounts.md#mounts-that-expose-the-home-directory).
-
-To override the working directory inside the sandbox, use `--sandbox-cwd`:
-
-```bash
-airlock start --sandbox-cwd /tmp
-```
 
 ## Image pulling and caching
 

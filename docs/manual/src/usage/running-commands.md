@@ -35,9 +35,8 @@ You can use `airlock exec` in any subdirectory of the project.
 parent directory, and uses the nearest one, even if it is not running.
 A stopped sandbox starts with the config of the last `airlock start`.
 If the sandbox was never started, the command fails. The command
-runs in the same working directory as on the host. If the sandbox
-started with `--sandbox-cwd`, the command runs in the matching directory
-below that guest path. To use a different directory, use `--cwd` (or `-w`):
+runs in the same working directory as on the host. To use a different
+directory, use `--cwd` (or `-w`):
 
 ```bash
 # /home/example/my-project

@@ -11,6 +11,7 @@ use clap::Args;
 use crate::cli::{self, LogLevel};
 use crate::config::config_values::Policy;
 use crate::context::Context;
+use crate::messages;
 use crate::runtime::HostRuntime;
 use crate::sandbox::{self, Exit, ExitedBeforeReady, Interrupted, Run};
 
@@ -21,8 +22,9 @@ pub struct StartArgs {
     /// Log level
     #[arg(long, env = "AIRLOCK_LOG_LEVEL", default_value = "info")]
     pub log_level: LogLevel,
-    /// Working directory in the container (default: the host cwd)
-    #[arg(long)]
+    /// Working directory in the container (default: the host cwd).
+    /// Deprecated and hidden from the help.
+    #[arg(long, hide = true)]
     pub sandbox_cwd: Option<String>,
     /// Run the container command in a login shell (reads /etc/profile, ~/.profile)
     #[arg(short = 'l', long)]
@@ -98,6 +100,13 @@ async fn run(args: StartArgs, extra_args: Vec<String>, context: Context) -> Resu
     sandbox::check_system_requirements(context.settings.vmm)?;
     let host_cwd = sandbox::resolve_host_cwd()?;
     sandbox::init_logging(args.log_level);
+    if args.sandbox_cwd.is_some() {
+        cli::log!(
+            "{} {}",
+            cli::yellow("!"),
+            messages::start::SANDBOX_CWD_DEPRECATED
+        );
+    }
     // The terminal runtime. Bad `[monitor.keys]` values fail here.
     let runtime =
         HostRuntime::new(args.monitor, &context.settings).map_err(|e| Exit::error(2, e))?;
