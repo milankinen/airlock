@@ -1,23 +1,11 @@
-# Docker: the engine, CLI, Buildx and Compose v2 from the distro
-# packages. airlock starts dockerd as a daemon (config.lua) because no
-# init system runs in the sandbox.
+# Docker engine, CLI, Buildx and Compose v2 from distro packages.
+# config.lua starts dockerd (no init system in the sandbox).
 #
-# Sources:
+# Packages:
 # - https://pkgs.alpinelinux.org/package/v3.24/community/x86_64/docker
-#   (docker-engine, docker-cli, docker-cli-buildx)
-# - https://pkgs.alpinelinux.org/package/v3.24/community/x86_64/docker-cli-compose
-# - https://packages.debian.org/trixie/docker.io (dockerd only. The
-#   client docker-cli is only recommended, and airlock_pkg_install does not
-#   install recommended packages.)
-# - https://packages.debian.org/trixie/docker-cli
-# - https://packages.debian.org/trixie/docker-buildx
-# - https://packages.debian.org/trixie/docker-compose (Compose v2.
-#   Debian 12 has the Python Compose v1 under this name.)
-# - https://packages.ubuntu.com/resolute/docker.io (includes the client)
-# - https://packages.ubuntu.com/resolute/docker-compose-v2
-# - https://github.com/docker/compose/blob/v1/README.md (v1 is end of life)
-#
-# Args: allow-pulls changes only the network rules (config.lua).
+# - https://packages.debian.org/trixie/docker.io
+# - https://packages.ubuntu.com/resolute/docker.io
+# - https://github.com/docker/compose/blob/v1/README.md (v1 is EOL)
 
 airlock_steps 1
 airlock_status "installing packages"
@@ -27,14 +15,12 @@ case "$DISTRO" in
         ;;
     debian)
         airlock_pkg_install docker.io ca-certificates
-        # Debian 13 and later: the client is the separate docker-cli
-        # package. Ubuntu and Debian 12 have it in docker.io.
+        # Debian 13+ has the client in docker-cli. Ubuntu and Debian 12
+        # have it in docker.io.
         if ! command -v docker >/dev/null 2>&1; then
             airlock_pkg_install docker-cli
         fi
-        # Buildx and Compose v2 are optional because older releases do
-        # not have them. When the plugins are there, a new run does not
-        # call apt.
+        # Optional: old releases do not have Buildx or Compose v2.
         if ! docker buildx version </dev/null >/dev/null 2>&1 3>&-; then
             if airlock_pkg_available docker-buildx; then
                 airlock_pkg_install docker-buildx
@@ -45,8 +31,7 @@ case "$DISTRO" in
                 # Ubuntu
                 airlock_pkg_install docker-compose-v2
             elif airlock_pkg_available docker-compose; then
-                # Compose v2 on Debian 13 and later. On Debian 12 this is
-                # the end-of-life Python Compose v1 (1.x). Skip that one.
+                # Debian 13+: Compose v2. Debian 12: Compose v1, skip.
                 _candidate=$(apt-cache policy docker-compose 2>/dev/null 3>&- |
                     sed -n 's/^ *Candidate: *//p')
                 case "$_candidate" in
