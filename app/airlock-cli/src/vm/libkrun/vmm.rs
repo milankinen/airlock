@@ -83,12 +83,17 @@ struct VtableHandle {
     metadata: u32,
     vtable_ptr: *const c_void,
     user_data: *const c_void,
-    vtable_size: u16,
 }
 
 /// `KrunPushStrVtable`: functions of a string writer.
 #[repr(C)]
 struct PushStrVtable {
+    /// Number of functions after `drop`.
+    num_slots: u16,
+    /// Must be zero.
+    reserved1: u16,
+    /// Must be zero.
+    reserved2: u32,
     drop: Option<unsafe extern "C" fn(*mut c_void)>,
     push: unsafe extern "C" fn(*mut c_void, KrunStr) -> bool,
 }
@@ -222,6 +227,9 @@ impl Api {
         }
         let mut text = String::new();
         let vtable = PushStrVtable {
+            num_slots: 1,
+            reserved1: 0,
+            reserved2: 0,
             drop: None,
             push: push_to_string,
         };
@@ -230,7 +238,6 @@ impl Api {
             metadata: 0,
             vtable_ptr: (&raw const vtable).cast(),
             user_data: (&raw mut text).cast_const().cast(),
-            vtable_size: u16::try_from(size_of::<PushStrVtable>()).expect("small vtable"),
         };
         // SAFETY: `err` is an error from libkrun. The writer and its data
         // live until the call ends. The error is not used after the destroy.

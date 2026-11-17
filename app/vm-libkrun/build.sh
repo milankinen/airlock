@@ -7,7 +7,7 @@ set -euo pipefail
 
 # Pinned unreleased 2.0 commit: free page reporting exists only on main.
 LIBKRUN_REPO="https://github.com/containers/libkrun.git"
-LIBKRUN_COMMIT="a0375321bb1e6e51312e022af53e9e7668d3a07e"
+LIBKRUN_COMMIT="1156ba7f7aa016b8b16b15e7fd278f65a57716a0"
 
 SRC="$1"
 OUTPUT="$2"
