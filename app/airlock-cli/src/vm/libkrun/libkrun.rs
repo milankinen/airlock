@@ -34,9 +34,14 @@ impl VmmBackend for Libkrun {
         ""
     }
 
-    // libkrun shows the host owner as is. Map it to root in the image
-    // layers and to the container user in the other shares.
-    fn id_map(&self, container_uid: u32, container_gid: u32) -> Option<(IdMap, IdMap)> {
+    // Image layers: libkrun shows the host owner as is, so map the host
+    // user to root.
+    // User data shares: libkrun shows the container user as the owner
+    // (fixed owner semantics) and refuses an idmap on them. The boot
+    // request has no way to send only the image map, so send a map from
+    // the host user to the host user. Guest init makes no idmap for a map
+    // that changes no id.
+    fn id_map(&self, _container_uid: u32, _container_gid: u32) -> Option<(IdMap, IdMap)> {
         // SAFETY: `getuid` and `getgid` cannot fail.
         let (host_uid, host_gid) = unsafe { (libc::getuid(), libc::getgid()) };
         let map = |guest_uid, guest_gid| IdMap {
@@ -45,7 +50,7 @@ impl VmmBackend for Libkrun {
             guest_uid,
             guest_gid,
         };
-        Some((map(0, 0), map(container_uid, container_gid)))
+        Some((map(0, 0), map(host_uid, host_gid)))
     }
 
     fn boot_vm<'a>(
@@ -161,6 +166,7 @@ impl LibkrunVm {
                         path: utf8(&share.host_path)?,
                         read_only: share.read_only,
                         immutable: share.immutable,
+                        fixed_owner: share.user_data.then_some(config.user_data_owner),
                     })
                 })
                 .collect::<anyhow::Result<_>>()?,

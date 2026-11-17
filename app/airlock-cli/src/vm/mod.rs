@@ -185,6 +185,7 @@ pub async fn start(
         runtime_dir: sandbox_dir,
         asset_dir: boot_files.dir,
         kvm: project.config.vm.kvm,
+        user_data_owner: (image.uid, image.gid),
     };
 
     let vm_handle = backend.boot_vm(&vm_config).await?;
@@ -281,6 +282,7 @@ fn prepare_shares(
         read_only: true,
         // A layer dir never changes after the download.
         immutable: true,
+        user_data: false,
     }];
 
     for m in mounts
@@ -299,6 +301,7 @@ fn prepare_shares(
             host_path: m.source.clone(),
             read_only: m.read_only,
             immutable: false,
+            user_data: true,
         });
     }
 
@@ -352,6 +355,7 @@ fn prepare_shares(
             host_path: files_rw_dir.reverify()?,
             read_only: false,
             immutable: false,
+            user_data: true,
         });
     }
     if has_ro_files {
@@ -360,6 +364,7 @@ fn prepare_shares(
             host_path: files_ro_dir.reverify()?,
             read_only: true,
             immutable: false,
+            user_data: true,
         });
     }
 

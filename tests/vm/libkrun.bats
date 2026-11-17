@@ -71,6 +71,22 @@ read_only = true'
     [[ "$(echo "$output" | grep -c '^0:0$')" == 3 ]] || false
 }
 
+# Test that the host gets the file modes that the guest sets. Host tools
+# then see the same mode, for example the executable bit of a script.
+#   1. In the guest, make a script with mode 755 and a dir with mode 750
+#      in the project dir
+#   2. Check the modes on the host
+@test "libkrun shares keep guest file modes on host" {
+    run_vm sh -c 'touch "$PWD/mode.sh" && chmod 755 "$PWD/mode.sh" && mkdir -m 750 "$PWD/mode.d"'
+    local file_mode dir_mode
+    file_mode="$(stat -f %Lp mode.sh)"
+    dir_mode="$(stat -f %Lp mode.d)"
+    rm -rf mode.sh mode.d
+    assert_success
+    [[ "$file_mode" == 755 ]] || false
+    [[ "$dir_mode" == 750 ]] || false
+}
+
 # Test that a non-root container user owns the host files, and that the
 # rootfs keeps the image owners. The image runs as `curl_user`.
 #   1. Make a project with the image and a host file

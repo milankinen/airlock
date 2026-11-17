@@ -1,8 +1,9 @@
 # Apple Virtualization: project dir shows as owned by root
 
 Backend: Apple Virtualization (`vmm = "apple-virt"`, the macOS default).
-Not affected: libkrun and Cloud Hypervisor. They put an id map on the
-shares.
+Not affected: libkrun and Cloud Hypervisor. libkrun shows the container
+user as the owner of all files in the shares, also the share root.
+Cloud Hypervisor puts an id map on the shares.
 
 ## Symptom
 

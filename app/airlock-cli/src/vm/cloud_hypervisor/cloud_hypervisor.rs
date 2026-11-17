@@ -739,11 +739,13 @@ mod tests {
                 host_path: VerifiedPath::new(&share, &roots).unwrap(),
                 read_only: false,
                 immutable: false,
+                user_data: true,
             }],
             cache_disk: None,
             runtime_dir: VerifiedPath::new(&runtime, &roots).unwrap(),
             asset_dir: VerifiedPath::new(root, &roots).unwrap(),
             kvm: false,
+            user_data_owner: (0, 0),
         }
     }
 

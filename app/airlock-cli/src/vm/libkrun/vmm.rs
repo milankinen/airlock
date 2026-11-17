@@ -50,6 +50,10 @@ pub(super) struct VmmShare {
     pub read_only: bool,
     /// If `true`, the guest keeps file data in its cache across opens.
     pub immutable: bool,
+    /// Guest owner (`uid`, `gid`) of all files in the share. The share then
+    /// uses the host mode bits and ignores owner changes. `None`: the guest
+    /// sees the host owner, and keeps the guest owner and mode in an xattr.
+    pub fixed_owner: Option<(u32, u32)>,
 }
 
 /// libkrun object handle.
@@ -106,6 +110,8 @@ const KERNEL_FORMAT_RAW: u32 = 1;
 const DISK_FORMAT_RAW: u32 = 0;
 /// `KRUN_FREE_PAGE_REPORTING_MODE_REPLACE`: free guest pages go back to macOS.
 const FREE_PAGE_REPORTING_REPLACE: u32 = 1;
+/// `KRUN_PERMISSION_SEMANTICS_LINUX_SIMPLIFIED_FIXED_OWNER`.
+const PERMISSION_SEMANTICS_FIXED_OWNER: u32 = 2;
 /// `KRUN_CACHE_POLICY_ALWAYS`.
 const CACHE_POLICY_ALWAYS: u32 = 2;
 /// `KRUN_LOG_LEVEL_WARN`.
@@ -198,6 +204,8 @@ krun_api! {
     krun_fs_device_new: fn(KrunStr, KrunStr, ErrOut) -> Handle;
     krun_fs_device_new_read_only: fn(KrunStr, KrunStr, ErrOut) -> Handle;
     krun_fs_device_set_cache_policy: fn(Handle, u32, ErrOut) -> u64;
+    krun_fs_device_set_permission_semantics: fn(Handle, u32, ErrOut) -> u64;
+    krun_fs_device_set_fixed_owner: fn(Handle, u32, u32, ErrOut) -> u64;
     krun_block_device_new: fn(KrunStr, KrunStr, u32, ErrOut) -> Handle;
     krun_vsock_device_new: fn(u64, u32, ErrOut) -> Handle;
     krun_vsock_device_add_unix_port: fn(Handle, u32, KrunStr, bool);
@@ -460,6 +468,22 @@ fn run(config: &VmmConfig) -> Result<std::convert::Infallible, String> {
         if share.immutable {
             api.call(&format!("cache policy {}", share.tag), |e| unsafe {
                 (api.krun_fs_device_set_cache_policy)(fs, CACHE_POLICY_ALWAYS, e)
+            })?;
+        }
+        // With the default semantics, the host keeps guest files as 0600
+        // and the guest mode only in an xattr. The fixed owner semantics
+        // keep the real mode bits on the host and the attribute cache.
+        if let Some((uid, gid)) = share.fixed_owner {
+            api.call(&format!("permission semantics {}", share.tag), |e| unsafe {
+                (api.krun_fs_device_set_permission_semantics)(
+                    fs,
+                    PERMISSION_SEMANTICS_FIXED_OWNER,
+                    e,
+                )
+            })?;
+            // Set the owner after the semantics: a new semantics clears it.
+            api.call(&format!("fixed owner {}", share.tag), |e| unsafe {
+                (api.krun_fs_device_set_fixed_owner)(fs, uid, gid, e)
             })?;
         }
         add(fs);

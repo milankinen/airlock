@@ -18,6 +18,11 @@ pub struct VmShare {
     // Only the libkrun backend reads it.
     #[cfg_attr(not(vm_libkrun), allow(dead_code))]
     pub immutable: bool,
+    /// If `true`, the share has user data (project, mounts), not image
+    /// files.
+    // Only the libkrun backend reads it.
+    #[cfg_attr(not(vm_libkrun), allow(dead_code))]
+    pub user_data: bool,
 }
 
 /// Full VM configuration for the VM backend.
@@ -43,4 +48,9 @@ pub struct VmConfig {
     pub asset_dir: VerifiedPath,
     /// Enable nested virtualization and give the guest access to KVM.
     pub kvm: bool,
+    /// Container user (`uid`, `gid`) that owns the user data shares in the
+    /// guest.
+    // Only the libkrun backend reads it.
+    #[cfg_attr(not(vm_libkrun), allow(dead_code))]
+    pub user_data_owner: (u32, u32),
 }
