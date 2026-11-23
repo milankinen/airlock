@@ -6,7 +6,8 @@
 
 use std::ffi::OsStr;
 use std::io::Read;
-use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use tracing::{debug, info, warn};
@@ -28,6 +29,7 @@ use crate::init::MountConfig;
 ///  2. Bind-mount the directory and cache mounts on the rootfs. Skips a
 ///     mount if its path has a symlink that the container user or a share
 ///     controls (see [`safe_resolve`]).
+///     A new or empty cache dir gets the owner and mode of its target.
 ///  3. Hide the configured mask paths in the project.
 ///
 /// Args:
@@ -201,6 +203,9 @@ pub(super) fn assemble(mounts: &MountConfig, uid: u32, gid: u32) -> anyhow::Resu
                 let Some(src) = resolve_or_skip(&cache_root, target, &policy)? else {
                     continue;
                 };
+                if let Err(e) = set_cache_owner(&src, &dst, uid, gid) {
+                    warn!("cache {} → {target}: {e:#}", cache.name);
+                }
                 super::mount::bind_fd(&src.fd, &dst.fd, false)
                     .map_err(|e| anyhow::anyhow!("cache {} → {target}: {e}", cache.name))?;
                 info!("cache: {} → {target}", cache.name);
@@ -246,6 +251,44 @@ pub(super) fn assemble(mounts: &MountConfig, uid: u32, gid: u32) -> anyhow::Resu
         }
     }
 
+    Ok(())
+}
+
+/// Give a cache dir the owner and mode of its target. The container user
+/// can then write a cache in its home dir.
+///
+/// The cache dir gets the owner and mode of the target dir if the target
+/// exists in the rootfs. A new target and the cache dir get the container
+/// user and mode 0755. The change applies only to a new or empty cache dir
+/// and not to its content, so a user change of the owner stays.
+/// Args:
+///  - `src`: Cache dir on the project disk
+///  - `dst`: Target dir in the rootfs
+///  - `uid`: Container user ID
+///  - `gid`: Container group ID
+fn set_cache_owner(
+    src: &safe_resolve::Resolved,
+    dst: &safe_resolve::Resolved,
+    uid: u32,
+    gid: u32,
+) -> anyhow::Result<()> {
+    let (uid, gid, mode) = if dst.created {
+        // A new target has the owner of its parent dir. Give it the owner
+        // of the cache, so the next boot reads the same owner from it.
+        safe_resolve::chown(&dst.fd, uid, gid)?;
+        (uid, gid, 0o755)
+    } else {
+        let st = safe_resolve::stat_at(&dst.fd, OsStr::new(""), libc::AT_EMPTY_PATH)?;
+        (st.st_uid, st.st_gid, st.st_mode & 0o7777)
+    };
+    // The `/proc/self/fd` link opens the exact dir of the fd.
+    let src_path = format!("/proc/self/fd/{}", src.fd.as_raw_fd());
+    if !src.created && std::fs::read_dir(&src_path)?.next().is_some() {
+        debug!("cache dir has content, keeping its owner");
+        return Ok(());
+    }
+    safe_resolve::chown(&src.fd, uid, gid)?;
+    std::fs::set_permissions(&src_path, std::fs::Permissions::from_mode(mode))?;
     Ok(())
 }
 
@@ -313,4 +356,97 @@ fn reset_if_image_changed(image_id: &str) -> anyhow::Result<()> {
     std::fs::create_dir_all("/mnt/disk/overlay")?;
     std::fs::write(id_file, image_id)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, chown};
+    use std::path::Path;
+
+    use airlock_test_utils::temp_dir;
+
+    use super::set_cache_owner;
+    use crate::init::linux::safe_resolve::{Policy, Resolved, mkdirs, open_dir};
+
+    /// Resolve the cache dir and the target dir of `path`, then set the
+    /// owner of the cache dir for container user 1000:1000.
+    fn set_owner(rootfs: &Path, cache: &Path, path: &str) {
+        let policy = Policy {
+            uid: 1000,
+            gid: 1000,
+            shared_devs: Vec::new(),
+        };
+        let resolve = |root: &Path| -> Resolved {
+            let root = open_dir(root.to_str().unwrap()).unwrap();
+            mkdirs(root.as_fd(), path, &policy).unwrap()
+        };
+        let dst = resolve(rootfs);
+        let src = resolve(cache);
+        set_cache_owner(&src, &dst, 1000, 1000).unwrap();
+    }
+
+    /// Get the uid, gid and mode of `path`.
+    fn owner(path: &Path) -> (u32, u32, u32) {
+        let m = std::fs::metadata(path).unwrap();
+        (m.uid(), m.gid(), m.mode() & 0o7777)
+    }
+
+    /// Test that the owner of a cache comes from the target. Then a
+    /// non-root container user can write a cache in its home dir, and a
+    /// cache on an image dir has the same access as the image dir.
+    /// Needs root for the chown.
+    ///   1. Make an image dir owned by 1234:1234 with mode 0750
+    ///   2. Set the owner of a new cache for it and for a missing target
+    ///   3. Check that the first cache has the image owner and mode
+    ///   4. Check that the second cache and its target have the container
+    ///      user
+    #[test]
+    fn cache_owner_comes_from_target() {
+        // SAFETY: no arguments, no side effects.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skip: needs root");
+            return;
+        }
+        let tmp = temp_dir();
+        let (rootfs, cache) = (tmp.path().join("rootfs"), tmp.path().join("cache"));
+        std::fs::create_dir_all(rootfs.join("srv/data")).unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        chown(rootfs.join("srv/data"), Some(1234), Some(1234)).unwrap();
+        std::fs::set_permissions(rootfs.join("srv/data"), PermissionsExt::from_mode(0o750))
+            .unwrap();
+
+        set_owner(&rootfs, &cache, "/srv/data");
+        set_owner(&rootfs, &cache, "/opt/new");
+
+        assert_eq!(owner(&cache.join("srv/data")), (1234, 1234, 0o750));
+        assert_eq!(owner(&cache.join("srv")), (0, 0, 0o755));
+        assert_eq!(owner(&cache.join("opt/new")), (1000, 1000, 0o755));
+        assert_eq!(owner(&rootfs.join("opt/new")), (1000, 1000, 0o755));
+    }
+
+    /// Test that a cache with content keeps its owner. The user can change
+    /// the owner on purpose, and a change of a large cache is slow.
+    /// Needs root for the chown.
+    ///   1. Make a cache dir owned by root with a file in it
+    ///   2. Make the target owned by 1000:1000
+    ///   3. Check that the cache dir stays owned by root
+    #[test]
+    fn cache_with_existing_content_keeps_owner() {
+        // SAFETY: no arguments, no side effects.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skip: needs root");
+            return;
+        }
+        let tmp = temp_dir();
+        let (rootfs, cache) = (tmp.path().join("rootfs"), tmp.path().join("cache"));
+        std::fs::create_dir_all(rootfs.join("home/u/.cache")).unwrap();
+        chown(rootfs.join("home/u/.cache"), Some(1000), Some(1000)).unwrap();
+        std::fs::create_dir_all(cache.join("home/u/.cache")).unwrap();
+        std::fs::write(cache.join("home/u/.cache/f"), "x").unwrap();
+
+        set_owner(&rootfs, &cache, "/home/u/.cache");
+
+        assert_eq!(owner(&cache.join("home/u/.cache")).0, 0);
+    }
 }

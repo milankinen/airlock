@@ -45,6 +45,8 @@ impl std::error::Error for Refused {}
 pub(super) struct Resolved {
     /// `O_PATH` fd of the directory.
     pub fd: OwnedFd,
+    /// `true` if this resolve made the last directory of the path.
+    pub created: bool,
 }
 
 /// Open the directory `path` as an `O_PATH` fd. Use it for the root of a
@@ -81,18 +83,21 @@ pub(super) fn mkdirs(
     let mut stack = vec![root.try_clone_to_owned()?];
     let mut todo: Vec<OsString> = Vec::new();
     crate::util::push_components(&mut todo, Path::new(path));
+    let mut created = false;
     let mut hops = 0;
     while let Some(name) = todo.pop() {
         if name == ".." {
             if stack.len() > 1 {
                 stack.pop();
             }
+            created = false;
             continue;
         }
         let parent = stack.last().expect("stack has the root");
         let err = match open_child(parent, &name) {
             Ok(fd) => {
                 stack.push(fd);
+                created = false;
                 continue;
             }
             Err(e) => e,
@@ -103,6 +108,7 @@ pub(super) fn mkdirs(
                     make_child(parent, &name).map_err(|e| anyhow::anyhow!("{path}: {e:#}"))?
                 {
                     stack.push(fd);
+                    created = true;
                 } else {
                     // An other process made the entry first. Check it again.
                     todo.push(name);
@@ -139,6 +145,7 @@ pub(super) fn mkdirs(
     }
     Ok(Resolved {
         fd: stack.pop().expect("stack has the root"),
+        created,
     })
 }
 
@@ -437,6 +444,22 @@ mod tests {
 
         let err = resolve(tmp.path(), "/a", &user_policy()).err().unwrap();
         assert!(err.to_string().contains("too many symlinks"), "{err:#}");
+    }
+
+    /// Test that the result tells if the resolve made the last dir. The
+    /// cache owner rules use it.
+    ///   1. Resolve a new path, then the same path again
+    ///   2. Check that only the first resolve made the dir
+    ///   3. Check that a path that ends in `..` is not new
+    #[test]
+    fn result_tells_if_last_dir_is_new() {
+        let tmp = temp_dir();
+        let root = open_dir(tmp.path().to_str().unwrap()).unwrap();
+        let created = |p: &str| mkdirs(root.as_fd(), p, &user_policy()).unwrap().created;
+
+        assert!(created("/a/b"));
+        assert!(!created("/a/b"));
+        assert!(!created("/a/c/.."));
     }
 
     /// Test that a symlink in a shared host dir is refused. Another sandbox

@@ -1,7 +1,9 @@
-# Safe mount targets
+# Cache owner and safe mount targets
 
 ## Why
 
+* Named cache dirs belonged to root. A non-root image user could not
+  write in them, for example in `~/.cache`.
 * The guest can make symlinks that steer the mounts of the init process,
   which runs as root. Known attack paths:
   * A `..` in a symlink target escapes the container root.
@@ -28,8 +30,16 @@
 * The mount uses the held fds: `open_tree`, `mount_setattr` and
   `move_mount`. A read-only remount through `/proc/self/fd` changes the
   mount below the target, so it is not usable.
-* New dirs get the owner of the nearest existing parent. For example
-  `~/.cargo` under a user-owned `~` belongs to the user.
+* Owner of a named cache dir:
+  * The target exists in the image: the cache dir gets its uid, gid and
+    mode.
+  * The target does not exist: the container uid and gid, mode 0755. The
+    new target dir also gets the container user.
+  * New parent dirs get the owner of the nearest existing parent. For
+    example `~/.cargo` under a user-owned `~` belongs to the user.
+  * Only a new or empty cache dir changes owner. A cache that an older
+    version made as root, and that has content, stays root-owned. Remove
+    the cache to get the new owner.
 * The writable check counts a dir of the container user as writable for
   each mode, because the owner can `chmod` it. Container processes have
   no supplementary groups, so the check uses only the primary gid.
@@ -50,5 +60,5 @@
 
 ## Testing
 
-* VM test in `tests/vm/caches.bats`: a skipped cache path with a
-  symlink in the project dir.
+* VM tests in `tests/vm/caches.bats`: cache owner with a non-root user,
+  and a skipped cache path with a symlink in the project dir.

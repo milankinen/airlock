@@ -2,11 +2,33 @@
 
 load helpers
 
-# Named caches on the sandbox disk: refusal of cache paths that go through
-# guest-made symlinks.
+# Named caches on the sandbox disk: owner of the cache dirs and refusal of
+# cache paths that go through guest-made symlinks.
 
 setup_file() {
     vm_setup_file
+}
+
+# Test that a non-root image user can write in a named cache below the
+# home directory, and that the data stays after a restart. A cache dir
+# that root owns is not usable for this user. The image runs as the
+# non-root user `curl_user`.
+#   1. Make a project with the image and a cache for `~/.cache/x`
+#   2. In the sandbox, write a file in the cache and check the cache owner
+#   3. In a new sandbox, check that the file is still there
+@test "named cache in home is writable by non-root user and persists" {
+    mkdir -p cache-owner
+    cd cache-owner
+    printf '[vm]\nimage = "curlimages/curl:latest"\n\n[disk.cache.x]\npaths = ["~/.cache/x"]\n' >airlock.toml
+    run_vm sh -c 'echo cache-data >~/.cache/x/file && echo "owner=$(stat -c %U ~/.cache/x)"'
+    assert_success
+    assert_output_contains "owner=curl_user"
+
+    run_vm sh -c 'cat ~/.cache/x/file'
+    cd ..
+    rm -rf cache-owner
+    assert_success
+    assert_output_contains "cache-data"
 }
 
 # Test that a cache path in the project dir is skipped when the guest
