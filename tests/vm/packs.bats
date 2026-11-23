@@ -81,6 +81,19 @@ check_second_start() {
     assert_output_contains "ALL-PACKS-OK"
 }
 
+# Check that ~/.codex/tmp is on the sandbox disk, not in the host dir that
+# all sandboxes share. Codex deletes the helper dirs there that it can
+# lock, and a lock in one VM is not visible in other VMs.
+check_codex_tmp_per_sandbox() {
+    run_airlock start -- sh -c 'touch ~/.codex/tmp/marker ~/.codex/shared-marker && echo MARKED'
+    assert_success
+    assert_output_contains "MARKED"
+    local share
+    share="$(data_dir)/share/all/packs/codex/codex"
+    [[ -e "$share/shared-marker" ]]
+    [[ ! -e "$share/tmp/marker" ]]
+}
+
 # Check that each script can run again on a disk that has the pack. An
 # "unconfirmed" record means that the install did not confirm its disk
 # write. If no session ran after the install, the next start runs the
@@ -153,18 +166,21 @@ check_legacy_installs_nothing() {
 # Test the pack life cycle on an Alpine sandbox: a new sandbox installs
 # every pack without a question, a second start installs nothing,
 # unconfirmed records run each script again if no session ran after the
-# install, and a removed pack needs a terminal or --yes.
+# install, ~/.codex/tmp is per sandbox, and a removed pack needs a
+# terminal or --yes.
 #   1. Run start with all packs and no terminal, and check the installs
 #   2. Run start again and check that there is no install
-#   3. Change all install records to unconfirmed and check that start
+#   3. Check that ~/.codex/tmp is not in the shared Codex dir
+#   4. Change all install records to unconfirmed and check that start
 #      fails, because sessions ran. Then mark that no session ran, run
 #      start, and check that each pack installs again with no failure
-#   4. Remove mise from the config and check that start fails, then run
+#   5. Remove mise from the config and check that start fails, then run
 #      start --yes and check that a new disk has the other packs only
 @test "alpine: packs install, stay, run again and need --yes to remove" {
     cd alpine
     check_install
     check_second_start
+    check_codex_tmp_per_sandbox
     check_rerun
     check_removed_pack
 }
@@ -181,15 +197,17 @@ check_legacy_installs_nothing() {
 # Alpine test.
 #   1. Run start with all packs and no terminal, and check the installs
 #   2. Run start again and check that there is no install
-#   3. Change all install records to unconfirmed and check that start
+#   3. Check that ~/.codex/tmp is not in the shared Codex dir
+#   4. Change all install records to unconfirmed and check that start
 #      fails, because sessions ran. Then mark that no session ran, run
 #      start, and check that each pack installs again with no failure
-#   4. Remove mise from the config and check that start fails, then run
+#   5. Remove mise from the config and check that start fails, then run
 #      start --yes and check that a new disk has the other packs only
 @test "debian: packs install, stay, run again and need --yes to remove" {
     cd debian
     check_install
     check_second_start
+    check_codex_tmp_per_sandbox
     check_rerun
     check_removed_pack
 }

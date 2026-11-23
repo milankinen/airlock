@@ -44,6 +44,14 @@ airlock secrets add OPENAI_API_KEY
 Codex then uses it automatically. The real value stays on the host. Codex
 gets only a surrogate.
 
+## Codex directory
+
+All sandboxes with the `codex` pack share `~/.codex`, for example the
+settings and the sessions. Each sandbox has its own `~/.codex/tmp` on the
+sandbox disk. Codex keeps the helper files of its running processes
+there. If sandboxes share this directory, Codex in one sandbox can delete
+the helpers of Codex in another sandbox.
+
 ## Airlock tools
 
 Since version 2, the pack configures Codex to use the `airlock` MCP
