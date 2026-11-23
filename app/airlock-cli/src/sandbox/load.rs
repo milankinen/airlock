@@ -271,23 +271,29 @@ struct CaData {
     key: String,
 }
 
-/// Generate a self-signed CA keypair and write it to `ca.json`.
-fn generate_ca(sandbox_dir: &VerifiedPath) -> anyhow::Result<()> {
-    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+/// Generate a self-signed CA keypair for the TLS interception.
+/// Returns:
+///   The CA certificate PEM and the CA private key PEM.
+pub(crate) fn new_ca_pem() -> anyhow::Result<(String, String)> {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
 
     let mut params = CertificateParams::new(vec![])?;
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    // Strict X.509 checks refuse a CA with a path length and no `keyCertSign`.
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     params
         .distinguished_name
         .push(rcgen::DnType::CommonName, "airlock CA");
 
     let key_pair = KeyPair::generate()?;
     let cert = params.self_signed(&key_pair)?;
+    Ok((cert.pem(), key_pair.serialize_pem()))
+}
 
-    let ca_data = CaData {
-        cert: cert.pem(),
-        key: key_pair.serialize_pem(),
-    };
+/// Generate a self-signed CA keypair and write it to `ca.json`.
+fn generate_ca(sandbox_dir: &VerifiedPath) -> anyhow::Result<()> {
+    let (cert, key) = new_ca_pem()?;
+    let ca_data = CaData { cert, key };
     // ca.json holds the CA private key. Write it owner-only (0600) and
     // atomically. A truncated file after a crash blocks all later runs:
     // `has_ca` skips a new CA, but `read_ca` cannot parse the file.

@@ -193,3 +193,70 @@ fn non_http_bytes_to_owned_host_are_refused_not_relayed() {
         assert_eq!(accepted.load(Ordering::SeqCst), 0);
     });
 }
+
+/// Test that the TLS MITM chain has the extensions that strict X.509 checks
+/// need, so that Python 3.13 and later accept it.
+///   1. Send an HTTPS GET through the MITM and keep the leaf certificate
+///   2. Check that the leaf key identifier matches the CA
+///   3. Check the key usages of the leaf and of the CA
+#[test]
+fn mitm_certificate_chain_has_extensions_for_strict_verification() {
+    use x509_parser::prelude::{ParsedExtension, X509Certificate, parse_x509_certificate};
+
+    fn key_ids<'a>(cert: &'a X509Certificate<'a>) -> (Option<&'a [u8]>, Option<&'a [u8]>) {
+        let (mut aki, mut ski) = (None, None);
+        for ext in cert.extensions() {
+            match ext.parsed_extension() {
+                ParsedExtension::AuthorityKeyIdentifier(id) => {
+                    aki = id.key_identifier.as_ref().map(|k| k.0);
+                }
+                ParsedExtension::SubjectKeyIdentifier(id) => ski = Some(id.0),
+                _ => {}
+            }
+        }
+        (aki, ski)
+    }
+
+    let upstream = FakeUpstream::bind(&[b"http/1.1"]);
+    run_with_config(trusting(&upstream), |proxy, _, mitm_ca| async move {
+        let port = upstream.port();
+        upstream.serve(Router::new().route("/hello", get(|| async { "tls-ok" })));
+        let mut tls = guest_tls(&proxy, &mitm_ca, port, &[b"http/1.1"]).await;
+        let leaf_der = tls.get_ref().1.peer_certificates().unwrap()[0].clone();
+        let req =
+            format!("GET /hello HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+        tls.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = String::new();
+        tls.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(resp.ends_with("tls-ok"), "{resp}");
+
+        let ca_der = rustls_pemfile::certs(&mut mitm_ca.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap();
+        let (_, ca) = parse_x509_certificate(&ca_der).unwrap();
+        let (_, leaf) = parse_x509_certificate(&leaf_der).unwrap();
+
+        let (_, ca_ski) = key_ids(&ca);
+        let (leaf_aki, leaf_ski) = key_ids(&leaf);
+        assert!(ca_ski.is_some(), "CA has no Subject Key Identifier");
+        assert_eq!(leaf_aki, ca_ski, "leaf AKI does not match CA SKI");
+        assert!(leaf_ski.is_some(), "leaf has no Subject Key Identifier");
+
+        let ca_bc = ca.basic_constraints().unwrap().unwrap().value;
+        assert!(ca_bc.ca);
+        assert_eq!(ca_bc.path_len_constraint, Some(0));
+        let ca_ku = ca.key_usage().unwrap().expect("CA has no key usage");
+        assert!(ca_ku.critical);
+        assert!(ca_ku.value.key_cert_sign());
+
+        let leaf_bc = leaf.basic_constraints().unwrap().unwrap().value;
+        assert!(!leaf_bc.ca);
+        let leaf_ku = leaf.key_usage().unwrap().expect("leaf has no key usage");
+        assert!(leaf_ku.value.digital_signature());
+        assert!(!leaf_ku.value.key_cert_sign());
+        let leaf_eku = leaf.extended_key_usage().unwrap();
+        assert!(leaf_eku.expect("leaf has no EKU").value.server_auth);
+    });
+}

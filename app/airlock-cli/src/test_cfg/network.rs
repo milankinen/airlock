@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use airlock_common::network_capnp::{connect_result, network_proxy, tcp_sink};
-use airlock_test_utils::{TestCa, block_on_local, rpc_loopback, temp_dir, tls_trusting};
+use airlock_test_utils::{block_on_local, rpc_loopback, temp_dir, tls_trusting};
 use bytes::{Buf, Bytes};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{broadcast, mpsc};
@@ -198,10 +198,9 @@ pub fn build_network(cfg: TestNetworkConfig) -> (RequestLog, String, Network) {
     let sandbox_env = SandboxEnv::from_secrets(cfg.inject);
     let rule_set = rules::RuleSet::new(&config, &sandbox_env).unwrap();
 
-    // The MITM CA of the sandbox.
-    let mitm_ca = TestCa::generate();
-    let mitm_ca_pem = mitm_ca.cert_pem;
-    let interceptor = TlsInterceptor::new(&mitm_ca_pem, &mitm_ca.key_pem).unwrap();
+    // The MITM CA of the sandbox, made as a real sandbox makes it.
+    let (mitm_ca_pem, mitm_ca_key) = crate::sandbox::load::new_ca_pem().unwrap();
+    let interceptor = TlsInterceptor::new(&mitm_ca_pem, &mitm_ca_key).unwrap();
 
     // The upstream TLS client trusts the system roots and the test CAs.
     let mut root_store = rustls::RootCertStore::empty();
@@ -275,7 +274,7 @@ pub fn network_in_project(toml: &str, dir: &Path) -> anyhow::Result<ConfigNetwor
         crate::vault::Vault::for_storage_type(crate::vault::VaultStorageType::Disabled),
     );
     let env = crate::sandbox::resolve_env(&config, &context.vault)?;
-    let ca = TestCa::generate();
+    let (ca_cert, ca_key) = crate::sandbox::load::new_ca_pem().unwrap();
     let project = Project {
         sandbox_dir: crate::util::VerifiedPath::new_follow(dir.join("sandbox"), None).unwrap(),
         host_home: crate::util::VerifiedPath::new_follow(dir, None).unwrap(),
@@ -283,8 +282,8 @@ pub fn network_in_project(toml: &str, dir: &Path) -> anyhow::Result<ConfigNetwor
         guest_cwd: dir.display().to_string(),
         config,
         env: env.clone(),
-        ca_cert: ca.cert_pem,
-        ca_key: ca.key_pem,
+        ca_cert,
+        ca_key,
         context,
     };
     let network = Network::new(

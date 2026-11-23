@@ -10,7 +10,7 @@ use std::sync::Arc;
 use airlock_common::network_capnp::tcp_sink;
 use bytes::Bytes;
 use quick_cache::sync::Cache;
-use rcgen::{CertificateParams, Issuer, KeyPair};
+use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 use rustls::ServerConfig;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
@@ -205,6 +205,12 @@ impl TlsInterceptor {
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, format!("airlock {hostname}"));
+        // Strict X.509 checks (the default in Python 3.13 and later) refuse
+        // a leaf with no Authority Key Identifier.
+        params.use_authority_key_identifier_extension = true;
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         let leaf_cert = params.signed_by(&leaf_key, &self.issuer)?;
 
         let cert_der = rustls::pki_types::CertificateDer::from(leaf_cert.der().to_vec());
