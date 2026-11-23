@@ -131,6 +131,8 @@ smoltcp = { version = "0.13", default-features = false, features = [
 
 # TLS parsing
 tls-parser = "0.12"
+# X.509 parsing, for the certificate checks in tests
+x509-parser = "0.18"
 # Public suffix list, for the wildcard check of network grants
 psl = "2"
 

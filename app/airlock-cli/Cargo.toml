@@ -89,6 +89,7 @@ rustls-pemfile = { workspace = true }
 tempfile = { workspace = true }
 tower = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+x509-parser = { workspace = true }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 notify-rust = { workspace = true }

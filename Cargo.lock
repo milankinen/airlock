@@ -116,6 +116,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "x509-parser",
  "xattr",
  "yaml-edit",
 ]
