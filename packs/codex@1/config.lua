@@ -11,6 +11,16 @@ config.mounts = {
     },
 }
 
+-- Each sandbox keeps ~/.codex/tmp on its own disk. At start, Codex
+-- deletes the helper dirs in tmp that it can lock. A lock in one VM is
+-- not visible in other VMs, so a shared tmp lets one sandbox delete the
+-- helpers of a Codex that runs in another sandbox.
+config.disk = {
+    cache = {
+        ["codex-tmp"] = { paths = { "~/.codex/tmp" } },
+    },
+}
+
 config.network = {
     -- The openai service owns the ChatGPT sign-in and backend hosts
     -- (auth.openai.com, chatgpt.com). airlock allows them, keeps the real
