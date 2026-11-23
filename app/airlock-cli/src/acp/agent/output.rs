@@ -265,6 +265,31 @@ mod tests {
         assert_eq!(run.items, vec![Output::TooLong, Output::Exit(0)]);
     }
 
+    /// Test that a long line in many small chunks comes out in a short
+    /// time. A search of the full partial line for each chunk takes
+    /// quadratic time and blocks the proxy. With these sizes the quadratic
+    /// search scans about 68 GB, and the linear search scans 8 MiB.
+    ///   1. Send an 8 MiB line in 512 byte chunks, then the newline
+    ///   2. Check that the line comes out whole in less than 5 seconds
+    #[tokio::test]
+    async fn long_line_split_has_linear_time_complexity() {
+        const LEN: usize = 8 * 1024 * 1024;
+        const CHUNK: usize = 512;
+        let mut events: Vec<_> = (0..LEN / CHUNK)
+            .map(|_| ProcessEvent::Stdout(vec![b'x'; CHUNK]))
+            .collect();
+        events.push(out("\n"));
+        events.push(ProcessEvent::Exit(0));
+        let started = std::time::Instant::now();
+        let run = run(events, LEN, 1).await;
+        let elapsed = started.elapsed();
+        assert_eq!(
+            run.items,
+            vec![Output::Line(vec![b'x'; LEN]), Output::Exit(0)]
+        );
+        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+    }
+
     /// Test that a relay that ends without the exit gives exit code 1, and
     /// that the line without a newline still comes out.
     ///   1. Send a line without a newline and end the relay
