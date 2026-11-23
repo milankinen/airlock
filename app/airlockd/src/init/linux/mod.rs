@@ -15,6 +15,7 @@ mod disk;
 mod mount;
 mod net;
 mod overlay;
+mod safe_resolve;
 
 /// Apply the host wall-clock to `CLOCK_REALTIME`. See
 /// [`super::set_clock`].
@@ -83,7 +84,7 @@ pub fn setup(
     disk::setup(&mounts.caches)?;
 
     // 6. Assemble container rootfs (overlayfs layers + dir/cache bind mounts)
-    overlay::assemble(mounts)?;
+    overlay::assemble(mounts, config.uid, config.gid)?;
 
     // 7. DNS
     net::setup_dns()?;

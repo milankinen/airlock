@@ -248,6 +248,56 @@ pub(super) fn bind(src: &str, dst: &str, read_only: bool) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Bind-mount the directory `src` on the directory `dst`, optionally
+/// read-only. Both are open fds, so a symlink can not change the source or
+/// the target after the resolve.
+pub(super) fn bind_fd(src: &OwnedFd, dst: &OwnedFd, read_only: bool) -> anyhow::Result<()> {
+    let fail = |step| anyhow::anyhow!("bind-mount: {step}: {}", std::io::Error::last_os_error());
+    // A remount through `/proc/self/fd` finds the mount below the new one.
+    // Thus make a detached copy, set read-only on it, then attach it.
+    // SAFETY (all syscalls below): the fds are open and the strings are
+    // null-terminated. Each result is checked.
+    let tree = unsafe {
+        libc::syscall(
+            libc::SYS_open_tree,
+            src.as_raw_fd(),
+            c"".as_ptr(),
+            libc::OPEN_TREE_CLONE | libc::OPEN_TREE_CLOEXEC | libc::AT_EMPTY_PATH as libc::c_uint,
+        )
+    };
+    let tree = owned_fd(tree).ok_or_else(|| fail("open_tree"))?;
+    if read_only {
+        let attr = libc::mount_attr {
+            attr_set: libc::MOUNT_ATTR_RDONLY,
+            attr_clr: 0,
+            propagation: 0,
+            userns_fd: 0,
+        };
+        let res = unsafe {
+            libc::syscall(
+                libc::SYS_mount_setattr,
+                tree.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH,
+                &raw const attr,
+                size_of::<libc::mount_attr>(),
+            )
+        };
+        check(res).map_err(|()| fail("set read-only"))?;
+    }
+    let res = unsafe {
+        libc::syscall(
+            libc::SYS_move_mount,
+            tree.as_raw_fd(),
+            c"".as_ptr(),
+            dst.as_raw_fd(),
+            c"".as_ptr(),
+            libc::MOVE_MOUNT_F_EMPTY_PATH | libc::MOVE_MOUNT_T_EMPTY_PATH,
+        )
+    };
+    check(res).map_err(|()| fail("attach"))
+}
+
 /// Mount a filesystem.
 /// Args:
 ///  - `source`: Mount source (device or name, for example `proc`)
@@ -293,7 +343,81 @@ pub(super) fn fs(
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
     use super::swap_map;
+
+    /// Test that a read-only bind on an fd target is read-only. A remount
+    /// through the fd path finds the mount below, so this needs its own
+    /// check. Needs root and a new mount namespace, else the test skips.
+    ///   1. In a child process, enter a new private mount namespace
+    ///   2. Bind a dir read-only on an other dir, both as fds
+    ///   3. Check that a write through the target fails with EROFS
+    ///   4. Check that the source is still writable
+    #[test]
+    fn read_only_bind_on_fd_target_is_read_only() {
+        // SAFETY: no arguments, no side effects.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skip: needs root");
+            return;
+        }
+        let tmp = airlock_test_utils::temp_dir();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        // Make all values before the fork. The child of a multithreaded
+        // process must not allocate, so it uses only raw syscalls.
+        let cstr = |p: &std::path::Path| std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+        let (src_dir, dst_dir) = (cstr(&src), cstr(&dst));
+        let (dst_file, src_file) = (cstr(&dst.join("f")), cstr(&src.join("f")));
+        // Exit codes of the child: 0 pass, 1 fail, 2 skip.
+        // SAFETY: the child does only syscalls and exits.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            // SAFETY: raw syscalls on values made before the fork.
+            unsafe {
+                if libc::unshare(libc::CLONE_NEWNS) != 0
+                    || libc::mount(
+                        c"none".as_ptr(),
+                        c"/".as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_REC | libc::MS_PRIVATE,
+                        std::ptr::null(),
+                    ) != 0
+                {
+                    libc::_exit(2);
+                }
+                // Open the dirs in the new namespace. A mount of the old
+                // namespace is not a valid target.
+                let open = |p: &std::ffi::CString| {
+                    let fd = libc::open(p.as_ptr(), libc::O_PATH | libc::O_DIRECTORY);
+                    if fd < 0 {
+                        libc::_exit(1);
+                    }
+                    OwnedFd::from_raw_fd(fd)
+                };
+                let (src_fd, dst_fd) = (open(&src_dir), open(&dst_dir));
+                // `bind_fd` allocates only on error.
+                if super::bind_fd(&src_fd, &dst_fd, true).is_err() {
+                    libc::_exit(1);
+                }
+                let flags = libc::O_WRONLY | libc::O_CREAT;
+                let ro = libc::open(dst_file.as_ptr(), flags, 0o644) < 0
+                    && *libc::__errno_location() == libc::EROFS;
+                let rw = libc::open(src_file.as_ptr(), flags, 0o644) >= 0;
+                libc::_exit(i32::from(!(ro && rw)));
+            }
+        }
+        let mut status = 0;
+        // SAFETY: `pid` is the child of this test.
+        unsafe { libc::waitpid(pid, &raw mut status, 0) };
+        match libc::WEXITSTATUS(status) {
+            0 => {}
+            2 => eprintln!("skip: no mount namespace"),
+            code => panic!("child failed with {code}"),
+        }
+    }
 
     /// Test that the id map swaps two ids and keeps the others. The kernel
     /// refuses overlapping ranges.

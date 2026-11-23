@@ -4,12 +4,14 @@
 //! configured mounts. Hides sandbox internals and the masked paths from the
 //! container.
 
+use std::ffi::OsStr;
 use std::io::Read;
-use std::os::fd::FromRawFd;
+use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::path::Path;
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
+use super::safe_resolve::{self, Policy};
 use crate::init::MountConfig;
 
 /// Assemble the container rootfs at `/mnt/overlay/rootfs`.
@@ -23,12 +25,16 @@ use crate::init::MountConfig;
 ///     - Writes the file-mount symlinks into the upperdir.
 ///     - Adds the CA bundles as a tmpfs lowerdir (see
 ///       [`super::ca::prepare_overlay`]).
-///  2. Bind-mount the directory and cache mounts on the rootfs.
+///  2. Bind-mount the directory and cache mounts on the rootfs. Skips a
+///     mount if its path has a symlink that the container user or a share
+///     controls (see [`safe_resolve`]).
 ///  3. Hide the configured mask paths in the project.
 ///
 /// Args:
 ///  - `mounts`: Mount configuration from the host
-pub(super) fn assemble(mounts: &MountConfig) -> anyhow::Result<()> {
+///  - `uid`: Container user ID
+///  - `gid`: Container group ID
+pub(super) fn assemble(mounts: &MountConfig, uid: u32, gid: u32) -> anyhow::Result<()> {
     let has_disk = Path::new("/mnt/disk").is_dir();
 
     // Upper/work must be on a local filesystem (not VirtioFS/FUSE). Use the
@@ -155,29 +161,49 @@ pub(super) fn assemble(mounts: &MountConfig) -> anyhow::Result<()> {
     }
     info!("assembled rootfs via overlayfs");
 
-    let rootfs = Path::new("/mnt/overlay/rootfs");
+    let rootfs = safe_resolve::open_dir("/mnt/overlay/rootfs")?;
+    // Symlinks in the shares are refused, because another sandbox or the
+    // host can change them.
+    let mut shared_devs = Vec::new();
+    for dir in &mounts.dirs {
+        let fd = safe_resolve::open_dir(&format!("/mnt/{}", dir.tag))?;
+        shared_devs.push(safe_resolve::stat_at(&fd, OsStr::new(""), libc::AT_EMPTY_PATH)?.st_dev);
+    }
+    let policy = Policy {
+        uid,
+        gid,
+        shared_devs,
+    };
 
     // Directory bind mounts
     for dir in &mounts.dirs {
-        let src = format!("/mnt/{}", dir.tag);
-        let dst = crate::util::resolve_in_root(rootfs, &dir.target);
-        std::fs::create_dir_all(&dst)?;
-        super::mount::bind(&src, &dst.to_string_lossy(), dir.read_only)?;
-        info!("dir: {src} → {}", dst.display());
+        let src_path = format!("/mnt/{}", dir.tag);
+        let src = safe_resolve::open_dir(&src_path)?;
+        let Some(dst) = resolve_or_skip(&rootfs, &dir.target, &policy)? else {
+            continue;
+        };
+        super::mount::bind_fd(&src, &dst.fd, dir.read_only)
+            .map_err(|e| anyhow::anyhow!("{src_path} → {}: {e}", dir.target))?;
+        info!("dir: {src_path} → {}", dir.target);
     }
 
     // Cache bind mounts (after the dir mounts, so they have priority over
     // them).
     if has_disk {
         for cache in mounts.caches.iter().filter(|c| c.enabled) {
+            let cache_root = safe_resolve::open_dir(&format!("/mnt/disk/cache/{}", cache.name))?;
             for target in &cache.paths {
-                let rel = target.strip_prefix('/').unwrap_or(target);
-                let src = Path::new("/mnt/disk/cache").join(&cache.name).join(rel);
-                let dst = crate::util::resolve_in_root(rootfs, target);
-                std::fs::create_dir_all(&src)?;
-                std::fs::create_dir_all(&dst)?;
-                super::mount::bind(&src.to_string_lossy(), &dst.to_string_lossy(), false)?;
-                info!("cache: {} → {}", &cache.name, dst.display());
+                let Some(dst) = resolve_or_skip(&rootfs, target, &policy)? else {
+                    continue;
+                };
+                // Paths of the same cache can be in each other, so the
+                // cache dir can have symlinks of the container user.
+                let Some(src) = resolve_or_skip(&cache_root, target, &policy)? else {
+                    continue;
+                };
+                super::mount::bind_fd(&src.fd, &dst.fd, false)
+                    .map_err(|e| anyhow::anyhow!("cache {} → {target}: {e}", cache.name))?;
+                info!("cache: {} → {target}", cache.name);
             }
         }
     }
@@ -198,23 +224,49 @@ pub(super) fn assemble(mounts: &MountConfig) -> anyhow::Result<()> {
         let _ = std::fs::remove_dir_all(&project_mask_root);
         std::fs::create_dir_all(&project_mask_root)?;
 
-        let project_root = crate::util::resolve_in_root(rootfs, &project_mount.target);
-
         // User-defined masks: bind-mount the empty source directory of the
-        // mask over each of its paths in the project.
+        // mask over each of its paths in the project. A mask hides secrets,
+        // so a refused path stops the boot. It is not skipped. A guest can
+        // thus stop the next boot of its own project, and that is accepted.
+        // The project dir is the root of the mask paths, so a `..` or a
+        // symlink can not move a mask out of the project.
+        let project = safe_resolve::mkdirs(rootfs.as_fd(), &project_mount.target, &policy)
+            .map_err(|e| anyhow::anyhow!("masks: {e:#}"))?;
         for mask in &mounts.masks {
-            let src = format!("{project_mask_root}/{}", mask.name);
-            std::fs::create_dir_all(&src)?;
+            let src_path = format!("{project_mask_root}/{}", mask.name);
+            std::fs::create_dir_all(&src_path)?;
+            let src = safe_resolve::open_dir(&src_path)?;
             for rel in &mask.paths {
-                let dst = project_root.join(rel);
-                std::fs::create_dir_all(&dst)?;
-                super::mount::bind(&src, &dst.to_string_lossy(), true)?;
-                info!("mask {}: hid {}", mask.name, dst.display());
+                let dst = safe_resolve::mkdirs(project.fd.as_fd(), rel, &policy)
+                    .map_err(|e| anyhow::anyhow!("mask {}: {e:#}", mask.name))?;
+                super::mount::bind_fd(&src, &dst.fd, true)
+                    .map_err(|e| anyhow::anyhow!("mask {} → {rel}: {e}", mask.name))?;
+                info!("mask {}: hid {rel}", mask.name);
             }
         }
     }
 
     Ok(())
+}
+
+/// Resolve the mount target `path` below `root`.
+/// Returns:
+///   The directory, or `None` if the policy refuses a symlink in the path.
+///   A refused path gets a warning, and the boot continues without this
+///   mount.
+fn resolve_or_skip(
+    root: &OwnedFd,
+    path: &str,
+    policy: &Policy,
+) -> anyhow::Result<Option<safe_resolve::Resolved>> {
+    match safe_resolve::mkdirs(root.as_fd(), path, policy) {
+        Ok(dir) => Ok(Some(dir)),
+        Err(e) if e.is::<safe_resolve::Refused>() => {
+            warn!("skipping mount: {e}");
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Read `/dev/kmsg` without blocking and return the last 20 lines that

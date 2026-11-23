@@ -348,6 +348,8 @@ impl supervisor::Server for SupervisorImpl {
                 epoch: params.get_epoch(),
                 epoch_nanos: params.get_epoch_nanos(),
                 host_ports: params.get_host_ports()?.iter().collect(),
+                uid,
+                gid,
             },
             mount_config: MountConfig {
                 image_id: params.get_image_id()?.to_str()?.to_string(),

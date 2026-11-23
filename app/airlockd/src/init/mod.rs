@@ -18,6 +18,10 @@ pub struct InitConfig {
     /// Host TCP ports whose traffic goes through the network proxy, so the
     /// sandbox can intercept localhost traffic.
     pub host_ports: Vec<u16>,
+    /// Container user ID.
+    pub uid: u32,
+    /// Container group ID.
+    pub gid: u32,
 }
 
 /// A directory mount: a VirtioFS tag mapped to a container path.
