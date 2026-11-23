@@ -47,10 +47,7 @@ gets only a surrogate.
 ## Codex directory
 
 All sandboxes with the `codex` pack share `~/.codex`, for example the
-settings and the sessions. Each sandbox has its own `~/.codex/tmp` on the
-sandbox disk. Codex keeps the helper files of its running processes
-there. If sandboxes share this directory, Codex in one sandbox can delete
-the helpers of Codex in another sandbox.
+settings and the sessions.
 
 ## Airlock tools
 

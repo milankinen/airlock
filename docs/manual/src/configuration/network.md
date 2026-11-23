@@ -275,13 +275,6 @@ it in the VM's system trust store. TLS interception is therefore
 transparent to processes inside the container — they see valid
 certificates.
 
-The certificates also pass strict X.509 checks. For example, Python 3.13
-and later use strict checks by default. A sandbox that an older airlock
-version made keeps its old CA, and strict checks refuse that CA. In such a
-sandbox, Python shows `certificate verify failed`. To get a new CA, remove
-the sandbox with `airlock remove` and start it again. This also removes the
-disk of the sandbox.
-
 You can disable middleware without removing it:
 
 ```toml
