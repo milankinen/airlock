@@ -3,6 +3,10 @@ name: Publish Manual
 on:
   workflow_dispatch:
 
+# Read-only token by default. The deploy job adds the Pages permissions.
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest

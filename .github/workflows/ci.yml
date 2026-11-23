@@ -5,6 +5,10 @@ on:
     branches: [ main ]
   pull_request:
 
+# Read-only token for all jobs.
+permissions:
+  contents: read
+
 jobs:
   # ── Stage 1 ────────────────────────────────────────────
   lint-macos:

@@ -18,6 +18,12 @@ concurrency:
   group: release
   cancel-in-progress: false
 
+# Read-only token by default. Jobs that write add their own permissions.
+# actions: read lets gh read CI runs and download their artifacts.
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   resolve-ci-run:
     if: github.ref == 'refs/heads/main'
@@ -247,6 +253,7 @@ jobs:
       ci_run_id: ${{ needs.resolve-ci-run.outputs.run_id }}
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@v4
       - name: Download Linux artifacts from CI
@@ -367,6 +374,7 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       pages: write
       id-token: write
     environment:
