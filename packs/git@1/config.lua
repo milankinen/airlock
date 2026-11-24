@@ -1,8 +1,8 @@
 -- Git: commit author and committer from the host.
 
--- Read a key from the global git config of the host
+-- Read a key from the host's Git config for the current directory.
 local function git_config(key)
-    local cmd = io.popen("git config --global --includes --get " .. key .. " 2>/dev/null")
+    local cmd = io.popen("git config --get " .. key .. " 2>/dev/null")
     if not cmd then
         return nil
     end
