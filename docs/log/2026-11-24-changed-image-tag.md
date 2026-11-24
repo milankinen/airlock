@@ -4,8 +4,9 @@
 
 After a change of `vm.image` from `debian:bookworm-slim` to
 `debian:trixie-slim`, the next start kept the bookworm image and the old
-disk. The output showed the trixie tag with the bookworm digest. Versions
-v2026.11.3 to v2026.11.5 with `if-not-present` have this problem.
+disk. The output showed the trixie tag with the bookworm digest. This
+occurs with `if-not-present` on v2026.11.5. The code is in v2026.11.3 and
+later. v2026.11.3 and v2026.11.4 were not tested.
 
 ## Cause
 
