@@ -193,6 +193,32 @@ check_legacy_installs_nothing() {
     check_legacy_installs_nothing
 }
 
+# Test that the Git pack uses the host identity for this repository.
+#   1. Set the name locally and select the email by remote URL
+#   2. Start the sandbox and check the author and committer
+@test "git pack uses the local commit name and the email for its remote" {
+    local key
+    for key in "${!GIT_@}"; do
+        unset "$key"
+    done
+    export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$FILE_TEMP_DIR/gitconfig"
+    git config --global user.email default@example.com
+    git config --global 'includeIf.hasconfig:remote.*.url:https://work.example/**.path' work.inc
+    git config --file "$FILE_TEMP_DIR/work.inc" user.email dev@work.example
+    git init -q repo
+    cd repo
+    git remote add origin https://work.example/team/repo.git
+    git config user.name "Project Name"
+    write_config '[packs]
+git = { version = 1 }'
+
+    run_vm sh -c 'echo "author=$GIT_AUTHOR_NAME <$GIT_AUTHOR_EMAIL>"
+                  echo "committer=$GIT_COMMITTER_NAME <$GIT_COMMITTER_EMAIL>"'
+    assert_success
+    assert_output_contains "author=Project Name <dev@work.example>"
+    assert_output_contains "committer=Project Name <dev@work.example>"
+}
+
 # Test the pack life cycle on a Debian sandbox, with the same steps as the
 # Alpine test.
 #   1. Run start with all packs and no terminal, and check the installs
