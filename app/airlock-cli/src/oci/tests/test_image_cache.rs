@@ -225,6 +225,15 @@ fn recreate_of_imported_sandbox_with_unknown_image_stops() {
     );
 }
 
+/// The stored image of a sandbox that started with `name` and `digest`.
+fn stored(name: &str, digest: &str) -> StoredImage {
+    let image = OciImage {
+        name: name.to_string(),
+        ..image(digest, vec![])
+    };
+    stored_image(&serde_json::to_vec(&CachedImage::V3(image)).unwrap()).unwrap()
+}
+
 /// Test that only an `if-not-present` tag with a registry source pins the
 /// stored digest.
 ///   1. Check that an `if-not-present` tag gets the pin
@@ -235,7 +244,7 @@ fn stored_digest_is_pinned_only_for_if_not_present_tag_with_registry_source() {
     let digest = format!("sha256:{}", "a".repeat(64));
     let tag = ImageRef::auto("alpine:3");
     assert_eq!(
-        stored_pin(&tag, Some(&format!("{digest}\n"))).map(|r| r.name),
+        stored_pin(&tag, Some(&stored("alpine:3", &format!("{digest}\n")))).map(|r| r.name),
         Some(format!("alpine:3@{digest}"))
     );
 
@@ -249,8 +258,31 @@ fn stored_digest_is_pinned_only_for_if_not_present_tag_with_registry_source() {
         ..tag.clone()
     };
     for cfg in [&if_changed, &pinned, &docker] {
-        assert!(stored_pin(cfg, Some(&digest)).is_none(), "{cfg:?}");
+        let stored = stored(&cfg.name, &digest);
+        assert!(stored_pin(cfg, Some(&stored)).is_none(), "{cfg:?}");
     }
     assert!(stored_pin(&tag, None).is_none());
-    assert!(stored_pin(&tag, Some("sha256:short")).is_none());
+    assert!(stored_pin(&tag, Some(&stored("alpine:3", "sha256:short"))).is_none());
+}
+
+/// Test that a changed tag does not pin the stored digest. The registry
+/// resolves a pin by its digest only, and the old digest is in the same
+/// repository, so a pin gives the old image.
+///   1. Check that an image stored with another tag gives no pin
+///   2. Check that an imported sandbox, which stores no name, gets the pin
+#[test]
+fn stored_digest_of_another_tag_is_not_pinned() {
+    let digest = format!("sha256:{}", "a".repeat(64));
+    let tag = ImageRef::auto("debian:trixie-slim");
+    let other = stored("debian:bookworm-slim", &digest);
+    assert!(stored_pin(&tag, Some(&other)).is_none());
+
+    let imported = StoredImage {
+        digest: digest.clone(),
+        name: None,
+    };
+    assert_eq!(
+        stored_pin(&tag, Some(&imported)).map(|r| r.name),
+        Some(format!("debian:trixie-slim@{digest}"))
+    );
 }

@@ -210,11 +210,15 @@ pub async fn prepare(
         return use_cached_image(data_dir, sandbox_dir, &sandbox_image, img).map(unchanged);
     }
 
-    // Read only the stored digest (if any) for change detection. An
-    // imported sandbox without an image link has the digest in the marker.
-    let stored_digest = read_image_json(&sandbox_image)
-        .and_then(|json| stored_image_id(json.as_bytes()))
-        .or_else(|| read_import_marker(sandbox_dir));
+    // Read only the stored digest and name (if any) for change detection.
+    // An imported sandbox without an image link has only the digest, in the
+    // marker.
+    let stored = read_image_json(&sandbox_image)
+        .and_then(|json| stored_image(json.as_bytes()))
+        .or_else(|| {
+            let digest = read_import_marker(sandbox_dir)?;
+            Some(StoredImage { digest, name: None })
+        });
 
     let registry_host: String = image_name
         .parse::<oci_client::Reference>()
@@ -222,7 +226,7 @@ pub async fn prepare(
 
     // The pinned try never asks for credentials and falls back to the tag:
     // a local image stores its image ID, which no registry knows.
-    let resolved = match stored_pin(image_cfg, stored_digest.as_deref()) {
+    let resolved = match stored_pin(image_cfg, stored.as_ref()) {
         Some(pinned_cfg) => {
             match resolve_with_auth(vault, &pinned_cfg, &registry_host, false).await {
                 Err(e) if !cli::is_interrupted() => {
@@ -252,13 +256,9 @@ pub async fn prepare(
     };
 
     // Check for an image change before the download.
-    let digest_changed = stored_digest
-        .as_deref()
-        .is_none_or(|s| s.trim() != image.digest);
-
     let mut change = ImageChange::Unchanged;
-    if let Some(old_digest) = stored_digest
-        && digest_changed
+    if let Some(old) = stored
+        && old.digest.trim() != image.digest
     {
         change = match guard_recreate(sandbox_dir, on_change)? {
             OnImageChange::Ask => ask_image_changed()?,
@@ -275,7 +275,7 @@ pub async fn prepare(
             // `ensure_image` only from the same resolution as its source.
             // An imported sandbox can have no valid old digest. Then the
             // old image is gone.
-            let old_digest = old_digest.trim();
+            let old_digest = old.digest.trim();
             let old_image = cache::image_path(data_dir, old_digest)
                 .ok()
                 .and_then(|path| read_ready_image(data_dir, &path));
@@ -393,7 +393,8 @@ pub fn import_image(
         .read("image", MAX_IMAGE_FILE)
         .ok()
         .flatten()
-        .and_then(|bytes| stored_image_id(&bytes))
+        .and_then(|bytes| stored_image(&bytes))
+        .map(|stored| stored.digest)
         .filter(|digest| is_sha256_digest(digest));
     // Use the cache file, not the old file. Only the cache file is trusted.
     let cached = digest.as_deref().and_then(|digest| {
@@ -535,19 +536,34 @@ fn read_image_json(path: &VerifiedPath) -> Option<String> {
     path.read_to_string_capped(MAX_IMAGE_FILE).ok()
 }
 
+/// The image of the last start of a sandbox.
+struct StoredImage {
+    /// Image digest.
+    digest: String,
+    /// Image reference that the user configured. `None` if it is not known
+    /// (an imported sandbox).
+    name: Option<String>,
+}
+
 /// Pin the stored digest of a sandbox that has no ready cache entry (after
 /// a format change or a sweep). With `if-not-present`, a moved tag must not
 /// give an image change.
 /// Args:
 ///  - `image_cfg`: Configured image
-///  - `stored_digest`: Digest of the last start
+///  - `stored`: Image of the last start
 ///
 /// Returns:
 ///   The pinned reference, or `None` if no pin applies. Local engines get
-///   none: they store an image ID, not a registry digest.
-fn stored_pin(image_cfg: &ImageRef, stored_digest: Option<&str>) -> Option<ImageRef> {
-    let digest = stored_digest?.trim();
-    let pin = image_cfg.pull_policy == PullPolicy::IfNotPresent
+///   none: they store an image ID, not a registry digest. A changed name
+///   gets none: the old digest can exist in the repository of the new tag.
+fn stored_pin(image_cfg: &ImageRef, stored: Option<&StoredImage>) -> Option<ImageRef> {
+    let stored = stored?;
+    let digest = stored.digest.trim();
+    // An unknown name keeps the pin. Otherwise a moved tag is an image change,
+    // and `--yes` then deletes the disk of an imported sandbox.
+    let same_name = stored.name.as_ref().is_none_or(|n| *n == image_cfg.name);
+    let pin = same_name
+        && image_cfg.pull_policy == PullPolicy::IfNotPresent
         && image_cfg.pinned_digest().is_none()
         && matches!(
             image_cfg.resolution,
@@ -560,15 +576,18 @@ fn stored_pin(image_cfg: &ImageRef, stored_digest: Option<&str>) -> Option<Image
     })
 }
 
-/// Get the image digest from image JSON of the current or an older schema,
-/// for the image change check after a schema change.
-fn stored_image_id(json: &[u8]) -> Option<String> {
+/// Get the image digest and name from image JSON of the current or an older
+/// schema, for the image change check after a schema change.
+fn stored_image(json: &[u8]) -> Option<StoredImage> {
     let json: serde_json::Value = serde_json::from_slice(json).ok()?;
-    // The digest has the same place in all known schemas.
+    // Both have the same place in all known schemas.
     if !matches!(json["schema"].as_str(), Some("v2" | "v3")) {
         return None;
     }
-    json["image_id"].as_str().map(String::from)
+    Some(StoredImage {
+        digest: json["image_id"].as_str()?.to_string(),
+        name: json["name"].as_str().map(String::from),
+    })
 }
 
 /// Read a cached image JSON file and unwrap it into an [`OciImage`].
