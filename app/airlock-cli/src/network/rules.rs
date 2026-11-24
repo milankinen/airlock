@@ -10,6 +10,7 @@ use std::rc::Rc;
 
 use anyhow::Context;
 
+use super::host::{HostPattern, PatternError};
 use super::http;
 use super::middleware::LogFn;
 use super::target::{InjectTarget, InjectedSecret, MiddlewareTarget, NetworkTarget};
@@ -169,10 +170,7 @@ pub(crate) fn rule_targets(
     for target_str in allow {
         let (host, port) = parse_pattern(target_str)
             .with_context(|| crate::messages::network::rule_allow_context(rule_name))?;
-        let target = NetworkTarget {
-            host: host.to_string(),
-            port,
-        };
+        let target = NetworkTarget { host, port };
         if passthrough {
             out.passthrough.push(target.clone());
         }
@@ -181,10 +179,7 @@ pub(crate) fn rule_targets(
     for target_str in deny {
         let (host, port) = parse_pattern(target_str)
             .with_context(|| crate::messages::network::rule_deny_context(rule_name))?;
-        out.deny.push(NetworkTarget {
-            host: host.to_string(),
-            port,
-        });
+        out.deny.push(NetworkTarget { host, port });
     }
     Ok(out)
 }
@@ -217,7 +212,7 @@ pub fn resolve_middleware(
             let (host, port) = parse_pattern(target_str)
                 .with_context(|| crate::messages::network::middleware_target_context(mw_name))?;
             targets.push(MiddlewareTarget {
-                host: host.to_string(),
+                host,
                 port,
                 middleware: compiled.clone(),
             });
@@ -275,7 +270,7 @@ fn inject_targets(
         let (host, port) = parse_pattern(target_str)
             .with_context(|| crate::messages::network::rule_allow_context(rule_name))?;
         targets.push(InjectTarget {
-            host: host.to_string(),
+            host,
             port,
             secrets: secrets.to_vec(),
         });
@@ -353,13 +348,21 @@ pub(super) fn parse_target(target: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Parse a `host[:port]` pattern into host and validated port.
+/// Parse a `host[:port]` pattern into host pattern and validated port.
 /// Returns:
 ///   `(host, port)`. The port is `None` ("any port") only if the pattern has
 ///   no port or the port is `*`. All other port strings that are not valid
-///   numbers give an error.
-pub fn parse_pattern(target: &str) -> anyhow::Result<(&str, Option<u16>)> {
+///   numbers give an error. A host that can never match a destination
+///   ([`HostPattern::parse`]) also gives an error.
+pub fn parse_pattern(target: &str) -> anyhow::Result<(HostPattern, Option<u16>)> {
     let (host, port) = parse_target(target);
+    // A `/` outside of the host, as in `[fc00::]/7`, is no range either.
+    let host = if target.contains('/') && !host.contains('/') {
+        Err(PatternError::IpRange)
+    } else {
+        HostPattern::parse(host)
+    }
+    .map_err(|e| anyhow::anyhow!(crate::messages::network::invalid_host(target, e)))?;
     // Never use the wildcard as a fallback. With a fallback, a typo such as
     // `allow = ["*:8O80"]` (letter O) or `["api.example.com:https"]` would
     // allow all ports instead of none. An inject target with a typo would
@@ -400,8 +403,30 @@ mod tests {
             ("[::1]", "::1", None),
             ("[::1]:443", "::1", Some(443)),
             ("[2001:db8::1]:8080", "2001:db8::1", Some(8080)),
+            ("10.0.0.0/8:443", "10.0.0.0/8", Some(443)),
+            ("fc00::/7", "fc00::/7", None),
+            ("[fc00::/7]:443", "fc00::/7", Some(443)),
         ] {
-            assert_eq!(parse_pattern(pattern).unwrap(), (host, port), "{pattern}");
+            let (parsed, parsed_port) = parse_pattern(pattern).unwrap();
+            assert_eq!(
+                (parsed.to_string(), parsed_port),
+                (host.to_string(), port),
+                "{pattern}"
+            );
+        }
+    }
+
+    /// Test that a pattern whose host can never match fails, also with a
+    /// `/` outside of the host. Such a deny pattern would load and deny
+    /// nothing.
+    ///   1. Parse patterns with a bad host and with a `/` after the port or
+    ///      the brackets
+    ///   2. Check that each fails with an error that names the pattern
+    #[test]
+    fn parse_pattern_with_host_that_never_matches_fails() {
+        for bad in ["10.0.0.0:443/8", "[fc00::]/7", "10.*"] {
+            let err = parse_pattern(bad).unwrap_err().to_string();
+            assert!(err.contains(bad), "{bad}: {err}");
         }
     }
 

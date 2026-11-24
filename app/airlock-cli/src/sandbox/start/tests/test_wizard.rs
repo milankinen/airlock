@@ -364,8 +364,7 @@ fn template_section_is_first_only_when_templates_exist() {
 
 /// Test that a pack with no kind shows in the "Other" section, after the
 /// tools. The section is only there when such a pack exists.
-///   1. Open the form with the built-in packs and the sample pack, and
-///      check that there is no
+///   1. Open the form with only a tool pack, and check that there is no
 ///      "Other" section
 ///   2. Open the form with a tool pack and a pack with no kind
 ///   3. Check that the pack with no kind is the only row of the "Other"
@@ -380,20 +379,16 @@ fn pack_without_kind_shows_in_other_section_after_tools() {
             .map(String::from)
             .collect()
     };
-    let form = Form::new(
-        &data_dir_at(data.path()),
-        &crate::packs::init_with_sample(),
-        None,
-        &[],
-        Mode::Start,
+    let hammer = (
+        "hammer@1/pack.toml",
+        "label = \"Hammer\"\ndescription = \"A tool\"\nkind = \"tool\"\n".to_string(),
     );
+    let tools_only = load_packs(vec![hammer.clone()]);
+    let form = Form::new(&data_dir_at(data.path()), &tools_only, None, &[], Mode::Start);
     assert!(!lines(&form).iter().any(|l| l == "Other"));
 
     let packs = load_packs(vec![
-        (
-            "hammer@1/pack.toml",
-            "label = \"Hammer\"\ndescription = \"A tool\"\nkind = \"tool\"\n".into(),
-        ),
+        hammer,
         (
             "misc@1/pack.toml",
             "label = \"Misc\"\ndescription = \"No kind\"\n".into(),

@@ -7,7 +7,10 @@ use crate::config::config_values;
 use crate::network::rules::RuleSet;
 use crate::packs::approval::Approved;
 use crate::sandbox::resolve_env;
-use crate::test_cfg::{configured_variants, host_env_vault, resolve_project_toml};
+use crate::test_cfg::network::network_from_toml;
+use crate::test_cfg::{
+    configured_variants, host_env_vault, project_toml_error, resolve_project_toml,
+};
 
 /// Return the config values of each built-in pack for all combinations of
 /// its arg values, as `(pack name, label, value)`.
@@ -318,7 +321,7 @@ fn agent_packs_inject_host_tokens_that_exist() {
         };
 
         let (env, inject) = resolve(&tokens);
-        let mut hosts: Vec<&str> = inject.iter().map(|t| t.host.as_str()).collect();
+        let mut hosts: Vec<String> = inject.iter().map(|t| t.host.to_string()).collect();
         hosts.sort_unstable();
         assert_eq!(hosts, api_hosts, "{pack}");
         let mut expected = tokens.clone();
@@ -418,4 +421,63 @@ fn git_pack_sets_host_commit_identity() {
     );
     assert_eq!(env.guest_value("GIT_COMMITTER_NAME"), Some("Env Committer"));
     assert_eq!(env.guest_value("GIT_COMMITTER_EMAIL"), None);
+}
+
+/// Test that the private network pack denies the private addresses, also in
+/// other address forms and behind names, and lets the `except` addresses
+/// through. In `allow` mode, the same addresses get the opposite.
+///   1. Build the network of the pack in `deny` mode with two exceptions
+///   2. Check addresses in and out of the exceptions, and the addresses
+///      that a name can connect to
+///   3. Build it in `allow` mode under deny-by-default and check addresses
+///   4. Check that an exception that is not an address stops the config
+#[test]
+fn private_network_pack_denies_private_addresses_except_listed() {
+    let network = |policy: &str, mode: &str| {
+        network_from_toml(&format!(
+            "[network]\npolicy = \"{policy}\"\n[packs]\nprivate-network = {{ version = 1, \
+             args = {{ mode = \"{mode}\", except = \"192.168.1.10, 10.8.0.0/16\" }} }}\n"
+        ))
+        .unwrap()
+        .network
+    };
+    let deny = network("allow-by-default", "deny");
+    for (host, allowed) in [
+        ("192.168.1.1", false),
+        ("[::ffff:a9fe:a9fe]", false),
+        ("127.0.0.1", false),
+        ("fd00::1", false),
+        ("192.168.1.10", true),
+        ("10.8.3.4", true),
+        ("8.8.8.8", true),
+    ] {
+        assert_eq!(deny.resolve_target(host, 80).allowed, allowed, "{host}");
+    }
+    let name = deny.resolve_target("git.example.com", 443);
+    for (ip, allowed) in [
+        ("10.8.0.5", true),
+        ("10.9.0.1", false),
+        ("169.254.169.254", false),
+        ("8.8.8.8", true),
+    ] {
+        assert_eq!(name.allows_address(ip.parse().unwrap()), allowed, "{ip}");
+    }
+
+    let allow = network("deny-by-default", "allow");
+    for (host, allowed) in [
+        ("192.168.1.1", true),
+        ("192.168.1.10", false),
+        ("10.8.3.4", false),
+        ("8.8.8.8", false),
+    ] {
+        assert_eq!(allow.resolve_target(host, 80).allowed, allowed, "{host}");
+    }
+
+    let err = project_toml_error(
+        "[packs]\nprivate-network = { version = 1, args = { except = \"nas.lan\" } }\n",
+    );
+    assert!(
+        err.contains("pack private-network: `nas.lan` is not an IP address or an IP range"),
+        "{err}"
+    );
 }

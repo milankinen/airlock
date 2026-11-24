@@ -72,6 +72,7 @@ dependencies = [
  "hyper-util",
  "include_dir",
  "indicatif",
+ "ipnet",
  "jsonc-parser",
  "keyring",
  "libc",

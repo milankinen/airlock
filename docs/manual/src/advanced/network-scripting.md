@@ -72,7 +72,7 @@ The `req` object is available in every middleware script:
 | `req:header(name)`                 | Read a single header value (use `req:header("host")` for the raw, client-sent `Host`) |
 | `req:setHeader(name, value)`       | Set or overwrite a header                                                             |
 | `req:setBasicAuth(user, password)` | Set the `Authorization` header to HTTP Basic credentials.                             |
-| `req:hostMatches(pattern)`         | Match the connect target against a wildcard pattern                                   |
+| `req:hostMatches(pattern)`         | Match the connect target against a host pattern of a network rule                     |
 | `req:body()`                       | Read the request body (returns a Body object)                                         |
 | `req:setBody(value)`               | Replace the body (string, table, Body, or nil)                                        |
 | `req:deny()`                       | Block the request with a 403 response                                                 |

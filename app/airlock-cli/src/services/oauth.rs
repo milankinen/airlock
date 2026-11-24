@@ -166,7 +166,7 @@ impl Upstream {
     ) -> anyhow::Result<(StatusCode, Bytes)> {
         let host = self.endpoint.host();
         let port = self.endpoint.port();
-        let tcp = tokio::net::TcpStream::connect((host, port))
+        let tcp = tokio::net::TcpStream::connect((host.to_string(), port))
             .await
             .with_context(|| crate::messages::services::connect_to(host, port))?;
         let mut config = (*self.tls).clone();

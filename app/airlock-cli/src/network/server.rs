@@ -14,6 +14,7 @@ use tokio::task::AbortHandle;
 use tracing::debug;
 
 use super::grant::GrantAccess;
+use super::host::Host;
 use super::host_socket::HostSocket;
 use super::target::ResolvedTarget;
 use super::{DenyReporter, Network, http, io, tcp, tls, traffic};
@@ -121,7 +122,7 @@ impl Network {
         client_sink: tcp_sink::Client,
         grant: Option<&GrantAccess>,
     ) -> (tcp_sink::Client, AbortHandle, bool) {
-        let net_target = self.resolve_target_in(host, port, grant);
+        let net_target = self.resolve_target_in(&Host::parse(host), port, grant);
         debug!(
             "connect {host}:{port} ({}{})",
             if net_target.allowed {
@@ -132,7 +133,12 @@ impl Network {
             if grant.is_some() { ", grant" } else { "" }
         );
         let id = self.next_connection_id();
-        self.emit_connect(id, &net_target.host, net_target.port, net_target.allowed);
+        self.emit_connect(
+            id,
+            &net_target.host.to_string(),
+            net_target.port,
+            net_target.allowed,
+        );
         let allowed = net_target.allowed;
         let (sink, abort) = spawn_tcp_connection(
             id,
@@ -298,6 +304,11 @@ async fn handle_connection(
 ) -> anyhow::Result<()> {
     let addr = format!("{}:{}", target.host, target.port);
 
+    // Phase 2 of the decision: check the addresses of an allowed name, with
+    // one DNS lookup. A target with no allowed address gets the normal
+    // deny handling below.
+    tcp::resolve(&mut target).await?;
+
     // Passthrough targets skip all detection. The proxy connects to the real
     // server immediately and relays raw bytes. Non-HTTP protocols need this
     // when their first client bytes cannot be sniffed. For example, the
@@ -327,7 +338,8 @@ async fn handle_connection(
     // *is* the raw stream. `detect_http` replays the sniffed prefix outside
     // the counter, so it does not count those bytes two times.
     let (container, alpn) = if is_tls {
-        tls::accept_container(&target.host, first, rx, client_sink, interceptor, counter).await?
+        let host = target.host.to_string();
+        tls::accept_container(&host, first, rx, client_sink, interceptor, counter).await?
     } else {
         (
             traffic::count(tcp::container_transport(first, rx, client_sink), counter),
@@ -349,7 +361,7 @@ async fn handle_connection(
     // it got in some other way). Thus refuse, and do not connect upstream.
     if target.interceptor.is_some() && !is_http {
         debug!("denied: {addr} (owned host sent non-HTTP bytes)");
-        deny_reporter.report(&target.host, target.port, false);
+        deny_reporter.report(&target.host.to_string(), target.port, false);
         return Ok(());
     }
 
@@ -369,7 +381,7 @@ async fn handle_connection(
         .await?;
     } else {
         if !target.allowed {
-            deny_reporter.report(&target.host, target.port, target.grantable);
+            deny_reporter.report(&target.host.to_string(), target.port, target.grantable);
         }
         Box::pin(tcp::relay(container, server)).await;
     }

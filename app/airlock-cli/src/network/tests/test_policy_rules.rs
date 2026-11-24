@@ -1,6 +1,6 @@
 //! Tests for network policy and rules from config: allow, deny,
-//! passthrough and inject decisions, config conflicts and the public-only
-//! network.
+//! passthrough and inject decisions, IP addresses and ranges, config
+//! conflicts and the public-only network.
 
 use std::sync::atomic::Ordering;
 
@@ -320,17 +320,27 @@ fn public_only_network_denies_local_destinations_by_name_and_literal() {
     assert!(public.allowed && public.public_only);
 }
 
-/// Test that a public-only network never opens a connection to a local
-/// address. A denied answer is not enough if the dial already happened.
+/// Test that a network never opens a connection to a local address that it
+/// denies: a public-only network, a deny range and the private network pack.
+/// A denied answer is not enough if the dial already happened.
 ///   1. Start a local server that counts accepted connections
 ///   2. Send a GET to it by three loopback names through each network
-///   3. Check the 204 answers on the normal network only
-///   4. Check that the server accepted no connection from the public-only
-///      network
+///   3. Check the 204 answers on the normal network, and the 403 answers on
+///      the other networks
+///   4. Check that the server accepted no connection from the other networks
 #[test]
-fn public_only_network_never_dials_local_address() {
+fn network_that_denies_local_addresses_never_dials_them() {
     let toml = "[network]\npolicy = \"allow-always\"";
-    for (network, reachable) in [(network(toml).public_only(), false), (network(toml), true)] {
+    let by_default = "[network]\npolicy = \"allow-by-default\"\n";
+    // `localhost` also resolves to `::1`, which `127.0.0.0/8` does not have.
+    let deny_range = format!("{by_default}[network.rules.r]\ndeny = [\"127.0.0.0/8\", \"::1\"]");
+    let pack = format!("{by_default}[packs]\nprivate-network = {{ version = 1 }}");
+    for (network, reachable) in [
+        (network(toml).public_only(), false),
+        (network(&deny_range), false),
+        (network(&pack), false),
+        (network(toml), true),
+    ] {
         let upstream = AcceptCounter::bind();
         let port = upstream.port();
         run_network(network, |proxy| async move {
@@ -342,14 +352,75 @@ fn public_only_network_never_dials_local_address() {
                     .unwrap()
                     .roundtrip(&http_get(port, "/"))
                     .await;
-                assert_eq!(
-                    resp.starts_with("HTTP/1.1 204"),
-                    reachable,
-                    "{host}: {resp}"
-                );
+                // A denied name gets the normal deny answer, also when only
+                // its resolved address is denied.
+                let expected = if reachable {
+                    "HTTP/1.1 204"
+                } else {
+                    "HTTP/1.1 403"
+                };
+                assert!(resp.starts_with(expected), "{host}: {resp}");
             }
             let expected = if reachable { 3 } else { 0 };
             assert_eq!(accepted.load(Ordering::SeqCst), expected);
         });
     }
+}
+
+/// Test that a deny of an IP address or a range covers each text form of
+/// the address and the addresses that a name resolves to. The guest picks
+/// the form, so else `::ffff:169.254.169.254` or a name gets past the deny.
+///   1. Build a network with deny ranges, a denied address and an exact
+///      allow rule
+///   2. Check that each form of a denied address is denied
+///   3. Check the addresses that a name can connect to, on two ports
+///   4. Check that a port forward and allow-always have no deny ranges
+#[test]
+fn deny_of_address_or_range_covers_all_address_forms_and_names() {
+    let network = network(
+        "[network]\npolicy = \"allow-by-default\"\n\
+         [network.rules.r]\n\
+         allow = [\"git.example.com\"]\n\
+         deny = [\"10.0.0.0/8\", \"fd00::/8\", \"8.8.0.0/16:80\", \"127.0.0.0/8\", \
+         \"169.254.169.254\"]\n\
+         [network.ports.db]\nhost = [5432]\n",
+    );
+    for host in [
+        "169.254.169.254",
+        "::ffff:169.254.169.254",
+        "[::ffff:a9fe:a9fe]",
+        "64:ff9b::a9fe:a9fe",
+        "10.1.2.3",
+    ] {
+        assert!(!network.resolve_target(host, 443).allowed, "{host}");
+    }
+    for (port, ip, expected) in [
+        (443, "10.1.2.3", false),
+        (443, "169.254.169.254", false),
+        (443, "::ffff:10.1.2.3", false),
+        (443, "64:ff9b::a01:203", false),
+        (443, "fd00::1", false),
+        (443, "192.168.1.1", true),
+        (443, "8.8.8.8", true),
+        (80, "8.8.8.8", false),
+    ] {
+        let target = network.resolve_target("git.example.com", port);
+        assert!(target.allowed);
+        assert_eq!(
+            target.allows_address(ip.parse().unwrap()),
+            expected,
+            "{ip}:{port}"
+        );
+    }
+    assert!(
+        network
+            .resolve_target("localhost", 5432)
+            .allows_all_addresses()
+    );
+    network.handle().control().set_policy(Policy::AllowAlways);
+    assert!(
+        network
+            .resolve_target("git.example.com", 443)
+            .allows_all_addresses()
+    );
 }

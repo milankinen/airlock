@@ -30,6 +30,7 @@
         - [Node.js](./packs/tools/nodejs.md)
         - [Python](./packs/tools/python.md)
         - [Rust](./packs/tools/rust.md)
+    - [Private network](./packs/private-network.md)
     - [Authoring packs](./packs/authoring.md)
 - [Templates](./templates.md)
 - [Secrets](./secrets.md)

@@ -43,6 +43,7 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 include_dir = { workspace = true }
 indicatif = { workspace = true }
+ipnet = { workspace = true }
 keyring = { workspace = true }
 libc = { workspace = true }
 mimalloc = { workspace = true }

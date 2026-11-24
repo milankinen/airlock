@@ -58,6 +58,7 @@ deny = [
 ```
 
 The port part must be a number or `*` (or left out to match all ports).
+In the host part, `*` must be the full host or a `*.` prefix.
 
 airlock always checks deny patterns first, and they win unconditionally,
 regardless of allow rules. This makes it safe to use broad wildcards in
@@ -75,6 +76,27 @@ You can disable rules without removing them:
 enabled = false
 allow = ["*"]
 ```
+
+### IP addresses and ranges
+
+A pattern can also be an IP address or an IP range:
+
+```toml
+[network.rules.lan]
+allow = ["192.168.1.0/24"]
+deny = ["192.168.1.1", "[fd00::/8]:443"]
+```
+
+airlock compares IP addresses as addresses, not as text. Thus a deny of
+`169.254.169.254` also blocks `::ffff:169.254.169.254`.
+
+A name pattern matches only host names, and an address or a range
+matches only connections to an IP address. To allow a host name, add the
+name. A deny of an address or a range also blocks the host names that
+resolve to an address in it.
+
+To block the local network and the other private addresses, use the
+[private network pack](../packs/private-network.md).
 
 ### Passthrough
 
