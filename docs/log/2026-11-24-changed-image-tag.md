@@ -18,30 +18,50 @@ reference by the digest, and the old digest exists in the same repository.
 
 ## Fix
 
-The stored image file has the configured name of the last start, also in
-the `v2` schema. The pin now applies only if that name is the configured
+The pin now applies only if the name of the last start is the configured
 name. Otherwise airlock resolves the tag, and a different digest gives the
 image change question.
 
 An import marker has only a digest. It keeps the pin. Without the pin, a
 moved tag is an image change, and `--yes` removes the imported disk.
 
+## Stored name
+
+The image file of a sandbox is a hardlink to the cache entry of a digest,
+and that entry has one name. Another sandbox with the same digest and a
+different tag writes its name there, and the next start links the first
+sandbox to that entry. The name check then fails, with these effects:
+
+* A start resolves the tag. If the tag moved, an unchanged config gives an
+  image change, and `--yes` removes the disk.
+* `airlock exec` on the stopped sandbox finds no image. v2026.11.5 also has
+  this problem.
+* After the answer "Continue with current sandbox", the old entry has the
+  new tag. Another sandbox on that entry that changes to the same tag keeps
+  the old image with no question. v2026.11.5 has the same code.
+
+Each start thus writes `<name>@<digest>` to `image.ref` in the sandbox
+directory. The fast path, the pin and `airlock exec` use that name. The
+digest makes a reference that does not match the image file invalid, for
+example after a stopped start or a start of an older airlock version. A
+sandbox without a valid reference uses the name in its image file, also in
+the `v2` schema. The name of a kept old image no longer goes into the
+shared entry.
+
 ## Known limits
 
-* A sandbox that already kept its old image has the new name in its image
-  file, so it stays on the old image. Remove the sandbox to get the new
-  image.
-* Sandboxes with different tags for one digest share a cache entry, which
-  has the name of only one of them. A start links the image file of the
-  sandbox to that entry, so the next start can find an other name and
-  resolve the tag. If the tag moved, this gives the image change question,
-  as before v2026.11.3.
+* A sandbox that kept its old image on an older airlock version has the new
+  name in its image file, so it stays on the old image. Remove the sandbox
+  to get the new image.
 
 ## Tests
 
 * `test_image_cache::stored_digest_of_another_tag_is_not_pinned`
+* `test_image_cache::sandbox_keeps_own_image_name_when_cache_entry_gets_another_name`
 * `tests/vm/image.bats` changes a tag and checks the guest version and the
   disk. It fails without the fix.
 * Manual check with a local registry, for an unchanged name and a moved
   tag: a missing layer, a `v2` image file and an import marker each keep
   the old image and the disk.
+* Manual check with two sandboxes on one digest: an unchanged config with a
+  moved tag, `--yes`, `airlock exec`, and a kept old image.

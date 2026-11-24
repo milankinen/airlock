@@ -4,6 +4,7 @@
 use airlock_test_utils::temp_dir;
 
 use super::*;
+use crate::test_cfg::vault::{MemoryStorage, vault_with};
 
 /// Cache a small layer as `digest` and return its layer key.
 fn small_layer(data_dir: &DataDir, digest: &str) -> String {
@@ -285,4 +286,52 @@ fn stored_digest_of_another_tag_is_not_pinned() {
         stored_pin(&tag, Some(&imported)).map(|r| r.name),
         Some(format!("debian:trixie-slim@{digest}"))
     );
+}
+
+/// Test that a sandbox keeps its own image name when another sandbox with
+/// the same digest writes its name into the shared cache entry. Otherwise a
+/// moved tag gives an image change although the config did not change, and
+/// `airlock exec` finds no image.
+///   1. Start a sandbox with a cached image. No registry is available, so a
+///      start works only with the cached image
+///   2. Write another name into the cache entry. Start two times, because
+///      the first start links the sandbox to that entry
+///   3. Check that the sandbox image is there for its own name only
+///   4. Put a reference with another digest in the sandbox and check that it
+///      is ignored
+#[tokio::test]
+async fn sandbox_keeps_own_image_name_when_cache_entry_gets_another_name() {
+    let home = temp_dir();
+    let data_dir = &data_dir_at(home.path());
+    let sandbox = data_dir.sandboxes.join("box").unwrap();
+    std::fs::create_dir_all(real(&sandbox)).unwrap();
+    let vault = vault_with(MemoryStorage::default(), &[]);
+    let own = ImageRef {
+        resolution: Resolution::Registry,
+        insecure: true,
+        ..ImageRef::auto("127.0.0.1:1/debian:bookworm")
+    };
+    let other = ImageRef {
+        name: "127.0.0.1:1/debian:12".to_string(),
+        ..own.clone()
+    };
+    let mut entry = image("sha256:shared", vec![small_layer(data_dir, "sha256:L1")]);
+    entry.name.clone_from(&own.name);
+    ensure_image_hardlink(data_dir, &sandbox.join("image").unwrap(), &entry).unwrap();
+    let start = || prepare(data_dir, &sandbox, &own, &vault, OnImageChange::Refuse);
+    start().await.unwrap();
+
+    entry.name.clone_from(&other.name);
+    write_cached_image(data_dir, &entry.image_id, &entry).unwrap();
+    for _ in 0..2 {
+        let prepared = start().await.unwrap();
+        assert_eq!(prepared.change, ImageChange::Unchanged);
+        assert_eq!(prepared.image.name, own.name);
+    }
+    assert!(load_sandbox_image(data_dir, &sandbox, &own).is_some());
+    assert!(load_sandbox_image(data_dir, &sandbox, &other).is_none());
+
+    write_image_ref(&sandbox, &own.name, "sha256:older").unwrap();
+    assert!(load_sandbox_image(data_dir, &sandbox, &own).is_none());
+    assert!(load_sandbox_image(data_dir, &sandbox, &other).is_some());
 }
