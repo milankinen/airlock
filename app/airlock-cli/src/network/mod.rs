@@ -10,11 +10,11 @@ mod check_target_conflicts;
 mod control;
 mod deny_reporter;
 pub(crate) mod grant;
+pub(crate) mod host;
 mod host_socket;
 pub(crate) mod http;
 pub(crate) mod interceptor;
 pub(crate) mod io;
-mod matchers;
 pub(crate) mod middleware;
 pub mod reverse_forward;
 pub(crate) mod rule_file;
@@ -40,6 +40,7 @@ pub use self::control::NetworkControl;
 pub use self::deny_reporter::DenyReporter;
 use self::grant::GrantAccess;
 pub use self::grant::{AgentAccess, GrantContext};
+use self::host::Host;
 use self::host_socket::HostSocket;
 use crate::config::config_values::Policy;
 use crate::network::http::middleware::CompiledMiddleware;
@@ -228,10 +229,7 @@ fn labeled_passthrough(
             let (host, port) = rules::parse_pattern(allow)?;
             out.push(check_target_conflicts::LabeledTarget {
                 label: crate::messages::network::label_rule_passthrough(rule_name, allow),
-                target: NetworkTarget {
-                    host: host.to_string(),
-                    port,
-                },
+                target: NetworkTarget { host, port },
             });
         }
     }
@@ -252,10 +250,7 @@ fn labeled_middleware(
             let (host, port) = rules::parse_pattern(target_str)?;
             out.push(check_target_conflicts::LabeledTarget {
                 label: crate::messages::network::label_middleware(mw_name, target_str),
-                target: NetworkTarget {
-                    host: host.to_string(),
-                    port,
-                },
+                target: NetworkTarget { host, port },
             });
         }
     }
@@ -278,10 +273,7 @@ fn labeled_inject(
             let (host, port) = rules::parse_pattern(allow)?;
             out.push(check_target_conflicts::LabeledTarget {
                 label: crate::messages::network::label_rule_inject(rule_name, allow),
-                target: NetworkTarget {
-                    host: host.to_string(),
-                    port,
-                },
+                target: NetworkTarget { host, port },
             });
         }
     }
@@ -433,21 +425,27 @@ impl Network {
     /// [`Network::resolve_target_in`] has the rules.
     #[cfg(test)]
     pub fn resolve_target(&self, host: &str, port: u16) -> ResolvedTarget {
-        self.resolve_target_in(host, port, None)
+        self.resolve_target_in(&Host::parse(host), port, None)
     }
 
     /// Find how to handle a connection to `host:port`.
     ///
+    /// The decision uses no DNS lookup: a lookup of a denied name can
+    /// carry data out of the sandbox. A name matches only name patterns,
+    /// and an IP address matches only IP ranges. For an allowed name, the
+    /// relay checks the resolved addresses later (see [`tcp::resolve`]).
+    ///
     /// The rules, in order:
     /// 0. `deny-always`: deny. A public-only network denies local names and
-    ///    non-public IP literals. It also checks the resolved addresses when
-    ///    it connects.
+    ///    non-public IP addresses. It also checks the resolved addresses
+    ///    when it connects.
     /// 1. Localhost port forward: change the port, and allow with
     ///    passthrough.
     /// 2. Host of an enabled service that cannot run: deny under every
     ///    policy.
     /// 3. `allow-always`: allow with middleware.
-    /// 4. Deny rules (with the deny patterns of the grant rule): deny.
+    /// 4. Deny rules (with the deny patterns of the grant rule): deny. IP
+    ///    ranges also apply to the resolved addresses of a name.
     /// 5. Host that a network service owns: allow and intercept.
     /// 6. Allow rules and the hosts of the grant: allow with middleware.
     /// 7. No match: `allow-by-default` allows, `deny-by-default` denies.
@@ -464,7 +462,7 @@ impl Network {
     ///   and secrets.
     pub(crate) fn resolve_target_in(
         &self,
-        host: &str,
+        host: &Host,
         port: u16,
         grant: Option<&GrantAccess>,
     ) -> ResolvedTarget {
@@ -477,14 +475,14 @@ impl Network {
         }
 
         // Localhost port forward: change the destination port.
-        let (host, port, port_forwarded) = if is_localhost(host) {
-            if let Some(&host_port) = self.port_forwards.get(&port) {
-                ("127.0.0.1", host_port, true)
-            } else {
-                (host, port, false)
-            }
-        } else {
-            (host, port, false)
+        let forward = host
+            .is_localhost()
+            .then(|| self.port_forwards.get(&port))
+            .flatten();
+        let forwarded_host = Host::Ip(std::net::Ipv4Addr::LOCALHOST.into());
+        let (host, port, port_forwarded) = match forward {
+            Some(&host_port) => (&forwarded_host, host_port, true),
+            None => (host, port, false),
         };
 
         let interceptor = if port_forwarded {
@@ -529,6 +527,16 @@ impl Network {
             vec![]
         };
 
+        let denied_ranges = if !allowed || port_forwarded || matches!(policy, Policy::AllowAlways) {
+            vec![]
+        } else {
+            let mut ranges = target::ip_ranges(&self.rules.borrow().active.deny, port);
+            if let Some(g) = grant {
+                ranges.extend(g.denied_ranges(port));
+            }
+            ranges
+        };
+
         // Port-forwarded destinations always use passthrough. The guest can
         // use any protocol on localhost, not only HTTP. Interception would
         // break non-HTTP forwards (for example Postgres).
@@ -552,7 +560,7 @@ impl Network {
         };
 
         ResolvedTarget {
-            host: host.to_string(),
+            host: host.clone(),
             port,
             middleware,
             secrets,
@@ -561,21 +569,22 @@ impl Network {
             grantable,
             passthrough,
             public_only: self.public_only || (grant_only && grant::grant_needs_public_only()),
+            denied_ranges,
+            addresses: vec![],
             service_hosts,
         }
     }
 
-    /// Get the canonical hosts of all network services, with the hosts of
-    /// the services that cannot run.
-    fn service_hosts(&self) -> Rc<[String]> {
-        let mut hosts: Vec<String> = Vec::new();
+    /// Get the hosts of all network services, with the hosts of the
+    /// services that cannot run.
+    fn service_hosts(&self) -> Rc<[Host]> {
+        let mut hosts: Vec<Host> = Vec::new();
         let targets = self
             .interceptors
             .iter()
             .flat_map(|i| i.targets())
             .chain(&self.unavailable_targets);
-        for t in targets {
-            let host = matchers::canonical_host(&t.host);
+        for host in targets.filter_map(|t| t.host.exact_host()) {
             if !hosts.contains(&host) {
                 hosts.push(host);
             }
@@ -585,31 +594,31 @@ impl Network {
 
     /// Find the enabled service interceptor that owns `host:port`.
     /// Interceptors own disjoint hosts. Thus the first match is the only one.
-    fn interceptor_for(&self, host: &str, port: u16) -> Option<Rc<dyn Interceptor>> {
+    fn interceptor_for(&self, host: &Host, port: u16) -> Option<Rc<dyn Interceptor>> {
         self.interceptors
             .iter()
             .find(|s| s.targets().iter().any(|t| t.matches(host, port)))
             .cloned()
     }
 
-    fn is_denied_by_rule(&self, host: &str, port: u16) -> bool {
+    fn is_denied_by_rule(&self, host: &Host, port: u16) -> bool {
         self.rules
             .borrow()
             .active
             .deny
             .iter()
-            .any(|t| t.matches(host, port))
+            .any(|t| t.denies(host, port))
     }
 
     /// Collect the masked secrets of all inject targets that match
     /// `host:port`, with no duplicate variable names.
-    fn collect_secrets(&self, host: &str, port: u16) -> Vec<InjectedSecret> {
+    fn collect_secrets(&self, host: &Host, port: u16) -> Vec<InjectedSecret> {
         let mut out: Vec<InjectedSecret> = Vec::new();
         add_secrets(&self.rules.borrow().inject, host, port, &mut out);
         out
     }
 
-    fn is_passthrough_target(&self, host: &str, port: u16) -> bool {
+    fn is_passthrough_target(&self, host: &Host, port: u16) -> bool {
         self.rules
             .borrow()
             .active
@@ -618,7 +627,7 @@ impl Network {
             .any(|t| t.matches(host, port))
     }
 
-    fn is_allowed(&self, host: &str, port: u16, policy: Policy) -> bool {
+    fn is_allowed(&self, host: &Host, port: u16, policy: Policy) -> bool {
         // The allow-always policy overrides deny targets.
         if matches!(policy, Policy::AllowAlways) {
             return true;
@@ -685,7 +694,7 @@ impl Network {
     }
 
     /// Collect the compiled middleware of all matching middleware targets.
-    fn collect_middleware(&self, host: &str, port: u16) -> Vec<CompiledMiddleware> {
+    fn collect_middleware(&self, host: &Host, port: u16) -> Vec<CompiledMiddleware> {
         self.middleware_targets
             .iter()
             .filter(|mt| mt.matches(host, port))
@@ -698,7 +707,7 @@ impl Network {
 /// `out`, with no duplicate variable names.
 pub(crate) fn add_secrets(
     targets: &[InjectTarget],
-    host: &str,
+    host: &Host,
     port: u16,
     out: &mut Vec<InjectedSecret>,
 ) {
@@ -712,9 +721,9 @@ pub(crate) fn add_secrets(
     }
 }
 
-fn denied(host: &str, port: u16) -> ResolvedTarget {
+fn denied(host: &Host, port: u16) -> ResolvedTarget {
     ResolvedTarget {
-        host: host.to_string(),
+        host: host.clone(),
         port,
         middleware: vec![],
         secrets: vec![],
@@ -723,26 +732,22 @@ fn denied(host: &str, port: u16) -> ResolvedTarget {
         grantable: false,
         passthrough: false,
         public_only: false,
+        denied_ranges: vec![],
+        addresses: vec![],
         service_hosts: Rc::from([]),
     }
 }
 
-/// Check if `host` is one of the canonical `service_hosts`, in any
-/// spelling.
-pub(crate) fn is_service_host(service_hosts: &[String], host: &str) -> bool {
-    let host = matchers::canonical_host(host);
-    service_hosts.contains(&host)
-}
-
-fn is_localhost(host: &str) -> bool {
-    host == "localhost" || host == "127.0.0.1" || host == "::1"
+/// Check if `host` is one of the `service_hosts`.
+pub(crate) fn is_service_host(service_hosts: &[Host], host: &Host) -> bool {
+    service_hosts.contains(host)
 }
 
 /// Return true if `host` is a non-public destination without a DNS lookup:
-/// a `localhost` name or a non-public IP literal.
-fn is_local_host(host: &str) -> bool {
-    let name = host.trim_end_matches('.').to_ascii_lowercase();
-    name == "localhost"
-        || name.ends_with(".localhost")
-        || target::ip_literal(host).is_some_and(|ip| !target::is_public_ip(ip))
+/// a `localhost` name or a non-public IP address.
+fn is_local_host(host: &Host) -> bool {
+    match host {
+        Host::Name(name) => name == "localhost" || name.ends_with(".localhost"),
+        Host::Ip(ip) => !target::is_public_ip(*ip),
+    }
 }

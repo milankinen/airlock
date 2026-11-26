@@ -3,10 +3,11 @@
 //! Some packs make their config values with a Lua script instead of a static
 //! config file. The script runs on the host and can read the pack args and
 //! the host, for example the git user name. Pack scripts get a small Lua
-//! API.
+//! API, also helpers for IP address ranges.
 
 use std::collections::BTreeMap;
 
+use ipnet::IpNet;
 use mlua::{Lua, LuaSerdeExt};
 
 use crate::packs::setup_env::SetupEnv;
@@ -46,6 +47,11 @@ struct Fail(String);
 ///    of their mounts in it.
 ///  - `fail(message)`: Stops with the config error
 ///    `pack <name>: <message>`.
+///  - `ip.private_ranges()`: List of the address ranges that are not
+///    public: loopback, private, link-local and other local ranges.
+///  - `ip.exclude(ranges, except)`: The `ranges` with the addresses of
+///    `except` removed. Both are lists of IP addresses and ranges. An entry
+///    that is not valid is an error.
 ///
 /// Args:
 ///  - `pack`: Pack that owns the script
@@ -135,6 +141,7 @@ fn run(
         Err(mlua::Error::external(Fail(message)))
     })?;
     globals.set("fail", fail)?;
+    globals.set("ip", ip_table(&lua)?)?;
 
     let chunk = match &pack.version {
         Some(version) => format!("@packs/{}@{version}/config.lua", pack.id),
@@ -144,6 +151,68 @@ fn run(
     let config: mlua::Value = globals.get("config")?;
     let setup = setup_vars(globals.get("setup")?)?;
     Ok((lua.from_value(config)?, setup))
+}
+
+/// Make the `ip` table of the Lua API (see [`evaluate`]).
+fn ip_table(lua: &Lua) -> mlua::Result<mlua::Table> {
+    let table = lua.create_table()?;
+    let private = lua.create_function(|_, ()| {
+        let ranges = crate::network::target::PRIVATE_RANGES.iter();
+        Ok(ranges.map(ToString::to_string).collect::<Vec<_>>())
+    })?;
+    table.set("private_ranges", private)?;
+    let exclude = lua.create_function(|_, (ranges, except): (Vec<String>, Vec<String>)| {
+        let except = parse_nets(&except)?;
+        let mut out = Vec::new();
+        for range in parse_nets(&ranges)? {
+            out.extend(exclude(range, &except));
+        }
+        Ok(out.iter().map(ToString::to_string).collect::<Vec<_>>())
+    })?;
+    table.set("exclude", exclude)?;
+    Ok(table)
+}
+
+/// Parse IP addresses and ranges, as a network rule reads them.
+/// Returns:
+///   The ranges, or a [`Fail`] error that names the first entry that is
+///   not an IP address or range.
+fn parse_nets(items: &[String]) -> mlua::Result<Vec<IpNet>> {
+    use crate::network::host::HostPattern;
+    items
+        .iter()
+        .map(|item| {
+            let net = HostPattern::parse(item).ok().and_then(|p| p.net());
+            net.ok_or_else(|| {
+                let message = crate::messages::packs::not_ip_range(item);
+                mlua::Error::external(Fail(message))
+            })
+        })
+        .collect()
+}
+
+/// Remove the addresses of all `except` ranges from `range`.
+/// Returns:
+///   The remaining addresses as a list of ranges.
+fn exclude(range: IpNet, except: &[IpNet]) -> Vec<IpNet> {
+    let Some((first, rest)) = except.split_first() else {
+        return vec![range];
+    };
+    // Two ranges are disjoint, or one has the other in it.
+    if first.contains(&range.network()) && first.prefix_len() <= range.prefix_len() {
+        return vec![];
+    }
+    if !range.contains(&first.network()) {
+        return exclude(range, rest);
+    }
+    // `first` is inside `range`: split `range` in two halves and continue
+    // in each. The depth is at most 128 steps.
+    range
+        .subnets(range.prefix_len() + 1)
+        .into_iter()
+        .flatten()
+        .flat_map(|half| exclude(half, except))
+        .collect()
 }
 
 /// Read the `setup` global after the script ran.

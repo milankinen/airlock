@@ -18,8 +18,9 @@ use hyper::body::Incoming;
 use mlua::{Function, Lua, UserData, UserDataFields, UserDataMethods};
 use tracing::trace;
 
+use crate::network::host::{Host, HostPattern};
 use crate::network::http::{ResponseBody, streamed};
-use crate::network::{DenyReporter, matchers, middleware};
+use crate::network::{DenyReporter, middleware};
 
 type RequestBody = ResponseBody;
 
@@ -131,7 +132,7 @@ pub async fn run<F, Fut>(
     req: hyper::Request<Incoming>,
     middleware: &[CompiledMiddleware],
     deny_reporter: Rc<DenyReporter>,
-    connect_host: Rc<str>,
+    connect_host: Rc<Host>,
     send: F,
 ) -> anyhow::Result<hyper::Response<ResponseBody>>
 where
@@ -214,7 +215,7 @@ where
         Ok(resp) => Ok(resp),
         Err(ref e) if is_denied(e) => {
             // A middleware deny is not grantable. The port is not known here.
-            deny_reporter.report(&connect_host, 0, false);
+            deny_reporter.report(&connect_host.to_string(), 0, false);
             Ok(hyper::Response::builder()
                 .status(403)
                 .extension(Denied)
@@ -240,7 +241,7 @@ struct State {
     /// for (set at connect time). Used by `req.host` and `req:hostMatches`.
     /// These must NOT trust the request URI or the `Host` header, which the
     /// guest controls.
-    connect_host: Rc<str>,
+    connect_host: Rc<Host>,
 }
 
 impl State {
@@ -359,8 +360,12 @@ impl UserData for State {
         );
         methods.add_method("hostMatches", |_, this, pattern: String| {
             // Match the authenticated connect target, not the request URI
-            // or `Host` header, which the guest can spoof.
-            Ok(matchers::host_matches(&this.connect_host, &pattern))
+            // or `Host` header, which the guest can spoof. A pattern that
+            // can never match is a script error, not a silent `false`.
+            let pattern = HostPattern::parse(&pattern).map_err(|e| {
+                mlua::Error::runtime(crate::messages::network::invalid_host(&pattern, e))
+            })?;
+            Ok(pattern.matches(&this.connect_host))
         });
 
         methods.add_method("deny", |_, _, ()| -> mlua::Result<()> {

@@ -3,6 +3,8 @@
 //! Connects to the upstream server and relays raw bytes between the sandbox
 //! and the server.
 
+use std::net::SocketAddr;
+
 use airlock_common::network_capnp::tcp_sink;
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10,8 +12,9 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::debug;
 
+use super::host::Host;
 use super::io;
-use super::target::{self, ResolvedTarget};
+use super::target::ResolvedTarget;
 
 /// Wrap the RPC channel to the guest in a [`io::Transport`]. This does not
 /// connect to the real server. The allow path uses it with
@@ -52,26 +55,64 @@ pub async fn connect_server(target: &ResolvedTarget) -> anyhow::Result<io::Trans
     })
 }
 
-/// Open a TCP stream to `target`.
+/// Check the addresses of an allowed target before the relay connects
+/// to it. This is the second phase of the decision (see
+/// [`crate::network::Network::resolve_target_in`]). It does something only
+/// for a public-only target or a target with deny ranges. It resolves a
+/// name one time and keeps the allowed addresses for [`dial`]. Thus a DNS
+/// answer that changes between the check and the connect (DNS rebinding)
+/// cannot get past it.
 /// Returns:
-///   The stream, or error if the connection fails. For a
-///   [`ResolvedTarget::public_only`] target, also an error if the host has
-///   no public address.
-pub async fn dial(target: &ResolvedTarget) -> anyhow::Result<TcpStream> {
-    let addr = format!("{}:{}", target.host, target.port);
-    if !target.public_only {
-        return Ok(TcpStream::connect(&addr).await?);
+///   Error if the lookup fails. A target with no allowed address is
+///   denied ([`ResolvedTarget::deny`]).
+pub async fn resolve(target: &mut ResolvedTarget) -> anyhow::Result<()> {
+    if !target.allowed || target.allows_all_addresses() {
+        return Ok(());
     }
-    // Resolve the name here and connect only to public addresses. The check
-    // applies to the addresses that the stream connects to. Thus a name such
-    // as `localhost` or DNS rebinding cannot get past it.
-    let host = target::ip_literal(&target.host).map_or(target.host.clone(), |ip| ip.to_string());
-    let public: Vec<_> = tokio::net::lookup_host((host.as_str(), target.port))
-        .await?
-        .filter(|a| target::is_public_ip(a.ip()))
+    let addresses: Vec<SocketAddr> = match &target.host {
+        Host::Ip(ip) => vec![SocketAddr::new(*ip, target.port)],
+        Host::Name(name) => tokio::time::timeout(
+            crate::constants::TCP_CONNECT_TIMEOUT,
+            tokio::net::lookup_host((name.as_str(), target.port)),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("lookup timed out: {name}"))??
+        .collect(),
+    };
+    target.addresses = addresses
+        .into_iter()
+        .filter(|a| target.allows_address(a.ip()))
         .collect();
-    anyhow::ensure!(!public.is_empty(), "blocked: {addr} has no public address");
-    Ok(TcpStream::connect(&public[..]).await?)
+    if target.addresses.is_empty() {
+        debug!(
+            "denied: {}:{} has no allowed address",
+            target.host, target.port
+        );
+        target.deny();
+    }
+    Ok(())
+}
+
+/// Open a TCP stream to `target`: to the addresses that [`resolve`] kept,
+/// else to the host.
+/// Returns:
+///   The stream, or error if the connection fails. Also an error for a
+///   target that needs the address check of [`resolve`] and has no
+///   addresses.
+pub async fn dial(target: &ResolvedTarget) -> anyhow::Result<TcpStream> {
+    if !target.addresses.is_empty() {
+        return Ok(TcpStream::connect(&target.addresses[..]).await?);
+    }
+    anyhow::ensure!(
+        target.allows_all_addresses(),
+        "blocked: {}:{} has no checked address",
+        target.host,
+        target.port
+    );
+    Ok(match &target.host {
+        Host::Ip(ip) => TcpStream::connect(SocketAddr::new(*ip, target.port)).await?,
+        Host::Name(name) => TcpStream::connect((name.as_str(), target.port)).await?,
+    })
 }
 
 /// Relay bytes in both directions between two transports, until one
@@ -147,7 +188,8 @@ async fn drain_to_eof(src: &mut io::BoxRead, buf: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
-    //! Tests for the shutdown of the raw TCP relay.
+    //! Tests for the dial of checked addresses and the shutdown of the raw
+    //! TCP relay.
 
     use std::cell::Cell;
     use std::future::Future;
@@ -254,5 +296,28 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), relay(container, server))
             .await
             .expect("relay finishes");
+    }
+
+    /// Test that the dial uses the addresses that the check kept and does
+    /// not resolve the name again. A second lookup can give an other
+    /// answer (DNS rebinding).
+    ///   1. Resolve a target with a deny range for a name that has no DNS
+    ///      record
+    ///   2. Give it the address of a local listener as the checked address
+    ///   3. Check that the dial connects to the listener
+    #[tokio::test]
+    async fn dial_uses_checked_addresses_and_does_not_resolve_again() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let network = crate::test_cfg::network::network_from_toml(
+            "[network]\npolicy = \"allow-by-default\"\n\
+             [network.rules.r]\ndeny = [\"10.0.0.0/8\"]\n",
+        )
+        .unwrap()
+        .network;
+        let mut target = network.resolve_target("no-record.invalid", addr.port());
+        assert!(target.allowed && !target.allows_all_addresses());
+        target.addresses = vec![addr];
+        dial(&target).await.expect("dial to the checked address");
     }
 }

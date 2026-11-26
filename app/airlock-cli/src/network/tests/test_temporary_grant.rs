@@ -21,6 +21,8 @@ use crate::approval::{
 use crate::config::config_values::RuleEnabled;
 use crate::messages::grants as msg;
 use crate::network::grant::GrantAccess;
+use crate::network::host::Host;
+use crate::network::rules::{OnDemandRule, rule_targets};
 use crate::network::target::NetworkTarget;
 use crate::network::{GrantContext, Network};
 use crate::test_cfg::network::*;
@@ -441,7 +443,8 @@ fn config_deny_rule_wins_over_grant() {
 /// a public suffix or the host machine. Only `*` alone asks for all hosts. The system resolver
 /// reads numeric names such as `2130706433` as loopback addresses.
 ///   1. Ask for grants of wildcards, public suffixes, local names, private
-///      addresses, numeric address forms, bad labels and an empty list
+///      addresses, IP ranges, numeric address forms, bad labels and an empty
+///      list
 ///   2. Check that each request is denied
 ///   3. Check that the approver got no prompt
 #[test]
@@ -467,6 +470,8 @@ fn wide_local_and_numeric_grant_hosts_are_refused_before_approval() {
             &["192.168.1.10"],
             &["169.254.169.254"],
             &["[fd00::1]:443"],
+            &["8.8.8.0/24"],
+            &["0.0.0.0/0"],
             &["2130706433"],
             &["0x7f.1"],
             &["0x7f000001.example.com"],
@@ -752,10 +757,32 @@ fn connection_allowed_only_by_grant_dials_public_addresses_only() {
             port: None,
         },
     ]);
-    let granted = network.resolve_target_in("granted.example.com", 443, Some(&grant));
+    let granted = network.resolve_target_in(&Host::parse("granted.example.com"), 443, Some(&grant));
     assert!(granted.allowed && granted.public_only);
-    let allowed = network.resolve_target_in("allowed.example.com", 443, Some(&grant));
+    let allowed = network.resolve_target_in(&Host::parse("allowed.example.com"), 443, Some(&grant));
     assert!(allowed.allowed && !allowed.public_only);
+}
+
+/// Test that the deny ranges of an on-demand rule also cover the addresses
+/// that a name resolves to.
+///   1. Make a grant of a rule that allows all hosts and denies a range
+///   2. Resolve a name with the grant
+///   3. Check that it cannot connect to an address in the range
+#[test]
+fn deny_range_of_on_demand_rule_covers_resolved_addresses() {
+    let network = network_from_toml("[network]\npolicy = \"deny-by-default\"")
+        .unwrap()
+        .network;
+    let targets = rule_targets("r", &["*".into()], &["8.8.0.0/16".into()], false).unwrap();
+    let grant = GrantAccess::Rule(Rc::new(OnDemandRule {
+        allow_patterns: vec!["*".into()],
+        targets,
+        inject: vec![],
+    }));
+    let target = network.resolve_target_in(&Host::parse("api.example.com"), 443, Some(&grant));
+    assert!(target.allowed);
+    assert!(!target.allows_address("8.8.8.8".parse().unwrap()));
+    assert!(target.allows_address("1.1.1.1".parse().unwrap()));
 }
 
 /// Test that an on-demand rule is not active for normal connections, and
@@ -1108,7 +1135,7 @@ fn all_hosts_grant_must_be_alone_and_keeps_deny_rules_and_public_only() {
     crate::network::grant::deny_loopback_on_this_thread();
     {
         let access = GrantAccess::AllHosts;
-        let t = network.resolve_target_in("any.example.org", 443, Some(&access));
+        let t = network.resolve_target_in(&Host::parse("any.example.org"), 443, Some(&access));
         assert!(t.allowed && t.public_only);
         for host in [
             "blocked.example.com",
@@ -1117,7 +1144,7 @@ fn all_hosts_grant_must_be_alone_and_keeps_deny_rules_and_public_only() {
             "10.0.0.1",
             "127.0.0.1",
         ] {
-            let t = network.resolve_target_in(host, 443, Some(&access));
+            let t = network.resolve_target_in(&Host::parse(host), 443, Some(&access));
             assert!(!t.allowed, "{host}");
         }
     }

@@ -277,6 +277,7 @@ values = ["a", "b"]
                 "nodejs@1",
                 "python@1",
                 "rust@1",
+                "private-network@1",
             ]
         );
     }

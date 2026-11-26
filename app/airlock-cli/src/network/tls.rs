@@ -137,7 +137,7 @@ pub async fn connect_server(
         None => vec![b"http/1.1".to_vec()],
     };
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-    let server_name = rustls::pki_types::ServerName::try_from(target.host.clone())
+    let server_name = rustls::pki_types::ServerName::try_from(target.host.to_string())
         .map_err(|e| anyhow::anyhow!("invalid hostname: {e}"))?;
     let server_tls = connector.connect(server_name, server_stream).await?;
     let server_h2 = server_tls.get_ref().1.alpn_protocol() == Some(b"h2");

@@ -1799,6 +1799,17 @@ pub mod network {
         )
     }
 
+    /// Error when the host of a target pattern can never match a host.
+    pub fn invalid_host(target: impl Display, error: crate::network::host::PatternError) -> String {
+        use crate::network::host::PatternError;
+        let why = match error {
+            PatternError::IpRange => "`/` must be part of an IP range, for example `10.0.0.0/8`",
+            PatternError::Wildcard => "`*` must be the full host or a `*.` prefix",
+            PatternError::Host => "not a host name or an IP address",
+        };
+        format!("`{target}`: {why}")
+    }
+
     /// Error when the port of a target pattern is not valid.
     pub fn invalid_port(target: impl Display, port: impl Display) -> String {
         format!("`{target}`: port `{port}` must be a number in 0-65535 or `*`")
@@ -2443,6 +2454,12 @@ pub mod packs {
     /// Error shown when the pack directory cannot be made or `config.lua` fails.
     pub fn pack_failed(name: impl Display, detail: impl Display) -> String {
         format!("pack {name}: {detail}")
+    }
+
+    /// Error of a pack IP helper for an entry that is not an IP address or
+    /// an IP range.
+    pub fn not_ip_range(entry: impl Display) -> String {
+        format!("`{entry}` is not an IP address or an IP range")
     }
 
     /// Error shown when `config.lua` leaves `config` as a value that is not a table.

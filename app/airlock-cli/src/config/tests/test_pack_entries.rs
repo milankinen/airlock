@@ -201,9 +201,10 @@ fn invalid_pack_entries_are_reported_together() {
     assert!(err.starts_with("invalid configuration\n"), "{err}");
     for line in [
         "* `packs.nope` unknown pack (known: alpine, debian, claude, codex, copilot, docker, \
-         git, mise, nodejs, python, rust, sample) (set in: airlock.toml)",
+         git, mise, nodejs, python, rust, sample, private-network) (set in: airlock.toml)",
         "* `packs.claude-code` unknown pack (known: alpine, debian, claude, codex, copilot, \
-         docker, git, mise, nodejs, python, rust, sample); `claude-code` is a list-form name: \
+         docker, git, mise, nodejs, python, rust, sample, private-network); `claude-code` is a \
+         list-form name: \
          write `presets = [\"claude-code\"]` (set in: airlock.toml)",
         "* `packs.python` must be a table (set in: airlock.toml)",
         "* `packs.rust` needs `version` (set in: airlock.toml): 1",

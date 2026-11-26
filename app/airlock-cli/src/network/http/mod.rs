@@ -32,6 +32,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
 use tracing::{debug, trace};
 
+use crate::network::host::Host;
 use crate::network::http::executor::LocalExecutor;
 use crate::network::http::senders::{H1Sender, H2Sender, RequestSender};
 use crate::network::http::upgrade::Upgrade;
@@ -136,7 +137,7 @@ pub async fn relay(
     // Then the request headers are parsed and show in the Requests sub-tab.
     // Each request gets a 403, and the server transport is not used.
     if !target.allowed {
-        let target_host = target.host.clone();
+        let target_host = target.host.to_string();
         let target_port = target.port;
         let grantable = target.grantable;
         let deny_reporter = deny_reporter.clone();
@@ -173,8 +174,8 @@ pub async fn relay(
     let interceptor = target.interceptor;
     let service_hosts = target.service_hosts;
     // Where the guest connected, as the interceptor sees it.
-    let endpoint = Rc::new(Endpoint::new(&target.host, target.port));
-    let target_host = target.host.clone();
+    let endpoint = Rc::new(Endpoint::of(target.host.clone(), target.port));
+    let target_host = target.host.to_string();
     let target_port = target.port;
     let allowed = target.allowed;
     let upgrade_shared = upgrade.clone();
@@ -198,7 +199,7 @@ pub async fn relay(
                 upgrade.requested();
             }
             let method = req.method().clone();
-            let connect_host: std::rc::Rc<str> = std::rc::Rc::from(target_host.as_str());
+            let connect_host = Rc::new(endpoint.host().clone());
             // The innermost step: the interceptor that owns the host, then
             // the upstream. The interceptor runs after middleware, so
             // scripts and the monitor see only its surrogates.
@@ -217,7 +218,7 @@ pub async fn relay(
                             "denied: request names a service host on {}",
                             endpoint.host()
                         );
-                        deny_reporter.report(endpoint.host(), endpoint.port(), false);
+                        deny_reporter.report(&endpoint.host().to_string(), endpoint.port(), false);
                         return Ok(text_response(
                             StatusCode::MISDIRECTED_REQUEST,
                             "request names a service host on a connection that the service does not handle\n",
@@ -411,8 +412,8 @@ where
 /// Check if the `:authority` or the `Host` header of `req` names one of the
 /// `service_hosts`. A `Host` value that does not parse counts as a match,
 /// because the upstream can read it in a different way.
-fn names_service_host<B>(req: &Request<B>, service_hosts: &[String]) -> bool {
-    let is_service = |h: &str| crate::network::is_service_host(service_hosts, h);
+fn names_service_host<B>(req: &Request<B>, service_hosts: &[Host]) -> bool {
+    let is_service = |h: &str| crate::network::is_service_host(service_hosts, &Host::parse(h));
     if req.uri().host().is_some_and(is_service) {
         return true;
     }

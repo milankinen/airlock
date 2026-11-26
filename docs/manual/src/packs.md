@@ -24,8 +24,9 @@ each kind:
 - [Distros](./packs/distros.md) set the base image
 - [Agents](./packs/agents.md) install coding agents
 - [Tools](./packs/tools.md) install languages and other tools
-- Other packs do not have one of these kinds, for example a pack that
-  adds only config
+- Other packs do not have one of these kinds, for example the
+  [private network](./packs/private-network.md) pack, which adds only
+  config
 
 ## Pack sources
 

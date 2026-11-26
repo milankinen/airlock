@@ -30,15 +30,16 @@ use std::time::Duration;
 
 use airlock_common::network_capnp::{connect_target, denied, network_proxy, rule_info};
 use anyhow::Context as _;
+use ipnet::IpNet;
 use tokio::sync::Semaphore;
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
-use super::matchers::canonical_host;
+use super::host::Host;
 use super::rule_file::{self, ApprovedRules, RuleWrite};
 use super::rules::{OnDemandRule, parse_pattern};
-use super::target::{InjectedSecret, NetworkTarget, ip_literal, is_public_ip};
+use super::target::{InjectedSecret, NetworkTarget, ip_ranges, is_public_ip};
 use super::{Network, add_secrets};
 use crate::approval::{
     Approval, Approver, Decision, GrantPrompt, PromptCommand, PromptRequest, Running,
@@ -278,8 +279,8 @@ impl Drop for PendingGuard<'_> {
 /// pass the same checks as a host in a grant request: a public IP literal,
 /// or a valid name that is not local, not a public suffix and not a
 /// numeric address form.
-pub(crate) fn is_grantable_host(host: &str) -> bool {
-    check_host(&canonical_host(host)).is_ok()
+pub(crate) fn is_grantable_host(host: &Host) -> bool {
+    check_host(&host.to_string()).is_ok()
 }
 
 /// Check that an IP literal in a grant is public.
@@ -302,7 +303,7 @@ fn check_host(host: &str) -> Result<(), String> {
     if host.is_empty() {
         return Err("empty host".into());
     }
-    if let Some(ip) = ip_literal(host) {
+    if let Host::Ip(ip) = Host::parse(host) {
         return check_ip(host, ip);
     }
     let (wildcard, name) = match host.strip_prefix("*.") {
@@ -380,13 +381,13 @@ pub(crate) fn parse_hosts(hosts: &[String]) -> Result<(Vec<String>, Vec<NetworkT
     let mut targets: Vec<NetworkTarget> = Vec::new();
     for raw in hosts {
         let raw = raw.trim();
-        let (host, port) = parse_pattern(raw).map_err(|e| e.to_string())?;
-        let host = canonical_host(host);
+        let (pattern, port) = parse_pattern(raw).map_err(|e| e.to_string())?;
+        let host = pattern.to_string();
         check_host(&host)?;
         if port == Some(0) {
             return Err(format!("{raw}: port 0"));
         }
-        if targets.iter().any(|t| t.host == host && t.port == port) {
+        if targets.iter().any(|t| t.host == pattern && t.port == port) {
             continue;
         }
         labels.push(match port {
@@ -394,7 +395,10 @@ pub(crate) fn parse_hosts(hosts: &[String]) -> Result<(Vec<String>, Vec<NetworkT
             Some(p) => format!("{host}:{p}"),
             None => host.clone(),
         });
-        targets.push(NetworkTarget { host, port });
+        targets.push(NetworkTarget {
+            host: pattern,
+            port,
+        });
     }
     Ok((labels, targets))
 }
@@ -404,13 +408,13 @@ pub(crate) fn parse_hosts(hosts: &[String]) -> Result<(Vec<String>, Vec<NetworkT
 /// checked on ports 80 and 443.
 fn all_allowed_already(network: &Network, targets: &[NetworkTarget]) -> bool {
     targets.iter().all(|t| {
-        if t.host.starts_with("*.") {
+        let Some(host) = t.host.exact_host() else {
             return false;
-        }
+        };
         let ports = t.port.map_or(vec![80, 443], |p| vec![p]);
         ports
             .into_iter()
-            .all(|p| network.resolve_target_in(&t.host, p, None).allowed)
+            .all(|p| network.resolve_target_in(&host, p, None).allowed)
     })
 }
 
@@ -426,7 +430,7 @@ pub(crate) enum GrantAccess {
 
 impl GrantAccess {
     /// Return true if the access allows `host:port`.
-    pub(crate) fn allows(&self, host: &str, port: u16) -> bool {
+    pub(crate) fn allows(&self, host: &Host, port: u16) -> bool {
         let targets = match self {
             GrantAccess::Hosts(targets) => targets,
             GrantAccess::AllHosts => return is_grantable_host(host),
@@ -436,15 +440,23 @@ impl GrantAccess {
     }
 
     /// Return true if the deny patterns of the rule match `host:port`.
-    pub(crate) fn denies(&self, host: &str, port: u16) -> bool {
+    pub(crate) fn denies(&self, host: &Host, port: u16) -> bool {
         match self {
             GrantAccess::Hosts(_) | GrantAccess::AllHosts => false,
-            GrantAccess::Rule(rule) => rule.targets.deny.iter().any(|t| t.matches(host, port)),
+            GrantAccess::Rule(rule) => rule.targets.deny.iter().any(|t| t.denies(host, port)),
+        }
+    }
+
+    /// Get the IP ranges that the deny patterns of the rule deny on `port`.
+    pub(crate) fn denied_ranges(&self, port: u16) -> Vec<IpNet> {
+        match self {
+            GrantAccess::Hosts(_) | GrantAccess::AllHosts => vec![],
+            GrantAccess::Rule(rule) => ip_ranges(&rule.targets.deny, port),
         }
     }
 
     /// Return true if the rule relays `host:port` with no interception.
-    pub(crate) fn passthrough(&self, host: &str, port: u16) -> bool {
+    pub(crate) fn passthrough(&self, host: &Host, port: u16) -> bool {
         match self {
             GrantAccess::Hosts(_) | GrantAccess::AllHosts => false,
             GrantAccess::Rule(rule) => rule
@@ -456,7 +468,7 @@ impl GrantAccess {
     }
 
     /// Add the secrets that the rule injects for `host:port` to `out`.
-    pub(crate) fn add_secrets(&self, host: &str, port: u16, out: &mut Vec<InjectedSecret>) {
+    pub(crate) fn add_secrets(&self, host: &Host, port: u16, out: &mut Vec<InjectedSecret>) {
         if let GrantAccess::Rule(rule) = self {
             add_secrets(&rule.inject, host, port, out);
         }

@@ -1,0 +1,17 @@
+label = "private network"
+description = "Deny or allow the local network and the other private addresses"
+
+[[args]]
+key = "mode"
+type = "choice"
+description = "private addresses"
+default = "deny"
+values = ["deny", "allow"]
+
+[[args]]
+key = "except"
+type = "choice"
+description = "addresses and ranges with the opposite mode, comma-separated"
+default = "none"
+values = ["none"]
+other = true

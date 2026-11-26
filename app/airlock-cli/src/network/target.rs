@@ -4,54 +4,67 @@
 //! connection, and the host and port of an upstream. Also includes helpers
 //! that classify IP addresses, for example public or private.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::rc::Rc;
 
+use ipnet::IpNet;
+
+use super::host::{Host, HostPattern};
 use super::http::middleware::CompiledMiddleware;
 use super::interceptor::Interceptor;
-use super::matchers;
 use crate::sandbox::MaskedSecret;
 
 /// One `host[:port]` pattern, parsed at startup from the `allow` or `deny`
 /// list of a rule.
 #[derive(Clone, Debug)]
 pub struct NetworkTarget {
-    /// Host pattern (see [`matchers::host_matches`]).
-    pub host: String,
+    /// Host pattern.
+    pub host: HostPattern,
     /// Port, or `None` for all ports.
     pub port: Option<u16>,
 }
 
 impl NetworkTarget {
     /// Return true if this target matches `host:port`.
-    pub fn matches(&self, host: &str, port: u16) -> bool {
-        matchers::host_matches(host, &self.host) && self.port.is_none_or(|p| p == port)
+    pub fn matches(&self, host: &Host, port: u16) -> bool {
+        self.host.matches(host) && self.port.is_none_or(|p| p == port)
+    }
+
+    /// Return true if this deny target matches `host:port`. An IPv6
+    /// address with an embedded IPv4 address (NAT64, 6to4) also matches
+    /// through the IPv4 address. Else that form of a denied address gets
+    /// past the deny.
+    pub fn denies(&self, host: &Host, port: u16) -> bool {
+        self.matches(host, port)
+            || matches!(host, Host::Ip(ip) if embedded_v4(*ip)
+                .is_some_and(|v4| self.matches(&Host::Ip(IpAddr::V4(v4)), port)))
     }
 }
 
 /// Host and port that the proxy connects to.
 ///
-/// The host is always canonical ([`matchers::canonical_host`]: lowercase,
-/// no trailing dot). Thus the services can compare endpoints exactly. The
-/// guest DNS keeps the case of a name, and `AUTH.OPENAI.COM` or
-/// `api.anthropic.com.` is the same host as the endpoint.
+/// The host is always canonical. Thus the services can compare endpoints
+/// exactly. The guest DNS keeps the case of a name, and `AUTH.OPENAI.COM`
+/// or `api.anthropic.com.` is the same host as the endpoint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Endpoint {
-    host: String,
+    host: Host,
     port: u16,
 }
 
 impl Endpoint {
-    /// Make an endpoint. The host becomes canonical.
+    /// Make an endpoint of a host name or an IP address.
     pub fn new(host: &str, port: u16) -> Self {
-        Self {
-            host: matchers::canonical_host(host),
-            port,
-        }
+        Self::of(Host::parse(host), port)
+    }
+
+    /// Make an endpoint of a parsed host.
+    pub fn of(host: Host, port: u16) -> Self {
+        Self { host, port }
     }
 
     /// Get the canonical host.
-    pub fn host(&self) -> &str {
+    pub fn host(&self) -> &Host {
         &self.host
     }
 
@@ -63,17 +76,25 @@ impl Endpoint {
     /// Get the `Host` and `:authority` value for a request to the endpoint:
     /// `host` for port 443, `host:port` for other ports.
     pub fn authority(&self) -> String {
+        let host = match &self.host {
+            Host::Ip(IpAddr::V6(ip)) => format!("[{ip}]"),
+            host => host.to_string(),
+        };
         if self.port == 443 {
-            self.host.clone()
+            host
         } else {
-            format!("{}:{}", self.host, self.port)
+            format!("{host}:{}", self.port)
         }
     }
 
     /// Get a target that matches only this endpoint.
     pub fn target(&self) -> NetworkTarget {
+        let host = match &self.host {
+            Host::Name(name) => HostPattern::Name(name.clone()),
+            Host::Ip(ip) => HostPattern::Net(IpNet::from(*ip)),
+        };
         NetworkTarget {
-            host: self.host.clone(),
+            host,
             port: Some(self.port),
         }
     }
@@ -83,11 +104,12 @@ impl Endpoint {
 pub fn targets_of(endpoints: &[&Endpoint]) -> Vec<NetworkTarget> {
     let mut out: Vec<NetworkTarget> = Vec::new();
     for e in endpoints {
+        let target = e.target();
         if !out
             .iter()
-            .any(|t| t.host == e.host && t.port == Some(e.port))
+            .any(|t| t.host == target.host && t.port == target.port)
         {
-            out.push(e.target());
+            out.push(target);
         }
     }
     out
@@ -96,8 +118,8 @@ pub fn targets_of(endpoints: &[&Endpoint]) -> Vec<NetworkTarget> {
 /// Compiled middleware script with one target pattern.
 #[derive(Clone)]
 pub struct MiddlewareTarget {
-    /// Host pattern (see [`matchers::host_matches`]).
-    pub host: String,
+    /// Host pattern.
+    pub host: HostPattern,
     /// Port, or `None` for all ports.
     pub port: Option<u16>,
     /// Compiled middleware script.
@@ -106,8 +128,8 @@ pub struct MiddlewareTarget {
 
 impl MiddlewareTarget {
     /// Return true if this middleware target matches `host:port`.
-    pub fn matches(&self, host: &str, port: u16) -> bool {
-        matchers::host_matches(host, &self.host) && self.port.is_none_or(|p| p == port)
+    pub fn matches(&self, host: &Host, port: u16) -> bool {
+        self.host.matches(host) && self.port.is_none_or(|p| p == port)
     }
 }
 
@@ -137,8 +159,8 @@ impl std::ops::Deref for InjectedSecret {
 /// All entries of a rule share the same secrets.
 #[derive(Clone, Debug)]
 pub struct InjectTarget {
-    /// Host pattern (see [`matchers::host_matches`]).
-    pub host: String,
+    /// Host pattern.
+    pub host: HostPattern,
     /// Port, or `None` for all ports.
     pub port: Option<u16>,
     /// Secrets to inject.
@@ -147,8 +169,8 @@ pub struct InjectTarget {
 
 impl InjectTarget {
     /// Return true if this inject target matches `host:port`.
-    pub fn matches(&self, host: &str, port: u16) -> bool {
-        matchers::host_matches(host, &self.host) && self.port.is_none_or(|p| p == port)
+    pub fn matches(&self, host: &Host, port: u16) -> bool {
+        self.host.matches(host) && self.port.is_none_or(|p| p == port)
     }
 }
 
@@ -158,7 +180,7 @@ impl InjectTarget {
 #[allow(clippy::struct_excessive_bools)] // independent flags
 pub struct ResolvedTarget {
     /// Destination host (after port forward changes).
-    pub host: String,
+    pub host: Host,
     /// Destination port (after port forward changes).
     pub port: u16,
     /// Middleware scripts from all matching middleware rules.
@@ -187,10 +209,16 @@ pub struct ResolvedTarget {
     /// proxy ignores all other addresses that the host resolves to. Thus a
     /// name cannot reach the host loopback, the LAN or cloud metadata.
     pub public_only: bool,
-    /// Canonical hosts of all network services. A request on a connection
-    /// that no service owns must not name one of them in its `Host` or
+    /// Address ranges of the deny rules. The proxy ignores the addresses in
+    /// them that the host resolves to.
+    pub denied_ranges: Vec<IpNet>,
+    /// Addresses to connect to. Empty until the relay resolves a name that
+    /// needs an address check (see [`super::tcp::resolve`]).
+    pub addresses: Vec<SocketAddr>,
+    /// Hosts of all network services. A request on a connection that no
+    /// service owns must not name one of them in its `Host` or
     /// `:authority`.
-    pub service_hosts: Rc<[String]>,
+    pub service_hosts: Rc<[Host]>,
 }
 
 impl ResolvedTarget {
@@ -201,64 +229,94 @@ impl ResolvedTarget {
     pub fn is_passthrough(&self) -> bool {
         self.allowed && self.passthrough
     }
+
+    /// Return true if the proxy can connect to each address of the host.
+    pub fn allows_all_addresses(&self) -> bool {
+        !self.public_only && self.denied_ranges.is_empty()
+    }
+
+    /// Return true if the proxy can connect to the address `ip`.
+    pub fn allows_address(&self, ip: IpAddr) -> bool {
+        (!self.public_only || is_public_ip(ip)) && !in_ranges(&self.denied_ranges, ip)
+    }
+
+    /// Deny the connection after the decision, for example because the
+    /// host resolves to no allowed address. The connection then gets the
+    /// normal deny handling.
+    pub fn deny(&mut self) {
+        self.allowed = false;
+        self.grantable = false;
+        self.passthrough = false;
+        self.interceptor = None;
+        self.middleware.clear();
+        self.secrets.clear();
+    }
 }
 
-/// Return true if `ip` is a public address. A public address is not
-/// unspecified, loopback, private (RFC 1918, ULA), link-local (cloud
-/// metadata), shared (CGNAT), broadcast, multicast or reserved.
+/// Get the IP ranges of the `targets` that apply to `port`.
+pub fn ip_ranges(targets: &[NetworkTarget], port: u16) -> Vec<IpNet> {
+    targets
+        .iter()
+        .filter(|t| t.port.is_none_or(|p| p == port))
+        .filter_map(|t| t.host.net())
+        .collect()
+}
+
+/// Return true if `ip` is in one of the `ranges`. The IPv4 address that an
+/// IPv6 address embeds (IPv4-mapped, IPv4-compatible, NAT64, 6to4) counts
+/// too. Else the IPv6 form of an address gets past a range.
+pub fn in_ranges(ranges: &[IpNet], ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    let v4 = embedded_v4(ip).map(IpAddr::V4);
+    ranges
+        .iter()
+        .any(|r| r.contains(&ip) || v4.is_some_and(|v4| r.contains(&v4)))
+}
+
+/// Ranges of the addresses that are not public: unspecified, loopback,
+/// private (RFC 1918, ULA), link-local (cloud metadata), shared (CGNAT),
+/// broadcast, multicast and reserved. The private network pack denies the
+/// same ranges.
+pub static PRIVATE_RANGES: std::sync::LazyLock<Vec<IpNet>> = std::sync::LazyLock::new(|| {
+    [
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "224.0.0.0/4",
+        "240.0.0.0/4",
+        "::/128",
+        "::1/128",
+        "fc00::/7",
+        "fe80::/10",
+        "fec0::/10",
+        "ff00::/8",
+    ]
+    .iter()
+    .map(|r| r.parse().expect("valid range"))
+    .collect()
+});
+
+/// Return true if `ip` is a public address: not in [`PRIVATE_RANGES`].
 /// For IPv4-compatible, IPv4-mapped, NAT64 and 6to4 addresses, the
 /// embedded IPv4 address decides.
 pub fn is_public_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_public_v4(v4),
-        IpAddr::V6(v6) => is_public_v6(v6),
-    }
+    !in_ranges(&PRIVATE_RANGES, ip)
 }
 
-fn is_public_v4(ip: Ipv4Addr) -> bool {
-    let [a, b, ..] = ip.octets();
-    !(a == 0
-        || ip.is_loopback()
-        || ip.is_private()
-        || ip.is_link_local()
-        || (a == 100 && (b & 0xc0) == 64)
-        || ip.is_broadcast()
-        || ip.is_multicast()
-        || a >= 240)
-}
-
-fn is_public_v6(ip: Ipv6Addr) -> bool {
-    if ip.is_unspecified() || ip.is_loopback() {
-        return false;
-    }
-    let seg = ip.segments();
-    let v4 = |hi: u16, lo: u16| Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo));
-    // IPv4-compatible (deprecated), IPv4-mapped, NAT64 and 6to4.
-    let embedded = match seg {
+/// Get the IPv4 address in an IPv4-compatible (deprecated), IPv4-mapped,
+/// NAT64 or 6to4 address.
+fn embedded_v4(ip: IpAddr) -> Option<Ipv4Addr> {
+    let IpAddr::V6(ip) = ip else { return None };
+    match ip.segments() {
         [0, 0, 0, 0, 0, 0 | 0xffff, hi, lo]
         | [0x64, 0xff9b, 0, 0, 0, 0, hi, lo]
-        | [0x2002, hi, lo, ..] => Some(v4(hi, lo)),
+        | [0x2002, hi, lo, ..] => Some(Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo))),
         _ => None,
-    };
-    if let Some(v4) = embedded {
-        return is_public_v4(v4);
     }
-    !(ip.is_unique_local()
-        || ip.is_unicast_link_local()
-        // Site-local (deprecated) and multicast.
-        || (seg[0] & 0xffc0) == 0xfec0
-        || ip.is_multicast())
-}
-
-/// Parse `host` as an IP literal, with or without brackets.
-/// Returns:
-///   The IP address, or `None` if `host` is not an IP literal.
-pub fn ip_literal(host: &str) -> Option<IpAddr> {
-    host.strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host)
-        .parse()
-        .ok()
 }
 
 #[cfg(test)]

@@ -4,7 +4,6 @@
 //!  * passthrough targets that overlap intercepted targets
 //!  * reverse port forwards that use the same host port
 
-use super::matchers;
 use super::target::NetworkTarget;
 
 /// Reverse port forward with a label for error messages.
@@ -84,18 +83,9 @@ pub fn check_passthrough_conflicts(
 }
 
 /// Return true if at least one concrete `(host, port)` matches both
-/// targets. The wildcard rules are the same as in
-/// [`super::matchers::host_matches`]:
-///
-/// - `*` matches all hosts.
-/// - `*.<suffix>` matches all subdomains of `<suffix>` at all depths.
-///   `*.example.com` matches `api.example.com` and `a.b.example.com`.
-/// - All other patterns are exact literals (with localhost aliases).
-///
-/// The pattern syntax is narrow. Thus a small case analysis is sufficient,
-/// and no generic regex intersection is necessary.
+/// targets.
 fn targets_overlap(a: &NetworkTarget, b: &NetworkTarget) -> bool {
-    ports_overlap(a.port, b.port) && hosts_overlap(&a.host, &b.host)
+    ports_overlap(a.port, b.port) && a.host.overlaps(&b.host)
 }
 
 fn ports_overlap(a: Option<u16>, b: Option<u16>) -> bool {
@@ -103,37 +93,6 @@ fn ports_overlap(a: Option<u16>, b: Option<u16>) -> bool {
         (None, _) | (_, None) => true,
         (Some(x), Some(y)) => x == y,
     }
-}
-
-fn hosts_overlap(a: &str, b: &str) -> bool {
-    // Compare canonical forms, as host_matches does. Else `Example.com` or
-    // `example.com.` would not conflict with `example.com`, but at run time
-    // both match the same host.
-    let (a, b) = (matchers::canonical_host(a), matchers::canonical_host(b));
-    let (a, b) = (a.as_str(), b.as_str());
-    if a == "*" || b == "*" {
-        return true;
-    }
-    match (a.strip_prefix("*."), b.strip_prefix("*.")) {
-        // Two wildcards: *.A and *.B overlap only if A == B, or if one suffix
-        // is a dot-separated sub-suffix of the other (for example
-        // "example.com" and "prod.example.com"). A host such as
-        // `x.prod.example.com` matches both `*.example.com` and
-        // `*.prod.example.com`.
-        (Some(sa), Some(sb)) => {
-            sa == sb
-                || sa.strip_suffix(sb).is_some_and(|p| p.ends_with('.'))
-                || sb.strip_suffix(sa).is_some_and(|p| p.ends_with('.'))
-        }
-        // Wildcard and literal: use host_matches, so the rules stay the same.
-        (Some(_sa), None) => matchers::host_matches(b, a),
-        (None, Some(_sb)) => matchers::host_matches(a, b),
-        (None, None) => a == b || (is_localhost(a) && is_localhost(b)),
-    }
-}
-
-fn is_localhost(s: &str) -> bool {
-    s == "localhost" || s == "127.0.0.1" || s == "::1"
 }
 
 #[cfg(test)]
@@ -145,17 +104,14 @@ mod tests {
     /// Parse the target pattern `s`, for example `*.example.com:443`.
     fn t(s: &str) -> NetworkTarget {
         let (host, port) = super::super::rules::parse_pattern(s).unwrap();
-        NetworkTarget {
-            host: host.to_string(),
-            port,
-        }
+        NetworkTarget { host, port }
     }
 
     /// Test that two target patterns overlap only when some host and port
     /// match both. A false answer hides a passthrough conflict, and a false
     /// overlap refuses a valid config.
     ///   1. Take pairs of patterns: exact, other case or trailing dot,
-    ///      localhost aliases, wildcards, ports
+    ///      localhost aliases, wildcards, ports, IP ranges
     ///   2. Check the overlap result in both argument orders
     #[test]
     fn targets_overlap_when_some_host_and_port_match_both() {
@@ -183,6 +139,11 @@ mod tests {
             ("example.com", "example.com:443", true),
             ("example.com:80", "example.com:443", false),
             ("*.example.com:80", "api.example.com:443", false),
+            ("10.0.0.0/8", "10.1.2.3", true),
+            ("10.0.0.0/8", "11.1.2.3", false),
+            ("10.0.0.0/8", "10.1.0.0/16", true),
+            ("10.0.0.0/8", "192.168.0.0/16", false),
+            ("10.0.0.0/8", "*.example.com", false),
         ] {
             assert_eq!(targets_overlap(&t(a), &t(b)), expected, "{a} / {b}");
             assert_eq!(targets_overlap(&t(b), &t(a)), expected, "{b} / {a}");
