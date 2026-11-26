@@ -25,19 +25,29 @@ pub struct NetworkTarget {
 }
 
 impl NetworkTarget {
-    /// Return true if this target matches `host:port`.
+    /// Return true if this target matches `host:port`. An IP address
+    /// matches only in its own canonical form. Use it for the targets that
+    /// select a connection, for example passthrough or middleware. Use
+    /// [`NetworkTarget::allows`] for allow rules and
+    /// [`NetworkTarget::denies`] for deny rules.
     pub fn matches(&self, host: &Host, port: u16) -> bool {
         self.host.matches(host) && self.port.is_none_or(|p| p == port)
     }
 
-    /// Return true if this deny target matches `host:port`. An IPv6
-    /// address with an embedded IPv4 address (NAT64, 6to4) also matches
-    /// through the IPv4 address. Else that form of a denied address gets
-    /// past the deny.
-    pub fn denies(&self, host: &Host, port: u16) -> bool {
+    /// Return true if this allow rule target allows `host:port`.
+    pub fn allows(&self, host: &Host, port: u16) -> bool {
         self.matches(host, port)
-            || matches!(host, Host::Ip(ip) if embedded_v4(*ip)
-                .is_some_and(|v4| self.matches(&Host::Ip(IpAddr::V4(v4)), port)))
+    }
+
+    /// Return true if this deny rule target denies `host:port`.
+    pub fn denies(&self, host: &Host, port: u16) -> bool {
+        match host {
+            // An IPv6 address also matches through the IPv4 address that it
+            // embeds (NAT64, 6to4). Else that form gets past the deny. Allow
+            // rules do not do this: a 6to4 address is a different host.
+            Host::Ip(ip) => ip_forms(*ip).any(|ip| self.matches(&Host::Ip(ip), port)),
+            Host::Name(_) => self.matches(host, port),
+        }
     }
 }
 
@@ -89,12 +99,8 @@ impl Endpoint {
 
     /// Get a target that matches only this endpoint.
     pub fn target(&self) -> NetworkTarget {
-        let host = match &self.host {
-            Host::Name(name) => HostPattern::Name(name.clone()),
-            Host::Ip(ip) => HostPattern::Net(IpNet::from(*ip)),
-        };
         NetworkTarget {
-            host,
+            host: HostPattern::exact(&self.host),
             port: Some(self.port),
         }
     }
@@ -253,24 +259,27 @@ impl ResolvedTarget {
     }
 }
 
-/// Get the IP ranges of the `targets` that apply to `port`.
+/// Get the IP ranges that the deny `targets` deny on `port`
+/// ([`HostPattern::deny_ranges`]).
 pub fn ip_ranges(targets: &[NetworkTarget], port: u16) -> Vec<IpNet> {
     targets
         .iter()
         .filter(|t| t.port.is_none_or(|p| p == port))
-        .filter_map(|t| t.host.net())
+        .flat_map(|t| t.host.deny_ranges())
         .collect()
 }
 
 /// Return true if `ip` is in one of the `ranges`. The IPv4 address that an
-/// IPv6 address embeds (IPv4-mapped, IPv4-compatible, NAT64, 6to4) counts
-/// too. Else the IPv6 form of an address gets past a range.
+/// IPv6 address embeds counts too ([`embedded_v4`]). Else the IPv6 form of
+/// an address gets past a range.
 pub fn in_ranges(ranges: &[IpNet], ip: IpAddr) -> bool {
+    ip_forms(ip).any(|ip| ranges.iter().any(|r| r.contains(&ip)))
+}
+
+/// Get `ip` in canonical form, and the IPv4 address that it embeds.
+fn ip_forms(ip: IpAddr) -> impl Iterator<Item = IpAddr> {
     let ip = ip.to_canonical();
-    let v4 = embedded_v4(ip).map(IpAddr::V4);
-    ranges
-        .iter()
-        .any(|r| r.contains(&ip) || v4.is_some_and(|v4| r.contains(&v4)))
+    std::iter::once(ip).chain(embedded_v4(ip).map(IpAddr::V4))
 }
 
 /// Ranges of the addresses that are not public: unspecified, loopback,
@@ -308,12 +317,17 @@ pub fn is_public_ip(ip: IpAddr) -> bool {
 }
 
 /// Get the IPv4 address in an IPv4-compatible (deprecated), IPv4-mapped,
-/// NAT64 or 6to4 address.
+/// IPv4-translated, NAT64 or 6to4 address.
 fn embedded_v4(ip: IpAddr) -> Option<Ipv4Addr> {
     let IpAddr::V6(ip) = ip else { return None };
     match ip.segments() {
+        // `::` and `::1` are IPv6 addresses, not IPv4-compatible ones.
+        [0, 0, 0, 0, 0, 0, 0, 0 | 1] => None,
         [0, 0, 0, 0, 0, 0 | 0xffff, hi, lo]
+        | [0, 0, 0, 0, 0xffff, 0, hi, lo]
         | [0x64, 0xff9b, 0, 0, 0, 0, hi, lo]
+        // Local-use NAT64 (RFC 8215): only the usual /96 form.
+        | [0x64, 0xff9b, 1, _, _, _, hi, lo]
         | [0x2002, hi, lo, ..] => Some(Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo))),
         _ => None,
     }
@@ -359,6 +373,8 @@ mod tests {
             "::ffff:127.0.0.1",
             "::ffff:169.254.169.254",
             "64:ff9b::a9fe:a9fe",
+            "64:ff9b:1::a9fe:a9fe",
+            "::ffff:0:a9fe:a9fe",
             "::127.0.0.1",
             "::10.0.0.1",
             "2002:7f00:1::1",
@@ -366,6 +382,29 @@ mod tests {
             "2002:c0a8:101::1",
         ] {
             assert!(!is_public_ip(ip.parse().unwrap()), "{ip}");
+        }
+    }
+
+    /// Test that an IPv6 address matches an IPv4 range only through a real
+    /// embedded IPv4 address. Else a deny of `0.0.0.0/8` also denies `::1`
+    /// and `::`.
+    ///   1. Take IPv6 addresses with and without an embedded IPv4 address
+    ///   2. Check each against IPv4 ranges
+    #[test]
+    fn ipv6_address_matches_ipv4_range_only_through_embedded_address() {
+        let ranges: Vec<IpNet> = ["0.0.0.0/8", "169.254.0.0/16"]
+            .iter()
+            .map(|r| r.parse().unwrap())
+            .collect();
+        for (ip, expected) in [
+            ("::1", false),
+            ("::", false),
+            ("::0.0.0.2", true),
+            ("::ffff:0:a9fe:a9fe", true),
+            ("64:ff9b:1:2::a9fe:a9fe", true),
+            ("64:ff9b:2::a9fe:a9fe", false),
+        ] {
+            assert_eq!(in_ranges(&ranges, ip.parse().unwrap()), expected, "{ip}");
         }
     }
 
@@ -384,6 +423,7 @@ mod tests {
             "2606:4700::1111",
             "::ffff:1.1.1.1",
             "64:ff9b::808:808",
+            "64:ff9b:1::808:808",
             "::8.8.8.8",
             "2002:808:808::1",
         ] {

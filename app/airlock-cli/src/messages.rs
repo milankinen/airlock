@@ -1810,6 +1810,21 @@ pub mod network {
         format!("`{target}`: {why}")
     }
 
+    /// Error when the connect to an upstream server times out.
+    pub fn connect_timed_out(addr: impl Display) -> String {
+        format!("connection timed out: {addr}")
+    }
+
+    /// Error when the DNS lookup of an upstream name times out.
+    pub fn lookup_timed_out(name: impl Display) -> String {
+        format!("lookup timed out: {name}")
+    }
+
+    /// Error when the relay must dial a target with no checked address.
+    pub fn no_checked_address(host: impl Display, port: impl Display) -> String {
+        format!("blocked: {host}:{port} has no checked address")
+    }
+
     /// Error when the port of a target pattern is not valid.
     pub fn invalid_port(target: impl Display, port: impl Display) -> String {
         format!("`{target}`: port `{port}` must be a number in 0-65535 or `*`")

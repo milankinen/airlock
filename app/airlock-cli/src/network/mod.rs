@@ -436,9 +436,10 @@ impl Network {
     /// relay checks the resolved addresses later (see [`tcp::resolve`]).
     ///
     /// The rules, in order:
-    /// 0. `deny-always`: deny. A public-only network denies local names and
-    ///    non-public IP addresses. It also checks the resolved addresses
-    ///    when it connects.
+    /// 0. `deny-always`, or a host that is neither an IP address nor a
+    ///    valid host name: deny. A public-only network denies local names
+    ///    and non-public IP addresses. It also checks the resolved
+    ///    addresses when it connects.
     /// 1. Localhost port forward: change the port, and allow with
     ///    passthrough.
     /// 2. Host of an enabled service that cannot run: deny under every
@@ -470,7 +471,10 @@ impl Network {
 
         // Ad-hoc guest → host forwards do the same check for each connection
         // (see `NetworkControl::allows_port_forward`). Keep the two the same.
-        if matches!(policy, Policy::DenyAlways) || (self.public_only && is_local_host(host)) {
+        if matches!(policy, Policy::DenyAlways)
+            || !host.is_valid()
+            || (self.public_only && is_local_host(host))
+        {
             return denied(host, port);
         }
 
@@ -642,7 +646,7 @@ impl Network {
                 .active
                 .allow
                 .iter()
-                .any(|t| t.matches(host, port))
+                .any(|t| t.allows(host, port))
     }
 
     /// Return true if the policy is `deny-always`. This policy blocks all

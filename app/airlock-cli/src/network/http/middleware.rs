@@ -361,11 +361,8 @@ impl UserData for State {
         methods.add_method("hostMatches", |_, this, pattern: String| {
             // Match the authenticated connect target, not the request URI
             // or `Host` header, which the guest can spoof. A pattern that
-            // can never match is a script error, not a silent `false`.
-            let pattern = HostPattern::parse(&pattern).map_err(|e| {
-                mlua::Error::runtime(crate::messages::network::invalid_host(&pattern, e))
-            })?;
-            Ok(pattern.matches(&this.connect_host))
+            // can never match gives `false`.
+            Ok(HostPattern::parse(&pattern).is_ok_and(|p| p.matches(&this.connect_host)))
         });
 
         methods.add_method("deny", |_, _, ()| -> mlua::Result<()> {

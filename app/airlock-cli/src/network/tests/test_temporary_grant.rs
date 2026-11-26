@@ -499,10 +499,12 @@ fn wide_local_and_numeric_grant_hosts_are_refused_before_approval() {
 
 /// Test that a request is denied with no prompt when the network already
 /// allows all its hosts. A prompt for that would only train the user to
-/// click allow.
-///   1. Allow one host with a config rule
+/// click allow. A grant cannot allow a denied address either, so a port
+/// with a deny range gets a text that tells this.
+///   1. Allow one host with a config rule, and deny a range on port 22
 ///   2. Ask for a grant of that host and check the deny text
-///   3. Ask for that host and one more host, and check that the user gets
+///   3. Ask for it on port 22 and check the text about denied addresses
+///   4. Ask for that host and one more host, and check that the user gets
 ///      a prompt
 #[test]
 fn grant_of_already_allowed_hosts_is_denied_without_prompt() {
@@ -515,6 +517,7 @@ fn grant_of_already_allowed_hosts_is_denied_without_prompt() {
 
         [network.rules.api]
         allow = ["api.example.com"]
+        deny = ["10.0.0.0/8:22"]
         "#;
     let (network, approver, _dir) = grant_network(toml, Decision::Allow);
     run_network(network, |proxy| async move {
@@ -522,7 +525,12 @@ fn grant_of_already_allowed_hosts_is_denied_without_prompt() {
             .await
             .err()
             .unwrap();
-        assert!(err.contains("already allows"), "{err}");
+        assert!(err.contains("already allows all requested hosts"), "{err}");
+        let (_, err) = request_grant(&proxy, &["api.example.com:22"])
+            .await
+            .err()
+            .unwrap();
+        assert!(err.contains("cannot allow an address"), "{err}");
         assert!(approver.prompts.borrow().is_empty());
 
         request_grant(&proxy, &["api.example.com", "docs.example.com"])

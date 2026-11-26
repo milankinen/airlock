@@ -403,19 +403,29 @@ pub(crate) fn parse_hosts(hosts: &[String]) -> Result<(Vec<String>, Vec<NetworkT
     Ok((labels, targets))
 }
 
-/// Return true if the network allows all `targets` with no grant. A
-/// wildcard pattern always needs the grant. A pattern with no port is
-/// checked on ports 80 and 443.
-fn all_allowed_already(network: &Network, targets: &[NetworkTarget]) -> bool {
-    targets.iter().all(|t| {
-        let Some(host) = t.host.exact_host() else {
-            return false;
-        };
-        let ports = t.port.map_or(vec![80, 443], |p| vec![p]);
-        ports
-            .into_iter()
-            .all(|p| network.resolve_target_in(&host, p, None).allowed)
-    })
+/// Check if the network allows all `targets` with no grant. A wildcard
+/// pattern always needs the grant. A pattern with no port is checked on
+/// ports 80 and 443.
+/// Returns:
+///   `None` if a target needs the grant. Else `Some(checked)`: `checked`
+///   is true if the proxy checks the addresses that a host name resolves
+///   to (deny ranges, public-only).
+fn allowed_already(network: &Network, targets: &[NetworkTarget]) -> Option<bool> {
+    let mut checked = false;
+    for t in targets {
+        let host = t.host.exact_host()?;
+        for port in t.port.map_or(vec![80, 443], |p| vec![p]) {
+            let target = network.resolve_target_in(&host, port, None);
+            if !target.allowed {
+                return None;
+            }
+            // No DNS lookup here: a lookup of a requested name can carry
+            // data out before the user sees the prompt. The decision of an
+            // IP address is final already.
+            checked |= matches!(host, Host::Name(_)) && !target.allows_all_addresses();
+        }
+    }
+    Some(checked)
 }
 
 /// Extra access of a grant connection.
@@ -436,7 +446,7 @@ impl GrantAccess {
             GrantAccess::AllHosts => return is_grantable_host(host),
             GrantAccess::Rule(rule) => &rule.targets.allow,
         };
-        targets.iter().any(|t| t.matches(host, port))
+        targets.iter().any(|t| t.allows(host, port))
     }
 
     /// Return true if the deny patterns of the rule match `host:port`.
@@ -646,10 +656,21 @@ async fn decide(network: Rc<Network>, req: Request) -> Result<Granted, Denial> {
         }
         (false, true) => {
             let (hosts, targets) = parse_hosts(&req.hosts)?;
-            if all_allowed_already(&network, &targets) {
-                return Err("the network already allows all requested hosts. \
-                            Run the command with no grant."
-                    .into());
+            // A grant cannot allow an address that the network checks and
+            // denies. Thus a prompt does not help in that case either.
+            match allowed_already(&network, &targets) {
+                Some(false) => {
+                    return Err("the network already allows all requested hosts. \
+                                Run the command with no grant."
+                        .into());
+                }
+                Some(true) => {
+                    return Err("the network already allows all requested host names. \
+                                Run the command with no grant. A grant cannot allow \
+                                an address that a deny rule or the network denies."
+                        .into());
+                }
+                None => {}
             }
             let prompt = PromptRequest::Hosts {
                 hosts: hosts.clone(),

@@ -321,10 +321,11 @@ fn public_only_network_denies_local_destinations_by_name_and_literal() {
 }
 
 /// Test that a network never opens a connection to a local address that it
-/// denies: a public-only network, a deny range and the private network pack.
-/// A denied answer is not enough if the dial already happened.
+/// denies: a public-only network, a deny range, a deny of `localhost` and
+/// the private network pack. A denied answer is not enough if the dial
+/// already happened.
 ///   1. Start a local server that counts accepted connections
-///   2. Send a GET to it by three loopback names through each network
+///   2. Send a GET to it by loopback names and forms through each network
 ///   3. Check the 204 answers on the normal network, and the 403 answers on
 ///      the other networks
 ///   4. Check that the server accepted no connection from the other networks
@@ -334,10 +335,14 @@ fn network_that_denies_local_addresses_never_dials_them() {
     let by_default = "[network]\npolicy = \"allow-by-default\"\n";
     // `localhost` also resolves to `::1`, which `127.0.0.0/8` does not have.
     let deny_range = format!("{by_default}[network.rules.r]\ndeny = [\"127.0.0.0/8\", \"::1\"]");
+    let deny_localhost = format!("{by_default}[network.rules.r]\ndeny = [\"localhost\"]");
     let pack = format!("{by_default}[packs]\nprivate-network = {{ version = 1 }}");
+    // The resolver reads the numeric forms as `127.0.0.1`.
+    let hosts = ["127.0.0.1", "127.1", "2130706433", "0x7f.1", "localhost"];
     for (network, reachable) in [
         (network(toml).public_only(), false),
         (network(&deny_range), false),
+        (network(&deny_localhost), false),
         (network(&pack), false),
         (network(toml), true),
     ] {
@@ -345,8 +350,7 @@ fn network_that_denies_local_addresses_never_dials_them() {
         let port = upstream.port();
         run_network(network, |proxy| async move {
             let accepted = upstream.start();
-            // `127.1` is a short form of `127.0.0.1`.
-            for host in ["127.0.0.1", "127.1", "localhost"] {
+            for host in hosts {
                 let resp = TestConnection::connect(&proxy, host, port)
                     .await
                     .unwrap()
@@ -361,7 +365,7 @@ fn network_that_denies_local_addresses_never_dials_them() {
                 };
                 assert!(resp.starts_with(expected), "{host}: {resp}");
             }
-            let expected = if reachable { 3 } else { 0 };
+            let expected = if reachable { hosts.len() } else { 0 };
             assert_eq!(accepted.load(Ordering::SeqCst), expected);
         });
     }
@@ -423,4 +427,43 @@ fn deny_of_address_or_range_covers_all_address_forms_and_names() {
             .resolve_target("git.example.com", 443)
             .allows_all_addresses()
     );
+}
+
+/// Test that a deny of `localhost` also denies each loopback address that
+/// a name resolves to, for example `foo.localhost`.
+///   1. Build a network that denies `localhost`
+///   2. Check the addresses that an allowed name can connect to
+#[test]
+fn deny_of_localhost_covers_all_loopback_addresses() {
+    let network = network(
+        "[network]\npolicy = \"allow-by-default\"\n\
+         [network.rules.r]\ndeny = [\"localhost\"]\n",
+    );
+    let target = network.resolve_target("example.com", 443);
+    assert!(target.allowed);
+    for (ip, expected) in [
+        ("127.0.0.1", false),
+        ("127.0.1.1", false),
+        ("::1", false),
+        ("::ffff:127.0.0.2", false),
+        ("8.8.8.8", true),
+    ] {
+        assert_eq!(target.allows_address(ip.parse().unwrap()), expected, "{ip}");
+    }
+}
+
+/// Test that a host that is neither an IP address nor a valid host name is
+/// denied under each policy, for example `fe80::1%en0`.
+///   1. Build a network with allow-by-default
+///   2. Set allow-by-default and allow-always in turn
+///   3. Check that each host that is not valid is denied
+#[test]
+fn host_that_is_not_name_or_address_is_denied_under_each_policy() {
+    let network = network("[network]\npolicy = \"allow-by-default\"\n");
+    for policy in [Policy::AllowByDefault, Policy::AllowAlways] {
+        network.handle().control().set_policy(policy);
+        for host in ["fe80::1%en0", "256.1", "0x17f000001", "a..b", "foo bar"] {
+            assert!(!network.resolve_target(host, 443).allowed, "{host}");
+        }
+    }
 }

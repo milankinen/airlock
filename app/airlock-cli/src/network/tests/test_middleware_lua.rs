@@ -146,8 +146,10 @@ fn middleware_response_edits_reach_guest() {
 
 /// Test that host matches in Lua use the connect target, not the `Host`
 /// header. A guest controls the header, so a header match is easy to evade
-/// or to spoof.
-///   1. Add a middleware that denies `evil.com` and `127.0.0.1/target`
+/// or to spoof. A pattern that is not valid gives `false`, not a script
+/// error.
+///   1. Add a middleware that denies `evil.com`, `127.0.0.1/target` and
+///      patterns that are not valid
 ///   2. Send a request to 127.0.0.1 with a spoofed `Host: evil.com`
 ///   3. Check that the spoofed request passes
 ///   4. Check that `/target` gets 403 and other paths pass
@@ -158,6 +160,7 @@ fn host_rule_matches_connect_target_not_host_header() {
         r#"
         if req:hostMatches("evil.com") then req:deny() end
         if req:hostMatches("127.0.0.1") and req.path == "/target" then req:deny() end
+        if req:hostMatches("127.0.0.1:80") or req:hostMatches("*foo.com") then req:deny() end
         "#,
     )]);
     run_with_config(cfg, |proxy, _, _| async move {

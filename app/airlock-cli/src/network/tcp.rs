@@ -46,7 +46,7 @@ pub async fn connect_server(target: &ResolvedTarget) -> anyhow::Result<io::Trans
     debug!("plain tcp: {addr}");
     let server = tokio::time::timeout(crate::constants::TCP_CONNECT_TIMEOUT, dial(target))
         .await
-        .map_err(|_| anyhow::anyhow!("connection timed out: {addr}"))??;
+        .map_err(|_| anyhow::anyhow!(crate::messages::network::connect_timed_out(&addr)))??;
     let (sr, sw) = server.into_split();
     Ok(io::Transport {
         read: Box::new(sr),
@@ -76,7 +76,7 @@ pub async fn resolve(target: &mut ResolvedTarget) -> anyhow::Result<()> {
             tokio::net::lookup_host((name.as_str(), target.port)),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("lookup timed out: {name}"))??
+        .map_err(|_| anyhow::anyhow!(crate::messages::network::lookup_timed_out(name)))??
         .collect(),
     };
     target.addresses = addresses
@@ -105,9 +105,7 @@ pub async fn dial(target: &ResolvedTarget) -> anyhow::Result<TcpStream> {
     }
     anyhow::ensure!(
         target.allows_all_addresses(),
-        "blocked: {}:{} has no checked address",
-        target.host,
-        target.port
+        crate::messages::network::no_checked_address(&target.host, target.port)
     );
     Ok(match &target.host {
         Host::Ip(ip) => TcpStream::connect(SocketAddr::new(*ip, target.port)).await?,
