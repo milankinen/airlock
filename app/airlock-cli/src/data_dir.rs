@@ -1,10 +1,10 @@
 //! Airlock data directory layout.
 //!
 //! All sandboxes share the user's airlock data directory. It contains the
-//! database, the sandboxes that are not in their project, the templates,
-//! the VM boot assets, the OCI images and layers, the host side of the pack
-//! mounts, fallback CLI sockets and, on macOS, the notifier app. The user
-//! settings can move the directory, also with a link.
+//! database, the sandboxes, the templates, the VM boot assets, the OCI
+//! images and layers, the host side of the pack mounts, fallback CLI
+//! sockets and, on macOS, the notifier app. The user settings can move the
+//! directory, also with a link.
 //!
 //! The data directory is private: airlock makes it, the sandboxes directory
 //! and the templates directory with access for the user only. All
@@ -27,8 +27,7 @@ pub(crate) struct DataDir {
     pub root: VerifiedPath,
     /// The database (`db/`).
     pub db: VerifiedPath,
-    /// The sandboxes that are not in their project (`boxes/`). The user
-    /// can move it to an other disk with a link.
+    /// The sandboxes (`boxes/`).
     pub sandboxes: VerifiedPath,
     /// The templates (`templates/`).
     pub templates: VerifiedPath,
@@ -64,7 +63,7 @@ impl DataDir {
         let root = create_private_dir(root)?;
         Ok(Self {
             db: root.join(crate::db::DIR)?,
-            sandboxes: sandboxes_dir(&root)?,
+            sandboxes: root.join(crate::sandbox::BOXES_DIR)?,
             templates: root.join(crate::templates::TEMPLATES_DIR)?,
             vm: root.join("vm")?,
             images: root.join("oci/images")?,
@@ -75,21 +74,6 @@ impl DataDir {
             root,
         })
     }
-}
-
-/// Get the sandboxes directory of the data directory `root`.
-fn sandboxes_dir(root: &VerifiedPath) -> anyhow::Result<VerifiedPath> {
-    let dir = root.join(crate::sandbox::BOXES_DIR)?;
-    // Only airlock and the user can write the data dir. Thus a link here
-    // is from the user, who moved the sandboxes to an other disk. Follow
-    // only this link.
-    if dir
-        .symlink_metadata()
-        .is_ok_and(|m| m.file_type().is_symlink())
-    {
-        return Ok(root.join_follow(crate::sandbox::BOXES_DIR, None)?);
-    }
-    Ok(dir)
 }
 
 /// Make `dir` and its missing parents. A new directory gets mode 0700: the
