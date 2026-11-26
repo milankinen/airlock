@@ -96,7 +96,7 @@ In addition to the standard Lua imports, the script gets these inputs:
 | `pack.args`      | Arg values, with the defaults. A `bool` arg is a boolean, a `choice` arg is a string |
 | `pack.directory` | Host directory of the pack. airlock makes it before the script runs. All projects with the pack share it. Use it for the host side of mounts |
 | `fail(message)`  | Function that stops with the config error `pack <name>: <message>` |
-| `ip.private_ranges()` | Function that gives the list of the private IP ranges: loopback, private, link-local and the other ranges that are not public |
+| `ip.private_ranges()` | Function that gives the list of the IP ranges that are not public |
 | `ip.exclude(ranges, except)` | Function that removes the addresses of `except` from `ranges`. Both are lists of IP addresses and ranges. It gives a list of ranges |
 
 The script writes its outputs to these tables. Both are empty when the

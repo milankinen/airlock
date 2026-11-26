@@ -10,9 +10,12 @@ git = { version = "1" }
 The pack has no args. It allows no hosts. Add a network rule for your Git
 server, for example `github.com`.
 
-The pack sets the Git commit author and committer to the values of the
-host. At startup, Git reads the repository settings and applies matching
-conditional includes (`includeIf`) from the host's global config.
-The host variables `GIT_AUTHOR_*` and `GIT_COMMITTER_*` take precedence.
-Changes to `.git/config` inside the sandbox can affect the identity at
-the next start.
+The pack sets the Git commit author and committer from the host.
+airlock uses the first value that it finds, in this order:
+
+1. The host environment variables `GIT_AUTHOR_*` and `GIT_COMMITTER_*`
+2. The Git config keys `author.*` and `committer.*`
+3. The Git config keys `user.*`
+
+airlock reads the Git config of the project repository. Thus sandboxes
+of different repositories can have different authors.
