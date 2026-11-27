@@ -2000,17 +2000,6 @@ pub mod oci {
     /// Error line when the registry refuses the credentials.
     pub const AUTH_FAILED_RETRY: &str = "authentication failed, try again";
 
-    /// Error when the image file cannot get a hardlink in the sandbox directory.
-    pub fn hardlink_image_failed(
-        image_path: impl Display,
-        sandbox_image: impl Display,
-        err: impl Display,
-    ) -> String {
-        format!(
-            "cannot hardlink {image_path} to {sandbox_image}: {err}, both must be on one filesystem"
-        )
-    }
-
     /// Error when the image has no layers.
     pub fn image_has_no_layers(image_id: impl Display) -> String {
         format!("image {image_id} has no layers")

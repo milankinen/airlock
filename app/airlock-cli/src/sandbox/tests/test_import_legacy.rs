@@ -119,8 +119,9 @@ fn write_installs(sandbox: &Path) {
 ///      `run.json`, the symlink and the FIFO are not taken
 ///   4. Check that the disk is the same file with the same content and is
 ///      still sparse
-///   5. Check that the image is a link to the cache file, the records are
-///      cleaned, and the host file and `.airlock` are as expected
+///   5. Check that the image marker has the digest of the old image, the
+///      records are cleaned, and the host file and `.airlock` are as
+///      expected
 #[test]
 fn import_takes_only_checked_files_and_ignores_planted_entries() {
     let setup = Setup::new();
@@ -129,7 +130,7 @@ fn import_takes_only_checked_files_and_ignores_planted_entries() {
     sparse_disk(&old);
     let disk_ino = std::fs::metadata(old.join("disk.img")).unwrap().ino();
     write_installs(&old);
-    let (_, image_json) = cached_image(&setup.context, "alpine");
+    let (image_id, image_json) = cached_image(&setup.context, "alpine");
     std::fs::write(old.join("image"), &image_json).unwrap();
     let victim = setup.root.join("victim");
     std::fs::write(&victim, "host secret").unwrap();
@@ -143,7 +144,7 @@ fn import_takes_only_checked_files_and_ignores_planted_entries() {
         "ca.json",
         "disk.id",
         "disk.img",
-        "image",
+        "image.imported",
         "installs.json",
         "run.lock",
         "startup.lock",
@@ -167,14 +168,10 @@ fn import_takes_only_checked_files_and_ignores_planted_entries() {
         legacy_ca()
     );
 
-    let image = std::fs::metadata(dir.join("image")).unwrap();
-    let cache_dir = setup.context.data.images.to_path().unwrap().to_path_buf();
-    let cached = std::fs::read_dir(cache_dir)
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap();
-    assert_eq!(image.ino(), cached.metadata().unwrap().ino());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("image.imported")).unwrap(),
+        image_id
+    );
 
     let installs: InstallState =
         serde_json::from_slice(&std::fs::read(dir.join("installs.json")).unwrap()).unwrap();

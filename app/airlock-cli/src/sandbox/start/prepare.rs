@@ -115,7 +115,7 @@ pub async fn prepare(
         .map(|name| templates::find(&context.data, name))
         .transpose()
         .map_err(|e| Exit::error(1, e))?;
-    location::fill_new_sandbox(&context, lock, first, options.can_prompt, options.yes)?;
+    location::fill_new_sandbox(lock, first, options.can_prompt, options.yes)?;
     // The sandbox step can select the config of the last run.
     let ensured = Box::pin(ensure::ensure_sandbox(
         &context,

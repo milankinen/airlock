@@ -110,7 +110,7 @@ pub fn migrate_legacy_cache(data_dir: VerifiedPath) -> VerifiedPath {
         return data_dir;
     }
     // One rename keeps the inodes. Thus running sandboxes keep their open
-    // files, and the hard links to cached images stay valid.
+    // files.
     let moved = data_dir
         .parent()
         .map_or(Ok(()), |parent| create_private_dir(&parent).map(drop))

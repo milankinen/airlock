@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use crate::cache;
 use crate::cli::cmd_rm::{RmArgs, run};
 use crate::context::Context;
+use crate::oci::ImageOwner;
+use crate::oci::record::{self, ImageRecord};
 use crate::sandbox::{SandboxLock, registry};
 use crate::test_cfg::oci::verified_dir;
 use crate::test_cfg::sandboxes::stopped_sandbox_dir;
@@ -30,8 +32,8 @@ fn rm(context: &Context, dir: &Path) -> i32 {
     block_on_local(run(&FORCE, context, &verified_dir(dir)))
 }
 
-/// A project in the temp home with a started sandbox. The sandbox image is
-/// a hard link to an image in the OCI cache, as `airlock start` makes it.
+/// A project in the temp home with a started sandbox. The image record of
+/// the sandbox names an image in the OCI cache, as `airlock start` makes it.
 struct Project {
     dir: PathBuf,
     id: String,
@@ -56,10 +58,20 @@ impl Project {
         let sandbox = context.data.sandboxes.given().join(&id);
         stopped_sandbox_dir(&sandbox);
         std::fs::write(sandbox.join("disk.img"), b"data").unwrap();
-        let image = cache::image_path(&context.data, &format!("sha256:{name}")).unwrap();
+        let digest = format!("sha256:{name}");
+        let image = cache::image_path(&context.data, &digest).unwrap();
         let image = image.to_path().unwrap().to_path_buf();
         std::fs::write(&image, br#"{"schema":"v2","image_layers":[]}"#).unwrap();
-        std::fs::hard_link(&image, sandbox.join("image")).unwrap();
+        let record = ImageRecord {
+            digest,
+            name: Some(name.to_string()),
+        };
+        block_on_local(record::set(
+            &context.db,
+            &ImageOwner::Sandbox(id.clone()),
+            record,
+        ))
+        .unwrap();
         Self {
             dir,
             id,

@@ -18,7 +18,7 @@ use crate::context::Context;
 use crate::data_dir::DataDir;
 #[cfg(not(test))]
 use crate::oci::prepare as prepare_image;
-use crate::oci::{ImageChange, ImageChangeStop, OnImageChange};
+use crate::oci::{ImageChange, ImageChangeStop, ImageOwner, OnImageChange, record};
 #[cfg(not(test))]
 use crate::packs::install::facts::check as check_image;
 use crate::packs::install::plan::{self, DecideInput, Wanted};
@@ -117,8 +117,8 @@ pub async fn create(
 /// Build the template `name` from `config`.
 ///
 /// Gets the image, installs the packs of `config` on a new disk, and moves
-/// the disk, the install records, the image link and the config to the
-/// template directory. If `config` comes from an other template, the build
+/// the disk, the install records, the image record and the config to the
+/// template. If `config` comes from an other template, the build
 /// starts with a copy of that template. If a pack of that template changed,
 /// the changed-packs question decides (with `--yes`, the build starts with
 /// a new disk). The build directory is removed at the end, also on failure.
@@ -151,12 +151,23 @@ pub(crate) async fn build_template(
     .await
     .and_then(|toml| keep_files(data_dir, name, &build.sandbox, &toml, replace));
     drop(lock);
-    if result.is_ok() {
-        let _ = build.root.remove_dir_all();
-    } else {
-        remove_except_log(&build);
+    let build_owner = ImageOwner::TemplateBuild(name.to_string());
+    let replaced = match result {
+        Ok(replaced) => replaced,
+        Err(e) => {
+            let _ = record::remove(&context.db, &build_owner).await;
+            remove_except_log(&build);
+            return Err(e);
+        }
+    };
+    let template_owner = ImageOwner::Template(name.to_string());
+    record::rename(&context.db, &build_owner, &template_owner).await?;
+    let _ = build.root.remove_dir_all();
+    if replaced {
+        // The old template image can be unused now.
+        crate::oci::gc_sweep(&context.db, data_dir).await;
     }
-    result
+    Ok(())
 }
 
 /// [`build_template`] under the lock of the build sandbox `lock`, up to the
@@ -201,7 +212,9 @@ async fn build_locked(
     let values = &resolved.values;
     cli::log!("{}", messages::templates::building_template(name));
     let prepared = prepare_image(
+        &context.db,
         &context.data,
+        &ImageOwner::TemplateBuild(name.to_string()),
         &build.sandbox,
         &values.vm.image,
         &context.vault,
@@ -319,8 +332,9 @@ fn pin_image(toml: &str, image: &ImageRef, pin: Option<&str>) -> anyhow::Result<
 ///  - `replace`: Replace a template with the same name
 ///
 /// Returns:
-///   Error if the template exists and `replace` is false, or a move
-///   fails. Then the old template does not change.
+///   `true` if an old template was replaced. Error if the template exists
+///   and `replace` is false, or a move fails. Then the old template does
+///   not change.
 // The files go to a staging directory first. The rename of the staging
 // directory is the commit point: a parallel create of the same name fails
 // there. A replaced template moves aside first, and is removed after the
@@ -331,7 +345,7 @@ fn keep_files(
     sandbox_dir: &VerifiedPath,
     toml: &str,
     replace: bool,
-) -> Result<(), Exit> {
+) -> Result<bool, Exit> {
     // `build_template` made the dir. Check it again to pin it.
     let root = data_dir.templates.reverify().map_err(anyhow::Error::from)?;
     let dir = root.join(name).map_err(anyhow::Error::from)?;
@@ -379,10 +393,8 @@ fn keep_files(
     }
     if replaced {
         let _ = old.remove_dir_all();
-        // The old template image can be unused now.
-        crate::oci::gc_sweep(data_dir);
     }
-    Ok(())
+    Ok(replaced)
 }
 
 /// Remove the build directory `build` after a failed build, except the
@@ -450,14 +462,26 @@ impl BuildDir {
     /// Returns:
     ///   The paths, or error if the path check fails.
     fn new(data_dir: &DataDir, name: &str) -> anyhow::Result<Self> {
-        let root = data_dir
-            .templates
-            .clone()
-            .join(format!("{BUILD_PREFIX}{name}"))?;
+        let root = build_root(data_dir, name)?;
         Ok(Self {
             sandbox: root.join("sandbox")?,
             project: root.join("project")?,
             root,
         })
     }
+}
+
+/// Return the build directory of the template `name`.
+fn build_root(data_dir: &DataDir, name: &str) -> anyhow::Result<VerifiedPath> {
+    Ok(data_dir
+        .templates
+        .clone()
+        .join(format!("{BUILD_PREFIX}{name}"))?)
+}
+
+/// Return the directory of the build sandbox of the template `name`.
+/// Returns:
+///   The path, or error if the path check fails.
+pub(crate) fn build_sandbox_dir(data_dir: &DataDir, name: &str) -> anyhow::Result<VerifiedPath> {
+    Ok(build_root(data_dir, name)?.join("sandbox")?)
 }

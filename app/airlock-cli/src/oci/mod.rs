@@ -13,6 +13,7 @@ mod credentials;
 mod docker;
 mod gc;
 mod layer;
+pub(crate) mod record;
 mod registry;
 
 use std::io::{self, Read};
@@ -21,12 +22,15 @@ use futures::stream::{self, StreamExt};
 pub use gc::sweep as gc_sweep;
 use oci_client::config::ConfigFile as OciConfig;
 use oci_client::secrets::RegistryAuth;
+pub use record::ImageOwner;
 
 use crate::cli::prompt::PromptError;
 use crate::cli::prompt::choose::{Choice, Choose};
 use crate::config::config_values::{ImageRef, PullPolicy, Resolution};
 use crate::data_dir::DataDir;
+use crate::db::Db;
 use crate::oci::credentials::ToRegistryAuth;
+use crate::oci::record::{IMPORT_MARKER, ImageRecord};
 use crate::sandbox::Project;
 use crate::util::PinnedDir;
 use crate::util::verified_path::{self, Refusal, VerifiedPath};
@@ -46,12 +50,6 @@ const MAX_LAYER_RECORD_FILE: u64 = 1024 * 1024;
 /// Defense in depth: the cache entry can come from an old sandbox import.
 const MAX_IMAGE_FILE: u64 = 4 * 1024 * 1024;
 
-/// File in the sandbox directory with the image digest of an imported old
-/// sandbox, when its image is not in the cache. Empty if the digest is not
-/// known. [`prepare`] uses it as the stored digest, thus a different image
-/// gives the image change question.
-const IMPORT_MARKER: &str = "image.imported";
-
 /// Counter that makes the temp names of image file writes unique in a
 /// process.
 static IMAGE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -63,15 +61,16 @@ static IMAGE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// overrides. `vm::start` adds mounts, disks and env (from the resolved
 /// `SandboxEnv`). `sandbox::main_argv` adds command overrides.
 ///
-/// Stored on disk at `images/<digest>`, wrapped in [`CachedImage`]. The same
-/// file is hardlinked to `<sandbox>/image` to tell GC that the image is in use.
+/// Stored on disk at `images/<digest>`, wrapped in [`CachedImage`]. The
+/// image record of each sandbox and template names the digest that it uses.
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct OciImage {
     /// OCI image digest. The supervisor uses it to detect image changes.
     pub image_id: String,
-    /// Image reference that the user configured (e.g. `alpine:3.20`). The
-    /// fast path uses it to check that the cached entry still matches the
-    /// configured image name, without a new tag resolution.
+    /// Image reference that the user configured (e.g. `alpine:3.20`).
+    // Not in the cache entry: sandboxes with different names for one digest
+    // share the entry. An older entry has the name and it is ignored.
+    #[serde(skip)]
     pub name: String,
     /// Layer keys, topmost first. Each key is a versioned layer name
     /// ([`cache::layer_key`]). It is the directory name under
@@ -161,7 +160,9 @@ pub struct PreparedImage {
 
 /// Resolve, download and prepare the OCI image for a sandbox.
 /// Args:
+///  - `db`: The airlock database with the image records
 ///  - `data_dir`: Airlock data directory
+///  - `owner`: Owner of the image record (the sandbox)
 ///  - `sandbox_dir`: Directory of the sandbox
 ///  - `image_cfg`: Configured image reference and pull settings
 ///  - `vault`: Vault that holds the registry credentials
@@ -172,28 +173,30 @@ pub struct PreparedImage {
 ///   The prepared image and what happened to the old image, or error.
 ///   Stops with [`ImageChangeStop`] if the user aborts or nobody can answer.
 pub async fn prepare(
+    db: &Db,
     data_dir: &DataDir,
+    owner: &ImageOwner,
     sandbox_dir: &VerifiedPath,
     image_cfg: &ImageRef,
     vault: &Vault,
     on_change: OnImageChange,
 ) -> anyhow::Result<PreparedImage> {
-    let sandbox_image = sandbox_dir.join("image")?;
     let image_name = &image_cfg.name;
     let unchanged = |image| PreparedImage {
         image,
         change: ImageChange::Unchanged,
         pin: None,
     };
+    let target = Target {
+        db,
+        owner,
+        sandbox_dir,
+        image_name,
+    };
 
-    // The cached image of this sandbox. Set only if it is complete on disk
-    // and its name is still the configured image name, or its digest is
-    // the pinned digest. Sandboxes share the cache entry, and a different
-    // name can be in it. A pinned digest names one image, thus the name
-    // is not necessary then. A sandbox from a template uses this.
-    let pinned = image_cfg.pinned_digest();
-    let cached = read_ready_image(data_dir, &sandbox_image)
-        .filter(|img| img.name == *image_name || pinned == Some(img.image_id.as_str()));
+    // For the cached image, the pin and the change detection.
+    let stored = record::load(db, owner, sandbox_dir).await?;
+    let cached = sandbox_image(data_dir, stored.as_ref(), image_cfg);
 
     // Fast path: use the cached image and skip the network request that
     // resolves the tag to a digest.
@@ -207,14 +210,8 @@ pub async fn prepare(
             || image_cfg.pinned_digest().is_some())
     {
         tracing::debug!("image cache hit for {image_name}");
-        return use_cached_image(data_dir, sandbox_dir, &sandbox_image, img).map(unchanged);
+        return use_cached_image(&target, img).await.map(unchanged);
     }
-
-    // Read only the stored digest (if any) for change detection. An
-    // imported sandbox without an image link has the digest in the marker.
-    let stored_digest = read_image_json(&sandbox_image)
-        .and_then(|json| stored_image_id(json.as_bytes()))
-        .or_else(|| read_import_marker(sandbox_dir));
 
     let registry_host: String = image_name
         .parse::<oci_client::Reference>()
@@ -222,7 +219,7 @@ pub async fn prepare(
 
     // The pinned try never asks for credentials and falls back to the tag:
     // a local image stores its image ID, which no registry knows.
-    let resolved = match stored_pin(image_cfg, stored_digest.as_deref()) {
+    let resolved = match stored_pin(image_cfg, stored.as_ref()) {
         Some(pinned_cfg) => {
             match resolve_with_auth(vault, &pinned_cfg, &registry_host, false).await {
                 Err(e) if !cli::is_interrupted() => {
@@ -247,20 +244,17 @@ pub async fn prepare(
             if !prompt_resolution_failed(&e)? {
                 return Err(e);
             }
-            return use_cached_image(data_dir, sandbox_dir, &sandbox_image, img).map(unchanged);
+            return use_cached_image(&target, img).await.map(unchanged);
         }
     };
 
     // Check for an image change before the download.
-    let digest_changed = stored_digest
-        .as_deref()
-        .is_none_or(|s| s.trim() != image.digest);
-
     let mut change = ImageChange::Unchanged;
-    if let Some(old_digest) = stored_digest
-        && digest_changed
+    let mut sweep = false;
+    if let Some(old) = &stored
+        && old.digest != image.digest
     {
-        change = match guard_recreate(sandbox_dir, on_change)? {
+        change = match guard_recreate(old, sandbox_dir, on_change)? {
             OnImageChange::Ask => ask_image_changed()?,
             OnImageChange::Recreate => ImageChange::Recreate,
             OnImageChange::Refuse => return Err(ImageChangeStop::NeedsTerminal.into()),
@@ -275,25 +269,17 @@ pub async fn prepare(
             // `ensure_image` only from the same resolution as its source.
             // An imported sandbox can have no valid old digest. Then the
             // old image is gone.
-            let old_digest = old_digest.trim();
-            let old_image = cache::image_path(data_dir, old_digest)
+            let old_image = cache::image_path(data_dir, &old.digest)
                 .ok()
                 .and_then(|path| read_ready_image(data_dir, &path));
-            if let Some(mut old) = old_image {
-                // Write the configured name into the kept image, so the
-                // name-keyed fast path finds it on the next start. Otherwise
-                // each later run resolves again and asks the same question.
-                if old.name != *image_name {
-                    old.name.clone_from(image_name);
-                    write_cached_image(data_dir, old_digest, &old)?;
-                }
-                return use_cached_image(data_dir, sandbox_dir, &sandbox_image, old).map(|image| {
-                    PreparedImage {
+            if let Some(old) = old_image {
+                return use_cached_image(&target, old)
+                    .await
+                    .map(|image| PreparedImage {
                         image,
                         change: ImageChange::KeepOld,
                         pin: None,
-                    }
-                });
+                    });
             }
             change = ImageChange::OldImageGone;
             cli::log!(
@@ -302,18 +288,31 @@ pub async fn prepare(
                 messages::oci::OLD_IMAGE_UNAVAILABLE
             );
         } else {
-            // Remove the image hardlink. This sandbox then no longer marks
-            // the old image as in use, so the sweep below can collect it.
-            let _ = sandbox_image.remove_file();
             cli::log!(
                 "  {} {}",
                 cli::check(),
                 messages::oci::OLD_ENVIRONMENT_ERASED
             );
-            // GC: remove images that no sandbox uses, and the layers that
-            // only those images used.
-            gc::sweep(data_dir);
+            sweep = true;
         }
+    }
+
+    // Write the record before the download. Thus a sweep of another process
+    // keeps the new image of this sandbox, and the old image is no longer
+    // in use by this sandbox.
+    record::set(
+        db,
+        owner,
+        ImageRecord {
+            digest: image.digest.clone(),
+            name: Some(image_name.clone()),
+        },
+    )
+    .await?;
+    if sweep {
+        // GC: remove images that no sandbox uses, and the layers that
+        // only those images used.
+        gc::sweep(db, data_dir).await;
     }
 
     // A local image ID is not a registry digest, and a registry digest that
@@ -327,13 +326,6 @@ pub async fn prepare(
         res = ensure_image(data_dir, &mut image, image_name, &auth, image_cfg.insecure) => res?,
         () = cli::interrupted() => return Err(ImageChangeStop::Interrupted.into()),
     };
-    // Hardlink the cached image file into the sandbox directory. nlink > 1
-    // on `images/<digest>` protects it from GC. Without it, a sibling sandbox
-    // that creates a new image can start a sweep that deletes this one.
-    // Always do this: also when the digest did not change, a previous run
-    // can have left a standalone copy instead of a hardlink.
-    ensure_image_hardlink(data_dir, &sandbox_image, &oci_image)?;
-    remove_import_marker(sandbox_dir);
     sandbox_dir.join("overlay")?.mkdirs()?;
 
     Ok(PreparedImage {
@@ -343,71 +335,69 @@ pub async fn prepare(
     })
 }
 
-/// Finish [`prepare`] with an image that is already cached on disk. Creates
-/// the GC hardlink again, makes sure that the overlay dir exists, and reports
-/// the cached image.
+/// The sandbox of a [`prepare`] call, for [`use_cached_image`].
+struct Target<'a> {
+    /// The airlock database with the image records
+    db: &'a Db,
+    /// Owner of the image record
+    owner: &'a ImageOwner,
+    /// Directory of the sandbox
+    sandbox_dir: &'a VerifiedPath,
+    /// Configured image name
+    image_name: &'a str,
+}
+
+/// Finish [`prepare`] with an image that is already cached on disk. Writes
+/// the image record of `target`, makes sure that the overlay dir exists, and
+/// reports the cached image.
 ///
 /// The fast path and the resolution-failure fallback both use this, so both
 /// leave the sandbox in the same state as a newly pulled image.
-fn use_cached_image(
-    data_dir: &DataDir,
-    sandbox_dir: &VerifiedPath,
-    sandbox_image: &VerifiedPath,
-    image: OciImage,
-) -> anyhow::Result<OciImage> {
-    // Invariant: `sandbox/image` must be a hardlink to the canonical cache
-    // file, so the GC sweep sees that the sandbox uses it. Repair it on each
-    // prepare. A cache wipe, a cache-path migration, or an older run can
-    // break the link. Then the sweep can delete the image.
-    ensure_image_hardlink(data_dir, sandbox_image, &image)?;
-    remove_import_marker(sandbox_dir);
+async fn use_cached_image(target: &Target<'_>, mut image: OciImage) -> anyhow::Result<OciImage> {
+    let record = ImageRecord {
+        digest: image.image_id.clone(),
+        name: Some(target.image_name.to_string()),
+    };
+    record::set(target.db, target.owner, record).await?;
+    image.name = target.image_name.to_string();
     cli::log!(
         "  {} {}",
         cli::check(),
         messages::oci::image_cached(cli::dim(&image.image_id[..19.min(image.image_id.len())]))
     );
-    sandbox_dir.join("overlay")?.mkdirs()?;
+    target.sandbox_dir.join("overlay")?.mkdirs()?;
     Ok(image)
 }
 
 /// Take the image of an old sandbox into the new sandbox `sandbox_dir`.
 /// The old `image` file is not copied, because the guest could write it.
-/// Only its digest is used. If the image of that digest is in the cache,
-/// the sandbox links to it. Else, if a disk was imported, the sandbox gets
-/// a marker, and the next [`prepare`] treats the image as changed.
+/// Only its digest goes into an import marker, if a disk was imported. The
+/// next [`prepare`] then compares the configured image with this digest.
 /// Args:
-///  - `data_dir`: Airlock data directory
 ///  - `old`: Directory of the old sandbox
 ///  - `sandbox_dir`: Directory of the new sandbox
 ///  - `disk_imported`: The import took the disk of the old sandbox
 ///
 /// Returns:
-///   Error if the link or the marker cannot be written.
+///   Error if the marker cannot be written.
 pub fn import_image(
-    data_dir: &DataDir,
     old: &PinnedDir,
     sandbox_dir: &VerifiedPath,
     disk_imported: bool,
 ) -> anyhow::Result<()> {
+    // Without a disk, the image of the old sandbox does not matter.
+    if !disk_imported {
+        return Ok(());
+    }
     let digest = old
         .read("image", MAX_IMAGE_FILE)
         .ok()
         .flatten()
-        .and_then(|bytes| stored_image_id(&bytes))
-        .filter(|digest| is_sha256_digest(digest));
-    // Use the cache file, not the old file. Only the cache file is trusted.
-    let cached = digest.as_deref().and_then(|digest| {
-        let path = cache::image_path(data_dir, digest).ok()?;
-        read_cached_image(&path).filter(|image| image.image_id == digest)
-    });
-    if let Some(image) = cached {
-        return ensure_image_hardlink(data_dir, &sandbox_dir.join("image")?, &image);
-    }
-    // Without a disk, the image of the old sandbox does not matter.
-    if disk_imported {
-        let marker = digest.unwrap_or_default();
-        sandbox_dir.join(IMPORT_MARKER)?.write(marker)?;
-    }
+        .and_then(|bytes| stored_image(&bytes))
+        .map(|stored| stored.digest)
+        .filter(|digest| is_sha256_digest(digest))
+        .unwrap_or_default();
+    sandbox_dir.join(IMPORT_MARKER)?.write(digest)?;
     Ok(())
 }
 
@@ -415,15 +405,21 @@ pub fn import_image(
 /// An imported sandbox with a disk and an unknown old image gives a change
 /// for each image. A re-create without a question would delete the
 /// imported disk, thus `Recreate` stops for it.
+/// Args:
+///  - `stored`: Image record of the sandbox
+///  - `sandbox_dir`: Directory of the sandbox
+///  - `on_change`: What to do about the change
+///
 /// Returns:
 ///   `on_change`, or [`ImageChangeStop::ImportedImageUnknown`] in place of
 ///   `Recreate` for such a sandbox.
 pub(crate) fn guard_recreate(
+    stored: &ImageRecord,
     sandbox_dir: &VerifiedPath,
     on_change: OnImageChange,
 ) -> Result<OnImageChange, ImageChangeStop> {
     if on_change == OnImageChange::Recreate
-        && read_import_marker(sandbox_dir).is_some_and(|digest| digest.is_empty())
+        && stored.digest.is_empty()
         && crate::sandbox::has_disk(sandbox_dir)
     {
         return Err(ImageChangeStop::ImportedImageUnknown);
@@ -439,28 +435,6 @@ fn is_sha256_digest(digest: &str) -> bool {
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     })
-}
-
-/// Read the image digest of the import marker in `sandbox_dir`.
-/// Returns:
-///   The digest (empty if not known), or `None` if there is no marker.
-pub(crate) fn read_import_marker(sandbox_dir: &VerifiedPath) -> Option<String> {
-    // A digest is about 71 bytes.
-    const CAP: u64 = 256;
-    let text = sandbox_dir
-        .join(IMPORT_MARKER)
-        .ok()?
-        .read_to_string_capped(CAP)
-        .ok()?;
-    Some(text.trim().to_string())
-}
-
-/// Remove the import marker in `sandbox_dir`. The sandbox has an image
-/// link now, which gives the stored digest.
-fn remove_import_marker(sandbox_dir: &VerifiedPath) {
-    if let Ok(marker) = sandbox_dir.join(IMPORT_MARKER) {
-        let _ = marker.remove_file();
-    }
 }
 
 /// Resolve the configured image reference to a digest and find working
@@ -540,14 +514,20 @@ fn read_image_json(path: &VerifiedPath) -> Option<String> {
 /// give an image change.
 /// Args:
 ///  - `image_cfg`: Configured image
-///  - `stored_digest`: Digest of the last start
+///  - `stored`: Image record of the sandbox
 ///
 /// Returns:
 ///   The pinned reference, or `None` if no pin applies. Local engines get
-///   none: they store an image ID, not a registry digest.
-fn stored_pin(image_cfg: &ImageRef, stored_digest: Option<&str>) -> Option<ImageRef> {
-    let digest = stored_digest?.trim();
-    let pin = image_cfg.pull_policy == PullPolicy::IfNotPresent
+///   none: they store an image ID, not a registry digest. A changed name
+///   gets none: the old digest can exist in the repository of the new tag.
+fn stored_pin(image_cfg: &ImageRef, stored: Option<&ImageRecord>) -> Option<ImageRef> {
+    let stored = stored?;
+    let digest = &stored.digest;
+    // An unknown name keeps the pin. Otherwise a moved tag is an image change,
+    // and `--yes` then deletes the disk of an imported sandbox.
+    let same_name = stored.name.as_ref().is_none_or(|n| *n == image_cfg.name);
+    let pin = same_name
+        && image_cfg.pull_policy == PullPolicy::IfNotPresent
         && image_cfg.pinned_digest().is_none()
         && matches!(
             image_cfg.resolution,
@@ -560,15 +540,18 @@ fn stored_pin(image_cfg: &ImageRef, stored_digest: Option<&str>) -> Option<Image
     })
 }
 
-/// Get the image digest from image JSON of the current or an older schema,
-/// for the image change check after a schema change.
-fn stored_image_id(json: &[u8]) -> Option<String> {
+/// Get the image digest and name from image JSON of the current or an older
+/// schema. For the image files of older versions.
+fn stored_image(json: &[u8]) -> Option<ImageRecord> {
     let json: serde_json::Value = serde_json::from_slice(json).ok()?;
-    // The digest has the same place in all known schemas.
+    // Both have the same place in all known schemas.
     if !matches!(json["schema"].as_str(), Some("v2" | "v3")) {
         return None;
     }
-    json["image_id"].as_str().map(String::from)
+    Some(ImageRecord {
+        digest: json["image_id"].as_str()?.trim().to_string(),
+        name: json["name"].as_str().map(String::from),
+    })
 }
 
 /// Read a cached image JSON file and unwrap it into an [`OciImage`].
@@ -604,66 +587,49 @@ pub(crate) fn read_ready_image(data_dir: &DataDir, path: &VerifiedPath) -> Optio
 }
 
 /// Get the image that the last `airlock start` prepared for a sandbox. Uses
-/// no network and changes nothing.
+/// no network.
 /// Args:
+///  - `db`: The airlock database with the image records
 ///  - `data_dir`: Airlock data directory
+///  - `owner`: Owner of the image record (the sandbox)
 ///  - `sandbox_dir`: Directory of the sandbox
+///  - `image_cfg`: Configured image
 ///
 /// Returns:
-///   The image, or `None` if the sandbox has no complete image on disk.
-///   Then `airlock start` must prepare it.
-pub(crate) fn load_sandbox_image(
+///   The image, or `None` if the sandbox has no complete image on disk for
+///   the configured name or its pinned digest. Then `airlock start` must
+///   prepare it.
+pub(crate) async fn load_sandbox_image(
+    db: &Db,
     data_dir: &DataDir,
+    owner: &ImageOwner,
     sandbox_dir: &VerifiedPath,
-) -> Option<OciImage> {
-    let path = sandbox_dir.join("image").ok()?;
-    read_ready_image(data_dir, &path)
+    image_cfg: &ImageRef,
+) -> anyhow::Result<Option<OciImage>> {
+    let stored = record::load(db, owner, sandbox_dir).await?;
+    Ok(sandbox_image(data_dir, stored.as_ref(), image_cfg))
 }
 
-/// Make sure that `sandbox_image` is a hardlink to `images/<digest>`. The
-/// hardlink tells GC that the sandbox uses the image.
-/// Args:
-///  - `data_dir`: Airlock data directory
-///  - `sandbox_image`: The `image` file in the sandbox directory
-///  - `image`: Image of the cache file. Written if the cache file is
-///    missing.
-///
+/// Get the cached image of a sandbox with the image record `stored`.
 /// Returns:
-///   Error if the hardlink fails.
-fn ensure_image_hardlink(
+///   The image with the configured name, or `None` if the record is for
+///   another name or digest, or the image is not complete on disk.
+fn sandbox_image(
     data_dir: &DataDir,
-    sandbox_image: &VerifiedPath,
-    image: &OciImage,
-) -> anyhow::Result<()> {
-    // Do nothing if the inodes already match. Otherwise remove the old
-    // `sandbox_image` and link it again. The metadata does not follow a
-    // symlink, so a planted link never counts as linked.
-    use std::os::unix::fs::MetadataExt;
-    let image_path = cache::image_path(data_dir, &image.image_id)?;
-    let linked = match (sandbox_image.metadata(), image_path.metadata()) {
-        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
-        _ => false,
+    stored: Option<&ImageRecord>,
+    image_cfg: &ImageRef,
+) -> Option<OciImage> {
+    let digest = match (image_cfg.pinned_digest(), stored) {
+        // A pinned digest names one image, thus the name is not necessary.
+        // A new sandbox from a template uses this.
+        (Some(pinned), None) => pinned,
+        (Some(pinned), Some(stored)) if stored.digest == pinned => pinned,
+        (None, Some(stored)) if stored.name.as_ref() == Some(&image_cfg.name) => &stored.digest,
+        _ => return None,
     };
-    if linked {
-        return Ok(());
-    }
-    // A cache wipe or a path migration can remove the canonical cache file.
-    // Write the sandbox copy back first, so there is a file to link to.
-    if image_path.symlink_metadata().is_err() {
-        write_cached_image(data_dir, &image.image_id, image)?;
-    }
-    let _ = sandbox_image.remove_file();
-    // Fail on a link error. Both paths are under `$HOME`, so the only
-    // probable cause is a cross-filesystem config problem. Without the link,
-    // GC does not protect the sandbox image.
-    image_path.hard_link_to(sandbox_image).map_err(|e| {
-        anyhow::anyhow!(messages::oci::hardlink_image_failed(
-            &image_path,
-            sandbox_image,
-            e
-        ))
-    })?;
-    Ok(())
+    let mut image = read_ready_image(data_dir, &cache::image_path(data_dir, digest).ok()?)?;
+    image.name.clone_from(&image_cfg.name);
+    Some(image)
 }
 
 /// Write the cache file of the image `digest` atomically.
@@ -1144,14 +1110,9 @@ async fn ensure_image(
     let image_path = cache::image_path(data_dir, &resolved.digest)?;
 
     // Digest-keyed cache hit: a sibling project already pulled this image
-    // and all its layers are still on disk. Skip the pull. Write the current
-    // name, so the per-sandbox fast path in `prepare()` (which matches on
-    // name) sees the current tag.
+    // and all its layers are still on disk. Skip the pull.
     if let Some(mut cached) = read_ready_image(data_dir, &image_path) {
-        if cached.name != image_name {
-            cached.name = image_name.to_string();
-            write_cached_image(data_dir, &resolved.digest, &cached)?;
-        }
+        cached.name = image_name.to_string();
         return Ok(cached);
     }
 

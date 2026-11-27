@@ -1,12 +1,12 @@
 //! New sandboxes from templates.
 //!
 //! Gives a new sandbox the disk, the install records, the install
-//! snapshots, the CA and the image of a template. The disk is a
+//! snapshots and the CA of a template. The disk is a
 //! copy-on-write clone where the file system can do it. Otherwise it is a
 //! normal copy that keeps the disk sparse. The new disk gets its own
 //! identity, and the install records move to it.
 
-use super::{CA_FILE, IMAGE_FILE, Template};
+use super::{CA_FILE, Template};
 use crate::messages;
 use crate::packs::install::snapshots::{SNAPSHOTS_CAP, SNAPSHOTS_FILE};
 use crate::packs::install::state::{self as install_state, ReadState};
@@ -19,9 +19,9 @@ use crate::vm::disk::{self, DISK_FILE};
 ///
 /// The sandbox must have no disk and no install records. After the copy,
 /// the sandbox has a copy of the template disk with a new identity, the
-/// install records of the template for that disk, the CA of the template,
-/// and the template image. The image is optional: if the link fails, the
-/// image step gets the image again.
+/// install records of the template for that disk, and the CA of the
+/// template. If the template config pins the image digest, the image step
+/// finds the cached image of the template.
 /// Args:
 ///  - `template`: The template
 ///  - `sandbox`: Directory of the new sandbox. The caller holds its lock.
@@ -54,12 +54,6 @@ pub fn seed(
     if result.is_err() {
         unseed(sandbox_dir);
         return result;
-    }
-    // The image link is only a shortcut. Without it, the image step gets
-    // the image again. The link source cannot be a symlink, because a
-    // link of a symlink follows it on macOS.
-    if let (Ok(src), Ok(dst)) = (template.dir.join(IMAGE_FILE), sandbox_dir.join(IMAGE_FILE)) {
-        let _ = src.hard_link_to(&dst);
     }
     Ok(())
 }
@@ -97,7 +91,7 @@ fn copy_file(template: &Template, sandbox: &PinnedDir, name: &str, cap: u64) -> 
 }
 
 /// Remove the template disk, its install records and its install
-/// snapshots from the sandbox `sandbox`. The image and the CA stay. The
+/// snapshots from the sandbox `sandbox`. The CA stays. The
 /// next disk is empty, and all packs install again.
 /// Returns:
 ///   Error if a remove fails.
@@ -117,7 +111,6 @@ pub fn unseed(sandbox_dir: &VerifiedPath) {
         disk::DISK_ID_FILE,
         install_state::STATE_FILE,
         SNAPSHOTS_FILE,
-        IMAGE_FILE,
         CA_FILE,
     ] {
         if let Ok(path) = sandbox_dir.join(file) {

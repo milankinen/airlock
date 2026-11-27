@@ -114,7 +114,7 @@ pub async fn import_into_new(
     let id = registry::find_or_register(&context.db, boxes, project).await?;
     let lock = SandboxLock::acquire_box(project, &context.data.sandboxes, &id)?;
     let mut first = FirstStart::check(&lock);
-    let result = sandbox::migrate::import_legacy(context, &lock);
+    let result = sandbox::migrate::import_legacy(&lock);
     first.after_import(&result);
     match result {
         Ok(()) => Ok(lock),

@@ -17,7 +17,7 @@ use crate::config::{LayeredConfig, ResolvedConfig};
 use crate::context::Context;
 #[cfg(not(test))]
 use crate::oci::prepare as prepare_image;
-use crate::oci::{ImageChange, ImageChangeStop, OciImage, OnImageChange};
+use crate::oci::{ImageChange, ImageChangeStop, ImageOwner, OciImage, OnImageChange};
 #[cfg(not(test))]
 use crate::packs::install::facts::check as check_image;
 use crate::packs::install::plan::{self, DecideInput, Pending, Plan, Transition, Wanted, Why};
@@ -377,7 +377,9 @@ pub async fn ensure_sandbox(
     let values = &resolved.values;
     sandbox::process::vm::report::print_preparing(lock.dir(), &values.vm.image.name);
     let prepared = prepare_image(
+        &context.db,
         &context.data,
+        &ImageOwner::sandbox(lock.dir())?,
         lock.dir(),
         &values.vm.image,
         vault,
