@@ -3,8 +3,10 @@
 
 use crate::config::LayeredConfig;
 use crate::config::generated::{GeneratedConfig, NewEntry, Target};
+use crate::oci::{ImageOwner, record};
 use crate::packs::install::state::PackStatus;
 use crate::templates::{self, FILES};
+use crate::test_cfg::block_on_local;
 use crate::test_cfg::packs::test_packs;
 use crate::test_cfg::start::{StartProject, fake_host};
 use crate::vm::disk::DISK_FILE;
@@ -50,7 +52,7 @@ fn sandbox_from_template_installs_only_extra_packs() {
     assert_eq!(ran(), ["alpha"]);
 
     let template = templates::find(data_dir, "base").unwrap();
-    for file in FILES.iter().filter(|f| **f != templates::IMAGE_FILE) {
+    for file in FILES {
         assert!(
             template.dir.to_path().unwrap().join(file).is_file(),
             "{file}"
@@ -58,6 +60,9 @@ fn sandbox_from_template_installs_only_extra_packs() {
     }
     let image = template.config.image.clone().expect("a pinned image");
     assert!(image.contains("@sha256:"), "{image}");
+    let owner = ImageOwner::Template("base".into());
+    let stored = block_on_local(record::get(&project.context().db, &owner)).unwrap();
+    assert!(image.ends_with(&stored.expect("template image record").digest));
     assert_eq!(templates::list(data_dir).len(), 1, "no build directory");
 
     let beta = NewEntry {

@@ -30,18 +30,14 @@ use crate::vm::disk::{DISK_FILE, DISK_ID_FILE};
 pub const TEMPLATES_DIR: &str = "templates";
 /// The config file of a template.
 pub const CONFIG_FILE: &str = "airlock.toml";
-/// The image reference file of a template. It is a hardlink to the cached
-/// image, thus the image cleanup keeps the image.
-pub const IMAGE_FILE: &str = "image";
 /// The CA keypair file of a template. Pack installs can write the CA
 /// certificate into the CA bundles on the disk, thus a sandbox from the
 /// template must use the same CA.
 pub const CA_FILE: &str = "ca.json";
 /// The files of a template. Nothing else is kept. A template of an older
 /// airlock has no install snapshots.
-pub const FILES: [&str; 7] = [
+pub const FILES: [&str; 6] = [
     CONFIG_FILE,
-    IMAGE_FILE,
     DISK_FILE,
     DISK_ID_FILE,
     STATE_FILE,

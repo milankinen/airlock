@@ -503,8 +503,16 @@ async fn prepare_last_run(
         .ok_or_else(|| anyhow::anyhow!(messages::cli::no_last_run_config(&target.project)))?;
     let resolved = &last.resolved;
 
-    let image = oci::load_sandbox_image(&context.data, sandbox_dir, &resolved.values.vm.image)
-        .ok_or_else(|| anyhow::anyhow!(messages::sandbox_process::IMAGE_MISSING_RUN_START))?;
+    let owner = oci::ImageOwner::sandbox(sandbox_dir)?;
+    let image = oci::load_sandbox_image(
+        &context.db,
+        &context.data,
+        &owner,
+        sandbox_dir,
+        &resolved.values.vm.image,
+    )
+    .await?
+    .ok_or_else(|| anyhow::anyhow!(messages::sandbox_process::IMAGE_MISSING_RUN_START))?;
     if !sandbox::has_disk(sandbox_dir) {
         anyhow::bail!(messages::sandbox_process::DISK_MISSING_RUN_START);
     }

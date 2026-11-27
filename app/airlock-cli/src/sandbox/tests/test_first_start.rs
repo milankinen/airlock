@@ -55,8 +55,7 @@ fn failed_first_start_removes_only_new_sandbox_without_user_files() {
     std::fs::write(other.join(".airlock/airlock.toml"), "[vm]\n").unwrap();
     let lock = block_on_local(lock_sandbox(&context, &verified_dir(&other))).unwrap();
     let mut first = FirstStart::check(&lock);
-    crate::sandbox::start::location::fill_new_sandbox(&context, &lock, &mut first, false, false)
-        .unwrap();
+    crate::sandbox::start::location::fill_new_sandbox(&lock, &mut first, false, false).unwrap();
     block_on_local(first.remove(&context.db, &lock, &lock_id(&lock)));
     assert!(lock.dir().to_path().unwrap().join("airlock.toml").is_file());
     assert_eq!(registered(), 2);

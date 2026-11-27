@@ -71,7 +71,7 @@ async fn rm_box(args: &RmArgs, context: &Context, sandbox: &Sandbox) -> i32 {
         );
         return 1;
     }
-    oci::gc_sweep(&context.data);
+    oci::gc_sweep(&context.db, &context.data).await;
     cli::log!("{}", messages::cli::SANDBOX_REMOVED);
     0
 }

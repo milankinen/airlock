@@ -63,7 +63,6 @@ pub async fn check_registered(context: &Context, sandbox: &Sandbox) -> anyhow::R
 /// project config in `.airlock` moves into it. A sandbox that is not new
 /// stays as it is, also with a stale `.airlock` next to it.
 /// Args:
-///  - `context`: Process context, for the image cache
 ///  - `lock`: The held sandbox locks
 ///  - `first`: The first start state of the sandbox. A move of user files
 ///    keeps the sandbox
@@ -73,7 +72,6 @@ pub async fn check_registered(context: &Context, sandbox: &Sandbox) -> anyhow::R
 /// Returns:
 ///   `Ok`, or the exit for an error or an aborted question.
 pub fn fill_new_sandbox(
-    context: &Context,
     lock: &SandboxLock,
     first: &mut FirstStart,
     can_prompt: bool,
@@ -85,7 +83,7 @@ pub fn fill_new_sandbox(
     let host_cwd = lock.host_cwd();
     if sandbox::lookup::has_legacy_sandbox(host_cwd) {
         ask_import(can_prompt, yes)?;
-        let result = migrate::import_legacy(context, lock);
+        let result = migrate::import_legacy(lock);
         first.after_import(&result);
         return match result {
             Ok(()) => {

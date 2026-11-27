@@ -40,13 +40,8 @@ sandbox to that entry. The name check then fails, with these effects:
   new tag. Another sandbox on that entry that changes to the same tag keeps
   the old image with no question. v2026.11.5 has the same code.
 
-Each start thus writes `<name>@<digest>` to `image.ref` in the sandbox
-directory. The fast path, the pin and `airlock exec` use that name. The
-digest makes a reference that does not match the image file invalid, for
-example after a stopped start or a start of an older airlock version. A
-sandbox without a valid reference uses the name in its image file, also in
-the `v2` schema. The name of a kept old image no longer goes into the
-shared entry.
+Each sandbox thus has its own image record in the database. See
+`2026-11-27-image-records.md`.
 
 ## Known limits
 
@@ -57,7 +52,7 @@ shared entry.
 ## Tests
 
 * `test_image_cache::stored_digest_of_another_tag_is_not_pinned`
-* `test_image_cache::sandbox_keeps_own_image_name_when_cache_entry_gets_another_name`
+* `test_image_cache::sandboxes_with_different_names_for_one_image_keep_own_names`
 * `tests/vm/image.bats` changes a tag and checks the guest version and the
   disk. It fails without the fix.
 * Manual check with a local registry, for an unchanged name and a moved

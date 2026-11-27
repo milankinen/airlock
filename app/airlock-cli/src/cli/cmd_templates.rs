@@ -75,7 +75,7 @@ pub async fn main(args: TemplateArgs, context: &Context) -> i32 {
             Ok(0)
         }
         TemplateCmd::Info { name } => info(&context.data, &name),
-        TemplateCmd::Remove { name, force } => remove(&context.data, &name, force),
+        TemplateCmd::Remove { name, force } => remove(context, &name, force).await,
         TemplateCmd::Create {
             name,
             force,
@@ -216,7 +216,8 @@ fn info(data: &DataDir, name: &str) -> anyhow::Result<i32> {
 
 /// Remove the template `name` after a confirmation (unless `force`). Then
 /// remove the images that nothing uses.
-fn remove(data: &DataDir, name: &str, force: bool) -> anyhow::Result<i32> {
+async fn remove(context: &Context, name: &str, force: bool) -> anyhow::Result<i32> {
+    let data = &context.data;
     // Fail before the question.
     templates::find(data, name)?;
     if !force && !confirm(name) {
@@ -224,7 +225,7 @@ fn remove(data: &DataDir, name: &str, force: bool) -> anyhow::Result<i32> {
         return Ok(0);
     }
     templates::remove(data, name)?;
-    oci::gc_sweep(data);
+    oci::gc_sweep(&context.db, data).await;
     cli::log!("{}", messages::cli::template_removed(name));
     Ok(0)
 }

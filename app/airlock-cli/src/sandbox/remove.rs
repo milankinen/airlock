@@ -50,6 +50,8 @@ pub async fn remove_box(context: &Context, id: &str) -> anyhow::Result<()> {
         _ => {}
     }
     registry::unregister(&context.db, id).await?;
+    let owner = crate::oci::ImageOwner::Sandbox(id.to_string());
+    crate::oci::record::remove(&context.db, &owner).await?;
     drop((held, made));
     Ok(())
 }

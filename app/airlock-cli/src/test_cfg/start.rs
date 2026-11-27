@@ -19,7 +19,11 @@ use crate::config::config_values::ImageRef;
 use crate::config::{ConfigOverrides, LayeredConfig, ResolveInput};
 use crate::context::Context;
 use crate::data_dir::DataDir;
-use crate::oci::{ImageChange, ImageChangeStop, OciImage, OnImageChange, PreparedImage};
+use crate::db::Db;
+use crate::oci::record::{self, ImageRecord};
+use crate::oci::{
+    ImageChange, ImageChangeStop, ImageOwner, OciImage, OnImageChange, PreparedImage,
+};
 use crate::packs::install::progress::InstallProgress;
 use crate::packs::install::setup::{self, Ended, Report, Save, SetupError};
 use crate::packs::install::state::{self, InstallState, ReadState};
@@ -80,44 +84,53 @@ pub fn fake_image(name: &str) -> OciImage {
 }
 
 /// `oci::prepare` for tests. With the fakes on, the image is the
-/// [`fake_image`] of the configured name. An import marker counts as
-/// another image. If the sandbox had another image,
-/// [`OnImageChange::Recreate`] makes it again and [`OnImageChange::Refuse`]
-/// stops.
+/// [`fake_image`] of the configured name, and the image record of `owner`
+/// gives the old image. An import marker never names a fake image, thus it
+/// is a change. If the sandbox had another image, [`OnImageChange::Recreate`]
+/// makes it again and [`OnImageChange::Refuse`] stops.
 pub async fn prepare_image(
+    db: &Db,
     data_dir: &DataDir,
+    owner: &ImageOwner,
     sandbox_dir: &VerifiedPath,
     image_cfg: &ImageRef,
     vault: &Vault,
     on_change: OnImageChange,
 ) -> anyhow::Result<PreparedImage> {
     if !fake_host(|host| host.enabled) {
-        return crate::oci::prepare(data_dir, sandbox_dir, image_cfg, vault, on_change).await;
+        return crate::oci::prepare(
+            db,
+            data_dir,
+            owner,
+            sandbox_dir,
+            image_cfg,
+            vault,
+            on_change,
+        )
+        .await;
     }
     fake_host(|host| host.prepared += 1);
-    let link = sandbox_dir.to_path()?.join("test-image");
     let name = image_cfg.name.as_str();
-    // An imported sandbox has the old image in the import marker. A
-    // marker never names a fake image, thus it is a change.
-    let stored = std::fs::read_to_string(&link)
-        .ok()
-        .or_else(|| crate::oci::read_import_marker(sandbox_dir).map(|_| String::new()));
-    let change = match stored {
-        Some(old) if old != name => match crate::oci::guard_recreate(sandbox_dir, on_change)? {
-            OnImageChange::Recreate => ImageChange::Recreate,
-            OnImageChange::Refuse => return Err(ImageChangeStop::NeedsTerminal.into()),
-            OnImageChange::Ask => panic!("tests have no terminal"),
-        },
-        _ => ImageChange::Unchanged,
-    };
-    std::fs::write(&link, name)?;
-    // As `oci::prepare`, which removes the marker after the image link.
-    let _ = std::fs::remove_file(sandbox_dir.to_path()?.join("image.imported"));
     let mut image = fake_image(name);
     // A pinned digest names the image, as with a real registry.
     if let Some(digest) = image_cfg.pinned_digest() {
         image.image_id = digest.to_string();
     }
+    let change = match record::load(db, owner, sandbox_dir).await? {
+        Some(old) if old.digest != image.image_id => {
+            match crate::oci::guard_recreate(&old, sandbox_dir, on_change)? {
+                OnImageChange::Recreate => ImageChange::Recreate,
+                OnImageChange::Refuse => return Err(ImageChangeStop::NeedsTerminal.into()),
+                OnImageChange::Ask => panic!("tests have no terminal"),
+            }
+        }
+        _ => ImageChange::Unchanged,
+    };
+    let stored = ImageRecord {
+        digest: image.image_id.clone(),
+        name: Some(name.to_string()),
+    };
+    record::set(db, owner, stored).await?;
     let pin = Some(image.image_id.clone());
     Ok(PreparedImage { image, change, pin })
 }
@@ -215,7 +228,7 @@ pub async fn locate_sandbox(
 ) -> Result<SandboxLock, Exit> {
     let lock = lock_sandbox(context, host_cwd).await?;
     let mut first = FirstStart::check(&lock);
-    if let Err(e) = location::fill_new_sandbox(context, &lock, &mut first, can_prompt, yes) {
+    if let Err(e) = location::fill_new_sandbox(&lock, &mut first, can_prompt, yes) {
         first
             .remove(&context.db, &lock, &super::sandboxes::lock_id(&lock))
             .await;
@@ -412,7 +425,7 @@ impl StartProject {
         options: &SandboxOptions,
         template: Option<crate::templates::Template>,
     ) -> Result<(), Exit> {
-        location::fill_new_sandbox(&self.context, lock, first, options.can_prompt, options.yes)?;
+        location::fill_new_sandbox(lock, first, options.can_prompt, options.yes)?;
         let sandbox = crate::sandbox::start::ensure::ensure_sandbox(
             &self.context,
             lock,

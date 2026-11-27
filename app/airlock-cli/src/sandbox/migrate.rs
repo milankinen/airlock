@@ -18,7 +18,6 @@ use super::load::{CA_CAP, is_valid_ca};
 use super::lock::SandboxLock;
 use super::lookup::PROJECT_SANDBOX;
 use crate::config::files::local_config_names;
-use crate::context::Context;
 use crate::packs::install::state::{self, PackStatus, ReadState, STATE_CAP, STATE_FILE};
 use crate::util::PinnedDir;
 use crate::util::clone::clone_from_file;
@@ -91,13 +90,12 @@ fn run_hook(
 /// sandbox then (see [`super::FirstStart`]), except after
 /// [`MigrateError::DiskKept`].
 /// Args:
-///  - `context`: Process context, for the image cache
 ///  - `lock`: The held locks of the new sandbox. Its directory has no
 ///    sandbox files.
 ///
 /// Returns:
 ///   `Ok` after the import, or the reason of the failure.
-pub fn import_legacy(context: &Context, lock: &SandboxLock) -> Result<(), MigrateError> {
+pub fn import_legacy(lock: &SandboxLock) -> Result<(), MigrateError> {
     let host_cwd = lock.host_cwd();
     // Never follow a symlink at `.airlock` or `.airlock/sandbox`.
     let airlock = airlock_dir(host_cwd)?;
@@ -144,7 +142,7 @@ pub fn import_legacy(context: &Context, lock: &SandboxLock) -> Result<(), Migrat
         .map_err(anyhow::Error::from)?;
 
     let mut disk_moved = false;
-    let taken = take_entries(context, &old, &new, lock.dir(), &mut disk_moved);
+    let taken = take_entries(&old, &new, lock.dir(), &mut disk_moved);
     #[cfg(test)]
     let taken = taken.and_then(|()| run_hook(&AFTER_TAKE));
     let taken = taken.and_then(|()| move_config_files(&airlock, lock.dir()));
@@ -175,14 +173,12 @@ pub fn import_legacy(context: &Context, lock: &SandboxLock) -> Result<(), Migrat
 /// directory `new`. A missing or refused file is not taken.
 ///
 /// Args:
-///  - `context`: Process context, for the image cache
 ///  - `old`: Directory of the old sandbox
 ///  - `new`: Directory of the new sandbox
 ///  - `new_dir`: Path of `new`
 ///  - `disk_moved`: Set to `true` when the disk is moved, so that a
 ///    rollback can move it back
 fn take_entries(
-    context: &Context,
     old: &PinnedDir,
     new: &PinnedDir,
     new_dir: &VerifiedPath,
@@ -206,7 +202,7 @@ fn take_entries(
             new.write_atomic("ca.json", &ca, 0o600)?;
         }
     }
-    oci::import_image(&context.data, old, new_dir, disk_imported)
+    oci::import_image(old, new_dir, disk_imported)
 }
 
 /// Move the disk `src` (the open disk of `old`) into `new`. Copies it if

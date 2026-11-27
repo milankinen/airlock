@@ -100,6 +100,10 @@ impl FirstStart {
         {
             tracing::warn!("remove sandbox dir {}: {e}", lock.dir());
         }
+        let owner = crate::oci::ImageOwner::Sandbox(id.to_string());
+        if let Err(e) = crate::oci::record::remove(db, &owner).await {
+            tracing::warn!("remove image record of sandbox {id}: {e:#}");
+        }
     }
 }
 

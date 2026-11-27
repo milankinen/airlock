@@ -156,7 +156,7 @@ async fn remove(context: &Context, ids: &[String], force: bool) -> anyhow::Resul
         }
     }
     if removed {
-        oci::gc_sweep(&context.data);
+        oci::gc_sweep(&context.db, &context.data).await;
     }
     Ok(code)
 }

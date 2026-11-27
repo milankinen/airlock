@@ -1,10 +1,34 @@
-//! Tests for the cached image entries, the sandbox image links and the
-//! garbage collector of the OCI cache.
+//! Tests for the cached image entries, the image records and the garbage
+//! collector of the OCI cache.
 
 use airlock_test_utils::temp_dir;
 
 use super::*;
+use crate::oci::record;
 use crate::test_cfg::vault::{MemoryStorage, vault_with};
+
+/// A valid sandbox id for the tests.
+const BOX_ID: &str = "abcd2345";
+
+/// Open the database of `data_dir`.
+fn open_db(data_dir: &DataDir) -> Db {
+    Db::open(&data_dir.db).unwrap()
+}
+
+/// Make the directory of the sandbox `id` in `data_dir`.
+fn sandbox_dir(data_dir: &DataDir, id: &str) -> VerifiedPath {
+    let dir = data_dir.sandboxes.join(id).unwrap();
+    std::fs::create_dir_all(real(&dir)).unwrap();
+    dir
+}
+
+/// The image record of an image `digest` with the configured `name`.
+fn named(name: &str, digest: &str) -> ImageRecord {
+    ImageRecord {
+        digest: digest.to_string(),
+        name: Some(name.to_string()),
+    }
+}
 
 /// Cache a small layer as `digest` and return its layer key.
 fn small_layer(data_dir: &DataDir, digest: &str) -> String {
@@ -52,17 +76,20 @@ fn cached_image_is_ready_only_while_all_its_layers_exist() {
     assert!(read_ready_image(data_dir, &empty).is_none());
 }
 
-/// Test that the GC sweep keeps only the images that a sandbox links to and
-/// their layers, and removes all staging leftovers.
-///   1. Cache a live image (linked by a sandbox) and an orphan image that
-///      share one layer
+/// Test that the GC sweep keeps only the images that an image record names
+/// and their layers, removes all staging leftovers, and removes the record
+/// of a sandbox that is gone.
+///   1. Cache a live image (named by a sandbox record) and an orphan image
+///      that share one layer
 ///   2. Add staging leftovers to the layer cache
 ///   3. Sweep and check that only the live image and its layers stay
-///   4. Remove the sandbox, sweep again and check that all is gone
-#[test]
-fn gc_sweep_keeps_only_images_linked_by_sandboxes_and_their_layers() {
+///   4. Remove the sandbox directory, sweep again and check that all is gone,
+///      also the record
+#[tokio::test]
+async fn gc_sweep_keeps_only_images_named_by_records_and_their_layers() {
     let home = temp_dir();
     let data_dir = &data_dir_at(home.path());
+    let db = open_db(data_dir);
     let shared = small_layer(data_dir, "sha256:shared");
     let own = small_layer(data_dir, "sha256:own");
     let orphaned = small_layer(data_dir, "sha256:orphaned");
@@ -70,19 +97,19 @@ fn gc_sweep_keeps_only_images_linked_by_sandboxes_and_their_layers() {
     let orphan = image("sha256:orphan", vec![orphaned.clone(), shared.clone()]);
     let live_path = real(&cache::image_path(data_dir, &live.image_id).unwrap());
     let orphan_path = real(&cache::image_path(data_dir, &orphan.image_id).unwrap());
+    write_cached_image(data_dir, &live.image_id, &live).unwrap();
     write_cached_image(data_dir, &orphan.image_id, &orphan).unwrap();
-    let sandbox = data_dir.sandboxes.join("box").unwrap();
-    std::fs::create_dir_all(real(&sandbox)).unwrap();
-    let sandbox_image = sandbox.join("image").unwrap();
-    // The second call must see the existing link and do nothing.
-    ensure_image_hardlink(data_dir, &sandbox_image, &live).unwrap();
-    ensure_image_hardlink(data_dir, &sandbox_image, &live).unwrap();
+    let sandbox = sandbox_dir(data_dir, BOX_ID);
+    let owner = ImageOwner::Sandbox(BOX_ID.to_string());
+    record::set(&db, &owner, named("alpine:3.19", &live.image_id))
+        .await
+        .unwrap();
     let layers = real(&cache::layers_root(data_dir).unwrap());
     std::fs::write(layers.join("abc.download.tmp"), b"").unwrap();
     std::fs::write(layers.join("def.download"), b"").unwrap();
     std::fs::create_dir_all(layers.join("ghi.tmp")).unwrap();
 
-    gc_sweep(data_dir);
+    gc_sweep(&db, data_dir).await;
 
     assert!(live_path.exists());
     assert!(!orphan_path.exists());
@@ -98,65 +125,127 @@ fn gc_sweep_keeps_only_images_linked_by_sandboxes_and_their_layers() {
     assert_eq!(left, expected);
 
     std::fs::remove_dir_all(real(&sandbox)).unwrap();
-    gc_sweep(data_dir);
+    gc_sweep(&db, data_dir).await;
 
     assert!(!live_path.exists());
     assert!(!layer_exists(data_dir, &own) && !layer_exists(data_dir, &shared));
+    assert_eq!(record::get(&db, &owner).await.unwrap(), None);
 }
 
-/// Test that the sandbox image link is made again when the cache entry is
-/// gone, so that the GC does not remove the image of a live sandbox.
-///   1. Link a sandbox to a cached image
-///   2. Remove the cache entry and link again
-///   3. Sweep and check that the image entry exists and is ready
-#[test]
-fn sandbox_image_link_is_restored_when_cache_entry_was_wiped() {
+/// Test that the image files of an older version become image records, so
+/// that a sweep keeps the images of sandboxes and templates that did not
+/// start since the update.
+///   1. Cache two images. Give a sandbox and a template the image file of an
+///      older version for them, and give a second sandbox an import marker
+///   2. Sweep and check that both images stay
+///   3. Check the records, and that the old files are gone
+///   4. Start the first sandbox with no registry and check that it uses the
+///      cached image
+#[tokio::test]
+async fn image_files_of_older_version_become_records_and_keep_images() {
     let home = temp_dir();
     let data_dir = &data_dir_at(home.path());
-    let live = image("sha256:live", vec![small_layer(data_dir, "sha256:L1")]);
-    let live_path = cache::image_path(data_dir, &live.image_id).unwrap();
-    let sandbox_image = data_dir.root.join("image").unwrap();
-    ensure_image_hardlink(data_dir, &sandbox_image, &live).unwrap();
+    let db = open_db(data_dir);
+    let layer = small_layer(data_dir, "sha256:L1");
+    let mut started = image("sha256:started", vec![layer.clone()]);
+    let template_image = image("sha256:template", vec![layer]);
+    for img in [&started, &template_image] {
+        write_cached_image(data_dir, &img.image_id, img).unwrap();
+    }
+    // An older version wrote the name into the image file.
+    let legacy = |img: &OciImage, name: &str| {
+        let mut json = serde_json::to_value(CachedImage::V3(img.clone())).unwrap();
+        json["name"] = name.into();
+        json.to_string()
+    };
+    let sandbox = sandbox_dir(data_dir, BOX_ID);
+    std::fs::write(
+        real(&sandbox).join("image"),
+        legacy(&started, "127.0.0.1:1/alpine:3"),
+    )
+    .unwrap();
+    let template = data_dir.templates.join("base").unwrap();
+    std::fs::create_dir_all(real(&template)).unwrap();
+    std::fs::write(
+        real(&template).join("image"),
+        legacy(&template_image, "alpine:edge"),
+    )
+    .unwrap();
+    let imported = sandbox_dir(data_dir, "imported");
+    std::fs::write(real(&imported).join(IMPORT_MARKER), "sha256:old\n").unwrap();
 
-    std::fs::remove_file(real(&live_path)).unwrap();
-    ensure_image_hardlink(data_dir, &sandbox_image, &live).unwrap();
+    gc_sweep(&db, data_dir).await;
 
-    gc_sweep(data_dir);
+    for img in [&started, &template_image] {
+        assert!(real(&cache::image_path(data_dir, &img.image_id).unwrap()).exists());
+    }
+    let owner = ImageOwner::Sandbox(BOX_ID.to_string());
     assert_eq!(
-        read_ready_image(data_dir, &live_path).unwrap().image_id,
-        "sha256:live"
+        record::get(&db, &owner).await.unwrap(),
+        Some(named("127.0.0.1:1/alpine:3", "sha256:started"))
     );
+    let base = ImageOwner::Template("base".into());
+    assert_eq!(
+        record::get(&db, &base).await.unwrap(),
+        Some(named("alpine:edge", "sha256:template"))
+    );
+    let imported_owner = ImageOwner::Sandbox("imported".into());
+    assert_eq!(
+        record::get(&db, &imported_owner).await.unwrap(),
+        Some(ImageRecord {
+            digest: "sha256:old".into(),
+            name: None
+        })
+    );
+    for file in ["image", IMPORT_MARKER] {
+        for dir in [&sandbox, &template, &imported] {
+            assert!(!real(dir).join(file).exists(), "{dir}/{file}");
+        }
+    }
+
+    let vault = vault_with(MemoryStorage::default(), &[]);
+    let cfg = ImageRef {
+        resolution: Resolution::Registry,
+        insecure: true,
+        ..ImageRef::auto("127.0.0.1:1/alpine:3")
+    };
+    let prepared = prepare(
+        &db,
+        data_dir,
+        &owner,
+        &sandbox,
+        &cfg,
+        &vault,
+        OnImageChange::Refuse,
+    )
+    .await
+    .unwrap();
+    started.name.clone_from(&cfg.name);
+    assert_eq!(prepared.change, ImageChange::Unchanged);
+    assert_eq!(prepared.image.image_id, started.image_id);
+    assert_eq!(prepared.image.name, started.name);
 }
 
-/// Test that a symlink at the `image` file of a sandbox is not followed. A
-/// followed link lets airlock read or link a host file.
-///   1. Write a host file and put a symlink to it at the sandbox `image`
-///   2. Check that the image read ignores the link
-///   3. Link the sandbox to a cached image
-///   4. Check that the host file did not change and that `image` is now a
-///      hard link to the cache entry
-#[test]
-fn planted_sandbox_image_symlink_is_not_followed() {
-    use std::os::unix::fs::MetadataExt;
-
+/// Test that a symlink at the image file of an older version is not
+/// followed. A followed link lets airlock read a host file as the record.
+///   1. Write a host file with image JSON, and put a symlink to it at the
+///      sandbox `image`
+///   2. Read the record and check that there is none and the host file did
+///      not change
+#[tokio::test]
+async fn planted_image_file_symlink_is_not_followed() {
     let home = temp_dir();
     let data_dir = &data_dir_at(home.path());
+    let db = open_db(data_dir);
     let victim = home.path().join("victim.json");
-    let live = image("sha256:live", vec![small_layer(data_dir, "sha256:L1")]);
-    let json = serde_json::to_vec(&CachedImage::V3(live.clone())).unwrap();
+    let json = serde_json::to_vec(&CachedImage::V3(image("sha256:x", vec![]))).unwrap();
     std::fs::write(&victim, &json).unwrap();
-    std::os::unix::fs::symlink(&victim, home.path().join("image")).unwrap();
-    let sandbox_image = data_dir.root.join("image").unwrap();
+    let sandbox = sandbox_dir(data_dir, BOX_ID);
+    std::os::unix::fs::symlink(&victim, real(&sandbox).join("image")).unwrap();
 
-    assert!(read_cached_image(&sandbox_image).is_none());
-    ensure_image_hardlink(data_dir, &sandbox_image, &live).unwrap();
-
+    let owner = ImageOwner::Sandbox(BOX_ID.to_string());
+    assert_eq!(record::load(&db, &owner, &sandbox).await.unwrap(), None);
     assert_eq!(std::fs::read(&victim).unwrap(), json);
-    let link = std::fs::symlink_metadata(home.path().join("image")).unwrap();
-    let entry =
-        std::fs::metadata(real(&cache::image_path(data_dir, &live.image_id).unwrap())).unwrap();
-    assert!(link.is_file());
-    assert_eq!((link.dev(), link.ino()), (entry.dev(), entry.ino()));
 }
 
 /// Test that the sweep does not follow a symlink or open a FIFO in the
@@ -166,8 +255,8 @@ fn planted_sandbox_image_symlink_is_not_followed() {
 ///      images dir
 ///   2. Make a FIFO in the images dir
 ///   3. Sweep and check that the layer is gone and both entries stay
-#[test]
-fn gc_sweep_skips_symlink_and_fifo_in_images_dir() {
+#[tokio::test]
+async fn gc_sweep_skips_symlink_and_fifo_in_images_dir() {
     let home = temp_dir();
     let data_dir = &data_dir_at(home.path());
     let layer = small_layer(data_dir, "sha256:L1");
@@ -181,7 +270,7 @@ fn gc_sweep_skips_symlink_and_fifo_in_images_dir() {
     // SAFETY: `fifo` is a valid C string.
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
 
-    gc_sweep(data_dir);
+    gc_sweep(&open_db(data_dir), data_dir).await;
 
     assert!(!layer_exists(data_dir, &layer));
     assert!(std::fs::symlink_metadata(images.join("link")).is_ok());
@@ -191,48 +280,43 @@ fn gc_sweep_skips_symlink_and_fifo_in_images_dir() {
 
 /// Test that `--yes` never re-creates an imported sandbox with a disk and an
 /// unknown old image, because the re-create deletes the imported disk.
-///   1. Make a sandbox dir with a disk and an empty import marker
+///   1. Make a sandbox dir with a disk and a record with no digest
 ///   2. Check that `Recreate` stops with `ImportedImageUnknown`, and that
 ///      `Ask` and `Refuse` stay
-///   3. Write a known digest into the marker and check that `Recreate` stays
+///   3. Check that a known digest keeps `Recreate`
 ///   4. Remove the disk and check that `Recreate` stays
 #[test]
 fn recreate_of_imported_sandbox_with_unknown_image_stops() {
     let tmp = temp_dir();
     let dir = crate::test_cfg::oci::verified_dir(tmp.path());
     std::fs::write(tmp.path().join(crate::vm::disk::DISK_FILE), "disk").unwrap();
-    std::fs::write(tmp.path().join(IMPORT_MARKER), "").unwrap();
+    let unknown = ImageRecord {
+        digest: String::new(),
+        name: None,
+    };
 
     assert!(matches!(
-        guard_recreate(&dir, OnImageChange::Recreate),
+        guard_recreate(&unknown, &dir, OnImageChange::Recreate),
         Err(ImageChangeStop::ImportedImageUnknown)
     ));
     for mode in [OnImageChange::Ask, OnImageChange::Refuse] {
-        assert_eq!(guard_recreate(&dir, mode).unwrap(), mode);
+        assert_eq!(guard_recreate(&unknown, &dir, mode).unwrap(), mode);
     }
 
-    let digest = format!("sha256:{}", "a".repeat(64));
-    std::fs::write(tmp.path().join(IMPORT_MARKER), digest).unwrap();
+    let known = ImageRecord {
+        digest: format!("sha256:{}", "a".repeat(64)),
+        name: None,
+    };
     assert_eq!(
-        guard_recreate(&dir, OnImageChange::Recreate).unwrap(),
+        guard_recreate(&known, &dir, OnImageChange::Recreate).unwrap(),
         OnImageChange::Recreate
     );
 
-    std::fs::write(tmp.path().join(IMPORT_MARKER), "").unwrap();
     std::fs::remove_file(tmp.path().join(crate::vm::disk::DISK_FILE)).unwrap();
     assert_eq!(
-        guard_recreate(&dir, OnImageChange::Recreate).unwrap(),
+        guard_recreate(&unknown, &dir, OnImageChange::Recreate).unwrap(),
         OnImageChange::Recreate
     );
-}
-
-/// The stored image of a sandbox that started with `name` and `digest`.
-fn stored(name: &str, digest: &str) -> StoredImage {
-    let image = OciImage {
-        name: name.to_string(),
-        ..image(digest, vec![])
-    };
-    stored_image(&serde_json::to_vec(&CachedImage::V3(image)).unwrap()).unwrap()
 }
 
 /// Test that only an `if-not-present` tag with a registry source pins the
@@ -245,7 +329,7 @@ fn stored_digest_is_pinned_only_for_if_not_present_tag_with_registry_source() {
     let digest = format!("sha256:{}", "a".repeat(64));
     let tag = ImageRef::auto("alpine:3");
     assert_eq!(
-        stored_pin(&tag, Some(&stored("alpine:3", &format!("{digest}\n")))).map(|r| r.name),
+        stored_pin(&tag, Some(&named("alpine:3", &digest))).map(|r| r.name),
         Some(format!("alpine:3@{digest}"))
     );
 
@@ -259,11 +343,11 @@ fn stored_digest_is_pinned_only_for_if_not_present_tag_with_registry_source() {
         ..tag.clone()
     };
     for cfg in [&if_changed, &pinned, &docker] {
-        let stored = stored(&cfg.name, &digest);
+        let stored = named(&cfg.name, &digest);
         assert!(stored_pin(cfg, Some(&stored)).is_none(), "{cfg:?}");
     }
     assert!(stored_pin(&tag, None).is_none());
-    assert!(stored_pin(&tag, Some(&stored("alpine:3", "sha256:short"))).is_none());
+    assert!(stored_pin(&tag, Some(&named("alpine:3", "sha256:short"))).is_none());
 }
 
 /// Test that a changed tag does not pin the stored digest. The registry
@@ -275,10 +359,10 @@ fn stored_digest_is_pinned_only_for_if_not_present_tag_with_registry_source() {
 fn stored_digest_of_another_tag_is_not_pinned() {
     let digest = format!("sha256:{}", "a".repeat(64));
     let tag = ImageRef::auto("debian:trixie-slim");
-    let other = stored("debian:bookworm-slim", &digest);
+    let other = named("debian:bookworm-slim", &digest);
     assert!(stored_pin(&tag, Some(&other)).is_none());
 
-    let imported = StoredImage {
+    let imported = ImageRecord {
         digest: digest.clone(),
         name: None,
     };
@@ -288,50 +372,70 @@ fn stored_digest_of_another_tag_is_not_pinned() {
     );
 }
 
-/// Test that a sandbox keeps its own image name when another sandbox with
-/// the same digest writes its name into the shared cache entry. Otherwise a
-/// moved tag gives an image change although the config did not change, and
-/// `airlock exec` finds no image.
-///   1. Start a sandbox with a cached image. No registry is available, so a
-///      start works only with the cached image
-///   2. Write another name into the cache entry. Start two times, because
-///      the first start links the sandbox to that entry
-///   3. Check that the sandbox image is there for its own name only
-///   4. Put a reference with another digest in the sandbox and check that it
-///      is ignored
+/// Test that two sandboxes with different names for one digest each keep
+/// their own name. The cached image is shared, but each sandbox has its own
+/// record. Otherwise a moved tag gives an image change although the config
+/// did not change, and `airlock exec` finds no image.
+///   1. Cache one image, and give two sandboxes records with different names
+///      for it
+///   2. Start each sandbox two times. No registry is available, so a start
+///      works only with the cached image
+///   3. Check that each sandbox has the image for its own name only
 #[tokio::test]
-async fn sandbox_keeps_own_image_name_when_cache_entry_gets_another_name() {
+async fn sandboxes_with_different_names_for_one_image_keep_own_names() {
     let home = temp_dir();
     let data_dir = &data_dir_at(home.path());
-    let sandbox = data_dir.sandboxes.join("box").unwrap();
-    std::fs::create_dir_all(real(&sandbox)).unwrap();
+    let db = open_db(data_dir);
     let vault = vault_with(MemoryStorage::default(), &[]);
-    let own = ImageRef {
+    let bookworm = ImageRef {
         resolution: Resolution::Registry,
         insecure: true,
         ..ImageRef::auto("127.0.0.1:1/debian:bookworm")
     };
-    let other = ImageRef {
+    let twelve = ImageRef {
         name: "127.0.0.1:1/debian:12".to_string(),
-        ..own.clone()
+        ..bookworm.clone()
     };
-    let mut entry = image("sha256:shared", vec![small_layer(data_dir, "sha256:L1")]);
-    entry.name.clone_from(&own.name);
-    ensure_image_hardlink(data_dir, &sandbox.join("image").unwrap(), &entry).unwrap();
-    let start = || prepare(data_dir, &sandbox, &own, &vault, OnImageChange::Refuse);
-    start().await.unwrap();
-
-    entry.name.clone_from(&other.name);
-    write_cached_image(data_dir, &entry.image_id, &entry).unwrap();
-    for _ in 0..2 {
-        let prepared = start().await.unwrap();
-        assert_eq!(prepared.change, ImageChange::Unchanged);
-        assert_eq!(prepared.image.name, own.name);
+    let shared = image("sha256:shared", vec![small_layer(data_dir, "sha256:L1")]);
+    write_cached_image(data_dir, &shared.image_id, &shared).unwrap();
+    let boxes = [(BOX_ID, &bookworm), ("efgh2345", &twelve)].map(|(id, cfg)| {
+        (
+            ImageOwner::Sandbox(id.to_string()),
+            sandbox_dir(data_dir, id),
+            cfg,
+        )
+    });
+    for (owner, _, cfg) in &boxes {
+        record::set(&db, owner, named(&cfg.name, &shared.image_id))
+            .await
+            .unwrap();
     }
-    assert!(load_sandbox_image(data_dir, &sandbox, &own).is_some());
-    assert!(load_sandbox_image(data_dir, &sandbox, &other).is_none());
 
-    write_image_ref(&sandbox, &own.name, "sha256:older").unwrap();
-    assert!(load_sandbox_image(data_dir, &sandbox, &own).is_none());
-    assert!(load_sandbox_image(data_dir, &sandbox, &other).is_some());
+    for _ in 0..2 {
+        for (owner, dir, cfg) in &boxes {
+            let prepared = prepare(
+                &db,
+                data_dir,
+                owner,
+                dir,
+                cfg,
+                &vault,
+                OnImageChange::Refuse,
+            )
+            .await
+            .unwrap();
+            assert_eq!(prepared.change, ImageChange::Unchanged);
+            assert_eq!(prepared.image.name, cfg.name);
+        }
+    }
+    for (owner, dir, cfg) in &boxes {
+        let load = |cfg| load_sandbox_image(&db, data_dir, owner, dir, cfg);
+        assert!(load(cfg).await.unwrap().is_some());
+        let other = if cfg.name == bookworm.name {
+            &twelve
+        } else {
+            &bookworm
+        };
+        assert!(load(other).await.unwrap().is_none());
+    }
 }

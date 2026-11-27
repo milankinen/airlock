@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use crate::context::Context;
 use crate::messages;
+use crate::oci::ImageOwner;
+use crate::oci::record::{self, ImageRecord};
 use crate::sandbox::start::Exit;
 use crate::sandbox::{self, FindOpts, registry};
 use crate::test_cfg::packs::test_packs;
@@ -358,8 +360,8 @@ fn running_project_sandbox_is_not_moved() {
 /// question.
 ///   1. Make an older project sandbox with a disk and no image file
 ///   2. Start with `--yes` and `--allow-configuration-changes`
-///   3. Check that the start stops with exit code 2, and that the imported
-///      disk stays
+///   3. Check that the start stops with exit code 2, that the imported
+///      disk stays, and that the image record has no old digest
 #[test]
 fn yes_start_keeps_imported_disk_when_old_image_is_unknown() {
     let project = StartProject::new(test_packs());
@@ -373,5 +375,12 @@ fn yes_start_keeps_imported_disk_when_old_image_is_unknown() {
     let dir = project.sandbox_dir();
     assert!(dir.starts_with(project.context().data.sandboxes.to_path().unwrap()));
     assert_eq!(read(&dir, "disk.img"), "disk");
-    assert_eq!(read(&dir, "image.imported"), "");
+    // The start took the import marker into the image record.
+    let id = dir.file_name().unwrap().to_str().unwrap().to_string();
+    let stored = block_on_local(record::get(&project.context().db, &ImageOwner::Sandbox(id)));
+    let unknown = ImageRecord {
+        digest: String::new(),
+        name: None,
+    };
+    assert_eq!(stored.unwrap(), Some(unknown));
 }
